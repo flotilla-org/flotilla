@@ -212,6 +212,9 @@ pub struct MessageStatus {
     // Compatibility default for pre-#3799 records; removable one roll after #3799.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fence_recheck_at: Option<DateTime<Utc>>,
+    /// Resume known-unsent deferrals on the next holder observation (#3961).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_holder_version: Option<String>,
     /// Preserve possibly-written submissions when an operator authorizes another attempt.
     // Compatibility default for pre-#3799 records; removable one roll after #3799.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -245,6 +248,7 @@ impl Default for MessageStatus {
         Self {
             operator_delivery: None,
             fence_recheck_at: None,
+            deferred_holder_version: None,
             delivery_history: Vec::new(),
             phase: MessagePhase::Accepted,
             accepted_sequence: None,

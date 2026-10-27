@@ -120,6 +120,8 @@ pub fn terminal_session_attach_target_with_stale_status(
 pub struct TerminalSessionTarget<'a> {
     pub spec: &'a TerminalSessionSpec,
     pub vessel_ref: Option<&'a str>,
+    /// Actual running harness, which can differ from a newly resolved selector.
+    pub harness: Option<&'a str>,
 }
 
 /// Spec-only conversion preserves agent context; tool sessions need the
@@ -130,13 +132,14 @@ impl<'a> From<&'a TerminalSessionSpec> for TerminalSessionTarget<'a> {
             TerminalSessionSource::Agent { context, .. } => Some(context.vessel_ref.as_str()),
             TerminalSessionSource::Tool { .. } => None,
         };
-        Self { spec, vessel_ref: vessel_ref.filter(|value| !value.is_empty()) }
+        Self { spec, vessel_ref: vessel_ref.filter(|value| !value.is_empty()), harness: None }
     }
 }
 
 impl<'a> From<&'a ResourceObject<TerminalSession>> for TerminalSessionTarget<'a> {
     fn from(session: &'a ResourceObject<TerminalSession>) -> Self {
         let mut target = Self::from(&session.spec);
+        target.harness = session.status.as_ref().and_then(|status| status.crew.as_ref()).map(|crew| crew.adapter.as_str());
         if matches!(session.spec.source, TerminalSessionSource::Tool { .. }) {
             target.vessel_ref = session.metadata.labels.get(VESSEL_REF_LABEL).map(String::as_str).filter(|value| !value.is_empty());
         }
@@ -421,6 +424,9 @@ pub struct TerminalSessionStatus {
     /// roll after this field lands (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_unreachable: Option<String>,
+    /// Drafts saved before guarded composer clearing (#3961). Retained across restart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stashed_drafts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -787,13 +793,20 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
         match self {
             Self::HoldTurnDelivery { hold } => status.turn_delivery_hold = Some(hold.clone()),
             Self::MarkStarting => {
+                let stashed_drafts = std::mem::take(&mut status.stashed_drafts);
                 let completion_pending = status.completion_pending.take();
                 let turn_delivery_hold = status.turn_delivery_hold.take();
                 let mut retired_launches = std::mem::take(&mut status.retired_launches);
                 if let Some(crew) = status.crew.take() {
                     retired_launches.insert(crew.id);
                 }
-                *status = TerminalSessionStatus { completion_pending, turn_delivery_hold, retired_launches, ..Default::default() };
+                *status = TerminalSessionStatus {
+                    completion_pending,
+                    turn_delivery_hold,
+                    retired_launches,
+                    stashed_drafts,
+                    ..Default::default()
+                };
             }
             Self::ClearRetiredLaunches => status.retired_launches.clear(),
             Self::ObserveCleatEndpoint { endpoint } => status.cleat_endpoint = endpoint.clone(),
@@ -1486,10 +1499,13 @@ mod tests {
             reason: "episode limit".into(),
             raised_at: chrono::DateTime::<Utc>::UNIX_EPOCH,
         };
-        let mut status = TerminalSessionStatus::default();
+        // Cover both empty and nonempty saved drafts across repeated lifecycle resets.
+        let drafts = if tc.draw(gs::booleans()) { vec!["draft\nwith 'quotes' and \\".to_string()] } else { Vec::new() };
+        let mut status = TerminalSessionStatus { stashed_drafts: drafts.clone(), ..Default::default() };
         TerminalSessionStatusPatch::HoldTurnDelivery { hold: hold.clone() }.apply(&mut status);
         for _ in 0..restarts {
             TerminalSessionStatusPatch::MarkStarting.apply(&mut status);
+            assert_eq!(status.stashed_drafts, drafts, "saved drafts survive restarting the child");
             TerminalSessionStatusPatch::MarkRunning {
                 configured_limits: None,
                 session_id: "session".into(),
@@ -1517,6 +1533,7 @@ mod tests {
         };
         continuation.apply(&mut status);
         assert!(status.turn_delivery_hold.is_none());
+        assert_eq!(status.stashed_drafts, drafts, "delivering a continuation does not discard saved text");
     }
 
     #[test]

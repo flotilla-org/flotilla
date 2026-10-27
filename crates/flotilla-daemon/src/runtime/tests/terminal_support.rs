@@ -15,7 +15,9 @@ pub(super) struct DeliveryProbePool {
     pub(super) screens: Vec<String>,
     pub(super) submission_error: bool,
     pub(super) working_after_delivery: bool,
-    pub(super) controller_fence_unverifiable: AtomicBool,
+    pub(super) recent_controller_input: AtomicBool,
+    pub(super) controller_attached: AtomicBool,
+    pub(super) draft: StdMutex<Option<String>>,
     pub(super) controller_refusals: AtomicUsize,
     pub(super) submission_attempts: AtomicUsize,
     pub(super) submission_attempted: tokio::sync::Notify,
@@ -34,7 +36,9 @@ impl DeliveryProbePool {
             screens: Vec::new(),
             submission_error: false,
             working_after_delivery: false,
-            controller_fence_unverifiable: AtomicBool::new(false),
+            recent_controller_input: AtomicBool::new(false),
+            controller_attached: AtomicBool::new(false),
+            draft: StdMutex::new(None),
             controller_refusals: AtomicUsize::new(0),
             submission_attempts: AtomicUsize::new(0),
             submission_attempted: tokio::sync::Notify::new(),
@@ -109,9 +113,6 @@ impl TerminalPool for DeliveryProbePool {
     async fn guarded_deliver(&self, session: &str, text: &str) -> Result<flotilla_terminal::TerminalSubmission, String> {
         self.submission_attempts.fetch_add(1, Ordering::SeqCst);
         self.submission_attempted.notify_one();
-        if self.controller_fence_unverifiable.load(Ordering::SeqCst) {
-            return Ok(flotilla_terminal::TerminalSubmission::ControllerFenceUnverifiable);
-        }
         if self.controller_refusals.try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1)).is_ok() {
             return Ok(flotilla_terminal::TerminalSubmission::Refused("controller input is not idle".into()));
         }
@@ -121,11 +122,6 @@ impl TerminalPool for DeliveryProbePool {
 
     async fn operator_deliver(&self, session: &str, text: &str) -> Result<(), String> {
         self.deliver(session, text).await
-    }
-
-    async fn retry_delivery(&self, _session_name: &str, _text: &str) -> Result<(), String> {
-        self.retries.fetch_add(1, Ordering::SeqCst);
-        Ok(())
     }
 }
 
@@ -179,9 +175,22 @@ impl TerminalPool for HooklessComposerPool {
 }
 
 pub(super) async fn refresh_message_test_attention(runtime: &TerminalControllerRuntime, backend: &ResourceBackend, name: &str) {
+    refresh_message_test_attention_at(runtime, backend, name, Utc::now()).await;
+}
+
+pub(super) async fn refresh_message_test_attention_at(
+    runtime: &TerminalControllerRuntime,
+    backend: &ResourceBackend,
+    name: &str,
+    now: chrono::DateTime<Utc>,
+) {
     let sessions = backend.using::<TerminalSession>(NAMESPACE);
     let holder = sessions.get(name).await.expect("attention holder");
-    let observation = runtime.observe_attention(name, (&holder).into()).await.expect("terminal observation").expect("observed attention");
+    let mut observation =
+        runtime.observe_attention(name, (&holder).into()).await.expect("terminal observation").expect("observed attention");
+    if let Some(attention) = &mut observation.attention {
+        attention.as_of = now;
+    }
     flotilla_store::apply_status_patch(
         &sessions,
         name,
@@ -190,14 +199,14 @@ pub(super) async fn refresh_message_test_attention(runtime: &TerminalControllerR
             attention: observation.attention,
             occupancy: observation.occupancy,
             output_digest: observation.output_digest,
-            observed_at: Utc::now(),
+            observed_at: now,
         },
     )
     .await
     .expect("terminal controller attention projection");
 }
 
-pub(super) async fn run_message_batch_pool_case(operator_closes: bool, refusals: usize) {
+pub(super) async fn run_message_batch_pool_case(operator_closes: bool) {
     use flotilla_discovery_testkit::fake_discovery;
     use flotilla_resources::{Message, MessageExpectation, MessagePhase, MessageRelation, MessageSpec, ROLE_LABEL, VESSEL_LABEL};
 
@@ -210,7 +219,6 @@ pub(super) async fn run_message_batch_pool_case(operator_closes: bool, refusals:
     let backend = daemon.resource_backend();
     let mut probe = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
     probe.submission_error = true;
-    probe.controller_refusals.store(refusals, Ordering::SeqCst);
     probe.screens = vec!["› Ask Codex to do anything".into(); 1000];
     probe.screens.push("new tool output\n• Working (1s • esc to interrupt)\n› Ask Codex to do anything".into());
     let pool = Arc::new(probe);
@@ -348,25 +356,12 @@ pub(super) async fn run_message_batch_pool_case(operator_closes: bool, refusals:
     assert_eq!(backend.using::<Message>(NAMESPACE).list().await.expect("cross-host Message fixture operation succeeds").items.len(), 3);
     inbox.reconcile_delivery(&keystroke_router(&runtime.state), now).await.expect("cross-host Message fixture operation succeeds");
     tokio::task::yield_now().await;
-    for attempt in 1..=refusals {
-        tokio::time::timeout(Duration::from_secs(2), pool.submission_attempted.notified()).await.expect("guard retry reached PTY boundary");
-        assert_eq!(pool.submission_attempts.load(Ordering::SeqCst), attempt);
-        assert!(pool.inputs.lock().expect("input log").is_empty(), "a refusal leaves the FIFO batch queued and unsent");
-        assert!(
-            !runtime.state.terminal_deliveries.lock().expect("delivery reservation").is_empty(),
-            "the batch keeps its de-duplication reservation"
-        );
-        inbox.reconcile_delivery(&keystroke_router(&runtime.state), now).await.expect("pending batch reconciliation");
-        assert_eq!(pool.submission_attempts.load(Ordering::SeqCst), attempt, "reconciliation must not start another submission");
-        tokio::time::advance(Duration::from_millis(200)).await;
-        tokio::task::yield_now().await;
-    }
     tokio::time::sleep(Duration::from_secs(6)).await;
     inbox
         .reconcile_delivery(&keystroke_router(&runtime.state), now + chrono::Duration::seconds(1))
         .await
         .expect("cross-host Message fixture operation succeeds");
-    assert_eq!(pool.submission_attempts.load(Ordering::SeqCst), refusals + 1);
+    assert_eq!(pool.submission_attempts.load(Ordering::SeqCst), 1);
     assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
     assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
     {
@@ -577,5 +572,101 @@ impl TerminalPool for AttachableToolPool {
             daemon: "vessel-daemon".into(),
             session: session.into(),
         }))
+    }
+}
+
+// Process-boundary stand-in for cleat: controller input closes an unverifiable
+// fence, and only a matched composer selector plus quiet time can replace it.
+// The scenario uses the real CleatTerminalPool parser and command construction.
+pub(super) struct ControllerCleatRunner {
+    pub(super) probe: Arc<DeliveryProbePool>,
+    pub(super) recognizer_installed: AtomicBool,
+}
+
+#[async_trait]
+impl CommandRunner for ControllerCleatRunner {
+    async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+        panic!("unexpected command discovery in delivery scenario")
+    }
+
+    async fn run(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &std::path::Path,
+        label: &flotilla_provider_runtime::ChannelLabel,
+    ) -> Result<String, String> {
+        let output = self.run_output(cmd, args, cwd, label).await?;
+        if output.success() {
+            Ok(output.stdout)
+        } else {
+            Err(output.stderr)
+        }
+    }
+
+    async fn run_output(
+        &self,
+        _cmd: &str,
+        args: &[&str],
+        _cwd: &std::path::Path,
+        _label: &flotilla_provider_runtime::ChannelLabel,
+    ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
+        use flotilla_provider_runtime::CommandOutput;
+        let start = args
+            .iter()
+            .position(|arg| matches!(*arg, "list" | "capture" | "inspect" | "recognizer" | "send" | "clear-composer"))
+            .expect("cleat operation in controlled client envelope");
+        let args = &args[start..];
+        let quiet = !self.probe.recent_controller_input.load(Ordering::SeqCst);
+        let refusal = |reason: &str| Ok(CommandOutput { stdout: String::new(), stderr: reason.into(), exit_code: Some(1) });
+        let stdout = match args[0] {
+            "list" => {
+                self.probe.observations.fetch_add(1, Ordering::SeqCst);
+                serde_json::json!([{"id":"agent","status":if self.probe.controller_attached.load(Ordering::SeqCst) {"Attached"} else {"Detached"}}]).to_string()
+            }
+            "capture" => self.probe.capture_screen("agent").await?.unwrap_or_default(),
+            "inspect" => {
+                let draft = self.probe.draft.lock().unwrap().clone().unwrap_or_default();
+                let recognizer = self
+                    .recognizer_installed
+                    .load(Ordering::SeqCst)
+                    .then(|| serde_json::json!({"id":"codex","error":null,"observation":{"roles":[{"role":"composer","value":draft}]}}));
+                serde_json::json!({"last_controller_input_at": if quiet {0} else {Utc::now().timestamp_millis()}, "recognizer":recognizer})
+                    .to_string()
+            }
+            "recognizer" => {
+                assert_eq!(args, ["recognizer", "set", "agent", "codex"]);
+                self.recognizer_installed.store(true, Ordering::SeqCst);
+                String::new()
+            }
+            "clear-composer" => {
+                let draft = args.iter().find_map(|arg| arg.strip_prefix("--draft=")).expect("exact draft guard, including leading hyphens");
+                assert!(args.windows(2).any(|pair| pair == ["--controller-idle", "2m"]));
+                if !quiet || self.probe.draft.lock().unwrap().as_deref() != Some(draft) {
+                    return refusal("not-matched: composer changed before clear");
+                }
+                *self.probe.draft.lock().unwrap() = None;
+                String::new()
+            }
+            "send" => {
+                self.probe.submission_attempts.fetch_add(1, Ordering::SeqCst);
+                if !quiet {
+                    return refusal("controller-active: recent input (controller.cause=quiet-time)");
+                }
+                if !args.windows(2).any(|pair| pair == ["--if", "composer[value='']"])
+                    || !args.windows(2).any(|pair| pair == ["--controller-idle", "2s"])
+                {
+                    return refusal("controller-active: unverifiable echo (controller.cause=fence-unverifiable)");
+                }
+                if self.probe.draft.lock().unwrap().is_some() {
+                    return refusal("not-matched: composer holds a draft");
+                }
+                assert!(self.recognizer_installed.load(Ordering::SeqCst));
+                self.probe.deliver("agent", args.last().unwrap()).await?;
+                String::new()
+            }
+            other => panic!("unexpected cleat operation {other}"),
+        };
+        Ok(CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) })
     }
 }

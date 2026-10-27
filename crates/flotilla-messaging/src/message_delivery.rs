@@ -14,7 +14,7 @@ use crate::{
     apply_status_patch,
     delivery_hold::{
         delivery_acceptance_evidence, delivery_demand, delivery_demand_name, delivery_retry_backoff, delivery_retry_exhausted,
-        CONTROLLER_FENCE_RECHECK_FOR, DELIVERY_HOLD_FOR, DELIVERY_HOLD_REASON_ANNOTATION, DELIVERY_MAX_ATTEMPTS,
+        DELIVERY_HOLD_FOR, DELIVERY_HOLD_REASON_ANNOTATION, DELIVERY_MAX_ATTEMPTS,
     },
     message_expectation_open, message_supersedes,
     role_routing::topic_receiver_addresses,
@@ -85,13 +85,6 @@ impl MessageInbox {
                 let submission = status.and_then(|status| status.submission.as_ref());
                 [
                     message.spec.deadline.filter(|deadline| *deadline > now),
-                    status
-                        .filter(|status| {
-                            status.submission.is_none() && status.fence_recheck_at.is_some() && HeldMessageBatch::is_held(message)
-                        })
-                        .map(|status| {
-                            status.fence_recheck_at.unwrap_or(now + CONTROLLER_FENCE_RECHECK_FOR).max(now + CONTROLLER_FENCE_RECHECK_FOR)
-                        }),
                     status.and_then(|status| status.retry.as_ref()).and_then(|retry| retry.next_attempt_at()).filter(|due| *due > now),
                     submission
                         .map(|submission| submission.started_at + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR)
@@ -769,47 +762,47 @@ impl MessageInbox {
                 return Ok(());
             }
         }
-        // The session marker is persisted before the batch members. Repair a
-        // partially written refusal before observing Working/receipt evidence:
-        // this batch is known unsent, even if some members still have their old
-        // submission after a store error or daemon restart.
-        if let Some(condition) = holder
-            .status
-            .as_ref()
-            .and_then(|status| status.degraded.as_ref())
-            .filter(|condition| condition.is_controller_fence_unverifiable())
-        {
-            if let Some(rejected) = pending.iter().find(|message| {
-                condition.message_id.as_ref().is_some_and(|id| {
-                    message.metadata.name == *id
-                        || message.status.as_ref().is_some_and(|status| {
-                            status.failed_batch_members.contains(id)
-                                || status.submission.as_ref().is_some_and(|submission| submission.members.contains(id))
-                        })
-                })
-            }) {
-                let status = status_for(rejected);
-                let names = status.submission.as_ref().map(|submission| &submission.members).unwrap_or(&status.failed_batch_members);
-                let members = names
-                    .iter()
-                    .map(|name| {
-                        all.iter()
-                            .find(|message| message.metadata.name == *name)
-                            .cloned()
-                            .ok_or_else(|| ResourceError::invalid(format!("rejected message batch member `{name}` is absent")))
+        // One-roll recovery for the old, definitely-unsent fence holds. Retire
+        // their retry/deadline state and let the recognizer guard decide now.
+        let mut repaired = false;
+        for message in pending {
+            let mut status = status_for(message);
+            let legacy_refusal = holder.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
+                condition.is_controller_fence_unverifiable()
+                    && condition.message_id.as_ref().is_some_and(|id| {
+                        message.metadata.name == *id
+                            || status
+                                .submission
+                                .as_ref()
+                                .is_some_and(|submission| submission.started_at <= condition.observed_at && submission.members.contains(id))
                     })
-                    .collect::<Result<Vec<_>, _>>()?;
-                if members.iter().any(|member| {
-                    member
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.submission.as_ref())
-                        .is_some_and(|submission| submission.started_at <= condition.observed_at)
-                }) {
-                    self.controller_fence_unverifiable(receivers, &members, &condition.message, now).await?;
-                    return Ok(());
-                }
+            });
+            if status.fence_recheck_at.is_some() || legacy_refusal {
+                status.fence_recheck_at = None;
+                status.retry = None;
+                status.submission = None;
+                self.write(message, &status).await?;
+                apply_status_patch(
+                    &self.backend.using::<TerminalSession>(&self.namespace),
+                    &holder.metadata.name,
+                    &crate::TerminalSessionStatusPatch::ClearMessageDeliveryHold {
+                        message_id: holder
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.degraded.as_ref())
+                            .filter(|condition| condition.is_controller_fence_unverifiable())
+                            .and_then(|condition| condition.message_id.clone())
+                            .unwrap_or_else(|| message.metadata.name.clone()),
+                    },
+                )
+                .await?;
+                self.clear_signal(receivers, message).await?;
+                tracing::info!(message = %message.metadata.name, "retired legacy known-unsent controller fence hold");
+                repaired = true;
             }
+        }
+        if repaired {
+            return Ok(());
         }
         if let Some(request) = pending
             .iter()
@@ -880,18 +873,18 @@ impl MessageInbox {
             if pending.iter().any(|message| {
                 message.status.as_ref().and_then(|status| status.retry.as_ref()).is_some_and(|retry| match &retry.disposition {
                     ControllerRetryDisposition::Retryable { next_attempt_at } => now < *next_attempt_at,
-                    ControllerRetryDisposition::Terminal { .. } => {
-                        let fence = message.status.as_ref().is_some_and(|status| status.fence_recheck_at.is_some())
-                            || holder.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
-                                condition.is_controller_fence_unverifiable()
-                                    && pending.iter().any(|member| condition.message_id.as_deref() == Some(member.metadata.name.as_str()))
-                            });
-                        !fence || message.status.as_ref().and_then(|status| status.fence_recheck_at).is_some_and(|due| now < due)
-                    }
+                    ControllerRetryDisposition::Terminal { .. } => true,
                 })
             }) {
                 return Ok(());
             }
+        }
+        if pending.iter().any(|message| {
+            message.status.as_ref().and_then(|status| status.deferred_holder_version.as_deref())
+                == Some(holder.metadata.resource_version.as_str())
+        }) {
+            tracing::debug!(holder = %holder.metadata.name, "known-unsent batch waits for the next holder observation");
+            return Ok(());
         }
         let target = delivery_target(holder);
         let existing_ref = existing.as_ref().map(submission_ref);
@@ -1077,6 +1070,7 @@ impl MessageInbox {
                 status.retry = None;
             }
             status.submission = Some(submission.clone());
+            status.deferred_holder_version = None;
             status.operator_delivery = None;
             status.fence_recheck_at = None;
             self.write(message, &status).await?;
@@ -1220,11 +1214,22 @@ impl MessageInbox {
             TransportOutcome::NotSubmitted { reason } | TransportOutcome::Unsupported { reason } => {
                 self.failed(receivers, members, &reason, false, now).await
             }
-            TransportOutcome::ControllerFenceUnverifiable { reason } => {
-                self.controller_fence_unverifiable(receivers, members, &reason, now).await
-            }
             TransportOutcome::Unconfirmed { reason } => {
                 self.failed(receivers, members, &format!("held pending acceptance evidence: {reason}"), true, now).await
+            }
+            TransportOutcome::Deferred { reason, reform_batch } => {
+                release(router, &delivery(holder, members, submission.clone())).await;
+                for member in members {
+                    let current = self.messages.get(&member.metadata.name).await?;
+                    let mut status = status_for(&current);
+                    status.submission = None;
+                    status.fence_recheck_at = None;
+                    status.deferred_holder_version = (!reform_batch).then(|| holder.metadata.resource_version.clone());
+                    MessageStatusPatch::Wait { phase: MessagePhase::Deliverable, reason: reason.clone(), at: now }.apply(&mut status);
+                    self.write(&current, &status).await?;
+                }
+                tracing::info!(%reason, "message remains queued without a delivery attempt");
+                Ok(())
             }
             TransportOutcome::Pending => Ok(()),
             TransportOutcome::Accepted { .. } => {
@@ -1264,75 +1269,6 @@ impl MessageInbox {
             }
             .instrument(flotilla_tracing::queued_span(&member.metadata.name, "receipt"))
             .await?;
-        }
-        Ok(())
-    }
-
-    async fn controller_fence_unverifiable(
-        &self,
-        receivers: &MessageReceiverSnapshot,
-        members: &[ResourceObject<Message>],
-        reason: &str,
-        now: DateTime<Utc>,
-    ) -> Result<(), ResourceError> {
-        let Some(first) = members.first() else {
-            return Err(ResourceError::invalid("controller fence refusal requires a nonempty batch"));
-        };
-        // Write the session-level proof first, so a partial batch write can be
-        // repaired at the start of deliver_group_traced without retyping input.
-        // A receiver lost between result and snapshot is still a known-unsent
-        // batch: park it durably; a future holder lookup can raise its gate.
-        let mut failures = 1;
-        if let Some(holder) = self.resolve_receiver(receivers, first).await? {
-            let current = self.messages.get(&first.metadata.name).await?;
-            let submitted_at =
-                current.status.as_ref().and_then(|status| status.submission.as_ref()).map(|submission| submission.started_at);
-            let already_recorded = holder.object.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
-                condition.is_controller_fence_unverifiable()
-                    && condition.message_id.as_deref() == Some(first.metadata.name.as_str())
-                    && submitted_at.is_none_or(|at| at <= condition.observed_at)
-            });
-            failures = holder
-                .object
-                .status
-                .as_ref()
-                .and_then(|status| status.degraded.as_ref())
-                .filter(|condition| condition.message_id.as_deref() == Some(first.metadata.name.as_str()))
-                .map_or(1, |condition| {
-                    if already_recorded {
-                        condition.consecutive_failures
-                    } else {
-                        condition.consecutive_failures.saturating_add(1)
-                    }
-                });
-            if !already_recorded {
-                apply_status_patch(
-                    &self.backend.using::<TerminalSession>(&self.namespace),
-                    &holder.object.metadata.name,
-                    &crate::TerminalSessionStatusPatch::MarkControllerFenceUnverifiable {
-                        message_id: first.metadata.name.clone(),
-                        message: reason.into(),
-                        observed_at: now,
-                    },
-                )
-                .await?;
-            }
-        }
-        for member in members {
-            let current = self.messages.get(&member.metadata.name).await?;
-            if current.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
-                continue;
-            }
-            let mut status = status_for(&current);
-            status.retry = Some(ControllerRetry::terminal(status.retry.as_ref(), now, reason));
-            status.submission = None;
-            status.fence_recheck_at = Some(now + crate::delivery_hold::controller_fence_recheck_delay(failures));
-            status.failed_batch_members = members.iter().map(|message| message.metadata.name.clone()).collect();
-            MessageStatusPatch::Wait { phase: MessagePhase::Deliverable, reason: reason.into(), at: now }.apply(&mut status);
-            self.write(&current, &status).await?;
-            if member.metadata.name == first.metadata.name {
-                self.signal(receivers, &ResourceObject { status: Some(status), ..current }, now).await?;
-            }
         }
         Ok(())
     }
@@ -1800,30 +1736,6 @@ mod framing_tests {
             admitted.status.as_ref().expect("admitted status").accepted_sequence
         );
         assert_eq!(current.status.expect("status").phase, MessagePhase::Deliverable);
-    }
-
-    // A receiver disappearing before failure persistence does not turn known
-    // unsent input into a receipt or a retry. With no holder there is no gate
-    // target; the durable failed batch remains for a future holder lookup.
-    #[tokio::test]
-    async fn unverifiable_fence_without_a_receiver_still_parks_the_batch() {
-        let backend = crate::ResourceBackend::new(flotilla_store_testkit::memory_backend());
-        let inbox = MessageInbox::new(backend.clone(), "project");
-        let stored = backend.using::<Message>("project");
-        let mut intent = messages().remove(0);
-        intent.receiver = "project/convoy/work/coder".into();
-        let message = stored.create(&InputMeta::builder().name("lost-holder".into()).build(), &intent).await.expect("intent");
-        let receivers = MessageReceiverSnapshot::load(&backend, "project").await.expect("empty snapshot");
-        assert!(inbox.resolve_receiver(&receivers, &message).await.expect("lookup").is_none());
-        let reason = crate::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE;
-        inbox.controller_fence_unverifiable(&receivers, &[message], reason, Utc::now()).await.expect("park known-unsent input");
-        let status = stored.get("lost-holder").await.expect("message").status.expect("failure");
-        assert!(status.resolved_receiver.is_none());
-        assert!(status.submission.is_none());
-        assert_eq!(status.reason.as_deref(), Some(reason));
-        assert!(matches!(status.retry.expect("retry disposition").disposition, ControllerRetryDisposition::Terminal { .. }));
-        assert!(backend.using::<Demand>("project").list().await.expect("gates").items.is_empty());
-        assert!(inbox.controller_fence_unverifiable(&receivers, &[], reason, Utc::now()).await.is_err());
     }
 
     #[derive(Clone, Default)]

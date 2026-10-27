@@ -748,6 +748,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     completion_pending: None,
                     degraded: None,
                     daemon_unreachable: None,
+                    stashed_drafts: Vec::new(),
                 };
                 let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
                 let patch = TerminalSessionStatusPatch::MarkRunning {

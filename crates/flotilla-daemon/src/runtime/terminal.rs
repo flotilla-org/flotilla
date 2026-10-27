@@ -83,10 +83,8 @@ pub(super) const DELIVERY_CONFIRMATION_GRACE: Duration = Duration::from_secs(4);
 
 pub(crate) const DELIVERY_CONFIRMATION_STABLE_FOR: Duration = Duration::from_secs(1);
 
-pub(super) const DELIVERY_READY_POLLS: usize = 150;
-
-// Screen classification is the same evidence for observation, turn release, and
-// submission. Pixel redraws and principal attachment status do not define turns.
+// Adapter classification supplies attention and acceptance evidence. Cleat owns
+// the composer judgement that gates all writes.
 pub(super) async fn observe_terminal_screen(
     pool: &dyn TerminalPool,
     adapter: Option<&dyn AgentAdapter>,
@@ -126,31 +124,6 @@ pub(super) async fn observe_terminal_screen(
         attention: state.map(|state| flotilla_resources::TerminalAttention { state, as_of: now, source: TerminalAttentionSource::Screen }),
         occupancy,
     }))
-}
-
-pub(super) async fn wait_for_delivery_ready(
-    pool: &dyn TerminalPool,
-    adapter: Option<&dyn AgentAdapter>,
-    session_id: &str,
-    readiness: TerminalDeliveryReadiness,
-) -> Result<bool, String> {
-    let mut polls = 0;
-    loop {
-        let observation = observe_terminal_screen(pool, adapter, session_id, Utc::now())
-            .await?
-            .ok_or_else(|| format!("terminal session {session_id} disappeared before message delivery"))?;
-        // Pools without any attention evidence retain best-effort delivery.
-        if observation.attention.is_none_or(|attention| attention.state == TerminalAttentionState::Idle) {
-            return Ok(true);
-        }
-        polls += 1;
-        // Startup alone has a deadline (and reports StartupNotReady). A queued
-        // mid-session turn waits for its boundary without that startup timeout.
-        if readiness == TerminalDeliveryReadiness::Startup && polls >= DELIVERY_READY_POLLS {
-            return Ok(false);
-        }
-        tokio::time::sleep(DELIVERY_CONFIRMATION_POLL).await;
-    }
 }
 
 pub(super) async fn session_busy_after_delivery_grace(
@@ -193,41 +166,14 @@ pub(super) async fn deliver_and_confirm(
     adapter: Option<&dyn AgentAdapter>,
     session_id: &str,
     message: &str,
-    readiness: TerminalDeliveryReadiness,
-    clear_before_delivery: bool,
+    _readiness: TerminalDeliveryReadiness,
 ) -> Result<TerminalDeliveryOutcome, String> {
-    // This confirmation task is in-memory. A crash after PTY acceptance and
-    // before its durable receipt/hold can still cause a resend after restart;
-    // crash-atomic delivery needs a pre-write intent and harness acknowledgement.
-    // Readiness only observes the session and never writes input, so any error
-    // from wait_for_delivery_ready is known-unsent and safe for bounded retry.
-    // PTY input sent during agent startup can be consumed before the TUI has
-    // enabled its composer input modes. A newly launched agent reports active,
-    // so wait for its first idle observation before sending delivery bytes.
-    let deadline =
-        tokio::time::Instant::now() + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.to_std().expect("positive hold bound");
-    loop {
-        match tokio::time::timeout_at(deadline, wait_for_delivery_ready(pool, adapter, session_id, readiness)).await {
-            Ok(Ok(true)) => {}
-            Err(_) => return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)),
-            result => {
-                warn!(%session_id, ?result, "agent session readiness failed before any message input was sent");
-                return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
-            }
-        }
-        // timeout_at can poll an immediately-ready observation at the deadline.
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
-        }
-        let outcome = submit_and_confirm(pool, adapter, session_id, message, clear_before_delivery).await?;
-        if outcome != TerminalDeliveryOutcome::Pending {
-            return Ok(outcome);
-        }
-        tokio::time::sleep(DELIVERY_CONFIRMATION_POLL).await;
-    }
+    // All writes are gated atomically by cleat, including startup deliveries.
+    // Adapter observations remain acceptance evidence only.
+    submit_and_confirm(pool, adapter, session_id, message).await
 }
 
-/// Readiness and freshness are both pre-write steps under one hold deadline.
+/// Revalidate batch freshness immediately before the atomic guarded write.
 pub(super) async fn deliver_guarded_and_confirm(
     pool: &dyn TerminalPool,
     adapter: Option<&dyn AgentAdapter>,
@@ -236,40 +182,20 @@ pub(super) async fn deliver_guarded_and_confirm(
     inbox: &flotilla_messaging::MessageInbox,
     members: &[String],
 ) -> Result<TerminalDeliveryOutcome, String> {
-    let deadline =
-        tokio::time::Instant::now() + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.to_std().expect("positive hold bound");
-    loop {
-        let ready =
-            tokio::time::timeout_at(deadline, wait_for_delivery_ready(pool, adapter, session, TerminalDeliveryReadiness::TurnBoundary))
-                .await;
-        if ready.is_err() {
-            // Stop waiting; the durable intent remains for the operator gate.
-            return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
+    // Cleat is the only write gate. No adapter classifier or hold deadline may
+    // turn a known-unsent queued message into an operator-only hold.
+    match inbox.validate_delivery_members(members, Utc::now()).await {
+        Ok(true) => {}
+        Ok(false) => {
+            info!(%session, "batch member superseded before input; reforming the unsent batch");
+            return Ok(TerminalDeliveryOutcome::BatchSuperseded);
         }
-        if !matches!(ready, Ok(Ok(true))) {
-            return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
+        Err(error) => {
+            info!(%session, %error, "turn condition not yet observable; no input sent");
+            return Ok(TerminalDeliveryOutcome::Deferred("turn condition not yet observable"));
         }
-        match tokio::time::timeout_at(deadline, inbox.validate_delivery_members(members, Utc::now())).await {
-            Ok(Ok(true)) => {}
-            Err(_) => return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)),
-            Ok(Err(error)) => {
-                warn!(%session, %error, "message freshness is unavailable before input; holding the unsent batch");
-                return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
-            }
-            Ok(Ok(false)) => return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady)),
-        }
-        // timeout_at polls an immediately-ready future before its timer; enforce
-        // the bound even if readiness and validation complete at the deadline.
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
-        }
-        // No second readiness wait may separate validation from terminal input.
-        let outcome = submit_and_confirm(pool, adapter, session, text, false).await?;
-        if outcome != TerminalDeliveryOutcome::Pending {
-            return Ok(outcome);
-        }
-        tokio::time::sleep(DELIVERY_CONFIRMATION_POLL).await;
     }
+    submit_and_confirm(pool, adapter, session, text).await
 }
 
 pub(super) async fn submit_and_confirm(
@@ -277,23 +203,21 @@ pub(super) async fn submit_and_confirm(
     adapter: Option<&dyn AgentAdapter>,
     session_id: &str,
     message: &str,
-    clear_before_delivery: bool,
 ) -> Result<TerminalDeliveryOutcome, String> {
-    let submission = if clear_before_delivery {
-        pool.guarded_retry_delivery(session_id, message).await
-    } else {
-        pool.guarded_deliver(session_id, message).await
-    };
+    let submission = pool.guarded_deliver(session_id, message).await;
     match submission {
         Ok(TerminalSubmission::Submitted) => {}
-        Ok(TerminalSubmission::ControllerFenceUnverifiable) => {
-            return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::ControllerFenceUnverifiable));
-        }
         Ok(TerminalSubmission::Refused(reason)) => {
             debug!(%session_id, %reason, "cleat refused atomic submission; keeping delivery queued");
             // Keep the in-flight batch at the FIFO head. A refusal consumes
             // neither a receipt nor the bounded transport-failure budget.
-            return Ok(TerminalDeliveryOutcome::Pending);
+            let reason = match reason.split_once(':').map(|(code, _)| code) {
+                Some("not-matched") => "cleat composer selector did not match; no input sent",
+                Some("role-absent") => "cleat composer role is absent; no input sent",
+                Some("unsupported") => "cleat composer recognizer is unsupported; no input sent",
+                _ => "cleat controller is active; no input sent",
+            };
+            return Ok(TerminalDeliveryOutcome::Deferred(reason));
         }
         Err(error) => {
             warn!(%session_id, %error, "message write has an ambiguous outcome; holding without resending");
@@ -407,7 +331,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
             .map(|tag| serde_json::from_str(&tag.value).map_err(|error| format!("invalid credential permissions: {error}")))
             .transpose()?
             .unwrap_or_default();
-        let pool_tags = tags
+        let mut pool_tags = tags
             .iter()
             .filter(|tag| {
                 tag.key != CREDENTIAL_REF_SESSION_TAG
@@ -657,6 +581,11 @@ impl TerminalRuntime for TerminalControllerRuntime {
             pool.kill_session(&session_id).await?;
         }
         let initial_size = is_agent_session.then_some(CREW_SESSION_SIZE);
+        if let Some(crew) = &crew {
+            if matches!(crew.adapter.as_str(), "codex" | "claude-code") {
+                pool_tags.push(flotilla_terminal::TerminalSessionTag::new("recognizer", &crew.adapter));
+            }
+        }
         pool.ensure_session_with_size(&session_id, &command, &cwd, &env, &pool_tags, initial_size).await?;
         if recovered_from_lost {
             if let Err(error) = pool.retain_recovered_recording(name).await {
@@ -750,6 +679,17 @@ impl TerminalRuntime for TerminalControllerRuntime {
 
     async fn observe_attention(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<Option<TerminalObservation>, String> {
         let pool = self.pool_for_spec(spec).await?;
+        if let TerminalSessionSource::Agent { selector, .. } = &spec.source {
+            let harness = match spec.harness {
+                Some(harness) => harness.to_owned(),
+                None => CapabilityTable::seeded().resolve_selector(selector)?.adapter,
+            };
+            if matches!(harness.as_str(), "codex" | "claude-code") {
+                pool.ensure_recognizer(session_id, &harness)
+                    .await
+                    .map_err(|error| format!("cannot attach {harness} recognizer to {session_id}: {error}"))?;
+            }
+        }
         let adapter = self.adapter_for_spec(spec).await?;
         observe_terminal_screen(&*pool, adapter.as_deref(), session_id, Utc::now()).await
     }
@@ -831,7 +771,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         let TerminalSessionSource::Agent { .. } = &spec.source else {
             return Err("crew message delivery requires an agent terminal".to_string());
         };
-        let clear_before_delivery = match lookup_terminal_delivery(&self.state.terminal_deliveries, session_id, message) {
+        match lookup_terminal_delivery(&self.state.terminal_deliveries, session_id, message) {
             TerminalDeliveryLookup::InFlight => return Ok(TerminalDeliveryOutcome::Pending),
             TerminalDeliveryLookup::Taken(delivery) if delivery.message == message => {
                 return match delivery.task.await {
@@ -845,9 +785,8 @@ impl TerminalRuntime for TerminalControllerRuntime {
             TerminalDeliveryLookup::Taken(delivery) => {
                 delivery.task.abort();
                 let _ = delivery.task.await;
-                true
             }
-            TerminalDeliveryLookup::Vacant => false,
+            TerminalDeliveryLookup::Vacant => {}
         };
         let pool = self.pool_for_spec(spec).await?;
         let adapter = self.adapter_for_spec(spec).await?;
@@ -859,9 +798,10 @@ impl TerminalRuntime for TerminalControllerRuntime {
         if deliveries.contains_key(session_id) {
             return Ok(TerminalDeliveryOutcome::Pending);
         }
-        let task = tokio::spawn(async move {
-            deliver_and_confirm(&*pool, adapter.as_deref(), &session_id_owned, &message_owned, readiness, clear_before_delivery).await
-        });
+        let task =
+            tokio::spawn(
+                async move { deliver_and_confirm(&*pool, adapter.as_deref(), &session_id_owned, &message_owned, readiness).await },
+            );
         deliveries.insert(session_id.to_string(), PendingTerminalDelivery { message_batch: None, message: message.to_string(), task });
         Ok(TerminalDeliveryOutcome::Pending)
     }

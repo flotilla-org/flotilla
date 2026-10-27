@@ -215,7 +215,7 @@ impl AgentTransport for TerminalControllerRuntime {
         let other_delivery = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned").contains_key(session);
         let evidence = if other_delivery { None } else { evidence };
         Ok(TransportObservation {
-            ready: same_receiver && !other_delivery && attention.is_some_and(|attention| attention.state == TerminalAttentionState::Idle),
+            ready: same_receiver && !other_delivery,
             working: same_receiver
                 && !other_delivery
                 && attention.is_some_and(|attention| {
@@ -305,6 +305,18 @@ impl AgentTransport for TerminalControllerRuntime {
             Ok(pool) => pool,
             Err(reason) => return TransportOutcome::NotSubmitted { reason },
         };
+        if let Some(harness) = holder
+            .status
+            .as_ref()
+            .and_then(|status| status.crew.as_ref())
+            .map(|crew| crew.adapter.as_str())
+            .filter(|harness| matches!(*harness, "codex" | "claude-code"))
+        {
+            if let Err(error) = pool.ensure_recognizer(&batch.submission.session, harness).await {
+                tracing::warn!(session = %batch.submission.session, %error, "crew recognizer unavailable; no input sent");
+                return TransportOutcome::Deferred { reason: format!("cannot attach {harness} recognizer: {error}"), reform_batch: false };
+            }
+        }
         let adapter = match self.adapter_for_spec((&holder).into()).await {
             Ok(adapter) => adapter,
             Err(reason) => return TransportOutcome::NotSubmitted { reason },
@@ -321,13 +333,54 @@ impl AgentTransport for TerminalControllerRuntime {
         let operator_reason = batch.submission.operator_reason.clone();
         let task = tokio::spawn(async move {
             let inbox = daemon.message_inbox(&namespace).await;
+            // Validate before touching a draft as well as immediately before send.
+            match inbox.validate_delivery_members(&members, Utc::now()).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!(%session, "batch member superseded; no input sent");
+                    return Ok(TerminalDeliveryOutcome::BatchSuperseded);
+                }
+                Err(error) => {
+                    tracing::info!(%session, %error, "turn condition not yet observable; no input sent");
+                    return Ok(TerminalDeliveryOutcome::Deferred("turn condition not yet observable"));
+                }
+            }
             if operator_reason.is_some() {
                 // The inbox pinned this authorization to the inspected receiver.
-                if !inbox.validate_delivery_members(&members, Utc::now()).await.map_err(|error| error.to_string())? {
-                    return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
-                }
                 pool.operator_deliver(&session, &text).await?;
                 return Ok(TerminalDeliveryOutcome::Confirmed);
+            }
+            let prepare_composer = async {
+                if let Some(draft) = pool.abandoned_draft(&session).await? {
+                    let sessions = daemon.resource_backend().using::<TerminalSession>(&namespace);
+                    loop {
+                        let current = sessions.get(&holder.metadata.name).await.map_err(|error| error.to_string())?;
+                        let mut status = current.status.clone().ok_or("holder status disappeared")?;
+                        if status.stashed_drafts.contains(&draft) {
+                            break;
+                        }
+                        status.stashed_drafts.push(draft.clone());
+                        match sessions.update_status(&current.metadata.name, &current.metadata.resource_version, &status).await {
+                            Ok(_) => break,
+                            Err(ResourceError::Conflict { .. }) => continue,
+                            Err(error) => return Err(error.to_string()),
+                        }
+                    }
+                    if !pool.clear_draft(&session, &draft).await? {
+                        tracing::info!(%session, "composer changed before guarded clear; no message input sent");
+                        return Ok(false);
+                    }
+                }
+                Ok::<_, String>(true)
+            }
+            .await;
+            match prepare_composer {
+                Ok(true) => {}
+                Ok(false) => return Ok(TerminalDeliveryOutcome::Deferred("composer changed before guarded clear")),
+                Err(error) => {
+                    tracing::warn!(%session, %error, "composer preparation failed; no message input sent");
+                    return Ok(TerminalDeliveryOutcome::Deferred("composer preparation unavailable; no message input sent"));
+                }
             }
             deliver_guarded_and_confirm(&*pool, adapter.as_deref(), &session, &text, &inbox, &members).await
         });
@@ -393,6 +446,10 @@ pub(super) fn message_transport_outcome(result: Result<TerminalDeliveryOutcome, 
     use TransportOutcome as Outcome;
     match result {
         Ok(TerminalDeliveryOutcome::Pending) => Outcome::Pending,
+        Ok(TerminalDeliveryOutcome::Deferred(reason)) => Outcome::Deferred { reason: reason.into(), reform_batch: false },
+        Ok(TerminalDeliveryOutcome::BatchSuperseded) => {
+            Outcome::Deferred { reason: "batch member superseded; reforming batch".into(), reform_batch: true }
+        }
         Ok(TerminalDeliveryOutcome::Confirmed) => Outcome::Accepted { evidence: "holder remained Working after cleat submission".into() },
         Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady)) => {
             Outcome::NotSubmitted { reason: "terminal was not ready before submission".into() }
@@ -401,7 +458,7 @@ pub(super) fn message_transport_outcome(result: Result<TerminalDeliveryOutcome, 
             Outcome::Unconfirmed { reason: "cleat submission has no acceptance evidence yet".into() }
         }
         Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::ControllerFenceUnverifiable)) => {
-            Outcome::ControllerFenceUnverifiable { reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into() }
+            Outcome::Deferred { reason: flotilla_resources::CONTROLLER_FENCE_UNVERIFIABLE_MESSAGE.into(), reform_batch: false }
         }
         Err(reason) => Outcome::Unconfirmed { reason },
     }

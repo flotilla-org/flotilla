@@ -313,6 +313,7 @@ pub struct ExplainedSubscription {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExplainedTerminalCondition {
+    StashedDrafts { drafts: Vec<String> },
     ProviderUnavailable { message: String },
     SessionLost { message: String },
     ProcessExited { exit_code: Option<i32> },
@@ -324,6 +325,7 @@ pub enum ExplainedTerminalCondition {
 impl std::fmt::Display for ExplainedTerminalCondition {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::StashedDrafts { drafts } => write!(f, "abandoned composer drafts saved before delivery: {drafts:?}"),
             Self::ProviderUnavailable { message } => {
                 write!(f, "terminal provider unavailable: {message}; retrying without failing the crew")
             }

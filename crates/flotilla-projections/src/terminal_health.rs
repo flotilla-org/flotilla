@@ -32,6 +32,10 @@ pub fn condition(status: &TerminalSessionStatus) -> Option<ExplainedTerminalCond
                     .daemon_unreachable
                     .as_ref()
                     .map(|message| ExplainedTerminalCondition::ProviderUnavailable { message: message.clone() })
+            })
+            .or_else(|| {
+                (!status.stashed_drafts.is_empty())
+                    .then(|| ExplainedTerminalCondition::StashedDrafts { drafts: status.stashed_drafts.clone() })
             }),
     }
 }

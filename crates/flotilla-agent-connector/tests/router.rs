@@ -372,7 +372,7 @@ fn session_restart_failure_does_not_fall_back(tc: hegel::TestCase) {
     let accept_repeat = tc.draw(gs::booleans());
     let alternatives = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
     let calls: Calls = Default::default();
-    let failure = TransportOutcome::ControllerFenceUnverifiable { reason: "ControllerFenceUnverifiable: exit the agent; resume".into() };
+    let failure = TransportOutcome::Deferred { reason: "cleat composer did not match".into(), reform_batch: false };
     let offers: Vec<_> = (0..=alternatives).map(|i| TransportOffer::new(TransportId::new(format!("transport-{i}")), TUI_SHAPE)).collect();
     let mut router = TransportRouter::new().with_connector("harness", Arc::new(Offers(offers)));
     for i in 0..=alternatives {
