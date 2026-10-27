@@ -35,6 +35,7 @@ pub mod clone;
 pub mod definition;
 pub mod environment;
 pub mod image_build;
+pub mod manifest_root;
 pub mod terminal_session;
 
 use std::collections::BTreeMap;

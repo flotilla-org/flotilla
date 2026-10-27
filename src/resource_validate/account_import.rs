@@ -3,46 +3,15 @@
 //! store (bindings first, so each provision's reference finds its binding), read back, and
 //! reported as counts by kind and state with each refusal named.
 
-use std::collections::BTreeMap;
-
-use flotilla_provisioning::engine::{
-    account::rehearse_accounts,
-    import::{ImportRefusal, ImportReport},
-};
-use flotilla_resources::{AccountBinding, AccountProvision, K8sResourceObject, Resource, ResourceObject};
-use serde_json::Value;
+use flotilla_provisioning::engine::{account::rehearse_accounts, import::ImportReport};
+use flotilla_resources::{AccountBinding, AccountProvision};
 
 /// The kinds the rehearsal reads, by their plural.
 pub(super) const KINDS: [&str; 2] = ["accountbindings", "accountprovisions"];
 
-/// Raw documents of one namespace, by kind plural.
-#[derive(Default)]
-pub(super) struct Documents(pub BTreeMap<String, Vec<Value>>);
-
-/// The home a listed record is authored at: its origin root, or this daemon.
-fn home(item: &Value) -> String {
-    item.pointer("/metadata/annotations/flotilla.work~1origin-root").and_then(Value::as_str).unwrap_or("local").to_owned()
-}
+pub(super) use super::import_rows::Documents;
 
 impl Documents {
-    fn decoded<R: Resource>(&self, plural: &str, kind: &'static str, report: &mut ImportReport) -> Vec<(ResourceObject<R>, String)> {
-        let mut decoded = Vec::new();
-        for item in self.0.get(plural).into_iter().flatten() {
-            let object = serde_json::from_value::<K8sResourceObject<R>>(item.clone())
-                .map_err(|error| error.to_string())
-                .and_then(|object| ResourceObject::from_k8s_object(object).map_err(|error| error.to_string()));
-            match object {
-                Ok(object) => decoded.push((object, home(item))),
-                Err(error) => report.refused.push(ImportRefusal {
-                    kind,
-                    record: item.pointer("/metadata/name").and_then(Value::as_str).unwrap_or("<unnamed>").to_owned(),
-                    reason: format!("does not decode: {error}"),
-                }),
-            }
-        }
-        decoded
-    }
-
     pub(super) fn rehearse(&self) -> ImportReport {
         let mut report = ImportReport::default();
         let bindings = self.decoded::<AccountBinding>("accountbindings", "AccountBinding", &mut report);

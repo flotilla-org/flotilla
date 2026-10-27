@@ -2,20 +2,21 @@
 //! identity needed by future write-through and branch promotion.
 use std::path::{Component, Path};
 
+use flotilla_schema::Stored;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Stored)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CharterSource {
+    #[store(code = "rp")]
     Repository {
         repo: String,
         branch: String,
         #[serde(default)]
         path: String,
     },
-    LocalDirectory {
-        directory: String,
-    },
+    #[store(code = "ld")]
+    LocalDirectory { directory: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

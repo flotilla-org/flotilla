@@ -47,7 +47,7 @@ pub(super) const PLAN: &[(&str, Plan)] = &[
     ("FleetDesignation", Plan::Imported("definitions import (#3824 layer 2b)")),
     ("Forge", Plan::Imported("definitions import (#3824 layer 2b)")),
     ("ImageLayer", Plan::Imported("definitions import (#3824 layer 2b)")),
-    ("ManifestRoot", Plan::Moving("#3824 layer 2")),
+    ("ManifestRoot", Plan::Imported("ManifestRoot import (#3824 layer 2c)")),
     ("WorkflowTemplate", Plan::Imported("definitions import (#3824 layer 2b)")),
     ("Project", Plan::Moving("#3824 layer 3")),
     ("Repository", Plan::Moving("#3824 layer 3")),
