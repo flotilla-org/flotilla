@@ -2037,10 +2037,7 @@ impl AdmissionReadContext<'_> {
         namespace: &str,
         intent: &flotilla_protocol::ConvoyStartIntent,
     ) -> Result<AdmissionReadContext<'a>, String> {
-        use flotilla_resources::{
-            CrewDefaults, CrewImageBaseline, DockerImageSource, FleetDesignation, FulfilmentRealisation, ImageBuild, ImageLayer,
-            FLEET_DESIGNATION_NAME,
-        };
+        use flotilla_resources::{CrewDefaults, FleetDesignation, ImageBuild, ImageLayer, FLEET_DESIGNATION_NAME};
         use flotilla_store::StoreQuery;
         let backend = &owner.backend;
         let project_ref = required_admission_value(&intent.project_ref, "project")?;
@@ -2157,24 +2154,6 @@ impl AdmissionReadContext<'_> {
             .query_declared::<CredentialSpec>(namespace, &StoreQuery::names(credential_names, true))
             .await
             .map_err(|error| error.to_string())?;
-        let mut baseline_names = BTreeSet::new();
-        let mut observe_image = |image: Option<&DockerImageSource>| {
-            if let Some(DockerImageSource::Baseline { image_baseline_ref }) = image {
-                baseline_names.insert(image_baseline_ref.clone());
-            }
-        };
-        for kind in &kinds.items {
-            if let FulfilmentRealisation::DockerPerVessel { image } = &kind.object.spec.realisation {
-                observe_image(image.as_ref());
-            }
-        }
-        for policy in &policies.items {
-            if let Some(docker) = &policy.object.spec.docker_per_vessel {
-                observe_image(docker.image.as_ref());
-            }
-        }
-        let baselines =
-            backend.definitions::<CrewImageBaseline>(namespace).list_names(baseline_names).await.map_err(|error| error.to_string())?;
         // Composed images resolve against every layer definition, and their
         // placement cost reads the per-identity builds.
         let image_layers = flotilla_store::read_definition_catalog::<ImageLayer>(backend, namespace).await?;
@@ -2188,7 +2167,6 @@ impl AdmissionReadContext<'_> {
         snapshot.insert_definitions::<CrewDefaults>(defaults)?;
         snapshot.insert_definitions::<Forge>(forges)?;
         snapshot.insert_definitions::<WorkflowTemplate>(workflows)?;
-        snapshot.insert_definitions::<CrewImageBaseline>(baselines)?;
         snapshot.insert_definitions::<ImageLayer>(image_layers)?;
         snapshot.insert::<Repository>(repository_sources)?;
         snapshot.insert::<FulfilmentKind>(kinds)?;
@@ -3320,20 +3298,10 @@ impl AdmissionReadContext<'_> {
         };
         if purpose == PlacementPurpose::Admission {
             if let Some(docker) = placement.selected.as_mut().and_then(|policy| policy.spec.docker_per_vessel.as_mut()) {
-                match &docker.image {
-                    // Freeze the compatibility baseline into a literal and keep
-                    // its provenance; later baseline edits never reach this convoy.
-                    Some(image @ flotilla_resources::DockerImageSource::Baseline { image_baseline_ref }) => {
-                        let resolved = image.resolve(&self.backend.definitions(namespace)).await?;
-                        docker.legacy_image_baseline_ref = Some(image_baseline_ref.clone());
-                        docker.image = Some(flotilla_resources::DockerImageSource::Literal(resolved));
-                    }
-                    Some(image @ flotilla_resources::DockerImageSource::Literal(_)) => {
-                        image.resolve(&self.backend.definitions(namespace)).await?;
-                    }
-                    // Composed images freeze per vessel once the placement is
-                    // final; they never carry the legacy tag exception.
-                    Some(flotilla_resources::DockerImageSource::Built { .. }) | None => docker.legacy_image_baseline_ref = None,
+                // A literal image is checked now; composed images freeze per vessel once the
+                // placement is final.
+                if let Some(image @ flotilla_resources::DockerImageSource::Literal(_)) = &docker.image {
+                    image.resolve()?;
                 }
             }
             validate_workflow_agent_adapters(&self.backend, namespace, workflow, placement.selected.as_ref(), allow_unready).await?;
@@ -4994,7 +4962,7 @@ pub async fn placement_agent_adapters(
         match &docker.image {
             None | Some(flotilla_resources::DockerImageSource::Built { .. }) => Ok((BTreeSet::new(), "composed image".to_string())),
             Some(image) => {
-                let detail = format!("image `{}`", image.resolve(&backend.definitions(namespace)).await?);
+                let detail = format!("image `{}`", image.resolve()?);
                 Ok((docker.agent_adapters.clone(), detail))
             }
         }

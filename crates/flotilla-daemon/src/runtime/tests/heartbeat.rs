@@ -825,7 +825,6 @@ async fn capped_docker_kind_publishes_free_slots_from_the_hosts_vessels() {
     let policy = PlacementPolicySpec::builder()
         .pool("cleat".to_string())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-            legacy_image_baseline_ref: None,
             memory_policy: Default::default(),
             host_ref: host_id.clone(),
             image: Some("crew:test".into()),

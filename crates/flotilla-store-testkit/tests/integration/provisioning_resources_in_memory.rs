@@ -199,7 +199,6 @@ fn docker_per_vessel_policy_uses_vessel_spelling_in_serialized_resources() {
     let spec = PlacementPolicySpec::builder()
         .pool("docker".to_string())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-            legacy_image_baseline_ref: None,
             memory_policy: Default::default(),
             host_ref: "01HXYZ".to_string(),
             image: Some("ghcr.io/flotilla/dev:latest".into()),

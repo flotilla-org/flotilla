@@ -2,7 +2,6 @@
 // Tests share a process: isolate state and keep process-wide mutations in separate targets.
 mod controller_loop;
 mod convoy_status_patch;
-mod crew_image_baseline;
 mod decode_once;
 mod digest;
 mod field_ownership;

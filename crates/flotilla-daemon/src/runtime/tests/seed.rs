@@ -40,7 +40,6 @@ async fn migrates_display_name_host_ref_to_canonical_host_id() {
     let docker_spec = PlacementPolicySpec::builder()
         .pool("cleat".to_string())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-            legacy_image_baseline_ref: None,
             memory_policy: Default::default(),
             host_ref: "udder".to_string(),
             image: Some("crew:test".into()),
@@ -153,7 +152,6 @@ async fn migrates_live_policy_names_to_fulfilment_kinds() {
         let spec = PlacementPolicySpec::builder()
             .pool("cleat".to_string())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                legacy_image_baseline_ref: None,
                 memory_policy: Default::default(),
                 host_ref: host.to_string(),
                 image: Some("crew:test".into()),
@@ -170,7 +168,6 @@ async fn migrates_live_policy_names_to_fulfilment_kinds() {
         let mut spec = PlacementPolicySpec::builder().pool("cleat".to_string()).build();
         if docker {
             spec.docker_per_vessel = Some(DockerPerVesselPlacementPolicySpec {
-                legacy_image_baseline_ref: None,
                 memory_policy: Default::default(),
                 host_ref: host.to_string(),
                 image: Some("ubuntu:24.04".into()),
@@ -215,7 +212,6 @@ async fn migrates_live_policy_names_to_fulfilment_kinds() {
     invalid.host_direct =
         Some(HostDirectPlacementPolicySpec { host_ref: "kiwi".to_string(), checkout: HostDirectPlacementPolicyCheckout::Worktree });
     invalid.docker_per_vessel = Some(DockerPerVesselPlacementPolicySpec {
-        legacy_image_baseline_ref: None,
         memory_policy: Default::default(),
         host_ref: "kiwi".to_string(),
         image: Some("crew:test".into()),
@@ -350,7 +346,6 @@ async fn docker_policy_registration_preserves_runtime_configuration_and_corrects
                 .pool("operator-edited-pool".to_string())
                 .priority(20)
                 .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                    legacy_image_baseline_ref: None,
                     memory_policy: Default::default(),
                     host_ref: "operator-edited-host".to_string(),
                     image: Some("operator/image:latest".into()),
@@ -374,7 +369,6 @@ async fn docker_policy_registration_preserves_runtime_configuration_and_corrects
     assert_eq!(
         reconciled.spec.docker_per_vessel,
         Some(DockerPerVesselPlacementPolicySpec {
-            legacy_image_baseline_ref: None,
             memory_policy: Default::default(),
             host_ref: profile.host_id,
             image: Some("operator/image:latest".into()),

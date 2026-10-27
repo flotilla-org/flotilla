@@ -543,7 +543,6 @@ async fn remote_placement_uses_replicated_host_capabilities() {
             &PlacementPolicySpec::builder()
                 .pool("passthrough".to_string())
                 .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
-                    legacy_image_baseline_ref: None,
                     memory_policy: Default::default(),
                     host_ref: "feta-host".to_string(),
                     image: Some("crew:latest".into()),

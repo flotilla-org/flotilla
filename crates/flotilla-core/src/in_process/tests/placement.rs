@@ -135,7 +135,6 @@ async fn default_remote_placement_resolves_replicated_credentials_before_admissi
             &PlacementPolicySpec::builder()
                 .pool("passthrough".to_string())
                 .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
-                    legacy_image_baseline_ref: None,
                     memory_policy: Default::default(),
                     host_ref: "udder-id".to_string(),
                     image: Some("crew:latest".into()),

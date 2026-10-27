@@ -147,14 +147,6 @@ pub struct DockerPerVesselPlacementPolicySpec {
     /// `Built` source into each prepared placement snapshot.
     #[serde(default, deserialize_with = "decode_optional_image_source", skip_serializing_if = "Option::is_none")]
     pub image: Option<DockerImageSource>,
-    /// Admission freezes baseline provenance alongside the resolved image.
-    /// Operator-authored policies normally omit this field. Explicit values are
-    /// accepted as asserted provenance, like the legacy Environment label; use
-    /// them only when preserving an image previously resolved from that baseline.
-    /// One-generation bridge until #2731; retire after its last writing roll
-    /// and the following compatibility generation (ADR 0047).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub legacy_image_baseline_ref: Option<String>,
     /// Controls registry access for the resolved image tag. Image build recipes
     /// are intentionally outside placement policy and are tracked separately.
     #[serde(default)]
@@ -170,17 +162,6 @@ pub struct DockerPerVesselPlacementPolicySpec {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub checkout: DockerCheckoutStrategy,
-}
-
-impl DockerPerVesselPlacementPolicySpec {
-    /// Frozen snapshots retain provenance after their image becomes a literal
-    /// or composition. Old live policies still carry the baseline source itself.
-    pub fn legacy_image_baseline_ref(&self) -> Option<&str> {
-        self.legacy_image_baseline_ref.as_deref().or(match &self.image {
-            Some(DockerImageSource::Baseline { image_baseline_ref }) => Some(image_baseline_ref.as_str()),
-            _ => None,
-        })
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,17 +181,12 @@ pub enum DockerCheckoutStrategy {
     FreshCloneInContainer { clone_path: String },
 }
 
-/// A placement-specific literal, a retired baseline reference, or the
-/// per-identity composed image admission froze into a prepared snapshot.
+/// A placement-specific literal, or the per-identity composed image admission froze into a
+/// prepared snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum DockerImageSource {
     Literal(String),
-    // Compatibility reader only: no fleet manifests author CrewImageBaseline.
-    // Remove with CrewImageBaseline after the cut-over roll.
-    Baseline {
-        image_baseline_ref: String,
-    },
     /// The vessel's composed image: its identity and the per-identity ImageBuild
     /// (`image-<hex>-<arch>`) that realises it on the placement architecture.
     Built {
@@ -221,7 +197,10 @@ pub enum DockerImageSource {
 
 /// Decode an optional image source, dropping the ADR 0053
 /// `{composition: {selection…}}` form as omitted. ADR 0047: remove the
-/// composition shim one roll after ADR 0062 images land.
+/// composition shim one roll after ADR 0062 images land. A retired
+/// CrewImageBaseline reference (`{image_baseline_ref}`) decodes as omitted too:
+/// the vessel's composed image, the default since ADR 0062 (#3824 layer 4b-i;
+/// remove one roll after it).
 pub(crate) fn decode_optional_image_source<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<DockerImageSource>, D::Error> {
@@ -231,6 +210,7 @@ pub(crate) fn decode_optional_image_source<'de, D: serde::Deserializer<'de>>(
         Some(serde_json::Value::Object(object)) if object.contains_key("composition") => {
             Ok(retired_composition_image(&object["composition"]))
         }
+        Some(serde_json::Value::Object(object)) if object.contains_key("image_baseline_ref") => Ok(None),
         Some(value) => serde_json::from_value(value).map(Some).map_err(serde::de::Error::custom),
     }
 }
@@ -290,10 +270,8 @@ mod image_source_tests {
                 Some(serde_json::json!("registry.test/crew@sha256:abc")),
                 Some(DockerImageSource::Literal("registry.test/crew@sha256:abc".into())),
             ),
-            (
-                Some(serde_json::json!({"image_baseline_ref": "crew"})),
-                Some(DockerImageSource::Baseline { image_baseline_ref: "crew".into() }),
-            ),
+            // A retired CrewImageBaseline reference is the vessel's composed image (#3824 layer 4b-i).
+            (Some(serde_json::json!({"image_baseline_ref": "crew"})), None),
             (
                 Some(serde_json::json!({"identity": "sha256:abc", "image_build_ref": "image-abc-amd64"})),
                 Some(DockerImageSource::Built { identity: "sha256:abc".into(), image_build_ref: "image-abc-amd64".into() }),

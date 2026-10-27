@@ -217,6 +217,10 @@ async fn validate_daemon_with_preview(
                         }
                     }
                 }
+                // A retired kind's rows are dropped by the import; this candidate has no decoder for them.
+                if import_plan::is_retired(&kind) {
+                    continue;
+                }
                 if let Err(error) = validate_stored_record(item) {
                     eprintln!("{label}/{name}: {error}");
                     failed = true;

@@ -1799,8 +1799,7 @@ async fn docker_provisions_prepared_digest_and_refuses_another_instance() {
 async fn preparation_pulls_only_pinned_registry_content() {
     let mut spec = pinned_spec();
     spec.docker.as_mut().expect("docker").image = format!("registry.example/crew@sha256:{}", "a".repeat(64));
-    let mut opts =
-        super::PrepareOpts { legacy_baseline: false, prepared_auth: test_registry_auth("/private/operation-auth"), ..Default::default() };
+    let mut opts = super::PrepareOpts { prepared_auth: test_registry_auth("/private/operation-auth"), ..Default::default() };
     let runner = Arc::new(QueuedRunner::new([Err("not held".into()), Ok("pulled".into()), Ok("held".into())]));
     let provider = super::contract_tests::docker_provider(runner.clone());
     provider.prepare(&spec, &opts).await.expect("pull existing digest");
@@ -1837,49 +1836,6 @@ async fn preparation_refuses_mutable_or_malformed_image_identity() {
         spec.docker.as_mut().expect("docker").image = image.into();
         assert!(provider.prepare(&spec, &Default::default()).await.is_err());
         assert!(runner.calls().is_empty());
-    }
-}
-
-// Live pre-#2731 fleet records carry a baseline tag and no ImageBuild ref.
-// A controller-admitted baseline remains launchable, but runs the resolved digest.
-#[tokio::test]
-#[cfg(unix)]
-async fn live_baseline_tag_without_image_build_provisions_a_digest() {
-    let tag = "forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-10-02.d9e59d8c.dbd6e440";
-    let digest = format!("sha256:{}", "b".repeat(64));
-    for held in [false, true] {
-        let runner = Arc::new(QueuedRunner::new([
-            if held { Ok("held".into()) } else { Err("not held".into()) },
-            Ok("pulled".into()),
-            Ok(digest.clone()),
-            Ok("container-id".into()),
-            Ok(digest.clone()),
-            Ok(r#"["HOME=/tmp","PATH=/usr/bin:/bin"]"#.into()),
-        ]));
-        let provider = super::contract_tests::docker_provider(runner.clone());
-        let mut spec = pinned_spec();
-        let docker = spec.docker.as_mut().expect("docker");
-        docker.image = tag.into();
-        docker.image_build_ref = None;
-        docker.pull_policy = flotilla_resources::DockerImagePullPolicy::Always;
-        let prepared = provider
-            .prepare(&spec, &super::PrepareOpts { legacy_baseline: true, ..Default::default() })
-            .await
-            .expect("prepare live baseline");
-        let handle =
-            provider.provision(EnvironmentId::new("live-baseline"), &prepared, Default::default()).await.expect("launch live record");
-        assert_eq!(handle.image().as_str(), digest);
-        let calls = runner.calls();
-        assert_eq!(calls[1].1, ["pull", "--platform", "linux/amd64", tag]);
-        assert!(calls.iter().find(|(_, args, _)| args.first().is_some_and(|arg| arg == "run")).unwrap().1.contains(&digest));
-        assert!(!calls.iter().find(|(_, args, _)| args.first().is_some_and(|arg| arg == "run")).unwrap().1.contains(&tag.to_string()));
-        assert!(calls
-            .iter()
-            .find(|(_, args, _)| args.first().is_some_and(|arg| arg == "run"))
-            .unwrap()
-            .1
-            .windows(2)
-            .any(|args| args == ["--pull", "never"]));
     }
 }
 
@@ -1953,4 +1909,20 @@ async fn docker_refuses_unsupported_requested_guest_before_execution() {
         assert!(result.err().expect("unsupported target").contains(&format!("guest platform {platform}")));
         assert!(runner.calls().is_empty());
     }
+}
+
+// A Docker Environment runs a pinned digest; a mutable tag is refused before any Docker call. The
+// CrewImageBaseline exception that once admitted a controller-verified tag is retired (#3824 layer 4b-i).
+#[tokio::test]
+#[cfg(unix)]
+async fn a_mutable_tag_is_refused_before_any_docker_call() {
+    let runner = Arc::new(RecordingRunner::new_ok("present"));
+    let provider = super::contract_tests::docker_provider(runner.clone());
+    let mut spec = pinned_spec();
+    let docker = spec.docker.as_mut().expect("docker");
+    docker.image = "registry.example/crew:latest".into();
+    docker.image_build_ref = None;
+    let error = provider.prepare(&spec, &Default::default()).await.err().expect("mutable tag");
+    assert!(error.contains("mutable tags are unsupported"), "{error}");
+    assert!(runner.calls().is_empty());
 }

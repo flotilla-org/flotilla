@@ -53,9 +53,6 @@ impl FulfilmentKindDefinition {
                 Some(DockerImageSource::Built { identity, image_build_ref }) => {
                     KindRealisation::DockerBuilt { identity: identity.clone(), image_build_ref: image_build_ref.clone() }
                 }
-                Some(DockerImageSource::Baseline { image_baseline_ref }) => {
-                    return Err(format!("its image names CrewImageBaseline `{image_baseline_ref}`, which retires"));
-                }
             },
         };
         Ok(Self {

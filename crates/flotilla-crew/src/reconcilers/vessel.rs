@@ -22,18 +22,18 @@ use flotilla_resources::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_resources::{
     address::artifact_slot_record_name, canonicalize_repo_url, host_direct_environment_name, is_prepared_snapshot,
     repository_workspace_slugs, Artifact, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy,
-    CrewImageBaseline, CrewSource, CrewWorkPhase, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerImageSource,
-    Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy,
-    PlacementPolicySpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceError, ResourceObject, ResourceProvenance, Stance,
-    TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, Vessel, VesselImage, VesselPhase,
-    VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
+    CrewSource, CrewWorkPhase, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerImageSource, Environment,
+    EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Repository,
+    RepositoryKey, RepositorySpec, Resource, ResourceError, ResourceObject, ResourceProvenance, Stance, TerminalSession,
+    TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, Vessel, VesselImage, VesselPhase, VesselStatusPatch, WorkPhase,
+    ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
     CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
     CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND, VESSEL_REF_LABEL,
 };
 use flotilla_store::{
     controller::{delete_lifecycle_owned_matching, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
-    DefinitionResolver, ReplicaReadResolver, ResourceBackend, TypedResolver,
+    ReplicaReadResolver, ResourceBackend, TypedResolver,
 };
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -88,7 +88,6 @@ pub struct VesselReconciler {
     convoys: TypedResolver<Convoy>,
     repositories: TypedResolver<Repository>,
     placement_policies: TypedResolver<PlacementPolicy>,
-    image_baselines: DefinitionResolver<CrewImageBaseline>,
     environments: TypedResolver<Environment>,
     clones: TypedResolver<Clone>,
     checkouts: TypedResolver<Checkout>,
@@ -127,7 +126,6 @@ impl VesselReconciler {
             convoys: backend.clone().using::<Convoy>(namespace),
             repositories: backend.clone().using::<Repository>(namespace),
             placement_policies: backend.clone().using::<PlacementPolicy>(namespace),
-            image_baselines: backend.definitions(namespace),
             environments: backend.clone().using::<Environment>(namespace),
             clones: backend.clone().using::<Clone>(namespace),
             checkouts: backend.clone().using::<Checkout>(namespace),
@@ -476,21 +474,18 @@ struct ImageStamp {
 fn composed_image(placement_policy: &ResourceObject<PlacementPolicy>, digest: Option<String>) -> Option<VesselImage> {
     match placement_policy.spec.docker_per_vessel.as_ref()?.image.as_ref()? {
         DockerImageSource::Built { identity, .. } => Some(VesselImage { identity: identity.clone(), digest }),
-        DockerImageSource::Literal(_) | DockerImageSource::Baseline { .. } => None,
+        DockerImageSource::Literal(_) => None,
     }
 }
 
 /// The Environment's image fields: a composed image names its per-identity
 /// ImageBuild and receives the build's digest from the Environment reconciler;
-/// literal and baseline images resolve now.
-async fn environment_image(
-    image: &Option<DockerImageSource>,
-    baselines: &flotilla_store::DefinitionResolver<flotilla_resources::CrewImageBaseline>,
-) -> Result<(String, Option<String>), String> {
+/// a literal image resolves now.
+fn environment_image(image: &Option<DockerImageSource>) -> Result<(String, Option<String>), String> {
     match image {
         None => Err("composed image was not frozen at admission; readmit the convoy".into()),
         Some(DockerImageSource::Built { image_build_ref, .. }) => Ok((String::new(), Some(image_build_ref.clone()))),
-        Some(image) => image.resolve(baselines).await.map(|image| (image, None)),
+        Some(image) => image.resolve().map(|image| (image, None)),
     }
 }
 
@@ -767,7 +762,7 @@ impl VesselReconciler {
                             Some(Ok(spec)) => spec,
                             Some(Err(message)) => return Ok(VesselPrepared::failed(message)),
                             None => {
-                                let (image_ref, image_build_ref) = match environment_image(image, &self.image_baselines).await {
+                                let (image_ref, image_build_ref) = match environment_image(image) {
                                     Ok(image) => image,
                                     Err(message) => return Ok(VesselPrepared::failed(message)),
                                 };
@@ -1254,7 +1249,7 @@ impl VesselReconciler {
                         if let Err(message) = configure_contained_tracking(&mut env, &contained_branches) {
                             return Ok(VesselPrepared::failed(message));
                         }
-                        let (image_ref, image_build_ref) = match environment_image(image, &self.image_baselines).await {
+                        let (image_ref, image_build_ref) = match environment_image(image) {
                             Ok(image) => image,
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         };
@@ -1951,20 +1946,14 @@ fn cloud_environment_spec(
 }
 
 fn environment_provider_labels(policy: &ResourceObject<PlacementPolicy>) -> BTreeMap<String, String> {
-    let mut labels: BTreeMap<String, String> = policy
+    policy
         .metadata
         .labels
         .get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL)
         .or_else(|| policy.spec.provider_requirements.as_ref().and_then(|requirements| requirements.instance.as_ref()))
         .map(|instance| (ENVIRONMENT_PROVIDER_INSTANCE_LABEL.into(), instance.clone()))
         .into_iter()
-        .collect();
-    if let Some(docker) = &policy.spec.docker_per_vessel {
-        if let Some(image_baseline_ref) = docker.legacy_image_baseline_ref() {
-            labels.insert("flotilla.work/legacy-image-baseline".into(), image_baseline_ref.to_string());
-        }
-    }
-    labels
+        .collect()
 }
 
 fn owned_child_meta(name: &str, workspace: &ResourceObject<Vessel>, mut extra_labels: BTreeMap<String, String>) -> InputMeta {

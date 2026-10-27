@@ -587,7 +587,6 @@ pub(super) async fn observe_fulfilment_facts(
             kinds.push(kind);
         }
     }
-    let baselines = backend.clone().definitions::<flotilla_resources::CrewImageBaseline>(namespace);
     // The kinds listed above are this store's own records, never replicas, so
     // writing their observed grants stays with the daemon that authors them.
     let kind_store = backend.clone().using::<FulfilmentKind>(namespace);
@@ -627,7 +626,7 @@ pub(super) async fn observe_fulfilment_facts(
             _ => None,
         };
         let image = match &kind.spec.realisation {
-            FulfilmentRealisation::DockerPerVessel { image: Some(image) } => match image.resolve(&baselines).await {
+            FulfilmentRealisation::DockerPerVessel { image: Some(image) } => match image.resolve() {
                 Ok(image) => Some(image),
                 Err(error) => {
                     warn!(kind = %kind.metadata.name, %error, "cannot probe unresolved fulfilment image");
