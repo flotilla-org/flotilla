@@ -85,6 +85,8 @@ impl ResourceBackend {
 
     /// Record restart intent before resetting runtime observations. The captured predecessor
     /// survives delayed actuation, so applying an old plan cannot request a second replacement.
+    /// A writer without a captured launch is refused: the terminal controller establishes an
+    /// unheld session's first request before runtime work; a later plan can name that launch.
     pub async fn request_terminal_replacement(
         &self,
         obj: &ResourceObject<crate::TerminalSession>,

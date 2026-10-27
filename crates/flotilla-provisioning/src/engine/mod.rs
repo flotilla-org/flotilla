@@ -12,6 +12,7 @@
 //!
 //! Lifecycle consumers read the engine directly; no binding writes a status copy.
 //! Terminal restarts explicitly request the next launch, naming its predecessor.
+//! An unheld terminal is requested before runtime work, independent of legacy observations.
 //!
 //! In progress, suspect and next attempt are judgements, never stored: a reconciler's in-progress
 //! patches (cloning, waiting for an image build, a build's reservation) carry no step, and its
@@ -139,14 +140,10 @@ pub trait Lifecycles<K: LifecycleKind>: Send + Sync {
     fn request(&self, name: &str, request: K::Request, at: Timestamp) -> Result<Resource<Lifecycle<K>>, EngineError>;
 
     /// Requests a successor named by its predecessor, serialized with this home's writes.
-    fn replace_launch(&self, _name: &str, _replaces: &str, _request: K::Request, _at: Timestamp) -> Result<String, EngineError> {
-        Err(EngineError::Failed("this home does not support launch replacement".into()))
-    }
+    fn replace_launch(&self, name: &str, replaces: &str, request: K::Request, at: Timestamp) -> Result<String, EngineError>;
 
     /// Finish the predecessor ending implied by a durable successor request before provider work.
-    fn finish_launch_request(&self, _name: &str, _at: Timestamp) -> Result<(), EngineError> {
-        Ok(())
-    }
+    fn finish_launch_request(&self, name: &str, at: Timestamp) -> Result<(), EngineError>;
 
     /// Applies `step` to `name` with the step's own evidence. A failed attempt is followed by a
     /// give-up with its cause, kept only if the engine accepts it.
@@ -540,6 +537,12 @@ where
         let home = Arc::clone(lifecycles);
         let (prepared_launch, terminal) = tokio::task::spawn_blocking(move || {
             let (name, mut held) = current::<B>(home.as_ref(), &owned);
+            // The first launch is ordinary intent, not a predecessorless restart. Establish it
+            // before the reader runs, so a legacy Stopped/Lost observation cannot strand it.
+            if B::LAUNCHES && held.is_none() {
+                let request = B::request(&owned, home.home()).map_err(ResourceError::other)?;
+                held = Some(home.request(&name, request, at(Utc::now())).map_err(|error| ResourceError::other(error.to_string()))?);
+            }
             if B::LAUNCHES && held.as_ref().is_some_and(|resource| matches!(resource.state(), LifecycleState::Requested { .. })) {
                 home.finish_launch_request(&name, at(Utc::now()))
                     .map_err(|error| ResourceError::other(format!("engine predecessor recovery: {error}")))?;

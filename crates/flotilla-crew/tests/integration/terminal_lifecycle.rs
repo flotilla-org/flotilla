@@ -71,11 +71,16 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(phase: Phase) -> Self {
+        Self::with_initial_launch(phase, true).await
+    }
+    async fn with_initial_launch(phase: Phase, requested: bool) -> Self {
         let backend = ResourceBackend::new(flotilla_store_sqlite::SqliteBackend::open_in_memory().expect("resources"));
         super::terminal_session_reconciler::create_ready_environment(&backend, "env").await;
         let obj = store_object(&backend, terminal_session(phase)).await;
         let lifecycle = LifecycleFixture::<TerminalSessionBinding>::new(false);
-        lifecycle.request(&obj);
+        if requested {
+            lifecycle.request(&obj);
+        }
         backend.install_terminal_launches(Arc::new(EngineTerminalLaunches { lifecycles: lifecycle.home.clone() }));
         backend.install_terminal_readings(lifecycle.reads.clone());
         Self {
@@ -382,5 +387,90 @@ async fn in_flight_old_launch_report_cannot_end_the_requested_successor() {
     assert!(outcome.requeue_after.is_some(), "revisit the current launch");
     assert_eq!(fixture.reading().name, "terminal-a#2");
     assert_eq!(fixture.reading().reading, LifecycleReading::InProgress);
+    assert!(fixture.lifecycle.home.get("terminal-a#3").is_none());
+}
+
+// A predecessorless restart is refused without observation changes; normal reconciliation
+// claims the first launch even when a legacy observation says Stopped or Lost.
+#[tokio::test]
+async fn unheld_terminal_claims_first_launch_before_runtime_work() {
+    for phase in [Phase::Stopped, Phase::Lost] {
+        let fixture = Fixture::with_initial_launch(phase, false).await;
+        let error = fixture.backend.request_terminal_replacement(&fixture.obj, None, fixture.clock.now()).await.unwrap_err();
+        assert!(error.to_string().contains("captured engine launch"));
+        assert!(fixture.lifecycle.home.get("terminal-a#1").is_none());
+        let controller = fixture.controller();
+        fixture.tick(&controller, true).await;
+        assert_eq!(fixture.reading().name, "terminal-a#1");
+        assert_eq!(fixture.reading().reading, LifecycleReading::Ready { identity: "new-1".into() });
+        assert_eq!(fixture.runtime.starts.load(Ordering::SeqCst), 1);
+        assert!(fixture.lifecycle.home.get("terminal-a#2").is_none());
+    }
+}
+
+// The controller loop must record the captured predecessor before publishing the runtime reset.
+// This plan-only reconciler supplies an ordinary outcome to the real actuation runner and SQLite homes.
+struct RestartPlan {
+    replaces: String,
+}
+impl Reconciler for RestartPlan {
+    type Resource = TerminalSession;
+    type Prepared = ();
+    async fn prepare(&self, _: &ResourceObject<TerminalSession>) -> Result<(), flotilla_resources::ResourceError> {
+        Ok(())
+    }
+    fn reconcile(&self, obj: &ResourceObject<TerminalSession>, _: &(), _: DateTime<chrono::Utc>) -> ReconcileOutcome<TerminalSession> {
+        if obj.status.as_ref().is_some_and(|status| status.phase == Phase::Starting) {
+            return ReconcileOutcome::new(None);
+        }
+        ReconcileOutcome::with_actuations(
+            None,
+            vec![flotilla_resources::Actuation::RestartTerminalSession {
+                name: obj.metadata.name.clone(),
+                replaces: Some(self.replaces.clone()),
+            }],
+        )
+    }
+    async fn run_finalizer(&self, _: &ResourceObject<TerminalSession>) -> Result<(), flotilla_resources::ResourceError> {
+        Ok(())
+    }
+    fn finalizer_name(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn controller_actuation_records_requested_successor_before_resetting_observations() {
+    let fixture = Fixture::new(Phase::Stopped).await;
+    fixture.lifecycle.finish(&fixture.obj, Ending::Released);
+    let predecessor = fixture.reading().name;
+    let sessions = fixture.backend.using::<TerminalSession>("flotilla");
+    let task = tokio::spawn(
+        flotilla_store::controller::ControllerLoop {
+            primary: sessions.clone(),
+            secondaries: vec![],
+            reconciler: RestartPlan { replaces: predecessor.clone() },
+            resync_interval: std::time::Duration::from_secs(3600),
+            backend: fixture.backend.clone(),
+        }
+        .run(),
+    );
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let raw = sessions.get("terminal-a").await.expect("raw");
+            if raw.status.as_ref().is_some_and(|status| status.phase == Phase::Starting) {
+                let launch = fixture.reading();
+                assert_eq!(launch.name, "terminal-a#2");
+                assert_eq!(launch.reading, LifecycleReading::InProgress);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    task.abort();
+    let _ = task.await;
+    observed.expect("controller published reset after request");
+    fixture.replace(&predecessor).await.expect("retry same intent");
     assert!(fixture.lifecycle.home.get("terminal-a#3").is_none());
 }

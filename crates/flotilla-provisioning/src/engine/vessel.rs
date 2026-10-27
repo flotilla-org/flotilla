@@ -225,6 +225,14 @@ where
         })
     }
 
+    fn replace_launch(&self, _: &str, _: &str, _: VesselSpec, _: Timestamp) -> Result<String, EngineError> {
+        Err(EngineError::Failed("a placement has no terminal launches".into()))
+    }
+
+    fn finish_launch_request(&self, _: &str, _: Timestamp) -> Result<(), EngineError> {
+        Ok(())
+    }
+
     fn step(&self, name: &str, step: &Step, at: Timestamp) -> Result<Resource<Lifecycle<VesselKind>>, EngineError> {
         let edge: LifecycleEdge = match step {
             Step::Realised { identity } => Realise { identity: identity.clone(), observed: Ref::new(name) }.into(),

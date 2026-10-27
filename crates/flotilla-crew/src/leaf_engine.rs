@@ -152,6 +152,8 @@ enum UnableEvidenceKey {
 }
 
 impl LeafSubscriptionTable {
+    /// Configure the read port before cloning or registering subscriptions, like the other
+    /// composition setters. An unconfigured table intentionally serves the primitives-off path.
     pub fn with_lifecycle_reads(mut self, reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>) -> Self {
         Arc::get_mut(&mut self.inner).expect("configure lifecycle reads before sharing subscriptions").lifecycle_reads = reads;
         self

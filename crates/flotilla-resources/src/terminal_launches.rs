@@ -14,6 +14,7 @@ pub struct TerminalLaunch {
 impl TerminalLaunch {
     /// A read view only: lifecycle phase and identity come from the engine; temporary
     /// unobservability remains runtime evidence about the same realised session.
+    /// The returned clone must never be published back as stored status.
     pub fn project(&self, obj: &ResourceObject<TerminalSession>) -> ResourceObject<TerminalSession> {
         let mut obj = obj.clone();
         let status = obj.status.get_or_insert_with(Default::default);
