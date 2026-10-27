@@ -23,6 +23,8 @@ use sha2::{Digest, Sha256};
 
 use crate::resource_manifest::{parse_document_contents, LoadedManifestFile};
 
+// Declared in flotilla-resources for the definitions import (#3824 layer 2b); this path goes with
+// the annotation writers when the definitions move onto the engine (layer 2b-ii).
 pub(crate) use flotilla_resources::definition_provenance::{
     CHARTER_REVISION_ANNOTATION as CHARTER_REVISION, CHARTER_SCOPE_ANNOTATION as CHARTER_SCOPE, CHARTER_SOURCE_ANNOTATION as CHARTER_SOURCE,
 };

@@ -3,6 +3,8 @@ use flotilla_resources::WorkflowTemplateSpec;
 pub use flotilla_resources::ENSURED_FROM_ANNOTATION;
 use serde::Deserialize;
 
+// Declared in flotilla-resources for the definitions import (#3824 layer 2b); this path goes with
+// the annotation writers when the definitions move onto the engine (layer 2b-ii).
 pub use flotilla_resources::definition_provenance::{
     MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
 };

@@ -257,6 +257,8 @@ pub const PROJECT_IMAGE_LAYER_PATH: &str = ".flotilla/image";
 pub const CHARTER_IMAGE_LAYER_PATH: &str = "image";
 
 /// Marks ImageLayers the primary-repository sync authored.
+// Declared in flotilla-resources for the definitions import (#3824 layer 2b); this path goes with
+// the annotation writers when the definitions move onto the engine (layer 2b-ii).
 pub use flotilla_resources::definition_provenance::PROJECT_IMAGE_MANAGER;
 
 /// Every regular file of one layer directory at one revision, keyed by path
