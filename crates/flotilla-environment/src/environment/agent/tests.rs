@@ -371,6 +371,30 @@ async fn runner_and_material_contract(agent: Arc<dyn TestAgent>) {
     assert!(runner.same_filesystem(&source, &destination).await.is_err());
 }
 
+// Vessel delivery (#3964 contract 3) runs every step through the agent: it
+// creates a home with exactly its mode while keeping what is already there,
+// reads a missing record as absent and a written one back, and resolves the
+// contained writable base.
+over_each_transport!(delivery_operations_cross_the_agent);
+async fn delivery_operations_cross_the_agent(agent: Arc<dyn TestAgent>) {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let vessel: Arc<dyn VesselAgent> = Arc::new(runner_for(&agent, directory.path()));
+    let home = directory.path().join("agent-homes/requesters/convoy/coder/claude");
+    vessel.ensure_directory(&home, 0o700).await.unwrap();
+    assert_eq!(std::fs::metadata(&home).unwrap().permissions().mode() & 0o777, 0o700);
+    let record = home.join(".record");
+    assert_eq!(vessel.read_text(&record).await.unwrap(), None);
+    vessel.write_text(&record, "skills\tdigest\tagent-push\n", 0o600).await.unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+    vessel.ensure_directory(&home, 0o700).await.unwrap();
+    assert_eq!(std::fs::metadata(&home).unwrap().permissions().mode() & 0o777, 0o700, "an existing home is narrowed again");
+    assert_eq!(vessel.read_text(&record).await.unwrap().as_deref(), Some("skills\tdigest\tagent-push\n"), "its contents are kept");
+    assert_eq!(std::fs::metadata(&record).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(vessel.ensure_directory(Path::new("relative"), 0o700).await.is_err());
+    assert_eq!(vessel.writable_base().await.unwrap(), Path::new(super::super::runner::CONTAINED_WRITABLE_CONFIG_BASE));
+}
+
 // Issue 3486: flotilla's CLI cycle is separate from drydock's. Updating files
 // changes what exec sees while the same agent incarnation continues running.
 over_each_transport!(pushing_new_cli_layer_does_not_reexec_agent);

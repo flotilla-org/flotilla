@@ -1586,6 +1586,9 @@ mod tests {
         struct Resident(Result<(), String>);
         #[async_trait::async_trait]
         impl VesselAgent for Resident {
+            fn commands(&self) -> Arc<dyn CommandRunner> {
+                panic!("attach never runs commands through the resident agent")
+            }
             async fn ready(&self) -> Result<(), String> {
                 self.0.clone()
             }

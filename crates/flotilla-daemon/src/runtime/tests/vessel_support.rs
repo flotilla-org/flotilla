@@ -53,6 +53,9 @@ impl RunnerVessel {
 
 #[async_trait]
 impl VesselAgent for RunnerVessel {
+    fn commands(&self) -> Arc<dyn CommandRunner> {
+        self.runner.clone()
+    }
     async fn ready(&self) -> Result<(), String> {
         Ok(())
     }

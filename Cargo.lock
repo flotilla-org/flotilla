@@ -3834,12 +3834,17 @@ dependencies = [
 name = "flotilla-vessel-delivery"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "flotilla-environment",
+ "flotilla-provider-runtime",
  "hegeltest",
  "libc",
  "proc-macro2",
  "quote",
  "smallvec",
  "syn 2.0.117",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

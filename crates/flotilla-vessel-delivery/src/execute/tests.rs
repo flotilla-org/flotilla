@@ -1,0 +1,137 @@
+use std::{
+    os::unix::fs::PermissionsExt,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+};
+
+use flotilla_environment::environment::EnvironmentTool;
+use flotilla_provider_runtime::{CommandRunner, ProcessCommandRunner};
+
+use super::*;
+use crate::vocabulary::{RelativePath, TreeSources};
+
+/// A vessel whose agent is this process: real `sh` and files under a temporary
+/// writable base. It stands in for the drydock agent's process boundary only.
+struct LocalVessel {
+    base: tempfile::TempDir,
+}
+
+#[async_trait]
+impl VesselAgent for LocalVessel {
+    async fn ready(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn forward_socket(&self, _: &Path) -> Result<PathBuf, String> {
+        Err("delivery forwards no sockets".into())
+    }
+    async fn push_tools(&self, _: &[EnvironmentTool]) -> Result<(), String> {
+        Err("delivery pushes no tools".into())
+    }
+    fn commands(&self) -> Arc<dyn CommandRunner> {
+        Arc::new(ProcessCommandRunner)
+    }
+    async fn writable_base(&self) -> Result<PathBuf, String> {
+        Ok(self.base.path().to_path_buf())
+    }
+}
+
+/// Writes its digest into the tree through the agent, recording each delivery.
+struct Tree {
+    content: Mutex<String>,
+    fail: AtomicBool,
+    deliveries: Mutex<Vec<Mechanism>>,
+}
+
+impl Tree {
+    fn new(content: &str) -> Arc<Self> {
+        Arc::new(Self { content: Mutex::new(content.into()), fail: AtomicBool::new(false), deliveries: Mutex::default() })
+    }
+
+    fn deliveries(&self) -> usize {
+        self.deliveries.lock().expect("deliveries").len()
+    }
+}
+
+#[async_trait]
+impl TreeDelivery for Tree {
+    async fn deliver(&self, mechanism: Mechanism, _: Option<&Path>, target: &Path, agent: &dyn VesselAgent) -> Result<(), String> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err("source unavailable".into());
+        }
+        agent.ensure_directory(target, 0o755).await?;
+        let content = self.content.lock().expect("content").clone();
+        agent.write_text(&target.join("SKILL.md"), &content, 0o644).await?;
+        self.deliveries.lock().expect("deliveries").push(mechanism);
+        Ok(())
+    }
+}
+
+fn needs(skills: &str, notes: &str) -> Vec<Need> {
+    let tree = |name: &str, digest: &str| Need {
+        name: NeedName::new(name),
+        digest: ContentDigest::new(digest),
+        item: Item::Tree {
+            home: NeedName::new("home"),
+            path: RelativePath::new(format!("skills/{name}")).expect("path"),
+            sources: TreeSources { controller: true, url: true, host_path: None },
+        },
+    };
+    vec![
+        Need {
+            name: NeedName::new("home"),
+            digest: ContentDigest::new("home"),
+            item: Item::Home { key: RelativePath::new("agent-homes/requesters/c/coder/claude").expect("key") },
+        },
+        tree("skills", skills),
+        tree("notes", notes),
+    ]
+}
+
+// Behaviour (#3964 contract 3): the one executor runs each step through the
+// vessel agent, keyed by content digest. A home is created owner-only at its
+// key under the writable base, each tree lands inside it, and a re-run is a
+// no-op for what landed: only a changed digest, or a step that failed, is
+// delivered again.
+#[tokio::test]
+async fn re_runs_deliver_only_what_changed_or_failed() {
+    let vessel = LocalVessel { base: tempfile::tempdir().expect("base") };
+    let (skills, notes) = (Tree::new("skills v1"), Tree::new("notes v1"));
+    let trees = BTreeMap::from([
+        (NeedName::new("skills"), skills.clone() as Arc<dyn TreeDelivery>),
+        (NeedName::new("notes"), notes.clone() as Arc<dyn TreeDelivery>),
+    ]);
+    let run = |needs: Vec<Need>| {
+        let trees = trees.clone();
+        let vessel = &vessel;
+        async move { deliver(&needs, &trees, &ProviderMechanisms::default(), &CostTable::default(), vessel).await }
+    };
+
+    let first = run(needs("s1", "n1")).await.expect("first delivery");
+    let home = vessel.base.path().join("agent-homes/requesters/c/coder/claude");
+    assert_eq!(first.homes[&NeedName::new("home")], home, "the home is its key under the writable base");
+    assert_eq!(std::fs::metadata(&home).expect("home").permissions().mode() & 0o777, 0o700);
+    assert_eq!(std::fs::read_to_string(home.join("skills/skills/SKILL.md")).expect("skills"), "skills v1");
+    assert_eq!((skills.deliveries(), notes.deliveries()), (1, 1));
+    assert_eq!(*skills.deliveries.lock().expect("deliveries"), vec![Mechanism::AgentFetch { by: crate::FetchBy::Url }]);
+
+    let again = run(needs("s1", "n1")).await.expect("re-run");
+    assert!(again.plan.steps.iter().all(|step| step.action == Action::Keep), "{:?}", again.plan);
+    assert_eq!((skills.deliveries(), notes.deliveries()), (1, 1), "nothing is delivered twice");
+
+    *skills.content.lock().expect("content") = "skills v2".into();
+    run(needs("s2", "n1")).await.expect("changed skills");
+    assert_eq!((skills.deliveries(), notes.deliveries()), (2, 1), "only the changed digest is delivered");
+    assert_eq!(std::fs::read_to_string(home.join("skills/skills/SKILL.md")).expect("skills"), "skills v2");
+    run(needs("s2", "n1")).await.expect("re-run after a change");
+    assert_eq!((skills.deliveries(), notes.deliveries()), (2, 1), "a partial delivery still records what it kept");
+
+    notes.fail.store(true, Ordering::SeqCst);
+    *skills.content.lock().expect("content") = "skills v3".into();
+    let error = run(needs("s3", "n2")).await.expect_err("notes fail");
+    assert!(matches!(&error, DeliveryError::Step { need, .. } if need.as_str() == "notes"), "{error}");
+    notes.fail.store(false, Ordering::SeqCst);
+    run(needs("s3", "n2")).await.expect("retry");
+    assert_eq!((skills.deliveries(), notes.deliveries()), (3, 2), "the retry delivers only what failed");
+}

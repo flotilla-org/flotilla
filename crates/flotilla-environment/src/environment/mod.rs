@@ -265,12 +265,68 @@ impl ProvisionedMount {
     }
 }
 
-/// Host-facing capabilities of the one resident vessel agent.
+/// Host-facing capabilities of the one resident vessel agent. Vessel delivery
+/// (#3956) runs every step through these; it never uses a fallback runner.
 #[async_trait]
 pub trait VesselAgent: Send + Sync {
     async fn ready(&self) -> Result<(), String>;
     async fn forward_socket(&self, guest: &Path) -> Result<PathBuf, String>;
     async fn push_tools(&self, tools: &[EnvironmentTool]) -> Result<(), String>;
+    /// Run commands in the vessel, through the agent.
+    fn commands(&self) -> Arc<dyn CommandRunner>;
+
+    /// The base under which this vessel's writable state lives: the contained
+    /// base in a container, the host runner's base on a shared host.
+    async fn writable_base(&self) -> Result<PathBuf, String> {
+        self.commands().writable_config_base(None, Path::new(runner::CONTAINED_WRITABLE_CONFIG_BASE)).await
+    }
+
+    /// Create `path` and its parents, leaving `path` with exactly `mode`. Existing
+    /// contents are kept.
+    async fn ensure_directory(&self, path: &Path, mode: u32) -> Result<(), String> {
+        if !path.is_absolute() || mode > 0o777 {
+            return Err(format!("directory {} must be absolute with permission bits only", path.display()));
+        }
+        self.commands()
+            .run(
+                "sh",
+                &[
+                    "-c",
+                    "umask 077 && mkdir -p -- \"$1\" && chmod \"$2\" \"$1\"",
+                    "flotilla-ensure-directory",
+                    &path.to_string_lossy(),
+                    &format!("{mode:o}"),
+                ],
+                Path::new("/"),
+                &flotilla_provider_runtime::ChannelLabel::Default,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("create {}: {error}", path.display()))
+    }
+
+    /// The text of the regular file at `path`, or `None` when there is none.
+    async fn read_text(&self, path: &Path) -> Result<Option<String>, String> {
+        let output = self
+            .commands()
+            .run_output(
+                "sh",
+                &["-c", "if [ -f \"$1\" ]; then cat -- \"$1\"; else exit 3; fi", "flotilla-read-text", &path.to_string_lossy()],
+                Path::new("/"),
+                &flotilla_provider_runtime::ChannelLabel::Default,
+            )
+            .await?;
+        match output.exit_code {
+            Some(0) => Ok(Some(output.stdout)),
+            Some(3) => Ok(None),
+            code => Err(format!("read {}: exited {code:?}: {}", path.display(), output.stderr.trim())),
+        }
+    }
+
+    /// Replace the file at `path` with `content` and `mode`, atomically.
+    async fn write_text(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
+        self.commands().write_file_with_mode(path, content, mode).await
+    }
 }
 
 /// A live handle to a provisioned sandbox environment.

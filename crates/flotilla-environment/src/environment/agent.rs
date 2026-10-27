@@ -533,6 +533,9 @@ fn collect(source: &Path, destination: &Path, files: &mut Vec<FileEntry>, links:
 
 #[async_trait]
 impl VesselAgent for Arc<AgentRunner> {
+    fn commands(&self) -> Arc<dyn CommandRunner> {
+        self.clone()
+    }
     async fn ready(&self) -> Result<(), String> {
         self.healthy().await;
         self.client().await.map(|_| ())

@@ -1287,6 +1287,9 @@ struct DeadAgentEnvironment(TestInteriorEnvironment);
 struct DeadAgent;
 #[async_trait]
 impl flotilla_environment::environment::VesselAgent for DeadAgent {
+    fn commands(&self) -> Arc<dyn CommandRunner> {
+        Arc::new(DeadCaptureRunner(Arc::default()))
+    }
     async fn ready(&self) -> Result<(), String> {
         Err("agent unavailable".into())
     }
