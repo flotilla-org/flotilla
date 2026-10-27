@@ -74,9 +74,6 @@ pub struct PrepareOpts {
     /// Requested OCI guest target; omitted selects the provider's admitted default.
     #[cfg(unix)]
     pub platform: Option<drydock_protocol::Platform>,
-    /// Transitional admission for baseline-sourced tags until #2731 cuts the
-    /// fleet over to ImageBuild. Only the resource controller verifies provenance.
-    pub legacy_baseline: bool,
     pub prepared_auth: PreparedEnvironmentAuth,
 }
 

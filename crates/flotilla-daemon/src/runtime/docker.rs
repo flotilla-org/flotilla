@@ -20,8 +20,7 @@ use flotilla_protocol::{ConfiguredResourceLimits, EnvironmentId};
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provisioning::reconcilers::{EnvironmentProvisioning, EnvironmentRuntime};
 use flotilla_resources::{
-    Environment, EnvironmentSpec, PlacementPolicy, Resource, ResourceError, Vessel, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ENV,
-    CREDENTIAL_SCOPES_ENV,
+    Environment, EnvironmentSpec, ResourceError, Vessel, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ENV,
 };
 use tokio::sync::OnceCell;
 use tracing::{info, warn};
@@ -49,36 +48,6 @@ impl DockerControllerRuntime {
             }
         }
         result
-    }
-
-    // One-generation bridge until #2731. New snapshots and Environments freeze
-    // baseline provenance; old records recover it through the live policy.
-    pub(super) async fn legacy_baseline_for_environment(&self, name: &str) -> Result<bool, String> {
-        let backend = self.state.daemon.resource_backend();
-        let environment = match backend.using::<Environment>(&self.state.namespace).get(name).await {
-            Ok(environment) => environment,
-            Err(ResourceError::NotFound { .. }) => return Ok(false),
-            Err(error) => return Err(error.to_string()),
-        };
-        if environment.metadata.labels.contains_key("flotilla.work/legacy-image-baseline") {
-            return Ok(true);
-        }
-        let Some(owner) =
-            environment.metadata.owner_references.iter().find(|owner| owner.controller && owner.kind == Vessel::API_PATHS.kind)
-        else {
-            return Ok(false);
-        };
-        let vessel = match backend.using::<Vessel>(&self.state.namespace).get(&owner.name).await {
-            Ok(vessel) => vessel,
-            Err(ResourceError::NotFound { .. }) => return Ok(false),
-            Err(error) => return Err(error.to_string()),
-        };
-        let policy = match backend.using::<PlacementPolicy>(&self.state.namespace).get(&vessel.spec.placement_policy_ref).await {
-            Ok(policy) => policy,
-            Err(ResourceError::NotFound { .. }) => return Ok(false),
-            Err(error) => return Err(error.to_string()),
-        };
-        Ok(policy.spec.docker_per_vessel.is_some_and(|docker| docker.legacy_image_baseline_ref().is_some()))
     }
 
     pub(super) async fn provider_for_environment(
@@ -147,7 +116,6 @@ impl DockerControllerRuntime {
         name: &str,
         spec: &flotilla_resources::DockerEnvironmentSpec,
     ) -> Result<EnvironmentProvisioning, EnvironmentProvisionError> {
-        let legacy_baseline = self.legacy_baseline_for_environment(name).await?;
         let (mut environment_spec, instance) =
             match self.state.daemon.resource_backend().using::<Environment>(&self.state.namespace).get(name).await {
                 Ok(environment) => (
@@ -381,11 +349,7 @@ impl DockerControllerRuntime {
         let prepared = match provider
             .prepare(
                 &environment_spec,
-                &flotilla_environment::environment::PrepareOpts {
-                    legacy_baseline,
-                    prepared_auth: opts.prepared_auth.clone(),
-                    ..Default::default()
-                },
+                &flotilla_environment::environment::PrepareOpts { prepared_auth: opts.prepared_auth.clone(), ..Default::default() },
             )
             .await
         {

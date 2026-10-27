@@ -3,8 +3,8 @@
 `FulfilmentKind` is a home-authored, home-bound runtime resource. Its owning
 host publishes it and other hosts consume read-only replicas. This follows the
 existing live `PlacementPolicy` authorship and avoids competing definitions of
-one host's realisation. The crew image baseline remains a separate federated
-Definition (ADR 0039).
+one host's realisation. A kind's image is a pinned literal or the vessel's
+composed image (ADR 0062); CrewImageBaseline is retired (#3824).
 
 During A1, each host registers kinds with the names of its live placement
 policies. The three `docker-crew-image-*` manifests still author their policies;

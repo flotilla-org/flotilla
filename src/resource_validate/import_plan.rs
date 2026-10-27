@@ -75,6 +75,12 @@ pub(super) fn plan(plural: &str) -> Option<(&'static str, Plan)> {
     PLAN.iter().find(|(name, _)| *name == kind).copied()
 }
 
+/// Whether rows listed under `plural` are a retired kind's this candidate no longer decodes; the
+/// import drops them.
+pub(super) fn is_retired(plural: &str) -> bool {
+    !REGISTERED_RESOURCE_KINDS.iter().any(|entry| entry.plural == plural) && matches!(plan(plural), Some((_, Plan::Retired(_))))
+}
+
 /// Row counts of one namespace's listed kinds, by plural, and what the plan makes of them.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct Report {
@@ -170,5 +176,17 @@ mod tests {
         let mut unknown = Report::default();
         unknown.count("widgets", 1);
         assert!(unknown.blocks_import(), "a kind with no plan fails closed");
+    }
+
+    // Contract (#3824 layer 4b-i): a previous-generation daemon still lists a kind this candidate
+    // retired; its rows are counted as dropped and skip decoding, never "no import plan".
+    #[test]
+    fn a_retired_unregistered_kind_listed_by_an_older_daemon_is_dropped() {
+        assert!(is_retired("crewimagebaselines"));
+        assert!(!is_retired("events"), "a retired kind still registered keeps its decoder");
+        let mut report = Report::default();
+        report.count("crewimagebaselines", 2);
+        assert_eq!(report.dropped.get("CrewImageBaseline"), Some(&2));
+        assert!(!report.blocks_import());
     }
 }

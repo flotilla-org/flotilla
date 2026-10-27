@@ -1413,13 +1413,9 @@ fn generated_convoy_admission_is_homed_on_placement(tc: hegel::TestCase) {
 
 #[tokio::test]
 async fn router_duplicate_create_scenarios_admit_one_generation_at_the_requested_host() {
-    // #2941: remote contained admission freezes baseline provenance even when
-    // concurrent duplicate requests race through real routing and admission.
-    for (name, remote, baseline) in [
-        ("duplicate-local-create", false, false),
-        ("duplicate-routed-create", true, false),
-        ("duplicate-routed-baseline-create", true, true),
-    ] {
+    // Concurrent duplicate requests race through real routing and admission: one generation is
+    // admitted, at the requested host.
+    for (name, remote) in [("duplicate-local-create", false), ("duplicate-routed-create", true)] {
         let leader = empty_daemon_named("desk").await;
         let follower = empty_daemon_named("placement").await;
         for host in [&leader, &follower] {
@@ -1436,44 +1432,6 @@ async fn router_duplicate_create_scenarios_admit_one_generation_at_the_requested
             let host_id = home.local_host_id().expect("placement host identity").to_string();
             await_host_capacity(&topology.leader, &host_id).await;
             seed_target_placement_policy(&topology, "flotilla", "duplicate-placement").await;
-            if baseline {
-                let backend = home.resource_backend();
-                backend
-                    .definitions::<flotilla_resources::CrewImageBaseline>("flotilla")
-                    .apply(
-                        &InputMeta::builder().name("fleet-crew".into()).build(),
-                        &flotilla_resources::CrewImageBaselineSpec { image: "crew:baseline".into() },
-                    )
-                    .await
-                    .expect("baseline on admission host");
-                let hosts = backend.using::<Host>("flotilla");
-                let host = hosts.get(&host_id).await.expect("host");
-                let mut status = host.status.expect("status");
-                status.capabilities.insert("docker".into(), serde_json::json!(true));
-                status.capabilities.insert("os".into(), serde_json::json!("linux"));
-                hosts.update_status(&host_id, &host.metadata.resource_version, &status).await.expect("Docker host");
-                let policies = backend.using::<PlacementPolicy>("flotilla");
-                let policy = policies.get("duplicate-placement").await.expect("policy");
-                let contained = PlacementPolicySpec::builder()
-                    .pool("cleat".into())
-                    .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
-                        legacy_image_baseline_ref: None,
-                        host_ref: host_id.clone(),
-                        image: Some(flotilla_resources::DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".into() }),
-                        pull_policy: Default::default(),
-                        memory_policy: Default::default(),
-                        agent_adapters: Default::default(),
-                        default_cwd: None,
-                        env: Default::default(),
-                        checkout: flotilla_resources::DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".into() },
-                    })
-                    .build();
-                policies
-                    .update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &contained)
-                    .await
-                    .expect("contained policy");
-            }
-
             eventually(Duration::from_secs(5), Duration::from_millis(10), "origin sees workflow", || async {
                 topology.leader.resource_backend().definitions::<WorkflowTemplate>("flotilla").get("empty").await.is_ok()
             })
@@ -1518,19 +1476,6 @@ async fn router_duplicate_create_scenarios_admit_one_generation_at_the_requested
             1,
             "{name}: {results:?}"
         );
-        if baseline {
-            let backend = home.resource_backend();
-            let convoy = backend.using::<Convoy>("flotilla").list().await.expect("admitted convoy").items.pop().expect("convoy");
-            let snapshot = &convoy.metadata.annotations[flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION];
-            let policy = backend.using::<PlacementPolicy>("flotilla").get(snapshot).await.expect("prepared snapshot");
-            let docker = policy.spec.docker_per_vessel.expect("contained snapshot");
-            assert_eq!(
-                docker.image,
-                Some(flotilla_resources::DockerImageSource::Literal("crew:baseline".into())),
-                "legacy baseline must freeze as a literal"
-            );
-            assert_eq!(docker.legacy_image_baseline_ref.as_deref(), Some("fleet-crew"));
-        }
         for host in [&topology.leader, &topology.follower] {
             assert_eq!(
                 host.resource_backend().using::<Convoy>("flotilla").list().await.expect("local convoys").items.len(),
@@ -3786,7 +3731,6 @@ async fn remote_docker_admission_refusal_scenario(provider_case: Option<usize>, 
     let remote_policy = PlacementPolicySpec::builder()
         .pool("cleat".to_string())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-            legacy_image_baseline_ref: None,
             memory_policy: Default::default(),
             host_ref: "remote-docker-host".to_string(),
             image: Some("crew:latest".into()),

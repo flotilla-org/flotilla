@@ -160,7 +160,6 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
         PlacementPolicySpec::builder()
             .pool("passthrough".to_string())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                legacy_image_baseline_ref: None,
                 memory_policy: Default::default(),
                 host_ref: feta_host_ref.clone(),
                 image: Some("test-image".into()),

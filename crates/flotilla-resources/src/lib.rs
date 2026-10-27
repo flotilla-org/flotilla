@@ -29,7 +29,6 @@ pub use crew_defaults::{
     resolve_skills, skill_layers, validate_skill_ref, CrewDefaults, CrewDefaultsSpec, ResolvedSkills, SkillCatalogEntry, SkillDecision,
     SkillLayer, SkillOutcome, SkillRefusal,
 };
-mod crew_image_baseline;
 #[doc(hidden)]
 pub mod image_build;
 pub use image_build::{
@@ -159,7 +158,6 @@ pub use credential::{
     CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, CREW_SKILLS_ENV, INITIAL_AUTHORIZATION_EPOCH,
     RESOLVED_SKILLS_ENV, RETIRED_CREW_HOME_KEYS_ENV,
 };
-pub use crew_image_baseline::{CrewImageBaseline, CrewImageBaselineSpec};
 pub use dispatch_hold::{
     DispatchDeployment, DispatchDeploymentSpec, DispatchHold, DispatchHoldSpec, DispatchHoldStatus, DispatchHoldStatusPatch, HoldClearWhen,
 };
@@ -275,7 +273,6 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::ConvoyEnsure>($($argument),*);
         $callback::<$crate::CredentialGrant>($($argument),*);
         $callback::<$crate::CredentialSpec>($($argument),*);
-        $callback::<$crate::CrewImageBaseline>($($argument),*);
         $callback::<$crate::ImageBuild>($($argument),*);
         $callback::<$crate::ImageLayer>($($argument),*);
         $callback::<$crate::CrewDefaults>($($argument),*);

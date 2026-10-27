@@ -78,7 +78,6 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
     let policy = PlacementPolicySpec::builder()
         .pool("cleat".into())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-            legacy_image_baseline_ref: None,
             host_ref: host_id.clone(),
             image: None,
             pull_policy: Default::default(),
