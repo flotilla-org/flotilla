@@ -7,12 +7,16 @@
 //! need to the cheapest mechanism that meets its requirements, with costs in a
 //! [`CostTable`] rather than code, and keeps what has already landed. The
 //! planner is pure: needs, mechanisms and what is delivered in, a [`Plan`] out.
+//! [`deliver`] is the one executor: it reads what landed aboard, plans, and runs
+//! each step through the vessel agent alone, keyed by content digest.
 //!
 //! This crate knows no convoy and never parses an [`AccessKey`].
 
+mod execute;
 mod plan;
 mod vocabulary;
 
+pub use execute::{deliver, Delivered, DeliveryError, TreeDelivery, DELIVERY_RECORD};
 pub use plan::{plan, Action, CostTable, Landed, Plan, PlanError, Step};
 pub use vocabulary::{
     Access, AccessKey, ContentDigest, FetchBy, HostPathOffer, HostReach, Item, Liveness, Mechanism, Need, NeedName, ProviderMechanisms,

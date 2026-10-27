@@ -7,7 +7,7 @@ use super::*;
 use super::agentless_vessels::{AgentlessVessels, HostRefusal, VesselAgents, VesselHandle, VesselPaths};
 use crate::server::environment_sockets::{EnvironmentSocketRegistry, EnvironmentSocketService};
 use flotilla_discovery::DiscoveryRuntime;
-use flotilla_environment::environment::{EnvironmentTool, VesselAgent};
+use flotilla_environment::environment::{vessel_ops::RunnerVesselAgent, EntryKind, EnvironmentTool, VesselAgent};
 
 /// What the controller did to one vessel's agent.
 #[derive(Clone, Debug, Default)]
@@ -53,6 +53,28 @@ impl RunnerVessel {
 
 #[async_trait]
 impl VesselAgent for RunnerVessel {
+    fn commands(&self) -> Arc<dyn CommandRunner> {
+        self.runner.clone()
+    }
+    // The vessel's file facilities run on the host runner, as the real agent runs them there.
+    async fn writable_base(&self) -> Result<PathBuf, String> {
+        RunnerVesselAgent(self.runner.clone()).writable_base().await
+    }
+    async fn stat(&self, path: &Path) -> Result<Option<EntryKind>, String> {
+        RunnerVesselAgent(self.runner.clone()).stat(path).await
+    }
+    async fn create_dir(&self, path: &Path, mode: u32) -> Result<(), String> {
+        RunnerVesselAgent(self.runner.clone()).create_dir(path, mode).await
+    }
+    async fn read(&self, path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
+        RunnerVesselAgent(self.runner.clone()).read(path, limit).await
+    }
+    async fn write(&self, path: &Path, bytes: Vec<u8>, mode: u32) -> Result<(), String> {
+        RunnerVesselAgent(self.runner.clone()).write(path, bytes, mode).await
+    }
+    async fn symlink(&self, path: &Path, target: &Path) -> Result<(), String> {
+        RunnerVesselAgent(self.runner.clone()).symlink(path, target).await
+    }
     async fn ready(&self) -> Result<(), String> {
         Ok(())
     }

@@ -371,6 +371,47 @@ async fn runner_and_material_contract(agent: Arc<dyn TestAgent>) {
     assert!(runner.same_filesystem(&source, &destination).await.is_err());
 }
 
+// Vessel delivery (#3964 contract 3) runs every step through the agent's own file
+// facilities. The real agent creates a home with exactly its mode, keeping what is
+// already there, and refuses a symbolic link in its place. It reads a missing
+// record as absent and a written one back within its limit, stats without
+// following links, replaces a link in place, and resolves the contained base.
+over_each_transport!(delivery_operations_cross_the_agent);
+async fn delivery_operations_cross_the_agent(agent: Arc<dyn TestAgent>) {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let vessel: Arc<dyn VesselAgent> = Arc::new(runner_for(&agent, directory.path()));
+    let home = directory.path().join("agent-homes/requesters/convoy/coder/claude");
+    vessel.create_dir(&home, 0o700).await.unwrap();
+    assert_eq!(std::fs::metadata(&home).unwrap().permissions().mode() & 0o777, 0o700);
+    let record = home.join(".record");
+    assert_eq!(vessel.read(&record, 1024).await.unwrap(), None);
+    vessel.write(&record, b"skills\tdigest\tagent-push\n".to_vec(), 0o600).await.unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+    vessel.create_dir(&home, 0o700).await.unwrap();
+    assert_eq!(std::fs::metadata(&home).unwrap().permissions().mode() & 0o777, 0o700, "an existing home is narrowed again");
+    assert_eq!(
+        vessel.read(&record, 1024).await.unwrap().as_deref(),
+        Some(b"skills\tdigest\tagent-push\n".as_slice()),
+        "its contents are kept"
+    );
+    assert!(vessel.read(&record, 4).await.is_err(), "a read beyond its limit is refused");
+    assert_eq!(vessel.stat(&record).await.unwrap(), Some(EntryKind::File));
+    assert_eq!(vessel.stat(&home.join("absent")).await.unwrap(), None);
+    let login = home.join("auth.json");
+    vessel.symlink(&login, &record).await.unwrap();
+    vessel.symlink(&login, &home.join("rotated")).await.unwrap();
+    assert_eq!(std::fs::read_link(&login).unwrap(), home.join("rotated"), "a link is replaced in place");
+    assert_eq!(vessel.stat(&login).await.unwrap(), Some(EntryKind::Symlink), "stat never follows a link");
+    assert_eq!(std::fs::metadata(&record).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(vessel.create_dir(Path::new("relative"), 0o700).await.is_err());
+    let link = directory.path().join("linked-home");
+    std::os::unix::fs::symlink(&home, &link).unwrap();
+    assert!(vessel.create_dir(&link, 0o755).await.is_err(), "a linked home is refused, never followed");
+    assert_eq!(std::fs::metadata(&home).unwrap().permissions().mode() & 0o777, 0o700);
+    assert_eq!(vessel.writable_base().await.unwrap(), Path::new(super::super::runner::CONTAINED_WRITABLE_CONFIG_BASE));
+}
+
 // Issue 3486: flotilla's CLI cycle is separate from drydock's. Updating files
 // changes what exec sees while the same agent incarnation continues running.
 over_each_transport!(pushing_new_cli_layer_does_not_reexec_agent);

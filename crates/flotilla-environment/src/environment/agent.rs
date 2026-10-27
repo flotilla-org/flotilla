@@ -19,7 +19,7 @@ use tokio::{
     sync::{Mutex, OnceCell},
 };
 
-use super::{EnvironmentTool, VesselAgent};
+use super::{EntryKind, EnvironmentTool, VesselAgent};
 
 pub mod host;
 
@@ -533,6 +533,48 @@ fn collect(source: &Path, destination: &Path, files: &mut Vec<FileEntry>, links:
 
 #[async_trait]
 impl VesselAgent for Arc<AgentRunner> {
+    fn commands(&self) -> Arc<dyn CommandRunner> {
+        self.clone()
+    }
+    async fn writable_base(&self) -> Result<PathBuf, String> {
+        CommandRunner::writable_config_base(self.as_ref(), None, Path::new(super::runner::CONTAINED_WRITABLE_CONFIG_BASE)).await
+    }
+    async fn stat(&self, path: &Path) -> Result<Option<EntryKind>, String> {
+        match self.client().await?.stat(path).await {
+            Ok(entry) => Ok(Some(match entry.kind {
+                drydock_agent::EntryKind::File => EntryKind::File,
+                drydock_agent::EntryKind::Directory => EntryKind::Directory,
+                drydock_agent::EntryKind::Symlink => EntryKind::Symlink,
+                drydock_agent::EntryKind::Other => EntryKind::Other,
+            })),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("stat {}: {error}", path.display())),
+        }
+    }
+    async fn create_dir(&self, path: &Path, mode: u32) -> Result<(), String> {
+        // The agent applies exactly `mode`, keeps an existing directory's contents
+        // and refuses anything else, a symbolic link included, at `path`.
+        let options = FileOptions { mode: Some(mode), parents: true, ..FileOptions::default() };
+        self.client().await?.create_dir(path, &options).await.map(drop).map_err(|error| format!("create {}: {error}", path.display()))
+    }
+    async fn read(&self, path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
+        match self.client().await?.read_bytes(path, limit).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("read {}: {error}", path.display())),
+        }
+    }
+    async fn write(&self, path: &Path, bytes: Vec<u8>, mode: u32) -> Result<(), String> {
+        self.publish(path, bytes, Some(mode)).await
+    }
+    async fn symlink(&self, path: &Path, target: &Path) -> Result<(), String> {
+        let options = FileOptions { parents: true, ..FileOptions::default() };
+        self.client()
+            .await?
+            .symlink(path, target, &options)
+            .await
+            .map_err(|error| format!("link {} to {}: {error}", path.display(), target.display()))
+    }
     async fn ready(&self) -> Result<(), String> {
         self.healthy().await;
         self.client().await.map(|_| ())

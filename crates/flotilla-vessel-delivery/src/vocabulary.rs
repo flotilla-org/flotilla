@@ -173,6 +173,24 @@ impl fmt::Display for Mechanism {
     }
 }
 
+impl std::str::FromStr for Mechanism {
+    type Err = String;
+
+    /// Parses the form [`Mechanism`]'s `Display` writes.
+    fn from_str(text: &str) -> Result<Self, String> {
+        let host_path = |access, liveness| Self::HostPath { access, liveness };
+        Ok(match text {
+            "host-path(ro, live)" => host_path(Access::ReadOnly, Liveness::Live),
+            "host-path(ro, snapshot)" => host_path(Access::ReadOnly, Liveness::Snapshot),
+            "host-path(rw, live)" => host_path(Access::ReadWrite, Liveness::Live),
+            "host-path(rw, snapshot)" => host_path(Access::ReadWrite, Liveness::Snapshot),
+            "agent-fetch(url)" => Self::AgentFetch { by: FetchBy::Url },
+            "agent-push" => Self::AgentPush,
+            other => return Err(format!("unknown delivery mechanism `{other}`")),
+        })
+    }
+}
+
 /// What a host-path offer reaches.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostReach {

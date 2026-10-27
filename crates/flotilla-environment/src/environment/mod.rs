@@ -14,6 +14,7 @@ pub mod image_dockerfile;
 pub mod registry_auth;
 pub mod registry_client;
 pub mod runner;
+pub mod vessel_ops;
 pub use image::{ImageBuildService, LocalImageCache, OwnedBuilderSettings};
 pub use registry_auth::RegistryAuth;
 
@@ -265,12 +266,44 @@ impl ProvisionedMount {
     }
 }
 
-/// Host-facing capabilities of the one resident vessel agent.
+/// What is at a path, never following a final symbolic link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+/// Host-facing capabilities of the one resident vessel agent. Vessel delivery
+/// (#3956) runs every step through these general facilities; it never uses a
+/// fallback runner. File operations are the agent's own, not scripts a caller
+/// composes; running a command is one facility among them, for steps that are
+/// genuinely commands.
 #[async_trait]
 pub trait VesselAgent: Send + Sync {
     async fn ready(&self) -> Result<(), String>;
     async fn forward_socket(&self, guest: &Path) -> Result<PathBuf, String>;
     async fn push_tools(&self, tools: &[EnvironmentTool]) -> Result<(), String>;
+    /// Run commands in the vessel, through the agent.
+    fn commands(&self) -> Arc<dyn CommandRunner>;
+    /// The base under which this vessel's writable state lives: the contained
+    /// base in a container, the host runner's base on a shared host.
+    async fn writable_base(&self) -> Result<PathBuf, String>;
+    /// What is at `path`, or `None` when nothing is.
+    async fn stat(&self, path: &Path) -> Result<Option<EntryKind>, String>;
+    /// Create the directory `path`, and any missing parents with the agent's default
+    /// directory mode, leaving `path` with exactly `mode`. Existing contents are kept;
+    /// anything but a directory at `path`, a symbolic link included, is refused.
+    async fn create_dir(&self, path: &Path, mode: u32) -> Result<(), String>;
+    /// The regular file at `path`, following links, refused beyond `limit` bytes,
+    /// or `None` when there is none.
+    async fn read(&self, path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String>;
+    /// Replace the file at `path` with `bytes` and `mode`, atomically.
+    async fn write(&self, path: &Path, bytes: Vec<u8>, mode: u32) -> Result<(), String>;
+    /// Make `path` a symbolic link to `target`, atomically replacing anything there
+    /// but a directory.
+    async fn symlink(&self, path: &Path, target: &Path) -> Result<(), String>;
 }
 
 /// A live handle to a provisioned sandbox environment.
