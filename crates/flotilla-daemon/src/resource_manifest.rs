@@ -606,22 +606,30 @@ impl ResourceManifestReconciler {
         }
         let live_hash = resource_document_spec_hash(&live).map_err(|error| format!("{identity}: {error}"))?;
         let baseline = previous.baseline_hash.clone();
+        // Why the resource is kept: a stable cause (the event is recorded when it changes) and
+        // the reason the root reports. An operator releases an orphan by deleting the resource,
+        // by declaring the document again, or (for an edit) by restoring the applied spec.
         let kept = if spec.suspended.contains(key) {
-            Some("suspended; resume it to delete the resource".to_owned())
+            Some(("suspended", "suspended; resume it to delete the resource".to_owned()))
+        } else if baseline.is_none() {
+            Some(("unbaselined", "no baseline recorded for it, so its spec cannot be shown unchanged; the resource is kept".to_owned()))
         } else if baseline.as_deref() != Some(live_hash.as_str()) {
-            Some("live spec edited since its last apply; the resource is kept".to_owned())
+            Some(("edited", "live spec edited since its last apply; the resource is kept".to_owned()))
         } else {
+            // Accepted race: the store's delete takes no version precondition, so an edit landing
+            // between the read above and this delete is deleted rather than orphaned.
             match delete_resource_kind(&self.backend, &key.namespace, &key.kind, &key.name).await {
                 Ok(_) | Err(ResourceError::NotFound { .. }) => None,
-                Err(error) => Some(format!("delete refused: {error}")),
+                Err(error) => Some(("refused", format!("delete refused: {error}"))),
             }
         };
-        let Some(reason) = kept else {
+        let Some((cause, reason)) = kept else {
             info!(object = %identity, source = %self.source, path = %key.path, revision = %removed_in, "manifest document removed; deleted its resource");
             report.deleted += 1;
             return Ok(Some(removed(DocumentPhase::Deleted, None, None, None)));
         };
-        if previous.phase != DocumentPhase::Orphaned || previous.reason.as_deref() != Some(reason.as_str()) {
+        let previous_cause = (previous.phase == DocumentPhase::Orphaned).then(|| previous.reason.as_deref().map(orphan_cause)).flatten();
+        if previous_cause != Some(cause) {
             self.record_refusal_event(&identity, "ManifestPruneRefused", format!("{}: removed in {removed_in}: {reason}", key.path)).await;
             warn!(object = %identity, source = %self.source, path = %key.path, %reason, "manifest document removed; its resource is orphaned");
         }
@@ -986,6 +994,20 @@ impl ResourceManifestReconciler {
         insert_metadata_value(metadata, "annotations", LAST_APPLIED_HASH_ANNOTATION, &persisted_hash)?;
         apply_manifest_resource_document(&self.backend, &self.default_namespace, persisted).await.map_err(|error| error.to_string())?;
         Ok(())
+    }
+}
+
+/// The cause an orphan's reason (as [`ResourceManifestReconciler::judge_removed`] writes it)
+/// names, so a delete error whose text varies between passes is one cause.
+fn orphan_cause(reason: &str) -> &'static str {
+    if reason.starts_with("suspended") {
+        "suspended"
+    } else if reason.starts_with("no baseline") {
+        "unbaselined"
+    } else if reason.starts_with("live spec edited") {
+        "edited"
+    } else {
+        "refused"
     }
 }
 
@@ -2447,6 +2469,87 @@ mod tests {
             assert!(reason.contains("edited since its last apply"), "{store}: {reason}");
             assert!(root.status.stalled.as_ref().expect("stall").evidence.contains("forge.yaml"), "{store}");
         }
+    }
+
+    /// A reconciler over `dir` that has applied `policy.yaml` declaring `name`, and its backend.
+    async fn applied_policy(dir: &Path, name: &str) -> (ResourceBackend, ResourceManifestReconciler) {
+        write(&dir.join("policy.yaml"), &manifest(name, "one"));
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir).with_revision("r1");
+        reconciler.reconcile_once_for_test().await.expect("creation");
+        (backend, reconciler)
+    }
+
+    // Behaviour (#3992): a source that does not load is not a revision that removed its
+    // documents: the pass is refused before any is judged, and nothing is deleted.
+    #[tokio::test]
+    async fn a_source_that_does_not_load_prunes_nothing() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let dir = parent.path().join("manifests");
+        std::fs::create_dir(&dir).expect("manifest directory");
+        let (backend, mut reconciler) = applied_policy(&dir, "kept").await;
+        std::fs::remove_dir_all(&dir).expect("remove the source");
+
+        reconciler.reconcile_once_for_test().await.expect_err("the source does not load");
+        backend.using::<PlacementPolicy>(NAMESPACE).get("kept").await.expect("nothing is pruned");
+        assert_eq!(test_root(&backend).await.status.expect("status").documents[&key("kept")].phase, DocumentPhase::Applied);
+    }
+
+    // Behaviour (#3992): a file this revision holds but cannot parse may still declare its
+    // documents, so their records stand and their resources are kept.
+    #[tokio::test]
+    async fn an_unparsed_file_keeps_its_documents_records_and_resources() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (backend, mut reconciler) = applied_policy(dir.path(), "kept").await;
+        write(&dir.path().join("policy.yaml"), "invalid: [");
+
+        let report = reconciler.reconcile_once_for_test().await.expect("refusal pass");
+        assert_eq!((report.deleted, report.orphaned), (0, 0), "{report:?}");
+        backend.using::<PlacementPolicy>(NAMESPACE).get("kept").await.expect("nothing is pruned");
+        let status = test_root(&backend).await.status.expect("status");
+        assert!(status.documents[&key("kept")].baseline_hash.is_some(), "its baseline stands");
+    }
+
+    // Behaviour (#3992): a document moved to another file is still declared, so its resource is
+    // not judged removed under the old path, even while the new path reads it as drift.
+    #[tokio::test]
+    async fn a_moved_document_is_not_pruned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (backend, mut reconciler) = applied_policy(dir.path(), "moved").await;
+        let policies = backend.using::<PlacementPolicy>(NAMESPACE);
+        let current = policies.get("moved").await.expect("applied");
+        let live = PlacementPolicySpec::builder().pool("live".to_string()).build();
+        policies.update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &live).await.expect("live edit");
+        std::fs::rename(dir.path().join("policy.yaml"), dir.path().join("moved.yaml")).expect("move document");
+
+        let report = reconciler.reconcile_once_for_test().await.expect("move pass");
+        assert_eq!((report.drifted, report.deleted, report.orphaned), (1, 0, 0), "{report:?}");
+        assert_eq!(policies.get("moved").await.expect("nothing is pruned").spec.pool, "live");
+        let documents = test_root(&backend).await.status.expect("status").documents;
+        assert!(!documents.contains_key(&key("moved")), "the old key is dropped: {documents:?}");
+    }
+
+    // Behaviour (#3992): a suspended document that is removed is orphaned, not deleted; resuming
+    // it lets the next pass delete its unchanged resource.
+    #[tokio::test]
+    async fn a_removed_suspended_document_is_deleted_once_resumed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (backend, reconciler) = applied_policy(dir.path(), "paused").await;
+        set_suspended(&backend, key("paused"), true).await;
+        std::fs::remove_file(dir.path().join("policy.yaml")).expect("remove document");
+        let mut reconciler = reconciler.with_revision("r2");
+
+        assert_eq!(reconciler.reconcile_once_for_test().await.expect("suspended pass").orphaned, 1);
+        backend.using::<PlacementPolicy>(NAMESPACE).get("paused").await.expect("kept while suspended");
+        let state = test_root(&backend).await.status.expect("status").documents[&key("paused")].clone();
+        assert_eq!(state.phase, DocumentPhase::Orphaned);
+        assert!(state.reason.as_deref().is_some_and(|reason| reason.starts_with("suspended")), "{state:?}");
+
+        set_suspended(&backend, key("paused"), false).await;
+        assert_eq!(reconciler.reconcile_once_for_test().await.expect("resumed pass").deleted, 1);
+        assert!(matches!(backend.using::<PlacementPolicy>(NAMESPACE).get("paused").await, Err(ResourceError::NotFound { .. })));
+        let state = &test_root(&backend).await.status.expect("status").documents[&key("paused")];
+        assert_eq!((state.phase, state.removed_in.as_deref()), (DocumentPhase::Deleted, Some("r2")));
     }
 
     #[tokio::test]
