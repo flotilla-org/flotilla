@@ -4799,7 +4799,7 @@ impl InProcessDaemon {
         let environment = match checkout.spec.env_ref() {
             Some(env_ref) => self
                 .resolve_environment_ref(env_ref)
-                .ok_or_else(|| format!("command runner unavailable for checkout environment {env_ref}"))?,
+                .ok_or_else(|| format!("checkout environment {env_ref} is unavailable on this host"))?,
             None => ResolvedEnvironment {
                 runner: self.local_command_runner().ok_or("local command runner unavailable")?,
                 id: self.local_environment_id.clone(),

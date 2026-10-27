@@ -857,6 +857,9 @@ impl TerminalControllerRuntime {
         if let Some(access) = vessel {
             return Ok(access.handle.agent());
         }
+        // Provisioned environments register under their resource name, so the
+        // `env_ref` is their handle id; host environments fall through to the
+        // resolved runner below.
         let id = EnvironmentId::new(&spec.env_ref);
         let handle = self
             .state
