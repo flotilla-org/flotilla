@@ -293,6 +293,9 @@ pub(crate) fn check_kind_columns(conn: &Connection, kinds: &KindRegistry) -> Res
 /// table that differs in more than its codes, or a coded column whose CHECK cannot be read, which
 /// is never taken as current.
 ///
+/// A rebuild copies every row of the table while the open transaction holds its `IMMEDIATE`
+/// lock, so the first open after a widening costs time in the table's row count.
+///
 /// Rebuilding drops the old table, so the caller runs this with foreign keys off (inside a
 /// transaction `PRAGMA foreign_keys` cannot change): with them on, the drop would delete each
 /// child table's rows through their `ON DELETE CASCADE`.
