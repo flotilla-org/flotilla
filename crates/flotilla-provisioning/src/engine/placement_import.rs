@@ -12,7 +12,7 @@
 //! | PlacementPolicy with a kind of its name at its home | that kind stands; the policy gives its settings |
 //! | PlacementPolicy with none | a kind of its name: host, pool, cost class, image and the default grants a live policy's kind takes (`FulfilmentKindSpec::from_policy`); a host-direct policy takes its platform from its host's host-direct kind, and is refused without one |
 //! | A prepared placement snapshot (`placement-snapshot-*`, `-remote-placement-*`) | a Snapshot-origin kind of its name with its frozen image; its settings dropped, its host's apply |
-//! | A live policy's Docker pull and memory policy, cwd, env and checkout; host-direct checkout; a cloud sandbox's size, checkout and env | its host's EnvironmentProvider, one per realisation, named `<host>.<realisation>`; a manifest's declared settings override a seeded or operator policy's; refused when two of one rank set it differently |
+//! | A live policy's Docker pull and memory policy, cwd, env and checkout; host-direct checkout; a cloud sandbox's size, checkout and env | its host's EnvironmentProvider, one per realisation, named `<host>.<realisation>`; a manifest's declared settings override a seeded or operator policy's; undeclared settings equal to the built-in default are dropped; refused when two of one rank set it differently |
 //! | `priority` | dropped: admission selects by grants and cost (ADR 0046) |
 //! | `agent_adapters` | dropped: an image fact the host probes |
 //! | `legacy_image_baseline_ref` | dropped with CrewImageBaseline |
@@ -227,6 +227,12 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
                 "{PROVIDERS} `{name}` at `{home}`: `{first}`'s declared settings override those of `{}`",
                 overridden.join("`, `")
             ));
+        }
+        if rank && ProviderSettings::builtin(spec.settings.realisation()).as_ref() == Some(&spec.settings) {
+            // Nothing declares these settings, and they are the built-in default the host's
+            // provider runs with anyway: a stored copy would only shadow a later declaration.
+            *report.dropped.entry((PROVIDERS, "the built-in default settings")).or_default() += set.len();
+            continue;
         }
         let differing: Vec<_> = set
             .iter()

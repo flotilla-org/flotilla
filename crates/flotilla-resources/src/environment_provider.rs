@@ -64,6 +64,24 @@ pub enum ProviderSettings {
 }
 
 impl ProviderSettings {
+    /// The settings a host's provider of `realisation` runs with when nothing declares its own:
+    /// those the daemon seeded its `docker-on-*` and `host-direct-*` policies with, now built into
+    /// the code (the 2026-10-26 ruling on built-ins). A cloud sandbox has none: its size is
+    /// always declared.
+    pub fn builtin(realisation: &str) -> Option<Self> {
+        match realisation {
+            "docker_per_vessel" => Some(Self::DockerPerVessel {
+                pull_policy: DockerImagePullPolicy::default(),
+                memory_policy: EnvironmentMemoryPolicy::default(),
+                default_cwd: Some("/workspace".into()),
+                env: BTreeMap::new(),
+                checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".into() },
+            }),
+            "host_direct" => Some(Self::HostDirect { host_checkout: HostDirectPlacementPolicyCheckout::Worktree }),
+            _ => None,
+        }
+    }
+
     /// The realisation's name, as the settings' record name uses it.
     pub const fn realisation(&self) -> &'static str {
         match self {

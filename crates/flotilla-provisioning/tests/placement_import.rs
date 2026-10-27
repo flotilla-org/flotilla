@@ -136,8 +136,10 @@ fn policies_become_kinds_and_their_hosts_provider_settings() {
     );
 
     // Two live policies set kiwi's Docker provider alike: one record; the snapshot's 80% is not it.
+    // The seeded host-direct policy's settings are the built-in default, so no record holds them.
     let providers: BTreeMap<_, _> = imported.providers.iter().map(|placed| (placed.name.as_str(), &placed.record)).collect();
-    assert_eq!(providers.keys().copied().collect::<Vec<_>>(), [format!("{KIWI}.docker_per_vessel"), format!("{KIWI}.host_direct")]);
+    assert_eq!(providers.keys().copied().collect::<Vec<_>>(), [format!("{KIWI}.docker_per_vessel")]);
+    assert_eq!(report.dropped.get(&("EnvironmentProvider", "the built-in default settings")), Some(&1));
     let docker = providers[format!("{KIWI}.docker_per_vessel").as_str()];
     let ProviderSettings::DockerPerVessel { pull_policy, memory_policy, default_cwd, checkout, .. } = &docker.settings else {
         panic!("docker settings: {:?}", docker.settings)
