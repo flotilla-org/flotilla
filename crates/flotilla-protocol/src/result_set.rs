@@ -1275,6 +1275,9 @@ impl ConvoyRow {
 #[builder(on(String, into))]
 #[derive(flotilla_schema::Describe)]
 pub struct VesselRow {
+    /// Execution kind resolved from this vessel's placement policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_kind: Option<crate::EnvironmentKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
