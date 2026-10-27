@@ -1589,6 +1589,24 @@ mod tests {
             fn commands(&self) -> Arc<dyn CommandRunner> {
                 panic!("attach never runs commands through the resident agent")
             }
+            async fn writable_base(&self) -> Result<PathBuf, String> {
+                panic!("attach never delivers through the resident agent")
+            }
+            async fn stat(&self, _: &Path) -> Result<Option<flotilla_environment::environment::EntryKind>, String> {
+                panic!("attach never delivers through the resident agent")
+            }
+            async fn create_dir(&self, _: &Path, _: u32) -> Result<(), String> {
+                panic!("attach never delivers through the resident agent")
+            }
+            async fn read(&self, _: &Path, _: u64) -> Result<Option<Vec<u8>>, String> {
+                panic!("attach never delivers through the resident agent")
+            }
+            async fn write(&self, _: &Path, _: Vec<u8>, _: u32) -> Result<(), String> {
+                panic!("attach never delivers through the resident agent")
+            }
+            async fn symlink(&self, _: &Path, _: &Path) -> Result<(), String> {
+                panic!("attach never delivers through the resident agent")
+            }
             async fn ready(&self) -> Result<(), String> {
                 self.0.clone()
             }

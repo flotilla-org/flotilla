@@ -1290,6 +1290,24 @@ impl flotilla_environment::environment::VesselAgent for DeadAgent {
     fn commands(&self) -> Arc<dyn CommandRunner> {
         Arc::new(DeadCaptureRunner(Arc::default()))
     }
+    async fn writable_base(&self) -> Result<PathBuf, String> {
+        Err("agent unavailable".into())
+    }
+    async fn stat(&self, _: &Path) -> Result<Option<flotilla_environment::environment::EntryKind>, String> {
+        Err("agent unavailable".into())
+    }
+    async fn create_dir(&self, _: &Path, _: u32) -> Result<(), String> {
+        Err("agent unavailable".into())
+    }
+    async fn read(&self, _: &Path, _: u64) -> Result<Option<Vec<u8>>, String> {
+        Err("agent unavailable".into())
+    }
+    async fn write(&self, _: &Path, _: Vec<u8>, _: u32) -> Result<(), String> {
+        Err("agent unavailable".into())
+    }
+    async fn symlink(&self, _: &Path, _: &Path) -> Result<(), String> {
+        Err("agent unavailable".into())
+    }
     async fn ready(&self) -> Result<(), String> {
         Err("agent unavailable".into())
     }

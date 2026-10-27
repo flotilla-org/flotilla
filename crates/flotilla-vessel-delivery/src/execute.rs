@@ -24,6 +24,8 @@ use crate::{
 pub const DELIVERY_RECORD: &str = ".flotilla-delivery";
 const HOME_MODE: u32 = 0o700;
 const RECORD_MODE: u32 = 0o600;
+/// A record names a handful of needs; anything larger is not one.
+const RECORD_LIMIT: u64 = 64 * 1024;
 
 /// How one tree's content reaches its place, for whichever mechanism the plan chose.
 #[async_trait]
@@ -101,9 +103,11 @@ pub async fn deliver(
         .collect::<BTreeMap<_, _>>();
     let mut read = BTreeMap::new();
     for (name, home) in &homes {
-        let record =
-            agent.read_text(&home.join(DELIVERY_RECORD)).await.map_err(|error| DeliveryError::Step { need: name.clone(), error })?;
-        read.insert(name.clone(), record.as_deref().map(decode_record).unwrap_or_default());
+        let record = agent
+            .read(&home.join(DELIVERY_RECORD), RECORD_LIMIT)
+            .await
+            .map_err(|error| DeliveryError::Step { need: name.clone(), error })?;
+        read.insert(name.clone(), record.map(|bytes| decode_record(&String::from_utf8_lossy(&bytes))).unwrap_or_default());
     }
     let landed = read.values().flatten().map(|(need, landed)| (need.clone(), landed.clone())).collect();
     // The planner refuses a tree whose home is not a home need, so every step's home is in `homes`.
@@ -126,7 +130,7 @@ pub async fn deliver(
         let home = home_of(need);
         let failed = |error| DeliveryError::Step { need: need.name.clone(), error };
         match &need.item {
-            Item::Home { .. } => agent.ensure_directory(&homes[&home], HOME_MODE).await.map_err(failed)?,
+            Item::Home { .. } => agent.create_dir(&homes[&home], HOME_MODE).await.map_err(failed)?,
             Item::Tree { path, .. } => {
                 let tree = trees.get(&need.name).ok_or_else(|| DeliveryError::NoDelivery(need.name.clone()))?;
                 tree.deliver(step.mechanism, step.guest_source.as_deref(), &path.under(&homes[&home]), agent).await.map_err(failed)?;
@@ -134,14 +138,14 @@ pub async fn deliver(
         }
         let record = records.get_mut(&home).expect("every home has a record");
         record.insert(need.name.clone(), landed_by(step));
-        agent.write_text(&homes[&home].join(DELIVERY_RECORD), &encode_record(record), RECORD_MODE).await.map_err(failed)?;
+        agent.write(&homes[&home].join(DELIVERY_RECORD), encode_record(record).into_bytes(), RECORD_MODE).await.map_err(failed)?;
         written.insert(home, record.clone());
     }
     // A need no longer asked for leaves its home's record too, so the record and the plan agree.
     for (home, record) in &records {
         if written.get(home) != Some(record) {
             agent
-                .write_text(&homes[home].join(DELIVERY_RECORD), &encode_record(record), RECORD_MODE)
+                .write(&homes[home].join(DELIVERY_RECORD), encode_record(record).into_bytes(), RECORD_MODE)
                 .await
                 .map_err(|error| DeliveryError::Step { need: home.clone(), error })?;
         }

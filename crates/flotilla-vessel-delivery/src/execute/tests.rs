@@ -6,14 +6,15 @@ use std::{
     },
 };
 
-use flotilla_environment::environment::EnvironmentTool;
+use flotilla_environment::environment::{vessel_ops::RunnerVesselAgent, EntryKind, EnvironmentTool};
 use flotilla_provider_runtime::{CommandRunner, ProcessCommandRunner};
 
 use super::*;
 use crate::vocabulary::{RelativePath, TreeSources};
 
 /// A vessel whose agent is this process: real `sh` and files under a temporary
-/// writable base. It stands in for the drydock agent's process boundary only.
+/// writable base, through the runner-backed facilities. It stands in for the
+/// drydock agent's process boundary only.
 struct LocalVessel {
     base: tempfile::TempDir,
 }
@@ -34,6 +35,27 @@ impl VesselAgent for LocalVessel {
     }
     async fn writable_base(&self) -> Result<PathBuf, String> {
         Ok(self.base.path().to_path_buf())
+    }
+    async fn stat(&self, path: &Path) -> Result<Option<EntryKind>, String> {
+        self.local().stat(path).await
+    }
+    async fn create_dir(&self, path: &Path, mode: u32) -> Result<(), String> {
+        self.local().create_dir(path, mode).await
+    }
+    async fn read(&self, path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
+        self.local().read(path, limit).await
+    }
+    async fn write(&self, path: &Path, bytes: Vec<u8>, mode: u32) -> Result<(), String> {
+        self.local().write(path, bytes, mode).await
+    }
+    async fn symlink(&self, path: &Path, target: &Path) -> Result<(), String> {
+        self.local().symlink(path, target).await
+    }
+}
+
+impl LocalVessel {
+    fn local(&self) -> RunnerVesselAgent {
+        RunnerVesselAgent(self.commands())
     }
 }
 
@@ -60,9 +82,9 @@ impl TreeDelivery for Tree {
         if self.fail.load(Ordering::SeqCst) {
             return Err("source unavailable".into());
         }
-        agent.ensure_directory(target, 0o755).await?;
+        agent.create_dir(target, 0o755).await?;
         let content = self.content.lock().expect("content").clone();
-        agent.write_text(&target.join("SKILL.md"), &content, 0o644).await?;
+        agent.write(&target.join("SKILL.md"), content.into_bytes(), 0o644).await?;
         self.deliveries.lock().expect("deliveries").push(mechanism);
         Ok(())
     }

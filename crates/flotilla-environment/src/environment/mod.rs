@@ -14,6 +14,7 @@ pub mod image_dockerfile;
 pub mod registry_auth;
 pub mod registry_client;
 pub mod runner;
+pub mod vessel_ops;
 pub use image::{ImageBuildService, LocalImageCache, OwnedBuilderSettings};
 pub use registry_auth::RegistryAuth;
 
@@ -265,8 +266,20 @@ impl ProvisionedMount {
     }
 }
 
+/// What is at a path, never following a final symbolic link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
 /// Host-facing capabilities of the one resident vessel agent. Vessel delivery
-/// (#3956) runs every step through these; it never uses a fallback runner.
+/// (#3956) runs every step through these general facilities; it never uses a
+/// fallback runner. File operations are the agent's own, not scripts a caller
+/// composes; running a command is one facility among them, for steps that are
+/// genuinely commands.
 #[async_trait]
 pub trait VesselAgent: Send + Sync {
     async fn ready(&self) -> Result<(), String>;
@@ -274,60 +287,23 @@ pub trait VesselAgent: Send + Sync {
     async fn push_tools(&self, tools: &[EnvironmentTool]) -> Result<(), String>;
     /// Run commands in the vessel, through the agent.
     fn commands(&self) -> Arc<dyn CommandRunner>;
-
     /// The base under which this vessel's writable state lives: the contained
     /// base in a container, the host runner's base on a shared host.
-    async fn writable_base(&self) -> Result<PathBuf, String> {
-        self.commands().writable_config_base(None, Path::new(runner::CONTAINED_WRITABLE_CONFIG_BASE)).await
-    }
-
-    /// Create `path` and its parents, leaving `path` with exactly `mode`. Existing
-    /// contents are kept. Parents it creates are owner-only; a `path` that is a
-    /// symbolic link is refused rather than followed.
-    async fn ensure_directory(&self, path: &Path, mode: u32) -> Result<(), String> {
-        if !path.is_absolute() || mode > 0o777 {
-            return Err(format!("directory {} must be absolute with permission bits only", path.display()));
-        }
-        self.commands()
-            .run(
-                "sh",
-                &[
-                    "-c",
-                    "if [ -L \"$1\" ]; then echo \"$1 is a symbolic link\" >&2; exit 1; fi; umask 077 && mkdir -p -- \"$1\" && chmod \"$2\" \"$1\"",
-                    "flotilla-ensure-directory",
-                    &path.to_string_lossy(),
-                    &format!("{mode:o}"),
-                ],
-                Path::new("/"),
-                &flotilla_provider_runtime::ChannelLabel::Default,
-            )
-            .await
-            .map(|_| ())
-            .map_err(|error| format!("create {}: {error}", path.display()))
-    }
-
-    /// The text of the regular file at `path`, or `None` when there is none.
-    async fn read_text(&self, path: &Path) -> Result<Option<String>, String> {
-        let output = self
-            .commands()
-            .run_output(
-                "sh",
-                &["-c", "if [ -f \"$1\" ]; then cat -- \"$1\"; else exit 3; fi", "flotilla-read-text", &path.to_string_lossy()],
-                Path::new("/"),
-                &flotilla_provider_runtime::ChannelLabel::Default,
-            )
-            .await?;
-        match output.exit_code {
-            Some(0) => Ok(Some(output.stdout)),
-            Some(3) => Ok(None),
-            code => Err(format!("read {}: exited {code:?}: {}", path.display(), output.stderr.trim())),
-        }
-    }
-
-    /// Replace the file at `path` with `content` and `mode`, atomically.
-    async fn write_text(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
-        self.commands().write_file_with_mode(path, content, mode).await
-    }
+    async fn writable_base(&self) -> Result<PathBuf, String>;
+    /// What is at `path`, or `None` when nothing is.
+    async fn stat(&self, path: &Path) -> Result<Option<EntryKind>, String>;
+    /// Create the directory `path`, and any missing parents with the agent's default
+    /// directory mode, leaving `path` with exactly `mode`. Existing contents are kept;
+    /// anything but a directory at `path`, a symbolic link included, is refused.
+    async fn create_dir(&self, path: &Path, mode: u32) -> Result<(), String>;
+    /// The regular file at `path`, refused beyond `limit` bytes, or `None` when
+    /// there is no regular file there.
+    async fn read(&self, path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String>;
+    /// Replace the file at `path` with `bytes` and `mode`, atomically.
+    async fn write(&self, path: &Path, bytes: Vec<u8>, mode: u32) -> Result<(), String>;
+    /// Make `path` a symbolic link to `target`, atomically replacing anything there
+    /// but a directory.
+    async fn symlink(&self, path: &Path, target: &Path) -> Result<(), String>;
 }
 
 /// A live handle to a provisioned sandbox environment.
