@@ -210,16 +210,9 @@ impl AccountProvisioner for ClaudeDirect {
         }
     }
 
-    fn plan(&self, kind: EnvironmentKind) -> Result<ProvisionPlan, String> {
-        // Keep this strict: it is the only guard against a wrong-kind placement, and the launch
-        // side treats a vessel whose Environment record it cannot read as Docker.
-        if kind == EnvironmentKind::CloudSandbox {
-            return Err(format!(
-                "{} has no plan for {} environments: no agent writes the requester's home there",
-                Self::IMPLEMENTATION,
-                kind.as_str()
-            ));
-        }
+    fn plan(&self, _: EnvironmentKind) -> Result<ProvisionPlan, String> {
+        // Every kind's vessel agent writes the requester's home, a cloud sandbox's
+        // through drydock's agent (#3980), so one plan serves them all.
         Ok(ProvisionPlan {
             implementation: Self::IMPLEMENTATION.to_string(),
             effective_access: "account".to_string(),
@@ -271,6 +264,15 @@ mod tests {
         assert_eq!(ClaudeDirect.supplies(&CredentialConsumer::Claude), None);
         assert!(AccountProvisioners::seeded().supplies_any(&oauth));
         assert!(!AccountProvisioners::seeded().supplies_any(&CredentialConsumer::Codex));
+    }
+
+    // #3980: every kind's vessel agent writes the requester's home, so the Claude plan is
+    // the same wherever the crew is placed, a cloud sandbox included.
+    #[test]
+    fn the_claude_plan_is_the_same_for_every_kind() {
+        let kinds = [EnvironmentKind::Docker, EnvironmentKind::AgentlessSsh, EnvironmentKind::HostDirect, EnvironmentKind::CloudSandbox];
+        let plans = kinds.map(|kind| ClaudeDirect.plan(kind).expect("a plan"));
+        assert!(plans.iter().all(|plan| *plan == plans[0]), "{plans:?}");
     }
 
     // Review #3910: requesters whose names differ only in characters a path cannot carry get

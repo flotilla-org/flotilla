@@ -205,7 +205,12 @@ pub(super) struct TestInteriorEnvironment {
 
 #[async_trait]
 impl ProvisionedEnvironment for TestInteriorEnvironment {
-    flotilla_discovery_testkit::injected_environment_handle!();
+    flotilla_discovery_testkit::injected_environment_handle!(agent);
+
+    /// A container whose resident agent never answered: reconciliation pushes it no tools.
+    fn agent(&self) -> Arc<dyn flotilla_environment::environment::VesselAgent> {
+        Arc::new(flotilla_environment::environment::vessel_ops::UnavailableAgent("test interior".into()))
+    }
 
     fn id(&self) -> &EnvironmentId {
         &self.id

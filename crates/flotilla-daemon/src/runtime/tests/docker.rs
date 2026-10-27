@@ -1320,7 +1320,7 @@ impl flotilla_environment::environment::VesselAgent for DeadAgent {
 }
 #[async_trait]
 impl ProvisionedEnvironment for DeadAgentEnvironment {
-    flotilla_discovery_testkit::injected_environment_handle!();
+    flotilla_discovery_testkit::injected_environment_handle!(agent);
     fn id(&self) -> &EnvironmentId {
         self.0.id()
     }
@@ -1330,8 +1330,8 @@ impl ProvisionedEnvironment for DeadAgentEnvironment {
     fn runner(&self) -> Arc<dyn CommandRunner> {
         self.0.runner()
     }
-    fn agent(&self) -> Option<Arc<dyn flotilla_environment::environment::VesselAgent>> {
-        Some(Arc::new(DeadAgent))
+    fn agent(&self) -> Arc<dyn flotilla_environment::environment::VesselAgent> {
+        Arc::new(DeadAgent)
     }
     async fn observe(&self) -> flotilla_environment::environment::ProviderObservation {
         self.0.observe().await

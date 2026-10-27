@@ -351,7 +351,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         assert!(rendered.contains(expected), "{expected}\n{rendered}");
     }
     // Glue (#3964): explain shows each access's home, the mechanism and digest per need,
-    // and a failed delivery's retry.
+    // and a failed delivery's retry; #3980: and the agent connection its place reports.
     let mut deliveries = explanation.clone();
     deliveries.access_deliveries = vec![flotilla_protocol::ExplainedAccessDelivery {
         access: "flotilla/c1/work/coder".into(),
@@ -369,10 +369,18 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
             error: "mint failed".into(),
             next_at: "2026-10-27T12:00:02+00:00".into(),
         }),
+        agent_connection: Some(flotilla_protocol::provider::AgentConnectionReport {
+            provider: "daytona-eu".into(),
+            module: "daytona".into(),
+            vessel: "sbx-1".into(),
+            endpoint: "ssh.daytona.example:22".into(),
+            mode: "local_forward".into(),
+        }),
     }];
     let rendered = format_convoy_explanation_human(&deliveries);
     for expected in [
         "Delivered flotilla/c1/work/coder at env-b1 (claude) into /state/agent-homes/requesters/c1/coder/claude",
+        "  agent connection: local_forward via ssh.daytona.example:22 to daytona vessel sbx-1 (provider daytona-eu)",
         "  skills: agent-fetch(url) 5e1f",
         "  Failed at account (attempt 2), retrying after 2026-10-27T12:00:02+00:00: mint failed",
     ] {

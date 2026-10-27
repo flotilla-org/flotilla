@@ -10752,10 +10752,10 @@ mod account_bindings {
         assert_eq!(explained.account_bindings.iter().map(|binding| binding.state.as_str()).collect::<Vec<_>>(), ["open", "closed"]);
     }
 
-    // Acceptance: a candidate kind with no plan for the Claude subscription drops out of
-    // placement, and explain shows the reason.
+    // Acceptance (#3980): a cloud-sandbox kind has a plan for the Claude subscription, since
+    // drydock's agent writes the requester's home there; placement never refuses it for that.
     #[tokio::test]
-    async fn a_kind_without_a_plan_is_refused_with_the_reason_in_explain() {
+    async fn a_cloud_sandbox_kind_has_a_plan_for_the_subscription() {
         let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
         let backend = daemon.resource_backend();
         claude_world(&daemon, &[("claude-max", "max@example.com")], &[("claude-max-contained", &["claude-max"])]).await;
@@ -10779,10 +10779,10 @@ mod account_bindings {
         let explained = explain(&daemon, "planned").await;
         let placement = &explained.vessel_placements["work"];
         assert_eq!(placement.policy_name, "host-direct-accounts");
-        let refusal = placement.refused_candidates.iter().find(|refusal| refusal.policy_name == "cloud-sandbox").expect("cloud refused");
-        assert_eq!(
-            refusal.reason,
-            "role `coder` needs `claude:subscription`: claude-direct has no plan for cloud-sandbox environments: no agent writes the requester's home there"
+        assert!(
+            placement.refused_candidates.iter().all(|refusal| !refusal.reason.contains("claude:subscription")),
+            "{:?}",
+            placement.refused_candidates
         );
     }
 

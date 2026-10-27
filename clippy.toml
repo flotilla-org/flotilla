@@ -139,7 +139,6 @@ absolute-paths-allowed-crates = [
     "rigging_http_serve",
     "rigging_process",
     "rigging_replay_testkit",
-    "rigging_ssh",
     "rigging_stream",
     "rigging_tls",
     "ring",

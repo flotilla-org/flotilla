@@ -132,7 +132,10 @@ pub(super) async fn run_with_cleanup(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::environment::{command_provider, drydock::GuestAgentRunner, EnvironmentInput};
+    use crate::environment::{
+        agent::{tests::MemoryAgent, AgentConnector, AgentRunner},
+        command_provider, EnvironmentInput,
+    };
     use flotilla_provider_runtime::{
         execution_context::{AccountState, AccountVariables, BaseLayer, BoundLayer, ExecutionPreparer},
         host_environment::{HostEnvironment, HostSupply},
@@ -486,17 +489,11 @@ case "$1" in success|failure)
 
     #[tokio::test]
     async fn vessel_agent_renders_the_prepared_context() {
-        use drydock_transport::{Limits, Transport};
+        let agent = MemoryAgent::new(false);
+        let client = Arc::new(agent.connect().await.expect("client"));
         let directory = tempfile::tempdir().expect("tempdir");
-        let (host, guest) = tokio::io::duplex(4096);
-        let (host, guest) = tokio::join!(
-            Transport::yamux(Box::new(host), true, Limits::default()),
-            Transport::yamux(Box::new(guest), false, Limits::default())
-        );
-        let agent = tokio::spawn(drydock_agent::Agent::new(guest.expect("guest"), "scenario".into(), directory.path().join("agent")).run());
-        let client = Arc::new(drydock_agent::Client::connect(host.expect("host"), "scenario").await.expect("client"));
-        let runner = Arc::new(GuestAgentRunner(client.clone()));
+        let runner = Arc::new(AgentRunner::new(agent.clone(), directory.path().into()));
         prepared_context_case(runner, CrewLaunch::Agent(client)).await;
-        agent.abort();
+        agent.stop();
     }
 }

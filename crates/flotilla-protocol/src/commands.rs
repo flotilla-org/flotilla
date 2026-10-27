@@ -549,6 +549,9 @@ pub struct ExplainedAccessDelivery {
     pub needs: Vec<ExplainedDeliveredNeed>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<ExplainedDeliveryRetry>,
+    /// What the place's provider reports it chose to reach its vessel agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_connection: Option<crate::provider::AgentConnectionReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

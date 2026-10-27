@@ -153,6 +153,10 @@ impl ProvisionedEnvironment for HostHandle {
     fn runner(&self) -> Arc<dyn CommandRunner> {
         Arc::clone(&self.runner)
     }
+    /// The host is the vessel: its agent works in process, through the host runner.
+    fn agent(&self) -> Arc<dyn super::VesselAgent> {
+        Arc::new(super::vessel_ops::RunnerVesselAgent(Arc::clone(&self.runner)))
+    }
     async fn destroy(&self) -> Result<(), String> {
         self.detached.store(true, Ordering::Release);
         Ok(())

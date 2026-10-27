@@ -1,27 +1,63 @@
 //! Provider-neutral Drydock adapter. The composition root owns host supervision;
 //! this adapter accepts the same ProviderApi for embedded and socket-backed use.
+//!
+//! Drydock owns the connection to each vessel's agent (ADR 0070): the adapter
+//! asks [`AgentReach`] for a connected agent and uses only the agent's API. It
+//! never interprets a reach, opens SSH or names a provider.
+mod connector;
 mod observations;
-mod reach;
-mod runner;
-use super::*;
+use super::{
+    agent::{AgentRunner, ForwardFailure},
+    vessel_ops::UnavailableAgent,
+    *,
+};
 use crate::environment::runner::{contained_credential_exclusions, CONTAINED_CODEX_HOME, CONTAINED_WRITABLE_CONFIG_BASE};
-use ::drydock::api::ProviderApi;
+use ::drydock::{
+    agent::{AgentLink, AgentReach, AgentReport},
+    api::ProviderApi,
+};
+use drydock_agent::{Endpoint, GuestForward};
 use drydock_protocol as wire;
-#[cfg(test)]
-pub(crate) use runner::AgentRunner as GuestAgentRunner;
-use runner::{error, AgentRunner};
+use flotilla_protocol::provider::AgentConnectionReport;
 const CHECKPOINT_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 use sha2::Digest;
 use std::{collections::BTreeMap, sync::RwLock, time::Duration};
 
+/// Where the guest serves the lab service.
+struct LabGuest {
+    /// The loopback address its name resolves to in the guest.
+    tcp: std::net::SocketAddr,
+    /// The forward's guest socket, beside its TCP listener.
+    socket: PathBuf,
+    /// The hosts file that names it.
+    hosts: PathBuf,
+}
+
+impl Default for LabGuest {
+    fn default() -> Self {
+        Self {
+            tcp: std::net::SocketAddr::from(([127, 0, 0, 1], 443)),
+            socket: "/run/drydock/flotilla-forgejo.sock".into(),
+            hosts: "/etc/hosts".into(),
+        }
+    }
+}
+/// The lab service's name inside the guest; it resolves to the guest's loopback.
+const LAB_HOSTNAME: &str = "forgejo.lab.flotilla.work";
+/// Where per-vessel attach sockets live on the controller: short, for SUN_LEN.
+const ATTACH_ROOT: &str = "/tmp/flotilla-cloud-agents";
+
 pub struct DrydockEnvironmentProvider {
     api: Arc<dyn ProviderApi>,
-    connector: Arc<dyn reach::Connector>,
+    reach: AgentReach,
     instance: String,
     module: String,
     lab_reach: Option<(String, u16)>,
+    lab_guest: LabGuest,
     owner: Arc<()>,
     directory: PathBuf,
+    attach_root: PathBuf,
+    executable: Arc<tokio::sync::OnceCell<Vec<u8>>>,
     declaration: RwLock<Option<wire::ProviderDeclaration>>,
     host: Option<Arc<::drydock::HostHandle>>,
     versions: RwLock<(String, String)>,
@@ -33,12 +69,15 @@ impl DrydockEnvironmentProvider {
     pub fn new(api: Arc<dyn ProviderApi>, instance: String, module: String, directory: PathBuf) -> Self {
         Self {
             api,
-            connector: Arc::new(reach::SshConnector),
+            reach: AgentReach::new(AgentLink::default()),
             instance,
             module,
             lab_reach: None,
+            lab_guest: LabGuest::default(),
             owner: Arc::new(()),
             directory,
+            attach_root: ATTACH_ROOT.into(),
+            executable: Default::default(),
             declaration: RwLock::new(None),
             host: None,
             versions: Default::default(),
@@ -46,6 +85,23 @@ impl DrydockEnvironmentProvider {
             observations: Default::default(),
             active: Default::default(),
         }
+    }
+    /// How this instance reaches its vessels' agents: drydock's, under the
+    /// provider's configured link preference.
+    pub fn with_agent_reach(mut self, reach: AgentReach) -> Self {
+        self.reach = reach;
+        self
+    }
+    /// The agent build this instance's vessels run, instead of the installed
+    /// generation's companion: for hosts and tests without one.
+    pub fn with_agent_build(mut self, build: Vec<u8>) -> Self {
+        self.executable = Arc::new(tokio::sync::OnceCell::new_with(Some(build)));
+        self
+    }
+    /// Where attach sockets for this instance's vessels live on the controller.
+    pub fn with_attach_root(mut self, root: PathBuf) -> Self {
+        self.attach_root = root;
+        self
     }
     pub fn with_lab_reach(mut self, reach: Option<(String, u16)>) -> Self {
         self.lab_reach = reach;
@@ -69,8 +125,7 @@ impl DrydockEnvironmentProvider {
                 });
             }
         }
-        let response = self.api.request(http::Method::GET, &["v1", "hello"], &[], None).await.map_err(api_error)?;
-        let hello: wire::Hello = serde_json::from_value(response.body).map_err(|_| "invalid drydock hello")?;
+        let hello = self.api.hello().await.map_err(api_error)?;
         if !hello.is_compatible() {
             return Err("drydock protocol version mismatch".into());
         }
@@ -81,18 +136,37 @@ impl DrydockEnvironmentProvider {
         *self.declaration.write().expect("declaration lock") = Some(declaration.clone());
         Ok(declaration)
     }
+    /// A handle for `environment`. A provisioned handle gets an agent; an
+    /// inventory handle has none until provision adopts it.
     fn handle(
         &self,
         environment: wire::Environment,
         image: String,
         env: BTreeMap<String, String>,
+        provisioned: bool,
     ) -> Result<Arc<DrydockEnvironment>, String> {
         let label = environment.label.as_ref().ok_or("unlabelled backing cannot be adopted")?;
+        let id = EnvironmentId::new(label.clone());
+        let platform = environment.platform.ok_or("guest platform unknown in recorded drydock environment")?;
+        let report = Arc::new(std::sync::Mutex::new(None));
+        let agent = provisioned.then(|| {
+            let connector = connector::DrydockAgentConnector {
+                api: self.api.clone(),
+                reach: self.reach.clone(),
+                instance: self.instance.clone(),
+                backing: environment.id.clone(),
+                identity: key_dir(&self.directory, &id).join("id_ed25519"),
+                platform: platform.clone(),
+                executable: self.executable.clone(),
+                report: report.clone(),
+            };
+            let attach = self.attach_root.join(&format!("{:x}", sha2::Sha256::digest(id.as_str().as_bytes()))[..24]);
+            Arc::new(AgentRunner::new(Arc::new(connector), attach))
+        });
         Ok(Arc::new(DrydockEnvironment {
             api: self.api.clone(),
-            connector: self.connector.clone(),
             instance: self.instance.clone(),
-            id: EnvironmentId::new(label.clone()),
+            id,
             descriptor: {
                 let versions = self.versions.read().expect("version lock");
                 flotilla_resources::EnvironmentProviderDescriptor {
@@ -102,26 +176,95 @@ impl DrydockEnvironmentProvider {
                     host_version: versions.0.clone(),
                     module_version: versions.1.clone(),
                     capabilities: self.capabilities(),
+                    agent_connection: None,
                 }
             },
             watch: self
                 .observations
                 .get_or_init(|| observations::Hub::start(self.api.clone(), self.instance.clone()))
                 .watch(environment.id.clone()),
-            platform: environment.platform.ok_or("guest platform unknown in recorded drydock environment")?,
             backing: environment.id,
             image: ImageId::new(image),
             env: RwLock::new(env),
-            lab_reach: self.lab_reach.clone(),
             capabilities: self.capabilities(),
             directory: self.directory.clone(),
             created_for_setup: std::sync::atomic::AtomicBool::new(false),
             checkpoint: std::sync::Mutex::new(None),
-            connection: Default::default(),
-            connecting: Default::default(),
-            assets: Default::default(),
+            agent,
+            report,
             checkpoint_error: Default::default(),
         }))
+    }
+
+    /// Bring the vessel to what this provision asks: its environment, its tools
+    /// pushed, its sockets forwarded and the lab service reachable, all through
+    /// the agent. Every step is idempotent, so re-adoption runs it again.
+    async fn set_up(&self, handle: &DrydockEnvironment, tools: &[EnvironmentTool]) -> Result<(), String> {
+        let agent = handle.agent.as_ref().ok_or("inventory handle has no vessel agent")?;
+        let environment = handle.env.read().expect("environment").clone();
+        agent.configure_environment(environment).await?;
+        // A socket is a guest forward to the controller. Writable shared material
+        // has no host mount here: the guest gets an initial copy.
+        let mut pushed = Vec::with_capacity(tools.len());
+        for tool in tools {
+            let mut tool = tool.clone();
+            for asset in std::mem::take(&mut tool.assets) {
+                if asset.kind == EnvironmentToolAssetKind::UnixSocket {
+                    forward_socket(agent, &asset).await.map_err(|failure| failure.to_string())?;
+                } else {
+                    tool.assets.push(EnvironmentToolAsset { access: EnvironmentToolAssetAccess::ReadOnly, ..asset });
+                }
+            }
+            pushed.push(tool);
+        }
+        VesselAgent::push_tools(agent, &pushed).await?;
+        if let Some((hostname, port)) = &self.lab_reach {
+            forward_lab(agent, hostname, *port, &self.lab_guest).await?;
+        }
+        ensure_directory(agent, &handle.capabilities.workspace_root).await
+    }
+}
+
+/// The guest socket of `asset` serves the controller socket it names.
+async fn forward_socket(agent: &AgentRunner, asset: &EnvironmentToolAsset) -> Result<(), ForwardFailure> {
+    let guest = asset.environment_path.as_path();
+    let id = format!("socket-{}", &format!("{:x}", sha2::Sha256::digest(guest.as_os_str().as_encoded_bytes()))[..16]);
+    let forward = GuestForward { id, unix: guest.into(), tcp: None };
+    agent.put_guest_forward(forward, Endpoint::Unix(asset.host_path.as_path().into())).await
+}
+
+/// The lab service, reached from the controller, at its own name and port 443
+/// inside the guest. TLS stays end to end; the guest receives no reach credential.
+async fn forward_lab(agent: &Arc<AgentRunner>, hostname: &str, port: u16, guest: &LabGuest) -> Result<(), String> {
+    // The agent's TCP endpoint names one address, so take the first in the
+    // resolver's order (RFC 6724 destination selection, as a plain connect tries first).
+    let address = tokio::net::lookup_host((hostname, port))
+        .await
+        .map_err(|error| format!("resolve lab service {hostname}:{port}: {error}"))?
+        .next()
+        .ok_or_else(|| format!("lab service {hostname}:{port} resolves to no address"))?;
+    let forward = GuestForward { id: "lab".into(), unix: guest.socket.clone(), tcp: Some(guest.tcp) };
+    agent.put_guest_forward(forward, Endpoint::Tcp(address)).await.map_err(|failure| failure.to_string())?;
+    // Provision holds this label's lock through set-up, so no two runs append at once.
+    let script = lab_hosts_script(&guest.hosts);
+    agent
+        .run("sh", &["-c", &script], Path::new("/"), &flotilla_provider_runtime::ChannelLabel::Default)
+        .await
+        .map(drop)
+        .map_err(|error| format!("lab hosts entry in {}: {error}", guest.hosts.display()))
+}
+
+fn lab_hosts_script(hosts: &Path) -> String {
+    let hosts = flotilla_protocol::arg::shell_quote(&hosts.to_string_lossy());
+    format!("grep -q '^127.0.0.1 {LAB_HOSTNAME}$' {hosts} || printf '\\n127.0.0.1 {LAB_HOSTNAME}\\n' >> {hosts}")
+}
+
+/// `mkdir -p`: a missing directory is created 0755; an existing one keeps its mode.
+async fn ensure_directory(agent: &Arc<AgentRunner>, path: &Path) -> Result<(), String> {
+    match VesselAgent::stat(agent, path).await? {
+        Some(EntryKind::Directory) => Ok(()),
+        None => VesselAgent::create_dir(agent, path, 0o755).await,
+        Some(_) => Err(format!("{} is not a directory", path.display())),
     }
 }
 struct Prepared {
@@ -183,7 +326,9 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
         if prepared.platform != platform {
             return Err(format!("unsupported guest platform {}", prepared.platform));
         }
-        self.connector.preflight(&prepared.platform)?;
+        // Fail now for a missing agent companion, rather than obscuring an
+        // installation error as guest boot latency.
+        connector::agent_build(&self.executable, &prepared.platform).await?;
         Ok(PreparedEnvironment::new(&self.owner, Prepared { prepared, spec: spec.clone() }))
     }
     async fn provision(
@@ -209,7 +354,7 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
         let keydir = key_dir(&self.directory, &id);
         ::drydock::local::private_dir(&keydir)?;
         let public = if keydir.join("id_ed25519.pub").is_file() && keydir.join("id_ed25519").is_file() {
-            tokio::fs::read_to_string(keydir.join("id_ed25519.pub")).await.map_err(error)?
+            tokio::fs::read_to_string(keydir.join("id_ed25519.pub")).await.map_err(|cause| cause.to_string())?
         } else {
             // An existing backing still trusts the original key. Regenerating
             // here cannot rotate that key through label-idempotent provision.
@@ -231,23 +376,10 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
             egress: wire::EgressRequest::Open,
             ssh_public_key: Some(public),
         };
-        let response = self
-            .api
-            .request(
-                http::Method::POST,
-                &["v1", "providers", &self.instance, "environments"],
-                &[],
-                Some(&serde_json::to_value(request).map_err(|e| e.to_string())?),
-            )
-            .await
-            .map_err(api_error)?;
-        if !(200..300).contains(&response.status) {
-            return Err(
-                api_error(::drydock::client::Error::Protocol(serde_json::from_value(response.body).map_err(|e| e.to_string())?)).into()
-            );
-        }
-        let created = response.status == 201;
-        let environment: wire::Environment = serde_json::from_value(response.body).map_err(|e| e.to_string())?;
+        let (created, environment) = match self.api.provision(&self.instance, &request).await.map_err(api_error)? {
+            ::drydock::api::Provisioned::Created(environment) => (true, environment),
+            ::drydock::api::Provisioned::Existing(environment) => (false, environment),
+        };
         let mut env = prepared.spec.env.clone();
         env.extend(opts.tokens);
         // Retired control entries may remain in preceding-generation records.
@@ -283,38 +415,16 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
         if let Some(handle) = active {
             if handle.backing == environment.id && handle.image.as_str() == prepared.spec.image {
                 handle.created_for_setup.store(false, std::sync::atomic::Ordering::Release);
-                let setup = async {
-                    let connection = handle.connect().await?;
-                    for tool in opts.tools {
-                        for asset in tool.assets {
-                            connection.deliver(asset.clone()).await?;
-                            handle.remember_asset(asset);
-                        }
-                    }
-                    // Re-adoption must apply rotated tokens and tool environments.
-                    connection.configure(env.clone()).await?;
-                    *handle.env.write().expect("environment") = env;
-                    Ok::<_, String>(())
-                }
-                .await;
-                setup.map_err(EnvironmentProvisionError::RetryAdoption)?;
+                // Re-adoption must apply rotated tokens and tool environments.
+                *handle.env.write().expect("environment") = env;
+                self.set_up(&handle, &opts.tools).await.map_err(EnvironmentProvisionError::RetryAdoption)?;
                 return Ok(handle);
             }
         }
-        let handle = self.handle(environment, prepared.spec.image.clone(), env)?;
+        let handle = self.handle(environment, prepared.spec.image.clone(), env, true)?;
         handle.created_for_setup.store(created, std::sync::atomic::Ordering::Release);
         let setup = async {
-            let connection = handle.connect().await?;
-            for tool in opts.tools {
-                for asset in tool.assets {
-                    connection.deliver(asset.clone()).await?;
-                    handle.remember_asset(asset);
-                }
-            }
-            let environment = handle.env.read().expect("environment").clone();
-            connection.configure(environment).await?;
-            connection.configure_lab(self.lab_reach.clone()).await?;
-            connection.make_directories(&handle.capabilities.workspace_root).await?;
+            self.set_up(&handle, &opts.tools).await?;
             // Checkpoints are advisory recovery material. Neither the first archive
             // nor a refresh may delay adoption or trigger setup rollback.
             let checkpoint = keydir.join("checkpoint.tar");
@@ -331,11 +441,7 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
                     if matches!(handle.observe().await.state, ObservationState::Gone { .. }) {
                         break;
                     }
-                    let result = async {
-                        let connection = handle.connect().await?;
-                        write_checkpoint(connection.runner(), &checkpoint, &root).await
-                    }
-                    .await;
+                    let result = write_checkpoint(handle.runner(), &checkpoint, &root).await;
                     *handle.checkpoint_error.write().expect("checkpoint health") = result.err();
                     // Do not hold the environment alive while waiting for the next refresh.
                     drop(handle);
@@ -363,7 +469,7 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
         items
             .into_iter()
             .filter(|e| e.label.is_some())
-            .map(|e| self.handle(e, String::new(), BTreeMap::new()).map(|h| h as EnvironmentHandle))
+            .map(|e| self.handle(e, String::new(), BTreeMap::new(), false).map(|h| h as EnvironmentHandle))
             .collect()
     }
     async fn list_backings(&self) -> Result<Vec<EnvironmentBacking>, String> {
@@ -459,23 +565,22 @@ fn capabilities(c: &wire::Capabilities) -> ProviderCapabilities {
     }
 }
 struct DrydockEnvironment {
-    platform: wire::Platform,
     api: Arc<dyn ProviderApi>,
-    connector: Arc<dyn reach::Connector>,
     instance: String,
     id: EnvironmentId,
     backing: String,
     image: ImageId,
     env: RwLock<BTreeMap<String, String>>,
-    lab_reach: Option<(String, u16)>,
     capabilities: ProviderCapabilities,
     descriptor: flotilla_resources::EnvironmentProviderDescriptor,
     created_for_setup: std::sync::atomic::AtomicBool,
     checkpoint: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     directory: PathBuf,
-    connection: RwLock<Option<Arc<dyn reach::Guest>>>,
-    connecting: tokio::sync::Mutex<()>,
-    assets: RwLock<Vec<EnvironmentToolAsset>>,
+    /// The vessel's agent, for a handle provision adopted.
+    agent: Option<Arc<AgentRunner>>,
+    /// What drydock reports it chose for the agent's latest connection:
+    /// recorded and shown, never decided on.
+    report: Arc<std::sync::Mutex<Option<AgentReport>>>,
     checkpoint_error: RwLock<Option<String>>,
     watch: observations::Watch,
 }
@@ -506,7 +611,7 @@ pub async fn write_checkpoint(runner: Arc<dyn CommandRunner>, target: &Path, roo
     ];
     let script = checkpoint_script(&paths);
     runner.run_to_file("sh", &["-c", &script], Path::new("/"), &temporary).await?;
-    tokio::fs::rename(temporary, target).await.map_err(error)
+    tokio::fs::rename(temporary, target).await.map_err(|cause| cause.to_string())
 }
 fn checkpoint_script(paths: &[String]) -> String {
     // Exclude reproducible build output and caches from both the preflight and
@@ -518,10 +623,10 @@ fn checkpoint_script(paths: &[String]) -> String {
         .iter()
         .copied()
         .chain(credentials.iter().map(String::as_str))
-        .map(|p| format!("--exclude={}", runner::quote(p)))
+        .map(|p| format!("--exclude={}", flotilla_protocol::arg::shell_quote(p)))
         .collect::<Vec<_>>()
         .join(" ");
-    let paths = paths.iter().map(|p| runner::quote(p)).collect::<Vec<_>>().join(" ");
+    let paths = paths.iter().map(|p| flotilla_protocol::arg::shell_quote(p)).collect::<Vec<_>>().join(" ");
     format!(
         "flotilla_checkpoint_size=$(du -sb {excludes} -- {paths} 2>/dev/null | awk '{{n += $1}} END {{printf \"%.0f\", n}}'); \
          test \"$flotilla_checkpoint_size\" -le {CHECKPOINT_LIMIT_BYTES} || exit 1; \
@@ -536,35 +641,6 @@ fn checkpoint_script(paths: &[String]) -> String {
     )
 }
 
-impl DrydockEnvironment {
-    fn remember_asset(&self, asset: EnvironmentToolAsset) {
-        let mut assets = self.assets.write().expect("assets");
-        assets.retain(|previous| previous.environment_path != asset.environment_path);
-        assets.push(asset);
-    }
-    async fn connect(&self) -> Result<Arc<dyn reach::Guest>, String> {
-        let _guard = self.connecting.lock().await;
-        let cached = self.connection.read().expect("connection").clone();
-        if let Some(connection) = cached {
-            if !connection.closed().await {
-                return Ok(connection);
-            }
-        }
-        self.connection.write().expect("connection").take();
-        let keydir = key_dir(&self.directory, &self.id);
-        let connection =
-            self.connector.connect(&*self.api, &self.instance, &self.backing, &self.platform, keydir.join("id_ed25519")).await?;
-        let assets = self.assets.read().expect("assets").clone();
-        for asset in assets {
-            connection.deliver(asset).await?;
-        }
-        let environment = self.env.read().expect("environment").clone();
-        connection.configure(environment).await?;
-        connection.configure_lab(self.lab_reach.clone()).await?;
-        *self.connection.write().expect("connection") = Some(connection.clone());
-        Ok(connection)
-    }
-}
 #[async_trait]
 impl ProvisionedEnvironment for DrydockEnvironment {
     async fn detect_readiness(&self) -> ProviderReadiness {
@@ -602,7 +678,14 @@ impl ProvisionedEnvironment for DrydockEnvironment {
         })
     }
     fn provider_descriptor(&self) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
-        Some(self.descriptor.clone())
+        let agent_connection = self.report.lock().expect("agent report").clone().map(|report| AgentConnectionReport {
+            provider: report.provider,
+            module: report.module,
+            vessel: report.environment,
+            endpoint: report.endpoint,
+            mode: report.link.to_string(),
+        });
+        Some(flotilla_resources::EnvironmentProviderDescriptor { agent_connection, ..self.descriptor.clone() })
     }
 
     async fn observe(&self) -> ProviderObservation {
@@ -621,10 +704,10 @@ impl ProvisionedEnvironment for DrydockEnvironment {
                 Err(e) => ObservationState::Unknown { reason: UnknownReason::ProviderApiError { message: api_error(e) } },
             }
         };
-        // Running backing plus usable guest transport is the readiness contract.
-        // A failed SSH reconnect is Unknown, never evidence that work is Gone.
-        if matches!(state, ObservationState::Running) && !self.image.as_str().is_empty() {
-            if let Err(message) = self.connect().await {
+        // Running backing plus a ready agent is the readiness contract. An agent
+        // that does not answer is Unknown, never evidence that work is Gone.
+        if let (ObservationState::Running, Some(agent)) = (&state, &self.agent) {
+            if let Err(message) = VesselAgent::ready(agent).await {
                 return ProviderObservation::new(ObservationState::Unknown { reason: UnknownReason::ProviderApiError { message } });
             }
         }
@@ -635,13 +718,22 @@ impl ProvisionedEnvironment for DrydockEnvironment {
         Ok(output.split('\0').filter_map(|entry| entry.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned()))).collect())
     }
     fn runner(&self) -> Arc<dyn CommandRunner> {
-        match self.connection.read().expect("connection").as_ref() {
-            Some(connection) => connection.runner(),
+        match &self.agent {
+            Some(agent) => agent.clone(),
             None => Arc::new(InventoryRunner),
+        }
+    }
+    fn agent(&self) -> Arc<dyn VesselAgent> {
+        match &self.agent {
+            Some(agent) => Arc::new(agent.clone()),
+            None => Arc::new(UnavailableAgent("inventory handle requires provision before guest access".into())),
         }
     }
     async fn destroy(&self) -> Result<(), String> {
         self.api.destroy(&self.instance, &self.backing).await.map_err(api_error)?;
+        if let Some(agent) = &self.agent {
+            agent.close().await;
+        }
         if let Some(task) = self.checkpoint.lock().expect("checkpoint task").take() {
             task.abort();
         }
@@ -718,7 +810,7 @@ async fn remove_keys(directory: &Path) -> Result<(), String> {
         match tokio::fs::remove_file(directory.join(file)).await {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(error(e)),
+            Err(e) => return Err(e.to_string()),
         }
     }
     Ok(())

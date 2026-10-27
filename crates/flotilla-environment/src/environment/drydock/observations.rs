@@ -102,7 +102,7 @@ fn event_observation(event: wire::EventKind) -> ObservationState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ::drydock::client::{Error, WireResponse};
+    use ::drydock::client::Error;
     struct Api {
         cursors: std::sync::Mutex<Vec<Option<String>>>,
         streams: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<::drydock::api::ObservationStream>>,
@@ -110,27 +110,55 @@ mod tests {
     #[async_trait]
     impl ProviderApi for Api {
         async fn hello(&self) -> Result<wire::Hello, Error> {
-            Err(Error::Transport)
+            Err(unused())
         }
         async fn observe(&self, since: Option<&str>) -> Result<::drydock::api::ObservationStream, Error> {
             self.cursors.lock().unwrap().push(since.map(str::to_owned));
-            self.streams.lock().await.recv().await.ok_or(Error::Transport)
+            self.streams.lock().await.recv().await.ok_or_else(|| Error::Transport("observation stream closed".into()))
         }
-        async fn request(
-            &self,
-            _: http::Method,
-            _: &[&str],
-            _: &[(&str, &str)],
-            _: Option<&serde_json::Value>,
-        ) -> Result<WireResponse, Error> {
-            Err(Error::Transport)
+        async fn prepare(&self, _: &str, _: &wire::PrepareRequest) -> Result<wire::Prepared, Error> {
+            Err(unused())
+        }
+        async fn provision(&self, _: &str, _: &wire::ProvisionRequest) -> Result<::drydock::api::Provisioned<wire::Environment>, Error> {
+            Err(unused())
+        }
+        async fn list(&self, _: &str) -> Result<Vec<wire::Environment>, Error> {
+            Err(unused())
+        }
+        async fn inspect(&self, _: &str, _: &str) -> Result<wire::Environment, Error> {
+            Err(unused())
+        }
+        async fn destroy(&self, _: &str, _: &str) -> Result<(), Error> {
+            Err(unused())
+        }
+        async fn reach(&self, _: &str, _: &str) -> Result<wire::Reach, Error> {
+            Err(unused())
+        }
+        async fn suspend(&self, _: &str, _: &str) -> Result<wire::ResumeToken, Error> {
+            Err(unused())
+        }
+        async fn resume(&self, _: &str, _: &str, _: &wire::ResumeToken) -> Result<(), Error> {
+            Err(unused())
+        }
+        async fn export(&self, _: &str, _: &str) -> Result<wire::Export, Error> {
+            Err(unused())
+        }
+        async fn quota(&self, _: &str) -> Result<wire::Quota, Error> {
+            Err(unused())
+        }
+        async fn usage(&self, _: &str, _: &wire::Period) -> Result<wire::Usage, Error> {
+            Err(unused())
         }
         async fn relay(&self, _: &str, _: &str) -> Result<rigging_stream::ByteStream, Error> {
-            Err(Error::Transport)
+            Err(unused())
         }
         async fn exec(&self, _: &str, _: &str, _: &wire::ExecRequest) -> Result<rigging_stream::ByteStream, Error> {
-            Err(Error::Transport)
+            Err(unused())
         }
+    }
+    /// Only observation is exercised here.
+    fn unused() -> Error {
+        Error::Transport("only observation is served".into())
     }
     async fn until(predicate: impl Fn() -> bool) {
         tokio::time::timeout(Duration::from_secs(4), async {
@@ -163,7 +191,10 @@ mod tests {
                 event: wire::EventKind::Gone { cause: wire::GoneCause::LifetimeCapReached },
             },
         };
-        tx.send(Box::pin(futures::stream::iter([Ok(record), Err(Error::Transport)])) as ::drydock::api::ObservationStream).await.unwrap();
+        tx.send(Box::pin(futures::stream::iter([Ok(record), Err(Error::Transport("disconnected".into()))]))
+            as ::drydock::api::ObservationStream)
+            .await
+            .unwrap();
         until(|| matches!(*first.state.read().unwrap(), Some(ObservationState::Gone { cause: GoneCause::LifetimeCapReached }))).await;
         until(|| api.cursors.lock().unwrap().len() == 2).await;
         assert_eq!(*api.cursors.lock().unwrap(), vec![None, Some("terminal-cursor".into())]);

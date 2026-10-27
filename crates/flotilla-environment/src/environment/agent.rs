@@ -137,6 +137,22 @@ impl Connection {
     }
 }
 
+/// A guest forward the vessel agent did not establish.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForwardFailure {
+    pub id: String,
+    pub guest: PathBuf,
+    pub reason: String,
+}
+
+impl std::fmt::Display for ForwardFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "guest forward {} at {}: {}", self.id, self.guest.display(), self.reason)
+    }
+}
+
+impl std::error::Error for ForwardFailure {}
+
 /// Files flotilla ensures are small configuration.
 pub(crate) const ENSURED_FILE_LIMIT: u64 = 16 * 1024 * 1024;
 /// Command output collected in memory, per stream. Generous, but finite.
@@ -348,23 +364,35 @@ impl AgentRunner {
     /// is connected. It survives reconnects, and its endpoint stays claimed
     /// by this vessel alone.
     pub async fn add_guest_forward(&self, id: &str, guest: &Path, host: &Path) -> Result<(), String> {
-        let host = Endpoint::Unix(host.into());
-        if !guest.is_absolute() {
-            return Err("guest forward path must be absolute".into());
-        }
-        let client = self.client().await?;
-        let mut state = self.state.lock().await;
         let forward = GuestForward { id: id.into(), unix: guest.into(), tcp: None };
-        match state.guest_forwards.get(id) {
+        self.put_guest_forward(forward, Endpoint::Unix(host.into())).await.map_err(|failure| failure.to_string())
+    }
+
+    /// Register `forward` in the guest, reaching `host` on the controller, as
+    /// [`Self::add_guest_forward`] does for a Unix socket. The guest may also
+    /// listen on a loopback TCP address. A refusal, or no answer within the
+    /// push timeout, is a failure naming the forward.
+    pub async fn put_guest_forward(&self, forward: GuestForward, host: Endpoint) -> Result<(), ForwardFailure> {
+        let failed = |reason: String| ForwardFailure { id: forward.id.clone(), guest: forward.unix.clone(), reason };
+        if !forward.unix.is_absolute() {
+            return Err(failed("guest forward path must be absolute".into()));
+        }
+        let client = self.client().await.map_err(failed)?;
+        let mut state = self.state.lock().await;
+        match state.guest_forwards.get(&forward.id) {
             Some(existing) if *existing == (forward.clone(), host.clone()) => return Ok(()),
-            Some(_) => return Err(format!("guest forward {id} already serves another endpoint")),
+            Some(_) => return Err(failed("already serves another endpoint".into())),
             None => {}
         }
         // The cached client may have been replaced while this call waited.
         let current = state.client.clone().unwrap_or(client);
         // A refused upsert releases its endpoint claim.
-        current.put_guest_forward(forward.clone(), host.clone()).await.map_err(|e| format!("guest forward {id}: {e}"))?;
-        state.guest_forwards.insert(id.into(), (forward, host));
+        match tokio::time::timeout(PUSH_TIMEOUT, current.put_guest_forward(forward.clone(), host.clone())).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(failed(error.to_string())),
+            Err(_) => return Err(failed(format!("no answer within {PUSH_TIMEOUT:?}"))),
+        }
+        state.guest_forwards.insert(forward.id.clone(), (forward, host));
         Ok(())
     }
 

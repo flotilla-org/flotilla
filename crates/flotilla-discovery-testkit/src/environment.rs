@@ -1,6 +1,8 @@
 //! Common declarations for injected contained test environments. Lifecycle state,
 //! command boundaries and adapter-specific capabilities belong to each fixture.
-pub use flotilla_environment::environment::{EnvironmentClass, EnvironmentInput, ProviderCapabilities, ProviderKind, ProviderReadiness};
+pub use flotilla_environment::environment::{
+    EnvironmentClass, EnvironmentInput, ProviderCapabilities, ProviderKind, ProviderReadiness, VesselAgent,
+};
 
 pub fn injected_kind() -> ProviderKind {
     ProviderKind::new(EnvironmentClass::Dummy, "injected")
@@ -54,6 +56,14 @@ macro_rules! injected_environment_provider {
 #[macro_export]
 macro_rules! injected_environment_handle {
     () => {
+        $crate::injected_environment_handle!(agent);
+        /// The injected runner stands for the vessel, its agent included.
+        fn agent(&self) -> std::sync::Arc<dyn $crate::environment::VesselAgent> {
+            $crate::environment::runner_agent(self.runner())
+        }
+    };
+    // For a handle that supplies its own agent.
+    (agent) => {
         fn capabilities(&self) -> $crate::environment::ProviderCapabilities {
             $crate::environment::injected_capabilities()
         }
@@ -61,6 +71,11 @@ macro_rules! injected_environment_handle {
             self.container_name().unwrap_or_else(|| self.id().as_str())
         }
     };
+}
+
+/// The in-process agent over an injected runner.
+pub fn runner_agent(runner: std::sync::Arc<dyn flotilla_provider_runtime::CommandRunner>) -> std::sync::Arc<dyn VesselAgent> {
+    std::sync::Arc::new(flotilla_environment::environment::vessel_ops::RunnerVesselAgent(runner))
 }
 
 /// Declared provider facts for in-memory admission fixtures. No process probes

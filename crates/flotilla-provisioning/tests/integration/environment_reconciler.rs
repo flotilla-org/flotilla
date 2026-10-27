@@ -687,6 +687,7 @@ impl EnvironmentRuntime for CloudRuntime {
                 host_version: "1".into(),
                 module_version: "1".into(),
                 capabilities: Default::default(),
+                agent_connection: None,
             })),
             survivors: Some(flotilla_resources::EnvironmentSurvivors {
                 host_checkpoint: Some("controller-checkpoint".into()),

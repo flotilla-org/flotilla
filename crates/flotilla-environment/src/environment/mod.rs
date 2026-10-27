@@ -528,9 +528,11 @@ pub trait ProvisionedEnvironment: Send + Sync {
     /// This must not include the provisioning host's ambient environment.
     async fn env_vars(&self) -> Result<HashMap<String, String>, String>;
     fn runner(&self) -> Arc<dyn CommandRunner>;
-    fn agent(&self) -> Option<Arc<dyn VesselAgent>> {
-        None
-    }
+    /// The vessel's one agent. Every kind has one (#3956 Q2): the drydock agent in
+    /// Docker and cloud vessels, an in-process agent over the host runner for
+    /// host-direct. A handle whose agent is not live returns one that is not
+    /// ready, so callers ask its readiness, never its presence.
+    fn agent(&self) -> Arc<dyn VesselAgent>;
     /// Explicit permission to reach an existing terminal independently of the
     /// resident vessel agent. A diagnostic runner alone grants no such access.
     fn terminal_route(&self) -> Option<&dyn ProviderTerminalRoute> {
