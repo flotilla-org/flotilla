@@ -1315,6 +1315,13 @@ async fn open_provisioning_lifecycles(
             .await
             .map_err(|error| error.to_string())??;
     daemon.resource_backend().install_engine_records(Arc::new(repositories));
+    // #3824 layer 3b: Project, with project operations' record and the dispatch queue's judgement.
+    let service = daemon.decided_store()?;
+    let clock = daemon.clock_for_scenarios();
+    let projects = tokio::task::spawn_blocking(move || flotilla_provisioning::engine::projects::EngineProjects::open(service, clock))
+        .await
+        .map_err(|error| error.to_string())??;
+    daemon.resource_backend().install_engine_records(Arc::new(projects));
     tokio::task::spawn_blocking(move || {
         let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
         let log = || StoreLog::new(Arc::clone(&store));

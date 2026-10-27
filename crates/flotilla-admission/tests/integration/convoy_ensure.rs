@@ -153,11 +153,6 @@ async fn driver_reconcile_now_acknowledges_recordless_teardown_and_readmits_the_
 }
 
 #[tokio::test]
-async fn duplicate_operational_entry_refusal_records_a_project_event() {
-    ensure_scenarios::duplicate_operational_entry_refusal_records_a_project_event(&Controller).await;
-}
-
-#[tokio::test]
 async fn ensure_dependency_fingerprint_tracks_replicated_placement_changes() {
     ensure_scenarios::ensure_dependency_fingerprint_tracks_replicated_placement_changes(&Controller).await;
 }

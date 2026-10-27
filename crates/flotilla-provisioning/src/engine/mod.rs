@@ -37,6 +37,7 @@ pub mod import;
 pub mod manifest_root;
 pub mod manifest_root_import;
 pub mod project_import;
+pub mod projects;
 pub mod reads;
 pub mod repositories;
 pub mod repository_import;

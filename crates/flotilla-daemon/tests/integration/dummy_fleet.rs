@@ -1137,6 +1137,12 @@ impl DummyDaemon {
         let repository = flotilla_resources::RepositorySpec::remote("https://transport.example/transport/app").expect("repository");
         let record = flotilla_provisioning::stored::repository::RepositoryRecord::new(repository.clone()).expect("record");
         log.create(&repository.key().to_string(), &record, "transport", at).expect("repository record");
+        // #3824 layer 3b: a Project, and its project operations' record.
+        let project = flotilla_resources::ProjectSpec::builder().display_name("transport".into()).build();
+        let record = flotilla_provisioning::stored::project::ProjectDefinition::new(origin(), &project).expect("project");
+        log.create("transport", &record, "transport", at).expect("project record");
+        let ops = flotilla_provisioning::stored::project::ProjectOpsRecord { refused: None, entries: None };
+        log.create("transport", &ops, "transport", at).expect("project ops record");
     }
 
     fn transport_binding(&self, at: flotilla_schema::Timestamp) -> flotilla_provisioning::stored::account::BindingSpec {
@@ -1240,6 +1246,8 @@ impl DummyDaemon {
                 collect!(stored flotilla_provisioning::stored::definition::ImageLayerDefinition);
                 collect!(stored flotilla_provisioning::stored::definition::WorkflowTemplateDefinition);
                 collect!(stored flotilla_provisioning::stored::repository::RepositoryRecord);
+                collect!(stored flotilla_provisioning::stored::project::ProjectDefinition);
+                collect!(stored flotilla_provisioning::stored::project::ProjectOpsRecord);
                 assert_eq!(covered, registered, "every registered engine kind needs a transport fixture");
                 Ok(snapshots)
             })

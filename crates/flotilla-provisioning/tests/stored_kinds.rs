@@ -56,7 +56,9 @@ fn provisioning_kind_codes_are_pinned() {
     assert_eq!(held("AccountProvision"), Some(KindCode::new("ap")));
     assert_eq!(held("ManifestRoot"), Some(KindCode::new("mr")));
     assert_eq!(held("Repository"), Some(KindCode::new("ry")));
-    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 16);
+    assert_eq!(held("Project"), Some(KindCode::new("pj")));
+    assert_eq!(held("ProjectOps"), Some(KindCode::new("po")));
+    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 18);
     // The definition kinds (#3824 layer 2b), in the decided store with their writers (2b-ii).
     for (kind, code) in [
         ("Forge", "fo"),
