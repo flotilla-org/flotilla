@@ -126,8 +126,8 @@ fn fixtures() -> Vec<Box<dyn Fixture>> {
 async fn resolves_to(fixture: &dyn Fixture, label: &str) -> bool {
     let manifest = fixture.home().join("skills").join(MARKER);
     let store = fixture.store();
-    is_published(store, &fixture.home().join("skills"), &archive(label)).await.expect("inspect")
-        && store.exists(&manifest).await.expect("manifest")
+    let layout = Layout::new(&fixture.home().join("skills")).expect("layout");
+    super::resolves_to(store, &layout, &archive(label)).await.expect("inspect") && store.exists(&manifest).await.expect("manifest")
 }
 
 // #3663: a new tree replaces the old one in one flip, the old one stays

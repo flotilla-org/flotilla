@@ -18,7 +18,6 @@ use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -29,7 +28,6 @@ use sha2::Digest;
 /// Every attempt touches its tree, so an in-flight attempt is never reaped
 /// unless it has stalled this long, and its final verification catches that.
 pub const REAP_AFTER_MINUTES: u32 = 60;
-const ATTEMPTS: u32 = 3;
 
 /// A canonical archive of one tree, named by the sha256 of its bytes.
 #[derive(Debug, Clone)]
@@ -217,11 +215,6 @@ impl Layout {
     }
 }
 
-/// Whether the destination already resolves to this archive's complete tree.
-pub async fn is_published(store: &dyn TreeStore, destination: &Path, archive: &TreeArchive) -> Result<bool, PublishError> {
-    resolves_to(store, &Layout::new(destination)?, archive).await
-}
-
 /// The completion record: a link naming the archive's tree, which resolves.
 async fn resolves_to(store: &dyn TreeStore, layout: &Layout, archive: &TreeArchive) -> Result<bool, PublishError> {
     Ok(store.entry(&layout.destination).await? == Entry::Link(layout.target(&archive.digest))
@@ -231,22 +224,10 @@ async fn resolves_to(store: &dyn TreeStore, layout: &Layout, archive: &TreeArchi
 /// Make `destination` resolve to the archive's tree. Every attempt writes only
 /// uniquely named entries until its final rename, and every writer of one
 /// selection publishes the same digest, so concurrent or abandoned attempts
-/// converge. Transient failures restart from the beginning with a new attempt.
+/// converge. A failed attempt is retried whole by its caller, with a new attempt
+/// id; vessel delivery records it and retries with backoff.
 pub async fn publish(store: &dyn TreeStore, destination: &Path, archive: &TreeArchive) -> Result<(), PublishError> {
-    let layout = Layout::new(destination)?;
-    let mut attempt = 1;
-    loop {
-        match publish_once(store, &layout, archive).await {
-            Err(error) if !error.permanent && attempt < ATTEMPTS => {
-                tokio::time::sleep(Duration::from_secs(u64::from(attempt))).await;
-                attempt += 1;
-            }
-            result => return result,
-        }
-    }
-}
-
-async fn publish_once(store: &dyn TreeStore, layout: &Layout, archive: &TreeArchive) -> Result<(), PublishError> {
+    let layout = &Layout::new(destination)?;
     let target = layout.target(&archive.digest);
     // An ambiguous earlier activation is reconciled by identity alone.
     if resolves_to(store, layout, archive).await? {

@@ -31,7 +31,6 @@ const MAX_ENTRIES: usize = 4096;
 const MAX_DEPTH: usize = 16;
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TREE_BYTES: u64 = 64 * 1024 * 1024;
-const FETCH_ATTEMPTS: u32 = 3;
 /// Object caches unused this long are retired; a retired cache costs one refetch.
 const CACHE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
@@ -195,27 +194,17 @@ impl SkillTrees {
             }
             None => None,
         };
-        let mut attempt = 1;
-        loop {
-            let file = credential.as_ref().map(|directory| GitCredentialFile::new(directory.path().join("token"), Arc::clone(directory)));
-            match self.vcs.fetch_commit(&self.cache, &source.repository, &source.revision, file).await {
-                Ok(()) => return Ok(()),
-                Err(CommitFetchError::Transient(error)) if attempt < FETCH_ATTEMPTS => {
-                    tracing::warn!(source = %source.name, revision = %source.revision, %error, attempt, "skill source fetch failed; retrying");
-                    tokio::time::sleep(Duration::from_secs(u64::from(attempt))).await;
-                    attempt += 1;
-                }
-                Err(CommitFetchError::Transient(error) | CommitFetchError::FallbackFailed(error)) => {
-                    return Err(SkillTreeError::transient(format!("{context}: {error}")))
-                }
-                Err(CommitFetchError::Unavailable(error)) => {
-                    return Err(SkillTreeError::permanent(format!(
-                        "{context}: {error}; re-pin the crew's skills to a revision the server serves"
-                    )))
-                }
-                Err(CommitFetchError::Refused(error)) => return Err(SkillTreeError::permanent(format!("{context}: {error}"))),
+        // A failure is retried whole by vessel delivery, with backoff.
+        let file = credential.map(|directory| GitCredentialFile::new(directory.path().join("token"), directory));
+        self.vcs.fetch_commit(&self.cache, &source.repository, &source.revision, file).await.map_err(|error| match error {
+            CommitFetchError::Transient(error) | CommitFetchError::FallbackFailed(error) => {
+                SkillTreeError::transient(format!("{context}: {error}"))
             }
-        }
+            CommitFetchError::Unavailable(error) => {
+                SkillTreeError::permanent(format!("{context}: {error}; re-pin the crew's skills to a revision the server serves"))
+            }
+            CommitFetchError::Refused(error) => SkillTreeError::permanent(format!("{context}: {error}")),
+        })
     }
 
     /// One selected skill's files, under its frozen name. Only regular files
