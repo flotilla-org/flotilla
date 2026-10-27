@@ -12,7 +12,7 @@ use flotilla_protocol::{
         ConvoyRow, IndependentRow, ProjectRepositoriesRow, Readiness, ReadinessState, SessionPhase, StandingRoleHold, StandingRoleRow,
         SurfaceState, Timestamp, VesselRow, WorkPhase,
     },
-    HostName, ReferenceContext, ViewAddress, AWARENESS_REL_FOR_CONVOY,
+    EnvironmentKind, HostName, ReferenceContext, ViewAddress, AWARENESS_REL_FOR_CONVOY,
 };
 use flotilla_resources::{
     ChangeRequest, ChangeRequestStatus, Forge, Issue, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability,
@@ -1185,12 +1185,10 @@ fn project_independent(catalog: &mut Catalog, independent: &IndependentRow, mint
     }
     if let Some(recipe) = independent.attach.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &independent.host)) {
         catalog.assert_entity(entity.clone(), action_facts(&recipe, "pane"), ordinal);
-        facts.extend(direct_facts(
-            independent.cleat_endpoint.as_ref(),
-            Some(flotilla_protocol::EnvironmentKind::Direct),
-            &independent.host,
-            mint,
-        ));
+        // Independent rows have no vessel kind, so retain the host-native
+        // assumption. Container-hosted independents need their own environment
+        // evidence before they can be filtered here.
+        facts.extend(direct_facts(independent.cleat_endpoint.as_ref(), Some(EnvironmentKind::Direct), &independent.host, mint));
     }
     catalog.assert_entity(entity, facts, ordinal);
 }
@@ -1286,7 +1284,7 @@ fn action_facts(recipe: &Recipe, vehicle: &'static str) -> Vec<(String, Metadata
 
 fn direct_facts(
     endpoint: Option<&CleatEndpoint>,
-    environment_kind: Option<flotilla_protocol::EnvironmentKind>,
+    environment_kind: Option<EnvironmentKind>,
     host: &HostName,
     mint: &dyn RecipeMint,
 ) -> Vec<(&'static str, MetadataValue)> {
@@ -1294,13 +1292,13 @@ fn direct_facts(
         return vec![(KEY_PRIMARY_DIRECT_REASON, MetadataValue::text("no observed Cleat daemon endpoint for this session"))];
     };
     match environment_kind {
-        Some(flotilla_protocol::EnvironmentKind::Provisioned) => {
+        Some(EnvironmentKind::Provisioned) => {
             return vec![(KEY_PRIMARY_DIRECT_REASON, MetadataValue::text("Cleat daemon is inside a container; use flotilla attach"))];
         }
         None => {
             return vec![(KEY_PRIMARY_DIRECT_REASON, MetadataValue::text("Cleat daemon environment is unknown; use flotilla attach"))];
         }
-        Some(flotilla_protocol::EnvironmentKind::Direct) => {}
+        Some(EnvironmentKind::Direct) => {}
     }
     match mint.direct_transport(host) {
         Ok(transport) => {

@@ -293,7 +293,7 @@ fn direct_cleat_recipe_contract_covers_remote_local_fallback_and_withdrawal() {
         CleatEndpoint { runtime_root: "/var/lib/flotilla/cleat".to_owned(), daemon: "work@3".to_owned(), session: "session-42".to_owned() };
     let mut terminal = vessel().convoy(&reference).name("coder").phase(WorkPhase::Running).materialize("terminal-remote-coder").call();
     terminal.cleat_endpoint = Some(endpoint.clone());
-    terminal.environment_kind = Some(flotilla_protocol::EnvironmentKind::Direct);
+    terminal.environment_kind = Some(EnvironmentKind::Direct);
     let convoy = ConvoyRow::builder()
         .resource(reference)
         .name("remote")
@@ -330,7 +330,7 @@ fn direct_cleat_recipe_contract_covers_remote_local_fallback_and_withdrawal() {
 
     // Container daemons cannot be addressed in either transport's host namespace.
     // The kind/transport cross-product exhausts this finite projection decision.
-    for kind in [Some(flotilla_protocol::EnvironmentKind::Provisioned), None] {
+    for kind in [Some(EnvironmentKind::Provisioned), None] {
         for transport in [&remote_mint, &local_mint] {
             let mut container = convoy.clone();
             container.vessels[0].environment_kind = kind;

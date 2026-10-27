@@ -26,8 +26,8 @@ use flotilla_protocol::{
         ProjectRepositoryMembership, QueryChanges, QueryId, QueryScope, ReadinessBlocker, ReadinessState, ResultDelta, SessionPhase,
         StandingRoleHold, StandingRoleRow, SurfaceState, VesselRow, WorkPhase,
     },
-    Change, ConfiguredResourceLimits, DaemonEvent, HostName, LifecycleAuthority, RepoDelta, RepoIdentity, RepositoryKey, ResourceRef,
-    UNKNOWN_REPOSITORY_LABEL,
+    Change, ConfiguredResourceLimits, DaemonEvent, EnvironmentKind, HostName, LifecycleAuthority, RepoDelta, RepoIdentity, RepositoryKey,
+    ResourceRef, UNKNOWN_REPOSITORY_LABEL,
 };
 use flotilla_resources::{
     api_version, convoy_subject_rows, repository_display_labels, subject_relationship_conflicts, Checkout, CheckoutSpec,
@@ -521,9 +521,6 @@ impl Aggregator {
             }
         }
         self.state.replace_local_independent_rows(Vec::new()).await;
-        let mut durable_convoy_stream = self.recover_replica_convoy_watch(durable_convoys).await?;
-        let mut durable_demand_stream = self.recover_demand_watch(durable_demands).await?;
-        let mut durable_environment_stream = self.recover_environment_watch(durable_environments).await?;
         let mut placement_policy_stream = match durable_placement_policies {
             Some(source) => {
                 let (items, watch) = Self::recover_replica_watch(source).await?;
@@ -532,6 +529,9 @@ impl Aggregator {
             }
             None => Box::pin(futures::stream::pending()) as BoxStream<'static, Result<ReadWatchEvent<PlacementPolicy>, ResourceError>>,
         };
+        let mut durable_convoy_stream = self.recover_replica_convoy_watch(durable_convoys).await?;
+        let mut durable_demand_stream = self.recover_demand_watch(durable_demands).await?;
+        let mut durable_environment_stream = self.recover_environment_watch(durable_environments).await?;
         let mut durable_session_stream = self.recover_replica_session_watch(durable_sessions).await?;
         let mut durable_fleet_stream = match durable_fleet_designation {
             Some(source) => self.recover_fleet_designation_watch(source).await?,
@@ -2801,7 +2801,10 @@ impl Aggregator {
         })
     }
 
-    fn vessel_environment_kind(&self, convoy: &ResourceRef, name: &str, host: &HostName) -> Option<flotilla_protocol::EnvironmentKind> {
+    /// Resolve the running vessel's execution kind from its observed policy.
+    /// The spec reference is best-effort when no observed reference is recorded.
+    /// Without a recorded version, policy edits since launch cannot be detected.
+    fn vessel_environment_kind(&self, convoy: &ResourceRef, name: &str, host: &HostName) -> Option<EnvironmentKind> {
         let vessel = self.convoy_vessels(&convoy.namespace, &convoy.name).find(|source| {
             source.object.metadata.namespace == convoy.namespace
                 && source.object.spec.convoy_ref == convoy.name
@@ -2820,8 +2823,9 @@ impl Aggregator {
                 // the vessel. An unqualified reference must still be unambiguous.
                 let mut candidates = self
                     .placement_policies
-                    .values()
-                    .filter(|policy| policy.object.metadata.namespace == convoy.namespace && policy.object.metadata.name == *policy_ref);
+                    .range((convoy.namespace.clone(), policy_ref.clone(), None)..)
+                    .take_while(|((namespace, name, _), _)| namespace == &convoy.namespace && name == policy_ref)
+                    .map(|(_, policy)| policy);
                 let candidate = candidates.next()?;
                 candidates.next().is_none().then_some(candidate)
             })?;
@@ -2835,8 +2839,8 @@ impl Aggregator {
             return None;
         }
         match (&policy.object.spec.host_direct, &policy.object.spec.docker_per_vessel, &policy.object.spec.cloud_sandbox_per_vessel) {
-            (Some(_), None, None) => Some(flotilla_protocol::EnvironmentKind::Direct),
-            (None, Some(_), None) | (None, None, Some(_)) => Some(flotilla_protocol::EnvironmentKind::Provisioned),
+            (Some(_), None, None) => Some(EnvironmentKind::Direct),
+            (None, Some(_), None) | (None, None, Some(_)) => Some(EnvironmentKind::Provisioned),
             _ => None,
         }
     }
@@ -6456,13 +6460,45 @@ mod tests {
         }
     }
 
+    async fn vessel_policy_objects(
+        variant: serde_json::Value,
+        observed: bool,
+    ) -> (ResourceObject<Vessel>, ResourceObject<PlacementPolicy>) {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let mut spec = variant;
+        spec["pool"] = serde_json::json!("arbitrary-instance");
+        let policy = backend
+            .using::<PlacementPolicy>("flotilla")
+            .create(&InputMeta::builder().name("actual-policy".into()).build(), &serde_json::from_value(spec).expect("policy spec"))
+            .await
+            .expect("policy");
+        let mut vessel = backend
+            .using::<Vessel>("flotilla")
+            .create(
+                &InputMeta::builder().name("vessel".into()).build(),
+                &flotilla_resources::VesselSpec {
+                    convoy_ref: "convoy-a".into(),
+                    vessel_name: "implement".into(),
+                    placement_policy_ref: if observed { "desired-policy" } else { "actual-policy" }.into(),
+                    adopted_checkout_refs: Default::default(),
+                },
+            )
+            .await
+            .expect("vessel");
+        vessel.status = observed.then(|| flotilla_resources::VesselStatus {
+            observed_policy_ref: Some("actual-policy".into()),
+            observed_policy_version: Some(policy.metadata.resource_version.clone()),
+            ..Default::default()
+        });
+        (vessel, policy)
+    }
+
     // Vessel rows carry the observed policy's execution kind, including replicas.
     // Exhaustive kind/origin cases cover missing policy evidence and deletion;
     // no process or transport is involved in this resource-store join.
     #[tokio::test]
     async fn vessel_environment_kind_follows_observed_policy_and_withdraws_on_deletion() {
-        use flotilla_protocol::EnvironmentKind;
-        for (remote, foreign_policy) in [(false, false), (true, false), (true, true)] {
+        for (remote, foreign_policy, observed) in [(false, false, true), (true, false, true), (true, true, true), (false, false, false)] {
             for (variant, expected) in [
                 (serde_json::json!({"host_direct": {"host_ref": "local", "checkout": "worktree"}}), EnvironmentKind::Direct),
                 (
@@ -6470,32 +6506,7 @@ mod tests {
                     EnvironmentKind::Provisioned,
                 ),
             ] {
-                let backend = ResourceBackend::new(InMemoryBackend::default());
-                let mut spec = variant;
-                spec["pool"] = serde_json::json!("arbitrary-instance");
-                let policy = backend
-                    .using::<PlacementPolicy>("flotilla")
-                    .create(&InputMeta::builder().name("actual-policy".into()).build(), &serde_json::from_value(spec).expect("policy spec"))
-                    .await
-                    .expect("policy");
-                let mut vessel = backend
-                    .using::<Vessel>("flotilla")
-                    .create(
-                        &InputMeta::builder().name("vessel".into()).build(),
-                        &flotilla_resources::VesselSpec {
-                            convoy_ref: "convoy-a".into(),
-                            vessel_name: "implement".into(),
-                            placement_policy_ref: "desired-policy".into(),
-                            adopted_checkout_refs: Default::default(),
-                        },
-                    )
-                    .await
-                    .expect("vessel");
-                vessel.status = Some(flotilla_resources::VesselStatus {
-                    observed_policy_ref: Some("actual-policy".into()),
-                    observed_policy_version: Some(policy.metadata.resource_version.clone()),
-                    ..Default::default()
-                });
+                let (vessel, policy) = vessel_policy_objects(variant, observed).await;
                 let (events, _) = broadcast::channel(8);
                 let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), events);
                 let provenance = if remote {
@@ -6515,18 +6526,34 @@ mod tests {
                 let definition = &status.workflow_snapshot.as_ref().expect("snapshot").vessels[0];
                 let row =
                     |aggregator: &Aggregator| aggregator.summarize_vessel(&reference, definition, status.work.get("implement"), None, None);
-                assert_eq!(row(&aggregator).environment_kind, None);
+                assert_eq!(
+                    row(&aggregator).environment_kind,
+                    None,
+                    "remote={remote}, foreign_policy={foreign_policy}, observed={observed}"
+                );
                 let source =
                     ReadResourceObject { object: policy, provenance: if foreign_policy { ResourceProvenance::Local } else { provenance } };
                 apply_readiness_event(&mut aggregator.placement_policies, ReadWatchEvent::Added(source.clone()));
-                assert_eq!(row(&aggregator).environment_kind, Some(expected));
+                assert_eq!(
+                    row(&aggregator).environment_kind,
+                    Some(expected),
+                    "remote={remote}, foreign_policy={foreign_policy}, observed={observed}"
+                );
                 // A later policy version is not evidence of the running vessel's kind.
                 let mut changed = source.clone();
                 changed.object.metadata.resource_version.push_str("-changed");
                 apply_readiness_event(&mut aggregator.placement_policies, ReadWatchEvent::Modified(changed));
-                assert_eq!(row(&aggregator).environment_kind, None);
+                assert_eq!(
+                    row(&aggregator).environment_kind,
+                    if observed { None } else { Some(expected) },
+                    "remote={remote}, foreign_policy={foreign_policy}, observed={observed}"
+                );
                 apply_readiness_event(&mut aggregator.placement_policies, ReadWatchEvent::Deleted(source));
-                assert_eq!(row(&aggregator).environment_kind, None);
+                assert_eq!(
+                    row(&aggregator).environment_kind,
+                    None,
+                    "remote={remote}, foreign_policy={foreign_policy}, observed={observed}"
+                );
             }
         }
     }
