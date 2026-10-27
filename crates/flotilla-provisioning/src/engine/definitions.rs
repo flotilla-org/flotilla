@@ -241,6 +241,15 @@ fn rescan(read: &mut Read<'_>, records: &mut Records, home: &str) -> Result<(), 
     scan::<WorkflowTemplateDefinition>(read, records, home)
 }
 
+/// `kind`'s record `name` as several homes' resolve at `home`: its own, else the lexically first
+/// home's (the map's order).
+fn resolve(records: &Records, home: &str, kind: &str, name: &str) -> Option<Held> {
+    let mut held = records.iter().filter(|((held, held_name, _), _)| *held == kind && held_name == name);
+    let first = held.next()?;
+    let chosen = std::iter::once(first).chain(held).find(|((_, _, owner), _)| owner == home).unwrap_or(first);
+    Some(chosen.1.clone())
+}
+
 /// The definition records of the decided store at one home.
 pub struct EngineDefinitions {
     service: Arc<Service>,
@@ -310,16 +319,15 @@ impl EngineDefinitions {
 
     /// `kind`'s record `name` as several homes' resolve: this home's, else the first home's.
     fn resolve(&self, records: &Records, kind: &str, name: &str) -> Option<Held> {
-        let mut held = records.iter().filter(|((held, held_name, _), _)| *held == kind && held_name == name);
-        let first = held.next()?;
-        let chosen = std::iter::once(first).chain(held).find(|((_, _, home), _)| *home == self.home).unwrap_or(first);
-        Some(chosen.1.clone())
+        resolve(records, &self.home, kind, name)
     }
 
     fn write<K: Definition>(&self, name: &str, origin: DefinitionOrigin, spec: Value) -> Result<DefinitionRecord, String> {
         let value = K::build(origin, spec)?;
         let now = self.now();
         let version = match self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())? {
+            // The stored value holds the origin too, so a new revision of a manifest document
+            // writes even when its spec is unchanged; an identical write logs nothing.
             Some(current) if current.spec == value => current.version,
             Some(current) => self.log.edit(name, current.version, &value, WRITER, now).map_err(|error| error.to_string())?,
             None => self.log.create(name, &value, WRITER, now).map_err(|error| error.to_string())?,
@@ -350,6 +358,7 @@ impl DefinitionRecords for EngineDefinitions {
     async fn list(&self, kind: &str) -> Result<Vec<DefinitionRecord>, String> {
         let resident = self.refresh()?;
         let mut names: Vec<&String> = resident.records.keys().filter(|(held, _, _)| *held == kind).map(|(_, name, _)| name).collect();
+        // The map orders by kind, then name, then home, so one name's homes are adjacent.
         names.dedup();
         names.into_iter().filter_map(|name| self.resolve(&resident.records, kind, name)).collect()
     }
@@ -372,12 +381,37 @@ impl DefinitionRecords for EngineDefinitions {
                 tokio::time::sleep(POLL).await;
                 let homes = service.homes();
                 // A pass that fails is tried again at the next poll; the watcher sees no tick.
-                let changed = service.with_store(|store| Ok(!follower.pass(&mut store.read()?, &homes)?.is_empty()));
-                if changed.unwrap_or(false) {
-                    return Some(((), (service, follower)));
+                match service.with_store(|store| Ok(!follower.pass(&mut store.read()?, &homes)?.is_empty())) {
+                    Ok(true) => return Some(((), (service, follower))),
+                    Ok(false) => {}
+                    Err(error) => tracing::warn!(%error, "definition change stream could not read the log; retrying"),
                 }
             }
         });
         Ok(Box::pin(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn held(home: &str) -> Held {
+        Ok(DefinitionRecord { name: "fleet".into(), home: home.into(), origin: DefinitionOrigin::Operator, spec: Value::Null, version: 1 })
+    }
+
+    // Behaviour (#3824 layer 2b-ii, as the import placed records): a name several homes hold reads
+    // as this home's record, else the lexically first home's; another kind's or name's never.
+    #[test]
+    fn a_name_several_homes_hold_reads_as_this_homes_else_the_first() {
+        let records: Records = ["udder", "feta", "kiwi"]
+            .into_iter()
+            .map(|home| (("FleetDesignation", "fleet".to_owned(), home.to_owned()), held(home)))
+            .chain([(("Forge", "fleet".to_owned(), "aaa".to_owned()), held("aaa"))])
+            .collect();
+        let home_of = |at: &str| resolve(&records, at, "FleetDesignation", "fleet").expect("held").expect("encodes").home;
+        assert_eq!(home_of("kiwi"), "kiwi");
+        assert_eq!(home_of("b5"), "feta");
+        assert!(resolve(&records, "kiwi", "FleetDesignation", "other").is_none());
     }
 }
