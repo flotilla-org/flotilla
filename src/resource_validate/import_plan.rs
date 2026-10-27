@@ -61,6 +61,8 @@ pub(super) const PLAN: &[(&str, Plan)] = &[
     ("Artifact", Plan::Moving("#3824 layer 7")),
     ("Demand", Plan::Moving("#3824 layer 8")),
     ("Regard", Plan::Moving("#3938")),
+    // A plain record beside AccountProvision; its type already derives `Stored` (#3964).
+    ("AccessDelivery", Plan::Moving("#3824, plain like AccountProvision")),
 ];
 
 /// The plan for the kind listed under `plural`, if it has one.
