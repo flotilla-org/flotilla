@@ -295,7 +295,10 @@ impl AgentMaterialRegistry {
     /// sources (ADR 0052): the tree the access layer delivers into the crew's home.
     pub async fn skill_tree(&self, selected: &[flotilla_resources::SkillCatalogEntry]) -> Result<SkillTree, String> {
         let sources = if selected.is_empty() { Ok(Vec::new()) } else { self.skills.selected_sources(selected).await };
-        match sources {
+        match sources.and_then(|sources| {
+            one_repository_per_credential(&sources).map_err(|(source, error)| format!("{error}\n{STAGE_SOURCE_PREFIX}{source}"))?;
+            Ok(sources)
+        }) {
             Ok(sources) => Ok(SkillTree { sources, selected: selected.to_vec() }),
             Err(error) => Err(self.report_skill_failure(&error, selected).await),
         }
@@ -754,7 +757,6 @@ fn authorize_frozen_sources(
     sources: &[SkillSource],
     declared_credentials: &BTreeMap<String, flotilla_resources::CredentialSpecSpec>,
 ) -> Result<(), String> {
-    let mut credential_repositories = BTreeMap::new();
     for source in sources {
         if let Some(credential) = &source.credential {
             let spec = declared_credentials.get(credential).ok_or_else(|| {
@@ -762,11 +764,23 @@ fn authorize_frozen_sources(
             })?;
             crate::credential::skill_source_repository(credential, spec, &source.repository)
                 .map_err(|error| format!("skill source {} revision {}: {error}", source.name, source.revision))?;
+        }
+    }
+    one_repository_per_credential(sources).map_err(|(_, error)| error)
+}
+
+/// A source credential is minted narrowed to one repository, so sources sharing a
+/// credential must share their repository.
+fn one_repository_per_credential(sources: &[SkillSource]) -> Result<(), (String, String)> {
+    let mut credential_repositories = BTreeMap::new();
+    for source in sources {
+        if let Some(credential) = &source.credential {
             if credential_repositories.insert(credential, &source.repository).is_some_and(|previous| previous != &source.repository) {
-                return Err(format!(
+                let error = format!(
                     "skill source {} credential {credential}: one credential cannot be narrowed to multiple source repositories",
                     source.name
-                ));
+                );
+                return Err((source.name.clone(), error));
             }
         }
     }
@@ -2704,6 +2718,32 @@ esac
             .collect::<Vec<_>>();
         assert_eq!(names, [std::ffi::OsString::from("private-source")], "only the frozen selection is installed");
         assert!(!token.exists(), "the source token is removed after staging");
+    }
+
+    // A source credential is minted narrowed to one repository, so a tree whose sources
+    // share a credential across two repositories is refused before anything is delivered.
+    #[tokio::test]
+    async fn one_credential_is_not_narrowed_to_two_repositories() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let bundle = registry.skills.source.as_ref().expect("source");
+        let source = |name: &str| serde_json::json!({"name": name, "repository": format!("https://github.com/example/{name}.git"), "revision": "1".repeat(40), "credential": "private-skills"});
+        let manifest = serde_json::json!({"schema_version": 5, "sources": [source("private-skills"), source("other-skills")]});
+        std::fs::write(bundle.join(SKILL_BUNDLE_MANIFEST), manifest.to_string()).expect("manifest");
+        let other = flotilla_resources::SkillCatalogEntry {
+            source: "other-skills".into(),
+            repository: "example/other-skills".into(),
+            ..crew_skill("other-source", "skills/other-folder")
+        };
+        let error = registry
+            .skill_tree(&[crew_skill("private-source", "skills/private-folder"), other])
+            .await
+            .expect_err("one credential, two repositories");
+        assert!(error.contains("cannot be narrowed to multiple source repositories"), "{error}");
+        registry
+            .skill_tree(&[crew_skill("private-source", "skills/private-folder")])
+            .await
+            .expect("one repository per credential resolves");
     }
 
     fn crew_skill(name: &str, path: &str) -> flotilla_resources::SkillCatalogEntry {

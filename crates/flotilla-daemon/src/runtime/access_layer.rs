@@ -118,9 +118,14 @@ pub(super) async fn deliver_access(
         .await
         .map_err(|error| format!("deliver access `{access}` aboard `{}`: {error}", launch.account.env_ref))?;
     for step in &delivered.plan.steps {
-        tracing::info!(%access, place = launch.account.env_ref, need = %step.need, mechanism = %step.mechanism, action = ?step.action, "vessel delivery");
+        tracing::debug!(%access, place = launch.account.env_ref, need = %step.need, mechanism = %step.mechanism, action = ?step.action, "vessel delivery");
     }
-    let home = delivered.homes[&NeedName::new(HOME)].display().to_string();
+    let home = delivered
+        .homes
+        .get(&NeedName::new(HOME))
+        .ok_or_else(|| format!("deliver access `{access}` aboard `{}`: no home was delivered", launch.account.env_ref))?
+        .display()
+        .to_string();
     let mut environment = vec![(harness.variable.to_string(), home.clone())];
     if let Some(bound) = bound {
         environment.retain(|(name, _)| !bound.environment(&home).iter().any(|(bound, _)| bound == name));
@@ -205,22 +210,18 @@ impl TreeDelivery for SkillsDelivery {
         let requests = self.tree.credentials();
         if !requests.is_empty() {
             let store = self.state.credential_store.as_ref().ok_or("skill sources need the host-local credential store")?;
-            let mut minted: BTreeMap<String, (String, std::path::PathBuf)> = BTreeMap::new();
+            // `skill_tree` refused a credential over two repositories, so one token per
+            // credential serves every source that names it.
+            let mut minted: BTreeMap<String, std::path::PathBuf> = BTreeMap::new();
             for request in requests {
                 let token = match minted.get(&request.credential) {
-                    Some((repository, _)) if repository != &request.repository => {
-                        return Err(format!(
-                            "skill source {} credential {} mint failed: one credential cannot be narrowed to multiple source repositories",
-                            request.source, request.credential
-                        ))
-                    }
-                    Some((_, token)) => token.clone(),
+                    Some(token) => token.clone(),
                     None => {
                         let token =
                             store.prepare_skill_source(&request.credential, &request.repository, &*runner).await.map_err(|error| {
                                 format!("skill source {} credential {} mint failed: {error}", request.source, request.credential)
                             })?;
-                        minted.insert(request.credential.clone(), (request.repository.clone(), token.clone()));
+                        minted.insert(request.credential.clone(), token.clone());
                         token
                     }
                 };
