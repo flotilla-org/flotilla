@@ -208,14 +208,15 @@ fn object<K: Definition>(name: String, home: String, version: u64, value: &K, or
 /// Record `id` as the old object, with the stamps its last change says.
 fn record<K: Definition>(
     read: &mut Read<'_>,
+    roots: &mut provenance::Roots,
     id: ResourceId,
     name: String,
     home: String,
     version: u64,
     value: &K,
 ) -> Result<Held, StoreError> {
-    let change = provenance::last_change(read, id)?;
-    let origin = provenance::origin_of(read, K::NAME, &name, change.as_ref(), value.project())?;
+    let change = read.last_change(id)?;
+    let origin = provenance::origin_of(read, roots, K::NAME, &name, change.as_ref(), value.project())?;
     Ok(object(name, home, version, value, &origin))
 }
 
@@ -223,7 +224,7 @@ fn record<K: Definition>(
 fn load<K: Definition>(read: &mut Read<'_>, id: Option<ResourceId>) -> Result<Option<Held>, StoreError> {
     let Some(id) = id else { return Ok(None) };
     let Some(loaded) = read.load::<K>(id)? else { return Ok(None) };
-    record(read, id, loaded.name, loaded.home, loaded.version, &loaded.value).map(Some)
+    record(read, &mut provenance::Roots::default(), id, loaded.name, loaded.home, loaded.version, &loaded.value).map(Some)
 }
 
 /// Reads `identity` again into `records`: its current row, or none once deleted.
@@ -248,13 +249,13 @@ fn reload(read: &mut Read<'_>, records: &mut Records, identity: &Identity) -> Re
 }
 
 /// Every record of kind `K` homed at `home`.
-fn scan<K: Definition>(read: &mut Read<'_>, records: &mut Records, home: &str) -> Result<(), StoreError> {
+fn scan<K: Definition>(read: &mut Read<'_>, roots: &mut provenance::Roots, records: &mut Records, home: &str) -> Result<(), StoreError> {
     let mut after = None;
     loop {
         let page = read.scan::<K>(home, after, 64)?;
         for id in page.ids {
             if let Some(loaded) = read.load::<K>(id)? {
-                let found = record(read, id, loaded.name.clone(), loaded.home, loaded.version, &loaded.value)?;
+                let found = record(read, roots, id, loaded.name.clone(), loaded.home, loaded.version, &loaded.value)?;
                 records.insert((K::NAME, loaded.name, home.to_owned()), found);
             }
         }
@@ -268,13 +269,15 @@ fn scan<K: Definition>(read: &mut Read<'_>, records: &mut Records, home: &str) -
 /// Reads every record homed at `home` into `records`, in place of what they held.
 fn rescan(read: &mut Read<'_>, records: &mut Records, home: &str) -> Result<(), StoreError> {
     records.retain(|(_, _, owner), _| owner != home);
-    scan::<ForgeDefinition>(read, records, home)?;
-    scan::<FleetDesignationDefinition>(read, records, home)?;
-    scan::<CredentialSpecDefinition>(read, records, home)?;
-    scan::<CredentialGrantDefinition>(read, records, home)?;
-    scan::<CrewDefaultsDefinition>(read, records, home)?;
-    scan::<ImageLayerDefinition>(read, records, home)?;
-    scan::<WorkflowTemplateDefinition>(read, records, home)
+    // One read of each root the home's definitions name, whatever their number.
+    let roots = &mut provenance::Roots::default();
+    scan::<ForgeDefinition>(read, roots, records, home)?;
+    scan::<FleetDesignationDefinition>(read, roots, records, home)?;
+    scan::<CredentialSpecDefinition>(read, roots, records, home)?;
+    scan::<CredentialGrantDefinition>(read, roots, records, home)?;
+    scan::<CrewDefaultsDefinition>(read, roots, records, home)?;
+    scan::<ImageLayerDefinition>(read, roots, records, home)?;
+    scan::<WorkflowTemplateDefinition>(read, roots, records, home)
 }
 
 /// `kind`'s record `name` as several homes' resolve at `home`: its own, else the lexically first
@@ -370,6 +373,8 @@ impl EngineDefinitions {
                 // An unchanged record declared again for the same reason logs nothing; for a new
                 // reason, such as a manifest's next revision, it is written again under that change.
                 Some(current) if current.spec == value => {
+                    // Read apart from the record: another write between the two moves its version,
+                    // so the touch below is refused as a conflict and the loop reads again.
                     let last = self.log.last_change::<K>(name, &self.home).map_err(|error| error.to_string())?;
                     if last.is_some_and(|last| last.writer == change.change().writer && last.items == change.change().items) {
                         Ok(current.version)

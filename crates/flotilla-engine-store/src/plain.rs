@@ -86,7 +86,9 @@ impl PendingChange {
 
     /// A change that joins this home's newest change naming its first item, when that change has
     /// the same writer and items: one reason, such as a root's pass at one revision, is one change
-    /// however many writes carry it. A change with no items never joins.
+    /// however many writes carry it. A change with no items never joins. Only the newest change
+    /// naming the item is joined, so another writer's change naming it in between starts a new one;
+    /// a joined change keeps its first write's time, which is when the reason was first written.
     pub fn joining(change: NewChange) -> Self {
         Self { change, joins: true, opened: Mutex::new(None) }
     }

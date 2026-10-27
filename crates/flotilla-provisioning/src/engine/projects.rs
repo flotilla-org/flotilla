@@ -144,10 +144,14 @@ fn composed_version(project: u64, ops: Option<u64>, revision: u64) -> u64 {
 const JUDGEMENT_BITS: u32 = 24;
 
 /// Project `id`, with its origin as its last change says it.
-fn load_project(read: &mut Read<'_>, id: ResourceId) -> Result<Option<(String, u64, ProjectDefinition, DefinitionOrigin)>, StoreError> {
+fn load_project(
+    read: &mut Read<'_>,
+    roots: &mut provenance::Roots,
+    id: ResourceId,
+) -> Result<Option<(String, u64, ProjectDefinition, DefinitionOrigin)>, StoreError> {
     let Some(loaded) = read.load::<ProjectDefinition>(id)? else { return Ok(None) };
-    let change = provenance::last_change(read, id)?;
-    let origin = provenance::origin_of(read, KIND, &loaded.name, change.as_ref(), None)?;
+    let change = read.last_change(id)?;
+    let origin = provenance::origin_of(read, roots, KIND, &loaded.name, change.as_ref(), None)?;
     Ok(Some((loaded.name, loaded.version, loaded.value, origin)))
 }
 
@@ -156,8 +160,11 @@ fn reload(read: &mut Read<'_>, records: &mut Records, identity: &Identity) -> Re
     let id = read.resolve(identity.kind, &identity.name, &identity.home)?;
     let held = records.entry(key.clone()).or_default();
     if identity.kind == PROJECT {
-        held.project =
-            id.map(|id| load_project(read, id)).transpose()?.flatten().map(|(_, version, value, origin)| (version, value, origin));
+        held.project = id
+            .map(|id| load_project(read, &mut provenance::Roots::default(), id))
+            .transpose()?
+            .flatten()
+            .map(|(_, version, value, origin)| (version, value, origin));
     } else if identity.kind == OPS {
         held.ops = id.map(|id| read.load::<ProjectOpsRecord>(id)).transpose()?.flatten().map(|loaded| (loaded.version, loaded.value));
     }
@@ -169,11 +176,13 @@ fn reload(read: &mut Read<'_>, records: &mut Records, identity: &Identity) -> Re
 
 fn rescan(read: &mut Read<'_>, records: &mut Records, home: &str) -> Result<(), StoreError> {
     records.retain(|(_, owner), _| owner != home);
+    // One read of each root the home's Projects name, whatever their number.
+    let mut roots = provenance::Roots::default();
     let mut after = None;
     loop {
         let page = read.scan::<ProjectDefinition>(home, after, 64)?;
         for id in page.ids {
-            if let Some((name, version, value, origin)) = load_project(read, id)? {
+            if let Some((name, version, value, origin)) = load_project(read, &mut roots, id)? {
                 records.entry((name, home.to_owned())).or_default().project = Some((version, value, origin));
             }
         }
@@ -326,6 +335,8 @@ impl EngineProjects {
                     if origin.is_none() {
                         return Ok(());
                     }
+                    // Read apart from the record: another write between the two moves its version,
+                    // so the touch below is refused as a conflict and the loop reads again.
                     let last = self.log.last_change::<K>(name, &self.home).map_err(|error| error.to_string())?;
                     if last.is_some_and(|last| last.writer == change.change().writer && last.items == change.change().items) {
                         return Ok(());

@@ -18,6 +18,8 @@
 //! | admission snapshot | `admission` | none |
 //! | operator apply | `operator` | none |
 
+use std::collections::BTreeMap;
+
 use flotilla_protocol::RepositoryKey;
 use flotilla_resources::{
     definitions::{CharterOrigin, DefinitionOrigin},
@@ -48,11 +50,28 @@ fn item(kind: KindCode, name: &str, home: &str, revision: Option<&str>) -> Chang
     ChangeItem { record: Identity { kind, name: name.to_owned(), home: home.to_owned() }, revision: revision.map(str::to_owned) }
 }
 
+/// The prefix of an inline charter's source, as charter delegation writes it.
+const INLINE_CHARTER: &str = "inline charter ";
+
 /// The repository a charter source names, by its key: `{repo}@{branch}:{path}`, as charter
-/// delegation writes a repository pointer's. An inline charter's source names no repository.
+/// delegation writes a repository pointer's. A branch holds no `:` (git refuses one), so the path
+/// follows the last `:`, and the repository precedes the `@` before it. Only a remote URL names a
+/// key here: an ssh remote's needs its host resolved, which a store read cannot do. An inline
+/// charter's source names no repository; another source that names none is warned of, since its
+/// change then holds the root's revision alone.
 fn charter_repository(source: &str) -> Option<RepositoryKey> {
-    let (repo, _) = source.rsplit_once('@')?;
-    RepositorySpec::remote(repo).ok().map(|spec| spec.key())
+    if source.starts_with(INLINE_CHARTER) {
+        return None;
+    }
+    let repository = source
+        .rsplit_once(':')
+        .and_then(|(pointer, _)| pointer.rsplit_once('@'))
+        .and_then(|(repo, _)| RepositorySpec::remote(repo).ok())
+        .map(|spec| spec.key());
+    if repository.is_none() {
+        tracing::warn!(%source, "a charter source names no repository; its change holds the root's revision alone");
+    }
+    repository
 }
 
 /// The project a `namespace/project` scope names.
@@ -98,10 +117,32 @@ pub(crate) fn materialized_project(origin: &DefinitionOrigin) -> Option<String> 
     }
 }
 
+/// The roots a pass over records has read: each one's source and its documents' paths by kind and
+/// name, so a rescan reads each root once, not once per record it declares.
+#[derive(Default)]
+pub(crate) struct Roots(BTreeMap<Identity, Option<Root>>);
+
+/// A root's source, and the path of each document it declares, by kind and name.
+struct Root {
+    source: String,
+    paths: BTreeMap<(String, String), String>,
+}
+
+impl Roots {
+    fn get(&mut self, read: &mut Read<'_>, root: &Identity) -> Result<Option<&Root>, StoreError> {
+        if !self.0.contains_key(root) {
+            let held = load_root(read, root)?;
+            self.0.insert(root.clone(), held);
+        }
+        Ok(self.0.get(root).and_then(Option::as_ref))
+    }
+}
+
 /// The origin of record `name` of resource kind `kind`, rebuilt from its last change, with `project`
 /// its own `project` column (a workflow template's). A record no change explains is an operator's.
 pub(crate) fn origin_of(
     read: &mut Read<'_>,
+    roots: &mut Roots,
     kind: &str,
     name: &str,
     change: Option<&ChangeHeader>,
@@ -113,7 +154,10 @@ pub(crate) fn origin_of(
     Ok(match change.writer.as_str() {
         MANIFEST => {
             let Some(root) = named(ROOT) else { return Ok(DefinitionOrigin::Operator) };
-            let (source, path) = root_document(read, &root.record, kind, name)?;
+            let (source, path) = match roots.get(read, &root.record)? {
+                Some(held) => (Some(held.source.clone()), held.paths.get(&(kind.to_owned(), name.to_owned())).cloned()),
+                None => (None, None),
+            };
             let charter = named(PROJECT).map(|project| CharterOrigin {
                 source: None,
                 revision: named(REPOSITORY).map_or_else(|| revision(root), revision),
@@ -153,22 +197,19 @@ pub(crate) fn origin_of(
     })
 }
 
-/// The source of `root`, and the path of the document declaring `kind` `name` in it: the root's
-/// baselines list every document it declares. Either is absent while the root does not hold it.
-fn root_document(read: &mut Read<'_>, root: &Identity, kind: &str, name: &str) -> Result<(Option<String>, Option<String>), StoreError> {
-    let Some(id) = read.resolve(root.kind, &root.name, &root.home)? else { return Ok((None, None)) };
-    let Some(loaded) = read.load::<Resource<ManifestRoot>>(id)? else { return Ok((None, None)) };
+/// The source of `root`, and the path of each document it declares: the root's baselines list
+/// every one. None while this store does not hold the root.
+fn load_root(read: &mut Read<'_>, root: &Identity) -> Result<Option<Root>, StoreError> {
+    let Some(id) = read.resolve(root.kind, &root.name, &root.home)? else { return Ok(None) };
+    let Some(loaded) = read.load::<Resource<ManifestRoot>>(id)? else { return Ok(None) };
     let spec = loaded.value.spec();
-    let path = spec.baselines.keys().find_map(|document| {
-        let key: DocumentKey = serde_json::from_value(serde_json::Value::String(document.0.clone())).ok()?;
-        (key.kind == kind && key.name == name).then_some(key.path)
-    });
-    Ok((Some(spec.source.clone()), path))
-}
-
-/// The change of resource `id`'s newest entry.
-pub(crate) fn last_change(read: &mut Read<'_>, id: flotilla_schema_sqlite::ResourceId) -> Result<Option<ChangeHeader>, StoreError> {
-    read.last_change(id)
+    let paths = spec
+        .baselines
+        .keys()
+        .filter_map(|document| serde_json::from_value::<DocumentKey>(serde_json::Value::String(document.0.clone())).ok())
+        .map(|key| ((key.kind, key.name), key.path))
+        .collect();
+    Ok(Some(Root { source: spec.source.clone(), paths }))
 }
 
 #[cfg(test)]
@@ -179,9 +220,18 @@ mod tests {
     // repository's, and an inline charter names none.
     #[test]
     fn a_charter_names_its_repository_by_key() {
-        let key = charter_repository("https://example.test/app-ops@reviewed:charter").expect("a repository pointer");
-        assert_eq!(key, RepositorySpec::remote("https://example.test/app-ops").expect("spec").key());
+        let key = |repo: &str| RepositorySpec::remote(repo).expect("spec").key();
+        for (source, repo) in [
+            ("https://example.test/app-ops@reviewed:charter", "https://example.test/app-ops"),
+            ("https://example.test/app-ops@main:", "https://example.test/app-ops"),
+            ("https://example.test/app-ops@release/2026@q4:charter", "https://example.test/app-ops@release/2026"),
+        ] {
+            assert_eq!(charter_repository(source), Some(key(repo)), "{source}");
+        }
         assert_eq!(charter_repository("inline charter flotilla/p in ops.yaml"), None);
+        assert_eq!(charter_repository("not a pointer"), None);
+        // An ssh remote's key needs its host resolved, which a store read cannot do: no item.
+        assert_eq!(charter_repository("git@github.com:acme/app-ops.git@main:charter/ops"), None);
         assert_eq!(scoped_project("flotilla/p"), "p");
     }
 }

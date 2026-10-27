@@ -681,8 +681,10 @@ impl ResourceManifestReconciler {
                 && [crate::charter_delegation::CHARTER_REVISION, crate::charter_delegation::CHARTER_SCOPE].iter().all(|key| {
                     document["metadata"]["annotations"].get(*key).and_then(Value::as_str) == annotations.get(*key).map(String::as_str)
                 })
-                // Where a charter was read is no record's: the engine's change holds the charter's
-                // repository and revision, so its record carries no source to compare (#4024).
+                // Where a charter was read is held by no engine change (#4024): a record there has
+                // no charter source to compare. Its change holds the charter's revision, scope and,
+                // for a repository's charter, the repository; a charter moved to another source at
+                // the same revision and scope is not seen as a change through this stamp.
                 && annotations.get(crate::charter_delegation::CHARTER_SOURCE).is_none_or(|stored| {
                     document["metadata"]["annotations"].get(crate::charter_delegation::CHARTER_SOURCE).and_then(Value::as_str)
                         == Some(stored.as_str())
