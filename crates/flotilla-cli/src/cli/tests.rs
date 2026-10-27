@@ -534,7 +534,19 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
             viable_not_selected: Vec::new(),
             allocation: Some(FulfilmentAllocation {
                 chosen_kind: "macos-scarce".into(),
-                candidates: Vec::new(),
+                candidates: vec![flotilla_protocol::FulfilmentAllocationCandidate {
+                    kind: "host-direct-b1".into(),
+                    host: "b1".into(),
+                    cost_class: "owned_idle".into(),
+                    host_ready: true,
+                    sleeping_until: None,
+                    free_vessel_slots: Some(0),
+                    max_vessels: Some(2),
+                    single_tenant: true,
+                    reserved_for_platform: false,
+                    minimal: true,
+                    available: false,
+                }],
                 reservation_reason: Some("no unreserved capacity covers the needs".into()),
             }),
         }),
@@ -576,6 +588,11 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
     assert!(output.contains("Degraded checkout vessel-local/checkout-local: objects copied across filesystems"));
     assert!(output.contains("Fulfilment: macos-scarce on comte"), "{output}");
     assert!(output.contains("Reserved platform capacity used: no unreserved capacity covers the needs"), "{output}");
+    // #4002: each candidate shows its containment declaration, cap and free slots.
+    assert!(
+        output.contains("host-direct-b1 on b1: cost owned_idle, ready true, sleep until none, free slots 0 of 2, single tenant true,"),
+        "{output}"
+    );
     assert!(!output.contains("Escalation:"), "{output}");
 }
 

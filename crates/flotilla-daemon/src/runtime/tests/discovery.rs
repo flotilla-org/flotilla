@@ -158,6 +158,7 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
             display_name: "beaufort".to_string(),
             host_direct_pool: "cleat".to_string(),
             available_pools: vec!["cleat".to_string()],
+            max_vessels: Some(2),
             ..manual_profile(host_id, false)
         },
         environment_id: environment_id.clone(),
@@ -171,7 +172,7 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
         runner,
         host_environment: Default::default(),
         accounts: Default::default(),
-        max_vessels: Some(2),
+        single_tenant: false,
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
         vessel_agent: Err("the test's vessel agents run on the host runner".into()),
     };
@@ -425,7 +426,7 @@ async fn agentless_host_without_vessel_agents_is_refused_at_placement() {
         }),
         host_environment: Default::default(),
         accounts: Default::default(),
-        max_vessels: None,
+        single_tenant: false,
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
         vessel_agent: reach,
     };

@@ -56,6 +56,8 @@ pub struct DirectEnvironmentState {
     pub host_environment: HostEnvironment,
     /// An agentless SSH host's declared vessel cap (#3793).
     pub max_vessels: Option<u32>,
+    /// An agentless SSH host declared dedicated and single-tenant (#4002).
+    pub single_tenant: bool,
 }
 
 #[derive(Clone)]
@@ -117,6 +119,7 @@ impl EnvironmentManager {
                 ssh_destination: None,
                 host_environment: HostEnvironment::default(),
                 max_vessels: None,
+                single_tenant: false,
             }),
         );
 
@@ -164,6 +167,7 @@ impl EnvironmentManager {
                     ssh_destination: None,
                     host_environment: HostEnvironment::default(),
                     max_vessels: None,
+                    single_tenant: false,
                 }));
                 Ok(())
             }
@@ -252,11 +256,19 @@ impl EnvironmentManager {
         }
     }
 
-    pub fn set_direct_environment_max_vessels(&self, env_id: &EnvironmentId, max_vessels: Option<u32>) -> Result<(), String> {
+    /// Record what an agentless SSH host declares in `hosts.toml`: its vessel
+    /// cap (#3793) and whether it is single-tenant (#4002).
+    pub fn set_direct_environment_declaration(
+        &self,
+        env_id: &EnvironmentId,
+        max_vessels: Option<u32>,
+        single_tenant: bool,
+    ) -> Result<(), String> {
         let mut managed = self.managed.lock().expect("environment manager lock poisoned");
         match managed.get_mut(env_id) {
             Some(ManagedEnvironmentKind::Direct(state)) => {
                 state.max_vessels = max_vessels;
+                state.single_tenant = single_tenant;
                 Ok(())
             }
             _ => Err(format!("direct environment not found: {env_id}")),

@@ -370,9 +370,13 @@ impl Reconciler for ConvoyReconciler {
                                 .find(|host| host.object.metadata.name == id.as_str())
                                 .map(|host| host.object.clone())
                         });
+                        // A daemon host's cap bounds only the Docker
+                        // placements admission recorded as capped (#4002).
+                        // The live cap's value wins: lowering it holds admitted
+                        // convoys, removing it releases them.
                         let vessel_cap = host.as_ref().and_then(|host| match host.spec.connection {
                             HostConnection::AgentlessSsh { .. } => host.spec.max_vessels,
-                            HostConnection::Daemon => None,
+                            HostConnection::Daemon => selected.max_vessels.and(host.spec.max_vessels),
                         });
                         let status = host.and_then(|host| host.status).map(|mut status| {
                             status.apply_heartbeat_readiness(self.clock.now());
@@ -384,8 +388,8 @@ impl Reconciler for ConvoyReconciler {
                             .as_ref()
                             .and_then(|status| status.fulfilment_facts.get(&selected.kind))
                             .and_then(|facts| facts.free_vessel_slots);
-                        // A capped agentless host admits convoys in admission
-                        // order while its live vessels leave room (#3793).
+                        // A capped host admits convoys in admission order
+                        // while its live vessels leave room (#3793, #4002).
                         let full = match (vessel_cap, canonical.as_ref()) {
                             (Some(cap), Some(host)) => match self.vessel_occupancy(host.as_str()).await {
                                 Ok(Some(occupancy)) => !occupancy.admits(&obj.metadata.name, cap),

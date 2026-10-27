@@ -90,6 +90,12 @@ pub struct HostSpec {
     /// work. Previous-generation Host records omit it (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_vessels: Option<u32>,
+    /// An agentless SSH host declared dedicated and single-tenant (#4002):
+    /// the whole VM is the sandbox boundary, so least-privilege placement
+    /// ranks its host reach as contained. Previous-generation Host records
+    /// omit it (ADR 0047).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub single_tenant: bool,
 }
 
 const fn default_expected_concurrent_rust_crews() -> u32 {
@@ -104,11 +110,23 @@ impl Default for HostSpec {
             expected_concurrent_rust_crews: 4,
             image_build_capacity: None,
             max_vessels: None,
+            single_tenant: false,
         }
     }
 }
 
 impl HostSpec {
+    /// The cap that bounds a placement of `realisation` here: every placement
+    /// on an agentless SSH host (#3793), and Docker per-vessel placements on
+    /// a daemon's host (#4002). `None` is unbounded, or pin-only on an
+    /// agentless host.
+    pub fn vessel_cap(&self, realisation: &crate::FulfilmentRealisation) -> Option<u32> {
+        match (&self.connection, realisation) {
+            (HostConnection::AgentlessSsh { .. }, _) | (_, crate::FulfilmentRealisation::DockerPerVessel { .. }) => self.max_vessels,
+            _ => None,
+        }
+    }
+
     pub fn rust_build_jobs(&self, host_cores: usize) -> usize {
         host_cores.max(1)
     }
@@ -383,6 +401,33 @@ impl FulfilmentFacts {
                 .iter()
                 .zip(right)
                 .all(|((left_kind, left), (right_kind, right))| left_kind == right_kind && left.same_observation(right))
+    }
+}
+
+#[cfg(test)]
+mod vessel_cap_tests {
+    use super::{HostConnection, HostSpec};
+    use crate::FulfilmentRealisation;
+
+    // #3793, #4002: an agentless host's cap bounds every placement there; a
+    // daemon host's cap bounds only its Docker per-vessel placements.
+    #[test]
+    fn vessel_cap_by_connection_and_realisation() {
+        let agentless = HostConnection::AgentlessSsh { owning_daemon: "owner".into(), destination: "crew@b1".into() };
+        let docker = FulfilmentRealisation::DockerPerVessel { image: None };
+        let direct = FulfilmentRealisation::HostDirect;
+        let cloud = FulfilmentRealisation::CloudSandboxPerVessel { image: "sandbox".into() };
+        for (connection, realisation, capped) in [
+            (agentless.clone(), &direct, true),
+            (agentless, &docker, true),
+            (HostConnection::Daemon, &docker, true),
+            (HostConnection::Daemon, &direct, false),
+            (HostConnection::Daemon, &cloud, false),
+        ] {
+            let host = HostSpec { connection: connection.clone(), max_vessels: Some(3), ..HostSpec::default() };
+            assert_eq!(host.vessel_cap(realisation), capped.then_some(3), "{connection:?} {realisation:?}");
+            assert_eq!(HostSpec { max_vessels: None, ..host }.vessel_cap(realisation), None);
+        }
     }
 }
 

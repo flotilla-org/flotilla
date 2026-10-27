@@ -177,6 +177,7 @@ fn host(runner: Arc<dyn CommandRunner>) -> Host {
             available_pools: vec!["cleat".into()],
             available_agent_adapters: Default::default(),
             docker_available: false,
+            max_vessels: None,
         },
         environment_id: EnvironmentId::new(ENVIRONMENT),
         destination: "crew@b1".into(),
@@ -189,7 +190,7 @@ fn host(runner: Arc<dyn CommandRunner>) -> Host {
         accounts: flotilla_discovery::FactoryRegistry::default_all().account_variables(),
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::<String, FulfilmentFacts>::new())),
         vessel_agent: Err("vessel agents are reached directly in this test".into()),
-        max_vessels: None,
+        single_tenant: false,
     };
     Host { _runtime: runtime, home, state, profile }
 }

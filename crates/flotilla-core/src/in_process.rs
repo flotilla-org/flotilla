@@ -407,6 +407,14 @@ async fn load_env_vars(runner: &dyn CommandRunner, cwd: &Path) -> HashMap<String
         .collect()
 }
 
+/// What an agentless host's `hosts.toml` entry declares about its capacity
+/// (#3793) and tenancy (#4002); a static SSH environment declares neither.
+#[derive(Clone, Copy, Debug, Default)]
+struct AgentlessHostDeclaration {
+    max_vessels: Option<u32>,
+    single_tenant: bool,
+}
+
 const STATIC_SSH_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn register_static_ssh_direct_environment(
@@ -416,7 +424,7 @@ async fn register_static_ssh_direct_environment(
     environment: &StaticEnvironmentConfig,
     host_direct: bool,
     multiplex: bool,
-    max_vessels: Option<u32>,
+    declaration: AgentlessHostDeclaration,
 ) -> Result<(), String> {
     let fallback_env_id = static_ssh_environment_id(config_key);
     let destination = flotilla_config::ssh_destination(&environment.hostname, environment.user.as_deref());
@@ -454,7 +462,7 @@ async fn register_static_ssh_direct_environment(
     if host_direct {
         environment_manager.set_direct_environment_ssh_destination(&env_id, destination)?;
     }
-    environment_manager.set_direct_environment_max_vessels(&env_id, max_vessels)?;
+    environment_manager.set_direct_environment_declaration(&env_id, declaration.max_vessels, declaration.single_tenant)?;
     Ok(())
 }
 
@@ -486,8 +494,16 @@ async fn register_static_ssh_direct_environments(
     };
 
     for (config_key, environment) in &daemon_config.environments {
-        if let Err(err) =
-            register_static_ssh_direct_environment(environment_manager, discovery, config_key, environment, false, true, None).await
+        if let Err(err) = register_static_ssh_direct_environment(
+            environment_manager,
+            discovery,
+            config_key,
+            environment,
+            false,
+            true,
+            AgentlessHostDeclaration::default(),
+        )
+        .await
         {
             warn!(
                 environment = %config_key,
@@ -514,7 +530,7 @@ async fn register_static_ssh_direct_environments(
                     &environment,
                     true,
                     hosts.resolved_ssh_multiplex(label),
-                    remote.max_vessels,
+                    AgentlessHostDeclaration { max_vessels: remote.max_vessels, single_tenant: remote.single_tenant },
                 )
                 .await
                 {

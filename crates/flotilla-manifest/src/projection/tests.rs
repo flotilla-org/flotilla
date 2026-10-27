@@ -2683,6 +2683,7 @@ fn placement_catalog_preserves_raw_facts(tc: hegel::TestCase) {
                     sleeping_until: None,
                     free_vessel_slots: Some(1),
                     max_vessels: None,
+                    single_tenant: false,
                     reserved_for_platform: false,
                     minimal,
                     available: true,

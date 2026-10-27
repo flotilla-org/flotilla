@@ -60,10 +60,10 @@ use tracing::warn;
 use crate::project_ops;
 use crate::regard_lifecycle::{RegardLifecycle, SurfaceGestureOutcome};
 use crate::support::{
-    agentless_vessel_cap, authoritative_placement_host, check_placement_capacity, ensure_prepared_placement_snapshot,
-    ensure_prepared_workflow_snapshot, home_copy_wins_by_name, host_generation, host_occupancies, host_occupancy, is_agentless_ssh_host,
-    placement_actuator_host_ref, placement_host_not_ready_reason, placement_host_ref, placement_target_host, policy_targets_agentless_ssh,
-    prepared_snapshot_name, resolve_placement_provider, unready_placement_refusal, AGENTLESS_SSH_PIN_ONLY,
+    authoritative_placement_host, check_placement_capacity, ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot,
+    home_copy_wins_by_name, host_generation, host_occupancies, host_occupancy, is_agentless_ssh_host, placement_actuator_host_ref,
+    placement_host_not_ready_reason, placement_host_ref, placement_target_host, policy_targets_agentless_ssh, prepared_snapshot_name,
+    resolve_placement_provider, unready_placement_refusal, AGENTLESS_SSH_PIN_ONLY,
 };
 
 /// Routing uses replicated observations as hints; only admission may refuse on
@@ -2193,7 +2193,7 @@ impl AdmissionReadContext<'_> {
         let capped = hosts
             .items
             .iter()
-            .filter(|host| agentless_vessel_cap(&host.object).is_some())
+            .filter(|host| host.object.spec.max_vessels.is_some())
             .map(|host| host.object.metadata.name.clone())
             .collect();
         let occupancy = host_occupancies(backend, namespace, &capped).await?;
@@ -2774,7 +2774,8 @@ impl AdmissionReadContext<'_> {
             if let Some(canonical_kind_host) = &canonical_kind_host {
                 kind.spec.host_ref = canonical_kind_host.to_string();
             }
-            let vessel_cap = host.and_then(agentless_vessel_cap);
+            let vessel_cap = host.and_then(|host| host.spec.vessel_cap(&kind.spec.realisation));
+            let single_tenant = host.is_some_and(|host| host.spec.single_tenant);
             if host.is_some_and(is_agentless_ssh_host) && vessel_cap.is_none() && pin != Some(kind.metadata.name.as_str()) {
                 rejected.push(refusal(AGENTLESS_SSH_PIN_ONLY.to_string()));
                 continue;
@@ -2950,7 +2951,16 @@ impl AdmissionReadContext<'_> {
                         Arc::clone(self.runtime.lifecycle_reads),
                     )
                     .await?;
-                    candidates.push(KindCandidate { kind, placement, free_slots, vessel_cap, host_ready, sleeping_until, image_cost });
+                    candidates.push(KindCandidate {
+                        kind,
+                        placement,
+                        free_slots,
+                        vessel_cap,
+                        single_tenant,
+                        host_ready,
+                        sleeping_until,
+                        image_cost,
+                    });
                 }
                 Err(error) => rejected.push(refusal(error)),
             }
@@ -2975,15 +2985,16 @@ impl AdmissionReadContext<'_> {
         if pin.is_none() && has_unreserved {
             (candidates, reserved) = candidates.into_iter().partition(|candidate| !placement_tiebreak.reserved(candidate));
         }
+        // A single-tenant host's reach ranks as contained (#4002).
+        let ranked =
+            |candidate: &KindCandidate| flotilla_resources::least_privilege_grants(&candidate.kind.spec.grants, candidate.single_tenant);
         let minimal = candidates
             .iter()
             .filter(|candidate| {
+                let grants = ranked(candidate);
                 !candidates.iter().any(|other| {
-                    other.kind.metadata.name != candidate.kind.metadata.name
-                        && flotilla_resources::effective_grants(&other.kind.spec.grants)
-                            .is_subset(&flotilla_resources::effective_grants(&candidate.kind.spec.grants))
-                        && flotilla_resources::effective_grants(&other.kind.spec.grants)
-                            != flotilla_resources::effective_grants(&candidate.kind.spec.grants)
+                    let other_grants = ranked(other);
+                    other.kind.metadata.name != candidate.kind.metadata.name && other_grants.is_subset(&grants) && other_grants != grants
                 })
             })
             .map(|candidate| candidate.kind.metadata.name.clone())
@@ -3014,6 +3025,7 @@ impl AdmissionReadContext<'_> {
                     sleeping_until: candidate.sleeping_until,
                     free_vessel_slots: candidate.free_slots,
                     max_vessels: candidate.vessel_cap,
+                    single_tenant: candidate.single_tenant,
                     reserved_for_platform: placement_tiebreak.reserved(candidate),
                     minimal: minimal.contains(&candidate.kind.metadata.name),
                     available: placement_tiebreak.available(candidate),
@@ -4254,8 +4266,10 @@ pub struct KindCandidate {
     pub kind: ResourceObject<FulfilmentKind>,
     pub placement: PlacementResolution,
     pub free_slots: Option<u32>,
-    /// An agentless SSH host's declared vessel cap (#3793).
+    /// The host's declared vessel cap for this kind's realisation (#3793, #4002).
     pub vessel_cap: Option<u32>,
+    /// The host is declared dedicated and single-tenant (#4002).
+    pub single_tenant: bool,
     pub host_ready: bool,
     pub sleeping_until: Option<DateTime<Utc>>,
     pub image_cost: flotilla_resources::ImageAcquisitionCost,
@@ -4317,7 +4331,7 @@ impl PlacementCandidateOrder for PlacementTieBreak<'_> {
                 candidate.image_cost,
                 candidate.kind.spec.cost_class,
                 Reverse(policy.spec.priority),
-                // Spread over capped agentless hosts with room: most free
+                // Spread over capped hosts with room: most free
                 // slots first. Other hosts keep their prior order.
                 Reverse(candidate.vessel_cap.and(candidate.free_slots).unwrap_or(u32::MAX)),
                 candidate.kind.metadata.name.clone(),
@@ -6127,6 +6141,7 @@ mod tests {
                 },
                 free_slots: slots,
                 vessel_cap: None,
+                single_tenant: false,
                 host_ready: ready,
                 sleeping_until,
             }

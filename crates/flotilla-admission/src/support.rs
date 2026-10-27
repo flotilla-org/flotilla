@@ -296,11 +296,6 @@ pub fn is_agentless_ssh_host(host: &ResourceObject<ResourceHost>) -> bool {
     matches!(host.spec.connection, flotilla_resources::HostConnection::AgentlessSsh { .. })
 }
 
-/// The vessel cap an agentless SSH host declares; other hosts have none.
-pub fn agentless_vessel_cap(host: &ResourceObject<ResourceHost>) -> Option<u32> {
-    is_agentless_ssh_host(host).then_some(host.spec.max_vessels).flatten()
-}
-
 /// What each of `hosts` holds against its cap, read from every convoy and
 /// vessel the store sees, listed once for all of them. The owning daemon is
 /// the only placer on its agentless hosts, so its store holds every convoy

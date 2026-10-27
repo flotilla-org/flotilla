@@ -156,6 +156,7 @@ pub(super) fn manual_profile(host_id: &str, docker_available: bool) -> LocalProv
         available_pools: vec!["passthrough".to_string()],
         available_agent_adapters: BTreeSet::new(),
         docker_available,
+        max_vessels: None,
     }
 }
 

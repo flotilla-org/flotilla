@@ -3149,8 +3149,15 @@ async fn allocation_separates_linux_coder_from_gui_verifier() {
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts.get("gui-host").await.expect("host");
     let mut status = host.status.expect("host status");
-    status.fulfilment_facts.insert("host-direct-gui".to_string(), FulfilmentFacts { gui_session_logged_in: true, ..Default::default() });
+    let facts = FulfilmentFacts { gui_session_logged_in: true, ..Default::default() };
+    status.fulfilment_facts.insert("host-direct-gui".to_string(), facts.clone());
     hosts.update_status(&host.metadata.name, &host.metadata.resource_version, &status).await.expect("GUI facts");
+    // The host's probe grants the GUI session it observes (#4002).
+    let kinds = backend.using::<FulfilmentKind>("flotilla");
+    let kind = kinds.get("host-direct-gui").await.expect("GUI kind");
+    let mut spec = kind.spec.clone();
+    assert!(spec.observe_grants(&facts));
+    kinds.update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &spec).await.expect("observed GUI grant");
     let crew = |role: &str, need: &str| {
         flotilla_resources::CrewSpec::builder()
             .role(role.to_string())

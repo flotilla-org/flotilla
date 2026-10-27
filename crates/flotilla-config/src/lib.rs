@@ -216,6 +216,11 @@ pub struct RemoteHostConfig {
     /// host takes unpinned convoys within its cap; without a cap it takes
     /// only convoys that pin its placement.
     pub max_vessels: Option<u32>,
+    /// The agentless host is a dedicated, single-tenant machine: nothing else
+    /// lives there and its user exists only for crews, so the whole VM is the
+    /// sandbox boundary (#4002). Its host-direct kind then ranks as contained
+    /// in least-privilege placement. Absent means `false`.
+    pub single_tenant: bool,
     /// How the owning daemon reaches the vessel agents it runs on an agentless
     /// host (#3792). Absent, the host takes no vessels.
     pub vessel_agent: Option<VesselAgentReachConfig>,
@@ -305,6 +310,8 @@ struct RawRemoteHostConfig {
     #[serde(default)]
     max_vessels: Option<u32>,
     #[serde(default)]
+    single_tenant: bool,
+    #[serde(default)]
     vessel_agent: Option<VesselAgentReachConfig>,
 }
 
@@ -331,6 +338,7 @@ impl<'de> Deserialize<'de> for HostsConfig {
                         agentless_ssh: host.agentless_ssh,
                         supplies: host.supplies,
                         max_vessels: host.max_vessels,
+                        single_tenant: host.single_tenant,
                         vessel_agent: host.vessel_agent,
                     },
                 )
@@ -400,6 +408,11 @@ pub struct DaemonConfig {
     /// The optional loopback HTTP listener (ADR 0065); absent means none.
     #[serde(default)]
     pub http: HttpListenerConfig,
+    /// How many Docker per-vessel vessels this daemon's host holds at once,
+    /// the field an agentless host declares in `hosts.toml` (#4002). Absent
+    /// means unbounded, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_vessels: Option<u32>,
 }
 
 /// `[tracing]` enables OTLP/HTTP protobuf span export.
@@ -472,6 +485,7 @@ impl Default for DaemonConfig {
             dummy_fleet: None,
             primitives: None,
             http: HttpListenerConfig::default(),
+            max_vessels: None,
         }
     }
 }

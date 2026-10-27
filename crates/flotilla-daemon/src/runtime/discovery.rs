@@ -26,11 +26,11 @@ use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
 use flotilla_resources::{
     host_direct_environment_name, ConditionValue, FulfilmentFacts, FulfilmentKind, FulfilmentRealisation, Host, HostCondition,
-    HostConnection, HostSpec, HostStatus, InputMeta, ModelProbeState, Platform, ResourceError, AGENTLESS_CAPABILITY,
+    HostConnection, HostSpec, HostStatus, InputMeta, ModelProbeState, Platform, ResourceError, ResourceObject, AGENTLESS_CAPABILITY,
     AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, DOCKER_POLICY_NAME_PREFIX, HELD_CREDENTIALS_CAPABILITY,
     OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, TRANSPORT_CAPABILITY,
 };
-use flotilla_store::ResourceBackend;
+use flotilla_store::{ResourceBackend, TypedResolver};
 use serde_json::json;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -57,6 +57,10 @@ pub(super) struct LocalProvisioningProfile {
     pub(super) available_pools: Vec<String>,
     pub(super) available_agent_adapters: BTreeSet<String>,
     pub(super) docker_available: bool,
+    /// The vessels this host declares it can hold: an agentless host's from
+    /// `hosts.toml` (#3793), the daemon's own host's Docker cap from
+    /// `daemon.toml` (#4002).
+    pub(super) max_vessels: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -70,8 +74,8 @@ pub(super) struct AgentlessSshProfile {
     pub(super) host_environment: HostEnvironment,
     /// Where the registered families keep account state.
     pub(super) accounts: AccountVariables,
-    /// The vessels this host declares it can hold (#3793).
-    pub(super) max_vessels: Option<u32>,
+    /// The host is declared dedicated and single-tenant (#4002).
+    pub(super) single_tenant: bool,
     pub(super) fulfilment_facts: Arc<RwLock<BTreeMap<String, FulfilmentFacts>>>,
     /// How its vessel agents are reached (#3792), or why they cannot be.
     pub(super) vessel_agent: Result<SshAgentReach, String>,
@@ -146,6 +150,7 @@ pub(super) async fn discover_agentless_ssh_profile(
         available_pools,
         available_agent_adapters: registry.agent_adapters.ids().map(ToString::to_string).collect(),
         docker_available: false,
+        max_vessels: direct.max_vessels,
     };
     daemon.set_direct_environment_registry(&environment_id, Arc::clone(&registry))?;
     let destination = direct.ssh_destination.ok_or_else(|| format!("SSH host {} has no destination", provisioning.host_id))?;
@@ -159,7 +164,7 @@ pub(super) async fn discover_agentless_ssh_profile(
         runner: direct.runner,
         host_environment: direct.host_environment,
         accounts: daemon.discovery_runtime().factories.account_variables(),
-        max_vessels: direct.max_vessels,
+        single_tenant: direct.single_tenant,
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
         vessel_agent,
     })
@@ -219,7 +224,8 @@ pub(super) async fn register_agentless_ssh_resources(
     let mut spec = HostSpec {
         display_name: provisioning.display_name.clone(),
         connection: HostConnection::AgentlessSsh { owning_daemon: owner_host_id.to_string(), destination: profile.destination.clone() },
-        max_vessels: profile.max_vessels,
+        max_vessels: provisioning.max_vessels,
+        single_tenant: profile.single_tenant,
         ..HostSpec::default()
     };
     match hosts.get(&provisioning.host_id).await {
@@ -347,7 +353,7 @@ pub(super) async fn apply_agentless_ssh_observation(
     }
     // The owning daemon is the only placer here, so it alone counts the
     // vessels held against the host's cap (#3793).
-    if let Some(cap) = ssh.max_vessels {
+    if let Some(cap) = profile.max_vessels {
         let occupancy = flotilla_admission::support::host_occupancy(&daemon.resource_backend(), namespace, &profile.host_id).await?;
         let probed = ssh.fulfilment_facts.read().await;
         for (kind, facts) in fulfilment_facts.iter_mut() {
@@ -513,6 +519,8 @@ pub(super) async fn build_local_profile(
         available_pools,
         available_agent_adapters,
         docker_available,
+        // The composition root sets the daemon's own cap from `daemon.toml`.
+        max_vessels: None,
     })
 }
 
@@ -580,6 +588,18 @@ pub(super) async fn observe_fulfilment_facts(
         }
     }
     let baselines = backend.clone().definitions::<flotilla_resources::CrewImageBaseline>(namespace);
+    // The kinds listed above are this store's own records, never replicas, so
+    // writing their observed grants stays with the daemon that authors them.
+    let kind_store = backend.clone().using::<FulfilmentKind>(namespace);
+    // A capped kind's free slots are counted from the vessels placed on the
+    // host, as admission counts them (#4002). An agentless host's are counted
+    // when its observation is published (#3793).
+    let host_spec =
+        hosts.items.iter().find(|host| host.metadata.name == host_ref).map(|host| &host.spec).filter(|host| host.connection.is_daemon());
+    let occupancy = match host_spec.and_then(|host| host.max_vessels) {
+        Some(_) => Some(flotilla_admission::support::host_occupancy(backend, namespace, host_ref).await?),
+        None => None,
+    };
     let mut facts = BTreeMap::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     // Rotate the starting kind each pass: a persistently slow kind must not always take
@@ -600,6 +620,12 @@ pub(super) async fn observe_fulfilment_facts(
             provider.is_some_and(|provider| provider.capabilities().per_vessel),
             provider.is_none_or(|provider| provider.receives_host_tools()),
         );
+        // A missing terminal pool keeps the kind full.
+        let free_vessel_slots = match (pool_available, host_spec.and_then(|host| host.vessel_cap(&kind.spec.realisation)), &occupancy) {
+            (false, _, _) => Some(0),
+            (true, Some(cap), Some(occupancy)) => Some(occupancy.free_slots(cap)),
+            _ => None,
+        };
         let image = match &kind.spec.realisation {
             FulfilmentRealisation::DockerPerVessel { image: Some(image) } => match image.resolve(&baselines).await {
                 Ok(image) => Some(image),
@@ -612,10 +638,7 @@ pub(super) async fn observe_fulfilment_facts(
             // vessel's layers; resolution, not a probe, covers its image needs
             // (ADR 0062). Publish its capacity facts only.
             FulfilmentRealisation::DockerPerVessel { image: None } => {
-                facts.insert(
-                    kind.metadata.name,
-                    FulfilmentFacts { observed_at: Utc::now(), free_vessel_slots: (!pool_available).then_some(0), ..Default::default() },
-                );
+                facts.insert(kind.metadata.name, FulfilmentFacts { observed_at: Utc::now(), free_vessel_slots, ..Default::default() });
                 continue;
             }
             FulfilmentRealisation::HostDirect => None,
@@ -625,23 +648,20 @@ pub(super) async fn observe_fulfilment_facts(
             debug!(kind = %kind.metadata.name, ?provider_kind, "cannot observe fulfilment facts without an unambiguous environment provider");
             // Absence or ambiguity cannot attest a runtime endpoint. Replace
             // stale affirmative evidence with a fresh unknown observation.
-            facts.insert(
-                kind.metadata.name,
-                FulfilmentFacts {
-                    image: image.map(Into::into),
-                    observed_at: Utc::now(),
-                    free_vessel_slots: (!pool_available).then_some(0),
-                    ..Default::default()
-                },
-            );
+            // Unknown is not an observation, so the kind's grants stay as
+            // they are.
+            let unknown =
+                FulfilmentFacts { image: image.map(Into::into), observed_at: Utc::now(), free_vessel_slots, ..Default::default() };
+            facts.insert(kind.metadata.name, unknown);
             continue;
         };
-        let name = kind.metadata.name;
+        let name = kind.metadata.name.clone();
+        // Free slots are set afresh below, so a recent probe stays reusable
+        // while vessels come and go.
         let current = previous
             .get(&name)
             .filter(|prior| {
                 prior.image.as_ref().map(|image| &image.image_ref) == image.as_ref()
-                    && prior.free_vessel_slots == (!pool_available).then_some(0)
                     && Utc::now().signed_duration_since(prior.observed_at).to_std().is_ok_and(|age| age < Duration::from_secs(300))
             })
             .cloned();
@@ -676,10 +696,24 @@ pub(super) async fn observe_fulfilment_facts(
             for harness in observed.harnesses.values_mut() {
                 harness.models.clear();
             }
+            observed.free_vessel_slots = free_vessel_slots;
+            observe_grants(&kind_store, &kind, &observed).await;
             facts.insert(name, observed);
         }
     }
     Ok(facts)
+}
+
+/// Grants come from observation (#4002): a host-direct kind holds a GUI
+/// session grant exactly while its host's facts report one. A failed write
+/// is retried on the next pass.
+async fn observe_grants(kinds: &TypedResolver<FulfilmentKind>, kind: &ResourceObject<FulfilmentKind>, facts: &FulfilmentFacts) {
+    let mut spec = kind.spec.clone();
+    if spec.observe_grants(facts) {
+        if let Err(error) = kinds.update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &spec).await {
+            warn!(kind = %kind.metadata.name, %error, "failed to bring fulfilment grants in line with observation");
+        }
+    }
 }
 
 pub(super) const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";

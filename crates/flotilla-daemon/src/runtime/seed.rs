@@ -25,7 +25,7 @@ pub(super) async fn register_startup_resources(
     profile: &LocalProvisioningProfile,
 ) -> Result<(), String> {
     let backend = daemon.resource_backend();
-    ensure_host_exists(&backend, namespace, &profile.host_id, &profile.display_name)
+    ensure_host_exists(&backend, namespace, &profile.host_id, &profile.display_name, profile.max_vessels)
         .await
         .map_err(|error| format!("ensure_host_exists: {error}"))?;
     ensure_host_direct_environment_exists(&backend, namespace, profile)
@@ -41,10 +41,11 @@ pub(super) async fn ensure_host_exists(
     namespace: &str,
     host_name: &str,
     display_name: &str,
+    max_vessels: Option<u32>,
 ) -> Result<(), String> {
     let hosts = backend.clone().using::<Host>(namespace);
     match hosts.get(host_name).await {
-        Ok(existing) if existing.spec.display_name == display_name => return Ok(()),
+        Ok(existing) if existing.spec.display_name == display_name && existing.spec.max_vessels == max_vessels => return Ok(()),
         Ok(existing) => {
             return hosts
                 .update(
@@ -55,10 +56,13 @@ pub(super) async fn ensure_host_exists(
                         connection: Default::default(),
                         expected_concurrent_rust_crews: existing.spec.expected_concurrent_rust_crews,
                         image_build_capacity: existing.spec.image_build_capacity.clone(),
-                        // This path seeds the local daemon Host only. Agentless
-                        // hosts and their cap are written by
+                        // This path seeds the local daemon Host only, whose cap
+                        // bounds its Docker placements and which is never a
+                        // single-tenant agentless box (#4002). Agentless hosts,
+                        // their cap and tenancy are written by
                         // `register_agentless_ssh_resources`.
-                        max_vessels: None,
+                        max_vessels,
+                        single_tenant: false,
                     },
                 )
                 .await
@@ -71,7 +75,7 @@ pub(super) async fn ensure_host_exists(
     hosts
         .create(
             &empty_meta(host_name),
-            &HostSpec { display_name: display_name.to_string(), connection: Default::default(), ..HostSpec::default() },
+            &HostSpec { display_name: display_name.to_string(), connection: Default::default(), max_vessels, ..HostSpec::default() },
         )
         .await
         .map(|_| ())

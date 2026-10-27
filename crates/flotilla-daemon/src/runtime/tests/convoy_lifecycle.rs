@@ -500,7 +500,7 @@ async fn daemon_restart_publishes_and_logs_agent_adapter_regression() {
     let host_id = daemon.local_host_id().expect("local host id").to_string();
     let mut first_profile = manual_profile(&host_id, false);
     first_profile.available_agent_adapters = BTreeSet::from(["claude-code".to_string(), "codex".to_string()]);
-    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi").await.expect("host registration");
+    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi", None).await.expect("host registration");
     apply_host_heartbeat_with_credentials(
         &daemon,
         NAMESPACE,

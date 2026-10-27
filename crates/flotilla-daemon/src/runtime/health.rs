@@ -463,7 +463,7 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
     runtime_health: &RuntimeHealth,
 ) -> Result<(), String> {
     daemon.set_admission_free_space_path(PathBuf::from(&profile.repo_default_dir));
-    ensure_host_exists(&daemon.resource_backend(), namespace, &profile.host_id, &profile.display_name).await?;
+    ensure_host_exists(&daemon.resource_backend(), namespace, &profile.host_id, &profile.display_name, profile.max_vessels).await?;
     let backend = daemon.resource_backend();
     let hosts = backend.using::<Host>(namespace);
     let host = hosts.get(&profile.host_id).await.map_err(|err| err.to_string())?;
