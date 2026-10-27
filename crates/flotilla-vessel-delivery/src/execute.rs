@@ -94,6 +94,9 @@ pub async fn deliver(
     if let Some(need) = needs.iter().find(|need| !recordable(need.name.as_str()) || !recordable(need.digest.as_str())) {
         return Err(DeliveryError::Unrecordable(need.name.clone()));
     }
+    if let Some(need) = needs.iter().find(|need| matches!(need.item, Item::Tree { .. }) && !trees.contains_key(&need.name)) {
+        return Err(DeliveryError::NoDelivery(need.name.clone()));
+    }
     let base = agent.writable_base().await.map_err(DeliveryError::Agent)?;
     let homes = needs
         .iter()
@@ -138,7 +141,7 @@ pub async fn deliver(
         match &need.item {
             Item::Home { .. } => agent.create_dir(&homes[&home], HOME_MODE).await.map_err(failed)?,
             Item::Tree { path, .. } => {
-                let tree = trees.get(&need.name).ok_or_else(|| DeliveryError::NoDelivery(need.name.clone()))?;
+                let tree = &trees[&need.name];
                 // Forget what landed before replacing it, so a replacement that fails
                 // partway is never taken for the content the record named.
                 if written.get(&home).is_some_and(|record| record.contains_key(&need.name)) {

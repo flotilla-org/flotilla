@@ -184,6 +184,7 @@ async fn undeliverable_needs_are_refused() {
         .await
         .expect_err("notes has no delivery");
     assert_eq!(error, DeliveryError::NoDelivery(NeedName::new("notes")));
+    assert_eq!(std::fs::read_dir(vessel.base.path()).expect("base").count(), 0, "nothing landed before the refusal");
     let mut unrecordable = needs("s1", "n1");
     unrecordable[1].digest = ContentDigest::new("two\tfields");
     let error = deliver(&unrecordable, &trees, &ProviderMechanisms::default(), &CostTable::default(), &vessel).await.expect_err("tab");
