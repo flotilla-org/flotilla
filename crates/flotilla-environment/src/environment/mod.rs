@@ -282,7 +282,8 @@ pub trait VesselAgent: Send + Sync {
     }
 
     /// Create `path` and its parents, leaving `path` with exactly `mode`. Existing
-    /// contents are kept.
+    /// contents are kept. Parents it creates are owner-only; a `path` that is a
+    /// symbolic link is refused rather than followed.
     async fn ensure_directory(&self, path: &Path, mode: u32) -> Result<(), String> {
         if !path.is_absolute() || mode > 0o777 {
             return Err(format!("directory {} must be absolute with permission bits only", path.display()));
@@ -292,7 +293,7 @@ pub trait VesselAgent: Send + Sync {
                 "sh",
                 &[
                     "-c",
-                    "umask 077 && mkdir -p -- \"$1\" && chmod \"$2\" \"$1\"",
+                    "if [ -L \"$1\" ]; then echo \"$1 is a symbolic link\" >&2; exit 1; fi; umask 077 && mkdir -p -- \"$1\" && chmod \"$2\" \"$1\"",
                     "flotilla-ensure-directory",
                     &path.to_string_lossy(),
                     &format!("{mode:o}"),

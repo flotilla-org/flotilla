@@ -134,4 +134,50 @@ async fn re_runs_deliver_only_what_changed_or_failed() {
     notes.fail.store(false, Ordering::SeqCst);
     run(needs("s3", "n2")).await.expect("retry");
     assert_eq!((skills.deliveries(), notes.deliveries()), (3, 2), "the retry delivers only what failed");
+
+    // An unreadable record line is ignored, so its need is delivered again.
+    let record = home.join(DELIVERY_RECORD);
+    let text = std::fs::read_to_string(&record).expect("record");
+    std::fs::write(&record, text.replace("notes\t", "notes-garbled ")).expect("garble");
+    run(needs("s3", "n2")).await.expect("garbled record");
+    assert_eq!((skills.deliveries(), notes.deliveries()), (3, 3), "only the unreadable entry is delivered again");
+
+    // A need no longer asked for leaves the record, so asking again delivers it.
+    run(needs("s3", "n2").into_iter().filter(|need| need.name.as_str() != "notes").collect()).await.expect("drop notes");
+    assert!(!std::fs::read_to_string(&record).expect("record").contains("notes"), "the record follows the plan");
+    run(needs("s3", "n2")).await.expect("notes again");
+    assert_eq!((skills.deliveries(), notes.deliveries()), (3, 4));
+}
+
+// Behaviour: a tree with no delivery for its content, or a name its record cannot
+// hold, is refused before anything is written.
+#[tokio::test]
+async fn undeliverable_needs_are_refused() {
+    let vessel = LocalVessel { base: tempfile::tempdir().expect("base") };
+    let trees = BTreeMap::from([(NeedName::new("skills"), Tree::new("skills") as Arc<dyn TreeDelivery>)]);
+    let error = deliver(&needs("s1", "n1"), &trees, &ProviderMechanisms::default(), &CostTable::default(), &vessel)
+        .await
+        .expect_err("notes has no delivery");
+    assert_eq!(error, DeliveryError::NoDelivery(NeedName::new("notes")));
+    let mut unrecordable = needs("s1", "n1");
+    unrecordable[1].digest = ContentDigest::new("two\tfields");
+    let error = deliver(&unrecordable, &trees, &ProviderMechanisms::default(), &CostTable::default(), &vessel).await.expect_err("tab");
+    assert_eq!(error, DeliveryError::Unrecordable(NeedName::new("skills")));
+}
+
+// Behaviour: every mechanism a record holds reads back as itself, so a recorded
+// delivery is recognised on the next run.
+#[test]
+fn recorded_mechanisms_read_back_as_themselves() {
+    use crate::{Access, FetchBy, Liveness};
+    let mut mechanisms = vec![Mechanism::AgentFetch { by: FetchBy::Url }, Mechanism::AgentPush];
+    for access in [Access::ReadOnly, Access::ReadWrite] {
+        for liveness in [Liveness::Live, Liveness::Snapshot] {
+            mechanisms.push(Mechanism::HostPath { access, liveness });
+        }
+    }
+    for mechanism in mechanisms {
+        assert_eq!(mechanism.to_string().parse::<Mechanism>(), Ok(mechanism));
+    }
+    assert!("agent-teleport".parse::<Mechanism>().is_err());
 }

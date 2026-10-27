@@ -373,7 +373,8 @@ async fn runner_and_material_contract(agent: Arc<dyn TestAgent>) {
 
 // Vessel delivery (#3964 contract 3) runs every step through the agent: it
 // creates a home with exactly its mode while keeping what is already there,
-// reads a missing record as absent and a written one back, and resolves the
+// refuses a symbolic link in its place, reads a missing record as absent and a
+// written one back, and resolves the
 // contained writable base.
 over_each_transport!(delivery_operations_cross_the_agent);
 async fn delivery_operations_cross_the_agent(agent: Arc<dyn TestAgent>) {
@@ -392,6 +393,10 @@ async fn delivery_operations_cross_the_agent(agent: Arc<dyn TestAgent>) {
     assert_eq!(vessel.read_text(&record).await.unwrap().as_deref(), Some("skills\tdigest\tagent-push\n"), "its contents are kept");
     assert_eq!(std::fs::metadata(&record).unwrap().permissions().mode() & 0o777, 0o600);
     assert!(vessel.ensure_directory(Path::new("relative"), 0o700).await.is_err());
+    let link = directory.path().join("linked-home");
+    std::os::unix::fs::symlink(&home, &link).unwrap();
+    assert!(vessel.ensure_directory(&link, 0o755).await.is_err(), "a linked home is refused, never followed");
+    assert_eq!(std::fs::metadata(&home).unwrap().permissions().mode() & 0o777, 0o700);
     assert_eq!(vessel.writable_base().await.unwrap(), Path::new(super::super::runner::CONTAINED_WRITABLE_CONFIG_BASE));
 }
 

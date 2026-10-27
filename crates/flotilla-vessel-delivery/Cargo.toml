@@ -8,11 +8,14 @@ description = "Vessel delivery (#3956): the lowering vocabulary, the pure planne
 [dependencies]
 async-trait = { workspace = true }
 flotilla-environment = { path = "../flotilla-environment" }
+tracing = { workspace = true }
 
 [dev-dependencies]
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 hegeltest = { workspace = true }
 tempfile = { workspace = true }
+# `test-util` is unused here, but keeps the test-graph tokio features aligned with the
+# workspace for ci/build-graph/check.py.
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 
 [lints]
