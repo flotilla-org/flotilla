@@ -296,8 +296,8 @@ pub trait VesselAgent: Send + Sync {
     /// directory mode, leaving `path` with exactly `mode`. Existing contents are kept;
     /// anything but a directory at `path`, a symbolic link included, is refused.
     async fn create_dir(&self, path: &Path, mode: u32) -> Result<(), String>;
-    /// The regular file at `path`, refused beyond `limit` bytes, or `None` when
-    /// there is no regular file there.
+    /// The regular file at `path`, following links, refused beyond `limit` bytes,
+    /// or `None` when there is none.
     async fn read(&self, path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String>;
     /// Replace the file at `path` with `bytes` and `mode`, atomically.
     async fn write(&self, path: &Path, bytes: Vec<u8>, mode: u32) -> Result<(), String>;

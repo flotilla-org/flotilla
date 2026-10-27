@@ -64,9 +64,17 @@ pub async fn symlink(runner: &dyn CommandRunner, path: &Path, target: &Path) -> 
         .map_err(|error| format!("link {} to {}: {error}", path.display(), target.display()))
 }
 
-/// The regular file at `path` as text, refused beyond `limit` bytes.
+/// The regular file at `path` as text, following links, refused beyond `limit` bytes.
 pub async fn read(runner: &dyn CommandRunner, path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
-    if stat(runner, path).await? != Some(EntryKind::File) {
+    let regular = runner
+        .run(
+            "sh",
+            &["-c", r#"[ -f "$1" ] && echo file || echo none"#, "flotilla-is-file", &absolute(path)?],
+            Path::new("/"),
+            &ChannelLabel::Default,
+        )
+        .await;
+    if regular.map_err(|error| format!("read {}: {error}", path.display()))?.trim() != "file" {
         return Ok(None);
     }
     let text = runner

@@ -558,9 +558,6 @@ impl VesselAgent for Arc<AgentRunner> {
         self.client().await?.create_dir(path, &options).await.map(drop).map_err(|error| format!("create {}: {error}", path.display()))
     }
     async fn read(&self, path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
-        if VesselAgent::stat(self, path).await? != Some(EntryKind::File) {
-            return Ok(None);
-        }
         match self.client().await?.read_bytes(path, limit).await {
             Ok(bytes) => Ok(Some(bytes)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
