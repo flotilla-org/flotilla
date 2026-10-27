@@ -1492,6 +1492,20 @@ mod tests {
         assert_eq!(rewritten, written);
     }
 
+    // ADR 0047, #3964: a frozen crew written by r879 carries #3953's caller-home label.
+    // It decodes with the label dropped, keeps the crew's own labels, and is never written back.
+    #[test]
+    fn retired_crew_home_label_is_accepted_and_dropped() {
+        let mut crew = crew("coder", agent("code"));
+        crew.labels.insert("team".into(), "kept".into());
+        let written = serde_json::to_value(&crew).expect("serialize crew");
+        let mut stored = written.clone();
+        stored["labels"]["flotilla.work/requester-home-key"] = serde_json::json!("agent-homes/requesters/c/coder/claude");
+
+        let decoded: CrewSpec = serde_json::from_value(stored).expect("r879 crew decodes");
+        assert_eq!(serde_json::to_value(&decoded).expect("serialize crew"), written);
+    }
+
     #[test]
     fn unknown_vessel_fields_other_than_legacy_stance_are_refused() {
         let mut typo = serde_json::to_value(VesselRequirement::builder().name("work".to_string()).crew(vec![]).build()).expect("serialize");
