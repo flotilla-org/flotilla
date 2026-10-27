@@ -58,9 +58,6 @@ pub struct BindingSpec {
     #[store(records)]
     pub epochs: Records<EpochEntry>,
     pub opened_at: Timestamp,
-    /// Retired by #3964: the access layer derives each requester's home, so nothing writes a
-    /// key and none is read. Kept until the owner's schema review drops the column.
-    pub home_key: Option<String>,
 }
 
 states! {

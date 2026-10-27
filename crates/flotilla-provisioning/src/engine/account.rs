@@ -250,8 +250,6 @@ pub fn binding_spec(old: &AccountBindingSpec) -> BindingSpec {
         selection: old.selection.clone(),
         epochs: old.epochs.clone(),
         opened_at: old.opened_at,
-        // #3964: the access layer derives each home; nothing records a key any more.
-        home_key: None,
     }
 }
 

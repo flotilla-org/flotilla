@@ -1101,7 +1101,6 @@ impl DummyDaemon {
             selection: Selection::Draw { index: 0 },
             epochs: flotilla_schema::Records::new(),
             opened_at: at,
-            home_key: None,
         }
     }
 
