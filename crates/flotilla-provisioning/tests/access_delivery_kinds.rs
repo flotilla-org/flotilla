@@ -5,7 +5,7 @@
 mod schema_support;
 
 use flotilla_provisioning::stored;
-use flotilla_resources::{access_delivery, account_access};
+use flotilla_resources::access_delivery;
 use flotilla_schema::{render_view, KindCode};
 use flotilla_schema_sqlite::{schema_ddl, DdlMode, Store};
 use schema_support::{check, plan};
@@ -31,8 +31,9 @@ fn access_delivery_store_schema_view_matches_the_snapshot() {
 // kind and the account access kinds under a code none of them holds.
 #[test]
 fn access_delivery_kind_code_is_free_beside_the_production_kinds() {
+    // The production kinds include the account access kinds (#3824 layer 1).
     let mut registry = stored::production_kinds().expect("production kinds");
-    for set in account_access::registry().expect("registry").iter().chain(access_delivery::registry().expect("registry").iter()) {
+    for set in access_delivery::registry().expect("registry").iter() {
         registry.register_table_set(set.clone()).expect("no code, name or table is held twice");
     }
     assert_eq!(registry.iter().find(|set| set.kind == "AccessDelivery").map(|set| set.code), Some(KindCode::new("ad")));
