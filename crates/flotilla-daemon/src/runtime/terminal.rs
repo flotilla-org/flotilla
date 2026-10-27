@@ -99,9 +99,9 @@ pub(crate) const DELIVERY_CONFIRMATION_POLL: Duration = Duration::from_millis(20
 
 pub(super) const DELIVERY_CONFIRMATION_GRACE: Duration = Duration::from_secs(4);
 /// How long teardown lets a typed engine turn settle before aborting it (#3894):
-/// its confirmation grace, with room for the submission itself. The finalizer
-/// rechecks without blocking, so other sessions' teardown proceeds meanwhile.
-const ENGINE_TURN_SETTLE_FOR: Duration = Duration::from_secs(10);
+/// derived from the confirmation grace, with room for the submission itself.
+/// The finalizer rechecks without blocking, so other sessions' teardown proceeds.
+const ENGINE_TURN_SETTLE_FOR: Duration = Duration::from_secs(2 * DELIVERY_CONFIRMATION_GRACE.as_secs() + 2);
 
 pub(crate) const DELIVERY_CONFIRMATION_STABLE_FOR: Duration = Duration::from_secs(1);
 
