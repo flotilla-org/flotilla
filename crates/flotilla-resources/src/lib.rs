@@ -3,7 +3,9 @@
 // Remove when async_trait or Clippy stops producing this warning.
 #![allow(clippy::double_must_use)]
 
+pub mod access_delivery;
 pub mod account_access;
+pub use access_delivery::{AccessDelivery, AccessDeliverySpec};
 pub use account_access::{AccountBinding, AccountBindingSpec, AccountProvision, AccountProvisionSpec};
 #[doc(hidden)]
 pub mod address;
