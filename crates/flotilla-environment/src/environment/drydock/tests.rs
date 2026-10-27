@@ -132,6 +132,8 @@ pub(super) async fn fixture_prepared_spec(
             "reference",
             &wire::PrepareRequest {
                 platform: None,
+                route: None,
+                image_pull: None,
                 image_digest: spec.image.clone(),
                 tools_digest: "reference-fixture-tools".into(),
                 size: size(&spec.size),
