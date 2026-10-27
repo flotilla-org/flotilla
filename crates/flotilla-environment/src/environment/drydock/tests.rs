@@ -321,23 +321,36 @@ async fn missing_host_binary_is_not_ready() {
     .unwrap();
 }
 
-// #3745: transport EOF without Exit must fail asset delivery without
-// replacing a recovery archive; cancellation must remove the temporary archive.
+// #3745: transport EOF without an exit frame must fail a checkpoint without
+// replacing its recovery archive; cancellation must remove the temporary
+// archive. Asset delivery no longer streams process output (it uses the
+// agent's file operations), so only the checkpoint stream is faulted here.
 #[tokio::test]
-async fn truncated_agent_streams_preserve_recovery_and_reject_assets() {
+async fn truncated_agent_streams_preserve_recovery() {
     use axum::{
         body::{Body, Bytes},
-        routing::{get, post},
+        routing::{delete, get, post},
         Router,
     };
-    use drydock_agent::ExecEvent;
     use futures::StreamExt;
     use std::sync::atomic::{AtomicU8, Ordering};
     // Fake only the guest's HTTP response boundary; use real yamux, HTTP/2,
-    // agent framing, AgentRunner, upload, and checkpoint publication/cleanup.
+    // the agent's process framing, AgentRunner and checkpoint publication.
     const COMPLETE: u8 = 0;
     const TRUNCATED: u8 = 1;
     const STALLED: u8 = 2;
+    /// One process output frame: kind, big-endian length, payload.
+    fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![kind];
+        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+    fn output(stderr: bool, bytes: &[u8]) -> Vec<u8> {
+        let mut payload = 0u64.to_be_bytes().to_vec();
+        payload.extend_from_slice(bytes);
+        frame(if stderr { 2 } else { 1 }, &payload)
+    }
     // Requests are sequential across phases, so each handler reads its phase mode.
     let mode = Arc::new(AtomicU8::new(COMPLETE));
     let (host, guest) = tokio::io::duplex(64 * 1024);
@@ -347,32 +360,26 @@ async fn truncated_agent_streams_preserve_recovery_and_reject_assets() {
     );
     let mut guest = guest.unwrap();
     let state = mode.clone();
+    let info = serde_json::json!({"id": "1-1", "pid": 1, "program": "tar", "state": "running", "buffered": 0, "stdout": 0, "stderr": 0});
     let server = tokio::spawn(async move {
         let router = Router::new()
             .route(
                 "/hello",
-                get(|| async {
-                    axum::Json(drydock_agent::Hello { fingerprint: "fault-fixture".into(), features: vec![], platform: None })
-                }),
+                get(|| async { axum::Json(serde_json::json!({"fingerprint": "fault-fixture", "features": [], "platform": null})) }),
             )
+            .route("/processes", post(move || std::future::ready((axum::http::StatusCode::CREATED, axum::Json(info.clone())))))
+            .route("/processes/{id}", delete(|| std::future::ready(axum::http::StatusCode::NO_CONTENT)))
             .route(
-                "/exec",
-                post(move || {
+                "/processes/{id}/output",
+                get(move || {
                     let mode = state.load(Ordering::SeqCst);
                     async move {
-                        let bytes = if mode == COMPLETE { b"archive bytes".as_slice() } else { b"partial replacement".as_slice() };
-                        let mut events = vec![ExecEvent::Stdout(bytes.to_vec()), ExecEvent::Stderr(b"secret guest stderr".to_vec())];
+                        let content = if mode == COMPLETE { b"archive bytes".as_slice() } else { b"partial replacement".as_slice() };
+                        let mut bytes = output(false, content);
+                        bytes.extend(output(true, b"secret guest stderr"));
                         if mode == COMPLETE {
-                            events.push(ExecEvent::Exit { code: Some(0) });
+                            bytes.extend(frame(3, br#"{"code":0,"signal":null,"timed_out":false}"#));
                         }
-                        let bytes = events
-                            .into_iter()
-                            .flat_map(|event| {
-                                let mut bytes = serde_json::to_vec(&event).unwrap();
-                                bytes.push(b'\n');
-                                bytes
-                            })
-                            .collect::<Vec<_>>();
                         let end = if mode == STALLED { futures::stream::pending().boxed() } else { futures::stream::empty().boxed() };
                         Body::from_stream(futures::stream::once(async move { Ok::<_, std::io::Error>(Bytes::from(bytes)) }).chain(end))
                     }
@@ -394,15 +401,6 @@ async fn truncated_agent_streams_preserve_recovery_and_reject_assets() {
     write_checkpoint(runner.clone(), &target, Path::new("/work")).await.unwrap();
     assert_eq!(std::fs::read(&target).unwrap(), b"archive bytes");
     mode.store(TRUNCATED, Ordering::SeqCst);
-    let assets = tempfile::tempdir().unwrap();
-    let folder = assets.path().join("folder");
-    std::fs::create_dir(&folder).unwrap();
-    let link = assets.path().join("link");
-    std::os::unix::fs::symlink("folder", &link).unwrap();
-    for source in [&folder, &link] {
-        let error = reach::upload(&agent, source, Path::new("/asset")).await.unwrap_err();
-        assert_eq!(error, "drydock guest operation failed (UnexpectedEof)");
-    }
     let error = write_checkpoint(runner.clone(), &target, Path::new("/work")).await.unwrap_err();
     assert_eq!(error, "drydock guest operation failed (UnexpectedEof)");
     assert_eq!(std::fs::read(&target).unwrap(), b"archive bytes");

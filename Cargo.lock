@@ -234,7 +234,7 @@ dependencies = [
  "addr2line",
  "cfg-if",
  "libc",
- "miniz_oxide",
+ "miniz_oxide 0.8.9",
  "object",
  "rustc-demangle",
  "windows-link",
@@ -621,6 +621,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32fast"
+version = "1.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ba106e844045ddc02c20768ac4b0b7cb45f2cc2ecbd833ac9f5dacb183c2055"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "critical-section"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -898,7 +907,7 @@ dependencies = [
 [[package]]
 name = "drydock"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=e3e5f6969fcade32576d340d549c7e85d1f7ec18#e3e5f6969fcade32576d340d549c7e85d1f7ec18"
+source = "git+https://github.com/flotilla-org/drydock?rev=0efc2182cb3cbbfeef6505350bc3087e7f743072#0efc2182cb3cbbfeef6505350bc3087e7f743072"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -936,24 +945,35 @@ dependencies = [
 [[package]]
 name = "drydock-agent"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=e3e5f6969fcade32576d340d549c7e85d1f7ec18#e3e5f6969fcade32576d340d549c7e85d1f7ec18"
+source = "git+https://github.com/flotilla-org/drydock?rev=0efc2182cb3cbbfeef6505350bc3087e7f743072#0efc2182cb3cbbfeef6505350bc3087e7f743072"
 dependencies = [
  "axum",
  "bytes",
  "drydock-protocol",
  "drydock-transport",
+ "flate2",
+ "futures-util",
+ "getrandom 0.3.4",
+ "headers",
  "hickory-proto",
  "http",
+ "http-body",
  "http-body-util",
  "libc",
+ "percent-encoding",
+ "rustix",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sha2",
  "socket2",
+ "tar",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
- "tokio-stream",
+ "tokio-util",
  "tokio-vsock",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]
@@ -961,7 +981,7 @@ dependencies = [
 [[package]]
 name = "drydock-client"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=e3e5f6969fcade32576d340d549c7e85d1f7ec18#e3e5f6969fcade32576d340d549c7e85d1f7ec18"
+source = "git+https://github.com/flotilla-org/drydock?rev=0efc2182cb3cbbfeef6505350bc3087e7f743072#0efc2182cb3cbbfeef6505350bc3087e7f743072"
 dependencies = [
  "async-trait",
  "bytes",
@@ -981,7 +1001,7 @@ dependencies = [
 [[package]]
 name = "drydock-host"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=e3e5f6969fcade32576d340d549c7e85d1f7ec18#e3e5f6969fcade32576d340d549c7e85d1f7ec18"
+source = "git+https://github.com/flotilla-org/drydock?rev=0efc2182cb3cbbfeef6505350bc3087e7f743072#0efc2182cb3cbbfeef6505350bc3087e7f743072"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1008,7 +1028,7 @@ dependencies = [
 [[package]]
 name = "drydock-protocol"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=e3e5f6969fcade32576d340d549c7e85d1f7ec18#e3e5f6969fcade32576d340d549c7e85d1f7ec18"
+source = "git+https://github.com/flotilla-org/drydock?rev=0efc2182cb3cbbfeef6505350bc3087e7f743072#0efc2182cb3cbbfeef6505350bc3087e7f743072"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -1022,7 +1042,7 @@ dependencies = [
 [[package]]
 name = "drydock-transport"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=e3e5f6969fcade32576d340d549c7e85d1f7ec18#e3e5f6969fcade32576d340d549c7e85d1f7ec18"
+source = "git+https://github.com/flotilla-org/drydock?rev=0efc2182cb3cbbfeef6505350bc3087e7f743072#0efc2182cb3cbbfeef6505350bc3087e7f743072"
 dependencies = [
  "async-trait",
  "axum",
@@ -1230,6 +1250,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1246,6 +1276,17 @@ name = "fixedbitset"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ce7134b9999ecaf8bcd65542e436736ef32ddca1b3e06094cb6ec5755203b80"
+
+[[package]]
+name = "flate2"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
+dependencies = [
+ "crc32fast",
+ "miniz_oxide 0.9.1",
+ "zlib-rs",
+]
 
 [[package]]
 name = "flotilla"
@@ -1550,6 +1591,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tower",
+ "tower-http",
  "tracing",
  "tracing-core",
  "zeroize",
@@ -4046,6 +4088,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "headers"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc2700e3fe555c3310aa7286cac6167449f2c87e0eb58769c9208a1c58a1d106"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "headers-core",
+ "http",
+ "httpdate",
+ "mime",
+ "sha1",
+]
+
+[[package]]
+name = "headers-core"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54b4a22553d4242c49fddb9ba998a99962b5cc6f22cb5a3482bec22522403ce4"
+dependencies = [
+ "http",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4787,6 +4853,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
 dependencies = [
  "adler2",
+]
+
+[[package]]
+name = "miniz_oxide"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
+dependencies = [
+ "adler2",
+ "simd-adler32",
 ]
 
 [[package]]
@@ -6424,6 +6500,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "simd-adler32"
+version = "0.3.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+
+[[package]]
 name = "similar"
 version = "2.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6642,6 +6724,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
 dependencies = [
  "core-foundation-sys",
+ "libc",
+]
+
+[[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
  "libc",
 ]
 
@@ -6916,17 +7008,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-stream"
-version = "0.1.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
-dependencies = [
- "futures-core",
- "pin-project-lite",
- "tokio",
-]
-
-[[package]]
 name = "tokio-tungstenite"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7089,11 +7170,13 @@ dependencies = [
  "futures-util",
  "http",
  "http-body",
+ "http-body-util",
  "iri-string",
  "pin-project-lite",
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -8339,6 +8422,12 @@ dependencies = [
  "quote",
  "syn 2.0.117",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 
 [[package]]
 name = "zmij"

@@ -1,78 +1,44 @@
 //! Agent-backed execution and protected material writes. No credential enters argv.
 use super::*;
-use drydock_agent::{Client, Exec, ExecEvent};
+use drydock_agent::{Client, Exec, ExecEvent, FileOptions};
 use flotilla_provider_runtime::{ChannelLabel, CommandOutput, CommandRunner};
 
 pub(crate) struct AgentRunner(pub Arc<Client>);
 impl AgentRunner {
     pub(super) async fn write_bytes(&self, path: &Path, bytes: Vec<u8>, mode: u32) -> Result<(), String> {
-        if !matches!(mode, 0o600 | 0o700 | 0o755 | 0o644) {
-            return Err("unsupported material mode".into());
-        }
-        // The agent's generic file API defaults to public asset permissions.
-        // Keep secret bytes inside a private directory until their final mode
-        // is set; publish with rename only after chmod succeeds.
-        let dir = self.run("mktemp", &["-d", "/tmp/flotilla-write.XXXXXXXX"], Path::new("/"), &ChannelLabel::Default).await?;
-        let dir = dir.trim();
-        let temporary = Path::new(dir).join("content");
-        // JSON encodes byte arrays with substantial overhead. Bound each file
-        // request below the agent's body limit even for large fleet binaries.
-        const CHUNK_BYTES: usize = 8 * 1024 * 1024;
-        if bytes.len() <= CHUNK_BYTES {
-            self.0.write(temporary.clone(), bytes, false).await.map_err(error)?;
-        } else {
-            self.0.write(temporary.clone(), vec![], false).await.map_err(error)?;
-            let chunk_file = Path::new(dir).join("chunk");
-            for chunk in bytes.chunks(CHUNK_BYTES) {
-                self.0.write(chunk_file.clone(), chunk.to_vec(), false).await.map_err(error)?;
-                self.run(
-                    "sh",
-                    &["-c", &format!("cat -- {} >> {}", quote(&chunk_file.to_string_lossy()), quote(&temporary.to_string_lossy()))],
-                    Path::new("/"),
-                    &ChannelLabel::Default,
-                )
-                .await?;
-            }
-        }
-        let script = format!(
-            "flotilla_write_directory={}; trap 'rm -rf -- \"$flotilla_write_directory\"' EXIT; chmod {:o} {} && mkdir -p -- {} && mv -f -- {} {}",
-            quote(dir),
-            mode,
-            quote(&temporary.to_string_lossy()),
-            quote(&path.parent().ok_or("file has no parent")?.to_string_lossy()),
-            quote(&temporary.to_string_lossy()),
-            quote(&path.to_string_lossy())
-        );
-        self.run("sh", &["-c", &script], Path::new("/"), &ChannelLabel::Default).await?;
-        Ok(())
+        self.0.write_bytes(path, bytes, &material(mode)?).await.map(drop).map_err(error)
     }
+    pub(super) async fn write_from(&self, source: &Path, path: &Path, mode: u32) -> Result<(), String> {
+        let options = material(mode)?;
+        let file = tokio::fs::File::open(source).await.map_err(error)?;
+        self.0.write(path, file, &options).await.map(drop).map_err(error)
+    }
+}
+/// The agent writes a private sibling, applies the mode and renames it into
+/// place, so no reader sees partial or wider-than-final material.
+fn material(mode: u32) -> Result<FileOptions, String> {
+    if !matches!(mode, 0o600 | 0o700 | 0o755 | 0o644) {
+        return Err("unsupported material mode".into());
+    }
+    Ok(FileOptions { mode: Some(mode), parents: true, ..FileOptions::default() })
 }
 #[async_trait]
 impl CommandRunner for AgentRunner {
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
-        let mut events = self
-            .0
-            .exec(Exec { program: cmd.into(), args: args.iter().map(|s| (*s).into()).collect(), cwd: Some(cwd.into()) })
-            .await
-            .map_err(error)?;
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let mut exit_code = None;
-        while let Some(event) = events.next().await.map_err(error)? {
-            match event {
-                ExecEvent::Stdout(bytes) => stdout.extend(bytes),
-                ExecEvent::Stderr(bytes) => stderr.extend(bytes),
-                ExecEvent::Exit { code } => exit_code = code,
-            }
-        }
-        Ok(CommandOutput { stdout: String::from_utf8_lossy(&stdout).into(), stderr: String::from_utf8_lossy(&stderr).into(), exit_code })
+        let exec = Exec { cwd: Some(cwd.into()), ..Exec::new(cmd, args.iter().copied()) };
+        let (stdout, stderr, status) = self.0.run(exec, super::super::agent::OUTPUT_LIMIT).await.map_err(error)?;
+        Ok(CommandOutput {
+            stdout: String::from_utf8_lossy(&stdout).into(),
+            stderr: String::from_utf8_lossy(&stderr).into(),
+            exit_code: status.code,
+        })
     }
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
         let output = self.run_output(cmd, args, cwd, label).await?;
         if output.success() {
             Ok(output.stdout)
         } else {
-            Err(format!("guest command failed with exit {:?}", output.exit_code))
+            Err(format!("guest command failed with exit {:?}: {}", output.exit_code, output.stderr))
         }
     }
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
@@ -98,11 +64,7 @@ impl CommandRunner for AgentRunner {
         use tokio::io::AsyncWriteExt;
         let mut output =
             tokio::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(destination).await.map_err(error)?;
-        let mut events = self
-            .0
-            .exec(Exec { program: cmd.into(), args: args.iter().map(|s| (*s).into()).collect(), cwd: Some(cwd.into()) })
-            .await
-            .map_err(error)?;
+        let mut events = self.0.exec(Exec { cwd: Some(cwd.into()), ..Exec::new(cmd, args.iter().copied()) }).await.map_err(error)?;
         let mut success = false;
         let mut written = 0_u64;
         while let Some(event) = events.next().await.map_err(error)? {
@@ -115,7 +77,7 @@ impl CommandRunner for AgentRunner {
                     }
                     output.write_all(&bytes).await.map_err(error)?;
                 }
-                ExecEvent::Exit { code } => success = code == Some(0),
+                ExecEvent::Exit(status) => success = status.success(),
                 ExecEvent::Stderr(_) => {}
             }
         }
@@ -127,44 +89,34 @@ impl CommandRunner for AgentRunner {
         }
     }
     async fn read_file_to(&self, source: &Path, destination: &Path) -> Result<(), String> {
-        let bytes = self.0.read(source.into()).await.map_err(error)?;
-        tokio::fs::write(destination, bytes).await.map_err(error)
+        let download = self.0.read(source).await.map_err(error)?;
+        let mut file = tokio::fs::File::create(destination).await.map_err(error)?;
+        download.copy_to(&mut file).await.map(drop).map_err(error)
     }
     async fn write_file_from(&self, source: &Path, destination: &Path) -> Result<(), String> {
-        let bytes = tokio::fs::read(source).await.map_err(error)?;
-        self.write_bytes(destination, bytes, 0o600).await
+        self.write_from(source, destination, 0o600).await
     }
-    async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
-        let dir = self.run("mktemp", &["-d", "/tmp/flotilla-input.XXXXXXXX"], Path::new("/"), label).await?;
-        let dir = dir.trim();
-        let path = format!("{dir}/input");
-        self.0.write(path.clone().into(), input.to_vec(), false).await.map_err(error)?;
-        let script = format!(
-            "flotilla_input_directory={}; trap 'rm -rf -- \"$flotilla_input_directory\"' EXIT; {} < {}",
-            quote(dir),
-            std::iter::once(cmd).chain(args.iter().copied()).map(quote).collect::<Vec<_>>().join(" "),
-            quote(&path)
-        );
-        self.run("sh", &["-c", &script], cwd, label).await
+    async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, _: &ChannelLabel, input: &[u8]) -> Result<String, String> {
+        let exec = Exec { cwd: Some(cwd.into()), ..Exec::new(cmd, args.iter().copied()) };
+        let (stdout, stderr, status) = super::super::agent::exec_with_input(&self.0, exec, input).await.map_err(error)?;
+        if status.success() {
+            Ok(String::from_utf8_lossy(&stdout).into())
+        } else {
+            Err(format!("guest command failed with exit {:?}: {}", status.code, String::from_utf8_lossy(&stderr)))
+        }
     }
 
     async fn ensure_file(&self, path: &Path, content: &str) -> Result<String, String> {
-        let parent = path.parent().ok_or("config file has no parent")?;
-        self.run("mkdir", &["-p", &parent.to_string_lossy()], Path::new("/"), &ChannelLabel::Default).await?;
-        let pattern = parent.join(".flotilla-ensure.XXXXXXXX");
-        let directory = self.run("mktemp", &["-d", &pattern.to_string_lossy()], Path::new("/"), &ChannelLabel::Default).await?;
-        let directory = directory.trim();
-        let staged = Path::new(directory).join("content");
-        self.write_bytes(&staged, content.as_bytes().to_vec(), 0o600).await?;
-        // Staging in the target directory keeps the link on the same filesystem.
-        // link() publishes a complete file only when the destination is absent.
-        let target = quote(&path.to_string_lossy());
-        let script = format!(
-            "flotilla_ensure_directory={}; trap 'rm -rf -- \"$flotilla_ensure_directory\"' EXIT; test ! -d {target} && (ln -- {} {target} 2>/dev/null || test -f {target}) && cat -- {target}",
-            quote(directory),
-            quote(&staged.to_string_lossy())
-        );
-        self.run("sh", &["-c", &script], Path::new("/"), &ChannelLabel::Default).await
+        // An exclusive write publishes a complete file only when none exists.
+        let options = FileOptions { exclusive: true, ..material(0o600)? };
+        match self.0.write_bytes(path, content.as_bytes().to_vec(), &options).await {
+            Ok(_) => Ok(content.into()),
+            Err(cause) if cause.kind() == std::io::ErrorKind::AlreadyExists => {
+                String::from_utf8(self.0.read_bytes(path, super::super::agent::ENSURED_FILE_LIMIT).await.map_err(error)?)
+                    .map_err(|e| e.to_string())
+            }
+            Err(cause) => Err(error(cause)),
+        }
     }
 }
 pub(super) fn quote(value: &str) -> String {
@@ -181,8 +133,8 @@ mod tests {
     use super::*;
     use drydock_transport::{Limits, Transport};
     use std::os::unix::fs::PermissionsExt;
-    // ADR 0044's interim staging must preserve protected bytes and use stdin,
-    // not argv, for secrets. Exercise the real agent over in-memory transport.
+    // Protected bytes keep their mode and secrets travel on stdin, not argv.
+    // Exercise the real agent over in-memory transport.
     #[tokio::test]
     async fn protected_files_and_stdin_cross_the_real_agent() {
         let directory = tempfile::tempdir().unwrap();
@@ -193,27 +145,39 @@ mod tests {
         );
         let task = tokio::spawn(drydock_agent::Agent::new(guest.unwrap(), "reference-test".into(), directory.path().join("agent")).run());
         let runner = AgentRunner(Arc::new(Client::connect(host.unwrap(), "reference-test").await.unwrap()));
-        let file = directory.path().join("credential");
-        for content in ["", "test-value with spaces\n", "literal $(no-substitution) `no-command` é"] {
-            runner.write_file_with_mode(&file, content, 0o600).await.unwrap();
+        let file = directory.path().join("missing parent").join("credential");
+        for (content, mode) in [("", 0o600), ("test-value with spaces\n", 0o644), ("literal $(no-substitution) `no-command` é", 0o600)] {
+            runner.write_file_with_mode(&file, content, mode).await.unwrap();
             assert_eq!(tokio::fs::read_to_string(&file).await.unwrap(), content);
-            assert_eq!(tokio::fs::metadata(&file).await.unwrap().permissions().mode() & 0o777, 0o600);
-            let echoed = runner.run_with_input("cat", &[], directory.path(), &ChannelLabel::Default, content.as_bytes()).await.unwrap();
-            assert_eq!(echoed, content);
+            assert_eq!(tokio::fs::metadata(&file).await.unwrap().permissions().mode() & 0o777, mode);
         }
+        assert!(runner.write_file_with_mode(&file, "wider", 0o666).await.is_err());
         // Concurrent config creation must publish one complete winner, and
         // every caller must see the same value instead of replacing a peer.
         let shared = directory.path().join("space ' literal $(text)").join("shared-config");
         let (left, right) = tokio::join!(runner.ensure_file(&shared, "left"), runner.ensure_file(&shared, "right"));
         assert_eq!(left.unwrap(), right.unwrap());
         assert_eq!(runner.ensure_file(&shared, "replacement").await.unwrap(), tokio::fs::read_to_string(&shared).await.unwrap());
-        // Cross the production chunk boundary by one byte; binary tool uploads
-        // must preserve every byte and their final executable mode.
+        assert_eq!(tokio::fs::metadata(&shared).await.unwrap().permissions().mode() & 0o777, 0o600);
+        // Large binary tool uploads preserve every byte and their final mode,
+        // whether sent from memory or streamed from a host file.
         let large = directory.path().join("large-tool");
         let bytes = (0..8 * 1024 * 1024 + 1).map(|i| (i % 251) as u8).collect::<Vec<_>>();
         runner.write_bytes(&large, bytes.clone(), 0o755).await.unwrap();
         assert_eq!(tokio::fs::read(&large).await.unwrap(), bytes);
         assert_eq!(tokio::fs::metadata(&large).await.unwrap().permissions().mode() & 0o777, 0o755);
+        let streamed = directory.path().join("streamed-tool");
+        runner.write_from(&large, &streamed, 0o700).await.unwrap();
+        assert_eq!(tokio::fs::read(&streamed).await.unwrap(), bytes);
+        assert_eq!(tokio::fs::metadata(&streamed).await.unwrap().permissions().mode() & 0o777, 0o700);
+        let copied = directory.path().join("copied");
+        runner.read_file_to(&streamed, &copied).await.unwrap();
+        assert_eq!(tokio::fs::read(&copied).await.unwrap(), bytes);
+        assert!(runner.0.processes().await.unwrap().is_empty(), "file operations must not run guest processes");
+        for content in ["", "stdin secret\n"] {
+            let echoed = runner.run_with_input("cat", &[], directory.path(), &ChannelLabel::Default, content.as_bytes()).await.unwrap();
+            assert_eq!(echoed, content);
+        }
         let binary = directory.path().join("binary");
         runner.run_to_file("printf", &["\\001\\377\\000"], directory.path(), &binary).await.unwrap();
         assert_eq!(tokio::fs::read(binary).await.unwrap(), vec![1, 255, 0]);

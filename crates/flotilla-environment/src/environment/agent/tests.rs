@@ -358,6 +358,12 @@ async fn runner_and_material_contract(agent: Arc<dyn TestAgent>) {
     runner.read_file_to(&destination, &copied).await.unwrap();
     assert_eq!(std::fs::read(copied).unwrap(), bytes);
     assert_eq!(runner.run_with_input("cat", &[], &cwd, &ChannelLabel::Default, b"stdin secret").await.unwrap(), "stdin secret");
+    // Input and output larger than any pipe buffer stream concurrently, and a
+    // program that never reads its input still succeeds, as with a redirect.
+    let large = "0123456789abcdef".repeat(256 * 1024);
+    assert_eq!(runner.run_with_input("cat", &[], &cwd, &ChannelLabel::Default, large.as_bytes()).await.unwrap(), large);
+    assert_eq!(runner.run_with_input("true", &[], &cwd, &ChannelLabel::Default, large.as_bytes()).await.unwrap(), "");
+    assert!(runner.run_with_input("false", &[], &cwd, &ChannelLabel::Default, b"").await.is_err());
     runner.write_file(&destination, "").await.unwrap();
     assert!(std::fs::read(&destination).unwrap().is_empty());
     assert!(runner.write_file_with_mode(&destination, "bad", 0o1000).await.is_err());
@@ -596,9 +602,10 @@ async fn pushes_complete_generations_and_retains_old_cleat_files(memory: Arc<dyn
 }
 
 // Relative cwd never silently selects the agent's default directory, including
-// the file-stream route. Default writes retain drydock's documented 0644 mode.
-over_each_transport!(cwd_is_absolute_and_default_file_mode_is_explicit);
-async fn cwd_is_absolute_and_default_file_mode_is_explicit(memory: Arc<dyn TestAgent>) {
+// the file-stream route. A write without a mode takes the agent's private
+// default, so a credential written through the runner is never world-readable.
+over_each_transport!(cwd_is_absolute_and_default_file_mode_is_private);
+async fn cwd_is_absolute_and_default_file_mode_is_private(memory: Arc<dyn TestAgent>) {
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
     let runner = runner_for(&memory, directory.path());
@@ -610,7 +617,7 @@ async fn cwd_is_absolute_and_default_file_mode_is_explicit(memory: Arc<dyn TestA
     }
     let file = directory.path().join("default-mode");
     runner.write_file(&file, "default").await.unwrap();
-    assert_eq!(std::fs::metadata(file).unwrap().permissions().mode() & 0o777, 0o644);
+    assert_eq!(std::fs::metadata(file).unwrap().permissions().mode() & 0o777, 0o600);
 }
 
 struct ReplaceableConnector(Mutex<Arc<MemoryAgent>>);
@@ -812,4 +819,110 @@ async fn recorded_platform_mismatch_refuses_before_upload() {
     assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     assert!(error.to_string().contains(&format!("prepared for {recorded} but its agent reports {current}")));
     assert_eq!(opens, 1);
+}
+
+// Files, links and directories go through the agent's file operations, never
+// a guest process. A replacement applies its new mode, readers see only whole
+// files, and no staging entry is left beside the destination.
+over_each_transport!(file_operations_publish_atomically_without_guest_processes);
+async fn file_operations_publish_atomically_without_guest_processes(agent: Arc<dyn TestAgent>) {
+    use super::super::{EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind};
+    use std::os::unix::fs::PermissionsExt;
+    let host = tempfile::tempdir().unwrap();
+    let guest = tempfile::tempdir().unwrap();
+    let runner = runner_for(&agent, host.path());
+    let target = guest.path().join("material/nested/auth.json");
+    runner.write_file_with_mode(&target, "first", 0o600).await.unwrap();
+    assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o600);
+    runner.write_file_with_mode(&target, "second", 0o640).await.unwrap();
+    assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o640);
+    assert_eq!(std::fs::read(&target).unwrap(), b"second");
+    let source = host.path().join("source");
+    std::fs::write(&source, vec![7; 300 * 1024]).unwrap();
+    let copy = guest.path().join("material/copy");
+    runner.write_file_from(&source, &copy).await.unwrap();
+    let readback = host.path().join("readback");
+    runner.read_file_to(&copy, &readback).await.unwrap();
+    assert_eq!(std::fs::read(&readback).unwrap(), vec![7; 300 * 1024]);
+    let config = guest.path().join("config/settings");
+    assert_eq!(runner.ensure_file(&config, "kept").await.unwrap(), "kept");
+    assert_eq!(runner.ensure_file(&config, "ignored").await.unwrap(), "kept");
+    let tools = host.path().join("kit");
+    std::fs::create_dir_all(tools.join("v1")).unwrap();
+    std::fs::write(tools.join("v1/tool"), b"tool").unwrap();
+    std::fs::set_permissions(tools.join("v1/tool"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink("v1/tool", tools.join("entry")).unwrap();
+    let installed = guest.path().join("opt");
+    let layer = [EnvironmentTool::new("tool", installed.join("entry")).with_asset(EnvironmentToolAsset::new(
+        &tools,
+        &installed,
+        EnvironmentToolAssetKind::Directory,
+        EnvironmentToolAssetAccess::ReadOnly,
+        "tool",
+    ))];
+    runner.push_tools(&layer).await.unwrap();
+    assert_eq!(std::fs::read(installed.join("entry")).unwrap(), b"tool");
+    assert_eq!(std::fs::metadata(installed.join("v1/tool")).unwrap().permissions().mode() & 0o777, 0o755);
+    for directory in [guest.path().join("material"), guest.path().join("material/nested"), guest.path().join("config"), installed] {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(!name.to_string_lossy().starts_with('.'), "staging entry {name:?} left in {}", directory.display());
+        }
+    }
+    let observer = agent.connect().await.unwrap();
+    assert!(observer.processes().await.unwrap().is_empty(), "file operations must not run guest processes");
+}
+
+// An agent that restarts behind a surviving link comes back with no
+// configuration and no forwards. Its configuration tag changes, so the next
+// health check pushes the environment and every forward again.
+over_each_transport!(health_check_restores_state_an_agent_lost);
+async fn health_check_restores_state_an_agent_lost(agent: Arc<dyn TestAgent>) {
+    let directory = tempfile::Builder::new().prefix("frs-").tempdir_in("/tmp").unwrap();
+    let runner = runner_for(&agent, directory.path());
+    runner.configure_environment(BTreeMap::from([("VESSEL".into(), "restored".into())])).await.unwrap();
+    let endpoint = directory.path().join("daemon.sock");
+    let listener = UnixListener::bind(&endpoint).unwrap();
+    let guest = directory.path().join("flotilla.sock");
+    runner.add_guest_forward("flotilla-daemon", &guest, &endpoint).await.unwrap();
+    // Forwards are resources of their own: adding one leaves the configuration
+    // tag alone, so a health check after it sees no restart.
+    let pushed = runner.state.lock().await.etag.clone().unwrap();
+    let live = runner.state.lock().await.client.clone().unwrap();
+    assert_eq!(live.configuration().await.unwrap().etag, pushed);
+    assert!(runner.healthy().await);
+    assert_eq!(runner.state.lock().await.etag.clone().unwrap(), pushed, "an unchanged tag pushes nothing");
+    // What a restart leaves behind the same link: empty configuration and no forwards.
+    let client = runner.state.lock().await.client.clone().unwrap();
+    client.remove_guest_forward("flotilla-daemon").await.unwrap();
+    client.configure(Configuration::default()).await.unwrap();
+    assert!(UnixStream::connect(&guest).await.is_err());
+    assert!(runner.healthy().await);
+    let echo = runner.run("sh", &["-c", "printf %s \"$VESSEL\""], Path::new("/"), &ChannelLabel::Default).await.unwrap();
+    assert_eq!(echo, "restored");
+    let mut crew = UnixStream::connect(&guest).await.unwrap();
+    crew.write_all(b"ping").await.unwrap();
+    let (mut daemon, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+    let mut request = [0; 4];
+    daemon.read_exact(&mut request).await.unwrap();
+    assert_eq!(&request, b"ping");
+    assert_eq!(agent.starts(), 1);
+}
+
+// A refused guest forward releases the host endpoint it claimed, on the same
+// client: correcting the request and retrying succeeds, and nothing is cached.
+over_each_transport!(refused_guest_forward_releases_its_endpoint);
+async fn refused_guest_forward_releases_its_endpoint(agent: Arc<dyn TestAgent>) {
+    let directory = tempfile::Builder::new().prefix("frg-").tempdir_in("/tmp").unwrap();
+    let runner = runner_for(&agent, directory.path());
+    let endpoint = directory.path().join("daemon.sock");
+    let _listener = UnixListener::bind(&endpoint).unwrap();
+    let occupied = directory.path().join("occupied");
+    std::fs::write(&occupied, b"not a socket").unwrap();
+    assert!(runner.add_guest_forward("flotilla-daemon", &occupied, &endpoint).await.is_err());
+    assert!(runner.state.lock().await.guest_forwards.is_empty());
+    let guest = directory.path().join("flotilla.sock");
+    runner.add_guest_forward("flotilla-daemon", &guest, &endpoint).await.unwrap();
+    UnixStream::connect(&guest).await.unwrap();
+    assert_eq!(agent.starts(), 1, "the refusal did not need a new client");
 }
