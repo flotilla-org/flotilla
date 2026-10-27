@@ -44,13 +44,16 @@ CREATE TABLE "access_delivery" (
   "place" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "harness" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "home" TEXT NOT NULL,
+  "retry_need" TEXT,
   "retry_attempts" INTEGER,
   "retry_error" TEXT,
   "retry_next_at" INTEGER,
-  CHECK (CASE WHEN "retry_attempts" IS NOT NULL
-      THEN "retry_error" IS NOT NULL
+  CHECK (CASE WHEN "retry_need" IS NOT NULL
+      THEN "retry_attempts" IS NOT NULL
+      AND "retry_error" IS NOT NULL
       AND "retry_next_at" IS NOT NULL
-      ELSE "retry_error" IS NULL
+      ELSE "retry_attempts" IS NULL
+      AND "retry_error" IS NULL
       AND "retry_next_at" IS NULL
       END)
 ) STRICT;
@@ -79,6 +82,7 @@ CREATE VIEW "access_delivery_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "access_delivery"."place") AS "place",
   (SELECT "s" FROM "strings" WHERE "id" = "access_delivery"."harness") AS "harness",
   "access_delivery"."home",
+  "access_delivery"."retry_need",
   "access_delivery"."retry_attempts",
   "access_delivery"."retry_error",
   "access_delivery"."retry_next_at"

@@ -38,8 +38,8 @@ fn access_delivery_kind_code_is_free_beside_the_production_kinds() {
     assert_eq!(registry.iter().find(|set| set.kind == "AccessDelivery").map(|set| set.code), Some(KindCode::new("ad")));
 }
 
-// Behaviour (#3320 production shape, #3392 A1): every statement for the kind searches a key
-// or a declared index, and removing a place finds its deliveries by index.
+// Behaviour (#3320 production shape, #3392 A1): every statement the kind's store generates
+// searches a key or a declared index, never a scan or a temporary sort.
 #[test]
 fn access_delivery_statements_search_by_key() {
     let store =

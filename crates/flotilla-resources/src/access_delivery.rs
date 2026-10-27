@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 use crate::{resource::define_resource, status_patch::NoStatusPatch, ReplicationClass};
 
 /// The mechanism a need was delivered through, in the vessel delivery vocabulary
-/// (#3956 Q8). Fetch by digest and provider volumes are further variants.
+/// (#3956 Q8). Fetch by digest (#3926, #3909) and provider volumes will be added as
+/// further variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
 #[serde(rename_all = "kebab-case")]
 pub enum DeliveryMechanism {
@@ -58,7 +59,10 @@ pub struct DeliveredNeed {
 /// The access layer's last failed attempt at the place, and when the next is due.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
 pub struct DeliveryRetry {
+    /// The need whose step failed; the needs before it in the plan landed.
+    pub need: String,
     pub attempts: u32,
+    /// A bounded diagnostic that never carries delivered material.
     pub error: String,
     pub next_at: Timestamp,
 }
