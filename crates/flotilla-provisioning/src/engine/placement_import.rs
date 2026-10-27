@@ -121,8 +121,8 @@ struct PolicySettings {
 enum Merged {
     /// A record, with notes on what it overrode or folded.
     Record {
-        origin: DefinitionOrigin,
-        spec: EnvironmentProviderSpec,
+        origin: Box<DefinitionOrigin>,
+        spec: Box<EnvironmentProviderSpec>,
         notes: Vec<String>,
     },
     /// Nothing declares them and they are the built-in default: no record; `policies` dropped.
@@ -188,7 +188,7 @@ fn merge_settings(mut set: Vec<PolicySettings>) -> Merged {
         };
         notes.push(format!("set by policies `{}`{origins}", policies.join("`, `")));
     }
-    Merged::Record { origin: first.origin.clone(), spec, notes }
+    Merged::Record { origin: Box::new(first.origin.clone()), spec: Box::new(spec), notes }
 }
 
 /// The kind a policy with none of its name becomes. `host_platform` is the platform grant of its
@@ -309,7 +309,7 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
         match merge_settings(set) {
             Merged::Record { origin, spec, notes } => {
                 report.notes.extend(notes.into_iter().map(|note| format!("{PROVIDERS} `{name}` at `{home}`: {note}")));
-                imported.providers.push(Placed { name, home, record: EnvironmentProviderDefinition::new(origin, &spec) });
+                imported.providers.push(Placed { name, home, record: EnvironmentProviderDefinition::new(*origin, &spec) });
             }
             Merged::Builtin { policies } => *report.dropped.entry((PROVIDERS, "the built-in default settings")).or_default() += policies,
             Merged::Refused(reason) => {
