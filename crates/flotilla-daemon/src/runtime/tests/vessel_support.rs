@@ -17,7 +17,23 @@ pub(super) struct RecordedVessel {
     pub(super) forwards: Vec<(PathBuf, PathBuf)>,
     pub(super) tool_pushes: usize,
     pub(super) attach_forwards: Vec<PathBuf>,
+    /// Artifacts made store entries, by digest, with how their bytes arrived.
+    pub(super) artifacts: Vec<(String, ArtifactArrival)>,
     pub(super) closed: bool,
+}
+
+/// How an artifact's bytes reached the vessel's store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ArtifactArrival {
+    /// The vessel fetched them from these upstream URLs.
+    Fetched(Vec<String>),
+    Pushed,
+}
+
+/// Where the fake agent of the vessel at `agent` keeps an entry, as drydock keeps its
+/// store beside the agent.
+pub(super) fn store_entry(agent: &Path, sha256: &str) -> PathBuf {
+    agent.join("store/artifacts").join(sha256)
 }
 
 /// Opens every vessel onto `runner`, keyed by its agent directory, and gives
@@ -74,6 +90,25 @@ impl VesselAgent for RunnerVessel {
     }
     async fn symlink(&self, path: &Path, target: &Path) -> Result<(), String> {
         RunnerVesselAgent(self.runner.clone()).symlink(path, target).await
+    }
+    // This process-boundary fake models a Linux amd64 host whose agent store records what
+    // arrived, never reaching the network.
+    async fn platform(&self) -> Result<drydock_protocol::Platform, String> {
+        Ok(drydock_protocol::Platform::new("linux", "amd64"))
+    }
+    async fn fetch_artifact(&self, sha256: &str, urls: &[String], _: flotilla_resources::PinUnpack) -> Result<(), String> {
+        self.record(|vessel| vessel.artifacts.push((sha256.into(), ArtifactArrival::Fetched(urls.to_vec()))));
+        Ok(())
+    }
+    async fn push_artifact(&self, sha256: &str, _: &Path, _: flotilla_resources::PinUnpack) -> Result<(), String> {
+        self.record(|vessel| vessel.artifacts.push((sha256.into(), ArtifactArrival::Pushed)));
+        Ok(())
+    }
+    async fn link_artifact(&self, path: &Path, sha256: &str, member: &Path) -> Result<(), String> {
+        let host = RunnerVesselAgent(self.runner.clone());
+        host.create_dir(path.parent().ok_or("a link needs a directory")?, 0o755).await?;
+        let entry = store_entry(&self.agent, sha256);
+        host.symlink(path, &if member.as_os_str().is_empty() { entry } else { entry.join(member) }).await
     }
     async fn ready(&self) -> Result<(), String> {
         Ok(())

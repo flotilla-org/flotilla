@@ -305,6 +305,10 @@ pub trait VesselAgent: Send + Sync {
     /// Make `path` a symbolic link to `target`, atomically replacing anything there
     /// but a directory.
     async fn symlink(&self, path: &Path, target: &Path) -> Result<(), String>;
+    /// The platform the vessel's agent reports it was built for, which is the guest's.
+    async fn platform(&self) -> Result<drydock_protocol::Platform, String> {
+        Err("this vessel agent does not report its platform".into())
+    }
     /// Make the artifact with `sha256` an entry of the agent's verified store
     /// (drydock#86), fetched by the vessel itself from `urls` in order; a repeat is
     /// answered from the store's index. Only bytes hashing to `sha256` are kept.

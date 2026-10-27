@@ -10,6 +10,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_agent::adapter::AgentAdapter;
+use flotilla_agent::adapter::AgentAdapterRegistry;
 use flotilla_agent::adapter::AgentLaunchRequest;
 use flotilla_agent::adapter::CapabilityTable;
 use flotilla_agent::{CLAUDE_CODE_HOOK_TOKEN_ENV, CLAUDE_CODE_HOOK_URL_ENV};
@@ -36,7 +37,7 @@ use flotilla_terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, T
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use super::access_layer::{deliver_access, AccessLaunch};
+use super::access_layer::{deliver_access, AccessDelivered, AccessLaunch};
 use super::account_access::{AccountLaunch, BoundAccount};
 use super::agentless_vessels::{apply_reach_environment, compose_session_environment, vessel_base, VesselAccess};
 use super::credentials::RuntimeSessionCapabilities;
@@ -469,10 +470,6 @@ impl TerminalRuntime for TerminalControllerRuntime {
                         String::from_utf8(body).map_err(|error| format!("brief artifact is not UTF-8: {error}"))?;
                 }
                 let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
-                let adapter = registry
-                    .agent_adapters
-                    .get(&requirement.adapter)
-                    .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
                 let vcs = if spec.env_ref == self.state.host_direct_environment_name {
                     self.state.daemon.local_vcs_for_checkout(cwd.as_path()).await?
                 } else {
@@ -489,7 +486,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 // material from the access layer, through its vessel agent, before its
                 // harness starts. The daemon host's own sessions have no vessel: a
                 // requester there starts only in the home its binding delivers (#3907).
-                let accessed = if spec.env_ref == self.state.host_direct_environment_name {
+                let delivered = if spec.env_ref == self.state.host_direct_environment_name {
                     match requirement.account_access() {
                         Some(access) => {
                             let runner = launch_runner()?;
@@ -503,9 +500,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
                                 .display()
                                 .to_string();
                             bound.deliver(&self.state, &account, &home, &*runner).await?;
-                            bound.environment(&home)
+                            AccessDelivered { environment: bound.environment(&home), executable: None }
                         }
-                        None => Vec::new(),
+                        None => AccessDelivered::default(),
                     }
                 } else {
                     let agent = self.vessel_agent(spec, vessel.as_deref()).await?;
@@ -517,6 +514,15 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     };
                     deliver_access(&self.state, &launch, agent, &credential_env).await?
                 };
+                // #3909: a harness the access layer delivered is the one this launch runs.
+                let adapter = match &delivered.executable {
+                    Some(executable) => {
+                        AgentAdapterRegistry::delivered(&requirement.adapter, executable, &delivered.environment, launch_runner()?)
+                            .ok_or_else(|| format!("agent adapter {} has no built-in harness", requirement.adapter))?
+                    }
+                    None => self.session_adapter(spec, &requirement.adapter).await?,
+                };
+                let accessed = delivered.environment;
                 credential_env.retain(|(key, _)| !accessed.iter().any(|(name, _)| name == key));
                 // #3913: the access layer's home and token file are the crew's bound layer;
                 // the prepared context sets them from there.
@@ -765,11 +771,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         }
         let TerminalSessionSource::Agent { selector, .. } = &spec.source else { return Ok(None) };
         let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
-        let registry = self.registry_for_spec(spec).await?;
-        let adapter = registry
-            .agent_adapters
-            .get(&requirement.adapter)
-            .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
+        let adapter = self.session_adapter(spec, &requirement.adapter).await?;
         let screen = match self.pool_for_spec(spec).await {
             Ok(pool) => match pool.capture_screen(session_id).await {
                 Ok(screen) => screen.unwrap_or_default(),
@@ -789,11 +791,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
     async fn observe_failure(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<Option<String>, String> {
         let TerminalSessionSource::Agent { selector, .. } = &spec.source else { return Ok(None) };
         let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
-        let registry = self.registry_for_spec(spec).await?;
-        let adapter = registry
-            .agent_adapters
-            .get(&requirement.adapter)
-            .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
+        let adapter = self.session_adapter(spec, &requirement.adapter).await?;
         let pool = self.pool_for_spec(spec).await?;
         let stable = pool
             .list_sessions()
@@ -895,12 +893,8 @@ impl TerminalRuntime for TerminalControllerRuntime {
         let TerminalSessionSource::Agent { selector, brief, .. } = &spec.source else {
             return Ok(());
         };
-        let registry = self.registry_for_spec(spec).await?;
         let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
-        let adapter = registry
-            .agent_adapters
-            .get(&requirement.adapter)
-            .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
+        let adapter = self.session_adapter(spec, &requirement.adapter).await?;
 
         let mut roots = BTreeSet::from([spec.cwd.clone()]);
         roots.extend(brief.copies.iter().cloned());
@@ -975,13 +969,21 @@ impl TerminalControllerRuntime {
     pub(super) async fn adapter_for_spec(&self, spec: TerminalSessionTarget<'_>) -> Result<Option<Arc<dyn AgentAdapter>>, String> {
         let TerminalSessionSource::Agent { selector, .. } = &spec.source else { return Ok(None) };
         let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
-        let registry = self.registry_for_spec(spec).await?;
-        registry
-            .agent_adapters
-            .get(&requirement.adapter)
-            .cloned()
-            .map(Some)
-            .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))
+        self.session_adapter(spec, &requirement.adapter).await.map(Some)
+    }
+
+    /// The adapter a session's harness runs under: the place's discovered one, or, on an
+    /// agentless vessel, whose access layer delivers the pinned harness (#3909), the
+    /// built-in adapter for it even when the host has none installed. Observation and
+    /// cleanup never run its binary; launch uses the executable delivery returns.
+    async fn session_adapter(&self, spec: TerminalSessionTarget<'_>, adapter: &str) -> Result<Arc<dyn AgentAdapter>, String> {
+        let unavailable = || format!("agent adapter {adapter} unavailable for environment {}", spec.env_ref);
+        if let Some(found) = self.registry_for_spec(spec).await?.agent_adapters.get(adapter) {
+            return Ok(Arc::clone(found));
+        }
+        let Some(vessel) = self.vessel_for_spec(spec).await? else { return Err(unavailable()) };
+        let name = flotilla_agent::adapter::harness_binary(adapter).ok_or_else(unavailable)?;
+        AgentAdapterRegistry::delivered(adapter, Path::new(name), &[], vessel.runner()).ok_or_else(unavailable)
     }
 
     pub(super) async fn pool_for_spec(&self, spec: TerminalSessionTarget<'_>) -> Result<Arc<dyn TerminalPool>, String> {

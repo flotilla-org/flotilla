@@ -588,6 +588,9 @@ impl VesselAgent for Arc<AgentRunner> {
             .await
             .map_err(|error| format!("link {} to {}: {error}", path.display(), target.display()))
     }
+    async fn platform(&self) -> Result<Platform, String> {
+        self.client().await?.hello().platform.clone().ok_or_else(|| "the vessel agent predates platform reporting".to_string())
+    }
     async fn fetch_artifact(&self, sha256: &str, urls: &[String], unpack: PinUnpack) -> Result<(), String> {
         let sources = urls.iter().map(|url| ArtifactSource::Upstream { url: url.clone() }).collect();
         let fetch = Fetch { sources, unpack: store_unpack(unpack)? };
