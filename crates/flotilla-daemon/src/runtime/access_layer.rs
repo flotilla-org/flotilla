@@ -11,16 +11,20 @@
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use async_trait::async_trait;
-use flotilla_credentials::{AgentMaterialRegistry, HarnessLogin, SkillTree};
+use flotilla_credentials::{AgentMaterialRegistry, HarnessHome, HarnessLogin, SkillTree};
 use flotilla_environment::environment::VesselAgent;
 use flotilla_resources::{
     account_access::{requester_home, AccessName},
     Convoy, Environment, ResourceError, Vessel,
 };
 use flotilla_vessel_delivery::{
-    deliver, Access, AccessKey, ContentDigest, CostTable, HostPathOffer, HostReach, Item, Liveness, Mechanism, Need, NeedName,
-    ProviderMechanisms, RelativePath, TreeDelivery, TreeSources,
+    deliver, Access, AccessKey, ContentDigest, CostTable, DeliveryError, HostPathOffer, HostReach, Item, Liveness, Mechanism, Need,
+    NeedName, Plan, ProviderMechanisms, RelativePath, TreeDelivery, TreeSources,
 };
+
+use self::status::AccessStatus;
+
+pub(super) mod status;
 
 use super::account_access::{AccountLaunch, BoundAccount};
 use super::credentials::agent_material_environment;
@@ -30,6 +34,8 @@ const HOME: &str = "home";
 const SKILLS: &str = "skills";
 const ACCOUNT: &str = "account";
 const LOGIN: &str = "login";
+/// The need a failure is recorded against when it was in planning, not in one need's step.
+const PLAN: &str = "plan";
 
 /// One crew's launch, as the access layer needs it.
 pub(super) struct AccessLaunch<'a> {
@@ -55,12 +61,45 @@ pub(super) async fn deliver_access(
     let material = state.agent_material.as_ref().ok_or("vessel delivery requires the agent material registry")?;
     let Some(harness) = material.harness_home(launch.adapter) else { return Ok(Vec::new()) };
     let crew = frozen_crew(state, &launch.account, launch.vessel_ref).await?;
+    let status = AccessStatus::read(state, &launch.account, &crew.access, launch.adapter).await?;
+    status.due(state)?;
+    match deliver_crew(state, launch, material, &harness, crew, agent, delivered).await {
+        Ok((plan, home, environment)) => {
+            status.delivered(state, &plan, &home).await?;
+            Ok(environment)
+        }
+        Err(Failed { need, error }) => {
+            status.failed(state, need, &error).await?;
+            Err(error)
+        }
+    }
+}
+
+/// A delivery that failed at one need: the need it was preparing or delivering.
+struct Failed {
+    need: String,
+    error: String,
+}
+
+fn failed_at(need: &str) -> impl FnOnce(String) -> Failed + '_ {
+    move |error| Failed { need: need.to_string(), error }
+}
+
+async fn deliver_crew(
+    state: &Arc<ControllerRuntimeState>,
+    launch: &AccessLaunch<'_>,
+    material: &Arc<AgentMaterialRegistry>,
+    harness: &HarnessHome,
+    crew: FrozenCrew,
+    agent: Arc<dyn VesselAgent>,
+    delivered: &[(String, String)],
+) -> Result<(Plan, String, Vec<(String, String)>), Failed> {
     let access = AccessKey::new(crew.access);
     let home_key = requester_home(Path::new(""), launch.account.convoy, launch.account.role, harness.name);
     let mut needs = vec![Need {
         name: NeedName::new(HOME),
         digest: ContentDigest::new(home_key.display().to_string()),
-        item: Item::Home { key: RelativePath::new(home_key)? },
+        item: Item::Home { key: RelativePath::new(home_key).map_err(failed_at(HOME))? },
     }];
     let mut trees: BTreeMap<NeedName, Arc<dyn TreeDelivery>> = BTreeMap::new();
     let mut tree =
@@ -72,7 +111,7 @@ pub(super) async fn deliver_access(
             });
             trees.insert(NeedName::new(name), delivery);
         };
-    let skills = material.skill_tree(&crew.skills).await?;
+    let skills = material.skill_tree(&crew.skills).await.map_err(failed_at(SKILLS))?;
     tree(
         &mut needs,
         SKILLS,
@@ -82,27 +121,28 @@ pub(super) async fn deliver_access(
         Arc::new(SkillsDelivery { state: state.clone(), material: material.clone(), tree: skills }),
     );
     let bound = match launch.access {
-        Some(access) => Some(Arc::new(BoundAccount::resolve(state, &launch.account, access).await?)),
+        Some(access) => Some(Arc::new(BoundAccount::resolve(state, &launch.account, access).await.map_err(failed_at(ACCOUNT))?)),
         None => None,
     };
     if let Some(bound) = &bound {
         tree(
             &mut needs,
             ACCOUNT,
-            bound.digest(state, &launch.account).await?,
+            bound.digest(state, &launch.account).await.map_err(failed_at(ACCOUNT))?,
             flotilla_agent::account_access::CLAUDE_OAUTH_TOKEN_FILE,
             TreeSources { controller: true, ..TreeSources::default() },
             Arc::new(AccountDelivery { state: state.clone(), launch: OwnedAccountLaunch::of(&launch.account), bound: bound.clone() }),
         );
     }
-    let base = agent.writable_base().await?;
+    let base = agent.writable_base().await.map_err(failed_at(HOME))?;
     // A container's harness defaults (its contained Codex home) apply only inside it; an
     // SSH host's harness homes are what credential delivery put under its base.
     let resolved = if launch.account.agentless {
         delivered.to_vec()
     } else {
-        let declared = declared_environment(state, &launch.account).await?;
-        agent_material_environment(material, &[launch.adapter.to_string()].into(), &declared, delivered.iter().cloned())?
+        let declared = declared_environment(state, &launch.account).await.map_err(failed_at(LOGIN))?;
+        agent_material_environment(material, &[launch.adapter.to_string()].into(), &declared, delivered.iter().cloned())
+            .map_err(failed_at(LOGIN))?
     };
     if let Some(login) = material.harness_login(launch.adapter, &resolved, &base) {
         tree(
@@ -114,16 +154,26 @@ pub(super) async fn deliver_access(
             Arc::new(LoginDelivery(login)),
         );
     }
+    let place = launch.account.env_ref;
     let delivered = deliver(&needs, &trees, &place_mechanisms(launch.account.agentless), &CostTable::default(), agent.as_ref())
         .await
-        .map_err(|error| format!("deliver access `{access}` aboard `{}`: {error}", launch.account.env_ref))?;
+        .map_err(|error| Failed {
+            need: match &error {
+                DeliveryError::Step { need, .. } | DeliveryError::NoDelivery(need) | DeliveryError::Unrecordable(need) => need.to_string(),
+                DeliveryError::Plan(_) | DeliveryError::Agent(_) => PLAN.to_string(),
+            },
+            error: format!("deliver access `{access}` aboard `{place}`: {error}"),
+        })?;
     for step in &delivered.plan.steps {
-        tracing::debug!(%access, place = launch.account.env_ref, need = %step.need, mechanism = %step.mechanism, action = ?step.action, "vessel delivery");
+        tracing::debug!(%access, place, need = %step.need, mechanism = %step.mechanism, action = ?step.action, "vessel delivery");
     }
     let home = delivered
         .homes
         .get(&NeedName::new(HOME))
-        .ok_or_else(|| format!("deliver access `{access}` aboard `{}`: no home was delivered", launch.account.env_ref))?
+        .ok_or_else(|| Failed {
+            need: HOME.to_string(),
+            error: format!("deliver access `{access}` aboard `{place}`: no home was delivered"),
+        })?
         .display()
         .to_string();
     let mut environment = vec![(harness.variable.to_string(), home.clone())];
@@ -131,7 +181,7 @@ pub(super) async fn deliver_access(
         environment.retain(|(name, _)| !bound.environment(&home).iter().any(|(bound, _)| bound == name));
         environment.extend(bound.environment(&home));
     }
-    Ok(environment)
+    Ok((delivered.plan, home, environment))
 }
 
 /// What a place offers vessel delivery beyond the mandatory agent fetch and push. An SSH

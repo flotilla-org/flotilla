@@ -184,6 +184,8 @@ struct AgentlessLaunch {
     host: Arc<FakeHost>,
     env: TerminalEnvVars,
     command: String,
+    /// What `convoy explain` shows the access layer delivered.
+    deliveries: Vec<flotilla_protocol::ExplainedAccessDelivery>,
 }
 
 impl AgentlessLaunch {
@@ -204,6 +206,19 @@ async fn try_launch_on_agentless_host(adapter: &str, grant_claude: bool) -> Resu
     // The forwarded daemon socket needs a short real directory (SUN_LEN).
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
+    let launched = launch_agentless(agentless_host(&host, &runtime_dir), adapter, grant_claude).await;
+    match launched {
+        Ok(session) => Ok(AgentlessLaunch { host, env: session.env_vars, command: session.command, deliveries: session.deliveries }),
+        Err(error) => {
+            assert_host_harness_untouched(&AgentlessLaunch { host, env: Vec::new(), command: String::new(), deliveries: Vec::new() });
+            Err(error)
+        }
+    }
+}
+
+/// `host` as an agentless host whose `claude` and `codex` have never been run, its crew
+/// frozen with one skill.
+fn agentless_host(host: &Arc<FakeHost>, runtime_dir: &flotilla_test_support::TestSocketDir) -> AgentlessHost {
     // The agentless host's discovery bag is its SSH login environment: it
     // never names a flotilla environment.
     let bag = EnvironmentBag::new()
@@ -213,25 +228,13 @@ async fn try_launch_on_agentless_host(adapter: &str, grant_claude: bool) -> Resu
         .with(EnvironmentAssertion::binary("git", "/usr/bin/git"))
         .with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude"))
         .with(EnvironmentAssertion::binary("codex", "/usr/local/bin/codex"));
-    let launched = launch_agentless(
-        AgentlessHost {
-            runner: host.clone(),
-            bag,
-            host_environment: HostEnvironment::default(),
-            checkout: CHECKOUT.to_string(),
-            session_env: BTreeMap::new(),
-            skills: vec![frozen_skill("research")],
-        },
-        adapter,
-        grant_claude,
-    )
-    .await;
-    match launched {
-        Ok(session) => Ok(AgentlessLaunch { host, env: session.env_vars, command: session.command }),
-        Err(error) => {
-            assert_host_harness_untouched(&AgentlessLaunch { host, env: Vec::new(), command: String::new() });
-            Err(error)
-        }
+    AgentlessHost {
+        runner: host.clone(),
+        bag,
+        host_environment: HostEnvironment::default(),
+        checkout: CHECKOUT.to_string(),
+        session_env: BTreeMap::new(),
+        skills: vec![frozen_skill("research")],
     }
 }
 
@@ -254,6 +257,7 @@ struct AgentlessHost {
 struct LaunchedSession {
     env_vars: TerminalEnvVars,
     command: String,
+    deliveries: Vec<flotilla_protocol::ExplainedAccessDelivery>,
 }
 
 /// The terminal runtime, agentless host and crew session spec a launch runs with.
@@ -414,7 +418,14 @@ impl AgentlessRuntime {
         assert_eq!(socket.as_ref(), Some(&vessel.daemon_socket()));
         assert_eq!(prepared.environment.get("FLOTILLA_DAEMON_SOCKET").map(PathBuf::from), socket);
         assert!(matches!(prepared.forwards.as_slice(), [(guest, _)] if *guest == vessel.daemon_socket()), "{:?}", prepared.forwards);
-        Ok(LaunchedSession { env_vars: launch.env_vars.clone(), command: launch.command.clone() })
+        Ok(LaunchedSession { env_vars: launch.env_vars.clone(), command: launch.command.clone(), deliveries: self.deliveries().await })
+    }
+
+    /// What `convoy explain` shows the access layer delivered for the convoy.
+    async fn deliveries(&self) -> Vec<flotilla_protocol::ExplainedAccessDelivery> {
+        flotilla_projections::read_projections::access_delivery_evidence(&self.daemon.resource_backend(), NAMESPACE, "demo")
+            .await
+            .expect("access deliveries")
     }
 }
 
@@ -428,6 +439,13 @@ fn assert_staged_into_launched_home(launch: &AgentlessLaunch, variable: &str) {
     };
     assert!(record.lines().any(|line| line.starts_with("skills\t") && line.contains("\tagent-fetch(url)\t")), "{record}");
     assert!(record.lines().any(|line| line.starts_with("home\t") && line.contains("\thost-path(rw, live)\t")), "{record}");
+    // Contract 4: the access's status shows the same home and each need's mechanism.
+    let [delivery] = launch.deliveries.as_slice() else { panic!("one access delivered: {:?}", launch.deliveries) };
+    assert_eq!(delivery.home, home);
+    assert_eq!(delivery.retry, None);
+    let mechanisms = delivery.needs.iter().map(|need| (need.need.as_str(), need.mechanism.as_str())).collect::<BTreeMap<_, _>>();
+    assert_eq!(mechanisms.get("home"), Some(&"host-path(rw, live)"));
+    assert_eq!(mechanisms.get("skills"), Some(&"agent-fetch(url)"));
 }
 
 /// No launch writes the host user's harness configuration; it reads as it did.
@@ -1020,4 +1038,54 @@ async fn a_withdrawal_waits_for_a_delivery_in_progress() {
     drop(delivering);
     withdrawal.await.expect("join").expect("place pass");
     assert_eq!(host.entry(format!("{BOUND_HOME}/.flotilla-oauth-token")), None);
+}
+
+// #3964 contract 4: a failed delivery records, for its access, the need it failed at and
+// when the next attempt is due. A relaunch before then is refused without another attempt;
+// once due, the next delivery lands and clears the retry.
+#[tokio::test]
+async fn failed_delivery_waits_for_its_retry_and_is_cleared_once_delivered() {
+    let runtime_dir = flotilla_test_support::TestSocketDir::new();
+    let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
+    let runtime = agentless_runtime(agentless_host(&host, &runtime_dir), "claude-code").await;
+    runtime.launch().await.expect_err("no account is bound");
+    let retry = |deliveries: Vec<flotilla_protocol::ExplainedAccessDelivery>| {
+        let [delivery] = deliveries.as_slice() else { panic!("one access: {deliveries:?}") };
+        delivery.retry.clone()
+    };
+    let failed = retry(runtime.deliveries().await).expect("the failure is recorded");
+    assert_eq!((failed.need.as_str(), failed.attempts), ("account", 1));
+
+    bind_account(&runtime.daemon.resource_backend(), "demo", "coder", "claude-max", "crew@example.com").await;
+    runtime.launch().await.expect_err("the retry is not yet due");
+    assert_eq!(retry(runtime.deliveries().await), Some(failed), "no attempt before the retry is due");
+
+    // Time passes: the recorded retry falls due.
+    let records = runtime.daemon.resource_backend().using::<flotilla_resources::AccessDelivery>(NAMESPACE);
+    let [record] = records.list().await.expect("records").items.try_into().expect("one record");
+    let mut due = record.spec.clone();
+    due.retry.as_mut().expect("retry").next_at = flotilla_schema::Timestamp::from_datetime(&chrono::DateTime::UNIX_EPOCH);
+    let meta = InputMeta::builder().name(record.metadata.name.clone()).labels(record.metadata.labels.clone()).build();
+    records.update(&meta, &record.metadata.resource_version, &due).await.expect("retry due");
+    runtime.launch().await.expect("delivered once due");
+    assert_eq!(retry(runtime.deliveries().await), None);
+}
+
+// #3964: an access's status lasts as long as its place and its convoy. While both
+// remain it is kept; once the convoy is gone, the access has ended and the record goes.
+#[tokio::test]
+async fn access_status_goes_with_its_convoy() {
+    let runtime_dir = flotilla_test_support::TestSocketDir::new();
+    let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
+    let runtime = agentless_runtime(agentless_host(&host, &runtime_dir), "codex").await;
+    runtime.launch().await.expect("delivered");
+    let backend = runtime.daemon.resource_backend();
+    let records = backend.clone().using::<flotilla_resources::AccessDelivery>(NAMESPACE);
+    let [record] = records.list().await.expect("records").items.try_into().expect("one record");
+    let (_, reconciler) = super::super::access_layer::status::status_controller(Arc::clone(&runtime.state), NAMESPACE.to_string());
+    reconciler.retire(&record).await.expect("retire");
+    assert_eq!(records.list().await.expect("records").items.len(), 1, "kept while its place and convoy remain");
+    backend.using::<Convoy>(NAMESPACE).delete("demo").await.expect("convoy ended");
+    reconciler.retire(&record).await.expect("retire");
+    assert!(records.list().await.expect("records").items.is_empty(), "removed with its convoy");
 }

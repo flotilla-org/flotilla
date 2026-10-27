@@ -599,6 +599,14 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_staged_into(
         [StagedSkills { destination: home.join("skills"), names: vec!["research".into()] }],
         "the crew's frozen skills are staged into that same home"
     );
+    // Contract 4: the access's status shows the same home and each need's mechanism.
+    let deliveries =
+        flotilla_projections::read_projections::access_delivery_evidence(&backend, NAMESPACE, "demo").await.expect("deliveries");
+    let [delivery] = deliveries.as_slice() else { panic!("one access delivered: {deliveries:?}") };
+    assert_eq!(Path::new(&delivery.home), home);
+    let mechanisms = delivery.needs.iter().map(|need| (need.need.as_str(), need.mechanism.as_str())).collect::<BTreeMap<_, _>>();
+    assert_eq!(mechanisms.get("home"), Some(&"agent-push"));
+    assert_eq!(mechanisms.get("skills"), Some(&"agent-fetch(url)"));
     mint_session.assert_complete();
 }
 

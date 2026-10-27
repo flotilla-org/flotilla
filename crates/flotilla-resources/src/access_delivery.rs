@@ -47,6 +47,20 @@ pub enum DeliveryMechanism {
     AgentPush,
 }
 
+impl DeliveryMechanism {
+    /// The vessel delivery vocabulary's own spelling, as `convoy explain` shows it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::HostPathReadOnlyLive => "host-path(ro, live)",
+            Self::HostPathReadOnlySnapshot => "host-path(ro, snapshot)",
+            Self::HostPathReadWriteLive => "host-path(rw, live)",
+            Self::HostPathReadWriteSnapshot => "host-path(rw, snapshot)",
+            Self::AgentFetchUrl => "agent-fetch(url)",
+            Self::AgentPush => "agent-push",
+        }
+    }
+}
+
 /// One need as it landed at the place.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
 pub struct DeliveredNeed {

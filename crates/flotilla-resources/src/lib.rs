@@ -257,6 +257,7 @@ pub use watch::{ResourceList, ResourcePosition, ResourceTombstone, WatchEvent, W
 #[macro_export]
 macro_rules! for_each_registered_resource {
     ($callback:ident, $($argument:expr),* $(,)?) => {{
+        $callback::<$crate::AccessDelivery>($($argument),*);
         $callback::<$crate::AccountBinding>($($argument),*);
         $callback::<$crate::AccountProvision>($($argument),*);
         $callback::<$crate::Artifact>($($argument),*);
