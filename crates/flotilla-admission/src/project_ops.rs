@@ -1742,10 +1742,11 @@ mod tests {
             let observed = ResourceBackend::new(InMemoryBackend::observed());
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
             let namespace = std::sync::RwLock::new("flotilla".to_string());
+            let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
             let service = ProjectService {
                 image_layer_refresh: Default::default(),
                 resource_backend: &backend,
-                manifest_roots: Box::leak(Box::new(flotilla_store::OldStoreManifestRoots::new(backend.clone()))),
+                manifest_roots: &roots,
                 observed_resource_backend: &observed,
                 clock: &clock,
                 namespace: &namespace,
@@ -1917,10 +1918,11 @@ mod tests {
         });
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new(test_namespace.to_string());
+        let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
         let service = ProjectService {
             image_layer_refresh: Default::default(),
             resource_backend: &backend,
-            manifest_roots: Box::leak(Box::new(flotilla_store::OldStoreManifestRoots::new(backend.clone()))),
+            manifest_roots: &roots,
             observed_resource_backend: &observed,
             clock: &clock,
             namespace: &namespace,
