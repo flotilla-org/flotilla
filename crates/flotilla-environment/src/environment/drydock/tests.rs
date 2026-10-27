@@ -5,7 +5,6 @@ use ::drydock::{
     client::Client,
     conformance,
 };
-use flotilla_provider_runtime::ChannelLabel;
 use hegel::generators as gs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -15,8 +14,9 @@ const BUILD: &[u8] = b"flotilla drydock test agent";
 /// A real Rust drydock host with the reference module, whose vessels declare
 /// an agent reached over SSH, and an in-process gateway serving a real agent
 /// under that reach's forwarding rules. The stand-in vessel is this host: its
-/// workspace root is the fixture's, and only `tar` and `du` are faked on the
-/// vessel's PATH, so checkpoints never archive the test host.
+/// workspace root is the fixture's, and `tar` and `du` are faked on the
+/// vessel's PATH, so checkpoints never archive the test host. `df` and `stat`
+/// answer as GNU's do, so the checkpoint script sees a Linux guest on any host.
 struct HostFixture {
     _directory: tempfile::TempDir,
     root: PathBuf,
@@ -67,11 +67,14 @@ impl HostFixture {
         .unwrap();
         runtime.configure(&configuration).await.unwrap();
         std::fs::create_dir(root.join("vessel")).unwrap();
-        let gateway = Gateway::start(&root.join("vessel"), reverse_forwards, BUILD).unwrap();
+        // The provider prepares linux/amd64 guests, so the stand-in vessel
+        // reports that platform on any test host.
+        let gateway = Gateway::start_as(&root.join("vessel"), reverse_forwards, BUILD, crate::guest_tools::linux_amd64()).unwrap();
         let bin = root.join("bin");
         std::fs::create_dir(&bin).unwrap();
         // `du` reports nothing to archive, refuses once `du-fails` exists and
-        // hangs while `du-hangs` does; `tar` writes a fixed archive.
+        // hangs while `du-hangs` does; `tar` writes a fixed archive; `df` has
+        // room for it and `stat -c%s` reports its size.
         for (name, script) in [
             (
                 "du",
@@ -81,6 +84,8 @@ impl HostFixture {
                 ),
             ),
             ("tar", "#!/bin/sh\nwhile [ $# -gt 0 ]; do [ \"$1\" = -cf ] && { shift; printf archive > \"$1\"; }; shift; done\n".into()),
+            ("df", "#!/bin/sh\nprintf 'Filesystem 1-blocks Used Available Use%% Mounted\\ntmp 0 0 1099511627776 0%% /tmp\\n'\n".into()),
+            ("stat", "#!/bin/sh\nfor last; do :; done\nwc -c < \"$last\" | tr -d ' '\n".into()),
         ] {
             std::fs::write(bin.join(name), script).unwrap();
             std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -551,8 +556,11 @@ async fn lost_agent_reconnects_on_liveness() {
 // #3765 S2: build caches do not consume the survivor budget, and an oversized
 // archive is refused before any bytes stream to the host. Use real GNU tools
 // over a small temporary tree; sparse files cross the bound without disk cost.
+// The script runs in Linux guests, so only a Linux host has its tools.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn checkpoint_excludes_caches_and_preflights_size() {
+    use flotilla_provider_runtime::ChannelLabel;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("work ' quoted");
     tokio::fs::create_dir_all(root.join("target")).await.unwrap();

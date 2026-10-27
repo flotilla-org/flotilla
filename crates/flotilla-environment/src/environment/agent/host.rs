@@ -36,14 +36,14 @@ const MISSING_EXECUTABLE: i32 = 64;
 const BOOTSTRAP: &str = r#"dir=$1
 shift
 umask 077
-mkdir -p -- "$dir" && chmod 700 -- "$dir" || exit 1
+mkdir -p -- "$dir" && chmod -- 700 "$dir" || exit 1
 [ -x "$dir/drydock-agent" ] || exit 64
 exec env -i HOME="${HOME:-/}" USER="${USER:-}" LOGNAME="${LOGNAME:-}" SHELL="${SHELL:-/bin/sh}" \
   XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" "$@" \
   "$dir/drydock-agent" --supervise --socket "$dir/agent.sock""#;
 
 /// Publish the copied executable only once it is complete and executable.
-const INSTALL: &str = r#"chmod 700 -- "$1" && mv -f -- "$1" "$2""#;
+const INSTALL: &str = r#"chmod -- 700 "$1" && mv -f -- "$1" "$2""#;
 
 /// Kill the supervisor and agent serving one socket, then remove the vessel's
 /// directories. Both processes end their argv with `--socket <socket>`; the
