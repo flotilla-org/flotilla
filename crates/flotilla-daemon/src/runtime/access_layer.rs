@@ -19,7 +19,7 @@ use flotilla_resources::{
 };
 use flotilla_vessel_delivery::{
     deliver, Access, AccessKey, ContentDigest, CostTable, DeliveryError, HostPathOffer, HostReach, Item, Liveness, Mechanism, Need,
-    NeedName, Plan, ProviderMechanisms, RelativePath, TreeDelivery, TreeSources,
+    NeedName, Plan, ProviderMechanisms, Reachability, RelativePath, TreeDelivery, TreeSources,
 };
 
 use self::status::AccessStatus;
@@ -186,15 +186,16 @@ async fn deliver_crew(
 
 /// What a place offers vessel delivery beyond the mandatory agent fetch and push. An SSH
 /// host's writable base is the host's own durable storage; a container's is not, so its
-/// homes are created through the agent. Step 4 of #3956 moves this declaration onto each
-/// provider instance.
+/// homes are created through the agent. Both kinds in use reach public sources: neither
+/// declares an egress policy, and their skills are already fetched aboard. Step 4 of
+/// #3956 moves this declaration onto each provider instance.
 fn place_mechanisms(agentless: bool) -> ProviderMechanisms {
     let host_paths = if agentless {
         vec![HostPathOffer { reach: HostReach::WritableBase, access: Access::ReadWrite, liveness: Liveness::Live }]
     } else {
         Vec::new()
     };
-    ProviderMechanisms { host_paths }
+    ProviderMechanisms { host_paths, reach: Reachability { vessel_public: true } }
 }
 
 /// The crew's frozen entry, as the caller reads it from its convoy: its access key and

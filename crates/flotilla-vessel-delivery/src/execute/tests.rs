@@ -97,7 +97,7 @@ fn needs(skills: &str, notes: &str) -> Vec<Need> {
         item: Item::Tree {
             home: NeedName::new("home"),
             path: RelativePath::new(format!("skills/{name}")).expect("path"),
-            sources: TreeSources { controller: true, url: true, host_path: None },
+            sources: TreeSources { controller: true, url: true, ..TreeSources::default() },
         },
     };
     vec![

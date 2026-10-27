@@ -22,8 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::{resource::define_resource, status_patch::NoStatusPatch, ReplicationClass};
 
 /// The mechanism a need was delivered through, in the vessel delivery vocabulary
-/// (#3956 Q8). Fetch by digest (#3926, #3909) and provider volumes will be added as
-/// further variants.
+/// (#3956 Q8). Provider volumes will be added as a further variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
 #[serde(rename_all = "kebab-case")]
 pub enum DeliveryMechanism {
@@ -42,6 +41,10 @@ pub enum DeliveryMechanism {
     /// The vessel agent fetched the content by URL.
     #[store(code = "fu")]
     AgentFetchUrl,
+    /// The vessel agent fetched the content by its digest into its verified store
+    /// (#3909, drydock#86).
+    #[store(code = "fd")]
+    AgentFetchDigest,
     /// The controller pushed the content through the vessel agent.
     #[store(code = "pu")]
     AgentPush,
@@ -56,6 +59,7 @@ impl DeliveryMechanism {
             Self::HostPathReadWriteLive => "host-path(rw, live)",
             Self::HostPathReadWriteSnapshot => "host-path(rw, snapshot)",
             Self::AgentFetchUrl => "agent-fetch(url)",
+            Self::AgentFetchDigest => "agent-fetch(digest)",
             Self::AgentPush => "agent-push",
         }
     }

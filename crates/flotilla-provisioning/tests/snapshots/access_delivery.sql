@@ -60,7 +60,7 @@ CREATE TABLE "access_delivery" (
 CREATE TABLE "access_delivery_needs" (
   "access_delivery" INTEGER NOT NULL,
   "key" TEXT NOT NULL,
-  "mechanism" TEXT NOT NULL CHECK ("mechanism" IN ('fu', 'hrl', 'hrs', 'hwl', 'hws', 'pu')),
+  "mechanism" TEXT NOT NULL CHECK ("mechanism" IN ('fd', 'fu', 'hrl', 'hrs', 'hwl', 'hws', 'pu')),
   "digest" TEXT NOT NULL,
   "at" INTEGER NOT NULL,
   PRIMARY KEY ("access_delivery", "key"),
@@ -69,6 +69,7 @@ CREATE TABLE "access_delivery_needs" (
 CREATE INDEX "access_delivery_by_access" ON "access_delivery" ("access");
 CREATE INDEX "access_delivery_by_place" ON "access_delivery" ("place");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('ad', 'needs.mechanism', 'fd', 'AgentFetchDigest'),
   ('ad', 'needs.mechanism', 'fu', 'AgentFetchUrl'),
   ('ad', 'needs.mechanism', 'hrl', 'HostPathReadOnlyLive'),
   ('ad', 'needs.mechanism', 'hrs', 'HostPathReadOnlySnapshot'),

@@ -20,5 +20,5 @@ pub use execute::{deliver, Delivered, DeliveryError, TreeDelivery, DELIVERY_RECO
 pub use plan::{plan, Action, CostTable, Landed, Plan, PlanError, Step};
 pub use vocabulary::{
     Access, AccessKey, ContentDigest, FetchBy, HostPathOffer, HostReach, Item, Liveness, Mechanism, Need, NeedName, ProviderMechanisms,
-    RelativePath, TreeSources,
+    Reachability, RelativePath, TreeSources, Visibility,
 };

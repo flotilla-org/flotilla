@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 use hegel::generators as gs;
 
 use super::*;
-use crate::vocabulary::{HostPathOffer, RelativePath, TreeSources};
+use crate::vocabulary::{HostPathOffer, Reachability, RelativePath, TreeSources, Visibility};
 
 fn home(name: &str) -> Need {
     Need {
@@ -22,7 +22,12 @@ fn tree(name: &str, home: &str, sources: TreeSources) -> Need {
 }
 
 fn sources(controller: bool, url: bool, host_path: Option<&str>) -> TreeSources {
-    TreeSources { controller, url, host_path: host_path.map(PathBuf::from) }
+    TreeSources { controller, url, host_path: host_path.map(PathBuf::from), digest: None }
+}
+
+/// Content the controller can obtain, addressed by digest at sources of `visibility`.
+fn by_digest(visibility: Visibility) -> TreeSources {
+    TreeSources { controller: true, digest: Some(visibility), ..TreeSources::default() }
 }
 
 fn writable_base(access: Access) -> HostPathOffer {
@@ -39,6 +44,7 @@ fn writable_directory(host: &str, guest: &str) -> HostPathOffer {
 
 const PUSH: Mechanism = Mechanism::AgentPush;
 const FETCH: Mechanism = Mechanism::AgentFetch { by: FetchBy::Url };
+const FETCH_DIGEST: Mechanism = Mechanism::AgentFetch { by: FetchBy::Digest };
 const RW_LIVE: Mechanism = Mechanism::HostPath { access: Access::ReadWrite, liveness: Liveness::Live };
 const RO_LIVE: Mechanism = Mechanism::HostPath { access: Access::ReadOnly, liveness: Liveness::Live };
 const RO_SNAPSHOT: Mechanism = Mechanism::HostPath { access: Access::ReadOnly, liveness: Liveness::Snapshot };
@@ -53,6 +59,7 @@ struct Row {
     rule: &'static str,
     needs: Vec<Need>,
     offers: Vec<HostPathOffer>,
+    reach: Reachability,
     delivered: Vec<Delivered>,
     costs: CostTable,
     /// (need, mechanism, action, guest source), in plan order.
@@ -60,12 +67,26 @@ struct Row {
 }
 
 fn row(rule: &'static str, needs: Vec<Need>, offers: Vec<HostPathOffer>) -> Row {
-    Row { rule, needs, offers, delivered: Vec::new(), costs: CostTable::default(), expected: Ok(Vec::new()) }
+    Row {
+        rule,
+        needs,
+        offers,
+        reach: Reachability::default(),
+        delivered: Vec::new(),
+        costs: CostTable::default(),
+        expected: Ok(Vec::new()),
+    }
 }
 
 impl Row {
     fn delivered(mut self, delivered: Vec<Delivered>) -> Self {
         self.delivered = delivered;
+        self
+    }
+
+    /// The vessel reaches public sources.
+    fn public(mut self) -> Self {
+        self.reach = Reachability { vessel_public: true };
         self
     }
 
@@ -108,6 +129,26 @@ fn needs_lower_to_the_cheapest_mechanism_meeting_their_requirements() {
         row("the cost table, not code, orders mechanisms", vec![home("home"), tree("skills", "home", sources(true, true, None))], vec![])
             .costs(CostTable { agent_push: 1, ..CostTable::default() })
             .plans(vec![("home", PUSH, Deliver, None), ("skills", PUSH, Deliver, None)]),
+        row(
+            "a public pinned artifact is fetched by a vessel that reaches it",
+            vec![home("home"), tree("harness", "home", by_digest(Visibility::Public))],
+            vec![],
+        )
+        .public()
+        .plans(vec![("home", PUSH, Deliver, None), ("harness", FETCH_DIGEST, Deliver, None)]),
+        row(
+            "a public artifact a vessel cannot reach is pushed",
+            vec![home("home"), tree("harness", "home", by_digest(Visibility::Public))],
+            vec![],
+        )
+        .plans(vec![("home", PUSH, Deliver, None), ("harness", PUSH, Deliver, None)]),
+        row(
+            "a private artifact is never fetched by the vessel",
+            vec![home("home"), tree("harness", "home", by_digest(Visibility::Private { authority: "forge".into() }))],
+            vec![],
+        )
+        .public()
+        .plans(vec![("home", PUSH, Deliver, None), ("harness", PUSH, Deliver, None)]),
         row(
             "a host copy inside an offered directory is reached where it lies",
             vec![home("home"), tree("skills", "home", sources(true, true, Some("/host/skills/a")))],
@@ -197,7 +238,8 @@ fn needs_lower_to_the_cheapest_mechanism_meeting_their_requirements() {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let actual = plan(&row.needs, &ProviderMechanisms { host_paths: row.offers.clone() }, &delivered, &row.costs).map(|plan| {
+        let mechanisms = ProviderMechanisms { host_paths: row.offers.clone(), reach: row.reach.clone() };
+        let actual = plan(&row.needs, &mechanisms, &delivered, &row.costs).map(|plan| {
             plan.steps.into_iter().map(|step| (step.need.to_string(), step.mechanism, step.action, step.guest_source)).collect::<Vec<_>>()
         });
         let expected = row.expected.clone().map(|steps| {
@@ -216,9 +258,11 @@ fn needs_lower_to_the_cheapest_mechanism_meeting_their_requirements() {
 // keeps everything, so a re-run is a no-op.
 //
 // Generator: one home and zero to four trees, each with every combination of
-// controller, URL and host copy (inside or outside the offered directory), over
-// providers offering nothing, a read-only or read-write writable base, a live or
-// snapshot read-only directory and a writable one, under every ordering of the cost table.
+// controller, URL, host copy (inside or outside the offered directory) and digest
+// sources (none, public or private), over providers offering nothing, a read-only or
+// read-write writable base, a live or snapshot read-only directory and a writable one,
+// with or without a vessel that reaches public sources, under every ordering of the
+// cost table.
 #[hegel::test]
 fn planning_again_over_what_landed_keeps_everything(tc: hegel::TestCase) {
     let mut needs = vec![home("home")];
@@ -226,12 +270,17 @@ fn planning_again_over_what_landed_keeps_everything(tc: hegel::TestCase) {
     for index in 0..trees {
         let controller = tc.draw(gs::booleans());
         let url = tc.draw(gs::booleans());
+        let digest = match tc.draw(gs::integers::<u8>().min_value(0).max_value(2)) {
+            0 => None,
+            1 => Some(Visibility::Public),
+            _ => Some(Visibility::Private { authority: "forge".into() }),
+        };
         let host = match tc.draw(gs::integers::<u8>().min_value(0).max_value(2)) {
             0 => None,
             1 => Some("/host/tree"),
             _ => Some("/elsewhere/tree"),
         };
-        needs.push(tree(&format!("tree-{index}"), "home", sources(controller, url, host)));
+        needs.push(tree(&format!("tree-{index}"), "home", TreeSources { digest, ..sources(controller, url, host) }));
     }
     let mut offers = Vec::new();
     if tc.draw(gs::booleans()) {
@@ -247,9 +296,10 @@ fn planning_again_over_what_landed_keeps_everything(tc: hegel::TestCase) {
         host_path_live: tc.draw(gs::integers::<u32>().min_value(0).max_value(3)),
         host_path_snapshot: tc.draw(gs::integers::<u32>().min_value(0).max_value(3)),
         agent_fetch_url: tc.draw(gs::integers::<u32>().min_value(0).max_value(3)),
+        agent_fetch_digest: tc.draw(gs::integers::<u32>().min_value(0).max_value(3)),
         agent_push: tc.draw(gs::integers::<u32>().min_value(0).max_value(3)),
     };
-    let mechanisms = ProviderMechanisms { host_paths: offers };
+    let mechanisms = ProviderMechanisms { host_paths: offers, reach: Reachability { vessel_public: tc.draw(gs::booleans()) } };
     // Mandatory mechanisms: a tree the controller holds or a URL names is always suppliable.
     let mandatory = needs.iter().all(|need| match &need.item {
         Item::Home { .. } => true,
@@ -271,11 +321,18 @@ fn planning_again_over_what_landed_keeps_everything(tc: hegel::TestCase) {
                     && step.guest_source.is_none(),
                 "a home is writable: {step:?}"
             ),
-            Item::Tree { .. } => assert!(
-                !matches!(step.mechanism, Mechanism::HostPath { .. })
-                    || matches!(step.mechanism, Mechanism::HostPath { access: Access::ReadOnly, .. }) && step.guest_source.is_some(),
-                "a host-path tree is read-only where the guest sees it: {step:?}"
-            ),
+            Item::Tree { sources, .. } => {
+                assert!(
+                    !matches!(step.mechanism, Mechanism::HostPath { .. })
+                        || matches!(step.mechanism, Mechanism::HostPath { access: Access::ReadOnly, .. }) && step.guest_source.is_some(),
+                    "a host-path tree is read-only where the guest sees it: {step:?}"
+                );
+                assert!(
+                    step.mechanism != Mechanism::AgentFetch { by: FetchBy::Digest }
+                        || sources.digest == Some(Visibility::Public) && mechanisms.reach.vessel_public,
+                    "a vessel fetches only public content it reaches: {step:?}"
+                );
+            }
         }
     }
     let again = plan(&needs, &mechanisms, &first.landed(), &costs).expect("the same needs plan again");

@@ -121,6 +121,7 @@ fn delivery_mechanism(mechanism: Mechanism) -> DeliveryMechanism {
         Mechanism::HostPath { access: Access::ReadWrite, liveness: Liveness::Live } => DeliveryMechanism::HostPathReadWriteLive,
         Mechanism::HostPath { access: Access::ReadWrite, liveness: Liveness::Snapshot } => DeliveryMechanism::HostPathReadWriteSnapshot,
         Mechanism::AgentFetch { by: FetchBy::Url } => DeliveryMechanism::AgentFetchUrl,
+        Mechanism::AgentFetch { by: FetchBy::Digest } => DeliveryMechanism::AgentFetchDigest,
         Mechanism::AgentPush => DeliveryMechanism::AgentPush,
     }
 }
@@ -221,7 +222,8 @@ mod tests {
     // `convoy explain` spelling is the vocabulary's own, so the record names what ran.
     #[test]
     fn stored_mechanisms_read_as_the_vocabulary_names_them() {
-        let mut mechanisms = vec![Mechanism::AgentFetch { by: FetchBy::Url }, Mechanism::AgentPush];
+        let mut mechanisms =
+            vec![Mechanism::AgentFetch { by: FetchBy::Url }, Mechanism::AgentFetch { by: FetchBy::Digest }, Mechanism::AgentPush];
         for access in [Access::ReadOnly, Access::ReadWrite] {
             for liveness in [Liveness::Live, Liveness::Snapshot] {
                 mechanisms.push(Mechanism::HostPath { access, liveness });
