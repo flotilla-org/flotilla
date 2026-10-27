@@ -561,6 +561,88 @@ async fn unavailable_governor_scenario(unavailable: GovernorUnavailable, restart
     }
 }
 
+/// A coder beside its convoy's crew supervisor, whose session runs with this
+/// attention, under a supervision policy naming that supervisor first. The coder
+/// has either declared its stall or is working with its own session observed.
+async fn coder_beside_governor(
+    declared: bool,
+    governor: Option<TerminalAttentionState>,
+    now: DateTime<Utc>,
+) -> (ResourceBackend, ReconcilerWake, Arc<RecordingTurnDelivery>) {
+    let (backend, wake, delivery) = if declared { project_supervision_case(&[]).await } else { actor_nudge_scenario(&[]).await };
+    update_convoy(&backend, "stalled-work", |status| {
+        status.work.insert("supervise".into(), WorkState::builder().phase(WorkPhase::Running).build());
+        status.crew_work.insert(
+            "supervise".into(),
+            BTreeMap::from([("governor".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+        );
+        status.workflow_snapshot.as_mut().expect("workflow").supervision = Some(vec![
+            flotilla_resources::SupervisionTarget::ConvoyCrew { vessel: "supervise".into(), role: "governor".into() },
+            flotilla_resources::SupervisionTarget::Operator,
+        ]);
+        if declared {
+            external_patches::mark_crew_stalled(
+                "stalled-work".into(),
+                "work".into(),
+                "coder".into(),
+                now,
+                flotilla_resources::StallReason::Other,
+                None,
+                "needs decision".into(),
+            )
+            .apply(status);
+        }
+    })
+    .await;
+    let sessions = backend.using::<TerminalSession>("flotilla");
+    let session = sessions
+        .create(
+            &InputMeta::builder()
+                .name("governor-session".into())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.into(), "stalled-work".into()),
+                    (VESSEL_LABEL.into(), "supervise".into()),
+                    (ROLE_LABEL.into(), "governor".into()),
+                ]))
+                .build(),
+            &flotilla_resources::TerminalSessionSpec {
+                env_ref: "env".into(),
+                role: "governor".into(),
+                source: TerminalSessionSource::Tool { command: "govern".into() },
+                cwd: "/workspace".into(),
+                env: Default::default(),
+                pool: "cleat".into(),
+            },
+        )
+        .await
+        .expect("governor session");
+    let status = flotilla_resources::TerminalSessionStatus {
+        phase: TerminalSessionPhase::Running,
+        attention: governor.map(|state| TerminalAttention { state, as_of: now, source: TerminalAttentionSource::Hook }),
+        ..Default::default()
+    };
+    sessions.update_status("governor-session", &session.metadata.resource_version, &status).await.expect("governor running");
+    let id = uuid::Uuid::new_v4();
+    wake.subscriptions.inner.rows.lock().await.insert(
+        id,
+        LeafSubscriptionRow {
+            id,
+            namespace: "flotilla".into(),
+            leaves: vec![leaf(
+                LeafAddress::Work { convoy: "stalled-work".into(), work: "supervise".into() },
+                ".crew.governor.phase",
+                "Done",
+            )],
+            watcher: LeafWatcher::ReconcilerWake { convoy: "stalled-work".into() },
+            maker: LeafMaker::Actor { vessel: "supervise".into(), role: "governor".into() },
+            freshness_demand: None,
+            created_at: now,
+            episode_key: EpisodeKeyFields::default(),
+        },
+    );
+    (backend, wake, delivery)
+}
+
 // #3893: a crew's declared stall escalates to its convoy's crew supervisor on
 // its own evidence. Neither the supervisor's unjudged row (running, no attention
 // yet) nor its unable row (needs input), in either row order, holds the stall
@@ -570,76 +652,8 @@ async fn a_declared_crew_stall_reaches_its_supervisor_beside_other_rows() {
     for governor in [None, Some(TerminalAttentionState::NeedsInput)] {
         // Rows are judged in hash order; repeat so both orders occur.
         for _ in 0..4 {
-            let (backend, wake, delivery) = project_supervision_case(&[]).await;
             let now = Utc::now();
-            update_convoy(&backend, "stalled-work", |status| {
-                status.work.insert("supervise".into(), WorkState::builder().phase(WorkPhase::Running).build());
-                status.crew_work.insert(
-                    "supervise".into(),
-                    BTreeMap::from([("governor".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-                );
-                status.workflow_snapshot.as_mut().expect("workflow").supervision = Some(vec![
-                    flotilla_resources::SupervisionTarget::ConvoyCrew { vessel: "supervise".into(), role: "governor".into() },
-                    flotilla_resources::SupervisionTarget::Operator,
-                ]);
-                external_patches::mark_crew_stalled(
-                    "stalled-work".into(),
-                    "work".into(),
-                    "coder".into(),
-                    now,
-                    flotilla_resources::StallReason::Other,
-                    None,
-                    "needs decision".into(),
-                )
-                .apply(status);
-            })
-            .await;
-            let sessions = backend.using::<TerminalSession>("flotilla");
-            let session = sessions
-                .create(
-                    &InputMeta::builder()
-                        .name("governor-session".into())
-                        .labels(BTreeMap::from([
-                            (CONVOY_LABEL.into(), "stalled-work".into()),
-                            (VESSEL_LABEL.into(), "supervise".into()),
-                            (ROLE_LABEL.into(), "governor".into()),
-                        ]))
-                        .build(),
-                    &flotilla_resources::TerminalSessionSpec {
-                        env_ref: "env".into(),
-                        role: "governor".into(),
-                        source: TerminalSessionSource::Tool { command: "govern".into() },
-                        cwd: "/workspace".into(),
-                        env: Default::default(),
-                        pool: "cleat".into(),
-                    },
-                )
-                .await
-                .expect("governor session");
-            let status = flotilla_resources::TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                attention: governor.map(|state| TerminalAttention { state, as_of: now, source: TerminalAttentionSource::Hook }),
-                ..Default::default()
-            };
-            sessions.update_status("governor-session", &session.metadata.resource_version, &status).await.expect("governor running");
-            let id = uuid::Uuid::new_v4();
-            wake.subscriptions.inner.rows.lock().await.insert(
-                id,
-                LeafSubscriptionRow {
-                    id,
-                    namespace: "flotilla".into(),
-                    leaves: vec![leaf(
-                        LeafAddress::Work { convoy: "stalled-work".into(), work: "supervise".into() },
-                        ".crew.governor.phase",
-                        "Done",
-                    )],
-                    watcher: LeafWatcher::ReconcilerWake { convoy: "stalled-work".into() },
-                    maker: LeafMaker::Actor { vessel: "supervise".into(), role: "governor".into() },
-                    freshness_demand: None,
-                    created_at: now,
-                    episode_key: EpisodeKeyFields::default(),
-                },
-            );
+            let (backend, wake, delivery) = coder_beside_governor(true, governor, now).await;
             let convoys = backend.using::<Convoy>("flotilla");
             let objects = HashMap::from([("stalled-work".into(), convoys.get("stalled-work").await.expect("convoy"))]);
             wake.judge_stalls_at("flotilla", &objects, now).await.expect("judge");
@@ -649,6 +663,21 @@ async fn a_declared_crew_stall_reaches_its_supervisor_beside_other_rows() {
             assert_eq!((supervisor.vessel.as_str(), supervisor.role.as_str()), ("supervise", "governor"), "governor {governor:?}");
             assert_eq!(delivery.requests.lock().expect("deliveries").iter().filter(|request| request.role == "governor").count(), 1);
         }
+    }
+}
+
+// #3893: only the crew's own declaration overrides its neighbours. A coder
+// unable on its session's evidence (needs input), beside a working supervisor,
+// is still held: no stall is raised and nothing is escalated.
+#[tokio::test]
+async fn an_undeclared_unable_row_beside_an_able_row_still_holds() {
+    for _ in 0..4 {
+        let now = Utc::now();
+        let (backend, wake, delivery) = coder_beside_governor(false, Some(TerminalAttentionState::Working), now).await;
+        observe_actor_source(&backend, &wake, TerminalAttentionState::NeedsInput, TerminalAttentionSource::Hook, now).await;
+        let status = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy").status.expect("status");
+        assert!(status.stalled.is_none(), "an able neighbour holds an undeclared stall: {:?}", status.stalled);
+        assert!(delivery.requests.lock().expect("deliveries").is_empty(), "nothing escalated");
     }
 }
 
