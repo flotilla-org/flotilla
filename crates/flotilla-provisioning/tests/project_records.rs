@@ -119,9 +119,16 @@ async fn contract(backend: &ResourceBackend) {
 
     // The parent of another Project cannot be deleted; a leaf can, and is gone from every read.
     assert!(definitions.delete("acme").await.is_err(), "a parent stays");
+    let before: u64 = projects.get("widgets").await.expect("read").metadata.resource_version.parse().expect("numeric version");
     definitions.delete("widgets").await.expect("delete");
     assert!(definitions.get("widgets").await.is_err());
     assert!(backend.including_replicas::<Project>(NS).get("widgets").await.is_err());
+
+    // A Project declared again under the name reads at a version above any of the one before, so
+    // no stale version written against the old one matches it.
+    definitions.apply(&meta, &spec("widgets", Some("acme"))).await.expect("declare again");
+    let again: u64 = projects.get("widgets").await.expect("read").metadata.resource_version.parse().expect("numeric version");
+    assert!(again > before, "{again} after {before}");
 }
 
 #[tokio::test]

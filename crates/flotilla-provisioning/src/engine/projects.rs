@@ -105,8 +105,7 @@ fn object(name: &str, home: &str, held: &Held, judged: Option<&Judged>) -> Optio
         dispatch_queue_attention: queue.attention,
     };
     let (labels, annotations) = stamp(&project.origin);
-    // Each part's version only moves forward while this home runs, so their sum moves with any.
-    let version = version + held.ops.as_ref().map_or(0, |(version, _)| *version) + judged.map_or(0, |judged| judged.revision);
+    let version = composed_version(*version, held.ops.as_ref().map(|(version, _)| *version), judged.map_or(0, |judged| judged.revision));
     Some((|| {
         Ok(EngineObject {
             name: name.to_owned(),
@@ -119,6 +118,17 @@ fn object(name: &str, home: &str, held: &Held, judged: Option<&Judged>) -> Optio
         })
     })())
 }
+
+/// The version a Project reads at: its records' latest log version, above the judgement's
+/// revision. Log versions are this home's write sequence, so they only rise, across a delete and
+/// a create of the same name too; a judgement change raises the low part under an unchanged log.
+/// A restart forgets the judgement, so its low part may repeat a version read before the restart.
+fn composed_version(project: u64, ops: Option<u64>, revision: u64) -> u64 {
+    (project.max(ops.unwrap_or(0)) << JUDGEMENT_BITS) | (revision & ((1 << JUDGEMENT_BITS) - 1))
+}
+
+/// The low bits of a Project's version that count judgement changes.
+const JUDGEMENT_BITS: u32 = 24;
 
 fn reload(read: &mut Read<'_>, records: &mut Records, identity: &Identity) -> Result<(), StoreError> {
     let key = (identity.name.clone(), identity.home.clone());
@@ -238,6 +248,10 @@ impl EngineProjects {
                 })
                 .map_err(|error| error.to_string())?;
         }
+        // A judgement outlives no Project of this home: whatever removed it, a later one of the
+        // name starts afresh (its log version is above anything the old one read at).
+        locked(&self.judged)
+            .retain(|name, _| resident.records.get(&(name.clone(), self.home.clone())).is_some_and(|held| held.project.is_some()));
         Ok(resident)
     }
 
