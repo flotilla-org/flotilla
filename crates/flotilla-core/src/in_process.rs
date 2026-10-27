@@ -617,7 +617,7 @@ pub async fn discover_repo_for_environment(
     .await)
 }
 
-const SUPERSEDED_BY_ANNOTATION: &str = "flotilla.work/superseded-by";
+use flotilla_resources::definition_provenance::SUPERSEDED_BY_ANNOTATION;
 
 #[cfg(test)]
 fn input_meta_from_resource<T: Resource>(resource: &flotilla_resources::ResourceObject<T>) -> InputMeta {
