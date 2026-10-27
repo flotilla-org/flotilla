@@ -440,6 +440,8 @@ mod tests {
         directories: Mutex<BTreeSet<PathBuf>>,
         links: Mutex<BTreeSet<PathBuf>>,
         calls: Mutex<Vec<String>>,
+        /// Refuse the next link, as an agent connection lost mid-delivery would.
+        refuse_link: std::sync::atomic::AtomicBool,
     }
 
     impl Recording {
@@ -504,6 +506,9 @@ mod tests {
             Ok(())
         }
         async fn link_artifact(&self, path: &Path, sha256: &str, member: &Path) -> Result<(), String> {
+            if self.refuse_link.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err("the agent connection was lost".into());
+            }
             // As the agent does: a link replaces anything there but a directory.
             if self.directories.lock().expect("directories").contains(path) {
                 return Err(format!("{} is a directory", path.display()));
@@ -538,7 +543,8 @@ mod tests {
     // harness layers use: the archive is pushed by its digest and the home's `skills` is
     // linked to it. A repeat whose record already names the tree's digest pushes nothing;
     // a real `skills` directory left by an older delivery is moved aside once, before the
-    // first link, and never again.
+    // first link, and never again. A link that fails after the move leaves the access
+    // undelivered (no harness starts), and the retry links without moving anything.
     #[tokio::test]
     async fn skills_are_pushed_by_digest_and_linked_and_a_legacy_directory_is_moved_aside_once() {
         let cache = tempfile::tempdir().expect("cache");
@@ -555,15 +561,19 @@ mod tests {
         agent.directories.lock().expect("directories").insert(skills.into());
         let run = |digest: String| {
             let (needs, trees, agent) = (skill_needs(&digest), &trees, &agent);
-            async move { deliver(&needs, trees, &place_mechanisms(false), &CostTable::default(), agent).await.expect("delivered") }
+            async move { deliver(&needs, trees, &place_mechanisms(false), &CostTable::default(), agent).await }
         };
         let (push, link) = (format!("push {} tar.gz", archive.sha256), format!("link {} {}/", skills.display(), archive.sha256));
 
-        run(tree.digest()).await;
-        assert_eq!(agent.calls(), [push.clone(), format!("rename {}", skills.display()), link.clone()], "first delivery");
-        run(tree.digest()).await;
+        agent.refuse_link.store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = run(tree.digest()).await.expect_err("the link failed");
+        assert!(!error.is_permanent(), "{error}");
+        assert_eq!(agent.calls(), [push.clone(), format!("rename {}", skills.display())], "moved aside, not yet linked");
+        run(tree.digest()).await.expect("retried");
+        assert_eq!(agent.calls(), [push.clone(), link.clone()], "the retry links; nothing is left to move aside");
+        run(tree.digest()).await.expect("kept");
         assert_eq!(agent.calls(), Vec::<String>::new(), "the record already names this digest");
-        run(format!("{}-reselected", tree.digest())).await;
+        run(format!("{}-reselected", tree.digest())).await.expect("redelivered");
         assert_eq!(agent.calls(), [push, link], "a later delivery finds a link, not a directory");
     }
 

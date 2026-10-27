@@ -26,7 +26,9 @@ impl SkillArchive {
     /// Entries in component order, each file after its parent directories; only
     /// directories and regular files, modes 0700 or 0600, owner 0, mtime 0 and no
     /// owner names, in a gzip stream with no name or time. The bytes, and so the
-    /// digest, depend only on the paths, modes and contents, never on input order.
+    /// digest, depend only on the paths, modes and contents, never on input order,
+    /// for a given `flate2` build: another compressor version or backend may compress
+    /// differently, which costs one more push into the agent's cache, never a wrong tree.
     pub fn build(files: Vec<ArchiveFile>) -> Result<Self, String> {
         let mut entries = BTreeMap::<Vec<String>, Option<ArchiveFile>>::new();
         for file in files {

@@ -113,6 +113,9 @@ impl SkillTree {
     }
 
     /// Content identity: every source at its pinned revision, and every selected path.
+    /// It hashes the JSON of `SkillSource` and `SkillCatalogEntry` (object keys sorted),
+    /// so adding or renaming one of their fields changes every crew's digest: each home is
+    /// delivered once more, and nothing else changes.
     pub fn digest(&self) -> String {
         use sha2::{Digest, Sha256};
         let identity = serde_json::json!({"sources": self.sources, "selected": self.selected});

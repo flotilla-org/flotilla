@@ -54,9 +54,16 @@ impl Probes for CandidateProbes<'_> {
             return Ok(Vec::new());
         }
         let source = self.options.sources.as_deref().ok_or("frozen skills require --skill-sources (candidate supply directory)")?;
+        // A fresh private directory per run (0700, removed on drop): a fixed name under the
+        // shared temporary directory could be pre-created by another user, whose Git config
+        // there would then run as the operator.
+        let cache = tempfile::Builder::new()
+            .prefix("flotilla-skill-probe-")
+            .tempdir()
+            .map_err(|error| format!("create the skill probe's object cache: {error}"))?;
         let trees = flotilla_daemon::SkillTrees::new(
             std::sync::Arc::new(flotilla_vcs::vcs::FlotillaVcs::object_cache(std::sync::Arc::clone(&self.runner))),
-            std::env::temp_dir().join("flotilla-skill-probe-cache"),
+            cache.path().join("objects"),
         );
         flotilla_daemon::validate_frozen_vessel_skills(&trees, source, selected, credentials, &self.options.credential_tokens).await
     }
