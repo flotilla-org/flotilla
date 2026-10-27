@@ -414,7 +414,6 @@ async fn a_finished_long_runner_handles_a_late_handoff_and_lands() {
 // A late handoff reopens the recipient and transfers the engine promises; the
 // recipient delivers its engine Convoy after handling that additional turn.
 #[tokio::test(start_paused = true)]
-#[ignore = "flotilla#3894: late handoff reaches the dummy process but no engine Message receipt is committed before convoy teardown"]
 async fn on_the_engine_a_finished_long_runner_handles_a_late_handoff() {
     late_handoff_scenario(true).await;
 }

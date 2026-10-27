@@ -31,6 +31,8 @@ struct Recording {
     views: Mutex<usize>,
     /// The engine's change feed, when the test publishes on one.
     changes: Mutex<Option<tokio::sync::broadcast::Sender<String>>>,
+    /// The promises the engine holds, once handed over from the stored status.
+    held: Option<OldPromises>,
 }
 
 #[async_trait]
@@ -69,8 +71,10 @@ impl EngineConvoys for Recording {
     }
     fn promises(&self, convoy: &ResourceObject<Convoy>, _: Option<&str>) -> Result<Option<OldPromises>, String> {
         *self.views.lock().expect("views") += 1;
-        // The engine's view: here, the stored promises as they are.
-        Ok(self.holds.then(|| convoy.status.as_ref().map(|status| status.promises.clone()).unwrap_or_default()))
+        // The engine's view: the promises handed to it, else the stored promises as they are.
+        Ok(self
+            .holds
+            .then(|| self.held.clone().unwrap_or_else(|| convoy.status.as_ref().map(|status| status.promises.clone()).unwrap_or_default())))
     }
     fn changes(&self) -> tokio::sync::broadcast::Receiver<String> {
         match self.changes.lock().expect("changes").as_ref() {
@@ -232,4 +236,118 @@ async fn engine_changes_wake_the_convoy_reconciler() {
     .expect("woken");
     assert_eq!(woken, "c");
     watch.abort();
+}
+
+/// The engine Message path's one answer the hold reads: whether the crew has
+/// an undelivered turn. The convoy reconciler asks it nothing else.
+struct Turns {
+    backend: ResourceBackend,
+    awaiting: bool,
+}
+
+#[async_trait]
+impl flotilla_crew::ports::EngineMessages for Turns {
+    async fn view(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler reads no message views")
+    }
+    async fn views(
+        &self,
+        _: &str,
+    ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler reads no message views")
+    }
+    async fn admit(
+        &self,
+        _: &str,
+        _: &str,
+        _: &flotilla_resources::MessageSpec,
+    ) -> Result<ResourceObject<flotilla_resources::Message>, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler admits nothing")
+    }
+    async fn withdraw(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+        unreachable!("the convoy reconciler withdraws nothing")
+    }
+    fn home(&self) -> String {
+        "home-a".into()
+    }
+    async fn await_reply(
+        &self,
+        _: &str,
+        _: &str,
+        _: &flotilla_resources::MessageSpec,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+    ) -> Result<bool, String> {
+        unreachable!("the convoy reconciler records no replies")
+    }
+    async fn end_stalls(&self, _: &str, _: &[String], _: Option<&str>, _: &str) -> Result<Vec<String>, String> {
+        unreachable!("the convoy reconciler ends no stalls")
+    }
+    async fn awaits_delivery(&self, namespace: &str, receiver: &str) -> Result<bool, String> {
+        assert_eq!((namespace, receiver), (NAMESPACE, "flotilla/c/work/coder"));
+        Ok(self.awaiting)
+    }
+    fn charter_notices(self: Arc<Self>, namespace: &str) -> Box<dyn flotilla_messaging::CharterNotices> {
+        Box::new(flotilla_messaging::MessageInbox::new(self.backend.clone(), namespace))
+    }
+}
+
+// Behaviour (#3894): with the engine deciding, a crew whose promises are all kept
+// derives Done only once no turn to its live session is undelivered; while one
+// is, the reconciler holds the Done and rechecks soon, since no Message watch
+// wakes it when the turn is delivered.
+#[tokio::test]
+async fn an_undelivered_turn_holds_the_engines_derived_done() {
+    use flotilla_resources::{TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus, CONVOY_LABEL};
+    for awaiting in [true, false] {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let mut convoy = ledger_convoy(&backend).await;
+        // Handed over: the engine holds the kept promises; the stored status holds none.
+        let status = convoy.status.as_mut().expect("status");
+        let mut held = std::mem::take(&mut status.promises);
+        for promise in held.get_mut("work").and_then(|crew| crew.get_mut("coder")).expect("promises") {
+            promise.state = PromiseState::Kept;
+        }
+        let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
+        let session = sessions
+            .create(
+                &InputMeta::builder()
+                    .name("coder-session".into())
+                    .labels(BTreeMap::from([
+                        (CONVOY_LABEL.into(), "c".into()),
+                        (flotilla_resources::VESSEL_LABEL.into(), "work".into()),
+                        (flotilla_resources::ROLE_LABEL.into(), "coder".into()),
+                    ]))
+                    .build(),
+                &flotilla_resources::TerminalSessionSpec {
+                    env_ref: "env".into(),
+                    role: "coder".into(),
+                    source: TerminalSessionSource::Tool { command: "test".into() },
+                    cwd: "/workspace".into(),
+                    env: Default::default(),
+                    pool: "cleat".into(),
+                },
+            )
+            .await
+            .expect("session");
+        let running = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() };
+        sessions.update_status("coder-session", &session.metadata.resource_version, &running).await.expect("running");
+        let messages: flotilla_crew::ports::MessagePath = Arc::new(OnceLock::new());
+        let turns: Arc<dyn flotilla_crew::ports::EngineMessages> = Arc::new(Turns { backend: backend.clone(), awaiting });
+        assert!(messages.set(turns).is_ok());
+        let engine = Arc::new(Recording { holds: true, held: Some(held), ..Default::default() });
+        let reconciler = reconciler(&backend, engine).with_terminal_sessions(sessions).with_messages(messages);
+        let prepared = reconciler.prepare(&convoy).await.expect("prepare");
+        let outcome = reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
+        let derived = matches!(outcome.patch, Some(ConvoyStatusPatch::DeriveCrewDone { .. }));
+        assert_eq!(derived, !awaiting, "awaiting {awaiting}: {:?}", outcome.patch);
+        if awaiting {
+            assert_eq!(outcome.requeue_after, Some(std::time::Duration::from_secs(1)), "a held Done rechecks soon");
+        }
+    }
 }

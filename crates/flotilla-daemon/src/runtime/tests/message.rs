@@ -794,10 +794,10 @@ async fn terminal_delivery_lookup_deduplicates_same_message_and_replaces_a_diffe
         std::future::pending::<()>().await;
         Ok(TerminalDeliveryOutcome::Confirmed)
     });
-    deliveries
-        .lock()
-        .expect("delivery lock")
-        .insert("agent".to_string(), PendingTerminalDelivery { message_batch: None, message: "first".to_string(), task: pending_task });
+    deliveries.lock().expect("delivery lock").insert(
+        "agent".to_string(),
+        PendingTerminalDelivery { message_batch: None, message: "first".to_string(), task: pending_task, engine_turn: None },
+    );
 
     assert!(matches!(lookup_terminal_delivery(&deliveries, "agent", "first"), TerminalDeliveryLookup::InFlight));
     let TerminalDeliveryLookup::Taken(replaced) = lookup_terminal_delivery(&deliveries, "agent", "second") else {
@@ -811,10 +811,10 @@ async fn terminal_delivery_lookup_deduplicates_same_message_and_replaces_a_diffe
     while !completed_task.is_finished() {
         tokio::task::yield_now().await;
     }
-    deliveries
-        .lock()
-        .expect("delivery lock")
-        .insert("agent".to_string(), PendingTerminalDelivery { message_batch: None, message: "second".to_string(), task: completed_task });
+    deliveries.lock().expect("delivery lock").insert(
+        "agent".to_string(),
+        PendingTerminalDelivery { message_batch: None, message: "second".to_string(), task: completed_task, engine_turn: None },
+    );
     let TerminalDeliveryLookup::Taken(completed) = lookup_terminal_delivery(&deliveries, "agent", "second") else {
         panic!("finished delivery should be drained")
     };
@@ -850,10 +850,10 @@ async fn message_batch_owns_its_task_until_the_receiver_releases_it() {
                 tokio::task::yield_now().await;
             }
         }
-        deliveries
-            .lock()
-            .expect("pending transport tasks")
-            .insert("agent".into(), PendingTerminalDelivery { message_batch: Some("batch".into()), message: "framed input".into(), task });
+        deliveries.lock().expect("pending transport tasks").insert(
+            "agent".into(),
+            PendingTerminalDelivery { message_batch: Some("batch".into()), message: "framed input".into(), task, engine_turn: None },
+        );
         for text in ["framed input", "legacy follow-up"] {
             assert!(matches!(lookup_terminal_delivery(&deliveries, "agent", text), TerminalDeliveryLookup::InFlight));
             assert_eq!(deliveries.lock().expect("pending transport tasks").len(), 1);
