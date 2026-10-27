@@ -113,7 +113,7 @@ fn engine_backend(directory: &tempfile::TempDir) -> ResourceBackend {
     let service = Arc::new(Service::open(&directory.path().join("decided.sqlite"), "alpha", kinds).expect("store"));
     let records = EngineDefinitions::open(service, Arc::new(SystemClock) as Arc<dyn Clock>).expect("open");
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    backend.install_definition_records(Arc::new(records));
+    backend.install_engine_records(Arc::new(records));
     backend
 }
 

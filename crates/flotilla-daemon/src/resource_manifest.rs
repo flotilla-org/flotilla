@@ -1972,7 +1972,7 @@ mod tests {
         let clock: Arc<dyn flotilla_resources::Clock> = Arc::new(flotilla_resources::SystemClock);
         let roots: Arc<dyn ManifestRoots> = Arc::new(EngineManifestRoots::open(Arc::clone(&service), Arc::clone(&clock)).expect("roots"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        backend.install_definition_records(Arc::new(EngineDefinitions::open(service, clock).expect("definitions")));
+        backend.install_engine_records(Arc::new(EngineDefinitions::open(service, clock).expect("definitions")));
         let forges = backend.definitions::<Forge>(NAMESPACE);
         let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path()).with_roots(Arc::clone(&roots));
 
