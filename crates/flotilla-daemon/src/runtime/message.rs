@@ -386,7 +386,12 @@ impl AgentTransport for TerminalControllerRuntime {
         });
         deliveries.insert(
             batch.submission.session.clone(),
-            PendingTerminalDelivery { message_batch: Some(batch.submission.batch_id.clone()), message: batch.text.clone(), task },
+            PendingTerminalDelivery {
+                message_batch: Some(batch.submission.batch_id.clone()),
+                message: batch.text.clone(),
+                task,
+                before_submit: None,
+            },
         );
         TransportOutcome::Pending
     }

@@ -109,11 +109,13 @@ impl MessageDelivery {
 
     pub(super) async fn pass(&mut self) -> Result<(), String> {
         let now = Timestamp::from_datetime(&Utc::now());
+        // Receipts first: a turn confirmed before its session's teardown records
+        // its receipt before rebind unbinds and ends that session (#3894).
+        self.collect_turns().await;
         let holders = self.holders(now).await?;
         let person = self.primitives.register_person(now).await?;
         let people = self.primitives.person_inboxes(&self.namespace).await?.into_iter().map(|inbox| (inbox, person.clone()));
         self.rebind(&holders, people.collect(), now).await?;
-        self.collect_turns().await;
         for holder in holders.values() {
             if !self.inflight.contains_key(&holder.session_id) {
                 self.start_turn(holder).await?;
@@ -188,6 +190,10 @@ impl MessageDelivery {
         let live: BTreeSet<_> = holders.values().map(|holder| holder.terminal.metadata.name.clone()).collect();
         let backend = self.state.daemon.resource_backend();
         for name in self.sessions.difference(&live).cloned().collect::<Vec<_>>() {
+            // A turn still settling ends its session only once its receipt is recorded.
+            if self.inflight.values().any(|turn| turn.consumer.id == name) {
+                continue;
+            }
             let reason = match backend.using::<TerminalSession>(&self.namespace).get(&name).await {
                 Ok(terminal) if terminal.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running) => continue,
                 Ok(terminal) if terminal.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Stopped) => {
@@ -404,6 +410,8 @@ impl MessageDelivery {
         }
         let session = holder.session_id.clone();
         let typed = text.clone();
+        let before_submit = tokio_util::sync::CancellationToken::new();
+        let teardown = before_submit.clone();
         let trace_spans: Vec<_> = members.iter().map(|message| flotilla_tracing::queued_span(message, "attempt")).collect();
         let primary_span = trace_spans.first().cloned().unwrap_or_else(tracing::Span::none);
         let task = tokio::spawn(
@@ -413,12 +421,18 @@ impl MessageDelivery {
                 for span in &_trace_spans {
                     span.in_scope(|| tracing::info!("message transport attempt"));
                 }
+                // Teardown stops a turn not yet typed; once typed, it runs to its confirmation.
+                if teardown.is_cancelled() {
+                    return Ok(TerminalDeliveryOutcome::Deferred("teardown stopped the turn before it was typed; no input sent"));
+                }
                 submit_and_confirm(&*pool, adapter.as_deref(), &session, &typed).await
             }
             .instrument(primary_span),
         );
-        deliveries
-            .insert(holder.session_id.clone(), PendingTerminalDelivery { message_batch: Some(ENGINE_BATCH.into()), message: text, task });
+        deliveries.insert(
+            holder.session_id.clone(),
+            PendingTerminalDelivery { message_batch: Some(ENGINE_BATCH.into()), message: text, task, before_submit: Some(before_submit) },
+        );
         self.inflight.insert(holder.session_id.clone(), InFlight { consumer: holder.consumer.clone(), members });
         Ok(())
     }

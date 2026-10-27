@@ -2253,6 +2253,11 @@ impl InProcessDaemon {
         self.vessel_seats_path.set(seats).map_err(|_| "the vessel seats port is already installed".to_owned())
     }
 
+    /// The crew's `[primitives]` Message path: empty until the switch's primitives are installed.
+    pub fn crew_message_path(&self) -> flotilla_crew::ports::MessagePath {
+        Arc::clone(&self.crew_message_path)
+    }
+
     /// The `[primitives]` Convoy path: empty until the switch's primitives are installed.
     pub fn convoy_engine_path(&self) -> flotilla_resources::convoy::engine::EngineConvoyPath {
         Arc::clone(&self.convoy_engine_path)

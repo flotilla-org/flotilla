@@ -50,6 +50,9 @@ pub(super) struct PendingTerminalDelivery {
     pub(super) message_batch: Option<String>,
     pub(super) message: String,
     pub(super) task: JoinHandle<Result<TerminalDeliveryOutcome, String>>,
+    /// An engine turn's: teardown cancels it before typing and lets a typed
+    /// turn settle, reserved, so the delivery adapter records its receipt (#3894).
+    pub(super) before_submit: Option<tokio_util::sync::CancellationToken>,
 }
 
 pub(super) enum TerminalDeliveryLookup {
@@ -800,13 +803,40 @@ impl TerminalRuntime for TerminalControllerRuntime {
             tokio::spawn(
                 async move { deliver_and_confirm(&*pool, adapter.as_deref(), &session_id_owned, &message_owned, readiness).await },
             );
-        deliveries.insert(session_id.to_string(), PendingTerminalDelivery { message_batch: None, message: message.to_string(), task });
+        deliveries.insert(
+            session_id.to_string(),
+            PendingTerminalDelivery { message_batch: None, message: message.to_string(), task, before_submit: None },
+        );
         Ok(TerminalDeliveryOutcome::Pending)
     }
 
     async fn kill_session(&self, session_id: &str, spec: TerminalSessionTarget<'_>) -> Result<(), String> {
-        if let Some(delivery) = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned").remove(session_id) {
-            delivery.task.abort();
+        let engine_turn = {
+            let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
+            match deliveries.get(session_id).map(|delivery| delivery.before_submit.clone()) {
+                Some(Some(before_submit)) => {
+                    before_submit.cancel();
+                    true
+                }
+                Some(None) => {
+                    deliveries.remove(session_id).expect("reserved delivery").task.abort();
+                    false
+                }
+                None => false,
+            }
+        };
+        // A typed engine turn settles within its confirmation grace; it stays
+        // reserved so the delivery adapter commits its receipt after the kill.
+        while engine_turn
+            && self
+                .state
+                .terminal_deliveries
+                .lock()
+                .expect("terminal deliveries lock poisoned")
+                .get(session_id)
+                .is_some_and(|delivery| delivery.before_submit.is_some() && !delivery.task.is_finished())
+        {
+            tokio::time::sleep(DELIVERY_CONFIRMATION_POLL).await;
         }
         let pool = self.pool_for_spec(spec).await?;
         if pool.tracks_session_liveness() {

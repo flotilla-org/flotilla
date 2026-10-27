@@ -987,6 +987,17 @@ impl MessagePrimitives {
         Ok(views)
     }
 
+    /// Whether a message to `receiver`, an old crew address, is admitted at
+    /// this home and not yet delivered: Pending in the receiver's inbox.
+    pub async fn awaits_delivery(&self, namespace: &str, receiver: &str) -> Result<bool, String> {
+        let roles = self.roles(namespace).await?;
+        let records = self.records(namespace).await.map_err(|error| error.to_string())?;
+        let inbox = Conversion { roles: &roles, forges: &records.forges, records: &*records }.inbox(receiver)?;
+        Ok(self.messages()?.iter().any(|(_, message)| {
+            message.spec().inbox == inbox && matches!(message.state(), flotilla_state_machines::machines::message::MessageState::Pending)
+        }))
+    }
+
     /// One message by its old record name, in the old shape.
     pub async fn view(&self, namespace: &str, record: &str) -> Result<Option<ReadResourceObject<OldMessage>>, ResourceError> {
         let Some((id, home)) = self.locate(record).map_err(ResourceError::other)? else { return Ok(None) };
@@ -1079,6 +1090,9 @@ impl flotilla_crew::ports::EngineMessages for MessagePrimitives {
     }
     async fn end_stalls(&self, namespace: &str, seats: &[String], stalled: Option<&str>, reason: &str) -> Result<Vec<String>, String> {
         MessagePrimitives::end_stalls(self, namespace, seats, stalled, reason).await
+    }
+    async fn awaits_delivery(&self, namespace: &str, receiver: &str) -> Result<bool, String> {
+        MessagePrimitives::awaits_delivery(self, namespace, receiver).await
     }
     fn charter_notices(self: Arc<Self>, namespace: &str) -> Box<dyn flotilla_messaging::CharterNotices> {
         Box::new(EngineCharterNotices { primitives: self, namespace: namespace.to_owned() })

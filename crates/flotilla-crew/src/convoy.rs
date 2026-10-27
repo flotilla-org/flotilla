@@ -51,6 +51,8 @@ pub struct ConvoyReconciler {
     teardown_runtime: Option<Arc<dyn ConvoyTeardownRuntime>>,
     /// The `[primitives]` switch's Convoy path; empty while it is off.
     engine: EngineConvoyPath,
+    /// The `[primitives]` switch's Message path; empty while it is off.
+    messages: crate::ports::MessagePath,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +98,7 @@ impl ConvoyReconciler {
             prepared_snapshot_gc: None,
             teardown_runtime: None,
             engine: EngineConvoyPath::default(),
+            messages: crate::ports::MessagePath::default(),
         }
     }
 
@@ -103,6 +106,34 @@ impl ConvoyReconciler {
     pub fn with_engine(mut self, engine: EngineConvoyPath) -> Self {
         self.engine = engine;
         self
+    }
+
+    /// The `[primitives]` switch's Message path, set at startup when it is on.
+    pub fn with_messages(mut self, messages: crate::ports::MessagePath) -> Self {
+        self.messages = messages;
+        self
+    }
+
+    /// A live crew session has an engine turn not yet delivered to it (#3894).
+    async fn turn_awaits(&self, obj: &ResourceObject<Convoy>, vessel: &str, role: &str) -> Result<bool, ResourceError> {
+        let (Some(messages), Some(sessions)) = (self.messages.get(), &self.terminal_sessions) else { return Ok(false) };
+        let live = sessions
+            .list_matching_labels(&BTreeMap::from([
+                (CONVOY_LABEL.to_string(), obj.metadata.name.clone()),
+                (VESSEL_LABEL.to_string(), vessel.to_string()),
+                (ROLE_LABEL.to_string(), role.to_string()),
+            ]))
+            .await?
+            .items
+            .iter()
+            .any(|session| session.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running));
+        if !live {
+            return Ok(false);
+        }
+        let namespace = &obj.metadata.namespace;
+        let receiver =
+            crate::leaf_engine::crew_role_address(obj.spec.project_ref.as_deref().unwrap_or(namespace), &obj.metadata.name, vessel, role);
+        messages.awaits_delivery(namespace, &receiver).await.map_err(ResourceError::other)
     }
 
     pub fn with_artifacts(mut self, artifacts: ReplicaReadResolver<Artifact>) -> Self {
@@ -531,6 +562,21 @@ impl Reconciler for ConvoyReconciler {
                     other => other,
                 })
         });
+        // A crew reopened for a turn is not done before that turn reaches its
+        // live session, so teardown cannot drop the turn or its receipt (#3894).
+        let derived = match &promise_patch {
+            Some(ConvoyStatusPatch::DeriveCrewDone { vessel, role, .. }) if engine.is_some() => obj
+                .status
+                .as_ref()
+                .and_then(|status| status.crew_work.get(vessel)?.get(role))
+                .filter(|work| !work.phase.is_terminal())
+                .map(|_| (vessel.clone(), role.clone())),
+            _ => None,
+        };
+        let promise_patch = match derived {
+            Some((vessel, role)) if self.turn_awaits(obj, &vessel, &role).await? => None,
+            _ => promise_patch,
+        };
         let settlement = if is_landing {
             Some(evaluate_landing_settlement_with_disposition(
                 obj,

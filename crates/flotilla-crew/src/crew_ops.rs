@@ -2237,10 +2237,20 @@ impl CrewService {
         };
         let environment_ref = target_session.as_ref().or(anchor.as_ref()).expect("target or anchor session").spec.env_ref.clone();
         let previous_status = convoy.status.clone().ok_or_else(|| format!("convoy `{}` has no status", context.convoy))?;
+        let mut admitted = None;
         if let Some(engine) = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy) {
             // Handoff is the engine's `Reassign` of the sender's open promises (#3574 decision 3).
             engine.reassign(&convoy, &context.vessel, &context.caller_role, target).await?;
+            // Admit the turn before reopening its recipient: the reopened crew's
+            // derived Done waits on that turn's delivery (#3894).
+            admitted = Some(self.publish_message_intent(&context.namespace, &message_name, &intent).await?);
         }
+        let send = || async {
+            match &admitted {
+                Some(admitted) => Ok(admitted.clone()),
+                None => self.publish_message_intent(&context.namespace, &message_name, &intent).await,
+            }
+        };
         let reopened = apply_resource_status_patch(
             &convoys,
             &context.convoy,
@@ -2258,7 +2268,7 @@ impl CrewService {
             return Err(format!("convoy `{}` became terminal during crew handoff", context.convoy));
         }
         if target_origin.is_some() {
-            return match self.publish_message_intent(&context.namespace, &message_name, &intent).await {
+            return match send().await {
                 Ok(_) => Ok(()),
                 Err(error) => Err(self
                     .restore_crew_work_after_delivery_failure(
@@ -2286,11 +2296,9 @@ impl CrewService {
                     Err(format!("crew target `{target}` moved to another environment during credential staging"))
                 }
                 Ok(existing) => match existing.status.as_ref().map(|status| status.phase) {
-                    Some(ResourceTerminalSessionPhase::Running) => {
-                        self.publish_message_intent(&context.namespace, &message_name, &intent).await.map(|_| ())
-                    }
+                    Some(ResourceTerminalSessionPhase::Running) => send().await.map(|_| ()),
                     Some(ResourceTerminalSessionPhase::Stopped | ResourceTerminalSessionPhase::Lost) => {
-                        self.publish_message_intent(&context.namespace, &message_name, &intent).await.map(|_| ())?;
+                        send().await.map(|_| ())?;
                         apply_resource_status_patch(&sessions, &terminal_name, &TerminalSessionStatusPatch::MarkStarting)
                             .await
                             .map(|_| ())
@@ -2299,9 +2307,7 @@ impl CrewService {
                     Some(ResourceTerminalSessionPhase::Failed) => {
                         Err(format!("crew target `{target}` failed provisioning and cannot be revived"))
                     }
-                    Some(ResourceTerminalSessionPhase::Starting) | None => {
-                        self.publish_message_intent(&context.namespace, &message_name, &intent).await.map(|_| ())
-                    }
+                    Some(ResourceTerminalSessionPhase::Starting) | None => send().await.map(|_| ()),
                 },
                 Err(ResourceError::NotFound { .. }) => {
                     let anchor = anchor.ok_or_else(|| format!("crew target `{target}` disappeared during credential staging"))?;
@@ -2402,7 +2408,7 @@ impl CrewService {
                             }) => {}
                         Err(error) => return Err(error.to_string()),
                     }
-                    self.publish_message_intent(&context.namespace, &message_name, &intent).await.map(|_| ())
+                    send().await.map(|_| ())
                 }
                 Err(err) => Err(err.to_string()),
             }

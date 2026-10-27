@@ -100,6 +100,9 @@ impl EngineMessages for RecordingMessages {
         self.ended.lock().expect("ended").push((seats.to_vec(), stalled.map(str::to_owned)));
         Ok(Vec::new())
     }
+    async fn awaits_delivery(&self, _namespace: &str, _receiver: &str) -> Result<bool, String> {
+        Ok(false)
+    }
     fn charter_notices(self: Arc<Self>, namespace: &str) -> Box<dyn flotilla_messaging::CharterNotices> {
         Box::new(flotilla_messaging::MessageInbox::new(self.backend.clone(), namespace))
     }
