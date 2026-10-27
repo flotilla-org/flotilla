@@ -108,6 +108,9 @@ impl ManifestRoots for OldStoreManifestRoots {
     }
 
     async fn declare(&self, namespace: &str, name: &str, declaration: RootDeclaration) -> Result<RootView, String> {
+        if name.contains('.') {
+            return Err(format!("ManifestRoot {name}: a declared name must not contain '.'"));
+        }
         let roots = self.backend.using::<ManifestRoot>(namespace);
         let current = match roots.get(name).await {
             Ok(root) => Some(root),

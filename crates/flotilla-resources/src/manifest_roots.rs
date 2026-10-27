@@ -66,7 +66,8 @@ pub trait ManifestRoots: Send + Sync {
     /// Every root of every home.
     async fn roots(&self, namespace: &str) -> Result<Vec<RootView>, String>;
     /// Declares root `name` homed here, or brings its binding up to `declaration`; refused when a
-    /// root of that name declares another host, path or source.
+    /// root of that name declares another host, path or source, and for a name containing `.`
+    /// (the engine's generation separator; declared names are `manifest-<hex>` and `ops-<hex>`).
     async fn declare(&self, namespace: &str, name: &str, declaration: RootDeclaration) -> Result<RootView, String>;
     /// Ends root `name`: its source was removed. Its records stay for attribution; absent is done.
     async fn retire(&self, namespace: &str, name: &str) -> Result<(), String>;

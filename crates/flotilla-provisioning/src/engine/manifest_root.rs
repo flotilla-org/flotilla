@@ -138,12 +138,7 @@ impl EngineManifestRoots {
 
     /// Applies `edge` to this home's root `engine`; a write that changes nothing is done.
     fn apply(&self, engine: &str, edge: impl Into<RootEdge>) -> Result<bool, String> {
-        match locked(&self.roots).apply(engine, edge, &(), self.now()) {
-            Ok(_) => Ok(true),
-            Err(WriteError::Refused(RootRefusal::Unchanged)) => Ok(false),
-            Err(WriteError::Refused(refusal)) => Err(format!("ManifestRoot {engine} refused: {refusal:?}")),
-            Err(other) => Err(format!("ManifestRoot {engine}: {other:?}")),
-        }
+        apply_to(&mut locked(&self.roots), engine, edge, self.now())
     }
 
     /// The view of `root`, homed at `home`.
@@ -166,6 +161,29 @@ impl EngineManifestRoots {
             }
         }
         chosen.into_iter().map(|((home, _), root)| self.view(&home, root)).collect()
+    }
+}
+
+/// Applies `edge` to root `engine` of `roots`; a write that changes nothing is done.
+fn apply_to(roots: &mut Home<ManifestRoot, StoreLog>, engine: &str, edge: impl Into<RootEdge>, now: Timestamp) -> Result<bool, String> {
+    match roots.apply(engine, edge, &(), now) {
+        Ok(_) => Ok(true),
+        Err(WriteError::Refused(RootRefusal::Unchanged)) => Ok(false),
+        Err(WriteError::Refused(refusal)) => Err(format!("ManifestRoot {}: {}", base(engine), refused(&refusal))),
+        Err(other) => Err(format!("ManifestRoot {}: {other:?}", base(engine))),
+    }
+}
+
+/// What a refusal tells the operator whose write it refused.
+fn refused(refusal: &RootRefusal) -> &'static str {
+    match refusal {
+        RootRefusal::Empty => "the write names no revision, reason or token",
+        RootRefusal::Unchanged => "the write changes nothing",
+        RootRefusal::Unreached => "the pass records a document it did not reach",
+        RootRefusal::NoRequest => "no resolution of that document is requested under that token",
+        RootRefusal::Unclaimed => "the resolution has not been started",
+        RootRefusal::Settled => "the resolution is settled already; request it again",
+        RootRefusal::Ended => "the root is retired",
     }
 }
 
@@ -323,42 +341,54 @@ impl ManifestRoots for EngineManifestRoots {
     }
 
     async fn declare(&self, namespace: &str, name: &str, declaration: RootDeclaration) -> Result<RootView, String> {
-        if let Some(engine) = self.live(name) {
-            let current = locked(&self.roots).get(&engine).cloned().expect("live root is held");
-            let spec = current.spec();
-            let moved = spec.host != declaration.host || spec.path != declaration.path || spec.source != declaration.source;
-            if moved && !declaration.ops {
-                return Err(if spec.host != declaration.host {
-                    format!("ManifestRoot {name} belongs to another host")
-                } else {
-                    format!("ManifestRoot {name} has a conflicting declaration")
-                });
-            }
-            if !moved {
-                self.apply(&engine, Rebind { binding: declaration.binding.clone() })?;
-                return self.root(namespace, name).await?.ok_or_else(|| format!("ManifestRoot {name} vanished"));
-            }
-            // An ops binding that moved its path or source is a new declaration: the request is
-            // fixed, so the old root retires and the next generation opens.
-            self.apply(&engine, Retire {})?;
+        if name.contains('.') {
+            // `.` separates a name from its generation.
+            return Err(format!("ManifestRoot {name}: a declared name must not contain '.'"));
         }
-        let next = {
-            let roots = locked(&self.roots);
-            let used: Vec<u64> = roots.resources().filter(|root| base(root.name()) == name).map(|root| generation(root.name())).collect();
-            match used.iter().max() {
-                None => name.to_owned(),
-                Some(last) => format!("{name}.{}", last + 1),
+        let now = self.now();
+        {
+            // One lock from reading the live generation to creating the next, so two declarations
+            // of one name cannot both open the same generation, or retire one and open none.
+            let mut roots = locked(&self.roots);
+            let live = roots
+                .resources()
+                .filter(|root| base(root.name()) == name && matches!(root.state(), RootState::Bound { .. }))
+                .max_by_key(|root| generation(root.name()))
+                .map(|root| (root.name().to_owned(), root.spec().clone()));
+            let mut open = true;
+            if let Some((engine, spec)) = live {
+                let moved = spec.host != declaration.host || spec.path != declaration.path || spec.source != declaration.source;
+                if moved && !declaration.ops {
+                    return Err(if spec.host != declaration.host {
+                        format!("ManifestRoot {name} belongs to another host")
+                    } else {
+                        format!("ManifestRoot {name} has a conflicting declaration")
+                    });
+                }
+                if moved {
+                    // An ops binding that moved its path or source is a new declaration: the request
+                    // is fixed, so the old root retires and the next generation opens.
+                    apply_to(&mut roots, &engine, Retire {}, now)?;
+                } else {
+                    apply_to(&mut roots, &engine, Rebind { binding: declaration.binding.clone() }, now)?;
+                    open = false;
+                }
             }
-        };
-        let request = RootRequest {
-            host: declaration.host.clone(),
-            path: declaration.path.clone(),
-            source: declaration.source.clone(),
-            binding: declaration.binding.clone(),
-        };
-        locked(&self.roots)
-            .create(next.clone(), request, &(), self.now())
-            .map_err(|error| format!("declare ManifestRoot {name}: {error:?}"))?;
+            if open {
+                let last = roots.resources().filter(|root| base(root.name()) == name).map(|root| generation(root.name())).max();
+                let next = match last {
+                    None => name.to_owned(),
+                    Some(last) => format!("{name}.{}", last + 1),
+                };
+                let request = RootRequest {
+                    host: declaration.host.clone(),
+                    path: declaration.path.clone(),
+                    source: declaration.source.clone(),
+                    binding: declaration.binding.clone(),
+                };
+                roots.create(next, request, &(), now).map_err(|error| format!("declare ManifestRoot {name}: {error:?}"))?;
+            }
+        }
         self.root(namespace, name).await?.ok_or_else(|| format!("ManifestRoot {name} vanished"))
     }
 
@@ -388,6 +418,10 @@ impl ManifestRoots for EngineManifestRoots {
                 .collect::<Result<_, _>>()?,
         };
         self.apply(&engine, applied)?;
+        // The judgement follows the records just written; the settlements below are each their own
+        // write, and a pass that fails among them is repeated whole by the next, which the claimed
+        // check and `Unchanged` absorb.
+        locked(&self.judged).insert(engine.clone(), pass.documents.clone());
         // Settle each resolution the pass claimed and finished.
         let resolutions = locked(&self.roots).get(&engine).map(|root| root.spec().resolutions.clone()).unwrap_or_default();
         for (key, document) in &pass.documents {
@@ -404,7 +438,6 @@ impl ManifestRoots for EngineManifestRoots {
                 self.apply(&engine, Resolve { document: document_key.0, token: token.clone(), outcome: settled })?;
             }
         }
-        locked(&self.judged).insert(engine, pass.documents);
         Ok(())
     }
 
@@ -429,7 +462,7 @@ impl ManifestRoots for EngineManifestRoots {
         match locked(&self.roots).apply(&engine, edge, &(), self.now()) {
             Ok(_) => Ok(true),
             Err(WriteError::Refused(RootRefusal::NoRequest | RootRefusal::Settled | RootRefusal::Unchanged)) => Ok(false),
-            Err(WriteError::Refused(refusal)) => Err(format!("ManifestRoot {name} refused the claim: {refusal:?}")),
+            Err(WriteError::Refused(refusal)) => Err(format!("ManifestRoot {name}: {}", refused(&refusal))),
             Err(other) => Err(format!("ManifestRoot {name}: {other:?}")),
         }
     }

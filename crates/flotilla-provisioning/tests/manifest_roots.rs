@@ -62,6 +62,7 @@ async fn contract(roots: &dyn ManifestRoots) {
     roots.declare(NS, ROOT, declaration(Some("project-map"))).await.expect("rebind");
     assert!(roots.root(NS, ROOT).await.expect("read").expect("root").spec.binding.is_some());
     assert!(roots.declare(NS, ROOT, RootDeclaration { host: "kiwi".into(), ..declaration(None) }).await.is_err());
+    assert!(roots.declare(NS, "manifest-a.1", declaration(None)).await.is_err(), "`.` is the generation separator");
 
     // A complete pass records its revision, each document's baseline and each refusal, and the
     // refusals make the root's stall.
@@ -98,11 +99,27 @@ async fn contract(roots: &dyn ManifestRoots) {
     assert!(roots.claim_resolution(NS, ROOT, &b, &token).await.expect("claim"), "the request is claimed");
     assert!(!roots.claim_resolution(NS, ROOT, &b, &token).await.expect("claim again"), "a claim is made once");
     assert!(!roots.claim_resolution(NS, ROOT, &b, "stale").await.expect("stale claim"), "a stale token claims nothing");
+    // A pass that read the root before the claim, and so carries no outcome for it, leaves the claim.
+    let unaware = pass(
+        "r1",
+        true,
+        vec![
+            (a.clone(), document(DocumentPhase::Applied, "ha", None)),
+            (b.clone(), document(DocumentPhase::Refused, "hb", Some("unmanaged object"))),
+        ],
+    );
+    roots.record_pass(NS, ROOT, unaware).await.expect("pass");
+    let root = roots.root(NS, ROOT).await.expect("read").expect("root");
+    assert_eq!(root.status.documents[&b].resolution_outcome, Some(ResolutionOutcome::Started), "the claim stands");
     let mut synced = document(DocumentPhase::Applied, "hb", None);
     synced.resolved_token = Some(token.clone());
     synced.resolution_outcome = Some(ResolutionOutcome::Synced);
     let second = pass("r2", true, vec![(a.clone(), document(DocumentPhase::Applied, "ha", None)), (b.clone(), synced)]);
-    roots.record_pass(NS, ROOT, second).await.expect("pass");
+    roots.record_pass(NS, ROOT, second.clone()).await.expect("pass");
+    // A pass repeated whole (a retry after a failure part way) is accepted and changes nothing.
+    let before = roots.root(NS, ROOT).await.expect("read").expect("root").status;
+    roots.record_pass(NS, ROOT, second).await.expect("repeated pass");
+    assert_eq!(roots.root(NS, ROOT).await.expect("read").expect("root").status.documents, before.documents);
     let root = roots.root(NS, ROOT).await.expect("read").expect("root");
     assert_eq!(root.status.applied_revision.as_deref(), Some("r2"));
     assert_eq!(root.status.source_error, None, "a pass clears the source error");
