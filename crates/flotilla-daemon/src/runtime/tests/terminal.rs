@@ -626,13 +626,13 @@ async fn terminal_teardown_lets_a_typed_engine_turn_settle_for_its_receipt() {
         tokio::time::pause();
         let stop = tokio_util::sync::CancellationToken::new();
         let cancelled = stop.clone();
-        // The adapter's turn: waiting for readiness until teardown cancels it,
+        // The adapter's turn: not yet typed until teardown cancels it,
         // confirming a typed submission, or hung inside one.
         let task = tokio::spawn(async move {
             match turn {
                 Turn::Untyped => {
                     cancelled.cancelled().await;
-                    Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady))
+                    Ok(TerminalDeliveryOutcome::Deferred("teardown stopped the turn before it was typed; no input sent"))
                 }
                 Turn::Typed => {
                     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -668,7 +668,7 @@ async fn terminal_teardown_lets_a_typed_engine_turn_settle_for_its_receipt() {
                 let outcome = reserved.task.await.expect("turn task");
                 match turn {
                     Turn::Untyped => {
-                        assert!(matches!(outcome, Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady))))
+                        assert!(matches!(outcome, Ok(TerminalDeliveryOutcome::Deferred(_))))
                     }
                     _ => assert!(matches!(outcome, Ok(TerminalDeliveryOutcome::Confirmed))),
                 }
