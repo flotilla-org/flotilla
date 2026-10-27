@@ -3,6 +3,10 @@
 # TLA+, TLC dumps every reachable state, and dump2json.py writes them as JSON.
 # Usage: conformance/export.sh OUTPUT_DIRECTORY
 set -euo pipefail
+server=()
+if [ -n "${QUINT_SERVER_ENDPOINT:-}" ]; then
+  server=(--server-endpoint "$QUINT_SERVER_ENDPOINT")
+fi
 cd "$(dirname "$0")"
 out=$1
 jar=${APALACHE_JAR:-$HOME/.quint/apalache-dist-0.62.1/apalache/lib/apalache.jar}
@@ -12,7 +16,7 @@ for machine in ${MACHINES:-lifecycle agent_session convoy message ensure vessel 
   module="${machine}_conformance"
   invariant=()
   if [ "$machine" = convoy ]; then invariant=(--invariant quotaRefinesPlacement); fi
-  quint compile "$machine.qnt" --target tlaplus "${invariant[@]}" > "$out/$machine.compile.log"
+  quint compile ${server[@]+"${server[@]}"} "$machine.qnt" --target tlaplus ${invariant[@]+"${invariant[@]}"} > "$out/$machine.compile.log"
   awk '/^-+ MODULE/{found=1} found' "$out/$machine.compile.log" > "$out/$module.tla"
   printf 'INIT q_init\nNEXT q_step\n' > "$out/$module.cfg"
   if [ "$machine" = convoy ]; then printf 'INVARIANT q_inv\n' >> "$out/$module.cfg"; fi

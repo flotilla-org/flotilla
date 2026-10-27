@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Each isolated mutation must produce a safety counterexample, never a tool error.
 set -euo pipefail
+server=()
+if [ -n "${QUINT_SERVER_ENDPOINT:-}" ]; then
+  server=(--server-endpoint "$QUINT_SERVER_ENDPOINT")
+fi
 # Expanded typed compositions exceed the JVM's default parser stack.
 export JVM_ARGS="${JVM_ARGS:--Xmx3g -Xss16m}"
 cd "$(dirname "$0")/.."
@@ -22,7 +26,7 @@ for mutant in activity_unchanged expiry_without_watermark release_only_realised 
   mkdir -p "$destination"
   cp -R machines world scenarios "$destination/"
   patch -s -d "$destination" -p1 < "mutants/$mutant.patch"
-  quint compile "$destination/scenarios/$scenario.qnt" --target tlaplus --invariant safety > "$destination/compile.log"
+  quint compile ${server[@]+"${server[@]}"} "$destination/scenarios/$scenario.qnt" --target tlaplus --invariant safety > "$destination/compile.log"
   awk '/^-+ MODULE/{found=1} found' "$destination/compile.log" > "$destination/$scenario.tla"
   printf 'INIT q_init\nNEXT q_step\nINVARIANT q_inv\nVIEW view\n' > "$destination/$scenario.cfg"
   if java -Xmx2g -Xss512k -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers "${TLC_WORKERS:-4}" \

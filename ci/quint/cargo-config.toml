@@ -1,0 +1,22 @@
+# Only quick-tier harness packages are optimised. Dependency builds retain the
+# workspace's dev settings, apart from bundled SQLite used by the store suites.
+[profile.test.package.flotilla-state-machines]
+opt-level = 2
+
+[profile.test.package.flotilla-provisioning]
+opt-level = 2
+
+[profile.test.package.flotilla-schema-sqlite]
+opt-level = 2
+
+[profile.test.package.flotilla-engine-store]
+opt-level = 2
+
+[profile.test.package.flotilla-inbox]
+opt-level = 2
+
+[profile.test.package.libsqlite3-sys]
+opt-level = 3
+
+[profile.test.package.flotilla-quint-testkit]
+opt-level = 2
