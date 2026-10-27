@@ -7,7 +7,8 @@
 // authorises) and its authorisation epochs grow (a replacement login for the same account).
 module account_binding {
   // What admission chose; it never changes. The epoch lineage starts at the selection's epoch.
-  type Request = { requester: str, credential: str, grants: Set[str], epoch: int }
+  // The home key is the requester's home relative to a place's writable base (#3953).
+  type Request = { requester: str, credential: str, grants: Set[str], epoch: int, homeKey: str }
   // DeliveredUntil: the time delivered material was last known present in a vessel, if any.
   type Delivered = Never | Until(int)
   type State = Open({ grants: Set[str], epoch: int })
