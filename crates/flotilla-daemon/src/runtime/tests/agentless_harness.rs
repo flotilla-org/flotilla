@@ -132,13 +132,6 @@ impl CommandRunner for FakeHost {
     }
 
     async fn run_with_input(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel, _input: &[u8]) -> Result<String, String> {
-        // The staging script fetches each source in the vessel; here each selected skill lands.
-        if let Some(staged) = StagedSkills::of(args) {
-            for name in staged.names {
-                self.put(&staged.destination.join(name).join("SKILL.md"), "---\nname: staged\n---\n");
-            }
-            return ok();
-        }
         panic!("credential preparation cannot send model turns: {cmd} {args:?}")
     }
 
@@ -246,7 +239,7 @@ fn agentless_host(host: &Arc<FakeHost>, runtime_dir: &flotilla_test_support::Tes
         host_environment: HostEnvironment::default(),
         checkout: CHECKOUT.to_string(),
         session_env: BTreeMap::new(),
-        skills: vec![frozen_skill("research")],
+        skills: true,
     }
 }
 
@@ -260,8 +253,8 @@ struct AgentlessHost {
     checkout: String,
     /// What the session spec declares, as credential delivery adds to it.
     session_env: BTreeMap<String, String>,
-    /// The crew's frozen skills.
-    skills: Vec<flotilla_resources::SkillCatalogEntry>,
+    /// Whether the crew freezes a selection of the local `research` skill.
+    skills: bool,
 }
 
 /// What the terminal pool was asked to start.
@@ -345,6 +338,8 @@ async fn agentless_runtime(host: AgentlessHost, adapter: &str) -> AgentlessRunti
         vessel_agent: Err("the test's vessel agents run on the host runner".into()),
     };
     register_agentless_ssh_resources(&backend, NAMESPACE, &local_host_id, &profile).await.expect("register agentless resources");
+    let source = LocalSkillSource::new(temp.path(), "research");
+    let skills = if skills { vec![source.selected.clone()] } else { Vec::new() };
     freeze_crew(&backend, "demo", "demo-work", "coder", adapter, skills).await;
     let credential_store = Arc::new(CredentialStore::new(
         backend,
@@ -373,8 +368,9 @@ async fn agentless_runtime(host: AgentlessHost, adapter: &str) -> AgentlessRunti
         .with_credential_store(credential_store)
         .with_agent_material(Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([(
             FLOTILLA_SKILLS_DIR_ENV,
-            write_test_skill_sources(temp.path()).display().to_string(),
-        )]))))),
+            source.supply.display().to_string(),
+        )])))))
+        .with_skill_trees(LocalSkillSource::trees(temp.path())),
     );
     let spec = flotilla_resources::TerminalSessionSpec {
         env_ref: ENVIRONMENT.to_string(),
@@ -448,17 +444,23 @@ impl AgentlessRuntime {
     }
 }
 
-/// #3964: the access layer staged the crew's frozen skills into exactly the home its
-/// harness launches with, and recorded what landed there. #3909: the vessel fetched the
-/// adapter's pinned harness by digest from its upstream URL into that home, and the
-/// launch runs it.
+/// #3964, #3663: the access layer pushed the crew's frozen skills into the vessel agent's
+/// cache and linked exactly the home its harness launches with to them, and recorded what
+/// landed there. #3909: the vessel fetched the adapter's pinned harness by digest from its
+/// upstream URL into that home, and the launch runs it.
 fn assert_staged_into_launched_home(launch: &AgentlessLaunch, variable: &str, adapter: &str) {
     let home = launch.value(variable).expect("launched home");
-    assert!(launch.host.entry(format!("{home}/skills/research/SKILL.md")).is_some(), "skills are staged into the launched home");
+    let Some(HostEntry::Link(entry)) = launch.host.entry(format!("{home}/skills")) else { panic!("no skills link in the launched home") };
+    let skills = ArtifactArrival::Pushed(vec![".flotilla-sources.json".into(), "research/SKILL.md".into()]);
+    assert!(
+        launch.artifacts.iter().any(|(sha256, arrival)| entry.ends_with(sha256) && *arrival == skills),
+        "the skills link names the pushed tree: {entry:?} {:?}",
+        launch.artifacts
+    );
     let Some(HostEntry::File(record)) = launch.host.entry(format!("{home}/{}", flotilla_vessel_delivery::DELIVERY_RECORD)) else {
         panic!("no delivery record in the launched home")
     };
-    assert!(record.lines().any(|line| line.starts_with("skills\t") && line.contains("\tagent-fetch(url)\t")), "{record}");
+    assert!(record.lines().any(|line| line.starts_with("skills\t") && line.contains("\tagent-push\t")), "{record}");
     assert!(record.lines().any(|line| line.starts_with("home\t") && line.contains("\thost-path(rw, live)\t")), "{record}");
     // Contract 4: the access's status shows the same home and each need's mechanism.
     let [delivery] = launch.deliveries.as_slice() else { panic!("one access delivered: {:?}", launch.deliveries) };
@@ -466,13 +468,13 @@ fn assert_staged_into_launched_home(launch: &AgentlessLaunch, variable: &str, ad
     assert_eq!(delivery.retry, None);
     let mechanisms = delivery.needs.iter().map(|need| (need.need.as_str(), need.mechanism.as_str())).collect::<BTreeMap<_, _>>();
     assert_eq!(mechanisms.get("home"), Some(&"host-path(rw, live)"));
-    assert_eq!(mechanisms.get("skills"), Some(&"agent-fetch(url)"));
+    assert_eq!(mechanisms.get("skills"), Some(&"agent-push"));
     assert_eq!(mechanisms.get("harness"), Some(&"agent-fetch(digest)"));
     let pinned = pinned_harness_sha256(adapter);
+    let fetched = launch.artifacts.iter().filter(|(_, arrival)| matches!(arrival, ArtifactArrival::Fetched(_))).collect::<Vec<_>>();
     assert!(
-        matches!(launch.artifacts.as_slice(), [(sha256, ArtifactArrival::Fetched(urls))] if *sha256 == pinned && urls.len() == 1),
-        "{:?}",
-        launch.artifacts
+        matches!(fetched.as_slice(), [(sha256, ArtifactArrival::Fetched(urls))] if *sha256 == pinned && urls.len() == 1),
+        "{fetched:?}"
     );
     let binary = flotilla_agent::adapter::harness_binary(adapter).expect("built-in harness");
     assert!(launch.command.contains(&format!("{home}/.flotilla/harness/bin/{binary} ")), "{}", launch.command);
@@ -734,7 +736,7 @@ async fn agentless_harness_path_is_composed_and_never_the_login_profile() {
 
     let session = launch_agentless(
         // A real shell stands in for the host here, so the crew selects no skills to fetch.
-        AgentlessHost { runner, bag, host_environment, checkout: checkout.display().to_string(), session_env, skills: Vec::new() },
+        AgentlessHost { runner, bag, host_environment, checkout: checkout.display().to_string(), session_env, skills: false },
         "claude-code",
         true,
     )
@@ -793,7 +795,7 @@ async fn a_supply_overriding_a_flotilla_variable_is_a_host_configuration_error()
             host_environment,
             checkout: CHECKOUT.to_string(),
             session_env: BTreeMap::new(),
-            skills: vec![frozen_skill("research")],
+            skills: true,
         },
         "claude-code",
         true,
@@ -830,7 +832,7 @@ async fn a_supply_setting_a_family_account_variable_is_a_host_configuration_erro
             host_environment,
             checkout: CHECKOUT.to_string(),
             session_env: BTreeMap::new(),
-            skills: vec![frozen_skill("research")],
+            skills: true,
         },
         "claude-code",
         true,
@@ -872,7 +874,7 @@ async fn bound_agentless_crew_with(
             host_environment: HostEnvironment::default(),
             checkout: CHECKOUT.to_string(),
             session_env: BTreeMap::new(),
-            skills: vec![frozen_skill("research")],
+            skills: true,
         },
         "claude-code",
     )
@@ -1136,6 +1138,33 @@ async fn failed_delivery_waits_for_its_retry_and_is_cleared_once_delivered() {
     records.update(&meta, &record.metadata.resource_version, &due).await.expect("retry due");
     runtime.launch().await.expect("delivered once due");
     assert_eq!(retry(runtime.deliveries().await), None);
+}
+
+// #3663: a delivery refused on positive evidence is recorded as permanent and never
+// retried. Here the current supply no longer declares the crew's frozen source, so the
+// skills need is refused; a later launch is refused without another attempt.
+#[tokio::test]
+async fn a_permanent_refusal_is_recorded_and_never_retried() {
+    let runtime_dir = flotilla_test_support::TestSocketDir::new();
+    let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
+    let runtime = agentless_runtime(agentless_host(&host, &runtime_dir), "codex").await;
+    let supply = runtime._temp.path().join("generation/skills/.flotilla-sources.json");
+    let other =
+        serde_json::json!({"schema_version": 5, "sources": [{"name": "other", "repository": "/elsewhere", "revision": "3".repeat(40)}]});
+    fs::write(&supply, other.to_string()).expect("the supply moves on");
+    runtime.launch().await.expect_err("the frozen source is no longer authorized");
+    let failed = |deliveries: Vec<flotilla_protocol::ExplainedAccessDelivery>| {
+        let [delivery] = deliveries.as_slice() else { panic!("one access: {deliveries:?}") };
+        delivery.retry.clone().expect("the failure is recorded")
+    };
+    let refused = failed(runtime.deliveries().await);
+    assert_eq!((refused.need.as_str(), refused.attempts), ("skills", 1));
+    assert!(refused.error.starts_with("permanent") && refused.error.contains("not declared"), "{}", refused.error);
+    assert_eq!(refused.next_at, "", "no retry is ever due");
+
+    let error = runtime.launch().await.expect_err("still refused");
+    assert!(error.contains("permanent"), "{error}");
+    assert_eq!(failed(runtime.deliveries().await), refused, "no further attempt");
 }
 
 // #3964: an access's status lasts as long as its place and its convoy. While both

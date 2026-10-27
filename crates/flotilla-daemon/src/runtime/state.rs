@@ -58,6 +58,8 @@ pub(super) struct ControllerRuntimeState {
     pub(super) hook_endpoint: Option<HookEndpoint>,
     pub(super) credential_store: Option<Arc<CredentialStore>>,
     pub(super) agent_material: Option<Arc<AgentMaterialRegistry>>,
+    /// Crews' skill trees, fetched on this daemon's host (#3663).
+    pub(super) skill_trees: Arc<flotilla_credentials::SkillTrees>,
     pub(super) blob_store: Option<Arc<TieredBlobStore>>,
     pub(super) image_inventory: Option<Arc<flotilla_provisioning::image_inventory::ImageInventoryPublisher<super::ports::ProviderImageIo>>>,
     /// This host's ADR 0062 image build service, when it can build images.
@@ -217,8 +219,13 @@ impl ControllerRuntimeState {
                 .expect("account provider address");
             environment_providers.insert(address, provider.clone()).expect("unique cloud provider address");
         }
+        let skill_trees = Arc::new(flotilla_credentials::SkillTrees::new(
+            Arc::new(flotilla_vcs::vcs::FlotillaVcs::object_cache(Arc::clone(&daemon.discovery_runtime().runner))),
+            config.state_dir().as_path().join("skill-source-cache"),
+        ));
         Self {
             environment_providers,
+            skill_trees,
             local_core_count: std::thread::available_parallelism,
             daemon,
             config,
@@ -335,6 +342,12 @@ impl ControllerRuntimeState {
 
     pub(super) fn with_credential_store(mut self, credential_store: Arc<CredentialStore>) -> Self {
         self.credential_store = Some(credential_store);
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_skill_trees(mut self, skill_trees: flotilla_credentials::SkillTrees) -> Self {
+        self.skill_trees = Arc::new(skill_trees);
         self
     }
 

@@ -123,6 +123,10 @@ hegeltest = { workspace = true }
 http = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled"] }
 prometheus-parse = "0.2"
+# #3663: the content cache model lists a pushed skill archive's files.
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
+rigging-process = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 drydock-host.workspace = true

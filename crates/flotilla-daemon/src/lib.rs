@@ -26,7 +26,7 @@ pub mod supervisor;
 
 pub(crate) const DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH: &str = "run/socket-path";
 
-pub use flotilla_credentials::validate_frozen_vessel_skills;
+pub use flotilla_credentials::{validate_frozen_vessel_skills, SkillTrees};
 
 #[cfg(test)]
 extern crate self as flotilla_daemon;

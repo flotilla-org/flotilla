@@ -27,7 +27,8 @@ pub(super) struct RecordedVessel {
 pub(super) enum ArtifactArrival {
     /// The vessel fetched them from these upstream URLs.
     Fetched(Vec<String>),
-    Pushed,
+    /// The controller pushed them; a pushed archive's files, by path.
+    Pushed(Vec<String>),
 }
 
 /// Where the fake agent of the vessel at `agent` keeps an entry, as drydock keeps its
@@ -100,8 +101,12 @@ impl VesselAgent for RunnerVessel {
         self.record(|vessel| vessel.artifacts.push((sha256.into(), ArtifactArrival::Fetched(urls.to_vec()))));
         Ok(())
     }
-    async fn push_artifact(&self, sha256: &str, _: &Path, _: flotilla_resources::PinUnpack) -> Result<(), String> {
-        self.record(|vessel| vessel.artifacts.push((sha256.into(), ArtifactArrival::Pushed)));
+    async fn push_artifact(&self, sha256: &str, file: &Path, unpack: flotilla_resources::PinUnpack) -> Result<(), String> {
+        let files = match unpack {
+            flotilla_resources::PinUnpack::TarGz => archive_files(&fs::read(file).map_err(|error| error.to_string())?),
+            _ => Vec::new(),
+        };
+        self.record(|vessel| vessel.artifacts.push((sha256.into(), ArtifactArrival::Pushed(files))));
         Ok(())
     }
     async fn link_artifact(&self, path: &Path, sha256: &str, member: &Path) -> Result<(), String> {

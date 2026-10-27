@@ -23,17 +23,6 @@ pub(super) fn write_test_skill_sources(root: &Path) -> PathBuf {
     skills
 }
 
-pub(super) fn write_test_credentialed_skill_sources(root: &Path) -> PathBuf {
-    let skills = root.join("generation/credentialed-skills");
-    fs::create_dir_all(&skills).expect("create credentialed skill source manifest directory");
-    fs::write(
-            skills.join(".flotilla-sources.json"),
-            r#"{"schema_version":5,"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"1111111111111111111111111111111111111111","credential":"github-skills-fork"}]}"#,
-        )
-        .expect("write credentialed skill source manifest");
-    skills
-}
-
 pub(super) struct SshProvisioningRecordingRunner {
     pub(super) commands: Arc<StdMutex<Vec<String>>>,
 }
@@ -63,37 +52,232 @@ impl CommandRunner for SshProvisioningRecordingRunner {
     }
 }
 
-/// What one run of the skill staging script was asked to install: its destination and
-/// the frozen skill names, read from its arguments at the vessel's process boundary.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct StagedSkills {
-    pub(super) destination: PathBuf,
-    pub(super) names: Vec<String>,
+/// A real skill source for launch scenarios: a local Git repository holding `name`,
+/// the generation supply that authorizes it, and the crew's frozen selection of it.
+pub(super) struct LocalSkillSource {
+    pub(super) supply: PathBuf,
+    pub(super) selected: flotilla_resources::SkillCatalogEntry,
 }
 
-impl StagedSkills {
-    /// Parse the staging script's argument layout (`flotilla_vcs`'s `stage_git_skill_sources`):
-    /// after the command identifier come the manifest, destination, cleanup flag and cache,
-    /// then per source its name, repository, revision, token, credential, path count, paths,
-    /// entry count and `(name, path)` entries.
-    pub(super) fn of(args: &[&str]) -> Option<Self> {
-        let start = args.iter().position(|arg| *arg == "flotilla-stage-skills")?;
-        let destination = PathBuf::from(args.get(start + 2)?);
-        let mut rest = args.get(start + 5..)?.iter();
-        let mut names = Vec::new();
-        while rest.next().is_some() {
-            let paths = rest.nth(4)?.parse::<usize>().ok()?;
-            let entries = rest.nth(paths)?.parse::<usize>().ok()?;
-            for _ in 0..entries {
-                names.push(rest.next()?.to_string());
-                rest.next()?;
-            }
-        }
-        Some(Self { destination, names })
+impl LocalSkillSource {
+    pub(super) fn new(root: &Path, name: &str) -> Self {
+        let repository = root.join("skill-source");
+        fs::create_dir_all(repository.join("skills").join(name)).expect("skill source");
+        fs::write(repository.join("skills").join(name).join("SKILL.md"), format!("---\nname: {name}\ndescription: test\n---\n"))
+            .expect("skill");
+        // Git subprocess boundary: the controller's host-side fetch reads this repository.
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+                .args(args)
+                .current_dir(&repository)
+                .output()
+                .expect("spawn git");
+            assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+            String::from_utf8(output.stdout).expect("utf-8").trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "pin"]);
+        let revision = git(&["rev-parse", "HEAD"]);
+        let supply = root.join("generation/skills");
+        fs::create_dir_all(&supply).expect("supply");
+        let source = repository.display().to_string();
+        fs::write(
+            supply.join(".flotilla-sources.json"),
+            serde_json::json!({"schema_version": 5, "sources": [{"name": "local", "repository": source, "revision": revision}]})
+                .to_string(),
+        )
+        .expect("supply manifest");
+        let selected = flotilla_resources::SkillCatalogEntry {
+            source: "local".into(),
+            repository: source,
+            revision,
+            name: name.into(),
+            path: format!("skills/{name}"),
+        };
+        Self { supply, selected }
+    }
+
+    /// The controller's host-side acquisition, over the real Git CLI. Its Git commands
+    /// skip the host Git config guard, whose probes share a process-wide budget of eight
+    /// that the many launch scenarios running at once would exhaust; the guard has its own
+    /// tests, and these repositories are the test's own.
+    pub(super) fn trees(root: &Path) -> flotilla_credentials::SkillTrees {
+        flotilla_credentials::SkillTrees::new(
+            Arc::new(flotilla_vcs::vcs::FlotillaVcs::object_cache(Arc::new(rigging_process::ProcessRunner::new(OwnRepositories)))),
+            root.join("skill-source-cache"),
+        )
     }
 }
 
-pub(super) struct CredentialInteriorRunner(pub(super) DiscoveryMockRunner, pub(super) Option<Arc<StdMutex<Vec<StagedSkills>>>>);
+/// A guard that admits every command: the launch scenarios' skill sources are repositories
+/// the test created.
+struct OwnRepositories;
+
+#[async_trait]
+impl rigging_process::CommandGuard for OwnRepositories {
+    fn scratch_namespace(&self) -> &str {
+        "flotilla"
+    }
+    async fn check(&self, _: &str, _: &[&str], _: &Path) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// The vessel agent's content cache, modelled for launch scenarios (#3663): a pushed
+/// archive is checked against its digest and its files listed, and each link into the
+/// cache is recorded. Where the agent keeps an entry is its own; nothing here names it.
+#[derive(Default)]
+pub(super) struct ContentCache {
+    entries: StdMutex<BTreeMap<String, Vec<String>>>,
+    links: StdMutex<BTreeMap<PathBuf, String>>,
+}
+
+impl ContentCache {
+    /// The files of the entry `path` is linked to, if it is linked to one.
+    pub(super) fn linked_files(&self, path: impl AsRef<Path>) -> Option<Vec<String>> {
+        let digest = self.links.lock().expect("links").get(path.as_ref()).cloned()?;
+        self.entries.lock().expect("entries").get(&digest).cloned()
+    }
+
+    pub(super) fn push(&self, sha256: &str, file: &Path, unpack: flotilla_resources::PinUnpack) -> Result<(), String> {
+        use sha2::Digest;
+        let bytes = fs::read(file).map_err(|error| error.to_string())?;
+        if format!("{:x}", sha2::Sha256::digest(&bytes)) != sha256 {
+            return Err(format!("pushed bytes do not hash to {sha256}"));
+        }
+        let files = match unpack {
+            flotilla_resources::PinUnpack::TarGz => archive_files(&bytes),
+            other => panic!("the content cache model unpacks only tar.gz, not {other:?}"),
+        };
+        self.entries.lock().expect("entries").insert(sha256.to_string(), files);
+        Ok(())
+    }
+
+    pub(super) fn link(&self, path: &Path, sha256: &str, member: &Path) -> Result<(), String> {
+        assert!(member.as_os_str().is_empty(), "skills link the whole entry");
+        if !self.entries.lock().expect("entries").contains_key(sha256) {
+            return Err(format!("no cache entry {sha256}"));
+        }
+        self.links.lock().expect("links").insert(path.to_path_buf(), sha256.to_string());
+        Ok(())
+    }
+}
+
+/// The regular files of a gzipped tar, by path.
+pub(super) fn archive_files(bytes: &[u8]) -> Vec<String> {
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(bytes));
+    let mut files = archive
+        .entries()
+        .expect("archive entries")
+        .map(|entry| entry.expect("archive entry"))
+        .filter(|entry| entry.header().entry_type().is_file())
+        .map(|entry| entry.path().expect("entry path").display().to_string())
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+}
+
+/// A contained vessel's agent: its file facilities run through the vessel's runner, as
+/// the in-process agent runs them, and its content cache is `cache`.
+struct CachedAgent {
+    files: flotilla_environment::environment::vessel_ops::RunnerVesselAgent,
+    cache: Arc<ContentCache>,
+}
+
+#[async_trait]
+impl flotilla_environment::environment::VesselAgent for CachedAgent {
+    async fn ready(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn forward_socket(&self, guest: &Path) -> Result<PathBuf, String> {
+        self.files.forward_socket(guest).await
+    }
+    async fn push_tools(&self, tools: &[flotilla_environment::environment::EnvironmentTool]) -> Result<(), String> {
+        self.files.push_tools(tools).await
+    }
+    fn commands(&self) -> Arc<dyn CommandRunner> {
+        self.files.commands()
+    }
+    async fn writable_base(&self) -> Result<PathBuf, String> {
+        self.files.writable_base().await
+    }
+    async fn stat(&self, path: &Path) -> Result<Option<flotilla_environment::environment::EntryKind>, String> {
+        self.files.stat(path).await
+    }
+    async fn create_dir(&self, path: &Path, mode: u32) -> Result<(), String> {
+        self.files.create_dir(path, mode).await
+    }
+    async fn read(&self, path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
+        self.files.read(path, limit).await
+    }
+    async fn write(&self, path: &Path, bytes: Vec<u8>, mode: u32) -> Result<(), String> {
+        self.files.write(path, bytes, mode).await
+    }
+    async fn symlink(&self, path: &Path, target: &Path) -> Result<(), String> {
+        self.files.symlink(path, target).await
+    }
+    async fn push_artifact(&self, sha256: &str, file: &Path, unpack: flotilla_resources::PinUnpack) -> Result<(), String> {
+        self.cache.push(sha256, file, unpack)
+    }
+    async fn link_artifact(&self, path: &Path, sha256: &str, member: &Path) -> Result<(), String> {
+        self.cache.link(path, sha256, member)
+    }
+}
+
+/// A contained vessel whose agent answers, with a content cache: the handle launch finds
+/// among the controller's provisioned environments.
+pub(super) struct CachedInterior {
+    pub(super) inner: TestInteriorEnvironment,
+    pub(super) cache: Arc<ContentCache>,
+}
+
+#[async_trait]
+impl ProvisionedEnvironment for CachedInterior {
+    flotilla_discovery_testkit::injected_environment_handle!(agent);
+
+    fn agent(&self) -> Arc<dyn flotilla_environment::environment::VesselAgent> {
+        Arc::new(CachedAgent {
+            files: flotilla_environment::environment::vessel_ops::RunnerVesselAgent(self.inner.runner()),
+            cache: Arc::clone(&self.cache),
+        })
+    }
+
+    fn id(&self) -> &EnvironmentId {
+        self.inner.id()
+    }
+
+    fn image(&self) -> &ImageId {
+        self.inner.image()
+    }
+
+    fn container_name(&self) -> Option<&str> {
+        self.inner.container_name()
+    }
+
+    fn provisioned_mounts(&self) -> Vec<ProvisionedMount> {
+        Vec::new()
+    }
+
+    async fn observe(&self) -> flotilla_environment::environment::ProviderObservation {
+        self.inner.observe().await
+    }
+
+    async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
+        self.inner.env_vars().await
+    }
+
+    fn runner(&self) -> Arc<dyn CommandRunner> {
+        self.inner.runner()
+    }
+
+    async fn destroy(&self) -> Result<(), String> {
+        self.inner.destroy().await
+    }
+}
+
+pub(super) struct CredentialInteriorRunner(pub(super) DiscoveryMockRunner);
 
 #[derive(Default)]
 pub(super) struct PersistentPathRecordingRunner {
@@ -127,18 +311,11 @@ impl CommandRunner for PersistentPathRecordingRunner {
 #[async_trait]
 impl CommandRunner for CredentialInteriorRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
-        if cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-stage-skills")) {
-            if let (Some(staged), Some(skills)) = (&self.1, StagedSkills::of(args)) {
-                staged.lock().expect("staged").push(skills);
-            }
-            Ok("ok".to_string())
-        } else if cmd == "sh" && (args.contains(&"flotilla-stat") || args.contains(&"flotilla-is-file")) {
+        if cmd == "sh" && (args.contains(&"flotilla-stat") || args.contains(&"flotilla-is-file")) {
             // Nothing vessel delivery reads has landed in this stand-in's homes.
             Ok("none\n".to_string())
         } else if cmd == "mkdir"
                 || cmd == "chmod"
-                || (cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-skills-preflight")))
-                || (cmd == "sh" && args.contains(&"flotilla-prune-skill-tokens"))
                 // This runner stands in for the contained process boundary;
                 // real scratch copying and credential links are tested in agent_material.
                 || (cmd == "sh" && args.contains(&"flotilla-harness-home"))
@@ -160,12 +337,14 @@ impl CommandRunner for CredentialInteriorRunner {
         self.0.run_output(cmd, args, cwd, label).await
     }
 
-    async fn run_with_input(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel, _input: &[u8]) -> Result<String, String> {
-        if cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-stage-skills")) {
-            if let (Some(staged), Some(skills)) = (&self.1, StagedSkills::of(args)) {
-                staged.lock().expect("staged").push(skills);
-            }
-        }
+    async fn run_with_input(
+        &self,
+        _cmd: &str,
+        _args: &[&str],
+        _cwd: &Path,
+        _label: &ChannelLabel,
+        _input: &[u8],
+    ) -> Result<String, String> {
         Ok("ok".to_string())
     }
 

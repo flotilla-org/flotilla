@@ -2,12 +2,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Component, Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
 
 use async_trait::async_trait;
 use flotilla_environment::environment::runner::CONTAINED_CODEX_HOME;
-use flotilla_environment::environment::runner::CONTAINED_WRITABLE_CONFIG_BASE;
 use flotilla_environment::environment::runner::{CONTAINED_CODEX_AUTH_FILE, HARNESS_AUTH_FILES};
 use flotilla_environment::environment::ProvisionedMount;
 use flotilla_environment::environment::ProvisionedMountMode;
@@ -15,17 +13,12 @@ use flotilla_environment::environment::{EntryKind, VesselAgent};
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
-use flotilla_vcs::providers::skill_source::stage_git_skill_sources;
-use flotilla_vcs::providers::skill_source::STAGE_DIAGNOSTIC_PREFIX;
-use flotilla_vcs::providers::skill_source::STAGE_RETRYABLE_PREFIX;
-use flotilla_vcs::providers::skill_source::STAGE_SOURCE_PREFIX;
 use futures::future::BoxFuture;
 use tokio::{fs, io::AsyncWriteExt};
-use tracing::{info, warn};
-use url::Url;
 
 use crate::{
     codex_central::codex_central_auth_path,
+    skill_trees::{inspect_skill_sources, SkillTree, SkillTreeError},
     vessel_config::{agent_environment_fragment, Fragment},
 };
 
@@ -38,8 +31,6 @@ pub const FLOTILLA_SKILLS_DIR_ENV: &str = "FLOTILLA_SKILLS_DIR";
 /// flotilla-org/flotilla#1913; this is the consumer contract it satisfies.
 /// Absent, a crew simply starts from an empty scratch directory.
 pub(crate) const FLOTILLA_CODEX_HOME_TEMPLATE_ENV: &str = "FLOTILLA_CODEX_HOME_TEMPLATE";
-const SKILL_BUNDLE_MANIFEST: &str = ".flotilla-sources.json";
-const CONTAINER_SKILLS_SOURCE: &str = "/run/flotilla/skills";
 pub const CONTAINER_CODEX_HOME: &str = CONTAINED_CODEX_HOME;
 /// The one credential file inside a crew's `CODEX_HOME`. Everything else under
 /// that directory is per-crew scratch Codex may write freely.
@@ -61,14 +52,6 @@ pub struct AgentMaterialDelivery {
     /// hello; preceding providers can still lower this descriptor to a mount.
     pub mount: ProvisionedMount,
     pub preflight: AgentMaterialPreflight,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkillSourceCredentialRequest {
-    pub source: String,
-    pub repository: String,
-    pub revision: String,
-    pub credential: String,
 }
 
 /// The home variable and directory name a harness's crews use.
@@ -142,37 +125,6 @@ impl HarnessLogin {
 
 /// A harness's static config file is small; anything larger is not one to seed.
 const STATIC_CONFIG_LIMIT: u64 = 1024 * 1024;
-
-/// A crew's frozen skill selection with the authorized sources it is fetched from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkillTree {
-    sources: Vec<SkillSource>,
-    selected: Vec<flotilla_resources::SkillCatalogEntry>,
-}
-
-impl SkillTree {
-    /// Content identity: every source at its pinned revision, and every selected path.
-    pub fn digest(&self) -> String {
-        use sha2::{Digest, Sha256};
-        let identity = serde_json::json!({"sources": self.sources, "selected": self.selected});
-        format!("{:x}", Sha256::digest(identity.to_string().as_bytes()))
-    }
-
-    /// The source credentials staging needs, one per credentialed source.
-    pub fn credentials(&self) -> Vec<SkillSourceCredentialRequest> {
-        self.sources
-            .iter()
-            .filter_map(|source| {
-                source.credential.clone().map(|credential| SkillSourceCredentialRequest {
-                    source: source.name.clone(),
-                    repository: source.repository.clone(),
-                    revision: source.revision.clone(),
-                    credential,
-                })
-            })
-            .collect()
-    }
-}
 
 #[async_trait]
 trait AgentMaterialAdapter: Send + Sync {
@@ -258,7 +210,7 @@ impl AgentMaterialRegistry {
                 .filter_map(|adapter_id| self.adapters.get(adapter_id.as_str()))
                 .any(|adapter| adapter.requires_skills_for_prepare(environment))
             {
-                deliveries.push(self.skills.prepare().await?);
+                self.skills.prepare().await?;
             }
             Ok(deliveries)
         })
@@ -291,65 +243,11 @@ impl AgentMaterialRegistry {
         Some(HarnessLogin { base })
     }
 
-    /// A crew's frozen skill selection, resolved against this generation's authorized
-    /// sources (ADR 0052): the tree the access layer delivers into the crew's home.
-    pub async fn skill_tree(&self, selected: &[flotilla_resources::SkillCatalogEntry]) -> Result<SkillTree, String> {
-        let sources = if selected.is_empty() { Ok(Vec::new()) } else { self.skills.selected_sources(selected).await };
-        match sources.and_then(|sources| {
-            one_repository_per_credential(&sources).map_err(|(source, error)| format!("{error}\n{STAGE_SOURCE_PREFIX}{source}"))?;
-            Ok(sources)
-        }) {
-            Ok(sources) => Ok(SkillTree { sources, selected: selected.to_vec() }),
-            Err(error) => Err(self.report_skill_failure(&error, selected).await),
-        }
-    }
-
-    /// Warn with the failing source, its frozen revision and its credential, and return the
-    /// error without its source marker.
-    async fn report_skill_failure(&self, error: &str, selected: &[flotilla_resources::SkillCatalogEntry]) -> String {
-        let source_name = error.lines().rev().find_map(|line| line.strip_prefix(STAGE_SOURCE_PREFIX));
-        let source = match self.skills.source.clone() {
-            Some(path) => tokio::task::spawn_blocking(move || inspect_skill_sources(&path))
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .and_then(|inspection| inspection.sources.into_iter().find(|source| Some(source.name.as_str()) == source_name)),
-            None => None,
-        };
-        let revision = selected
-            .iter()
-            .find(|entry| Some(entry.source.as_str()) == source_name)
-            .map(|entry| entry.revision.as_str())
-            .or_else(|| source.as_ref().map(|source| source.revision.as_str()));
-        warn!(
-            source = source_name.unwrap_or("skill-bundle"),
-            revision = revision.unwrap_or("unresolved"),
-            credential = source.as_ref().and_then(|source| source.credential.as_deref()).unwrap_or("none"),
-            %error,
-            "skill staging failed"
-        );
-        error.lines().filter(|line| !line.starts_with(STAGE_SOURCE_PREFIX)).collect::<Vec<_>>().join("\n")
-    }
-
-    /// Place `tree` at `destination` through `runner`, fetching each source at its
-    /// pinned revision in the vessel. Removes the source token files afterwards,
-    /// whether or not staging succeeds.
-    pub async fn stage_skill_tree(
-        &self,
-        tree: &SkillTree,
-        destination: &Path,
-        source_token_files: &BTreeMap<String, PathBuf>,
-        runner: &dyn CommandRunner,
-    ) -> Result<(), String> {
-        match self.skills.stage(tree, destination, source_token_files, runner).await {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                if let Err(error) = remove_source_token_files(source_token_files, runner).await {
-                    warn!(%error, "failed to clean skill-source tokens after staging error");
-                }
-                Err(self.report_skill_failure(&error, &tree.selected).await)
-            }
-        }
+    /// A crew's frozen skill selection, resolved once against this generation's
+    /// authorized sources (ADR 0052): the tree the access layer delivers into the
+    /// crew's home, and the sources its archive is built from.
+    pub async fn skill_tree(&self, selected: &[flotilla_resources::SkillCatalogEntry]) -> Result<SkillTree, SkillTreeError> {
+        SkillTree::resolve(self.skills.source.as_deref(), selected).await
     }
 
     pub fn fragments(&self, required_adapters: &BTreeSet<String>, environment: &BTreeMap<String, String>) -> Vec<Fragment> {
@@ -670,390 +568,33 @@ async fn install_read_only_copy(contents: &[u8], destination: &Path) -> Result<b
     Ok(true)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-struct SkillBundleManifest {
-    schema_version: u32,
-    sources: Vec<SkillSource>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct SkillSource {
-    name: String,
-    repository: String,
-    revision: String,
-    credential: Option<String>,
-    #[serde(default = "default_skill_source_paths")]
-    paths: Vec<String>,
-}
-
-/// A standing convoy retains its admission pin after a generation roll. The
-/// current supply still authorizes the repository, credential and path roots;
-/// only the revision comes from the durable selection (ADR 0052).
-fn resolve_frozen_sources(sources: &[SkillSource], selected: &[flotilla_resources::SkillCatalogEntry]) -> Result<Vec<SkillSource>, String> {
-    let mut resolved = BTreeMap::new();
-    for entry in selected {
-        let source = sources.iter().find(|source| source.name == entry.source);
-        let credential = source.and_then(|source| source.credential.as_deref()).unwrap_or("none");
-        let context = format!("skill source {} revision {} credential {}", entry.source, entry.revision, credential);
-        let resolve = || -> Result<SkillSource, String> {
-            let source = source.ok_or_else(|| format!("{context}: source is not declared by this generation"))?;
-            if entry.revision.len() != 40 || !entry.revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return Err(format!("{context}: frozen revision must be a full commit SHA"));
-            }
-            flotilla_resources::validate_skill_ref(&entry.name).map_err(|error| format!("{context}: {error}"))?;
-            flotilla_resources::crew_defaults::validate_skill_path(&entry.path).map_err(|error| format!("{context}: {error}"))?;
-            if entry.repository != source.repository
-                && flotilla_resources::crew_defaults::source_repository_path(&source.repository) != Some(entry.repository.as_str())
-            {
-                return Err(format!(
-                    "{context}: frozen repository {} differs from authorized source {}",
-                    entry.repository, source.repository
-                ));
-            }
-            if !source.paths.iter().any(|path| flotilla_resources::crew_defaults::path_within_source(&entry.path, path)) {
-                return Err(format!("{context}: frozen skill {} is outside the authorized source paths", entry.path));
-            }
-            let mut source = source.clone();
-            source.revision = entry.revision.clone();
-            Ok(source)
-        };
-        let source = resolve().map_err(|error| format!("{error}\n{STAGE_SOURCE_PREFIX}{}", entry.source))?;
-        if resolved.keys().any(|(name, revision)| name == &source.name && revision != &source.revision) {
-            return Err(format!(
-                "{context}: one crew cannot select two revisions of the same source\n{STAGE_SOURCE_PREFIX}{}",
-                entry.source
-            ));
-        }
-        resolved.insert((source.name.clone(), source.revision.clone()), source);
-    }
-    Ok(resolved.into_values().collect())
-}
-
-/// Validate all frozen crews aboard one vessel with provisioning's combined
-/// source authority, then stage each crew separately to retain name isolation.
-pub fn validate_frozen_vessel_skills<'a>(
-    source: &'a Path,
-    crews: &'a BTreeMap<String, Vec<flotilla_resources::SkillCatalogEntry>>,
-    declared_credentials: &'a BTreeMap<String, flotilla_resources::CredentialSpecSpec>,
-    credential_tokens: &'a BTreeMap<String, PathBuf>,
-    runner: &'a dyn CommandRunner,
-) -> BoxFuture<'a, Result<(), String>> {
-    Box::pin(async move {
-        let all = crews.values().flatten().cloned().collect::<Vec<_>>();
-        let sources = resolve_frozen_sources(&inspect_skill_sources(source)?.sources, &all)?;
-        authorize_frozen_sources(&sources, declared_credentials)?;
-        for (crew, selected) in crews {
-            if !selected.is_empty() {
-                stage_frozen_skills(&sources, selected, credential_tokens, runner)
-                    .await
-                    .map_err(|error| format!("crew {crew}: {error}"))?;
-            }
-        }
-        Ok(())
-    })
-}
-
-fn authorize_frozen_sources(
-    sources: &[SkillSource],
-    declared_credentials: &BTreeMap<String, flotilla_resources::CredentialSpecSpec>,
-) -> Result<(), String> {
-    for source in sources {
-        if let Some(credential) = &source.credential {
-            let spec = declared_credentials.get(credential).ok_or_else(|| {
-                format!("skill source {} revision {}: credential {credential} has no declared CredentialSpec", source.name, source.revision)
-            })?;
-            crate::credential::skill_source_repository(credential, spec, &source.repository)
-                .map_err(|error| format!("skill source {} revision {}: {error}", source.name, source.revision))?;
-        }
-    }
-    one_repository_per_credential(sources).map_err(|(_, error)| error)
-}
-
-/// A source credential is minted narrowed to one repository, so sources sharing a
-/// credential must share their repository.
-fn one_repository_per_credential(sources: &[SkillSource]) -> Result<(), (String, String)> {
-    let mut credential_repositories = BTreeMap::new();
-    for source in sources {
-        if let Some(credential) = &source.credential {
-            if credential_repositories.insert(credential, &source.repository).is_some_and(|previous| previous != &source.repository) {
-                let error = format!(
-                    "skill source {} credential {credential}: one credential cannot be narrowed to multiple source repositories",
-                    source.name
-                );
-                return Err((source.name.clone(), error));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Candidate-side pre-roll probe. Uses the same supply authorization and exact
-/// revision staging as provisioning, without touching a crew's staged skills.
-/// Token files are explicit operator inputs, keyed by the declared credential;
-/// ambient Git credentials are disabled by the staging implementation.
-#[cfg(test)]
-async fn validate_frozen_skills(
-    source: &Path,
-    selected: &[flotilla_resources::SkillCatalogEntry],
-    declared_credentials: &BTreeMap<String, flotilla_resources::CredentialSpecSpec>,
-    credential_tokens: &BTreeMap<String, PathBuf>,
-    runner: &dyn CommandRunner,
-) -> Result<(), String> {
-    let sources = resolve_frozen_sources(&inspect_skill_sources(source)?.sources, selected)?;
-    authorize_frozen_sources(&sources, declared_credentials)?;
-    stage_frozen_skills(&sources, selected, credential_tokens, runner).await
-}
-
-/// Stage one crew from the vessel's already resolved and authorized source set.
-/// Filter before staging to keep other crews' sources and names isolated.
-async fn stage_frozen_skills(
-    sources: &[SkillSource],
-    selected: &[flotilla_resources::SkillCatalogEntry],
-    credential_tokens: &BTreeMap<String, PathBuf>,
-    runner: &dyn CommandRunner,
-) -> Result<(), String> {
-    let sources = sources.iter().filter(|source| selected.iter().any(|entry| entry.source == source.name)).collect::<Vec<_>>();
-    let scratch = tempfile::tempdir().map_err(|error| format!("create frozen-skill probe directory: {error}"))?;
-    let mut args = vec![
-        "flotilla-stage-skills".into(),
-        format!("json:{}", serde_json::json!({"schema_version": 5, "sources": sources})),
-        scratch.path().join("selected").to_string_lossy().into_owned(),
-        "false".into(),
-        scratch.path().join("cache").to_string_lossy().into_owned(),
-    ];
-    for (index, source) in sources.iter().enumerate() {
-        let token = if let Some(credential) = &source.credential {
-            let path = credential_tokens.get(credential).ok_or_else(|| {
-                format!(
-                    "skill source {} revision {}: credential {credential} requires an explicit probe token file",
-                    source.name, source.revision
-                )
-            })?;
-            // Staging deletes tokens after failed probes; protect the operator's
-            // original by supplying a private, disposable copy.
-            let copy = scratch.path().join(format!("token-{index}"));
-            std::fs::copy(path, &copy).map_err(|error| format!("copy probe token for {credential}: {error}"))?;
-            copy.to_string_lossy().into_owned()
-        } else {
-            String::new()
-        };
-        args.extend([
-            source.name.clone(),
-            source.repository.clone(),
-            source.revision.clone(),
-            token,
-            source.credential.clone().unwrap_or_default(),
-            source.paths.len().to_string(),
-        ]);
-        args.extend(source.paths.clone());
-        let entries = selected.iter().filter(|entry| entry.source == source.name).collect::<Vec<_>>();
-        args.push(entries.len().to_string());
-        for entry in entries {
-            args.extend([entry.name.clone(), entry.path.clone()]);
-        }
-    }
-    stage_git_skill_sources(runner, &args).await.map(|_| ())
-}
-
-fn default_skill_source_paths() -> Vec<String> {
-    vec!["skills".to_string()]
-}
-
+/// The generation's skill supply. Only its manifest is read, on the daemon
+/// host; the trees are fetched there and pushed at launch (#3663).
 #[derive(Debug, Clone)]
 struct SkillBundle {
     source: Option<PathBuf>,
-    staging_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SkillBundle {
     fn new(source: Option<PathBuf>) -> Self {
-        Self { source, staging_lock: Arc::new(tokio::sync::Mutex::new(())) }
+        Self { source }
     }
 
-    async fn prepare(&self) -> Result<AgentMaterialDelivery, String> {
-        let source = self
-            .source
-            .clone()
-            .ok_or_else(|| format!("contained agent requires generation-pinned skill sources declared by {FLOTILLA_SKILLS_DIR_ENV}"))?;
-        tokio::task::spawn_blocking({
-            let source = source.clone();
-            move || inspect_skill_sources(&source)
-        })
-        .await
-        .map_err(|error| format!("inspect generation-pinned skill bundle task failed: {error}"))??;
-        Ok(AgentMaterialDelivery {
-            mount: ProvisionedMount::new(source, CONTAINER_SKILLS_SOURCE, ProvisionedMountMode::Ro),
-            preflight: AgentMaterialPreflight {
-                command: "sh".to_string(),
-                args: vec![
-                    "-c".to_string(),
-                    "test -f \"$1/.flotilla-sources.json\"".to_string(),
-                    "flotilla-skills-preflight".to_string(),
-                    CONTAINER_SKILLS_SOURCE.to_string(),
-                ],
-                failure_context: "generation-pinned skill source preflight failed".to_string(),
-            },
-        })
+    fn path(&self) -> Result<&Path, String> {
+        self.source
+            .as_deref()
+            .ok_or_else(|| format!("contained agent requires generation-pinned skill sources declared by {FLOTILLA_SKILLS_DIR_ENV}"))
     }
 
-    async fn selected_sources(&self, selected: &[flotilla_resources::SkillCatalogEntry]) -> Result<Vec<SkillSource>, String> {
-        let path =
-            self.source.clone().ok_or_else(|| format!("contained agent requires skill sources declared by {FLOTILLA_SKILLS_DIR_ENV}"))?;
-        let inspection = tokio::task::spawn_blocking(move || inspect_skill_sources(&path))
+    /// Refuse a contained agent before its container exists when the
+    /// generation declares no usable skill supply.
+    async fn prepare(&self) -> Result<(), String> {
+        let source = self.path()?.to_path_buf();
+        tokio::task::spawn_blocking(move || inspect_skill_sources(&source))
             .await
-            .map_err(|error| format!("inspect skill sources task failed: {error}"))??;
-        resolve_frozen_sources(&inspection.sources, selected)
+            .map_err(|error| format!("inspect generation-pinned skill bundle task failed: {error}"))?
+            .map(drop)
     }
-
-    /// Stage `tree` at `destination` through `runner`. Removes the token files once
-    /// staging succeeds; the caller removes them after a failure.
-    async fn stage(
-        &self,
-        tree: &SkillTree,
-        destination: &Path,
-        source_token_files: &BTreeMap<String, PathBuf>,
-        runner: &dyn CommandRunner,
-    ) -> Result<(), String> {
-        let config_base = runner
-            .writable_config_base(None, Path::new(CONTAINED_WRITABLE_CONFIG_BASE))
-            .await
-            .map_err(|error| format!("resolve contained agent skill base: {error}"))?;
-        let manifest = serde_json::json!({"schema_version": 5, "sources": tree.sources});
-        let mut args = vec![
-            "flotilla-stage-skills".to_string(),
-            format!("json:{manifest}"),
-            destination.to_string_lossy().into_owned(),
-            "true".to_string(),
-            config_base.join("skill-source-cache").to_string_lossy().into_owned(),
-        ];
-        for source in &tree.sources {
-            let token_file = source_token_files.get(&source.name).map(|path| path.to_string_lossy().into_owned()).unwrap_or_default();
-            args.extend([
-                source.name.clone(),
-                source.repository.clone(),
-                source.revision.clone(),
-                token_file,
-                source.credential.clone().unwrap_or_default(),
-                source.paths.len().to_string(),
-            ]);
-            args.extend(source.paths.clone());
-            let entries =
-                tree.selected.iter().filter(|entry| entry.source == source.name && entry.revision == source.revision).collect::<Vec<_>>();
-            args.push(entries.len().to_string());
-            for entry in entries {
-                args.extend([entry.name.clone(), entry.path.clone()]);
-            }
-        }
-        for attempt in 1..=3 {
-            // Each attempt owns the cache and destination swap, but backoff must
-            // leave the lock free for other crews. Cancellation releases the lock.
-            let result = {
-                let _staging_guard = self.staging_lock.lock().await;
-                stage_git_skill_sources(runner, &args).await
-            };
-            match result {
-                Ok(_) => break,
-                Err(error) if error.lines().any(|line| line == STAGE_RETRYABLE_PREFIX) && attempt < 3 => {
-                    tokio::time::sleep(Duration::from_secs(attempt)).await;
-                }
-                Err(error) => return Err(skill_stage_error(&destination.to_string_lossy(), &error)),
-            }
-        }
-        info!(destination = %destination.display(), selected = ?tree.selected, "staged generation-pinned agent skills");
-        Ok(())
-    }
-}
-
-fn skill_stage_error(environment_ref: &str, stderr: &str) -> String {
-    // A git child can write to the shared stderr pipe after the script reports
-    // its failure, so prefer the script's marked diagnostic regardless of order.
-    let reason = stderr
-        .lines()
-        .rev()
-        .find_map(|line| line.strip_prefix(STAGE_DIAGNOSTIC_PREFIX))
-        .or_else(|| stderr.lines().rev().find(|line| !line.trim().is_empty()))
-        .unwrap_or("skill staging command failed");
-    let details = stderr.lines().filter(|line| *line != STAGE_RETRYABLE_PREFIX).collect::<Vec<_>>().join("\n");
-    let details = details.trim();
-    if details.is_empty() {
-        format!("stage generation-pinned skills for {environment_ref}: {reason}")
-    } else {
-        format!("stage generation-pinned skills for {environment_ref}: {reason}\n{details}")
-    }
-}
-
-async fn remove_source_token_files(source_token_files: &BTreeMap<String, PathBuf>, runner: &dyn CommandRunner) -> Result<(), String> {
-    if source_token_files.is_empty() {
-        return Ok(());
-    }
-    let paths = source_token_files.values().map(|path| path.to_string_lossy().into_owned()).collect::<Vec<_>>();
-    let mut args = vec!["-f", "--"];
-    args.extend(paths.iter().map(String::as_str));
-    runner
-        .run("rm", &args, Path::new("/"), &ChannelLabel::Default)
-        .await
-        .map(|_| ())
-        .map_err(|error| format!("discard unused skill-source credential files: {error}"))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SkillBundleInspection {
-    sources: Vec<SkillSource>,
-}
-
-/// Validates the supply side of skill staging only: the manifest must pin an
-/// arbitrary, well-formed set of sources and may attach a named credential to
-/// each source.
-/// There is deliberately no required-skill assertion here — what a given crew
-/// receives is resolved at admission from CrewDefaults, Project, and dispatch
-/// declarations, and checked against the candidate catalog before a roll.
-fn inspect_skill_sources(source: &Path) -> Result<SkillBundleInspection, String> {
-    let manifest_path = source.join(SKILL_BUNDLE_MANIFEST);
-    let manifest = std::fs::read_to_string(&manifest_path)
-        .map_err(|error| format!("read skill bundle manifest {}: {error}", manifest_path.display()))?;
-    let manifest = serde_json::from_str::<SkillBundleManifest>(&manifest)
-        .map_err(|error| format!("decode skill bundle manifest {}: {error}", manifest_path.display()))?;
-    if manifest.schema_version != 5 || manifest.sources.is_empty() {
-        return Err(format!("skill source manifest {} must use schema version 5 and pin at least one source", manifest_path.display()));
-    }
-    let names = manifest.sources.iter().map(|source| source.name.as_str()).collect::<BTreeSet<_>>();
-    if names.len() != manifest.sources.len()
-        || manifest.sources.iter().any(|source| {
-            source.name.is_empty()
-                || source.name == "."
-                || source.name == ".."
-                || source.name.contains('/')
-                || source.name.contains('\\')
-                || source.name.chars().any(|character| matches!(character, '\r' | '\n'))
-                || source.repository.is_empty()
-                || (source.repository.contains("://")
-                    && Url::parse(&source.repository).map_or(true, |url| {
-                        url.password().is_some() || (matches!(url.scheme(), "http" | "https") && !url.username().is_empty())
-                    }))
-                || source.credential.as_ref().is_some_and(|credential| {
-                    credential.is_empty()
-                        || credential.contains('/')
-                        || credential.contains('\\')
-                        || credential.chars().any(|character| matches!(character, '\r' | '\n'))
-                })
-                || source.paths.is_empty()
-                || source.paths.iter().collect::<BTreeSet<_>>().len() != source.paths.len()
-                || source.paths.iter().any(|path| {
-                    path.is_empty()
-                        || path.starts_with('/')
-                        || path.ends_with('/')
-                        || path.contains('\\')
-                        || path.chars().any(|character| matches!(character, '\r' | '\n' | '*' | '?' | '[' | ']'))
-                        || path.split('/').any(|component| component.is_empty() || component == "." || component == "..")
-                })
-        })
-    {
-        return Err(format!("skill source manifest {} has invalid or duplicate source entries", manifest_path.display()));
-    }
-    if manifest.sources.iter().any(|source| source.revision.len() != 40 || !source.revision.bytes().all(|byte| byte.is_ascii_hexdigit())) {
-        return Err(format!("skill source manifest {} must pin every source to a full commit SHA", manifest_path.display()));
-    }
-    Ok(SkillBundleInspection { sources: manifest.sources })
 }
 
 #[async_trait]
@@ -1155,104 +696,33 @@ impl AgentMaterialAdapter for ClaudeCodeMaterialAdapter {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::{io, os::unix::fs::PermissionsExt, path::Path, process::Command, sync::Mutex};
+    use std::{os::unix::fs::PermissionsExt, path::Path};
 
     use flotilla_discovery_testkit::TestEnvVars;
     use flotilla_provider_runtime::CommandOutput;
 
     use super::*;
+    use crate::skill_trees::SKILL_BUNDLE_MANIFEST;
 
+    /// Process boundary: real commands on this host, with the contained writable base and
+    /// the contained Codex home both under a temporary directory.
     #[derive(Clone)]
-    struct LogCaptureWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for LogCaptureWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().expect("log capture lock should be healthy").extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    // Boundary double: records process argv and stdin separately.
-    struct RecordingRunner {
-        calls: Mutex<Vec<(String, Vec<String>)>>,
-        inputs: Mutex<Vec<Vec<u8>>>,
+    struct ContainedRunner {
+        config_base: PathBuf,
     }
 
     #[async_trait]
-    impl CommandRunner for RecordingRunner {
-        async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
-            self.inputs.lock().expect("recording input lock").push(input.to_vec());
-            self.run(cmd, args, cwd, label).await
-        }
-
-        async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
-            self.calls
-                .lock()
-                .expect("recording runner lock should be healthy")
-                .push((cmd.to_string(), args.iter().map(|arg| (*arg).to_string()).collect()));
-            Ok(String::new())
-        }
-
-        async fn run_output(
-            &self,
-            cmd: &str,
-            args: &[&str],
-            cwd: &Path,
-            label: &ChannelLabel,
-        ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
-            self.run(cmd, args, cwd, label).await.map(|stdout| flotilla_provider_runtime::CommandOutput {
-                stdout,
-                stderr: String::new(),
-                exit_code: Some(0),
-            })
-        }
-
-        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
-            true
-        }
-    }
-
-    #[derive(Clone)]
-    pub(crate) struct PromisorRunner {
-        pub(crate) config_base: PathBuf,
-        skills_source: PathBuf,
-        path: String,
-    }
-
-    #[async_trait]
-    impl CommandRunner for PromisorRunner {
+    impl CommandRunner for ContainedRunner {
         async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
-            self.run_with_input(cmd, args, cwd, label, &[]).await
-        }
-
-        async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
-            let container_manifest = format!("{CONTAINER_SKILLS_SOURCE}/{SKILL_BUNDLE_MANIFEST}");
-            let source_manifest = self.skills_source.join(SKILL_BUNDLE_MANIFEST).to_string_lossy().into_owned();
             let args = args
                 .iter()
-                .map(|arg| {
-                    if *arg == container_manifest {
-                        source_manifest.clone()
-                    } else if let Ok(relative) = Path::new(arg).strip_prefix(CONTAINER_CODEX_HOME) {
-                        self.config_base.join("codex").join(relative).display().to_string()
-                    } else {
-                        (*arg).to_string()
-                    }
+                .map(|arg| match Path::new(arg).strip_prefix(CONTAINER_CODEX_HOME) {
+                    Ok(relative) => self.config_base.join("codex").join(relative).display().to_string(),
+                    Err(_) => (*arg).to_string(),
                 })
                 .collect::<Vec<_>>();
-            let mut env_args = vec![
-                format!("PATH={}", self.path),
-                format!("FLOTILLA_TEST_FETCH_LOG={}", self.config_base.parent().expect("config parent").join("fetches").display()),
-                cmd.to_string(),
-            ];
-            env_args.extend(args);
-            let refs = env_args.iter().map(String::as_str).collect::<Vec<_>>();
-            flotilla_provider_runtime::ProcessCommandRunner.run_with_input("env", &refs, cwd, label, input).await
+            let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            flotilla_provider_runtime::ProcessCommandRunner.run(cmd, &refs, cwd, label).await
         }
 
         async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
@@ -1270,118 +740,8 @@ pub(crate) mod tests {
             Ok(self.config_base.clone())
         }
 
-        async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
-            flotilla_provider_runtime::ProcessCommandRunner.write_file(path, content).await
-        }
-
         async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
             flotilla_provider_runtime::ProcessCommandRunner.write_file_with_mode(path, content, mode).await
-        }
-    }
-
-    pub(crate) fn promisor_runner(root: &Path) -> PromisorRunner {
-        let bin = root.join("bin");
-        std::fs::create_dir_all(&bin).expect("create fake Git bin");
-        let git = bin.join("git");
-        std::fs::write(
-            &git,
-            r#"#!/bin/sh
-set -eu
-test "$1" = -C
-checkout=$2
-shift 2
-case "$1" in
-  init)
-    if [ -f "$FLOTILLA_TEST_FETCH_LOG.init-secret" ]; then
-      cat "$FLOTILLA_TEST_FETCH_LOG.init-secret" >&2
-      exit 1
-    fi
-    name=$3
-    mkdir -p "$checkout/$name/.git"
-    ;;
-  remote|sparse-checkout)
-    ;;
-  config)
-    test "$2" = credential.helper
-    printf '%s' "$3" >"$checkout/.git/credential-helper"
-    ;;
-  -c|fetch)
-    while [ "$1" = -c ]; do shift 2; done
-    test "$1" = fetch
-    printf '%s\n' fetch >>"$FLOTILLA_TEST_FETCH_LOG"
-    if [ -f "$FLOTILLA_TEST_FETCH_LOG.drop-token" ]; then
-      rm -f -- "$(cat "$FLOTILLA_TEST_FETCH_LOG.drop-token")"
-      helper=$(cat "$checkout/.git/credential-helper")
-      credentials=$(sh -c "${helper#\!} get")
-      case "$credentials" in
-        *'password=test-token'*) ;;
-        *) echo 'anonymous fetch attempted' >&2; exit 128;;
-      esac
-    fi
-    if [ -f "$FLOTILLA_TEST_FETCH_LOG.capture-token" ]; then
-      helper=$(cat "$checkout/.git/credential-helper")
-      credentials=$(sh -c "${helper#\!} get")
-      case "$credentials" in
-        *'password='*) ;;
-        *) echo 'credential helper did not return a password' >&2; exit 128;;
-      esac
-      token=${credentials##*password=}
-      [ -n "$token" ] || { echo 'anonymous fetch attempted' >&2; exit 128; }
-      printf '%s\n' "$token" >>"$FLOTILLA_TEST_FETCH_LOG.tokens"
-    fi
-    if [ -f "$FLOTILLA_TEST_FETCH_LOG.transient" ]; then
-      rm "$FLOTILLA_TEST_FETCH_LOG.transient"
-      echo 'fatal: TLS connection reset by peer' >&2
-      exit 128
-    fi
-    if [ -f "$FLOTILLA_TEST_FETCH_LOG.fail" ]; then
-      printf 'fatal: credential %s rejected by remote\n' "$(cat "$GITHUB_TOKEN_FILE")" >&2
-      exit 75
-    fi
-    if [ -f "$FLOTILLA_TEST_FETCH_LOG.auth" ]; then
-      printf 'fatal: HTTP/2 %s credential %s rejected by remote\n' "$(cat "$FLOTILLA_TEST_FETCH_LOG.auth")" "$(cat "$GITHUB_TOKEN_FILE")" >&2
-      exit 128
-    fi
-    eval "revision=\${$#}"
-    if [ -f "$FLOTILLA_TEST_FETCH_LOG.wrong-revision" ]; then
-      revision=2222222222222222222222222222222222222222
-    fi
-    printf '%s' "$revision" >"$checkout/.git/FETCH_HEAD"
-    ;;
-  rev-parse)
-    cat "$checkout/.git/FETCH_HEAD"
-    ;;
-  checkout)
-    if [ -f "$FLOTILLA_TEST_FETCH_LOG.checkout-auth" ]; then
-      echo "fatal: could not read Username for 'https://github.com': terminal prompts disabled" >&2
-      exit 128
-    fi
-    if [ ! -s "$checkout/.git/credential-helper" ] || [ -z "${GITHUB_TOKEN_FILE:-}" ] || [ ! -s "$GITHUB_TOKEN_FILE" ]; then
-      echo "fatal: could not read Username for 'https://github.com': terminal prompts disabled" >&2
-      echo "fatal: could not fetch promised blob from promisor remote" >&2
-      exit 1
-    fi
-    mkdir -p "$checkout/skills/private-folder"
-    printf '%s\n' '---' 'name: private-source' 'description: test skill' '---' '# Private source' >"$checkout/skills/private-folder/SKILL.md"
-    mkdir -p "$checkout/skills/unselected"
-    printf '%s\n' '---' 'name: unselected' 'description: test skill' '---' >"$checkout/skills/unselected/SKILL.md"
-    mkdir -p "$checkout/plugins/private-folder"
-    printf '%s\n' '---' 'name: private-source' 'description: test skill' '---' '# Private source' >"$checkout/plugins/private-folder/SKILL.md"
-    ;;
-  *)
-    echo "unexpected fake git command: $*" >&2
-    exit 1
-    ;;
-esac
-"#,
-        )
-        .expect("write fake Git");
-        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).expect("make fake Git executable");
-        let system_path = std::env::var("PATH").expect("test process PATH");
-        PromisorRunner {
-            config_base: root.join("config"),
-            skills_source: root.join("generation/skills"),
-            path: format!("{}:{system_path}", bin.display()),
         }
     }
 
@@ -1486,7 +846,7 @@ esac
             let result = registry.prepare("crew", &required, &BTreeMap::new()).await;
             if supported {
                 let deliveries = result.expect("injected Linux support permits delivery");
-                assert_eq!(deliveries.len(), 2);
+                assert_eq!(deliveries.len(), 1);
                 assert_eq!(
                     std::fs::read(deliveries[0].mount.host_path.as_path().join(CODEX_AUTH_FILE)).expect("delivered auth"),
                     std::fs::read(registry.codex_credential_source()).expect("central auth"),
@@ -1530,7 +890,7 @@ esac
         let deliveries =
             registry.prepare("env-a", &BTreeSet::from([CODEX_ADAPTER_ID.to_string()]), &BTreeMap::new()).await.expect("prepare");
 
-        assert_eq!(deliveries.len(), 2);
+        assert_eq!(deliveries.len(), 1, "skills are pushed at launch, not mounted");
         assert_eq!(
             deliveries[0].mount,
             ProvisionedMount::new(
@@ -1546,14 +906,6 @@ esac
             "the crew must receive the refresher's own auth.json byte for byte"
         );
         assert_eq!(delivered_auth_mode(&delivered), CODEX_AUTH_MODE, "the delivered credential must be read-only");
-        assert_eq!(
-            deliveries[1].mount,
-            ProvisionedMount::new(
-                registry.skills.source.clone().expect("generation skill source"),
-                CONTAINER_SKILLS_SOURCE,
-                ProvisionedMountMode::Ro,
-            )
-        );
         let composed = crate::vessel_config::compose(
             crate::vessel_config::TargetId::AgentEnvironment,
             registry.fragments(&BTreeSet::from([CODEX_ADAPTER_ID.to_string()]), &BTreeMap::new()),
@@ -1607,783 +959,6 @@ esac
             temp.path().join(".config/flotilla/credentials/codex-central/auth.json"),
             "operator-facing failures name the one central login, not a per-crew slot"
         );
-    }
-
-    // Glue: a literal dash pathname must reach the shell as a pathname rather
-    // than its stdin sentinel; normalization must not change other arguments.
-    #[tokio::test]
-    async fn skill_manifest_dash_path_is_not_stdin() {
-        let runner = RecordingRunner::default();
-        let args = ["flotilla-stage-skills", "-", "/skills", "false", "/cache"].map(str::to_string);
-        stage_git_skill_sources(&runner, &args).await.expect("stage pathname");
-        let calls = runner.calls.lock().expect("recorded calls");
-        assert_eq!(&calls[0].1[3..], &["flotilla-stage-skills", "./-", "/skills", "false", "/cache"]);
-        assert!(runner.inputs.lock().expect("recorded input").is_empty());
-    }
-
-    /// The host behind an agentless SSH runner, recording each command; its
-    /// writable config base is `/host/state/flotilla`.
-    impl AgentMaterialRegistry {
-        /// Stage each manifest source's `private-folder` into the `skills` directory of
-        /// every required harness's home `environment` names, through the access layer's
-        /// staging entry point.
-        pub(crate) async fn stage_test_skills(
-            &self,
-            _crew: &str,
-            required_adapters: &BTreeSet<String>,
-            environment: &[(String, String)],
-            source_token_files: &BTreeMap<String, PathBuf>,
-            runner: &dyn CommandRunner,
-        ) -> Result<(), String> {
-            let inspection = inspect_skill_sources(self.skills.source.as_ref().expect("test source"))?;
-            let selected = inspection
-                .sources
-                .iter()
-                .map(|source| flotilla_resources::SkillCatalogEntry {
-                    source: source.name.clone(),
-                    repository: source.repository.clone(),
-                    revision: source.revision.clone(),
-                    name: "private-source".to_string(),
-                    path: format!("{}/private-folder", source.paths[0]),
-                })
-                .collect::<Vec<_>>();
-            let tree = self.skill_tree(&selected).await?;
-            for adapter in required_adapters {
-                let variable = self.harness_home(adapter).expect("managed harness").variable;
-                if let Some((_, home)) = environment.iter().find(|(name, _)| name == variable) {
-                    self.stage_skill_tree(&tree, &Path::new(home).join("skills"), source_token_files, runner).await?;
-                }
-            }
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn pinned_skills_are_staged_to_the_seam_resolved_claude_config() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path());
-        let required = BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]);
-        let environment = vec![
-            ("CLAUDE_CONFIG_DIR".to_string(), "/tmp/flotilla-config/credentials/claude-max/claude".to_string()),
-            ("GIT_CONFIG_GLOBAL".to_string(), "/tmp/flotilla-config/credentials/gitconfig".to_string()),
-            ("GITHUB_TOKEN_FILE".to_string(), "/tmp/flotilla-config/credentials/github-app/token".to_string()),
-        ];
-        let runner = RecordingRunner::default();
-
-        registry
-            .stage_test_skills(
-                "crew-alice",
-                &required,
-                &environment,
-                &BTreeMap::from([("mattpocock-skills".to_string(), PathBuf::from("/tmp/skills-token"))]),
-                &runner,
-            )
-            .await
-            .expect("stage pinned skills");
-
-        let calls = runner.calls.lock().expect("recording runner lock should be healthy");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "sh");
-        assert_eq!(calls[0].1[4], "-", "inline manifest is consumed through stdin");
-        assert!(!calls[0].1.iter().any(|arg| arg.starts_with("json:")));
-        let inputs = runner.inputs.lock().expect("recorded stdin");
-        let manifest: SkillBundleManifest = serde_json::from_slice(&inputs[0]).expect("manifest");
-        assert_eq!(manifest.sources[0].revision, "1".repeat(40));
-        assert!(calls[0].1.contains(&"/tmp/flotilla-config/credentials/claude-max/claude/skills".to_string()));
-        assert!(calls[0].1.contains(&"https://github.com/flotilla-org/mattpocock-skills.git".to_string()));
-        assert!(calls[0].1.contains(&"1111111111111111111111111111111111111111".to_string()));
-        assert!(calls[0].1.contains(&"plugins/rjw-sdlc/skills".to_string()));
-        assert!(calls[0].1.contains(&"/tmp/skills-token".to_string()));
-        assert!(calls[0].1[1].contains("fetch --quiet --depth=1 --filter=blob:none --no-tags"));
-        assert!(calls[0].1[1].contains("credential.helper="), "public fetches must clear the project credential helper");
-        assert!(calls[0].1[1].contains("pinned revision does not exist"));
-        assert!(calls[0].1[1].contains("init --quiet"));
-        assert!(calls[0].1[1].contains("2>\"$sources/fetch.stderr\""), "git failures must retain their stderr diagnostics");
-        assert!(calls[0].1[1].contains("sparse-checkout set --no-cone --stdin"));
-        assert!(calls[0].1[1].contains("skill source $name declared path $path is missing at pinned revision $revision"));
-        assert!(calls[0].1[1].contains("skill source $name declared path $path has no SKILL.md at pinned revision $revision"));
-        assert!(!calls[0].1[1].contains("required"), "staging must carry no skill-name policy; demand validation is #1790's contract");
-    }
-
-    #[test]
-    fn skill_stage_error_leads_with_declared_path_failure() {
-        let stderr = "hint: Using 'master' as the name for the initial branch.\nFrom https://github.com/flotilla-org/cleat\n * branch 0f23944 -> FETCH_HEAD\nflotilla-stage-skills: skill source cleat declared path skills is missing at pinned revision 0f23944\n";
-        let message = skill_stage_error("crew-work", stderr);
-        assert!(message.starts_with(
-            "stage generation-pinned skills for crew-work: skill source cleat declared path skills is missing at pinned revision 0f23944"
-        ));
-        assert!(message.contains("From https://github.com/flotilla-org/cleat"));
-    }
-
-    #[test]
-    fn skill_stage_error_prefers_script_diagnostic_over_late_git_stderr() {
-        let stderr = "fatal: early git failure\nflotilla-stage-skills: skill source missing-source anonymous fetch failed at pinned revision 0000000000000000000000000000000000000000\nfatal: git upload-pack: not our ref 0000000000000000000000000000000000000000\n";
-        let message = skill_stage_error("crew-fetch", stderr);
-        assert!(message.starts_with("stage generation-pinned skills for crew-fetch: skill source missing-source anonymous fetch failed"));
-        assert!(message.contains("fatal: git upload-pack: not our ref"));
-    }
-
-    #[test]
-    fn skill_stage_error_uses_last_nonempty_line_without_script_diagnostic() {
-        let message = skill_stage_error("crew-fetch", "fatal: early git failure\nfatal: final git failure\n");
-        assert_eq!(
-            message,
-            "stage generation-pinned skills for crew-fetch: fatal: final git failure\nfatal: early git failure\nfatal: final git failure"
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_skill_source_fetch_names_source_and_pinned_revision() {
-        for credentialed in [false, true] {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let repository = temp.path().join("repository");
-            let init = Command::new("git").args(["init", "--quiet"]).arg(&repository).output().expect("initialize local repository");
-            assert!(init.status.success(), "git init failed: {}", String::from_utf8_lossy(&init.stderr));
-
-            let skills = temp.path().join("generation/skills");
-            std::fs::create_dir_all(&skills).expect("create skill bundle");
-            let revision = "0000000000000000000000000000000000000000";
-            let credential = if credentialed { r#", "credential": "local-test""# } else { "" };
-            std::fs::write(
-                skills.join(SKILL_BUNDLE_MANIFEST),
-                format!(
-                    r#"{{"schema_version":5,"sources":[{{"name":"missing-source","repository":"{}","revision":"{revision}"{credential}}}]}}"#,
-                    repository.display()
-                ),
-            )
-            .expect("write skill bundle manifest");
-            let token_file = temp.path().join("source.token");
-            let tokens = if credentialed {
-                std::fs::write(&token_file, "unused-test-token").expect("write source token");
-                BTreeMap::from([("missing-source".to_string(), token_file.clone())])
-            } else {
-                BTreeMap::new()
-            };
-            let runner = PromisorRunner {
-                config_base: temp.path().join("config"),
-                skills_source: skills.clone(),
-                path: std::env::var("PATH").expect("test process PATH"),
-            };
-            let registry = test_registry(Arc::new(TestEnvVars::new([(FLOTILLA_SKILLS_DIR_ENV, skills.to_string_lossy().into_owned())])));
-            let environment = vec![("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())];
-            let error = registry
-                .stage_test_skills("crew-fetch", &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]), &environment, &tokens, &runner)
-                .await
-                .expect_err("fetch of an absent revision must fail");
-            assert!(!error.is_empty(), "fetch failure must produce a diagnostic");
-            assert!(error.contains("missing-source"), "diagnostic must name the source: {error}");
-            assert!(error.contains(revision), "diagnostic must name the pinned revision: {error}");
-            assert!(error.contains("pinned revision does not exist"), "absent revision must be terminal: {error}");
-            assert!(error.contains("command: git -C"), "diagnostic must name the Git command: {error}");
-            assert!(error.contains("exit code: 128"), "diagnostic must include Git's exit code: {error}");
-            assert!(error.contains("fatal:"), "diagnostic must retain Git stderr: {error}");
-            if credentialed {
-                assert!(!token_file.exists(), "failed staging must remove the source token");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn credentialed_partial_clone_keeps_credentials_for_lazy_checkout_fetch() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path());
-        let skills = registry.skills.source.as_ref().expect("generation skill source");
-        std::fs::write(
-            skills.join(SKILL_BUNDLE_MANIFEST),
-            r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#,
-        )
-        .expect("write private source manifest");
-        let runner = promisor_runner(temp.path());
-        let destination = runner.config_base.join("claude/skills");
-        let token_file = temp.path().join("private-skills.token");
-        std::fs::write(&token_file, "secret-token").expect("write source token");
-
-        registry
-            .stage_test_skills(
-                "crew-private",
-                &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
-                &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
-                &BTreeMap::from([("private-skills".to_string(), token_file.clone())]),
-                &runner,
-            )
-            .await
-            .expect("stage private partial-clone source through lazy checkout fetch");
-
-        assert!(destination.join("private-source/SKILL.md").is_file());
-        assert!(!token_file.exists(), "one-shot source token must be cleaned after materialization");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn concurrent_staging_reuses_one_pinned_fetch() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = Arc::new(registry(temp.path()));
-        let runner = Arc::new(promisor_runner(temp.path()));
-        let required = BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]);
-        let skills = registry.skills.source.as_ref().expect("generation source");
-        std::fs::write(
-            skills.join(SKILL_BUNDLE_MANIFEST),
-            r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#,
-        )
-        .expect("write manifest");
-        let results = futures::future::join_all((0..4).map(|index| {
-            let destination = runner.config_base.join(format!("claude-{index}"));
-            let required = required.clone();
-            let registry = Arc::clone(&registry);
-            let runner = Arc::clone(&runner);
-            let token_file = temp.path().join(format!("source-{index}.token"));
-            std::fs::write(&token_file, "test-token").expect("write token");
-            let tokens = BTreeMap::from([("private-skills".to_string(), token_file)]);
-            tokio::spawn(async move {
-                registry
-                    .stage_test_skills(
-                        &format!("crew-{index}"),
-                        &required,
-                        &[("CLAUDE_CONFIG_DIR".to_string(), destination.to_string_lossy().into_owned())],
-                        &tokens,
-                        &*runner,
-                    )
-                    .await
-            })
-        }))
-        .await;
-        assert!(results.iter().all(|result| result.as_ref().is_ok_and(Result::is_ok)), "concurrent staging failed: {results:?}");
-        let fetches = std::fs::read_to_string(temp.path().join("fetches")).expect("fake fetch log");
-        assert_eq!(fetches.lines().count(), 1, "one fetch for the pinned source");
-        for index in 0..4 {
-            assert!(runner.config_base.join(format!("claude-{index}/skills/private-source/SKILL.md")).is_file());
-        }
-        let error = registry
-            .stage_test_skills(
-                "crew-without-private-credential",
-                &required,
-                &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("unauthorized").to_string_lossy().into_owned())],
-                &BTreeMap::new(),
-                &*runner,
-            )
-            .await
-            .expect_err("private cache must still require a credential");
-        assert!(error.contains("credential private-skills is unavailable"), "unexpected error: {error}");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn concurrent_dispatches_recover_from_one_git_128_fetch_failure_without_losing_tokens() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = Arc::new(registry(temp.path()));
-        let runner = Arc::new(promisor_runner(temp.path()));
-        let skills = registry.skills.source.as_ref().expect("generation source");
-        std::fs::write(
-            skills.join(SKILL_BUNDLE_MANIFEST),
-            r#"{"schema_version":5,"sources":[{"name":"mattpocock-skills","repository":"https://github.com/example/mattpocock-skills.git","revision":"1111111111111111111111111111111111111111","credential":"github-skills-fork"}]}"#,
-        )
-        .expect("manifest");
-        std::fs::write(temp.path().join("fetches.transient"), "").expect("one failing fetch");
-        let results = futures::future::join_all((0..6).map(|index| {
-            let registry = Arc::clone(&registry);
-            let runner = Arc::clone(&runner);
-            let token_file = temp.path().join(format!("source-{index}.token"));
-            std::fs::write(&token_file, format!("token-{index}\n")).expect("unique minted token");
-            tokio::spawn(async move {
-                let result = registry
-                    .stage_test_skills(
-                        &format!("crew-{index}"),
-                        &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
-                        &[(
-                            "CLAUDE_CONFIG_DIR".to_string(),
-                            runner.config_base.join(format!("claude-{index}")).to_string_lossy().into_owned(),
-                        )],
-                        &BTreeMap::from([("mattpocock-skills".to_string(), token_file.clone())]),
-                        &*runner,
-                    )
-                    .await;
-                (result, token_file)
-            })
-        }))
-        .await;
-        for (index, task) in results.into_iter().enumerate() {
-            let (result, token_file) = task.expect("staging task");
-            result.expect("each concurrent crew must stage");
-            assert!(!token_file.exists(), "crew {index} must clean its own token after staging");
-            assert!(runner.config_base.join(format!("claude-{index}/skills/private-source/SKILL.md")).is_file());
-        }
-        assert_eq!(std::fs::read_to_string(temp.path().join("fetches")).expect("fetch log").lines().count(), 2);
-    }
-
-    #[tokio::test]
-    async fn credentialed_fetch_survives_original_token_file_disappearing_before_git_reads_it() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path());
-        let runner = promisor_runner(temp.path());
-        let skills = registry.skills.source.as_ref().expect("generation source");
-        std::fs::write(
-            skills.join(SKILL_BUNDLE_MANIFEST),
-            r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#,
-        )
-        .expect("manifest");
-        let token_file = temp.path().join("one-shot.token");
-        std::fs::write(&token_file, "test-token").expect("token");
-        std::fs::write(temp.path().join("fetches.drop-token"), token_file.to_string_lossy().as_bytes()).expect("drop marker");
-        registry
-            .stage_test_skills(
-                "crew-private",
-                &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
-                &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
-                &BTreeMap::from([("private-skills".to_string(), token_file)]),
-                &runner,
-            )
-            .await
-            .expect("staging keeps its own credential copy through fetch");
-        let empty_token = temp.path().join("empty.token");
-        std::fs::write(&empty_token, "").expect("empty token fixture");
-        let error = registry
-            .stage_test_skills(
-                "crew-with-empty-token",
-                &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
-                &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("empty").to_string_lossy().into_owned())],
-                &BTreeMap::from([("private-skills".to_string(), empty_token)]),
-                &runner,
-            )
-            .await
-            .expect_err("empty token must stop staging before fetch");
-        assert!(error.contains("credential private-skills is unavailable"), "unexpected error: {error}");
-        assert_eq!(std::fs::read_to_string(temp.path().join("fetches")).expect("fetch log").lines().count(), 1);
-    }
-
-    #[tokio::test]
-    async fn transient_skill_fetch_retries_and_failure_redacts_credential() {
-        for should_recover in [true, false] {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let registry = registry(temp.path());
-            let runner = promisor_runner(temp.path());
-            let skills = registry.skills.source.as_ref().expect("generation source");
-            std::fs::write(
-                skills.join(SKILL_BUNDLE_MANIFEST),
-                r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#,
-            )
-            .expect("write manifest");
-            let token_file = temp.path().join("source.token");
-            std::fs::write(&token_file, "secret-for-redaction").expect("write token");
-            let marker = if should_recover { "fetches.transient" } else { "fetches.fail" };
-            std::fs::write(temp.path().join(marker), "").expect("write fake fetch marker");
-            let result = registry
-                .stage_test_skills(
-                    "crew-private",
-                    &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
-                    &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
-                    &BTreeMap::from([("private-skills".to_string(), token_file)]),
-                    &runner,
-                )
-                .await;
-            let fetches = std::fs::read_to_string(temp.path().join("fetches")).expect("fake fetch log");
-            if should_recover {
-                result.expect("second fetch should recover");
-                assert_eq!(fetches.lines().count(), 2);
-            } else {
-                let error = result.expect_err("persistent fetch failure should surface");
-                assert_eq!(fetches.lines().count(), 3, "retry ceiling must be bounded");
-                assert!(error.contains("command: git -C"), "missing Git command: {error}");
-                assert!(error.contains("exit code: 75"), "missing Git exit code: {error}");
-                assert!(error.contains("fatal: credential [redacted credential] rejected by remote"), "missing redacted stderr: {error}");
-                assert!(!error.contains("secret-for-redaction"), "credential leaked into status: {error}");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn skill_fetch_auth_failure_is_terminal_and_redacts_newline_terminated_token() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path());
-        let skills = registry.skills.source.as_ref().expect("generation source");
-        std::fs::write(
-            skills.join(SKILL_BUNDLE_MANIFEST),
-            r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#,
-        )
-        .expect("manifest");
-        let runner = promisor_runner(temp.path());
-        std::fs::write(temp.path().join("fetches.auth"), "401").expect("auth marker");
-        let token_file = temp.path().join("source.token");
-        std::fs::write(&token_file, "secret-for-redaction\n").expect("token");
-        let error = registry
-            .stage_test_skills(
-                "crew-private",
-                &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
-                &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
-                &BTreeMap::from([("private-skills".to_string(), token_file.clone())]),
-                &runner,
-            )
-            .await
-            .expect_err("401 must terminate staging");
-        assert_eq!(std::fs::read_to_string(temp.path().join("fetches")).expect("fetch log").lines().count(), 1);
-        assert!(error.contains("authentication or authorization failed"), "{error}");
-        assert!(error.contains("fatal: HTTP/2 401 credential [redacted credential] rejected by remote"), "{error}");
-        assert!(!error.contains("secret-for-redaction"), "{error}");
-        assert!(!token_file.exists(), "failed staging cleans the token");
-
-        std::fs::write(temp.path().join("fetches.auth"), "403").expect("authorization marker");
-        std::fs::write(&token_file, "secret-for-redaction\n").expect("second token");
-        let error = registry
-            .stage_test_skills(
-                "crew-private-403",
-                &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
-                &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude-403").to_string_lossy().into_owned())],
-                &BTreeMap::from([("private-skills".to_string(), token_file)]),
-                &runner,
-            )
-            .await
-            .expect_err("403 must terminate staging");
-        assert_eq!(std::fs::read_to_string(temp.path().join("fetches")).expect("fetch log").lines().count(), 2);
-        assert!(error.contains("fatal: HTTP/2 403 credential [redacted credential] rejected by remote"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn skill_checkout_prompt_failure_is_terminal() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path());
-        let skills = registry.skills.source.as_ref().expect("generation source");
-        std::fs::write(
-            skills.join(SKILL_BUNDLE_MANIFEST),
-            r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#,
-        )
-        .expect("manifest");
-        let runner = promisor_runner(temp.path());
-        std::fs::write(temp.path().join("fetches.checkout-auth"), "").expect("checkout auth marker");
-        let token_file = temp.path().join("source.token");
-        std::fs::write(&token_file, "test-token").expect("token");
-        let error = registry
-            .stage_test_skills(
-                "crew-private",
-                &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
-                &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
-                &BTreeMap::from([("private-skills".to_string(), token_file)]),
-                &runner,
-            )
-            .await
-            .expect_err("disabled credential prompt is terminal");
-        assert!(error.contains("authentication or authorization failed"), "{error}");
-        assert!(error.contains("could not read Username"), "{error}");
-        assert_eq!(std::fs::read_to_string(temp.path().join("fetches")).expect("fetch log").lines().count(), 1);
-    }
-
-    #[tokio::test]
-    async fn skill_stage_redacts_early_git_stderr() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path());
-        let skills = registry.skills.source.as_ref().expect("generation source");
-        std::fs::write(
-            skills.join(SKILL_BUNDLE_MANIFEST),
-            r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#,
-        )
-        .expect("manifest");
-        let runner = promisor_runner(temp.path());
-        std::fs::write(temp.path().join("fetches.init-secret"), "fatal: secret\\for-redaction\n").expect("init marker");
-        let token_file = temp.path().join("source.token");
-        std::fs::write(&token_file, "secret\\for-redaction\n").expect("token");
-        let error = registry
-            .stage_test_skills(
-                "crew-private",
-                &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
-                &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
-                &BTreeMap::from([("private-skills".to_string(), token_file)]),
-                &runner,
-            )
-            .await
-            .expect_err("init failure must surface");
-        assert!(error.contains("fatal: [redacted credential]"), "{error}");
-        assert!(!error.contains("secret\\for-redaction"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn skill_cache_rebuilds_when_source_changes_or_ready_marker_is_missing() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path());
-        let skills = registry.skills.source.as_ref().expect("generation source");
-        let manifest = skills.join(SKILL_BUNDLE_MANIFEST);
-        let runner = promisor_runner(temp.path());
-        let cache = runner.config_base.join("skill-source-cache/private-skills-1111111111111111111111111111111111111111");
-        let cases = [
-            ("https://github.com/example/one.git", "skills", 1),
-            ("https://github.com/example/two.git", "skills", 2),
-            ("https://github.com/example/two.git", "plugins", 3),
-            ("https://github.com/example/two.git", "plugins", 4),
-        ];
-        for (index, (repository, path, expected_fetches)) in cases.into_iter().enumerate() {
-            std::fs::write(
-                &manifest,
-                format!(
-                    r#"{{"schema_version":5,"sources":[{{"name":"private-skills","repository":"{repository}","revision":"1111111111111111111111111111111111111111","credential":"private-skills","paths":["{path}"]}}]}}"#
-                ),
-            )
-            .expect("manifest");
-            if index == 3 {
-                std::fs::remove_file(cache.join(".flotilla-ready")).expect("remove ready marker");
-            }
-            let token_file = temp.path().join(format!("source-{index}.token"));
-            std::fs::write(&token_file, "test-token").expect("token");
-            registry
-                .stage_test_skills(
-                    &format!("crew-{index}"),
-                    &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
-                    &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join(format!("claude-{index}")).to_string_lossy().into_owned())],
-                    &BTreeMap::from([("private-skills".to_string(), token_file)]),
-                    &runner,
-                )
-                .await
-                .expect("stage source");
-            assert_eq!(std::fs::read_to_string(temp.path().join("fetches")).expect("fetch log").lines().count(), expected_fetches);
-            assert!(cache.join(".flotilla-ready").is_file());
-        }
-    }
-
-    #[tokio::test]
-    async fn skill_stage_rejects_a_fetch_of_the_wrong_revision() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path());
-        let skills = registry.skills.source.as_ref().expect("generation source");
-        std::fs::write(
-            skills.join(SKILL_BUNDLE_MANIFEST),
-            r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#,
-        )
-        .expect("manifest");
-        let runner = promisor_runner(temp.path());
-        std::fs::write(temp.path().join("fetches.wrong-revision"), "").expect("wrong revision marker");
-        let token_file = temp.path().join("source.token");
-        std::fs::write(&token_file, "test-token").expect("token");
-        let error = registry
-            .stage_test_skills(
-                "crew-private",
-                &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
-                &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
-                &BTreeMap::from([("private-skills".to_string(), token_file)]),
-                &runner,
-            )
-            .await
-            .expect_err("wrong revision must fail");
-        assert!(error.contains("fetch returned the wrong pinned revision 1111111111111111111111111111111111111111"), "{error}");
-        assert_eq!(std::fs::read_to_string(temp.path().join("fetches")).expect("fetch log").lines().count(), 1);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn transient_backoff_does_not_hold_the_staging_mutex() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = Arc::new(registry(temp.path()));
-        let skills = registry.skills.source.as_ref().expect("generation source");
-        std::fs::write(
-            skills.join(SKILL_BUNDLE_MANIFEST),
-            r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#,
-        )
-        .expect("manifest");
-        let runner = Arc::new(promisor_runner(temp.path()));
-        std::fs::write(temp.path().join("fetches.transient"), "").expect("transient marker");
-        let stage = |name: &'static str, registry: Arc<AgentMaterialRegistry>, runner: Arc<PromisorRunner>, root: PathBuf| async move {
-            let token_file = root.join(format!("{name}.token"));
-            std::fs::write(&token_file, "test-token").expect("token");
-            registry
-                .stage_test_skills(
-                    name,
-                    &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
-                    &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join(name).to_string_lossy().into_owned())],
-                    &BTreeMap::from([("private-skills".to_string(), token_file)]),
-                    &*runner,
-                )
-                .await
-        };
-        let first = tokio::spawn(stage("crew-first", Arc::clone(&registry), Arc::clone(&runner), temp.path().to_path_buf()));
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !temp.path().join("fetches").exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("first fetch started");
-        let guard = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Ok(guard) = registry.skills.staging_lock.try_lock() {
-                    return guard;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("staging lock should be available during backoff");
-        assert!(!first.is_finished(), "the first crew must still be backing off when the lock becomes available");
-        drop(guard);
-        stage("crew-second", Arc::clone(&registry), Arc::clone(&runner), temp.path().to_path_buf())
-            .await
-            .expect("second crew stages while first backs off");
-        first.await.expect("first task").expect("first staging");
-    }
-
-    #[test]
-    fn staged_skill_source_revisions_are_reported() {
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let writer = LogCaptureWriter(Arc::clone(&output));
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_target(false)
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let bundle = tempfile::tempdir().expect("tempdir");
-        let skills = write_skill_sources(bundle.path());
-        let inspection = inspect_skill_sources(&skills).expect("inspect skill sources");
-        info!(
-            environment = "crew-alice",
-            adapter = CLAUDE_CODE_ADAPTER_ID,
-            sources = ?inspection.sources,
-            "staged generation-pinned contained agent skills"
-        );
-
-        let logs = String::from_utf8(output.lock().expect("log capture lock should be healthy").clone()).expect("UTF-8 logs");
-        assert!(logs.contains("staged generation-pinned contained agent skills"), "missing provisioning event: {logs}");
-        assert!(logs.contains("crew-alice"), "provisioning event must identify its holder: {logs}");
-        assert!(logs.contains("1111111111111111111111111111111111111111"), "provisioning event must report source pins: {logs}");
-    }
-
-    #[test]
-    fn skill_manifest_rejects_duplicate_or_traversing_source_names() {
-        let bundle = tempfile::tempdir().expect("tempdir");
-        let skills = write_skill_sources(bundle.path());
-        let manifest_path = skills.join(SKILL_BUNDLE_MANIFEST);
-        let manifest = std::fs::read_to_string(&manifest_path).expect("read fixture manifest");
-        std::fs::write(&manifest_path, manifest.replace(r#""name":"rjw-skills""#, r#""name":"mattpocock-skills""#))
-            .expect("write duplicate-name fixture manifest");
-        let error = inspect_skill_sources(&skills).expect_err("duplicate source name must fail validation");
-        assert!(error.contains("invalid or duplicate source entries"), "unexpected validation error: {error}");
-
-        std::fs::write(&manifest_path, manifest.replace(r#""name":"rjw-skills""#, r#""name":"../rjw-skills""#))
-            .expect("write traversing-name fixture manifest");
-        let error = inspect_skill_sources(&skills).expect_err("path-traversing source name must fail validation");
-        assert!(error.contains("invalid or duplicate source entries"), "unexpected validation error: {error}");
-
-        std::fs::write(&manifest_path, manifest.replace("github-skills-fork", "../credential"))
-            .expect("write traversing credential fixture manifest");
-        let error = inspect_skill_sources(&skills).expect_err("path-traversing credential must fail validation");
-        assert!(error.contains("invalid or duplicate source entries"), "unexpected validation error: {error}");
-    }
-
-    #[test]
-    fn skill_manifest_validates_declared_paths_and_applies_the_default() {
-        let bundle = tempfile::tempdir().expect("tempdir");
-        let skills = write_skill_sources(bundle.path());
-        let manifest_path = skills.join(SKILL_BUNDLE_MANIFEST);
-        let manifest = std::fs::read_to_string(&manifest_path).expect("read fixture manifest");
-        let inspection = inspect_skill_sources(&skills).expect("inspect default and declared paths");
-        assert_eq!(inspection.sources[0].paths, ["skills"]);
-        assert_eq!(inspection.sources[1].paths, ["plugins/rjw-sdlc/skills"]);
-
-        for invalid in [
-            "",
-            "../skills",
-            "plugins/../skills",
-            "/skills",
-            "skills/",
-            r"plugins\skills",
-            "skills\nother",
-            "skills/*",
-            "skills/[ab]",
-            "skills?",
-        ] {
-            let encoded = serde_json::to_string(invalid).expect("encode invalid fixture path");
-            std::fs::write(&manifest_path, manifest.replace(r#"["plugins/rjw-sdlc/skills"]"#, &format!("[{encoded}]")))
-                .expect("write invalid-path fixture manifest");
-            let error = inspect_skill_sources(&skills).expect_err("invalid source path must fail validation");
-            assert!(error.contains("invalid or duplicate source entries"), "unexpected validation error for {invalid:?}: {error}");
-        }
-
-        std::fs::write(&manifest_path, manifest.replace(r#"["plugins/rjw-sdlc/skills"]"#, r#"["skills","skills"]"#))
-            .expect("write duplicate-path fixture manifest");
-        let error = inspect_skill_sources(&skills).expect_err("duplicate source paths must fail validation");
-        assert!(error.contains("invalid or duplicate source entries"), "unexpected validation error: {error}");
-    }
-
-    #[test]
-    fn skill_manifest_accepts_any_source_count() {
-        let bundle = tempfile::tempdir().expect("tempdir");
-        let skills = write_skill_sources(bundle.path());
-        let manifest_path = skills.join(SKILL_BUNDLE_MANIFEST);
-        std::fs::write(
-            &manifest_path,
-            r#"{"schema_version":5,"sources":[{"name":"only","repository":"https://example.com/only.git","revision":"1111111111111111111111111111111111111111"}]}"#,
-        )
-        .expect("write single-source manifest");
-        let inspection = inspect_skill_sources(&skills).expect("single source must validate");
-        assert_eq!(inspection.sources.len(), 1);
-
-        std::fs::write(
-            &manifest_path,
-            r#"{"schema_version":5,"sources":[{"name":"one","repository":"https://example.com/one.git","revision":"1111111111111111111111111111111111111111"},{"name":"two","repository":"https://example.com/two.git","revision":"2222222222222222222222222222222222222222"},{"name":"three","repository":"https://example.com/three.git","revision":"3333333333333333333333333333333333333333"}]}"#,
-        )
-        .expect("write three-source manifest");
-        let inspection = inspect_skill_sources(&skills).expect("three sources must validate");
-        assert_eq!(inspection.sources.len(), 3);
-    }
-
-    #[test]
-    fn skill_manifest_allows_credentials_on_arbitrary_sources() {
-        let bundle = tempfile::tempdir().expect("tempdir");
-        let skills = write_skill_sources(bundle.path());
-        let manifest_path = skills.join(SKILL_BUNDLE_MANIFEST);
-        let manifest = std::fs::read_to_string(&manifest_path).expect("read fixture manifest");
-
-        std::fs::write(
-            &manifest_path,
-            manifest.replace("https://github.com/flotilla-org/mattpocock-skills.git", "https://github.com/another-owner/private.git"),
-        )
-        .expect("write relocated credentialed source fixture manifest");
-        let inspection = inspect_skill_sources(&skills).expect("credentialed source repository remains manifest data");
-        assert_eq!(inspection.sources.len(), 2);
-    }
-
-    #[test]
-    fn skill_manifest_accepts_ssh_usernames_but_rejects_http_userinfo_and_passwords() {
-        let bundle = tempfile::tempdir().expect("tempdir");
-        let skills = write_skill_sources(bundle.path());
-        let path = skills.join(SKILL_BUNDLE_MANIFEST);
-        let original = std::fs::read_to_string(&path).expect("manifest");
-        let repository = "https://github.com/rjwittams/rjw-skills.git";
-        std::fs::write(&path, original.replace(repository, "ssh://git@github.com/rjwittams/rjw-skills.git")).expect("SSH manifest");
-        inspect_skill_sources(&skills).expect("ordinary SSH username is allowed");
-        for invalid in [
-            "https://user:pass@github.com/rjwittams/rjw-skills.git",
-            "https://user@github.com/rjwittams/rjw-skills.git",
-            "ssh://git:pass@github.com/rjwittams/rjw-skills.git",
-        ] {
-            std::fs::write(&path, original.replace(repository, invalid)).expect("invalid manifest");
-            inspect_skill_sources(&skills).expect_err("embedded secret or HTTP userinfo is rejected");
-        }
-    }
-
-    #[test]
-    fn skill_manifest_rejects_unpinned_revisions() {
-        let bundle = tempfile::tempdir().expect("tempdir");
-        let skills = write_skill_sources(bundle.path());
-        let manifest_path = skills.join(SKILL_BUNDLE_MANIFEST);
-        let manifest = std::fs::read_to_string(&manifest_path).expect("read fixture manifest");
-
-        for unpinned in ["main", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaz", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] {
-            std::fs::write(&manifest_path, manifest.replace("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", unpinned))
-                .expect("write unpinned fixture manifest");
-            let error = inspect_skill_sources(&skills).expect_err("a revision that is not a full SHA must fail validation");
-            assert!(error.contains("full commit SHA"), "unexpected validation error for {unpinned}: {error}");
-        }
-    }
-
-    #[test]
-    fn skill_manifest_rejects_a_superseded_schema_version() {
-        let bundle = tempfile::tempdir().expect("tempdir");
-        let skills = write_skill_sources(bundle.path());
-        let manifest_path = skills.join(SKILL_BUNDLE_MANIFEST);
-        let manifest = std::fs::read_to_string(&manifest_path).expect("read fixture manifest");
-        std::fs::write(&manifest_path, manifest.replace(r#""schema_version":5"#, r#""schema_version":4"#))
-            .expect("write superseded-schema fixture manifest");
-        let error = inspect_skill_sources(&skills).expect_err("schema version 4 must fail validation");
-        assert!(error.contains("schema version 5"), "unexpected validation error: {error}");
-
-        std::fs::write(&manifest_path, r#"{"schema_version":5,"sources":[]}"#).expect("write empty-source fixture manifest");
-        let error = inspect_skill_sources(&skills).expect_err("empty source set must fail validation");
-        assert!(error.contains("at least one source"), "unexpected validation error: {error}");
     }
 
     #[tokio::test]
@@ -2687,239 +1262,10 @@ esac
             .prepare("canary", &BTreeSet::from(["fleet-canary".to_string()]), &BTreeMap::new())
             .await
             .expect("no model login is required");
-        assert_eq!(deliveries.len(), 1);
-        assert_eq!(deliveries[0].mount.environment_path.as_path(), Path::new(CONTAINER_SKILLS_SOURCE));
+        assert!(deliveries.is_empty(), "the canary needs no login, and skills are pushed at launch");
         assert!(!temp.path().join(".local/share/flotilla/agent-homes").exists());
     }
 
-    // Only the selected frontmatter names land in a crew's skills, even when the pinned
-    // source also supplies an unrelated skill.
-    #[tokio::test]
-    async fn only_frozen_skills_land_in_the_home() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path());
-        let bundle = registry.skills.source.as_ref().expect("source");
-        std::fs::write(bundle.join(SKILL_BUNDLE_MANIFEST), r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#).expect("manifest");
-        let runner = promisor_runner(temp.path());
-        let token = temp.path().join("token");
-        std::fs::write(&token, "test-token").expect("token");
-        let tree = registry.skill_tree(&[crew_skill("private-source", "skills/private-folder")]).await.expect("resolve");
-        let destination = runner.config_base.join("agent-homes/requesters/convoy/coder/claude/skills");
-        registry
-            .stage_skill_tree(&tree, &destination, &BTreeMap::from([("private-skills".to_string(), token.clone())]), &runner)
-            .await
-            .expect("stage selected");
-        let names = std::fs::read_dir(&destination)
-            .expect("staged directory")
-            .filter_map(|entry| {
-                let entry = entry.expect("entry");
-                entry.file_type().expect("file type").is_dir().then(|| entry.file_name())
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(names, [std::ffi::OsString::from("private-source")], "only the frozen selection is installed");
-        assert!(!token.exists(), "the source token is removed after staging");
-    }
-
-    // A source credential is minted narrowed to one repository, so a tree whose sources
-    // share a credential across two repositories is refused before anything is delivered.
-    #[tokio::test]
-    async fn one_credential_is_not_narrowed_to_two_repositories() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path());
-        let bundle = registry.skills.source.as_ref().expect("source");
-        let source = |name: &str| serde_json::json!({"name": name, "repository": format!("https://github.com/example/{name}.git"), "revision": "1".repeat(40), "credential": "private-skills"});
-        let manifest = serde_json::json!({"schema_version": 5, "sources": [source("private-skills"), source("other-skills")]});
-        std::fs::write(bundle.join(SKILL_BUNDLE_MANIFEST), manifest.to_string()).expect("manifest");
-        let other = flotilla_resources::SkillCatalogEntry {
-            source: "other-skills".into(),
-            repository: "example/other-skills".into(),
-            ..crew_skill("other-source", "skills/other-folder")
-        };
-        let error = registry
-            .skill_tree(&[crew_skill("private-source", "skills/private-folder"), other])
-            .await
-            .expect_err("one credential, two repositories");
-        assert!(error.contains("cannot be narrowed to multiple source repositories"), "{error}");
-        registry
-            .skill_tree(&[crew_skill("private-source", "skills/private-folder")])
-            .await
-            .expect("one repository per credential resolves");
-    }
-
-    fn crew_skill(name: &str, path: &str) -> flotilla_resources::SkillCatalogEntry {
-        flotilla_resources::SkillCatalogEntry {
-            source: "private-skills".into(),
-            repository: "example/private-skills".into(),
-            revision: "1".repeat(40),
-            name: name.into(),
-            path: path.into(),
-        }
-    }
-
-    // Candidate probing preserves the governor's old revision while using the
-    // current supply authority. Missing authority/tokens and a remote serving
-    // another revision refuse; failed staging must preserve operator token files.
-    #[tokio::test]
-    async fn pre_roll_skill_probe_checks_authority_pin_and_preserves_operator_tokens() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path());
-        let bundle = registry.skills.source.as_ref().expect("source");
-        std::fs::write(
-            bundle.join(SKILL_BUNDLE_MANIFEST),
-            serde_json::to_vec(&serde_json::json!({
-                "schema_version": 5,
-                "sources": [{
-                    "name": "private-skills",
-                    "repository": "https://github.com/example/private-skills.git",
-                    "revision": "2".repeat(40),
-                    "credential": "private-skills",
-                }],
-            }))
-            .expect("manifest JSON"),
-        )
-        .expect("new supply");
-        // Subprocess-boundary stand-in enforces the Git staging CLI, supplies
-        // lazy blobs and records the exact revision fetched without networking.
-        let runner = promisor_runner(temp.path());
-        let selected = vec![crew_skill("private-source", "skills/private-folder")];
-        let spec = serde_json::from_value(serde_json::json!({
-            "consumer": {"adapter": "github-app", "installation_id": 1},
-            "source": {
-                "kind": "github-app",
-                "app_id_path": "/test/app-id",
-                "private_key_path": "/test/key",
-            },
-            "lifecycle": "refreshable",
-        }))
-        .expect("credential spec");
-        let declared = BTreeMap::from([("private-skills".into(), spec)]);
-        let missing = validate_frozen_skills(bundle, &selected, &BTreeMap::new(), &BTreeMap::new(), &runner)
-            .await
-            .expect_err("undeclared credential");
-        assert!(missing.contains("no declared CredentialSpec"));
-        let missing = validate_frozen_skills(bundle, &selected, &declared, &BTreeMap::new(), &runner).await.expect_err("token required");
-        assert!(missing.contains("explicit probe token"));
-        let token = temp.path().join("operator-token");
-        std::fs::write(&token, "test-token").expect("token");
-        let tokens = BTreeMap::from([("private-skills".into(), token.clone())]);
-        let mut invalid = declared.clone();
-        invalid.get_mut("private-skills").expect("spec").lifecycle = flotilla_resources::CredentialLifecycle::Static;
-        assert!(validate_frozen_skills(bundle, &selected, &invalid, &tokens, &runner)
-            .await
-            .expect_err("candidate cannot mint static App credentials")
-            .contains("refreshable"));
-        let crews = BTreeMap::from([("coder".into(), selected.clone()), ("reviewer".into(), selected.clone())]);
-        validate_frozen_vessel_skills(bundle, &crews, &declared, &tokens, &runner).await.expect("shared names remain isolated by crew");
-        let mut incompatible = crews.clone();
-        incompatible.get_mut("reviewer").expect("reviewer")[0].revision = "3".repeat(40);
-        assert!(validate_frozen_vessel_skills(bundle, &incompatible, &declared, &tokens, &runner)
-            .await
-            .expect_err("incompatible shared source pins")
-            .contains("two revisions"));
-        validate_frozen_skills(bundle, &selected, &declared, &tokens, &runner).await.expect("old pin remains satisfiable");
-        assert_eq!(std::fs::read_to_string(&token).expect("operator token"), "test-token");
-        std::fs::write(temp.path().join("fetches.wrong-revision"), "").expect("remote serves wrong pin");
-        let error = validate_frozen_skills(bundle, &selected, &declared, &tokens, &runner).await.expect_err("exact revision required");
-        assert!(error.contains("revision"), "{error}");
-        assert_eq!(std::fs::read_to_string(token).expect("operator token survives refusal"), "test-token");
-    }
-
-    // #2875: failures before the Git script carry the same named context and
-    // underlying cause in both returned status material and the warning.
-    #[tokio::test]
-    async fn skill_resolution_warning_reports_the_frozen_source_and_cause() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path());
-        let bundle = registry.skills.source.as_ref().expect("source");
-        std::fs::write(bundle.join(SKILL_BUNDLE_MANIFEST), r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"2222222222222222222222222222222222222222","credential":"private-skills"}]}"#).expect("manifest");
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let writer = LogCaptureWriter(Arc::clone(&output));
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_target(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let error =
-            registry.skill_tree(&[crew_skill("private-source", "skills-other/private-folder")]).await.expect_err("unauthorized path");
-        assert!(error.contains("outside the authorized source paths"));
-        let log = String::from_utf8(output.lock().expect("log").clone()).expect("UTF-8 log");
-        for expected in [
-            "skill staging failed",
-            "private-skills",
-            "1111111111111111111111111111111111111111",
-            "credential=",
-            "outside the authorized source paths",
-        ] {
-            assert!(log.contains(expected), "missing {expected}: {log}");
-        }
-        assert!(log.contains("credential=private-skills") || log.contains("credential=\"private-skills\""), "{log}");
-        assert!(!log.contains("source=unknown") && !log.contains("revision=unknown"), "{log}");
-    }
-
-    // A bundle-level failure must not blame an unrelated selected source.
-    #[tokio::test]
-    async fn skill_bundle_warning_does_not_attribute_a_missing_bundle_to_selected_source() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path());
-        std::fs::remove_dir_all(registry.skills.source.as_ref().expect("source")).expect("remove bundle");
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let writer = LogCaptureWriter(Arc::clone(&output));
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_target(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        registry.skill_tree(&[crew_skill("private-source", "skills/private-folder")]).await.expect_err("missing bundle");
-        let log = String::from_utf8(output.lock().expect("log").clone()).expect("UTF-8 log");
-        assert!(log.contains("source=skill-bundle") || log.contains("source=\"skill-bundle\""), "{log}");
-        assert!(!log.contains("source=private-skills") && !log.contains("source=\"private-skills\""), "{log}");
-    }
-
-    // #2875: retaining a frozen revision never authorizes another repository,
-    // an undeclared source, path traversal, or an unpinned ref. Diagnostics name
-    // the source, revision, credential and concrete refusal before any mint.
-    #[hegel::test]
-    fn frozen_skill_resolution_preserves_source_authority(tc: hegel::TestCase) {
-        let case = tc.draw(hegel::generators::integers::<u8>().min_value(0).max_value(5));
-        let source = SkillSource {
-            name: "private-skills".into(),
-            repository: "https://github.com/example/private-skills.git".into(),
-            revision: "2".repeat(40),
-            credential: Some("private-skills".into()),
-            paths: vec!["skills".into()],
-        };
-        let mut entry = crew_skill("private-source", "skills/private-folder");
-        match case {
-            0 => entry.repository = "other/private-skills".into(),
-            1 => entry.path = "skills/../escape".into(),
-            2 => entry.path = "skills-other/private-folder".into(),
-            3 => entry.revision = "main".into(),
-            4 => entry.source = "undeclared".into(),
-            5 => entry.name = "../escape".into(),
-            _ => unreachable!(),
-        }
-        let error = resolve_frozen_sources(&[source], std::slice::from_ref(&entry)).expect_err("untrusted frozen material refused");
-        assert!(error.contains(&entry.source) && error.contains(&entry.revision) && error.contains("credential"), "{error}");
-        assert!(
-            error.contains("differs")
-                || error.contains("invalid")
-                || error.contains("outside")
-                || error.contains("full commit SHA")
-                || error.contains("not declared"),
-            "{error}"
-        );
-    }
-
-    // #2875: a standing governor's frozen selection survives a reboot into a
-    // newer generation, retaining its revision and narrowed source credential.
-    // #3655, #3964: a Codex crew links the login of the vessel's delivered home only when
-    // that home is flotilla-managed under the target's writable base or the contained Codex
     // home; a personal, escaping or absent home falls back to the target's ambient login.
     // Claude crews run on their bound account and link no login.
     #[test]
@@ -2944,45 +1290,15 @@ esac
         assert_eq!(login("unmanaged-harness", None), None);
     }
 
-    // #2875: a governor's frozen selection survives a reboot into a newer generation,
-    // retaining its revision and narrowed source credential.
+    // Issue #2672: crews sharing a harness and vessel each link the vessel's delivered
+    // login: static config seeds a crew once, a crew's own edits survive, and a refreshed
+    // login reaches every crew.
     #[tokio::test]
-    async fn governor_frozen_skills_resolve_after_generation_restart() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = registry(temp.path());
-        let bundle = registry.skills.source.as_ref().expect("source");
-        std::fs::write(bundle.join(SKILL_BUNDLE_MANIFEST), r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"2222222222222222222222222222222222222222","credential":"private-skills"}]}"#).expect("new generation manifest");
-        let runner = promisor_runner(temp.path());
-        let home = runner.config_base.join("agent-homes/requesters/standing/governor/claude");
-        let tree = registry.skill_tree(&[crew_skill("private-source", "skills/private-folder")]).await.expect("resolve frozen tree");
-        let requests = tree.credentials();
-        assert_eq!(requests.len(), 1, "frozen revision still needs its source credential");
-        assert_eq!(requests[0].revision, "1".repeat(40));
-        let token = temp.path().join("token");
-        std::fs::write(&token, "test-token").expect("token");
-        registry
-            .stage_skill_tree(&tree, &home.join("skills"), &BTreeMap::from([("private-skills".into(), token)]), &runner)
-            .await
-            .expect("stage frozen revision after restart");
-        assert!(home.join("skills/private-source/SKILL.md").is_file());
-        let staged: SkillBundleManifest =
-            serde_json::from_slice(&std::fs::read(home.join("skills").join(SKILL_BUNDLE_MANIFEST)).expect("staged manifest"))
-                .expect("manifest");
-        assert_eq!(staged.sources[0].revision, "1".repeat(40), "staged provenance retains the admission pin");
-    }
-
-    // Issue #2672: crews sharing a harness and vessel have disjoint homes, each holding
-    // exactly its frozen selection, including none, and reusing one pinned fetch. Each
-    // links the vessel's delivered login: static config seeds a crew once, a crew's own
-    // edits survive, and a refreshed login reaches every crew.
-    #[tokio::test]
-    async fn crews_in_one_vessel_see_only_their_own_skills_and_share_the_login() {
+    async fn crews_in_one_vessel_share_the_login() {
         for api_key in [false, true] {
             let temp = tempfile::tempdir().expect("tempdir");
             let registry = registry(temp.path());
-            let bundle = registry.skills.source.as_ref().expect("source");
-            std::fs::write(bundle.join(SKILL_BUNDLE_MANIFEST), r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#).expect("manifest");
-            let runner = promisor_runner(temp.path());
+            let runner = ContainedRunner { config_base: temp.path().join("config") };
             let base = if api_key { runner.config_base.join("agent-homes/model-api/codex") } else { runner.config_base.join("codex") };
             std::fs::create_dir_all(&base).expect("base home");
             std::fs::write(base.join("settings.json"), "{}").expect("settings");
@@ -2994,38 +1310,12 @@ esac
             let home = |role: &str| runner.config_base.join("agent-homes/requesters/shared").join(role).join("codex");
             // The vessel's file facilities over this process's own shell and files.
             let agent = flotilla_environment::environment::vessel_ops::RunnerVesselAgent(Arc::new(runner.clone()));
-            let crews = [
-                ("coder", vec![crew_skill("private-source", "skills/private-folder")]),
-                ("reviewer", vec![crew_skill("unselected", "skills/unselected")]),
-                ("observer", Vec::new()),
-            ];
-            for (role, selected) in &crews {
-                let token = temp.path().join(format!("token-{role}"));
-                std::fs::write(&token, "test-token").expect("token");
-                let tree = registry.skill_tree(selected).await.expect("resolve");
-                registry
-                    .stage_skill_tree(&tree, &home(role).join("skills"), &BTreeMap::from([("private-skills".into(), token)]), &runner)
-                    .await
-                    .expect("stage crew");
+            let crews = ["coder", "reviewer"];
+            for role in crews {
+                std::fs::create_dir_all(home(role)).expect("crew home");
                 login.link(&home(role), &agent).await.expect("link login");
             }
-            assert!(home("coder").join("skills/private-source/SKILL.md").is_file());
-            let skills = |role: &str| {
-                std::fs::read_dir(home(role).join("skills"))
-                    .expect("skills")
-                    .filter_map(|entry| entry.ok().filter(|entry| entry.file_type().expect("type").is_dir()).map(|entry| entry.file_name()))
-                    .collect::<Vec<_>>()
-            };
-            assert_eq!(skills("coder"), ["private-source"]);
-            assert_eq!(skills("reviewer"), ["unselected"]);
-            assert!(skills("observer").is_empty());
-            assert!(!base.join("skills").exists(), "no vessel-wide skill union");
-            assert_eq!(
-                std::fs::read_to_string(temp.path().join("fetches")).expect("fetch log").lines().count(),
-                1,
-                "crews reuse the pinned source cache"
-            );
-            for (role, _) in &crews {
+            for role in crews {
                 assert_eq!(std::fs::read_to_string(home(role).join("settings.json")).expect("settings"), "{}");
                 assert_eq!(std::fs::read_to_string(home(role).join("auth.json")).expect("linked auth"), "first-token");
             }
@@ -3040,7 +1330,7 @@ esac
             let replacement = base.join("auth.new");
             std::fs::write(&replacement, "refreshed-token").expect("new auth");
             std::fs::rename(replacement, base.join("auth.json")).expect("atomic refresh");
-            for (role, _) in &crews {
+            for role in crews {
                 assert_eq!(std::fs::read_to_string(home(role).join("auth.json")).expect("refreshed linked auth"), "refreshed-token");
             }
         }

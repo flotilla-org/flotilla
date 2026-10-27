@@ -30,28 +30,35 @@ pub(super) trait Probes {
         &self,
         selected: &BTreeMap<String, Vec<SkillCatalogEntry>>,
         credentials: &BTreeMap<String, CredentialSpecSpec>,
-    ) -> Result<(), String>;
+    ) -> Result<Vec<String>, String>;
     async fn image(&self, reference: &str) -> Result<(), String>;
 }
 
 pub(super) struct CandidateProbes<'a> {
     pub options: &'a super::ValidationOptions,
     pub inventory: &'a [Value],
-    pub runner: &'a dyn CommandRunner,
+    pub runner: std::sync::Arc<dyn CommandRunner>,
     pub provider: &'a dyn EnvironmentProvider,
 }
 
 impl Probes for CandidateProbes<'_> {
+    /// Each crew is fetched and checked as at launch, on this host, with the
+    /// operator's token files; crews of one vessel at different revisions of
+    /// one source are permitted and returned as notices.
     async fn skills(
         &self,
         selected: &BTreeMap<String, Vec<SkillCatalogEntry>>,
         credentials: &BTreeMap<String, CredentialSpecSpec>,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<String>, String> {
         if selected.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let source = self.options.sources.as_deref().ok_or("frozen skills require --skill-sources (candidate supply directory)")?;
-        flotilla_daemon::validate_frozen_vessel_skills(source, selected, credentials, &self.options.credential_tokens, self.runner).await
+        let trees = flotilla_daemon::SkillTrees::new(
+            std::sync::Arc::new(flotilla_vcs::vcs::FlotillaVcs::object_cache(std::sync::Arc::clone(&self.runner))),
+            std::env::temp_dir().join("flotilla-skill-probe-cache"),
+        );
+        flotilla_daemon::validate_frozen_vessel_skills(&trees, source, selected, credentials, &self.options.credential_tokens).await
     }
 
     async fn image(&self, reference: &str) -> Result<(), String> {
@@ -124,6 +131,8 @@ pub(super) struct Report {
     grants: CategoryCount,
     pub failures: Vec<String>,
     pub waivers: Vec<String>,
+    /// Satisfiable but worth the operator's attention; never a failure.
+    pub notices: Vec<String>,
     validated_elsewhere: Vec<String>,
 }
 
@@ -253,13 +262,10 @@ pub(super) async fn check(inventory: &[Value], retired: &BTreeSet<(String, Strin
                         })
                         .collect::<Vec<_>>()
                         .join(", ");
-                    report.record(
-                        Category::Skills,
-                        &identity,
-                        &format!("{} [{refs}]", vessel.name),
-                        probes.skills(&crews, &credentials).await,
-                        waiver,
-                    );
+                    let result = probes.skills(&crews, &credentials).await.map(|notices| {
+                        report.notices.extend(notices.into_iter().map(|notice| format!("Convoy/{identity} {}: {notice}", vessel.name)));
+                    });
+                    report.record(Category::Skills, &identity, &format!("{} [{refs}]", vessel.name), result, waiver);
                 }
             }
         } else if convoy.status.as_ref().is_some_and(|status| status.phase != ConvoyPhase::Pending) {
@@ -518,9 +524,9 @@ mod tests {
             &self,
             selected: &BTreeMap<String, Vec<SkillCatalogEntry>>,
             _credentials: &BTreeMap<String, CredentialSpecSpec>,
-        ) -> Result<(), String> {
+        ) -> Result<Vec<String>, String> {
             if selected.values().flatten().all(|entry| entry.revision == self.revision) {
-                Ok(())
+                Ok(Vec::new())
             } else {
                 Err("pinned revision does not exist".into())
             }
@@ -1041,7 +1047,7 @@ mod tests {
                 flotilla_environment::environment::EnvironmentInput::Docker,
                 runner.clone(),
             );
-            let probes = CandidateProbes { options: &options, inventory: &inventory, runner: runner.as_ref(), provider: provider.as_ref() };
+            let probes = CandidateProbes { options: &options, inventory: &inventory, runner: runner.clone(), provider: provider.as_ref() };
             assert_eq!(check_identity(&probes, &local, Some(&registry)).await.is_ok(), cached || published);
             assert_eq!(*runner.calls.lock().expect("calls"), usize::from(!cached));
             if !cached && !published {
@@ -1069,7 +1075,7 @@ mod tests {
             runner.clone(),
         );
         let options = super::super::ValidationOptions::default();
-        let probes = CandidateProbes { options: &options, inventory: &[], runner: runner.as_ref(), provider: provider.as_ref() };
+        let probes = CandidateProbes { options: &options, inventory: &[], runner: runner.clone(), provider: provider.as_ref() };
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         runtime.block_on(async {
             assert_eq!(probes.image("crew:test").await.is_ok(), local || registry);
@@ -1105,7 +1111,7 @@ mod tests {
             flotilla_environment::environment::EnvironmentInput::Docker,
             runner.clone(),
         );
-        let probes = CandidateProbes { options: &options, inventory: &inventory, runner: runner.as_ref(), provider: provider.as_ref() };
+        let probes = CandidateProbes { options: &options, inventory: &inventory, runner: runner.clone(), provider: provider.as_ref() };
         assert!(probes.image(&digest).await.is_err(), "retired availability is not evidence");
         assert_eq!(*runner.calls.lock().expect("calls"), 0);
 
