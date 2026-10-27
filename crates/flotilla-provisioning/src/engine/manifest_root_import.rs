@@ -5,6 +5,7 @@
 //! | `spec.host`, `path`, `source` | the request, fixed |
 //! | `spec.binding` | the state's `binding` |
 //! | `status.applied_revision`, `source_error` | the state's `applied`, `source_error` |
+//! | the source error's stall, `began_at` | the state's `source_failed_at` |
 //! | `status.documents[*].baseline_hash` | `baselines` |
 //! | a Refused document's reason, since it was observed (the old status keeps `observed_at` while a document's state is unchanged) | `refusals` |
 //! | `spec.suspended` | `suspended` |
@@ -85,10 +86,13 @@ pub fn import_root(old: &ResourceObject<OldRoot>) -> Result<Resource<ManifestRoo
         suspended: old.spec.suspended.iter().map(document_name).collect::<Result<BTreeSet<_>, _>>()?,
         resolutions,
     };
+    // A source error's stall began when the old status recorded it.
+    let source_failed_at = status.source_error.as_ref().and(status.stalled.as_ref()).map(|stall| Timestamp::from_datetime(&stall.began_at));
     let state = RootState::Bound {
         binding: old.spec.binding.clone(),
         applied: status.applied_revision.clone(),
         source_error: status.source_error.clone(),
+        source_failed_at,
     };
     let since = Timestamp::from_datetime(&old.metadata.creation_timestamp);
     Ok(Resource::stored(old.metadata.name.clone(), spec, State::new(state, since), Version(1)))

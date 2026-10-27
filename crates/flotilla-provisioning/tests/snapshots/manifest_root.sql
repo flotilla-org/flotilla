@@ -52,6 +52,7 @@ CREATE TABLE "manifest_root" (
   "binding_directory" TEXT,
   "applied" TEXT,
   "source_error" TEXT,
+  "source_failed_at" INTEGER,
   CHECK (CASE WHEN "binding" = 'rp'
       THEN "binding_repo" IS NOT NULL
       AND "binding_branch" IS NOT NULL
@@ -156,7 +157,8 @@ CREATE VIEW "manifest_root_view" AS SELECT
   "manifest_root"."binding_path",
   "manifest_root"."binding_directory",
   "manifest_root"."applied",
-  "manifest_root"."source_error"
+  "manifest_root"."source_error",
+  "manifest_root"."source_failed_at"
 FROM "manifest_root";
 CREATE VIEW "manifest_root_baselines_view" AS SELECT
   "manifest_root_baselines"."manifest_root",

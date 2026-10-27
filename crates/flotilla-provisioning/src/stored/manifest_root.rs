@@ -6,7 +6,7 @@
 //! state drift detection needs, are records on the root; each document's phase is a judgement
 //! ([`phase`]), never stored; refusal reasons and the source error are latest-value records
 //! written on change. The root has one live state, `Bound`, whose data holds the scalar records
-//! (the binding, the applied revision, the source error). Its collections (baselines, refusals,
+//! (the binding, the applied revision, the source error and when it was first recorded). Its collections (baselines, refusals,
 //! suspensions, resolutions) are spec collections only its edges write, as a Convoy's duties are.
 //! A root whose source is removed ends, `Retired`, keeping its records for attribution.
 
@@ -98,9 +98,19 @@ states! {
     /// A root's state; its data is the scalar records.
     pub enum RootState => RootLabel {
         /// Declared, and reconciled by its host.
-        Bound { binding: Option<CharterSource>, applied: Option<String>, source_error: Option<String> } = "bd",
+        Bound {
+            binding: Option<CharterSource>,
+            applied: Option<String>,
+            source_error: Option<String>,
+            source_failed_at: Option<Timestamp>,
+        } = "bd",
         /// Its source was removed; its records stay for attribution.
-        Retired { binding: Option<CharterSource>, applied: Option<String>, source_error: Option<String> } = "rt",
+        Retired {
+            binding: Option<CharterSource>,
+            applied: Option<String>,
+            source_error: Option<String>,
+            source_failed_at: Option<Timestamp>,
+        } = "rt",
     }
 }
 
@@ -120,6 +130,13 @@ impl RootState {
     pub fn source_error(&self) -> Option<&str> {
         match self {
             RootState::Bound { source_error, .. } | RootState::Retired { source_error, .. } => source_error.as_deref(),
+        }
+    }
+
+    /// When the current source error was first recorded: the start of the stall it makes.
+    pub fn source_failed_at(&self) -> Option<Timestamp> {
+        match self {
+            RootState::Bound { source_failed_at, .. } | RootState::Retired { source_failed_at, .. } => *source_failed_at,
         }
     }
 }
@@ -355,8 +372,12 @@ fn pass(spec: &RootSpec, state: &RootState, applied: &Applied, now: Timestamp) -
         (spec.suspended.clone(), spec.resolutions.clone())
     };
     let (binding, previous) = (state.binding().cloned(), state.applied().map(str::to_owned));
-    let state =
-        RootState::Bound { binding, applied: if applied.complete { Some(applied.revision.clone()) } else { previous }, source_error: None };
+    let state = RootState::Bound {
+        binding,
+        applied: if applied.complete { Some(applied.revision.clone()) } else { previous },
+        source_error: None,
+        source_failed_at: None,
+    };
     Ok(Pass { baselines, refusals, suspended, resolutions, state })
 }
 
@@ -388,7 +409,7 @@ impl Machine for ManifestRoot {
                 EdgeDef::<Self, Applied>::new()
                     .from([Bound])
                     .to([Bound])
-                    .changes(["applied", "source_error"])
+                    .changes(["applied", "source_error", "source_failed_at"])
                     .writes(["baselines", "refusals", "suspended", "resolutions"])
                     .gate("a pass records only documents it reached, completes at a revision, and changes something", |h, applied| {
                         let next = pass(h.spec(), h.state(), applied, h.now())?;
@@ -429,7 +450,7 @@ impl Machine for ManifestRoot {
                 EdgeDef::<Self, SourceFailed>::new()
                     .from([Bound])
                     .to([Bound])
-                    .changes(["source_error"])
+                    .changes(["source_error", "source_failed_at"])
                     .gate("a failure names its error, and a new one", |h, failed| {
                         if failed.error.is_empty() {
                             Err(RootRefusal::Empty)
@@ -439,10 +460,11 @@ impl Machine for ManifestRoot {
                             Ok(())
                         }
                     })
-                    .effect(|_, state, failed| RootState::Bound {
+                    .effect(|h, state, failed| RootState::Bound {
                         binding: state.binding().cloned(),
                         applied: state.applied().map(str::to_owned),
                         source_error: Some(failed.error.clone()),
+                        source_failed_at: Some(h.now()),
                     }),
             )
             .edge(
@@ -554,6 +576,7 @@ impl Machine for ManifestRoot {
                         binding: rebind.binding.clone(),
                         applied: state.applied().map(str::to_owned),
                         source_error: state.source_error().map(str::to_owned),
+                        source_failed_at: state.source_failed_at(),
                     }),
             )
             .edge(
@@ -565,6 +588,7 @@ impl Machine for ManifestRoot {
                         binding: state.binding().cloned(),
                         applied: state.applied().map(str::to_owned),
                         source_error: state.source_error().map(str::to_owned),
+                        source_failed_at: state.source_failed_at(),
                     }),
             )
             .end(Retired, "the root's source was removed")
@@ -581,7 +605,7 @@ impl Machine for ManifestRoot {
             suspended: BTreeSet::new(),
             resolutions: BTreeMap::new(),
         };
-        Ok((spec, RootState::Bound { binding: request.binding, applied: None, source_error: None }))
+        Ok((spec, RootState::Bound { binding: request.binding, applied: None, source_error: None, source_failed_at: None }))
     }
 }
 
