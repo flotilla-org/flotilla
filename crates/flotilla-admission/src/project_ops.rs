@@ -24,7 +24,7 @@ use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
     PrincipalRef, ProviderData, ResourceRef,
 };
-use flotilla_resources::checkout_path::checkout_path;
+use flotilla_resources::{checkout_path::checkout_path, definition_provenance::WHOLE_REPOSITORY_PROJECT_MANAGER};
 use flotilla_resources::{
     normalize_project_spec, Clock, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyRepositorySpec,
     DeclarationRefusedCondition, Demand, DemandKind, DemandSpec, Forge, InputMeta, ObjectEvent, Project, ProjectRepositoryRole,
@@ -101,12 +101,10 @@ fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: St
     })
 }
 
-const WHOLE_REPOSITORY_PROJECT_MANAGED_BY_VALUE: &str = "whole-repository-project";
-
 fn whole_repository_project_meta(name: impl Into<String>) -> InputMeta {
     InputMeta::builder()
         .name(name.into())
-        .labels(BTreeMap::from([(MANAGED_BY_LABEL.to_string(), WHOLE_REPOSITORY_PROJECT_MANAGED_BY_VALUE.to_string())]))
+        .labels(BTreeMap::from([(MANAGED_BY_LABEL.to_string(), WHOLE_REPOSITORY_PROJECT_MANAGER.to_string())]))
         .build()
 }
 
@@ -125,13 +123,13 @@ async fn reconcile_whole_repository_project_definition(
         return Ok(existing);
     }
     let managed_by_generator =
-        existing.metadata.labels.get(MANAGED_BY_LABEL).is_some_and(|value| value == WHOLE_REPOSITORY_PROJECT_MANAGED_BY_VALUE);
+        existing.metadata.labels.get(MANAGED_BY_LABEL).is_some_and(|value| value == WHOLE_REPOSITORY_PROJECT_MANAGER);
     if managed_by_generator {
         return Ok(existing);
     }
 
     let mut meta = InputMeta::from(&existing.metadata);
-    meta.labels.insert(MANAGED_BY_LABEL.to_string(), WHOLE_REPOSITORY_PROJECT_MANAGED_BY_VALUE.to_string());
+    meta.labels.insert(MANAGED_BY_LABEL.to_string(), WHOLE_REPOSITORY_PROJECT_MANAGER.to_string());
     let reconciled = projects
         .update_metadata(&meta)
         .await

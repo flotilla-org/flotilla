@@ -1,6 +1,7 @@
 //! The definition kinds' import rehearsal (#3824 layer 2b): before a roll, every copy of a
 //! declared definition the daemon holds, local or replicated, in every namespace, is mapped onto
-//! the engine, restored into a temporary store and read back. The report counts imported records
+//! the engine, restored into a temporary store and read back. Project (#3824 layer 3b) is among
+//! them, with its project operations' status as ProjectOps records. The report counts imported records
 //! by kind and origin and dropped rows by reason (stored copies under a built-in's name among them),
 //! and names each refusal.
 
@@ -12,8 +13,8 @@ use flotilla_resources::{K8sResourceObject, Resource, ResourceObject};
 use serde_json::Value;
 
 /// The kinds the rehearsal reads, by their plural.
-pub(super) const KINDS: [&str; 7] =
-    ["forges", "fleetdesignations", "credentialspecs", "credentialgrants", "crewdefaults", "imagelayers", "workflowtemplates"];
+pub(super) const KINDS: [&str; 8] =
+    ["forges", "fleetdesignations", "credentialspecs", "credentialgrants", "crewdefaults", "imagelayers", "workflowtemplates", "projects"];
 
 /// Raw documents of every namespace, as `(namespace, plural, document)`.
 #[derive(Default)]
@@ -53,6 +54,7 @@ impl Documents {
             crew_defaults: self.copies("crewdefaults", &mut decoding),
             image_layers: self.copies("imagelayers", &mut decoding),
             workflow_templates: self.copies("workflowtemplates", &mut decoding),
+            projects: self.copies("projects", &mut decoding),
         };
         let mut report = rehearse_definitions(&copies);
         report.refused.splice(0..0, decoding.refused);

@@ -23,3 +23,12 @@ pub const PROJECT_IMAGE_MANAGER: &str = "project-image";
 pub const VERIFICATION_PROJECT_ANNOTATION: &str = "flotilla.work/verification-command-project";
 pub const VERIFICATION_PROVENANCE_ANNOTATION: &str = "flotilla.work/verification-command-provenance";
 pub const SUPERSEDED_BY_ANNOTATION: &str = "flotilla.work/superseded-by";
+
+/// Project's provenance keys (#3824 layer 3b): the repository, commit and file of the
+/// `project.yaml` declaration project operations materialised a Project from, and the managed-by
+/// value of a Project generated for a whole repository. Moved here from `flotilla-charter` and
+/// project operations for the import, below every writer.
+pub const BOOTSTRAP_REPOSITORY_ANNOTATION: &str = "flotilla.work/project-bootstrap-repository";
+pub const BOOTSTRAP_COMMIT_ANNOTATION: &str = "flotilla.work/project-bootstrap-commit";
+pub const DECLARATION_FILE_ANNOTATION: &str = "flotilla.work/project-declaration-file";
+pub const WHOLE_REPOSITORY_PROJECT_MANAGER: &str = "whole-repository-project";

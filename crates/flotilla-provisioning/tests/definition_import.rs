@@ -1,5 +1,6 @@
-//! The definitions import (#3824 layer 2b, ADR 0047): old copies of the declared definition
-//! kinds mapped onto the engine's plain kinds and read back from a rehearsal store.
+//! The definitions import (#3824 layers 2b and 3b, ADR 0047): old copies of the declared
+//! definition kinds and Project mapped onto the engine's plain kinds and read back from a
+//! rehearsal store.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -11,20 +12,23 @@ use flotilla_provisioning::{
         CharterOrigin, CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition, DefinitionOrigin,
         FleetDesignationDefinition, ForgeDefinition, ImageLayerDefinition, WorkflowTemplateDefinition,
     },
+    stored::project::{DeclarationRefusal, EntriesReadiness, ProjectDefinition, ProjectOpsRecord},
 };
 use flotilla_resources::{
     builtins::builtin_definitions,
     definition_provenance::{
-        CHARTER_REVISION_ANNOTATION, CHARTER_SCOPE_ANNOTATION, CHARTER_SOURCE_ANNOTATION, MANIFEST_MANAGED_BY_VALUE,
-        MANIFEST_PATH_ANNOTATION, MANIFEST_RECONCILER_ROOT_ANNOTATION, MANIFEST_REVISION_ANNOTATION, MANIFEST_SOURCE_ANNOTATION,
-        MATERIALIZED_PROJECT_ANNOTATION, PROJECT_IMAGE_MANAGER, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION,
-        SOURCE_REPOSITORY_ANNOTATION,
+        BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION, CHARTER_REVISION_ANNOTATION, CHARTER_SCOPE_ANNOTATION,
+        CHARTER_SOURCE_ANNOTATION, DECLARATION_FILE_ANNOTATION, MANIFEST_MANAGED_BY_VALUE, MANIFEST_PATH_ANNOTATION,
+        MANIFEST_RECONCILER_ROOT_ANNOTATION, MANIFEST_REVISION_ANNOTATION, MANIFEST_SOURCE_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION,
+        PROJECT_IMAGE_MANAGER, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
+        WHOLE_REPOSITORY_PROJECT_MANAGER,
     },
-    CredentialConsumer, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements,
-    CredentialSource, CredentialSpecSpec, CrewDefaultsSpec, FleetDesignationSpec, ForgeKind, ForgeSpec, HostActionSelector,
-    HostImageAction, ImageCacheBinding, ImageLayerResourceSpec, ImageSelection, LandingCredentialScope, ObjectMeta, RepositoryKey,
-    RepositoryTrust, Resource, ResourceObject, RoleDefinition, RoleSubscription, WorkflowTemplateSpec, MANAGED_BY_LABEL,
-    PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND,
+    CharterPointer, CharterSource, CharterStoreBinding, CredentialConsumer, CredentialGrantSelector, CredentialGrantSpec,
+    CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpecSpec, CrewDefaultsSpec,
+    DeclarationRefusedCondition, DispatchQueueAttention, FleetDesignationSpec, ForgeKind, ForgeSpec, HostActionSelector, HostImageAction,
+    ImageCacheBinding, ImageLayerResourceSpec, ImageSelection, LandingCredentialScope, ObjectMeta, OperationalEntriesCondition, Project,
+    ProjectRepositorySpec, ProjectSpec, ProjectStatus, RepositoryKey, RepositoryTrust, Resource, ResourceObject, RoleDefinition,
+    RoleSubscription, WorkflowTemplateSpec, BOOTSTRAP_PATH_ANNOTATION, MANAGED_BY_LABEL, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND,
 };
 use hegel::{generators as gs, TestCase};
 
@@ -77,10 +81,11 @@ fn maybe<T>(tc: &TestCase, value: impl FnOnce(&TestCase) -> T) -> Option<T> {
     tc.draw(gs::booleans()).then(|| value(tc))
 }
 
-/// The seven stamps the writers make, by index: an operator's, a manifest document's, a charter
-/// document's with its materialised project, project ops', a project image's, a snapshot's, and
-/// project ops' from an ops root; each with the origin the import must read from it.
-const STAMPS: u8 = 7;
+/// The nine stamps the writers make, by index: an operator's, a manifest document's, a charter
+/// document's with its materialised project, project ops', a project image's, a snapshot's,
+/// project ops' from an ops root, a `project.yaml` declaration's, and a whole-repository
+/// Project's; each with the origin the import must read from it.
+const STAMPS: u8 = 9;
 
 fn provenance(stamp: u8) -> (BTreeMap<String, String>, BTreeMap<String, String>, DefinitionOrigin) {
     let pairs = |items: &[(&str, &str)]| items.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect::<BTreeMap<_, _>>();
@@ -141,6 +146,18 @@ fn provenance(stamp: u8) -> (BTreeMap<String, String>, BTreeMap<String, String>,
             DefinitionOrigin::ProjectImage { project: "p".into(), commit: "abc".into() },
         ),
         5 => (pairs(&[(PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND)]), BTreeMap::new(), DefinitionOrigin::Snapshot),
+        // The retired bootstrap path rides along on previous-generation declarations and drops.
+        7 => (
+            BTreeMap::new(),
+            pairs(&[
+                (BOOTSTRAP_REPOSITORY_ANNOTATION, "repo"),
+                (BOOTSTRAP_COMMIT_ANNOTATION, "abc"),
+                (DECLARATION_FILE_ANNOTATION, "project.yaml"),
+                (BOOTSTRAP_PATH_ANNOTATION, "/srv/repo"),
+            ]),
+            DefinitionOrigin::ProjectDeclaration { repository: "repo".into(), commit: "abc".into(), file: "project.yaml".into() },
+        ),
+        8 => (pairs(&[(MANAGED_BY_LABEL, WHOLE_REPOSITORY_PROJECT_MANAGER)]), BTreeMap::new(), DefinitionOrigin::WholeRepository),
         _ => unreachable!("{stamp} is not a stamp"),
     }
 }
@@ -260,6 +277,38 @@ fn fleet(tc: &TestCase) -> FleetDesignationSpec {
     }
 }
 
+// The fleet's Projects at the last corpus refresh, each given a drawn parent, charter and
+// charter-store hosts, the columns a read selects by.
+fn project(tc: &TestCase) -> ProjectSpec {
+    let mut spec = pick(tc, &corpus_projects()).spec.clone();
+    spec.parent = maybe(tc, word);
+    spec.charter = maybe(tc, |tc| CharterPointer::Repository { repo: word(tc), branch: "main".into(), path: String::new() });
+    for member in &mut spec.repositories {
+        member.charter_store = maybe(tc, |tc| CharterStoreBinding {
+            host: word(tc),
+            source: CharterSource::LocalDirectory { directory: "/srv/charter".into() },
+        });
+    }
+    if tc.draw(gs::booleans()) {
+        spec.repositories.push(ProjectRepositorySpec::builder().repo(RepositoryKey("second".into())).build());
+    }
+    spec
+}
+
+fn corpus_projects() -> Vec<ResourceObject<Project>> {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../flotilla-store-testkit/tests/fixtures/stored-records/r355/Project.json");
+    let records: Vec<serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(path).expect("corpus")).expect("corpus json");
+    records
+        .into_iter()
+        .enumerate()
+        .map(|(index, record)| ResourceObject {
+            metadata: meta(&format!("project-{index}"), BTreeMap::new(), BTreeMap::new(), 1),
+            spec: serde_json::from_value(record["spec"].clone()).expect("corpus spec"),
+            status: record.get("status").map(|status| serde_json::from_value(status.clone()).expect("corpus status")),
+        })
+        .collect()
+}
+
 /// The shipped templates and stdlib layers: the wide kinds' real documents, under names of their own.
 fn shipped<S: serde::de::DeserializeOwned>(kind: &str) -> Vec<S> {
     builtin_definitions(kind)
@@ -286,7 +335,7 @@ fn imports_with_its_spec_and_origin(tc: &TestCase, stamp: u8) {
     let layers: Vec<ImageLayerResourceSpec> = shipped("ImageLayer");
     let (forge_spec, fleet_spec, credential, grant, defaults) =
         (forge(tc), fleet(tc), credential_spec(tc), credential_grant(tc), crew_defaults(tc));
-    let (template, layer) = (pick(tc, &templates).clone(), pick(tc, &layers).clone());
+    let (template, layer, project_spec) = (pick(tc, &templates).clone(), pick(tc, &layers).clone(), project(tc));
     let copies = DefinitionCopies {
         forges: vec![copy("forge", "alpha", labels.clone(), annotations.clone(), forge_spec.clone())],
         fleet_designations: vec![copy("fleet", "alpha", labels.clone(), annotations.clone(), fleet_spec.clone())],
@@ -295,10 +344,11 @@ fn imports_with_its_spec_and_origin(tc: &TestCase, stamp: u8) {
         crew_defaults: vec![copy("defaults", "alpha", labels.clone(), annotations.clone(), defaults.clone())],
         image_layers: vec![copy("layer", "alpha", labels.clone(), annotations.clone(), layer.clone())],
         workflow_templates: vec![copy("template", "alpha", labels.clone(), annotations.clone(), template.clone())],
+        projects: vec![copy("project", "alpha", labels.clone(), annotations.clone(), project_spec.clone())],
     };
     let report = rehearse_definitions(&copies);
     assert!(report.refused.is_empty(), "{:?}", report.refused);
-    assert_eq!(report.imported.values().sum::<usize>(), 7, "{report:?}");
+    assert_eq!(report.imported.values().sum::<usize>(), 8, "{report:?}");
 
     let mut report = ImportReport::default();
     let forge = only(import_kind::<ForgeDefinition>(&copies.forges, &mut report));
@@ -308,6 +358,7 @@ fn imports_with_its_spec_and_origin(tc: &TestCase, stamp: u8) {
     let defaults_record = only(import_kind::<CrewDefaultsDefinition>(&copies.crew_defaults, &mut report));
     let layer_record = only(import_kind::<ImageLayerDefinition>(&copies.image_layers, &mut report));
     let template_record = only(import_kind::<WorkflowTemplateDefinition>(&copies.workflow_templates, &mut report));
+    let project_record = only(import_kind::<ProjectDefinition>(&copies.projects, &mut report));
     for record_origin in [
         &forge.origin,
         &fleet.origin,
@@ -316,6 +367,7 @@ fn imports_with_its_spec_and_origin(tc: &TestCase, stamp: u8) {
         &defaults_record.origin,
         &layer_record.origin,
         &template_record.origin,
+        &project_record.origin,
     ] {
         assert_eq!(record_origin, &origin);
     }
@@ -326,6 +378,16 @@ fn imports_with_its_spec_and_origin(tc: &TestCase, stamp: u8) {
     assert_eq!(defaults_record.spec(), defaults);
     assert_eq!(Some(layer_record.spec()), layer.current());
     assert_eq!(template_record.spec(), &template);
+    assert_eq!(project_record.spec(), &project_spec);
+    let members = project_spec
+        .repositories
+        .iter()
+        .map(|member| (member.repo.0.clone(), member.charter_store.as_ref().map(|store| store.host.clone())));
+    assert_eq!((project_record.parent.clone(), project_record.chartered), (project_spec.parent.clone(), project_spec.charter.is_some()));
+    assert_eq!(
+        project_record.repositories.iter().map(|(key, member)| (key.clone(), member.charter_host.clone())).collect::<Vec<_>>(),
+        members.collect::<BTreeMap<_, _>>().into_iter().collect::<Vec<_>>()
+    );
 }
 
 fn only<S>(imported: Vec<ImportedDefinition<S>>) -> S {
@@ -444,4 +506,75 @@ fn the_import_carries_each_definition_to_the_homes_that_declare_it() {
     let report = rehearse_definitions(&copies);
     assert!(report.imported.is_empty() && report.refused.is_empty(), "{report:?}");
     assert_eq!(report.dropped.values().sum::<usize>(), 3, "{:?}", report.dropped);
+}
+
+// Behaviour (#3824 layer 3b plan, the Project import's table): every Project the fleet held
+// imports, and project operations' conditions in each copy's status become a ProjectOps record at
+// that copy's home, beside a Project that imports; the dispatch queue drops, being recomputed; a
+// declaration stamp wins over a whole-repository label left from before the registration; a spec
+// naming one repository twice is refused, and so are the ops beside it.
+#[test]
+fn project_operations_status_imports_beside_its_project() {
+    let corpus = corpus_projects();
+    let held = corpus.iter().filter(|project| project.status.as_ref().and_then(ProjectOpsRecord::from_status).is_some()).count();
+    assert!(held > 0, "the corpus holds project operations' status");
+    let copies = DefinitionCopies {
+        projects: corpus
+            .iter()
+            .map(|object| DefinitionCopy { namespace: "flotilla".into(), object: object.clone(), home: "alpha".into() })
+            .collect(),
+        ..Default::default()
+    };
+    let report = rehearse_definitions(&copies);
+    assert!(report.refused.is_empty(), "{report:?}");
+    assert_eq!(report.imported.get(&("Project", "operator")), Some(&corpus.len()), "{report:?}");
+    assert_eq!(report.imported.get(&("ProjectOps", "observed")), Some(&held), "{report:?}");
+
+    let refused =
+        DeclarationRefusedCondition { entry_path: "project.yaml".into(), message: "bad".into(), since: at(5), observed_at: at(6) };
+    let status = ProjectStatus {
+        declaration_refused: Some(refused),
+        operational_entries: Some(OperationalEntriesCondition { ready: false, message: "waiting".into() }),
+        dispatch_queue_attention: Some(DispatchQueueAttention {
+            count: 1,
+            oldest_ready_observed_at: at(1),
+            stale_since: at(2),
+            observed_at: at(3),
+        }),
+        ..Default::default()
+    };
+    let (labels, mut annotations, _) = provenance(7);
+    let mut both = labels.clone();
+    both.insert(MANAGED_BY_LABEL.into(), WHOLE_REPOSITORY_PROJECT_MANAGER.into());
+    annotations.remove(BOOTSTRAP_PATH_ANNOTATION);
+    let mut declared = copy::<Project>("declared", "beta", both, annotations, corpus[0].spec.clone());
+    declared.object.status = Some(status.clone());
+    let mut twice = copy::<Project>("twice", "beta", BTreeMap::new(), BTreeMap::new(), corpus[0].spec.clone());
+    twice.object.spec.repositories.push(twice.object.spec.repositories[0].clone());
+    twice.object.status = Some(status);
+    let copies = DefinitionCopies { projects: vec![declared, twice], ..Default::default() };
+    let report = rehearse_definitions(&copies);
+    assert_eq!(report.imported.get(&("Project", "project-declaration")), Some(&1), "{report:?}");
+    assert_eq!(report.refused.iter().map(|refusal| refusal.record.as_str()).collect::<Vec<_>>(), ["twice"], "{report:?}");
+    assert_eq!(report.dropped.get(&("ProjectOps", "dispatch queue, recomputed")), Some(&2), "{report:?}");
+    assert_eq!(report.dropped.get(&("ProjectOps", "its Project does not import")), Some(&1), "{report:?}");
+
+    let mut report = ImportReport::default();
+    let imported = BTreeSet::from([("flotilla".to_owned(), "declared".to_owned())]);
+    let [ops] = <[_; 1]>::try_from(flotilla_provisioning::engine::project_import::import_ops(&copies.projects, &imported, &mut report))
+        .ok()
+        .expect("one record");
+    assert_eq!((ops.name.as_str(), ops.home.as_str()), ("declared", "beta"));
+    assert_eq!(
+        ops.record,
+        ProjectOpsRecord {
+            refused: Some(DeclarationRefusal {
+                entry_path: "project.yaml".into(),
+                message: "bad".into(),
+                since: flotilla_schema::Timestamp::from_datetime(&at(5)),
+                observed_at: flotilla_schema::Timestamp::from_datetime(&at(6)),
+            }),
+            entries: Some(EntriesReadiness { ready: false, message: "waiting".into() }),
+        }
+    );
 }

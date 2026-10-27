@@ -13,6 +13,9 @@
 //! | Declared by a manifest at one or more homes | one record at each declaring home |
 //! | Declared by none | one record at the home that created it; the other copies fold into it |
 //!
+//! Project (layer 3b) imports alike, with its project operations' status as records of their own
+//! ([`super::project_import`]).
+//!
 //! Each record's [`DefinitionOrigin`] comes from its own home's copy: the labels and annotations
 //! its writer stamped. A copy that names an origin but lacks one of its fields is refused. The
 //! manifest's baseline and last-applied hashes are not carried: the ManifestRoot import (layer 2c)
@@ -26,15 +29,21 @@ use flotilla_engine_store::Rehearsal;
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
     builtins::is_builtin, definitions::declares, CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer,
-    ImageLayerResourceSpec, ObjectMeta, Resource, ResourceObject, WorkflowTemplate, WorkflowTemplateSpec,
+    ImageLayerResourceSpec, ObjectMeta, Project, Resource, ResourceObject, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use flotilla_schema::Kind;
 use flotilla_store::{definition_is_live, merge_definition_copies};
 
-use super::import::{ImportRefusal, ImportReport};
-use crate::stored::definition::{
-    self as stored, CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition, DefinitionOrigin,
-    FleetDesignationDefinition, ForgeDefinition, ImageLayerDefinition, WorkflowTemplateDefinition,
+use super::{
+    import::{ImportRefusal, ImportReport},
+    project_import::rehearse_project_ops,
+};
+use crate::stored::{
+    definition::{
+        self as stored, CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition, DefinitionOrigin,
+        FleetDesignationDefinition, ForgeDefinition, ImageLayerDefinition, WorkflowTemplateDefinition,
+    },
+    project::{self, ProjectDefinition},
 };
 
 /// One old copy of a definition: its namespace, the object, and the home that wrote it.
@@ -109,14 +118,17 @@ pub struct DefinitionCopies {
     pub crew_defaults: Vec<DefinitionCopy<CrewDefaults>>,
     pub image_layers: Vec<DefinitionCopy<ImageLayer>>,
     pub workflow_templates: Vec<DefinitionCopy<WorkflowTemplate>>,
+    /// Project (layer 3b), with its ProjectOps records from the copies' statuses.
+    pub projects: Vec<DefinitionCopy<Project>>,
 }
 
 /// Maps every copy in `copies` onto the engine, restores each record into one temporary store
-/// holding the definition kinds, reads it back, and reports counts by kind and origin, the drops
-/// by kind and reason, and each refusal.
+/// holding the definition kinds and Project's, reads it back, and reports counts by kind and
+/// origin, the drops by kind and reason, and each refusal.
 pub fn rehearse_definitions(copies: &DefinitionCopies) -> ImportReport {
     let mut report = ImportReport::default();
-    let mut rehearsal = match stored::registry().map_err(|error| format!("registry: {error:?}")).and_then(Rehearsal::open) {
+    let registry = stored::registry().and_then(|mut registry| project::register(&mut registry).map(|()| registry));
+    let mut rehearsal = match registry.map_err(|error| format!("registry: {error:?}")).and_then(Rehearsal::open) {
         Ok(rehearsal) => rehearsal,
         Err(reason) => {
             report.refused.push(ImportRefusal { kind: "definitions", record: "<all>".to_owned(), reason });
@@ -130,6 +142,8 @@ pub fn rehearse_definitions(copies: &DefinitionCopies) -> ImportReport {
     rehearse_kind::<CrewDefaultsDefinition>(&copies.crew_defaults, &mut rehearsal, &mut report);
     rehearse_kind::<ImageLayerDefinition>(&copies.image_layers, &mut rehearsal, &mut report);
     rehearse_kind::<WorkflowTemplateDefinition>(&copies.workflow_templates, &mut rehearsal, &mut report);
+    let projects = rehearse_kind::<ProjectDefinition>(&copies.projects, &mut rehearsal, &mut report);
+    rehearse_project_ops(&copies.projects, &projects, &mut rehearsal, &mut report);
     report
 }
 
@@ -254,19 +268,29 @@ where
     imported
 }
 
-fn rehearse_kind<D: DefinitionKind>(copies: &[DefinitionCopy<D::Old>], rehearsal: &mut Rehearsal, report: &mut ImportReport)
+/// Restores the records `copies` import to, and returns the `(namespace, name)` of each restored.
+fn rehearse_kind<D: DefinitionKind>(
+    copies: &[DefinitionCopy<D::Old>],
+    rehearsal: &mut Rehearsal,
+    report: &mut ImportReport,
+) -> BTreeSet<(String, String)>
 where
     D::Stored: OriginOf,
     ResourceObject<D::Old>: Clone,
 {
     let kind = <D::Stored as Kind>::KIND;
+    let mut restored = BTreeSet::new();
     for imported in import_kind::<D>(copies, report) {
         // Version 1: each record starts at its home as a fresh write, its old versions not carried.
         match rehearsal.restore(&imported.home, &imported.name, 1, &imported.record) {
-            Ok(()) => *report.imported.entry((kind, label(imported.record.origin()))).or_default() += 1,
+            Ok(()) => {
+                *report.imported.entry((kind, label(imported.record.origin()))).or_default() += 1;
+                restored.insert((imported.namespace, imported.name));
+            }
             Err(reason) => report.refused.push(ImportRefusal { kind, record: imported.name, reason }),
         }
     }
+    restored
 }
 
 /// A definition record's origin, for the report.
@@ -290,7 +314,8 @@ origin_of!(
     CredentialGrantDefinition,
     CrewDefaultsDefinition,
     ImageLayerDefinition,
-    WorkflowTemplateDefinition
+    WorkflowTemplateDefinition,
+    ProjectDefinition
 );
 
 /// An origin's label, as the report counts it.
@@ -301,6 +326,8 @@ pub fn label(origin: &DefinitionOrigin) -> &'static str {
         DefinitionOrigin::ProjectOps { .. } => "project-ops",
         DefinitionOrigin::ProjectImage { .. } => "project-image",
         DefinitionOrigin::Snapshot => "snapshot",
+        DefinitionOrigin::ProjectDeclaration { .. } => "project-declaration",
+        DefinitionOrigin::WholeRepository => "whole-repository",
     }
 }
 

@@ -40,7 +40,7 @@ CREATE TABLE codes (
 CREATE TABLE "credential_spec" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
-  "origin" TEXT NOT NULL CHECK ("origin" IN ('mf', 'op', 'pi', 'po', 'sn')),
+  "origin" TEXT NOT NULL CHECK ("origin" IN ('mf', 'op', 'pd', 'pi', 'po', 'sn', 'wr')),
   "origin_root" TEXT,
   "origin_source" TEXT,
   "origin_path" TEXT,
@@ -53,6 +53,7 @@ CREATE TABLE "credential_spec" (
   "origin_repository" TEXT,
   "origin_commit" TEXT,
   "origin_entry_path" TEXT,
+  "origin_file" TEXT,
   "consumer" TEXT NOT NULL CHECK ("consumer" IN ('cl', 'co', 'cx', 'dr', 'fj', 'ga', 'gh', 'gt', 'rb')),
   "consumer_actor_login" TEXT,
   "consumer_installation_id" INTEGER,
@@ -97,6 +98,7 @@ CREATE TABLE "credential_spec" (
       AND "origin_repository" IS NULL
       AND "origin_commit" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'mf'
       THEN "origin_root" IS NOT NULL
@@ -107,6 +109,7 @@ CREATE TABLE "credential_spec" (
       AND "origin_repository" IS NULL
       AND "origin_commit" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'po'
       THEN "origin_project" IS NOT NULL
@@ -121,6 +124,7 @@ CREATE TABLE "credential_spec" (
       AND "origin_charter_revision" IS NULL
       AND "origin_charter_scope" IS NULL
       AND "origin_materialized_project" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'pi'
       THEN "origin_project" IS NOT NULL
@@ -135,6 +139,7 @@ CREATE TABLE "credential_spec" (
       AND "origin_materialized_project" IS NULL
       AND "origin_repository" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'sn'
       THEN "origin_root" IS NULL
@@ -149,6 +154,37 @@ CREATE TABLE "credential_spec" (
       AND "origin_repository" IS NULL
       AND "origin_commit" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
+      END),
+  CHECK (CASE WHEN "origin" = 'pd'
+      THEN "origin_repository" IS NOT NULL
+      AND "origin_commit" IS NOT NULL
+      AND "origin_file" IS NOT NULL
+      AND "origin_root" IS NULL
+      AND "origin_source" IS NULL
+      AND "origin_path" IS NULL
+      AND "origin_revision" IS NULL
+      AND "origin_charter_source" IS NULL
+      AND "origin_charter_revision" IS NULL
+      AND "origin_charter_scope" IS NULL
+      AND "origin_materialized_project" IS NULL
+      AND "origin_project" IS NULL
+      AND "origin_entry_path" IS NULL
+      END),
+  CHECK (CASE WHEN "origin" = 'wr'
+      THEN "origin_root" IS NULL
+      AND "origin_source" IS NULL
+      AND "origin_path" IS NULL
+      AND "origin_revision" IS NULL
+      AND "origin_charter_source" IS NULL
+      AND "origin_charter_revision" IS NULL
+      AND "origin_charter_scope" IS NULL
+      AND "origin_materialized_project" IS NULL
+      AND "origin_project" IS NULL
+      AND "origin_repository" IS NULL
+      AND "origin_commit" IS NULL
+      AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "consumer" = 'gh'
       THEN "consumer_actor_login" IS NULL
@@ -342,9 +378,11 @@ CREATE TABLE "credential_spec_binaries" (
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cp', 'origin', 'mf', 'Manifest'),
   ('cp', 'origin', 'op', 'Operator'),
+  ('cp', 'origin', 'pd', 'ProjectDeclaration'),
   ('cp', 'origin', 'pi', 'ProjectImage'),
   ('cp', 'origin', 'po', 'ProjectOps'),
   ('cp', 'origin', 'sn', 'Snapshot'),
+  ('cp', 'origin', 'wr', 'WholeRepository'),
   ('cp', 'consumer', 'cl', 'Claude'),
   ('cp', 'consumer', 'co', 'ClaudeOauth'),
   ('cp', 'consumer', 'cx', 'Codex'),
@@ -377,6 +415,7 @@ CREATE VIEW "credential_spec_view" AS SELECT
   "credential_spec"."origin_repository",
   "credential_spec"."origin_commit",
   "credential_spec"."origin_entry_path",
+  "credential_spec"."origin_file",
   (SELECT "name" FROM "codes" WHERE "kind" = 'cp' AND "field" = 'consumer' AND "code" = "credential_spec"."consumer") AS "consumer",
   "credential_spec"."consumer_actor_login",
   "credential_spec"."consumer_installation_id",
@@ -410,7 +449,7 @@ FROM "credential_spec_binaries";
 CREATE TABLE "crew_defaults" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
-  "origin" TEXT NOT NULL CHECK ("origin" IN ('mf', 'op', 'pi', 'po', 'sn')),
+  "origin" TEXT NOT NULL CHECK ("origin" IN ('mf', 'op', 'pd', 'pi', 'po', 'sn', 'wr')),
   "origin_root" TEXT,
   "origin_source" TEXT,
   "origin_path" TEXT,
@@ -423,6 +462,7 @@ CREATE TABLE "crew_defaults" (
   "origin_repository" TEXT,
   "origin_commit" TEXT,
   "origin_entry_path" TEXT,
+  "origin_file" TEXT,
   "project_ref" TEXT,
   "default_workflow_ref" TEXT,
   "skills" BLOB NOT NULL,
@@ -446,6 +486,7 @@ CREATE TABLE "crew_defaults" (
       AND "origin_repository" IS NULL
       AND "origin_commit" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'mf'
       THEN "origin_root" IS NOT NULL
@@ -456,6 +497,7 @@ CREATE TABLE "crew_defaults" (
       AND "origin_repository" IS NULL
       AND "origin_commit" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'po'
       THEN "origin_project" IS NOT NULL
@@ -470,6 +512,7 @@ CREATE TABLE "crew_defaults" (
       AND "origin_charter_revision" IS NULL
       AND "origin_charter_scope" IS NULL
       AND "origin_materialized_project" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'pi'
       THEN "origin_project" IS NOT NULL
@@ -484,6 +527,7 @@ CREATE TABLE "crew_defaults" (
       AND "origin_materialized_project" IS NULL
       AND "origin_repository" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'sn'
       THEN "origin_root" IS NULL
@@ -498,6 +542,37 @@ CREATE TABLE "crew_defaults" (
       AND "origin_repository" IS NULL
       AND "origin_commit" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
+      END),
+  CHECK (CASE WHEN "origin" = 'pd'
+      THEN "origin_repository" IS NOT NULL
+      AND "origin_commit" IS NOT NULL
+      AND "origin_file" IS NOT NULL
+      AND "origin_root" IS NULL
+      AND "origin_source" IS NULL
+      AND "origin_path" IS NULL
+      AND "origin_revision" IS NULL
+      AND "origin_charter_source" IS NULL
+      AND "origin_charter_revision" IS NULL
+      AND "origin_charter_scope" IS NULL
+      AND "origin_materialized_project" IS NULL
+      AND "origin_project" IS NULL
+      AND "origin_entry_path" IS NULL
+      END),
+  CHECK (CASE WHEN "origin" = 'wr'
+      THEN "origin_root" IS NULL
+      AND "origin_source" IS NULL
+      AND "origin_path" IS NULL
+      AND "origin_revision" IS NULL
+      AND "origin_charter_source" IS NULL
+      AND "origin_charter_revision" IS NULL
+      AND "origin_charter_scope" IS NULL
+      AND "origin_materialized_project" IS NULL
+      AND "origin_project" IS NULL
+      AND "origin_repository" IS NULL
+      AND "origin_commit" IS NULL
+      AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END)
 ) STRICT;
 CREATE TABLE "crew_defaults_roles" (
@@ -516,9 +591,11 @@ CREATE TABLE "crew_defaults_roles" (
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('dc', 'origin', 'mf', 'Manifest'),
   ('dc', 'origin', 'op', 'Operator'),
+  ('dc', 'origin', 'pd', 'ProjectDeclaration'),
   ('dc', 'origin', 'pi', 'ProjectImage'),
   ('dc', 'origin', 'po', 'ProjectOps'),
-  ('dc', 'origin', 'sn', 'Snapshot');
+  ('dc', 'origin', 'sn', 'Snapshot'),
+  ('dc', 'origin', 'wr', 'WholeRepository');
 CREATE VIEW "crew_defaults_view" AS SELECT
   "crew_defaults"."id",
   "crew_defaults"."version",
@@ -535,6 +612,7 @@ CREATE VIEW "crew_defaults_view" AS SELECT
   "crew_defaults"."origin_repository",
   "crew_defaults"."origin_commit",
   "crew_defaults"."origin_entry_path",
+  "crew_defaults"."origin_file",
   "crew_defaults"."project_ref",
   "crew_defaults"."default_workflow_ref",
   "crew_defaults"."skills",
@@ -554,7 +632,7 @@ FROM "crew_defaults_roles";
 CREATE TABLE "fleet_designation" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
-  "origin" TEXT NOT NULL CHECK ("origin" IN ('mf', 'op', 'pi', 'po', 'sn')),
+  "origin" TEXT NOT NULL CHECK ("origin" IN ('mf', 'op', 'pd', 'pi', 'po', 'sn', 'wr')),
   "origin_root" TEXT,
   "origin_source" TEXT,
   "origin_path" TEXT,
@@ -567,6 +645,7 @@ CREATE TABLE "fleet_designation" (
   "origin_repository" TEXT,
   "origin_commit" TEXT,
   "origin_entry_path" TEXT,
+  "origin_file" TEXT,
   "fleet" TEXT,
   "project" TEXT NOT NULL,
   "image_cache_repository" TEXT,
@@ -591,6 +670,7 @@ CREATE TABLE "fleet_designation" (
       AND "origin_repository" IS NULL
       AND "origin_commit" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'mf'
       THEN "origin_root" IS NOT NULL
@@ -601,6 +681,7 @@ CREATE TABLE "fleet_designation" (
       AND "origin_repository" IS NULL
       AND "origin_commit" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'po'
       THEN "origin_project" IS NOT NULL
@@ -615,6 +696,7 @@ CREATE TABLE "fleet_designation" (
       AND "origin_charter_revision" IS NULL
       AND "origin_charter_scope" IS NULL
       AND "origin_materialized_project" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'pi'
       THEN "origin_project" IS NOT NULL
@@ -629,6 +711,7 @@ CREATE TABLE "fleet_designation" (
       AND "origin_materialized_project" IS NULL
       AND "origin_repository" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'sn'
       THEN "origin_root" IS NULL
@@ -643,6 +726,37 @@ CREATE TABLE "fleet_designation" (
       AND "origin_repository" IS NULL
       AND "origin_commit" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
+      END),
+  CHECK (CASE WHEN "origin" = 'pd'
+      THEN "origin_repository" IS NOT NULL
+      AND "origin_commit" IS NOT NULL
+      AND "origin_file" IS NOT NULL
+      AND "origin_root" IS NULL
+      AND "origin_source" IS NULL
+      AND "origin_path" IS NULL
+      AND "origin_revision" IS NULL
+      AND "origin_charter_source" IS NULL
+      AND "origin_charter_revision" IS NULL
+      AND "origin_charter_scope" IS NULL
+      AND "origin_materialized_project" IS NULL
+      AND "origin_project" IS NULL
+      AND "origin_entry_path" IS NULL
+      END),
+  CHECK (CASE WHEN "origin" = 'wr'
+      THEN "origin_root" IS NULL
+      AND "origin_source" IS NULL
+      AND "origin_path" IS NULL
+      AND "origin_revision" IS NULL
+      AND "origin_charter_source" IS NULL
+      AND "origin_charter_revision" IS NULL
+      AND "origin_charter_scope" IS NULL
+      AND "origin_materialized_project" IS NULL
+      AND "origin_project" IS NULL
+      AND "origin_repository" IS NULL
+      AND "origin_commit" IS NULL
+      AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "image_cache_repository" IS NOT NULL
       THEN "image_cache_pull_credential" IS NOT NULL
@@ -654,9 +768,11 @@ CREATE TABLE "fleet_designation" (
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('fl', 'origin', 'mf', 'Manifest'),
   ('fl', 'origin', 'op', 'Operator'),
+  ('fl', 'origin', 'pd', 'ProjectDeclaration'),
   ('fl', 'origin', 'pi', 'ProjectImage'),
   ('fl', 'origin', 'po', 'ProjectOps'),
-  ('fl', 'origin', 'sn', 'Snapshot');
+  ('fl', 'origin', 'sn', 'Snapshot'),
+  ('fl', 'origin', 'wr', 'WholeRepository');
 CREATE VIEW "fleet_designation_view" AS SELECT
   "fleet_designation"."id",
   "fleet_designation"."version",
@@ -673,6 +789,7 @@ CREATE VIEW "fleet_designation_view" AS SELECT
   "fleet_designation"."origin_repository",
   "fleet_designation"."origin_commit",
   "fleet_designation"."origin_entry_path",
+  "fleet_designation"."origin_file",
   "fleet_designation"."fleet",
   "fleet_designation"."project",
   "fleet_designation"."image_cache_repository",
@@ -682,7 +799,7 @@ FROM "fleet_designation";
 CREATE TABLE "forge" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
-  "origin" TEXT NOT NULL CHECK ("origin" IN ('mf', 'op', 'pi', 'po', 'sn')),
+  "origin" TEXT NOT NULL CHECK ("origin" IN ('mf', 'op', 'pd', 'pi', 'po', 'sn', 'wr')),
   "origin_root" TEXT,
   "origin_source" TEXT,
   "origin_path" TEXT,
@@ -695,6 +812,7 @@ CREATE TABLE "forge" (
   "origin_repository" TEXT,
   "origin_commit" TEXT,
   "origin_entry_path" TEXT,
+  "origin_file" TEXT,
   "forge_id" TEXT NOT NULL,
   "forge_kind" TEXT NOT NULL CHECK ("forge_kind" IN ('fj', 'gh')),
   "https_url" TEXT NOT NULL,
@@ -718,6 +836,7 @@ CREATE TABLE "forge" (
       AND "origin_repository" IS NULL
       AND "origin_commit" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'mf'
       THEN "origin_root" IS NOT NULL
@@ -728,6 +847,7 @@ CREATE TABLE "forge" (
       AND "origin_repository" IS NULL
       AND "origin_commit" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'po'
       THEN "origin_project" IS NOT NULL
@@ -742,6 +862,7 @@ CREATE TABLE "forge" (
       AND "origin_charter_revision" IS NULL
       AND "origin_charter_scope" IS NULL
       AND "origin_materialized_project" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'pi'
       THEN "origin_project" IS NOT NULL
@@ -756,6 +877,7 @@ CREATE TABLE "forge" (
       AND "origin_materialized_project" IS NULL
       AND "origin_repository" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'sn'
       THEN "origin_root" IS NULL
@@ -770,6 +892,37 @@ CREATE TABLE "forge" (
       AND "origin_repository" IS NULL
       AND "origin_commit" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
+      END),
+  CHECK (CASE WHEN "origin" = 'pd'
+      THEN "origin_repository" IS NOT NULL
+      AND "origin_commit" IS NOT NULL
+      AND "origin_file" IS NOT NULL
+      AND "origin_root" IS NULL
+      AND "origin_source" IS NULL
+      AND "origin_path" IS NULL
+      AND "origin_revision" IS NULL
+      AND "origin_charter_source" IS NULL
+      AND "origin_charter_revision" IS NULL
+      AND "origin_charter_scope" IS NULL
+      AND "origin_materialized_project" IS NULL
+      AND "origin_project" IS NULL
+      AND "origin_entry_path" IS NULL
+      END),
+  CHECK (CASE WHEN "origin" = 'wr'
+      THEN "origin_root" IS NULL
+      AND "origin_source" IS NULL
+      AND "origin_path" IS NULL
+      AND "origin_revision" IS NULL
+      AND "origin_charter_source" IS NULL
+      AND "origin_charter_revision" IS NULL
+      AND "origin_charter_scope" IS NULL
+      AND "origin_materialized_project" IS NULL
+      AND "origin_project" IS NULL
+      AND "origin_repository" IS NULL
+      AND "origin_commit" IS NULL
+      AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END)
 ) STRICT;
 CREATE TABLE "forge_hosts" (
@@ -781,9 +934,11 @@ CREATE TABLE "forge_hosts" (
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('fo', 'origin', 'mf', 'Manifest'),
   ('fo', 'origin', 'op', 'Operator'),
+  ('fo', 'origin', 'pd', 'ProjectDeclaration'),
   ('fo', 'origin', 'pi', 'ProjectImage'),
   ('fo', 'origin', 'po', 'ProjectOps'),
   ('fo', 'origin', 'sn', 'Snapshot'),
+  ('fo', 'origin', 'wr', 'WholeRepository'),
   ('fo', 'forge_kind', 'fj', 'Forgejo'),
   ('fo', 'forge_kind', 'gh', 'Github');
 CREATE VIEW "forge_view" AS SELECT
@@ -802,6 +957,7 @@ CREATE VIEW "forge_view" AS SELECT
   "forge"."origin_repository",
   "forge"."origin_commit",
   "forge"."origin_entry_path",
+  "forge"."origin_file",
   "forge"."forge_id",
   (SELECT "name" FROM "codes" WHERE "kind" = 'fo' AND "field" = 'forge_kind' AND "code" = "forge"."forge_kind") AS "forge_kind",
   "forge"."https_url",
@@ -814,7 +970,7 @@ FROM "forge_hosts";
 CREATE TABLE "credential_grant" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
-  "origin" TEXT NOT NULL CHECK ("origin" IN ('mf', 'op', 'pi', 'po', 'sn')),
+  "origin" TEXT NOT NULL CHECK ("origin" IN ('mf', 'op', 'pd', 'pi', 'po', 'sn', 'wr')),
   "origin_root" TEXT,
   "origin_source" TEXT,
   "origin_path" TEXT,
@@ -827,6 +983,7 @@ CREATE TABLE "credential_grant" (
   "origin_repository" TEXT,
   "origin_commit" TEXT,
   "origin_entry_path" TEXT,
+  "origin_file" TEXT,
   "host_action" TEXT CHECK ("host_action" IN ('bs', 'pl', 'ps')),
   "repository_trust" TEXT CHECK ("repository_trust" IN ('fk', 'ow')),
   "permissions" BLOB NOT NULL,
@@ -849,6 +1006,7 @@ CREATE TABLE "credential_grant" (
       AND "origin_repository" IS NULL
       AND "origin_commit" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'mf'
       THEN "origin_root" IS NOT NULL
@@ -859,6 +1017,7 @@ CREATE TABLE "credential_grant" (
       AND "origin_repository" IS NULL
       AND "origin_commit" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'po'
       THEN "origin_project" IS NOT NULL
@@ -873,6 +1032,7 @@ CREATE TABLE "credential_grant" (
       AND "origin_charter_revision" IS NULL
       AND "origin_charter_scope" IS NULL
       AND "origin_materialized_project" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'pi'
       THEN "origin_project" IS NOT NULL
@@ -887,6 +1047,7 @@ CREATE TABLE "credential_grant" (
       AND "origin_materialized_project" IS NULL
       AND "origin_repository" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'sn'
       THEN "origin_root" IS NULL
@@ -901,6 +1062,37 @@ CREATE TABLE "credential_grant" (
       AND "origin_repository" IS NULL
       AND "origin_commit" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
+      END),
+  CHECK (CASE WHEN "origin" = 'pd'
+      THEN "origin_repository" IS NOT NULL
+      AND "origin_commit" IS NOT NULL
+      AND "origin_file" IS NOT NULL
+      AND "origin_root" IS NULL
+      AND "origin_source" IS NULL
+      AND "origin_path" IS NULL
+      AND "origin_revision" IS NULL
+      AND "origin_charter_source" IS NULL
+      AND "origin_charter_revision" IS NULL
+      AND "origin_charter_scope" IS NULL
+      AND "origin_materialized_project" IS NULL
+      AND "origin_project" IS NULL
+      AND "origin_entry_path" IS NULL
+      END),
+  CHECK (CASE WHEN "origin" = 'wr'
+      THEN "origin_root" IS NULL
+      AND "origin_source" IS NULL
+      AND "origin_path" IS NULL
+      AND "origin_revision" IS NULL
+      AND "origin_charter_source" IS NULL
+      AND "origin_charter_revision" IS NULL
+      AND "origin_charter_scope" IS NULL
+      AND "origin_materialized_project" IS NULL
+      AND "origin_project" IS NULL
+      AND "origin_repository" IS NULL
+      AND "origin_commit" IS NULL
+      AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END)
 ) STRICT;
 CREATE TABLE "credential_grant_host_action_hosts" (
@@ -953,9 +1145,11 @@ CREATE TABLE "credential_grant_landing_credentials" (
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('gt', 'origin', 'mf', 'Manifest'),
   ('gt', 'origin', 'op', 'Operator'),
+  ('gt', 'origin', 'pd', 'ProjectDeclaration'),
   ('gt', 'origin', 'pi', 'ProjectImage'),
   ('gt', 'origin', 'po', 'ProjectOps'),
   ('gt', 'origin', 'sn', 'Snapshot'),
+  ('gt', 'origin', 'wr', 'WholeRepository'),
   ('gt', 'host_action', 'bs', 'ImageBuildSecret'),
   ('gt', 'host_action', 'pl', 'ImagePull'),
   ('gt', 'host_action', 'ps', 'ImagePush'),
@@ -979,6 +1173,7 @@ CREATE VIEW "credential_grant_view" AS SELECT
   "credential_grant"."origin_repository",
   "credential_grant"."origin_commit",
   "credential_grant"."origin_entry_path",
+  "credential_grant"."origin_file",
   (SELECT "name" FROM "codes" WHERE "kind" = 'gt' AND "field" = 'host_action' AND "code" = "credential_grant"."host_action") AS "host_action",
   (SELECT "name" FROM "codes" WHERE "kind" = 'gt' AND "field" = 'repository_trust' AND "code" = "credential_grant"."repository_trust") AS "repository_trust",
   "credential_grant"."permissions"
@@ -1013,7 +1208,7 @@ FROM "credential_grant_landing_credentials";
 CREATE TABLE "image_layer" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
-  "origin" TEXT NOT NULL CHECK ("origin" IN ('mf', 'op', 'pi', 'po', 'sn')),
+  "origin" TEXT NOT NULL CHECK ("origin" IN ('mf', 'op', 'pd', 'pi', 'po', 'sn', 'wr')),
   "origin_root" TEXT,
   "origin_source" TEXT,
   "origin_path" TEXT,
@@ -1026,6 +1221,7 @@ CREATE TABLE "image_layer" (
   "origin_repository" TEXT,
   "origin_commit" TEXT,
   "origin_entry_path" TEXT,
+  "origin_file" TEXT,
   "layer" TEXT NOT NULL,
   "layer_version" TEXT NOT NULL,
   "tier" TEXT NOT NULL CHECK ("tier" IN ('ar', 'ba', 'pr', 'sh')),
@@ -1051,6 +1247,7 @@ CREATE TABLE "image_layer" (
       AND "origin_repository" IS NULL
       AND "origin_commit" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'mf'
       THEN "origin_root" IS NOT NULL
@@ -1061,6 +1258,7 @@ CREATE TABLE "image_layer" (
       AND "origin_repository" IS NULL
       AND "origin_commit" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'po'
       THEN "origin_project" IS NOT NULL
@@ -1075,6 +1273,7 @@ CREATE TABLE "image_layer" (
       AND "origin_charter_revision" IS NULL
       AND "origin_charter_scope" IS NULL
       AND "origin_materialized_project" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'pi'
       THEN "origin_project" IS NOT NULL
@@ -1089,6 +1288,7 @@ CREATE TABLE "image_layer" (
       AND "origin_materialized_project" IS NULL
       AND "origin_repository" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'sn'
       THEN "origin_root" IS NULL
@@ -1103,6 +1303,37 @@ CREATE TABLE "image_layer" (
       AND "origin_repository" IS NULL
       AND "origin_commit" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
+      END),
+  CHECK (CASE WHEN "origin" = 'pd'
+      THEN "origin_repository" IS NOT NULL
+      AND "origin_commit" IS NOT NULL
+      AND "origin_file" IS NOT NULL
+      AND "origin_root" IS NULL
+      AND "origin_source" IS NULL
+      AND "origin_path" IS NULL
+      AND "origin_revision" IS NULL
+      AND "origin_charter_source" IS NULL
+      AND "origin_charter_revision" IS NULL
+      AND "origin_charter_scope" IS NULL
+      AND "origin_materialized_project" IS NULL
+      AND "origin_project" IS NULL
+      AND "origin_entry_path" IS NULL
+      END),
+  CHECK (CASE WHEN "origin" = 'wr'
+      THEN "origin_root" IS NULL
+      AND "origin_source" IS NULL
+      AND "origin_path" IS NULL
+      AND "origin_revision" IS NULL
+      AND "origin_charter_source" IS NULL
+      AND "origin_charter_revision" IS NULL
+      AND "origin_charter_scope" IS NULL
+      AND "origin_materialized_project" IS NULL
+      AND "origin_project" IS NULL
+      AND "origin_repository" IS NULL
+      AND "origin_commit" IS NULL
+      AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END)
 ) STRICT;
 CREATE TABLE "image_layer_provides" (
@@ -1114,9 +1345,11 @@ CREATE TABLE "image_layer_provides" (
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('il', 'origin', 'mf', 'Manifest'),
   ('il', 'origin', 'op', 'Operator'),
+  ('il', 'origin', 'pd', 'ProjectDeclaration'),
   ('il', 'origin', 'pi', 'ProjectImage'),
   ('il', 'origin', 'po', 'ProjectOps'),
   ('il', 'origin', 'sn', 'Snapshot'),
+  ('il', 'origin', 'wr', 'WholeRepository'),
   ('il', 'tier', 'ar', 'AgentRuntime'),
   ('il', 'tier', 'ba', 'Base'),
   ('il', 'tier', 'pr', 'Project'),
@@ -1140,6 +1373,7 @@ CREATE VIEW "image_layer_view" AS SELECT
   "image_layer"."origin_repository",
   "image_layer"."origin_commit",
   "image_layer"."origin_entry_path",
+  "image_layer"."origin_file",
   "image_layer"."layer",
   "image_layer"."layer_version",
   (SELECT "name" FROM "codes" WHERE "kind" = 'il' AND "field" = 'tier' AND "code" = "image_layer"."tier") AS "tier",
@@ -1154,7 +1388,7 @@ FROM "image_layer_provides";
 CREATE TABLE "workflow_template" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
-  "origin" TEXT NOT NULL CHECK ("origin" IN ('mf', 'op', 'pi', 'po', 'sn')),
+  "origin" TEXT NOT NULL CHECK ("origin" IN ('mf', 'op', 'pd', 'pi', 'po', 'sn', 'wr')),
   "origin_root" TEXT,
   "origin_source" TEXT,
   "origin_path" TEXT,
@@ -1167,6 +1401,7 @@ CREATE TABLE "workflow_template" (
   "origin_repository" TEXT,
   "origin_commit" TEXT,
   "origin_entry_path" TEXT,
+  "origin_file" TEXT,
   "template" BLOB NOT NULL REFERENCES "objects" ("hash"),
   CHECK (CASE WHEN "origin_charter_source" IS NOT NULL
       THEN "origin_charter_revision" IS NOT NULL
@@ -1187,6 +1422,7 @@ CREATE TABLE "workflow_template" (
       AND "origin_repository" IS NULL
       AND "origin_commit" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'mf'
       THEN "origin_root" IS NOT NULL
@@ -1197,6 +1433,7 @@ CREATE TABLE "workflow_template" (
       AND "origin_repository" IS NULL
       AND "origin_commit" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'po'
       THEN "origin_project" IS NOT NULL
@@ -1211,6 +1448,7 @@ CREATE TABLE "workflow_template" (
       AND "origin_charter_revision" IS NULL
       AND "origin_charter_scope" IS NULL
       AND "origin_materialized_project" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'pi'
       THEN "origin_project" IS NOT NULL
@@ -1225,6 +1463,7 @@ CREATE TABLE "workflow_template" (
       AND "origin_materialized_project" IS NULL
       AND "origin_repository" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END),
   CHECK (CASE WHEN "origin" = 'sn'
       THEN "origin_root" IS NULL
@@ -1239,6 +1478,37 @@ CREATE TABLE "workflow_template" (
       AND "origin_repository" IS NULL
       AND "origin_commit" IS NULL
       AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
+      END),
+  CHECK (CASE WHEN "origin" = 'pd'
+      THEN "origin_repository" IS NOT NULL
+      AND "origin_commit" IS NOT NULL
+      AND "origin_file" IS NOT NULL
+      AND "origin_root" IS NULL
+      AND "origin_source" IS NULL
+      AND "origin_path" IS NULL
+      AND "origin_revision" IS NULL
+      AND "origin_charter_source" IS NULL
+      AND "origin_charter_revision" IS NULL
+      AND "origin_charter_scope" IS NULL
+      AND "origin_materialized_project" IS NULL
+      AND "origin_project" IS NULL
+      AND "origin_entry_path" IS NULL
+      END),
+  CHECK (CASE WHEN "origin" = 'wr'
+      THEN "origin_root" IS NULL
+      AND "origin_source" IS NULL
+      AND "origin_path" IS NULL
+      AND "origin_revision" IS NULL
+      AND "origin_charter_source" IS NULL
+      AND "origin_charter_revision" IS NULL
+      AND "origin_charter_scope" IS NULL
+      AND "origin_materialized_project" IS NULL
+      AND "origin_project" IS NULL
+      AND "origin_repository" IS NULL
+      AND "origin_commit" IS NULL
+      AND "origin_entry_path" IS NULL
+      AND "origin_file" IS NULL
       END)
 ) STRICT;
 CREATE TABLE "workflow_template_roles" (
@@ -1250,9 +1520,11 @@ CREATE TABLE "workflow_template_roles" (
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('wt', 'origin', 'mf', 'Manifest'),
   ('wt', 'origin', 'op', 'Operator'),
+  ('wt', 'origin', 'pd', 'ProjectDeclaration'),
   ('wt', 'origin', 'pi', 'ProjectImage'),
   ('wt', 'origin', 'po', 'ProjectOps'),
-  ('wt', 'origin', 'sn', 'Snapshot');
+  ('wt', 'origin', 'sn', 'Snapshot'),
+  ('wt', 'origin', 'wr', 'WholeRepository');
 CREATE VIEW "workflow_template_view" AS SELECT
   "workflow_template"."id",
   "workflow_template"."version",
@@ -1269,6 +1541,7 @@ CREATE VIEW "workflow_template_view" AS SELECT
   "workflow_template"."origin_repository",
   "workflow_template"."origin_commit",
   "workflow_template"."origin_entry_path",
+  "workflow_template"."origin_file",
   "workflow_template"."template"
 FROM "workflow_template";
 CREATE VIEW "workflow_template_roles_view" AS SELECT
