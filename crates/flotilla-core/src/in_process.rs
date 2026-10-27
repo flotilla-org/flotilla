@@ -407,10 +407,10 @@ async fn load_env_vars(runner: &dyn CommandRunner, cwd: &Path) -> HashMap<String
         .collect()
 }
 
-/// What an agentless host's `hosts.toml` entry declares about its capacity
+/// What an SSH host's `hosts.toml` entry declares about its capacity
 /// (#3793) and tenancy (#4002); a static SSH environment declares neither.
 #[derive(Clone, Copy, Debug, Default)]
-struct AgentlessHostDeclaration {
+struct SshHostDeclaration {
     max_vessels: Option<u32>,
     single_tenant: bool,
 }
@@ -424,7 +424,7 @@ async fn register_static_ssh_direct_environment(
     environment: &StaticEnvironmentConfig,
     host_direct: bool,
     multiplex: bool,
-    declaration: AgentlessHostDeclaration,
+    declaration: SshHostDeclaration,
 ) -> Result<(), String> {
     let fallback_env_id = static_ssh_environment_id(config_key);
     let destination = flotilla_config::ssh_destination(&environment.hostname, environment.user.as_deref());
@@ -501,7 +501,7 @@ async fn register_static_ssh_direct_environments(
             environment,
             false,
             true,
-            AgentlessHostDeclaration::default(),
+            SshHostDeclaration::default(),
         )
         .await
         {
@@ -515,7 +515,7 @@ async fn register_static_ssh_direct_environments(
     }
     match config.load_hosts() {
         Ok(hosts) => {
-            for (label, remote) in hosts.hosts.iter().filter(|(_, host)| host.agentless_ssh) {
+            for (label, remote) in hosts.hosts.iter().filter(|(_, host)| host.ssh_host) {
                 let environment = StaticEnvironmentConfig {
                     hostname: remote.hostname.clone(),
                     user: remote.user.clone(),
@@ -530,15 +530,15 @@ async fn register_static_ssh_direct_environments(
                     &environment,
                     true,
                     hosts.resolved_ssh_multiplex(label),
-                    AgentlessHostDeclaration { max_vessels: remote.max_vessels, single_tenant: remote.single_tenant },
+                    SshHostDeclaration { max_vessels: remote.max_vessels, single_tenant: remote.single_tenant },
                 )
                 .await
                 {
-                    warn!(host = %label, %err, "failed to register agentless SSH host; continuing startup");
+                    warn!(host = %label, %err, "failed to register SSH host; continuing startup");
                 }
             }
         }
-        Err(err) => warn!(%err, "failed to load agentless SSH hosts"),
+        Err(err) => warn!(%err, "failed to load SSH hosts"),
     }
 }
 
@@ -801,8 +801,8 @@ pub struct InProcessDaemon {
     fleet: Arc<FleetService>,
     repository_inspector: RwLock<Option<Arc<dyn RepositoryInspector>>>,
     operator_reconciler: RwLock<Option<Arc<dyn OperatorReconciler>>>,
-    /// Sessions on agentless hosts run in their vessels' agents (#3792).
-    agentless_vessels: std::sync::RwLock<Option<Arc<dyn AgentlessVesselAccess>>>,
+    /// Sessions on SSH hosts run in their vessels' agents (#3792).
+    ssh_host_vessels: std::sync::RwLock<Option<Arc<dyn SshHostVesselAccess>>>,
     /// Process-lifetime host discovery, independent of tracked-root membership.
     /// Heartbeats publish these observations into Host status.
     local_provider_statuses: Vec<HostProviderStatus>,
@@ -850,11 +850,11 @@ pub trait OperatorReconciler: Send + Sync {
     async fn reconcile_now(&self, namespace: &str, kind: &str, name: &str) -> Result<String, String>;
 }
 
-/// #3792: a session on an agentless host runs in its vessel's drydock agent,
+/// #3792: a session on an SSH host runs in its vessel's drydock agent,
 /// which the daemon runtime owns. Its files and its attach go through that
 /// agent; each method answers `None` for a session elsewhere.
 #[async_trait]
-pub trait AgentlessVesselAccess: Send + Sync {
+pub trait SshHostVesselAccess: Send + Sync {
     /// The runner for commands and files in the session's vessel.
     async fn runner(&self, spec: TerminalSessionTarget<'_>) -> Option<Result<Arc<dyn CommandRunner>, String>>;
     /// Attach to the session's cleat through its vessel's agent: a local
@@ -1399,7 +1399,7 @@ impl InProcessDaemon {
             )),
             repository_inspector: RwLock::new(None),
             operator_reconciler: RwLock::new(None),
-            agentless_vessels: std::sync::RwLock::new(None),
+            ssh_host_vessels: std::sync::RwLock::new(None),
             local_provider_statuses,
             local_placement_provider_statuses: RwLock::new(Vec::new()),
         });
@@ -1580,15 +1580,15 @@ impl InProcessDaemon {
         *self.operator_reconciler.write().await = Some(reconciler);
     }
 
-    pub fn set_agentless_vessel_access(&self, access: Arc<dyn AgentlessVesselAccess>) {
-        *self.agentless_vessels.write().expect("agentless vessels lock poisoned") = Some(access);
+    pub fn set_ssh_host_vessel_access(&self, access: Arc<dyn SshHostVesselAccess>) {
+        *self.ssh_host_vessels.write().expect("SSH host vessels lock poisoned") = Some(access);
     }
 
-    /// The runner for a session's files: its vessel's agent on an agentless
+    /// The runner for a session's files: its vessel's agent on an SSH
     /// host (#3792), otherwise its environment's runner. `None` when neither
     /// is known; an error when the vessel's agent cannot be reached.
     pub async fn command_runner_for_session(&self, spec: TerminalSessionTarget<'_>) -> Option<Result<Arc<dyn CommandRunner>, String>> {
-        let access = self.agentless_vessels.read().expect("agentless vessels lock poisoned").clone();
+        let access = self.ssh_host_vessels.read().expect("SSH host vessels lock poisoned").clone();
         if let Some(runner) = match access {
             Some(access) => access.runner(spec).await,
             None => None,
@@ -2099,7 +2099,7 @@ impl InProcessDaemon {
 
     /// Direct SSH environments explicitly opted into host-direct placement.
     /// Their environment key is derived from the remote host's stable ID.
-    pub fn agentless_ssh_environments(&self) -> Vec<(EnvironmentId, flotilla_discovery::environment_manager::DirectEnvironmentState)> {
+    pub fn ssh_host_environments(&self) -> Vec<(EnvironmentId, flotilla_discovery::environment_manager::DirectEnvironmentState)> {
         self.environment_manager
             .managed_environments()
             .into_iter()
@@ -4929,7 +4929,7 @@ impl InProcessDaemon {
             host_name: &self.host_name,
             namespace: &self.provisioning_namespace,
             lifecycle_reads: self.lifecycle_reads.as_ref(),
-            agentless_vessels: self.agentless_vessels.read().expect("agentless vessels lock poisoned").clone(),
+            ssh_host_vessels: self.ssh_host_vessels.read().expect("SSH host vessels lock poisoned").clone(),
         }
     }
 

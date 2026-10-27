@@ -633,7 +633,7 @@ the host tests do not claim to verify remote cache-hit reporting.
 
 New candidates admit Linux amd64 guests from Linux amd64 and macOS arm64
 controllers. Docker retains its Linux daemon-adjacent Unix-socket transport;
-macOS controllers reach Linux guests through Drydock or agentless SSH. Docker
+macOS controllers reach Linux guests through Drydock or SSH hosts. Docker
 Desktop VM transport is outside this change. Other guest targets refuse with `NoPlatformBuild`; the controller's
 native tools are never a guest fallback. Previous generation archives remain
 valid for decoding and rollback, but without a catalog their guest provisioning

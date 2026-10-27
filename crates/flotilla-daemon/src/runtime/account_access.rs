@@ -52,13 +52,13 @@ pub(super) struct AccountLaunch<'a> {
     pub convoy: &'a str,
     pub role: &'a str,
     pub env_ref: &'a str,
-    pub agentless: bool,
+    pub ssh_host: bool,
 }
 
 /// The environment kind a launch's place is.
 async fn place_environment_kind(state: &ControllerRuntimeState, launch: &AccountLaunch<'_>) -> Result<EnvironmentKind, String> {
-    if launch.agentless {
-        return Ok(EnvironmentKind::AgentlessSsh);
+    if launch.ssh_host {
+        return Ok(EnvironmentKind::SshHost);
     }
     if launch.env_ref == state.host_direct_environment_name {
         return Ok(EnvironmentKind::HostDirect);

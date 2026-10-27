@@ -1539,7 +1539,7 @@ impl TerminalRuntime for ReachRuntime {
     }
 }
 
-// #3618: while an agentless host's forward is down the running session records
+// #3618: while an SSH host's forward is down the running session records
 // why its crew cannot reach the daemon, without leaving Running; recovery clears it.
 #[tokio::test]
 async fn unreachable_daemon_is_recorded_on_a_running_session_and_cleared() {

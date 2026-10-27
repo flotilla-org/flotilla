@@ -235,7 +235,7 @@ impl Drop for Sshd {
 }
 
 /// The socket agent reached through drydock's SSH transport and the loopback
-/// sshd, as an agentless host's vessel agent is.
+/// sshd, as an SSH host's vessel agent is.
 pub(crate) struct SshAgent {
     agent: Arc<SocketAgent>,
     transport: Arc<dyn host::AgentTransport>,

@@ -41,7 +41,7 @@ reference survives line drift.
 were read. No credential was minted or refreshed, no LLM request was made, and no grant,
 config, manifest or crew was changed.
 
-"Benbox" means the fleet's bare-VM hosts b1–b5, reached as agentless SSH hosts (#3878, #3884,
+"Benbox" means the fleet's bare-VM hosts b1–b5, reached as SSH hosts (#3878, #3884,
 PR #3659).
 
 ---
@@ -55,7 +55,7 @@ PR #3659).
      only).
    - **Grant-less pipelines.**
      - The central Codex ChatGPT login (`CodexMaterialAdapter`).
-     - Agentless ambient Codex login adoption (`adopt_ambient_login`).
+     - SSH host ambient Codex login adoption (`adopt_ambient_login`).
      - Host-direct ambient harness homes.
      - Skill-source GitHub App mints (ADR 0038, deliberately outside grants).
 
@@ -82,7 +82,7 @@ PR #3659).
    - The central Codex refresher is daemon-side and spawned unconditionally on every daemon.
      It has no lock, lease or flock.
 
-   Agentless Codex crews symlink the host user's writable `~/.codex/auth.json`. Every crew on
+   SSH host Codex crews symlink the host user's writable `~/.codex/auth.json`. Every crew on
    that host, and the host user, may then refresh one single-use refresh chain. #3661 tracks
    this.
 6. **The ADR language about a credential proxy describes a direction, not the code.**
@@ -167,7 +167,7 @@ Host held-credential publication:
   declared specs contribute no expiry today, so the expiry check never fires for declared
   credentials outside tests.
 - Published by `crates/flotilla-daemon/src/runtime/health.rs:418` (local) and
-  `runtime/discovery.rs:270-276` (agentless SSH).
+  `runtime/discovery.rs:270-276` (SSH host).
 
 ### 2.4 Carrying references to the runtime
 
@@ -216,7 +216,7 @@ Host held-credential publication:
 `<base>` is `runner.writable_config_base(..)`:
 - `/tmp/flotilla-config` in Docker and drydock (`runner.rs:23,169-174`;
   `crates/flotilla-environment/src/environment/drydock/runner.rs:87-89`).
-- The remote writable base for agentless SSH.
+- The remote writable base for SSH hosts.
 - `XDG_RUNTIME_DIR` or the state dir for host-direct (`credential.rs:1850-1855`).
 
 **Callers:**
@@ -281,7 +281,7 @@ Each row reports the following fields:
 | Refresh | None. `Refreshable` only re-reads the source on each prepare. |
 | Transport | `prepare_adapter` (`credential.rs:2036-2053`) runs `command -v claude`, then on first prepare an `api_key_preflight` GET of `api.anthropic.com/v1/models?limit=1` (`:2352-2363`, not a model turn). It then sets **`ANTHROPIC_API_KEY` in the env**. No file and no config dir. |
 | Lifecycle | No expiry or revocation model. A bad key fails the first preflight. |
-| Caller | Shared. In practice usable only on the daemon host's own non-contained session. Contained sessions (`FLOTILLA_ENVIRONMENT_ID` set; `session_is_contained`, `adapter.rs:699-701`) are refused without `CLAUDE_CODE_OAUTH_TOKEN` (`adapter.rs:888-890,927-929`), and agentless sessions are refused at `runtime/terminal.rs:498-504`. |
+| Caller | Shared. In practice usable only on the daemon host's own non-contained session. Contained sessions (`FLOTILLA_ENVIRONMENT_ID` set; `session_is_contained`, `adapter.rs:699-701`) are refused without `CLAUDE_CODE_OAUTH_TOKEN` (`adapter.rs:888-890,927-929`), and SSH host sessions are refused at `runtime/terminal.rs:498-504`. |
 | Tests | `two_claude_accounts_coexist_across_environments_but_never_share_one` (`credential.rs:5141`), which refuses API key + OAuth in one environment. No test names the contained-API-key refusal directly. |
 
 ### R2. Claude subscription OAuth (`CredentialConsumer::ClaudeOauth`)
@@ -289,14 +289,14 @@ Each row reports the following fields:
 | Field | Current state |
 |---|---|
 | Req | Same slot as R1. |
-| Grant | Shared. This is the **only** Claude path for contained and agentless crews. This crew's `claude-max` is an instance: its harness home is `/tmp/flotilla-config/agent-homes/claude-max/claude/crews/coder`. |
+| Grant | Shared. This is the **only** Claude path for contained and SSH host crews. This crew's `claude-max` is an instance: its harness home is `/tmp/flotilla-config/agent-homes/claude-max/claude/crews/coder`. |
 | Identity | `account_email` is declared but has **no production reader**. Test `requested_model_ignores_legacy_account_evidence_and_uses_only_selected_grants` (`crates/flotilla-controllers/tests/integration/in_process_daemon.rs:3446`) asserts that old account evidence is ignored. Effective identity is the credential name. |
 | Material | `CredentialSpec` source on the owning daemon host, resolved into daemon memory. A `claude setup-token` long-lived token is assumed by ADR 0022 (not verified, §9). |
 | Refresh | **No Flotilla Claude refresher.** `spawn_credential_refresh_task` handles only GitHub App. `Refreshable` re-reads per prepare (test `rotating_named_claude_oauth_material_reuses_the_stable_config_directory`, `credential.rs:5199`). |
-| Transport | `prepare_adapter` (`credential.rs:2056-2067`) sets **`CLAUDE_CODE_OAUTH_TOKEN` in the env**. It never makes an inference call (test `claude_oauth_preparation_never_requests_inference`, `:5273`). It also sets `CLAUDE_CONFIG_DIR = <base>/agent-homes/<name>/claude`, prepared by `prepare_harness_home` (`:2134-2181`: mode 700, one-time scratch import excluding auth files, symlinks for `HARNESS_AUTH_FILES` = `auth.json`, `.credentials.json`; `runner.rs:30`). Per-crew `…/claude/crews/<role>` comes from `AgentMaterialRegistry::crew_environment` (`agent_material.rs:279-328`). Agentless sessions use `host_harness_environment` (`:341-392`). On a host-direct non-contained session, `launch` drops `CLAUDE_CONFIG_DIR`, so the host's own `~/.claude` config stays and only authentication is replaced (`adapter.rs:900-905`; test `host_direct_claude_oauth_uses_delivered_auth_without_replacing_ambient_config`, `:2637`). |
+| Transport | `prepare_adapter` (`credential.rs:2056-2067`) sets **`CLAUDE_CODE_OAUTH_TOKEN` in the env**. It never makes an inference call (test `claude_oauth_preparation_never_requests_inference`, `:5273`). It also sets `CLAUDE_CONFIG_DIR = <base>/agent-homes/<name>/claude`, prepared by `prepare_harness_home` (`:2134-2181`: mode 700, one-time scratch import excluding auth files, symlinks for `HARNESS_AUTH_FILES` = `auth.json`, `.credentials.json`; `runner.rs:30`). Per-crew `…/claude/crews/<role>` comes from `AgentMaterialRegistry::crew_environment` (`agent_material.rs:279-328`). SSH host sessions use `host_harness_environment` (`:341-392`). On a host-direct non-contained session, `launch` drops `CLAUDE_CONFIG_DIR`, so the host's own `~/.claude` config stays and only authentication is replaced (`adapter.rs:900-905`; test `host_direct_claude_oauth_uses_delivered_auth_without_replacing_ambient_config`, `:2637`). |
 | Lifecycle | Expiry is not tracked (§2.3). The env value is fixed for the life of the process, with no redelivery. Withdrawal leaves `agent-homes/<name>`. |
-| Caller | `ensure_session` (`terminal.rs:414-421`); agentless refusal without it at `terminal.rs:498-504`. |
-| Tests | `credential.rs`: `claude_oauth_material_is_delivered_as_an_env_token_without_owning_agent_config` (`:5070`), `claude_oauth_delivery_refuses_an_environment_without_the_claude_binary` (`:5105`). `crates/flotilla-core/src/in_process/tests/credential_admission.rs`: `contained_claude_requires_and_accepts_a_project_selected_oauth_grant` (`:265`), `harness_bound_credential_reaches_only_vessels_running_that_harness` (`:330`), `trusted_claude_requires_and_accepts_a_project_selected_oauth_grant` (`:564`). Daemon `runtime/tests/agentless_harness.rs`: `agentless_claude_crew_starts_in_a_prepared_flotilla_home` (`:432`), `agentless_claude_crew_without_a_delivered_credential_is_refused_with_the_reason`. `runtime/tests/launch_support.rs` `assert_contained_claude_invocation_home`. |
+| Caller | `ensure_session` (`terminal.rs:414-421`); SSH host refusal without it at `terminal.rs:498-504`. |
+| Tests | `credential.rs`: `claude_oauth_material_is_delivered_as_an_env_token_without_owning_agent_config` (`:5070`), `claude_oauth_delivery_refuses_an_environment_without_the_claude_binary` (`:5105`). `crates/flotilla-core/src/in_process/tests/credential_admission.rs`: `contained_claude_requires_and_accepts_a_project_selected_oauth_grant` (`:265`), `harness_bound_credential_reaches_only_vessels_running_that_harness` (`:330`), `trusted_claude_requires_and_accepts_a_project_selected_oauth_grant` (`:564`). Daemon `runtime/tests/ssh_host_harness.rs`: `ssh_host_claude_crew_starts_in_a_prepared_flotilla_home` (`:432`), `ssh_host_claude_crew_without_a_delivered_credential_is_refused_with_the_reason`. `runtime/tests/launch_support.rs` `assert_contained_claude_invocation_home`. |
 
 ### R3. Ambient host Claude login (`ambient:claude`)
 
@@ -321,7 +321,7 @@ Each row reports the following fields:
 | Refresh | None. |
 | Transport | A **login transformation**, not env passthrough. `prepare_adapter` (`credential.rs:2068-2103`): `mkdir <base>/credentials/<name>/codex`, `CODEX_HOME=… codex login --with-api-key` with the key on **stdin**, `codex login status`, then a GET of `api.openai.com/v1/models?limit=1` (permitted by #3706 as non-inference). It sets `CODEX_HOME = prepare_harness_home(.., "codex")` (`<base>/agent-homes/<name>/codex`, with `auth.json` symlinked from the credential dir). `OPENAI_API_KEY` is never placed in the env. |
 | Lifecycle | `already_prepared` skips the login for non-`Refreshable` material. |
-| Caller | Shared. **On Docker it cannot coexist with the central login (R5):** both claim `CODEX_HOME` and composition fails (test `codex_credential_and_agent_material_conflict_before_container_creation`, `crates/flotilla-daemon/src/runtime/tests/credential_delivery.rs:709`). It works host-direct, agentless (a delivered home under the base is kept, `agent_material.rs:360-375`), or where `spec.env` sets `CODEX_HOME`. |
+| Caller | Shared. **On Docker it cannot coexist with the central login (R5):** both claim `CODEX_HOME` and composition fails (test `codex_credential_and_agent_material_conflict_before_container_creation`, `crates/flotilla-daemon/src/runtime/tests/credential_delivery.rs:709`). It works host-direct, SSH host (a delivered home under the base is kept, `agent_material.rs:360-375`), or where `spec.env` sets `CODEX_HOME`. |
 | Tests | `codex_material_is_transformed_by_stdin_login_and_never_passed_through_as_env` (`credential.rs:4778`), `harness_home_import_preserves_existing_sessions` (`:4826`). |
 
 ### R5. Dedicated central ChatGPT login (`CodexCentralRefresher` + `CodexMaterialAdapter`)
@@ -338,19 +338,19 @@ Each row reports the following fields:
 | Caller | Docker and drydock provisioning; redelivery task. |
 | Tests | `codex_central.rs:330-484` (`refresh_once_*`, `real_refresher_*`, fixed-response HTTP). `agent_material.rs`: `codex_adapter_delivers_a_read_only_copy_of_the_central_credential` (`:1673`), `one_central_credential_serves_every_crew_without_contention` (`:1715`), `an_unprovisioned_central_credential_fails_with_an_actionable_message` (`:1738`), `redelivery_replaces_a_stale_copy_and_preserves_per_crew_scratch` (`:2681`), `codex_rotation_uses_the_agent_runner_and_retries_unchanged_staging` (`:2717`). Daemon: `codex_adapter_delivers_the_central_credential_in_a_writable_codex_home` (`credential_delivery.rs:574`), `docker_codex_home_is_a_rw_host_mount_and_is_not_pushed` (`runtime/tests/docker.rs:1327`), `codex_central_refresh_task_survives_repeated_local_failures_without_panicking` (`runtime/tests/convoy_lifecycle.rs:960`). **No test covers concurrent refreshers or a guest rewriting `auth.json`.** |
 
-### R6. Agentless ambient Codex login adoption (PR #3659)
+### R6. SSH host ambient Codex login adoption (PR #3659)
 
 | Field | Current state |
 |---|---|
-| Req | Implicit: a codex crew on an agentless host. |
-| Grant | **None.** There is no codex equivalent of the agentless Claude refusal (`terminal.rs:495-502`). |
+| Req | Implicit: a codex crew on an SSH host. |
+| Grant | **None.** There is no codex equivalent of the SSH host Claude refusal (`terminal.rs:495-502`). |
 | Identity | The host user's ambient login, unrecorded. |
 | Material | `${CODEX_HOME:-$HOME/.codex}/auth.json` in the remote runner's environment. |
 | Refresh | **Not Flotilla.** The central refresher touches only the daemon host's central path, and redelivery skips non-`spec.docker` environments (`runtime/credentials.rs:727`). Each crew's codex process **and** the host user's own codex may refresh the one single-use chain. There is no lock. `docs/configuration.md:173-175` states this as design ("a crew that refreshes its token updates the host's one login file"). |
 | Transport | `CodexMaterialAdapter::adopt_ambient_login` (`agent_material.rs:1199-1222`) runs `ln -s` of the ambient file into `<base>/agent-homes/<env>/codex/auth.json` when none is present. This is a **writable symlink**, linked again into per-crew homes. A delivered R4 home under the base is kept instead. |
 | Lifecycle | None beyond the home directory. |
 | Caller | `ensure_session` → `host_harness_environment` (`terminal.rs:493-513`). |
-| Tests | `agentless_codex_crew_starts_in_a_prepared_flotilla_home` (`runtime/tests/agentless_harness.rs:455-476`, which asserts the link chain); `host_harness_homes_are_flotilla_owned_under_the_runner_base` (`agent_material.rs:1807`). |
+| Tests | `ssh_host_codex_crew_starts_in_a_prepared_flotilla_home` (`runtime/tests/ssh_host_harness.rs:455-476`, which asserts the link chain); `host_harness_homes_are_flotilla_owned_under_the_runner_base` (`agent_material.rs:1807`). |
 | Tracking | #3661 (open): "keep the linked host auth.json from diverging on token refresh". |
 
 ### R7. Other real Codex and harness launch paths
@@ -444,7 +444,7 @@ phrase for the composition of the per-host helpers in R8–R11, merged through
 | Material | App files on the daemon host. The token is narrowed upstream to the single source repository. |
 | Refresh | None. One shot. |
 | Transport | `<writable base>/skill-sources/<cred>/token-<uuid>` written by **the environment's runner** (`docker.rs:585`). For contained vessels that is inside the vessel (`/tmp/flotilla-config`). Staging git reads it through a `GITHUB_TOKEN_FILE` helper with `GIT_CONFIG_GLOBAL=/dev/null` (`crates/flotilla-vcs/src/providers/skill_source.rs:20,165-168`). |
-| Lifecycle | Deleted after staging or on failure (`skill_source.rs:46-52`; `remove_source_token_files`, `agent_material.rs:271`). `prune_abandoned_skill_source_tokens` (`credential.rs:76-101`) handles dead owners and files older than 6 days. Not staged on agentless hosts (`docs/configuration.md:176`). |
+| Lifecycle | Deleted after staging or on failure (`skill_source.rs:46-52`; `remove_source_token_files`, `agent_material.rs:271`). `prune_abandoned_skill_source_tokens` (`credential.rs:76-101`) handles dead owners and files older than 6 days. Not staged on SSH hosts (`docs/configuration.md:176`). |
 | Caller | Docker provisioning (`docker.rs:543-610`), plus the pre-roll probe `validate_frozen_vessel_skills` (`agent_material.rs:844-863`), which uses operator-supplied token files. |
 | Tests | `skill_source_credential_is_one_shot_and_narrowed_to_its_repository` (`credential.rs:4069`), `six_concurrent_skill_stagings_each_use_own_nonempty_token_after_slow_flaky_mints` (`:2573`), `partial_crew_staging_failure_removes_source_tokens` (`agent_material.rs:3357`), `pre_roll_skill_probe_checks_authority_pin_and_preserves_operator_tokens` (`:3055`), `fresh_claude_provisioning_stages_generation_pinned_skills` (`runtime/tests/credential_delivery.rs:426`). |
 | Tracking | #3663 (open, design) proposes a host-side fetch so that "no source token enters the guest". |
@@ -537,7 +537,7 @@ credentials. Every place below does so today. Production code only.
 | `credential.rs:45-74,1255` | skill source requires `GithubApp` |
 | `crates/flotilla-credentials/src/agent_material.rs:31-32,144-151` | `CODEX_ADAPTER_ID`, `CLAUDE_CODE_ADAPTER_ID`, registry {codex, claude-code, fleet-canary} |
 | `crates/flotilla-environment/src/environment/runner.rs:24,30` | `CONTAINED_CODEX_HOME`, `HARNESS_AUTH_FILES` |
-| `crates/flotilla-daemon/src/runtime/terminal.rs:498,546` | agentless `"claude-code"` OAuth requirement; hook injection |
+| `crates/flotilla-daemon/src/runtime/terminal.rs:498,546` | SSH host `"claude-code"` OAuth requirement; hook injection |
 | `crates/flotilla-daemon/src/runtime/credentials.rs:730` | `"codex"` redelivery filter |
 | `crates/flotilla-daemon/src/fulfilment_probe.rs:13` | `HARNESSES` |
 | `crates/flotilla-resources/src/terminal_session.rs:421,438` | `crew.adapter == "codex"` |
@@ -584,11 +584,11 @@ These exist today and could sit behind registered adapters. Whether to reuse the
 | Skill-source permission cap | **Not capped** by any grant (declaration permissions) |
 | Account identity (`account_email`, `actor_login`, Forgejo `username`) | **Metadata**: unread, or exported without verification |
 | Central Codex login authorised for a vessel | **No binding at all**: implicit for any Linux Docker codex vessel |
-| Agentless Codex login | **No binding**: the ambient host login |
+| SSH host Codex login | **No binding**: the ambient host login |
 | "Read-only" Codex copy | **File mode only** (0400) inside an Rw home mount owned by the crew uid. The crew can replace or refresh it. |
 | Token files (GitHub App, Forgejo, GitHttpToken) | 0600, owned by the crew uid, not read-only |
 | Env tokens (`GH_TOKEN`, `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`) | Fully visible to crew processes; cannot be withdrawn from a running process |
-| Separation of harness homes between crews sharing a credential | `agent-homes/<credential>/<harness>/crews/<role>` has **no environment component** (`runner.rs:46-48`). On a shared base (agentless, host-direct `XDG_RUNTIME_DIR`), two vessels with the same credential and role share a home. Docker separates by container filesystem. Codex central homes are keyed by environment. |
+| Separation of harness homes between crews sharing a credential | `agent-homes/<credential>/<harness>/crews/<role>` has **no environment component** (`runner.rs:46-48`). On a shared base (SSH host, host-direct `XDG_RUNTIME_DIR`), two vessels with the same credential and role share a home. Docker separates by container filesystem. Codex central homes are keyed by environment. |
 | Session env allowlist (ADR 0022) | Only where cleat supports `--env-clear`, otherwise the daemon env is inherited (`crates/flotilla-terminal/src/cleat.rs:184-207`) |
 | Egress restriction, per-listener identity (ADR 0044 P1–P5, ADR 0069) | **Not built**; no proxy, no `--network none` |
 | Material never replicates | **Enforced**: declarations replicate, material stays host files or vessel staging; checkpoints exclude auth files (`runner.rs:58-66`) |
@@ -600,7 +600,7 @@ These exist today and could sit behind registered adapters. Whether to reuse the
 | Claude OAuth (R2) | One token to every granted crew, in env (`one_central…`-style sharing is untested for Claude, but there is no limit in code) | None in Flotilla. The harness may refresh inside its own home; behaviour unverified (§9). | None |
 | Claude API key (R1) | Shared | Not applicable | Not applicable |
 | Codex central (R5) | One file → read-only copies to every codex vessel on the host (test `one_central_credential_serves_every_crew_without_contention`) | Daemon task, one per daemon process | **Comment-only "sole writer"**. No lock. Two daemons sharing a HOME, an operator script, or a guest codex that refreshes its copy could each rotate the chain. |
-| Codex agentless (R6) | Writable symlink shared by all crews and the host user | Every codex process on the host | **None** (#3661) |
+| Codex SSH host (R6) | Writable symlink shared by all crews and the host user | Every codex process on the host | **None** (#3661) |
 | Codex API key (R4) | Per credential home | Not applicable | Not applicable |
 | GitHub App (R8) | One minted token per (environment, credential) | Daemon refresh task | Per-key lock + generation check. Separate tokens per environment, so no shared refresh chain. |
 | Skill source (R13) | One per staging | None (one shot) | Not applicable |
@@ -623,7 +623,7 @@ code. ADR 0044 §4 assigns them to dispatch (#1928, #1394).
    - **Implication:** the ADR needs an explicit update at implementation, as #3878 says.
 2. **Per-crew revocable slot (ADR 0044 P2).** "each crew gets its own revocable slot, never the
    owner's personal login". **Code:** one `ClaudeOauth` credential (e.g. `claude-max`) is
-   delivered to every granted crew, with no per-crew slot. Agentless Codex uses the host user's
+   delivered to every granted crew, with no per-crew slot. SSH host Codex uses the host user's
    personal login (R6). #3878 separately rules that "shared use does not imply exclusive account
    slots".
 3. **Deleted pool (ADR 0022).** ADR 0022 still says rotating Codex material "is managed as a pool
@@ -635,7 +635,7 @@ code. ADR 0044 §4 assigns them to dispatch (#1928, #1394).
    wording: `runtime/tests/convoy_lifecycle.rs:968`, and `docs/research/2026-08-21-fly-sprites-as-vessel-backend.md`
    cites a deleted `MaterialPool` file.
 4. **Static material is a copy, never a bind mount (ADR 0044 §5).** The central Codex copy follows
-   this. **But** the whole Codex home containing it is an Rw bind mount, and agentless Codex uses a
+   this. **But** the whole Codex home containing it is an Rw bind mount, and SSH host Codex uses a
    **symlink** to the live login (R6). That is the "pin" the ADR rules out, plus shared write-back.
 5. **One delivery and refresh contract for every kind (ADR 0044 §5).** Actual refresh exists only
    for GitHub App and central Codex, with different surfacing: Demand versus WARN log. Skill
@@ -644,7 +644,7 @@ code. ADR 0044 §4 assigns them to dispatch (#1928, #1394).
 6. **Delivery lifetime / revocation (ADR 0044 §5).** "revoked when the session ends". Withdrawal
    removes `credentials/<name>` but leaves `agent-homes/<name>`. Env-delivered tokens cannot be
    revoked from a running process.
-7. **Single refresher (issue #1906, `codex_central.rs:12-15`) versus agentless adoption.**
+7. **Single refresher (issue #1906, `codex_central.rs:12-15`) versus SSH host adoption.**
    `docs/configuration.md:173-175` documents shared write-back by design. #1906 acceptance said
    "no shared writable auth.json". #3706 (closed) forbids reading an ambient login to infer access
    and adding ambient-authentication fallback in **probing and entitlement**. R6 is a launch path,
@@ -696,10 +696,10 @@ These are the concrete current behaviours that a migration starting with Claude 
 b1–b5 depends on, or must keep working. They are listed as constraints, not as a chosen design;
 #3884 chooses the slice.
 
-1. **Agentless Claude refuses without delivered OAuth.** The guard at `runtime/terminal.rs:498-504`
+1. **SSH host Claude refuses without delivered OAuth.** The guard at `runtime/terminal.rs:498-504`
    is what currently prevents ambient token or profile success on benbox hosts. A replacement must
    keep an equivalent refusal (#3884 acceptance: "without ambient token/profile success").
-2. **Agentless harness homes.** `host_harness_environment` (`agent_material.rs:341-392`) and
+2. **SSH host harness homes.** `host_harness_environment` (`agent_material.rs:341-392`) and
    `crew_environment` (`:279-328`) place homes under the runner's writable base. They must keep
    the host user's `~/.claude` byte-identical (#3706; `docs/configuration.md`). The home key
    currently lacks an environment component (§6). Any account-switching acceptance ("a subsequent
@@ -715,17 +715,17 @@ b1–b5 depends on, or must keep working. They are listed as constraints, not as
    universal trust, the per-vessel uniform role grant set, harness filtering, the GitHub App
    permission cap, and repository scope per credential.
 6. **Host-held availability and expiry.** `held_credentials` / `source_is_available` and
-   `credential_expiry` are SSH-published for agentless hosts (`runtime/discovery.rs:270-276`).
+   `credential_expiry` are SSH-published for SSH hosts (`runtime/discovery.rs:270-276`).
    Declared credentials report no expiry, so a "bounded real launch failure" for an expired
    Claude token is not observable today.
 7. **Observable selection.** The capability card (`SessionCapabilitySource::credentials`) and the
    brief's minted-scope section show credential names and repository scope only. Account identity
    is not shown (`account_email` unread).
 8. **Checkout, forge and skill access for benbox work.**
-   - **GitHub App delivery and refresh on agentless hosts** runs through the SSH host runner.
+   - **GitHub App delivery and refresh on SSH hosts** runs through the SSH host runner.
      #3805 ruled that Environment-scoped refresh stays there.
    - **Forgejo and GitHttpToken helpers** compose into one gitconfig (`vessel_config`).
-   - **Skills are not staged on agentless hosts** (`docs/configuration.md:176`), so private skill
+   - **Skills are not staged on SSH hosts** (`docs/configuration.md:176`), so private skill
      access on b1 is a gap, not a working path to preserve.
 9. **Fulfilment probes** run with isolated HOME and scrubbed auth env (R7). Probe and launch must
    share the declared prepared context (#3884, #3883).
@@ -733,7 +733,7 @@ b1–b5 depends on, or must keep working. They are listed as constraints, not as
     the central Codex Docker path (R5), and GitHub App delivery (R8) are what working crews use
     today. This crew runs on R2 + R8 + R10.
 11. **Codex is coupled to Claude-first only where hosts are shared.** On benbox, codex crews take
-    R6 (agentless ambient). Changing agentless homes for Claude touches the same
+    R6 (SSH host ambient). Changing SSH host homes for Claude touches the same
     `host_harness_environment` code that performs `adopt_ambient_login`.
 12. **Stored shape.** `CredentialConsumer`, `CredentialSpecSpec` and `CredentialGrantSpec` are
     replicated stored shapes. Changes are ADR 0047 one-generation decoding plus same-roll
@@ -753,8 +753,8 @@ migrated. #3885 decides the order, the interfaces and the issues.
 - [ ] **Central Codex refresh exclusion.** One coordinated refresher per authorisation session is
   shown by mechanism, not by comment. Refresh failure surfaces like GitHub App (Demand or
   attention), not only a WARN.
-- [ ] **Agentless ambient Codex adoption.** `adopt_ambient_login` is removed or gated by explicit
-  authorisation. `agentless_codex_crew_starts_in_a_prepared_flotilla_home` is replaced by a test
+- [ ] **SSH host ambient Codex adoption.** `adopt_ambient_login` is removed or gated by explicit
+  authorisation. `ssh_host_codex_crew_starts_in_a_prepared_flotilla_home` is replaced by a test
   of the authorised path. #3661 is resolved.
 - [ ] **Host-direct ambient harness homes.** Codex `~/.codex` and Claude `~/.claude` on daemon
   hosts either migrate or are explicitly authorised ambient provision.
@@ -834,10 +834,10 @@ At `7511b8c` the check reports exactly three misses, all expected:
   - #1906 (closed): eliminate the Codex pool; one refresher; read-only copy.
   - #1911 (closed via PR #1925): central refresher in flotillad.
   - PR #1931 (merged 2026-09-23): static read-only Codex delivery and redelivery; deleted `MaterialPool`.
-  - PR #3659 (merged 2026-10-21): agentless contained-harness path; Claude requires delivered OAuth; Codex links the host `auth.json`.
-  - #3661 (open): agentless Codex divergence.
+  - PR #3659 (merged 2026-10-21): SSH host contained-harness path; Claude requires delivered OAuth; Codex links the host `auth.json`.
+  - #3661 (open): SSH host Codex divergence.
   - #3706 (closed via PR #3872): no model-turn probes; isolated probe HOME; no ambient fallback.
-  - #3805 (open): agentless checkout and refresh ownership; Environment-scoped refresh stays on SSH.
+  - #3805 (open): SSH host checkout and refresh ownership; Environment-scoped refresh stays on SSH.
   - #3663 (open): host-side skill selection.
   - #3737 (open): homes as streams with a changeable writer.
   - #3312 (open): egress proxy contract draft.

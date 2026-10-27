@@ -2526,7 +2526,7 @@ impl Aggregator {
                 (host, host.map(HostName::new))
             }
         };
-        // Until the target's Host record replicates, an agentless SSH vessel
+        // Until the target's Host record replicates, an SSH host vessel
         // briefly reads as its own acting daemon (no cross-host direct reason);
         // the Host event rebuilds the row.
         let acting = reference
@@ -7468,11 +7468,11 @@ mod tests {
         assert_eq!(vessel.vessel_resource.expect("vessel resource").host, Some(HostName::new("feta")));
     }
 
-    // #4021: a vessel on an agentless SSH host is acted on by the Host's
+    // #4021: a vessel on an SSH host is acted on by the Host's
     // declared owning daemon, which writes every record about it. Joins use
     // that daemon; the machine the vessel runs on is information only.
     #[tokio::test]
-    async fn vessel_on_agentless_ssh_host_joins_records_through_its_owning_daemon() {
+    async fn vessel_on_ssh_host_joins_records_through_its_owning_daemon() {
         use flotilla_protocol::{result_set::ReadinessState, CanonicalHostId, PlacementDecision, PlacementTargetHost};
         use flotilla_resources::{HostConnection, HostSpec, VesselPhase, VesselSpec, VesselStatus};
         // A drydock cloud sandbox (Daytona) is placed on its controller's
@@ -7487,7 +7487,7 @@ mod tests {
             let provenance = ResourceProvenance::Replica { origin_root: origin, last_synced_at: Utc::now() };
             for (name, display_name, connection) in [
                 ("host-udder", "udder", HostConnection::Daemon),
-                ("host-b1", "b1", HostConnection::AgentlessSsh { owning_daemon: "host-udder".into(), destination: "b1.lan".into() }),
+                ("host-b1", "b1", HostConnection::SshHost { owning_daemon: "host-udder".into(), destination: "b1.lan".into() }),
             ] {
                 let host = backend
                     .using::<flotilla_resources::Host>("flotilla")
@@ -7583,7 +7583,7 @@ mod tests {
                 &InputMeta::builder().name("host-b1".into()).build(),
                 &HostSpec {
                     display_name: "b1".into(),
-                    connection: HostConnection::AgentlessSsh { owning_daemon: "host-udder".into(), destination: "b1.lan".into() },
+                    connection: HostConnection::SshHost { owning_daemon: "host-udder".into(), destination: "b1.lan".into() },
                     ..Default::default()
                 },
             )
@@ -7594,7 +7594,7 @@ mod tests {
         host.status = Some(HostStatus { heartbeat_at: Some(Utc::now()), ..Default::default() });
         assert!(!aggregator.apply_host_event(ReadWatchEvent::Modified(read(host.clone()))), "heartbeat");
 
-        host.spec.connection = HostConnection::AgentlessSsh { owning_daemon: "host-feta".into(), destination: "b1.lan".into() };
+        host.spec.connection = HostConnection::SshHost { owning_daemon: "host-feta".into(), destination: "b1.lan".into() };
         assert!(aggregator.apply_host_event(ReadWatchEvent::Modified(read(host.clone()))), "new owning daemon");
         assert_eq!(aggregator.acting_daemon("host-b1"), Some(HostName::new("host-feta")));
 

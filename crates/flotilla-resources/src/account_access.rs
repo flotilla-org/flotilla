@@ -199,7 +199,7 @@ pub struct AccountProvisionSpec {
     pub binding: Ref<AccountBindingSpec>,
     /// Where the agent loop runs: the Environment resource the harness launches in.
     pub place: String,
-    /// The environment kind the plan was resolved for (`docker`, `agentless-ssh`, …), as named
+    /// The environment kind the plan was resolved for (`docker`, `ssh-host`, …), as named
     /// by the environment provider.
     pub environment_kind: String,
     pub plan: ProvisionPlan,

@@ -199,7 +199,7 @@ async fn deliver_crew(
     let base = agent.writable_base().await.map_err(failed_at(HOME))?;
     // A container's harness defaults (its contained Codex home) apply only inside it; an
     // SSH host's harness homes are what credential delivery put under its base.
-    let resolved = if launch.account.agentless {
+    let resolved = if launch.account.ssh_host {
         delivered.to_vec()
     } else {
         let declared = declared_environment(state, &launch.account).await.map_err(failed_at(LOGIN))?;
@@ -218,7 +218,7 @@ async fn deliver_crew(
     }
     // #3909: where the place does not already carry the pinned harness, it lands in the
     // home by digest, through whichever mechanism the planner chooses.
-    let pinned = if place_carries_harnesses(launch.account.agentless) {
+    let pinned = if place_carries_harnesses(launch.account.ssh_host) {
         None
     } else {
         let architecture = agent.architecture().await.map_err(failed_at(HARNESS))?;
@@ -228,7 +228,7 @@ async fn deliver_crew(
         tree(&mut needs, HARNESS, pinned.sha256.clone(), (HOME, HARNESS_PATH), PinnedHarness::sources(), Arc::new(pinned.clone()));
     }
     let place = launch.account.env_ref;
-    let delivered = deliver(&needs, &trees, &place_mechanisms(launch.account.agentless), &CostTable::default(), agent.as_ref())
+    let delivered = deliver(&needs, &trees, &place_mechanisms(launch.account.ssh_host), &CostTable::default(), agent.as_ref())
         .await
         .map_err(|error| Failed {
             need: match &error {
@@ -263,16 +263,16 @@ async fn deliver_crew(
 /// Whether the place already carries the pinned harnesses. A composed crew image includes
 /// the harness layers, whose pins its identity hashes; an SSH host has no image. Step 4 of
 /// #3956 moves this declaration onto each provider instance.
-fn place_carries_harnesses(agentless: bool) -> bool {
-    !agentless
+fn place_carries_harnesses(ssh_host: bool) -> bool {
+    !ssh_host
 }
 
 /// What a place offers vessel delivery beyond the mandatory agent fetch and push. An SSH
 /// host's bases are the host's own storage; a container's are not, so its homes are
 /// created through the agent. Both kinds in use reach public sources: neither declares an
 /// egress policy. Step 4 of #3956 moves this declaration onto each provider instance.
-fn place_mechanisms(agentless: bool) -> ProviderMechanisms {
-    let host_paths = if agentless {
+fn place_mechanisms(ssh_host: bool) -> ProviderMechanisms {
+    let host_paths = if ssh_host {
         vec![HostPathOffer { reach: HostReach::WritableBase, access: Access::ReadWrite, liveness: Liveness::Live }]
     } else {
         Vec::new()
@@ -370,7 +370,7 @@ struct OwnedAccountLaunch {
     convoy: String,
     role: String,
     env_ref: String,
-    agentless: bool,
+    ssh_host: bool,
 }
 
 impl OwnedAccountLaunch {
@@ -380,7 +380,7 @@ impl OwnedAccountLaunch {
             convoy: launch.convoy.into(),
             role: launch.role.into(),
             env_ref: launch.env_ref.into(),
-            agentless: launch.agentless,
+            ssh_host: launch.ssh_host,
         }
     }
 
@@ -390,7 +390,7 @@ impl OwnedAccountLaunch {
             convoy: &self.convoy,
             role: &self.role,
             env_ref: &self.env_ref,
-            agentless: self.agentless,
+            ssh_host: self.ssh_host,
         }
     }
 }

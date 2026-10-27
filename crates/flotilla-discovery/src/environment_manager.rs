@@ -54,9 +54,9 @@ pub struct DirectEnvironmentState {
     /// The host's declared supplies, which its SSH runner composes into every
     /// command and a session launch composes into the harness environment.
     pub host_environment: HostEnvironment,
-    /// An agentless SSH host's declared vessel cap (#3793).
+    /// An SSH host's declared vessel cap (#3793).
     pub max_vessels: Option<u32>,
-    /// An agentless SSH host declared dedicated and single-tenant (#4002).
+    /// An SSH host declared dedicated and single-tenant (#4002).
     pub single_tenant: bool,
 }
 
@@ -256,7 +256,7 @@ impl EnvironmentManager {
         }
     }
 
-    /// Record what an agentless SSH host declares in `hosts.toml`: its vessel
+    /// Record what an SSH host declares in `hosts.toml`: its vessel
     /// cap (#3793) and whether it is single-tenant (#4002).
     pub fn set_direct_environment_declaration(
         &self,

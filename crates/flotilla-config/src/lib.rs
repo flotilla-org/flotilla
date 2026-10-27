@@ -209,24 +209,24 @@ pub struct RemoteHostConfig {
     pub ssh_multiplex: Option<bool>,
     /// This host has no flotillad. The owning daemon may use SSH to actuate
     /// host-direct placements there, but it must not enter the peer mesh.
-    pub agentless_ssh: bool,
+    pub ssh_host: bool,
     /// What the host supplies to commands flotilla runs there (#3722).
     pub supplies: Vec<HostSupply>,
-    /// How many vessels an agentless host can hold at once (#3793). A capped
+    /// How many vessels an SSH host can hold at once (#3793). A capped
     /// host takes unpinned convoys within its cap; without a cap it takes
     /// only convoys that pin its placement.
     pub max_vessels: Option<u32>,
-    /// The agentless host is a dedicated, single-tenant machine: nothing else
+    /// The SSH host is a dedicated, single-tenant machine: nothing else
     /// lives there and its user exists only for crews, so the whole VM is the
     /// sandbox boundary (#4002). Its host-direct kind then ranks as contained
     /// in least-privilege placement. Absent means `false`.
     pub single_tenant: bool,
-    /// How the owning daemon reaches the vessel agents it runs on an agentless
+    /// How the owning daemon reaches the vessel agents it runs on an SSH
     /// host (#3792). Absent, the host takes no vessels.
     pub vessel_agent: Option<VesselAgentReachConfig>,
 }
 
-/// The explicit SSH recipe for an agentless host's vessel agents (#3792).
+/// The explicit SSH recipe for an SSH host's vessel agents (#3792).
 /// Drydock's SSH transport reads no ambient SSH configuration, so the host
 /// key is pinned here and the key file named, never taken from `~/.ssh`.
 ///
@@ -303,8 +303,10 @@ struct RawRemoteHostConfig {
     expected_node_id: Option<NodeId>,
     user: Option<String>,
     ssh_multiplex: Option<bool>,
-    #[serde(default)]
-    agentless_ssh: bool,
+    // ADR 0047: remove the agentless_ssh alias one fleet roll after #4001,
+    // once udder's hosts.toml says `ssh_host`.
+    #[serde(default, alias = "agentless_ssh")]
+    ssh_host: bool,
     #[serde(default)]
     supplies: Vec<HostSupply>,
     #[serde(default)]
@@ -335,7 +337,7 @@ impl<'de> Deserialize<'de> for HostsConfig {
                         expected_node_id: host.expected_node_id,
                         user: host.user,
                         ssh_multiplex: host.ssh_multiplex,
-                        agentless_ssh: host.agentless_ssh,
+                        ssh_host: host.ssh_host,
                         supplies: host.supplies,
                         max_vessels: host.max_vessels,
                         single_tenant: host.single_tenant,
@@ -409,7 +411,7 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub http: HttpListenerConfig,
     /// How many Docker per-vessel vessels this daemon's host holds at once,
-    /// the field an agentless host declares in `hosts.toml` (#4002). Absent
+    /// the field an SSH host declares in `hosts.toml` (#4002). Absent
     /// means unbounded, as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_vessels: Option<u32>,

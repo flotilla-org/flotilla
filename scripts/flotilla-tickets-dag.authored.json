@@ -662,10 +662,10 @@
       "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1185\">#1185</a> host-agnostic placement policies"
     },
     "flotilla-org/flotilla#1186": {
-      "detail": "comte/beaufort/brie revival: agentless Host flavor, probed health, remote-runner actuation; salvage Plane-A inventory pre-deletion. Brainstorm",
+      "detail": "comte/beaufort/brie revival: SSH Host flavor, probed health, remote-runner actuation; salvage Plane-A inventory pre-deletion. Brainstorm",
       "stage": "design",
       "group": "trackA",
-      "dagLabel": "#1186 agentless hosts",
+      "dagLabel": "#1186 SSH hosts",
       "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1186\">#1186</a> ssh-only hosts in Plane B"
     },
     "flotilla-org/flotilla#1187": {

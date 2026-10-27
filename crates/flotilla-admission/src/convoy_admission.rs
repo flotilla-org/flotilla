@@ -61,9 +61,9 @@ use crate::project_ops;
 use crate::regard_lifecycle::{RegardLifecycle, SurfaceGestureOutcome};
 use crate::support::{
     authoritative_placement_host, check_placement_capacity, ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot,
-    home_copy_wins_by_name, host_generation, host_occupancies, host_occupancy, is_agentless_ssh_host, placement_actuator_host_ref,
-    placement_host_not_ready_reason, placement_host_ref, placement_target_host, policy_targets_agentless_ssh, prepared_snapshot_name,
-    resolve_placement_provider, unready_placement_refusal, AGENTLESS_SSH_PIN_ONLY,
+    home_copy_wins_by_name, host_generation, host_occupancies, host_occupancy, is_ssh_host, placement_actuator_host_ref,
+    placement_host_not_ready_reason, placement_host_ref, placement_target_host, policy_targets_ssh_host, prepared_snapshot_name,
+    resolve_placement_provider, unready_placement_refusal, SSH_HOST_PIN_ONLY,
 };
 
 /// Routing uses replicated observations as hints; only admission may refuse on
@@ -158,7 +158,7 @@ pub struct ConvoyAdmission {
 struct AdmissionReadContext<'a> {
     runtime: AdmissionRuntime<'a>,
     backend: ResourceBackend,
-    /// Capped agentless hosts' occupancy, counted from the live store when a
+    /// Capped SSH hosts' occupancy, counted from the live store when a
     /// request snapshot (which copies no convoys or vessels) is loaded.
     occupancy: BTreeMap<String, flotilla_resources::HostOccupancy>,
     /// Vessels this admission has already placed on each capped host: a
@@ -2756,10 +2756,8 @@ impl AdmissionReadContext<'_> {
             let policy_name = kind.metadata.name.clone();
             let refusal = |reason: String| PlacementRefusal { policy_name: policy_name.clone(), target_host: target_host.clone(), reason };
             // #3907: a kind where some requester's access has no plan drops out.
-            let environment_kind = flotilla_agent::account_access::EnvironmentKind::of_realisation(
-                &kind.spec.realisation,
-                host.is_some_and(is_agentless_ssh_host),
-            );
+            let environment_kind =
+                flotilla_agent::account_access::EnvironmentKind::of_realisation(&kind.spec.realisation, host.is_some_and(is_ssh_host));
             if let Some(reason) = crate::account_access::plan_refusal(workflow, environment_kind)? {
                 rejected.push(refusal(reason));
                 continue;
@@ -2776,8 +2774,8 @@ impl AdmissionReadContext<'_> {
             }
             let vessel_cap = host.and_then(|host| host.spec.vessel_cap(&kind.spec.realisation));
             let single_tenant = host.is_some_and(|host| host.spec.single_tenant);
-            if host.is_some_and(is_agentless_ssh_host) && vessel_cap.is_none() && pin != Some(kind.metadata.name.as_str()) {
-                rejected.push(refusal(AGENTLESS_SSH_PIN_ONLY.to_string()));
+            if host.is_some_and(is_ssh_host) && vessel_cap.is_none() && pin != Some(kind.metadata.name.as_str()) {
+                rejected.push(refusal(SSH_HOST_PIN_ONLY.to_string()));
                 continue;
             }
             // A convoy waits until all its vessels on a host fit, so one
@@ -2910,7 +2908,7 @@ impl AdmissionReadContext<'_> {
                         rejected.push(refusal("fulfilment kind and placement policy disagree on host or realisation".into()));
                         continue;
                     }
-                    // A capped agentless host's slots are counted afresh: the
+                    // A capped SSH host's slots are counted afresh: the
                     // published fact trails the admissions just made (#3793).
                     let free_slots = match (vessel_cap, host, purpose) {
                         (Some(cap), Some(host), PlacementPurpose::Admission) => Some(
@@ -4382,8 +4380,8 @@ async fn decide_default_placement(
     for mut policy in policies {
         let mut candidate_workflow = workflow.clone();
         // Only unpinned convoys reach default placement.
-        let refusal = if policy_targets_agentless_ssh(backend, namespace, &policy).await {
-            Some(AGENTLESS_SSH_PIN_ONLY.to_string())
+        let refusal = if policy_targets_ssh_host(backend, namespace, &policy).await {
+            Some(SSH_HOST_PIN_ONLY.to_string())
         } else if purpose == PlacementPurpose::Routing {
             None
         } else if let Some(reason) =
@@ -6197,7 +6195,7 @@ mod tests {
             let right = candidate("right", right.3, right.0, right.1, right.2);
             assert_eq!(placement_tiebreak.compare(&left, &right).is_lt(), left_wins, "{label}");
         }
-        // #3793: among otherwise equal capped agentless hosts, the most free
+        // #3793: among otherwise equal capped SSH hosts, the most free
         // slots wins; uncapped kinds keep name order whatever slots they publish.
         let mut fuller = candidate("a-fuller", FulfilmentCostClass::OwnedIdle, true, None, Some(1));
         let mut emptier = candidate("b-emptier", FulfilmentCostClass::OwnedIdle, true, None, Some(3));

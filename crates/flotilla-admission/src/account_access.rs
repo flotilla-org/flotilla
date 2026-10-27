@@ -24,7 +24,7 @@ use flotilla_schema::{Records, State, Timestamp};
 use flotilla_store::{ResourceBackend, StoreQuery};
 
 use crate::random::RandomSource;
-use crate::support::{authoritative_placement_host, is_agentless_ssh_host, placement_target_host};
+use crate::support::{authoritative_placement_host, is_ssh_host, placement_target_host};
 
 /// The requester an alternative set belongs to: one agent crew of one vessel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,7 +72,7 @@ pub const CONVOY_START_PIN: &str = "convoy start --account";
 
 /// The candidate environment kind a placement policy resolves to on its target host.
 pub fn placement_environment_kind(spec: &PlacementPolicySpec, host: Option<&ResourceObject<ResourceHost>>) -> EnvironmentKind {
-    EnvironmentKind::of_policy(spec, host.is_some_and(is_agentless_ssh_host))
+    EnvironmentKind::of_policy(spec, host.is_some_and(is_ssh_host))
 }
 
 /// The reason a candidate environment kind is refused: some requester's access has no plan

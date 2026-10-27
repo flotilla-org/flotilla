@@ -47,7 +47,7 @@ pub struct ConvoyReconciler {
     change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
     forges: Option<DefinitionResolver<Forge>>,
     hosts: Option<ReplicaReadResolver<Host>>,
-    /// Every convoy, to count an agentless host's vessels against its cap.
+    /// Every convoy, to count an SSH host's vessels against its cap.
     convoys: Option<ReplicaReadResolver<Convoy>>,
     change_request_stale_after: std::time::Duration,
     landing_evidence_stale_after: std::time::Duration,
@@ -413,7 +413,7 @@ impl Reconciler for ConvoyReconciler {
                         // The live cap's value wins: lowering it holds admitted
                         // convoys, removing it releases them.
                         let vessel_cap = host.as_ref().and_then(|host| match host.spec.connection {
-                            HostConnection::AgentlessSsh { .. } => host.spec.max_vessels,
+                            HostConnection::SshHost { .. } => host.spec.max_vessels,
                             HostConnection::Daemon => selected.max_vessels.and(host.spec.max_vessels),
                         });
                         let status = host.and_then(|host| host.status).map(|mut status| {

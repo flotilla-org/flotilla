@@ -129,7 +129,6 @@ use recovery_scenario::*;
 use terminal_support::*;
 
 mod adopted_checkouts;
-mod agentless_harness;
 mod clone_reads;
 mod convoy_lifecycle;
 mod credential_delivery;
@@ -144,6 +143,7 @@ mod heartbeat;
 mod memory_tests;
 mod message;
 mod seed;
+mod ssh_host_harness;
 mod supervisor_turns;
 mod terminal;
 mod vessel_seats;

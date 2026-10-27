@@ -159,15 +159,15 @@ The owner's environment and placement grill separated three things that "host" u
 
 - **A capacity pool** is what a ledger is keyed by: a host's compute and disk, or a provider account's quota. Each pool has one authoritative daemon that grants vessel leases from it ([ADR 0058, dispatch](0058-dispatch-four-queues-one-global-decider.md), 2026-10-20 amendment).
   - A provider's capability declaration names the pools its environments draw on. A host-direct or Docker environment draws on its host. A cloud sandbox draws on its account, and may also draw a little on the controlling host, which the capacity grill (#3303) is to model.
-  - This refines "the advertising host is the controlling host" above: the controlling host holds the credential, but it is not the pool. An agentless SSH host is its own pool, controlled by its owning daemon.
+  - This refines "the advertising host is the controlling host" above: the controlling host holds the credential, but it is not the pool. An SSH host is its own pool, controlled by its owning daemon.
   - "Host" may later split into pool, controller and place. A "cloud" Host run on Workers and Durable Objects would control providers with no environment of its own.
 - **An Environment stores a qualified provider address:** a place plus the provider instance, in [ADR 0066](0066-addresses-name-things-by-natural-key.md) segments. Examples:
-  - `host:b1/provider:host-direct` (an agentless SSH host);
+  - `host:b1/provider:host-direct` (an SSH host);
   - `host:udder/provider:docker`;
   - `account:namespace-lab/provider:namespace` (a cloud account).
   The address is copied from the vessel's lease when the Environment is created.
 - **The controller is resolved, never stored.** The place's replicated record (a Host, or the account's record) says which daemon controls it, so moving control changes no Environment. Failover, such as a disconnected host reaching a cloud account through another controller, hangs off this resolution later and is not designed here.
-- **`provider_for_environment` becomes one address-to-registry resolution** (#3521), replacing today's split between the local registry and agentless SSH profiles. The old `host_direct.host_ref` and `docker.host_ref` fields retire (owner ruling on #3521, 2026-10-20):
+- **`provider_for_environment` becomes one address-to-registry resolution** (#3521), replacing today's split between the local registry and SSH host profiles. The old `host_direct.host_ref` and `docker.host_ref` fields retire (owner ruling on #3521, 2026-10-20):
   - **Reads:** a record without an address derives one from them (`host:<host_ref>/provider:host-direct` or `/provider:docker`).
   - **Writes:** new Environments write only the address, so the two never disagree.
   - **Removal:** the fields go one roll after nothing writes them, or at the generated-table move (#3108), whichever is first, with the schema review.

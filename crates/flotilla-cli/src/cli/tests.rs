@@ -330,7 +330,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         epochs: vec!["1".into(), "2".into()],
         provisions: vec![flotilla_protocol::ExplainedAccountProvision {
             place: "env-b1".into(),
-            environment_kind: "agentless-ssh".into(),
+            environment_kind: "ssh-host".into(),
             implementation: "claude-direct".into(),
             effective_access: "account".into(),
             mechanism: "oauth-token-file:CLAUDE_CONFIG_DIR".into(),
@@ -346,7 +346,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         "  Reason: binding revoked: no authorizing grant; directly delivered until 2026-10-26T12:00:00+00:00",
         "  Grants: claude-box-accounts; epochs: 1 -> 2",
         "  Excluded claude-max: host `b1` does not hold it",
-        "  Provisioned at env-b1 (agentless-ssh): claude-direct oauth-token-file:CLAUDE_CONFIG_DIR into /state/agent-homes/requesters/c1/coder/claude, update push, delivered epoch 2",
+        "  Provisioned at env-b1 (ssh-host): claude-direct oauth-token-file:CLAUDE_CONFIG_DIR into /state/agent-homes/requesters/c1/coder/claude, update push, delivered epoch 2",
     ] {
         assert!(rendered.contains(expected), "{expected}\n{rendered}");
     }

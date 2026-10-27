@@ -21,7 +21,7 @@ async fn remote_rustc_wrapper_stages_once_in_a_private_directory() {
 }
 
 #[tokio::test]
-async fn bad_agentless_ssh_host_does_not_block_daemon_startup_or_other_hosts() {
+async fn bad_ssh_host_does_not_block_daemon_startup_or_other_hosts() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"ssh-resilience-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(temp.path()));
@@ -110,13 +110,13 @@ async fn bad_agentless_ssh_host_does_not_block_daemon_startup_or_other_hosts() {
 }
 
 #[tokio::test]
-async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
+async fn ssh_host_provisions_clone_and_worktree_through_its_runner() {
     // The host's home holds each vessel's cleat runtime, a socket directory (SUN_LEN).
     let temp = flotilla_test_support::TestSocketDir::new();
     let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
     let config_dir = temp.path().join("config");
     fs::create_dir_all(&config_dir).expect("config directory");
-    fs::write(config_dir.join("daemon.toml"), "machine_id = \"agentless-ssh-test\"\n").expect("daemon config");
+    fs::write(config_dir.join("daemon.toml"), "machine_id = \"ssh-host-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_dir));
     let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
     let local_host_id = daemon.local_host_id().expect("local host ID").to_string();
@@ -152,7 +152,7 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
         )) as Arc<dyn EnvironmentProvider>,
     );
     daemon.set_direct_environment_registry(&environment_id, Arc::new(registry)).expect("register SSH providers");
-    let profile = AgentlessSshProfile {
+    let profile = SshHostProfile {
         provisioning: LocalProvisioningProfile {
             repo_default_dir: temp.path().join("ssh-repos").display().to_string(),
             display_name: "beaufort".to_string(),
@@ -176,9 +176,7 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
         vessel_agent: Err("the test's vessel agents run on the host runner".into()),
     };
-    register_agentless_ssh_resources(&daemon.resource_backend(), NAMESPACE, &local_host_id, &profile)
-        .await
-        .expect("register SSH resources");
+    register_ssh_host_resources(&daemon.resource_backend(), NAMESPACE, &local_host_id, &profile).await.expect("register SSH resources");
     profile
         .fulfilment_facts
         .write()
@@ -188,7 +186,7 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
     std::fs::create_dir_all(&claude_dir).expect("create remote Claude dir");
     std::fs::write(claude_dir.join(".credentials.json"), r#"{"claudeAiOauth":{"expiresAt":1756000000000}}"#)
         .expect("write remote credential metadata");
-    apply_agentless_ssh_observation(&daemon, NAMESPACE, &profile, None, None).await.expect("publish SSH observation");
+    apply_ssh_host_observation(&daemon, NAMESPACE, &profile, None, None).await.expect("publish SSH observation");
     let host = daemon.resource_backend().using::<Host>(NAMESPACE).get(host_id).await.expect("SSH Host");
     // #3793: the owning daemon declares the configured cap and publishes the
     // free slots it counts for each of the host's kinds.
@@ -206,18 +204,18 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
         .update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &changed)
         .await
         .expect("edit SSH policy while the daemon runs");
-    apply_agentless_ssh_observation(&daemon, NAMESPACE, &profile, None, None).await.expect("refresh SSH observation");
+    apply_ssh_host_observation(&daemon, NAMESPACE, &profile, None, None).await.expect("refresh SSH observation");
     let kind =
         daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE).get("host-direct-ssh-test-host").await.expect("refreshed SSH kind");
     assert_eq!(kind.spec.pool, "alternate-pool");
     let mut unreachable = profile.clone();
     unreachable.runner = Arc::new(DiscoveryMockRunner::builder().on_run("rustc", &["--version"], Ok("rustc 9".into())).build());
-    apply_agentless_ssh_observation(&daemon, NAMESPACE, &unreachable, None, None).await.expect("publish unreachable SSH observation");
+    apply_ssh_host_observation(&daemon, NAMESPACE, &unreachable, None, None).await.expect("publish unreachable SSH observation");
     let unreachable_status =
         daemon.resource_backend().using::<Host>(NAMESPACE).get(host_id).await.expect("SSH Host").status.expect("unreachable SSH status");
     assert!(!unreachable_status.ready);
     assert!(unreachable_status.fulfilment_facts.is_empty(), "unreachable SSH host must not retain or probe facts");
-    apply_agentless_ssh_observation(&daemon, NAMESPACE, &profile, None, None).await.expect("restore SSH observation");
+    apply_ssh_host_observation(&daemon, NAMESPACE, &profile, None, None).await.expect("restore SSH observation");
     let vessel_pool = Arc::new(AttachableToolPool(FakeTerminalPool::new()));
     let mut vessel_registry = ProviderRegistry::new();
     vessel_registry.terminal_pools.insert(
@@ -235,8 +233,8 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
             local_host_id.clone(),
             format!("host-direct-{local_host_id}"),
         )
-        .with_agentless_ssh(vec![profile])
-        .with_agentless_vessels(Some(vessels_over(agents.clone(), temp.path())))
+        .with_ssh_host(vec![profile])
+        .with_ssh_host_vessels(Some(vessels_over(agents.clone(), temp.path())))
         .with_environment_tools(EnvironmentToolProvisioner::new(Vec::new())),
     );
     // The SSH host's host-direct Environment resolves to the provider in the
@@ -354,15 +352,15 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
     assert_eq!(vessel_pool.0.ensured.lock().await.len(), 1);
     assert!(pool.ensured.lock().await.is_empty(), "host pool must not launch tool crews");
     assert_eq!(terminal.session_liveness(&session_id, (&session).into()).await.unwrap(), TerminalLiveness::Running);
-    let paths = super::agentless_vessels::VesselPaths::new(
-        &state.agentless_ssh[environment_id.as_str()].env_bag,
-        &super::agentless_vessels::VesselKey::new(&environment_id, "ssh-crew-work"),
+    let paths = super::ssh_host_vessels::VesselPaths::new(
+        &state.ssh_host[environment_id.as_str()].env_bag,
+        &super::ssh_host_vessels::VesselKey::new(&environment_id, "ssh-crew-work"),
     )
     .unwrap();
     assert_eq!(agents.recorded(&paths).tool_pushes, 1);
     // Attach forwards the Cleat socket through this vessel's agent.
-    let access = super::agentless_vessels::VesselSessions { state: Arc::downgrade(&state) };
-    let attached = flotilla_core::in_process::AgentlessVesselAccess::attach(
+    let access = super::ssh_host_vessels::VesselSessions { state: Arc::downgrade(&state) };
+    let attached = flotilla_core::in_process::SshHostVesselAccess::attach(
         &access,
         (&session).into(),
         &session_id,
@@ -382,7 +380,7 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
 
 use flotilla_orchestration_testkit::InProcessDiscoveryExt;
 
-use super::agentless_vessels::{AgentlessVessels, HostPlatform, SshVesselAgents};
+use super::ssh_host_vessels::{HostPlatform, SshHostVessels, SshVesselAgents};
 use super::vessel_support::{vessels_over, RunnerVesselAgents};
 
 // #3792: a host this controller cannot run vessel agents on is refused at
@@ -390,7 +388,7 @@ use super::vessel_support::{vessels_over, RunnerVesselAgents};
 // whose tools this generation lacks, or no agent build. A platform never
 // probed successfully (an SSH blip) is diagnostic only.
 #[tokio::test]
-async fn agentless_host_without_vessel_agents_is_refused_at_placement() {
+async fn ssh_host_without_vessel_agents_is_refused_at_placement() {
     let system = if cfg!(target_os = "macos") { "Darwin" } else { "Linux" };
     assert_eq!(HostPlatform::from_uname(system, std::env::consts::ARCH), HostPlatform::controller());
     let controller_uname = "Linux x86_64\n";
@@ -398,7 +396,7 @@ async fn agentless_host_without_vessel_agents_is_refused_at_placement() {
     let build = state.path().join("drydock-agent");
     fs::write(&build, b"agent").expect("agent build");
     let found = build.clone();
-    let vessels = AgentlessVessels::new(
+    let vessels = SshHostVessels::new(
         Arc::new(SshVesselAgents::with_agent_build(Box::new(move |_| Ok(found.clone())))),
         vessel_support::held_socket_service(state.path()),
         state.path().join("vessels"),
@@ -410,7 +408,7 @@ async fn agentless_host_without_vessel_agents_is_refused_at_placement() {
         host_key: "ssh-ed25519 AAAA".into(),
         identity_file: state.path().join("key"),
     };
-    let profile = |id: &str, uname: Option<&str>, runtime: bool, reach: Result<_, String>| AgentlessSshProfile {
+    let profile = |id: &str, uname: Option<&str>, runtime: bool, reach: Result<_, String>| SshHostProfile {
         provisioning: manual_profile(id, false),
         environment_id: EnvironmentId::new(format!("host-direct-{id}")),
         destination: format!("crew@{id}"),
@@ -437,13 +435,12 @@ async fn agentless_host_without_vessel_agents_is_refused_at_placement() {
     };
 
     let (conditions, ready) =
-        super::discovery::agentless_vessel_conditions(Some(&vessels), &profile("b1", Some(controller_uname), true, Ok(reach.clone())))
-            .await;
+        super::discovery::ssh_host_vessel_conditions(Some(&vessels), &profile("b1", Some(controller_uname), true, Ok(reach.clone()))).await;
     assert!(ready, "{conditions:?}");
     assert!(conditions.is_empty());
 
     let (conditions, ready) =
-        super::discovery::agentless_vessel_conditions(Some(&vessels), &profile("b2", Some("Linux riscv64\n"), true, Ok(reach.clone())))
+        super::discovery::ssh_host_vessel_conditions(Some(&vessels), &profile("b2", Some("Linux riscv64\n"), true, Ok(reach.clone())))
             .await;
     assert!(!ready);
     let refusal = refused(conditions, ready).expect("refused");
@@ -451,24 +448,24 @@ async fn agentless_host_without_vessel_agents_is_refused_at_placement() {
 
     let missing = Err("hosts.toml [hosts.b3.vessel_agent] is not set".to_string());
     let (conditions, ready) =
-        super::discovery::agentless_vessel_conditions(Some(&vessels), &profile("b3", Some(controller_uname), false, missing)).await;
+        super::discovery::ssh_host_vessel_conditions(Some(&vessels), &profile("b3", Some(controller_uname), false, missing)).await;
     assert!(!ready);
     let reasons = conditions.iter().map(|condition| condition.reason.clone()).collect::<Vec<_>>();
     assert_eq!(reasons, ["MissingReach", "NoRuntimeDirectory"]);
     assert!(refused(conditions, ready).expect("refused").contains("vessel_agent"));
 
     let (conditions, ready) =
-        super::discovery::agentless_vessel_conditions(Some(&vessels), &profile("b4", None, true, Ok(reach.clone()))).await;
+        super::discovery::ssh_host_vessel_conditions(Some(&vessels), &profile("b4", None, true, Ok(reach.clone()))).await;
     assert!(ready);
     assert!(matches!(conditions.as_slice(), [condition] if condition.reason == "PlatformUnknown" && !condition.blocks_readiness()));
 
-    let no_build = AgentlessVessels::new(
+    let no_build = SshHostVessels::new(
         Arc::new(SshVesselAgents::with_agent_build(Box::new(|_| Err("install drydock-agent beside flotillad".into())))),
         vessel_support::held_socket_service(state.path()),
         state.path().join("vessels"),
     );
     let (conditions, ready) =
-        super::discovery::agentless_vessel_conditions(Some(&no_build), &profile("b5", Some(controller_uname), true, Ok(reach))).await;
+        super::discovery::ssh_host_vessel_conditions(Some(&no_build), &profile("b5", Some(controller_uname), true, Ok(reach))).await;
     assert!(!ready);
     assert!(matches!(conditions.as_slice(), [condition] if condition.reason == "NoAgentBuild"), "{conditions:?}");
 }

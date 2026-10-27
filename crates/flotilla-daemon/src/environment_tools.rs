@@ -26,9 +26,9 @@ use tokio::sync::OnceCell;
 pub(crate) struct EnvironmentToolProviderKind(&'static str);
 
 pub(crate) const DOCKER_PROVIDER_KIND: EnvironmentToolProviderKind = EnvironmentToolProviderKind("docker");
-/// A vessel on an agentless SSH host (#3792): only the generation layer,
+/// A vessel on an SSH host (#3792): only the generation layer,
 /// published under the vessel's own prefix, since nothing there is mounted.
-pub(crate) const AGENTLESS_SSH_PROVIDER_KIND: EnvironmentToolProviderKind = EnvironmentToolProviderKind("agentless-ssh");
+pub(crate) const SSH_HOST_PROVIDER_KIND: EnvironmentToolProviderKind = EnvironmentToolProviderKind("ssh-host");
 
 /// Where a Docker vessel mounts the generation layer; declared members are
 /// relative to it.
@@ -186,7 +186,7 @@ impl FleetToolsTool {
 #[async_trait]
 impl EnvironmentToolFactory for FleetToolsTool {
     fn provider_kinds(&self) -> &[EnvironmentToolProviderKind] {
-        &[DOCKER_PROVIDER_KIND, AGENTLESS_SSH_PROVIDER_KIND]
+        &[DOCKER_PROVIDER_KIND, SSH_HOST_PROVIDER_KIND]
     }
     async fn prepare(&self, name: &str, context: &dyn EnvironmentToolContext) -> Result<EnvironmentTool, String> {
         let mut cli = self.cli.prepare(name, context).await?;
@@ -813,7 +813,7 @@ pub(crate) mod tests {
             .all(|update| !matches!(update, EnvironmentVariableUpdate::PrependPath { name, .. } if name == "LD_LIBRARY_PATH")));
         assert!(tool.assets.iter().all(|asset| asset.kind != EnvironmentToolAssetKind::File
             || asset.environment_path.as_path() == Path::new(ENVIRONMENT_FLOTILLA_PATH)));
-        // #3792: a vessel on an agentless host takes the same generation as
+        // #3792: a vessel on an SSH host takes the same generation as
         // real directories under its own prefix: nothing to mount, no file
         // outside the prefix, and no variables of the container's.
         struct PrefixContext(PathBuf);

@@ -39,8 +39,8 @@ use tracing::{debug, info, warn};
 
 use super::access_layer::{deliver_access, deliver_host_account, AccessDelivered, AccessLaunch};
 use super::account_access::AccountLaunch;
-use super::agentless_vessels::{apply_reach_environment, compose_session_environment, vessel_base, VesselAccess};
 use super::credentials::RuntimeSessionCapabilities;
+use super::ssh_host_vessels::{apply_reach_environment, compose_session_environment, vessel_base, VesselAccess};
 use super::state::ControllerRuntimeState;
 use crate::blob_store::BlobDigest;
 use crate::blob_store::BlobStore;
@@ -320,9 +320,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
         spec: TerminalSessionTarget<'_>,
         tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
-        // #3792: a crew on an agentless host runs in its vessel's own agent:
+        // #3792: a crew on an SSH host runs in its vessel's own agent:
         // its providers, files and commands all go through that agent.
-        let agentless = self.state.agentless_ssh.get(&spec.env_ref);
+        let ssh_host = self.state.ssh_host.get(&spec.env_ref);
         let vessel = self.vessel_for_spec(spec).await?;
         let registry = match &vessel {
             Some(access) => Arc::clone(&access.registry),
@@ -372,7 +372,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
             None if credential_refs.is_empty() => Vec::new(),
             None => return Err("host-local credential store unavailable".to_string()),
         };
-        // An agentless crew's bound layer: what credential delivery and its
+        // An SSH host crew's bound layer: what credential delivery and its
         // harness homes produced, with the wrapper directories a declared
         // `PATH` names. No other declared variable joins it.
         let mut bound_material = credential_env.clone();
@@ -389,7 +389,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         // flotilla environment names it, and its harness takes the contained
         // path; the daemon host's own host-direct session does not.
         if let Some(access) = &vessel {
-            // #3618, #3792: an agentless host's crews reach the daemon through
+            // #3618, #3792: an SSH host's crews reach the daemon through
             // their vessel agent's forward, with the generation's CLI on PATH.
             apply_reach_environment(&mut credential_env, &spec.env_ref, &access.paths);
         } else if spec.env_ref != self.state.host_direct_environment_name {
@@ -421,7 +421,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     convoy: &context.convoy,
                     role: &spec.role,
                     env_ref: &spec.env_ref,
-                    agentless: agentless.is_some(),
+                    ssh_host: ssh_host.is_some(),
                 };
                 // #3964: a crew aboard a vessel gets its harness home, skills and account
                 // material from the access layer, through its vessel agent, before its
@@ -552,7 +552,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         let host_ref = if spec.env_ref == self.state.host_direct_environment_name {
             Some(self.state.local_host_ref.as_str())
         } else {
-            self.state.agentless_ssh.get(&spec.env_ref).map(|profile| profile.provisioning.host_id.as_str())
+            self.state.ssh_host.get(&spec.env_ref).map(|profile| profile.provisioning.host_id.as_str())
         };
         let mut configured_limits = None;
         if let Some(host_ref) = host_ref {
@@ -571,9 +571,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 ("RUSTC_WORKSPACE_WRAPPER".to_string(), wrapper.display().to_string()),
             ]);
         }
-        if let (Some(profile), Some(access)) = (agentless, &vessel) {
+        if let (Some(profile), Some(access)) = (ssh_host, &vessel) {
             // Rendered last, so nothing after it adds to PATH or sets a base
-            // variable. Every agentless launch reaches here with its vessel:
+            // variable. Every SSH host launch reaches here with its vessel:
             // without one it returned above.
             let bound = BoundLayer::delivered(&bound_material, &vessel_base(profile, &access.paths)?)?;
             command = compose_session_environment(&mut env, &command, &access.paths, profile, bound)?;
@@ -626,9 +626,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
         crew: &flotilla_resources::CrewSessionStatus,
     ) -> Result<Option<i32>, String> {
         let runner = self.runner_for_spec(spec).await?;
-        // Receipts are read in batches per runner: an agentless host's
+        // Receipts are read in batches per runner: an SSH host's
         // vessels each read through their own agent.
-        let vessel = self.state.agentless_ssh.contains_key(&spec.env_ref).then_some(spec.vessel_ref).flatten();
+        let vessel = self.state.ssh_host.contains_key(&spec.env_ref).then_some(spec.vessel_ref).flatten();
         let batch = match vessel {
             Some(vessel) => format!("{}/{vessel}", spec.env_ref),
             None => spec.env_ref.clone(),
@@ -671,7 +671,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
     }
 
     async fn daemon_reach(&self, spec: TerminalSessionTarget<'_>) -> Result<Option<String>, String> {
-        if !self.state.agentless_ssh.contains_key(&spec.env_ref) {
+        if !self.state.ssh_host.contains_key(&spec.env_ref) {
             return Ok(None);
         }
         // Also reconnects, or bootstraps, the vessel's agent for sessions
@@ -890,15 +890,15 @@ impl TerminalControllerRuntime {
             .ok_or_else(|| format!("provider registry unavailable for environment {env_ref}"))
     }
 
-    /// #3792: the prepared vessel a session on an agentless host runs in, and
+    /// #3792: the prepared vessel a session on an SSH host runs in, and
     /// `None` on every other environment. Both agent and tool crews name a vessel.
     pub(super) async fn vessel_for_spec(&self, spec: TerminalSessionTarget<'_>) -> Result<Option<Arc<VesselAccess>>, String> {
-        let Some(profile) = self.state.agentless_ssh.get(&spec.env_ref) else { return Ok(None) };
-        let vessel = spec.vessel_ref.ok_or_else(|| format!("agentless host {} requires a session vessel identity", spec.env_ref))?;
+        let Some(profile) = self.state.ssh_host.get(&spec.env_ref) else { return Ok(None) };
+        let vessel = spec.vessel_ref.ok_or_else(|| format!("SSH host {} requires a session vessel identity", spec.env_ref))?;
         self.state.vessel_access(profile, vessel).await.map(Some)
     }
 
-    /// The vessel agent a session's access layer runs through: the agentless host's
+    /// The vessel agent a session's access layer runs through: the SSH host's
     /// vessel agent, or the provisioned environment's.
     async fn vessel_agent(&self, spec: TerminalSessionTarget<'_>, vessel: Option<&VesselAccess>) -> Result<Arc<dyn VesselAgent>, String> {
         if let Some(access) = vessel {
@@ -945,7 +945,7 @@ impl TerminalControllerRuntime {
     }
 
     /// The adapter a session's harness runs under: the place's discovered one, or, on an
-    /// agentless vessel, whose access layer delivers the pinned harness (#3909), the
+    /// SSH host vessel, whose access layer delivers the pinned harness (#3909), the
     /// built-in adapter for it even when the host has none installed. Observation and
     /// cleanup never run its binary; launch uses the executable delivery returns.
     async fn session_adapter(&self, spec: TerminalSessionTarget<'_>, adapter: &str) -> Result<Arc<dyn AgentAdapter>, String> {

@@ -131,7 +131,7 @@ async fn placed_replica_is_projected_into_the_actuation_hosts_local_store() {
 }
 
 #[tokio::test]
-async fn owning_daemon_projects_a_vessel_placed_on_its_agentless_ssh_host() {
+async fn owning_daemon_projects_a_vessel_placed_on_its_ssh_host() {
     let admitting_root = NodeId::new("admitting-root");
     let admitting = ResourceBackend::new(InMemoryBackend::default()).with_local_root(admitting_root.clone());
     let owner = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("owning-root"));

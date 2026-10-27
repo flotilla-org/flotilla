@@ -498,9 +498,9 @@ async fn self_targeted_admission_resolves_display_name_policy_to_live_local_host
 }
 
 #[tokio::test]
-async fn capability_admission_places_on_agentless_ssh_hosts_only_when_pinned() {
+async fn capability_admission_places_on_ssh_hosts_only_when_pinned() {
     let temp = tempfile::tempdir().expect("tempdir");
-    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"agentless-owner\"\n").expect("daemon config");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"ssh-host-owner\"\n").expect("daemon config");
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
@@ -517,8 +517,8 @@ async fn capability_admission_places_on_agentless_ssh_hosts_only_when_pinned() {
             &test_meta("ssh-host"),
             &HostSpec {
                 display_name: "beaufort".into(),
-                connection: flotilla_resources::HostConnection::AgentlessSsh {
-                    owning_daemon: "agentless-owner".into(),
+                connection: flotilla_resources::HostConnection::SshHost {
+                    owning_daemon: "ssh-host-owner".into(),
                     destination: "crew@beaufort.example".into(),
                 },
                 ..HostSpec::default()
@@ -571,12 +571,12 @@ async fn capability_admission_places_on_agentless_ssh_hosts_only_when_pinned() {
 
     let refused = match daemon.resolve_capability_placement("flotilla", "project", &[], &workflow, &BTreeSet::new(), &unpinned).await {
         Ok((placement, _)) => {
-            assert!(placement.selected.is_none(), "an unpinned convoy must not land on an agentless SSH host");
+            assert!(placement.selected.is_none(), "an unpinned convoy must not land on an SSH host");
             placement.refused_candidates.into_iter().map(|candidate| candidate.reason).collect::<Vec<_>>().join("\n")
         }
         Err(error) => error,
     };
-    assert!(refused.contains("agentless SSH host takes only convoys that pin its placement"), "{refused}");
+    assert!(refused.contains("SSH host takes only convoys that pin its placement"), "{refused}");
 
     let (placement, _) = daemon
         .resolve_capability_placement("flotilla", "project", &[], &workflow, &BTreeSet::new(), &pinned)
@@ -594,7 +594,7 @@ async fn capability_admission_places_on_agentless_ssh_hosts_only_when_pinned() {
             &pinned,
         )
         .await
-        .expect_err("pinning does not let an agentless SSH host run an agent it lacks");
+        .expect_err("pinning does not let an SSH host run an agent it lacks");
     assert!(refused.contains("agent adapter `codex`"), "{refused}");
 }
 
@@ -770,9 +770,9 @@ async fn parallel_daemons_have_independent_free_space_probe_capacity() {
     }
 }
 
-/// An agentless SSH host, owned by `agentless-owner`, with its policy and
+/// An SSH host, owned by `ssh-host-owner`, with its policy and
 /// host-direct kind, optionally declaring a vessel cap (#3793).
-async fn agentless_host(backend: &ResourceBackend, name: &str, max_vessels: Option<u32>) {
+async fn ssh_host(backend: &ResourceBackend, name: &str, max_vessels: Option<u32>) {
     let hosts = backend.clone().using::<ResourceHost>("flotilla");
     let kind = format!("host-direct-{name}");
     let host = hosts
@@ -780,8 +780,8 @@ async fn agentless_host(backend: &ResourceBackend, name: &str, max_vessels: Opti
             &test_meta(name),
             &HostSpec {
                 display_name: name.into(),
-                connection: flotilla_resources::HostConnection::AgentlessSsh {
-                    owning_daemon: "agentless-owner".into(),
+                connection: flotilla_resources::HostConnection::SshHost {
+                    owning_daemon: "ssh-host-owner".into(),
                     destination: format!("crew@{name}.example"),
                 },
                 max_vessels,
@@ -825,8 +825,8 @@ async fn agentless_host(backend: &ResourceBackend, name: &str, max_vessels: Opti
         .expect("SSH host kind");
 }
 
-async fn agentless_owner(backend: &ResourceBackend, temp: &tempfile::TempDir) -> Arc<InProcessDaemon> {
-    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"agentless-owner\"\n").expect("daemon config");
+async fn ssh_host_owner(backend: &ResourceBackend, temp: &tempfile::TempDir) -> Arc<InProcessDaemon> {
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"ssh-host-owner\"\n").expect("daemon config");
     InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -838,17 +838,17 @@ async fn agentless_owner(backend: &ResourceBackend, temp: &tempfile::TempDir) ->
     .await
 }
 
-// #3793 acceptance: three agentless hosts that each declare `max_vessels = 1`
+// #3793 acceptance: three SSH hosts that each declare `max_vessels = 1`
 // take unpinned convoys, one per host. A fourth waits with "no free vessel
 // slots", and only a finished teardown of a vessel on its host lets it start:
 // a vessel still tearing down keeps its slot.
 #[tokio::test]
-async fn capped_agentless_hosts_spread_unpinned_convoys_and_queue_beyond_their_cap() {
+async fn capped_ssh_hosts_spread_unpinned_convoys_and_queue_beyond_their_cap() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let daemon = agentless_owner(&backend, &temp).await;
+    let daemon = ssh_host_owner(&backend, &temp).await;
     for name in ["b1", "b2", "b3"] {
-        agentless_host(&backend, name, Some(1)).await;
+        ssh_host(&backend, name, Some(1)).await;
     }
     let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
     let unpinned = flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".to_string()).build();
@@ -881,7 +881,7 @@ async fn capped_agentless_hosts_spread_unpinned_convoys_and_queue_beyond_their_c
         let (placement, _) = daemon
             .resolve_capability_placement("flotilla", "project", &[], &workflow, &BTreeSet::new(), &unpinned)
             .await
-            .expect("a capped agentless host takes an unpinned convoy");
+            .expect("a capped SSH host takes an unpinned convoy");
         let selected = placement.selected.expect("unpinned placement");
         // Admission records the decision on the convoy it creates.
         let decision = PlacementDecision {
@@ -972,12 +972,12 @@ async fn capped_agentless_hosts_spread_unpinned_convoys_and_queue_beyond_their_c
 // #3793: a host without `max_vessels` keeps the pin-only rule, even beside a
 // capped host that takes the unpinned convoy.
 #[tokio::test]
-async fn uncapped_agentless_host_still_refuses_unpinned_convoys() {
+async fn uncapped_ssh_host_still_refuses_unpinned_convoys() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let daemon = agentless_owner(&backend, &temp).await;
-    agentless_host(&backend, "b1", Some(1)).await;
-    agentless_host(&backend, "b9", None).await;
+    let daemon = ssh_host_owner(&backend, &temp).await;
+    ssh_host(&backend, "b1", Some(1)).await;
+    ssh_host(&backend, "b9", None).await;
     let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
     let unpinned = flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".to_string()).build();
     let (placement, _) = daemon
@@ -986,7 +986,7 @@ async fn uncapped_agentless_host_still_refuses_unpinned_convoys() {
         .expect("the capped host takes the convoy");
     assert_eq!(placement.selected.expect("placement").metadata.name, "host-direct-b1");
     let refusal = placement.refused_candidates.iter().find(|refusal| refusal.policy_name == "host-direct-b9").expect("b9 refused");
-    assert_eq!(refusal.reason, "agentless SSH host takes only convoys that pin its placement");
+    assert_eq!(refusal.reason, "SSH host takes only convoys that pin its placement");
 }
 
 // #3793: among otherwise equal hosts, placement prefers the one with the most
@@ -995,9 +995,9 @@ async fn uncapped_agentless_host_still_refuses_unpinned_convoys() {
 async fn placement_prefers_the_capped_host_with_most_free_slots() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let daemon = agentless_owner(&backend, &temp).await;
-    agentless_host(&backend, "b1", Some(2)).await;
-    agentless_host(&backend, "b2", Some(2)).await;
+    let daemon = ssh_host_owner(&backend, &temp).await;
+    ssh_host(&backend, "b1", Some(2)).await;
+    ssh_host(&backend, "b2", Some(2)).await;
     let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
     let unpinned = flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".to_string()).build();
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
@@ -1039,11 +1039,11 @@ async fn placement_prefers_the_capped_host_with_most_free_slots() {
 // cap is smaller than the vessels it would hold is refused rather than left
 // to wait forever.
 #[tokio::test]
-async fn capped_agentless_host_refuses_a_convoy_with_more_vessels_than_its_cap() {
+async fn capped_ssh_host_refuses_a_convoy_with_more_vessels_than_its_cap() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let daemon = agentless_owner(&backend, &temp).await;
-    agentless_host(&backend, "b1", Some(1)).await;
+    let daemon = ssh_host_owner(&backend, &temp).await;
+    ssh_host(&backend, "b1", Some(1)).await;
     let vessel = |name: &str| flotilla_resources::VesselRequirement::builder().name(name.to_string()).crew(Vec::new()).build();
     let workflow = WorkflowTemplateSpec::builder().vessels(vec![vessel("first"), vessel("second")]).build();
     let unpinned = flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".to_string()).build();
@@ -1062,8 +1062,8 @@ async fn capped_agentless_host_refuses_a_convoy_with_more_vessels_than_its_cap()
 async fn concurrent_admissions_onto_one_free_slot_provision_in_admission_order() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let daemon = agentless_owner(&backend, &temp).await;
-    agentless_host(&backend, "b1", Some(1)).await;
+    let daemon = ssh_host_owner(&backend, &temp).await;
+    ssh_host(&backend, "b1", Some(1)).await;
     let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
     let unpinned = flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".to_string()).build();
     // Both placements are decided before either convoy exists.
@@ -1142,10 +1142,10 @@ async fn docker_host(backend: &ResourceBackend, name: &str, max_vessels: Option<
         .expect("Docker kind");
 }
 
-/// A capped agentless box whose host-direct kind is derived as b1's is,
+/// A capped SSH host box whose host-direct kind is derived as b1's is,
 /// with or without the single-tenant declaration (#4002).
 async fn dedicated_box(backend: &ResourceBackend, name: &str, max_vessels: u32, single_tenant: bool) {
-    agentless_host(backend, name, Some(max_vessels)).await;
+    ssh_host(backend, name, Some(max_vessels)).await;
     let hosts = backend.clone().using::<ResourceHost>("flotilla");
     let host = hosts.get(name).await.expect("box");
     hosts
@@ -1214,7 +1214,7 @@ fn allocation_candidate<'a>(decision: &'a PlacementDecision, kind: &str) -> &'a 
 async fn declared_single_tenant_box_is_a_minimal_alternative_and_an_undeclared_one_is_not() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let daemon = agentless_owner(&backend, &temp).await;
+    let daemon = ssh_host_owner(&backend, &temp).await;
     docker_host(&backend, "feta", None).await;
     dedicated_box(&backend, "b1", 1, true).await;
     dedicated_box(&backend, "b2", 1, false).await;
@@ -1235,7 +1235,7 @@ async fn declared_single_tenant_box_is_a_minimal_alternative_and_an_undeclared_o
 async fn capped_docker_host_at_its_cap_overflows_to_a_box() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let daemon = agentless_owner(&backend, &temp).await;
+    let daemon = ssh_host_owner(&backend, &temp).await;
     docker_host(&backend, "feta", Some(1)).await;
     dedicated_box(&backend, "b1", 1, true).await;
     // The first convoy fills feta's one slot.
@@ -1247,12 +1247,12 @@ async fn capped_docker_host_at_its_cap_overflows_to_a_box() {
 }
 
 // #4002: when every contained candidate is at its cap, the convoy is still
-// admitted and waits at the capacity gate, as for a full agentless host.
+// admitted and waits at the capacity gate, as for a full SSH host.
 #[tokio::test]
 async fn all_candidates_full_means_the_convoy_waits() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let daemon = agentless_owner(&backend, &temp).await;
+    let daemon = ssh_host_owner(&backend, &temp).await;
     docker_host(&backend, "feta", Some(1)).await;
     dedicated_box(&backend, "b1", 1, true).await;
     for (name, pin) in [("first", "docker-feta"), ("second", "host-direct-b1")] {

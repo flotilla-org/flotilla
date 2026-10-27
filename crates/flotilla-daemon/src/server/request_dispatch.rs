@@ -175,7 +175,7 @@ impl<'a> RequestDispatcher<'a> {
             let service = ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
             let session = service.caller_session(caller).await?;
             // A crew's files are read where it runs: through its vessel's
-            // agent on an agentless host (#3792).
+            // agent on an SSH host (#3792).
             let runner = self
                 .daemon
                 .command_runner_for_session((&session).into())

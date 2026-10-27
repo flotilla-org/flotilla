@@ -27,7 +27,7 @@ use flotilla_resources::{Convoy, ConvoyProvisioningState, Environment, Host, Hos
 use flotilla_store::load_metrics::ControllerMetricsRegistry;
 use tokio::sync::{Mutex, Semaphore};
 
-use super::discovery::AgentlessSshProfile;
+use super::discovery::SshHostProfile;
 use super::environments::{stage_remote_rustc_wrapper, ActiveProvisionedEnvironment};
 use super::tasks::{load_checkout_archive_roots, CheckoutArchiveRoot};
 use super::terminal::PendingTerminalDelivery;
@@ -49,11 +49,11 @@ pub(super) struct ControllerRuntimeState {
     pub(super) local_core_count: fn() -> Result<NonZeroUsize, std::io::Error>,
     pub(super) namespace: String,
     pub(super) host_direct_environment_name: String,
-    pub(super) agentless_ssh: HashMap<String, AgentlessSshProfile>,
+    pub(super) ssh_host: HashMap<String, SshHostProfile>,
     pub(super) environment_tools: EnvironmentToolProvisioner,
     pub(super) environment_sockets: Option<EnvironmentSocketService>,
-    /// The vessel agents on agentless hosts (#3792).
-    pub(super) agentless_vessels: Option<Arc<super::agentless_vessels::AgentlessVessels>>,
+    /// The vessel agents on SSH hosts (#3792).
+    pub(super) ssh_host_vessels: Option<Arc<super::ssh_host_vessels::SshHostVessels>>,
     /// Where host-direct Claude Code crews post their hooks, when flotillad listens on TCP.
     pub(super) hook_endpoint: Option<HookEndpoint>,
     pub(super) credential_store: Option<Arc<CredentialStore>>,
@@ -129,11 +129,11 @@ impl ControllerRuntimeState {
         self
     }
 
-    /// Agentless crews reach the daemon only through their vessel agent's
+    /// SSH host crews reach the daemon only through their vessel agent's
     /// forward to an environment socket, so vessels exist exactly when the
     /// socket server does.
-    pub(super) fn with_agentless_vessels(mut self, vessels: Option<Arc<super::agentless_vessels::AgentlessVessels>>) -> Self {
-        self.agentless_vessels = vessels;
+    pub(super) fn with_ssh_host_vessels(mut self, vessels: Option<Arc<super::ssh_host_vessels::SshHostVessels>>) -> Self {
+        self.ssh_host_vessels = vessels;
         self
     }
 
@@ -146,7 +146,7 @@ impl ControllerRuntimeState {
         self.rust_build_jobs_through(host_ref, None).await
     }
 
-    /// As [`Self::rust_build_jobs`], counting an agentless host's cores through
+    /// As [`Self::rust_build_jobs`], counting an SSH host's cores through
     /// `runner` (a vessel's agent, #3792) rather than its SSH runner.
     pub(super) async fn rust_build_jobs_through(&self, host_ref: &str, runner: Option<&dyn CommandRunner>) -> Result<usize, String> {
         let host_spec = match self.daemon.resource_backend().using::<Host>(&self.namespace).get(host_ref).await {
@@ -154,7 +154,7 @@ impl ControllerRuntimeState {
             Err(ResourceError::NotFound { .. }) if host_ref == self.local_host_ref => HostSpec::default(),
             Err(error) => return Err(format!("read build fulfilment setting for host {host_ref}: {error}")),
         };
-        let cores = if let Some(profile) = self.agentless_ssh_for_host(host_ref) {
+        let cores = if let Some(profile) = self.ssh_host_profile(host_ref) {
             runner
                 .unwrap_or(profile.runner.as_ref())
                 .run("getconf", &["_NPROCESSORS_ONLN"], Path::new("/"), &ChannelLabel::Default)
@@ -170,15 +170,15 @@ impl ControllerRuntimeState {
         Ok(host_spec.rust_build_jobs(cores))
     }
 
-    /// The prepared vessel on an agentless host (#3792).
+    /// The prepared vessel on an SSH host (#3792).
     pub(super) async fn vessel_access(
         &self,
-        profile: &AgentlessSshProfile,
+        profile: &SshHostProfile,
         vessel: &str,
-    ) -> Result<Arc<super::agentless_vessels::VesselAccess>, String> {
+    ) -> Result<Arc<super::ssh_host_vessels::VesselAccess>, String> {
         let vessels =
-            self.agentless_vessels.as_ref().ok_or("EnvironmentSocketUnavailable: agentless vessels require a crew socket server")?;
-        let preparation = super::agentless_vessels::VesselPreparation {
+            self.ssh_host_vessels.as_ref().ok_or("EnvironmentSocketUnavailable: SSH host vessels require a crew socket server")?;
+        let preparation = super::ssh_host_vessels::VesselPreparation {
             tools: &self.environment_tools,
             discovery: self.daemon.discovery_runtime(),
             config: &self.config,
@@ -187,9 +187,9 @@ impl ControllerRuntimeState {
     }
 
     /// The Rust linker wrapper for a session in `env_ref`, staged on an
-    /// agentless host through `runner` when given (a vessel's agent, #3792).
+    /// SSH host through `runner` when given (a vessel's agent, #3792).
     pub(super) async fn rustc_wrapper_for_environment(&self, env_ref: &str, runner: Option<&dyn CommandRunner>) -> Result<PathBuf, String> {
-        if let Some(profile) = self.agentless_ssh.get(env_ref) {
+        if let Some(profile) = self.ssh_host.get(env_ref) {
             let runner = runner.unwrap_or(profile.runner.as_ref());
             let base = runner.writable_config_base(None, self.config.state_dir().as_path()).await?;
             return stage_remote_rustc_wrapper(runner, &base).await;
@@ -233,10 +233,10 @@ impl ControllerRuntimeState {
             local_host_ref,
             namespace: flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE.to_string(),
             host_direct_environment_name,
-            agentless_ssh: HashMap::new(),
+            ssh_host: HashMap::new(),
             environment_tools,
             environment_sockets: None,
-            agentless_vessels: None,
+            ssh_host_vessels: None,
             hook_endpoint: None,
             credential_store: None,
             agent_material: None,
@@ -313,7 +313,7 @@ impl ControllerRuntimeState {
         Ok(())
     }
 
-    pub(super) fn with_agentless_ssh(mut self, profiles: Vec<AgentlessSshProfile>) -> Self {
+    pub(super) fn with_ssh_host(mut self, profiles: Vec<SshHostProfile>) -> Self {
         for profile in &profiles {
             if let Some(registry) = self.daemon.environment_registry_for_environment(&profile.environment_id) {
                 let place = flotilla_address::Address::root(flotilla_address::Kind::Host, &profile.provisioning.host_id)
@@ -321,7 +321,7 @@ impl ControllerRuntimeState {
                 self.environment_providers.register_place(&place, &registry.environment_providers).expect("unique SSH provider addresses");
             }
         }
-        self.agentless_ssh = profiles.into_iter().map(|profile| (profile.environment_id.to_string(), profile)).collect();
+        self.ssh_host = profiles.into_iter().map(|profile| (profile.environment_id.to_string(), profile)).collect();
         self
     }
 
@@ -332,12 +332,12 @@ impl ControllerRuntimeState {
 
     /// Profiles are keyed by their environment ID; this finds one by the Host
     /// it drives.
-    pub(super) fn agentless_ssh_for_host(&self, host_ref: &str) -> Option<&AgentlessSshProfile> {
-        self.agentless_ssh.values().find(|profile| profile.provisioning.host_id == host_ref)
+    pub(super) fn ssh_host_profile(&self, host_ref: &str) -> Option<&SshHostProfile> {
+        self.ssh_host.values().find(|profile| profile.provisioning.host_id == host_ref)
     }
 
-    pub(super) fn agentless_host_refs(&self) -> Vec<CanonicalHostId> {
-        self.agentless_ssh.values().map(|profile| CanonicalHostId::resolved(&profile.provisioning.host_id)).collect()
+    pub(super) fn ssh_host_refs(&self) -> Vec<CanonicalHostId> {
+        self.ssh_host.values().map(|profile| CanonicalHostId::resolved(&profile.provisioning.host_id)).collect()
     }
 
     pub(super) fn with_credential_store(mut self, credential_store: Arc<CredentialStore>) -> Self {

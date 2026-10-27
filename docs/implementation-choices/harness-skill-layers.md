@@ -3,7 +3,7 @@
 The owner ruled the design checkpoint on PR #3909 on 2026-10-26. This records
 the decisions and what each build step does.
 
-"Agent-backed vessel" here means an agentless SSH vessel, the path that #3808
+"Agent-backed vessel" here means an SSH host vessel, the path that #3808
 moved onto drydock's agent. Docker vessels and drydock-provider sandboxes keep
 the harnesses baked into their pinned crew images.
 
@@ -96,8 +96,8 @@ variables whose values may name install paths.
 - `tools::Publisher` stages each published member at its install path and links
   stable entry points through `tools/current`. It derives the exposed
   directories and the retired-link cleanup from the declaration.
-- Docker mounts those directories and agentless vessels push them.
-- Both take the layer environment from the same declaration. The agentless
+- Docker mounts those directories and SSH host vessels push them.
+- Both take the layer environment from the same declaration. The SSH host
   vessel's `PATH` entries go to #3913's prepared base layer as its generation
   layers (`ExecutionPreparer::with_generation`), and its `TERMINFO_DIRS` is set
   with flotilla's own variables, so a host supply cannot override it.
@@ -178,7 +178,7 @@ This PR delivers harness binaries only; skills go to #3926.
 - The executable the access layer delivered is the one the launch runs. Its
   adapter is built through discovery's own code
   (`AgentAdapterRegistry::delivered`).
-- Observation, exit classification and cleanup on an agentless vessel get
+- Observation, exit classification and cleanup on an SSH host vessel get
   the built-in adapter even when the host has no harness installed. None of
   them runs the binary.
 
@@ -187,4 +187,4 @@ This PR delivers harness binaries only; skills go to #3926.
 owner's look-over on the PR.
 
 **Untouched.** The paths #3956 deletes are not extended: `docker.rs`
-provisioning, the per-crew launch branches, and `agentless_vessels.rs`.
+provisioning, the per-crew launch branches, and `ssh_host_vessels.rs`.

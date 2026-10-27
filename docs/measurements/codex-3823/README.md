@@ -113,7 +113,7 @@ all seven invocation definitions and trust states with the recorded discovery.
 ## Downstream launch contract
 
 The first CI run executed 4,151 selected tests: 4,150 passed and the daemon's
-`agentless_codex_crew_starts_in_a_prepared_flotilla_home` failed because it still
+`ssh_host_codex_crew_starts_in_a_prepared_flotilla_home` failed because it still
 asserted that the home installs the Stop hook. That pre-existing assertion
 encoded the behavior this fix removes. The contract now preserves the rendered
 launch command and checks all seven subscriptions are present once in the

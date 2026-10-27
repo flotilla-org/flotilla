@@ -233,7 +233,7 @@ mod tests {
         let runner = Arc::new(NoInference { slow_tool: true, ..Default::default() });
         let provider = command_provider(EnvironmentInput::HostDirect, runner.clone());
         let spec = FulfilmentKindSpec::builder()
-            .host_ref("agentless".into())
+            .host_ref("ssh-host".into())
             .pool("cleat".into())
             .realisation(FulfilmentRealisation::HostDirect)
             .build();

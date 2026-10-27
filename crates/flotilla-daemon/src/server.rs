@@ -218,11 +218,11 @@ fn build_peer_manager(
     let local_node_id = daemon.node_id().clone();
     let hosts_config = config.load_hosts()?;
 
-    let peer_count = hosts_config.hosts.values().filter(|host| !host.agentless_ssh).count();
+    let peer_count = hosts_config.hosts.values().filter(|host| !host.ssh_host).count();
     let mut peer_manager = PeerManager::new(local_node_id.clone());
     let command_runner = daemon.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?;
     for (name, host_config) in hosts_config.hosts {
-        if host_config.agentless_ssh {
+        if host_config.ssh_host {
             continue;
         }
         let expected_host_name = HostName::new(&host_config.expected_host_name);

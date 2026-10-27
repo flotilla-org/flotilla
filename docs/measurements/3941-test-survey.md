@@ -140,7 +140,7 @@ Across areas, the duplication comes in a few shapes. Each shape has its own fix.
 1. **An example kept beside the property that covers it.** A Hegel property draws a space that contains the example's inputs and asserts a superset of what it checks. Examples: core's probe-model needs and decision-ledger evidence, admission's driverless-home checks, crew's settlement and governor checks. *Fix:* delete the example. When the example covered a boundary the generator might miss, name that boundary in the generator.
 2. **A pinned table and a generator over the same tiny space.** Some generators draw from a 2×2 or one-boolean space that the pinned rows already enumerate (daemon integration cluster 2). *Fix:* keep the exhaustive table and delete the generator. The generated scenario engine stays for spaces too large to enumerate.
 3. **Patch and events asserted in two tests with the same setup.** A 60-line snapshot is copied so that one test can check the patch and another the events (controllers clusters 2 and 3). *Fix:* assert both in one test.
-4. **Near-copy scenario pairs.** Two tests share 60 to 90 lines of setup and differ in one input (core OAuth grant, self-targeted placement, agentless SSH). *Fix:* merge into one test over the stricter combination, or into an `rstest` table.
+4. **Near-copy scenario pairs.** Two tests share 60 to 90 lines of setup and differ in one input (core OAuth grant, self-targeted placement, SSH host). *Fix:* merge into one test over the stricter combination, or into an `rstest` table.
 5. **The same behaviour proved again in another crate.** Controllers' vessel finalizer, the #3145 resume path, admission functions and node identity are each proved again in crew, core or admission. *Fix:* keep the test in the crate that owns the behaviour. `flotilla-controllers` is pending retirement, so its copy goes.
 6. **Dead or identical code.** `flotilla-core/src/model/tests.rs` (≈350 lines) has no `mod` declaration, never compiles and calls APIs that no longer exist. `flotilla-daemon/tests/fixtures/ledger_revision_github.yaml` (156 lines) is referenced nowhere. Two controllers terminal-reclaim tests are identical line for line. `flotilla-controllers/tests/common/mod.rs` is a byte-identical copy of `flotilla-provisioning/tests/common/mod.rs` (540 lines). I checked each of these by hand (`grep`, `cmp`).
 
@@ -589,7 +589,7 @@ Note: `peer/` is Plane-A and bugfix-only, slated for deletion (CLAUDE.md). Clust
 | `runtime/tests/health.rs::fleet_health_surfaces_an_expired_ambient_claude_login…` (health.rs:342) | message wording `"ambient claude login expired on 2020-02-01"` | fold into cluster 11 and assert severity only | (in 11) |
 | `cli.rs::tracing_init_failure_is_returned_with_operator_context` (cli.rs:215) | the third-party `tracing` crate's error text | assert `starts_with("initialize daemon logging: ")` | 0 |
 | `runtime/tests/docker.rs` :207, :780, :798, :876, :1264 | exact provisioning error strings | assert the reserved target or adapter name appears; keep the "no container created" checks | 0 |
-| `runtime/tests/agentless_harness.rs` :525, :741, :760; `runtime/tests/terminal.rs:146`; `runtime/agentless_vessels/tests.rs:428` | full refusal wording | `contains` the variable or binding name; the wording is not a stable code | 0 |
+| `runtime/tests/ssh_host_harness.rs` :525, :741, :760; `runtime/tests/terminal.rs:146`; `runtime/ssh_host_vessels/tests.rs:428` | full refusal wording | `contains` the variable or binding name; the wording is not a stable code | 0 |
 | `server/tests.rs` :2409, :2567, :2617 | `"peer host X is not connected"` | `contains(host)`; the behaviour asserted next (no half-admitted record) is the real check | 0 |
 | `server/caller.rs::unsupported_platform_refusal_explains_missing_peer_identity` (caller.rs:518) | message wording per OS | keep the per-OS branch but use `contains("peer identity unavailable")` / `!contains` | 4 |
 | `server/tests.rs:6272` (`EnvironmentCommandDenied: …`), `server/tests.rs:184/196` (socket-path discovery file text) | stable refusal code / file format read by remote dialers | keep because contract | 0 |
@@ -669,11 +669,11 @@ Scope: `crates/flotilla-core` (paths below are relative to it). About 380 tests.
    - **Lines saved:** ≈75 net.
    - **Confidence:** medium. The policy `host_ref` differs (`host_id` vs display name). The merged test must keep the stale replica present while resolving by display name, which is the stricter combination.
 
-9. **An agentless SSH host takes only pinned convoys and cannot run an agent adapter**
-   - **Tests:** `src/in_process/tests/placement.rs::agentless_ssh_host_takes_only_pinned_work_and_routes_to_its_owner` (:333), `src/in_process/tests/host_admission.rs::capability_admission_places_on_agentless_ssh_hosts_only_when_pinned` (:501), `::uncapped_agentless_host_still_refuses_unpinned_convoys` (:975).
-   - **Survivor:** `placement.rs:333` for the placement layer (unpinned refused, pinned admissible, `codex` refused, owner routing, not-ready). For the daemon layer, `uncapped_agentless_host_still_refuses_unpinned_convoys`, extended with "pinned b9 → selected" and "pinned + `single_agent_workflow_spec` → Err contains `codex`" (~12 lines, using the existing `agentless_owner`/`agentless_host` helpers). Then delete `:501` (≈98 lines of hand-built daemon, host and kind setup).
+9. **An SSH host takes only pinned convoys and cannot run an agent adapter**
+   - **Tests:** `src/in_process/tests/placement.rs::ssh_host_takes_only_pinned_work_and_routes_to_its_owner` (:333), `src/in_process/tests/host_admission.rs::capability_admission_places_on_ssh_hosts_only_when_pinned` (:501), `::uncapped_ssh_host_still_refuses_unpinned_convoys` (:975).
+   - **Survivor:** `placement.rs:333` for the placement layer (unpinned refused, pinned admissible, `codex` refused, owner routing, not-ready). For the daemon layer, `uncapped_ssh_host_still_refuses_unpinned_convoys`, extended with "pinned b9 → selected" and "pinned + `single_agent_workflow_spec` → Err contains `codex`" (~12 lines, using the existing `ssh_host_owner`/`ssh_host` helpers). Then delete `:501` (≈98 lines of hand-built daemon, host and kind setup).
    - **Lines saved:** ≈85 net.
-   - **Confidence:** medium. `:501` builds its host and FulfilmentKind by hand instead of through the helpers. Check that `agentless_host` also creates the FulfilmentKind that capability placement needs.
+   - **Confidence:** medium. `:501` builds its host and FulfilmentKind by hand instead of through the helpers. Check that `ssh_host` also creates the FulfilmentKind that capability placement needs.
 
 10. **Recorded drain outcomes: which ones are actionable**
     - **Tests:** `src/cleat_roll/tests.rs::recorded_drain_reports_keep_host_failures_actionable` (:448), `::recorded_drain_outcomes_preserve_reports_and_continue` (:40).
@@ -693,7 +693,7 @@ Scope: `crates/flotilla-core` (paths below are relative to it). About 380 tests.
 | `in_process/tests/host_admission.rs` :28-32, :41-44, :86-90 | role-address/ambiguity/terminal-generation message wording | assert `Err` and candidate names only | ≈8 |
 | `in_process/tests/host_admission.rs` :420; `in_process/tests/admission.rs` :392 | message wording | `expect_err` is the behaviour; drop the string equality | 2 |
 | `in_process/tests/host_admission.rs::admitting_host_floor_gates_only_work_that_lands_on_it` :640 | floor constant + wording `"below the 20.0 GiB floor"` (already owned by `flotilla-admission/src/admission.rs:95`) | assert `is_err` only | 1 |
-| `placement.rs:387`, `host_admission.rs:989`, `host_admission.rs:579` | refusal reason wording `"agentless SSH host takes only convoys that pin its placement"` repeated 3× | expose a reason constant/enum and compare to it, or assert the policy is refused | 3 |
+| `placement.rs:387`, `host_admission.rs:989`, `host_admission.rs:579` | refusal reason wording `"SSH host takes only convoys that pin its placement"` repeated 3× | expose a reason constant/enum and compare to it, or assert the policy is refused | 3 |
 | `attach.rs::deleted_terminal_session_is_named_in_attach_error` :2403-2417 | 3 full messages | assert each contains the reference + host name | ≈8 |
 | `host_registry_tests.rs` :769, :794 | wording `"host not found"` | fold into cluster 7, assert `is_err` | 0 (counted above) |
 | `host_identity.rs` :734, :740 `remote_environment_state_dir_*` | literal paths | **keep** (the XDG/HOME layout is the contract) | 0 |

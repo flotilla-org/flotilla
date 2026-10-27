@@ -438,7 +438,7 @@ impl ReadProjections<'_> {
         let configured_hosts = self
             .config
             .load_hosts()
-            .map(|hosts| hosts.hosts.into_iter().filter(|(_, host)| !host.agentless_ssh).collect::<HashMap<_, _>>())
+            .map(|hosts| hosts.hosts.into_iter().filter(|(_, host)| !host.ssh_host).collect::<HashMap<_, _>>())
             .unwrap_or_default();
         let configured_names =
             configured_hosts.values().map(|remote| HostName::new(remote.expected_host_name.clone())).collect::<HashSet<_>>();
@@ -796,7 +796,7 @@ impl ReadProjections<'_> {
         let configured_hosts = self
             .config
             .load_hosts()
-            .map(|hosts| hosts.hosts.into_iter().filter(|(_, host)| !host.agentless_ssh).collect::<HashMap<_, _>>())
+            .map(|hosts| hosts.hosts.into_iter().filter(|(_, host)| !host.ssh_host).collect::<HashMap<_, _>>())
             .unwrap_or_default();
         let failures = self.fleet.replication_failures().await;
         let mut replication_failures_by_host = HashMap::<HostName, Vec<ResourceReplicationFailure>>::new();

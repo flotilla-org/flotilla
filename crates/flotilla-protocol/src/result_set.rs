@@ -1325,11 +1325,11 @@ pub struct VesselRow {
     #[shape(child)]
     pub depends_on: Vec<String>,
     /// Host whose daemon can act on this vessel: attach, joins and work
-    /// completion address it. For an agentless SSH host this is its owning
+    /// completion address it. For an SSH host this is its owning
     /// daemon, not the machine the vessel runs on.
     pub host: HostName,
     /// Machine the vessel runs on, as information only (#4021). Differs from
-    /// `host` when an agentless SSH host carries the vessel.
+    /// `host` when an SSH host carries the vessel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carried_by: Option<HostName>,
     /// Terminal-session reference from which a presentation manager can

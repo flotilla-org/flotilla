@@ -39,7 +39,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use super::credentials::reconcile_work_credentials;
-use super::discovery::{observe_fulfilment_facts, AgentlessSshProfile, BagEnvVars, FulfilmentProbeContext, LocalProvisioningProfile};
+use super::discovery::{observe_fulfilment_facts, BagEnvVars, FulfilmentProbeContext, LocalProvisioningProfile, SshHostProfile};
 use super::docker::DockerControllerRuntime;
 use super::environments::reconcile_provisioned_environments;
 use super::health::{apply_host_heartbeat_with_credentials, DaemonHealthIdentity, HostObservations, RuntimeHealth};
@@ -401,7 +401,7 @@ pub(super) fn spawn_local_fulfilment_probe_task(
     })
 }
 
-pub(super) fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, namespace: String, ssh: AgentlessSshProfile) -> JoinHandle<()> {
+pub(super) fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, namespace: String, ssh: SshHostProfile) -> JoinHandle<()> {
     // Compose the remote detection endpoint once, then retain that exact
     // provider instance across observation passes.
     let providers = Arc::new(command_provider_registry(&[EnvironmentInput::HostDirect], Arc::clone(&ssh.runner)));
@@ -429,7 +429,7 @@ pub(super) fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, name
                 Ok(observation) => observation,
                 Err(error) => {
                     let error = error.for_environment(ssh.environment_id.as_str());
-                    warn!(%error, "agentless host cannot be probed");
+                    warn!(%error, "SSH host cannot be probed");
                     return;
                 }
             };

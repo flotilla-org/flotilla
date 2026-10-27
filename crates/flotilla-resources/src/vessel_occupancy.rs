@@ -1,6 +1,6 @@
-//! Vessels held against an agentless SSH host's declared cap (#3793).
+//! Vessels held against an SSH host's declared cap (#3793).
 //!
-//! The owning daemon is the only placer on its agentless hosts, so admission,
+//! The owning daemon is the only placer on its SSH hosts, so admission,
 //! the published `free_vessel_slots` fact and a convoy's capacity wait all
 //! count from the same records. A vessel holds its slot from its convoy's
 //! admission until its Vessel record is gone, which the teardown finalizer

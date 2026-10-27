@@ -1,5 +1,5 @@
 //! #3792: vessel agents on a host flotilla reaches over SSH and runs no daemon
-//! on (an agentless host). Flotilla owns the host. Each vessel gets its own
+//! on (an SSH host). Flotilla owns the host. Each vessel gets its own
 //! supervised drydock agent in a private directory, bootstrapped through the
 //! host's existing command runner and reached through drydock's SSH transport.
 use std::{
