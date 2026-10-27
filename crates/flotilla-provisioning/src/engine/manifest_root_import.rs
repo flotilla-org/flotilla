@@ -7,7 +7,8 @@
 //! | `status.applied_revision`, `source_error` | the state's `applied`, `source_error` |
 //! | the source error's stall, `began_at` | the state's `source_failed_at` |
 //! | `status.documents[*].baseline_hash` | `baselines` |
-//! | a Refused document's reason, since it was observed (the old status keeps `observed_at` while a document's state is unchanged) | `refusals` |
+//! | a Refused or Orphaned document's reason, since it was observed (the old status keeps `observed_at` while a document's state is unchanged) | `refusals` |
+//! | a removed document's `removed_in` | `removals` |
 //! | `spec.suspended` | `suspended` |
 //! | `spec.resolutions`, with the status's outcome for its token | `resolutions`: Requested until claimed |
 //! | each document's phase, live and desired hashes, `stalled` | dropped: judgements |
@@ -43,12 +44,16 @@ pub fn import_root(old: &ResourceObject<OldRoot>) -> Result<Resource<ManifestRoo
     let status = old.status.clone().unwrap_or_default();
     let mut baselines = BTreeMap::new();
     let mut refusals = BTreeMap::new();
+    let mut removals = BTreeMap::new();
     for (key, document) in &status.documents {
         let name = document_name(key)?;
         if let Some(hash) = &document.baseline_hash {
             baselines.insert(name.clone(), hash.clone());
         }
-        if document.phase == DocumentPhase::Refused {
+        if let Some(revision) = &document.removed_in {
+            removals.insert(name.clone(), revision.clone());
+        }
+        if matches!(document.phase, DocumentPhase::Refused | DocumentPhase::Orphaned) {
             let reason = document.reason.clone().unwrap_or_else(|| "manifest document refused".to_owned());
             refusals.insert(name, RefusalRecord { reason, since: Timestamp::from_datetime(&document.observed_at) });
         }
@@ -85,6 +90,7 @@ pub fn import_root(old: &ResourceObject<OldRoot>) -> Result<Resource<ManifestRoo
         refusals,
         suspended: old.spec.suspended.iter().map(document_name).collect::<Result<BTreeSet<_>, _>>()?,
         resolutions,
+        removals,
     };
     // A source error's stall began when the old status recorded it.
     let source_failed_at = status.source_error.as_ref().and(status.stalled.as_ref()).map(|stall| Timestamp::from_datetime(&stall.began_at));

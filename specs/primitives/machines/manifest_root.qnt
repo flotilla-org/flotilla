@@ -24,6 +24,13 @@
 // - the charter binding the root reads is a record, changed by Rebind (it was edited in place in
 //   the old spec); a root whose source is removed (a project's ops binding) ends, Retired, keeping
 //   its records for attribution, and a source declared again later gets a new root.
+//
+// Amended for #3992 (a manifest root prunes the documents it no longer declares):
+// - a removal is a record: the revision that removed a document the root had applied. A pass
+//   reaches a removed document while it still reports it, replacing its removal as it replaces
+//   baselines and refusals, so a complete pass that no longer reports it drops it;
+// - a removed document whose resource was kept for an operator (an orphan) also keeps its
+//   baseline, for the next pass to judge again, and its refusal, which says why it was kept.
 module manifest_root {
   // What declares the root; it never changes: host, tree path and source.
   type Request = { host: str, path: str, source: str }
@@ -41,10 +48,12 @@ module manifest_root {
     refusals: str -> str,
     suspended: Set[str],
     resolutions: str -> Resolution,
+    removals: str -> str,
   }
   type State = Bound(Records) | Retired(Records)
-  // `reached` is every document the pass evaluated; `baselines` and `refusals` name only those.
-  type Event = Applied({ revision: str, complete: bool, reached: Set[str], baselines: str -> str, refusals: str -> str })
+  // `reached` is every document the pass evaluated; `baselines`, `refusals` and `removals` name
+  // only those.
+  type Event = Applied({ revision: str, complete: bool, reached: Set[str], baselines: str -> str, refusals: str -> str, removals: str -> str })
     | SourceFailed({ error: str })
     | Suspend({ document: str })
     | Unsuspend({ document: str })
@@ -75,7 +84,7 @@ module manifest_root {
       // A pass replaces the records of the documents it reached and clears the source error. A
       // complete pass reached every declared document: it advances the applied revision and drops
       // the suspensions and resolutions of documents no longer declared.
-      | Applied(a) => if (not(a.baselines.keys().union(a.refusals.keys()).subseteq(a.reached))) Refused(Unreached)
+      | Applied(a) => if (not(a.baselines.keys().union(a.refusals.keys()).union(a.removals.keys()).subseteq(a.reached))) Refused(Unreached)
           else if (a.complete and a.revision == "") Refused(Empty)
           else {
             val after = {
@@ -84,6 +93,7 @@ module manifest_root {
               sourceError: "",
               baselines: replaceKeys(x.baselines, if (a.complete) x.baselines.keys().union(a.reached) else a.reached, a.baselines),
               refusals: replaceKeys(x.refusals, if (a.complete) x.refusals.keys().union(a.reached) else a.reached, a.refusals),
+              removals: replaceKeys(x.removals, if (a.complete) x.removals.keys().union(a.reached) else a.reached, a.removals),
               suspended: if (a.complete) x.suspended.intersect(a.reached) else x.suspended,
               resolutions: if (a.complete) x.resolutions.keys().intersect(a.reached).mapBy(d => x.resolutions.get(d)) else x.resolutions,
             }
@@ -126,10 +136,12 @@ module manifest_root {
   // source declares, live the hash the definition holds, baseline the root's record of what it
   // last applied. Missing hashes read as "". Precedence: an operator's suspension first, then a
   // recorded refusal (every pass that reaches a document replaces its refusal, so a refusal is the
-  // last pass's verdict), then agreement, then drift from the baseline.
-  type Phase = PhaseApplied | PhaseDrifted | PhasePending | PhaseRefused | PhaseSuspended
+  // last pass's verdict), then agreement, then drift from the baseline. A recorded removal comes
+  // before all: Orphaned where a refusal says why its resource was kept, else Deleted.
+  type Phase = PhaseApplied | PhaseDrifted | PhasePending | PhaseRefused | PhaseSuspended | PhaseDeleted | PhaseOrphaned
   pure def phase(x: Records, document: str, live: str, desired: str): Phase =
-    if (x.suspended.contains(document)) PhaseSuspended
+    if (x.removals.keys().contains(document)) (if (x.refusals.keys().contains(document)) PhaseOrphaned else PhaseDeleted)
+    else if (x.suspended.contains(document)) PhaseSuspended
     else if (x.refusals.keys().contains(document)) PhaseRefused
     else if (live == desired) PhaseApplied
     else if (x.baselines.keys().contains(document) and x.baselines.get(document) != live) PhaseDrifted
@@ -147,6 +159,7 @@ module manifest_root {
     refusals: Map(),
     suspended: Set(),
     resolutions: Map(),
+    removals: Map(),
   }
   action init = roots' = IDS.mapBy(_ => Absent)
   action unchanged = roots' = roots

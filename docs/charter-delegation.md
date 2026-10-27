@@ -188,7 +188,9 @@ contents rather than inventing replacements.
 
 For an inline/delegated change later, update the single registration pointer and
 move its input documents together, preserving resource identities. Avoid
-introducing concurrent sources. Source disappearance does not prune manifest
-resources; deletions remain explicit lifecycle acts.
+introducing concurrent sources. A document removed from a source prunes the
+resource its root applied, unless the resource was edited since, in which case
+it is kept and reported orphaned (ADR 0048, #3992). Removing a whole root
+prunes nothing.
 
 Source reads have a 30-second deadline, including injected source readers. These reads hold the namespace authoring lock: a slow Git fetch can block other legacy and fleet writers in that namespace for up to 30 seconds before the read fails. This bounded contention preserves exclusion during pointer cut-over. A registered charter expansion has the same total deadline and refuses before a 33rd repository fetch; inline documents still count against the 10,000-document budget. Each fetched charter, and its image layer directory, is subject to the per-source file-count and byte limits described in [configuration](configuration.md#resource-manifests). Unknown text-file extensions produce a debug log and no resource documents.

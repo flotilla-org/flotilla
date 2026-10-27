@@ -7,7 +7,8 @@
 //! ([`phase`]), never stored; refusal reasons and the source error are latest-value records
 //! written on change. The root has one live state, `Bound`, whose data holds the scalar records
 //! (the binding, the applied revision, the source error and when it was first recorded). Its collections (baselines, refusals,
-//! suspensions, resolutions) are spec collections only its edges write, as a Convoy's duties are.
+//! suspensions, resolutions, and the removals of documents no longer declared, #3992) are spec
+//! collections only its edges write, as a Convoy's duties are.
 //! A root whose source is removed ends, `Retired`, keeping its records for attribution.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -92,6 +93,10 @@ pub struct RootSpec {
     pub suspended: BTreeSet<DocumentName>,
     #[store(child)]
     pub resolutions: BTreeMap<DocumentName, ResolutionRecord>,
+    /// The documents no longer declared whose removal the root still reports, with the revision
+    /// that removed each: deleted, or orphaned where a refusal records why its resource was kept.
+    #[store(child)]
+    pub removals: BTreeMap<DocumentName, String>,
 }
 
 states! {
@@ -141,8 +146,9 @@ impl RootState {
     }
 }
 
-/// One reconciliation pass: the documents it reached, with the baseline and refusal it recorded
-/// for each. A complete pass reached every declared document and advances the applied revision.
+/// One reconciliation pass: the documents it reached, with the baseline, refusal and removal it
+/// recorded for each. A complete pass reached every declared document, and every removed one it
+/// still reports, and advances the applied revision.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Applied {
     pub revision: String,
@@ -150,6 +156,9 @@ pub struct Applied {
     pub reached: BTreeSet<String>,
     pub baselines: BTreeMap<String, String>,
     pub refusals: BTreeMap<String, String>,
+    /// ADR 0047: absent from an edge a previous generation logged.
+    #[serde(default)]
+    pub removals: BTreeMap<String, String>,
 }
 
 /// The source did not load.
@@ -248,6 +257,7 @@ pub enum RootWrite {
     Refusals { before: BTreeMap<DocumentName, RefusalRecord>, after: BTreeMap<DocumentName, RefusalRecord> },
     Suspended { before: BTreeSet<DocumentName>, after: BTreeSet<DocumentName> },
     Resolutions { before: BTreeMap<DocumentName, ResolutionRecord>, after: BTreeMap<DocumentName, ResolutionRecord> },
+    Removals { before: BTreeMap<DocumentName, String>, after: BTreeMap<DocumentName, String> },
 }
 
 impl RecordWrite<RootSpec> for RootWrite {
@@ -257,6 +267,7 @@ impl RecordWrite<RootSpec> for RootWrite {
             RootWrite::Refusals { .. } => "refusals",
             RootWrite::Suspended { .. } => "suspended",
             RootWrite::Resolutions { .. } => "resolutions",
+            RootWrite::Removals { .. } => "removals",
         }
     }
 
@@ -266,6 +277,7 @@ impl RecordWrite<RootSpec> for RootWrite {
             RootWrite::Refusals { after, .. } => spec.refusals.clone_from(after),
             RootWrite::Suspended { after, .. } => spec.suspended.clone_from(after),
             RootWrite::Resolutions { after, .. } => spec.resolutions.clone_from(after),
+            RootWrite::Removals { after, .. } => spec.removals.clone_from(after),
         }
         Ok(())
     }
@@ -278,6 +290,7 @@ impl StoredWrite<Resource<ManifestRoot>> for RootWrite {
             RootWrite::Refusals { before, after } => edge.replace_children("refusals", before, after),
             RootWrite::Suspended { before, after } => edge.replace_children("suspended", before, after),
             RootWrite::Resolutions { before, after } => edge.replace_children("resolutions", before, after),
+            RootWrite::Removals { before, after } => edge.replace_children("removals", before, after),
         }
     }
 }
@@ -304,6 +317,7 @@ struct Pass {
     refusals: BTreeMap<DocumentName, RefusalRecord>,
     suspended: BTreeSet<DocumentName>,
     resolutions: BTreeMap<DocumentName, ResolutionRecord>,
+    removals: BTreeMap<DocumentName, String>,
     state: RootState,
 }
 
@@ -327,7 +341,13 @@ fn replace<V: Clone>(
 /// The records `applied` leaves on `spec` in `state`, at `now`; or the refusal.
 fn pass(spec: &RootSpec, state: &RootState, applied: &Applied, now: Timestamp) -> Result<Pass, RootRefusal> {
     let reached = names(&applied.reached);
-    if applied.baselines.keys().chain(applied.refusals.keys()).any(|document| !applied.reached.contains(document)) {
+    if applied
+        .baselines
+        .keys()
+        .chain(applied.refusals.keys())
+        .chain(applied.removals.keys())
+        .any(|document| !applied.reached.contains(document))
+    {
         return Err(RootRefusal::Unreached);
     }
     if applied.complete && applied.revision.is_empty() {
@@ -359,6 +379,11 @@ fn pass(spec: &RootSpec, state: &RootState, applied: &Applied, now: Timestamp) -
             })
             .collect(),
     );
+    let removals = replace(
+        &spec.removals,
+        &replaced_in(spec.removals.keys().collect()),
+        applied.removals.iter().map(|(document, revision)| (DocumentName(document.clone()), revision.clone())).collect(),
+    );
     let (suspended, resolutions) = if applied.complete {
         (
             spec.suspended.intersection(&reached).cloned().collect(),
@@ -378,7 +403,7 @@ fn pass(spec: &RootSpec, state: &RootState, applied: &Applied, now: Timestamp) -
         source_error: None,
         source_failed_at: None,
     };
-    Ok(Pass { baselines, refusals, suspended, resolutions, state })
+    Ok(Pass { baselines, refusals, suspended, resolutions, removals, state })
 }
 
 fn request(h: &Handle<'_, ManifestRoot>, document: &str) -> Option<ResolutionRecord> {
@@ -410,7 +435,7 @@ impl Machine for ManifestRoot {
                     .from([Bound])
                     .to([Bound])
                     .changes(["applied", "source_error", "source_failed_at"])
-                    .writes(["baselines", "refusals", "suspended", "resolutions"])
+                    .writes(["baselines", "refusals", "suspended", "resolutions", "removals"])
                     .gate("a pass records only documents it reached, completes at a revision, and changes something", |h, applied| {
                         let next = pass(h.spec(), h.state(), applied, h.now())?;
                         let spec = h.spec();
@@ -418,6 +443,7 @@ impl Machine for ManifestRoot {
                             && next.refusals == spec.refusals
                             && next.suspended == spec.suspended
                             && next.resolutions == spec.resolutions
+                            && next.removals == spec.removals
                             && next.state == *h.state()
                         {
                             Err(RootRefusal::Unchanged)
@@ -442,6 +468,9 @@ impl Machine for ManifestRoot {
                         }
                         if next.resolutions != spec.resolutions {
                             h.write(RootWrite::Resolutions { before: spec.resolutions.clone(), after: next.resolutions });
+                        }
+                        if next.removals != spec.removals {
+                            h.write(RootWrite::Removals { before: spec.removals.clone(), after: next.removals });
                         }
                         next.state
                     }),
@@ -604,6 +633,7 @@ impl Machine for ManifestRoot {
             refusals: BTreeMap::new(),
             suspended: BTreeSet::new(),
             resolutions: BTreeMap::new(),
+            removals: BTreeMap::new(),
         };
         Ok((spec, RootState::Bound { binding: request.binding, applied: None, source_error: None, source_failed_at: None }))
     }
@@ -618,12 +648,21 @@ pub enum Phase {
     Pending,
     Refused,
     Suspended,
+    Deleted,
+    Orphaned,
 }
 
-/// The spec's `phase`: suspension first, then a recorded refusal (the last pass's verdict), then
-/// agreement, then drift from the baseline. A missing hash reads as none.
+/// The spec's `phase`: a recorded removal first (Orphaned where a refusal records why its resource
+/// was kept, else Deleted), then suspension, then a recorded refusal (the last pass's verdict),
+/// then agreement, then drift from the baseline. A missing hash reads as none.
 pub fn phase(spec: &RootSpec, document: &DocumentName, live: Option<&str>, desired: Option<&str>) -> Phase {
-    if spec.suspended.contains(document) {
+    if spec.removals.contains_key(document) {
+        if spec.refusals.contains_key(document) {
+            Phase::Orphaned
+        } else {
+            Phase::Deleted
+        }
+    } else if spec.suspended.contains(document) {
         Phase::Suspended
     } else if spec.refusals.contains_key(document) {
         Phase::Refused

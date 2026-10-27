@@ -130,6 +130,7 @@ impl Conformance for RootConformance {
                     reached: texts(&o["reached"]),
                     baselines: text_map(&o["baselines"]),
                     refusals: text_map(&o["refusals"]),
+                    removals: text_map(&o["removals"]),
                 },
                 &(),
                 at,
@@ -172,6 +173,7 @@ impl Conformance for RootConformance {
             "baselines": string_map(spec.baselines.iter().map(|(document, hash)| (key(document), json!(hash)))),
             "refusals": string_map(spec.refusals.iter().map(|(document, refusal)| (key(document), json!(refusal.reason)))),
             "suspended": set_of(spec.suspended.iter().map(name)),
+            "removals": string_map(spec.removals.iter().map(|(document, revision)| (key(document), json!(revision)))),
             "resolutions": string_map(spec.resolutions.iter().map(|(document, record)| {
                 let act = match record.act {
                     Act::Sync => "Sync",

@@ -23,7 +23,7 @@ use flotilla_engine_store::{
     open_home, StoreLog,
 };
 use flotilla_resources::{
-    manifest_roots::{refusal_evidence, refusals, root_stall, ManifestRoots, PassReport, RootDeclaration, RootView},
+    manifest_roots::{refusal_evidence, refusals, removals, root_stall, ManifestRoots, PassReport, RootDeclaration, RootView},
     DocumentKey, DocumentPhase, DocumentState, ManifestRootSpec, ManifestRootStatus, Resolution, ResolutionAction, ResolutionOutcome,
 };
 use flotilla_schema::{Identity, Kind, KindCode, Timestamp};
@@ -252,14 +252,26 @@ fn view(
     let spec = root.spec();
     let state = root.state();
     let mut documents: BTreeMap<DocumentKey, DocumentState> = judged.cloned().unwrap_or_default();
-    let names: BTreeSet<&DocumentName> =
-        spec.baselines.keys().chain(spec.refusals.keys()).chain(spec.suspended.iter()).chain(spec.resolutions.keys()).collect();
+    let names: BTreeSet<&DocumentName> = spec
+        .baselines
+        .keys()
+        .chain(spec.refusals.keys())
+        .chain(spec.suspended.iter())
+        .chain(spec.resolutions.keys())
+        .chain(spec.removals.keys())
+        .collect();
     for document in names {
         let Some(key) = key_of(document) else { continue };
         let entry = documents.entry(key).or_insert_with(|| {
             let refusal = spec.refusals.get(document);
             DocumentState {
-                phase: if refusal.is_some() {
+                phase: if spec.removals.contains_key(document) {
+                    if refusal.is_some() {
+                        DocumentPhase::Orphaned
+                    } else {
+                        DocumentPhase::Deleted
+                    }
+                } else if refusal.is_some() {
                     DocumentPhase::Refused
                 } else if spec.suspended.contains(document) {
                     DocumentPhase::Suspended
@@ -273,10 +285,12 @@ fn view(
                 observed_at: refusal.and_then(|refusal| refusal.since.to_datetime()).unwrap_or(now),
                 resolved_token: None,
                 resolution_outcome: None,
+                removed_in: None,
             }
         });
         // The records are the decided state; the judgement only adds what they do not hold.
         entry.baseline_hash = spec.baselines.get(document).cloned();
+        entry.removed_in = spec.removals.get(document).cloned();
         if let Some(resolution) = spec.resolutions.get(document) {
             let settled = outcome(&resolution.outcome);
             entry.resolved_token = settled.is_some().then(|| resolution.token.clone());
@@ -416,6 +430,10 @@ impl ManifestRoots for EngineManifestRoots {
                 .iter()
                 .map(|(key, reason)| document_name(key).map(|name| (name.0, reason.clone())))
                 .collect::<Result<_, _>>()?,
+            removals: removals(&pass)
+                .iter()
+                .map(|(key, revision)| document_name(key).map(|name| (name.0, revision.clone())))
+                .collect::<Result<_, _>>()?,
         };
         self.apply(&engine, applied)?;
         // The judgement follows the records just written; the settlements below are each their own
@@ -449,7 +467,14 @@ impl ManifestRoots for EngineManifestRoots {
             (None, Some(revision)) => self
                 .apply(
                     &engine,
-                    Applied { revision, complete: true, reached: BTreeSet::new(), baselines: BTreeMap::new(), refusals: BTreeMap::new() },
+                    Applied {
+                        revision,
+                        complete: true,
+                        reached: BTreeSet::new(),
+                        baselines: BTreeMap::new(),
+                        refusals: BTreeMap::new(),
+                        removals: BTreeMap::new(),
+                    },
                 )
                 .map(drop),
             (None, None) => Ok(()),
