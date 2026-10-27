@@ -6,7 +6,7 @@
 //! | `spec.binding` | the state's `binding` |
 //! | `status.applied_revision`, `source_error` | the state's `applied`, `source_error` |
 //! | `status.documents[*].baseline_hash` | `baselines` |
-//! | a Refused document's reason, since it was observed | `refusals` |
+//! | a Refused document's reason, since it was observed (the old status keeps `observed_at` while a document's state is unchanged) | `refusals` |
 //! | `spec.suspended` | `suspended` |
 //! | `spec.resolutions`, with the status's outcome for its token | `resolutions`: Requested until claimed |
 //! | each document's phase, live and desired hashes, `stalled` | dropped: judgements |
@@ -25,19 +25,25 @@ use crate::stored::manifest_root::{
     self as stored, Act, DocumentName, ManifestRoot, Outcome, RefusalRecord, ResolutionRecord, RootSpec, RootState,
 };
 
-/// The engine's name of an old document key: the old status's map-key encoding.
-pub fn document_name(key: &DocumentKey) -> DocumentName {
-    let encoded = serde_json::to_value(key).ok().and_then(|value| value.as_str().map(str::to_owned));
-    DocumentName(encoded.unwrap_or_else(|| format!("{}\u{0}{}\u{0}{}\u{0}{}", key.path, key.kind, key.namespace, key.name)))
+/// The engine's name of an old document key: the old status's map-key encoding, under which the
+/// reconciler looks its records up. A key with no such encoding is refused, never renamed.
+pub fn document_name(key: &DocumentKey) -> Result<DocumentName, String> {
+    match serde_json::to_value(key) {
+        Ok(serde_json::Value::String(encoded)) => Ok(DocumentName(encoded)),
+        Ok(other) => Err(format!("document {}: key encodes as {other}, not text", key.path)),
+        Err(error) => Err(format!("document {}: key does not encode: {error}", key.path)),
+    }
 }
 
-/// Maps old root `old` onto the engine's ManifestRoot.
-pub fn import_root(old: &ResourceObject<OldRoot>) -> Resource<ManifestRoot> {
+/// Maps old root `old` onto the engine's ManifestRoot. Stored outcomes and reasons are carried as
+/// the previous generation recorded them (ADR 0047), even ones the gates would refuse as a new
+/// write, such as a failure with an empty reason: an import restores history, it does not replay it.
+pub fn import_root(old: &ResourceObject<OldRoot>) -> Result<Resource<ManifestRoot>, String> {
     let status = old.status.clone().unwrap_or_default();
     let mut baselines = BTreeMap::new();
     let mut refusals = BTreeMap::new();
     for (key, document) in &status.documents {
-        let name = document_name(key);
+        let name = document_name(key)?;
         if let Some(hash) = &document.baseline_hash {
             baselines.insert(name.clone(), hash.clone());
         }
@@ -50,7 +56,7 @@ pub fn import_root(old: &ResourceObject<OldRoot>) -> Resource<ManifestRoot> {
         .spec
         .resolutions
         .iter()
-        .map(|(key, resolution)| {
+        .map(|(key, resolution)| -> Result<_, String> {
             let settled =
                 status.documents.get(key).filter(|document| document.resolved_token.as_deref() == Some(resolution.token.as_str()));
             let outcome = match settled.and_then(|document| document.resolution_outcome.clone()) {
@@ -64,16 +70,19 @@ pub fn import_root(old: &ResourceObject<OldRoot>) -> Resource<ManifestRoot> {
                 ResolutionAction::Sync => Act::Sync,
                 ResolutionAction::Adopt => Act::Adopt,
             };
-            (document_name(key), ResolutionRecord { act, token: resolution.token.clone(), by: resolution.requested_by.clone(), outcome })
+            Ok((
+                document_name(key)?,
+                ResolutionRecord { act, token: resolution.token.clone(), by: resolution.requested_by.clone(), outcome },
+            ))
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
     let spec = RootSpec {
         host: old.spec.host.clone(),
         path: old.spec.path.clone(),
         source: old.spec.source.clone(),
         baselines,
         refusals,
-        suspended: old.spec.suspended.iter().map(document_name).collect::<BTreeSet<_>>(),
+        suspended: old.spec.suspended.iter().map(document_name).collect::<Result<BTreeSet<_>, _>>()?,
         resolutions,
     };
     let state = RootState::Bound {
@@ -82,7 +91,7 @@ pub fn import_root(old: &ResourceObject<OldRoot>) -> Resource<ManifestRoot> {
         source_error: status.source_error.clone(),
     };
     let since = Timestamp::from_datetime(&old.metadata.creation_timestamp);
-    Resource::stored(old.metadata.name.clone(), spec, State::new(state, since), Version(1))
+    Ok(Resource::stored(old.metadata.name.clone(), spec, State::new(state, since), Version(1)))
 }
 
 /// Maps every old root in `roots` (each with its home) onto the engine and rehearses them into a
@@ -101,10 +110,17 @@ pub fn rehearse_roots(roots: &[(ResourceObject<OldRoot>, String)], report: &mut 
         }
     };
     for (old, home) in roots {
-        let resource = import_root(old);
+        let refuse = |reason: String| ImportRefusal { kind: "ManifestRoot", record: old.metadata.name.clone(), reason };
+        let resource = match import_root(old) {
+            Ok(resource) => resource,
+            Err(reason) => {
+                report.refused.push(refuse(reason));
+                continue;
+            }
+        };
         match rehearsal.restore(home, &old.metadata.name, 1, &resource) {
             Ok(()) => *report.imported.entry(("ManifestRoot", "bound")).or_default() += 1,
-            Err(reason) => report.refused.push(ImportRefusal { kind: "ManifestRoot", record: old.metadata.name.clone(), reason }),
+            Err(reason) => report.refused.push(refuse(reason)),
         }
     }
 }

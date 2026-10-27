@@ -404,6 +404,9 @@ impl Machine for ManifestRoot {
                             Ok(())
                         }
                     })
+                    // The effect recomputes the gate's pass: an edge carries nothing from its gate to its
+                    // effect, and `pass` is a pure function of the spec, state, argument and time,
+                    // all of which the two share.
                     .effect(|h, _, applied| {
                         let Ok(next) = pass(h.spec(), h.state(), applied, h.now()) else { unreachable!("the gate refused") };
                         let spec = h.spec();

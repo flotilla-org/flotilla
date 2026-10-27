@@ -226,7 +226,7 @@ mod import {
     fn the_judgement_reads_every_imported_document_as_the_old_status_did(tc: TestCase) {
         let documents: Vec<_> = (0..tc.draw(gs::integers::<usize>().min_value(0).max_value(4))).map(|index| document(&tc, index)).collect();
         let old = root(&documents, BTreeMap::new());
-        let imported = import_root(&old);
+        let imported = import_root(&old).expect("imports");
         assert_eq!(imported.state().applied(), Some("r1"));
         assert!(matches!(imported.state(), RootState::Bound { binding: Some(CharterSource::LocalDirectory { .. }), .. }));
         for old in &documents {
@@ -236,8 +236,12 @@ mod import {
                 DocumentPhase::Refused => Phase::Refused,
                 DocumentPhase::Suspended => Phase::Suspended,
             };
-            let judged =
-                phase(imported.spec(), &document_name(&old.key), old.state.live_hash.as_deref(), old.state.desired_hash.as_deref());
+            let judged = phase(
+                imported.spec(),
+                &document_name(&old.key).expect("name"),
+                old.state.live_hash.as_deref(),
+                old.state.desired_hash.as_deref(),
+            );
             assert_eq!(judged, expected, "{:?}", old.key);
         }
         let mut report = ImportReport::default();
@@ -279,8 +283,8 @@ mod import {
             .iter()
             .map(|old| (old.key.clone(), Resolution { action: ResolutionAction::Sync, token: "t".into(), requested_by: "operator".into() }))
             .collect();
-        let imported = import_root(&root(&documents, resolutions));
-        let outcome = |index: usize| imported.spec().resolutions[&document_name(&documents[index].key)].outcome.clone();
+        let imported = import_root(&root(&documents, resolutions)).expect("imports");
+        let outcome = |index: usize| imported.spec().resolutions[&document_name(&documents[index].key).expect("name")].outcome.clone();
         assert_eq!(outcome(0), Outcome::Requested);
         assert_eq!(outcome(1), Outcome::Synced);
         assert_eq!(outcome(2), Outcome::Requested);
