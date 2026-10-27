@@ -630,3 +630,52 @@ fn landing_session_teardown_does_not_stall(tc: hegel::TestCase) {
         }
     });
 }
+
+// #4038: a Pending convoy waiting for host capacity holds a stall that only the
+// Convoy controller owns. The judge keeps it, so it is neither cleared nor
+// restarted every few seconds.
+fn pending_stall(cause: Option<flotilla_resources::StallCause>) -> flotilla_resources::StalledCondition {
+    flotilla_resources::StalledCondition {
+        leaves: Vec::new(),
+        maker: None,
+        evidence: "capacity for fulfilment `docker-crew-image` on host `feta` is unavailable (no free vessel slots)".into(),
+        source: StallEvidenceSource::LeafEngine,
+        cause,
+        began_at: Utc::now() - chrono::Duration::minutes(5),
+        rung: StallRung::Operator,
+        supervisor: None,
+        supervision_message: None,
+        supervision_index: None,
+        supervision_exhausted: false,
+        reason: None,
+        proposed_disposition: None,
+        nudge_history: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn judge_keeps_the_convoy_controllers_capacity_stall() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let wake = supervision_wake(&backend);
+    let stall = pending_stall(Some(flotilla_resources::StallCause::Capacity));
+    create_convoy(&backend, "waiting", ConvoyStatus { stalled: Some(stall.clone()), ..Default::default() }).await;
+    let convoys = backend.using::<Convoy>("flotilla");
+    let objects = HashMap::from([("waiting".into(), convoys.get("waiting").await.unwrap())]);
+    wake.sync_rows("flotilla", &objects).await.unwrap();
+    wake.judge_stalls("flotilla", &objects).await.unwrap();
+    assert_eq!(convoys.get("waiting").await.unwrap().status.unwrap().stalled, Some(stall));
+}
+
+// #4038: the capacity exemption is only for the controller's stall; any other
+// stall on a convoy with nothing actionable is still cleared.
+#[tokio::test]
+async fn judge_still_clears_other_stalls_on_a_convoy_with_nothing_actionable() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let wake = supervision_wake(&backend);
+    create_convoy(&backend, "waiting", ConvoyStatus { stalled: Some(pending_stall(None)), ..Default::default() }).await;
+    let convoys = backend.using::<Convoy>("flotilla");
+    let objects = HashMap::from([("waiting".into(), convoys.get("waiting").await.unwrap())]);
+    wake.sync_rows("flotilla", &objects).await.unwrap();
+    wake.judge_stalls("flotilla", &objects).await.unwrap();
+    assert!(convoys.get("waiting").await.unwrap().status.unwrap().stalled.is_none());
+}

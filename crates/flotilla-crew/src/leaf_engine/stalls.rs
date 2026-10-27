@@ -1576,10 +1576,13 @@ impl ReconcilerWake {
                     .stalled
                     .as_ref()
                     .filter(|stalled| {
-                        status.phase == ConvoyPhase::Active
-                            && actionable_rows > 0
-                            && (stalled.supervisor.is_some()
-                                || (stalled.rung == StallRung::Operator && stalled.source == StallEvidenceSource::Crew))
+                        // The Convoy controller owns a capacity wait: it sets and
+                        // clears it as the host's slots change (#4038).
+                        stalled.cause == Some(flotilla_resources::StallCause::Capacity)
+                            || (status.phase == ConvoyPhase::Active
+                                && actionable_rows > 0
+                                && (stalled.supervisor.is_some()
+                                    || (stalled.rung == StallRung::Operator && stalled.source == StallEvidenceSource::Crew)))
                     })
                     .cloned()
             };
