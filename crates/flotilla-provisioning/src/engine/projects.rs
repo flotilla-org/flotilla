@@ -128,7 +128,9 @@ fn object(name: &str, home: &str, held: &Held, judged: Option<&Judged>) -> Optio
 /// Two accepted gaps, both in the low part: a restart forgets the judgement, and its revision wraps
 /// after 2^24 changes under one log version; either may repeat a version read before.
 fn composed_version(project: u64, ops: Option<u64>, revision: u64) -> u64 {
-    (project.max(ops.unwrap_or(0)) << JUDGEMENT_BITS) | (revision & ((1 << JUDGEMENT_BITS) - 1))
+    let logged = project.max(ops.unwrap_or(0));
+    debug_assert!(logged < 1 << (u64::BITS - JUDGEMENT_BITS), "log version {logged} leaves no room for the judgement's revision");
+    (logged << JUDGEMENT_BITS) | (revision & ((1 << JUDGEMENT_BITS) - 1))
 }
 
 /// The low bits of a Project's version that count judgement changes.
@@ -186,6 +188,9 @@ pub struct EngineProjects {
     resident: Mutex<Resident>,
     /// This home's dispatch judgements, by Project name.
     judged: Mutex<BTreeMap<String, Judged>>,
+    /// Held across each write, so this home's writes of one Project (its definition and its
+    /// operations record together) never interleave. Taken before `resident` and `judged`.
+    writing: Mutex<()>,
     /// Ticks on each change of a judgement, which the log does not carry.
     judged_changes: tokio::sync::watch::Sender<u64>,
     clock: Arc<dyn flotilla_resources::Clock>,
@@ -208,6 +213,7 @@ impl EngineProjects {
             log,
             resident: Mutex::new(Resident { follower: Follower::new([PROJECT, OPS]), records: Records::new() }),
             judged: Mutex::default(),
+            writing: Mutex::default(),
             judged_changes: tokio::sync::watch::Sender::new(0),
             clock,
         };
@@ -264,23 +270,12 @@ impl EngineProjects {
     }
 
     /// Every record of `name` as the old object, by home; this home's with its judgement.
-    fn objects(&self, records: &Records, name: &str) -> Vec<Result<EngineObject, String>> {
-        let judged = locked(&self.judged);
+    fn objects(&self, records: &Records, judged: &BTreeMap<String, Judged>, name: &str) -> Vec<Result<EngineObject, String>> {
         records
             .range((name.to_owned(), String::new())..)
             .take_while(|((held, _), _)| held == name)
             .filter_map(|((_, home), held)| object(name, home, held, (*home == self.home).then(|| judged.get(name)).flatten()))
             .collect()
-    }
-
-    /// `name` as several homes' resolve: this home's record, else the lexically first home's.
-    fn resolve(&self, records: &Records, name: &str) -> Option<Result<EngineObject, String>> {
-        let mut objects = self.objects(records, name);
-        let mine = objects.iter().position(|object| object.as_ref().is_ok_and(|object| object.home == self.home));
-        match mine {
-            Some(index) => Some(objects.swap_remove(index)),
-            None => objects.into_iter().next(),
-        }
     }
 
     /// This home's current object `name`, read again from the store.
@@ -333,6 +328,15 @@ impl EngineProjects {
     }
 }
 
+/// One name's records as several homes' resolve at `home`: its own, else the lexically first
+/// home's (the order `objects` gives).
+fn prefer(mut objects: Vec<Result<EngineObject, String>>, home: &str) -> Option<Result<EngineObject, String>> {
+    match objects.iter().position(|object| object.as_ref().is_ok_and(|object| object.home == home)) {
+        Some(index) => Some(objects.swap_remove(index)),
+        None => objects.into_iter().next(),
+    }
+}
+
 fn refuse_kind(kind: &str) -> Result<(), String> {
     if kind == KIND {
         Ok(())
@@ -358,7 +362,8 @@ impl EngineRecords for EngineProjects {
     async fn get(&self, kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
         refuse_kind(kind)?;
         let resident = self.refresh()?;
-        self.resolve(&resident.records, name).transpose()
+        let judged = locked(&self.judged);
+        prefer(self.objects(&resident.records, &judged, name), &self.home).transpose()
     }
 
     async fn list(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
@@ -367,7 +372,12 @@ impl EngineRecords for EngineProjects {
         let mut names: Vec<&String> = resident.records.keys().map(|(name, _)| name).collect();
         // The map orders by name, then home, so one name's homes are adjacent.
         names.dedup();
-        Ok(names.into_iter().filter_map(|name| self.resolve(&resident.records, name)).filter_map(skip_unencoded).collect())
+        let judged = locked(&self.judged);
+        Ok(names
+            .into_iter()
+            .filter_map(|name| prefer(self.objects(&resident.records, &judged, name), &self.home))
+            .filter_map(skip_unencoded)
+            .collect())
     }
 
     async fn sources(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
@@ -375,7 +385,8 @@ impl EngineRecords for EngineProjects {
         let resident = self.refresh()?;
         let mut names: Vec<&String> = resident.records.keys().map(|(name, _)| name).collect();
         names.dedup();
-        Ok(names.into_iter().flat_map(|name| self.objects(&resident.records, name)).filter_map(skip_unencoded).collect())
+        let judged = locked(&self.judged);
+        Ok(names.into_iter().flat_map(|name| self.objects(&resident.records, &judged, name)).filter_map(skip_unencoded).collect())
     }
 
     async fn apply(
@@ -389,10 +400,11 @@ impl EngineRecords for EngineProjects {
         refuse_kind(kind)?;
         let spec: ProjectSpec = serde_json::from_value(spec).map_err(|error| format!("{KIND} spec: {error}"))?;
         let value = ProjectDefinition::new(origin(labels, annotations)?, &spec).map_err(|error| format!("{KIND} {name}: {error}"))?;
+        let _writing = locked(&self.writing);
         if self.log.get::<ProjectDefinition>(name, &self.home).map_err(|error| error.to_string())?.is_none() {
             // A new Project starts with no conditions: an operations record left by a delete that
-            // stopped part-way belongs to the one before. No status write races this: `set_status`
-            // refuses a name with no definition here, which holds until the write below.
+            // stopped part-way belongs to the one before. `writing` keeps any other write of the
+            // name out until the definition below is written.
             self.remove::<ProjectOpsRecord>(name)?;
         }
         self.write::<ProjectDefinition>(name, |_| Ok(Some(value.clone())))?;
@@ -402,6 +414,7 @@ impl EngineRecords for EngineProjects {
     async fn set_status(&self, kind: &str, name: &str, status: Value) -> Result<EngineObject, String> {
         refuse_kind(kind)?;
         let status: ProjectStatus = serde_json::from_value(status).map_err(|error| format!("{KIND} status: {error}"))?;
+        let _writing = locked(&self.writing);
         self.current(name)?;
         // Project operations' conditions are their record; once written it stays, emptied, until
         // the Project goes, so its version only moves forward.
@@ -422,6 +435,7 @@ impl EngineRecords for EngineProjects {
 
     async fn delete(&self, kind: &str, name: &str) -> Result<(), String> {
         refuse_kind(kind)?;
+        let _writing = locked(&self.writing);
         // The operations record first: a delete stopped between the two leaves a Project with no
         // conditions, never conditions with no Project.
         self.remove::<ProjectOpsRecord>(name)?;
@@ -460,5 +474,33 @@ impl EngineRecords for EngineProjects {
             }
         });
         Ok(Box::pin(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn held(home: &str) -> Result<EngineObject, String> {
+        Ok(EngineObject {
+            name: "widgets".into(),
+            home: home.into(),
+            version: 1,
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            spec: Value::Null,
+            status: None,
+        })
+    }
+
+    // Behaviour (#3824 layer 3b, as the import placed records): a name several homes hold reads as
+    // this home's record, else the lexically first home's.
+    #[test]
+    fn a_name_several_homes_hold_reads_as_this_homes_else_the_first() {
+        let homes = || ["feta", "kiwi", "udder"].map(held).to_vec();
+        let home_of = |at: &str| prefer(homes(), at).expect("held").expect("encodes").home;
+        assert_eq!(home_of("kiwi"), "kiwi");
+        assert_eq!(home_of("b5"), "feta");
+        assert!(prefer(Vec::new(), "kiwi").is_none());
     }
 }
