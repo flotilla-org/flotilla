@@ -561,6 +561,38 @@ async fn unavailable_governor_scenario(unavailable: GovernorUnavailable, restart
     }
 }
 
+/// The supervisor's running session, with this attention observed.
+async fn governor_session(backend: &ResourceBackend, governor: Option<TerminalAttentionState>, now: DateTime<Utc>) {
+    let sessions = backend.using::<TerminalSession>("flotilla");
+    let session = sessions
+        .create(
+            &InputMeta::builder()
+                .name("governor-session".into())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.into(), "stalled-work".into()),
+                    (VESSEL_LABEL.into(), "supervise".into()),
+                    (ROLE_LABEL.into(), "governor".into()),
+                ]))
+                .build(),
+            &flotilla_resources::TerminalSessionSpec {
+                env_ref: "env".into(),
+                role: "governor".into(),
+                source: TerminalSessionSource::Tool { command: "govern".into() },
+                cwd: "/workspace".into(),
+                env: Default::default(),
+                pool: "cleat".into(),
+            },
+        )
+        .await
+        .expect("governor session");
+    let status = flotilla_resources::TerminalSessionStatus {
+        phase: TerminalSessionPhase::Running,
+        attention: governor.map(|state| TerminalAttention { state, as_of: now, source: TerminalAttentionSource::Hook }),
+        ..Default::default()
+    };
+    sessions.update_status("governor-session", &session.metadata.resource_version, &status).await.expect("governor running");
+}
+
 /// A coder beside its convoy's crew supervisor, whose session runs with this
 /// attention, under a supervision policy naming that supervisor first. The coder
 /// has either declared its stall or is working with its own session observed.
@@ -594,34 +626,7 @@ async fn coder_beside_governor(
         }
     })
     .await;
-    let sessions = backend.using::<TerminalSession>("flotilla");
-    let session = sessions
-        .create(
-            &InputMeta::builder()
-                .name("governor-session".into())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.into(), "stalled-work".into()),
-                    (VESSEL_LABEL.into(), "supervise".into()),
-                    (ROLE_LABEL.into(), "governor".into()),
-                ]))
-                .build(),
-            &flotilla_resources::TerminalSessionSpec {
-                env_ref: "env".into(),
-                role: "governor".into(),
-                source: TerminalSessionSource::Tool { command: "govern".into() },
-                cwd: "/workspace".into(),
-                env: Default::default(),
-                pool: "cleat".into(),
-            },
-        )
-        .await
-        .expect("governor session");
-    let status = flotilla_resources::TerminalSessionStatus {
-        phase: TerminalSessionPhase::Running,
-        attention: governor.map(|state| TerminalAttention { state, as_of: now, source: TerminalAttentionSource::Hook }),
-        ..Default::default()
-    };
-    sessions.update_status("governor-session", &session.metadata.resource_version, &status).await.expect("governor running");
+    governor_session(&backend, governor, now).await;
     let id = uuid::Uuid::new_v4();
     wake.subscriptions.inner.rows.lock().await.insert(
         id,
@@ -650,8 +655,9 @@ async fn coder_beside_governor(
 #[tokio::test]
 async fn a_declared_crew_stall_reaches_its_supervisor_beside_other_rows() {
     for governor in [None, Some(TerminalAttentionState::NeedsInput)] {
-        // Rows are judged in hash order; repeat so both orders occur.
-        for _ in 0..4 {
+        // Rows are judged in the subscription table's hash order, which a test
+        // cannot fix; 16 runs miss an order with probability about 3e-5.
+        for _ in 0..16 {
             let now = Utc::now();
             let (backend, wake, delivery) = coder_beside_governor(true, governor, now).await;
             let convoys = backend.using::<Convoy>("flotilla");
