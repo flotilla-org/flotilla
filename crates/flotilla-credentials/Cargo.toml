@@ -34,6 +34,9 @@ jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 url = { workspace = true }
 tempfile = { workspace = true }
 futures = "0.3"
+# #3663: the canonical skill archive the vessel agent's content cache unpacks.
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
 
 [dev-dependencies]
 flotilla-store-memory = { path = "../flotilla-store-memory" }

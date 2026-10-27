@@ -311,6 +311,11 @@ pub trait VesselAgent: Send + Sync {
     /// Make `path` a symbolic link to `target`, atomically replacing anything there
     /// but a directory.
     async fn symlink(&self, path: &Path, target: &Path) -> Result<(), String>;
+    /// Move the entry at `from` to `to` in one `rename(2)`, refusing when anything is
+    /// already at `to`.
+    async fn rename(&self, from: &Path, to: &Path) -> Result<(), String> {
+        Err(format!("this vessel agent cannot rename {} to {}", from.display(), to.display()))
+    }
     /// The guest's architecture (`amd64`, `arm64`), as the vessel's agent reports the
     /// platform it was built for.
     async fn architecture(&self) -> Result<String, String> {

@@ -12,7 +12,7 @@ use std::{
 use async_trait::async_trait;
 use flotilla_environment::environment::VesselAgent;
 use flotilla_resources::{is_legacy_template, stdlib::stdlib_image_layers, ImageLayerSpec, PinUnpack};
-use flotilla_vessel_delivery::{FetchBy, Mechanism, TreeDelivery, TreeSources, Visibility};
+use flotilla_vessel_delivery::{FetchBy, Mechanism, StepFailure, TreeDelivery, TreeSources, Visibility};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
@@ -79,7 +79,7 @@ impl PinnedHarness {
 
 #[async_trait]
 impl TreeDelivery for PinnedHarness {
-    async fn deliver(&self, mechanism: Mechanism, _: Option<&Path>, target: &Path, agent: &dyn VesselAgent) -> Result<(), String> {
+    async fn deliver(&self, mechanism: Mechanism, _: Option<&Path>, target: &Path, agent: &dyn VesselAgent) -> Result<(), StepFailure> {
         match mechanism {
             Mechanism::AgentFetch { by: FetchBy::Digest } => {
                 agent.fetch_artifact(&self.sha256, std::slice::from_ref(&self.url), self.unpack).await?
@@ -88,13 +88,13 @@ impl TreeDelivery for PinnedHarness {
                 let local = download(&self.url, &self.sha256, DOWNLOAD_LIMIT).await?;
                 agent.push_artifact(&self.sha256, &local, self.unpack).await?
             }
-            other => return Err(format!("a harness cannot be delivered by {other}")),
+            other => return Err(format!("a harness cannot be delivered by {other}").into()),
         }
         // A single file is the executable itself; an archive's entry is the harness tree.
-        match self.unpack {
+        Ok(match self.unpack {
             PinUnpack::File => agent.link_artifact(&self.executable(target), &self.sha256, Path::new("")).await,
             PinUnpack::TarGz | PinUnpack::TarXz => agent.link_artifact(target, &self.sha256, Path::new("")).await,
-        }
+        }?)
     }
 }
 
@@ -266,6 +266,6 @@ mod tests {
         }
         let refused = PinnedHarness { binary: "claude", sha256, url, unpack: PinUnpack::File };
         let error = refused.deliver(Mechanism::AgentFetch { by: FetchBy::Url }, None, place, &Store::default()).await.unwrap_err();
-        assert!(error.contains("cannot be delivered by agent-fetch(url)"), "{error}");
+        assert!(error.error.contains("cannot be delivered by agent-fetch(url)"), "{error:?}");
     }
 }

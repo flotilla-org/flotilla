@@ -198,7 +198,7 @@ impl RevisionedTree for GitRevisionedTree<'_> {
                     tally.admit(&full, file.size())?;
                     selected.push((name, full, file));
                 }
-                TreeEntry::Other => return Err(format!("charter path {full} is not a regular file")),
+                TreeEntry::Symlink | TreeEntry::Submodule => return Err(format!("charter path {full} is not a regular file")),
             }
         }
         let mut files = BTreeMap::new();
@@ -311,7 +311,7 @@ pub async fn read_layer_directory(
                             tally.admit(&name, file.size())?;
                             selected.push((name, file));
                         }
-                        TreeEntry::Other => return Err(format!("layer path {name} is not a regular file")),
+                        TreeEntry::Symlink | TreeEntry::Submodule => return Err(format!("layer path {name} is not a regular file")),
                     }
                 }
                 let mut files = BTreeMap::new();

@@ -18,6 +18,9 @@ use super::super::{account_access::AccountLaunch, state::ControllerRuntimeState}
 const ERROR_LIMIT: usize = 1024;
 const FIRST_RETRY: Duration = Duration::from_secs(1);
 const LAST_RETRY: Duration = Duration::from_secs(60);
+/// How a permanent failure's diagnostic begins, so `convoy explain` and launch say why
+/// no retry is due.
+const PERMANENT: &str = "permanent, not retried: ";
 
 /// One access's status at one place, as launch read it before delivering.
 pub(in crate::runtime) struct AccessStatus {
@@ -85,12 +88,24 @@ impl AccessStatus {
     }
 
     /// Record a failed delivery: the need it failed at, a bounded diagnostic and when the
-    /// next attempt is due. What landed before stays recorded.
-    pub(in crate::runtime) async fn failed(&self, state: &ControllerRuntimeState, need: String, error: &str) -> Result<(), String> {
+    /// next attempt is due. A permanent failure, such as an authority refusal or a policy
+    /// violation, is never due again: launch stops retrying until the record is removed.
+    /// What landed before stays recorded.
+    pub(in crate::runtime) async fn failed(
+        &self,
+        state: &ControllerRuntimeState,
+        need: String,
+        error: &str,
+        permanent: bool,
+    ) -> Result<(), String> {
         let now = state.daemon.clock().now();
         let attempts = self.existing.as_ref().and_then(|existing| existing.spec.retry.as_ref()).map_or(0, |retry| retry.attempts) + 1;
-        let next_at = Timestamp::from_datetime(&(now + retry_delay(attempts)));
-        let retry = DeliveryRetry { need, attempts, error: bounded(error), next_at };
+        let (next_at, error) = if permanent {
+            (Timestamp::MAX, bounded(&format!("{PERMANENT}{error}")))
+        } else {
+            (Timestamp::from_datetime(&(now + retry_delay(attempts))), bounded(error))
+        };
+        let retry = DeliveryRetry { need, attempts, error, next_at };
         self.write(state, AccessDeliverySpec { retry: Some(retry), ..self.identity.clone() }).await
     }
 

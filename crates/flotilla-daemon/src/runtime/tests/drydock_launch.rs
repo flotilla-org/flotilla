@@ -104,21 +104,14 @@ async fn launch_through_drydock(reverse_forwards: bool, link: AgentLink) {
     let environment = environments.create(&empty_meta(env_id.as_str()), &spec).await.expect("environment record");
     let status = flotilla_resources::EnvironmentStatus { provider_descriptor: handle.provider_descriptor(), ..Default::default() };
     environments.update_status(env_id.as_str(), &environment.metadata.resource_version, &status).await.expect("environment status");
-    let (source, revision) = local_skill_source(root);
-    let skill = flotilla_resources::SkillCatalogEntry {
-        source: source.clone(),
-        repository: format!("file://{}", root.join("skills-repo").display()),
-        revision: revision.clone(),
-        name: "research".into(),
-        path: "skills/research".into(),
-    };
-    freeze_crew(&backend, &convoy, "demo-work", "coder", "claude-code", vec![skill]).await;
+    let source = LocalSkillSource::new(root, "research");
+    freeze_crew(&backend, &convoy, "demo-work", "coder", "claude-code", vec![source.selected.clone()]).await;
     bind_account(&backend, &convoy, "coder", "claude-max", "test@example.com").await;
 
     // Adapters are discovered over a stand-in runner; every guest step goes
     // through the drydock handle's agent.
     let adapters: Arc<dyn CommandRunner> =
-        Arc::new(CredentialInteriorRunner(DiscoveryMockRunner::builder().tool_exists("claude", true).build(), None));
+        Arc::new(CredentialInteriorRunner(DiscoveryMockRunner::builder().tool_exists("claude", true).build()));
     let bag = EnvironmentBag::new()
         .with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", env_id.to_string()))
         .with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude"))
@@ -143,7 +136,7 @@ async fn launch_through_drydock(reverse_forwards: bool, link: AgentLink) {
     ));
     let agent_material = Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([(
         FLOTILLA_SKILLS_DIR_ENV,
-        root.join("generation/skills").display().to_string(),
+        source.supply.display().to_string(),
     )]))));
     let state = Arc::new(
         ControllerRuntimeState::new(
@@ -155,7 +148,8 @@ async fn launch_through_drydock(reverse_forwards: bool, link: AgentLink) {
             "host-direct-host-test".to_string(),
         )
         .with_credential_store(credential_store)
-        .with_agent_material(agent_material),
+        .with_agent_material(agent_material)
+        .with_skill_trees(LocalSkillSource::trees(root)),
     );
     state
         .provisioned_environments
@@ -198,7 +192,9 @@ async fn launch_through_drydock(reverse_forwards: bool, link: AgentLink) {
         .iter()
         .find_map(|launch| launch.env_vars.iter().find(|(name, _)| name == "CLAUDE_CONFIG_DIR").map(|(_, home)| PathBuf::from(home)));
     assert_eq!(launched.as_ref(), Some(&home), "launch uses the home the access layer delivered");
-    assert_eq!(fs::read_to_string(home.join("skills/research/SKILL.md")).expect("staged skill"), "research skill\n");
+    // #3663: the home's skills link resolves into the agent's content cache.
+    assert!(fs::symlink_metadata(home.join("skills")).expect("skills link").file_type().is_symlink());
+    assert!(fs::read_to_string(home.join("skills/research/SKILL.md")).expect("pushed skill").contains("name: research"));
     let mut guest = tokio::net::UnixStream::connect(&guest_socket).await.expect("guest daemon socket");
     guest.write_all(b"crew").await.expect("guest write");
     let (mut controller, _) = tokio::time::timeout(Duration::from_secs(5), daemon_socket.accept()).await.expect("accept").expect("stream");
@@ -211,7 +207,7 @@ async fn launch_through_drydock(reverse_forwards: bool, link: AgentLink) {
     assert_eq!(Path::new(&delivery.home), home);
     let mechanisms = delivery.needs.iter().map(|need| (need.need.as_str(), need.mechanism.as_str())).collect::<BTreeMap<_, _>>();
     assert_eq!(mechanisms.get("home"), Some(&"agent-push"));
-    assert_eq!(mechanisms.get("skills"), Some(&"agent-fetch(url)"));
+    assert_eq!(mechanisms.get("skills"), Some(&"agent-push"));
     let connection = delivery.agent_connection.as_ref().expect("explain shows drydock's report");
     assert_eq!((connection.provider.as_str(), connection.mode.as_str()), ("stand-in", link.as_str()));
     assert_eq!(connection.vessel, handle.backing_id());
@@ -219,35 +215,4 @@ async fn launch_through_drydock(reverse_forwards: bool, link: AgentLink) {
     handle.destroy().await.expect("destroy");
     // The stand-in vessel is this host: leave nothing at its contained base.
     let _ = fs::remove_dir_all(home.parent().and_then(Path::parent).expect("convoy homes"));
-    let cache = Path::new(flotilla_environment::environment::runner::CONTAINED_WRITABLE_CONFIG_BASE).join("skill-source-cache");
-    let _ = fs::remove_dir_all(cache.join(format!("{source}-{revision}")));
-}
-
-/// A generation's skill source at a local repository, with one skill at its
-/// pinned revision. Returns the source's name and revision.
-fn local_skill_source(root: &Path) -> (String, String) {
-    let repository = root.join("skills-repo");
-    fs::create_dir_all(repository.join("skills/research")).expect("skill directory");
-    fs::write(repository.join("skills/research/SKILL.md"), "research skill\n").expect("skill");
-    let git = |args: &[&str]| {
-        let output = std::process::Command::new("git")
-            .args(["-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "init.defaultBranch=main"])
-            .args(args)
-            .current_dir(&repository)
-            .output()
-            .expect("git");
-        assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
-        String::from_utf8(output.stdout).expect("git output").trim().to_string()
-    };
-    git(&["init", "-q"]);
-    git(&["add", "."]);
-    git(&["commit", "-qm", "skills"]);
-    let revision = git(&["rev-parse", "HEAD"]);
-    let name = format!("local-skills-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-    let manifest = root.join("generation/skills");
-    fs::create_dir_all(&manifest).expect("source manifest directory");
-    let sources = json!({"schema_version": 5, "sources": [{"name": name, "repository": format!("file://{}", repository.display()),
-        "revision": revision, "paths": ["skills"]}]});
-    fs::write(manifest.join(".flotilla-sources.json"), sources.to_string()).expect("source manifest");
-    (name, revision)
 }

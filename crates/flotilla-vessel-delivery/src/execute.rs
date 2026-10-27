@@ -38,7 +38,34 @@ pub trait TreeDelivery: Send + Sync {
         guest_source: Option<&Path>,
         target: &Path,
         agent: &dyn VesselAgent,
-    ) -> Result<(), String>;
+    ) -> Result<(), StepFailure>;
+}
+
+/// Why a tree's delivery failed, and whether trying the same content again can help.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StepFailure {
+    pub error: String,
+    /// Only positive evidence, such as an authority refusal or a policy violation,
+    /// makes a failure permanent; anything else is retried.
+    pub permanent: bool,
+}
+
+impl StepFailure {
+    pub fn permanent(error: impl Into<String>) -> Self {
+        Self { error: error.into(), permanent: true }
+    }
+}
+
+impl From<String> for StepFailure {
+    fn from(error: String) -> Self {
+        Self { error, permanent: false }
+    }
+}
+
+impl From<&str> for StepFailure {
+    fn from(error: &str) -> Self {
+        error.to_string().into()
+    }
 }
 
 /// What one access delivered: where each home is aboard this vessel, and the
@@ -61,6 +88,8 @@ pub enum DeliveryError {
     Step {
         need: NeedName,
         error: String,
+        /// Retrying the same content cannot help.
+        permanent: bool,
     },
     Agent(String),
 }
@@ -71,13 +100,20 @@ impl fmt::Display for DeliveryError {
             Self::Plan(error) => write!(f, "plan vessel delivery: {error}"),
             Self::NoDelivery(need) => write!(f, "need `{need}` has no delivery"),
             Self::Unrecordable(need) => write!(f, "need `{need}` has a name or digest its delivery record cannot hold"),
-            Self::Step { need, error } => write!(f, "deliver `{need}`: {error}"),
+            Self::Step { need, error, .. } => write!(f, "deliver `{need}`: {error}"),
             Self::Agent(error) => write!(f, "vessel agent: {error}"),
         }
     }
 }
 
 impl std::error::Error for DeliveryError {}
+
+impl DeliveryError {
+    /// Whether retrying the same delivery cannot help.
+    pub fn is_permanent(&self) -> bool {
+        matches!(self, Self::Step { permanent: true, .. })
+    }
+}
 
 /// Plan the needs against what already landed aboard, then run the plan.
 ///
@@ -116,10 +152,11 @@ pub async fn deliver(
     }
     let mut read = BTreeMap::new();
     for (name, home) in &homes {
-        let record = agent
-            .read(&home.join(DELIVERY_RECORD), RECORD_LIMIT)
-            .await
-            .map_err(|error| DeliveryError::Step { need: name.clone(), error })?;
+        let record = agent.read(&home.join(DELIVERY_RECORD), RECORD_LIMIT).await.map_err(|error| DeliveryError::Step {
+            need: name.clone(),
+            error,
+            permanent: false,
+        })?;
         read.insert(name.clone(), record.map(|bytes| decode_record(&String::from_utf8_lossy(&bytes))).unwrap_or_default());
     }
     let landed = read.values().flatten().map(|(need, landed)| (need.clone(), landed.clone())).collect();
@@ -146,7 +183,7 @@ pub async fn deliver(
     for step in plan.steps.iter().filter(|step| step.action == Action::Deliver) {
         let need = by_name[&step.need];
         let home = home_of(need);
-        let failed = |error| DeliveryError::Step { need: need.name.clone(), error };
+        let failed = |error| DeliveryError::Step { need: need.name.clone(), error, permanent: false };
         match &need.item {
             Item::Home { .. } => agent.create_dir(&homes[&home], HOME_MODE).await.map_err(failed)?,
             Item::Tree { path, .. } => {
@@ -161,7 +198,9 @@ pub async fn deliver(
                         .map_err(failed)?;
                     written.insert(home.clone(), record.clone());
                 }
-                tree.deliver(step.mechanism, step.guest_source.as_deref(), &path.under(&homes[&home]), agent).await.map_err(failed)?;
+                tree.deliver(step.mechanism, step.guest_source.as_deref(), &path.under(&homes[&home]), agent)
+                    .await
+                    .map_err(|StepFailure { error, permanent }| DeliveryError::Step { need: need.name.clone(), error, permanent })?;
             }
         }
         let record = records.get_mut(&home).expect("every home has a record");
@@ -175,7 +214,7 @@ pub async fn deliver(
             agent
                 .write(&homes[home].join(DELIVERY_RECORD), encode_record(record).into_bytes(), RECORD_MODE)
                 .await
-                .map_err(|error| DeliveryError::Step { need: home.clone(), error })?;
+                .map_err(|error| DeliveryError::Step { need: home.clone(), error, permanent: false })?;
         }
     }
     Ok(Delivered { homes, plan })

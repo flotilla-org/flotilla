@@ -41,6 +41,23 @@ fn is_revision_cache(name: &str, directory: &Path) -> bool {
         && directory.join("objects").is_dir()
 }
 
+/// Create the bare object cache and recover known transaction locks. Callers
+/// hold the cache's exclusion, so a lock found here belongs to no live fetch.
+/// Recover only known transaction locks, never arbitrary pack temporaries or
+/// recursively discovered files.
+async fn prepare_object_cache(directory: &Path, runner: &Arc<dyn CommandRunner>) -> Result<(), String> {
+    tokio::fs::create_dir_all(directory).await.map_err(|error| error.to_string())?;
+    for name in ["shallow.lock", "FETCH_HEAD.lock", "packed-refs.lock", "config.lock", "HEAD.lock"] {
+        let path = directory.join(name);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("recover stale Git lock {}: {error}", path.display())),
+        }
+    }
+    GitCliBackend::new(directory, &**runner).run(&["init", "--bare", "."]).await.map(|_| ())
+}
+
 fn object_cache_lock(directory: &Path) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: OnceLock<flotilla_provider_runtime::weak_registry::WeakRegistry<PathBuf, tokio::sync::Mutex<()>>> = OnceLock::new();
     LOCKS.get_or_init(Default::default).get(directory)
@@ -414,6 +431,10 @@ pub trait RevisionedFile: Send + Sync {
     /// The blob's byte length, known without reading it, so consumers can
     /// refuse oversized inputs before any blob I/O.
     fn size(&self) -> u64;
+    /// Whether the tree records the blob as executable (`100755`).
+    fn executable(&self) -> bool {
+        false
+    }
     async fn read(&self) -> Result<Vec<u8>, String>;
 }
 
@@ -421,7 +442,90 @@ pub trait RevisionedFile: Send + Sync {
 /// Consumers choose which regular files to read and how to interpret their bytes.
 pub enum TreeEntry {
     File(Arc<dyn RevisionedFile>),
-    Other,
+    Symlink,
+    Submodule,
+}
+
+/// A credential for one exact-commit fetch: a file holding the token value,
+/// read by Git's credential helper so the value never enters argv or the
+/// environment. The guard travels with the fetch and is dropped only once Git
+/// has exited, even when the caller's future is dropped first.
+pub struct GitCredentialFile {
+    path: PathBuf,
+    _guard: Box<dyn Send + Sync>,
+}
+
+impl GitCredentialFile {
+    pub fn new(path: PathBuf, guard: impl Send + Sync + 'static) -> Self {
+        Self { path, _guard: Box::new(guard) }
+    }
+}
+
+/// Why an exact commit could not be made local. Only `Unavailable` and
+/// `Refused` are positive evidence; anything unclassified is `Transient`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitFetchError {
+    /// Every advertised branch and tag was fetched and the commit is not
+    /// reachable from them, or the server refuses fetches by SHA.
+    Unavailable(String),
+    /// The server refused the request's authority.
+    Refused(String),
+    Transient(String),
+    /// The fallback fetch of every advertised branch and tag failed for a
+    /// transient reason. Repeating that whole fetch at once rarely helps, so
+    /// callers should not retry it immediately.
+    FallbackFailed(String),
+}
+
+impl std::fmt::Display for CommitFetchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(message) | Self::Refused(message) | Self::Transient(message) | Self::FallbackFailed(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+fn is_auth_failure(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    [
+        "authentication failed",
+        "authorization failed",
+        "could not read username",
+        "could not read password",
+        "401 unauthorized",
+        "403 forbidden",
+        "requested url returned error: 401",
+        "requested url returned error: 403",
+        "permission denied (publickey)",
+        "repository not found",
+    ]
+    .iter()
+    .any(|pattern| stderr.contains(pattern))
+        || stderr.lines().any(|line| line.starts_with("remote:") && (line.contains("permission denied") || line.contains("access denied")))
+}
+
+/// Refusals of a want for an unadvertised object; these select the fallback.
+fn is_unadvertised_want_refusal(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    ["not our ref", "unadvertised object", "couldn't find remote ref", "could not find remote ref"]
+        .iter()
+        .any(|pattern| stderr.contains(pattern))
+}
+
+/// Bounded, single-line diagnostic text from Git's stderr.
+fn bounded_git_error(error: &str) -> String {
+    const LIMIT: usize = 4096;
+    let error = error.trim();
+    if error.len() <= LIMIT {
+        return error.to_string();
+    }
+    let mut end = LIMIT;
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &error[..end])
 }
 
 #[derive(bon::Builder)]
@@ -431,12 +535,17 @@ struct GitRevisionedFile {
     revision: String,
     name: String,
     size: u64,
+    executable: bool,
 }
 
 #[async_trait]
 impl RevisionedFile for GitRevisionedFile {
     fn size(&self) -> u64 {
         self.size
+    }
+
+    fn executable(&self) -> bool {
+        self.executable
     }
 
     async fn read(&self) -> Result<Vec<u8>, String> {
@@ -483,6 +592,21 @@ pub trait Vcs: Send + Sync {
         _path: &str,
     ) -> Result<BTreeMap<String, TreeEntry>, String> {
         Err("revision tree inspection is unavailable".into())
+    }
+
+    /// Make one exact commit local in the object cache for `repo`, without
+    /// changing what any branch resolves to. A cached commit costs no network
+    /// and records the cache's use. Servers that refuse fetches by SHA are
+    /// served by fetching every advertised branch and tag, unfiltered, so that
+    /// later tree reads never need the network or the credential again.
+    async fn fetch_commit(
+        &self,
+        _cache: &Path,
+        _repo: &str,
+        _commit: &str,
+        _credential: Option<GitCredentialFile>,
+    ) -> Result<(), CommitFetchError> {
+        Err(CommitFetchError::Refused(REVISION_FETCH_UNAVAILABLE.into()))
     }
 
     async fn read_repository(&self, _path: &Path, _read: RepositoryRead<'_>) -> Result<String, String> {
@@ -751,7 +875,8 @@ impl Vcs for FlotillaVcs {
         // The owned task finishes the transaction even if its reader goes away.
         let fetch = tokio::spawn(async move {
             let _guard = guard;
-            tokio::fs::create_dir_all(&directory).await.map_err(|error| error.to_string())?;
+            prepare_object_cache(&directory, &runner).await?;
+            let backend = GitCliBackend::new(&directory, &*runner);
             // This private object cache is mutated only under this exclusion.
             // Every fetch retains it until the command exits, so a shallow lock
             // found here cannot belong to any live fetch owned by this daemon.
@@ -759,18 +884,7 @@ impl Vcs for FlotillaVcs {
             // directory; flotillad-lifecycle.lock excludes a second daemon for
             // that state directory. Standalone validation uses a separate
             // inspector cache. Do not use this cache as an operator-managed
-            // Git repository. Recover only known transaction locks, never
-            // arbitrary pack temporaries or recursively discovered files.
-            for name in ["shallow.lock", "FETCH_HEAD.lock", "packed-refs.lock", "config.lock", "HEAD.lock"] {
-                let path = directory.join(name);
-                match tokio::fs::remove_file(&path).await {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(format!("recover stale Git lock {}: {error}", path.display())),
-                }
-            }
-            let backend = GitCliBackend::new(&directory, &*runner);
-            backend.run(&["init", "--bare", "."]).await?;
+            // Git repository.
             backend.run(&["check-ref-format", &format!("refs/heads/{branch}")]).await?;
             // A hard writer deadline covers every transport and credential
             // helper. The local runner sends SIGTERM, escalates if needed, and
@@ -853,6 +967,99 @@ impl Vcs for FlotillaVcs {
         Ok(retired)
     }
 
+    async fn fetch_commit(
+        &self,
+        cache: &Path,
+        repo: &str,
+        commit: &str,
+        credential: Option<GitCredentialFile>,
+    ) -> Result<(), CommitFetchError> {
+        if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(CommitFetchError::Refused(format!("{commit} is not a full commit SHA")));
+        }
+        let directory = revision_cache(cache, repo);
+        let guard = object_cache_lock(&directory).lock_owned().await;
+        let runner = Arc::clone(&self.runner);
+        let repo = repo.to_string();
+        let commit = commit.to_string();
+        // As for branch fetches, the owned task finishes the transaction and
+        // keeps exclusion and the credential until Git exits.
+        let fetch = tokio::spawn(async move {
+            let _guard = guard;
+            prepare_object_cache(&directory, &runner).await.map_err(CommitFetchError::Transient)?;
+            let backend = GitCliBackend::new(&directory, &*runner);
+            if backend.run(&["cat-file", "-e", &format!("{commit}^{{commit}}")]).await.is_ok() {
+                // FETCH_HEAD's mtime is the cache's last use (see retirement).
+                let fetch_head = directory.join("FETCH_HEAD");
+                let touched = tokio::fs::OpenOptions::new().create(true).append(true).open(fetch_head).await;
+                let touched = match touched {
+                    Ok(file) => file.into_std().await.set_modified(SystemTime::now()),
+                    Err(error) => Err(error),
+                };
+                touched.map_err(|error| CommitFetchError::Transient(format!("record use of cache for {repo}: {error}")))?;
+                return Ok(());
+            }
+            let helper = match &credential {
+                Some(credential) => {
+                    let path = credential.path.to_str().filter(|path| !path.contains('\'') && !path.contains('\n'));
+                    let path = path.ok_or_else(|| CommitFetchError::Refused("credential file path is not representable".into()))?;
+                    format!(
+                        "credential.helper=!f() {{ test \"$1\" = get || exit 0; printf 'username=x-access-token\\npassword=%s\\n' \"$(cat '{path}')\"; }}; f"
+                    )
+                }
+                None => String::new(),
+            };
+            // An empty helper first clears every ambient helper; only the
+            // explicit credential file may answer.
+            let mut prefix = vec!["-c", "credential.helper=", "-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=60"];
+            if credential.is_some() {
+                prefix.extend(["-c", helper.as_str()]);
+            }
+            let fetch = |refspecs: Vec<String>, shallow: bool| {
+                let mut args = prefix.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+                args.extend(["fetch", "--no-tags", "--no-auto-maintenance"].map(String::from));
+                if shallow {
+                    args.push("--depth=1".into());
+                }
+                args.extend(["--".into(), repo.clone()]);
+                args.extend(refspecs);
+                let backend = &backend;
+                async move {
+                    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+                    backend.run_with_timeout(&args, Duration::from_secs(300)).await
+                }
+            };
+            let classify = |error: String| {
+                if is_auth_failure(&error) {
+                    CommitFetchError::Refused(format!("{repo} refused the fetch: {}", bounded_git_error(&error)))
+                } else {
+                    CommitFetchError::Transient(format!("fetch {commit} from {repo}: {}", bounded_git_error(&error)))
+                }
+            };
+            match fetch(vec![commit.clone()], true).await {
+                Ok(_) if backend.run(&["cat-file", "-e", &format!("{commit}^{{commit}}")]).await.is_ok() => return Ok(()),
+                Ok(_) => return Err(CommitFetchError::Transient(format!("fetch of {commit} from {repo} did not deliver it"))),
+                Err(error) if is_unadvertised_want_refusal(&error) => {}
+                Err(error) => return Err(classify(error)),
+            }
+            warn!(repository = %repo, commit = %commit, "server refuses fetch by SHA; fetching every advertised branch and tag");
+            fetch(vec!["+refs/heads/*:refs/flotilla/heads/*".into(), "+refs/tags/*:refs/flotilla/tags/*".into()], false).await.map_err(
+                |error| match classify(error) {
+                    CommitFetchError::Transient(error) => CommitFetchError::FallbackFailed(error),
+                    refused => refused,
+                },
+            )?;
+            if backend.run(&["cat-file", "-e", &format!("{commit}^{{commit}}")]).await.is_ok() {
+                Ok(())
+            } else {
+                Err(CommitFetchError::Unavailable(format!(
+                    "{repo} could not serve pinned revision {commit} (not reachable from any advertised branch or tag, and the server refuses fetch by SHA)"
+                )))
+            }
+        });
+        fetch.await.map_err(|error| CommitFetchError::Transient(format!("commit fetch task: {error}")))?
+    }
+
     async fn files_at_revision(&self, cache: &Path, repo: &str, revision: &str, path: &str) -> Result<BTreeMap<String, TreeEntry>, String> {
         let directory = revision_cache(cache, repo);
         let lock = object_cache_lock(&directory);
@@ -878,6 +1085,7 @@ impl Vcs for FlotillaVcs {
                 relative
             };
             let contents = if meta.starts_with("100644 blob ") || meta.starts_with("100755 blob ") {
+                let executable = meta.starts_with("100755 ");
                 let size = meta.split_whitespace().nth(3).and_then(|size| size.parse().ok()).ok_or("invalid tree entry size")?;
                 TreeEntry::File(Arc::new(
                     GitRevisionedFile::builder()
@@ -886,10 +1094,13 @@ impl Vcs for FlotillaVcs {
                         .revision(revision.to_string())
                         .name(name.to_string())
                         .size(size)
+                        .executable(executable)
                         .build(),
                 ))
+            } else if meta.starts_with("160000 ") {
+                TreeEntry::Submodule
             } else {
-                TreeEntry::Other
+                TreeEntry::Symlink
             };
             files.insert(relative.to_string(), contents);
         }
@@ -2639,10 +2850,209 @@ mod tests {
             .iter()
             .map(|(name, entry)| match entry {
                 TreeEntry::File(file) => (name.as_str(), file.size()),
-                TreeEntry::Other => panic!("regular file"),
+                TreeEntry::Symlink | TreeEntry::Submodule => panic!("regular file"),
             })
             .collect::<Vec<_>>();
         assert_eq!(sizes, [("empty.md", 0), ("nested/a.yaml", 1234)]);
+    }
+
+    /// Git subprocess boundary: the real CLI, forced to protocol v0 when
+    /// `protocol_v0` holds. A v0 server without `allowReachableSHA1InWant`
+    /// refuses wants for unadvertised objects, as some self-hosted forges do.
+    struct RecordingGit {
+        protocol_v0: bool,
+        arguments: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingGit {
+        fn new(protocol_v0: bool) -> Arc<Self> {
+            Arc::new(Self { protocol_v0, arguments: Default::default() })
+        }
+
+        fn arguments<'a>(&self, cmd: &str, args: &'a [&'a str]) -> Vec<&'a str> {
+            self.arguments.lock().expect("arguments").extend(args.iter().map(|arg| arg.to_string()));
+            let mut forwarded = Vec::new();
+            if cmd == "git" && self.protocol_v0 {
+                forwarded.extend(["-c", "protocol.version=0"]);
+            }
+            forwarded.extend_from_slice(args);
+            forwarded
+        }
+    }
+
+    #[async_trait]
+    impl CommandRunner for RecordingGit {
+        async fn run(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            cwd: &Path,
+            label: &flotilla_provider_runtime::ChannelLabel,
+        ) -> Result<String, String> {
+            flotilla_provider_runtime::ProcessCommandRunner.run(cmd, &self.arguments(cmd, args), cwd, label).await
+        }
+
+        async fn run_with_timeout(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            cwd: &Path,
+            label: &flotilla_provider_runtime::ChannelLabel,
+            timeout: Duration,
+        ) -> Result<String, String> {
+            flotilla_provider_runtime::ProcessCommandRunner.run_with_timeout(cmd, &self.arguments(cmd, args), cwd, label, timeout).await
+        }
+
+        async fn run_output(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            cwd: &Path,
+            label: &flotilla_provider_runtime::ChannelLabel,
+        ) -> Result<CommandOutput, String> {
+            flotilla_provider_runtime::ProcessCommandRunner.run_output(cmd, &self.arguments(cmd, args), cwd, label).await
+        }
+
+        async fn run_to_file(&self, cmd: &str, args: &[&str], cwd: &Path, destination: &Path) -> Result<(), String> {
+            flotilla_provider_runtime::ProcessCommandRunner.run_to_file(cmd, &self.arguments(cmd, args), cwd, destination).await
+        }
+
+        async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+            flotilla_provider_runtime::ProcessCommandRunner.exists(cmd, args).await
+        }
+    }
+
+    // #3663: a frozen pin is fetched exactly, whatever its branch now names;
+    // once local it is served from the cache without the network, and a pin
+    // the server cannot serve is a permanent `Unavailable`, not transient.
+    #[tokio::test]
+    async fn exact_commit_fetch_serves_old_pins_and_refuses_unservable_ones() {
+        let source = tempfile::tempdir().expect("source");
+        let cache = tempfile::tempdir().expect("cache");
+        git(source.path(), &["init", "-q", "-b", "main"]);
+        let old = commit_file(source.path(), "skill.md", "old");
+        commit_file(source.path(), "skill.md", "new");
+        let repo = source.path().to_str().expect("repository path").to_string();
+        let vcs = test_fl(cache.path(), RecordingGit::new(false), true);
+
+        vcs.fetch_commit(cache.path(), &repo, &old, None).await.expect("old pin");
+        let missing = "0".repeat(40);
+        assert!(matches!(vcs.fetch_commit(cache.path(), &repo, &missing, None).await, Err(CommitFetchError::Unavailable(_))));
+
+        std::fs::remove_dir_all(source.path()).expect("remove remote");
+        vcs.fetch_commit(cache.path(), &repo, &old, None).await.expect("cached pin needs no remote");
+        let files = vcs.files_at_revision(cache.path(), &repo, &old, ".").await.expect("cached tree");
+        let TreeEntry::File(file) = &files["skill.md"] else { panic!("regular file") };
+        assert_eq!(file.read().await.expect("blob"), b"old");
+    }
+
+    // #3663: a server that refuses fetch by SHA still serves a pin reachable
+    // from an advertised branch or tag; an orphaned pin is `Unavailable`.
+    #[tokio::test]
+    async fn refused_sha_wants_fall_back_to_advertised_branches_and_tags() {
+        let source = tempfile::tempdir().expect("source");
+        let cache = tempfile::tempdir().expect("cache");
+        git(source.path(), &["init", "-q", "-b", "main"]);
+        // The pin sits behind the tag, so only the tag's history reaches it.
+        let tagged = commit_file(source.path(), "skill.md", "behind the tag");
+        let release = commit_file(source.path(), "skill.md", "release");
+        git(source.path(), &["tag", "release", &release]);
+        let orphaned = commit_file(source.path(), "skill.md", "orphaned");
+        git(source.path(), &["reset", "-q", "--hard", &release]);
+        git(source.path(), &["checkout", "-q", "--orphan", "replacement"]);
+        commit_file(source.path(), "other.md", "unrelated");
+        git(source.path(), &["branch", "-q", "-D", "main"]);
+        let repo = format!("file://{}", source.path().display());
+        let vcs = test_fl(cache.path(), RecordingGit::new(true), true);
+
+        vcs.fetch_commit(cache.path(), &repo, &tagged, None).await.expect("tag-reachable pin");
+        assert!(matches!(vcs.fetch_commit(cache.path(), &repo, &orphaned, None).await, Err(CommitFetchError::Unavailable(_))));
+    }
+
+    // #3663: a private fetch answers Git from the credential file alone. The
+    // token value never appears in argv, and the file's guard is released
+    // once the fetch has finished.
+    #[tokio::test]
+    async fn credential_file_stays_out_of_argv_and_is_released_after_the_fetch() {
+        let source = tempfile::tempdir().expect("source");
+        let cache = tempfile::tempdir().expect("cache");
+        git(source.path(), &["init", "-q", "-b", "main"]);
+        let pin = commit_file(source.path(), "skill.md", "private");
+        let token = "ghs_test_token_value";
+        let directory = tempfile::tempdir().expect("credential directory");
+        let path = directory.path().join("token");
+        std::fs::write(&path, token).expect("token file");
+        let held = directory.path().to_path_buf();
+        let runner = RecordingGit::new(false);
+        let vcs = test_fl(cache.path(), runner.clone(), true);
+
+        let credential = GitCredentialFile::new(path, directory);
+        vcs.fetch_commit(cache.path(), source.path().to_str().expect("path"), &pin, Some(credential)).await.expect("fetch");
+        assert!(!held.exists(), "credential directory outlived the fetch");
+        assert!(runner.arguments.lock().expect("arguments").iter().all(|argument| !argument.contains(token)));
+    }
+
+    // #3663: dropping the caller's future after the fetch has started does
+    // not leak the credential: the fetch task owns its guard and releases it
+    // once Git has exited.
+    #[tokio::test]
+    async fn a_dropped_fetch_still_releases_its_credential() {
+        let source = tempfile::tempdir().expect("source");
+        let cache = tempfile::tempdir().expect("cache");
+        git(source.path(), &["init", "-q", "-b", "main"]);
+        let pin = commit_file(source.path(), "skill.md", "private");
+        let directory = tempfile::tempdir().expect("credential directory");
+        std::fs::write(directory.path().join("token"), "token").expect("token file");
+        let held = directory.path().to_path_buf();
+        let vcs = test_fl(cache.path(), Arc::new(flotilla_provider_runtime::ProcessCommandRunner), true);
+        let repo = source.path().to_str().expect("path").to_string();
+
+        let credential = GitCredentialFile::new(held.join("token"), directory);
+        let mut fetch = Box::pin(vcs.fetch_commit(cache.path(), &repo, &pin, Some(credential)));
+        // One poll takes the uncontended cache lock and spawns the fetch task.
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+        drop(fetch);
+        for _ in 0..200 {
+            if !held.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("credential directory outlived the abandoned fetch");
+    }
+
+    // #3663: tree entries keep what skill delivery must police: the
+    // executable bit, and symlinks and submodules as distinct kinds.
+    #[tokio::test]
+    async fn tree_entries_distinguish_executables_symlinks_and_submodules() {
+        let source = tempfile::tempdir().expect("source");
+        let cache = tempfile::tempdir().expect("cache");
+        git(source.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(source.path().join("run.sh"), "#!/bin/sh\n").expect("script");
+        std::fs::set_permissions(source.path().join("run.sh"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("mode");
+        std::os::unix::fs::symlink("run.sh", source.path().join("link")).expect("symlink");
+        let first = commit_file(source.path(), "plain.md", "plain");
+        git(source.path(), &["update-index", "--add", "--cacheinfo", &format!("160000,{first},module")]);
+        git(source.path(), &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "module"]);
+        let pin = git_text(source.path(), &["rev-parse", "HEAD"]);
+        let repo = source.path().to_str().expect("path");
+        let vcs = test_fl(cache.path(), Arc::new(flotilla_provider_runtime::ProcessCommandRunner), true);
+        vcs.fetch_commit(cache.path(), repo, &pin, None).await.expect("fetch");
+
+        let files = vcs.files_at_revision(cache.path(), repo, &pin, ".").await.expect("tree");
+        let kinds = files
+            .iter()
+            .map(|(name, entry)| {
+                let kind = match entry {
+                    TreeEntry::File(file) if file.executable() => "executable",
+                    TreeEntry::File(_) => "file",
+                    TreeEntry::Symlink => "symlink",
+                    TreeEntry::Submodule => "submodule",
+                };
+                (name.as_str(), kind)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, [("link", "symlink"), ("module", "submodule"), ("plain.md", "file"), ("run.sh", "executable")]);
     }
 
     fn age_fetch(directory: &Path, age: Duration) {

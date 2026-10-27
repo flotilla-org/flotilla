@@ -129,16 +129,6 @@ pub(super) async fn freeze_crew(
 }
 
 /// A frozen selection of `name` from the generation's `mattpocock-skills` source.
-pub(super) fn frozen_skill(name: &str) -> flotilla_resources::SkillCatalogEntry {
-    flotilla_resources::SkillCatalogEntry {
-        source: "mattpocock-skills".into(),
-        repository: "flotilla-org/mattpocock-skills".into(),
-        revision: "1".repeat(40),
-        name: name.into(),
-        path: format!("skills/{name}"),
-    }
-}
-
 /// The token prefix a bound Claude launch starts with.
 pub(super) fn claude_token_prefix(dir: &str) -> String {
     format!("CLAUDE_CODE_OAUTH_TOKEN=\"$(cat -- '{dir}/.flotilla-oauth-token')\" ")
@@ -202,7 +192,6 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
             .tool_exists("claude", true)
             .on_run("mkdir", &["-p", &crew_config_dir.to_string_lossy()], Ok(String::new()))
             .build(),
-        None,
     ));
     let bag = EnvironmentBag::new()
         .with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", env_id.to_string()))
@@ -218,15 +207,18 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
         pool.clone(),
     );
     let contained_registry = Arc::new(contained_registry);
-    let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
-        id: env_id.clone(),
-        image: ImageId::new("contained-image"),
-        runner: Arc::clone(&runner),
-        env_vars: HashMap::from([("HOME".to_string(), "/home/crew".to_string())]),
-        destroyed: Arc::new(AtomicBool::new(false)),
+    let handle: EnvironmentHandle = Arc::new(CachedInterior {
+        inner: TestInteriorEnvironment {
+            id: env_id.clone(),
+            image: ImageId::new("contained-image"),
+            runner: Arc::clone(&runner),
+            env_vars: HashMap::from([("HOME".to_string(), "/home/crew".to_string())]),
+            destroyed: Arc::new(AtomicBool::new(false)),
+        },
+        cache: Arc::default(),
     });
     daemon
-        .register_provisioned_environment(env_id.clone(), handle, bag.clone(), Some(Arc::clone(&contained_registry)))
+        .register_provisioned_environment(env_id.clone(), Arc::clone(&handle), bag.clone(), Some(Arc::clone(&contained_registry)))
         .expect("register contained environment");
 
     let credential_store = Arc::new(CredentialStore::new(
@@ -252,6 +244,11 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
         // until its loopback forwarder (#3485).
         .with_hook_endpoint(Some(crate::server::HookEndpoint::listening_at("http://127.0.0.1:7878"))),
     );
+    state
+        .provisioned_environments
+        .lock()
+        .await
+        .insert(handle.backing_id().to_string(), super::super::environments::ActiveProvisionedEnvironment { handle });
     let spec = flotilla_resources::TerminalSessionSpec {
         env_ref: env_id.to_string(),
         role: "coder".to_string(),

@@ -346,7 +346,7 @@ async fn validate_daemon_with_preview(
         &frozen::CandidateProbes {
             options: probes,
             inventory: &frozen_inventory,
-            runner: &ProcessCommandRunner,
+            runner: Arc::new(ProcessCommandRunner),
             provider: image_provider.as_ref(),
         },
     )
@@ -355,6 +355,9 @@ async fn validate_daemon_with_preview(
     println!("frozen-reference satisfiability: {}", serde_json::to_string(&frozen_report)?);
     for error in &frozen_report.failures {
         eprintln!("{error}");
+    }
+    for notice in &frozen_report.notices {
+        eprintln!("notice: {notice}");
     }
     failed |= !frozen_report.failures.is_empty();
     for namespace in charter_namespaces {

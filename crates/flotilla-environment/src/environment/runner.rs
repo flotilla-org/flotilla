@@ -46,6 +46,9 @@ impl CredentialDeliveryPaths {
     pub fn harness_home(&self, name: &str, harness: &str) -> PathBuf {
         self.base.join("agent-homes").join(Self::component(name)).join(harness)
     }
+    /// Where the in-guest skill stager kept source tokens before #3663.
+    /// Vessels that predate host-side fetching may still hold stale tokens
+    /// there, so session capture keeps excluding it; remove one roll later.
     pub fn skill_source_dir(&self) -> PathBuf {
         self.base.join("skill-sources")
     }

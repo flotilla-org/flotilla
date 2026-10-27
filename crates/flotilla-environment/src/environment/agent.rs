@@ -10,7 +10,8 @@ use std::{
 
 use async_trait::async_trait;
 use drydock_agent::{
-    ArtifactSource, Client, Configuration, Endpoint, Exec, ExecEvent, ExitStatus, Fetch, FileOptions, GuestForward, HostForward, Unpack,
+    ArtifactSource, Client, Configuration, Endpoint, Exec, ExecEvent, ExitStatus, Fetch, FileOptions, GuestForward, HostForward, Rename,
+    Unpack,
 };
 use drydock_protocol::Platform;
 use drydock_transport::{Limits, Transport};
@@ -615,6 +616,10 @@ impl VesselAgent for Arc<AgentRunner> {
             .symlink(path, target, &options)
             .await
             .map_err(|error| format!("link {} to {}: {error}", path.display(), target.display()))
+    }
+    async fn rename(&self, from: &Path, to: &Path) -> Result<(), String> {
+        let rename = Rename { from: from.to_path_buf(), to: to.to_path_buf(), exclusive: true, parents: false };
+        self.client().await?.rename(&rename).await.map_err(|error| format!("rename {} to {}: {error}", from.display(), to.display()))
     }
     async fn architecture(&self) -> Result<String, String> {
         let platform = self.client().await?.hello().platform.clone();

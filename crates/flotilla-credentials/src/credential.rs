@@ -42,6 +42,13 @@ use crate::vessel_config::TargetKey;
 
 /// Shared, side-effect-free authority check for skill staging and the candidate
 /// pre-roll probe. Returns the repository name used to narrow the App token.
+#[async_trait::async_trait]
+impl crate::skill_trees::SkillSourceTokens for CredentialStore {
+    async fn mint(&self, credential: &str, repository: &str) -> Result<String, String> {
+        self.mint_skill_source_token(credential, repository).await
+    }
+}
+
 pub(crate) fn skill_source_repository(credential_name: &str, spec: &CredentialSpecSpec, repository: &str) -> Result<String, String> {
     let (CredentialConsumer::GithubApp { installation_id, installation_repository, .. }, CredentialSource::GithubApp { .. }) =
         (&spec.consumer, &spec.source)
@@ -71,32 +78,6 @@ pub(crate) fn skill_source_repository(credential_name: &str, spec: &CredentialSp
         return Err(bounded_adapter_error(credential_name, "github-app", "skill source repository must identify one owner/repository"));
     }
     Ok(components[1].to_string())
-}
-
-async fn prune_abandoned_skill_source_tokens(runner: &dyn CommandRunner, root: &Path) -> Result<(), String> {
-    const SCRIPT: &str = r#"[ -d "$1" ] || exit 0
-find "$1" -type f -name 'token-*' ! -name '*.in-use.*' -exec sh -c '
-  for token do
-    active=false
-    dead_owner=false
-    for marker in "$token".in-use.*; do
-      [ -f "$marker" ] || continue
-      pid=${marker##*.}
-      case "$pid" in *[!0-9]*|"") active=true; continue ;; esac
-      if signal_error=$(kill -0 "$pid" 2>&1); then active=true; continue; fi
-      case "$signal_error" in *[Pp]ermiss*|*permitted*) active=true; continue ;; esac
-      dead_owner=true
-      rm -f -- "$marker"
-    done
-    # A stager creates its marker before reading the token. Marker-less tokens
-    # may have just been minted, so only age can make them eligible for cleanup.
-    if [ "$active" = false ] && { [ "$dead_owner" = true ] || [ -n "$(find "$token" -prune -mtime +6 -print)" ]; }; then
-      rm -f -- "$token"
-    fi
-  done
-' _ {} +"#;
-    let path = root.to_string_lossy();
-    runner.run("sh", &["-c", SCRIPT, "flotilla-prune-skill-tokens", &path], Path::new("/"), &ChannelLabel::Default).await.map(|_| ())
 }
 
 #[derive(Serialize)]
@@ -1244,12 +1225,10 @@ impl CredentialStore {
         })
     }
 
-    pub fn prepare_skill_source<'a>(
-        &'a self,
-        credential_name: &'a str,
-        repository: &'a str,
-        runner: &'a dyn CommandRunner,
-    ) -> BoxFuture<'a, Result<PathBuf, String>> {
+    /// Mint a read token narrowed to one skill source repository. The value
+    /// stays on the daemon host: the caller hands it to the host-side fetch
+    /// only, and it never reaches a vessel (#3663).
+    pub fn mint_skill_source_token<'a>(&'a self, credential_name: &'a str, repository: &'a str) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(async move {
             let spec = self.spec(credential_name).await?;
             let repository_name = skill_source_repository(credential_name, &spec, repository)?;
@@ -1282,13 +1261,7 @@ impl CredentialStore {
             if token.value.trim().is_empty() {
                 return Err(bounded_adapter_error(credential_name, "github-app", "installation token response was empty"));
             }
-            let paths = self.delivery_paths(runner).await?;
-            prune_abandoned_skill_source_tokens(runner, &paths.skill_source_dir()).await?;
-            // Each staging owns its token. A concurrent staging must not replace or
-            // delete a token while another Git process is still reading it.
-            let token_file = paths.skill_source_dir().join(safe_component(credential_name)).join(format!("token-{}", uuid::Uuid::new_v4()));
-            write_github_app_token_file(runner, &token_file, token.value.trim_end()).await?;
-            Ok(token_file)
+            Ok(token.value.trim_end().to_string())
         })
     }
 
@@ -2444,10 +2417,6 @@ fn registry_environment_dir(environment_ref: &str) -> String {
     name
 }
 
-fn safe_component(name: &str) -> String {
-    name.chars().map(|character| if character.is_ascii_alphanumeric() || character == '-' { character } else { '-' }).collect()
-}
-
 fn image_registry_matches(image: &str, registry: &str) -> bool {
     image == registry || image.strip_prefix(registry).is_some_and(|remainder| remainder.starts_with('/'))
 }
@@ -2521,9 +2490,6 @@ mod tests {
     use flotilla_store_testkit::VirtualClock;
 
     use super::*;
-    use crate::agent_material::tests::promisor_runner;
-    use crate::agent_material::AgentMaterialRegistry;
-    use crate::agent_material::FLOTILLA_SKILLS_DIR_ENV;
 
     #[derive(Default)]
     struct TestEnv(BTreeMap<String, String>);
@@ -2552,146 +2518,6 @@ mod tests {
         calls: AtomicUsize,
         refresh_started: tokio::sync::Notify,
         release_refresh: tokio::sync::Notify,
-    }
-
-    // Test double at the GitHub token-mint HTTP boundary.
-    struct SlowFlakySkillMinter {
-        calls: AtomicUsize,
-        in_flight: AtomicUsize,
-        max_in_flight: AtomicUsize,
-        first_wave: tokio::sync::Barrier,
-    }
-
-    #[async_trait]
-    impl GithubAppTokenMinter for SlowFlakySkillMinter {
-        async fn resolve_installation(&self, _request: &GithubAppInstallationRequest) -> Result<u64, String> {
-            Err("unexpected installation resolution".to_string())
-        }
-
-        async fn mint(&self, _request: &GithubAppMintRequest) -> Result<GithubAppToken, GithubAppMintError> {
-            let call = self.calls.fetch_add(1, Ordering::SeqCst);
-            let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-            self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
-            if call < 6 {
-                self.first_wave.wait().await;
-            }
-            self.in_flight.fetch_sub(1, Ordering::SeqCst);
-            if matches!(call, 0 | 2) {
-                Err(GithubAppMintError::Transient("GitHub returned HTTP 500".to_string()))
-            } else {
-                Ok(GithubAppToken { permissions: None, value: format!("test-token-{call}"), expires_at: Utc::now() + Duration::hours(1) })
-            }
-        }
-    }
-
-    // Six independent stagings must enter mint concurrently, recover transient failures,
-    // fetch with distinct nonempty tokens, and clean up their own token files.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn six_concurrent_skill_stagings_each_use_own_nonempty_token_after_slow_flaky_mints() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let skills = temp.path().join("generation/skills");
-        std::fs::create_dir_all(&skills).expect("skill bundle");
-        std::fs::write(
-            skills.join(".flotilla-sources.json"),
-            r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"github-skills-fork"}]}"#,
-        )
-        .expect("manifest");
-        std::fs::write(temp.path().join("fetches.capture-token"), "").expect("capture marker");
-        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        backend
-            .definitions::<CredentialSpec>("flotilla")
-            .create(
-                &InputMeta::builder().name("github-skills-fork".to_string()).build(),
-                &CredentialSpecSpec {
-                    consumer: CredentialConsumer::GithubApp {
-                        actor_login: None,
-                        installation_id: Some(9876),
-                        installation_repository: None,
-                        permissions: Some(BTreeMap::from([("contents".to_string(), "read".to_string())])),
-                    },
-                    source: CredentialSource::GithubApp {
-                        app_id_path: "/host/app-id".to_string(),
-                        private_key_path: "/host/key".to_string(),
-                    },
-                    lifecycle: CredentialLifecycle::Refreshable,
-                    placement: CredentialPlacementRequirements::default(),
-                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
-                },
-            )
-            .await
-            .expect("credential declaration");
-        let minter = Arc::new(SlowFlakySkillMinter {
-            calls: AtomicUsize::new(0),
-            in_flight: AtomicUsize::new(0),
-            max_in_flight: AtomicUsize::new(0),
-            first_wave: tokio::sync::Barrier::new(6),
-        });
-        let store = Arc::new(CredentialStore::new_with_github_app_minter(
-            backend,
-            "flotilla",
-            Arc::new(TestEnv::default()),
-            EnvironmentBag::new(),
-            Arc::new(RecordingRunner::default()),
-            GithubAppMinting { clock: Arc::new(SystemClock), minter: minter.clone() },
-            temp.path().to_path_buf(),
-        ));
-        let registry = Arc::new(AgentMaterialRegistry::new(Arc::new(TestEnv(BTreeMap::from([
-            ("HOME".to_string(), temp.path().to_string_lossy().into_owned()),
-            (FLOTILLA_SKILLS_DIR_ENV.to_string(), skills.to_string_lossy().into_owned()),
-        ])))));
-        // Prepare every fake Git fixture before spawning: constructors rewrite the shared executable.
-        let runners = (0..6)
-            .map(|index| {
-                let mut runner = promisor_runner(temp.path());
-                runner.config_base = temp.path().join(format!("config-{index}"));
-                runner
-            })
-            .collect::<Vec<_>>();
-        let results = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            futures::future::join_all(runners.into_iter().enumerate().map(|(index, runner)| {
-                let store = Arc::clone(&store);
-                let registry = Arc::clone(&registry);
-                tokio::spawn(async move {
-                    let token_file = store
-                        .prepare_skill_source("github-skills-fork", "https://github.com/example/private-skills.git", &runner)
-                        .await
-                        .map_err(|error| format!("skill source private-skills credential github-skills-fork mint failed: {error}"))?;
-                    let outcome = registry
-                        .stage_test_skills(
-                            &format!("crew-{index}"),
-                            &BTreeSet::from(["claude-code".to_string()]),
-                            &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
-                            &BTreeMap::from([("private-skills".to_string(), token_file.clone())]),
-                            &runner,
-                        )
-                        .await;
-                    assert!(!token_file.exists(), "crew {index} must clean its own token");
-                    outcome?;
-                    // Each staging must install the fake Git response, never content from real Git.
-                    let staged_skill = runner.config_base.join("claude/skills/private-source/SKILL.md");
-                    assert_eq!(
-                        std::fs::read_to_string(staged_skill).expect("fake Git skill must be staged"),
-                        "---\nname: private-source\ndescription: test skill\n---\n# Private source\n",
-                        "crew {index} must use the fake Git response",
-                    );
-                    Ok::<(), String>(())
-                })
-            })),
-        )
-        .await
-        .expect("all six stagings must enter mint concurrently and finish");
-        for result in results {
-            result.expect("staging task").expect("retryable mints should recover and stage");
-        }
-        assert_eq!(minter.max_in_flight.load(Ordering::SeqCst), 6, "all six initial mints must overlap");
-        assert_eq!(minter.calls.load(Ordering::SeqCst), 8, "two transient failures must each be retried");
-        let fetches = std::fs::read_to_string(temp.path().join("fetches")).expect("fake Git fetch log");
-        assert_eq!(fetches.lines().collect::<Vec<_>>(), vec!["fetch"; 6], "each staging must fetch through fake Git");
-        let tokens = std::fs::read_to_string(temp.path().join("fetches.tokens")).expect("captured fetch tokens");
-        let tokens = tokens.lines().collect::<BTreeSet<_>>();
-        assert_eq!(tokens.len(), 6, "each fetch must use its own nonempty token");
-        assert!(tokens.iter().all(|token| token.starts_with("test-token-")));
     }
 
     #[async_trait]
@@ -4144,41 +3970,15 @@ interactions:
             state.path().to_path_buf(),
         );
 
-        let token_file = store
-            .prepare_skill_source("github-skills-fork", "https://github.com/flotilla-org/mattpocock-skills.git", &*runner)
+        let token = store
+            .mint_skill_source_token("github-skills-fork", "https://github.com/flotilla-org/mattpocock-skills.git")
             .await
             .expect("mint narrowed skill-source credential");
 
-        assert!(token_file.parent().expect("token parent").ends_with("skill-sources/github-skills-fork"));
-        assert!(runner.writes.lock().expect("writes lock").iter().any(|(path, contents)| path == &token_file && contents == "skill-token"));
+        assert_eq!(token, "skill-token");
+        assert!(runner.writes.lock().expect("writes lock").is_empty(), "a skill-source token never reaches a vessel");
         assert!(store.github_app_deliveries.lock().await.is_empty(), "one-shot skill tokens must not enter refresh registrations");
         session.assert_complete();
-    }
-
-    #[tokio::test]
-    async fn old_skill_source_tokens_are_reaped_without_touching_a_live_staging_token() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().join("skill-sources/source");
-        std::fs::create_dir_all(&root).expect("token directory");
-        let abandoned = root.join("token-abandoned");
-        let killed_stage = root.join("token-killed-stage");
-        let active = root.join("token-active");
-        let recent = root.join("token-recent");
-        for path in [&abandoned, &killed_stage, &active, &recent] {
-            std::fs::write(path, "test-token").expect("write token");
-        }
-        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 60 * 60);
-        for path in [&abandoned, &active] {
-            std::fs::File::open(path).expect("open token").set_modified(old).expect("age token");
-        }
-        std::fs::write(format!("{}.in-use.{}", active.display(), std::process::id()), "").expect("live marker");
-        std::fs::write(format!("{}.in-use.999999999", killed_stage.display()), "").expect("dead marker");
-        let runner = PathCommandRunner { bin_dir: temp.path().to_path_buf() };
-        prune_abandoned_skill_source_tokens(&runner, &temp.path().join("skill-sources")).await.expect("prune tokens");
-        assert!(!abandoned.exists(), "old abandoned token is removed");
-        assert!(!killed_stage.exists(), "token from a killed staging shell is removed on the next pass");
-        assert!(active.exists(), "old token held by a live staging shell is retained");
-        assert!(recent.exists(), "recent minted token is retained");
     }
 
     #[tokio::test]

@@ -31,7 +31,6 @@ use flotilla_credentials::CredentialRefreshError;
 use flotilla_credentials::CredentialStore;
 use flotilla_credentials::CONTAINER_CODEX_HOME;
 use flotilla_credentials::FLOTILLA_SKILLS_DIR_ENV;
-use flotilla_credentials_testkit::GITHUB_APP_TEST_PRIVATE_KEY;
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_crew::reconcilers::terminal_session::{
     TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalRuntime,
