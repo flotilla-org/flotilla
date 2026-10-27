@@ -730,7 +730,7 @@ fn parse_documents(path: &Path, content: &str) -> Result<Vec<Value>> {
 /// checks that it can read them (N→N+1), not that they meet current authoring rules.
 #[cfg(unix)]
 fn validate_stored_record(item: &Value) -> Result<(), ResourceError> {
-    validate_message_migration_complete(item).and_then(|()| decode_stored_resource_document(item))
+    validate_message_migration_complete(item).and_then(|()| decode_stored_resource_document(item)).map(drop)
 }
 
 #[cfg(all(test, unix))]
@@ -796,8 +796,16 @@ mod tests {
         if case == "unnamed-designation" {
             designation["spec"].as_object_mut().expect("designation spec").remove("fleet");
         }
+        // Usage is retired (#3943); a previous-generation daemon still lists its rows (#4007).
+        let usage = document(
+            "Usage",
+            "usage-b31c",
+            serde_json::json!({"provider":"codex","account":"crew@example.com"}),
+            serde_json::json!({"windows":[{"name":"weekly","used_percent":41.0}],"observed_at":"2026-10-17T00:00:00Z"}),
+        );
         BTreeMap::from([
             ("checkouts".into(), if case == "observed-checkout" { vec![checkout] } else { vec![] }),
+            ("usages".into(), if case == "retired-usage" { vec![usage.clone(), usage] } else { vec![] }),
             ("terminalsessions".into(), if case == "missing-identity" { vec![terminal] } else { vec![] }),
             (
                 "messages".into(),
@@ -872,8 +880,9 @@ mod tests {
     }
 
     // Contract #3760: candidate config switches the gate, observed checkouts are
-    // exempt, and every other refusal fails. Exhaust the finite on/off × store
-    // matrix, including empty stores, duplicate Messages and a missing designation.
+    // exempt, rows of a retired kind are dropped (#4007), and every other refusal
+    // fails. Exhaust the finite on/off × store matrix, including empty stores,
+    // duplicate Messages and a missing designation.
     // Named fleet-role Messages pass; an unnamed designation fails only when the candidate enables primitives.
     // The HTTP stand-in is the resource-socket process boundary; mapping and
     // temporary-store restoration use the real rehearsal implementations.
@@ -884,6 +893,7 @@ mod tests {
             for case in [
                 "empty",
                 "observed-checkout",
+                "retired-usage",
                 "missing-identity",
                 "message-refusal",
                 "missing-designation",
@@ -902,7 +912,7 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
                 assert_eq!(
                     result.is_err(),
-                    enabled && !matches!(case, "empty" | "observed-checkout" | "named-designation"),
+                    enabled && !matches!(case, "empty" | "observed-checkout" | "retired-usage" | "named-designation"),
                     "enabled={enabled}, case={case}: {result:?}"
                 );
             }

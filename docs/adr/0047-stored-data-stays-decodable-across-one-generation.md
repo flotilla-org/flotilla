@@ -66,6 +66,7 @@ A change to a shape that project-map or an ops repository authors either stays N
 
 - **At PR time:** a golden corpus of real stored records from the current generation is decoded by `cargo test` (#2169). A shape change that breaks stored data fails on the PR that makes it, naming the field. Authors fix the decoder, never the corpus. The corpus is refreshed only after each roll.
 - **At roll time:** before install, the candidate binary decodes each host's live store, specs and statuses (#2167). Any failure aborts the roll.
+- **Retired kinds (#4007):** retiring a resource kind keeps a deserialize-only record for it for one generation; validation reports its rows as retired and dropped, never as an unknown kind. The kind leaves `REGISTERED_RESOURCE_KINDS` for `RETIRED_RESOURCE_KINDS`, exactly as a retired field keeps a drop decoder, and its corpus file decodes as retired rather than being exempted.
 
 ## Consequences
 

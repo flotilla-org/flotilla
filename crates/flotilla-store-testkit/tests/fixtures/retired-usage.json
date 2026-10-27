@@ -1,0 +1,22 @@
+{
+  "apiVersion": "flotilla.work/v1",
+  "kind": "Usage",
+  "metadata": {
+    "name": "usage-b31c",
+    "namespace": "flotilla",
+    "resourceVersion": "1",
+    "creationTimestamp": "2026-10-17T00:00:00Z"
+  },
+  "spec": { "provider": "codex", "account": "crew@example.com" },
+  "status": {
+    "plan": "pro",
+    "windows": [
+      { "name": "session", "used_percent": 12.5, "resets_at": "2026-10-17T05:00:00Z", "window_minutes": 300 },
+      { "name": "weekly", "used_percent": 41.0, "resets_at": "2026-10-21T00:00:00Z", "window_minutes": 10080 }
+    ],
+    "pace": [
+      { "window": "weekly", "stage": "on_track", "delta_percent": -2.0, "expected_used_percent": 43.0, "will_last_to_reset": true }
+    ],
+    "observed_at": "2026-10-17T00:00:00Z"
+  }
+}

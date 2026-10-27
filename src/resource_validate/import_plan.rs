@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use flotilla_store::REGISTERED_RESOURCE_KINDS;
+use flotilla_store::{retired_resource_kind, REGISTERED_RESOURCE_KINDS};
 
 /// What the cut-over import does with one old-store kind's rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,8 +19,8 @@ pub(super) enum Plan {
 }
 
 /// Every kind the old store has held, by kind name, with its plan. A retired kind the store no
-/// longer registers (Usage, MaterialPool) is never listed by the daemon, so its rows are dropped
-/// without being counted; its entry records the ruling.
+/// longer registers is still listed by a previous-generation daemon; while it is in
+/// `RETIRED_RESOURCE_KINDS` (one generation, ADR 0047) its rows are counted as dropped.
 pub(super) const PLAN: &[(&str, Plan)] = &[
     ("Message", Plan::Imported("Message import (#3317)")),
     ("Environment", Plan::Imported("lifecycle import (#3629)")),
@@ -67,7 +67,11 @@ pub(super) const PLAN: &[(&str, Plan)] = &[
 
 /// The plan for the kind listed under `plural`, if it has one.
 pub(super) fn plan(plural: &str) -> Option<(&'static str, Plan)> {
-    let kind = REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.plural == plural)?.kind;
+    let kind = REGISTERED_RESOURCE_KINDS
+        .iter()
+        .find(|entry| entry.plural == plural)
+        .map(|entry| entry.kind)
+        .or_else(|| retired_resource_kind(plural).map(|retired| retired.kind))?;
     PLAN.iter().find(|(name, _)| *name == kind).copied()
 }
 
@@ -121,6 +125,8 @@ pub(super) fn print(namespace: &str, report: &Report) {
 
 #[cfg(test)]
 mod tests {
+    use flotilla_store::RETIRED_RESOURCE_KINDS;
+
     use super::*;
 
     // Contract (#3824 layer 0): the plan is total over the old store's registry, and names each
@@ -134,6 +140,9 @@ mod tests {
         kinds.sort_unstable();
         kinds.dedup();
         assert_eq!(kinds.len(), PLAN.len(), "a kind is planned twice");
+        for retired in RETIRED_RESOURCE_KINDS {
+            assert!(matches!(plan(retired.plural), Some((_, Plan::Retired(_)))), "{} keeps a drop decoder, so it is retired", retired.kind);
+        }
         for (kind, plan) in PLAN {
             if !REGISTERED_RESOURCE_KINDS.iter().any(|entry| entry.kind == *kind) {
                 assert!(matches!(plan, Plan::Retired(_)), "{kind} is not registered, so only a retired kind may be");
@@ -141,17 +150,19 @@ mod tests {
         }
     }
 
-    // Behaviour (#3824 layer 0, #3760 gate): retired rows are dropped and rows of a kind still
-    // moving are counted, and neither blocks the import; rows of a kind with no plan block it;
+    // Behaviour (#3824 layer 0, #3760 gate): retired rows are dropped, including those of a kind the
+    // store no longer registers (#4007), and rows of a kind still moving are counted, and neither
+    // blocks the import; rows of a kind with no plan block it;
     // imported kinds are left to their rehearsals; an empty listing counts nothing.
     #[test]
     fn only_rows_with_no_plan_block_the_import() {
         let mut report = Report::default();
         report.count("dispatchholds", 3);
         report.count("events", 2);
+        report.count("usages", 2);
         report.count("artifacts", 0);
         report.count("messages", 9);
-        assert_eq!(report.dropped, BTreeMap::from([("DispatchHold", 3), ("Event", 2)]));
+        assert_eq!(report.dropped, BTreeMap::from([("DispatchHold", 3), ("Event", 2), ("Usage", 2)]));
         assert!(!report.blocks_import(), "dropped and imported rows never block the import");
         report.count("artifacts", 1);
         assert_eq!(report.moving, BTreeMap::from([("Artifact", ("#3824 layer 7", 1))]));
