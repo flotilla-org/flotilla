@@ -177,6 +177,7 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
                 .map_err(|reason| format!("its kind: {reason}"));
             let refused = record.is_err();
             kinds.insert(key, KindEntry { namespaces: BTreeSet::from([copy.namespace.clone()]), record });
+            // A refused policy's settings and memory share are not noted: its refusal names it.
             if refused {
                 continue;
             }
@@ -218,7 +219,9 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
         let refuse = |reason: String| ImportRefusal { kind: KINDS, record: name.clone(), reason: format!("at `{home}`: {reason}") };
         if namespaces.len() > 1 {
             let held: Vec<_> = namespaces.into_iter().collect();
-            report.refused.push(refuse(format!("held in namespaces `{}`, and the engine has no namespaces", held.join("`, `"))));
+            // A copy refused on its own says so too, so fixing the namespaces does not hide it.
+            let also = record.err().map(|reason| format!("; {reason}")).unwrap_or_default();
+            report.refused.push(refuse(format!("held in namespaces `{}`, and the engine has no namespaces{also}", held.join("`, `"))));
             continue;
         }
         match record {

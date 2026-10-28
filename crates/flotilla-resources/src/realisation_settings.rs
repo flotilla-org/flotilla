@@ -32,7 +32,8 @@ pub fn differing_settings(spec: &PlacementPolicySpec) -> Vec<&'static str> {
         if docker.checkout != docker_checkout() {
             differing.push("checkout");
         }
-        if docker.default_cwd.as_deref().is_some_and(|cwd| cwd != DOCKER_WORKSPACE) {
+        // An unset cwd is not the constant: a vessel with no repositories would start in `/`.
+        if docker.default_cwd.as_deref() != Some(DOCKER_WORKSPACE) {
             differing.push("default_cwd");
         }
         if !docker.env.is_empty() {
@@ -74,5 +75,10 @@ mod tests {
         docker.pull_policy = DockerImagePullPolicy::Never;
         docker.env.insert("A".into(), "b".into());
         assert_eq!(differing_settings(&other), ["env", "pull_policy"]);
+        let mut other = policy.clone();
+        let docker = other.docker_per_vessel.as_mut().expect("docker");
+        docker.checkout = DockerCheckoutStrategy::FreshCloneInContainer { clone_path: DOCKER_WORKSPACE.into() };
+        docker.default_cwd = None;
+        assert_eq!(differing_settings(&other), ["checkout", "default_cwd"]);
     }
 }
