@@ -431,7 +431,7 @@ pub(super) async fn redeliver_central_logins(state: &Arc<ControllerRuntimeState>
     let now = Timestamp::from_datetime(&state.daemon.clock().now());
     let records = backend.using::<AccessDelivery>(namespace).list().await.map_err(|error| format!("list access deliveries: {error}"))?;
     let mut login = None;
-    let mut vessels = None;
+    let vessels = tokio::sync::OnceCell::new();
     for record in records.items {
         let Some(landed) = record.spec.needs.get(LOGIN).filter(|landed| HarnessLogin::is_central(&landed.digest)) else { continue };
         let retry = record.spec.retry.as_ref().filter(|retry| retry.need == LOGIN);
@@ -446,12 +446,16 @@ pub(super) async fn redeliver_central_logins(state: &Arc<ControllerRuntimeState>
         if landed.digest == digest && retry.is_none() {
             continue;
         }
-        let vessels = match &vessels {
-            Some(vessels) => vessels,
-            None => {
-                vessels.insert(backend.using::<Vessel>(namespace).list().await.map_err(|error| format!("list vessels: {error}"))?.items)
-            }
-        };
+        let vessels = vessels
+            .get_or_try_init(|| async {
+                backend
+                    .using::<Vessel>(namespace)
+                    .list()
+                    .await
+                    .map(|vessels| vessels.items)
+                    .map_err(|error| format!("list vessels: {error}"))
+            })
+            .await?;
         // A record whose vessel is gone goes with its place or convoy.
         let Some(vessel) = record_vessel(vessels, &record) else { continue };
         let pushed = async {
