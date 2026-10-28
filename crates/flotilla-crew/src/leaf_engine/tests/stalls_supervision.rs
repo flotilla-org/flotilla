@@ -1965,14 +1965,14 @@ async fn engine_vessel_progress_resets_the_launch_bound() {
         flotilla_resources::VesselSpec {
             convoy_ref: "stalled-work".into(),
             vessel_name: "work".into(),
-            placement_policy_ref: "local".into(),
+            fulfilment_kind_ref: "local".into(),
             adopted_checkout_refs: Default::default(),
         },
         flotilla_resources::VesselStatus {
             phase: flotilla_resources::VesselPhase::Provisioning,
             placement_decision: Some(
                 PlacementDecision::builder()
-                    .policy_name("local".into())
+                    .kind("local".into())
                     .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved("host"), display_name: "host".into() })
                     .build(),
             ),

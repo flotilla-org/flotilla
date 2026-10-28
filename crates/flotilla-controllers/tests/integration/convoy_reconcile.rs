@@ -3666,7 +3666,7 @@ async fn engine_ended_vessel_ends_its_seat_despite_provisioning_status() {
             let mut vessel = vessel_object("convoy-a", "implement", VesselPhase::Provisioning, Some("waiting for environment"));
             vessel.status.as_mut().expect("status").placement_decision = Some(
                 PlacementDecision::builder()
-                    .policy_name("laptop-docker".into())
+                    .kind("laptop-docker".into())
                     .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved("feta"), display_name: "feta".into() })
                     .build(),
             );

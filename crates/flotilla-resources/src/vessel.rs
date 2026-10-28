@@ -412,7 +412,7 @@ mod reading_tests {
             spec: VesselSpec {
                 convoy_ref: "convoy".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "local".into(),
+                fulfilment_kind_ref: "local".into(),
                 adopted_checkout_refs: Default::default(),
             },
             status: Some(VesselStatus { phase, message: Some("stored".into()), interrupted_roles, ..Default::default() }),
