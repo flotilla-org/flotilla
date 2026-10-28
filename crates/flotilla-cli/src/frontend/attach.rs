@@ -72,6 +72,11 @@ pub async fn run_attach(
     std::process::exit(code.unwrap_or(1));
 }
 
+/// cleat's exit status (EX_TEMPFAIL) for "the session moved or the path to it
+/// broke: resolve it again". Every other status ends the attach as it did.
+pub const CLEAT_REATTACH_STATUS: i32 = 75;
+const REATTACH_STABLE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Resolve, run and, when cleat asks for it, resolve again. `resolve` gets
 /// whether this is a reattach and yields `None` when the daemon is not there
 /// yet. Returns the status of the attach that ended for any other reason.
@@ -104,11 +109,6 @@ where
         tokio::time::sleep(reattach_backoff(failures)).await;
     }
 }
-
-/// cleat's exit status (EX_TEMPFAIL) for "the session moved or the path to it
-/// broke: resolve it again". Every other status ends the attach as it did.
-pub const CLEAT_REATTACH_STATUS: i32 = 75;
-const REATTACH_STABLE: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn reattach_backoff(failures: u32) -> std::time::Duration {
     std::time::Duration::from_millis((250u64 << failures.min(5)).min(5_000))
@@ -245,7 +245,7 @@ mod tests {
         let cleat = std::env::var("FLOTILLA_TEST_CLEAT_NEW").expect("pinned new cleat");
         let bin = std::path::Path::new(&cleat).parent().expect("cleat directory").to_string_lossy().into_owned();
         let path = format!("{bin}:{}", std::env::var("PATH").unwrap_or_default());
-        // SAFETY: the CI filter by name runs this ignored test alone in its process.
+        // SAFETY: ci/cleat-environment/test.sh filters by name, so this ignored test runs alone in its process.
         unsafe { std::env::set_var("PATH", &path) };
         let mut terminal = NativeTerminal::new("frontend::attach::tests::native_crew_probe");
         let session = terminal.endpoint.session.clone();

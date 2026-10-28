@@ -409,7 +409,6 @@ mod tests {
         assert!(super::remote_attach_plan(&duplicate, &HostName::new("kiwi"), "s", AttachMode::Default).is_err());
     }
 
-    // Direct argv has no shell boundary: assignment values retain their bytes.
     #[cfg(unix)]
     #[test]
     fn termination_sent_to_the_parent_reaches_the_attach_child() {
@@ -445,6 +444,7 @@ mod tests {
         }
     }
 
+    // Direct argv has no shell boundary: assignment values retain their bytes.
     #[test]
     fn env_assignment_becomes_unquoted_argv() {
         let plan = ResolvedAttachPlan::command(vec![
