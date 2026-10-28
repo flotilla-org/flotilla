@@ -1274,6 +1274,9 @@ impl ReferenceAddresses for OldStoreRecords {
     fn address(&self, reference: &OldReference) -> Result<Address, String> {
         match reference {
             OldReference::ControlRecord { resource, .. } if resource.kind == "Convoy" => self.convoy_address(&resource.name),
+            OldReference::ControlRecord { resource, .. } if resource.kind == "Project" => {
+                Address::project(&resource.name).map_err(|error| format!("project `{}`: {error}", resource.name))
+            }
             OldReference::Artifact { resource, .. } => {
                 let artifact = self.artifacts.get(&resource.name).ok_or_else(|| format!("artifact `{}` was not read", resource.name))?;
                 artifact_address(&artifact.spec.convoy, &artifact.spec.producer, &artifact.spec.kind, &artifact.spec.subject)
@@ -1325,6 +1328,10 @@ impl ViewLookups for OldStoreRecords {
         match address.kind() {
             AddressKind::Convoy => Some(OldReference::ControlRecord {
                 resource: reference("Convoy", address.name(), namespace),
+                revision: revision.to_owned(),
+            }),
+            AddressKind::Project => Some(OldReference::ControlRecord {
+                resource: reference("Project", address.name(), namespace),
                 revision: revision.to_owned(),
             }),
             AddressKind::Artifact => {

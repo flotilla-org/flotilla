@@ -1,20 +1,24 @@
 //! The Message import (#3317): one function maps an old record onto the new
 //! spec and state, written directly as a restore and then checked against the
-//! machine. Anything that cannot be mapped is refused with the record named.
+//! machine. Anything that cannot be mapped is refused with the record named,
+//! except a settled record whose receiver session, successor or referenced
+//! record is gone: settled history the engine never reads is dropped, counted
+//! by reason.
 //!
 //! | Old phase | New state |
 //! |---|---|
 //! | Accepted, WaitingOnReferences, Deliverable | Pending |
+//! | Delivered, expecting nothing | Settled |
 //! | Delivered | Awaiting |
 //! | Satisfied, Answered, OutcomeMet | Settled |
 //! | Expired | Dropped(Expired) |
 //! | Superseded | Dropped(Superseded) |
 //! | DeadLettered | Dropped(Undeliverable) |
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_address::Address;
-use flotilla_resources::{Message, MessagePhase, ResolvedMessageReceiver, ResourceObject};
+use flotilla_resources::{Message, MessageExpectation, MessagePhase, MessageReference, ResolvedMessageReceiver, ResourceObject};
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::{
@@ -67,6 +71,44 @@ impl std::fmt::Display for ImportRefusal {
     }
 }
 
+/// A settled record not carried onto the engine, with the reason it is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportDrop {
+    pub record: String,
+    pub reason: &'static str,
+}
+
+/// What the import makes of one old record it does not refuse.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Imported {
+    Message(Box<ImportedMessage>),
+    Dropped(ImportDrop),
+}
+
+/// Why a record does not import: refused, or something it names is missing,
+/// which drops a settled record and refuses an open one.
+enum Unimported {
+    Refused(String),
+    Missing { reason: &'static str, detail: String },
+}
+
+impl From<String> for Unimported {
+    fn from(reason: String) -> Self {
+        Unimported::Refused(reason)
+    }
+}
+
+fn missing(reason: &'static str, detail: impl Into<String>) -> Unimported {
+    Unimported::Missing { reason, detail: detail.into() }
+}
+
+/// Whether an old record is settled: nothing it awaits is still live work.
+fn settled(record: &ResourceObject<Message>) -> bool {
+    record.status.as_ref().is_some_and(|status| {
+        status.phase.is_terminal() || (status.phase == MessagePhase::Delivered && record.spec.expectation == MessageExpectation::None)
+    })
+}
+
 /// The address an imported message takes: its old record name, under its inbox.
 pub fn imported_name(inbox: &Address, record: &str) -> Result<String, String> {
     Address::message(inbox, record).map(|address| address.as_str().to_owned()).map_err(|error| error.to_string())
@@ -79,51 +121,85 @@ pub fn import_message(
     version: u64,
     conversion: &Conversion<'_>,
     world: &dyn ImportWorld,
-) -> Result<ImportedMessage, ImportRefusal> {
+) -> Result<Imported, ImportRefusal> {
     let record = old.record.metadata.name.clone();
-    let refuse = |reason: String| ImportRefusal { record: record.clone(), reason };
+    match convert(old, version, conversion, world) {
+        Ok(resource) => Ok(Imported::Message(Box::new(ImportedMessage { record, home: old.home.clone(), resource }))),
+        Err(Unimported::Missing { reason, .. }) if settled(old.record) => Ok(Imported::Dropped(ImportDrop { record, reason })),
+        Err(Unimported::Missing { detail: reason, .. } | Unimported::Refused(reason)) => Err(ImportRefusal { record, reason }),
+    }
+}
+
+fn convert(
+    old: &OldMessage<'_>,
+    version: u64,
+    conversion: &Conversion<'_>,
+    world: &dyn ImportWorld,
+) -> Result<Resource<Machine>, Unimported> {
+    let record = &old.record.metadata.name;
+    for name in [&old.record.spec.in_reply_to, &old.record.spec.supersedes].into_iter().flatten() {
+        if world.message(name).is_none() {
+            return Err(missing("a message it names is gone", format!("referenced message `{name}` was not read")));
+        }
+    }
+    for reference in &old.record.spec.references {
+        if matches!(
+            reference,
+            MessageReference::Commit { .. }
+                | MessageReference::Ref { .. }
+                | MessageReference::Artifact { .. }
+                | MessageReference::ControlRecord { .. }
+        ) {
+            conversion.reference(reference, false).map_err(|detail| missing("a record it references is gone or has no address", detail))?;
+        }
+    }
     let reference = |name: &str| -> Result<MessageRef, String> {
         let other = world.message(name).ok_or_else(|| format!("referenced message `{name}` was not read"))?;
         let inbox = conversion.receiver(&other.record.spec)?;
         Ok(MessageRef::new(imported_name(&inbox, name)?, other.home.clone()))
     };
-    let mut spec = conversion.spec(&old.record.spec, &reference).map_err(refuse)?;
+    let mut spec = conversion.spec(&old.record.spec, &reference)?;
     spec.admitted_seq = version;
-    let name = imported_name(&spec.inbox, &record).map_err(refuse)?;
-    let status = old.record.status.as_ref().ok_or_else(|| refuse("the record has no status".into()))?;
-    let receiver = || -> Result<Receiver, ImportRefusal> {
-        let resolved = status.resolved_receiver.as_ref().ok_or_else(|| refuse("a delivered phase without its receiver".into()))?;
-        let (id, host) =
-            world.session(resolved).ok_or_else(|| refuse(format!("the delivered session `{}` was not found", resolved.session)))?;
+    let name = imported_name(&spec.inbox, record)?;
+    let status = old.record.status.as_ref().ok_or_else(|| "the record has no status".to_owned())?;
+    let receiver = || -> Result<Receiver, Unimported> {
+        let resolved = status.resolved_receiver.as_ref().ok_or_else(|| "a delivered phase without its receiver".to_owned())?;
+        let (id, host) = world.session(resolved).ok_or_else(|| {
+            missing("its delivered session is gone", format!("the delivered session `{}` was not found", resolved.session))
+        })?;
         Ok(Receiver { kind: ConsumerKind::AgentSession, id, host })
     };
     let kept = || status.resolved_receiver.as_ref().map(|_| receiver()).transpose();
     let state = match status.phase {
         MessagePhase::Accepted | MessagePhase::WaitingOnReferences | MessagePhase::Deliverable => MessageState::Pending,
+        MessagePhase::Delivered if spec.expectation == Expectation::Nothing => MessageState::Settled { receiver: Some(receiver()?) },
         MessagePhase::Delivered => MessageState::Awaiting { receiver: receiver()? },
         MessagePhase::Satisfied | MessagePhase::Answered | MessagePhase::OutcomeMet => MessageState::Settled { receiver: kept()? },
+        MessagePhase::Expired if spec.deadline.is_none() => {
+            return Err(missing("expired without a deadline", "expired without a deadline"))
+        }
         MessagePhase::Expired => MessageState::Dropped { reason: DropReason::Expired, receiver: kept()?, watermark: None },
         MessagePhase::Superseded => {
-            let by = match world.successor(&record) {
+            let by = match world.successor(record) {
                 Some(successor) => successor.record.metadata.name.clone(),
                 None => status
                     .canonical_predecessor
                     .as_ref()
                     .map(|predecessor| predecessor.name.clone())
-                    .ok_or_else(|| refuse("superseded with no recorded successor".into()))?,
+                    .ok_or_else(|| missing("superseded with no recorded successor", "superseded with no recorded successor"))?,
             };
-            let successor = world.message(&by).ok_or_else(|| refuse(format!("its successor `{by}` was not read")))?;
-            let inbox = conversion.receiver(&successor.record.spec).map_err(refuse)?;
-            let by =
-                imported_name(&inbox, &by).map_err(refuse)?.parse().map_err(|error: flotilla_address::Error| refuse(error.to_string()))?;
+            let successor =
+                world.message(&by).ok_or_else(|| missing("its successor is gone", format!("its successor `{by}` was not read")))?;
+            let inbox = conversion.receiver(&successor.record.spec)?;
+            let by = imported_name(&inbox, &by)?.parse().map_err(|error: flotilla_address::Error| error.to_string())?;
             MessageState::Dropped { reason: DropReason::Superseded { by }, receiver: kept()?, watermark: None }
         }
         MessagePhase::DeadLettered => MessageState::Dropped { reason: DropReason::Undeliverable, receiver: kept()?, watermark: None },
     };
     let state = StoredState::<Machine>::new(state, timestamp(&status.since));
     let resource = Resource::stored(name, spec, state, flotilla_state_machines::Version(version));
-    check(&resource).map_err(refuse)?;
-    Ok(ImportedMessage { record, home: old.home.clone(), resource })
+    check(&resource)?;
+    Ok(resource)
 }
 
 /// Checks a restored message against the machine: replays, from a fresh
@@ -227,17 +303,20 @@ pub fn admission_order<'a>(records: impl IntoIterator<Item = OldMessage<'a>>) ->
         .collect()
 }
 
-/// What an import rehearsal found: counts by new state label and the refusals.
+/// What an import rehearsal found: counts by new state label, drops by
+/// reason, and the refusals.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ImportReport {
     pub imported: BTreeMap<&'static str, usize>,
+    pub dropped: BTreeMap<&'static str, usize>,
     pub refused: Vec<ImportRefusal>,
 }
 
 impl ImportReport {
-    pub fn record(&mut self, result: &Result<ImportedMessage, ImportRefusal>) {
+    pub fn record(&mut self, result: &Result<Imported, ImportRefusal>) {
         match result {
-            Ok(imported) => *self.imported.entry(label(imported.resource.state())).or_default() += 1,
+            Ok(Imported::Message(imported)) => *self.imported.entry(label(imported.resource.state())).or_default() += 1,
+            Ok(Imported::Dropped(drop)) => *self.dropped.entry(drop.reason).or_default() += 1,
             Err(refusal) => self.refused.push(refusal.clone()),
         }
     }
@@ -260,12 +339,50 @@ pub fn label(state: &MessageState) -> &'static str {
 }
 
 /// Imports every record of `records`, homed and ordered by [`admission_order`].
+/// A record that is not imported is gone to the records that name it, until
+/// no more are: a settled message naming a dropped one is dropped too.
 pub fn import_all<'a>(
     records: impl IntoIterator<Item = OldMessage<'a>>,
     conversion: &Conversion<'_>,
     world: &dyn ImportWorld,
-) -> Vec<Result<ImportedMessage, ImportRefusal>> {
-    admission_order(records).into_values().flatten().map(|(version, old)| import_message(&old, version, conversion, world)).collect()
+) -> Vec<Result<Imported, ImportRefusal>> {
+    let ordered: Vec<_> = admission_order(records).into_values().flatten().collect();
+    let mut gone = BTreeSet::new();
+    loop {
+        let view = Without { world, gone: &gone };
+        let results: Vec<_> = ordered.iter().map(|(version, old)| import_message(old, *version, conversion, &view)).collect();
+        let before = gone.len();
+        let mut next = gone.clone();
+        next.extend(results.iter().filter_map(|result| match result {
+            Ok(Imported::Message(_)) => None,
+            Ok(Imported::Dropped(ImportDrop { record, .. })) | Err(ImportRefusal { record, .. }) => Some(record.clone()),
+        }));
+        if next.len() == before {
+            return results;
+        }
+        gone = next;
+    }
+}
+
+/// A world with the named records hidden from what other records read.
+struct Without<'a> {
+    world: &'a dyn ImportWorld,
+    gone: &'a BTreeSet<String>,
+}
+
+impl ImportWorld for Without<'_> {
+    fn message(&self, name: &str) -> Option<OldMessage<'_>> {
+        if self.gone.contains(name) {
+            return None;
+        }
+        self.world.message(name)
+    }
+    fn successor(&self, name: &str) -> Option<OldMessage<'_>> {
+        self.world.successor(name)
+    }
+    fn session(&self, receiver: &ResolvedMessageReceiver) -> Option<(String, String)> {
+        self.world.session(receiver)
+    }
 }
 
 /// An [`ImportWorld`] over records already read: messages by name and the
