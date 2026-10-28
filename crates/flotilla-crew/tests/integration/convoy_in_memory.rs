@@ -283,8 +283,8 @@ async fn controller_loop_advances_task_via_vessel_secondary_watch() {
                 placement_decision: None,
                 phase: VesselPhase::Ready,
                 message: None,
-                observed_policy_ref: Some("laptop-docker".to_string()),
-                observed_policy_version: Some("17".to_string()),
+                observed_kind_ref: Some("laptop-docker".to_string()),
+                observed_kind_version: Some("17".to_string()),
                 environment_ref: Some("env-implement".to_string()),
                 image_ref: Some("registry.example/crew:latest".to_string()),
                 local_image_id: Some("sha256:test-image".to_string()),
@@ -375,7 +375,7 @@ async fn controller_loop_finalizer_deletes_vessels_and_checkouts() {
             &flotilla_resources::VesselSpec {
                 convoy_ref: "convoy-delete".to_string(),
                 vessel_name: "implement".to_string(),
-                placement_policy_ref: "laptop-docker".to_string(),
+                fulfilment_kind_ref: "laptop-docker".to_string(),
                 adopted_checkout_refs: Default::default(),
             },
         )
@@ -413,7 +413,7 @@ async fn controller_loop_finalizer_deletes_vessels_and_checkouts() {
             &flotilla_resources::VesselSpec {
                 convoy_ref: "convoy-delete".to_string(),
                 vessel_name: "adopted".to_string(),
-                placement_policy_ref: "laptop-docker".to_string(),
+                fulfilment_kind_ref: "laptop-docker".to_string(),
                 adopted_checkout_refs: Default::default(),
             },
         )
@@ -433,7 +433,7 @@ async fn controller_loop_finalizer_deletes_vessels_and_checkouts() {
             &flotilla_resources::VesselSpec {
                 convoy_ref: "convoy-delete".to_string(),
                 vessel_name: "observed".to_string(),
-                placement_policy_ref: "laptop-docker".to_string(),
+                fulfilment_kind_ref: "laptop-docker".to_string(),
                 adopted_checkout_refs: Default::default(),
             },
         )

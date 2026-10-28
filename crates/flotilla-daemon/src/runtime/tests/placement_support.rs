@@ -160,7 +160,6 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
         PlacementPolicySpec::builder()
             .pool("passthrough".to_string())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                legacy_image_baseline_ref: None,
                 memory_policy: Default::default(),
                 host_ref: feta_host_ref.clone(),
                 image: Some("test-image".into()),
@@ -223,10 +222,11 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
             &convoy.metadata.resource_version,
             &ConvoyStatus {
                 placement_decision: Some(PlacementDecision {
+                    provider_instance: None,
                     provider_workspace_root: None,
                     minimal_alternatives: Vec::new(),
                     escalation_reason: None,
-                    policy_name: policy_name.to_string(),
+                    kind: policy_name.to_string(),
                     target_host: PlacementTargetHost {
                         reference: CanonicalHostId::resolved(feta_host_ref.clone()),
                         display_name: "feta".to_string(),

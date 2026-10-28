@@ -502,7 +502,7 @@ fn vessel_spec() -> VesselSpec {
     VesselSpec {
         convoy_ref: "convoy-governor".to_string(),
         vessel_name: "work".to_string(),
-        placement_policy_ref: "policy-a".to_string(),
+        fulfilment_kind_ref: "policy-a".to_string(),
         adopted_checkout_refs: BTreeMap::new(),
     }
 }
@@ -3626,7 +3626,7 @@ fn environment_loss_preserves_recoverable_work(tc: hegel::TestCase) {
                 &VesselSpec {
                     convoy_ref: "loss".into(),
                     vessel_name: "work".into(),
-                    placement_policy_ref: "unused".into(),
+                    fulfilment_kind_ref: "unused".into(),
                     adopted_checkout_refs: Default::default(),
                 },
             )

@@ -212,30 +212,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         let spec = spec.docker.as_ref().expect("kind checked");
         let registry_digest = spec.image.rsplit_once('@').is_some_and(|(_, digest)| flotilla_resources::is_image_digest(digest));
         if !flotilla_resources::is_image_digest(&spec.image) && !registry_digest {
-            // #2731 has not cut fleet baselines over to ImageBuild. Admission is
-            // verified by the controller, never inferred from a tag's spelling.
-            if !opts.legacy_baseline || spec.image_build_ref.is_some() || spec.image.contains('@') || spec.image.is_empty() {
-                return Err("Docker environments require a pinned digest; mutable tags are unsupported".into());
-            }
-            let held = self.inner.image_exists(&spec.image, Path::new("/")).await?;
-            match spec.pull_policy {
-                flotilla_resources::DockerImagePullPolicy::Always => self.pull_prepared_image(&spec.image, opts).await?,
-                flotilla_resources::DockerImagePullPolicy::IfNotPresent if !held => self.pull_prepared_image(&spec.image, opts).await?,
-                flotilla_resources::DockerImagePullPolicy::Never if !held => {
-                    return Err("baseline image is absent and pull policy is never".into())
-                }
-                _ => {}
-            }
-            let digest = self
-                .inner
-                .runner
-                .run("docker", &["image", "inspect", "--format", "{{.Id}}", &spec.image], Path::new("/"), &ChannelLabel::Default)
-                .await?;
-            let digest = digest.trim();
-            if !flotilla_resources::is_image_digest(digest) {
-                return Err("baseline image did not resolve to a local digest".into());
-            }
-            return self.prepare_agent_image(ImageId::new(digest)).await;
+            return Err("Docker environments require a pinned digest; mutable tags are unsupported".into());
         }
         if !self.inner.image_exists(&spec.image, Path::new("/")).await? {
             if !registry_digest {

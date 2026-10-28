@@ -200,20 +200,22 @@ fn terminal_convoy_phase_clears_pending_brief() {
 #[test]
 fn placement_decision_is_written_once_without_overwriting_concurrent_status() {
     let first = PlacementDecision {
+        provider_instance: None,
         provider_workspace_root: None,
         minimal_alternatives: Vec::new(),
         escalation_reason: None,
-        policy_name: "host-direct-kiwi".to_string(),
+        kind: "host-direct-kiwi".to_string(),
         target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("kiwi-id"), display_name: "kiwi".to_string() },
         refused_candidates: Vec::new(),
         viable_not_selected: Vec::new(),
         allocation: None,
     };
     let second = PlacementDecision {
+        provider_instance: None,
         provider_workspace_root: None,
         minimal_alternatives: Vec::new(),
         escalation_reason: None,
-        policy_name: "host-direct-feta".to_string(),
+        kind: "host-direct-feta".to_string(),
         target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("feta-id"), display_name: "feta".to_string() },
         refused_candidates: Vec::new(),
         viable_not_selected: Vec::new(),

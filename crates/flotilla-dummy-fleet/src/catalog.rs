@@ -159,7 +159,6 @@ pub fn placement_policy(host_ref: &str) -> PlacementPolicySpec {
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
             host_ref: host_ref.into(),
             image: Some(DockerImageSource::Literal(DUMMY_IMAGE.into())),
-            legacy_image_baseline_ref: None,
             pull_policy: Default::default(),
             memory_policy: Default::default(),
             agent_adapters: [DUMMY_AGENT_ADAPTER.to_string()].into(),

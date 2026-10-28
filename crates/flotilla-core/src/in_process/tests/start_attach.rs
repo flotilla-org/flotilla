@@ -150,7 +150,7 @@ async fn start_attach_stage_uses_vessel_status() {
     let spec = VesselSpec {
         convoy_ref: "convoy-slow".into(),
         vessel_name: "work".into(),
-        placement_policy_ref: "test".into(),
+        fulfilment_kind_ref: "test".into(),
         adopted_checkout_refs: BTreeMap::new(),
     };
     // Unrelated vessel failures must not contaminate this convoy's start.

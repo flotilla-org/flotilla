@@ -1168,7 +1168,7 @@ async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown(
             &flotilla_resources::VesselSpec {
                 convoy_ref: "terminal-checkout".to_string(),
                 vessel_name: "work".to_string(),
-                placement_policy_ref: "test".to_string(),
+                fulfilment_kind_ref: "test".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
@@ -2013,7 +2013,6 @@ async fn create_test_contained_policy(backend: &flotilla_store::ResourceBackend,
     let policy = PlacementPolicySpec::builder()
         .pool("passthrough".to_string())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-            legacy_image_baseline_ref: None,
             memory_policy: Default::default(),
             host_ref: "host-test".into(),
             image: Some(image.into()),
@@ -2755,7 +2754,8 @@ async fn capability_placement_prefers_docker_and_records_pinned_escalation() {
     let docs = start_capability_convoy(&daemon, "docs-only", |_| {}).await;
     assert!(matches!(docs, CommandValue::ConvoyStarted { .. }), "{docs:?}");
     let docs = admitted_convoy(&backend, "docs-only").await;
-    assert_eq!(docs.status.expect("admitted status").placement_decision.expect("placement").policy_name, "docker-test");
+    let docs = docs.status.expect("admitted status").placement_decision.expect("placement");
+    assert_eq!((docs.kind.as_str(), docs.provider_instance.as_deref()), ("docker-test", Some("fixture-1")));
 
     let refused = start_capability_convoy(&daemon, "pinned-without-reason", |intent| {
         intent.placement_policy = Some("host-direct-linux".to_string());
@@ -2773,7 +2773,7 @@ async fn capability_placement_prefers_docker_and_records_pinned_escalation() {
     assert!(matches!(escalated, CommandValue::ConvoyStarted { .. }), "{escalated:?}");
     let escalated = admitted_convoy(&backend, "pinned-with-reason").await;
     let decision = escalated.status.expect("admitted status").placement_decision.expect("placement");
-    assert_eq!(decision.policy_name, "host-direct-linux");
+    assert_eq!((decision.kind.as_str(), decision.provider_instance.as_deref()), ("host-direct-linux", Some("fixture-0")));
     assert_eq!(decision.minimal_alternatives, ["docker-test"]);
     assert_eq!(decision.escalation_reason.as_deref(), Some("operator needs host tools"));
 }
@@ -2798,7 +2798,7 @@ async fn capability_admission_queues_on_sleeping_minimal_host() {
     assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
     let convoy = admitted_convoy(&backend, "sleeping-capacity").await;
     let decision = convoy.status.expect("status").placement_decision.expect("placement");
-    assert_eq!(decision.policy_name, "host-direct-sleeping");
+    assert_eq!(decision.kind, "host-direct-sleeping");
     let allocation = decision.allocation.expect("frozen allocation");
     let selected = allocation.candidates.iter().find(|candidate| candidate.kind == allocation.chosen_kind).expect("candidate");
     assert!(!selected.available);
@@ -2861,7 +2861,7 @@ async fn capability_admission_prefers_linux_when_macos_is_reserved() {
     assert!(matches!(started, CommandValue::ConvoyStarted { .. }), "{started:?}");
     let convoy = admitted_convoy(&backend, "reserved-unpinned").await;
     let decision = convoy.status.expect("status").placement_decision.expect("placement");
-    assert_eq!(decision.policy_name, "linux-available");
+    assert_eq!(decision.kind, "linux-available");
     assert_eq!(decision.allocation.expect("allocation").reservation_reason, None);
 }
 
@@ -2885,7 +2885,7 @@ async fn capability_admission_uses_only_macos_without_escalation_and_explains_fa
     assert!(matches!(started, CommandValue::ConvoyStarted { .. }), "{started:?}");
     let convoy = admitted_convoy(&backend, "reserved-only").await;
     let decision = convoy.status.expect("status").placement_decision.expect("placement");
-    assert_eq!(decision.policy_name, "macos-scarce");
+    assert_eq!(decision.kind, "macos-scarce");
     assert_eq!(decision.escalation_reason, None);
     let allocation = decision.allocation.expect("allocation");
     assert_eq!(allocation.chosen_kind, "macos-scarce");
@@ -2966,9 +2966,9 @@ async fn capability_placement_selects_each_vessel_from_its_own_role_needs() {
     let admitted = admitted_convoy(&backend, "mixed-needs").await;
     let docs = flotilla_resources::vessel_placement_pin(&admitted, "docs").expect("docs pin");
     let tools = flotilla_resources::vessel_placement_pin(&admitted, "tools").expect("tools pin");
-    assert_eq!(docs.decision.policy_name, "docker-test");
-    assert_eq!(tools.decision.policy_name, "host-direct-tools");
-    assert_ne!(docs.policy_ref, tools.policy_ref);
+    assert_eq!(docs.decision.kind, "docker-test");
+    assert_eq!(tools.decision.kind, "host-direct-tools");
+    assert_ne!(docs.kind_ref, tools.kind_ref);
 }
 
 #[tokio::test]
@@ -3176,11 +3176,10 @@ async fn allocation_separates_linux_coder_from_gui_verifier() {
     let result = start_capability_convoy(&daemon, "gui-verify", |intent| intent.workflow_ref = Some("gui-verify".to_string())).await;
     assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
     let admitted = admitted_convoy(&backend, "gui-verify").await;
-    assert_eq!(flotilla_resources::vessel_placement_pin(&admitted, "coder").expect("coder pin").decision.policy_name, "docker-test");
-    assert_eq!(
-        flotilla_resources::vessel_placement_pin(&admitted, "verify").expect("verifier pin").decision.policy_name,
-        "host-direct-gui"
-    );
+    let pin = |vessel: &str| flotilla_resources::vessel_placement_pin(&admitted, vessel).expect("pin").decision;
+    let (coder, verify) = (pin("coder"), pin("verify"));
+    assert_eq!((coder.kind.as_str(), coder.provider_instance.as_deref()), ("docker-test", Some("fixture-1")));
+    assert_eq!((verify.kind.as_str(), verify.provider_instance.as_deref()), ("host-direct-gui", Some("fixture-0")));
 }
 
 #[tokio::test]
@@ -3347,7 +3346,7 @@ async fn codex_admission_refuses_old_host_and_explains_version_gap() {
         .await
         .expect("explain");
     let CommandValue::ConvoyExplanation(explanation) = result else { panic!("{result:?}") };
-    assert_eq!(explanation.vessel_placements["work"].policy_name, "docker-test");
+    assert_eq!(explanation.vessel_placements["work"].kind, "docker-test");
     assert!(format!("{explanation:?}").contains("0.154.0"), "{explanation:?}");
     assert!(explanation.role_needs.values().flatten().any(|need| need == "harness:codex>=0.160.0"));
 }
@@ -3449,7 +3448,7 @@ async fn requested_model_ignores_legacy_account_evidence_and_uses_only_selected_
     let snapshot_name = admitted.metadata.annotations.get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION).expect("pinned workflow");
     let snapshot = backend.definitions::<WorkflowTemplate>("flotilla").get(snapshot_name).await.expect("workflow snapshot");
     let status = admitted.status.expect("admitted status");
-    assert_eq!(status.placement_decision.expect("placement").policy_name, "host-direct-model");
+    assert_eq!(status.placement_decision.expect("placement").kind, "host-direct-model");
     // #3907: the Claude account is the requester's binding, never a vessel-wide reference.
     assert!(snapshot.spec.vessels[0].credential_refs.is_empty());
     let binding = backend
@@ -3477,7 +3476,7 @@ async fn requested_model_ignores_legacy_account_evidence_and_uses_only_selected_
         panic!("explanation should be available after admission: {result:?}");
     };
     assert!(!explanation.role_needs.values().flatten().any(|need| need.starts_with("harness:claude-code")));
-    assert_eq!(explanation.vessel_placements["work"].policy_name, "host-direct-model");
+    assert_eq!(explanation.vessel_placements["work"].kind, "host-direct-model");
     let formerly_refused = start_capability_convoy(&daemon, "model-unavailable", |intent| {
         intent.agent_overrides.push(flotilla_protocol::AgentOverride {
             capability: "code".to_string(),
@@ -3748,12 +3747,12 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
     assert_eq!(convoy.spec.placement_policy.as_deref(), Some("host-direct-b-remote"));
     let decision =
         convoy.status.and_then(|status| status.placement_decision).expect("admission should persist the complete placement decision");
-    assert_eq!(decision.policy_name, "host-direct-b-remote");
+    assert_eq!(decision.kind, "host-direct-b-remote");
     assert_eq!(decision.refused_candidates.len(), 1);
-    assert_eq!(decision.refused_candidates[0].policy_name, "host-direct-a-empty");
+    assert_eq!(decision.refused_candidates[0].kind, "host-direct-a-empty");
     assert!(decision.refused_candidates[0].reason.contains("harness:codex>=0.160.0"));
     assert_eq!(decision.viable_not_selected.len(), 1);
-    assert_eq!(decision.viable_not_selected[0].policy_name, "host-direct-z-local");
+    assert_eq!(decision.viable_not_selected[0].kind, "host-direct-z-local");
     assert_eq!(decision.viable_not_selected[0].reason, "minimal alternative");
 }
 
@@ -7391,10 +7390,7 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
     assert_eq!(successor.spec.repositories.len(), 1);
     assert_eq!(successor.spec.repositories[0].repo_ref, expected);
     assert_eq!(successor.spec.repositories[0].url, "https://forgejo.lab.flotilla.work/robert/ghostty-ops");
-    assert_eq!(
-        successor.status.as_ref().expect("admitted status").placement_decision.as_ref().expect("placement").policy_name,
-        "governor-host"
-    );
+    assert_eq!(successor.status.as_ref().expect("admitted status").placement_decision.as_ref().expect("placement").kind, "governor-host");
 
     let inspected = daemon.inspect_repository_path(&repo, None).await.expect("resolve and sweep identities");
     assert!(matches!(inspected.spec.identity(), RepositoryIdentity::Forge { forge_ref, .. } if forge_ref == "flotilla-lab"));
@@ -8894,7 +8890,7 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
             &flotilla_resources::VesselSpec {
                 convoy_ref: "handoff-convoy".to_string(),
                 vessel_name: "work".to_string(),
-                placement_policy_ref: "host-direct".to_string(),
+                fulfilment_kind_ref: "host-direct".to_string(),
                 adopted_checkout_refs: Default::default(),
             },
         )
@@ -9488,7 +9484,7 @@ async fn crew_completion_advisory_does_not_claim_or_consume_a_follow_up() {
             &flotilla_resources::VesselSpec {
                 convoy_ref: "turn-boundary".to_string(),
                 vessel_name: "work".to_string(),
-                placement_policy_ref: "test".to_string(),
+                fulfilment_kind_ref: "test".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
@@ -9656,7 +9652,7 @@ async fn crew_completion_reports_pending_promises_without_a_refusal() {
             &flotilla_resources::VesselSpec {
                 convoy_ref: "missing-ledger".to_string(),
                 vessel_name: "work".to_string(),
-                placement_policy_ref: "test".to_string(),
+                fulfilment_kind_ref: "test".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
@@ -10393,7 +10389,7 @@ async fn convoy_resume_milliseconds_after_complete_still_lands() {
             &flotilla_resources::VesselSpec {
                 convoy_ref: "claimed-resume".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "test".into(),
+                fulfilment_kind_ref: "test".into(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
@@ -10785,7 +10781,7 @@ mod account_bindings {
         assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
         let explained = explain(&daemon, "planned").await;
         let placement = &explained.vessel_placements["work"];
-        assert_eq!(placement.policy_name, "host-direct-accounts");
+        assert_eq!(placement.kind, "host-direct-accounts");
         assert!(
             placement.refused_candidates.iter().all(|refusal| !refusal.reason.contains("claude:subscription")),
             "{:?}",

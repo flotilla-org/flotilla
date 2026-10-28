@@ -163,16 +163,19 @@ fn what_the_move_cannot_carry_is_refused() {
         ],
     };
     let report = rehearse_placement(&copies);
+    let mut imported = ImportReport::default();
+    let kinds = import_placement(&copies, &mut imported).kinds;
+    let baseline = kinds.iter().find(|placed| placed.name == "baseline").expect("the baseline policy's kind");
+    assert_eq!(baseline.record.realisation, KindRealisation::DockerComposed);
     let refused: Vec<_> = report.refused.iter().map(|refusal| refusal.to_string()).collect();
     for (record, reason) in [
-        ("baseline", "CrewImageBaseline `crew`, which retires"),
         ("constrained", "constrain more than the instance"),
         ("orphan-host-direct", "its host has no host-direct kind"),
         ("clash", "the engine has no namespaces"),
     ] {
         assert!(refused.iter().any(|line| line.contains(record) && line.contains(reason)), "{record}: {reason} in {refused:#?}");
     }
-    assert_eq!(refused.len(), 4, "{refused:#?}");
+    assert_eq!(refused.len(), 3, "{refused:#?}");
     assert!(
         refused.iter().any(|line| line.contains("orphan-host-direct") && line.contains("the engine has no namespaces")),
         "{refused:#?}"

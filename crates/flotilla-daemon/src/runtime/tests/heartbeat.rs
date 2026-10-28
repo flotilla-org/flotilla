@@ -825,7 +825,6 @@ async fn capped_docker_kind_publishes_free_slots_from_the_hosts_vessels() {
     let policy = PlacementPolicySpec::builder()
         .pool("cleat".to_string())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-            legacy_image_baseline_ref: None,
             memory_policy: Default::default(),
             host_ref: host_id.clone(),
             image: Some("crew:test".into()),
@@ -877,8 +876,9 @@ async fn capped_docker_kind_publishes_free_slots_from_the_hosts_vessels() {
         .await
         .expect("convoy");
     let decision = flotilla_protocol::PlacementDecision {
+        provider_instance: None,
         provider_workspace_root: None,
-        policy_name: format!("host-direct-{host_id}"),
+        kind: format!("host-direct-{host_id}"),
         target_host: flotilla_protocol::PlacementTargetHost {
             reference: flotilla_protocol::CanonicalHostId::resolved(host_id.clone()),
             display_name: "feta".to_string(),

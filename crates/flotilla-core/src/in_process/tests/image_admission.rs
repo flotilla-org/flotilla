@@ -129,7 +129,7 @@ fn vessel(name: &str, crew: Vec<CrewSpec>, needs: &[&str]) -> VesselRequirement 
 
 fn decision() -> PlacementDecision {
     PlacementDecision::builder()
-        .policy_name("crew-policy".into())
+        .kind("crew-policy".into())
         .target_host(flotilla_protocol::PlacementTargetHost {
             reference: flotilla_protocol::CanonicalHostId::resolved("host-a"),
             display_name: "host-a".into(),

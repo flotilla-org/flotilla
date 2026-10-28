@@ -15,12 +15,11 @@ use crate::{
     host::HostStatus,
     replica::{LAST_SYNCED_AT_ANNOTATION, ORIGIN_ROOT_ANNOTATION},
     AccessDelivery, AccountBinding, AccountProvision, Artifact, ChangeRequest, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure,
-    CredentialGrant, CredentialSpec, CrewDefaults, CrewImageBaseline, Demand, DispatchDeployment, DispatchHold, DispatchObservation,
-    Environment, Event, FieldOwnedResource, FleetDesignation, Forge, ForgeRead, ForgeReadHeartbeat, FulfilmentKind, Host, ImageBuild,
-    ImageLayer, InputMeta, Issue, ManifestRoot, Message, ObjectMeta, OwnerReference, PlacementPolicy, Project, ReadResourceList,
-    ReadWatchEvent, Regard, ReplicaCursor, ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceList,
-    ResourceObject, ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    CredentialGrant, CredentialSpec, CrewDefaults, Demand, DispatchDeployment, DispatchHold, DispatchObservation, Environment, Event,
+    FieldOwnedResource, FleetDesignation, Forge, ForgeRead, ForgeReadHeartbeat, FulfilmentKind, Host, ImageBuild, ImageLayer, InputMeta,
+    Issue, ManifestRoot, Message, ObjectMeta, OwnerReference, PlacementPolicy, Project, ReadResourceList, ReadWatchEvent, Regard,
+    ReplicaCursor, ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject,
+    ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
 
 pub const MANIFEST_WRITER_SOURCE: &str = "resource-manifest";
@@ -46,7 +45,6 @@ enum RegisteredResource {
     CredentialGrant,
     CredentialSpec,
     CrewDefaults,
-    CrewImageBaseline,
     ImageBuild,
     ImageLayer,
     Demand,
@@ -136,7 +134,6 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
         &["credentialspec", "credential_spec", "credential_specs", "credential-spec", "credential-specs"],
     ),
     kind::<CrewDefaults>(RegisteredResource::CrewDefaults, &["crew-defaults"]),
-    kind::<CrewImageBaseline>(RegisteredResource::CrewImageBaseline, &["crew-image-baseline", "image-baseline"]),
     kind::<ImageBuild>(RegisteredResource::ImageBuild, &["image-build"]),
     kind::<ImageLayer>(RegisteredResource::ImageLayer, &["image-layer"]),
     kind::<Demand>(RegisteredResource::Demand, &[]),
@@ -192,6 +189,8 @@ pub const RETIRED_RESOURCE_KINDS: &[RetiredResourceKind] = &[
     // Retired by #3943 (shipped in r887); remove one roll later, once the corpus is refreshed (#4014).
     // The stored-corpus test reads each entry's r355 file, so retiring r355 forces this removal.
     RetiredResourceKind { kind: "Usage", plural: "usages", api_version: "flotilla.work/v1" },
+    // Remove one roll after it ships, once the corpus is refreshed.
+    RetiredResourceKind { kind: "CrewImageBaseline", plural: "crewimagebaselines", api_version: "flotilla.work/v1" },
 ];
 
 /// What a stored document decoded as.
@@ -238,7 +237,6 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::CredentialGrant => poll_typed_resource!($body::<CredentialGrant>($($arg),*)),
             RegisteredResource::CredentialSpec => poll_typed_resource!($body::<CredentialSpec>($($arg),*)),
             RegisteredResource::CrewDefaults => poll_typed_resource!($body::<CrewDefaults>($($arg),*)),
-            RegisteredResource::CrewImageBaseline => poll_typed_resource!($body::<CrewImageBaseline>($($arg),*)),
             RegisteredResource::Demand => poll_typed_resource!($body::<Demand>($($arg),*)),
             RegisteredResource::DispatchDeployment => poll_typed_resource!($body::<DispatchDeployment>($($arg),*)),
             RegisteredResource::AccountBinding => poll_typed_resource!($body::<AccountBinding>($($arg),*)),
@@ -279,7 +277,6 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::CredentialGrant => $body::<CredentialGrant>(),
             RegisteredResource::CredentialSpec => $body::<CredentialSpec>(),
             RegisteredResource::CrewDefaults => $body::<CrewDefaults>(),
-            RegisteredResource::CrewImageBaseline => $body::<CrewImageBaseline>(),
             RegisteredResource::Demand => $body::<Demand>(),
             RegisteredResource::DispatchDeployment => $body::<DispatchDeployment>(),
             RegisteredResource::AccountBinding => $body::<AccountBinding>(),
@@ -320,7 +317,6 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::CredentialGrant => $body::<CredentialGrant>($($arg),*),
             RegisteredResource::CredentialSpec => $body::<CredentialSpec>($($arg),*),
             RegisteredResource::CrewDefaults => $body::<CrewDefaults>($($arg),*),
-            RegisteredResource::CrewImageBaseline => $body::<CrewImageBaseline>($($arg),*),
             RegisteredResource::Demand => $body::<Demand>($($arg),*),
             RegisteredResource::DispatchDeployment => $body::<DispatchDeployment>($($arg),*),
             RegisteredResource::AccountBinding => $body::<AccountBinding>($($arg),*),
@@ -443,7 +439,6 @@ pub fn declared_resource_kinds() -> Vec<crate::ResourceKind> {
             RegisteredResource::CredentialGrant => crate::ResourceKind::of::<CredentialGrant>(),
             RegisteredResource::CredentialSpec => crate::ResourceKind::of::<CredentialSpec>(),
             RegisteredResource::CrewDefaults => crate::ResourceKind::of::<CrewDefaults>(),
-            RegisteredResource::CrewImageBaseline => crate::ResourceKind::of::<CrewImageBaseline>(),
             RegisteredResource::Demand => crate::ResourceKind::of::<Demand>(),
             RegisteredResource::DispatchDeployment => crate::ResourceKind::of::<DispatchDeployment>(),
             RegisteredResource::AccountBinding => crate::ResourceKind::of::<AccountBinding>(),

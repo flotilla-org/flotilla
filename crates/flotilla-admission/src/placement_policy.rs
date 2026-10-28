@@ -114,7 +114,6 @@ mod tests {
         PlacementPolicySpec::builder()
             .pool(pool.to_string())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                legacy_image_baseline_ref: None,
                 memory_policy: Default::default(),
                 host_ref: host.to_string(),
                 image: Some("registration-default:latest".into()),
@@ -175,7 +174,7 @@ mod tests {
         let created = policies.get("docker-shared").await.expect("registered policy");
         let mut operator_spec = created.spec.clone();
         let runtime = operator_spec.docker_per_vessel.as_mut().expect("docker strategy");
-        runtime.image = Some(DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".to_string() });
+        runtime.image = Some(DockerImageSource::Literal("registry.test/crew@sha256:operator".to_string()));
         runtime.pull_policy = DockerImagePullPolicy::Never;
         runtime.memory_policy.host_memory_percent = 30;
         runtime.agent_adapters = BTreeSet::from(["codex".to_string()]);
@@ -197,7 +196,7 @@ mod tests {
         assert_eq!(runtime.memory_policy.host_memory_percent, 30);
 
         assert_eq!(runtime.host_ref, "remote");
-        assert_eq!(runtime.image, Some(DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".to_string() }));
+        assert_eq!(runtime.image, Some(DockerImageSource::Literal("registry.test/crew@sha256:operator".to_string())));
         assert_eq!(runtime.pull_policy, DockerImagePullPolicy::Never);
         assert_eq!(runtime.agent_adapters, BTreeSet::from(["codex".to_string()]));
         assert_eq!(runtime.default_cwd.as_deref(), Some("/operator-workspace"));

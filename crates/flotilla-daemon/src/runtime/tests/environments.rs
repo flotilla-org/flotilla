@@ -82,7 +82,7 @@ async fn standing_backing_inspection_accepts_local_absence_only_after_startup_ob
                 }),
                 placement_decision: Some(
                     PlacementDecision::builder()
-                        .policy_name("docker".to_string())
+                        .kind("docker".to_string())
                         .target_host(PlacementTargetHost {
                             reference: CanonicalHostId::resolved("host-test"),
                             display_name: "host-test".to_string(),

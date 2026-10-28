@@ -1304,7 +1304,7 @@ impl ConvoyAdmission {
             let value = serde_json::to_value(policy).map_err(|error| error.to_string())?;
             let name = self.placement_snapshot_name(&value)?;
             ensure_prepared_placement_snapshot(&self.backend, namespace, &name, policy).await?;
-            pins.insert(vessel.clone(), flotilla_resources::VesselPlacementPin { policy_ref: name, decision: decision.clone() });
+            pins.insert(vessel.clone(), flotilla_resources::VesselPlacementPin { kind_ref: name, decision: decision.clone() });
         }
         Ok(BTreeMap::from([(
             flotilla_resources::VESSEL_PLACEMENTS_ANNOTATION.to_string(),
@@ -1946,7 +1946,7 @@ impl AdmissionReadContext<'_> {
             .backend
             .clone()
             .including_replicas::<PlacementPolicy>(namespace)
-            .get(&placement.policy_name)
+            .get(&placement.kind)
             .await
             .is_ok_and(|source| placement_host_ref(&source.object).is_some() || source.object.spec.cloud_sandbox_per_vessel.is_some());
         if !has_replica && !is_host_targeted_placement {
@@ -2037,10 +2037,7 @@ impl AdmissionReadContext<'_> {
         namespace: &str,
         intent: &flotilla_protocol::ConvoyStartIntent,
     ) -> Result<AdmissionReadContext<'a>, String> {
-        use flotilla_resources::{
-            CrewDefaults, CrewImageBaseline, DockerImageSource, FleetDesignation, FulfilmentRealisation, ImageBuild, ImageLayer,
-            FLEET_DESIGNATION_NAME,
-        };
+        use flotilla_resources::{CrewDefaults, FleetDesignation, ImageBuild, ImageLayer, FLEET_DESIGNATION_NAME};
         use flotilla_store::StoreQuery;
         let backend = &owner.backend;
         let project_ref = required_admission_value(&intent.project_ref, "project")?;
@@ -2157,24 +2154,6 @@ impl AdmissionReadContext<'_> {
             .query_declared::<CredentialSpec>(namespace, &StoreQuery::names(credential_names, true))
             .await
             .map_err(|error| error.to_string())?;
-        let mut baseline_names = BTreeSet::new();
-        let mut observe_image = |image: Option<&DockerImageSource>| {
-            if let Some(DockerImageSource::Baseline { image_baseline_ref }) = image {
-                baseline_names.insert(image_baseline_ref.clone());
-            }
-        };
-        for kind in &kinds.items {
-            if let FulfilmentRealisation::DockerPerVessel { image } = &kind.object.spec.realisation {
-                observe_image(image.as_ref());
-            }
-        }
-        for policy in &policies.items {
-            if let Some(docker) = &policy.object.spec.docker_per_vessel {
-                observe_image(docker.image.as_ref());
-            }
-        }
-        let baselines =
-            backend.definitions::<CrewImageBaseline>(namespace).list_names(baseline_names).await.map_err(|error| error.to_string())?;
         // Composed images resolve against every layer definition, and their
         // placement cost reads the per-identity builds.
         let image_layers = flotilla_store::read_definition_catalog::<ImageLayer>(backend, namespace).await?;
@@ -2188,7 +2167,6 @@ impl AdmissionReadContext<'_> {
         snapshot.insert_definitions::<CrewDefaults>(defaults)?;
         snapshot.insert_definitions::<Forge>(forges)?;
         snapshot.insert_definitions::<WorkflowTemplate>(workflows)?;
-        snapshot.insert_definitions::<CrewImageBaseline>(baselines)?;
         snapshot.insert_definitions::<ImageLayer>(image_layers)?;
         snapshot.insert::<Repository>(repository_sources)?;
         snapshot.insert::<FulfilmentKind>(kinds)?;
@@ -2759,7 +2737,7 @@ impl AdmissionReadContext<'_> {
                     .unwrap_or_else(|| kind.spec.host_ref.clone()),
             };
             let policy_name = kind.metadata.name.clone();
-            let refusal = |reason: String| PlacementRefusal { policy_name: policy_name.clone(), target_host: target_host.clone(), reason };
+            let refusal = |reason: String| PlacementRefusal { kind: policy_name.clone(), target_host: target_host.clone(), reason };
             // #3907: a kind where some requester's access has no plan drops out.
             let environment_kind =
                 flotilla_agent::account_access::EnvironmentKind::of_realisation(&kind.spec.realisation, host.is_some_and(is_ssh_host));
@@ -2978,7 +2956,7 @@ impl AdmissionReadContext<'_> {
             return Err(format!(
                 "no fulfilment kind covers {}; candidates: {}",
                 role_needs.join(", "),
-                rejected.iter().map(|refusal| format!("{}: {}", refusal.policy_name, refusal.reason)).collect::<Vec<_>>().join("; ")
+                rejected.iter().map(|refusal| format!("{}: {}", refusal.kind, refusal.reason)).collect::<Vec<_>>().join("; ")
             ));
         }
         let placement_tiebreak = self.runtime.fulfilment_decider.for_admission(needs, self.runtime.clock.now());
@@ -3007,7 +2985,7 @@ impl AdmissionReadContext<'_> {
             Some(pin) => candidates.iter().position(|candidate| candidate.kind.metadata.name == pin).ok_or_else(|| {
                 format!(
                     "pinned fulfilment `{pin}` cannot cover vessel needs; candidates: {}",
-                    rejected.iter().map(|refusal| format!("{}: {}", refusal.policy_name, refusal.reason)).collect::<Vec<_>>().join("; ")
+                    rejected.iter().map(|refusal| format!("{}: {}", refusal.kind, refusal.reason)).collect::<Vec<_>>().join("; ")
                 )
             })?,
             None => candidates.iter().position(|candidate| minimal.contains(&candidate.kind.metadata.name)).expect("nonempty minimal set"),
@@ -3061,7 +3039,7 @@ impl AdmissionReadContext<'_> {
             let policy = candidate.placement.selected.as_ref().expect("validated candidate has policy");
             let target_host = placement_target_host(&self.backend, namespace, policy).await?;
             selected.placement.viable_not_selected.push(PlacementViableCandidate {
-                policy_name: candidate.kind.metadata.name.clone(),
+                kind: candidate.kind.metadata.name.clone(),
                 target_host,
                 reason: if minimal.contains(&candidate.kind.metadata.name) { "minimal alternative" } else { "grants a strict superset" }
                     .to_string(),
@@ -3194,10 +3172,11 @@ impl AdmissionReadContext<'_> {
                 workflow.vessels[index] = one.vessels.remove(0);
                 if let Some(selected) = resolution.selected.as_ref() {
                     let decision = PlacementDecision {
+                        provider_instance: crate::support::provider_instance(selected).map(str::to_owned),
                         provider_workspace_root: crate::support::provider_workspace_root(&self.backend, namespace, selected).await?,
                         minimal_alternatives: alternatives.clone(),
                         escalation_reason: intent.escalation_reason.clone(),
-                        policy_name: selected.metadata.name.clone(),
+                        kind: selected.metadata.name.clone(),
                         target_host: placement_target_host(&self.backend, namespace, selected).await?,
                         refused_candidates: resolution.refused_candidates.clone(),
                         viable_not_selected: resolution.viable_not_selected.clone(),
@@ -3249,10 +3228,11 @@ impl AdmissionReadContext<'_> {
                 image_builds.extend(builds);
                 let decision = match result.0.selected.as_ref() {
                     Some(selected) => Some(PlacementDecision {
+                        provider_instance: crate::support::provider_instance(selected).map(str::to_owned),
                         provider_workspace_root: crate::support::provider_workspace_root(&self.backend, namespace, selected).await?,
                         minimal_alternatives: result.1.clone(),
                         escalation_reason: intent.escalation_reason.clone(),
-                        policy_name: selected.metadata.name.clone(),
+                        kind: selected.metadata.name.clone(),
                         target_host: placement_target_host(&self.backend, namespace, selected).await?,
                         refused_candidates: result.0.refused_candidates.clone(),
                         viable_not_selected: result.0.viable_not_selected.clone(),
@@ -3310,7 +3290,7 @@ impl AdmissionReadContext<'_> {
                     let reasons = placement
                         .refused_candidates
                         .iter()
-                        .map(|candidate| format!("- `{}`: {}", candidate.policy_name, candidate.reason))
+                        .map(|candidate| format!("- `{}`: {}", candidate.kind, candidate.reason))
                         .collect::<Vec<_>>()
                         .join("\n");
                     return Err(format!("no placement policy satisfies workflow; candidates:\n{reasons}"));
@@ -3320,20 +3300,10 @@ impl AdmissionReadContext<'_> {
         };
         if purpose == PlacementPurpose::Admission {
             if let Some(docker) = placement.selected.as_mut().and_then(|policy| policy.spec.docker_per_vessel.as_mut()) {
-                match &docker.image {
-                    // Freeze the compatibility baseline into a literal and keep
-                    // its provenance; later baseline edits never reach this convoy.
-                    Some(image @ flotilla_resources::DockerImageSource::Baseline { image_baseline_ref }) => {
-                        let resolved = image.resolve(&self.backend.definitions(namespace)).await?;
-                        docker.legacy_image_baseline_ref = Some(image_baseline_ref.clone());
-                        docker.image = Some(flotilla_resources::DockerImageSource::Literal(resolved));
-                    }
-                    Some(image @ flotilla_resources::DockerImageSource::Literal(_)) => {
-                        image.resolve(&self.backend.definitions(namespace)).await?;
-                    }
-                    // Composed images freeze per vessel once the placement is
-                    // final; they never carry the legacy tag exception.
-                    Some(flotilla_resources::DockerImageSource::Built { .. }) | None => docker.legacy_image_baseline_ref = None,
+                // A literal image is checked now; composed images freeze per vessel once the
+                // placement is final.
+                if let Some(image @ flotilla_resources::DockerImageSource::Literal(_)) = &docker.image {
+                    image.resolve()?;
                 }
             }
             validate_workflow_agent_adapters(&self.backend, namespace, workflow, placement.selected.as_ref(), allow_unready).await?;
@@ -3553,10 +3523,11 @@ impl AdmissionReadContext<'_> {
         let placement_policy = placement.selected.as_ref().map(|placement| placement.metadata.name.clone());
         let placement_decision = match placement.selected.as_ref() {
             Some(selected) => Some(PlacementDecision {
+                provider_instance: crate::support::provider_instance(selected).map(str::to_owned),
                 provider_workspace_root: crate::support::provider_workspace_root(&self.backend, namespace, selected).await?,
                 minimal_alternatives,
                 escalation_reason: intent.escalation_reason.clone(),
-                policy_name: selected.metadata.name.clone(),
+                kind: selected.metadata.name.clone(),
                 target_host: placement_target_host(&self.backend, namespace, selected).await?,
                 refused_candidates: placement.refused_candidates,
                 viable_not_selected: placement.viable_not_selected,
@@ -4411,7 +4382,7 @@ async fn decide_default_placement(
                 reference: CanonicalHostId::resolved(String::new()),
                 display_name: "no target host".to_string(),
             });
-            refused_candidates.push(PlacementRefusal { policy_name: policy.metadata.name.clone(), target_host, reason });
+            refused_candidates.push(PlacementRefusal { kind: policy.metadata.name.clone(), target_host, reason });
         } else {
             viable.push(policy);
         }
@@ -4425,7 +4396,7 @@ async fn decide_default_placement(
                 resolved_viable.push(policy);
             }
             Err(reason) => refused_candidates.push(PlacementRefusal {
-                policy_name: policy.metadata.name.clone(),
+                kind: policy.metadata.name.clone(),
                 target_host: PlacementTargetHost {
                     reference: CanonicalHostId::resolved(String::new()),
                     display_name: "no target host".to_string(),
@@ -4448,7 +4419,7 @@ async fn decide_default_placement(
         for policy in viable {
             let target_host = viable_targets.remove(&policy.metadata.name).expect("viable placement target was resolved");
             let reason = placement_ordering_reason(&selected, &selected_target, &policy, &target_host, local_host_ref);
-            viable_not_selected.push(PlacementViableCandidate { policy_name: policy.metadata.name.clone(), target_host, reason });
+            viable_not_selected.push(PlacementViableCandidate { kind: policy.metadata.name.clone(), target_host, reason });
         }
         return Ok(PlacementResolution { selected: Some(selected), refused_candidates, viable_not_selected, allocation: None });
     }
@@ -4463,10 +4434,10 @@ async fn decide_default_placement(
         if refused_candidates.is_empty() {
             return Err(format!("no placement policy satisfies {requirement}; candidates: (none)"));
         }
-        refused_candidates.sort_by(|left, right| left.policy_name.cmp(&right.policy_name));
+        refused_candidates.sort_by(|left, right| left.kind.cmp(&right.kind));
         let candidates = refused_candidates
             .iter()
-            .map(|candidate| format!("- `{}`: {}", candidate.policy_name, candidate.reason))
+            .map(|candidate| format!("- `{}`: {}", candidate.kind, candidate.reason))
             .collect::<Vec<_>>()
             .join("\n");
         return Err(format!("no placement policy satisfies {requirement}; candidates:\n{candidates}"));
@@ -4994,7 +4965,7 @@ pub async fn placement_agent_adapters(
         match &docker.image {
             None | Some(flotilla_resources::DockerImageSource::Built { .. }) => Ok((BTreeSet::new(), "composed image".to_string())),
             Some(image) => {
-                let detail = format!("image `{}`", image.resolve(&backend.definitions(namespace)).await?);
+                let detail = format!("image `{}`", image.resolve()?);
                 Ok((docker.agent_adapters.clone(), detail))
             }
         }
@@ -5672,8 +5643,9 @@ mod tests {
                 .spec(ConvoySpec::builder().workflow_ref("scratch".into()).build())
                 .workflow(WorkflowTemplateSpec::builder().build())
                 .placement_decision(PlacementDecision {
+                    provider_instance: None,
                     provider_workspace_root: None,
-                    policy_name: "remote-policy".into(),
+                    kind: "remote-policy".into(),
                     target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("remote"), display_name: "remote".into() },
                     minimal_alternatives: Vec::new(),
                     escalation_reason: None,

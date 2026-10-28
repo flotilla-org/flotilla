@@ -22,18 +22,18 @@ use flotilla_resources::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_resources::{
     address::artifact_slot_record_name, canonicalize_repo_url, host_direct_environment_name, is_prepared_snapshot,
     repository_workspace_slugs, Artifact, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy,
-    CrewImageBaseline, CrewSource, CrewWorkPhase, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerImageSource,
-    Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy,
-    PlacementPolicySpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceError, ResourceObject, ResourceProvenance, Stance,
-    TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, Vessel, VesselImage, VesselPhase,
-    VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
+    CrewSource, CrewWorkPhase, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerImageSource, Environment,
+    EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Repository,
+    RepositoryKey, RepositorySpec, Resource, ResourceError, ResourceObject, ResourceProvenance, Stance, TerminalSession,
+    TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, Vessel, VesselImage, VesselPhase, VesselStatusPatch, WorkPhase,
+    ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
     CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
     CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND, VESSEL_REF_LABEL,
 };
 use flotilla_store::{
     controller::{delete_lifecycle_owned_matching, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
-    DefinitionResolver, ReplicaReadResolver, ResourceBackend, TypedResolver,
+    ReplicaReadResolver, ResourceBackend, TypedResolver,
 };
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -88,7 +88,6 @@ pub struct VesselReconciler {
     convoys: TypedResolver<Convoy>,
     repositories: TypedResolver<Repository>,
     placement_policies: TypedResolver<PlacementPolicy>,
-    image_baselines: DefinitionResolver<CrewImageBaseline>,
     environments: TypedResolver<Environment>,
     clones: TypedResolver<Clone>,
     checkouts: TypedResolver<Checkout>,
@@ -127,7 +126,6 @@ impl VesselReconciler {
             convoys: backend.clone().using::<Convoy>(namespace),
             repositories: backend.clone().using::<Repository>(namespace),
             placement_policies: backend.clone().using::<PlacementPolicy>(namespace),
-            image_baselines: backend.definitions(namespace),
             environments: backend.clone().using::<Environment>(namespace),
             clones: backend.clone().using::<Clone>(namespace),
             checkouts: backend.clone().using::<Checkout>(namespace),
@@ -421,22 +419,22 @@ impl PlacementStrategy {
 enum PlannedPatch {
     None,
     Provisioning {
-        observed_policy_ref: String,
-        observed_policy_version: String,
+        observed_kind_ref: String,
+        observed_kind_version: String,
         placement_decision: Option<PlacementDecision>,
         waiting_for: String,
         image: Option<VesselImage>,
     },
     EnvironmentRecreation {
-        observed_policy_ref: String,
-        observed_policy_version: String,
+        observed_kind_ref: String,
+        observed_kind_version: String,
         placement_decision: Option<PlacementDecision>,
         message: String,
         image: Option<VesselImage>,
     },
     CheckoutChurn {
-        observed_policy_ref: String,
-        observed_policy_version: String,
+        observed_kind_ref: String,
+        observed_kind_version: String,
         placement_decision: Option<PlacementDecision>,
         message: String,
         image: Option<VesselImage>,
@@ -476,21 +474,18 @@ struct ImageStamp {
 fn composed_image(placement_policy: &ResourceObject<PlacementPolicy>, digest: Option<String>) -> Option<VesselImage> {
     match placement_policy.spec.docker_per_vessel.as_ref()?.image.as_ref()? {
         DockerImageSource::Built { identity, .. } => Some(VesselImage { identity: identity.clone(), digest }),
-        DockerImageSource::Literal(_) | DockerImageSource::Baseline { .. } => None,
+        DockerImageSource::Literal(_) => None,
     }
 }
 
 /// The Environment's image fields: a composed image names its per-identity
 /// ImageBuild and receives the build's digest from the Environment reconciler;
-/// literal and baseline images resolve now.
-async fn environment_image(
-    image: &Option<DockerImageSource>,
-    baselines: &flotilla_store::DefinitionResolver<flotilla_resources::CrewImageBaseline>,
-) -> Result<(String, Option<String>), String> {
+/// a literal image resolves now.
+fn environment_image(image: &Option<DockerImageSource>) -> Result<(String, Option<String>), String> {
     match image {
         None => Err("composed image was not frozen at admission; readmit the convoy".into()),
         Some(DockerImageSource::Built { image_build_ref, .. }) => Ok((String::new(), Some(image_build_ref.clone()))),
-        Some(image) => image.resolve(baselines).await.map(|image| (image, None)),
+        Some(image) => image.resolve().map(|image| (image, None)),
     }
 }
 
@@ -525,8 +520,8 @@ impl VesselPrepared {
         Self {
             phase: None,
             patch: PlannedPatch::CheckoutChurn {
-                observed_policy_ref: placement_policy.metadata.name.clone(),
-                observed_policy_version: placement_policy.metadata.resource_version.clone(),
+                observed_kind_ref: placement_policy.metadata.name.clone(),
+                observed_kind_version: placement_policy.metadata.resource_version.clone(),
                 placement_decision,
                 message: format!("checkout {checkout_name} is missing shortly after a create attempt; retrying after backoff"),
                 image: composed_image(placement_policy, None),
@@ -609,10 +604,10 @@ impl VesselReconciler {
             }
         }
 
-        let placement_policy = match self.placement_dependency(obj, &obj.spec.placement_policy_ref).await {
+        let placement_policy = match self.placement_dependency(obj, &obj.spec.fulfilment_kind_ref).await {
             Ok(policy) => policy,
             Err(ResourceError::NotFound { .. }) => {
-                return Ok(VesselPrepared::failed(format!("placement policy {} not found", obj.spec.placement_policy_ref)))
+                return Ok(VesselPrepared::failed(format!("placement policy {} not found", obj.spec.fulfilment_kind_ref)))
             }
             Err(err) => return Err(err),
         };
@@ -767,7 +762,7 @@ impl VesselReconciler {
                             Some(Ok(spec)) => spec,
                             Some(Err(message)) => return Ok(VesselPrepared::failed(message)),
                             None => {
-                                let (image_ref, image_build_ref) = match environment_image(image, &self.image_baselines).await {
+                                let (image_ref, image_build_ref) = match environment_image(image) {
                                     Ok(image) => image,
                                     Err(message) => return Ok(VesselPrepared::failed(message)),
                                 };
@@ -1198,8 +1193,8 @@ impl VesselReconciler {
                             return Ok(VesselPrepared {
                                 phase: None,
                                 patch: PlannedPatch::EnvironmentRecreation {
-                                    observed_policy_ref: placement_policy.metadata.name.clone(),
-                                    observed_policy_version: placement_policy.metadata.resource_version.clone(),
+                                    observed_kind_ref: placement_policy.metadata.name.clone(),
+                                    observed_kind_version: placement_policy.metadata.resource_version.clone(),
                                     placement_decision: placement_decision.clone(),
                                     message: format!(
                                         "environment {env_name} Git checkout membership or protection mounts changed; \
@@ -1254,7 +1249,7 @@ impl VesselReconciler {
                         if let Err(message) = configure_contained_tracking(&mut env, &contained_branches) {
                             return Ok(VesselPrepared::failed(message));
                         }
-                        let (image_ref, image_build_ref) = match environment_image(image, &self.image_baselines).await {
+                        let (image_ref, image_build_ref) = match environment_image(image) {
                             Ok(image) => image,
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         };
@@ -1646,77 +1641,76 @@ impl Reconciler for VesselReconciler {
         prepared: &Self::Prepared,
         now: DateTime<Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
-        let patch = match &prepared.patch {
-            PlannedPatch::None => None,
-            PlannedPatch::Provisioning { observed_policy_ref, observed_policy_version, placement_decision, waiting_for, image } => {
-                Some(VesselStatusPatch::MarkProvisioning {
-                    observed_policy_ref: observed_policy_ref.clone(),
-                    observed_policy_version: observed_policy_version.clone(),
-                    placement_decision: placement_decision.clone(),
-                    started_at: now,
-                    message: provisioning_stuck_message(obj, prepared.phase, waiting_for, now),
-                    image: image.clone(),
-                })
-            }
-            PlannedPatch::EnvironmentRecreation { message, .. } if prepared.phase == Some(VesselPhase::Ready) => {
-                (obj.status.as_ref().and_then(|status| status.message.as_deref()) != Some(message))
-                    .then(|| VesselStatusPatch::RequireEnvironmentRecreation { message: message.clone() })
-            }
-            PlannedPatch::CheckoutChurn { observed_policy_ref, observed_policy_version, placement_decision, message, image }
-            | PlannedPatch::EnvironmentRecreation { observed_policy_ref, observed_policy_version, placement_decision, message, image } => {
-                if obj
-                    .status
-                    .as_ref()
-                    .is_some_and(|status| prepared.phase == Some(VesselPhase::Provisioning) && status.message.as_deref() == Some(message))
-                {
-                    None
-                } else {
+        let patch =
+            match &prepared.patch {
+                PlannedPatch::None => None,
+                PlannedPatch::Provisioning { observed_kind_ref, observed_kind_version, placement_decision, waiting_for, image } => {
                     Some(VesselStatusPatch::MarkProvisioning {
-                        observed_policy_ref: observed_policy_ref.clone(),
-                        observed_policy_version: observed_policy_version.clone(),
+                        observed_kind_ref: observed_kind_ref.clone(),
+                        observed_kind_version: observed_kind_version.clone(),
                         placement_decision: placement_decision.clone(),
                         started_at: now,
-                        message: Some(message.clone()),
+                        message: provisioning_stuck_message(obj, prepared.phase, waiting_for, now),
                         image: image.clone(),
                     })
                 }
-            }
-            PlannedPatch::Ready {
-                configured_limits,
-                placement_decision,
-                environment_ref,
-                image,
-                checkout_refs,
-                terminal_session_refs,
-                requested_stance,
-                effective_stance,
-            } => Some(VesselStatusPatch::MarkReady {
-                configured_limits: configured_limits.clone(),
-                placement_decision: placement_decision.clone(),
-                environment_ref: Some(environment_ref.clone()),
-                image_ref: image.as_ref().map(|image| image.image_ref.clone()),
-                local_image_id: image.as_ref().map(|image| image.local_image_id.clone()),
-                registry_digest: image.as_ref().and_then(|image| image.registry_digest.clone()),
-                checkout_refs: checkout_refs.clone(),
-                terminal_session_refs: terminal_session_refs.clone(),
-                requested_stance: *requested_stance,
-                effective_stance: *effective_stance,
-                ready_at: now,
-                image: image.as_ref().and_then(|image| image.composed.clone()),
-            }),
-            PlannedPatch::Interrupted { roles, message }
-                if obj.status.as_ref().is_none_or(|status| {
-                    prepared.phase != Some(VesselPhase::Interrupted)
-                        || status.interrupted_roles != *roles
-                        || status.message.as_deref() != Some(message.as_str())
-                }) =>
-            {
-                Some(VesselStatusPatch::MarkInterrupted { roles: roles.clone(), message: message.clone() })
-            }
-            PlannedPatch::Interrupted { .. } => None,
-            PlannedPatch::Lost { message } => Some(VesselStatusPatch::MarkLost { message: message.clone() }),
-            PlannedPatch::Failed { message } => Some(VesselStatusPatch::MarkFailed { message: message.clone() }),
-        };
+                PlannedPatch::EnvironmentRecreation { message, .. } if prepared.phase == Some(VesselPhase::Ready) => {
+                    (obj.status.as_ref().and_then(|status| status.message.as_deref()) != Some(message))
+                        .then(|| VesselStatusPatch::RequireEnvironmentRecreation { message: message.clone() })
+                }
+                PlannedPatch::CheckoutChurn { observed_kind_ref, observed_kind_version, placement_decision, message, image }
+                | PlannedPatch::EnvironmentRecreation { observed_kind_ref, observed_kind_version, placement_decision, message, image } => {
+                    if obj.status.as_ref().is_some_and(|status| {
+                        prepared.phase == Some(VesselPhase::Provisioning) && status.message.as_deref() == Some(message)
+                    }) {
+                        None
+                    } else {
+                        Some(VesselStatusPatch::MarkProvisioning {
+                            observed_kind_ref: observed_kind_ref.clone(),
+                            observed_kind_version: observed_kind_version.clone(),
+                            placement_decision: placement_decision.clone(),
+                            started_at: now,
+                            message: Some(message.clone()),
+                            image: image.clone(),
+                        })
+                    }
+                }
+                PlannedPatch::Ready {
+                    configured_limits,
+                    placement_decision,
+                    environment_ref,
+                    image,
+                    checkout_refs,
+                    terminal_session_refs,
+                    requested_stance,
+                    effective_stance,
+                } => Some(VesselStatusPatch::MarkReady {
+                    configured_limits: configured_limits.clone(),
+                    placement_decision: placement_decision.clone(),
+                    environment_ref: Some(environment_ref.clone()),
+                    image_ref: image.as_ref().map(|image| image.image_ref.clone()),
+                    local_image_id: image.as_ref().map(|image| image.local_image_id.clone()),
+                    registry_digest: image.as_ref().and_then(|image| image.registry_digest.clone()),
+                    checkout_refs: checkout_refs.clone(),
+                    terminal_session_refs: terminal_session_refs.clone(),
+                    requested_stance: *requested_stance,
+                    effective_stance: *effective_stance,
+                    ready_at: now,
+                    image: image.as_ref().and_then(|image| image.composed.clone()),
+                }),
+                PlannedPatch::Interrupted { roles, message }
+                    if obj.status.as_ref().is_none_or(|status| {
+                        prepared.phase != Some(VesselPhase::Interrupted)
+                            || status.interrupted_roles != *roles
+                            || status.message.as_deref() != Some(message.as_str())
+                    }) =>
+                {
+                    Some(VesselStatusPatch::MarkInterrupted { roles: roles.clone(), message: message.clone() })
+                }
+                PlannedPatch::Interrupted { .. } => None,
+                PlannedPatch::Lost { message } => Some(VesselStatusPatch::MarkLost { message: message.clone() }),
+                PlannedPatch::Failed { message } => Some(VesselStatusPatch::MarkFailed { message: message.clone() }),
+            };
 
         let mut outcome = ReconcileOutcome::with_actuations(patch, prepared.actuations.clone());
         if matches!(&prepared.patch, PlannedPatch::CheckoutChurn { .. }) {
@@ -1864,8 +1858,8 @@ fn provisioning_patch(
     waiting_for: String,
 ) -> PlannedPatch {
     PlannedPatch::Provisioning {
-        observed_policy_ref: placement_policy.metadata.name.clone(),
-        observed_policy_version: placement_policy.metadata.resource_version.clone(),
+        observed_kind_ref: placement_policy.metadata.name.clone(),
+        observed_kind_version: placement_policy.metadata.resource_version.clone(),
         placement_decision,
         waiting_for,
         image: composed_image(placement_policy, None),
@@ -1951,20 +1945,14 @@ fn cloud_environment_spec(
 }
 
 fn environment_provider_labels(policy: &ResourceObject<PlacementPolicy>) -> BTreeMap<String, String> {
-    let mut labels: BTreeMap<String, String> = policy
+    policy
         .metadata
         .labels
         .get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL)
         .or_else(|| policy.spec.provider_requirements.as_ref().and_then(|requirements| requirements.instance.as_ref()))
         .map(|instance| (ENVIRONMENT_PROVIDER_INSTANCE_LABEL.into(), instance.clone()))
         .into_iter()
-        .collect();
-    if let Some(docker) = &policy.spec.docker_per_vessel {
-        if let Some(image_baseline_ref) = docker.legacy_image_baseline_ref() {
-            labels.insert("flotilla.work/legacy-image-baseline".into(), image_baseline_ref.to_string());
-        }
-    }
-    labels
+        .collect()
 }
 
 fn owned_child_meta(name: &str, workspace: &ResourceObject<Vessel>, mut extra_labels: BTreeMap<String, String>) -> InputMeta {
@@ -2245,7 +2233,7 @@ mod tests {
                     &VesselSpec {
                         convoy_ref: "convoy".to_string(),
                         vessel_name: "work".to_string(),
-                        placement_policy_ref: snapshot_name.to_string(),
+                        fulfilment_kind_ref: snapshot_name.to_string(),
                         adopted_checkout_refs: BTreeMap::new(),
                     },
                 )
@@ -2336,10 +2324,11 @@ mod tests {
     #[test]
     fn waiting_message_replaces_the_structured_host_direct_environment_name() {
         let decision = PlacementDecision {
+            provider_instance: None,
             provider_workspace_root: None,
             minimal_alternatives: Vec::new(),
             escalation_reason: None,
-            policy_name: "host-direct-test".to_string(),
+            kind: "host-direct-test".to_string(),
             target_host: PlacementTargetHost {
                 reference: flotilla_protocol::CanonicalHostId::resolved("01HXYZ"),
                 display_name: "kiwi".to_string(),
@@ -2370,10 +2359,11 @@ mod tests {
             })
             .build();
         let decision = PlacementDecision {
+            provider_instance: None,
             provider_workspace_root: None,
             minimal_alternatives: Vec::new(),
             escalation_reason: None,
-            policy_name: "host-direct-udder".to_string(),
+            kind: "host-direct-udder".to_string(),
             target_host: PlacementTargetHost {
                 reference: flotilla_protocol::CanonicalHostId::resolved("1c8df992"),
                 display_name: "udder".to_string(),
@@ -2481,14 +2471,14 @@ mod tests {
             VesselSpec {
                 convoy_ref: "convoy".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "local".into(),
+                fulfilment_kind_ref: "local".into(),
                 adopted_checkout_refs: Default::default(),
             },
             VesselStatus {
                 phase: VesselPhase::Lost,
                 placement_decision: Some(
                     PlacementDecision::builder()
-                        .policy_name("local".into())
+                        .kind("local".into())
                         .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved("host"), display_name: "host".into() })
                         .build(),
                 ),

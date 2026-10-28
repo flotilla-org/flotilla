@@ -272,8 +272,8 @@ pub(super) async fn fulfilment_grants_for_terminal(
     let selected_kind = vessel_name
         .as_deref()
         .and_then(|name| flotilla_resources::vessel_placement_pin(&convoy, name))
-        .map(|pin| pin.decision.policy_name)
-        .or_else(|| convoy.status.and_then(|status| status.placement_decision.map(|decision| decision.policy_name)))?;
+        .map(|pin| pin.decision.kind)
+        .or_else(|| convoy.status.and_then(|status| status.placement_decision.map(|decision| decision.kind)))?;
     backend.including_replicas::<FulfilmentKind>(&context.namespace).get(&selected_kind).await.ok().map(|source| source.object.spec.grants)
 }
 

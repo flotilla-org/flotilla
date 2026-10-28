@@ -386,8 +386,7 @@ pub async fn choose_bindings(
     for alternative in &mut alternatives {
         let placement = placements.get(&alternative.requester.vessel).map(|(spec, decision)| (spec, decision)).or(fallback);
         if let Some((spec, decision)) = placement {
-            check_at_host(backend, namespace, std::slice::from_mut(alternative), spec, &decision.target_host, &decision.policy_name)
-                .await?;
+            check_at_host(backend, namespace, std::slice::from_mut(alternative), spec, &decision.target_host, &decision.kind).await?;
         }
         let pin = pins.get(&alternative.requester.role).map(|pin| (pin.as_str(), CONVOY_START_PIN));
         let selected = select(alternative, pin, random)?;

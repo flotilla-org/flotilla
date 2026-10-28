@@ -135,7 +135,6 @@ async fn default_remote_placement_resolves_replicated_credentials_before_admissi
             &PlacementPolicySpec::builder()
                 .pool("passthrough".to_string())
                 .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
-                    legacy_image_baseline_ref: None,
                     memory_policy: Default::default(),
                     host_ref: "udder-id".to_string(),
                     image: Some("crew:latest".into()),
@@ -213,7 +212,7 @@ async fn placement_candidates_and_refusals_agree_across_roots() {
     let right = default_convoy_placement_policy(&feta, "flotilla", None, &[], &workflow, None).await.expect("feta candidates");
     assert_eq!(left.refused_candidates, right.refused_candidates);
     assert_eq!(
-        left.refused_candidates.iter().map(|candidate| candidate.policy_name.as_str()).collect::<Vec<_>>(),
+        left.refused_candidates.iter().map(|candidate| candidate.kind.as_str()).collect::<Vec<_>>(),
         vec!["feta-policy", "kiwi-policy"]
     );
     for backend in [&kiwi, &feta] {
@@ -383,7 +382,7 @@ async fn ssh_host_takes_only_pinned_work_and_routes_to_its_owner() {
     let unpinned = default_convoy_placement_policy(&backend, "flotilla", None, &[], &trusted, None).await.expect("placement scoring");
     assert!(unpinned.selected.is_none(), "an unpinned convoy must not land on an SSH host");
     assert_eq!(unpinned.refused_candidates.len(), 1);
-    assert_eq!(unpinned.refused_candidates[0].policy_name, policy.metadata.name);
+    assert_eq!(unpinned.refused_candidates[0].kind, policy.metadata.name);
     assert_eq!(unpinned.refused_candidates[0].reason, "SSH host takes only convoys that pin its placement");
     validate_workflow_agent_adapters(&backend, "flotilla", &trusted, Some(&policy), false)
         .await
@@ -506,7 +505,7 @@ async fn default_placement_refuses_unknown_host_without_blocking_tool_workflow()
 
     let resolution = default_convoy_placement_policy(&backend, "flotilla", None, &[], &workflow, None).await.expect("clean candidate");
     assert_eq!(resolution.selected.expect("clean placement").metadata.name, "z-clean");
-    assert_eq!(resolution.refused_candidates[0].policy_name, "a-unknown-host");
+    assert_eq!(resolution.refused_candidates[0].kind, "a-unknown-host");
 }
 
 #[tokio::test]

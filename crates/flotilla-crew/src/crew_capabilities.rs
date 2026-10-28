@@ -57,8 +57,8 @@ pub async fn session_card(
         TerminalSessionSource::Agent { context, .. } => {
             let vessel =
                 backend.including_replicas::<Vessel>(namespace).get(&context.vessel_ref).await.map_err(|error| error.to_string())?.object;
-            let policy = vessel_placement_pin(&convoy, &vessel.spec.vessel_name).map(|pin| pin.decision.policy_name).or_else(|| {
-                convoy.status.as_ref().and_then(|status| status.placement_decision.as_ref().map(|decision| decision.policy_name.clone()))
+            let policy = vessel_placement_pin(&convoy, &vessel.spec.vessel_name).map(|pin| pin.decision.kind).or_else(|| {
+                convoy.status.as_ref().and_then(|status| status.placement_decision.as_ref().map(|decision| decision.kind.clone()))
             });
             if let Some(policy) = policy {
                 let kind =

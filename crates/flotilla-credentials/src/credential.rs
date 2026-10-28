@@ -2726,7 +2726,7 @@ mod tests {
                     &VesselSpec {
                         convoy_ref: "crew".into(),
                         vessel_name: "work".into(),
-                        placement_policy_ref: "policy".into(),
+                        fulfilment_kind_ref: "policy".into(),
                         adopted_checkout_refs: Default::default(),
                     },
                 )

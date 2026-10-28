@@ -1377,7 +1377,7 @@ fn placement_facts(decision: &flotilla_protocol::PlacementDecision, convoy: bool
         }
     };
     let mut facts = vec![
-        (keys.policy, MetadataValue::text(&decision.policy_name)),
+        (keys.policy, MetadataValue::text(&decision.kind)),
         (keys.host_ref, MetadataValue::text(decision.target_host.reference.to_string())),
         (keys.host_name, MetadataValue::text(&decision.target_host.display_name)),
         (

@@ -70,7 +70,9 @@ pub const ENSURED_FROM_ANNOTATION: &str = "flotilla.work/ensured-from";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VesselPlacementPin {
-    pub policy_ref: String,
+    // Drop the alias one roll after the rename.
+    #[serde(alias = "policy_ref")]
+    pub kind_ref: String,
     pub decision: PlacementDecision,
 }
 
@@ -94,6 +96,7 @@ pub struct ConvoySpec {
     pub dispatching_principal_ref: PrincipalRef,
     #[builder(default)]
     pub inputs: BTreeMap<String, InputValue>,
+    /// A FulfilmentKind's name.
     pub placement_policy: Option<String>,
     #[builder(default)]
     pub repositories: Vec<ConvoyRepositorySpec>,
@@ -4298,8 +4301,9 @@ mod admission_tests {
         let alternatives = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
         let escalation = tc.draw(gs::booleans());
         let decision = PlacementDecision {
+            provider_instance: None,
             provider_workspace_root: None,
-            policy_name: format!("policy-{identity}"),
+            kind: format!("policy-{identity}"),
             target_host: PlacementTargetHost {
                 reference: CanonicalHostId::resolved(format!("host-{identity}")),
                 display_name: format!("Host {identity}"),

@@ -236,7 +236,6 @@ pub(super) async fn ensure_default_policies(
                     })
                 })
                 .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                    legacy_image_baseline_ref: None,
                     memory_policy: Default::default(),
                     host_ref: profile.host_id.clone(),
                     image: Some(DEFAULT_DOCKER_IMAGE.into()),

@@ -243,12 +243,47 @@ fn cloud_stored_shapes_remain_decodable() {
     assert_eq!(serde_json::to_value(status).unwrap()["provider_descriptor"], document["status"]["provider_descriptor"]);
     let placement: Value = serde_json::from_str(include_str!("../fixtures/cloud-placement-decision.json")).unwrap();
     let decision: flotilla_protocol::PlacementDecision = serde_json::from_value(placement.clone()).unwrap();
-    assert_eq!(serde_json::to_value(decision).unwrap(), placement);
+    let mut written = placement.clone();
+    written["kind"] = written.as_object_mut().unwrap().remove("policy_name").unwrap();
+    assert_eq!(serde_json::to_value(decision).unwrap(), written);
     // Prior-generation input omits every new field and still decodes.
     let mut old = document["spec"].clone();
     old["cloud_sandbox"].as_object_mut().unwrap().remove("probe_needs");
     let old: flotilla_resources::EnvironmentSpec = serde_json::from_value(old).unwrap();
     assert!(old.cloud_sandbox.unwrap().probe_needs.is_empty());
+}
+
+#[test]
+fn previous_generation_placement_names_decode_as_kind_names() {
+    let spec: flotilla_resources::VesselSpec =
+        serde_json::from_value(serde_json::json!({"convoy_ref": "c", "vessel_name": "work", "placement_policy_ref": "docker-on-kiwi"}))
+            .unwrap();
+    assert_eq!(spec.fulfilment_kind_ref, "docker-on-kiwi");
+    let status: flotilla_resources::VesselStatus = serde_json::from_value(
+        serde_json::json!({"phase": "Provisioning", "observed_policy_ref": "docker-on-kiwi", "observed_policy_version": "7"}),
+    )
+    .unwrap();
+    assert_eq!((status.observed_kind_ref.as_deref(), status.observed_kind_version.as_deref()), (Some("docker-on-kiwi"), Some("7")));
+    let host = serde_json::json!({"ref": "kiwi-id", "display_name": "kiwi"});
+    let pin: flotilla_resources::VesselPlacementPin = serde_json::from_value(serde_json::json!({
+        "policy_ref": "docker-on-kiwi",
+        "decision": {
+            "policy_name": "docker-on-kiwi",
+            "target_host": host,
+            "refused_candidates": [{"policy_name": "host-direct-kiwi", "target_host": host, "reason": "r"}],
+            "viable_not_selected": [{"policy_name": "docker-on-feta", "target_host": host, "reason": "v"}],
+        },
+    }))
+    .unwrap();
+    assert_eq!(pin.kind_ref, "docker-on-kiwi");
+    assert_eq!(pin.decision.kind, "docker-on-kiwi");
+    assert_eq!(pin.decision.refused_candidates[0].kind, "host-direct-kiwi");
+    assert_eq!(pin.decision.viable_not_selected[0].kind, "docker-on-feta");
+    assert_eq!(pin.decision.provider_instance, None);
+    let written = serde_json::to_string(&(&spec, &status, &pin)).unwrap();
+    for old in ["placement_policy_ref", "observed_policy_", "policy_ref", "policy_name"] {
+        assert!(!written.contains(old), "{old} in {written}");
+    }
 }
 
 // #3777 review 2 / ADR 0047: previous-generation cloud control entries retain

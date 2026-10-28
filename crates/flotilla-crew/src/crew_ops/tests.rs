@@ -281,7 +281,7 @@ async fn resume_reads_environment_lifecycle_without_a_copy() {
             VesselSpec {
                 convoy_ref: "crew".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "policy".into(),
+                fulfilment_kind_ref: "policy".into(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
             VesselStatus { environment_ref: Some("env".into()), ..Default::default() },
