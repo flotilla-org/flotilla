@@ -8,7 +8,7 @@ use clap::{error::ErrorKind, CommandFactory, FromArgMatches};
 use flotilla_cli::cli::args::{Cli, SubCommand};
 
 fn check_file(path: &Path) -> usize {
-    let source = fs::read_to_string(path).expect("read stock skill reference");
+    let source = fs::read_to_string(path).unwrap_or_else(|error| panic!("read stock skill file {}: {error}", path.display()));
     let mut count = 0;
     for (index, line) in source.lines().enumerate() {
         let line = line.trim();
@@ -46,6 +46,9 @@ fn stock_skill_commands_match_clap_tree() {
     let mut entrypoint_examples = BTreeMap::new();
     for entry in fs::read_dir(&skills).expect("stock skills directory") {
         let skill = entry.expect("skill directory").path();
+        if !skill.is_dir() {
+            continue;
+        }
         let name = skill.file_name().expect("skill name").to_string_lossy().into_owned();
         entrypoint_examples.insert(name, check_file(&skill.join("SKILL.md")));
         let Ok(references) = fs::read_dir(skill.join("references")) else { continue };
