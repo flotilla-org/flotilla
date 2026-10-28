@@ -218,7 +218,8 @@ async fn exhausted_launch_recovers_after_restart_without_copy_or_provider_work()
     let before = home.get("terminal-a#1").expect("durable attempt").version();
     let controller = fixture.controller_with(home.clone());
     assert!(fixture.tick(&controller, false).await.patch.is_none());
-    assert_eq!(home.get("terminal-a#1").expect("gave up").version().0, before.0 + 1, "GiveUp only, no repeated Attempted");
+    // One write takes two of the home's sequence numbers: its change, then its entry.
+    assert_eq!(home.get("terminal-a#1").expect("gave up").version().0, before.0 + 2, "GiveUp only, no repeated Attempted");
     assert_eq!(fixture.reading().reading, LifecycleReading::GaveUp { cause: "launch refused".into() });
     fixture.tick(&controller, false).await;
     assert_eq!(fixture.runtime.starts.load(Ordering::SeqCst), 0);
