@@ -131,7 +131,7 @@ fn every_storable_artifact_imports_and_reads_back(tc: hegel::TestCase) {
     let summary = (0..entries).map(|index| (format!("key-{index}"), summary_value(&tc))).collect();
     let mut old = spec(summary);
     old.convoy = tc.draw(gs::sampled_from(vec![String::new(), "demo".to_owned()]));
-    old.size = tc.draw(gs::integers::<u64>());
+    old.size = tc.draw(gs::integers::<u64>().min_value(0).max_value(i64::MAX as u64));
     old.recorded_at = tc.draw(gs::booleans()).then(|| time(&tc));
     old.expires_at = time(&tc);
     old.pinned = tc.draw(gs::booleans());
@@ -156,7 +156,8 @@ fn every_storable_artifact_imports_and_reads_back(tc: hegel::TestCase) {
 }
 
 // Behaviour (ADR 0047): the corpus's artifacts import; a deleted copy drops; a copy whose summary
-// holds a value no put accepts is refused, named; one name a home holds in two namespaces is
+// holds a value no put accepts (an array, a null) is refused, named, as is a size above the stored
+// integer range (#3320: stored integers never wrap); one name a home holds in two namespaces is
 // refused in both (#3212: no namespaces), unless one of them is deleted, while the same name at
 // two homes imports at each.
 #[test]
@@ -166,6 +167,10 @@ fn copies_the_engine_cannot_hold_are_dropped_or_refused() {
     let mut deleted = object("deleted", spec(BTreeMap::new()));
     deleted.metadata.deletion_timestamp = Some(Utc::now());
     let nested = object("nested", spec(BTreeMap::from([("list".to_owned(), serde_json::json!([1]))])));
+    let null = object("null", spec(BTreeMap::from([("gone".to_owned(), serde_json::Value::Null)])));
+    let mut huge = spec(BTreeMap::new());
+    huge.size = i64::MAX as u64 + 1;
+    let huge = object("huge", huge);
     let shared = object("shared", spec(BTreeMap::new()));
     let gone = object("gone", spec(BTreeMap::new()));
     let mut gone_elsewhere = gone.clone();
@@ -175,6 +180,8 @@ fn copies_the_engine_cannot_hold_are_dropped_or_refused() {
     copies.extend([
         copy(deleted, "flotilla", "alpha"),
         copy(nested, "flotilla", "alpha"),
+        copy(null, "flotilla", "alpha"),
+        copy(huge, "flotilla", "alpha"),
         copy(shared.clone(), "flotilla", "alpha"),
         copy(shared.clone(), "flotilla", "beta"),
         copy(shared.clone(), "flotilla", "gamma"),
@@ -187,5 +194,5 @@ fn copies_the_engine_cannot_hold_are_dropped_or_refused() {
     assert_eq!(report.imported.values().sum::<usize>(), imported, "{report:?}");
     assert_eq!(report.dropped.values().sum::<usize>(), 2, "{report:?}");
     let refused: Vec<_> = report.refused.iter().map(|refusal| (refusal.record.as_str(), refusal.reason.contains("`gamma`"))).collect();
-    assert_eq!(refused, [("nested", false), ("shared", true), ("shared", true)], "{report:?}");
+    assert_eq!(refused, [("nested", false), ("null", false), ("huge", false), ("shared", true), ("shared", true)], "{report:?}");
 }

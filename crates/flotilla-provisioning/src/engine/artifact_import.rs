@@ -5,6 +5,7 @@
 //! | Deleted | dropped |
 //! | `spec` | the record's columns, times to the microsecond; the summary as one document |
 //! | A summary value that is null, an array or an object | refused: a put accepts only strings, numbers and booleans |
+//! | A `size` above `i64::MAX` | refused: stored integers are signed and never wrap |
 //! | `status.ledger_comment_creations` | dropped: nothing asks for a reservation any more |
 //! | Owner references, labels and annotations | dropped (#3212) |
 //!
