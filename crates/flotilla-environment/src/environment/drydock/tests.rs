@@ -507,7 +507,7 @@ async fn guest_sockets_are_agent_forwards_through_either_link() {
         };
         assert_eq!(report, expected);
         let agent = handle.agent();
-        agent.forward_controller_socket(&guest_socket, &host.root.join("daemon.sock")).await.unwrap();
+        agent.forward_controller_socket(&guest_socket, None, &host.root.join("daemon.sock")).await.unwrap();
         let tool = EnvironmentTool::new("flotilla", host.root.join("vessel/opt/flotilla")).with_asset(EnvironmentToolAsset::new(
             host.root.join("bin/tar"),
             host.root.join("vessel/opt/flotilla/tool"),
@@ -528,7 +528,7 @@ async fn guest_sockets_are_agent_forwards_through_either_link() {
         // A guest path whose parent is a file cannot be listened on.
         std::fs::write(host.root.join("hosts-file"), b"").unwrap();
         let (unservable, daemon_path) = (host.root.join("hosts-file/daemon.sock"), host.root.join("daemon.sock"));
-        let refused = agent.forward_controller_socket(&unservable, &daemon_path);
+        let refused = agent.forward_controller_socket(&unservable, None, &daemon_path);
         let message = tokio::time::timeout(Duration::from_secs(5), refused)
             .await
             .expect("a refused forward never hangs")

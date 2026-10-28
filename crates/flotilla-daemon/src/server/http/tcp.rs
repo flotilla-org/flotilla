@@ -109,15 +109,18 @@ pub(in crate::server) struct TcpListener {
     server: TcpServer,
     policy: TcpPolicy<CallerAuth>,
     origin: String,
-    hook_key: HookKey,
     /// Whether the configured port is fixed (non-zero), so the origin survives a restart.
     fixed_port: bool,
 }
 
 impl TcpListener {
-    pub(in crate::server) async fn bind(listen: &ListenAddress, state_dir: &Path, logins: Arc<LoginStore>) -> Result<Self, String> {
-        let directory = state_dir.join(TOKEN_DIRECTORY);
-        private_directory(&directory).map_err(|error| format!("prepare HTTP token directory {}: {error}", directory.display()))?;
+    pub(in crate::server) async fn bind(
+        listen: &ListenAddress,
+        state_dir: &Path,
+        logins: Arc<LoginStore>,
+        hook_key: HookKey,
+    ) -> Result<Self, String> {
+        let directory = prepare_token_directory(state_dir)?;
         let token_path = directory.join(TOKEN_FILE);
         let server = TcpServer::bind(listen.bind_address(), &token_path)
             .await
@@ -126,15 +129,8 @@ impl TcpListener {
         let token = std::fs::read(&token_path).map_err(|error| format!("read HTTP token {}: {error}", token_path.display()))?;
         // rigging writes the bare 64-hex token; trailing whitespace is never part of it.
         let token: [u8; 32] = Sha256::digest(token.trim_ascii_end()).into();
-        let hook_key = HookKey::load_or_create(&directory)?;
-        let hooks = hook_key.clone();
-        let policy = TcpPolicy::new(listen.allowed_hosts(bound.port()), move |request| authenticate(request, &token, &hooks, &logins));
-        Ok(Self { server, policy, origin: listen.origin(bound.port()), hook_key, fixed_port: listen.bind_address().port() != 0 })
-    }
-
-    /// The key this listener verifies hook tokens with.
-    pub(in crate::server) fn hook_key(&self) -> &HookKey {
-        &self.hook_key
+        let policy = TcpPolicy::new(listen.allowed_hosts(bound.port()), move |request| authenticate(request, &token, &hook_key, &logins));
+        Ok(Self { server, policy, origin: listen.origin(bound.port()), fixed_port: listen.bind_address().port() != 0 })
     }
 
     /// Whether the listen address was configured with a fixed port, rather than port 0,
@@ -196,6 +192,13 @@ fn authenticate(request: &Request, token: &[u8; 32], hooks: &HookKey, logins: &L
         return admit(CallerAuth::Anonymous, false);
     }
     None
+}
+
+/// The private directory beneath `state_dir` holding the listener's token and the hook key.
+pub(in crate::server) fn prepare_token_directory(state_dir: &Path) -> Result<std::path::PathBuf, String> {
+    let directory = state_dir.join(TOKEN_DIRECTORY);
+    private_directory(&directory).map_err(|error| format!("prepare HTTP token directory {}: {error}", directory.display()))?;
+    Ok(directory)
 }
 
 /// Create `directory` owner-only, or narrow an existing one to owner-only. A symlink or

@@ -487,12 +487,19 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     materialized_brief.content.push_str("\n\n");
                     materialized_brief.content.push_str(&card);
                 }
-                // Host-direct Claude Code delivers hooks over HTTP while flotillad listens on
-                // loopback TCP (#3247); vessel sessions keep command hooks until their
-                // loopback forwarder (#3485). The token binds the hooks to this terminal.
-                if spec.env_ref == self.state.host_direct_environment_name && requirement.adapter == "claude-code" {
-                    let hooks = if let Some(endpoint) = self.state.hook_endpoint.as_ref() {
-                        endpoint.claude_code_launch(&self.state.daemon.resource_backend(), &context.namespace, name).await
+                // Claude Code delivers hooks over HTTP: host-direct while flotillad listens on
+                // loopback TCP, and in a Docker vessel through its agent's forward. SSH host
+                // and cloud vessels keep command hooks. The token binds the hooks to this terminal.
+                if requirement.adapter == "claude-code" {
+                    let hooks = if spec.env_ref == self.state.host_direct_environment_name {
+                        match self.state.hook_endpoint.as_ref() {
+                            Some(endpoint) => {
+                                endpoint.claude_code_launch(&self.state.daemon.resource_backend(), &context.namespace, name).await
+                            }
+                            None => None,
+                        }
+                    } else if vessel.is_none() {
+                        super::docker::docker_vessel_hooks(&self.state, &spec.env_ref, &context.namespace, name).await
                     } else {
                         None
                     };

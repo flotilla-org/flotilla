@@ -505,6 +505,7 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_pushed_into(
             destroyed: Arc::new(AtomicBool::new(false)),
         },
         cache: Arc::clone(&cache),
+        forwards: Arc::default(),
     });
     daemon
         .register_provisioned_environment(env_id.clone(), Arc::clone(&handle), bag.clone(), Some(Arc::new(contained_registry)))

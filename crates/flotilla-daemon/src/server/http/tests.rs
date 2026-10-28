@@ -416,7 +416,8 @@ impl Listening {
             .await
             .expect("loopback listen address");
         let daemon = Incarnation::with_origin(ListenerOrigin::default());
-        let listener = TcpListener::bind(&listen, state_dir, Arc::clone(&daemon.logins)).await.expect("bind loopback listener");
+        let key = super::HookEndpoint::load(state_dir).expect("hook key").key().cloned().expect("loaded key");
+        let listener = TcpListener::bind(&listen, state_dir, Arc::clone(&daemon.logins), key).await.expect("bind loopback listener");
         daemon.origin.set(listener.origin().to_owned());
         let port = listener.local_addr().expect("bound address").port();
         let token = std::fs::read_to_string(state_dir.join(TOKEN_DIRECTORY).join(TOKEN_FILE)).expect("token file");
@@ -505,7 +506,8 @@ async fn token_directory_is_narrowed_and_never_followed() {
     let linked = tempfile::tempdir().expect("state dir");
     std::os::unix::fs::symlink(elsewhere.path(), linked.path().join(TOKEN_DIRECTORY)).expect("symlink");
     let listen = ListenAddress::resolve_with("127.0.0.1:0", |_, _| async { Ok(Vec::new()) }).await.expect("listen address");
-    let refused = TcpListener::bind(&listen, linked.path(), Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock)))).await;
+    let logins = Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock)));
+    let refused = TcpListener::bind(&listen, linked.path(), logins, super::hooks::HookKey::generate().expect("key")).await;
     assert!(refused.is_err_and(|error| error.contains("symlinks are refused")));
     assert_eq!(std::fs::metadata(elsewhere.path()).expect("target").permissions().mode() & 0o777, 0o755, "the target was not touched");
 }

@@ -10,27 +10,39 @@ pub(crate) fn directory_name(id: &EnvironmentId) -> String {
     digest[..16].iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// One socket's identity: an environment's own, or one of its vessels' on a
-/// host whose vessels share the environment (#3792). A vessel agent claims its
-/// host endpoint exclusively, so each vessel there needs a socket of its own;
-/// every one serves its environment.
+/// One socket's identity: an environment's own, one of its vessels' on a host
+/// whose vessels share the environment (#3792), or the host end of a Docker
+/// vessel's agent forward. A vessel agent claims its host endpoint
+/// exclusively, so each forward needs a socket of its own; every one serves
+/// its environment.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SocketKey {
     environment: EnvironmentId,
-    vessel: Option<String>,
+    scope: SocketScope,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum SocketScope {
+    Environment,
+    Vessel(String),
+    AgentForward,
 }
 
 impl SocketKey {
     fn directory_name(&self) -> String {
-        match &self.vessel {
-            None => directory_name(&self.environment),
-            Some(vessel) => {
+        match &self.scope {
+            SocketScope::Environment => directory_name(&self.environment),
+            SocketScope::Vessel(vessel) => {
                 let mut digest = Sha256::new();
                 for part in [self.environment.as_str(), vessel] {
                     digest.update((part.len() as u64).to_le_bytes());
                     digest.update(part.as_bytes());
                 }
                 digest.finalize()[..16].iter().map(|byte| format!("{byte:02x}")).collect()
+            }
+            SocketScope::AgentForward => {
+                let digest = Sha256::new().chain_update(b"agent-forward\0").chain_update(self.environment.as_str().as_bytes()).finalize();
+                digest[..16].iter().map(|byte| format!("{byte:02x}")).collect()
             }
         }
     }
@@ -136,7 +148,7 @@ impl EnvironmentSocketRegistry {
         state_dir: &DaemonHostPath,
         spawn_accept_loop: impl FnOnce(UnixListener, EnvironmentId) -> JoinHandle<()>,
     ) -> Result<DaemonHostPath, String> {
-        self.add_keyed(SocketKey { environment: id, vessel: None }, state_dir, spawn_accept_loop).await
+        self.add_keyed(SocketKey { environment: id, scope: SocketScope::Environment }, state_dir, spawn_accept_loop).await
     }
 
     async fn add_keyed(
@@ -172,7 +184,7 @@ impl EnvironmentSocketRegistry {
         tokio::fs::set_permissions(socket_path.as_path(), std::fs::Permissions::from_mode(0o600))
             .await
             .map_err(|error| format!("protect environment socket: {error}"))?;
-        info!(id = %key.environment, vessel = ?key.vessel, path = %socket_path, "environment socket listening");
+        info!(id = %key.environment, scope = ?key.scope, path = %socket_path, "environment socket listening");
 
         let handle = spawn_accept_loop(listener, key.environment.clone());
         self.sockets.insert(key, (Some(handle), socket_path.clone()));
@@ -182,11 +194,12 @@ impl EnvironmentSocketRegistry {
 
     /// Remove an environment socket, and its vessels' sockets, and clean up.
     pub async fn remove(&mut self, id: &EnvironmentId) -> Result<(), String> {
-        let vessels = self.sockets.keys().filter(|key| key.environment == *id && key.vessel.is_some()).cloned().collect::<Vec<_>>();
-        for key in vessels {
+        let scoped =
+            self.sockets.keys().filter(|key| key.environment == *id && key.scope != SocketScope::Environment).cloned().collect::<Vec<_>>();
+        for key in scoped {
             self.remove_keyed(&key).await?;
         }
-        self.remove_keyed(&SocketKey { environment: id.clone(), vessel: None }).await
+        self.remove_keyed(&SocketKey { environment: id.clone(), scope: SocketScope::Environment }).await
     }
 
     async fn remove_keyed(&mut self, key: &SocketKey) -> Result<(), String> {
@@ -210,7 +223,7 @@ impl EnvironmentSocketRegistry {
                 }
             }
             self.sockets.remove(key);
-            info!(%id, vessel = ?key.vessel, "environment socket removed");
+            info!(%id, scope = ?key.scope, "environment socket removed");
         }
         Ok(())
     }
@@ -227,7 +240,7 @@ impl EnvironmentSocketRegistry {
             if let Some(parent) = path.as_path().parent() {
                 let _ = tokio::fs::remove_dir(parent).await;
             }
-            info!(id = %key.environment, vessel = ?key.vessel, "environment socket removed");
+            info!(id = %key.environment, scope = ?key.scope, "environment socket removed");
         }
     }
 }
@@ -268,20 +281,26 @@ impl EnvironmentSocketService {
     }
 
     pub(crate) async fn prepare(&self, id: EnvironmentId) -> Result<DaemonHostPath, String> {
-        self.prepare_reached(SocketKey { environment: id, vessel: None }, SocketReach::Mounted).await
+        self.prepare_reached(SocketKey { environment: id, scope: SocketScope::Environment }, SocketReach::Mounted).await
+    }
+
+    /// The socket a Docker vessel's agent forwards its guest listeners to, beside
+    /// the mounted one. Its kernel peer is flotillad's own agent client.
+    pub(crate) async fn prepare_agent_forward(&self, id: EnvironmentId) -> Result<DaemonHostPath, String> {
+        self.prepare_reached(SocketKey { environment: id, scope: SocketScope::AgentForward }, SocketReach::Forwarded).await
     }
 
     /// The socket a vessel's agent forwards its crews to, where the vessel is
     /// the whole environment (#3981).
     pub(crate) async fn prepare_forwarded(&self, id: EnvironmentId) -> Result<DaemonHostPath, String> {
-        self.prepare_reached(SocketKey { environment: id, vessel: None }, SocketReach::Forwarded).await
+        self.prepare_reached(SocketKey { environment: id, scope: SocketScope::Environment }, SocketReach::Forwarded).await
     }
 
     /// The socket one vessel's agent forwards its crews to, on an SSH
     /// host where vessels share their environment (#3792). It serves that
     /// environment.
     pub(crate) async fn prepare_vessel_forwarded(&self, id: EnvironmentId, vessel: &str) -> Result<DaemonHostPath, String> {
-        self.prepare_reached(SocketKey { environment: id, vessel: Some(vessel.to_string()) }, SocketReach::Forwarded).await
+        self.prepare_reached(SocketKey { environment: id, scope: SocketScope::Vessel(vessel.to_string()) }, SocketReach::Forwarded).await
     }
 
     async fn prepare_reached(&self, key: SocketKey, reach: SocketReach) -> Result<DaemonHostPath, String> {
@@ -295,7 +314,11 @@ impl EnvironmentSocketService {
     }
 
     pub(crate) async fn remove_vessel(&self, id: &EnvironmentId, vessel: &str) -> Result<(), String> {
-        self.registry.lock().await.remove_keyed(&SocketKey { environment: id.clone(), vessel: Some(vessel.to_string()) }).await
+        self.registry
+            .lock()
+            .await
+            .remove_keyed(&SocketKey { environment: id.clone(), scope: SocketScope::Vessel(vessel.to_string()) })
+            .await
     }
 }
 
@@ -438,6 +461,36 @@ mod tests {
         assert!(!parent.exists());
         restarted.remove(&id).await.expect("duplicate teardown");
     }
+    // A Docker vessel's agent forward gets its own socket, served as forwarded, beside the
+    // mounted one; teardown of the environment retires both.
+    #[tokio::test]
+    async fn agent_forward_socket_is_its_own_and_retires_with_its_environment() {
+        let directory = flotilla_test_support::TestSocketDir::new();
+        let root = DaemonHostPath::new(directory.socket_path("env"));
+        let _cleanup = SocketAliasGuard::new(&root);
+        let reaches = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&reaches);
+        let service = EnvironmentSocketService::new(
+            std::sync::Arc::new(tokio::sync::Mutex::new(EnvironmentSocketRegistry::new())),
+            root,
+            move |listener, environment, reach| {
+                recorded.lock().expect("reaches").push((environment, reach));
+                tokio::spawn(async move {
+                    let _listener = listener;
+                    std::future::pending::<()>().await
+                })
+            },
+        );
+        let id = EnvironmentId::new("env-docker");
+        let mounted = service.prepare(id.clone()).await.expect("mounted socket");
+        let forwarded = service.prepare_agent_forward(id.clone()).await.expect("forward socket");
+        assert_ne!(mounted.as_path().parent(), forwarded.as_path().parent(), "the forward never shares the mounted directory");
+        assert_eq!(service.prepare_agent_forward(id.clone()).await.expect("idempotent"), forwarded);
+        assert_eq!(*reaches.lock().expect("reaches"), [(id.clone(), SocketReach::Mounted), (id.clone(), SocketReach::Forwarded)]);
+        service.remove(&id).await.expect("teardown");
+        assert!(!mounted.as_path().exists() && !forwarded.as_path().exists());
+    }
+
     // Unlink failure cannot leave a dead listener masquerading as an idempotent
     // registration. Once the filesystem obstruction is removed, add must rebind.
     #[tokio::test]

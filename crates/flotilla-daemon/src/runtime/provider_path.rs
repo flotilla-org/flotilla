@@ -117,7 +117,7 @@ async fn deliver_vessel_layer(
             apply(&mut environment, update, &guest.to_string_lossy(), agent.as_ref()).await?;
         }
     }
-    agent.forward_controller_socket(&guest, controller.as_path()).await.map_err(|error| format!("forward crew socket: {error}"))?;
+    agent.forward_controller_socket(&guest, None, controller.as_path()).await.map_err(|error| format!("forward crew socket: {error}"))?;
     agent.push_tools(&tools).await.map_err(|error| format!("push vessel tools: {error}"))?;
     agent.extend_environment(environment).await.map_err(|error| format!("configure vessel environment: {error}"))
 }

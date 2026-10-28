@@ -29,12 +29,16 @@ use tower::ServiceExt;
 use super::{
     hooks::{HookKey, HOOK_KEY_FILE},
     tcp::{TOKEN_DIRECTORY, TOKEN_FILE},
-    CallerAuth, HookEndpoint, HttpRouter, ListenAddress, ListenerOrigin, LoginStore, TcpListener,
+    CallerAuth, HookEndpoint, HookLaunch, HttpRouter, ListenAddress, ListenerOrigin, LoginStore, TcpListener,
 };
 
 const NAMESPACE: &str = "flotilla";
 const CODER: &str = "terminal-work-coder";
 const REVIEWER: &str = "terminal-work-reviewer";
+const VESSEL: &str = "env-work";
+const VESSEL_CODER: &str = "terminal-vessel-coder";
+const OTHER_VESSEL: &str = "env-other";
+const OTHER_CODER: &str = "terminal-other-coder";
 
 fn terminal(session_name: &str) -> AgentHookTerminalRef {
     AgentHookTerminalRef { namespace: NAMESPACE.into(), session_name: session_name.into() }
@@ -50,6 +54,7 @@ struct Daemon {
     backend: ResourceBackend,
     agents: SharedAgentStateStore,
     logins: Arc<LoginStore>,
+    hooks: HookEndpoint,
     router: Router,
 }
 
@@ -62,16 +67,21 @@ impl Daemon {
         for session in [CODER, REVIEWER] {
             running_crew_terminal(&backend, session).await;
         }
+        for (session, environment) in [(VESSEL_CODER, VESSEL), (OTHER_CODER, OTHER_VESSEL)] {
+            running_crew_terminal_in(&backend, session, environment).await;
+        }
         let agents = flotilla_agent::shared_in_memory_agent_state_store();
         let logins = Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock)));
+        let hooks = HookEndpoint::with_key(HookKey::generate().expect("hook key"));
         let router = HttpRouter::builder()
             .backend(backend.clone())
             .agent_state_store(Arc::clone(&agents))
             .logins(Arc::clone(&logins))
             .tcp_origin(ListenerOrigin::default())
+            .hooks(hooks.clone())
             .build()
             .into_router();
-        Self { backend, agents, logins, router }
+        Self { backend, agents, logins, hooks, router }
     }
 
     async fn call(&self, caller: CallerAuth, request: Request<Body>) -> StatusCode {
@@ -97,12 +107,16 @@ impl Daemon {
 }
 
 async fn running_crew_terminal(backend: &ResourceBackend, session_name: &str) {
+    running_crew_terminal_in(backend, session_name, "host-direct").await;
+}
+
+async fn running_crew_terminal_in(backend: &ResourceBackend, session_name: &str, env_ref: &str) {
     let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
     let created = sessions
         .create(
             &InputMeta::builder().name(session_name.to_string()).build(),
             &TerminalSessionSpec {
-                env_ref: "host-direct".into(),
+                env_ref: env_ref.into(),
                 role: "coder".into(),
                 source: TerminalSessionSource::Agent {
                     selector: Selector { capability: "code".into(), adapter: None, model: None },
@@ -282,13 +296,29 @@ struct Listening {
     serving: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
+/// Claude Code as the runtime launches it in `session_name`: the settings overlay and
+/// launch environment `launch` gives that session.
+fn claude_code_launched(launch: HookLaunch, session_name: &str) -> ClaudeCode {
+    let environment = [
+        (flotilla_agent::CLAUDE_CODE_HOOK_URL_ENV.to_owned(), launch.base_url.clone()),
+        (CLAUDE_CODE_HOOK_TOKEN_ENV.to_owned(), launch.token),
+        ("FLOTILLA_NAMESPACE".to_owned(), NAMESPACE.to_owned()),
+        ("FLOTILLA_TERMINAL_SESSION".to_owned(), session_name.to_owned()),
+        ("CLAUDE_CODE_OAUTH_TOKEN".to_owned(), "never-sent".to_owned()),
+    ];
+    let launch_environment = environment.to_vec();
+    let settings = flotilla_agent::claude_code_hook_settings_over(ClaudeCodeHookTransport::from_environment(&launch_environment));
+    ClaudeCode { settings, environment: environment.into_iter().collect() }
+}
+
 impl Listening {
     async fn start(daemon: &Daemon, state_dir: &Path) -> Self {
         let listen = ListenAddress::resolve_with("127.0.0.1:0", |_, _| async { Ok(Vec::new()) }).await.expect("listen address");
-        let listener = TcpListener::bind(&listen, state_dir, Arc::clone(&daemon.logins)).await.expect("bind loopback listener");
+        let hooks = HookEndpoint::load(state_dir).expect("hook key");
+        let key = hooks.key().cloned().expect("loaded key");
+        let listener = TcpListener::bind(&listen, state_dir, Arc::clone(&daemon.logins), key).await.expect("bind loopback listener");
         let port = listener.local_addr().expect("bound address").port();
-        let hooks = HookEndpoint::default();
-        hooks.set(listener.origin(), listener.hook_key().clone());
+        hooks.set_origin(listener.origin());
         let file_token = std::fs::read_to_string(state_dir.join(TOKEN_DIRECTORY).join(TOKEN_FILE)).expect("token file");
         let serving = tokio::spawn(listener.serve(daemon.router.clone(), std::future::pending()));
         Self { port, hooks, file_token, serving }
@@ -299,16 +329,7 @@ impl Listening {
     async fn claude_code(&self, backend: &ResourceBackend, session_name: &str) -> ClaudeCode {
         let launch = self.hooks.claude_code_launch(backend, NAMESPACE, session_name).await.expect("listener is bound");
         assert_eq!(launch.base_url, format!("http://127.0.0.1:{}/v1/hooks/claude-code", self.port));
-        let environment = [
-            (flotilla_agent::CLAUDE_CODE_HOOK_URL_ENV.to_owned(), launch.base_url.clone()),
-            (CLAUDE_CODE_HOOK_TOKEN_ENV.to_owned(), launch.token),
-            ("FLOTILLA_NAMESPACE".to_owned(), NAMESPACE.to_owned()),
-            ("FLOTILLA_TERMINAL_SESSION".to_owned(), session_name.to_owned()),
-            ("CLAUDE_CODE_OAUTH_TOKEN".to_owned(), "never-sent".to_owned()),
-        ];
-        let launch_environment = environment.to_vec();
-        let settings = flotilla_agent::claude_code_hook_settings_over(ClaudeCodeHookTransport::from_environment(&launch_environment));
-        ClaudeCode { settings, environment: environment.into_iter().collect() }
+        claude_code_launched(launch, session_name)
     }
 
     async fn post(&self, path: &str, authorization: Option<&str>) -> u16 {
@@ -383,9 +404,9 @@ async fn host_direct_claude_code_hooks_update_their_terminal_over_http() {
 // Router level, with each caller injected as its listener would attach it: a hook token's
 // terminal decides which session the POST updates, whatever native session ID the body
 // names, so one crew cannot alias another's agent. The user's own callers post as
-// `flotilla hook` does outside a managed terminal. Environment sockets (until #3485),
-// browser sessions and anonymous callers are refused, and a hook token reaches nothing
-// but the hook routes.
+// `flotilla hook` does outside a managed terminal. An environment caller without a hook
+// token, browser sessions and anonymous callers are refused, and a hook token reaches
+// nothing but the hook routes.
 #[tokio::test]
 async fn hook_posts_reach_the_session_their_caller_authenticates() {
     let daemon = Daemon::new().await;
@@ -414,7 +435,7 @@ async fn hook_posts_reach_the_session_their_caller_authenticates() {
     let environment = CallerAuth::Environment { environment: EnvironmentId::new("env-work"), peer: None };
     let session = daemon.logins.mint_code().ok().and_then(|code| daemon.logins.redeem(&code.code).ok().flatten()).expect("session").0;
     for (caller, status) in [
-        (environment, StatusCode::FORBIDDEN),
+        (environment, StatusCode::UNAUTHORIZED),
         (CallerAuth::Session(session), StatusCode::FORBIDDEN),
         (CallerAuth::Anonymous, StatusCode::UNAUTHORIZED),
     ] {
@@ -487,11 +508,14 @@ async fn hook_tokens_are_bound_to_their_terminal_and_survive_restarts() {
     assert_eq!(restarted.hooks.claude_code_launch(&daemon.backend, NAMESPACE, CODER).await.expect("endpoint").token, token);
 }
 
-// Without a TCP listener there is no hook endpoint, and launches keep command hooks.
+// Without a TCP listener there is no host-direct hook endpoint, and those launches keep
+// command hooks.
 #[tokio::test]
-async fn no_listener_means_no_hook_endpoint() {
+async fn no_listener_means_no_host_direct_hook_endpoint() {
     let daemon = Daemon::new().await;
-    assert_eq!(HookEndpoint::default().claude_code_launch(&daemon.backend, NAMESPACE, CODER).await, None);
+    let state = tempfile::tempdir().expect("state dir");
+    let hooks = HookEndpoint::load(state.path()).expect("hook key");
+    assert_eq!(hooks.claude_code_launch(&daemon.backend, NAMESPACE, CODER).await, None);
 }
 
 // The hook URL is fixed into each crew's settings at launch, so only a listener with a
@@ -503,8 +527,9 @@ async fn only_a_fixed_listen_port_serves_hooks() {
     let state = tempfile::tempdir().expect("state directory");
     let logins = Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock)));
     let ephemeral = ListenAddress::resolve_with("127.0.0.1:0", |_, _| async { Ok(Vec::new()) }).await.expect("listen address");
-    let listener = TcpListener::bind(&ephemeral, state.path(), Arc::clone(&logins)).await.expect("bind port 0");
-    let hooks = HookEndpoint::default();
+    let hooks = HookEndpoint::load(state.path()).expect("hook key");
+    let key = hooks.key().cloned().expect("loaded key");
+    let listener = TcpListener::bind(&ephemeral, state.path(), Arc::clone(&logins), key.clone()).await.expect("bind port 0");
     hooks.publish(&listener);
     assert_eq!(hooks.claude_code_launch(&daemon.backend, NAMESPACE, CODER).await, None, "port 0 keeps command hooks");
     drop(listener);
@@ -515,13 +540,13 @@ async fn only_a_fixed_listen_port_serves_hooks() {
         let port = std::net::TcpListener::bind("127.0.0.1:0").and_then(|probe| probe.local_addr()).expect("free port").port();
         let fixed =
             ListenAddress::resolve_with(&format!("127.0.0.1:{port}"), |_, _| async { Ok(Vec::new()) }).await.expect("listen address");
-        match TcpListener::bind(&fixed, state.path(), Arc::clone(&logins)).await {
+        match TcpListener::bind(&fixed, state.path(), Arc::clone(&logins), key.clone()).await {
             Ok(listener) => break (port, listener),
             Err(_) if attempts < 5 => attempts += 1,
             Err(error) => panic!("bind fixed port: {error}"),
         }
     };
-    let hooks = HookEndpoint::default();
+    let hooks = HookEndpoint::load(state.path()).expect("hook key");
     hooks.publish(&listener);
     let launch = hooks.claude_code_launch(&daemon.backend, NAMESPACE, CODER).await.expect("a fixed port serves hooks");
     assert_eq!(launch.base_url, format!("http://127.0.0.1:{port}/v1/hooks/claude-code"));
@@ -622,4 +647,207 @@ async fn missing_terminal_keeps_command_hooks() {
     let daemon = Daemon::new().await;
     let endpoint = HookEndpoint::listening_at("http://127.0.0.1:7878");
     assert_eq!(endpoint.claude_code_launch(&daemon.backend, NAMESPACE, "missing").await, None);
+}
+
+fn hook_post_with(event: &str, input: &serde_json::Value, token: &str) -> Request<Body> {
+    let mut request = hook_post(event, input);
+    request.headers_mut().insert(header::AUTHORIZATION, format!("Bearer {token}").parse().expect("header value"));
+    request
+}
+
+/// Each request one vessel's environment socket served: the caller its accept loop
+/// attached, its headers and its path.
+type Seen = Arc<std::sync::Mutex<Vec<(Option<CallerAuth>, axum::http::HeaderMap, String)>>>;
+
+/// One Docker vessel's agent forward to flotillad: the vessel's forwarded environment
+/// socket, served the daemon's router as the accept loop serves it, and a real drydock
+/// agent and client, with only their link in memory, whose guest forward listens on
+/// loopback TCP and reaches that socket.
+struct ForwardedVessel {
+    tcp: SocketAddr,
+    seen: Seen,
+    _client: drydock_agent::Client,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    _directory: tempfile::TempDir,
+}
+
+impl ForwardedVessel {
+    async fn start(daemon: &Daemon, environment: &str) -> Self {
+        let directory = tempfile::Builder::new().prefix("fvf-").tempdir_in("/tmp").expect("socket directory");
+        let socket = directory.path().join("flotilla.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("environment socket");
+        let seen = Seen::default();
+        let recorded = Arc::clone(&seen);
+        let router =
+            daemon.router.clone().layer(axum::middleware::from_fn(move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let caller = match request.extensions().get::<rigging_http_serve::Caller<CallerAuth>>() {
+                    Some(rigging_http_serve::Caller::Custom(caller)) => Some(caller.clone()),
+                    _ => None,
+                };
+                recorded.lock().expect("seen").push((caller, request.headers().clone(), request.uri().path().to_owned()));
+                next.run(request)
+            }));
+        let bound = EnvironmentId::new(environment);
+        let serving = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let (router, environment) = (router.clone(), bound.clone());
+                tokio::spawn(async move {
+                    let first = stream.read_u8().await.expect("preface");
+                    assert!(super::is_http_preface(first), "the forward carries HTTP");
+                    let caller = move |_| CallerAuth::Environment { environment, peer: None };
+                    let _ = super::serve_sniffed(stream, first, router, caller, std::future::pending()).await;
+                });
+            }
+        });
+        let (host, guest) = tokio::io::duplex(64 * 1024);
+        let executable = directory.path().join("agent");
+        let agent = tokio::spawn(async move {
+            let transport = drydock_transport::Transport::yamux(Box::new(guest), false, Default::default()).await.expect("guest link");
+            let _ = drydock_agent::Agent::new(transport, "vessel agent".into(), executable).run().await;
+        });
+        let link = drydock_transport::Transport::yamux(Box::new(host), true, Default::default()).await.expect("host link");
+        let client = drydock_agent::Client::connect(link, "vessel agent").await.expect("agent hello");
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").and_then(|probe| probe.local_addr()).expect("free port");
+        let forward = drydock_agent::GuestForward { id: "flotillad".into(), unix: directory.path().join("guest.sock"), tcp: Some(tcp) };
+        client.put_guest_forward(forward, drydock_agent::Endpoint::Unix(socket)).await.expect("guest forward");
+        Self { tcp, seen, _client: client, tasks: vec![serving, agent], _directory: directory }
+    }
+
+    async fn launch(&self, daemon: &Daemon, session_name: &str) -> HookLaunch {
+        daemon
+            .hooks
+            .vessel_claude_code_launch(&format!("http://{}", self.tcp), &daemon.backend, NAMESPACE, session_name)
+            .await
+            .expect("launch")
+    }
+
+    fn seen(&self) -> Vec<(Option<CallerAuth>, axum::http::HeaderMap, String)> {
+        self.seen.lock().expect("seen").clone()
+    }
+}
+
+impl Drop for ForwardedVessel {
+    fn drop(&mut self) {
+        self.tasks.iter().for_each(tokio::task::JoinHandle::abort);
+    }
+}
+
+// Router level, with the caller injected as a vessel's environment socket attaches it: a
+// hook POST needs the hook token of a live terminal in that vessel. A missing, forged,
+// foreign-key, tampered, deleted, other vessel's or host-direct terminal's token is 401,
+// and the token reaches nothing beyond what the vessel already reaches.
+#[tokio::test]
+async fn vessel_hook_posts_need_a_live_token_for_a_terminal_in_that_vessel() {
+    let daemon = Daemon::new().await;
+    let vessel = CallerAuth::Environment { environment: EnvironmentId::new(VESSEL), peer: None };
+    let launch = |session_name: &'static str| {
+        let daemon = &daemon;
+        async move {
+            daemon
+                .hooks
+                .vessel_claude_code_launch("http://127.0.0.1:15080", &daemon.backend, NAMESPACE, session_name)
+                .await
+                .expect("launch")
+        }
+    };
+    let token = launch(VESSEL_CODER).await.token;
+    let stop = hook_input("Stop", "vessel-session", serde_json::json!({"stop_hook_active": false}));
+    assert_eq!(daemon.call(vessel.clone(), hook_post_with("stop", &stop, &token)).await, StatusCode::OK);
+    assert_eq!(daemon.attention(VESSEL_CODER).await, Some(TerminalAttentionState::Idle));
+    assert_eq!(daemon.agent(&attachable(VESSEL_CODER)).map(|(status, _)| status), Some(AgentStatus::Idle));
+
+    let generation =
+        daemon.backend.clone().using::<TerminalSession>(NAMESPACE).get(VESSEL_CODER).await.expect("session").metadata.creation_timestamp;
+    let foreign = HookKey::generate().expect("other key").mint(&terminal(VESSEL_CODER), &generation.to_rfc3339());
+    let mut parts: Vec<&str> = token.split('.').collect();
+    let other = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, OTHER_CODER);
+    parts[2] = &other;
+    let forged = parts.join(".");
+    for (label, request) in [
+        ("no token", hook_post("stop", &stop)),
+        ("forged terminal", hook_post_with("stop", &stop, &forged)),
+        ("another key", hook_post_with("stop", &stop, &foreign)),
+        ("tampered signature", hook_post_with("stop", &stop, &format!("{token}x"))),
+        ("another vessel's terminal", hook_post_with("stop", &stop, &launch(OTHER_CODER).await.token)),
+        ("a host-direct terminal", hook_post_with("stop", &stop, &launch(CODER).await.token)),
+    ] {
+        assert_eq!(daemon.call(vessel.clone(), request).await, StatusCode::UNAUTHORIZED, "{label}");
+    }
+    assert_eq!(daemon.attention(OTHER_CODER).await, None);
+    assert_eq!(daemon.attention(CODER).await, None);
+
+    let resources = Request::get("/apis/flotilla.work/v1/namespaces/flotilla/convoys")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request");
+    assert_eq!(daemon.call(vessel.clone(), resources).await, StatusCode::FORBIDDEN);
+
+    daemon.backend.clone().using::<TerminalSession>(NAMESPACE).delete(VESSEL_CODER).await.expect("delete");
+    assert_eq!(daemon.call(vessel, hook_post_with("stop", &stop, &token)).await, StatusCode::UNAUTHORIZED, "deleted terminal");
+}
+
+// A Claude Code crew in a Docker vessel posts its hooks to the agent's loopback forward,
+// and the stream reaches that vessel's environment socket with every header unchanged:
+// its terminal's state updates as over host-direct HTTP. A command request crosses the
+// same forward unchanged as that vessel. The same settings aimed at another vessel's
+// forward arrive as that vessel and are refused.
+#[tokio::test]
+async fn vessel_hooks_and_commands_cross_the_agent_forward_unchanged() {
+    let daemon = Daemon::new().await;
+    let work = ForwardedVessel::start(&daemon, VESSEL).await;
+    let other = ForwardedVessel::start(&daemon, OTHER_VESSEL).await;
+    let launch = work.launch(&daemon, VESSEL_CODER).await;
+    assert_eq!(launch.base_url, format!("http://{}/v1/hooks/claude-code", work.tcp));
+    let token = launch.token.clone();
+    let claude = claude_code_launched(launch, VESSEL_CODER);
+
+    let start = claude.fire("SessionStart", "startup", &hook_input("SessionStart", "v-1", serde_json::json!({"source": "startup"}))).await;
+    assert_eq!(start.commands, ["flotilla hook claude-code session-start"], "SessionStart stays a command in the cut-down CLI");
+    let prompt = hook_input("UserPromptSubmit", "v-1", serde_json::json!({"prompt": "fix the bug"}));
+    assert_eq!(claude.fire("UserPromptSubmit", "", &prompt).await.http, [HookOutcome::Succeeded]);
+    assert_eq!(daemon.attention(VESSEL_CODER).await, Some(TerminalAttentionState::Working));
+    let stop = hook_input("Stop", "v-1", serde_json::json!({"stop_hook_active": false}));
+    assert_eq!(claude.fire("Stop", "", &stop).await.http, [HookOutcome::Succeeded]);
+    assert_eq!(daemon.attention(VESSEL_CODER).await, Some(TerminalAttentionState::Idle));
+    let (caller, headers, path) = work.seen().pop().expect("the hook reached the vessel's socket");
+    assert_eq!(caller, Some(CallerAuth::Environment { environment: EnvironmentId::new(VESSEL), peer: None }));
+    assert_eq!(path, "/v1/hooks/claude-code/stop");
+    assert_eq!(headers.get(header::AUTHORIZATION).expect("authorization"), &format!("Bearer {token}"));
+    assert_eq!(headers.get(header::HOST).expect("host"), &work.tcp.to_string());
+
+    let mut command = tokio::net::TcpStream::connect(work.tcp).await.expect("connect");
+    let request = format!(
+        "GET /v1/status HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer opaque\r\nX-Flotilla-Probe: kept\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+        work.tcp
+    );
+    command.write_all(request.as_bytes()).await.expect("request");
+    let mut response = Vec::new();
+    command.read_to_end(&mut response).await.expect("response");
+    assert!(response.starts_with(b"HTTP/1.1 "), "the router answered through the forward");
+    let (caller, headers, path) = work.seen().pop().expect("the command reached the vessel's socket");
+    assert_eq!(
+        (caller, path.as_str()),
+        (Some(CallerAuth::Environment { environment: EnvironmentId::new(VESSEL), peer: None }), "/v1/status")
+    );
+    let forwarded: Vec<(String, String)> =
+        headers.iter().map(|(name, value)| (name.as_str().to_owned(), value.to_str().expect("ASCII").to_owned())).collect();
+    let sent = [
+        ("host", work.tcp.to_string()),
+        ("authorization", "Bearer opaque".into()),
+        ("x-flotilla-probe", "kept".into()),
+        ("accept", "application/json".into()),
+        ("connection", "close".into()),
+    ];
+    assert_eq!(forwarded, sent.map(|(name, value)| (name.to_owned(), value)));
+
+    let misdirected = HookLaunch { base_url: format!("http://{}/v1/hooks/claude-code", other.tcp), token };
+    let misdirected = claude_code_launched(misdirected, VESSEL_CODER);
+    let outcomes = misdirected.fire("Stop", "", &stop).await.http;
+    let [HookOutcome::NonBlockingError(refused)] = outcomes.as_slice() else {
+        panic!("another vessel's forward refuses this vessel's token: {outcomes:?}");
+    };
+    assert!(refused.starts_with("401"), "{refused}");
+    let (caller, _, _) = other.seen().pop().expect("the hook reached the other vessel's socket");
+    assert_eq!(caller, Some(CallerAuth::Environment { environment: EnvironmentId::new(OTHER_VESSEL), peer: None }));
+    assert_eq!(daemon.attention(OTHER_CODER).await, None);
 }

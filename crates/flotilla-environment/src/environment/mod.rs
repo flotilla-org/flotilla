@@ -26,6 +26,7 @@ mod tests;
 
 use std::{
     collections::HashMap,
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -143,8 +144,9 @@ pub struct EnvironmentToolAsset {
 }
 
 impl EnvironmentToolAsset {
-    /// Host endpoints remain vessel-specific mounts until the daemon-forward
-    /// contract lands (#3485). Writable shared material is not a pushed file.
+    /// Host endpoints are vessel-specific mounts; an agent forward serves only
+    /// what a mount cannot, such as loopback TCP. Writable shared material is not
+    /// a pushed file.
     pub fn requires_mount(&self) -> bool {
         self.kind == EnvironmentToolAssetKind::UnixSocket
             || self.access == EnvironmentToolAssetAccess::SharedWritable
@@ -190,6 +192,13 @@ pub const CONTAINED_DAEMON_REQUIRED_ENV: &str = "FLOTILLA_CONTAINED_HOST_DAEMON"
 
 /// Shared name for the host-daemon socket delivered to contained tools.
 pub const DAEMON_SOCKET_ENV: &str = "FLOTILLA_DAEMON_SOCKET";
+
+/// The guest socket of a Docker vessel's agent forward to flotillad, beside its
+/// loopback listener; the mounted socket stays the CLI's.
+pub const CONTAINED_DAEMON_FORWARD_SOCKET: &str = "/run/drydock/flotillad.sock";
+/// The loopback address a Docker vessel's agent serves flotillad on, for clients
+/// that speak only TCP, such as Claude Code's HTTP hooks.
+pub const CONTAINED_DAEMON_FORWARD_TCP: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 15080);
 
 pub fn contained_daemon_socket_path(host_socket_path: &Path) -> PathBuf {
     let file_name = host_socket_path.file_name().expect("daemon socket path must name a socket file");
@@ -284,10 +293,11 @@ pub trait VesselAgent: Send + Sync {
     async fn ready(&self) -> Result<(), String>;
     async fn forward_socket(&self, guest: &Path) -> Result<PathBuf, String>;
     async fn push_tools(&self, tools: &[EnvironmentTool]) -> Result<(), String>;
-    /// Serve the socket `guest` in the vessel, carrying each connection to the
-    /// controller's Unix socket `controller`: the reverse of [`Self::forward_socket`].
-    async fn forward_controller_socket(&self, guest: &Path, controller: &Path) -> Result<(), String> {
-        let _ = controller;
+    /// Serve the socket `guest` in the vessel, and loopback `tcp` there when given,
+    /// carrying each connection to the controller's Unix socket `controller`: the
+    /// reverse of [`Self::forward_socket`].
+    async fn forward_controller_socket(&self, guest: &Path, tcp: Option<SocketAddr>, controller: &Path) -> Result<(), String> {
+        let _ = (tcp, controller);
         Err(format!("this vessel agent cannot serve {} from the controller", guest.display()))
     }
     /// Add `environment` to what every command in the vessel runs with, over

@@ -910,6 +910,35 @@ async fn guest_forward_reaches_host_endpoint_across_reconnects(agent: Arc<dyn Te
     assert!(runner.run("true", &[], Path::new("/"), &ChannelLabel::Default).await.is_err());
 }
 
+over_each_transport!(controller_forward_carries_guest_tcp_bytes_unchanged);
+async fn controller_forward_carries_guest_tcp_bytes_unchanged(agent: Arc<dyn TestAgent>) {
+    let directory = tempfile::Builder::new().prefix("fcf-").tempdir_in("/tmp").unwrap();
+    let runner = runner_for(&agent, directory.path());
+    let endpoint = directory.path().join("daemon.sock");
+    let listener = UnixListener::bind(&endpoint).unwrap();
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let guest = directory.path().join("flotillad.sock");
+    VesselAgent::forward_controller_socket(&runner, &guest, Some(tcp), &endpoint).await.unwrap();
+    VesselAgent::forward_controller_socket(&runner, &guest, Some(tcp), &endpoint).await.unwrap();
+    let request = b"POST /v1/hooks/claude-code/stop HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer v2.token\r\nX-Custom: kept\r\nContent-Length: 2\r\n\r\n{}";
+    let mut crew = tokio::net::TcpStream::connect(tcp).await.unwrap();
+    crew.write_all(request).await.unwrap();
+    let (mut daemon, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+    let mut received = vec![0; request.len()];
+    daemon.read_exact(&mut received).await.unwrap();
+    assert_eq!(received, request);
+    daemon.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+    let mut reply = [0; 19];
+    crew.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply, b"HTTP/1.1 200 OK\r\n\r\n");
+    let mut socket = UnixStream::connect(&guest).await.unwrap();
+    socket.write_all(b"unix").await.unwrap();
+    let (mut daemon, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+    let mut received = [0; 4];
+    daemon.read_exact(&mut received).await.unwrap();
+    assert_eq!(&received, b"unix");
+}
+
 // A hello only verifies the prepared platform. A mismatch must stop before the
 // upgrade route is used, even when the fingerprint also needs an update.
 #[tokio::test]

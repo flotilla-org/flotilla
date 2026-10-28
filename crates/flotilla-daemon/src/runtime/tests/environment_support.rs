@@ -184,7 +184,12 @@ pub(super) fn archive_files(bytes: &[u8]) -> Vec<String> {
 struct CachedAgent {
     files: flotilla_environment::environment::vessel_ops::RunnerVesselAgent,
     cache: Arc<ContentCache>,
+    forwards: Arc<StdMutex<Vec<ControllerForward>>>,
 }
+
+/// A controller forward an agent was asked to serve: its guest socket, guest loopback
+/// address and controller socket.
+pub(super) type ControllerForward = (PathBuf, Option<std::net::SocketAddr>, PathBuf);
 
 #[async_trait]
 impl flotilla_environment::environment::VesselAgent for CachedAgent {
@@ -195,7 +200,14 @@ impl flotilla_environment::environment::VesselAgent for CachedAgent {
         self.files.forward_socket(guest).await
     }
     async fn push_tools(&self, tools: &[flotilla_environment::environment::EnvironmentTool]) -> Result<(), String> {
+        if tools.is_empty() {
+            return Ok(());
+        }
         self.files.push_tools(tools).await
+    }
+    async fn forward_controller_socket(&self, guest: &Path, tcp: Option<std::net::SocketAddr>, controller: &Path) -> Result<(), String> {
+        self.forwards.lock().expect("forwards").push((guest.into(), tcp, controller.into()));
+        Ok(())
     }
     fn commands(&self) -> Arc<dyn CommandRunner> {
         self.files.commands()
@@ -231,6 +243,7 @@ impl flotilla_environment::environment::VesselAgent for CachedAgent {
 pub(super) struct CachedInterior {
     pub(super) inner: TestInteriorEnvironment,
     pub(super) cache: Arc<ContentCache>,
+    pub(super) forwards: Arc<StdMutex<Vec<ControllerForward>>>,
 }
 
 #[async_trait]
@@ -241,6 +254,7 @@ impl ProvisionedEnvironment for CachedInterior {
         Arc::new(CachedAgent {
             files: flotilla_environment::environment::vessel_ops::RunnerVesselAgent(self.inner.runner()),
             cache: Arc::clone(&self.cache),
+            forwards: Arc::clone(&self.forwards),
         })
     }
 
