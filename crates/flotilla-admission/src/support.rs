@@ -166,7 +166,7 @@ pub fn placement_host_ref(policy: &ResourceObject<PlacementPolicy>) -> Option<&s
         .or_else(|| policy.spec.docker_per_vessel.as_ref().map(|spec| spec.host_ref.as_str()))
 }
 
-/// The provider instance frozen on `policy`, once admission has resolved one.
+/// The provider instance admission froze on `policy`: its requirement's instance, else its instance label.
 pub fn provider_instance(policy: &ResourceObject<PlacementPolicy>) -> Option<&str> {
     policy
         .spec

@@ -3176,8 +3176,10 @@ async fn allocation_separates_linux_coder_from_gui_verifier() {
     let result = start_capability_convoy(&daemon, "gui-verify", |intent| intent.workflow_ref = Some("gui-verify".to_string())).await;
     assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
     let admitted = admitted_convoy(&backend, "gui-verify").await;
-    assert_eq!(flotilla_resources::vessel_placement_pin(&admitted, "coder").expect("coder pin").decision.kind, "docker-test");
-    assert_eq!(flotilla_resources::vessel_placement_pin(&admitted, "verify").expect("verifier pin").decision.kind, "host-direct-gui");
+    let pin = |vessel: &str| flotilla_resources::vessel_placement_pin(&admitted, vessel).expect("pin").decision;
+    let (coder, verify) = (pin("coder"), pin("verify"));
+    assert_eq!((coder.kind.as_str(), coder.provider_instance.as_deref()), ("docker-test", Some("fixture-1")));
+    assert_eq!((verify.kind.as_str(), verify.provider_instance.as_deref()), ("host-direct-gui", Some("fixture-0")));
 }
 
 #[tokio::test]
