@@ -28,6 +28,7 @@
 
 pub mod account;
 pub mod artifact_import;
+pub mod artifacts;
 pub mod checkout;
 pub mod clone;
 pub mod definition_import;

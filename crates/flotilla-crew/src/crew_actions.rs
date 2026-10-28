@@ -63,19 +63,6 @@ impl CrewActions<'_> {
         Ok(id)
     }
 
-    pub async fn execute_action_artifact_reserve_ledger_comment(&self, id: u64, command: &Command) -> Result<u64, String> {
-        let CommandAction::ArtifactReserveLedgerComment { namespace, name, address } = &command.action else {
-            return Err("ledger reservation selected the wrong handler".into());
-        };
-        let identity = self.events.start(id, command.description().to_string());
-        let result = match flotilla_store::reserve_ledger_comment_creation(self.resource_backend, namespace, name, address).await {
-            Ok(granted) => CommandValue::LedgerCommentCreationReserved { granted },
-            Err(error) => CommandValue::Error { message: error.to_string() },
-        };
-        self.events.finish(id, identity, result);
-        Ok(id)
-    }
-
     pub async fn execute_action_crew_handoff(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::CrewHandoff { context, target, message, carries } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());

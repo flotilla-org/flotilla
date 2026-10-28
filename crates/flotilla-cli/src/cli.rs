@@ -1424,7 +1424,6 @@ fn format_person_inbox_human(inbox: &flotilla_protocol::PersonInboxResponse) -> 
 fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> String {
     use flotilla_protocol::commands::CommandValue;
     match result {
-        CommandValue::LedgerCommentCreationReserved { granted } => format!("ledger comment creation granted: {granted}"),
         CommandValue::Ok => "ok".to_string(),
         CommandValue::CrewEscalated { receiver } => format!("escalated to {receiver}"),
         CommandValue::CrewEscalationRefused { rung, reason } => format!("escalation refused at {rung} rung: {reason}"),

@@ -7,8 +7,6 @@ use flotilla_resources::{error, field_ownership, host, labels, resource, retenti
 
 mod account_records;
 pub use account_records::{OldStoreAccounts, SwitchedAccounts};
-mod artifact;
-pub use artifact::*;
 mod backend;
 pub use backend::*;
 pub mod controller;

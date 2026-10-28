@@ -155,8 +155,7 @@ pub fn handle_attach_dispatch_completion(session_id: uuid::Uuid, result: Result<
 /// Called when a `CommandFinished` event arrives from the daemon.
 pub fn handle_result(result: CommandValue, app: &mut App) {
     match result {
-        CommandValue::LedgerCommentCreationReserved { .. }
-        | CommandValue::Ok
+        CommandValue::Ok
         | CommandValue::ResourceReconciled { .. }
         | CommandValue::ConvoyBriefDelivered { .. }
         | CommandValue::ConvoyBriefInformational { .. }
