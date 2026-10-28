@@ -421,6 +421,10 @@ impl TreeDelivery for LoginDelivery {
     }
 }
 
+/// How long one crew's login push may take before it is recorded as failed, so an unreachable
+/// host delays the rest of a rotation pass by at most this.
+const LOGIN_PUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// #4037: push the central login's current crew copy into every crew home holding an older
 /// one, on every kind of place, through the crew's own vessel agent: the refresher rotates
 /// the central login and no crew can refresh its copy. A failed push is recorded as the
@@ -457,23 +461,32 @@ pub(super) async fn redeliver_central_logins(state: &Arc<ControllerRuntimeState>
             })
             .await?;
         // A record whose vessel is gone goes with its place or convoy.
-        let Some(vessel) = record_vessel(vessels, &record) else { continue };
-        let pushed = async {
+        let Some(vessel) = record_vessel(vessels, &record) else {
+            tracing::debug!(access = %record.spec.access, place = %record.spec.place, "no live vessel for a central Codex login copy");
+            continue;
+        };
+        let push = async {
             let access = match state.ssh_host.get(&record.spec.place) {
                 Some(profile) => Some(state.vessel_access(profile, &vessel.metadata.name).await?),
                 None => None,
             };
             let agent = state.vessel_agent(&record.spec.place, access.as_deref()).await?;
             login.deliver(Path::new(&record.spec.home), agent.as_ref()).await
-        }
-        .await;
+        };
+        let pushed = tokio::time::timeout(LOGIN_PUSH_TIMEOUT, push)
+            .await
+            .unwrap_or_else(|_| Err(format!("timed out after {}s", LOGIN_PUSH_TIMEOUT.as_secs())));
         match &pushed {
             Ok(()) => tracing::info!(access = %record.spec.access, place = %record.spec.place, "pushed the rotated central Codex login"),
             Err(error) => {
                 tracing::warn!(access = %record.spec.access, place = %record.spec.place, %error, "failed to push the rotated central Codex login")
             }
         }
-        status::record_push(state, namespace, &record, LOGIN, &digest, pushed).await?;
+        // One record's write losing a race with a launch must not hold back every later crew;
+        // the next pass reads it afresh.
+        if let Err(error) = status::record_push(state, namespace, &record, LOGIN, &digest, pushed).await {
+            tracing::warn!(access = %record.spec.access, place = %record.spec.place, %error, "failed to record a central Codex login push");
+        }
     }
     Ok(())
 }
@@ -481,11 +494,17 @@ pub(super) async fn redeliver_central_logins(state: &Arc<ControllerRuntimeState>
 /// The live vessel an access record's crew is aboard, by the access key [`frozen_crew`] composes.
 fn record_vessel<'a>(vessels: &'a [ResourceObject<Vessel>], record: &ResourceObject<AccessDelivery>) -> Option<&'a ResourceObject<Vessel>> {
     let convoy = record.metadata.labels.get(CONVOY_LABEL)?;
-    let mut parts = record.spec.access.rsplitn(3, '/');
-    let (_role, vessel_name) = (parts.next()?, parts.next()?);
     vessels.iter().find(|vessel| {
-        vessel.metadata.deletion_timestamp.is_none() && &vessel.spec.convoy_ref == convoy && vessel.spec.vessel_name == vessel_name
+        vessel.metadata.deletion_timestamp.is_none()
+            && &vessel.spec.convoy_ref == convoy
+            && access_names_vessel(&record.spec.access, convoy, &vessel.spec.vessel_name)
     })
+}
+
+/// Whether an access key `{project}/{convoy}/{vessel}/{role}` names this convoy's vessel,
+/// whatever the project and role hold.
+fn access_names_vessel(access: &str, convoy: &str, vessel_name: &str) -> bool {
+    access.contains(&format!("/{convoy}/{vessel_name}/"))
 }
 
 #[cfg(test)]
@@ -686,5 +705,12 @@ mod tests {
         .expect_err("refused");
         assert!(error.is_permanent() && error.to_string().contains("credential reader"), "{error}");
         assert_eq!(agent.calls(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_access_key_names_its_vessel_whatever_the_project_and_role_hold() {
+        assert!(access_names_vessel("org/repo/convoy-1/implement/review/lead", "convoy-1", "implement"));
+        assert!(!access_names_vessel("org/repo/convoy-1/implement-2/coder", "convoy-1", "implement"));
+        assert!(!access_names_vessel("org/repo/convoy-2/implement/coder", "convoy-1", "implement"));
     }
 }

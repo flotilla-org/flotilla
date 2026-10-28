@@ -563,6 +563,7 @@ fn crew_copy(central: &[u8]) -> Result<Vec<u8>, String> {
     if let Some(tokens) = auth.get_mut("tokens").and_then(serde_json::Value::as_object_mut) {
         tokens.insert("refresh_token".to_string(), serde_json::Value::String(String::new()));
     }
+    // A login without `tokens` (an API-key `auth.json`) holds no refresh token to withhold.
     let mut copy = serde_json::to_vec_pretty(&auth).map_err(|error| format!("encode crew copy: {error}"))?;
     copy.push(b'\n');
     Ok(copy)
@@ -1346,45 +1347,43 @@ pub(crate) mod tests {
     // login reaches every crew.
     #[tokio::test]
     async fn crews_in_one_vessel_share_the_login() {
-        {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let registry = registry(temp.path());
-            let runner = ContainedRunner { config_base: temp.path().join("config") };
-            let base = runner.config_base.join("agent-homes/model-api/codex");
-            std::fs::create_dir_all(&base).expect("base home");
-            std::fs::write(base.join("settings.json"), "{}").expect("settings");
-            std::fs::write(base.join("auth.json"), "first-token").expect("auth");
-            let login = registry
-                .harness_login(CODEX_ADAPTER_ID, &[("CODEX_HOME".into(), base.display().to_string())], &runner.config_base)
-                .await
-                .expect("login")
-                .expect("Codex links a login");
-            let home = |role: &str| runner.config_base.join("agent-homes/requesters/shared").join(role).join("codex");
-            // The vessel's file facilities over this process's own shell and files.
-            let agent = flotilla_environment::environment::vessel_ops::RunnerVesselAgent(Arc::new(runner.clone()));
-            let crews = ["coder", "reviewer"];
-            for role in crews {
-                std::fs::create_dir_all(home(role)).expect("crew home");
-                login.deliver(&home(role), &agent).await.expect("link login");
-            }
-            for role in crews {
-                assert_eq!(std::fs::read_to_string(home(role).join("settings.json")).expect("settings"), "{}");
-                assert_eq!(std::fs::read_to_string(home(role).join("auth.json")).expect("linked auth"), "first-token");
-            }
-            std::fs::write(base.join("settings.json"), "base changed").expect("base update");
-            std::fs::write(home("coder").join("settings.json"), "crew edited").expect("crew edit");
-            login.deliver(&home("coder"), &agent).await.expect("relink");
-            assert_eq!(
-                std::fs::read_to_string(home("coder").join("settings.json")).expect("crew settings"),
-                "crew edited",
-                "base changes never overwrite crew scratch"
-            );
-            let replacement = base.join("auth.new");
-            std::fs::write(&replacement, "refreshed-token").expect("new auth");
-            std::fs::rename(replacement, base.join("auth.json")).expect("atomic refresh");
-            for role in crews {
-                assert_eq!(std::fs::read_to_string(home(role).join("auth.json")).expect("refreshed linked auth"), "refreshed-token");
-            }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let runner = ContainedRunner { config_base: temp.path().join("config") };
+        let base = runner.config_base.join("agent-homes/model-api/codex");
+        std::fs::create_dir_all(&base).expect("base home");
+        std::fs::write(base.join("settings.json"), "{}").expect("settings");
+        std::fs::write(base.join("auth.json"), "first-token").expect("auth");
+        let login = registry
+            .harness_login(CODEX_ADAPTER_ID, &[("CODEX_HOME".into(), base.display().to_string())], &runner.config_base)
+            .await
+            .expect("login")
+            .expect("Codex links a login");
+        let home = |role: &str| runner.config_base.join("agent-homes/requesters/shared").join(role).join("codex");
+        // The vessel's file facilities over this process's own shell and files.
+        let agent = flotilla_environment::environment::vessel_ops::RunnerVesselAgent(Arc::new(runner.clone()));
+        let crews = ["coder", "reviewer"];
+        for role in crews {
+            std::fs::create_dir_all(home(role)).expect("crew home");
+            login.deliver(&home(role), &agent).await.expect("link login");
+        }
+        for role in crews {
+            assert_eq!(std::fs::read_to_string(home(role).join("settings.json")).expect("settings"), "{}");
+            assert_eq!(std::fs::read_to_string(home(role).join("auth.json")).expect("linked auth"), "first-token");
+        }
+        std::fs::write(base.join("settings.json"), "base changed").expect("base update");
+        std::fs::write(home("coder").join("settings.json"), "crew edited").expect("crew edit");
+        login.deliver(&home("coder"), &agent).await.expect("relink");
+        assert_eq!(
+            std::fs::read_to_string(home("coder").join("settings.json")).expect("crew settings"),
+            "crew edited",
+            "base changes never overwrite crew scratch"
+        );
+        let replacement = base.join("auth.new");
+        std::fs::write(&replacement, "refreshed-token").expect("new auth");
+        std::fs::rename(replacement, base.join("auth.json")).expect("atomic refresh");
+        for role in crews {
+            assert_eq!(std::fs::read_to_string(home(role).join("auth.json")).expect("refreshed linked auth"), "refreshed-token");
         }
     }
 }
