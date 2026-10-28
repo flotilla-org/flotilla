@@ -213,9 +213,13 @@ pub fn exec_attach_plan(plan: &ResolvedAttachPlan) -> Result<Infallible, String>
 /// alone are forwarded to the child rather than orphaning it.
 pub fn run_attach_plan_waiting(plan: &ResolvedAttachPlan) -> Result<Option<i32>, String> {
     let (program, args) = attach_argv(plan)?;
+    // Installed before the spawn so no signal can take the default action in
+    // between; until the child exists the handler drops them.
+    #[cfg(unix)]
+    let forward = signal_forward::install();
     let mut child = Command::new(&program).args(args).spawn().map_err(|error| format!("could not start {program} attach hop: {error}"))?;
     #[cfg(unix)]
-    let _forward = signal_forward::to(child.id());
+    forward.child(child.id());
     let status = child.wait().map_err(|error| format!("could not wait for {program} attach hop: {error}"))?;
     Ok(status.code())
 }
@@ -235,10 +239,18 @@ mod signal_forward {
         }
     }
 
+    /// The handler state is process-global, so only one attach child may be
+    /// supervised at a time; concurrent guards would clobber each other.
     pub struct Guard([libc::sighandler_t; 2]);
 
-    pub fn to(pid: u32) -> Guard {
-        CHILD.store(pid as i32, Ordering::SeqCst);
+    impl Guard {
+        pub fn child(&self, pid: u32) {
+            CHILD.store(pid as i32, Ordering::SeqCst);
+        }
+    }
+
+    pub fn install() -> Guard {
+        CHILD.store(0, Ordering::SeqCst);
         let mut previous = [libc::SIG_DFL; 2];
         for (slot, signal) in previous.iter_mut().zip(SIGNALS) {
             // SAFETY: installing a handler that only calls async-signal-safe kill.
@@ -388,6 +400,20 @@ mod tests {
     // Glue: one mapping from the structured assignment to env's argv element.
     // Direct argv rejects the same invalid identifiers as shell flattening,
     // while reporting a recoverable error to the caller.
+    #[cfg(unix)]
+    #[test]
+    fn termination_sent_to_the_parent_reaches_the_attach_child() {
+        let plan = ResolvedAttachPlan(vec![flotilla_protocol::ResolvedAttachAction::Command(
+            ["sh", "-c", "trap 'exit 7' TERM; while :; do sleep 0.05; done"].into_iter().map(|part| Arg::Literal(part.into())).collect(),
+        )]);
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            // SAFETY: signalling our own process; the forwarding handler is installed.
+            unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+        });
+        assert_eq!(super::run_attach_plan_waiting(&plan).expect("attach child runs"), Some(7));
+    }
+
     #[test]
     fn env_assignment_rejects_invalid_argv_keys() {
         for key in ["", "A=B", "FOO-BAR", "9KEY", "A;cmd"] {
