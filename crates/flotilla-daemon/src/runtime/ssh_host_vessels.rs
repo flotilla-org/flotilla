@@ -43,7 +43,7 @@ use flotilla_store::ResourceBackend;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OnceCell};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use super::discovery::SshHostProfile;
 use crate::environment_tools::{EnvironmentToolContext, EnvironmentToolProvisioner, SSH_HOST_PROVIDER_KIND};
@@ -595,9 +595,12 @@ impl SshHostVessels {
         vessel: &str,
     ) -> Result<Arc<VesselAccess>, String> {
         let (vessels, profile, name) = (Arc::clone(self), profile.clone(), vessel.to_string());
-        tokio::spawn(async move { vessels.access_here(&preparer.preparation(), &profile, &name).await })
-            .await
-            .map_err(|error| format!("vessel {vessel} preparation stopped: {error}"))?
+        tokio::spawn(async move { vessels.access_here(&preparer.preparation(), &profile, &name).await }).await.map_err(|error| {
+            if error.is_panic() {
+                error!(%vessel, %error, "vessel preparation panicked");
+            }
+            format!("vessel {vessel} preparation stopped: {error}")
+        })?
     }
 
     async fn access_here(
