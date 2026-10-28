@@ -2499,6 +2499,7 @@ dependencies = [
  "rigging-process",
  "tempfile",
  "tokio",
+ "toml 0.8.23",
  "tracing",
 ]
 
@@ -2630,6 +2631,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
  "url",

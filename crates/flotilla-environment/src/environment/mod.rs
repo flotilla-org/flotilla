@@ -7,6 +7,7 @@ mod seam;
 pub use seam::*;
 pub mod docker;
 pub mod docker_image;
+pub mod docker_vessels;
 pub mod dummy;
 pub mod host_direct;
 pub mod image;

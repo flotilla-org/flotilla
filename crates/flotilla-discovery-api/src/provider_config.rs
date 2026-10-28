@@ -26,6 +26,10 @@ pub trait ProviderConfigView: Send + Sync {
     fn state_dir(&self) -> &DaemonHostPath;
     fn resolve_checkout_config(&self, repo_root: &ExecutionEnvironmentPath) -> ResolvedCheckoutConfig;
     async fn load_config_for_probe(&self) -> Result<ProviderConfig, String>;
+    /// `daemon.toml`'s raw `[docker_vessels]` table; views without a daemon config have none.
+    async fn load_docker_vessels_for_probe(&self) -> Result<Option<toml::Table>, String> {
+        Ok(None)
+    }
 }
 
 /// Forward the view through shared ownership so discovery callers can keep
@@ -44,6 +48,9 @@ impl<T: ProviderConfigView + ?Sized> ProviderConfigView for std::sync::Arc<T> {
     }
     async fn load_config_for_probe(&self) -> Result<ProviderConfig, String> {
         (**self).load_config_for_probe().await
+    }
+    async fn load_docker_vessels_for_probe(&self) -> Result<Option<toml::Table>, String> {
+        (**self).load_docker_vessels_for_probe().await
     }
 }
 
@@ -72,6 +79,12 @@ impl ProviderConfigView for ConfigStore {
             ai_utility: config.ai_utility,
             terminal_pool: config.terminal_pool,
         })
+    }
+    async fn load_docker_vessels_for_probe(&self) -> Result<Option<toml::Table>, String> {
+        let read = self.daemon_config_read();
+        let config =
+            flotilla_provider_runtime::probe::blocking("daemon config", flotilla_provider_runtime::probe::PROBE_TIMEOUT, read).await?;
+        Ok(config.docker_vessels)
     }
 }
 
@@ -129,5 +142,21 @@ checkout_path = "../worktrees/{{ branch }}"
         assert_eq!(view.base_path(), store.base_path());
         assert_eq!(view.state_dir(), store.state_dir());
         assert_eq!(view.resolve_checkout_config(&ExecutionEnvironmentPath::new(directory.path())).path, "../worktrees/{{ branch }}");
+    }
+
+    // Probes see daemon.toml's [docker_vessels] table through any shared view,
+    // none without the table, and an error for an unparseable file rather than none.
+    #[tokio::test]
+    async fn docker_vessels_reach_provider_probes_from_daemon_toml() {
+        let directory = tempfile::tempdir().expect("config directory");
+        let view: std::sync::Arc<dyn ProviderConfigView> = std::sync::Arc::new(ConfigStore::with_base(directory.path()));
+        assert_eq!(view.load_docker_vessels_for_probe().await.expect("no daemon.toml"), None);
+        let daemon = directory.path().join("daemon.toml");
+        std::fs::write(&daemon, "[docker_vessels]\nslice = \"flotilla-crews.slice\"\nmemory_ceiling_gib = 20\n").expect("daemon.toml");
+        let vessels = view.load_docker_vessels_for_probe().await.expect("valid table").expect("table present");
+        assert_eq!(vessels["slice"].as_str(), Some("flotilla-crews.slice"));
+        assert_eq!(vessels["memory_ceiling_gib"].as_integer(), Some(20));
+        std::fs::write(&daemon, "[docker_vessels]\nslice = 3\n[docker_vessels]\n").expect("daemon.toml");
+        assert!(view.load_docker_vessels_for_probe().await.is_err());
     }
 }

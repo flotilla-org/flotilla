@@ -44,6 +44,29 @@ To override the default for every convoy start that omits those flags, set
 auto_attach = false
 ```
 
+## Docker crew memory
+
+A host can bound its Docker crews together under one systemd slice, giving each
+crew a memory ceiling in place of the placement policy's share. In
+`~/.config/flotilla/daemon.toml`:
+
+```toml
+[docker_vessels]
+slice = "flotilla-crews.slice"   # systemd slice name; must end in .slice
+memory_ceiling_gib = 20          # most one crew may use; memory = memory-swap
+```
+
+Both keys are required. A missing or unknown key, or a name that is not a
+systemd slice, leaves the host without its Docker provider until it is fixed.
+Without the table, crews keep the placement policy's share. With it, a crew is
+provisioned only when Docker uses the systemd cgroup driver and the slice is
+loaded with a finite `MemoryMax`, and neither that limit nor the host's RAM is
+below the ceiling. The ceiling bounds one crew and the slice bounds them all,
+so crews near the ceiling together can still reach the slice limit and be
+killed inside it. The table is read at provider discovery, so restart the
+daemon after changing it. The unit and install steps are in
+[`config/systemd/system`](../config/systemd/system/README.md).
+
 ## Dispatch-time agent selection
 
 Workflow templates name *capabilities* (`code`, `code-review`), never

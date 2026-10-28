@@ -13,6 +13,7 @@ use flotilla_discovery_api::UnmetRequirement;
 #[cfg(unix)]
 use crate::environment::docker::DockerAgentSettings;
 use crate::environment::docker::DockerEnvironmentProvider;
+use crate::environment::docker_vessels::DockerVessels;
 use crate::environment::EnvironmentProvider;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::ChannelLabel;
@@ -32,17 +33,22 @@ impl Factory for DockerEnvironmentFactory {
     async fn probe(
         &self,
         env: &EnvironmentBag,
-        _config: &dyn ProviderConfigView,
+        config: &dyn ProviderConfigView,
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn EnvironmentProvider>, Vec<UnmetRequirement>> {
+        let vessels = config
+            .load_docker_vessels_for_probe()
+            .await
+            .and_then(|table| table.map(DockerVessels::parse).transpose())
+            .map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?;
         let build = || {
-            let provider = DockerEnvironmentProvider::new(runner.clone());
+            let provider = DockerEnvironmentProvider::new(runner.clone()).with_vessel_slice(vessels.clone());
             #[cfg(unix)]
             let provider = provider.with_agent_settings(DockerAgentSettings {
                 runtime_root: {
                     use sha2::{Digest, Sha256};
-                    Path::new("/tmp").join(&format!("fd-{:x}", Sha256::digest(_config.state_dir().to_string().as_bytes()))[..23])
+                    Path::new("/tmp").join(&format!("fd-{:x}", Sha256::digest(config.state_dir().to_string().as_bytes()))[..23])
                 },
                 executable: env
                     .find_binary("drydock-agent")
@@ -109,6 +115,30 @@ mod tests {
         let result = DockerEnvironmentFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without docker");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("docker".into())));
+    }
+
+    // An invalid [docker_vessels] leaves no Docker provider, so no vessel starts
+    // outside the slice it names; a valid one keeps the provider available.
+    #[tokio::test]
+    async fn docker_factory_requires_valid_docker_vessels() {
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("docker", "/usr/local/bin/docker"));
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (table, valid) in [
+            ("slice = 'flotilla-crews.slice'\nmemory_ceiling_gib = 20\n", true),
+            ("slice = 'flotilla-crews.slice'\n", false),
+            ("slice = 'flotilla-crews'\nmemory_ceiling_gib = 20\n", false),
+        ] {
+            let config = TestConfig::with_base(dir.path()).with_docker_vessels(toml::from_str(table).expect("table"));
+            let runner = Arc::new(DiscoveryMockRunner::builder().build());
+            let result = DockerEnvironmentFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
+            match result {
+                Ok(_) => assert!(valid, "{table} should be refused"),
+                Err(unmet) => {
+                    assert!(!valid, "{table} should be accepted");
+                    assert!(matches!(unmet.as_slice(), [UnmetRequirement::MissingConfig(_)]), "{unmet:?}");
+                }
+            }
+        }
     }
 
     #[tokio::test]

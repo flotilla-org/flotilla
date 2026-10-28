@@ -415,6 +415,9 @@ pub struct DaemonConfig {
     /// means unbounded, as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_vessels: Option<u32>,
+    /// `[docker_vessels]`, parsed and validated by the Docker environment adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker_vessels: Option<toml::Table>,
 }
 
 /// `[tracing]` enables OTLP/HTTP protobuf span export.
@@ -488,6 +491,7 @@ impl Default for DaemonConfig {
             primitives: None,
             http: HttpListenerConfig::default(),
             max_vessels: None,
+            docker_vessels: None,
         }
     }
 }
@@ -925,12 +929,19 @@ impl ConfigStore {
 
     /// Load daemon config from `~/.config/flotilla/daemon.toml`.
     pub fn load_daemon_config(&self) -> Result<DaemonConfig, String> {
+        self.daemon_config_read()()
+    }
+
+    /// An owned `daemon.toml` read, for callers that run it off the async runtime.
+    pub fn daemon_config_read(&self) -> impl FnOnce() -> Result<DaemonConfig, String> + Send + 'static {
         let path = self.base_path().join("daemon.toml");
-        if path.as_path().exists() {
-            let content = std::fs::read_to_string(path.as_path()).map_err(|err| format!("failed to read {path}: {err}"))?;
-            toml::from_str(&content).map_err(|err| format!("failed to parse {path}: {err}"))
-        } else {
-            Ok(DaemonConfig::default())
+        move || {
+            if path.as_path().exists() {
+                let content = std::fs::read_to_string(path.as_path()).map_err(|err| format!("failed to read {path}: {err}"))?;
+                toml::from_str(&content).map_err(|err| format!("failed to parse {path}: {err}"))
+            } else {
+                Ok(DaemonConfig::default())
+            }
         }
     }
 
