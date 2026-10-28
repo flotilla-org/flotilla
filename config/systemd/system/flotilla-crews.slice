@@ -1,0 +1,14 @@
+[Unit]
+Description=Flotilla Docker crew containers
+Documentation=https://github.com/flotilla-org/flotilla/blob/main/config/systemd/system/README.md
+Before=slices.target
+
+[Slice]
+# Percentages of host RAM; on a 61 GiB host these are about 44 GiB and 52 GiB.
+MemoryHigh=72%
+MemoryMax=85%
+# Below the default of 100, so flotillad, dockerd and sshd keep priority.
+CPUWeight=50
+IOWeight=50
+# systemd-oomd acts on crews under pressure before it reaches other services.
+ManagedOOMMemoryPressure=kill
