@@ -15,6 +15,8 @@ import subprocess
 import sys
 
 
+# The deployed generation's kinds, retired ones included (Usage, DispatchObservation); drop a
+# retired kind once the corpus captured after the roll that retired it no longer holds its rows.
 KINDS = (
     "Artifact", "ChangeRequest", "Issue", "Checkout", "Clone", "Convoy",
     "ConvoyEnsure", "CredentialGrant", "CredentialSpec", "CrewImageBaseline",

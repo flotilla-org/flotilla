@@ -106,23 +106,6 @@ fn convoy_ensure_crd_parses_with_expected_shape() {
 }
 
 #[test]
-fn dispatch_observation_crd_parses_with_immutable_record_fields() {
-    let observation: serde_json::Value =
-        serde_yml::from_str(include_str!("../../../flotilla-resources/src/crds/dispatch_observation.crd.yaml"))
-            .expect("DispatchObservation CRD should parse");
-
-    assert_eq!(observation["metadata"]["name"], "dispatchobservations.flotilla.work");
-    assert_eq!(observation["spec"]["names"]["kind"], "DispatchObservation");
-    let required = observation["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["required"]
-        .as_array()
-        .expect("required observation fields");
-    assert!(required.iter().any(|field| field == "workflow_ref"));
-    assert!(!required.iter().any(|field| field == "placement_policy"));
-    assert!(required.iter().any(|field| field == "stance"));
-    assert!(required.iter().any(|field| field == "time_from_ready_seconds"));
-}
-
-#[test]
 fn k8s_object_projection_rejects_wrong_resource_identity() {
     let object = convoy_object("alpha", convoy_spec("review"), None);
     let mut projected = object.to_k8s_object();

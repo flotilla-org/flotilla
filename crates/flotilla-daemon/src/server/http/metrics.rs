@@ -55,6 +55,9 @@ impl Exposition {
             "flotilla_store_read_contention_total" => "Busy read refusals returned to callers; each refusal counts once.",
             "flotilla_store_queue_wait_seconds" => "Time queued before a store read or write starts, in seconds.",
             "flotilla_store_execution_seconds" => "Store read or write execution time, excluding queue wait, in seconds.",
+            "flotilla_dispatch_time_from_ready_seconds" => {
+                "Time from an issue entering the dispatch queue to its convoy's creation, in seconds."
+            }
             _ => "Daemon load instrumentation; counters are cumulative and peaks are high-water marks since startup.",
         };
         self.families.entry(self.current.clone()).or_insert_with(|| format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
@@ -113,6 +116,10 @@ fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDa
             out.number("flotilla_controller_busy_seconds_total", "counter", &labels, snapshot.busy_micros as f64 / 1_000_000.0);
             out.number("flotilla_controller_queue_peak", "gauge", &labels, snapshot.queue_peak);
         }
+    }
+    for ((project, workflow), histogram) in crate::dispatch_reconciler::DispatchMetrics::global().snapshot() {
+        let labels = format!(",project=\"{}\",workflow=\"{}\"", escaped(&project), escaped(&workflow));
+        out.histogram("flotilla_dispatch_time_from_ready_seconds", &labels, &histogram);
     }
     let replication = metrics.replication.snapshot();
     for (name, value) in [
@@ -284,6 +291,7 @@ mod tests {
         })
         .await
         .expect("dummy crew launched before scrape");
+        crate::dispatch_reconciler::DispatchMetrics::global().record("metrics-project", "implement", Duration::from_secs(90));
         let logins = Arc::new(super::super::LoginStore::new(daemon.clock_for_scenarios()));
         let router = HttpRouter::for_daemon(daemon.clone(), logins.clone(), Default::default())
             .with_load_metrics(metrics.clone(), true)
@@ -335,6 +343,7 @@ mod tests {
             "flotilla_forge_budget_window_reported_cost",
             "flotilla_forge_budget_window_unreported_calls",
             "flotilla_forge_budget_window_start_seconds",
+            "flotilla_dispatch_time_from_ready_seconds",
         ] {
             assert!(text.contains(&format!("# TYPE {family} ")), "missing {family}");
         }
@@ -350,6 +359,9 @@ mod tests {
                 _ => panic!("unexpected summary"),
             }
         }
+        assert!(text.lines().any(|line| line.starts_with("flotilla_dispatch_time_from_ready_seconds_sum{")
+            && line.contains("project=\"metrics-project\",workflow=\"implement\"")
+            && line.ends_with(" 90")));
         for name in ["flotilla_store_queue_wait_seconds_count", "flotilla_store_execution_seconds_count"] {
             assert!(text.lines().filter(|line| line.starts_with(name)).any(|line| line
                 .rsplit_once(' ')

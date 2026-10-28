@@ -135,7 +135,6 @@ pub struct DispatchIssueFacts {
     pub issue_type: Option<String>,
     pub blockers: Vec<IssueRef>,
     pub has_open_pull_request: bool,
-    pub landed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -49,8 +49,6 @@ pub mod delivery_hold;
 #[doc(hidden)]
 pub mod digest;
 pub use digest::{digest_bucket, DigestQuery, PartitionDigest, DIGEST_FANOUT};
-mod dispatch_hold;
-mod dispatch_observation;
 mod environment;
 #[doc(hidden)]
 pub mod error;
@@ -158,10 +156,6 @@ pub use credential::{
     CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, CREW_SKILLS_ENV, INITIAL_AUTHORIZATION_EPOCH,
     RESOLVED_SKILLS_ENV, RETIRED_CREW_HOME_KEYS_ENV,
 };
-pub use dispatch_hold::{
-    DispatchDeployment, DispatchDeploymentSpec, DispatchHold, DispatchHoldSpec, DispatchHoldStatus, DispatchHoldStatusPatch, HoldClearWhen,
-};
-pub use dispatch_observation::{DispatchObservation, DispatchObservationSpec, DISPATCH_RECONCILER_PROVENANCE};
 pub use environment::{
     host_direct_environment_name, validate_environment_provider_address, CloudSandboxEnvironmentSpec, CloudSandboxSize,
     DockerEnvironmentSpec, Environment, EnvironmentMemoryPolicy, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase,
@@ -278,9 +272,6 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::CrewDefaults>($($argument),*);
         $callback::<$crate::FulfilmentKind>($($argument),*);
         $callback::<$crate::Demand>($($argument),*);
-        $callback::<$crate::DispatchHold>($($argument),*);
-        $callback::<$crate::DispatchDeployment>($($argument),*);
-        $callback::<$crate::DispatchObservation>($($argument),*);
         $callback::<$crate::Environment>($($argument),*);
         $callback::<$crate::FleetDesignation>($($argument),*);
         $callback::<$crate::Forge>($($argument),*);

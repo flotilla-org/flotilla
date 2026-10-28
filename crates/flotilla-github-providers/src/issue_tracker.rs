@@ -620,7 +620,6 @@ impl flotilla_issue_tracker::IssueProvider for GitHubIssueProvider {
             let raw = gh_api_get!(self.api, &endpoint, &self.host_root)?;
             let pr: serde_json::Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
             facts.has_open_pull_request |= pr["state"] == "open";
-            facts.landed |= pr["merged_at"].as_str().is_some();
         }
         Ok(facts)
     }
@@ -1101,9 +1100,8 @@ mod tests {
         let dependent = provider.dispatch_facts(&IssueRef { source: source.clone(), id: "2783".into() }).await.expect("native facts");
         assert!(dependent.blockers.contains(&IssueRef { source: source.clone(), id: "2782".into() }));
         assert_eq!(dependent.issue_type.as_deref(), Some("Task"));
-        let landed = provider.dispatch_facts(&IssueRef { source, id: "1385".into() }).await.expect("landing facts");
-        assert!(landed.landed);
-        assert!(!landed.has_open_pull_request);
+        let merged = provider.dispatch_facts(&IssueRef { source, id: "1385".into() }).await.expect("merged PR facts");
+        assert!(!merged.has_open_pull_request);
         session.finish();
     }
 
