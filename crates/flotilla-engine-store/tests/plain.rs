@@ -255,3 +255,40 @@ fn a_follower_names_written_resources_and_rescans_after_a_snapshot() {
     assert!(applied < version);
     assert_eq!(pass(&mut follower), vec![Followed::Rescan(HOME.into())], "a snapshot leaves no entries to read");
 }
+
+// Behaviour (#4024): a joining change is one change for every write of one reason; another writer's
+// change naming the same record in between starts a new one; an unchanged record declared again
+// is written under the new change by `touch`, and `last_change` names it.
+#[test]
+fn joining_touch_and_last_change() {
+    use flotilla_schema::{ChangeItem, Identity};
+    let mut kinds = KindRegistry::new();
+    register_plain::<Sample>(&mut kinds).expect("register");
+    let home = open(HOME, &kinds);
+    let log = PlainLog::new(Arc::clone(&home));
+    let spec = Sample { title: "a".into(), owner: "b".into(), limit: None, tags: Vec::new() };
+    let root = Identity { kind: <Sample as Kind>::CODE, name: "root".into(), home: HOME.into() };
+    let reason = |writer: &str, at: i64| {
+        PendingChange::joining(
+            NewChange::new(writer, Timestamp::from_micros(at))
+                .with_items([ChangeItem { record: root.clone(), revision: Some("r1".into()) }]),
+        )
+    };
+    log.create("one", &spec, &reason("manifest", 1)).expect("one");
+    log.create("two", &spec, &reason("manifest", 2)).expect("two");
+    let first = log.last_change::<Sample>("one", HOME).expect("read").expect("changed");
+    assert_eq!(log.last_change::<Sample>("two", HOME).expect("read").expect("changed").seq, first.seq, "one reason, one change");
+    assert_eq!(first.at, Timestamp::from_micros(1), "a joined change keeps its first write's time");
+
+    log.create("other", &spec, &reason("someone else", 3)).expect("another writer naming the root");
+    log.create("three", &spec, &reason("manifest", 4)).expect("three");
+    let third = log.last_change::<Sample>("three", HOME).expect("read").expect("changed");
+    assert_ne!(third.seq, first.seq, "the newest change naming the root is another writer's: a new change");
+
+    let version = log.get::<Sample>("one", HOME).expect("get").expect("held").version;
+    let touched = log.touch::<Sample>("one", version, &reason("manifest", 5)).expect("touch");
+    assert!(touched > version);
+    assert_eq!(log.get::<Sample>("one", HOME).expect("get").expect("held").spec, spec, "a touch changes no field");
+    assert_eq!(log.last_change::<Sample>("one", HOME).expect("read").expect("changed").seq, third.seq, "joined the newest");
+    assert_eq!(log.last_change::<Sample>("absent", HOME).expect("read"), None);
+}

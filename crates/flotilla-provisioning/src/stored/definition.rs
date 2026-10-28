@@ -2,14 +2,11 @@
 //! CredentialSpec, CredentialGrant, CrewDefaults, ImageLayer and WorkflowTemplate, each a plain
 //! kind (a spec with no machine) written by its home's single writer.
 //!
-//! Each kind keeps its serde spec, the shape manifests author, and stores it as typed columns. The
-//! provenance the old store kept as labels and annotations is one typed datum, [`DefinitionOrigin`],
-//! on every kind (#3212: no labels or annotations). The two wide kinds, ImageLayer and
+//! Each kind keeps its serde spec, the shape manifests author, and stores it as typed columns. A row
+//! holds only its own fields: why it was written is its change's (#4024), and the provenance the old
+//! store kept as labels and annotations is rebuilt from that change. The two wide kinds, ImageLayer and
 //! WorkflowTemplate, store the columns their reads select by and the authored definition as one
 //! frozen document (ADR 0064, `frozen`); the others are laid out in full.
-//!
-//! Nothing reads or writes these tables yet: the import rehearsal restores into them, and they
-//! join the daemon's decided store with the definition writers and readers in layer 2b-ii.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,13 +19,10 @@ use flotilla_resources::{
 };
 use flotilla_schema::{Frozen, KindRegistry, RegistryError, Stored};
 
-pub use flotilla_resources::definitions::{CharterOrigin, DefinitionOrigin};
-
 /// A Forge, as the engine stores it: kind code `fo`.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 #[store(kind = "Forge", code = "fo")]
 pub struct ForgeDefinition {
-    pub origin: DefinitionOrigin,
     pub forge_id: String,
     pub forge_kind: ForgeKind,
     /// DNS names and SSH aliases; the remote-host selection reads them.
@@ -39,9 +33,8 @@ pub struct ForgeDefinition {
 }
 
 impl ForgeDefinition {
-    pub fn new(origin: DefinitionOrigin, spec: &ForgeSpec) -> Self {
+    pub fn new(spec: &ForgeSpec) -> Self {
         Self {
-            origin,
             forge_id: spec.forge_id.clone(),
             forge_kind: spec.kind,
             hosts: spec.hosts.clone(),
@@ -65,7 +58,6 @@ impl ForgeDefinition {
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 #[store(kind = "FleetDesignation", code = "fl")]
 pub struct FleetDesignationDefinition {
-    pub origin: DefinitionOrigin,
     pub fleet: Option<String>,
     pub project: String,
     #[store(flatten)]
@@ -73,8 +65,8 @@ pub struct FleetDesignationDefinition {
 }
 
 impl FleetDesignationDefinition {
-    pub fn new(origin: DefinitionOrigin, spec: &FleetDesignationSpec) -> Self {
-        Self { origin, fleet: spec.fleet.clone(), project: spec.project.clone(), image_cache: spec.image_cache.clone() }
+    pub fn new(spec: &FleetDesignationSpec) -> Self {
+        Self { fleet: spec.fleet.clone(), project: spec.project.clone(), image_cache: spec.image_cache.clone() }
     }
 
     pub fn spec(&self) -> FleetDesignationSpec {
@@ -86,7 +78,6 @@ impl FleetDesignationDefinition {
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 #[store(kind = "CredentialSpec", code = "cp")]
 pub struct CredentialSpecDefinition {
-    pub origin: DefinitionOrigin,
     pub consumer: CredentialConsumer,
     pub source: CredentialSource,
     pub lifecycle: CredentialLifecycle,
@@ -97,9 +88,8 @@ pub struct CredentialSpecDefinition {
 }
 
 impl CredentialSpecDefinition {
-    pub fn new(origin: DefinitionOrigin, spec: &CredentialSpecSpec) -> Self {
+    pub fn new(spec: &CredentialSpecSpec) -> Self {
         Self {
-            origin,
             consumer: spec.consumer.clone(),
             source: spec.source.clone(),
             lifecycle: spec.lifecycle,
@@ -155,7 +145,6 @@ impl From<&LandingScope> for LandingCredentialScope {
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 #[store(kind = "CredentialGrant", code = "gt")]
 pub struct CredentialGrantDefinition {
-    pub origin: DefinitionOrigin,
     /// The host action a host-action grant selects; none for a work grant.
     pub host_action: Option<HostImageAction>,
     /// The hosts a host-action grant names; empty selects every eligible host.
@@ -178,10 +167,9 @@ pub struct CredentialGrantDefinition {
 }
 
 impl CredentialGrantDefinition {
-    pub fn new(origin: DefinitionOrigin, spec: &CredentialGrantSpec) -> Self {
+    pub fn new(spec: &CredentialGrantSpec) -> Self {
         let selector = &spec.selector;
         Self {
-            origin,
             host_action: selector.host_action.as_ref().map(|host| host.action),
             host_action_hosts: selector.host_action.as_ref().map(|host| host.hosts.clone()).unwrap_or_default(),
             projects: selector.projects.clone(),
@@ -214,7 +202,6 @@ impl CredentialGrantDefinition {
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 #[store(kind = "CrewDefaults", code = "dc")]
 pub struct CrewDefaultsDefinition {
-    pub origin: DefinitionOrigin,
     pub project_ref: Option<String>,
     pub default_workflow_ref: Option<String>,
     #[store(child)]
@@ -228,9 +215,8 @@ pub struct CrewDefaultsDefinition {
 }
 
 impl CrewDefaultsDefinition {
-    pub fn new(origin: DefinitionOrigin, spec: &CrewDefaultsSpec) -> Self {
+    pub fn new(spec: &CrewDefaultsSpec) -> Self {
         Self {
-            origin,
             project_ref: spec.project_ref.clone(),
             default_workflow_ref: spec.default_workflow_ref.clone(),
             roles: spec.roles.clone(),
@@ -256,7 +242,6 @@ impl CrewDefaultsDefinition {
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 #[store(kind = "ImageLayer", code = "il")]
 pub struct ImageLayerDefinition {
-    pub origin: DefinitionOrigin,
     pub layer: String,
     pub layer_version: String,
     pub tier: ImageLayerTier,
@@ -269,9 +254,8 @@ pub struct ImageLayerDefinition {
 }
 
 impl ImageLayerDefinition {
-    pub fn new(origin: DefinitionOrigin, spec: &ImageLayerSpec) -> Result<Self, String> {
+    pub fn new(spec: &ImageLayerSpec) -> Result<Self, String> {
         Ok(Self {
-            origin,
             layer: spec.name.clone(),
             layer_version: spec.version.clone(),
             tier: spec.tier,
@@ -292,7 +276,10 @@ impl ImageLayerDefinition {
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 #[store(kind = "WorkflowTemplate", code = "wt")]
 pub struct WorkflowTemplateDefinition {
-    pub origin: DefinitionOrigin,
+    /// The project a template was materialised for: by project operations from its operational
+    /// entries, or by a charter for the project it delegates to (#4024 ruling 2). Admission and
+    /// project operations read it to know whose template it is.
+    pub project: Option<String>,
     #[store(child)]
     pub roles: BTreeSet<String>,
     #[store(frozen)]
@@ -300,9 +287,9 @@ pub struct WorkflowTemplateDefinition {
 }
 
 impl WorkflowTemplateDefinition {
-    pub fn new(origin: DefinitionOrigin, spec: &WorkflowTemplateSpec) -> Result<Self, String> {
+    pub fn new(project: Option<String>, spec: &WorkflowTemplateSpec) -> Result<Self, String> {
         Ok(Self {
-            origin,
+            project,
             roles: spec.roles.iter().map(|role| role.role.clone()).collect(),
             template: Frozen::new(spec.clone()).map_err(|error| format!("freeze the template: {error}"))?,
         })

@@ -18,6 +18,8 @@
 //!
 //! Each record's [`DefinitionOrigin`] comes from its own home's copy: the labels and annotations
 //! its writer stamped. A copy that names an origin but lacks one of its fields is refused. The
+//! record holds only its own fields (#4024); the origin goes with it as the import's change, and
+//! a workflow template's materialised project becomes its `project` column. The
 //! manifest's baseline and last-applied hashes are not carried: the ManifestRoot import (layer 2c)
 //! takes the baselines from the root's status, which holds the same hashes.
 //!
@@ -28,8 +30,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_engine_store::Rehearsal;
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
-    builtins::is_builtin, definitions::declares, CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer,
-    ImageLayerResourceSpec, ObjectMeta, Project, Resource, ResourceObject, WorkflowTemplate, WorkflowTemplateSpec,
+    builtins::is_builtin,
+    definitions::{declares, DefinitionOrigin},
+    CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer, ImageLayerResourceSpec, ObjectMeta, Project,
+    Resource, ResourceObject, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use flotilla_schema::Kind;
 use flotilla_store::{definition_is_live, merge_definition_copies};
@@ -40,8 +44,8 @@ use super::{
 };
 use crate::stored::{
     definition::{
-        self as stored, CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition, DefinitionOrigin,
-        FleetDesignationDefinition, ForgeDefinition, ImageLayerDefinition, WorkflowTemplateDefinition,
+        self as stored, CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition, FleetDesignationDefinition,
+        ForgeDefinition, ImageLayerDefinition, WorkflowTemplateDefinition,
     },
     project::{self, ProjectDefinition},
 };
@@ -64,8 +68,8 @@ pub enum Mapped<S> {
 pub trait DefinitionKind {
     type Old: Resource;
     type Stored: Kind + PartialEq;
-    /// The engine record of `spec` declared by `origin`.
-    fn map(origin: DefinitionOrigin, spec: &<Self::Old as Resource>::Spec) -> Result<Mapped<Self::Stored>, String>;
+    /// The engine record of `spec`, materialised for `project` when a template is.
+    fn map(project: Option<String>, spec: &<Self::Old as Resource>::Spec) -> Result<Mapped<Self::Stored>, String>;
 }
 
 /// A kind whose every old spec maps onto one engine record.
@@ -74,8 +78,8 @@ macro_rules! whole_definition {
         impl DefinitionKind for $stored {
             type Old = $old;
             type Stored = $stored;
-            fn map(origin: DefinitionOrigin, spec: &<$old as Resource>::Spec) -> Result<Mapped<$stored>, String> {
-                Ok(Mapped::Stored(<$stored>::new(origin, spec)))
+            fn map(_: Option<String>, spec: &<$old as Resource>::Spec) -> Result<Mapped<$stored>, String> {
+                Ok(Mapped::Stored(<$stored>::new(spec)))
             }
         }
     )*};
@@ -92,9 +96,9 @@ whole_definition!(
 impl DefinitionKind for ImageLayerDefinition {
     type Old = ImageLayer;
     type Stored = ImageLayerDefinition;
-    fn map(origin: DefinitionOrigin, spec: &ImageLayerResourceSpec) -> Result<Mapped<ImageLayerDefinition>, String> {
+    fn map(_: Option<String>, spec: &ImageLayerResourceSpec) -> Result<Mapped<ImageLayerDefinition>, String> {
         match spec {
-            ImageLayerResourceSpec::Current(layer) => ImageLayerDefinition::new(origin, layer).map(Mapped::Stored),
+            ImageLayerResourceSpec::Current(layer) => ImageLayerDefinition::new(layer).map(Mapped::Stored),
             ImageLayerResourceSpec::Retired => Ok(Mapped::Dropped("retired ADR 0053 layer")),
         }
     }
@@ -103,8 +107,8 @@ impl DefinitionKind for ImageLayerDefinition {
 impl DefinitionKind for WorkflowTemplateDefinition {
     type Old = WorkflowTemplate;
     type Stored = WorkflowTemplateDefinition;
-    fn map(origin: DefinitionOrigin, spec: &WorkflowTemplateSpec) -> Result<Mapped<WorkflowTemplateDefinition>, String> {
-        WorkflowTemplateDefinition::new(origin, spec).map(Mapped::Stored)
+    fn map(project: Option<String>, spec: &WorkflowTemplateSpec) -> Result<Mapped<WorkflowTemplateDefinition>, String> {
+        WorkflowTemplateDefinition::new(project, spec).map(Mapped::Stored)
     }
 }
 
@@ -153,6 +157,8 @@ pub struct ImportedDefinition<S> {
     pub name: String,
     pub home: String,
     pub record: S,
+    /// Why its home's copy was written: the import's change for it.
+    pub origin: DefinitionOrigin,
 }
 
 /// Maps the copies of `D`'s kind onto engine records, one group of copies per namespace and name.
@@ -227,12 +233,13 @@ where
                     continue;
                 }
             };
-            match D::map(origin, &merged.spec) {
+            match D::map(super::provenance::materialized_project(&origin), &merged.spec) {
                 Ok(Mapped::Stored(record)) => imported.push(ImportedDefinition {
                     namespace: namespace.to_owned(),
                     name: name.to_owned(),
                     home: copy.home.clone(),
                     record,
+                    origin,
                 }),
                 Ok(Mapped::Dropped(reason)) => {
                     // The spec is the merged one, so every home's record drops alike: count the copies once.
@@ -275,7 +282,6 @@ fn rehearse_kind<D: DefinitionKind>(
     report: &mut ImportReport,
 ) -> BTreeSet<(String, String)>
 where
-    D::Stored: OriginOf,
     ResourceObject<D::Old>: Clone,
 {
     let kind = <D::Stored as Kind>::KIND;
@@ -284,7 +290,7 @@ where
         // Version 1: each record starts at its home as a fresh write, its old versions not carried.
         match rehearsal.restore(&imported.home, &imported.name, 1, &imported.record) {
             Ok(()) => {
-                *report.imported.entry((kind, label(imported.record.origin()))).or_default() += 1;
+                *report.imported.entry((kind, label(&imported.origin))).or_default() += 1;
                 restored.insert((imported.namespace, imported.name));
             }
             Err(reason) => report.refused.push(ImportRefusal { kind, record: imported.name, reason }),
@@ -292,31 +298,6 @@ where
     }
     restored
 }
-
-/// A definition record's origin, for the report.
-pub trait OriginOf {
-    fn origin(&self) -> &DefinitionOrigin;
-}
-
-macro_rules! origin_of {
-    ($($stored:ty),*) => {$(
-        impl OriginOf for $stored {
-            fn origin(&self) -> &DefinitionOrigin {
-                &self.origin
-            }
-        }
-    )*};
-}
-origin_of!(
-    ForgeDefinition,
-    FleetDesignationDefinition,
-    CredentialSpecDefinition,
-    CredentialGrantDefinition,
-    CrewDefaultsDefinition,
-    ImageLayerDefinition,
-    WorkflowTemplateDefinition,
-    ProjectDefinition
-);
 
 /// An origin's label, as the report counts it.
 pub fn label(origin: &DefinitionOrigin) -> &'static str {

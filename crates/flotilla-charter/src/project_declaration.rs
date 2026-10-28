@@ -3,9 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_resources::{canonicalize_repo_url, CapabilityNeed, ProjectRepositoryRole};
 use serde::Deserialize;
 
-pub const DECLARATION_FILE: &str = "project.yaml";
 pub use flotilla_resources::definition_provenance::{
-    BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION, DECLARATION_FILE_ANNOTATION,
+    BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION, DECLARATION_FILE, DECLARATION_FILE_ANNOTATION,
 };
 // ADR 0047: retired key used only for cleanup; remove one fleet roll after #2484 ships.
 pub use flotilla_resources::BOOTSTRAP_PATH_ANNOTATION;

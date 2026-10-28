@@ -9,8 +9,8 @@ use flotilla_provisioning::{
     engine::definition_import::{import_kind, rehearse_definitions, DefinitionCopies, DefinitionCopy, ImportedDefinition},
     engine::import::ImportReport,
     stored::definition::{
-        CharterOrigin, CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition, DefinitionOrigin,
-        FleetDesignationDefinition, ForgeDefinition, ImageLayerDefinition, WorkflowTemplateDefinition,
+        CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition, FleetDesignationDefinition, ForgeDefinition,
+        ImageLayerDefinition, WorkflowTemplateDefinition,
     },
     stored::project::{DeclarationRefusal, EntriesReadiness, ProjectDefinition, ProjectOpsRecord},
 };
@@ -23,6 +23,7 @@ use flotilla_resources::{
         PROJECT_IMAGE_MANAGER, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
         WHOLE_REPOSITORY_PROJECT_MANAGER,
     },
+    definitions::{CharterOrigin, DefinitionOrigin},
     CharterPointer, CharterSource, CharterStoreBinding, CredentialConsumer, CredentialGrantSelector, CredentialGrantSpec,
     CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpecSpec, CrewDefaultsSpec,
     DeclarationRefusedCondition, DispatchQueueAttention, FleetDesignationSpec, ForgeKind, ForgeSpec, HostActionSelector, HostImageAction,
@@ -99,7 +100,7 @@ fn provenance(stamp: u8) -> (BTreeMap<String, String>, BTreeMap<String, String>,
                 (MANIFEST_REVISION_ANNOTATION, "r1"),
             ]);
             let charter =
-                (stamp == 2).then(|| CharterOrigin { source: "charter".into(), revision: "c1".into(), scope: "flotilla/p".into() });
+                (stamp == 2).then(|| CharterOrigin { source: Some("charter".into()), revision: "c1".into(), scope: "flotilla/p".into() });
             if charter.is_some() {
                 annotations.extend(pairs(&[
                     (CHARTER_SOURCE_ANNOTATION, "charter"),
@@ -113,8 +114,8 @@ fn provenance(stamp: u8) -> (BTreeMap<String, String>, BTreeMap<String, String>,
             }
             let origin = DefinitionOrigin::Manifest {
                 root: "root".into(),
-                source: "src".into(),
-                path: "a.yaml".into(),
+                source: Some("src".into()),
+                path: Some("a.yaml".into()),
                 revision: "r1".into(),
                 charter,
                 materialized_project,
@@ -137,7 +138,7 @@ fn provenance(stamp: u8) -> (BTreeMap<String, String>, BTreeMap<String, String>,
                 project: "p".into(),
                 repository: "repo".into(),
                 commit: "abc".into(),
-                entry_path: ".flotilla/ops/x.yaml".into(),
+                entry_path: Some(".flotilla/ops/x.yaml".into()),
             },
         ),
         4 => (
@@ -155,7 +156,7 @@ fn provenance(stamp: u8) -> (BTreeMap<String, String>, BTreeMap<String, String>,
                 (DECLARATION_FILE_ANNOTATION, "project.yaml"),
                 (BOOTSTRAP_PATH_ANNOTATION, "/srv/repo"),
             ]),
-            DefinitionOrigin::ProjectDeclaration { repository: "repo".into(), commit: "abc".into(), file: "project.yaml".into() },
+            DefinitionOrigin::ProjectDeclaration { repository: "repo".into(), commit: "abc".into() },
         ),
         8 => (pairs(&[(MANAGED_BY_LABEL, WHOLE_REPOSITORY_PROJECT_MANAGER)]), BTreeMap::new(), DefinitionOrigin::WholeRepository),
         _ => unreachable!("{stamp} is not a stamp"),
@@ -351,14 +352,14 @@ fn imports_with_its_spec_and_origin(tc: &TestCase, stamp: u8) {
     assert_eq!(report.imported.values().sum::<usize>(), 8, "{report:?}");
 
     let mut report = ImportReport::default();
-    let forge = only(import_kind::<ForgeDefinition>(&copies.forges, &mut report));
-    let fleet = only(import_kind::<FleetDesignationDefinition>(&copies.fleet_designations, &mut report));
-    let credential_record = only(import_kind::<CredentialSpecDefinition>(&copies.credential_specs, &mut report));
-    let grant_record = only(import_kind::<CredentialGrantDefinition>(&copies.credential_grants, &mut report));
-    let defaults_record = only(import_kind::<CrewDefaultsDefinition>(&copies.crew_defaults, &mut report));
-    let layer_record = only(import_kind::<ImageLayerDefinition>(&copies.image_layers, &mut report));
-    let template_record = only(import_kind::<WorkflowTemplateDefinition>(&copies.workflow_templates, &mut report));
-    let project_record = only(import_kind::<ProjectDefinition>(&copies.projects, &mut report));
+    let forge = only_imported(import_kind::<ForgeDefinition>(&copies.forges, &mut report));
+    let fleet = only_imported(import_kind::<FleetDesignationDefinition>(&copies.fleet_designations, &mut report));
+    let credential_record = only_imported(import_kind::<CredentialSpecDefinition>(&copies.credential_specs, &mut report));
+    let grant_record = only_imported(import_kind::<CredentialGrantDefinition>(&copies.credential_grants, &mut report));
+    let defaults_record = only_imported(import_kind::<CrewDefaultsDefinition>(&copies.crew_defaults, &mut report));
+    let layer_record = only_imported(import_kind::<ImageLayerDefinition>(&copies.image_layers, &mut report));
+    let template_record = only_imported(import_kind::<WorkflowTemplateDefinition>(&copies.workflow_templates, &mut report));
+    let project_record = only_imported(import_kind::<ProjectDefinition>(&copies.projects, &mut report));
     for record_origin in [
         &forge.origin,
         &fleet.origin,
@@ -371,28 +372,38 @@ fn imports_with_its_spec_and_origin(tc: &TestCase, stamp: u8) {
     ] {
         assert_eq!(record_origin, &origin);
     }
-    assert_eq!(forge.spec(), forge_spec);
-    assert_eq!(fleet.spec(), fleet_spec);
-    assert_eq!(credential_record.spec(), credential);
-    assert_eq!(grant_record.spec(), grant);
-    assert_eq!(defaults_record.spec(), defaults);
-    assert_eq!(Some(layer_record.spec()), layer.current());
-    assert_eq!(template_record.spec(), &template);
-    assert_eq!(project_record.spec(), &project_spec);
+    assert_eq!(forge.record.spec(), forge_spec);
+    assert_eq!(fleet.record.spec(), fleet_spec);
+    assert_eq!(credential_record.record.spec(), credential);
+    assert_eq!(grant_record.record.spec(), grant);
+    assert_eq!(defaults_record.record.spec(), defaults);
+    assert_eq!(Some(layer_record.record.spec()), layer.current());
+    assert_eq!(template_record.record.spec(), &template);
+    // A template's materialised project is its own column, not provenance (#4024 ruling 2).
+    let materialized = match &origin {
+        DefinitionOrigin::Manifest { materialized_project, .. } => materialized_project.clone(),
+        DefinitionOrigin::ProjectOps { project, .. } => Some(project.clone()),
+        _ => None,
+    };
+    assert_eq!(template_record.record.project, materialized);
+    assert_eq!(project_record.record.spec(), &project_spec);
     let members = project_spec
         .repositories
         .iter()
         .map(|member| (member.repo.0.clone(), member.charter_store.as_ref().map(|store| store.host.clone())));
-    assert_eq!((project_record.parent.clone(), project_record.chartered), (project_spec.parent.clone(), project_spec.charter.is_some()));
     assert_eq!(
-        project_record.repositories.iter().map(|(key, member)| (key.clone(), member.charter_host.clone())).collect::<Vec<_>>(),
+        (project_record.record.parent.clone(), project_record.record.chartered),
+        (project_spec.parent.clone(), project_spec.charter.is_some())
+    );
+    assert_eq!(
+        project_record.record.repositories.iter().map(|(key, member)| (key.clone(), member.charter_host.clone())).collect::<Vec<_>>(),
         members.collect::<BTreeMap<_, _>>().into_iter().collect::<Vec<_>>()
     );
 }
 
-fn only<S>(imported: Vec<ImportedDefinition<S>>) -> S {
+fn only_imported<S>(imported: Vec<ImportedDefinition<S>>) -> ImportedDefinition<S> {
     let [imported] = <[_; 1]>::try_from(imported).ok().expect("one record");
-    imported.record
+    imported
 }
 
 fn manifest_stamp(root: &str) -> (BTreeMap<String, String>, BTreeMap<String, String>) {

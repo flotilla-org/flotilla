@@ -6,6 +6,11 @@
 //!
 //! A name several homes hold (each host's manifest declaring the fleet's designation) reads as
 //! this home's record, else the lexically first home's, as the import placed them (#3977).
+//!
+//! A record holds only its own fields. Its writer's stamps are its change's writer and items
+//! ([`provenance`](super::provenance)), and a record reads with the stamps rebuilt from its last
+//! change. One reason is one change: a root's pass at one revision joins the change its first write
+//! opened, and a record declared again for a new reason, unchanged, is written again under it.
 
 use std::{
     collections::BTreeMap,
@@ -24,14 +29,16 @@ use flotilla_resources::{
     WorkflowTemplateSpec,
 };
 use flotilla_schema::{Identity, Kind, KindCode, NewChange, Timestamp};
-use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
+use flotilla_schema_sqlite::{stream::Service, Read, ResourceId, StoreError};
 use futures::stream::BoxStream;
 use serde_json::Value;
 
+use super::provenance;
 use crate::stored::definition::{
     CredentialGrantDefinition, CredentialSpecDefinition, CrewDefaultsDefinition, FleetDesignationDefinition, ForgeDefinition,
     ImageLayerDefinition, WorkflowTemplateDefinition,
 };
+use crate::stored::manifest_root::ManifestRoot;
 
 /// How often a change stream looks for new entries in the log, as the account port's does.
 const POLL: Duration = Duration::from_millis(500);
@@ -39,15 +46,18 @@ const POLL: Duration = Duration::from_millis(500);
 /// How often a write that loses a race to another writer of its name reads and tries again.
 const WRITE_ATTEMPTS: usize = 3;
 
-/// The writer the plain-kind port records for this port's writes.
+/// The writer of a delete, which names no origin: the port deletes what its callers remove.
 const WRITER: &str = "definition-records";
 
 /// A definition kind as the port serves it: its resource kind's serde spec in and out.
 trait Definition: Kind + PartialEq + Sized {
     /// The resource kind's name.
     const NAME: &'static str;
-    fn build(origin: DefinitionOrigin, spec: Value) -> Result<Self, String>;
-    fn origin(&self) -> &DefinitionOrigin;
+    fn build(project: Option<String>, spec: Value) -> Result<Self, String>;
+    /// The project a record was materialised for: a workflow template's `project` column.
+    fn project(&self) -> Option<&str> {
+        None
+    }
     fn spec(&self) -> Result<Value, String>;
 }
 
@@ -64,11 +74,8 @@ macro_rules! whole {
     ($($stored:ty => $name:literal, $spec:ty);* $(;)?) => {$(
         impl Definition for $stored {
             const NAME: &'static str = $name;
-            fn build(origin: DefinitionOrigin, spec: Value) -> Result<Self, String> {
-                Ok(<$stored>::new(origin, &decode::<$spec>($name, spec)?))
-            }
-            fn origin(&self) -> &DefinitionOrigin {
-                &self.origin
+            fn build(_: Option<String>, spec: Value) -> Result<Self, String> {
+                Ok(<$stored>::new(&decode::<$spec>($name, spec)?))
             }
             fn spec(&self) -> Result<Value, String> {
                 encode(<$stored>::spec(self))
@@ -87,15 +94,12 @@ whole!(
 
 impl Definition for ImageLayerDefinition {
     const NAME: &'static str = "ImageLayer";
-    fn build(origin: DefinitionOrigin, spec: Value) -> Result<Self, String> {
+    fn build(_: Option<String>, spec: Value) -> Result<Self, String> {
         match decode::<ImageLayerResourceSpec>(Self::NAME, spec)? {
-            ImageLayerResourceSpec::Current(layer) => ImageLayerDefinition::new(origin, &layer),
+            ImageLayerResourceSpec::Current(layer) => ImageLayerDefinition::new(&layer),
             // Handled before building: see `EngineDefinitions::apply`.
             ImageLayerResourceSpec::Retired => Err("a retired ImageLayer has no stored form".into()),
         }
-    }
-    fn origin(&self) -> &DefinitionOrigin {
-        &self.origin
     }
     fn spec(&self) -> Result<Value, String> {
         encode(ImageLayerResourceSpec::Current(Box::new(ImageLayerDefinition::spec(self).clone())))
@@ -104,11 +108,11 @@ impl Definition for ImageLayerDefinition {
 
 impl Definition for WorkflowTemplateDefinition {
     const NAME: &'static str = "WorkflowTemplate";
-    fn build(origin: DefinitionOrigin, spec: Value) -> Result<Self, String> {
-        WorkflowTemplateDefinition::new(origin, &decode::<WorkflowTemplateSpec>(Self::NAME, spec)?)
+    fn build(project: Option<String>, spec: Value) -> Result<Self, String> {
+        WorkflowTemplateDefinition::new(project, &decode::<WorkflowTemplateSpec>(Self::NAME, spec)?)
     }
-    fn origin(&self) -> &DefinitionOrigin {
-        &self.origin
+    fn project(&self) -> Option<&str> {
+        self.project.as_deref()
     }
     fn spec(&self) -> Result<Value, String> {
         encode(WorkflowTemplateDefinition::spec(self))
@@ -165,6 +169,15 @@ fn codes() -> [(KindCode, &'static str); 7] {
     ]
 }
 
+/// The ManifestRoot's code: a root's baselines hold the paths its definitions read with, so a
+/// root's change re-reads its home's definitions.
+const ROOT: KindCode = <flotilla_state_machines::Resource<ManifestRoot> as Kind>::CODE;
+
+/// The codes the resident map follows: the definition kinds, and the root.
+fn followed() -> Vec<KindCode> {
+    codes().map(|(code, _)| code).into_iter().chain([ROOT]).collect()
+}
+
 fn kind_name(code: KindCode) -> Option<&'static str> {
     codes().into_iter().find(|(held, _)| *held == code).map(|(_, name)| name)
 }
@@ -185,15 +198,33 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn record<K: Definition>(name: String, home: String, version: u64, value: &K) -> Held {
+/// `value` as the old object, stamped as `origin`'s writer stamps it.
+fn object<K: Definition>(name: String, home: String, version: u64, value: &K, origin: &DefinitionOrigin) -> Held {
     let spec = value.spec().map_err(|error| format!("{} {name} at {home}: {error}", K::NAME))?;
-    let (labels, annotations) = stamp(value.origin());
+    let (labels, annotations) = stamp(origin);
     Ok(EngineObject { name, home, version, labels, annotations, spec, status: None })
 }
 
+/// Record `id` as the old object, with the stamps its last change says.
+fn record<K: Definition>(
+    read: &mut Read<'_>,
+    roots: &mut provenance::Roots,
+    id: ResourceId,
+    name: String,
+    home: String,
+    version: u64,
+    value: &K,
+) -> Result<Held, StoreError> {
+    let change = read.last_change(id)?;
+    let origin = provenance::origin_of(read, roots, K::NAME, &name, change.as_ref(), value.project())?;
+    Ok(object(name, home, version, value, &origin))
+}
+
 /// The current row of `id` of kind `K`, if any.
-fn load<K: Definition>(read: &mut Read<'_>, id: Option<flotilla_schema_sqlite::ResourceId>) -> Result<Option<Held>, StoreError> {
-    Ok(id.map(|id| read.load::<K>(id)).transpose()?.flatten().map(|loaded| record(loaded.name, loaded.home, loaded.version, &loaded.value)))
+fn load<K: Definition>(read: &mut Read<'_>, id: Option<ResourceId>) -> Result<Option<Held>, StoreError> {
+    let Some(id) = id else { return Ok(None) };
+    let Some(loaded) = read.load::<K>(id)? else { return Ok(None) };
+    record(read, &mut provenance::Roots::default(), id, loaded.name, loaded.home, loaded.version, &loaded.value).map(Some)
 }
 
 /// Reads `identity` again into `records`: its current row, or none once deleted.
@@ -218,13 +249,13 @@ fn reload(read: &mut Read<'_>, records: &mut Records, identity: &Identity) -> Re
 }
 
 /// Every record of kind `K` homed at `home`.
-fn scan<K: Definition>(read: &mut Read<'_>, records: &mut Records, home: &str) -> Result<(), StoreError> {
+fn scan<K: Definition>(read: &mut Read<'_>, roots: &mut provenance::Roots, records: &mut Records, home: &str) -> Result<(), StoreError> {
     let mut after = None;
     loop {
         let page = read.scan::<K>(home, after, 64)?;
         for id in page.ids {
             if let Some(loaded) = read.load::<K>(id)? {
-                let found = record(loaded.name.clone(), loaded.home, loaded.version, &loaded.value);
+                let found = record(read, roots, id, loaded.name.clone(), loaded.home, loaded.version, &loaded.value)?;
                 records.insert((K::NAME, loaded.name, home.to_owned()), found);
             }
         }
@@ -238,13 +269,15 @@ fn scan<K: Definition>(read: &mut Read<'_>, records: &mut Records, home: &str) -
 /// Reads every record homed at `home` into `records`, in place of what they held.
 fn rescan(read: &mut Read<'_>, records: &mut Records, home: &str) -> Result<(), StoreError> {
     records.retain(|(_, _, owner), _| owner != home);
-    scan::<ForgeDefinition>(read, records, home)?;
-    scan::<FleetDesignationDefinition>(read, records, home)?;
-    scan::<CredentialSpecDefinition>(read, records, home)?;
-    scan::<CredentialGrantDefinition>(read, records, home)?;
-    scan::<CrewDefaultsDefinition>(read, records, home)?;
-    scan::<ImageLayerDefinition>(read, records, home)?;
-    scan::<WorkflowTemplateDefinition>(read, records, home)
+    // One read of each root the home's definitions name, whatever their number.
+    let roots = &mut provenance::Roots::default();
+    scan::<ForgeDefinition>(read, roots, records, home)?;
+    scan::<FleetDesignationDefinition>(read, roots, records, home)?;
+    scan::<CredentialSpecDefinition>(read, roots, records, home)?;
+    scan::<CredentialGrantDefinition>(read, roots, records, home)?;
+    scan::<CrewDefaultsDefinition>(read, roots, records, home)?;
+    scan::<ImageLayerDefinition>(read, roots, records, home)?;
+    scan::<WorkflowTemplateDefinition>(read, roots, records, home)
 }
 
 /// `kind`'s record `name` as several homes' resolve at `home`: its own, else the lexically first
@@ -276,7 +309,7 @@ impl EngineDefinitions {
     pub fn open(service: Arc<Service>, clock: Arc<dyn flotilla_resources::Clock>) -> Result<Self, String> {
         let log = PlainLog::new(service.store());
         let home = log.home().to_owned();
-        let follower = Follower::new(codes().map(|(code, _)| code));
+        let follower = Follower::new(followed());
         let opened = Self { service, home, log, resident: Mutex::new(Resident { follower, records: Records::new() }), clock };
         let homes = opened.service.homes();
         {
@@ -308,6 +341,7 @@ impl EngineDefinitions {
                     let mut read = store.read()?;
                     for followed in follower.pass(&mut read, &homes)? {
                         match followed {
+                            Followed::Changed(identity) if identity.kind == ROOT => rescan(&mut read, records, &identity.home)?,
                             Followed::Changed(identity) => reload(&mut read, records, &identity)?,
                             Followed::Rescan(home) => rescan(&mut read, records, &home)?,
                         }
@@ -329,21 +363,30 @@ impl EngineDefinitions {
     }
 
     fn write<K: Definition>(&self, name: &str, origin: DefinitionOrigin, spec: Value) -> Result<EngineObject, String> {
-        let value = K::build(origin, spec)?;
+        let value = K::build(provenance::materialized_project(&origin), spec)?;
         // Writers of one name at this home are not serialised (the manifest reconciler, the CLI,
         // project ops): a write that loses a race reads again and writes over the winner, as the
         // old store's last writer won.
         for _ in 0..WRITE_ATTEMPTS {
-            let now = self.now();
+            let change = PendingChange::joining(provenance::change_of(&origin, &self.home, self.now()));
             let written = match self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())? {
-                // The stored value holds the origin too, so a new revision of a manifest document
-                // writes even when its spec is unchanged; an identical write logs nothing.
-                Some(current) if current.spec == value => Ok(current.version),
-                Some(current) => self.log.edit(name, current.version, &value, &PendingChange::new(NewChange::new(WRITER, now))),
-                None => self.log.create(name, &value, &PendingChange::new(NewChange::new(WRITER, now))),
+                // An unchanged record declared again for the same reason logs nothing; for a new
+                // reason, such as a manifest's next revision, it is written again under that change.
+                Some(current) if current.spec == value => {
+                    // Read apart from the record: another write between the two moves its version,
+                    // so the touch below is refused as a conflict and the loop reads again.
+                    let last = self.log.last_change::<K>(name, &self.home).map_err(|error| error.to_string())?;
+                    if last.is_some_and(|last| last.writer == change.change().writer && last.items == change.change().items) {
+                        Ok(current.version)
+                    } else {
+                        self.log.touch::<K>(name, current.version, &change)
+                    }
+                }
+                Some(current) => self.log.edit(name, current.version, &value, &change),
+                None => self.log.create(name, &value, &change),
             };
             match written {
-                Ok(version) => return record(name.to_owned(), self.home.clone(), version, &value),
+                Ok(version) => return object(name.to_owned(), self.home.clone(), version, &value, &origin),
                 Err(PlainError::Conflict { .. } | PlainError::Exists { .. } | PlainError::Missing { .. }) => continue,
                 Err(error) => return Err(format!("write {} {name}: {error}", K::NAME)),
             }
@@ -439,7 +482,7 @@ impl EngineRecords for EngineDefinitions {
 
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
         let service = Arc::clone(&self.service);
-        let mut follower = Follower::new(codes().map(|(code, _)| code));
+        let mut follower = Follower::new(followed());
         let homes = service.homes();
         service.with_store(|store| follower.start(&mut store.read()?, &homes)).map_err(|error| error.to_string())?;
         let stream = futures::stream::unfold((service, follower), |(service, mut follower)| async move {

@@ -678,14 +678,16 @@ impl ResourceManifestReconciler {
                 && annotations.get(MANIFEST_SOURCE_ANNOTATION).map(String::as_str) == Some(self.source.as_str())
                 && annotations.get(MANIFEST_PATH_ANNOTATION).map(String::as_str) == Some(path.to_string_lossy().as_ref())
                 && annotations.contains_key(MANIFEST_REVISION_ANNOTATION)
-                && [
-                    crate::charter_delegation::CHARTER_SOURCE,
-                    crate::charter_delegation::CHARTER_REVISION,
-                    crate::charter_delegation::CHARTER_SCOPE,
-                ]
-                .iter()
-                .all(|key| {
+                && [crate::charter_delegation::CHARTER_REVISION, crate::charter_delegation::CHARTER_SCOPE].iter().all(|key| {
                     document["metadata"]["annotations"].get(*key).and_then(Value::as_str) == annotations.get(*key).map(String::as_str)
+                })
+                // Where a charter was read is held by no engine change (#4024): a record there has
+                // no charter source to compare. Its change holds the charter's revision, scope and,
+                // for a repository's charter, the repository; a charter moved to another source at
+                // the same revision and scope is not seen as a change through this stamp.
+                && annotations.get(crate::charter_delegation::CHARTER_SOURCE).is_none_or(|stored| {
+                    document["metadata"]["annotations"].get(crate::charter_delegation::CHARTER_SOURCE).and_then(Value::as_str)
+                        == Some(stored.as_str())
                 })
                 && ((self.binding.is_none()
                     && document["metadata"]["annotations"].get(crate::charter_delegation::CHARTER_REVISION).is_none())
@@ -1981,7 +1983,7 @@ mod tests {
         let applied = forges.get("lab").await.expect("forge");
         let origin = flotilla_resources::definitions::origin(&applied.metadata.labels, &applied.metadata.annotations).expect("origin");
         assert!(
-            matches!(&origin, DefinitionOrigin::Manifest { root, path, .. } if *root == reconciler.root_name() && path == "forge.yaml")
+            matches!(&origin, DefinitionOrigin::Manifest { root, path, .. } if *root == reconciler.root_name() && path.as_deref() == Some("forge.yaml"))
         );
 
         let settled = reconciler.reconcile_once_for_test().await.expect("settled pass");

@@ -31,4 +31,7 @@ pub const SUPERSEDED_BY_ANNOTATION: &str = "flotilla.work/superseded-by";
 pub const BOOTSTRAP_REPOSITORY_ANNOTATION: &str = "flotilla.work/project-bootstrap-repository";
 pub const BOOTSTRAP_COMMIT_ANNOTATION: &str = "flotilla.work/project-bootstrap-commit";
 pub const DECLARATION_FILE_ANNOTATION: &str = "flotilla.work/project-declaration-file";
+/// The one file a Project declaration is read from: the value `DECLARATION_FILE_ANNOTATION` always
+/// holds, so nothing stores it (#4024).
+pub const DECLARATION_FILE: &str = "project.yaml";
 pub const WHOLE_REPOSITORY_PROJECT_MANAGER: &str = "whole-repository-project";

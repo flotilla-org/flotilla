@@ -53,130 +53,9 @@ CREATE TABLE codes (
 CREATE TABLE "project" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
-  "origin" TEXT NOT NULL CHECK ("origin" IN ('mf', 'op', 'pd', 'pi', 'po', 'sn', 'wr')),
-  "origin_root" TEXT,
-  "origin_source" TEXT,
-  "origin_path" TEXT,
-  "origin_revision" TEXT,
-  "origin_charter_source" TEXT,
-  "origin_charter_revision" TEXT,
-  "origin_charter_scope" TEXT,
-  "origin_materialized_project" TEXT,
-  "origin_project" TEXT,
-  "origin_repository" TEXT,
-  "origin_commit" TEXT,
-  "origin_entry_path" TEXT,
-  "origin_file" TEXT,
   "parent" TEXT,
   "chartered" INTEGER NOT NULL CHECK ("chartered" IN (0, 1)),
-  "definition" BLOB NOT NULL REFERENCES "objects" ("hash"),
-  CHECK (CASE WHEN "origin_charter_source" IS NOT NULL
-      THEN "origin_charter_revision" IS NOT NULL
-      AND "origin_charter_scope" IS NOT NULL
-      ELSE "origin_charter_revision" IS NULL
-      AND "origin_charter_scope" IS NULL
-      END),
-  CHECK (CASE WHEN "origin" = 'op'
-      THEN "origin_root" IS NULL
-      AND "origin_source" IS NULL
-      AND "origin_path" IS NULL
-      AND "origin_revision" IS NULL
-      AND "origin_charter_source" IS NULL
-      AND "origin_charter_revision" IS NULL
-      AND "origin_charter_scope" IS NULL
-      AND "origin_materialized_project" IS NULL
-      AND "origin_project" IS NULL
-      AND "origin_repository" IS NULL
-      AND "origin_commit" IS NULL
-      AND "origin_entry_path" IS NULL
-      AND "origin_file" IS NULL
-      END),
-  CHECK (CASE WHEN "origin" = 'mf'
-      THEN "origin_root" IS NOT NULL
-      AND "origin_source" IS NOT NULL
-      AND "origin_path" IS NOT NULL
-      AND "origin_revision" IS NOT NULL
-      AND "origin_project" IS NULL
-      AND "origin_repository" IS NULL
-      AND "origin_commit" IS NULL
-      AND "origin_entry_path" IS NULL
-      AND "origin_file" IS NULL
-      END),
-  CHECK (CASE WHEN "origin" = 'po'
-      THEN "origin_project" IS NOT NULL
-      AND "origin_repository" IS NOT NULL
-      AND "origin_commit" IS NOT NULL
-      AND "origin_entry_path" IS NOT NULL
-      AND "origin_root" IS NULL
-      AND "origin_source" IS NULL
-      AND "origin_path" IS NULL
-      AND "origin_revision" IS NULL
-      AND "origin_charter_source" IS NULL
-      AND "origin_charter_revision" IS NULL
-      AND "origin_charter_scope" IS NULL
-      AND "origin_materialized_project" IS NULL
-      AND "origin_file" IS NULL
-      END),
-  CHECK (CASE WHEN "origin" = 'pi'
-      THEN "origin_project" IS NOT NULL
-      AND "origin_commit" IS NOT NULL
-      AND "origin_root" IS NULL
-      AND "origin_source" IS NULL
-      AND "origin_path" IS NULL
-      AND "origin_revision" IS NULL
-      AND "origin_charter_source" IS NULL
-      AND "origin_charter_revision" IS NULL
-      AND "origin_charter_scope" IS NULL
-      AND "origin_materialized_project" IS NULL
-      AND "origin_repository" IS NULL
-      AND "origin_entry_path" IS NULL
-      AND "origin_file" IS NULL
-      END),
-  CHECK (CASE WHEN "origin" = 'sn'
-      THEN "origin_root" IS NULL
-      AND "origin_source" IS NULL
-      AND "origin_path" IS NULL
-      AND "origin_revision" IS NULL
-      AND "origin_charter_source" IS NULL
-      AND "origin_charter_revision" IS NULL
-      AND "origin_charter_scope" IS NULL
-      AND "origin_materialized_project" IS NULL
-      AND "origin_project" IS NULL
-      AND "origin_repository" IS NULL
-      AND "origin_commit" IS NULL
-      AND "origin_entry_path" IS NULL
-      AND "origin_file" IS NULL
-      END),
-  CHECK (CASE WHEN "origin" = 'pd'
-      THEN "origin_repository" IS NOT NULL
-      AND "origin_commit" IS NOT NULL
-      AND "origin_file" IS NOT NULL
-      AND "origin_root" IS NULL
-      AND "origin_source" IS NULL
-      AND "origin_path" IS NULL
-      AND "origin_revision" IS NULL
-      AND "origin_charter_source" IS NULL
-      AND "origin_charter_revision" IS NULL
-      AND "origin_charter_scope" IS NULL
-      AND "origin_materialized_project" IS NULL
-      AND "origin_project" IS NULL
-      AND "origin_entry_path" IS NULL
-      END),
-  CHECK (CASE WHEN "origin" = 'wr'
-      THEN "origin_root" IS NULL
-      AND "origin_source" IS NULL
-      AND "origin_path" IS NULL
-      AND "origin_revision" IS NULL
-      AND "origin_charter_source" IS NULL
-      AND "origin_charter_revision" IS NULL
-      AND "origin_charter_scope" IS NULL
-      AND "origin_materialized_project" IS NULL
-      AND "origin_project" IS NULL
-      AND "origin_repository" IS NULL
-      AND "origin_commit" IS NULL
-      AND "origin_entry_path" IS NULL
-      AND "origin_file" IS NULL
-      END)
+  "definition" BLOB NOT NULL REFERENCES "objects" ("hash")
 ) STRICT;
 CREATE TABLE "project_repositories" (
   "project" INTEGER NOT NULL,
@@ -185,31 +64,9 @@ CREATE TABLE "project_repositories" (
   PRIMARY KEY ("project", "key"),
   FOREIGN KEY ("project") REFERENCES "project" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
-INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
-  ('pj', 'origin', 'mf', 'Manifest'),
-  ('pj', 'origin', 'op', 'Operator'),
-  ('pj', 'origin', 'pd', 'ProjectDeclaration'),
-  ('pj', 'origin', 'pi', 'ProjectImage'),
-  ('pj', 'origin', 'po', 'ProjectOps'),
-  ('pj', 'origin', 'sn', 'Snapshot'),
-  ('pj', 'origin', 'wr', 'WholeRepository');
 CREATE VIEW "project_view" AS SELECT
   "project"."id",
   "project"."version",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'pj' AND "field" = 'origin' AND "code" = "project"."origin") AS "origin",
-  "project"."origin_root",
-  "project"."origin_source",
-  "project"."origin_path",
-  "project"."origin_revision",
-  "project"."origin_charter_source",
-  "project"."origin_charter_revision",
-  "project"."origin_charter_scope",
-  "project"."origin_materialized_project",
-  "project"."origin_project",
-  "project"."origin_repository",
-  "project"."origin_commit",
-  "project"."origin_entry_path",
-  "project"."origin_file",
   "project"."parent",
   "project"."chartered",
   "project"."definition"
