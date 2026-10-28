@@ -140,8 +140,7 @@ pub enum HostDirectPlacementPolicyCheckout {
     Worktree,
 }
 
-/// Decoded through [`StoredDockerPerVessel`], which mirrors every field and holds their decode
-/// defaults: a new field is added to both until that shim is removed.
+/// Decoded through [`StoredDockerPerVessel`]: a new field is added to both.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "StoredDockerPerVessel")]
 pub struct DockerPerVesselPlacementPolicySpec {
@@ -167,10 +166,8 @@ pub struct DockerPerVesselPlacementPolicySpec {
     pub checkout: DockerCheckoutStrategy,
 }
 
-/// A Docker policy as stored, with the provenance an admission snapshot froze from a retired
-/// CrewImageBaseline. That snapshot's image is the baseline's mutable tag, which Docker
-/// realisation refuses without the retired bridge, so it decodes as the vessel's composed image,
-/// as a live policy's `{image_baseline_ref}` does (#3824 layer 4b-i; remove one roll after it).
+/// A snapshot frozen from a retired CrewImageBaseline holds its mutable tag, which Docker refuses,
+/// so it decodes as the vessel's composed image.
 #[derive(Deserialize)]
 struct StoredDockerPerVessel {
     host_ref: String,
@@ -251,9 +248,7 @@ pub enum DockerImageSource {
 /// Decode an optional image source, dropping the ADR 0053
 /// `{composition: {selection…}}` form as omitted. ADR 0047: remove the
 /// composition shim one roll after ADR 0062 images land. A retired
-/// CrewImageBaseline reference (`{image_baseline_ref}`) decodes as omitted too:
-/// the vessel's composed image, the default since ADR 0062 (#3824 layer 4b-i;
-/// remove one roll after it).
+/// CrewImageBaseline reference decodes as omitted too.
 pub(crate) fn decode_optional_image_source<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<DockerImageSource>, D::Error> {
@@ -329,7 +324,6 @@ mod image_source_tests {
                 Some(serde_json::json!("registry.test/crew@sha256:abc")),
                 Some(DockerImageSource::Literal("registry.test/crew@sha256:abc".into())),
             ),
-            // A retired CrewImageBaseline reference is the vessel's composed image (#3824 layer 4b-i).
             (Some(serde_json::json!({"image_baseline_ref": "crew"})), None),
             (
                 Some(serde_json::json!({"identity": "sha256:abc", "image_build_ref": "image-abc-amd64"})),
@@ -371,9 +365,6 @@ mod image_source_tests {
         assert_eq!(kind.realisation, crate::FulfilmentRealisation::DockerPerVessel { image: None });
     }
 
-    // ADR 0047 (#3824 layer 4b-i): a snapshot admission froze from a retired CrewImageBaseline holds
-    // the baseline's mutable tag and its provenance. It decodes as the vessel's composed image, and
-    // its encoding carries neither.
     #[test]
     fn a_snapshot_frozen_from_a_baseline_runs_the_composed_image() {
         let mut frozen = policy(Some(serde_json::json!("registry.test/crew:baseline")));

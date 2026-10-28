@@ -163,7 +163,6 @@ fn what_the_move_cannot_carry_is_refused() {
         ],
     };
     let report = rehearse_placement(&copies);
-    // A retired CrewImageBaseline image decodes as the vessel's composed image (#3824 layer 4b-i).
     let mut imported = ImportReport::default();
     let kinds = import_placement(&copies, &mut imported).kinds;
     let baseline = kinds.iter().find(|placed| placed.name == "baseline").expect("the baseline policy's kind");

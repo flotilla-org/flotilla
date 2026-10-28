@@ -2,8 +2,7 @@ use crate::*;
 
 #[allow(async_fn_in_trait)]
 pub trait DockerImageSourceStoreExt: Sized {
-    /// The image reference a placement runs: a literal now; a composed image's once its ImageBuild
-    /// is built, which the environment reconciler reads.
+    /// A literal now; a composed image's once its ImageBuild is built.
     fn resolve(&self) -> Result<String, String>;
 }
 impl DockerImageSourceStoreExt for DockerImageSource {

@@ -75,8 +75,7 @@ pub(super) fn plan(plural: &str) -> Option<(&'static str, Plan)> {
     PLAN.iter().find(|(name, _)| *name == kind).copied()
 }
 
-/// Whether rows listed under `plural` are a retired kind's this candidate no longer decodes; the
-/// import drops them.
+/// Whether `plural` is a retired kind this candidate no longer decodes; the import drops its rows.
 pub(super) fn is_retired(plural: &str) -> bool {
     !REGISTERED_RESOURCE_KINDS.iter().any(|entry| entry.plural == plural) && matches!(plan(plural), Some((_, Plan::Retired(_))))
 }
@@ -178,8 +177,6 @@ mod tests {
         assert!(unknown.blocks_import(), "a kind with no plan fails closed");
     }
 
-    // Contract (#3824 layer 4b-i): a previous-generation daemon still lists a kind this candidate
-    // retired; its rows are counted as dropped and skip decoding, never "no import plan".
     #[test]
     fn a_retired_unregistered_kind_listed_by_an_older_daemon_is_dropped() {
         assert!(is_retired("crewimagebaselines"));
