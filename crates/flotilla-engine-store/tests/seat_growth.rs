@@ -111,8 +111,11 @@ fn standing_rollover_keeps_identity_live_seats_and_standing_duties() {
         assert_eq!(loaded.value.spec().seats.len(), 2);
         assert!(loaded.value.spec().promises.is_empty());
         let changes = read.changes(id, 0, 100).unwrap();
+        let headers = read.changes_of(&changes).unwrap();
         let mut replica = Store::open(rusqlite::Connection::open_in_memory().unwrap(), "replica", convoy_registry().unwrap()).unwrap();
         let mut write = replica.write().unwrap();
+        // Each entry's change first, as the stream sends it (#4024).
+        headers.iter().for_each(|header| write.record_change(header).unwrap());
         for change in &changes[..changes.len() - 1] {
             write.apply(change).unwrap();
         }
@@ -170,7 +173,13 @@ fn previous_database_and_create_event_decode_with_growth_defaults() {
         Timestamp(0),
     )
     .unwrap();
-    let mut event = store.lock().unwrap().read().unwrap().changes_since("home", 0, 1).unwrap().remove(0);
+    let (mut event, header) = {
+        let mut database = store.lock().unwrap();
+        let mut read = database.read().unwrap();
+        let event = read.changes_since("home", 0, 1).unwrap().remove(0);
+        let header = read.changes_of(std::slice::from_ref(&event)).unwrap().remove(0);
+        (event, header)
+    };
     // Previous-generation create events did not name the three new fields.
     event.effect.changes.retain_mut(|change| match change {
         flotilla_schema::Change::Set { row, field, .. } if row.is_empty() && field == "promise_floor" => false,
@@ -182,6 +191,7 @@ fn previous_database_and_create_event_decode_with_growth_defaults() {
     });
     let mut follower = Store::open(rusqlite::Connection::open_in_memory().unwrap(), "follower", convoy_registry().unwrap()).unwrap();
     let mut write = follower.write().unwrap();
+    write.record_change(&header).unwrap();
     write.apply(&event).unwrap();
     write.commit().unwrap();
     let mut read = follower.read().unwrap();

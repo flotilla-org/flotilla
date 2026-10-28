@@ -71,7 +71,7 @@ impl EnsureLogs for MemoryLogs {
         home.log()
             .history(name, flotilla_state_machines::Version(0), usize::MAX)
             .into_iter()
-            .map(|(_, event)| event.payload.edge.clone())
+            .map(|(_, event)| event.arguments.edge.clone())
             .collect()
     }
 }

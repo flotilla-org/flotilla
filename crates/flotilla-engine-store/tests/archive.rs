@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 
 use flotilla_engine_store::{
-    archive::{bundle_key, ArchiveKinds, ArchiveNote, Archiver, Bundle, Due, Prepared, Stage, ARCHIVE_AFTER_MICROS, ARCHIVE_WRITER},
+    archive::{bundle_key, ArchiveKinds, Archiver, Bundle, Due, Prepared, Stage, ARCHIVE_AFTER_MICROS, ARCHIVE_WRITER},
     registry, MessageLog,
 };
 use flotilla_schema::{Address, Cause, Identity, Kind, Timestamp};
@@ -119,16 +119,12 @@ fn a_dropped_message_ships_a_week_later_and_leaves_in_two_writes() {
     let mut elsewhere = self::store("gamma");
     assert_eq!(bundle.replay(&mut elsewhere).expect("replay"), Some(stored), "the entries rebuild the end state");
 
-    let note = ArchiveNote { key: bundle_key(&identity(&dropped)), digest: "0".repeat(64) };
     let deleted_at = due.saturating_add(1);
-    archiver.delete(&mut store, &identity(&dropped), version, &note, deleted_at).expect("delete");
+    archiver.delete(&mut store, &identity(&dropped), version, deleted_at).expect("delete");
     assert!(matches!(archiver.prepare(&mut store, &identity(&dropped)).expect("prepare"), Prepared::Gone));
     assert_eq!(archiver.candidates().count(), 0, "a candidate no longer stored at its end is dropped");
     archiver.refresh(&mut store).expect("refresh");
-    assert_eq!(
-        archiver.candidates().next().map(|candidate| &candidate.stage),
-        Some(&Stage::Deleted { at: deleted_at, note: note.clone() })
-    );
+    assert_eq!(archiver.candidates().next().map(|candidate| &candidate.stage), Some(&Stage::Deleted { at: deleted_at }));
     assert!(archiver.due(Timestamp(deleted_at.0 + GRACE - 1), GRACE).is_empty(), "the expunge waits a pass");
     assert!(!follow(&mut store, &mut follower, Some(cursor)), "the delete is tailed");
     cursor = follower.read().expect("read").watermark(HOME).expect("watermark").home_seq;
@@ -136,8 +132,8 @@ fn a_dropped_message_ships_a_week_later_and_leaves_in_two_writes() {
     let mut restarted = Archiver::new(HOME, kinds());
     restarted.refresh(&mut store).expect("startup scan");
     let expunge_at = deleted_at.saturating_add(GRACE);
-    assert_eq!(restarted.due(expunge_at, GRACE), [Due::Expunge(identity(&dropped), note.clone())], "a restart resumes at the expunge");
-    assert!(restarted.expunge(&mut store, &identity(&dropped), &note, expunge_at).expect("expunge"));
+    assert_eq!(restarted.due(expunge_at, GRACE), [Due::Expunge(identity(&dropped))], "a restart resumes at the expunge");
+    assert!(restarted.expunge(&mut store, &identity(&dropped), expunge_at).expect("expunge"));
     restarted.refresh(&mut store).expect("refresh");
     assert_eq!(restarted.candidates().count(), 0);
 
@@ -151,10 +147,9 @@ fn a_dropped_message_ships_a_week_later_and_leaves_in_two_writes() {
         let entries = read.changes_since(HOME, 0, 64).expect("log");
         let tombstone = entries.iter().find(|entry| entry.cause == Cause::Expunge).expect("expunge entry");
         assert_eq!(tombstone.effect.expunged, Some(identity(&dropped)));
-        assert_eq!(tombstone.writer, ARCHIVE_WRITER);
-        let logged: ArchiveNote =
-            flotilla_cbor::from_slice(tombstone.payload.as_deref().expect("note"), &flotilla_schema::INLINE_LIMITS).expect("note");
-        assert_eq!(logged, note);
+        // The archiver's change says who expunged it; the bundle's key is the identity's.
+        let change = read.change(HOME, tombstone.change).expect("read").expect("its change");
+        assert_eq!((change.writer.as_str(), change.at), (ARCHIVE_WRITER, expunge_at));
         assert!(!entries.iter().any(|entry| entry.name == dropped && entry.cause != Cause::Expunge), "its history went with it");
     }
 }

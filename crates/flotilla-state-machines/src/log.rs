@@ -23,15 +23,15 @@ use std::{
 
 use flotilla_schema::{Cause, Cbor, Code, Event, EventError, Timestamp};
 
-use crate::{Coded, EdgeEventOf, EdgeKind, EdgePayload, InputRead, Label, Machine, Resource, StoredState, Version};
+use crate::{Coded, EdgeEventOf, EdgeKind, InputRead, Label, Machine, Resource, StoredState, Version};
 
 /// Persists a home's writes and gives each its sequence.
 pub trait Log<M: Machine> {
-    /// Persists the creation of `resource` by `writer` at `at`, with the reads
-    /// its admission relied on as the entry's payload, and returns its version.
-    /// The payload never copies the spec: the create's effect holds it, so a
-    /// frozen body is stored at most twice (#3424 ruling 4). The resource's
-    /// own version is not yet set.
+    /// Persists the creation of `resource` by `writer` at `at`, as one change
+    /// whose inputs are the reads its admission relied on (#4024), and returns
+    /// its version. The change never copies the spec: the create's effect holds
+    /// it, so a frozen body is stored at most twice (#3424 ruling 4). The
+    /// resource's own version is not yet set.
     fn create(&mut self, writer: &str, at: Timestamp, resource: &Resource<M>, reads: &[InputRead]) -> Result<Version, LogError>;
 
     /// Storage-assigned creation metadata seam. The log may assign
@@ -52,11 +52,13 @@ pub trait Log<M: Machine> {
         Ok(resource)
     }
 
-    /// Persists `event`, which moved `next` out of `previous`, and returns the
-    /// write's version. `next` holds its next state at the version the write
-    /// must find stored, so a log over the store applies the edge under that
-    /// stamp ([`Resource::stored_edge`]).
-    fn edge(&mut self, previous: &StoredState<M>, next: &Resource<M>, event: &EdgeEventOf<M>) -> Result<Version, LogError>;
+    /// Persists `event`, written by `writer`, which moved `next` out of
+    /// `previous`, and returns the write's version: its entry holds the edge's
+    /// arguments, and its change the writer, time and reads (#4024). `next`
+    /// holds its next state at the version the write must find stored, so a log
+    /// over the store applies the edge under that stamp
+    /// ([`Resource::stored_edge`]).
+    fn edge(&mut self, writer: &str, previous: &StoredState<M>, next: &Resource<M>, event: &EdgeEventOf<M>) -> Result<Version, LogError>;
 
     /// [`Log::edge`] for an edge that also wrote the resource's records:
     /// `next` holds its next state and its records as they were before the
@@ -65,6 +67,7 @@ pub trait Log<M: Machine> {
     /// any write rather than drop it.
     fn edge_with_writes(
         &mut self,
+        writer: &str,
         previous: &StoredState<M>,
         next: &Resource<M>,
         event: &EdgeEventOf<M>,
@@ -73,7 +76,7 @@ pub trait Log<M: Machine> {
         if !writes.is_empty() {
             return Err(LogError::new("this log does not store records writes"));
         }
-        self.edge(previous, next, event)
+        self.edge(writer, previous, next, event)
     }
 }
 
@@ -156,7 +159,7 @@ impl<M: Machine> Log<M> for MemoryLog<M> {
         Ok(self.next(Version(0)))
     }
 
-    fn edge(&mut self, _: &StoredState<M>, next: &Resource<M>, event: &EdgeEventOf<M>) -> Result<Version, LogError> {
+    fn edge(&mut self, _: &str, _: &StoredState<M>, next: &Resource<M>, event: &EdgeEventOf<M>) -> Result<Version, LogError> {
         let version = self.next(next.version());
         self.edges.insert((next.name().to_owned(), version.0), event.clone());
         Ok(version)
@@ -165,12 +168,13 @@ impl<M: Machine> Log<M> for MemoryLog<M> {
     /// The memory log keeps events only; the home holds the records the writes change.
     fn edge_with_writes(
         &mut self,
+        writer: &str,
         previous: &StoredState<M>,
         next: &Resource<M>,
         event: &EdgeEventOf<M>,
         _: &[M::Write],
     ) -> Result<Version, LogError> {
-        self.edge(previous, next, event)
+        self.edge(writer, previous, next, event)
     }
 }
 
@@ -179,43 +183,46 @@ impl<M: Machine> Log<M> for MemoryLog<M> {
 pub enum EntryError {
     /// A code in the entry's header names no label or edge of the machine.
     UnknownCode { machine: &'static str, what: &'static str, code: Code },
-    /// An edge entry with no document.
-    MissingPayload,
-    /// The document is not the machine's edge payload.
-    Payload(EventError),
+    /// An edge entry with no arguments.
+    MissingArguments,
+    /// The arguments are not the machine's edge.
+    Arguments(EventError),
 }
 
 impl fmt::Display for EntryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EntryError::UnknownCode { machine, what, code } => write!(f, "{code} is not a {what} code of {machine}"),
-            EntryError::MissingPayload => f.write_str("the edge entry has no payload"),
-            EntryError::Payload(error) => write!(f, "the edge payload does not decode: {error}"),
+            EntryError::MissingArguments => f.write_str("the edge entry has no arguments"),
+            EntryError::Arguments(error) => write!(f, "the edge arguments do not decode: {error}"),
         }
     }
 }
 
 impl Error for EntryError {}
 
-/// The edge event a store log entry records, as the home that wrote it
-/// returned it: `None` for an entry that is no edge (a create, spec edit,
-/// delete or expunge). The header gives the edge and label codes, the writer
-/// and time; the document gives the edge and its reads.
-pub fn edge_event<M: Machine>(entry: &Event) -> Result<Option<EdgeEventOf<M>>, EntryError>
+/// An edge event as a store log entry records it: its edge and labels, its
+/// time (its change's), and the typed edge as its arguments. The reads the home
+/// recorded are its change's inputs, not part of the entry (#4024).
+pub type LoggedEdgeOf<M> = flotilla_schema::EdgeEvent<Label<M>, EdgeKind<M>, <M as Machine>::Edge>;
+
+/// The edge event a store log entry records, at its change's time `at`: `None`
+/// for an entry that is no edge (a create, spec edit, delete or expunge). The
+/// header gives the edge and label codes; the arguments give the edge.
+pub fn edge_event<M: Machine>(entry: &Event, at: Timestamp) -> Result<Option<LoggedEdgeOf<M>>, EntryError>
 where
-    EdgePayload<M::Edge>: Cbor,
+    M::Edge: Cbor,
 {
     let Cause::Edge { edge, from, to } = entry.cause else {
         return Ok(None);
     };
-    let payload: EdgePayload<M::Edge> = entry.payload().ok_or(EntryError::MissingPayload)?.map_err(EntryError::Payload)?;
+    let arguments: M::Edge = entry.arguments().ok_or(EntryError::MissingArguments)?.map_err(EntryError::Arguments)?;
     Ok(Some(flotilla_schema::EdgeEvent {
         edge: coded::<M, EdgeKind<M>>("edge", edge)?,
         from: coded::<M, Label<M>>("label", from)?,
         to: coded::<M, Label<M>>("label", to)?,
-        writer: entry.writer.clone(),
-        at: entry.at,
-        payload,
+        at,
+        arguments,
     }))
 }
 

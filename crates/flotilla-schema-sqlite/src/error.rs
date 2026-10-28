@@ -11,6 +11,10 @@ pub enum StoreError {
     /// The new store's pre-domain baseline has no migration path; reject it at open.
     #[error("strings table has no domain column: pre-domain dictionaries are unsupported; open a new domain-tagged store")]
     LegacyDictionarySchema,
+    /// The `log` table predates changes (#4024): its entries hold their writer, time and payload.
+    /// It has no migration path; reject it at open.
+    #[error("log table names no change: the database predates changes (#4024) and has no migration; open a new store")]
+    LegacyLogSchema,
     /// A kind table exists with other columns than its kind declares, such as one written before
     /// the parent key was named after its root table (#3627). Opening only creates missing tables,
     /// and SQLite reads an unknown double-quoted column name as a string literal, so a stale table
@@ -111,6 +115,10 @@ pub enum StoreError {
     /// `prev_seq`, `expected` the identity's sequence here.
     #[error("resource is at sequence {expected}; the change follows {found}")]
     Gap { expected: u64, found: u64 },
+    /// An entry from another home whose change this store does not hold: replication sends each
+    /// change before its first entry (#4024).
+    #[error("entry of change {seq} at {home}, which this store does not hold")]
+    MissingChange { home: String, seq: u64 },
     /// A listing asked for no rows; every listing takes a positive limit.
     #[error("a page limit must be at least 1")]
     ZeroLimit,
@@ -146,6 +154,10 @@ pub enum Malformed {
     /// numbers each change once, so the sender reused it.
     #[error("home sequence {home_seq} of {home} is already logged")]
     ReusedSequence { home: String, home_seq: u64 },
+    /// A change recorded again with another writer, time or items than the one held: a home
+    /// writes each change once, so the sender's copy is not the home's.
+    #[error("change {seq} of {home} is already held with another header or items")]
+    ChangeMismatch { home: String, seq: u64 },
     /// Above `i64::MAX`, or 0, which no write takes (sequences start at 1).
     #[error("home sequence {home_seq} cannot be stored")]
     Sequence { home_seq: u64 },

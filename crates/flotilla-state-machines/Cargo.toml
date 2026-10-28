@@ -15,6 +15,8 @@ serde = { workspace = true }
 strum = { workspace = true }
 
 [dev-dependencies]
+# Tests encode raw edge argument documents, as a log entry stores them.
+flotilla-cbor = { path = "../flotilla-cbor" }
 flotilla-quint-testkit = { path = "../flotilla-quint-testkit" }
 hegeltest = { workspace = true }
 # ITF traces and exported graphs are JSON; production code never decodes them.

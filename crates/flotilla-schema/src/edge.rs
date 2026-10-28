@@ -243,24 +243,23 @@ pub struct LabelCheck {
     pub code: Code,
 }
 
-/// An edge's event as its `log` entry records it: the header columns and the payload's canonical
-/// CBOR (#3392 G8). `about` is the edge's master, the resource it is about (G11), when it
-/// declares one.
+/// An edge's event as its `log` entry records it: the header columns and the arguments'
+/// canonical CBOR (#3392 G8). `about` is the edge's master, the resource it is about (G11), when
+/// it declares one. `at` is the edge's time, which its change carries (#4024).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeHeader {
     pub edge: Code,
     pub from: Code,
     pub to: Code,
-    pub writer: String,
     pub at: Timestamp,
-    pub payload: Vec<u8>,
+    pub arguments: Vec<u8>,
     pub about: Option<Identity>,
 }
 
 impl EdgeHeader {
-    /// The payload as the edge wrote it.
-    pub fn payload<P: Cbor>(&self) -> Result<P, EdgeError> {
-        flotilla_cbor::from_slice(&self.payload, &INLINE_LIMITS).map_err(|error| EdgeError::Payload { kind: error.kind() })
+    /// The arguments as the edge wrote them.
+    pub fn arguments<P: Cbor>(&self) -> Result<P, EdgeError> {
+        flotilla_cbor::from_slice(&self.arguments, &INLINE_LIMITS).map_err(|error| EdgeError::Arguments { kind: error.kind() })
     }
 }
 
@@ -314,23 +313,30 @@ pub enum EdgeError {
     /// A state carrying data is written by `Edge::transition`, from the previous value.
     #[error("the state of {field} carries data and is written by a transition from the previous value")]
     Data { field: String },
-    /// The event's payload is not an inline CBOR document within its bounds.
-    #[error("the event payload is not an inline document: {kind:?}")]
-    Payload { kind: flotilla_cbor::ErrorKind },
+    /// The event's arguments are not an inline CBOR document within its bounds.
+    #[error("the event arguments are not an inline document: {kind:?}")]
+    Arguments { kind: flotilla_cbor::ErrorKind },
 }
 
 /// One edge write to a resource of kind `K`, built from typed handles; see the module docs.
 ///
 /// ```text
 /// let next = State::new(TicketState::Closed { .. }, event.at);
-/// let event = EdgeEvent { edge: TicketEdge::Close, from: Open, to: Closed, writer, at, payload };
+/// let event = EdgeEvent { edge: TicketEdge::Close, from: Open, to: Closed, at, arguments };
 /// let edge = Edge::transition(Ticket::STATE, &previous, &next, &event)?.set(Ticket::TITLE, &title)?;
 /// write.apply_edge(current, edge)?;
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Edge<K> {
     parts: EdgeParts,
     kind: PhantomData<fn() -> K>,
+}
+
+// Not derived: a derive would require `K: Clone`, and `K` is only a marker.
+impl<K> Clone for Edge<K> {
+    fn clone(&self) -> Self {
+        Edge { parts: self.parts.clone(), kind: PhantomData }
+    }
 }
 
 impl<K> Edge<K> {
@@ -397,16 +403,10 @@ impl<K> Edge<K> {
     }
 
     fn empty<L: CodeEnum, E: CodeEnum, P: Cbor>(field: &'static str, event: &EdgeEvent<L, E, P>) -> Result<Edge<K>, EdgeError> {
-        let payload = flotilla_cbor::to_vec(&event.payload, &INLINE_LIMITS).map_err(|error| EdgeError::Payload { kind: error.kind() })?;
-        let header = EdgeHeader {
-            edge: event.edge.code(),
-            from: event.from.code(),
-            to: event.to.code(),
-            writer: event.writer.clone(),
-            at: event.at,
-            payload,
-            about: None,
-        };
+        let arguments =
+            flotilla_cbor::to_vec(&event.arguments, &INLINE_LIMITS).map_err(|error| EdgeError::Arguments { kind: error.kind() })?;
+        let header =
+            EdgeHeader { edge: event.edge.code(), from: event.from.code(), to: event.to.code(), at: event.at, arguments, about: None };
         let parts = EdgeParts {
             collections: Vec::new(),
             sets: Vec::new(),
@@ -496,6 +496,11 @@ impl<K> Edge<K> {
         self.parts.objects.append(&mut after.objects);
         self.parts.collections.push(EdgeCollection { table, role, before, after });
         Ok(self)
+    }
+
+    /// When the edge happened: the time its change carries (#4024).
+    pub fn at(&self) -> Timestamp {
+        self.parts.event.at
     }
 
     /// The writes, for a backend.

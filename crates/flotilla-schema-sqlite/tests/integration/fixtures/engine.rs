@@ -39,6 +39,7 @@ where
     M::State: StateData + Labelled<Label = Label<M>>,
     M::Write: StoredWrite<Resource<M>>,
     EdgePayload<M::Edge>: Cbor,
+    M::Edge: Cbor,
 {
     if candidates.is_empty() {
         return None;
@@ -61,17 +62,19 @@ where
     M::State: StateData + Labelled<Label = Label<M>>,
     M::Write: StoredWrite<Resource<M>>,
     EdgePayload<M::Edge>: Cbor,
+    M::Edge: Cbor,
 {
     fn create(&mut self, _: &str, _: Timestamp, _: &Resource<M>, _: &[InputRead]) -> Result<Version, LogError> {
         Ok(Version(1))
     }
 
-    fn edge(&mut self, previous: &StoredState<M>, next: &Resource<M>, event: &EdgeEventOf<M>) -> Result<Version, LogError> {
-        self.edge_with_writes(previous, next, event, &[])
+    fn edge(&mut self, writer: &str, previous: &StoredState<M>, next: &Resource<M>, event: &EdgeEventOf<M>) -> Result<Version, LogError> {
+        self.edge_with_writes(writer, previous, next, event, &[])
     }
 
     fn edge_with_writes(
         &mut self,
+        _: &str,
         previous: &StoredState<M>,
         next: &Resource<M>,
         event: &EdgeEventOf<M>,
@@ -82,7 +85,8 @@ where
         let edge = next.stored_edge_about(previous, event, master).expect("an applied edge is storable");
         let edge = writes.iter().try_fold(edge, |edge, write| write.store(edge)).expect("a records write is storable");
         self.edge = Some(edge);
-        Ok(Version(next.version().0 + 1))
+        // The store's next write takes its change's sequence, then its entry's (#4024).
+        Ok(Version(next.version().0 + 2))
     }
 }
 
@@ -102,6 +106,7 @@ where
     M::State: StateData + Labelled<Label = Label<M>>,
     M::Write: StoredWrite<Resource<M>>,
     EdgePayload<M::Edge>: Cbor,
+    M::Edge: Cbor,
 {
     let mut home = Home::<M, Capture<M>>::with_log(writer, Capture { edge: None }).expect("the machine's declaration validates");
     let version = resource.version().0;

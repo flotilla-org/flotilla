@@ -151,7 +151,7 @@ impl Conformance for LifecycleConformance {
             .log()
             .history(NAME, Version(0), usize::MAX)
             .into_iter()
-            .filter_map(|(_, event)| match &event.payload.edge {
+            .filter_map(|(_, event)| match &event.arguments.edge {
                 LifecycleEdge::Attempted(attempted) => Some(&attempted.outcome),
                 _ => None,
             })

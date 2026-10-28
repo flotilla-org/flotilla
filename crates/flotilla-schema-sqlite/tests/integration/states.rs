@@ -33,11 +33,20 @@ fn interned(conn: &Connection) -> u64 {
 /// Applies `edge` in its own transaction; returns the event it logged and the rows SQLite counted
 /// as written, excluding new `strings` and `resource_identity` rows.
 fn apply_counted(store: Store, current: Stamp, edge: Edge<Ticket>) -> (Store, Stamp, Event, u64) {
+    let at = edge.at();
+    let mut store = store;
+    // The edge's change is opened first, so the counted statements are the edge's own.
+    let change = {
+        let mut write = store.write().expect("write");
+        let change = write.open_change(&flotilla_schema::NewChange::new("test", at)).expect("change");
+        write.commit().expect("commit");
+        change
+    };
     let conn = store.into_connection();
     let before = (conn.total_changes(), interned(&conn));
     let mut store = Store::open(conn, LOCAL, registry()).expect("reopen");
     let mut write = store.write().expect("write");
-    let stamp = write.apply_edge(current, edge).expect("edge");
+    let stamp = write.apply_edge(current, edge, change).expect("edge");
     let mut changes = write.changes(current.id, current.version, 10).expect("changes");
     write.commit().expect("commit");
     let conn = store.into_connection();
@@ -73,7 +82,7 @@ fn closed() -> TicketState {
 
 fn event(from: TicketLabel, to: TicketLabel, at: i64) -> EdgeEvent<TicketLabel, TicketEdgeName, Payload<String>> {
     let edge = if from == to { TicketEdgeName::Edit } else { TicketEdgeName::Move };
-    EdgeEvent { edge, from, to, writer: "w".into(), at: Timestamp(at), payload: Payload { args: String::new(), reads: Vec::new() } }
+    EdgeEvent { edge, from, to, at: Timestamp(at), arguments: Payload { args: String::new(), reads: Vec::new() } }
 }
 
 fn edge(previous: &State<TicketState>, next: TicketState, at: i64) -> Edge<Ticket> {
@@ -137,7 +146,11 @@ fn a_transition_logs_its_state_and_exactly_the_rows_that_differ(tc: TestCase) {
         let since = new_root[label + 1].clone();
         assert_eq!(
             since,
-            if from == to { old_root[label + 1].clone() } else { Value::Int(change.at.micros()) },
+            if from == to {
+                old_root[label + 1].clone()
+            } else {
+                Value::Int(store.read().expect("read").change(LOCAL, change.change).expect("read").expect("its change").at.micros())
+            },
             "since moves with the label"
         );
 
@@ -197,7 +210,7 @@ fn transitions_round_trip_and_replay(tc: TestCase) {
             model = next;
         } else {
             let (edge, next) = current.value.edge(&tc, Pick::Draw).expect("a ticket always has an edge");
-            stamp = write.apply_edge(stamp, edge).expect("edge");
+            stamp = write.apply_edge(stamp, edge.clone(), &flotilla_schema::NewChange::new("test", edge.at())).expect("edge");
             model = next.stamped(Some(&current.value), stamp.version);
         }
         write.commit().expect("commit");
@@ -207,7 +220,9 @@ fn transitions_round_trip_and_replay(tc: TestCase) {
     let mut replica = Store::open(Connection::open_in_memory().expect("db"), "replica", registry()).expect("open");
     let mut write = replica.write().expect("write");
     write.insert("pre", &ticket(closed()), &origin()).expect("a local ticket interns its strings first");
-    for change in source.read().expect("read").changes_since(LOCAL, 0, 100).expect("log") {
+    let changes = source.read().expect("read").changes_since(LOCAL, 0, 100).expect("log");
+    crate::fixtures::carry_changes(&mut source, &mut write, &changes);
+    for change in changes {
         assert!(matches!(write.apply(&change).expect("apply"), Applied::Applied(_)));
     }
     let id = write.resolve(Ticket::CODE, "t", LOCAL).expect("resolve").expect("present");
@@ -217,7 +232,7 @@ fn transitions_round_trip_and_replay(tc: TestCase) {
 }
 
 fn dossier_event(args: DossierEdge, from: DossierState, to: DossierState) -> DossierEvent {
-    EdgeEvent { edge: args.name(), from, to, writer: "w".into(), at: Timestamp(6), payload: Payload { args, reads: Vec::new() } }
+    EdgeEvent { edge: args.name(), from, to, at: Timestamp(6), arguments: Payload { args, reads: Vec::new() } }
 }
 
 fn evidence() -> Evidence {
@@ -235,7 +250,13 @@ fn edge_refusals_come_in_a_fixed_order() {
     let mut write = store.write().expect("write");
     let inserted = write.insert("t", &ticket(open(&["a"], 1)), &origin()).expect("insert");
     let current = State::new(open(&["a"], 1), Timestamp(1));
-    let moved = write.apply_edge(inserted, edge(&current, open(&["a", "b"], 1), 2)).expect("a data-only edge");
+    let moved = write
+        .apply_edge(
+            inserted,
+            edge(&current, open(&["a", "b"], 1), 2),
+            &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(0)),
+        )
+        .expect("a data-only edge");
 
     // Leaves Closed, but the ticket is Open.
     let wrong_from = || {
@@ -248,8 +269,14 @@ fn edge_refusals_come_in_a_fixed_order() {
         )
         .expect("edge")
     };
-    assert!(matches!(write.apply_edge(inserted, wrong_from()), Err(StoreError::Conflict { .. })), "a stale stamp first");
-    let refused = write.apply_edge(moved, wrong_from());
+    assert!(
+        matches!(
+            write.apply_edge(inserted, wrong_from(), &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(0))),
+            Err(StoreError::Conflict { .. })
+        ),
+        "a stale stamp first"
+    );
+    let refused = write.apply_edge(moved, wrong_from(), &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(0)));
     assert!(
         matches!(&refused, Err(StoreError::WrongFrom { id, field, from, stored }) if *id == moved.id && field == "state" && *from == Code::new("c3") && stored == "c2"),
         "{refused:?}"
@@ -262,7 +289,7 @@ fn edge_refusals_come_in_a_fixed_order() {
         Edge::new(Dossier::STATE, &delivered, &dossier_event(DossierEdge::Deliver, DossierState::Delivered, DossierState::Delivered))
             .and_then(|edge| edge.append_in(Dossier::DELIVERABLES, Position(9), Deliverable::EVIDENCE, &evidence()))
             .expect("edge");
-    let refused = write.apply_edge(dossier, both.clone());
+    let refused = write.apply_edge(dossier, both.clone(), &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(0)));
     assert!(
         matches!(&refused, Err(StoreError::WrongFrom { from, stored, .. }) if *from == Code::new("c2") && stored == "c1"),
         "the label before the records row: {refused:?}"
@@ -270,9 +297,21 @@ fn edge_refusals_come_in_a_fixed_order() {
     let missing = Edge::new(Dossier::STATE, &delivered, &dossier_event(DossierEdge::Deliver, DossierState::Open, DossierState::Delivered))
         .and_then(|edge| edge.append_in(Dossier::DELIVERABLES, Position(9), Deliverable::EVIDENCE, &evidence()))
         .expect("edge");
-    assert!(matches!(write.apply_edge(dossier, missing), Err(StoreError::NoRecord { .. })), "then the records row");
+    assert!(
+        matches!(
+            write.apply_edge(dossier, missing.clone(), &flotilla_schema::NewChange::new("test", missing.at())),
+            Err(StoreError::NoRecord { .. })
+        ),
+        "then the records row"
+    );
     let stale = Stamp { version: dossier.version - 1, ..dossier };
-    assert!(matches!(write.apply_edge(stale, both), Err(StoreError::Conflict { .. })), "a stale stamp before the label");
+    assert!(
+        matches!(
+            write.apply_edge(stale, both.clone(), &flotilla_schema::NewChange::new("test", both.at())),
+            Err(StoreError::Conflict { .. })
+        ),
+        "a stale stamp before the label"
+    );
     write.commit().expect("commit");
 
     let mut remote = Store::open(Connection::open_in_memory().expect("db"), "remote", registry()).expect("open");
@@ -281,9 +320,16 @@ fn edge_refusals_come_in_a_fixed_order() {
     remote_write.commit().expect("commit");
     let change = remote.read().expect("read").changes_since("remote", 0, 1).expect("log").remove(0);
     let mut write = store.write().expect("write");
+    crate::fixtures::carry_changes(&mut remote, &mut write, std::slice::from_ref(&change));
     let Applied::Applied(far) = write.apply(&change).expect("apply") else { panic!("applied") };
     let stale_far = Stamp { version: far.version + 5, ..far };
-    assert!(matches!(write.apply_edge(stale_far, wrong_from()), Err(StoreError::NotHome { .. })), "ownership before everything");
+    assert!(
+        matches!(
+            write.apply_edge(stale_far, wrong_from(), &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(0))),
+            Err(StoreError::NotHome { .. })
+        ),
+        "ownership before everything"
+    );
 }
 
 // Behaviour (#3373 ruling 5): a refused edge writes nothing (no row, no sequence, no log
@@ -305,12 +351,17 @@ fn a_refused_edge_writes_nothing_and_the_transaction_goes_on() {
         &event(TicketLabel::Closed, TicketLabel::Open, 4),
     )
     .expect("edge");
-    assert!(matches!(write.apply_edge(inserted, wrong), Err(StoreError::WrongFrom { .. })));
+    assert!(matches!(
+        write.apply_edge(inserted, wrong.clone(), &flotilla_schema::NewChange::new("test", wrong.at())),
+        Err(StoreError::WrongFrom { .. })
+    ));
     assert_eq!(write.last_sequence(LOCAL).expect("sequence"), inserted.version, "no sequence taken");
     assert_eq!(write.changes(inserted.id, inserted.version, 10).expect("log"), [], "nothing logged");
     assert_eq!(write.load_snapshot(inserted.id).expect("snapshot"), Some(before.clone()), "no row written");
     let current = State::new(open(&["a"], 1), Timestamp(1));
-    let next = write.apply_edge(inserted, edge(&current, closed(), 5)).expect("the transaction is still usable");
+    let next = write
+        .apply_edge(inserted, edge(&current, closed(), 5), &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(0)))
+        .expect("the transaction is still usable");
     write.commit().expect("commit");
     let after = store.read().expect("read").load::<Ticket>(inserted.id).expect("load").expect("present");
     assert_eq!((after.version, after.value.state), (next.version, State::new(closed(), Timestamp(5))));
@@ -430,7 +481,7 @@ fn a_flattened_datum_moves_as_one_field() {
         ),
     ] {
         let built = edge(&state, next, at);
-        let moved = write.apply_edge(stamp, built).expect("edge");
+        let moved = write.apply_edge(stamp, built.clone(), &flotilla_schema::NewChange::new("test", built.at())).expect("edge");
         let change = write.changes(stamp.id, stamp.version, 10).expect("log").remove(0);
         let Change::State { values, .. } = &change.effect.changes[0] else { panic!("the state first: {change:?}") };
         let sets: Vec<(&str, Value)> = values.iter().map(|(name, value)| (name.as_str(), value.clone())).collect();
@@ -458,7 +509,13 @@ fn an_index_on_the_state_follows_transitions() {
     let ids =
         |write: &mut flotilla_schema_sqlite::Write<'_>| write.page(&Ticket::open_by_queue(&"q".to_owned()), None, 10).expect("page").ids;
     assert_eq!(ids(&mut write), [a.id, d.id]);
-    write.apply_edge(a, edge(&State::new(open(&["x"], 1), Timestamp(1)), closed(), 7)).expect("close");
+    write
+        .apply_edge(
+            a,
+            edge(&State::new(open(&["x"], 1), Timestamp(1)), closed(), 7),
+            &flotilla_schema::NewChange::new("test", flotilla_schema::Timestamp(0)),
+        )
+        .expect("close");
     assert_eq!(ids(&mut write), [d.id]);
     write.commit().expect("commit");
 }
@@ -475,7 +532,7 @@ fn every_label_pair_round_trips(tc: TestCase) {
     let mut state = State::new(first, Timestamp(1));
     for _ in 0..4 {
         let (edge, next, _) = transition(&tc, Pick::Draw, &state, next_value(&tc, Pick::Draw, &state.value));
-        stamp = write.apply_edge(stamp, edge).expect("edge");
+        stamp = write.apply_edge(stamp, edge.clone(), &flotilla_schema::NewChange::new("test", edge.at())).expect("edge");
         state = next;
         assert_eq!(write.load::<Ticket>(stamp.id).expect("load").expect("present").value.state, state);
     }

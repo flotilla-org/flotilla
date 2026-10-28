@@ -10,7 +10,7 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use flotilla_engine_store::StoreLog;
-use flotilla_schema::{Origin, Timestamp};
+use flotilla_schema::{NewChange, Timestamp};
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::{
     machines::convoy::{Convoy, ConvoyEdge, ConvoyLabel, ConvoyRefusal, ConvoyRequest, MemoryConvoyWorld},
@@ -138,8 +138,9 @@ impl Convoys {
             .map_err(|errors| WriteError::Log(LogError::new(format!("Convoy definition: {errors:?}"))))?;
         let created = fresh.create(name, request, &*world, now)?;
         let resource = created.resource.clone();
-        let origin =
-            Origin::new(&self.home_name, now).with_payload(&created.reads).map_err(|error| WriteError::Log(LogError::new(error)))?;
+        // One change retires the ended generation and admits the next. Which of its admission's
+        // reads name records, and so are the change's items, is the open question on #4024.
+        let change = NewChange::new(&self.home_name, now);
         let version = self
             .service
             .with_store(|store| {
@@ -154,8 +155,9 @@ impl Convoys {
                     loaded
                 };
                 let mut write = store.write()?;
-                write.delete::<Resource<Convoy>>(loaded.stamp(), &origin)?;
-                let stamp = write.insert(name, &resource, &origin)?;
+                let change = write.open_change(&change)?;
+                write.delete::<Resource<Convoy>>(loaded.stamp(), change)?;
+                let stamp = write.insert(name, &resource, change)?;
                 write.commit()?;
                 Ok(Some(stamp.version))
             })

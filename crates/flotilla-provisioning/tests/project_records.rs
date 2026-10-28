@@ -180,8 +180,10 @@ async fn the_engine_stores_project_operations_but_not_the_queue() {
                 refused: None,
                 entries: Some(flotilla_provisioning::stored::project::EntriesReadiness { ready: false, message: "stale".into() }),
             },
-            "test",
-            flotilla_schema::Timestamp::from_datetime(&at(0)),
+            &flotilla_engine_store::plain::PendingChange::new(flotilla_schema::NewChange::new(
+                "test",
+                flotilla_schema::Timestamp::from_datetime(&at(0)),
+            )),
         )
         .expect("stale operations record");
     let gadgets =

@@ -48,8 +48,8 @@ impl<L: InboxLog> Log<Message> for CountingLog<L> {
     fn create_resource(&mut self, w: &str, t: Timestamp, r: Resource<Message>, reads: &[InputRead]) -> Result<Resource<Message>, LogError> {
         self.inner.create_resource(w, t, r, reads)
     }
-    fn edge(&mut self, p: &StoredState<Message>, n: &Resource<Message>, e: &EdgeEventOf<Message>) -> Result<Version, LogError> {
-        self.inner.edge(p, n, e)
+    fn edge(&mut self, w: &str, p: &StoredState<Message>, n: &Resource<Message>, e: &EdgeEventOf<Message>) -> Result<Version, LogError> {
+        self.inner.edge(w, p, n, e)
     }
 }
 impl<L: InboxLog> InboxLog for CountingLog<L> {

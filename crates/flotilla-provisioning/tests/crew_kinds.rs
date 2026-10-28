@@ -51,7 +51,7 @@ fn crew_statements_and_identity_removal_search_by_key() {
     let mut failures = Vec::new();
     for (label, sql) in &statements {
         let rows = plan(&conn, sql);
-        if rows.iter().any(|row| row.contains("SCAN") || row.contains("TEMP B-TREE")) {
+        if schema_support::unkeyed(label, &rows) {
             failures.push(format!("{label}: {rows:?}"));
         }
     }

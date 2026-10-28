@@ -296,7 +296,7 @@ impl<M: Machine, L: Log<M>> Home<M, L> {
 
     /// Applies `edge` at `now`, reading `world` through the recording handle.
     /// The next state is entered at `now` when the label changes (otherwise at
-    /// the time the label was entered), and the event's payload holds the edge
+    /// the time the label was entered), and the event's document holds the edge
     /// and the gate's and effect's reads. The log takes the write (the
     /// previous state, the resource in its next state and the event) and gives
     /// its version, which the resource adopts (#3373 ruling R2): the home
@@ -330,8 +330,8 @@ impl<M: Machine, L: Log<M>> Home<M, L> {
         let to = next.label();
         let since = if from == to { resource.state.since } else { now };
         let previous = std::mem::replace(&mut resource.state, State::new(next, since));
-        let event = EdgeEvent { edge: edge.kind(), from, to, writer: self.writer.clone(), at: now, payload: EdgePayload { edge, reads } };
-        match self.log.edge_with_writes(&previous, resource, &event, &writes) {
+        let event = EdgeEvent { edge: edge.kind(), from, to, at: now, arguments: EdgePayload { edge, reads } };
+        match self.log.edge_with_writes(&self.writer, &previous, resource, &event, &writes) {
             Ok(version) => {
                 resource.version = version;
                 for write in &writes {

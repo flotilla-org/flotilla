@@ -1,7 +1,7 @@
 //! Log entries: one event per write, as the per-home `log` holds it (#3392 G8).
 //!
-//! An entry is a header (the cause, writer, time, an optional explanation and, for an edge, its
-//! codes and master) and an [`Effect`]: the authoritative change, in the kind's own named terms
+//! An entry is a header (the cause, its change and, for an edge, its codes, master and arguments)
+//! and an [`Effect`]: the authoritative change, in the kind's own named terms
 //! (fields, collections, columns), never positional row operations. A store applies an effect
 //! to its tables in one place, whether the event is its own write or another home's; replicas
 //! apply effects without re-running machines, and reads never replay the log.
@@ -80,27 +80,58 @@ impl Cause {
     }
 }
 
-/// Who wrote a create, spec edit, delete or expunge, when, and why: an edge carries the same in
-/// its event. `payload` is an inline CBOR document explaining the write, such as the reads a
-/// create's admission relied on. It never repeats the value written: a create's effect already
-/// sets every field and carries every object, so a frozen document is stored at most twice, in
-/// `objects` and in that effect (#3424 ruling 4).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Origin {
+/// One reason for writing at one home (#4024): who wrote, when, and the records the writes were
+/// made from. Every log entry points at its change; who and when are recorded once, here, never on
+/// each entry or row. A change is local to one writer at one home.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeHeader {
+    #[serde(rename = "h")]
+    pub home: String,
+    /// Taken from the home's sequence, as its entries' are.
+    #[serde(rename = "s")]
+    pub seq: u64,
+    #[serde(rename = "w")]
     pub writer: String,
+    #[serde(rename = "t")]
     pub at: Timestamp,
-    pub payload: Option<Vec<u8>>,
+    #[serde(rename = "i", default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<ChangeItem>,
 }
 
-impl Origin {
-    pub fn new(writer: impl Into<String>, at: Timestamp) -> Origin {
-        Origin { writer: writer.into(), at, payload: None }
+/// One input of a change: a record it was made from, at a revision when the record has one (a
+/// ManifestRoot at the commit applied, a Repository at a commit, a record at the version read).
+/// The record's kind says what the item is: there is no role.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ChangeItem {
+    #[serde(rename = "r")]
+    pub record: Identity,
+    #[serde(rename = "v", default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+}
+
+impl ChangeItem {
+    pub fn new(record: Identity, revision: Option<String>) -> ChangeItem {
+        ChangeItem { record, revision }
+    }
+}
+
+/// What a writer opens a change with; the store gives it its home and sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewChange {
+    pub writer: String,
+    pub at: Timestamp,
+    pub items: Vec<ChangeItem>,
+}
+
+impl NewChange {
+    pub fn new(writer: impl Into<String>, at: Timestamp) -> NewChange {
+        NewChange { writer: writer.into(), at, items: Vec::new() }
     }
 
-    /// `self` with `payload` as its explanation.
-    pub fn with_payload<P: Cbor>(mut self, payload: &P) -> Result<Origin, EventError> {
-        self.payload = Some(flotilla_cbor::to_vec(payload, &INLINE_LIMITS)?);
-        Ok(self)
+    /// `self` with `items` as its inputs.
+    pub fn with_items(mut self, items: impl IntoIterator<Item = ChangeItem>) -> NewChange {
+        self.items.extend(items);
+        self
     }
 }
 
@@ -211,7 +242,8 @@ impl Effect {
 }
 
 /// One log entry, as `changes`, `changes_since` and `about` read it and `apply` takes it from
-/// another home: the resource it changed, the home sequence it took, the header and the effect.
+/// another home: the resource it changed, the home sequence it took, the change it belongs to, the
+/// header and the effect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     /// Reserved coarse partition code, explicitly recorded at write time.
@@ -233,16 +265,16 @@ pub struct Event {
     pub prev_seq: u64,
     #[serde(rename = "c")]
     pub cause: Cause,
-    #[serde(rename = "w")]
-    pub writer: String,
-    #[serde(rename = "t")]
-    pub at: Timestamp,
+    /// The sequence of the change it belongs to, at the same home: who wrote it, when, and from
+    /// what are the change's.
+    #[serde(rename = "g")]
+    pub change: u64,
     /// An edge's master, the resource it is about (G11). `None` once that resource is expunged.
     #[serde(rename = "a", default, skip_serializing_if = "Option::is_none")]
     pub about: Option<Identity>,
-    /// The explanation: an edge's arguments and recorded reads, or an origin's payload.
+    /// An edge's arguments, an inline CBOR document; no other entry has them.
     #[serde(rename = "y", default, skip_serializing_if = "Option::is_none", with = "optional_bytes")]
-    pub payload: Option<Vec<u8>>,
+    pub arguments: Option<Vec<u8>>,
     #[serde(rename = "e")]
     pub effect: Effect,
 }
@@ -252,9 +284,9 @@ impl Event {
         Identity { kind: self.kind, name: self.name.clone(), home: self.home.clone() }
     }
 
-    /// The payload as its writer encoded it.
-    pub fn payload<P: Cbor>(&self) -> Option<Result<P, EventError>> {
-        self.payload.as_ref().map(|bytes| Ok(flotilla_cbor::from_slice(bytes, &INLINE_LIMITS)?))
+    /// An edge's arguments as its writer encoded them.
+    pub fn arguments<P: Cbor>(&self) -> Option<Result<P, EventError>> {
+        self.arguments.as_ref().map(|bytes| Ok(flotilla_cbor::from_slice(bytes, &INLINE_LIMITS)?))
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, EventError> {

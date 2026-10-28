@@ -9,7 +9,7 @@
 //! only when the label changes, and the label's data); the store keeps the
 //! name (the identity row) and the version. Edge events, attempts and receipts
 //! among them (R4), are no part of the row or the resource (#3373 ruling R1):
-//! each is the header and payload of its write's entry in the store's
+//! each is the header and arguments of its write's entry in the store's
 //! per-home log (#3392 G8), read in pages and decoded by
 //! [`edge_event`](crate::edge_event), and the kind declares its machine's edge
 //! codes, the only ones its entries may carry. [`Resource::stored_edge`] turns
@@ -161,8 +161,19 @@ where
     /// with [`Resource::stored_edge_about`], which also logs the master.
     ///
     /// [`EdgeDef::about`]: crate::EdgeDef::about
-    pub fn stored_edge(&self, previous: &StoredState<M>, event: &EdgeEventOf<M>) -> Result<Edge<Self>, EdgeError> {
-        Edge::transition(Self::STATE, previous, &self.state, event)
+    pub fn stored_edge(&self, previous: &StoredState<M>, event: &EdgeEventOf<M>) -> Result<Edge<Self>, EdgeError>
+    where
+        M::Edge: Cbor,
+    {
+        // The entry keeps the edge alone; the reads are the change's (#4024).
+        let logged = flotilla_schema::EdgeEvent {
+            edge: event.edge,
+            from: event.from,
+            to: event.to,
+            at: event.at,
+            arguments: event.arguments.edge.clone(),
+        };
+        Edge::transition(Self::STATE, previous, &self.state, &logged)
     }
 
     /// [`Resource::stored_edge`], with the edge's master as its log entry's
@@ -176,9 +187,12 @@ where
         previous: &StoredState<M>,
         event: &EdgeEventOf<M>,
         master: impl FnOnce(&str) -> Identity,
-    ) -> Result<Edge<Self>, EdgeError> {
+    ) -> Result<Edge<Self>, EdgeError>
+    where
+        M::Edge: Cbor,
+    {
         let edge = self.stored_edge(previous, event)?;
-        Ok(match M::definition().master(&event.payload.edge) {
+        Ok(match M::definition().master(&event.arguments.edge) {
             Some(name) => edge.about(master(&name)),
             None => edge,
         })

@@ -126,7 +126,7 @@ fn spec_edits_refuse_what_only_edges_write() {
     let stamp = write.update(&current, &edited, &origin()).expect("spec edit");
     let (edge, next) =
         step(&edited, "dave", Record { fulfiller: Ref::new("f") }, &MemoryEnsureWorld::default(), Timestamp(8)).expect("recorded");
-    let stamp = write.apply_edge(stamp, edge).expect("edge");
+    let stamp = write.apply_edge(stamp, edge.clone(), &flotilla_schema::NewChange::new("test", edge.at())).expect("edge");
     write.commit().expect("commit");
     let expected = next.stamped(Some(&edited), stamp.version).with_identity("e", stamp.version);
     assert_eq!(load(&mut store, &current).value, expected);
@@ -157,12 +157,12 @@ fn update<K: Kind>(store: &mut Store, current: &Loaded<K>, next: &K) {
 
 fn apply_edge<K: Kind>(store: &mut Store, current: Stamp, edge: Edge<K>) {
     let mut write = store.write().expect("write");
-    write.apply_edge(current, edge).expect("edge");
+    write.apply_edge(current, edge.clone(), &flotilla_schema::NewChange::new("w", edge.at())).expect("edge");
     write.commit().expect("commit");
 }
 
 // Behaviour (#3320 production shape, #3392 G8): a write touches only its rows, plus the home
-// sequence, the identity's sequence and one log row. An engine edge moving the state is one row
+// sequence, the identity's sequence and one log row, and the change it is part of (#4024). An engine edge moving the state is one row
 // write (the one state statement that also moves the version and writes the label's data),
 // whatever gate reads its document holds: the event is the log row. A spec edit
 // changing one of three inputs is one update and the root version; an unchanged value writes
@@ -183,7 +183,7 @@ fn writes_touch_only_their_rows() {
             .insert(
                 &format!("pre{n}"),
                 &message::sample().with_state(State::new(awaiting, Timestamp(0))),
-                &flotilla_schema::Origin::new("w", Timestamp(0)),
+                &flotilla_schema::NewChange::new("w", Timestamp(0)),
             )
             .expect("pre-intern writer and receiver domains");
         write.commit().expect("commit");
@@ -198,17 +198,20 @@ fn writes_touch_only_their_rows() {
     let deliver = Deliver { receiver: message::agent("s", "h"), transport: Transport::Turn };
     let (edge, delivered) = step(&current.value, "w", deliver, &*world, Timestamp(5)).expect("delivered");
     let (mut store, written) = rows_written(store, |store| apply_edge(store, current.stamp(), edge));
-    assert_eq!(written, 4, "the state with the version, the home and identity sequences and the log entry");
+    assert_eq!(
+        written, 6,
+        "the state with the version, the home and identity sequences, the log entry, and its change with the sequence it takes"
+    );
 
     let current = load(&mut store, &current);
     let (edge, _) = step(&delivered, "w", Settle { by: Settlement::Answered }, &*world, Timestamp(6)).expect("settled");
     let (store, written) = rows_written(store, |store| apply_edge(store, current.stamp(), edge));
-    assert_eq!(written, 4, "gate reads add no rows, and leaving a label's data is the same statement");
+    assert_eq!(written, 6, "gate reads add no rows, and leaving a label's data is the same statement");
 
     let mut changed = dossier.clone();
     changed.inputs.insert("b".into(), InputValue::Text { value: "B".into() });
     let (mut store, written) = rows_written(store, |store| update(store, &dossier_current, &changed));
-    assert_eq!(written, 5, "one input row, the root version, the home sequence, the identity sequence and the log entry");
+    assert_eq!(written, 7, "one input row, the root version, the home sequence, the identity sequence, the log entry, and its change with the sequence it takes");
 
     let dossier_current = load(&mut store, &dossier_current);
     let (_, written) = rows_written(store, |store| update(store, &dossier_current, &changed));

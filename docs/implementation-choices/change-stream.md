@@ -19,6 +19,10 @@ resource whose encoded snapshot exceeds a frame uses `ResourceChunk` frames. Tho
 split from the loaded logical rows, without a second SQL traversal, and assembled before the
 same `restore()` call. There is no separate child-row install path. The follower installs a complete snapshot and each subsequent delivery
 round transactionally. A disconnected round rolls back to its last committed prefix.
+A home's sequence numbers its changes and its entries (#4024). A tail sends each change as a
+`Reason` frame before its first entry, in sequence order, so the follower's cursor stays a
+prefix of the home's sequence; a change at or below the cursor is sent again before an entry
+that names it, and a replica records a change before applying any entry of it.
 
 The listener-independent `Service` owns the new store. The daemon exposes
 `GET /apis/flotilla.work/v1/change-stream[?after=<home_seq>]` on the existing resource HTTP API.
@@ -122,7 +126,9 @@ the protocol fingerprint changes with the query health fields.
 
 | Table | Columns | Primary key | Other indexes |
 |---|---|---|---|
-| log (changed) | 14: home, home_seq, resource, prev_seq, cause, edge, from, to, about, writer, at, payload, effect, **topic** | home, home_seq | resource/home_seq; about/at (partial); home/home_seq for expunges (partial) |
+| log (changed, #4024) | 13: home, home_seq, **change**, resource, prev_seq, cause, edge, from, to, about, **arguments**, effect, topic | home, home_seq | resource/home_seq; about (partial); home/home_seq for expunges (partial) |
+| change (new, #4024) | 4: home, seq, writer, at | home, seq | none |
+| change_items (new, #4024) | 5: change_home, change_seq, pos, record, revision | change_home, change_seq, pos | record |
 | stream_watermark (new) | 3: home, **home_seq**, applied_through | home | none |
 | stream_history (new) | 2: home, **home_seq** | home | none |
 

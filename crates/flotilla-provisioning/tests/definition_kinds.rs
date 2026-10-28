@@ -39,7 +39,7 @@ fn definition_statements_search_by_key() {
     let failures: Vec<_> = statements
         .iter()
         .map(|(label, sql)| (label, plan(&conn, sql)))
-        .filter(|(_, rows)| rows.iter().any(|row| row.contains("SCAN") || row.contains("TEMP B-TREE")))
+        .filter(|(label, rows)| schema_support::unkeyed(label, rows))
         .collect();
     assert!(failures.is_empty(), "{failures:#?}");
 }

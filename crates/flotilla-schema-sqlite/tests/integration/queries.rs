@@ -119,9 +119,9 @@ fn pending_admission_order_survives_replica_local_ids(tc: TestCase) {
         for admitted_seq in 1..=12 {
             let value = message::sample().with_spec(MessageSpec { admitted_seq, ..message::sample_spec() });
             let stamp = write.insert(&format!("message-{admitted_seq}"), &value, &origin()).expect("insert");
-            // Each fixture insert consumes one home sequence; this checks the
-            // source allocation assumption before testing replication/order.
-            assert_eq!(stamp.version, admitted_seq, "fixture uses the create's home sequence");
+            // Each fixture insert consumes two home sequences, its change's and its own (#4024);
+            // this checks the source allocation assumption before testing replication/order.
+            assert_eq!(stamp.version, 2 * admitted_seq, "fixture uses the create's home sequence");
             snapshots.push(write.load_snapshot(stamp.id).expect("snapshot").expect("present"));
         }
         write.commit().expect("commit");
@@ -152,7 +152,7 @@ fn pending_admission_order_survives_replica_local_ids(tc: TestCase) {
             .map(|id| {
                 let snapshot = read.load_snapshot(*id).expect("snapshot").expect("present");
                 let value = snapshot.decode::<Resource<Message>>().expect("decode");
-                assert_eq!(value.spec().admitted_seq, snapshot.version, "replication preserved admission");
+                assert_eq!(2 * value.spec().admitted_seq, snapshot.version, "replication preserved admission");
                 (value.spec().admitted_seq, snapshot.home, snapshot.name)
             })
             .collect();
@@ -228,7 +228,7 @@ fn index_pages_and_scans_match_the_model(tc: TestCase) {
                 } else if op == 3 {
                     // An edge moves the state, and with it membership of the state-filtered indexes.
                     if let Some((edge, next)) = current.value.edge(&tc, Pick::Draw) {
-                        write.apply_edge(current.stamp(), edge).expect("edge");
+                        write.apply_edge(current.stamp(), edge.clone(), &flotilla_schema::NewChange::new("test", edge.at())).expect("edge");
                         model.insert(id, next);
                     }
                 } else {

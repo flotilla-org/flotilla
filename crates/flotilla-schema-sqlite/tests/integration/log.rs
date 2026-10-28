@@ -13,7 +13,7 @@ use rusqlite::Connection;
 use flotilla_state_machines::machines::message::MessageSpec;
 
 use crate::fixtures::{
-    addr, message as messages, origin, registry, store,
+    addr, carry_changes, message as messages, origin, registry, store,
     synthetic::{workflow, InputValue},
     AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Person, Pick, Referral, Resource, TerminalSession, Ticket,
     Vessel, LOCAL,
@@ -45,13 +45,13 @@ fn step<K: Fixture>(tc: &TestCase, write: &mut Write<'_>, live: &mut Option<Stam
     };
     let change = match (*live, edge) {
         (_, Some((stamp, edge))) => {
-            let next = write.apply_edge(stamp, edge).expect("edge");
+            let next = write.apply_edge(stamp, edge.clone(), &flotilla_schema::NewChange::new("test", edge.at())).expect("edge");
             *live = Some(next);
             let change = logged(write, *last);
             assert_eq!(change.home_seq, next.version);
             assert!(matches!(change.cause, Cause::Edge { .. }), "{change:?}");
             assert!(matches!(change.effect.changes.first(), Some(Change::State { .. })), "an edge writes its state first");
-            assert!(change.payload.is_some(), "an edge's entry holds its document");
+            assert!(change.arguments.is_some(), "an edge's entry holds its arguments");
             change
         }
         (None, None) => {
@@ -84,9 +84,10 @@ fn step<K: Fixture>(tc: &TestCase, write: &mut Write<'_>, live: &mut Option<Stam
     };
     assert_eq!((change.kind, change.name.as_str(), change.home.as_str()), (K::CODE, name, LOCAL));
     assert!(change.home_seq > *last);
-    // Every write class records its writer and time: an edge its event's, the others their origin's.
+    // Every write names its change, which records its writer and time (#4024).
     if !matches!(change.cause, Cause::Edge { .. }) {
-        assert_eq!((change.writer.as_str(), change.at), (origin().writer.as_str(), origin().at));
+        let header = write.change(LOCAL, change.change).expect("read").expect("its change");
+        assert_eq!((header.writer.as_str(), header.at), (origin().writer.as_str(), origin().at));
     }
     // An appended row's stamp is the entry's sequence, never a value of the effect.
     for change in &change.effect.changes {
@@ -132,6 +133,7 @@ fn replay(source: &mut Store, target: &mut Store) -> Vec<Applied> {
         let Some(last) = page.last() else { return results };
         after = last.home_seq;
         let mut write = target.write().expect("write");
+        carry_changes(source, &mut write, &page);
         for change in &page {
             results.push(write.apply(change).expect("apply"));
         }
@@ -239,6 +241,7 @@ fn apply_writes_other_homes_and_generated_writes_do_not() {
 
     let mut local = store();
     let mut write = local.write().expect("write");
+    carry_changes(&mut remote, &mut write, &changes);
     for change in &changes {
         assert!(matches!(write.apply(change).expect("apply"), Applied::Applied(_)));
     }
@@ -289,6 +292,7 @@ fn every_change_carries_the_objects_its_rows_name() {
 
     let mut target = replica();
     let mut write = target.write().expect("write");
+    carry_changes(&mut source, &mut write, &changes);
     let stripped = Event { effect: Effect { objects: Default::default(), ..changes[1].effect.clone() }, ..changes[1].clone() };
     assert!(matches!(write.apply(&stripped), Err(StoreError::MissingObject { hash: missing }) if missing == *hash));
     assert_eq!(write.resolve(Dossier::CODE, "b", LOCAL).expect("resolve"), None, "a refused apply writes nothing");
@@ -314,6 +318,7 @@ fn a_tampered_object_is_refused() {
 
     let mut target = replica();
     let mut write = target.write().expect("write");
+    carry_changes(&mut source, &mut write, std::slice::from_ref(&change));
     assert!(matches!(write.apply(&change), Err(StoreError::TamperedObject { .. })));
     assert_eq!(write.resolve(Dossier::CODE, "c", LOCAL).expect("resolve"), None);
 }
@@ -337,6 +342,7 @@ fn malformed_events_are_refused() {
     let named = |pairs: &[(&str, Value)]| pairs.iter().map(|(name, value)| ((*name).to_owned(), value.clone())).collect::<Named>();
     let mut target = replica();
     let mut write = target.write().expect("write");
+    carry_changes(&mut source, &mut write, std::slice::from_ref(&change));
     let unknown = with(Change::Put { row: vec![], collection: "nope".into(), key: Named::new(), values: Named::new() });
     assert!(matches!(write.apply(&unknown), Err(StoreError::MalformedEvent(Malformed::UnknownTable { .. }))));
     let field = with(Change::Set { row: vec![], field: "nope".into(), values: Named::new() });
@@ -420,7 +426,9 @@ fn snapshot_plus_tail<K: Fixture>(tc: &TestCase) {
             let current = write.load::<K>(stamp.id).expect("load").expect("present");
             let edge = if tc.draw(gs::booleans()) { current.value.edge(tc, Pick::Draw) } else { None };
             stamp = match edge {
-                Some((edge, _)) => write.apply_edge(stamp, edge).expect("edge"),
+                Some((edge, _)) => {
+                    write.apply_edge(stamp, edge.clone(), &flotilla_schema::NewChange::new("test", edge.at())).expect("edge")
+                }
                 None => write.update(&current, &current.value.evolve(tc, Pick::Draw), &origin()).expect("update"),
             };
             write.commit().expect("commit");
@@ -436,6 +444,7 @@ fn snapshot_plus_tail<K: Fixture>(tc: &TestCase) {
         let tail = source.read().expect("read").changes(stamp.id, after, 2).expect("tail");
         let Some(last) = tail.last() else { break };
         after = last.home_seq;
+        carry_changes(&mut source, &mut write, &tail);
         for change in &tail {
             assert!(matches!(write.apply(change).expect("apply"), Applied::Applied(_)));
         }
@@ -499,6 +508,7 @@ fn removed_log_rows_never_resurrect_a_deleted_resource() {
 
     let mut target = replica();
     let mut write = target.write().expect("write");
+    carry_changes(&mut source, &mut write, &changes);
     for change in &changes {
         assert!(matches!(write.apply(change).expect("apply"), Applied::Applied(_)));
     }
@@ -534,6 +544,7 @@ fn a_skipped_change_is_a_gap() {
 
     let mut target = replica();
     let mut write = target.write().expect("write");
+    carry_changes(&mut source, &mut write, &changes);
     assert!(matches!(
         write.apply(&changes[1]),
         Err(StoreError::Gap { expected: 0, found, .. }) if found == seqs[0]
@@ -565,6 +576,7 @@ fn duplicate_creates_are_refused() {
 
     let mut target = replica();
     let mut write = target.write().expect("write");
+    carry_changes(&mut source, &mut write, std::slice::from_ref(&insert));
     write.apply(&insert).expect("insert");
     let again = Event { home_seq: insert.home_seq + 1, prev_seq: insert.home_seq, ..insert.clone() };
     assert!(matches!(write.apply(&again), Err(StoreError::Exists { name, .. }) if name == "c"));
@@ -588,6 +600,7 @@ fn a_refused_apply_leaves_no_cached_identity() {
 
     let mut target = replica();
     let mut write = target.write().expect("write");
+    carry_changes(&mut source, &mut write, &changes);
     assert!(matches!(write.apply(&a[1]), Err(StoreError::Gap { .. })));
     let Applied::Applied(b_stamp) = write.apply(&b[0]).expect("b") else { panic!("b applies") };
     assert_eq!(b_stamp.id, ResourceId(1), "b reuses the rowid a's refused apply rolled back");
@@ -641,6 +654,7 @@ fn a_reused_home_sequence_is_refused() {
     let change = first_change(&mut source, LOCAL);
     let mut target = replica();
     let mut write = target.write().expect("write");
+    carry_changes(&mut source, &mut write, std::slice::from_ref(&change));
     assert!(matches!(write.apply(&change), Ok(Applied::Applied(_))));
     let reused = Event { name: "b".into(), ..change.clone() };
     let refused = write.apply(&reused);
@@ -660,9 +674,11 @@ fn change_pages_respect_their_byte_budget() {
     let mut source = store();
     write_history(&mut source, "m", &["second", "third"]);
     let changes = log(&mut source, LOCAL);
-    // An entry's size is its stored effect and payload.
-    let sizes: Vec<usize> =
-        changes.iter().map(|change| change.effect.encode().expect("encode").len() + change.payload.as_ref().map_or(0, Vec::len)).collect();
+    // An entry's size is its stored effect and arguments.
+    let sizes: Vec<usize> = changes
+        .iter()
+        .map(|change| change.effect.encode().expect("encode").len() + change.arguments.as_ref().map_or(0, Vec::len))
+        .collect();
     let with_budget = |store: Store, bytes: usize| {
         let options = StoreOptions { change_page_bytes: bytes, ..StoreOptions::default() };
         Store::open_with(store.into_connection(), LOCAL, registry(), options).expect("reopen")
@@ -705,7 +721,12 @@ fn refusals_and_duplicates_create_no_rows() {
     write_history(&mut source, "ghost", &["second"]);
     let changes = log(&mut source, "elsewhere");
 
-    let (mut target, before) = row_counts(replica());
+    // The changes arrive first, in a transaction of their own: the refusals below are the entries'.
+    let mut target = replica();
+    let mut write = target.write().expect("write");
+    carry_changes(&mut source, &mut write, &changes);
+    write.commit().expect("commit changes");
+    let (mut target, before) = row_counts(target);
     let mut write = target.write().expect("write");
     assert!(matches!(write.apply(&changes[1]), Err(StoreError::Gap { expected: 0, .. })));
     let zero = Event { home_seq: 0, ..changes[0].clone() };

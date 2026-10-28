@@ -318,7 +318,7 @@ fn a_resources_edge_moves_since_only_with_the_label() {
         (parts.event.edge, parts.event.from, parts.event.to, parts.event.at),
         (CodeEnum::code(&event.edge), open, open, Timestamp(5))
     );
-    assert_eq!(parts.event.payload::<EdgePayload<ConvoyEdge>>().expect("payload"), event.payload);
+    assert_eq!(parts.event.arguments::<ConvoyEdge>().expect("arguments"), event.arguments.edge);
 
     let event = home.apply("c", Deliver, &world, Timestamp(8)).expect("delivered");
     let resource = home.get("c").expect("exists");

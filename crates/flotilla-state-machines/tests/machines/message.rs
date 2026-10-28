@@ -1,7 +1,7 @@
 //! Message (spec `machines/message.qnt`; scenarios `inbox_delivery`, `message_race`;
 //! ADR 0064 "Inboxes").
 
-use flotilla_schema::{Address, Cause, Cbor, Code, CodeEnum, EdgeHeader, Effect, Event, KindCode, Origin, Timestamp};
+use flotilla_schema::{Address, Cause, Cbor, Code, CodeEnum, EdgeHeader, Effect, Event, KindCode, Timestamp};
 use flotilla_state_machines::{
     edges,
     machines::{
@@ -285,7 +285,7 @@ fn expiry_needs_a_passed_deadline_and_no_expected_evidence() {
     let history = outcome.log().history("m", Version(0), usize::MAX);
     let (_, dropped) = history.last().expect("dropped");
     assert_eq!(dropped.at, t(6), "the drop's time is its event's, the state's since (G4)");
-    let reads = &dropped.payload.reads;
+    let reads = &dropped.arguments.reads;
     assert!(reads.iter().all(|read| read.kind != <AppliedThrough as Kind>::NAME), "{reads:?}");
 }
 
@@ -300,7 +300,7 @@ fn expiry_with_a_consumer_waits_for_the_watermark_and_records_it() {
     assert_eq!(home.apply("m", drop(DropReason::Expired), &world, t(7)).err(), refused(MessageRefusal::PrefixBeforeDeadline));
     world.applied_through.put(&Ref::new(INBOX), t(6));
     let event = home.apply("m", drop(DropReason::Expired), &world, t(7)).expect("expired");
-    let kinds: Vec<_> = event.payload.reads.iter().map(|read| (read.kind.as_ref(), read.name.as_str())).collect();
+    let kinds: Vec<_> = event.arguments.reads.iter().map(|read| (read.kind.as_ref(), read.name.as_str())).collect();
     assert!(kinds.contains(&(<Binding as Kind>::NAME, INBOX)), "{kinds:?}");
     assert!(kinds.contains(&(<AppliedThrough as Kind>::NAME, INBOX)), "{kinds:?}");
     assert_eq!(*state(&home), MessageState::Dropped { reason: DropReason::Expired, receiver: None, watermark: Some(t(6)) });
@@ -363,9 +363,9 @@ fn time_rules_are_strict_at_their_boundaries() {
     assert_eq!(undeliverable_at(14), None);
 }
 
-// An edge event is the header and payload of its log entry: the header holds the edge kind's and
-// labels' codes, and the inline document carries the typed edge and every read, so a decoded
-// payload equals the one the home appended.
+// An edge event is the header and arguments of its log entry: the header holds the edge kind's
+// and labels' codes, and the inline document carries the typed edge, so decoded arguments equal
+// the edge the home applied. Its reads are its change's, not the entry's (#4024).
 #[test]
 fn edge_events_round_trip_through_the_schema_codec() {
     let (mut home, mut world) = awaiting(None);
@@ -378,10 +378,10 @@ fn edge_events_round_trip_through_the_schema_codec() {
     assert_eq!(resource.version(), Version(3), "the home adopts the log's version");
     let header = resource.stored_edge(&previous, &event).expect("edge").into_parts().event;
     assert_eq!((header.edge, header.from, header.to), (event.edge.code(), event.from.code(), event.to.code()));
-    assert_eq!(header.payload::<EdgePayload<MessageEdge>>().expect("decodes"), event.payload);
+    assert_eq!(header.arguments::<MessageEdge>().expect("decodes"), event.arguments.edge, "the entry holds the edge's arguments");
     let delivered = events[0].1;
     assert_eq!((delivered.edge.code(), delivered.from.code(), delivered.to.code()), (Code::new("de"), Code::new("pe"), Code::new("aw")));
-    assert_eq!(delivered.payload.edge, deliver("s1", Transport::Turn).into());
+    assert_eq!(delivered.arguments.edge, deliver("s1", Transport::Turn).into());
 }
 
 // A payload's document is the edge's serde form: its code and arguments, never
@@ -416,17 +416,9 @@ fn payload_documents_name_references_and_keep_reads() {
     let trailing = serde_json::json!({ "edge": ["dr", { "reason": "Expired" }, "junk"], "reads": [] });
     let refused = serde_json::from_value::<EdgePayload<MessageEdge>>(trailing.clone()).expect_err("a third element");
     assert!(refused.to_string().contains("invalid length 3, expected a MessageEdge as [code, arguments]"), "{refused}");
-    let stored = Origin::new("w", t(0)).with_payload(&trailing).expect("encodes").payload.expect("a payload");
-    let header = EdgeHeader {
-        edge: Code::new("dr"),
-        from: Code::new("pe"),
-        to: Code::new("dr"),
-        writer: "w".into(),
-        at: t(0),
-        payload: stored,
-        about: None,
-    };
-    assert!(header.payload::<EdgePayload<MessageEdge>>().is_err(), "a stored payload with a third element is refused");
+    let stored = flotilla_cbor::to_vec(&trailing, &flotilla_schema::INLINE_LIMITS).expect("encodes");
+    let header = EdgeHeader { edge: Code::new("dr"), from: Code::new("pe"), to: Code::new("dr"), at: t(0), arguments: stored, about: None };
+    assert!(header.arguments::<EdgePayload<MessageEdge>>().is_err(), "a stored payload with a third element is refused");
 }
 
 /// A reference to `name` at `revision`, the subject or not.
@@ -494,7 +486,7 @@ fn a_lapsed_delivery_condition_withdraws_the_message() {
     assert_eq!(home.apply("m", drop(turn_rules.clone()), &world, t(1)).err(), refused(MessageRefusal::Unauthorised), "still holds");
     world.condition.put(&Ref::new(wanted.to_string()), false);
     let event = home.apply("m", drop(turn_rules.clone()), &world, t(2)).expect("withdrawn");
-    let reads: Vec<_> = event.payload.reads.iter().map(|read| (read.kind.as_ref(), read.name.as_str())).collect();
+    let reads: Vec<_> = event.arguments.reads.iter().map(|read| (read.kind.as_ref(), read.name.as_str())).collect();
     assert!(reads.contains(&(<Condition as Kind>::NAME, wanted.to_string().as_str())), "{reads:?}");
     assert_eq!(*state(&home), MessageState::Dropped { reason: turn_rules, receiver: None, watermark: None });
 }
@@ -638,10 +630,9 @@ fn entry(kind: &str, name: &str, home: &str, edge: &str, payload: &impl Cbor) ->
         home_seq: 1,
         prev_seq: 0,
         cause: Cause::Edge { edge: Code::new(edge), from: Code::new("ru"), to: Code::new("ru") },
-        writer: "w".into(),
-        at: t(1),
+        change: 1,
         about: None,
-        payload: Origin::new("w", t(1)).with_payload(payload).expect("encodes").payload,
+        arguments: Some(flotilla_cbor::to_vec(payload, &flotilla_schema::INLINE_LIMITS).expect("encodes")),
         effect: Effect::default(),
     }
 }
@@ -653,28 +644,11 @@ fn entry(kind: &str, name: &str, home: &str, edge: &str, payload: &impl Cbor) ->
 // retirement whose payload is not even the probe's edge document is skipped, not refused.
 #[test]
 fn the_receipt_reader_takes_every_accepted_consumer_kinds_receive() {
-    let session = entry(
-        "as",
-        "s1",
-        "kiwi",
-        "rv",
-        &EdgePayload { edge: AgentSessionEdge::Receive(Receive { message: "m".into(), transport: Transport::Turn }), reads: vec![] },
-    );
-    let probe = entry(
-        "pb",
-        "approve",
-        "rata",
-        "rv",
-        &EdgePayload { edge: ProbeEdge::Receive(ProbeReceive { message: "m".into(), transport: Transport::Notify }), reads: vec![] },
-    );
+    let session = entry("as", "s1", "kiwi", "rv", &AgentSessionEdge::Receive(Receive { message: "m".into(), transport: Transport::Turn }));
+    let probe =
+        entry("pb", "approve", "rata", "rv", &ProbeEdge::Receive(ProbeReceive { message: "m".into(), transport: Transport::Notify }));
     let retired = entry("pb", "approve", "rata", "rt", &"not an edge document".to_owned());
-    let other = entry(
-        "pb",
-        "other",
-        "rata",
-        "rv",
-        &EdgePayload { edge: ProbeEdge::Receive(ProbeReceive { message: "n".into(), transport: Transport::Turn }), reads: vec![] },
-    );
+    let other = entry("pb", "other", "rata", "rv", &ProbeEdge::Receive(ProbeReceive { message: "n".into(), transport: Transport::Turn }));
     let entries = [session, probe, retired, other];
     let agent = Receiver { kind: ConsumerKind::AgentSession, id: "s1".into(), host: "kiwi".into() };
     let controller = Receiver { kind: ConsumerKind::Controller, id: "approve".into(), host: "rata".into() };
@@ -698,15 +672,7 @@ fn the_receipt_reader_takes_every_accepted_consumer_kinds_receive() {
 // entry and a gate that read the first receipt sees the second as a change.
 #[test]
 fn a_replaced_receipt_still_advances_the_version() {
-    let receive = |transport| {
-        entry(
-            "as",
-            "s1",
-            "kiwi",
-            "rv",
-            &EdgePayload { edge: AgentSessionEdge::Receive(Receive { message: "m".into(), transport }), reads: vec![] },
-        )
-    };
+    let receive = |transport| entry("as", "s1", "kiwi", "rv", &AgentSessionEdge::Receive(Receive { message: "m".into(), transport }));
     let (first, second) = (receive(Transport::Notify), receive(Transport::Turn));
     let agent = Receiver { kind: ConsumerKind::AgentSession, id: "s1".into(), host: "kiwi".into() };
 

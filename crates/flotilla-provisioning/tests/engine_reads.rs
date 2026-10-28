@@ -131,9 +131,17 @@ fn a_replica_reads_the_ending_from_its_snapshot(tc: hegel::TestCase) {
     };
     let followed = replica_of();
     {
-        let events = origin.lock().expect("origin").read().expect("read").changes_since(HOME, 0, 100).expect("changes");
+        let (events, changes) = {
+            let mut origin = origin.lock().expect("origin");
+            let mut read = origin.read().expect("read");
+            let events = read.changes_since(HOME, 0, 100).expect("changes");
+            let changes = read.changes_of(&events).expect("their changes");
+            (events, changes)
+        };
         let mut store = followed.lock().expect("replica");
         let mut write = store.write().expect("write");
+        // Each entry's change first, as the stream sends it (#4024).
+        changes.iter().for_each(|change| write.record_change(change).expect("change"));
         for event in &events {
             write.apply(event).expect("applied");
         }

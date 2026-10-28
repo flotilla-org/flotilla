@@ -5,7 +5,7 @@ use std::{
     cell::Cell,
 };
 
-use flotilla_schema::{KindRegistry, Origin, Stored, Timestamp};
+use flotilla_schema::{KindRegistry, NewChange, Stored, Timestamp};
 use flotilla_schema_sqlite::Store;
 use rusqlite::Connection;
 
@@ -56,7 +56,7 @@ fn a_warm_scan_does_not_allocate_its_string_lookup_key() {
     kinds.register::<Probe>().expect("register");
     let mut store = Store::open(Connection::open_in_memory().expect("connection"), &home, kinds).expect("store");
     let mut write = store.write().expect("write");
-    write.insert("p", &Probe { value: 1 }, &Origin::new("w", Timestamp(0))).expect("insert");
+    write.insert("p", &Probe { value: 1 }, &NewChange::new("w", Timestamp(0))).expect("insert");
     write.commit().expect("commit");
     let mut read = store.read().expect("read");
     read.scan::<Probe>(&home, None, 1).expect("warm statements and cache");

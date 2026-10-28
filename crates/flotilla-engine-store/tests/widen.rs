@@ -2,7 +2,7 @@
 //! tables, rendered from a registry whose `receiver_kind` predates the Controller consumer.
 
 use flotilla_engine_store::registry;
-use flotilla_schema::{Address, ColumnType, KindRegistry, Origin, State, Timestamp};
+use flotilla_schema::{Address, ColumnType, KindRegistry, NewChange, State, Timestamp};
 use flotilla_schema_sqlite::{schema_ddl, DdlMode, Store, StoreError};
 use flotilla_state_machines::{
     machines::{
@@ -58,7 +58,7 @@ fn message(id: &str, kind: ConsumerKind, relation: Relation) -> Resource<Message
 
 fn insert(store: &mut Store, value: &Resource<Message>) -> Result<flotilla_schema_sqlite::ResourceId, StoreError> {
     let mut write = store.write()?;
-    let stamp = write.insert(value.name(), value, &Origin::new("test", Timestamp(1)))?;
+    let stamp = write.insert(value.name(), value, &NewChange::new("test", Timestamp(1)))?;
     write.commit()?;
     Ok(stamp.id)
 }

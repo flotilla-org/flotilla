@@ -153,8 +153,15 @@ impl crate::WatchReader for MessageLog {
         let events = read.changes_since(self.home(), after.0, 16).map_err(storage)?;
         let mut through = after;
         let mut changes: Vec<(Address, Change)> = Vec::new();
+        let home = self.home().to_owned();
+        // A home's sequence numbers its changes and its entries (#4024): only changes may lie
+        // between the cursor and the next entry, or the cursor's prefix is gone.
+        let only_changes = |read: &mut flotilla_schema_sqlite::Read<'_>, after: u64, before: u64| -> Result<bool, Error> {
+            let between = read.change_seqs(&home, after, before).map_err(storage)?;
+            Ok(between.len() as u64 == before.saturating_sub(after).saturating_sub(1))
+        };
         for entry in events {
-            if entry.home_seq != through.0 + 1 {
+            if entry.home_seq <= through.0 || !only_changes(&mut read, through.0, entry.home_seq)? {
                 return Err(Error::CursorExpired);
             }
             through = Cursor(entry.home_seq);
@@ -191,7 +198,8 @@ impl crate::WatchReader for MessageLog {
             let change = Change { cursor: Cursor(entry.home_seq), message, kind };
             changes.push((inbox, change));
         }
-        if through == after && read.last_sequence(self.home()).map_err(storage)? > after.0 {
+        let last = read.last_sequence(self.home()).map_err(storage)?;
+        if through == after && last > after.0 && !only_changes(&mut read, after.0, last + 1)? {
             return Err(Error::CursorExpired);
         }
         Ok(ChangePage { changes, through })

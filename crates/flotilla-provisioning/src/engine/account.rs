@@ -19,14 +19,14 @@ use std::{
 use flotilla_engine_store::{
     follow::{Followed, Follower},
     open_home,
-    plain::{Plain, PlainError, PlainLog},
+    plain::{PendingChange, Plain, PlainError, PlainLog},
     StoreLog,
 };
 use flotilla_resources::account_access::{
     binding_name, requester_parts, AccessName, AccountBindingSpec, AccountChange, AccountProvisionSpec, AccountRecords, BindingRecord,
     BindingState as OldState, EpochEntry, GrantName, GrantScope, PendingBinding, ProvisionRecord, ProvisionWrite,
 };
-use flotilla_schema::{Identity, Kind, KindCode, Ref, State, Timestamp};
+use flotilla_schema::{Identity, Kind, KindCode, NewChange, Ref, State, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use flotilla_state_machines::{Home, Resource, WriteError};
 use futures::stream::BoxStream;
@@ -466,8 +466,10 @@ impl AccountRecords for EngineAccounts {
         let now = self.now();
         let written = match self.provisions.get::<ProvisionSpec>(name, &self.home).map_err(|error| error.to_string())? {
             Some(existing) if !replace || existing.spec == spec => return Ok(()),
-            Some(existing) => self.provisions.edit(name, existing.version, &spec, WRITER, now).map(drop),
-            None => self.provisions.create(name, &spec, WRITER, now).map(drop),
+            Some(existing) => {
+                self.provisions.edit(name, existing.version, &spec, &PendingChange::new(NewChange::new(WRITER, now))).map(drop)
+            }
+            None => self.provisions.create(name, &spec, &PendingChange::new(NewChange::new(WRITER, now))).map(drop),
         };
         written.map_err(|error| format!("record account provision `{name}`: {error}"))
     }
@@ -479,7 +481,8 @@ impl AccountRecords for EngineAccounts {
         spec: &AccountProvisionSpec,
     ) -> Result<ProvisionWrite, String> {
         let version = provision.version.parse::<u64>().map_err(|error| format!("provision version: {error}"))?;
-        match self.provisions.edit(&provision.name, version, &provision_spec(spec), WRITER, self.now()) {
+        match self.provisions.edit(&provision.name, version, &provision_spec(spec), &PendingChange::new(NewChange::new(WRITER, self.now())))
+        {
             Ok(_) => Ok(ProvisionWrite::Written),
             Err(PlainError::Conflict { .. } | PlainError::Missing { .. }) => Ok(ProvisionWrite::Superseded),
             Err(error) => Err(format!("write account provision `{}`: {error}", provision.name)),
@@ -490,7 +493,7 @@ impl AccountRecords for EngineAccounts {
         let Some(existing) = self.provisions.get::<ProvisionSpec>(name, &self.home).map_err(|error| error.to_string())? else {
             return Ok(());
         };
-        match self.provisions.delete::<ProvisionSpec>(name, existing.version, WRITER, self.now()) {
+        match self.provisions.delete::<ProvisionSpec>(name, existing.version, &PendingChange::new(NewChange::new(WRITER, self.now()))) {
             Ok(()) | Err(PlainError::Missing { .. }) => Ok(()),
             Err(error) => Err(format!("remove account provision `{name}`: {error}")),
         }

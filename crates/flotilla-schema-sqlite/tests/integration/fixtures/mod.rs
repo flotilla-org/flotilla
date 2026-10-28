@@ -40,8 +40,10 @@ pub mod vessel;
 use std::fmt::Debug;
 
 use chrono::{DateTime, Utc};
-use flotilla_schema::{Address, Edge, EdgeEvent, Identity, Kind, KindCode, KindRegistry, Origin, Position, Records, Ref, Timestamp};
-use flotilla_schema_sqlite::Store;
+use flotilla_schema::{
+    Address, Edge, EdgeEvent, Event, Identity, Kind, KindCode, KindRegistry, NewChange, Position, Records, Ref, Timestamp,
+};
+use flotilla_schema_sqlite::{Store, Write};
 pub use flotilla_state_machines::{
     machines::{
         agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, ensure::Ensure, message::Message, person::Person,
@@ -82,13 +84,21 @@ pub fn payload<A>(tc: &TestCase, pick: Pick, args: A) -> Payload<A> {
 }
 
 /// The writer and time of the fixtures' creates, spec edits, deletes and expunges.
-pub fn origin() -> Origin {
-    Origin::new("fixture", Timestamp(1))
+pub fn origin() -> NewChange {
+    NewChange::new("fixture", Timestamp(1))
+}
+
+/// Records in `write` the changes of `events` as `source` holds them, as a stream sends each
+/// entry's change before it (#4024): an entry applies only after its change.
+pub fn carry_changes(source: &mut Store, write: &mut Write<'_>, events: &[Event]) {
+    for change in source.read().expect("read").changes_of(events).expect("changes") {
+        write.record_change(&change).expect("record change");
+    }
 }
 
 /// An edge event from `from` to `to`, with a drawn writer and time.
 pub fn event<L, E, A>(tc: &TestCase, edge: E, from: L, to: L, payload: Payload<A>) -> EdgeEvent<L, E, Payload<A>> {
-    EdgeEvent { edge, from, to, writer: name(tc), at: timestamp(tc), payload }
+    EdgeEvent { edge, from, to, at: timestamp(tc), arguments: payload }
 }
 
 /// A generated fixture kind.

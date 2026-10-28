@@ -113,7 +113,7 @@ fn run(batch: usize, events: usize) -> String {
         for _ in 0..batch {
             let edge = pending[n % MESSAGES].next().expect("an event left");
             let stamp = &mut messages[n % MESSAGES];
-            *stamp = write.apply_edge(*stamp, edge).expect("edge");
+            *stamp = write.apply_edge(*stamp, edge.clone(), &flotilla_schema::NewChange::new("test", edge.at())).expect("edge");
             n += 1;
         }
         let committing = Instant::now();

@@ -150,7 +150,7 @@ fn realise_needs_a_matching_observation() {
     assert_eq!(h.apply("r", realise("a"), &MemoryLifecycleWorld::default(), at(1)).err(), refused(LifecycleRefusal::MissingEvidence));
     assert_eq!(h.apply("r", realise("a"), &observed("b"), at(1)).err(), refused(LifecycleRefusal::MissingEvidence));
     let event = h.apply("r", realise("a"), &observed("a"), at(2)).expect("realised");
-    assert_eq!(event.payload.reads, [InputRead { kind: "realisation".into(), name: "r".into(), version: Some(Version(1)) }]);
+    assert_eq!(event.arguments.reads, [InputRead { kind: "realisation".into(), name: "r".into(), version: Some(Version(1)) }]);
     assert_eq!(state(&h), &LifecycleState::Realised { identity: "a".into() });
     assert_eq!(state(&h).identity(), Some("a"));
     assert!(state(&h).live() && state(&h).realised() && !state(&h).gone());

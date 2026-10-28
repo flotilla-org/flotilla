@@ -148,7 +148,7 @@ fn receipts_about(sessions: &Home<AgentSession>, message: &str) -> BTreeMap<Stri
     let mut about = BTreeMap::new();
     for session in sessions.resources() {
         for (_, event) in sessions.log().history(session.name(), Version(0), usize::MAX) {
-            let edge = &event.payload.edge;
+            let edge = &event.arguments.edge;
             if sessions.definition().master(edge).as_deref() == Some(message) {
                 let AgentSessionEdge::Receive(receive) = edge else { panic!("only a receipt is about a message") };
                 about.entry(session.name().to_string()).or_insert_with(Vec::new).push(receive.transport);
@@ -344,7 +344,7 @@ fn lifecycle_value<K: LifecycleKind>(home: &Home<Lifecycle<K>>, resource: &Resou
                 .log()
                 .history(resource.name(), Version(0), usize::MAX)
                 .into_iter()
-                .filter_map(|(_, event)| match &event.payload.edge {
+                .filter_map(|(_, event)| match &event.arguments.edge {
                     LifecycleEdge::Attempted(attempted) => Some(&attempted.outcome),
                     _ => None,
                 })
@@ -1287,7 +1287,7 @@ fn ensure_value(home: &Home<Ensure>, resource: &Resource<Ensure>) -> Value {
     let mut history = Vec::new();
     let mut window = 0;
     for (_, event) in home.log().history(resource.name(), Version(0), usize::MAX) {
-        match &event.payload.edge {
+        match &event.arguments.edge {
             EnsureEdge::Attempted(attempted) => history.push(attempted),
             EnsureEdge::Resume(_) => window = history.len(),
             _ => {}
@@ -1787,7 +1787,7 @@ fn awaiting_value(home: &Home<AwaitingReply>, resource: &Resource<AwaitingReply>
         AwaitingReplyState::Open => constant("Open"),
         AwaitingReplyState::Answered => {
             let history = home.log().history(resource.name(), Version(0), usize::MAX);
-            let reply = history.iter().find_map(|(_, event)| match &event.payload.edge {
+            let reply = history.iter().find_map(|(_, event)| match &event.arguments.edge {
                 AwaitingReplyEdge::Answer(answer) => Some(id_of(&answer.reply.name)),
                 _ => None,
             });

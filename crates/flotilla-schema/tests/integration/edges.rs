@@ -50,7 +50,7 @@ struct LifecycleArgs<I> {
 type LifecycleEvent<I> = EdgeEvent<Phase, LifecycleEdge, LifecycleArgs<I>>;
 
 fn event<I>(edge: LifecycleEdge, to: Phase, identity: Option<I>) -> LifecycleEvent<I> {
-    EdgeEvent { edge, from: Phase::Requested, to, writer: "w".into(), at: Timestamp(4), payload: LifecycleArgs { identity } }
+    EdgeEvent { edge, from: Phase::Requested, to, at: Timestamp(4), arguments: LifecycleArgs { identity } }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Stored)]
@@ -135,13 +135,12 @@ fn edge_events_are_the_log_entry_header() {
             edge: Code::new("c1"),
             from: Code::new("c1"),
             to: Code::new("c2"),
-            writer: "w".into(),
             at: Timestamp(4),
-            payload: flotilla_cbor::to_vec(&realise.payload, &flotilla_schema::INLINE_LIMITS).expect("cbor"),
+            arguments: flotilla_cbor::to_vec(&realise.arguments, &flotilla_schema::INLINE_LIMITS).expect("cbor"),
             about: Some(about),
         }
     );
-    assert_eq!(header.payload::<LifecycleArgs<Ident>>(), Ok(realise.payload));
+    assert_eq!(header.arguments::<LifecycleArgs<Ident>>(), Ok(realise.arguments));
     assert_eq!(set.validate(), Ok(()));
 }
 

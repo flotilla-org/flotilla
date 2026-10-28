@@ -20,17 +20,23 @@ use rusqlite::{Connection, OptionalExtension};
 /// - its cause: `create`, `edit` (a spec edit), `edge`, `delete` or `expunge`; an edge's header
 ///   (`edge`, `from` and `to`, codes of the kind's edges and labels, which the writer and `apply`
 ///   check against the kind, since one table holds no per-kind CHECK) and its master (`about`);
-/// - who wrote it (`writer`) and when (`at`);
-/// - `payload`, the explanation: an edge's arguments and recorded reads, or a create's admission
-///   request, as one inline CBOR document;
+/// - its `change`, the reason for writing it at its home (#4024): `change` is who wrote (`writer`),
+///   when (`at`) and the records the writes were made from (`change_items`, each a reference to a
+///   record and the revision it was at), recorded once however many entries the change wrote;
+/// - an edge's `arguments`, one inline CBOR document; no other entry has any;
 /// - `effect`, the authoritative change: named field-level changes in the kind's own terms, as
 ///   canonical CBOR, never positional row operations.
+///
+/// A change takes its `seq` from its home's sequence, as entries do, before its first entry. An
+/// item's record is any resource's identity; expunging that resource removes the item with it,
+/// and `change_items_by_record` is the search that cascade makes.
 ///
 /// The kind tables are a view of the log, written in the same transaction; reads never replay it.
 /// Nothing trims the log (G9): a delete is an event and keeps the resource's entries and identity,
 /// and only an expunge removes them. An expunge entry outlives the identity row it removes, so it
 /// alone has no `resource`; its effect names the identity. `log_by_resource` is a resource's
-/// history in sequence order, `log_about` the entries about a master in time order, and the
+/// history in sequence order, `log_about` the entries about a
+/// master (read in their changes' time order), and the
 /// partial `log_expunges` a home's expunge entries, the tombstones `apply` checks an event for an
 /// unknown identity against, so that check visits expunges only, not every later entry.
 ///
@@ -51,21 +57,34 @@ CREATE TABLE IF NOT EXISTS resource_identity (
 CREATE INDEX IF NOT EXISTS resource_identity_by_home ON resource_identity (home, kind);
 CREATE TABLE IF NOT EXISTS objects (hash BLOB PRIMARY KEY, bytes BLOB NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS home_sequence (home INTEGER PRIMARY KEY REFERENCES strings(id), last INTEGER NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS change (
+  home INTEGER NOT NULL REFERENCES strings(id), seq INTEGER NOT NULL,
+  writer INTEGER NOT NULL REFERENCES strings(id), at INTEGER NOT NULL,
+  PRIMARY KEY (home, seq)) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS change_items (
+  change_home INTEGER NOT NULL, change_seq INTEGER NOT NULL, pos INTEGER NOT NULL CHECK (pos >= 0),
+  record INTEGER NOT NULL REFERENCES resource_identity(id) ON DELETE CASCADE,
+  revision TEXT,
+  PRIMARY KEY (change_home, change_seq, pos),
+  FOREIGN KEY (change_home, change_seq) REFERENCES change(home, seq)) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS change_items_by_record ON change_items (record);
 CREATE TABLE IF NOT EXISTS log (
   home INTEGER NOT NULL REFERENCES strings(id), home_seq INTEGER NOT NULL,
+  change INTEGER NOT NULL,
   resource INTEGER REFERENCES resource_identity(id), prev_seq INTEGER NOT NULL,
   cause TEXT NOT NULL CHECK (cause IN ('create', 'edit', 'edge', 'delete', 'expunge')),
   edge TEXT, \"from\" TEXT, \"to\" TEXT,
   about INTEGER REFERENCES resource_identity(id) ON DELETE SET NULL,
-  writer INTEGER NOT NULL REFERENCES strings(id), at INTEGER NOT NULL,
-  payload BLOB, effect BLOB NOT NULL,
+  arguments BLOB, effect BLOB NOT NULL,
   topic TEXT NOT NULL DEFAULT 'all' CHECK (length(topic) BETWEEN 1 AND 8 AND topic NOT GLOB '*[^a-z0-9_]*' AND substr(topic, 1, 1) GLOB '[a-z]'),
   PRIMARY KEY (home, home_seq),
+  FOREIGN KEY (home, change) REFERENCES change(home, seq),
+  CHECK (change < home_seq),
   CHECK ((resource IS NULL) = (cause = 'expunge')),
-  CHECK (CASE WHEN cause = 'edge' THEN edge IS NOT NULL AND \"from\" IS NOT NULL AND \"to\" IS NOT NULL
-    ELSE edge IS NULL AND \"from\" IS NULL AND \"to\" IS NULL AND about IS NULL END)) STRICT;
+  CHECK (CASE WHEN cause = 'edge' THEN edge IS NOT NULL AND \"from\" IS NOT NULL AND \"to\" IS NOT NULL AND arguments IS NOT NULL
+    ELSE edge IS NULL AND \"from\" IS NULL AND \"to\" IS NULL AND about IS NULL AND arguments IS NULL END)) STRICT;
 CREATE INDEX IF NOT EXISTS log_by_resource ON log (resource, home_seq);
-CREATE INDEX IF NOT EXISTS log_about ON log (about, at) WHERE about IS NOT NULL;
+CREATE INDEX IF NOT EXISTS log_about ON log (about) WHERE about IS NOT NULL;
 CREATE INDEX IF NOT EXISTS log_expunges ON log (home, home_seq) WHERE cause = 'expunge';
 CREATE TABLE IF NOT EXISTS stream_watermark (
   home INTEGER PRIMARY KEY REFERENCES strings(id), home_seq INTEGER NOT NULL CHECK (home_seq >= 0), applied_through INTEGER NOT NULL
@@ -75,11 +94,11 @@ CREATE TABLE IF NOT EXISTS stream_history (
 ) STRICT, WITHOUT ROWID;
 ";
 
-/// The readable view of `log` (#3392 D4): each entry with its home, writer and resource named by
-/// their text, its kind's code, and its edge and labels named through `codes` by the entry's kind
-/// (the rows each kind declaring edges has under `log:edge` and `log:label`). `about` is the
-/// master as `kind:name@home`. An expunge entry's resource is gone, so its kind and name are null:
-/// its effect names the identity. The payload and effect stay CBOR.
+/// The readable view of `log` (#3392 D4): each entry with its home and resource named by their
+/// text, its kind's code, and its edge and labels named through `codes` by the entry's kind (the
+/// rows each kind declaring edges has under `log:edge` and `log:label`), and its change's writer
+/// and time. `about` is the master as `kind:name@home`. An expunge entry's resource is gone, so
+/// its kind and name are null: its effect names the identity. The arguments and effect stay CBOR.
 pub(crate) fn log_view() -> String {
     let named = |id: &str| format!("(SELECT \"s\" FROM \"strings\" WHERE \"id\" = {id})");
     let code = |field: &str, column: &str| {
@@ -105,14 +124,16 @@ pub(crate) fn log_view() -> String {
         code(LOG_LABEL_FIELD, "from"),
         code(LOG_LABEL_FIELD, "to"),
         about,
-        format!("{} AS \"writer\"", named("\"l\".\"writer\"")),
-        "\"l\".\"at\"".to_owned(),
-        "\"l\".\"payload\"".to_owned(),
+        "\"l\".\"change\"".to_owned(),
+        format!("{} AS \"writer\"", named("\"c\".\"writer\"")),
+        "\"c\".\"at\"".to_owned(),
+        "\"l\".\"arguments\"".to_owned(),
         "\"l\".\"effect\"".to_owned(),
         "\"l\".\"topic\"".to_owned(),
     ];
     format!(
-        "CREATE VIEW \"{LOG_VIEW}\" AS SELECT\n  {}\nFROM \"log\" AS \"l\" LEFT JOIN \"resource_identity\" AS \"i\" ON \"i\".\"id\" = \"l\".\"resource\"",
+        "CREATE VIEW \"{LOG_VIEW}\" AS SELECT\n  {}\nFROM \"log\" AS \"l\" JOIN \"change\" AS \"c\" ON \"c\".\"home\" = \"l\".\"home\" AND \"c\".\"seq\" = \"l\".\"change\"\n\
+         LEFT JOIN \"resource_identity\" AS \"i\" ON \"i\".\"id\" = \"l\".\"resource\"",
         columns.join(",\n  ")
     )
 }
@@ -134,6 +155,12 @@ pub(crate) const SHARED_STATEMENTS: &[(&str, &str)] = &[
     ("floor_get", FLOOR_GET),
     ("watermark_put", WATERMARK_PUT),
     ("log_append", LOG_APPEND),
+    ("change_append", CHANGE_APPEND),
+    ("change_item_append", CHANGE_ITEM_APPEND),
+    ("change_get", CHANGE_GET),
+    ("change_items", CHANGE_ITEMS),
+    ("change_exists", CHANGE_EXISTS),
+    ("change_seqs", CHANGE_SEQS),
     ("log_cause", LOG_CAUSE),
     ("log_by_resource", LOG_BY_RESOURCE),
     ("log_by_home", LOG_BY_HOME),
@@ -157,25 +184,45 @@ pub(crate) const SHARED_STATEMENTS: &[(&str, &str)] = &[
     ("object_bytes", OBJECT_BYTES),
 ];
 
-pub(crate) const LOG_APPEND: &str =
-    "INSERT INTO log (home, home_seq, resource, prev_seq, cause, edge, \"from\", \"to\", about, writer, at, \
-                                     payload, effect, topic) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)";
+pub(crate) const LOG_APPEND: &str = "INSERT INTO log (home, home_seq, change, resource, prev_seq, cause, edge, \"from\", \"to\", about, \
+                                     arguments, effect, topic) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)";
+pub(crate) const CHANGE_APPEND: &str = "INSERT INTO change (home, seq, writer, at) VALUES (?1, ?2, ?3, ?4)";
+pub(crate) const CHANGE_ITEM_APPEND: &str =
+    "INSERT INTO change_items (change_home, change_seq, pos, record, revision) VALUES (?1, ?2, ?3, ?4, ?5)";
+/// A change's writer (its text) and time.
+pub(crate) const CHANGE_GET: &str =
+    "SELECT (SELECT s FROM strings WHERE id = c.writer), c.at FROM change AS c WHERE c.home = ?1 AND c.seq = ?2";
+/// A change's items in order: each record's identity and its revision.
+pub(crate) const CHANGE_ITEMS: &str = "SELECT i.kind, n.s, h.s, ci.revision FROM change_items AS ci \
+     JOIN resource_identity AS i ON i.id = ci.record JOIN strings AS n ON n.id = i.name JOIN strings AS h ON h.id = i.home \
+     WHERE ci.change_home = ?1 AND ci.change_seq = ?2 ORDER BY ci.pos";
+pub(crate) const CHANGE_EXISTS: &str = "SELECT 1 FROM change WHERE home = ?1 AND seq = ?2";
+/// A home's changes between two of its sequences, in order: those a stream sends between entries.
+pub(crate) const CHANGE_SEQS: &str = "SELECT seq FROM change WHERE home = ?1 AND seq > ?2 AND seq < ?3 ORDER BY seq";
 pub(crate) const LOG_CAUSE: &str = "SELECT cause FROM log WHERE home = ?1 AND home_seq = ?2";
 /// The columns an entry is read back with, in `LogRow` order: its strings through `strings`' primary key.
 macro_rules! log_select {
     ($($rest:literal),*) => {
         concat!(
             "SELECT l.rowid, l.home_seq, l.resource, l.prev_seq, l.cause, l.edge, l.\"from\", l.\"to\", l.about, ",
-            "(SELECT s FROM strings WHERE id = l.writer), l.at, l.payload, l.effect, (SELECT s FROM strings WHERE id = l.home), l.topic ",
-            "FROM log AS l ",
+            "l.change, c.at, l.arguments, l.effect, (SELECT s FROM strings WHERE id = l.home), l.topic ",
+            "FROM log AS l JOIN change AS c ON c.home = l.home AND c.seq = l.change ",
             $($rest),*
         )
     };
 }
 pub(crate) const LOG_BY_RESOURCE: &str = log_select!("WHERE l.resource = ?1 AND l.home_seq > ?2 ORDER BY l.home_seq LIMIT ?3");
 pub(crate) const LOG_BY_HOME: &str = log_select!("WHERE l.home = ?1 AND l.home_seq > ?2 ORDER BY l.home_seq LIMIT ?3");
-pub(crate) const LOG_ABOUT_FIRST: &str = log_select!("WHERE l.about = ?1 ORDER BY l.at, l.rowid LIMIT ?2");
-pub(crate) const LOG_ABOUT_AFTER: &str = log_select!("WHERE l.about = ?1 AND (l.at, l.rowid) > (?2, ?3) ORDER BY l.at, l.rowid LIMIT ?4");
+/// The shared statements that sort their result through a temporary b-tree, by their labels in
+/// `Store::statements`. Entries about one master page in their changes' time order, the same on
+/// every replica; the time is the change's (#4024), so the sort follows the `log_about` search,
+/// over the few entries about one master (a message's receipts).
+pub const SORTED_STATEMENTS: [&str; 2] = ["log_about_first", "log_about_after"];
+
+/// The entries about a master in their changes' time order. Few entries are about one master, so
+/// they are found by `log_about` and sorted, not walked in an index's time order.
+pub(crate) const LOG_ABOUT_FIRST: &str = log_select!("WHERE l.about = ?1 ORDER BY c.at, l.rowid LIMIT ?2");
+pub(crate) const LOG_ABOUT_AFTER: &str = log_select!("WHERE l.about = ?1 AND (c.at, l.rowid) > (?2, ?3) ORDER BY c.at, l.rowid LIMIT ?4");
 pub(crate) const LOG_EXPUNGE: &str = "DELETE FROM log WHERE resource = ?1";
 /// A home's expunge entries after a sequence: the tombstones an event of an unknown identity is
 /// checked against.
@@ -242,6 +289,17 @@ pub(crate) fn sync_views(conn: &Connection, kinds: &KindRegistry) -> rusqlite::R
         }
     }
     Ok(())
+}
+
+/// Startup-only metadata guard: a `log` written before changes (#4024) holds each entry's writer,
+/// time and payload and names no change; it has no migration, so it is refused at open.
+pub(crate) fn log_predates_changes(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'log')
+           AND NOT EXISTS (SELECT 1 FROM pragma_table_info('log') WHERE name = 'change')",
+        [],
+        |row| row.get(0),
+    )
 }
 
 /// Startup-only metadata guard: fail clearly before a pre-domain dictionary reaches a writer.

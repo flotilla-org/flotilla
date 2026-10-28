@@ -67,6 +67,8 @@ fn every_table_is_strict_and_foreign_keys_hold() {
         [
             "agent_session",
             "awaiting_reply",
+            "change",
+            "change_items",
             "codes",
             "convoy",
             "convoy_duties",
@@ -169,7 +171,7 @@ fn the_log_view_names_edges_and_labels_by_the_entrys_kind() {
     let deliver = Deliver { receiver: message::agent("s", "h"), transport: Transport::Turn };
     let world: Box<dyn MessageWorld> = Box::new(world);
     let (edge, _) = engine::step(&resource, "deliverer", deliver, &*world, Timestamp(4)).expect("delivered");
-    write.apply_edge(stamp, edge).expect("edge");
+    write.apply_edge(stamp, edge.clone(), &flotilla_schema::NewChange::new("deliverer", edge.at())).expect("edge");
     write.commit().expect("commit");
     let conn = store.into_connection();
     let raw: (String, String, String) = conn
@@ -188,10 +190,10 @@ fn the_log_view_names_edges_and_labels_by_the_entrys_kind() {
     assert_eq!(
         rows,
         [
-            row(&[Some(LOCAL), Some("1"), Some("ms"), Some(engine::NAME), Some("create"), None, None, None, Some("fixture")]),
+            row(&[Some(LOCAL), Some("2"), Some("ms"), Some(engine::NAME), Some("create"), None, None, None, Some("fixture")]),
             row(&[
                 Some(LOCAL),
-                Some("2"),
+                Some("4"),
                 Some("ms"),
                 Some(engine::NAME),
                 Some("edge"),

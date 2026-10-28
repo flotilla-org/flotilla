@@ -142,7 +142,7 @@ fn outcome<T>(result: Result<T, WriteError<AwaitingReply>>) -> Step {
 /// The reply the record's `Answer` edge named.
 fn answering_reply(home: &Home<AwaitingReply>) -> i64 {
     let history = home.log().history(NAME, Version(0), usize::MAX);
-    let reply = history.iter().find_map(|(_, event)| match &event.payload.edge {
+    let reply = history.iter().find_map(|(_, event)| match &event.arguments.edge {
         AwaitingReplyEdge::Answer(answer) => Some(&answer.reply),
         _ => None,
     });

@@ -5,7 +5,7 @@
 
 //! See the [implementation choice](https://github.com/flotilla-org/flotilla/blob/main/docs/implementation-choices/change-stream.md).
 
-use flotilla_schema::{Event, Identity, Timestamp, LOG_LIMITS};
+use flotilla_schema::{ChangeHeader, Event, Identity, Timestamp, LOG_LIMITS};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -58,6 +58,10 @@ pub enum Frame {
         home_seq: u64,
     },
     Change(Box<Event>),
+    /// A change of the home (#4024), sent before any entry naming it. One whose sequence is the
+    /// next of the home's advances the cursor as an entry does; one before the cursor (opened
+    /// before a snapshot cut, and written into after it) is recorded and moves nothing.
+    Reason(Box<ChangeHeader>),
     Keepalive {
         home: String,
         watermark: Watermark,
@@ -126,12 +130,35 @@ fn serve_round(
             last
         }
     };
+    // Changes take sequences as entries do, so the tail is every change and entry after the
+    // cursor in sequence order; an entry's change opened before the cursor (before a snapshot's
+    // cut) is sent ahead of it too, once per round.
+    let mut sent = std::collections::BTreeSet::new();
+    let reason = |read: &mut crate::Read<'_>, seq: u64, send: &mut dyn FnMut(&[u8]) -> Result<(), StoreError>| {
+        let change = read.change(&home, seq)?.ok_or_else(|| StoreError::Stream("missing change".into()))?;
+        emit(Frame::Reason(Box::new(change)), send)
+    };
     loop {
         let events = read.changes_since(&home, cursor, MAX_PAGE)?;
+        // The page's changes, read once: those before each entry go out ahead of it, and once the
+        // log is exhausted the changes after the last entry end the tail.
+        let through = events.last().map_or(last.saturating_add(1), |event| event.home_seq);
+        let mut changes = read.change_seqs(&home, cursor, through)?.into_iter().peekable();
         if events.is_empty() {
+            for seq in changes {
+                reason(&mut read, seq, &mut send)?;
+                cursor = seq;
+            }
             break;
         }
         for event in events {
+            while let Some(seq) = changes.next_if(|seq| *seq < event.home_seq) {
+                reason(&mut read, seq, &mut send)?;
+                sent.insert(seq);
+            }
+            if event.change <= cursor && sent.insert(event.change) {
+                reason(&mut read, event.change, &mut send)?;
+            }
             cursor = event.home_seq;
             emit(Frame::Change(Box::new(event)), &mut send)?;
         }
@@ -273,6 +300,18 @@ impl<'a> Follower<'a> {
                     write.advance_watermark(home, cursor)?;
                     snapshot = None;
                 }
+                Frame::Reason(change) if change.home == home && snapshot.is_none() => {
+                    // The next sequence, or a change at or before the cursor re-sent ahead of an
+                    // entry naming it; anything later skips part of the home's prefix.
+                    if change.seq > cursor.home_seq + 1 {
+                        return Err(StoreError::Stream("tail is not the next home prefix".into()));
+                    }
+                    write.record_change(&change)?;
+                    if change.seq == cursor.home_seq + 1 {
+                        cursor.home_seq = change.seq;
+                        write.advance_watermark(home, cursor)?;
+                    }
+                }
                 Frame::Change(event) if event.home == home && snapshot.is_none() => {
                     if event.home_seq != cursor.home_seq + 1 {
                         return Err(StoreError::Stream("tail is not the next home prefix".into()));
@@ -308,7 +347,7 @@ pub struct ReadResult {
 
 impl flotilla_cbor::Message for Frame {
     const TYPES: &'static [&'static str] =
-        &["Failure", "Read", "Begin", "Resource", "ResourceChunk", "Tombstone", "End", "Change", "Keepalive"];
+        &["Failure", "Read", "Begin", "Resource", "ResourceChunk", "Tombstone", "End", "Change", "Reason", "Keepalive"];
 }
 
 /// Bounded exceptional resource assembly, well above WORKLOAD.md's 100 KiB convoy width.

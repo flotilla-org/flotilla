@@ -21,3 +21,10 @@ pub fn plan(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
     let rows = statement.query_map(rusqlite::params_from_iter(nulls), |row| row.get::<_, String>(3)).expect("plan");
     rows.collect::<Result<_, _>>().expect("plan rows")
 }
+
+/// Whether `label`'s plan scans, or sorts through a temporary b-tree when it is not one of the
+/// shared statements whose sort is reasoned (`SORTED_STATEMENTS`).
+pub fn unkeyed(label: &str, rows: &[String]) -> bool {
+    let sorts = !flotilla_schema_sqlite::SORTED_STATEMENTS.contains(&label);
+    rows.iter().any(|row| row.contains("SCAN") || (sorts && row.contains("TEMP B-TREE")))
+}

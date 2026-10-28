@@ -3499,6 +3499,7 @@ name = "flotilla-state-machines"
 version = "0.1.0"
 dependencies = [
  "flotilla-address",
+ "flotilla-cbor",
  "flotilla-quint-testkit",
  "flotilla-schema",
  "hegeltest",

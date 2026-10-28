@@ -69,17 +69,16 @@ fn creation_stores_the_admitted_state() {
 }
 
 // An accepted edge stores the next state, takes the log's version, and logs
-// one event holding the typed edge, the labels it moved between, the writer,
-// the time and the gate's reads.
+// one event holding the typed edge, the labels it moved between, the time and
+// the gate's reads; the writer goes to the log with it, as its change's (#4024).
 #[test]
 fn an_applied_edge_stores_the_next_state_and_appends_its_event() {
     let mut home = latch();
     let world = raised("bell");
     let event = home.apply("l", fire("bell"), &world, at(7)).expect("fires");
-    assert_eq!((event.edge, &event.payload.edge), (LatchEdgeKind::Fire, &LatchEdge::Fire(fire("bell"))));
+    assert_eq!((event.edge, &event.arguments.edge), (LatchEdgeKind::Fire, &LatchEdge::Fire(fire("bell"))));
     assert_eq!((event.from, event.to, event.at), (LatchLabel::Armed, LatchLabel::Fired, at(7)));
-    assert_eq!(event.writer, "kiwi");
-    assert_eq!(event.payload.reads, [InputRead { kind: "signal".into(), name: "bell".into(), version: Some(Version(1)) }]);
+    assert_eq!(event.arguments.reads, [InputRead { kind: "signal".into(), name: "bell".into(), version: Some(Version(1)) }]);
     let resource = home.get("l").expect("exists");
     assert_eq!(resource.state(), &Latch::Fired { shots: 1, by: "bell".into() });
     let history = home.log().history("l", Version(0), usize::MAX);
@@ -120,7 +119,7 @@ fn an_attempt_is_an_edge_on_its_labels() {
     let mut home = latch();
     let event = home.apply("l", failed("down", true), &Table::new(), at(1)).expect("attempted");
     assert_eq!((event.edge, event.from, event.to), (LatchEdgeKind::Try, LatchLabel::Armed, LatchLabel::Armed));
-    assert_eq!(event.payload.edge, LatchEdge::Try(failed("down", true)));
+    assert_eq!(event.arguments.edge, LatchEdge::Try(failed("down", true)));
     let state = home.get("l").expect("exists").state().clone();
     assert_eq!(tally(&state).0, 1);
     home.apply("l", fire("bell"), &raised("bell"), at(2)).expect("fired");
@@ -134,7 +133,7 @@ fn an_edge_about_a_master_records_only_its_event() {
     let mut home = latch();
     let before = home.get("l").expect("exists").state().clone();
     let event = home.apply("l", note(), &Table::new(), at(1)).expect("noted");
-    assert_eq!(home.definition().master(&event.payload.edge).as_deref(), Some("m"));
+    assert_eq!(home.definition().master(&event.arguments.edge).as_deref(), Some("m"));
     assert_eq!(home.definition().master(&fire("bell").into()), None);
     assert!(home.definition().find(LatchEdgeKind::Note).expect("declared").has_master());
     let resource = home.get("l").expect("exists");

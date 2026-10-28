@@ -6753,7 +6753,7 @@ async fn activity_failure_test_daemon() -> (tempfile::TempDir, Arc<InProcessDaem
 // Delete the SQLite row behind the live home to exercise a real failed edge write.
 #[tokio::test]
 async fn agent_activity_store_failure_preserves_legacy_attention() {
-    use flotilla_schema::{Kind, Origin, Timestamp};
+    use flotilla_schema::{Kind, NewChange, Timestamp};
     use flotilla_state_machines::{
         machines::agent_session::{Activity, AgentSession},
         Resource,
@@ -6766,7 +6766,7 @@ async fn agent_activity_store_failure_preserves_legacy_attention() {
             let mut write = store.write()?;
             let id = write.resolve(Resource::<AgentSession>::CODE, "agent", "home")?.unwrap();
             let loaded = write.load::<Resource<AgentSession>>(id)?.unwrap();
-            write.delete::<Resource<AgentSession>>(loaded.stamp(), &Origin::new("test", Timestamp(1)))?;
+            write.delete::<Resource<AgentSession>>(loaded.stamp(), &NewChange::new("test", Timestamp(1)))?;
             write.commit()
         })
         .unwrap();
@@ -6898,7 +6898,7 @@ impl PeerSender for StreamCommandWire {
 // a damaged HTTP body and unreachable point-read homes retain explicit failures.
 #[tokio::test]
 async fn routed_only_change_stream_follows_snapshot_and_tail() {
-    use flotilla_schema::{Kind, KindRegistry, Origin, Timestamp};
+    use flotilla_schema::{Kind, KindRegistry, NewChange, Timestamp};
     use flotilla_schema_sqlite::stream::Service;
     let (_local_dir, local) = empty_daemon().await;
     let (_home_dir, home) = empty_daemon_named("home").await;
@@ -6915,7 +6915,7 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
                 write.insert(
                     name,
                     &RoutedStreamSample { value: name.into(), tags: vec!["child".into()] },
-                    &Origin::new("writer", Timestamp(1)),
+                    &NewChange::new("writer", Timestamp(1)),
                 )?;
                 write.commit()
             })
@@ -6961,7 +6961,8 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     // A missing forwarded socket must use the working peer route immediately.
     let missing = rigging_tls::client_builder().unix_socket(dir.path().join("missing.sock")).build().unwrap();
     super::change_stream::follow_round(Arc::clone(&target), "home", Some(&missing), &router).await.unwrap();
-    assert_eq!(target.watermark("home").unwrap().home_seq, 20);
+    // Twenty writes, each a change and its entry (#4024).
+    assert_eq!(target.watermark("home").unwrap().home_seq, 40);
     // The stand-in replaces only HTTP: one unavailable route, then a damaged
     // response body. The existing peer wire continues to dispatch real rounds.
     let sockets = TestSocketDir::new();
@@ -6988,14 +6989,14 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     });
     seed("tail");
     super::change_stream::follow_round(Arc::clone(&target), "home", Some(&http), &router).await.unwrap();
-    assert_eq!(target.watermark("home").unwrap().home_seq, 21);
+    assert_eq!(target.watermark("home").unwrap().home_seq, 42);
     seed("partial");
     let error = super::change_stream::follow_round(Arc::clone(&target), "home", Some(&http), &router).await.unwrap_err();
     assert_eq!(error, "truncated home stream", "a mid-body failure must not fall back");
-    assert_eq!(target.watermark("home").unwrap().home_seq, 21);
+    assert_eq!(target.watermark("home").unwrap().home_seq, 42);
     serving.await.unwrap();
     super::change_stream::follow_round(Arc::clone(&target), "home", None, &router).await.unwrap();
-    assert_eq!(target.watermark("home").unwrap().home_seq, 22);
+    assert_eq!(target.watermark("home").unwrap().home_seq, 44);
     for index in 0..=21 {
         let name = match index {
             20 => "tail".into(),
@@ -7042,7 +7043,7 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     release.send(()).unwrap();
     writer.await.unwrap();
     assert_eq!(error, "routed frame timed out");
-    assert_eq!(target.watermark("home").unwrap().home_seq, 22);
+    assert_eq!(target.watermark("home").unwrap().home_seq, 44);
     // A growing resource can exceed snapshot assembly while each update and tail
     // remains bounded. A fresh follower exposes the identity and committed zero,
     // while the home latches the same failure even after serving a healthy tail.
@@ -7052,7 +7053,7 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
             let stamp = write.insert(
                 "large",
                 &RoutedStreamSample { value: "large".into(), tags: Vec::new() },
-                &Origin::new("writer", Timestamp(2)),
+                &NewChange::new("writer", Timestamp(2)),
             )?;
             write.commit()?;
             Ok(stamp.id)
@@ -7065,7 +7066,7 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
                 let current = write.load::<RoutedStreamSample>(resource)?.unwrap();
                 let mut tags = current.value.tags.clone();
                 tags.push("x".repeat(1024 * 1024));
-                write.update(&current, &RoutedStreamSample { value: "large".into(), tags }, &Origin::new("writer", Timestamp(2)))?;
+                write.update(&current, &RoutedStreamSample { value: "large".into(), tags }, &NewChange::new("writer", Timestamp(2)))?;
                 write.commit()
             })
             .unwrap();
@@ -7101,12 +7102,12 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     assert!(!fresh.has_watermark("home"));
 
     super::change_stream::follow_round(Arc::clone(&target), "home", None, &router).await.unwrap();
-    assert_eq!(target.watermark("home").unwrap().home_seq, 88);
+    assert_eq!(target.watermark("home").unwrap().home_seq, 176);
     let hosts = home.list_hosts_internal().await.unwrap();
     let environment = &hosts.hosts.iter().find(|host| host.is_local).unwrap().environment_id.clone().unwrap();
     let status = home.get_host_status_internal(environment).await.unwrap();
     let state = status.change_stream.unwrap();
-    assert_eq!(state.watermark, 88);
+    assert_eq!(state.watermark, 176);
     assert!(state.last_error.unwrap().contains("home/rs/large"), "tail success cannot clear a snapshot refusal");
 
     // HTTP must carry the producer's reason as a frame, rather than replacing it
@@ -7131,7 +7132,7 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
         .with_store(|store| {
             let mut write = store.write()?;
             let current = write.load::<RoutedStreamSample>(resource)?.unwrap();
-            write.delete::<RoutedStreamSample>(current.stamp(), &Origin::new("writer", Timestamp(3)))?;
+            write.delete::<RoutedStreamSample>(current.stamp(), &NewChange::new("writer", Timestamp(3)))?;
             write.commit()
         })
         .unwrap();
@@ -7156,9 +7157,9 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     .await
     .unwrap();
     following.abort();
-    assert_eq!(fresh.watermark("home").unwrap().home_seq, 89);
+    assert_eq!(fresh.watermark("home").unwrap().home_seq, 178);
     let state = home.get_host_status_internal(environment).await.unwrap().change_stream.unwrap();
-    assert_eq!(state.watermark, 89);
+    assert_eq!(state.watermark, 178);
     assert_eq!(state.consecutive_failures, 0);
     assert!(state.last_error.is_none());
     remote.abort();

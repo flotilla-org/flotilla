@@ -163,7 +163,7 @@ fn record_adds_to_the_recorded_set_and_keeps_the_label() {
     let world = MemoryEnsureWorld::default();
     let event = h.apply("e", Record { fulfiller: f("a") }, &world, at(1)).expect("recorded");
     assert_eq!((event.from, event.to), (EnsureLabel::Unfulfilled, EnsureLabel::Unfulfilled));
-    assert!(event.payload.reads.is_empty(), "an ungated record reads nothing");
+    assert!(event.arguments.reads.is_empty(), "an ungated record reads nothing");
     h.apply("e", Record { fulfiller: f("a") }, &world, at(2)).expect("recorded again");
     assert_eq!(*state(&h), unfulfilled(&["a"], &[]));
 }
@@ -248,7 +248,7 @@ fn attempts_keep_the_windows_tally() {
     let world = MemoryEnsureWorld::default();
     let event = h.apply("e", failed(true), &world, at(1)).expect("attempted");
     assert_eq!((event.from, event.to), (EnsureLabel::Unfulfilled, EnsureLabel::Unfulfilled));
-    assert!(event.payload.reads.is_empty(), "an ungated attempt reads nothing");
+    assert!(event.arguments.reads.is_empty(), "an ungated attempt reads nothing");
     let latest = Failure { at: at(1), cause: cause(), retryable: true };
     let tally = |h: &Home<Ensure>| (state(h).failures(), state(h).last_failure().cloned());
     assert_eq!(tally(&h), (1, Some(latest)));
