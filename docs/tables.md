@@ -54,10 +54,10 @@ Parameters apply to the rows route. Each is validated against the table's descri
 - `where=<field> <op> <literal>`, repeatable, all conditions must hold. The expression is the condition grammar of `flotilla-address` (`crates/flotilla-address/src/condition.rs`) with the field path and literal; it is not copied here. A column accepts an operator only if it appears in the column's `whereOperators`. Literals must fit the column type: integers parse as `i64`, booleans are `true`/`false`, timestamps are RFC 3339, `code` columns take one of their values. `cbor`, `frozen` and `blob` columns cannot be filtered. On resource kinds, `metadata.labels.<key>` filters by label with `==`.
 - `sort=a,-b`: comma-separated column names, `-` for descending. Columns must be `sortable`. The table's key columns are appended in ascending order, so the order is total. Null sorts before every value ascending, and after every value descending.
 - `columns=a,b`: the columns to return. Key columns are always included, and a `reference` column brings its `.kind` and `.home` companions.
-- `limit` (default 200, 1 to 10000) and `offset` (default 0).
+- `limit`: rows per page; 200 when absent, otherwise 1 to 10000 and `offset` (default 0).
 - `cursor`: the `cursor` of the previous `rows` message when it was not null. It is opaque, and bound to the table, `namespace`, `sort` and `where` of the query that produced it; a cursor used with a different query yields a `resync` message instead of rows. Paging is keyset: rows strictly after the cursor's sort values are returned, so inserts and deletes between pages do not shift it.
 - `count=exact|estimate`: adds a `count` message.
-- `namespace` (default `default`): the scope read. For engine kinds, a namespace other than `default` names the home.
+- `namespace` (default `default`): the scope read. Flotilla's own records live in the `flotilla` namespace, so a client that omits `namespace` gets empty tables and no error; pass `namespace=flotilla`. For engine kinds, a namespace other than `default` names the home.
 - `watch` (bare, or `true`): keep the stream open and send changes.
 
 `.log` tables accept no `watch`, `cursor`, `offset`, `count` or custom `sort`; they return a bounded snapshot in `home, sequence` order.
@@ -81,7 +81,7 @@ Every message is an object with a `type` field holding one of the names above. `
 |---|---|---|
 | `table` | `table`, `schema`, `incarnation`, `sequence` | The description (below), limited to the requested `columns`. |
 | `count` | `count`, `estimate`, `sequence` | Only when `count` was requested. |
-| `rows` | `rows`, `sequence`, `partial`, `cursor` | A batch of rows keyed by column name. `partial` is true if the result continues past the page or the request used `cursor` or `offset`. `cursor` is set on the last batch of a page that has more rows. |
+| `rows` | `rows`, `sequence`, `partial`, `cursor` | A batch of rows keyed by column name. `partial` is true when this response is not the whole table: more rows follow, or the request gave `offset` or `cursor`. A client pages on `cursor`, not `partial`: a non-null `cursor` on the last batch of a page means more pages, and null means there are none. |
 | `synced` | `sequence` | The snapshot is complete. |
 | `upsert` | `key`, `row`, `sequence` | A row appeared or changed. `key` is the values of the primary key columns. |
 | `delete` | `key`, `sequence` | A row disappeared. |
