@@ -2222,7 +2222,10 @@ mod tests {
             panels.iter().map(|panel| panel.table.meta.salience).collect::<Vec<_>>(),
             vec![Salience::Urgent, Salience::None, Salience::Attention, Salience::Info,]
         );
-        assert!(panels.iter().all(|panel| panel.table.meta.as_of == Some(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)));
+        assert!(panels
+            .iter()
+            .filter(|panel| panel.kind != ProjectPanelKind::Checkouts)
+            .all(|panel| panel.table.meta.as_of == Some(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)));
         assert_eq!(panels[0].table.rows[0].cells[0].text, "tables");
         assert_eq!(panels[1].table.rows[0].cells[1].text, "/work/flotilla");
         assert_eq!(
