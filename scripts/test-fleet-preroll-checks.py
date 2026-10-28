@@ -64,7 +64,8 @@ class Refusals(unittest.TestCase):
     # Contract: a manifest for another generation, or without a cleat pin, refuses.
     def test_unusable_manifest_refused(self):
         for name, document in [('other generation', {'generation': 'gen-2', 'sources': {'cleat': '1' * 40}}),
-                               ('no cleat pin', {'generation': 'gen-1', 'sources': {}})]:
+                               ('no cleat pin', {'generation': 'gen-1', 'sources': {}}),
+                               ('abbreviated pin', {'generation': 'gen-1', 'sources': {'cleat': '11246d09'}})]:
             with self.subTest(name), tempfile.TemporaryDirectory() as directory:
                 manifest = Path(directory) / 'generation.json'
                 manifest.write_text(json.dumps(document))

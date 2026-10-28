@@ -124,7 +124,8 @@ def check_cleat_pairing(root, generation, manifest, git):
         document = json.loads(Path(manifest).read_text())
         if document.get('generation') != generation:
             return [f'{manifest}: manifest is for generation {document.get("generation")}, not {generation}']
-        cleat_pairing.require_pairing(cleat_pairing.declared_revision(root), document['sources']['cleat'], git)
+        cleat_pairing.require_pairing(cleat_pairing.declared_revision(root),
+                                      cleat_pairing.normalize_pin(document['sources']['cleat']), git)
     except (cleat_pairing.PairingError, OSError, ValueError, KeyError, TypeError) as error:
         return [f'cleat pairing: {error}']
     return []
@@ -148,8 +149,9 @@ def check(root, generation, consumers, sync, run, manifest=None, git=cleat_pairi
         if failures:
             failures.append("sync BOTH files (docs/fleet-install.md#automatic-pre-roll-refusals): " +
                             shlex.join([str(root / "scripts/fleet-preroll-checks.sh"), generation,
-                                        "--source-root", str(root), "--manifest", str(manifest),
-                                        "--consumer", host, "--sync-bootstrap"]))
+                                        "--source-root", str(root)] +
+                                       (["--manifest", str(manifest)] if manifest else []) +
+                                       ["--consumer", host, "--sync-bootstrap"]))
         errors += failures
     return errors
 

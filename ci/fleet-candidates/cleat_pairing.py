@@ -28,6 +28,12 @@ def declared_revision(flotilla_root):
     return match.group(1)
 
 
+def normalize_pin(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", value):
+        raise PairingError(f"cleat pin must be an exact 40-character hexadecimal commit: {value!r}")
+    return value.lower()
+
+
 def git_run(args, **kwargs):
     return subprocess.run(["git", *args], capture_output=True, text=True, **kwargs)
 
@@ -63,9 +69,7 @@ def resolve_cleat_sha(flotilla_root, requested, run=git_run):
     declared = declared_revision(flotilla_root)
     if not requested:
         return declared
-    if not re.fullmatch(r"[0-9a-fA-F]{40}", requested):
-        raise PairingError(f"cleat_sha must be an exact 40-character hexadecimal commit: {requested}")
-    pinned = requested.lower()
+    pinned = normalize_pin(requested)
     require_pairing(declared, pinned, run)
     return pinned
 
