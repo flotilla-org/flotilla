@@ -58,7 +58,9 @@ grep oom_kill /sys/fs/cgroup/flotilla.slice/flotilla-crews.slice/memory.events
 ```
 
 The dash nests the slice under `flotilla.slice`, which systemd creates
-implicitly with no limits of its own.
+implicitly with no limits of its own. The daemon checks only the named slice's
+`MemoryMax`; a limit set on a parent slice is not inspected, and it can only
+tighten the bound.
 
 ## Per-crew soft limit
 
