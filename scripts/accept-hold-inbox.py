@@ -3,7 +3,7 @@
 
 Use baseline before exercising four distinct settled-check episodes. Use hold
 once held, resumed after an operator resume, and settled after the crew submits
-its ledger and completes. See docs/agents/settlement-operations.md.
+its ledger and completes.
 """
 import argparse
 import http.server

@@ -729,11 +729,6 @@ project-map and ops configurations when rolling this change; the new reader
 then removes the manual working-tree update step. Omit `[manifests]` to disable
 the fleet store.
 
-See [bounded charter registration and additive rollout](charter-delegation.md)
-for optional Project charter pointers, scope refusals, inline inputs and the
-post-roll fleet-ops/project-map/wheelhouse companion sequence. Existing stores
-and local placement policies can remain unchanged while this support rolls.
-
 ## Credential grant permissions
 
 For each credential on a vessel, matching `CredentialGrant` resources must all
@@ -753,8 +748,7 @@ flotilla resource validate /path/to/project-map/flotilla-manifests
 Permission maps are resolved at admission and retained in the convoy snapshot;
 repository scopes re-resolve during refresh. Spec edits are read during fresh
 credential preparation, while periodic token refresh retains the snapshot or
-prepared request's permissions. See [ADR 0044](adr/0044-credential-grants-select-on-the-work.md)
-for the absent-maximum case and the complete admission and refresh contract.
+prepared request's permissions.
 
 ## Dependencies
 
