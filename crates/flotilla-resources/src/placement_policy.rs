@@ -140,13 +140,15 @@ pub enum HostDirectPlacementPolicyCheckout {
     Worktree,
 }
 
+/// Decoded through [`StoredDockerPerVessel`], which mirrors every field and holds their decode
+/// defaults: a new field is added to both until that shim is removed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "StoredDockerPerVessel")]
 pub struct DockerPerVesselPlacementPolicySpec {
     pub host_ref: String,
     /// Omitted means the vessel's composed image (ADR 0062): admission writes a
     /// `Built` source into each prepared placement snapshot.
-    #[serde(default, deserialize_with = "decode_optional_image_source", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<DockerImageSource>,
     /// Controls registry access for the resolved image tag. Image build recipes
     /// are intentionally outside placement policy and are tracked separately.
