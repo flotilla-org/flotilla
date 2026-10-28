@@ -55,6 +55,7 @@ impl DockerVessels {
     /// Docker's systemd driver creates a missing slice silently and unbounded,
     /// so the slice must already be loaded with a finite `MemoryMax`. That
     /// limit and the host's RAM must each leave room for one vessel at the ceiling.
+    /// A slice removed between this check and `docker run` is still recreated unbounded.
     #[cfg(any(unix, test))]
     pub(super) async fn verify(&self, runner: &dyn CommandRunner, cgroup_driver: &str, host_memory_bytes: u64) -> Result<(), String> {
         let slice = &self.slice;
