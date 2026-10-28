@@ -54,8 +54,8 @@ pub fn codex_central_auth_path(env: &dyn EnvVars) -> PathBuf {
 
 /// Whether this host keeps a central Codex login: what Codex crews on the SSH hosts it
 /// owns are delivered (#4037).
-pub fn has_codex_central_login(env: &dyn EnvVars) -> bool {
-    codex_central_auth_path(env).is_file()
+pub async fn has_codex_central_login(env: &dyn EnvVars) -> bool {
+    tokio::fs::metadata(codex_central_auth_path(env)).await.is_ok_and(|metadata| metadata.is_file())
 }
 
 #[derive(Debug, Default, Clone)]
