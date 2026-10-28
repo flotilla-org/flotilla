@@ -445,7 +445,16 @@ async fn a_connect_that_never_reached_the_agent_asks_nothing_after_failing() {
     );
     connector.connect().await.map(drop).expect_err("the host is unreachable");
     let attempts = transport.opened.load(Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Every task the connect spawned has finished, so a probe it started has
+    // already opened its link.
+    let runtime = tokio::runtime::Handle::current();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while runtime.metrics().num_alive_tasks() > 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the connect's tasks finish");
     assert_eq!(transport.opened.load(Ordering::SeqCst), attempts, "no probe follows a connect that never reached the agent");
 }
 

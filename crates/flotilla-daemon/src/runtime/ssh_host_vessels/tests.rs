@@ -329,6 +329,18 @@ impl VesselPreparer for Preparer {
     }
 }
 
+/// An attach request preparing `vessel` in its own task, which the test can
+/// abort as a request past its deadline is.
+fn attaching(vessels: &Arc<SshHostVessels>, host: &Host, vessel: &str) -> tokio::task::JoinHandle<Result<Arc<VesselAccess>, String>> {
+    let (vessels, profile, vessel) = (Arc::clone(vessels), host.profile.clone(), vessel.to_string());
+    let preparer = Preparer {
+        tools: EnvironmentToolProvisioner::new(Vec::new()),
+        discovery: flotilla_discovery_testkit::fake_discovery(false),
+        config: ConfigStore::with_base(host.state.path().join("config")),
+    };
+    tokio::spawn(async move { vessels.access(Arc::new(preparer), &profile, &vessel).await })
+}
+
 async fn access(vessels: &Arc<SshHostVessels>, host: &Host, vessel: &str) -> Result<Arc<VesselAccess>, String> {
     access_with(vessels, host, vessel, EnvironmentToolProvisioner::new(Vec::new())).await
 }
@@ -430,18 +442,7 @@ async fn a_caller_that_stops_waiting_does_not_cut_off_its_vessels_agent_upgrade(
     let (sockets, _received) = recording_sockets(host.state.path());
     let vessels = Arc::new(SshHostVessels::new(agents.clone(), sockets, host.state.path().join("vessels")));
 
-    let attach = tokio::spawn({
-        let (vessels, profile) = (Arc::clone(&vessels), host.profile.clone());
-        let state = host.state.path().to_path_buf();
-        async move {
-            let preparer = Preparer {
-                tools: EnvironmentToolProvisioner::new(Vec::new()),
-                discovery: flotilla_discovery_testkit::fake_discovery(false),
-                config: ConfigStore::with_base(state.join("config")),
-            };
-            vessels.access(Arc::new(preparer), &profile, "convoy-1-work").await
-        }
-    });
+    let attach = attaching(&vessels, &host, "convoy-1-work");
     tokio::time::timeout(Duration::from_secs(10), gate.held.notified()).await.expect("the upload reaches the gate");
     attach.abort();
     assert!(attach.await.is_err_and(|error| error.is_cancelled()));
@@ -456,6 +457,48 @@ async fn a_caller_that_stops_waiting_does_not_cut_off_its_vessels_agent_upgrade(
     assert_eq!(agents.opened.load(Ordering::SeqCst), 1, "the next caller found the first preparation");
     assert_eq!(std::fs::read(vessel.paths.agent.join("drydock-agent")).unwrap(), build);
     assert_eq!(shell(&vessel, "printf ready").await, "ready");
+}
+
+// #4054 review: retiring a vessel while a preparation no caller waits for is
+// partway through its upgrade waits for the preparation, then closes what it
+// prepared. Nothing outlives the retire. Mutation check: a retire that doesn't
+// wait for the slot lock tears the vessel down under its unfinished upgrade.
+#[tokio::test(flavor = "multi_thread")]
+async fn retiring_a_vessel_mid_preparation_closes_what_the_preparation_leaves() {
+    let host = host(Arc::new(ProcessCommandRunner));
+    let build = (0..4 * 1024 * 1024).map(|byte: u32| byte as u8).collect::<Vec<_>>();
+    let gate = Gate::closing_after(1024 * 1024);
+    let agents = Arc::new(LocalAgents::upgrading(build, Arc::clone(&gate)));
+    let (sockets, _received) = recording_sockets(host.state.path());
+    let vessels = Arc::new(SshHostVessels::new(agents.clone(), sockets, host.state.path().join("vessels")));
+
+    let attach = attaching(&vessels, &host, "convoy-1-work");
+    tokio::time::timeout(Duration::from_secs(10), gate.held.notified()).await.expect("the upload reaches the gate");
+    attach.abort();
+    assert!(attach.await.is_err_and(|error| error.is_cancelled()));
+
+    let key = VesselKey::new(&host.profile.environment_id, "convoy-1-work");
+    let retire = tokio::spawn({
+        let (vessels, profile) = (Arc::clone(&vessels), host.profile.clone());
+        async move { vessels.retire(&profile, "convoy-1-work").await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !vessels.retired.lock().await.contains(&key) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the retire takes the vessel's slot");
+    assert!(!retire.is_finished(), "the retire waits for the preparation");
+
+    gate.open();
+    tokio::time::timeout(Duration::from_secs(10), retire).await.expect("the retire finishes").expect("retire");
+    assert_eq!(agents.upgrades.load(Ordering::SeqCst), 1, "the preparation finished before the retire");
+    let handles = agents.handles.lock().unwrap().clone();
+    assert_eq!(handles.len(), 1);
+    assert!(handles[0].is_closed(), "the retire closed what the preparation stored");
+    let error = access(&vessels, &host, "convoy-1-work").await.err().expect("not resurrected");
+    assert!(error.contains("torn down"), "{error}");
 }
 
 // #3792 contract 6: removing a vessel removes its forward, stops its agent
