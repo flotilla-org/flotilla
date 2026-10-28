@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{ConfiguredResourceLimits, PlacementDecision};
+use flotilla_protocol::{ConfiguredResourceLimits, LifecycleReading, PlacementDecision};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    resource::define_resource, status_patch::StatusPatch, ControllerRetry, LandingCredentialScope, ReplicationClass, RepositoryKey, Stance,
+    lifecycle_reads::{LifecycleReads, ProvisioningKind},
+    resource::define_resource,
+    status_patch::StatusPatch,
+    ControllerRetry, LandingCredentialScope, ReplicationClass, RepositoryKey, ResourceObject, Stance,
 };
 
 define_resource!(
@@ -181,6 +184,43 @@ pub enum VesselStatusPatch {
     MarkFailed {
         message: String,
     },
+}
+
+impl VesselPhase {
+    /// The phase the engine's reading decides; without a reading, the stored phase.
+    pub fn from_reading(reading: Option<&LifecycleReading>, status: Option<&VesselStatus>) -> Self {
+        match reading {
+            Some(LifecycleReading::Lost | LifecycleReading::Released) => Self::Lost,
+            Some(LifecycleReading::Failed { .. } | LifecycleReading::GaveUp { .. }) => Self::Failed,
+            Some(LifecycleReading::Ready { .. }) if status.is_some_and(|status| !status.interrupted_roles.is_empty()) => Self::Interrupted,
+            Some(LifecycleReading::Ready { .. }) => Self::Ready,
+            // Exhausted still holds a Requested lease until GiveUp commits.
+            Some(LifecycleReading::InProgress | LifecycleReading::Retrying { .. } | LifecycleReading::Exhausted { .. }) => {
+                Self::Provisioning
+            }
+            None => status.map(|status| status.phase).unwrap_or_default(),
+        }
+    }
+}
+
+/// A read view whose phase the engine decides. Never publish it back as stored status.
+pub fn project_reading(obj: &ResourceObject<Vessel>, reading: Option<&LifecycleReading>) -> ResourceObject<Vessel> {
+    let mut obj = obj.clone();
+    let Some(reading) = reading else { return obj };
+    let phase = VesselPhase::from_reading(Some(reading), obj.status.as_ref());
+    let status = obj.status.get_or_insert_with(Default::default);
+    if status.phase != phase {
+        status.phase = phase;
+        if matches!(phase, VesselPhase::Ready | VesselPhase::Lost | VesselPhase::Failed) {
+            status.message = reading.reason();
+        }
+    }
+    obj
+}
+
+/// The engine's view of `obj` homed at `origin`, or `obj` itself when the engine holds no record.
+pub fn read(reads: &dyn LifecycleReads, obj: &ResourceObject<Vessel>, origin: Option<&str>) -> Result<ResourceObject<Vessel>, String> {
+    Ok(project_reading(obj, reads.try_reading(ProvisioningKind::Vessel, &obj.metadata.name, origin)?.as_ref()))
 }
 
 impl StatusPatch<VesselStatus> for VesselStatusPatch {

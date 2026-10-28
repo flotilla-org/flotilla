@@ -1615,20 +1615,7 @@ impl Reconciler for VesselReconciler {
     async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         // Controllers mutate this home's Vessel records; replicas are read-only view inputs.
         let reading = self.lifecycle_reads.try_reading(ProvisioningKind::Vessel, &obj.metadata.name, None).map_err(ResourceError::other)?;
-        let phase = match reading {
-            Some(LifecycleReading::Lost | LifecycleReading::Released) => VesselPhase::Lost,
-            Some(LifecycleReading::Failed { .. } | LifecycleReading::GaveUp { .. }) => VesselPhase::Failed,
-            Some(LifecycleReading::Ready { .. }) => {
-                if obj.status.as_ref().is_some_and(|status| !status.interrupted_roles.is_empty()) {
-                    VesselPhase::Interrupted
-                } else {
-                    VesselPhase::Ready
-                }
-            }
-            // Exhausted still holds a Requested lease; the engine wrapper completes GiveUp before planning.
-            Some(_) => VesselPhase::Provisioning,
-            None => obj.status.as_ref().map(|status| status.phase).unwrap_or_default(),
-        };
+        let phase = VesselPhase::from_reading(reading.as_ref(), obj.status.as_ref());
         let mut prepared =
             if matches!(phase, VesselPhase::Failed | VesselPhase::Lost) { VesselPrepared::none() } else { self.prepare_plan(obj).await? };
         prepared.phase = Some(phase);

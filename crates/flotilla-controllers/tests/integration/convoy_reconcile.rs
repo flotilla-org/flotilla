@@ -556,6 +556,16 @@ async fn reconcile_once_with_resources(
     workspaces: Vec<flotilla_resources::ResourceObject<Vessel>>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> flotilla_store::controller::ReconcileOutcome<Convoy> {
+    reconcile_once_with_reads(convoy, template, workspaces, Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads), now).await
+}
+
+async fn reconcile_once_with_reads(
+    convoy: &flotilla_resources::ResourceObject<Convoy>,
+    template: Option<&flotilla_resources::ResourceObject<WorkflowTemplate>>,
+    workspaces: Vec<flotilla_resources::ResourceObject<Vessel>>,
+    reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> flotilla_store::controller::ReconcileOutcome<Convoy> {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
@@ -588,7 +598,10 @@ async fn reconcile_once_with_resources(
     }
 
     let current = convoys.get(&convoy.metadata.name).await.expect("convoy get should succeed");
-    let reconciler = ConvoyReconciler::new(templates.clone()).with_vessels(vessels.clone()).with_teardown_runtime(Arc::new(AlwaysEligible));
+    let reconciler = ConvoyReconciler::new(templates.clone())
+        .with_vessels(vessels.clone())
+        .with_lifecycle_reads(reads)
+        .with_teardown_runtime(Arc::new(AlwaysEligible));
     let deps = reconciler.prepare(&current).await.expect("dependency fetch should succeed");
     reconciler.reconcile(&current, &deps, now)
 }
@@ -3630,6 +3643,57 @@ async fn lost_vessel_interrupts_work_without_provisioning_retry_or_recreation() 
         assert!(!matches!(again.patch, Some(ConvoyStatusPatch::WorkInterrupted { .. })), "restart must not repeat loss roll-up");
         assert!(!again.actuations.iter().any(|action| matches!(action, Actuation::CreateVessel { .. })));
         assert!(!matches!(again.patch, Some(ConvoyStatusPatch::WorkProvisioningRetry { .. } | ConvoyStatusPatch::MarkWorkFailed { .. })));
+    }
+}
+
+// The engine's ending decides a seat even when the vessel's stored status never left Provisioning:
+// each ending rolls up exactly as the same ending recorded in stored status would.
+#[tokio::test]
+async fn engine_ended_vessel_ends_its_seat_despite_provisioning_status() {
+    use flotilla_protocol::{CanonicalHostId, LifecycleReading, PlacementDecision, PlacementTargetHost};
+    use flotilla_provisioning_testkit::{Ending, VesselFixture};
+    let endings = [
+        (Ending::Lost("env-implement"), LifecycleReading::Lost),
+        (Ending::GaveUp("host unreachable"), LifecycleReading::GaveUp { cause: "host unreachable".into() }),
+        (Ending::Released, LifecycleReading::Released),
+    ];
+    for phase in [WorkPhase::Launching, WorkPhase::Running, WorkPhase::Stalled] {
+        for (ending, reading) in endings.clone() {
+            let mut status = bootstrapped_convoy_status();
+            status.phase = ConvoyPhase::Active;
+            status.work.get_mut("implement").expect("work").phase = phase;
+            let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
+            let mut vessel = vessel_object("convoy-a", "implement", VesselPhase::Provisioning, Some("waiting for environment"));
+            vessel.status.as_mut().expect("status").placement_decision = Some(
+                PlacementDecision::builder()
+                    .policy_name("laptop-docker".into())
+                    .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved("feta"), display_name: "feta".into() })
+                    .build(),
+            );
+            let fixture = VesselFixture::new(false);
+            fixture.request(&vessel);
+            fixture.finish(&vessel, ending);
+
+            let engine = reconcile_once_with_reads(&convoy, None, vec![vessel.clone()], fixture.reads.clone(), timestamp(21)).await;
+            let mut ended = vessel.clone();
+            let stored = ended.status.as_mut().expect("status");
+            stored.phase = VesselPhase::from_reading(Some(&reading), None);
+            stored.message = reading.reason();
+            let old = reconcile_once_with_resources(&convoy, None, vec![ended], timestamp(21)).await;
+
+            let patch = engine.patch.as_ref().unwrap_or_else(|| panic!("{phase:?} {reading:?}: the ending reaches the seat"));
+            assert!(
+                matches!(
+                    patch,
+                    ConvoyStatusPatch::WorkInterrupted { .. }
+                        | ConvoyStatusPatch::WorkProvisioningRetry { .. }
+                        | ConvoyStatusPatch::MarkWorkFailed { .. }
+                ),
+                "{patch:?}"
+            );
+            assert_eq!(format!("{:?}", engine.patch), format!("{:?}", old.patch), "{phase:?} {reading:?}");
+            assert_eq!(format!("{:?}", engine.actuations), format!("{:?}", old.actuations), "{phase:?} {reading:?}");
+        }
     }
 }
 

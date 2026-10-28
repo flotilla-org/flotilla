@@ -43,6 +43,7 @@ flotilla-discovery = { path = "../flotilla-discovery" }
 flotilla-discovery-api = { path = "../flotilla-discovery-api" }
 flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }
 flotilla-provisioning = { path = "../flotilla-provisioning" }
+flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
 flotilla-store-testkit = { path = "../flotilla-store-testkit" }
 flotilla-orchestration-testkit = { path = "../flotilla-orchestration-testkit" }
 flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
