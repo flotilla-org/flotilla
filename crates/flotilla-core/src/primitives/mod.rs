@@ -1149,6 +1149,8 @@ pub struct OldStoreRecords {
     pub namespace: String,
     pub forges: Vec<ForgeSpec>,
     convoys: BTreeMap<String, ResourceObject<Convoy>>,
+    /// Convoys any read copy of which has not ended.
+    live_convoys: BTreeSet<String>,
     terminals: BTreeMap<String, ResourceObject<TerminalSession>>,
     artifacts: BTreeMap<String, ResourceObject<Artifact>>,
     repositories: Vec<ResourceObject<Repository>>,
@@ -1172,6 +1174,7 @@ impl OldStoreRecords {
         Self {
             namespace: namespace.to_owned(),
             forges,
+            live_convoys: live(&convoys),
             convoys: by_name(convoys),
             terminals: by_name(terminals),
             artifacts: by_name(artifacts),
@@ -1183,14 +1186,10 @@ impl OldStoreRecords {
     pub async fn load(backend: &ResourceBackend, namespace: &str) -> Result<Self, ResourceError> {
         let forges =
             backend.definitions::<flotilla_resources::Forge>(namespace).list().await?.into_iter().map(|forge| forge.spec).collect();
-        let convoys = backend
-            .including_replicas::<Convoy>(namespace)
-            .list()
-            .await?
-            .items
-            .into_iter()
-            .map(|convoy| (convoy.object.metadata.name.clone(), convoy.object))
-            .collect();
+        let convoys: Vec<_> =
+            backend.including_replicas::<Convoy>(namespace).list().await?.items.into_iter().map(|convoy| convoy.object).collect();
+        let live_convoys = live(&convoys);
+        let convoys = convoys.into_iter().map(|convoy| (convoy.metadata.name.clone(), convoy)).collect();
         let terminals = backend
             .including_replicas::<TerminalSession>(namespace)
             .list()
@@ -1222,7 +1221,7 @@ impl OldStoreRecords {
             .into_iter()
             .map(|project| (project.metadata.name.clone(), project))
             .collect();
-        Ok(Self { namespace: namespace.to_owned(), forges, convoys, terminals, artifacts, repositories, projects })
+        Ok(Self { namespace: namespace.to_owned(), forges, convoys, live_convoys, terminals, artifacts, repositories, projects })
     }
 
     /// Every project declared in this namespace, by name.
@@ -1264,6 +1263,15 @@ impl OldStoreRecords {
     }
 }
 
+/// A convoy with no status has not been seen to end.
+fn live(convoys: &[ResourceObject<Convoy>]) -> BTreeSet<String> {
+    convoys
+        .iter()
+        .filter(|convoy| !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()))
+        .map(|convoy| convoy.metadata.name.clone())
+        .collect()
+}
+
 impl ReferenceAddresses for OldStoreRecords {
     fn missing(&self, reference: &OldReference) -> Option<&'static str> {
         match reference {
@@ -1280,6 +1288,9 @@ impl ReferenceAddresses for OldStoreRecords {
     }
     fn convoy_project(&self, convoy: &str) -> Option<String> {
         OldStoreRecords::convoy_project(self, convoy)
+    }
+    fn convoy_ended(&self, convoy: &str) -> bool {
+        !self.live_convoys.contains(convoy)
     }
     fn principal_roles(&self, project: &str, principal: &str) -> Vec<String> {
         self.principal_backed(project).filter(|(_, holder)| *holder == principal).map(|(role, _)| role.to_owned()).collect()

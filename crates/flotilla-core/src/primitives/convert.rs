@@ -45,6 +45,12 @@ pub trait ReferenceAddresses: Send + Sync {
         None
     }
 
+    /// Whether `convoy` has ended: Landed, Abandoned or Failed, or no longer
+    /// held. `false` while it is live or when this port cannot tell.
+    fn convoy_ended(&self, _convoy: &str) -> bool {
+        false
+    }
+
     /// The roles `project`'s own charter declares `principal` holds
     /// (`role_definitions.<role>.principal`), by name.
     fn principal_roles(&self, _project: &str, _principal: &str) -> Vec<String> {

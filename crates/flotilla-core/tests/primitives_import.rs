@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, fs, path::Path};
 
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_core::primitives::{
-    convert::{Conversion, NoRecords},
+    convert::{Conversion, NoRecords, ReferenceAddresses},
     import::{
         admission_order, check, import_all, import_message, ImportDrop, ImportRefusal, Imported, ImportedMessage, OldMessage, ReadRecords,
     },
@@ -15,8 +15,8 @@ use flotilla_core::primitives::{
 };
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
-    Message, MessageExpectation, MessagePhase, MessageReference, MessageRelation, MessageSpec, MessageStatus, ObjectMeta, RepositorySpec,
-    ResolvedMessageReceiver, ResourceObject,
+    Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, Message, MessageExpectation, MessagePhase, MessageReference, MessageRelation,
+    MessageSpec, MessageStatus, ObjectMeta, RepositorySpec, ResolvedMessageReceiver, ResourceObject,
 };
 use flotilla_state_machines::machines::{
     consumer::{ConsumerKind, Receiver},
@@ -104,8 +104,12 @@ fn world(records: &[ResourceObject<Message>]) -> ReadRecords<'_> {
 
 /// Imports `records` and returns the result for the named record.
 fn outcome(records: &[ResourceObject<Message>], name: &str) -> Result<Imported, ImportRefusal> {
+    outcome_holding(records, name, &NoRecords)
+}
+
+fn outcome_holding(records: &[ResourceObject<Message>], name: &str, held: &dyn ReferenceAddresses) -> Result<Imported, ImportRefusal> {
     let roles = FleetRoles::declared("fleet").expect("roles");
-    let conversion = Conversion { roles: &roles, forges: &[], records: &NoRecords };
+    let conversion = Conversion { roles: &roles, forges: &[], records: held };
     let world = world(records);
     let old = records.iter().find(|record| record.metadata.name == name).expect("named record");
     import_message(&OldMessage { record: old, home: HOME.into() }, 1, &conversion, &world)
@@ -291,23 +295,105 @@ fn expectation(tc: &TestCase) -> MessageExpectation {
     }
 }
 
-// Behaviour: a record delivered to a session that is gone is dropped when
-// settled and refused, by name, when it still awaits its receiver.
-#[hegel::test(test_cases = 100)]
-fn a_gone_session_drops_settled_records_and_refuses_open_ones(tc: TestCase) {
-    let phase = tc.draw(
-        gs::sampled_from(MessagePhase::ALL.iter().copied().filter(|phase| phase.has_delivery_evidence()).collect::<Vec<_>>())
-            .print_as_debug(),
-    );
-    let records =
-        [record("message-a", spec(RECEIVER, "system:turn-rules", expectation(&tc)), status(phase, Some(1), Some(gone_session())))];
-    let result = outcome(&records, "message-a");
-    if settled(&records[0]) {
-        assert_eq!(dropped(&result), Some("its delivered session is gone"), "{phase:?}: {result:?}");
+fn convoy(name: &str, phase: Option<ConvoyPhase>) -> ResourceObject<Convoy> {
+    ResourceObject {
+        metadata: meta(name, 1),
+        spec: ConvoySpec::builder().workflow_ref("w".to_string()).project_ref("flotilla".to_string()).build(),
+        status: phase.map(|phase| ConvoyStatus { phase, ..Default::default() }),
+    }
+}
+
+fn holding(convoys: Vec<ResourceObject<Convoy>>) -> OldStoreRecords {
+    OldStoreRecords::from_records("flotilla", Vec::new(), convoys, Vec::new(), Vec::new(), Vec::new(), Vec::new())
+}
+
+const CONVOY_PHASES: [Option<ConvoyPhase>; 8] = [
+    None,
+    Some(ConvoyPhase::Pending),
+    Some(ConvoyPhase::Active),
+    Some(ConvoyPhase::Interrupted),
+    Some(ConvoyPhase::Landing),
+    Some(ConvoyPhase::Landed),
+    Some(ConvoyPhase::Failed),
+    Some(ConvoyPhase::Abandoned),
+];
+
+fn ended(phase: Option<ConvoyPhase>) -> bool {
+    matches!(phase, Some(ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Abandoned))
+}
+
+// Behaviour: a record missing its delivered session, a message it replies to
+// or an addressable reference is dropped with its reason when settled or when
+// every held copy of its receiver's convoy has ended (or none is held), and
+// refused by name while any copy is live.
+#[hegel::test(test_cases = 200)]
+fn a_missing_record_drops_when_settled_or_its_convoy_ended_and_is_refused_while_live(tc: TestCase) {
+    let copies = tc.draw(gs::vecs(gs::sampled_from(CONVOY_PHASES.to_vec()).print_as_debug()).max_size(3));
+    let convoy_ended = copies.iter().all(|phase| ended(*phase));
+    let held = holding(copies.iter().map(|phase| convoy("demo", *phase)).collect());
+    let gap = tc.draw(gs::sampled_from(vec!["session", "replied-to message", "TerminalSession reference"]));
+    let mut spec = spec(RECEIVER, "system:turn-rules", expectation(&tc));
+    let (phase, receiver, reason, detail) = match gap {
+        "session" => {
+            let phase = tc.draw(
+                gs::sampled_from(MessagePhase::ALL.iter().copied().filter(|phase| phase.has_delivery_evidence()).collect::<Vec<_>>())
+                    .print_as_debug(),
+            );
+            (phase, Some(gone_session()), "its delivered session is gone", "session-gone")
+        }
+        other => {
+            if other == "replied-to message" {
+                spec.in_reply_to = Some("message-gone".into());
+            } else {
+                spec.references = vec![control_record("TerminalSession", "terminal-1")];
+            }
+            let phase = tc.draw(gs::sampled_from(MessagePhase::ALL.to_vec()).print_as_debug());
+            let receiver = phase.has_delivery_evidence().then(delivered);
+            let (reason, detail) = if other == "replied-to message" {
+                ("a message it names is gone", "message-gone")
+            } else {
+                ("it references a kind with no address", "TerminalSession")
+            };
+            (phase, receiver, reason, detail)
+        }
+    };
+    let records = [record("message-a", spec, status(phase, Some(1), receiver))];
+    let result = outcome_holding(&records, "message-a", &held);
+    if settled(&records[0]) || convoy_ended {
+        assert_eq!(dropped(&result), Some(reason), "{phase:?} {copies:?}: {result:?}");
     } else {
-        let refusal = result.expect_err("an awaiting record with a gone session is refused");
+        let refusal = result.expect_err("an open record whose convoy is live is refused");
         assert_eq!(refusal.record, "message-a");
-        assert!(refusal.reason.contains("session-gone"), "{refusal}");
+        assert!(refusal.reason.contains(detail), "{refusal}");
+    }
+}
+
+// Behaviour: the receiver's convoy is the delivered holder's, else the
+// addressed role's; an open record received by a role in no convoy is
+// refused even when no convoy is held.
+#[test]
+fn the_receivers_convoy_is_the_delivered_holders_else_the_addressed_roles() {
+    let held = holding(vec![convoy("live", Some(ConvoyPhase::Active))]);
+    let awaiting = |name: &str, receiver: &str, role_address: Option<&str>| {
+        let delivery = ResolvedMessageReceiver { role_address: role_address.map(str::to_owned), ..gone_session() };
+        record(
+            name,
+            spec(receiver, "system:turn-rules", MessageExpectation::Reply),
+            status(MessagePhase::Delivered, Some(1), Some(delivery)),
+        )
+    };
+    let records = [
+        awaiting("standing-held-in-ended", "flotilla/gui-approver", Some(RECEIVER)),
+        awaiting("standing-unknown-holder", "flotilla/gui-approver", None),
+        awaiting("ended-held-in-live", RECEIVER, Some("flotilla/live/work/coder")),
+        awaiting("addressed-to-ended", RECEIVER, None),
+    ];
+    let outcome = |name: &str| outcome_holding(&records, name, &held);
+    assert_eq!(dropped(&outcome("standing-held-in-ended")), Some("its delivered session is gone"));
+    assert_eq!(dropped(&outcome("addressed-to-ended")), Some("its delivered session is gone"));
+    for name in ["standing-unknown-holder", "ended-held-in-live"] {
+        let refusal = outcome(name).expect_err("a live or unknown convoy keeps the refusal");
+        assert_eq!(refusal.record, name);
     }
 }
 
@@ -334,30 +420,13 @@ fn expired_without_a_deadline_is_dropped() {
     assert_eq!(dropped(&outcome(&records, "message-a")), Some("expired without a deadline"));
 }
 
-// Behaviour: a reply to a message that was not read is dropped when settled
-// and refused when open.
-#[test]
-fn a_gone_replied_to_message_drops_settled_records_and_refuses_open_ones() {
-    let mut reply = spec(RECEIVER, "system:turn-rules", MessageExpectation::None);
-    reply.in_reply_to = Some("message-gone".into());
-    let records = [
-        record("message-settled", reply.clone(), status(MessagePhase::Satisfied, Some(1), Some(delivered()))),
-        record("message-open", reply, status(MessagePhase::Deliverable, Some(2), None)),
-    ];
-    assert_eq!(dropped(&outcome(&records, "message-settled")), Some("a message it names is gone"));
-    let refusal = outcome(&records, "message-open").expect_err("an open reply to a gone message is refused");
-    assert_eq!(refusal.record, "message-open");
-    assert!(refusal.reason.contains("message-gone"), "{refusal}");
-}
-
 fn control_record(kind: &str, name: &str) -> MessageReference {
     MessageReference::ControlRecord { resource: ResourceRef::new("flotilla.work/v1", kind, "flotilla", name), revision: "7".into() }
 }
 
 // Behaviour: a Project reference maps to its project address and back; a
-// TerminalSession reference has no address and a missing artifact or
-// repository is gone, so each drops a settled record and refuses an open one;
-// a malformed reference is refused even when settled.
+// missing artifact or repository is gone, so it drops a settled record; a
+// held record with no address is refused even when settled.
 #[test]
 fn record_references_map_drop_or_refuse() {
     let roles = FleetRoles::declared("fleet").expect("roles");
@@ -375,8 +444,6 @@ fn record_references_map_drop_or_refuse() {
     };
     let olds = [
         referring("to-project", control_record("Project", "flotilla"), MessagePhase::Satisfied, Some(delivered())),
-        referring("settled-to-session", control_record("TerminalSession", "terminal-1"), MessagePhase::Satisfied, Some(delivered())),
-        referring("open-to-session", control_record("TerminalSession", "terminal-1"), MessagePhase::Accepted, None),
         referring(
             "to-artifact",
             MessageReference::Artifact {
@@ -414,13 +481,10 @@ fn record_references_map_drop_or_refuse() {
     let reference = &project.resource.spec().references[0];
     assert_eq!(reference.address.as_str(), "project:flotilla");
     assert_eq!(records.record(&reference.address, &reference.revision), Some(control_record("Project", "flotilla")));
-    assert_eq!(dropped(&import("settled-to-session")), Some("it references a kind with no address"));
     assert_eq!(dropped(&import("to-artifact")), Some("a referenced artifact is gone"));
     assert_eq!(dropped(&import("to-commit")), Some("a referenced repository is gone"));
     let held = import("to-unaddressable-commit").expect_err("a held record it cannot address is refused even when settled");
     assert_eq!(held.record, "to-unaddressable-commit");
-    let refusal = import("open-to-session").expect_err("an open record with an unaddressable reference is refused");
-    assert_eq!(refusal.record, "open-to-session");
 }
 
 // Behaviour: a settled record naming a dropped message is dropped in turn;
