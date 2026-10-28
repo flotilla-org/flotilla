@@ -232,7 +232,7 @@ async fn retire_removes_read_only_content_cache_entries() {
     std::fs::create_dir_all(&entry).unwrap();
     std::fs::write(entry.join("hegel.md"), "skill").unwrap();
     std::fs::set_permissions(entry.join("hegel.md"), std::fs::Permissions::from_mode(0o400)).unwrap();
-    for dir in [&entry, entry.parent().unwrap(), entry.parent().unwrap().parent().unwrap()] {
+    for dir in entry.ancestors().take_while(|dir| dir.starts_with(&directory)) {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
     }
     retire_host_agent(&ProcessCommandRunner, &directory, &[]).await.unwrap();

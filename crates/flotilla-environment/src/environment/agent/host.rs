@@ -50,9 +50,10 @@ exec env -i HOME="${HOME:-/}" USER="${USER:-}" LOGNAME="${LOGNAME:-}" SHELL="${S
 const INSTALL: &str = r#"chmod -- 700 "$1" && mv -f -- "$1" "$2""#;
 
 /// Kill the supervisor and agent serving one socket, then remove the vessel's
-/// directories. Drydock stores content-cache entries read-only, so the owner
-/// gets write permission on the trees first. Both processes end their argv with `--socket <socket>`; the
+/// directories. Both processes end their argv with `--socket <socket>`; the
 /// supervisor is killed in the same signal, so it cannot restart the agent.
+/// Drydock stores content-cache entries read-only, so the owner gets write
+/// permission on the trees before they are removed.
 /// `ps` rather than `/proc` keeps this portable to macOS hosts.
 const RETIRE: &str = r#"dir=$1
 shift
