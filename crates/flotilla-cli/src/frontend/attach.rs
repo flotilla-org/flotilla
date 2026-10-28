@@ -35,8 +35,12 @@ pub async fn run_attach(
                 },
                 Ok(other) => return Err(color_eyre::eyre::eyre!("unexpected attach response: {other:?}")),
                 // A daemon that is restarting is part of the roll being
-                // survived: wait for it. The first resolution fails as before.
-                Err(_) if reattaching => return Ok(None),
+                // survived: wait for it, saying why. The first resolution
+                // fails as before.
+                Err(error) if reattaching => {
+                    eprintln!("flotilla: cannot resolve {reference} yet: {error}");
+                    return Ok(None);
+                }
                 Err(error) => return Err(error),
             };
             let plan = client_attach_plan(
@@ -80,16 +84,20 @@ where
     loop {
         let Some(plan) = resolve(reattaching).await? else {
             failures += 1;
-            eprintln!("flotilla: waiting for the daemon to reattach");
+            eprintln!("flotilla: retrying");
             tokio::time::sleep(reattach_backoff(failures)).await;
             continue;
         };
         let started = std::time::Instant::now();
-        let code = crate::terminal::run_attach_plan_waiting(&plan).map_err(color_eyre::eyre::Report::msg)?;
+        // The attach blocks for its whole life; keep it off the executor.
+        let code = tokio::task::spawn_blocking(move || crate::terminal::run_attach_plan_waiting(&plan))
+            .await?
+            .map_err(color_eyre::eyre::Report::msg)?;
         if code != Some(CLEAT_REATTACH_STATUS) {
             return Ok(code);
         }
-        // A path that dies as soon as it is made must back off, not spin.
+        // A path that dies as soon as it is made must back off, not spin:
+        // short-lived attaches ratchet the wait up to its cap.
         failures = if started.elapsed() > REATTACH_STABLE { 0 } else { failures + 1 };
         eprintln!("flotilla: attachment moved or its path broke; reattaching");
         reattaching = true;
@@ -237,7 +245,7 @@ mod tests {
         let cleat = std::env::var("FLOTILLA_TEST_CLEAT_NEW").expect("pinned new cleat");
         let bin = std::path::Path::new(&cleat).parent().expect("cleat directory").to_string_lossy().into_owned();
         let path = format!("{bin}:{}", std::env::var("PATH").unwrap_or_default());
-        // SAFETY: this ignored test is the only one in its process.
+        // SAFETY: the CI filter by name runs this ignored test alone in its process.
         unsafe { std::env::set_var("PATH", &path) };
         let mut terminal = NativeTerminal::new("frontend::attach::tests::native_crew_probe");
         let session = terminal.endpoint.session.clone();

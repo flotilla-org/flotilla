@@ -209,10 +209,53 @@ pub fn exec_attach_plan(plan: &ResolvedAttachPlan) -> Result<Infallible, String>
 /// Run the attach command as a child and report how it ended (`None` when a
 /// signal killed it), so the caller can tell a cleat reattach request from an
 /// ordinary end. The child keeps the terminal; its status is the only signal.
+/// Unlike exec, this process stays alive, so SIGTERM and SIGHUP sent to it
+/// alone are forwarded to the child rather than orphaning it.
 pub fn run_attach_plan_waiting(plan: &ResolvedAttachPlan) -> Result<Option<i32>, String> {
     let (program, args) = attach_argv(plan)?;
-    let status = Command::new(&program).args(args).status().map_err(|error| format!("could not start {program} attach hop: {error}"))?;
+    let mut child = Command::new(&program).args(args).spawn().map_err(|error| format!("could not start {program} attach hop: {error}"))?;
+    #[cfg(unix)]
+    let _forward = signal_forward::to(child.id());
+    let status = child.wait().map_err(|error| format!("could not wait for {program} attach hop: {error}"))?;
     Ok(status.code())
+}
+
+#[cfg(unix)]
+mod signal_forward {
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    static CHILD: AtomicI32 = AtomicI32::new(0);
+    const SIGNALS: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGHUP];
+
+    extern "C" fn forward(signal: libc::c_int) {
+        let pid = CHILD.load(Ordering::SeqCst);
+        if pid > 0 {
+            // SAFETY: kill is async-signal-safe; the pid is our live child's.
+            unsafe { libc::kill(pid, signal) };
+        }
+    }
+
+    pub struct Guard([libc::sighandler_t; 2]);
+
+    pub fn to(pid: u32) -> Guard {
+        CHILD.store(pid as i32, Ordering::SeqCst);
+        let mut previous = [libc::SIG_DFL; 2];
+        for (slot, signal) in previous.iter_mut().zip(SIGNALS) {
+            // SAFETY: installing a handler that only calls async-signal-safe kill.
+            *slot = unsafe { libc::signal(signal, forward as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+        }
+        Guard(previous)
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CHILD.store(0, Ordering::SeqCst);
+            for (previous, signal) in self.0.iter().zip(SIGNALS) {
+                // SAFETY: restoring the handlers saved in `to`.
+                unsafe { libc::signal(signal, *previous) };
+            }
+        }
+    }
 }
 
 /// Translate a daemon-relative plan exactly once at the client endpoint seam.
