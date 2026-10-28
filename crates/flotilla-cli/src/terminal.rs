@@ -206,6 +206,88 @@ pub fn exec_attach_plan(plan: &ResolvedAttachPlan) -> Result<Infallible, String>
     std::process::exit(status.code().unwrap_or(1));
 }
 
+/// Run the attach command as a child and report how it ended (`None` when a
+/// signal killed it), so the caller can tell a cleat reattach request from an
+/// ordinary end. The child keeps the terminal; its status is the only signal.
+/// Unlike exec, this process stays alive, so SIGTERM and SIGHUP sent to it
+/// alone are forwarded to the child rather than orphaning it.
+pub fn run_attach_plan_waiting(plan: &ResolvedAttachPlan) -> Result<Option<i32>, String> {
+    let (program, args) = attach_argv(plan)?;
+    // Installed before the spawn so no signal can take the default action in
+    // between; until the child exists the handler only records them, and they are honoured once it does.
+    #[cfg(unix)]
+    let forward = signal_forward::install();
+    let mut child = Command::new(&program).args(args).spawn().map_err(|error| format!("could not start {program} attach hop: {error}"))?;
+    #[cfg(unix)]
+    forward.child(child.id());
+    let status = child.wait().map_err(|error| format!("could not wait for {program} attach hop: {error}"))?;
+    // A termination request ends the attach, whatever status cleat then picks.
+    #[cfg(unix)]
+    if forward.terminated() {
+        return Ok(None);
+    }
+    Ok(status.code())
+}
+
+#[cfg(unix)]
+mod signal_forward {
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+    static CHILD: AtomicI32 = AtomicI32::new(0);
+    const SIGNALS: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGHUP];
+
+    static TERMINATED: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn forward(signal: libc::c_int) {
+        TERMINATED.store(true, Ordering::SeqCst);
+        let pid = CHILD.load(Ordering::SeqCst);
+        if pid > 0 {
+            // SAFETY: kill is async-signal-safe; the pid is our live child's.
+            unsafe { libc::kill(pid, signal) };
+        }
+    }
+
+    /// The handler state is process-global, so only one attach child may be
+    /// supervised at a time; concurrent guards would clobber each other.
+    pub struct Guard([libc::sighandler_t; 2]);
+
+    impl Guard {
+        pub fn terminated(&self) -> bool {
+            TERMINATED.load(Ordering::SeqCst)
+        }
+
+        pub fn child(&self, pid: u32) {
+            CHILD.store(pid as i32, Ordering::SeqCst);
+            // A request that arrived before the child existed is honoured now.
+            if TERMINATED.load(Ordering::SeqCst) {
+                // SAFETY: the pid is our live child's.
+                unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+            }
+        }
+    }
+
+    pub fn install() -> Guard {
+        CHILD.store(0, Ordering::SeqCst);
+        TERMINATED.store(false, Ordering::SeqCst);
+        let mut previous = [libc::SIG_DFL; 2];
+        for (slot, signal) in previous.iter_mut().zip(SIGNALS) {
+            // SAFETY: installing a handler that only calls async-signal-safe kill.
+            *slot = unsafe { libc::signal(signal, forward as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+        }
+        Guard(previous)
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CHILD.store(0, Ordering::SeqCst);
+            for (previous, signal) in self.0.iter().zip(SIGNALS) {
+                // SAFETY: restoring the handlers saved in `self.0`.
+                unsafe { libc::signal(signal, *previous) };
+            }
+        }
+    }
+}
+
 /// Translate a daemon-relative plan exactly once at the client endpoint seam.
 pub fn client_attach_plan(
     endpoint: &DaemonEndpoint,
@@ -332,7 +414,39 @@ mod tests {
         assert!(super::remote_attach_plan(&duplicate, &HostName::new("kiwi"), "s", AttachMode::Default).is_err());
     }
 
-    // Direct argv has no shell boundary: assignment values retain their bytes.
+    #[cfg(unix)]
+    #[test]
+    fn termination_sent_to_the_parent_reaches_the_attach_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("terminated");
+        let ready = dir.path().join("ready");
+        let plan = ResolvedAttachPlan(vec![flotilla_protocol::ResolvedAttachAction::Command(
+            [
+                "sh",
+                "-c",
+                "trap 'touch \"$1\"; exit 7' TERM; touch \"$2\"; while :; do sleep 0.05; done",
+                "sh",
+                marker.to_str().expect("marker path"),
+                ready.to_str().expect("ready path"),
+            ]
+            .into_iter()
+            .map(|part| Arg::Literal(part.into()))
+            .collect(),
+        )]);
+        let waiting_for = ready.clone();
+        std::thread::spawn(move || {
+            // Signal only once the child has its trap in place.
+            while !waiting_for.exists() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // SAFETY: signalling our own process; the forwarding handler is installed.
+            unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+        });
+        // A termination request ends the attach even though the child chose a status.
+        assert_eq!(super::run_attach_plan_waiting(&plan).expect("attach child runs"), None);
+        assert!(marker.exists(), "the child received the forwarded SIGTERM");
+    }
+
     // Glue: one mapping from the structured assignment to env's argv element.
     // Direct argv rejects the same invalid identifiers as shell flattening,
     // while reporting a recoverable error to the caller.
@@ -347,6 +461,7 @@ mod tests {
         }
     }
 
+    // Direct argv has no shell boundary: assignment values retain their bytes.
     #[test]
     fn env_assignment_becomes_unquoted_argv() {
         let plan = ResolvedAttachPlan::command(vec![
