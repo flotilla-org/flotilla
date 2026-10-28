@@ -222,6 +222,23 @@ async fn retire_kills_this_vessels_supervisor_and_agent_and_removes_its_director
     let _ = theirs.wait();
 }
 
+// Drydock stores content-cache entries read-only; retirement still removes them.
+#[tokio::test]
+async fn retire_removes_read_only_content_cache_entries() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("v/vessel");
+    let entry = directory.join("drydock-agent.store/artifacts/abc/testing");
+    std::fs::create_dir_all(&entry).unwrap();
+    std::fs::write(entry.join("hegel.md"), "skill").unwrap();
+    std::fs::set_permissions(entry.join("hegel.md"), std::fs::Permissions::from_mode(0o400)).unwrap();
+    for dir in entry.ancestors().take_while(|dir| dir.starts_with(&directory)) {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    }
+    retire_host_agent(&ProcessCommandRunner, &directory, &[]).await.unwrap();
+    assert!(!directory.exists());
+}
+
 // #3653 under the agent: once the controller's handle is gone (the daemon
 // stopped), nothing it started keeps forwarding. The guest socket reaches no
 // daemon endpoint and no SSH client of the handle remains.
