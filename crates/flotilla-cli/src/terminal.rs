@@ -214,7 +214,7 @@ pub fn exec_attach_plan(plan: &ResolvedAttachPlan) -> Result<Infallible, String>
 pub fn run_attach_plan_waiting(plan: &ResolvedAttachPlan) -> Result<Option<i32>, String> {
     let (program, args) = attach_argv(plan)?;
     // Installed before the spawn so no signal can take the default action in
-    // between; until the child exists the handler ignores them (the request is lost).
+    // between; until the child exists the handler only records them, and they are honoured once it does.
     #[cfg(unix)]
     let forward = signal_forward::install();
     let mut child = Command::new(&program).args(args).spawn().map_err(|error| format!("could not start {program} attach hop: {error}"))?;
@@ -239,9 +239,9 @@ mod signal_forward {
     static TERMINATED: AtomicBool = AtomicBool::new(false);
 
     extern "C" fn forward(signal: libc::c_int) {
+        TERMINATED.store(true, Ordering::SeqCst);
         let pid = CHILD.load(Ordering::SeqCst);
         if pid > 0 {
-            TERMINATED.store(true, Ordering::SeqCst);
             // SAFETY: kill is async-signal-safe; the pid is our live child's.
             unsafe { libc::kill(pid, signal) };
         }
@@ -258,6 +258,11 @@ mod signal_forward {
 
         pub fn child(&self, pid: u32) {
             CHILD.store(pid as i32, Ordering::SeqCst);
+            // A request that arrived before the child existed is honoured now.
+            if TERMINATED.load(Ordering::SeqCst) {
+                // SAFETY: the pid is our live child's.
+                unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+            }
         }
     }
 
@@ -414,14 +419,26 @@ mod tests {
     fn termination_sent_to_the_parent_reaches_the_attach_child() {
         let dir = tempfile::tempdir().expect("tempdir");
         let marker = dir.path().join("terminated");
+        let ready = dir.path().join("ready");
         let plan = ResolvedAttachPlan(vec![flotilla_protocol::ResolvedAttachAction::Command(
-            ["sh", "-c", "trap 'touch \"$1\"; exit 7' TERM; while :; do sleep 0.05; done", "sh", marker.to_str().expect("marker path")]
-                .into_iter()
-                .map(|part| Arg::Literal(part.into()))
-                .collect(),
+            [
+                "sh",
+                "-c",
+                "trap 'touch \"$1\"; exit 7' TERM; touch \"$2\"; while :; do sleep 0.05; done",
+                "sh",
+                marker.to_str().expect("marker path"),
+                ready.to_str().expect("ready path"),
+            ]
+            .into_iter()
+            .map(|part| Arg::Literal(part.into()))
+            .collect(),
         )]);
-        std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(500));
+        let waiting_for = ready.clone();
+        std::thread::spawn(move || {
+            // Signal only once the child has its trap in place.
+            while !waiting_for.exists() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             // SAFETY: signalling our own process; the forwarding handler is installed.
             unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
         });

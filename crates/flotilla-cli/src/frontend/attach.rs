@@ -89,7 +89,6 @@ where
     loop {
         let Some(plan) = resolve(reattaching).await? else {
             failures += 1;
-            eprintln!("flotilla: retrying");
             tokio::time::sleep(reattach_backoff(failures)).await;
             continue;
         };
@@ -226,9 +225,6 @@ mod tests {
         assert_eq!(calls, [false, true, true, true]);
     }
 
-    // Real cleat, no fake output: a session handed to another daemon makes the
-    // attached client exit 75, and the attach resolves it again. Needs the
-    // pinned new cleat (FLOTILLA_TEST_CLEAT_NEW, see ci/cleat-environment).
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "private native crew subprocess only"]
@@ -236,6 +232,9 @@ mod tests {
         flotilla_discovery_testkit::native_terminal::crew_probe();
     }
 
+    // Real cleat, no fake output: a session handed to another daemon makes the
+    // attached client exit 75, and the attach resolves it again. Needs the
+    // pinned new cleat (FLOTILLA_TEST_CLEAT_NEW, see ci/cleat-environment).
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "needs the pinned new cleat: FLOTILLA_TEST_CLEAT_NEW"]
