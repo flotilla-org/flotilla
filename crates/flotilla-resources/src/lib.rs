@@ -92,6 +92,7 @@ pub mod prepared_snapshot;
 mod principal_attention;
 mod project;
 mod provisioning_identity;
+pub mod realisation_settings;
 mod replica;
 #[doc(hidden)]
 pub mod repository;
