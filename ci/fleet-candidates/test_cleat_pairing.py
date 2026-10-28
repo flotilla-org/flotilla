@@ -59,6 +59,15 @@ class CleatPairing(unittest.TestCase):
             with self.assertRaisesRegex(cleat_pairing.PairingError, "cannot fetch"):
                 cleat_pairing.resolve_cleat_sha(root, OLDER, failing)
 
+    # Only exit 1 means "not an ancestor"; any other failure is "cannot compare".
+    def test_compare_failure_refuses(self):
+        def broken(args, **kwargs):
+            return subprocess.CompletedProcess(args, 128 if args[0] == "merge-base" else 0, "", "bad object")
+        with tempfile.TemporaryDirectory() as root:
+            flotilla_root(root)
+            with self.assertRaisesRegex(cleat_pairing.PairingError, "cannot compare"):
+                cleat_pairing.resolve_cleat_sha(root, OLDER, broken)
+
 
 if __name__ == "__main__":
     unittest.main()

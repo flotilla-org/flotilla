@@ -35,8 +35,8 @@ def git_run(args, **kwargs):
 def require_pairing(declared, pinned, run=git_run):
     """Refuse a Cleat that does not contain the declared revision.
 
-    `run` is the git process boundary: it takes an argument vector (and an
-    optional `cwd`) and returns a completed process.
+    `run` is the git process boundary: it takes an argument vector and
+    optional `cwd` and `check` keywords (as subprocess.run does) and returns a completed process.
     """
     if pinned == declared:
         return

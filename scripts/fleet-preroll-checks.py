@@ -148,7 +148,7 @@ def check(root, generation, consumers, sync, run, manifest=None, git=cleat_pairi
         if failures:
             failures.append("sync BOTH files (docs/fleet-install.md#automatic-pre-roll-refusals): " +
                             shlex.join([str(root / "scripts/fleet-preroll-checks.sh"), generation,
-                                        "--source-root", str(root), "--manifest", str(manifest or "<generation.json>"),
+                                        "--source-root", str(root), "--manifest", str(manifest),
                                         "--consumer", host, "--sync-bootstrap"]))
         errors += failures
     return errors

@@ -61,6 +61,16 @@ class Refusals(unittest.TestCase):
         self.assertIn(older, errors[0])
         self.assertIn(declared, errors[0])
 
+    # Contract: a manifest for another generation, or without a cleat pin, refuses.
+    def test_unusable_manifest_refused(self):
+        for name, document in [('other generation', {'generation': 'gen-2', 'sources': {'cleat': '1' * 40}}),
+                               ('no cleat pin', {'generation': 'gen-1', 'sources': {}})]:
+            with self.subTest(name), tempfile.TemporaryDirectory() as directory:
+                manifest = Path(directory) / 'generation.json'
+                manifest.write_text(json.dumps(document))
+                errors = preroll.check_cleat_pairing(ROOT, 'gen-1', manifest, None)
+                self.assertEqual(len(errors), 1)
+
     # Contract: either bootstrap file drifting refuses; explicit repair sends
     # both generation files together, never just the mismatching member.
     def test_bootstrap_matrix(self):
