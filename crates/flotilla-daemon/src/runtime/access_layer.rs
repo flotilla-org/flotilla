@@ -23,8 +23,9 @@ use flotilla_environment::environment::{vessel_ops, EntryKind, VesselAgent};
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
     account_access::{requester_home, requester_material, AccessName},
-    Convoy, Environment, PinUnpack, ResourceError, Vessel,
+    AccessDelivery, Convoy, Environment, PinUnpack, ResourceError, ResourceObject, Vessel, CONVOY_LABEL,
 };
+use flotilla_schema::Timestamp;
 use flotilla_vessel_delivery::{
     deliver, Access, AccessKey, ContentDigest, CostTable, DeliveryError, HomeBase, HostPathOffer, HostReach, Item, Liveness, Mechanism,
     Need, NeedName, Plan, ProviderMechanisms, Reachability, RelativePath, StepFailure, TreeDelivery, TreeSources,
@@ -206,7 +207,7 @@ async fn deliver_crew(
         agent_material_environment(material, &[launch.adapter.to_string()].into(), &declared, delivered.iter().cloned())
             .map_err(failed_at(LOGIN))?
     };
-    if let Some(login) = material.harness_login(launch.adapter, &resolved, &base) {
+    if let Some(login) = material.harness_login(launch.adapter, &resolved, &base).await.map_err(failed_at(LOGIN))? {
         tree(
             &mut needs,
             LOGIN,
@@ -410,14 +411,77 @@ impl TreeDelivery for AccountDelivery {
     }
 }
 
-/// The crew's harness login, linked into its home.
+/// The crew's harness login, delivered into its home.
 struct LoginDelivery(HarnessLogin);
 
 #[async_trait]
 impl TreeDelivery for LoginDelivery {
     async fn deliver(&self, _: Mechanism, _: Option<&Path>, target: &Path, agent: &dyn VesselAgent) -> Result<(), StepFailure> {
-        Ok(self.0.link(target.parent().ok_or("a login needs its home")?, agent).await?)
+        Ok(self.0.deliver(target.parent().ok_or("a login needs its home")?, agent).await?)
     }
+}
+
+/// #4037: push the central login's current crew copy into every crew home holding an older
+/// one, on every kind of place, through the crew's own vessel agent: the refresher rotates
+/// the central login and no crew can refresh its copy. A failed push is recorded as the
+/// access's retry, which `convoy explain` shows, and is attempted again once due.
+pub(super) async fn redeliver_central_logins(state: &Arc<ControllerRuntimeState>, namespace: &str) -> Result<(), String> {
+    let Some(material) = state.agent_material.as_ref() else { return Ok(()) };
+    let backend = state.daemon.resource_backend();
+    let now = Timestamp::from_datetime(&state.daemon.clock().now());
+    let records = backend.using::<AccessDelivery>(namespace).list().await.map_err(|error| format!("list access deliveries: {error}"))?;
+    let mut login = None;
+    let mut vessels = None;
+    for record in records.items {
+        let Some(landed) = record.spec.needs.get(LOGIN).filter(|landed| HarnessLogin::is_central(&landed.digest)) else { continue };
+        let retry = record.spec.retry.as_ref().filter(|retry| retry.need == LOGIN);
+        if retry.is_some_and(|retry| retry.next_at > now) {
+            continue;
+        }
+        let login = match &login {
+            Some(login) => login,
+            None => login.insert(material.central_login().await?),
+        };
+        let digest = login.digest();
+        if landed.digest == digest && retry.is_none() {
+            continue;
+        }
+        let vessels = match &vessels {
+            Some(vessels) => vessels,
+            None => {
+                vessels.insert(backend.using::<Vessel>(namespace).list().await.map_err(|error| format!("list vessels: {error}"))?.items)
+            }
+        };
+        // A record whose vessel is gone goes with its place or convoy.
+        let Some(vessel) = record_vessel(vessels, &record) else { continue };
+        let pushed = async {
+            let access = match state.ssh_host.get(&record.spec.place) {
+                Some(profile) => Some(state.vessel_access(profile, &vessel.metadata.name).await?),
+                None => None,
+            };
+            let agent = state.vessel_agent(&record.spec.place, access.as_deref()).await?;
+            login.deliver(Path::new(&record.spec.home), agent.as_ref()).await
+        }
+        .await;
+        match &pushed {
+            Ok(()) => tracing::info!(access = %record.spec.access, place = %record.spec.place, "pushed the rotated central Codex login"),
+            Err(error) => {
+                tracing::warn!(access = %record.spec.access, place = %record.spec.place, %error, "failed to push the rotated central Codex login")
+            }
+        }
+        status::record_push(state, namespace, &record, LOGIN, &digest, pushed).await?;
+    }
+    Ok(())
+}
+
+/// The live vessel an access record's crew is aboard, by the access key [`frozen_crew`] composes.
+fn record_vessel<'a>(vessels: &'a [ResourceObject<Vessel>], record: &ResourceObject<AccessDelivery>) -> Option<&'a ResourceObject<Vessel>> {
+    let convoy = record.metadata.labels.get(CONVOY_LABEL)?;
+    let mut parts = record.spec.access.rsplitn(3, '/');
+    let (_role, vessel_name) = (parts.next()?, parts.next()?);
+    vessels.iter().find(|vessel| {
+        vessel.metadata.deletion_timestamp.is_none() && &vessel.spec.convoy_ref == convoy && vessel.spec.vessel_name == vessel_name
+    })
 }
 
 #[cfg(test)]

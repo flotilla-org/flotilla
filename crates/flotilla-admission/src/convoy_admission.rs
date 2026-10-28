@@ -43,7 +43,7 @@ use flotilla_resources::{
     IssueSourceUnavailable, ObjectMeta, ObservedChangeRequestState, PlacementPolicy, PlacementPolicySpec, Platform, Project, ProjectSpec,
     ReadResourceObject, Repository, RepositoryKey, RepositoryTrust, Resource, ResourceError, ResourceObject, ResourceProvenance,
     RoleHandoff, SupervisionTarget, TerminalCrewContext, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
-    BRIEF_ARTIFACTS_ANNOTATION, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
+    BRIEF_ARTIFACTS_ANNOTATION, CODEX_CENTRAL_LOGIN_CAPABILITY, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{HoldAct, RepositorySpec, SystemClock};
@@ -4189,6 +4189,9 @@ struct ConvoySnapshotBundle<'a> {
     evidence: BriefEvidence<'a>,
 }
 
+/// The harness adapter whose crews on an SSH host take its owner's central login (#4037).
+const CODEX_ADAPTER: &str = "codex";
+
 /// An issue body is the crew's contract, so admission may only reuse a
 /// recently observed snapshot. Keep this deliberately fixed until an
 /// operational need establishes that it should be configurable.
@@ -4999,6 +5002,7 @@ pub async fn placement_agent_adapters(
         let target_host = placement_target_host(backend, namespace, placement).await?;
         let host = authoritative_placement_host(backend, namespace, &target_host, &placement.metadata.name).await?;
         let host_label = target_host.display_name;
+        let ssh_host = is_ssh_host(&host);
         let generation = host_generation(host.status.as_ref()).to_string();
         let mut status = host.status.ok_or_else(|| {
             format!("placement `{}` host `{host_label}` generation `{generation}` has no observed status", placement.metadata.name)
@@ -5007,12 +5011,18 @@ pub async fn placement_agent_adapters(
         if !status.ready && !allow_unready {
             return Err(placement_host_not_ready_reason(&placement.metadata.name, &host_label, &generation, &status));
         }
-        let available_adapters = status.agent_adapters().map_err(|error| {
+        let mut available_adapters = status.agent_adapters().map_err(|error| {
             format!(
                 "placement `{}` host `{}` generation `{generation}` has invalid agent adapter capabilities: {error}",
                 placement.metadata.name, host_label
             )
         })?;
+        // #4037: an SSH host's Codex crews take a copy of its owning daemon's central
+        // login, so the host offers Codex only while the owner publishes one.
+        let central_login = status.capabilities.get(CODEX_CENTRAL_LOGIN_CAPABILITY).and_then(serde_json::Value::as_bool) == Some(true);
+        if ssh_host && !central_login && available_adapters.remove(CODEX_ADAPTER) {
+            return Ok((available_adapters, format!("host `{host_label}`, whose owning daemon has no central Codex login")));
+        }
         Ok((available_adapters, format!("host `{host_label}`")))
     } else {
         Ok((BTreeSet::new(), "unknown target environment".to_string()))

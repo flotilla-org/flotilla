@@ -21,9 +21,9 @@ use flotilla_crew::reconcilers::terminal_session::{
     TerminalRuntimeState,
 };
 use flotilla_discovery::registry::ProviderRegistry;
-use flotilla_environment::environment::{vessel_ops::RunnerVesselAgent, VesselAgent};
+use flotilla_environment::environment::VesselAgent;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
-use flotilla_protocol::{ConfiguredResourceLimits, EnvironmentId, TerminalStatus};
+use flotilla_protocol::{ConfiguredResourceLimits, TerminalStatus};
 use flotilla_provider_runtime::execution_context::BoundLayer;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
@@ -909,27 +909,7 @@ impl TerminalControllerRuntime {
     /// The vessel agent a session's access layer runs through: the SSH host's
     /// vessel agent, or the provisioned environment's.
     async fn vessel_agent(&self, spec: TerminalSessionTarget<'_>, vessel: Option<&VesselAccess>) -> Result<Arc<dyn VesselAgent>, String> {
-        if let Some(access) = vessel {
-            return Ok(access.handle.agent());
-        }
-        // Provisioned environments register under their resource name, so the
-        // `env_ref` is their handle id; host environments fall through to the
-        // resolved runner below.
-        let id = EnvironmentId::new(&spec.env_ref);
-        let handle = self
-            .state
-            .provisioned_environments
-            .lock()
-            .await
-            .values()
-            .find(|active| active.handle.id() == &id)
-            .map(|active| active.handle.clone());
-        Ok(match handle {
-            Some(handle) => handle.agent(),
-            // An environment without a provisioned handle is its host: its agent
-            // works in process, through the host runner.
-            None => Arc::new(RunnerVesselAgent(self.runner_for_env(&spec.env_ref)?)),
-        })
+        self.state.vessel_agent(&spec.env_ref, vessel).await
     }
 
     pub(super) async fn runner_for_spec(&self, spec: TerminalSessionTarget<'_>) -> Result<Arc<dyn CommandRunner>, String> {

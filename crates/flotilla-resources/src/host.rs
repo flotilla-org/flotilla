@@ -42,6 +42,9 @@ const LEGACY_SSH_HOST_CAPABILITY: &str = "agentless";
 pub const TRANSPORT_CAPABILITY: &str = "transport";
 pub const PLACEMENT_CAPABILITY: &str = "placement";
 pub const OWNING_DAEMON_CAPABILITY: &str = "owning_daemon";
+/// Whether an SSH host's owning daemon keeps a central Codex login, the one its
+/// Codex crews take a copy of (#4037). Absent reads as none.
+pub const CODEX_CENTRAL_LOGIN_CAPABILITY: &str = "codex_central_login";
 pub const HEARTBEAT_READY_TTL_SECS: i64 = 60;
 /// A heartbeat that observes nothing new apart from timestamps still commits
 /// once the stored `heartbeat_at` is this old. Readers then see `heartbeat_at`

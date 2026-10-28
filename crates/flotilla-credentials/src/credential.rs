@@ -4800,6 +4800,12 @@ interactions:
                 let args = args.iter().map(|arg| self.map(arg)).collect::<Vec<_>>();
                 ProcessCommandRunner.run_to_file(cmd, &args.iter().map(String::as_str).collect::<Vec<_>>(), cwd, target).await
             }
+            async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
+                use std::os::unix::fs::PermissionsExt;
+                let path = PathBuf::from(self.map(path.to_str().unwrap()));
+                std::fs::write(&path, content).map_err(|error| error.to_string())?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).map_err(|error| error.to_string())
+            }
         }
         let directory = tempfile::tempdir().unwrap();
         let runner = Arc::new(GuestFilesystem(directory.path().join("guest")));
@@ -4809,7 +4815,14 @@ interactions:
             std::fs::write(path, bytes).unwrap();
         };
         let paths = CredentialDeliveryPaths::new(CONTAINED_WRITABLE_CONFIG_BASE.into());
-        let registry = AgentMaterialRegistry::new(Arc::new(TestEnv(BTreeMap::new())));
+        // The owning daemon's central login, whose crew copy a central-login crew holds.
+        let central = directory.path().join("daemon-home/.config/flotilla/credentials/codex-central/auth.json");
+        std::fs::create_dir_all(central.parent().unwrap()).unwrap();
+        std::fs::write(&central, r#"{"tokens":{"access_token":"central","refresh_token":"central-refresh"}}"#).unwrap();
+        let registry = AgentMaterialRegistry::new(Arc::new(TestEnv(BTreeMap::from([(
+            "HOME".to_string(),
+            directory.path().join("daemon-home").display().to_string(),
+        )]))));
         let mut sessions = vec![PathBuf::from("/workspace/work.txt"), PathBuf::from("/var/lib/flotilla/cleat/session")];
         for (name, harness, adapter, variable) in
             [("model-api", "codex", "codex", "CODEX_HOME"), ("central-login", "codex", "codex", "CODEX_HOME")]
@@ -4827,14 +4840,16 @@ interactions:
             } else {
                 prepare_harness_home(&paths, name, harness, &*runner).await.unwrap()
             };
-            // The crew's own home, as the access layer delivers it, links the delivered login.
+            // The crew's own home, as the access layer delivers it, holds the delivered login.
             let crew = Path::new(CONTAINED_WRITABLE_CONFIG_BASE).join(format!("agent-homes/requesters/{name}/coder")).join(harness);
             let login = registry
                 .harness_login(adapter, &[(variable.into(), home.clone())], Path::new(CONTAINED_WRITABLE_CONFIG_BASE))
-                .expect("Codex links a login");
+                .await
+                .unwrap()
+                .expect("Codex has a login");
             let agent = flotilla_environment::environment::vessel_ops::RunnerVesselAgent(runner.clone());
             flotilla_environment::environment::VesselAgent::create_dir(&agent, &crew, 0o700).await.unwrap();
-            login.link(&crew, &agent).await.unwrap();
+            login.deliver(&crew, &agent).await.unwrap();
             if name != "central-login" {
                 write(&Path::new(&home).join("sessions/base.jsonl"), b"new session");
                 write(&delivered.join("auth.json"), b"rotated secret");

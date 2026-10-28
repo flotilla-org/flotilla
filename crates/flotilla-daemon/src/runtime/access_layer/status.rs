@@ -121,6 +121,44 @@ impl AccessStatus {
     }
 }
 
+/// Record a push of `need` outside a launch into the home `record` names (#4037): the
+/// digest that landed, or the retry a failure leaves.
+pub(in crate::runtime) async fn record_push(
+    state: &ControllerRuntimeState,
+    namespace: &str,
+    record: &ResourceObject<AccessDelivery>,
+    need: &str,
+    digest: &str,
+    pushed: Result<(), String>,
+) -> Result<(), String> {
+    let now = state.daemon.clock().now();
+    let mut spec = record.spec.clone();
+    spec.retry = match pushed {
+        Ok(()) => {
+            if let Some(landed) = spec.needs.get_mut(need) {
+                landed.digest = digest.to_string();
+                landed.at = Timestamp::from_datetime(&now);
+            }
+            // A launch's retry for another need stays recorded.
+            record.spec.retry.clone().filter(|retry| retry.need != need)
+        }
+        Err(error) => {
+            let attempts = record.spec.retry.as_ref().filter(|retry| retry.need == need).map_or(0, |retry| retry.attempts) + 1;
+            let next_at = Timestamp::from_datetime(&(now + retry_delay(attempts)));
+            Some(DeliveryRetry { need: need.to_string(), attempts, error: bounded(&error), next_at })
+        }
+    };
+    let meta = InputMeta::builder().name(record.metadata.name.clone()).labels(record.metadata.labels.clone()).build();
+    state
+        .daemon
+        .resource_backend()
+        .using::<AccessDelivery>(namespace)
+        .update(&meta, &record.metadata.resource_version, &spec)
+        .await
+        .map(drop)
+        .map_err(|error| format!("record access delivery `{}`: {error}", record.metadata.name))
+}
+
 /// One record per (access, place). The access is opaque and may hold any character, so
 /// the name is a digest of the pair.
 pub(in crate::runtime) fn record_name(access: &str, place: &str) -> String {

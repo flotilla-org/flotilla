@@ -405,6 +405,47 @@ async fn ssh_host_takes_only_pinned_work_and_routes_to_its_owner() {
     assert!(unavailable.contains("not ready"), "{unavailable}");
 }
 
+// #4037 contract 4: a Codex crew is placeable on an SSH host while its owning daemon
+// publishes a central Codex login, and refused with that reason while it publishes none.
+#[tokio::test]
+async fn codex_crews_place_on_an_ssh_host_only_while_its_owner_has_a_central_login() {
+    for central_login in [None, Some(false), Some(true)] {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let hosts = backend.using::<ResourceHost>("flotilla");
+        let connection = flotilla_resources::HostConnection::SshHost {
+            owning_daemon: "owner-host".to_string(),
+            destination: "crew@beaufort.example".to_string(),
+        };
+        let host = hosts.create(&test_meta("ssh-host"), &HostSpec { connection, ..HostSpec::default() }).await.expect("SSH Host");
+        let mut capabilities = BTreeMap::from([
+            (
+                flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+            ),
+            (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"])),
+            (flotilla_resources::SSH_HOST_CAPABILITY.to_string(), serde_json::json!(true)),
+        ]);
+        capabilities
+            .extend(central_login.map(|held| (flotilla_resources::CODEX_CENTRAL_LOGIN_CAPABILITY.to_string(), serde_json::json!(held))));
+        let status = HostStatus { capabilities, heartbeat_at: Some(Utc::now()), ready: true, ..HostStatus::default() };
+        hosts.update_status(&host.metadata.name, &host.metadata.resource_version, &status).await.expect("SSH observation");
+        let policy = placement_policy(&backend, "host-direct-ssh-host", "ssh-host").await;
+
+        let placed =
+            validate_workflow_agent_adapters(&backend, "flotilla", &flotilla_resources::single_agent_workflow_spec(), Some(&policy), false)
+                .await;
+
+        match central_login {
+            Some(true) => placed.expect("the owner's central login serves the host's Codex crews"),
+            _ => assert_eq!(
+                placed.expect_err("no central login to copy"),
+                "workflow requires agent adapter `codex`, which is not available in placement `host-direct-ssh-host` \
+                 (host `ssh-host`, whose owning daemon has no central Codex login)"
+            ),
+        }
+    }
+}
+
 #[tokio::test]
 async fn default_placement_prefers_local_host_referenced_by_display_name() {
     let backend = ResourceBackend::new(InMemoryBackend::default());

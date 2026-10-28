@@ -39,6 +39,8 @@ enum HostEntry {
 struct FakeHost {
     files: StdMutex<BTreeMap<PathBuf, HostEntry>>,
     writes: StdMutex<Vec<PathBuf>>,
+    /// Paths whose protected writes the host refuses, as a full disk would.
+    refused: StdMutex<BTreeSet<PathBuf>>,
 }
 
 impl FakeHost {
@@ -96,7 +98,6 @@ impl CommandRunner for FakeHost {
                 self.files.lock().expect("files").insert(PathBuf::from(path), HostEntry::Link(PathBuf::from(target)));
                 ok()
             }
-            ("sh", ["-c", _, "flotilla-ambient-home"]) => Ok(format!("{HOST_HOME}/.codex")),
             ("sh", ["-c", _, "flotilla-durable-base"]) => Ok(HOST_BASE.into()),
             ("cat", ["--", path]) => match self.entry(path) {
                 Some(HostEntry::File(content)) => Ok(content),
@@ -164,6 +165,9 @@ impl CommandRunner for FakeHost {
     }
 
     async fn write_file_with_mode(&self, path: &Path, content: &str, _mode: u32) -> Result<(), String> {
+        if self.refused.lock().expect("refused").contains(path) {
+            return Err(format!("write {}: No space left on device", path.display()));
+        }
         self.put(path, content);
         Ok(())
     }
@@ -270,6 +274,8 @@ struct LaunchedSession {
 /// The terminal runtime, SSH host and crew session spec a launch runs with.
 struct SshHostRuntime {
     _temp: TempDir,
+    /// The owning daemon's home, holding the central Codex login only its refresher writes.
+    daemon_home: PathBuf,
     daemon: Arc<InProcessDaemon>,
     state: Arc<ControllerRuntimeState>,
     pool: Arc<FakeTerminalPool>,
@@ -282,6 +288,8 @@ struct SshHostRuntime {
 /// declared but not yet bound.
 async fn ssh_host_runtime(host: SshHost, adapter: &str) -> SshHostRuntime {
     let temp = TempDir::new().expect("tempdir");
+    let daemon_home = temp.path().join("daemon-home");
+    write_central_login(&daemon_home, "access-one");
     let config_dir = temp.path().join("config");
     fs::create_dir_all(&config_dir).expect("config directory");
     fs::write(config_dir.join("daemon.toml"), "machine_id = \"ssh-host-harness-test\"\n").expect("daemon config");
@@ -366,10 +374,10 @@ async fn ssh_host_runtime(host: SshHost, adapter: &str) -> SshHostRuntime {
         .with_ssh_host_vessels(Some(vessels_over(agents.clone(), temp.path())))
         .with_environment_tools(EnvironmentToolProvisioner::new(Vec::new()))
         .with_credential_store(credential_store)
-        .with_agent_material(Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([(
-            FLOTILLA_SKILLS_DIR_ENV,
-            source.supply.display().to_string(),
-        )])))))
+        .with_agent_material(Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([
+            ("HOME", daemon_home.display().to_string()),
+            (FLOTILLA_SKILLS_DIR_ENV, source.supply.display().to_string()),
+        ])))))
         .with_skill_trees(LocalSkillSource::trees(temp.path())),
     );
     let spec = flotilla_resources::TerminalSessionSpec {
@@ -394,7 +402,23 @@ async fn ssh_host_runtime(host: SshHost, adapter: &str) -> SshHostRuntime {
         env: session_env,
         pool: "cleat".to_string(),
     };
-    SshHostRuntime { _temp: temp, daemon, state, pool, agents, vessel, spec }
+    SshHostRuntime { _temp: temp, daemon_home, daemon, state, pool, agents, vessel, spec }
+}
+
+/// The owning daemon's central Codex login under `home`, as its refresher leaves it.
+fn write_central_login(home: &Path, access_token: &str) {
+    let path = flotilla_credentials::codex_central_auth_path(&TestEnvVars::new([("HOME", home.display().to_string())]));
+    fs::create_dir_all(path.parent().expect("central login directory")).expect("central login directory");
+    let login = serde_json::json!({"tokens": {"access_token": access_token, "refresh_token": "central-refresh"}});
+    fs::write(&path, login.to_string()).expect("central login");
+}
+
+/// The crew copy a Codex crew holds at `home`: the owner's central login carrying
+/// `access_token`, and never its refresh token.
+fn assert_holds_central_copy(host: &FakeHost, home: &str, access_token: &str) {
+    let copy = host.json(format!("{home}/auth.json"));
+    assert_eq!(copy["tokens"]["access_token"], access_token, "{copy}");
+    assert_eq!(copy["tokens"]["refresh_token"], "", "a crew copy never carries the central refresh token");
 }
 
 /// Launch one crew of `adapter` on `host` through the terminal runtime's real
@@ -538,12 +562,11 @@ async fn ssh_host_claude_crew_starts_in_a_prepared_flotilla_home() {
     assert_host_harness_untouched(&launch);
 }
 
-// Acceptance (#3655, #3964): a Codex crew on an SSH host starts with
+// Acceptance (#3655, #3964, #4037): a Codex crew on an SSH host starts with
 // `CODEX_HOME` at its own flotilla-owned home under the host's durable state base, its
-// frozen skills staged there, with
-// workspace trust for the checkout in that home's own `config.toml`. The host
-// login is linked, never copied, and the host's `~/.codex/config.toml` is
-// never written.
+// frozen skills staged there, with workspace trust for the checkout in that home's own
+// `config.toml`. The home holds a read-only copy of the owning daemon's central login; the
+// host's own `~/.codex` login and config are never linked or written.
 #[tokio::test]
 async fn ssh_host_codex_crew_starts_in_a_prepared_flotilla_home() {
     let launch = launch_on_ssh_host("codex").await;
@@ -561,7 +584,7 @@ async fn ssh_host_codex_crew_starts_in_a_prepared_flotilla_home() {
         assert_eq!(launch.command.matches(&command).count(), 1, "invocation defines {command} once");
     }
     assert!(launch.command.contains("hooks.state="), "invocation carries hook trust records");
-    assert_eq!(launch.host.entry(format!("{home}/auth.json")), Some(HostEntry::Link(PathBuf::from("/home/crew/.codex/auth.json"))));
+    assert_holds_central_copy(&launch.host, &home, "access-one");
     assert_staged_into_launched_home(&launch, "CODEX_HOME", "codex");
     assert_image_harness_environment(&launch);
     assert_host_harness_untouched(&launch);
@@ -1170,4 +1193,71 @@ async fn access_status_goes_with_its_convoy() {
     backend.using::<Convoy>(NAMESPACE).delete("demo").await.expect("convoy ended");
     reconciler.retire(&record).await.expect("retire");
     assert!(records.list().await.expect("records").items.is_empty(), "removed with its convoy");
+}
+
+// #4037 contract 2: when the refresher rotates the central login, the next redelivery pass
+// pushes the new copy into the SSH-host crew's home through its vessel agent, and its
+// access records the copy that landed. The host's own login stays untouched.
+#[tokio::test]
+async fn a_rotated_central_login_is_pushed_into_the_ssh_host_crew_home() {
+    let runtime_dir = flotilla_test_support::TestSocketDir::new();
+    let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
+    let runtime = ssh_host_runtime(ssh_host(&host, &runtime_dir), "codex").await;
+    runtime.launch().await.expect("delivered");
+    let home = format!("{HOST_BASE}/agent-homes/requesters/demo/coder/codex");
+    let landed = |deliveries: Vec<flotilla_protocol::ExplainedAccessDelivery>| {
+        let [delivery] = deliveries.as_slice() else { panic!("one access: {deliveries:?}") };
+        delivery.needs.iter().find(|need| need.need == "login").expect("login need").digest.clone()
+    };
+    let launched = landed(runtime.deliveries().await);
+
+    write_central_login(&runtime.daemon_home, "access-two");
+    super::super::access_layer::redeliver_central_logins(&runtime.state, NAMESPACE).await.expect("redelivery pass");
+
+    assert_holds_central_copy(&host, &home, "access-two");
+    let rotated = landed(runtime.deliveries().await);
+    assert_ne!(rotated, launched, "the access records the rotated copy");
+    let writes = host.writes.lock().expect("writes").len();
+    super::super::access_layer::redeliver_central_logins(&runtime.state, NAMESPACE).await.expect("idle pass");
+    assert_eq!(host.writes.lock().expect("writes").len(), writes, "an unchanged copy is not pushed again");
+    assert_eq!(host.entry(format!("{HOST_HOME}/.codex/auth.json")), Some(HostEntry::File(r#"{"tokens":"host-login"}"#.into())));
+}
+
+// #4037 contract 2: a push that fails leaves the crew on its earlier copy, is shown on its
+// access in `convoy explain` with when it is next attempted, and lands once due.
+#[tokio::test]
+async fn a_failed_login_push_is_explained_and_retried() {
+    let runtime_dir = flotilla_test_support::TestSocketDir::new();
+    let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
+    let runtime = ssh_host_runtime(ssh_host(&host, &runtime_dir), "codex").await;
+    runtime.launch().await.expect("delivered");
+    let home = format!("{HOST_BASE}/agent-homes/requesters/demo/coder/codex");
+    let retry = |deliveries: Vec<flotilla_protocol::ExplainedAccessDelivery>| {
+        let [delivery] = deliveries.as_slice() else { panic!("one access: {deliveries:?}") };
+        delivery.retry.clone()
+    };
+    let redeliver = || super::super::access_layer::redeliver_central_logins(&runtime.state, NAMESPACE);
+    host.refused.lock().expect("refused").insert(PathBuf::from(format!("{home}/auth.json")));
+
+    write_central_login(&runtime.daemon_home, "access-two");
+    redeliver().await.expect("redelivery pass");
+
+    assert_holds_central_copy(&host, &home, "access-one");
+    let failed = retry(runtime.deliveries().await).expect("the failed push is explained");
+    assert_eq!((failed.need.as_str(), failed.attempts), ("login", 1));
+    assert!(failed.error.contains("No space left on device"), "{}", failed.error);
+    redeliver().await.expect("redelivery pass");
+    assert_eq!(retry(runtime.deliveries().await), Some(failed), "no attempt before the retry is due");
+
+    // The disk recovers and the recorded retry falls due.
+    host.refused.lock().expect("refused").clear();
+    let records = runtime.daemon.resource_backend().using::<flotilla_resources::AccessDelivery>(NAMESPACE);
+    let [record] = records.list().await.expect("records").items.try_into().expect("one record");
+    let mut due = record.spec.clone();
+    due.retry.as_mut().expect("retry").next_at = flotilla_schema::Timestamp::from_datetime(&chrono::DateTime::UNIX_EPOCH);
+    let meta = InputMeta::builder().name(record.metadata.name.clone()).labels(record.metadata.labels.clone()).build();
+    records.update(&meta, &record.metadata.resource_version, &due).await.expect("retry due");
+    redeliver().await.expect("redelivery pass");
+    assert_holds_central_copy(&host, &home, "access-two");
+    assert_eq!(retry(runtime.deliveries().await), None);
 }
