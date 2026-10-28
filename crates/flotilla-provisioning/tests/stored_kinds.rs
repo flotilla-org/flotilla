@@ -59,6 +59,10 @@ fn provisioning_kind_codes_are_pinned() {
     assert_eq!(held("Project"), Some(KindCode::new("pj")));
     assert_eq!(held("ProjectOps"), Some(KindCode::new("po")));
     assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 18);
+    // Artifact joins the decided store with its writers; its code is pinned beside every production kind now.
+    let mut with_artifact = stored::production_kinds().expect("production kinds");
+    stored::artifact::register(&mut with_artifact).expect("no production kind holds Artifact's code");
+    assert_eq!(with_artifact.iter().find(|set| set.kind == "Artifact").map(|set| set.code), Some(KindCode::new("af")));
     // The definition kinds (#3824 layer 2b), in the decided store with their writers (2b-ii).
     for (kind, code) in [
         ("Forge", "fo"),

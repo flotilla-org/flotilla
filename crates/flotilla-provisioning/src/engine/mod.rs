@@ -27,6 +27,7 @@
 //! With the switch off nothing is wrapped, and nothing changes.
 
 pub mod account;
+pub mod artifact_import;
 pub mod checkout;
 pub mod clone;
 pub mod definition_import;
