@@ -14,6 +14,13 @@
 //! deleting or recreated sessions. Legacy v1 tokens lack the instance binding and are
 //! refused; those crews must relaunch once.
 //!
+//! A token binds an event to its terminal, but crews in one vessel share a user and so can
+//! read each other's tokens, as they can already claim each other's terminal over the
+//! mounted socket: the trust boundary is the vessel, which the environment check enforces.
+//!
+//! A Docker vessel's agent serves the forward on a fixed guest loopback port. When the
+//! forward cannot be served there, launches log a warning and keep command hooks.
+//!
 //! Tokens do not expire. To rotate the key, stop flotillad, delete `http/hook-key` beneath
 //! its state directory and start it again: a fresh key is created, every token minted
 //! under the old one is refused, and crews relaunched afterwards get new tokens. Running
@@ -107,9 +114,9 @@ impl HookKey {
 
     fn read(path: &Path) -> Result<Option<Self>, String> {
         match std::fs::read_to_string(path) {
-            Ok(existing) => {
-                Self::decode(existing.trim_ascii_end()).map(Some).ok_or_else(|| format!("hook key {} is malformed", path.display()))
-            }
+            Ok(existing) => Self::decode(existing.trim_ascii_end())
+                .map(Some)
+                .ok_or_else(|| format!("hook key {} is malformed; delete it to create a fresh key", path.display())),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(format!("read hook key {}: {error}", path.display())),
         }

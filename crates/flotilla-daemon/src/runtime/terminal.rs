@@ -44,6 +44,7 @@ use super::ssh_host_vessels::{apply_reach_environment, compose_session_environme
 use super::state::ControllerRuntimeState;
 use crate::blob_store::BlobDigest;
 use crate::blob_store::BlobStore;
+use crate::server::HookLaunch;
 use flotilla_agent::adapter::FLOTILLA_ENVIRONMENT_ID_ENV;
 
 pub(super) struct PendingTerminalDelivery {
@@ -492,12 +493,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 // and cloud vessels keep command hooks. The token binds the hooks to this terminal.
                 if requirement.adapter == "claude-code" {
                     let hooks = if spec.env_ref == self.state.host_direct_environment_name {
-                        match self.state.hook_endpoint.as_ref() {
-                            Some(endpoint) => {
-                                endpoint.claude_code_launch(&self.state.daemon.resource_backend(), &context.namespace, name).await
-                            }
-                            None => None,
-                        }
+                        self.host_direct_hooks(&context.namespace, name).await
                     } else if vessel.is_none() {
                         super::docker::docker_vessel_hooks(&self.state, &spec.env_ref, &context.namespace, name).await
                     } else {
@@ -903,6 +899,13 @@ impl TerminalControllerRuntime {
             .resolve_environment_ref(env_ref)
             .and_then(|environment| self.state.daemon.environment_registry_for_environment(&environment.id))
             .ok_or_else(|| format!("provider registry unavailable for environment {env_ref}"))
+    }
+
+    /// The Claude Code hook launch for a host-direct session, while flotillad listens on
+    /// loopback TCP; `None` keeps command hooks.
+    async fn host_direct_hooks(&self, namespace: &str, session_name: &str) -> Option<HookLaunch> {
+        let endpoint = self.state.hook_endpoint.as_ref()?;
+        endpoint.claude_code_launch(&self.state.daemon.resource_backend(), namespace, session_name).await
     }
 
     /// #3792: the prepared vessel a session on an SSH host runs in, and
