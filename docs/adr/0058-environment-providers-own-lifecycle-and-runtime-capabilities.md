@@ -111,8 +111,9 @@ Rules:
 
 - **Loss observations carry `survivors`:**
   - the kind's persistent storage, which holds the agent home and checkout (a Firecracker data drive, a Docker volume or host folder, or cloud storage);
-  - a host-side checkpoint read back through the agent, used only where storage doesn't outlive the vessel;
   - the pushed branch, as the floor.
+
+  Session logs reach object storage through #3796.
 - **Survivors are kept until the convoy decides:** continue (#3108) or abandon.
 - **A recovery step** then extracts what matters, and the rest is expunged (#3081). Nothing is deleted on a timer, and host disk pressure is the visible signal. Abandon doesn't cascade.
 

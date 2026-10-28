@@ -104,21 +104,10 @@ incomplete snapshots never imply absence. Restart adoption re-enters idempotent
 provisioning to restore tools, credential staging and forwards together. Adoption
 has a 120-second budget to allow the 60-second SSH/agent connection and setup.
 
-The protocol currently offers no promise that Daytona storage outlives its cap,
-so survivors use a controller checkpoint. The first checkpoint runs in the
-background after setup, outside the adoption path; it is then refreshed every 30 seconds and
-includes the checkout, agent homes and cleat state. Status stores only its
-reference. Build outputs and caches are excluded; apparent input size and the
-exact staged archive size are checked before streaming. Failed refreshes retain
-the previous complete archive and report stale health in Environment status
-without clearing readiness or preventing new terminal sessions. Destruction
-keeps that archive for the convoy's continue/abandon decision and removes its
-SSH keys. The archive is capped at 512 MiB, lives in a validated 0700 directory
-with 0600 permissions, and includes staged credentials. Until #3744 adds managed
-retention, the operator must remove the referenced checkpoint directory after
-recovery or abandonment. Never publish the archive. Recent changes
-between successful checkpoints can still be lost; pushed branches remain the
-recovery floor.
+The protocol offers no promise that Daytona storage outlives its cap. Survivors
+are persistent storage and the pushed branch, which remains the recovery floor;
+session logs reach object storage through #3796. Destruction removes the
+vessel's SSH keys.
 
 ## Acceptance
 

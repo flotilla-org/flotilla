@@ -228,12 +228,13 @@ pub struct EnvironmentProviderDescriptor {
 }
 
 /// Durable references only; recovery owns their retention and deletion.
+// The retired `host_checkpoint` field (#4056) is accepted and dropped by this
+// type's lenient decoding (no `deny_unknown_fields`); keep it lenient until one
+// roll after #4056 lands, then this note can go.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentSurvivors {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persistent_storage: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_checkpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pushed_branch: Option<String>,
 }
@@ -487,6 +488,13 @@ mod retired_image_field_tests {
             serde_json::from_value(serde_json::json!({"phase": "Provisioning", "image_build_refs": ["a", "b"]})).expect("old status");
         assert_eq!(status.phase, EnvironmentPhase::Provisioning);
         assert!(serde_json::to_value(&status).expect("encode").get("image_build_refs").is_none());
+        // #4056: the retired host checkpoint survivor decodes and is dropped.
+        let status: EnvironmentStatus = serde_json::from_value(
+            serde_json::json!({"phase": "Ready", "survivors": {"host_checkpoint": "/state/checkpoint.tar", "pushed_branch": "b"}}),
+        )
+        .expect("old survivors");
+        let survivors = serde_json::to_value(&status).expect("encode")["survivors"].clone();
+        assert_eq!(survivors, serde_json::json!({"pushed_branch": "b"}));
     }
 }
 

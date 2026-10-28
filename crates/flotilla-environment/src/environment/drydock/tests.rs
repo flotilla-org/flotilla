@@ -1,5 +1,4 @@
 use super::*;
-use crate::environment::agent::AgentConnector;
 use ::drydock::{
     agent::{stand_in::Gateway, SshDialer},
     client::Client,
@@ -14,9 +13,7 @@ const BUILD: &[u8] = b"flotilla drydock test agent";
 /// A real Rust drydock host with the reference module, whose vessels declare
 /// an agent reached over SSH, and an in-process gateway serving a real agent
 /// under that reach's forwarding rules. The stand-in vessel is this host: its
-/// workspace root is the fixture's, and `tar` and `du` are faked on the
-/// vessel's PATH, so checkpoints never archive the test host. `df` and `stat`
-/// answer as GNU's do, so the checkpoint script sees a Linux guest on any host.
+/// workspace root is the fixture's.
 struct HostFixture {
     _directory: tempfile::TempDir,
     root: PathBuf,
@@ -72,24 +69,9 @@ impl HostFixture {
         let gateway = Gateway::start_as(&root.join("vessel"), reverse_forwards, BUILD, crate::guest_tools::linux_amd64()).unwrap();
         let bin = root.join("bin");
         std::fs::create_dir(&bin).unwrap();
-        // `du` reports nothing to archive, refuses once `du-fails` exists and
-        // hangs while `du-hangs` does; `tar` writes a fixed archive; `df` has
-        // room for it and `stat -c%s` reports its size.
-        for (name, script) in [
-            (
-                "du",
-                format!(
-                    "#!/bin/sh\n[ -e {0}/du-hangs ] && exec sleep 30\n[ -e {0}/du-fails ] && {{ printf '999999999999\\t-\\n'; exit 0; }}\nprintf '0\\t-\\n'\n",
-                    bin.display()
-                ),
-            ),
-            ("tar", "#!/bin/sh\nwhile [ $# -gt 0 ]; do [ \"$1\" = -cf ] && { shift; printf archive > \"$1\"; }; shift; done\n".into()),
-            ("df", "#!/bin/sh\nprintf 'Filesystem 1-blocks Used Available Use%% Mounted\\ntmp 0 0 1099511627776 0%% /tmp\\n'\n".into()),
-            ("stat", "#!/bin/sh\nfor last; do :; done\nwc -c < \"$last\" | tr -d ' '\n".into()),
-        ] {
-            std::fs::write(bin.join(name), script).unwrap();
-            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        // A file for the tool-asset test to push.
+        std::fs::write(bin.join("tar"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(bin.join("tar"), std::fs::Permissions::from_mode(0o755)).unwrap();
         Self { _directory: directory, root, runtime, client, gateway, task }
     }
     async fn ready(&self) {
@@ -193,20 +175,11 @@ async fn reference_lifecycle_through_environment_provider() {
         provider.list_backings().await.unwrap(),
         vec![EnvironmentBacking { environment_id: EnvironmentId::new("crew"), backing_id: first.backing_id().into() }]
     );
-    assert!(first.survivors().unwrap().host_checkpoint.is_some());
     let private = key_dir(&provider.directory, first.id());
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(std::fs::metadata(&private).unwrap().permissions().mode() & 0o777, 0o700);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !private.join("checkpoint.tar").exists() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
     provider.destroy(first.backing_id()).await.unwrap();
     assert!(!private.join("id_ed25519").exists());
-    assert!(private.join("checkpoint.tar").exists());
     provider.destroy(first.backing_id()).await.unwrap();
     assert!(provider.list_backings().await.unwrap().is_empty());
 }
@@ -337,102 +310,6 @@ async fn missing_host_binary_is_not_ready() {
     .unwrap();
 }
 
-// #3745: transport EOF without an exit frame must fail a checkpoint without
-// replacing its recovery archive; cancellation must remove the temporary
-// archive. Asset delivery no longer streams process output (it uses the
-// agent's file operations), so only the checkpoint stream is faulted here.
-#[tokio::test]
-async fn truncated_agent_streams_preserve_recovery() {
-    use axum::body::Bytes;
-    use drydock_agent::{
-        stand_in::{self, Ending, ScriptedOutput},
-        ExitStatus,
-    };
-    use std::sync::atomic::{AtomicU8, Ordering};
-    // drydock's stand-in agent scripts only the process output; use real yamux,
-    // HTTP/2, the agent's process framing, AgentRunner and checkpoint publication.
-    const COMPLETE: u8 = 0;
-    const TRUNCATED: u8 = 1;
-    const STALLED: u8 = 2;
-    // Requests are sequential across phases, so each handler reads its phase mode.
-    let mode = Arc::new(AtomicU8::new(COMPLETE));
-    let (host, guest) = tokio::io::duplex(64 * 1024);
-    let (host, guest) = tokio::join!(
-        drydock_transport::Transport::yamux(Box::new(host), true, Default::default()),
-        drydock_transport::Transport::yamux(Box::new(guest), false, Default::default())
-    );
-    let state = mode.clone();
-    let server = tokio::spawn(async move {
-        stand_in::serve(guest.unwrap(), "fault-fixture".into(), move || {
-            let mode = state.load(Ordering::SeqCst);
-            ScriptedOutput {
-                stdout: Bytes::from_static(if mode == COMPLETE { b"archive bytes".as_slice() } else { b"partial replacement".as_slice() }),
-                stderr: Bytes::from_static(b"secret guest stderr"),
-                ending: match mode {
-                    COMPLETE => Ending::Exit(ExitStatus { code: Some(0), signal: None, timed_out: false }),
-                    TRUNCATED => Ending::Close,
-                    _ => Ending::Stall,
-                },
-            }
-        })
-        .await
-    });
-    struct Server(tokio::task::JoinHandle<std::io::Result<()>>);
-    impl Drop for Server {
-        fn drop(&mut self) {
-            self.0.abort();
-        }
-    }
-    let server_guard = Server(server);
-    // The vessel runner is the agent's own runner, connected to the stand-in.
-    struct StandIn(tokio::sync::Mutex<Option<drydock_transport::Transport>>);
-    #[async_trait]
-    impl AgentConnector for StandIn {
-        async fn connect(&self) -> Result<drydock_agent::Client, String> {
-            let transport = self.0.lock().await.take().ok_or("the stand-in serves one link")?;
-            drydock_agent::Client::connect(transport, "fault-fixture").await.map_err(|cause| cause.to_string())
-        }
-    }
-    let directory = tempfile::tempdir().unwrap();
-    let runner: Arc<dyn CommandRunner> =
-        Arc::new(AgentRunner::new(Arc::new(StandIn(tokio::sync::Mutex::new(Some(host.unwrap())))), directory.path().join("attach")));
-    let directory = tempfile::tempdir().unwrap();
-    let target = directory.path().join("checkpoint.tar");
-    write_checkpoint(runner.clone(), &target, Path::new("/work")).await.unwrap();
-    assert_eq!(std::fs::read(&target).unwrap(), b"archive bytes");
-    mode.store(TRUNCATED, Ordering::SeqCst);
-    let error = write_checkpoint(runner.clone(), &target, Path::new("/work")).await.unwrap_err();
-    assert!(!error.contains("secret guest stderr"), "{error}");
-    assert_eq!(std::fs::read(&target).unwrap(), b"archive bytes");
-    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
-    mode.store(STALLED, Ordering::SeqCst);
-    let capture = tokio::spawn({
-        let (runner, target) = (runner.clone(), target.clone());
-        async move { write_checkpoint(runner, &target, Path::new("/work")).await }
-    });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let mut entries = tokio::fs::read_dir(directory.path()).await.unwrap();
-            let mut partial_exists = false;
-            while let Some(entry) = entries.next_entry().await.unwrap() {
-                partial_exists |= entry.path() != target;
-            }
-            if partial_exists {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap();
-    capture.abort();
-    assert!(capture.await.unwrap_err().is_cancelled());
-    assert_eq!(std::fs::read(&target).unwrap(), b"archive bytes");
-    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
-    // Every fault above came from the script, never from a stand-in that stopped serving.
-    assert!(!server_guard.0.is_finished(), "the stand-in served throughout");
-}
-
 // One slow agent connection must not block another label; repeated adoption
 // must refresh the existing guest's environment without reconnecting it.
 #[tokio::test]
@@ -553,44 +430,6 @@ async fn lost_agent_reconnects_on_liveness() {
     handle.destroy().await.unwrap();
 }
 
-// #3765 S2: build caches do not consume the survivor budget, and an oversized
-// archive is refused before any bytes stream to the host. Use real GNU tools
-// over a small temporary tree; sparse files cross the bound without disk cost.
-// The script runs in Linux guests, so only a Linux host has its tools.
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn checkpoint_excludes_caches_and_preflights_size() {
-    use flotilla_provider_runtime::ChannelLabel;
-    let directory = tempfile::tempdir().unwrap();
-    let root = directory.path().join("work ' quoted");
-    tokio::fs::create_dir_all(root.join("target")).await.unwrap();
-    tokio::fs::create_dir_all(root.join(".cargo/registry")).await.unwrap();
-    tokio::fs::write(root.join("work.txt"), b"uncommitted work").await.unwrap();
-    for path in [root.join("target/output"), root.join(".cargo/registry/cache")] {
-        let file = std::fs::File::create(path).unwrap();
-        file.set_len(1024 * 1024 * 1024).unwrap();
-    }
-    let runner = flotilla_provider_runtime::ProcessCommandRunner;
-    let target = directory.path().join("archive.tar");
-    let script = checkpoint_script(&[root.to_string_lossy().into_owned()]);
-    runner.run_to_file("sh", &["-c", &script], Path::new("/"), &target).await.unwrap();
-    let listing = runner.run("tar", &["-tf", target.to_str().unwrap()], Path::new("/"), &ChannelLabel::Default).await.unwrap();
-    assert!(listing.contains("work.txt"));
-    assert!(!listing.contains("target/output"));
-    assert!(!listing.contains("registry/cache"));
-    // Fake only df's free-space response; all archive tools remain real.
-    let no_space =
-        format!("df() {{ printf '%s\\n' 'Filesystem blocks used available capacity mount' 'tmp 100 100 0 100% /tmp'; }}; {script}");
-    let no_space_target = directory.path().join("no-space.tar");
-    assert!(runner.run_to_file("sh", &["-c", &no_space], Path::new("/"), &no_space_target).await.is_err());
-    assert_eq!(std::fs::metadata(no_space_target).unwrap().len(), 0);
-    let oversized = std::fs::File::create(root.join("oversized-work")).unwrap();
-    oversized.set_len(512 * 1024 * 1024 + 1).unwrap();
-    let refused = directory.path().join("refused.tar");
-    assert!(runner.run_to_file("sh", &["-c", &script], Path::new("/"), &refused).await.is_err());
-    assert_eq!(std::fs::metadata(refused).unwrap().len(), 0);
-}
-
 // #3765 F4 / review 4: incomplete adoption keys cannot be rotated by a
 // label-idempotent POST. Preserve the existing pair and backing, report the
 // missing key distinctly, and allow recovery after the original key is restored.
@@ -627,43 +466,6 @@ async fn incomplete_adoption_keypair_requires_restore() {
     fresh.destroy().await.unwrap();
 }
 
-// #3765 S2: periodic refresh failure preserves the completed archive and makes
-// checkpoint staleness visible through health. Only `du` is faked.
-#[tokio::test]
-async fn checkpoint_refresh_failure_reports_stale_health() {
-    let host = HostFixture::start().await;
-    host.ready().await;
-    let provider = host.provider();
-    let prepared = fixture_prepared(&host, &provider).await;
-    let id = EnvironmentId::new("checkpoint-health");
-    let handle = provider.provision(id.clone(), &prepared, host.opts()).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !key_dir(&provider.directory, &id).join("checkpoint.tar").exists() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    std::fs::write(host.root.join("bin/du-fails"), b"").unwrap();
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(31)).await;
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
-    tokio::time::resume();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while handle.health_message().is_none() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(handle.detect_readiness().await, ProviderReadiness::Ready);
-    assert!(handle.health_message().unwrap().contains("checkpoint stale"));
-    assert_eq!(tokio::fs::read(key_dir(&provider.directory, &id).join("checkpoint.tar")).await.unwrap(), b"archive");
-    handle.destroy().await.unwrap();
-}
-
 // #3765 liveness: an inventory snapshot collected before creation must not
 // override direct inspection of a live backing. Pin that interleaving explicitly.
 #[tokio::test]
@@ -678,27 +480,6 @@ async fn stale_snapshot_absence_is_confirmed_by_inspect() {
     *adopted.watch.state.write().unwrap() = Some(ObservationState::Gone { cause: GoneCause::MissingOnList });
     assert!(matches!(adopted.observe().await.state, ObservationState::Running));
     handle.destroy().await.unwrap();
-}
-
-// A checkpoint can hang or fail without delaying initial setup or re-adoption.
-#[tokio::test]
-async fn adoption_does_not_wait_for_initial_checkpoint() {
-    let host = HostFixture::start().await;
-    host.ready().await;
-    std::fs::write(host.root.join("bin/du-hangs"), b"").unwrap();
-    let provider = host.provider();
-    let prepared = fixture_prepared(&host, &provider).await;
-    let id = EnvironmentId::new("slow-checkpoint");
-    let first =
-        tokio::time::timeout(Duration::from_secs(5), provider.provision(id.clone(), &prepared, host.opts())).await.unwrap().unwrap();
-    drop(first);
-    drop(provider);
-    let restarted = host.provider();
-    let prepared = fixture_prepared(&host, &restarted).await;
-    let adopted = tokio::time::timeout(Duration::from_secs(5), restarted.provision(id, &prepared, host.opts())).await.unwrap().unwrap();
-    assert!(!adopted.created_for_setup());
-    assert_eq!(adopted.detect_readiness().await, ProviderReadiness::Ready);
-    adopted.destroy().await.unwrap();
 }
 
 // Behaviour (#3980 contracts 2, 3 and 7; #3981): through either agent link
