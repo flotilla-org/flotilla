@@ -61,7 +61,10 @@ systemd slice, leaves the host without its Docker provider until it is fixed.
 Without the table, crews keep the placement policy's share. With it, a crew is
 provisioned only when Docker uses the systemd cgroup driver and the slice is
 loaded with a finite `MemoryMax`, and neither that limit nor the host's RAM is
-below the ceiling. The unit and install steps are in
+below the ceiling. The ceiling bounds one crew and the slice bounds them all,
+so crews near the ceiling together can still reach the slice limit and be
+killed inside it. The table is read at provider discovery, so restart the
+daemon after changing it. The unit and install steps are in
 [`config/systemd/system`](../config/systemd/system/README.md).
 
 ## Dispatch-time agent selection

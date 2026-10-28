@@ -39,9 +39,13 @@ the slice's `MemoryMax` or the host's RAM is below the per-crew ceiling.
    memory_ceiling_gib = 20   # most one crew may use; no swap
    ```
 
-   Keep the ceiling well below the slice's `MemoryMax` so one crew can burst
-   while the others are idle. Without the table, crews keep the placement
-   policy's share and stay under `system.slice`.
+   The daemon reads the table when it discovers providers, so restart it after
+   editing the table. Keep the ceiling well below the slice's `MemoryMax` so one
+   crew can burst while the others are idle. The ceiling is checked for one crew
+   at a time: crews near the ceiling together can still reach the slice's
+   `MemoryMax`, and then the kernel or systemd-oomd kills inside the slice
+   rather than elsewhere on the host. Without the table, crews keep the
+   placement policy's share and stay under `system.slice`.
 
 ## Check after the roll
 
