@@ -1,7 +1,3 @@
-//! Placement's import (#3824 layer 4a, ADR 0047): old FulfilmentKinds and PlacementPolicies mapped
-//! onto the engine's FulfilmentKind definition and read back from a rehearsal store. The settings
-//! only a policy carried are code constants (the 2026-10-27 ruling); the import names what differs.
-
 use chrono::{TimeZone, Utc};
 use flotilla_provisioning::{
     engine::import::ImportReport,
@@ -44,10 +40,8 @@ fn copy<R: Resource>(name: &str, home: &str, labels: &[(&str, &str)], annotation
     }
 }
 
-/// Labels or annotations, as key and value.
 type Stamps = Vec<(&'static str, &'static str)>;
 
-/// The manifest stamps of this repository's `.flotilla/placement-policy.crew-image.yaml`.
 fn manifest() -> (Stamps, Stamps) {
     (
         vec![(MANAGED_BY_LABEL, MANIFEST_MANAGED_BY_VALUE)],
@@ -60,7 +54,6 @@ fn manifest() -> (Stamps, Stamps) {
     )
 }
 
-/// `.flotilla/placement-policy.crew-image.yaml`'s spec, with `memory` as its host memory share.
 fn crew_image(memory: u8) -> Value {
     json!({"pool": "cleat", "docker_per_vessel": {
         "host_ref": KIWI,
@@ -69,7 +62,6 @@ fn crew_image(memory: u8) -> Value {
         "checkout": {"worktree_on_host_and_mount": {"mount_path": "/workspace"}}}})
 }
 
-/// The kind the daemon migrates from a live Docker policy, with an operator's extra grant.
 fn migrated_kind() -> Value {
     json!({"host_ref": KIWI, "pool": "cleat", "cost_class": "owned_idle",
         "grants": ["platform:linux", "network:scoped", "toolchain:rust"], "realisation": "docker_per_vessel"})
@@ -84,11 +76,6 @@ fn host_direct_policy() -> Value {
     json!({"pool": "local", "host_direct": {"host_ref": KIWI, "checkout": "worktree"}})
 }
 
-// Behaviour (#3824 layer 4a, the 2026-10-26 and 2026-10-27 rulings): a live policy's kind of the
-// same name stands with its grants; a policy with no kind becomes one (a host-direct one taking its
-// host's platform); a prepared snapshot becomes a kind of its name with its frozen image, written
-// by admission; no setting is carried, the memory share is noted per host for its capacity, and
-// every record restores and reads back.
 #[test]
 fn policies_become_kinds_and_their_settings_are_constants() {
     let (labels, annotations) = manifest();
@@ -99,7 +86,6 @@ fn policies_become_kinds_and_their_settings_are_constants() {
         ],
         policies: vec![
             copy::<PlacementPolicy>("docker-crew-image-kiwi", "kiwi", &labels, &annotations, crew_image(50)),
-            // The seeded host-direct policy, before its migration made a kind of its name.
             copy::<PlacementPolicy>("host-direct-kiwi-2", "kiwi", &[], &[], host_direct_policy()),
             copy::<PlacementPolicy>("docker-on-kiwi", "kiwi", &[], &[], crew_image(50)),
             copy::<PlacementPolicy>("placement-snapshot-0123456789ab", "kiwi", &[(PREPARED_SNAPSHOT_LABEL, "placement")], &[], {
@@ -133,8 +119,6 @@ fn policies_become_kinds_and_their_settings_are_constants() {
         .expect("realisation")
     );
 
-    // The settings are the constants: none differs, and none is carried. The snapshot's 80% is
-    // its copy of the host's, not a share of its own; the live policies' 50% is the host's.
     assert!(!report.notes.iter().any(|note| note.contains("differ from the code constants")), "{:?}", report.notes);
     assert_eq!(report.dropped.get(&("PlacementPolicy", "a snapshot's settings, the constants")), Some(&1));
     let share = format!("host `{KIWI}` at `kiwi`: memory share: 50% of host memory over 4 crews, 0 bytes of swap each (`docker-crew-image-kiwi`, `docker-on-kiwi`)");
@@ -145,9 +129,6 @@ fn policies_become_kinds_and_their_settings_are_constants() {
     assert_eq!(rehearsed.imported.values().sum::<usize>(), imported.kinds.len());
 }
 
-// Behaviour (#3824 layer 4a): what cannot be carried is refused with its reason, so the pre-roll
-// gate names it; deleted rows and adapters are counted as drops; a host whose policies set two
-// memory shares is named, one to choose for its capacity.
 #[test]
 fn what_the_move_cannot_carry_is_refused() {
     let baseline = {
@@ -194,7 +175,6 @@ fn what_the_move_cannot_carry_is_refused() {
         assert!(refused.iter().any(|line| line.contains(record) && line.contains(reason)), "{record}: {reason} in {refused:#?}");
     }
     assert_eq!(refused.len(), 4, "{refused:#?}");
-    // A copy refused on its own and held in two namespaces gives both reasons.
     assert!(
         refused.iter().any(|line| line.contains("orphan-host-direct") && line.contains("the engine has no namespaces")),
         "{refused:#?}"
@@ -210,10 +190,6 @@ fn what_the_move_cannot_carry_is_refused() {
     );
 }
 
-// Behaviour (#3824 layer 4a, the 2026-10-27 ruling): a policy whose settings differ from the code
-// constants is named with the fields that differ, and still becomes its kind; a cloud sandbox's
-// settings are dropped; a constrained snapshot, its settings dropped, is not refused; and one
-// policy name at two homes imports at each.
 #[test]
 fn settings_other_than_the_constants_are_named() {
     let mut odd = crew_image(50);

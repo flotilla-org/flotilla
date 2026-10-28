@@ -56,41 +56,7 @@ CREATE TABLE "fulfilment_kind" (
   "host_ref" TEXT NOT NULL,
   "pool" TEXT NOT NULL,
   "cost_class" TEXT NOT NULL CHECK ("cost_class" IN ('me', 'oi', 'si')),
-  "realisation" TEXT NOT NULL CHECK ("realisation" IN ('cs', 'db', 'dk', 'dl', 'hd')),
-  "realisation_sandbox_image" TEXT,
-  "realisation_image" TEXT,
-  "realisation_identity" TEXT,
-  "realisation_image_build_ref" TEXT,
-  CHECK (CASE WHEN "realisation" = 'cs'
-      THEN "realisation_sandbox_image" IS NOT NULL
-      AND "realisation_image" IS NULL
-      AND "realisation_identity" IS NULL
-      AND "realisation_image_build_ref" IS NULL
-      END),
-  CHECK (CASE WHEN "realisation" = 'dk'
-      THEN "realisation_sandbox_image" IS NULL
-      AND "realisation_image" IS NULL
-      AND "realisation_identity" IS NULL
-      AND "realisation_image_build_ref" IS NULL
-      END),
-  CHECK (CASE WHEN "realisation" = 'dl'
-      THEN "realisation_image" IS NOT NULL
-      AND "realisation_sandbox_image" IS NULL
-      AND "realisation_identity" IS NULL
-      AND "realisation_image_build_ref" IS NULL
-      END),
-  CHECK (CASE WHEN "realisation" = 'db'
-      THEN "realisation_identity" IS NOT NULL
-      AND "realisation_image_build_ref" IS NOT NULL
-      AND "realisation_sandbox_image" IS NULL
-      AND "realisation_image" IS NULL
-      END),
-  CHECK (CASE WHEN "realisation" = 'hd'
-      THEN "realisation_sandbox_image" IS NULL
-      AND "realisation_image" IS NULL
-      AND "realisation_identity" IS NULL
-      AND "realisation_image_build_ref" IS NULL
-      END)
+  "realisation" BLOB NOT NULL
 ) STRICT;
 CREATE TABLE "fulfilment_kind_grants" (
   "fulfilment_kind" INTEGER NOT NULL,
@@ -101,23 +67,14 @@ CREATE TABLE "fulfilment_kind_grants" (
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('fk', 'cost_class', 'me', 'Metered'),
   ('fk', 'cost_class', 'oi', 'OwnedIdle'),
-  ('fk', 'cost_class', 'si', 'SubscriptionIncluded'),
-  ('fk', 'realisation', 'cs', 'CloudSandboxPerVessel'),
-  ('fk', 'realisation', 'db', 'DockerBuilt'),
-  ('fk', 'realisation', 'dk', 'DockerComposed'),
-  ('fk', 'realisation', 'dl', 'DockerLiteral'),
-  ('fk', 'realisation', 'hd', 'HostDirect');
+  ('fk', 'cost_class', 'si', 'SubscriptionIncluded');
 CREATE VIEW "fulfilment_kind_view" AS SELECT
   "fulfilment_kind"."id",
   "fulfilment_kind"."version",
   "fulfilment_kind"."host_ref",
   "fulfilment_kind"."pool",
   (SELECT "name" FROM "codes" WHERE "kind" = 'fk' AND "field" = 'cost_class' AND "code" = "fulfilment_kind"."cost_class") AS "cost_class",
-  (SELECT "name" FROM "codes" WHERE "kind" = 'fk' AND "field" = 'realisation' AND "code" = "fulfilment_kind"."realisation") AS "realisation",
-  "fulfilment_kind"."realisation_sandbox_image",
-  "fulfilment_kind"."realisation_image",
-  "fulfilment_kind"."realisation_identity",
-  "fulfilment_kind"."realisation_image_build_ref"
+  "fulfilment_kind"."realisation"
 FROM "fulfilment_kind";
 CREATE VIEW "fulfilment_kind_grants_view" AS SELECT
   "fulfilment_kind_grants"."fulfilment_kind",

@@ -1,8 +1,4 @@
-//! Placement's import rehearsal (#3824 layer 4a): before a roll, every FulfilmentKind and
-//! PlacementPolicy the daemon holds, local or replicated, in every namespace, is mapped onto the
-//! engine (each policy into a kind of its name; its settings are code constants), restored into a
-//! temporary store and read back. The report counts imported records by kind and origin and dropped
-//! rows by reason, and names each refusal.
+//! Placement's import rehearsal over every namespace the daemon holds, local or replicated.
 
 use flotilla_provisioning::engine::{
     import::{ImportRefusal, ImportReport},
@@ -11,14 +7,12 @@ use flotilla_provisioning::engine::{
 use flotilla_resources::{K8sResourceObject, Resource, ResourceObject};
 use serde_json::Value;
 
-/// The kinds the rehearsal reads, by their plural.
 pub(super) const KINDS: [&str; 2] = ["fulfilmentkinds", "placementpolicies"];
 
-/// Raw documents of every namespace, as `(namespace, plural, document)`.
+/// `(namespace, plural, document)`.
 #[derive(Default)]
 pub(super) struct Documents(pub Vec<(String, String, Value)>);
 
-/// The home a listed copy was written at: its origin root, or this daemon.
 fn home(item: &Value) -> String {
     item.pointer("/metadata/annotations/flotilla.work~1origin-root").and_then(Value::as_str).unwrap_or("local").to_owned()
 }
@@ -54,7 +48,6 @@ impl Documents {
     }
 }
 
-/// One line of counts, one of drops, then one line per note and per refusal.
 pub(super) fn print(report: &ImportReport) {
     let total: usize = report.imported.values().sum();
     let dropped: usize = report.dropped.values().sum();

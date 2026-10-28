@@ -1,31 +1,21 @@
-//! The realisation settings that are code constants (#3824 layer 4; the 2026-10-27 ruling). No
-//! kind or record holds them: a Docker vessel's checkout, cwd, env and pull policy and a
-//! host-direct vessel's checkout are the values every live policy carries. A cloud sandbox's
-//! settings are dropped, and the Docker memory share becomes a Host capacity (layer 4c).
-//!
-//! Until admission and realisation read them (layer 4b-iii), the placement import compares each
-//! policy's settings with them, so a host relying on other values is named before the roll.
+//! Realisation settings every live policy carries, held as code constants rather than stored.
 
 use crate::{DockerCheckoutStrategy, DockerImagePullPolicy, HostDirectPlacementPolicyCheckout, PlacementPolicySpec};
 
 /// Where a Docker vessel's checkout is mounted, and its working directory.
 pub const DOCKER_WORKSPACE: &str = "/workspace";
 
-/// A Docker vessel's image pull policy.
 pub const DOCKER_PULL_POLICY: DockerImagePullPolicy = DockerImagePullPolicy::Always;
 
-/// A Docker vessel's checkout: a worktree on its host, mounted at [`DOCKER_WORKSPACE`].
 pub fn docker_checkout() -> DockerCheckoutStrategy {
     DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: DOCKER_WORKSPACE.to_owned() }
 }
 
-/// A host-direct vessel's checkout: a worktree in place.
 pub fn host_direct_checkout() -> HostDirectPlacementPolicyCheckout {
     HostDirectPlacementPolicyCheckout::Worktree
 }
 
-/// The settings of `spec` that differ from the constants, by their names in a policy. A Docker
-/// policy's memory share is not compared: it becomes its host's capacity, not a constant.
+/// The memory share is not compared: it becomes its host's capacity, not a constant.
 pub fn differing_settings(spec: &PlacementPolicySpec) -> Vec<&'static str> {
     let mut differing = Vec::new();
     if let Some(docker) = &spec.docker_per_vessel {
@@ -53,8 +43,6 @@ pub fn differing_settings(spec: &PlacementPolicySpec) -> Vec<&'static str> {
 mod tests {
     use super::*;
 
-    // Behaviour (the 2026-10-27 ruling): the shipped crew-image policies carry exactly the
-    // constants, so the settings they declare need no carrier after the move.
     #[test]
     fn the_shipped_crew_image_settings_are_the_constants() {
         let policy: PlacementPolicySpec = serde_json::from_value(serde_json::json!({

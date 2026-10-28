@@ -1,58 +1,46 @@
-//! Placement's definition on the engine (#3824 layer 4a): FulfilmentKind, a plain definition kind
-//! written by its home's single writer.
-//!
-//! The 2026-10-26 rulings retire PlacementPolicy by finishing ADR 0046 (admission selects kinds by
-//! grants and cost). A FulfilmentKind keeps host, pool, grants, cost class and the realisation with
-//! its image; the provider is named by the realisation alone. The settings only a policy carried
-//! are code constants ([`flotilla_resources::realisation_settings`]; the 2026-10-27 ruling), and the
-//! row holds no provenance: why it was written is its change's (#4024).
-//!
-//! Nothing reads or writes this table yet: the import rehearsal restores into it, and it joins the
-//! daemon's decided store with admission and realisation (layer 4b).
+//! FulfilmentKind on the engine. The settings a policy carried are code constants in
+//! [`flotilla_resources::realisation_settings`], and why a row was written belongs to its change.
 
 use std::collections::BTreeSet;
 
 use flotilla_resources::{DockerImageSource, FulfilmentCostClass, FulfilmentGrant, FulfilmentKindSpec, FulfilmentRealisation};
 use flotilla_schema::{KindRegistry, RegistryError, Stored};
+use serde::{Deserialize, Serialize};
 
 /// How a kind realises its vessels, with the image it runs.
-#[derive(Clone, Debug, PartialEq, Eq, Stored)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum KindRealisation {
-    /// A cloud sandbox running `sandbox_image`.
-    #[store(code = "cs")]
-    CloudSandboxPerVessel { sandbox_image: String },
-    /// A container per vessel running its composed image (ADR 0062), frozen per vessel at
-    /// admission.
-    #[store(code = "dk")]
+    CloudSandboxPerVessel {
+        sandbox_image: String,
+    },
+    /// The vessel's composed image, frozen per vessel at admission.
     DockerComposed,
-    /// A container per vessel running a literal image reference.
-    #[store(code = "dl")]
-    DockerLiteral { image: String },
-    /// A container per vessel running a composed identity, as a snapshot froze it, with the
-    /// ImageBuild that realises it.
-    #[store(code = "db")]
-    DockerBuilt { identity: String, image_build_ref: String },
-    /// The host itself.
-    #[store(code = "hd")]
+    DockerLiteral {
+        image: String,
+    },
+    DockerBuilt {
+        identity: String,
+        image_build_ref: String,
+    },
     HostDirect,
 }
 
-/// A FulfilmentKind, as the engine stores it: kind code `fk`.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 #[store(kind = "FulfilmentKind", code = "fk")]
 pub struct FulfilmentKindDefinition {
-    /// The host that realises it; empty for a kind bound to no host (a cloud sandbox).
+    /// Empty for a kind bound to no host, such as a cloud sandbox.
     pub host_ref: String,
     pub pool: String,
     pub cost_class: FulfilmentCostClass,
-    /// What a vessel placed by this kind is granted; admission selects by them.
     #[store(child)]
     pub grants: BTreeSet<String>,
+    /// One document: admission picks a kind in memory, so no read selects by it.
+    #[store(cbor)]
     pub realisation: KindRealisation,
 }
 
 impl FulfilmentKindDefinition {
-    /// The record of `spec`. A kind naming a CrewImageBaseline is refused: the kind retires.
     pub fn new(spec: &FulfilmentKindSpec) -> Result<Self, String> {
         let realisation = match &spec.realisation {
             FulfilmentRealisation::CloudSandboxPerVessel { image } => {
@@ -103,13 +91,11 @@ impl FulfilmentKindDefinition {
     }
 }
 
-/// Registers FulfilmentKind `fk` into `registry`, a plain kind.
 pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     registry.register::<FulfilmentKindDefinition>()?;
     Ok(())
 }
 
-/// Placement's kind alone, for their DDL snapshot and the import rehearsal.
 pub fn registry() -> Result<KindRegistry, RegistryError> {
     let mut registry = KindRegistry::new();
     register(&mut registry)?;
