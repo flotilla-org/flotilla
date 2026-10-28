@@ -235,7 +235,7 @@ Before any consumer install, use a checkout of the **exact generation source
 revision**, after finalization. Run the operator gate from that checkout:
 
 ```bash
-scripts/fleet-preroll-checks.sh <generation> --consumer feta --consumer comte --consumer <other-consumer>
+scripts/fleet-preroll-checks.sh <generation> --manifest <generation.json> --consumer feta --consumer comte --consumer <other-consumer>
 ```
 
 Repeat `--consumer` for every installation consumer in the current fleet,
@@ -244,6 +244,12 @@ silently inherit a stale hard-coded inventory. A successful gate is required
 before proceeding to the existing candidate record/ops validation, feta canary
 and install/health-check steps. Run it again if tools or bootstrap files change.
 The script never installs or changes the active generation.
+
+The gate also refuses a generation whose manifest (`generation.json`) pins a
+Cleat that is neither the checkout's `CLEAT_NEW_REVISION`
+(`ci/cleat-environment/revisions.sh`) nor a descendant of it, naming both
+revisions. The `fleet-candidates` build applies the same rule to `cleat_sha`,
+which defaults to `CLEAT_NEW_REVISION` when empty.
 
 The read-only gate hashes raclette's `/usr/local/sbin/lab-fleet-promote`,
 `lab-fleet-finalize-darwin`, and `generation_validation.py` via
@@ -263,7 +269,7 @@ and `ci/fleet-candidates/generation_validation.py`. A mismatch refuses before
 installation and prints this exact paired sync command for the affected host:
 
 ```bash
-scripts/fleet-preroll-checks.sh <generation> --source-root <generation-checkout> --consumer <host> --sync-bootstrap
+scripts/fleet-preroll-checks.sh <generation> --source-root <generation-checkout> --manifest <generation.json> --consumer <host> --sync-bootstrap
 ```
 
 This explicit repair saves both installed files as `.pre-<generation>` before

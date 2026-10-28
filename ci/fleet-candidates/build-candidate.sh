@@ -53,7 +53,6 @@ package_cleat_terminfo() {
 
 main() {
 flotilla_sha="$(require_sha FLEET_FLOTILLA_SHA "${FLEET_FLOTILLA_SHA:-}")"
-cleat_sha="$(require_sha FLEET_CLEAT_SHA "${FLEET_CLEAT_SHA:-}")"
 mattpocock_skills_sha="$(require_sha FLEET_MATTPOCOCK_SKILLS_SHA "${FLEET_MATTPOCOCK_SKILLS_SHA:-}")"
 rjw_skills_sha="$(require_sha FLEET_RJW_SKILLS_SHA "${FLEET_RJW_SKILLS_SHA:-}")"
 
@@ -89,6 +88,8 @@ if [[ "$PWD" == / || "$output_root" != "$PWD/dist" ]]; then
 fi
 
 fetch_exact https://github.com/flotilla-org/flotilla.git "$flotilla_sha" "$flotilla_root"
+# An empty pin selects the Cleat this Flotilla revision declares; an older one is refused.
+cleat_sha="$(python3 "$(dirname "${BASH_SOURCE[0]}")/cleat_pairing.py" "$flotilla_root" "${FLEET_CLEAT_SHA:-}")"
 fetch_exact https://github.com/flotilla-org/cleat.git "$cleat_sha" "$cleat_root"
 # Both platforms build with the selected Flotilla revision's compiler.
 source "$(dirname "${BASH_SOURCE[0]}")/../toolchain/pin.sh"

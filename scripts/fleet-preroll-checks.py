@@ -10,6 +10,9 @@ import shlex
 import subprocess
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'ci/fleet-candidates'))
+import cleat_pairing  # noqa: E402
+
 # Executed by the remote Python, never by a remote shell with interpolated paths.
 REMOTE = r'''
 import base64, hashlib, json, os, pathlib, sys, tempfile
@@ -115,8 +118,21 @@ def check_pair(host, sources, paths, generation, sync, run):
     return errors
 
 
-def check(root, generation, consumers, sync, run):
-    errors = []
+def check_cleat_pairing(root, generation, manifest, git):
+    """The generation's Cleat must contain the Cleat its Flotilla declares (#4051)."""
+    try:
+        document = json.loads(Path(manifest).read_text())
+        if document.get('generation') != generation:
+            return [f'{manifest}: manifest is for generation {document.get("generation")}, not {generation}']
+        cleat_pairing.require_pairing(cleat_pairing.declared_revision(root),
+                                      cleat_pairing.normalize_pin(document['sources']['cleat']), git)
+    except (cleat_pairing.PairingError, OSError, ValueError, KeyError, TypeError) as error:
+        return [f'cleat pairing: {error}']
+    return []
+
+
+def check(root, generation, consumers, sync, run, manifest=None, git=cleat_pairing.git_run):
+    errors = check_cleat_pairing(root, generation, manifest, git) if manifest else []
     for host, names, directory in [
         ('raclette', ['lab-fleet-promote', 'lab-fleet-finalize-darwin', 'generation_validation.py'], '/usr/local/sbin/'),
         ('comte', ['lab-darwin-sign', 'generation_validation.py'], '~/.local/libexec/'),
@@ -133,7 +149,9 @@ def check(root, generation, consumers, sync, run):
         if failures:
             failures.append("sync BOTH files (docs/fleet-install.md#automatic-pre-roll-refusals): " +
                             shlex.join([str(root / "scripts/fleet-preroll-checks.sh"), generation,
-                                        "--source-root", str(root), "--consumer", host, "--sync-bootstrap"]))
+                                        "--source-root", str(root)] +
+                                       (["--manifest", str(manifest)] if manifest else []) +
+                                       ["--consumer", host, "--sync-bootstrap"]))
         errors += failures
     return errors
 
@@ -144,6 +162,7 @@ def main():
     parser.add_argument('--source-root', type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument('--consumer', action='append', required=True, help='SSH consumer name; repeat for EVERY consumer, including feta')
     parser.add_argument('--host-command', help='injected executable accepting HOST COMMAND and Python program on stdin')
+    parser.add_argument('--manifest', type=Path, required=True, help="the generation's generation.json, for its source pins")
     parser.add_argument('--sync-bootstrap', action='store_true')
     args = parser.parse_args()
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', args.generation):
@@ -152,7 +171,7 @@ def main():
         parser.error('invalid consumer SSH name')
     try:
         errors = check(args.source_root, args.generation, list(dict.fromkeys(args.consumer)),
-                       args.sync_bootstrap, lambda h, r: remote(h, r, args.host_command))
+                       args.sync_bootstrap, lambda h, r: remote(h, r, args.host_command), args.manifest)
         if errors:
             print('pre-roll refused:\n' + '\n'.join(errors), file=sys.stderr)
             return 1
