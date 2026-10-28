@@ -5,8 +5,9 @@ container starts under it (`docker run --cgroup-parent flotilla-crews.slice`)
 with a per-crew memory ceiling, and the slice's `MemoryMax` caps their total.
 
 The daemon refuses to provision a Docker crew when `daemon.toml` names a slice
-that is not loaded or has no finite `MemoryMax`, because Docker's systemd
-cgroup driver would otherwise create it silently with no limits.
+that is not loaded or has no finite `MemoryMax`, because Docker's systemd cgroup
+driver would otherwise create it silently with no limits. It also refuses when
+the slice's `MemoryMax` is below the per-crew ceiling.
 
 ## Install (operator, as root, on each Docker crew host)
 

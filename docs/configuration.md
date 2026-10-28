@@ -60,7 +60,7 @@ Both keys are required. A missing or unknown key, or a name that is not a
 systemd slice, leaves the host without its Docker provider until it is fixed.
 Without the table, crews keep the placement policy's share. With it, a crew is
 provisioned only when Docker uses the systemd cgroup driver and the slice is
-loaded with a finite `MemoryMax`. The unit and install steps are in
+loaded with a finite `MemoryMax` no lower than the ceiling. The unit and install steps are in
 [`config/systemd/system`](../config/systemd/system/README.md).
 
 ## Dispatch-time agent selection
