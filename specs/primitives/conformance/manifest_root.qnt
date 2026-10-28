@@ -3,7 +3,7 @@
 // document `a` that passes record, a second `b` only suspended (so a complete pass that does not
 // reach it prunes it) or named unrecorded (Unreached); one hash, one revision beside the empty
 // one, two tokens (a stale token and a new request), one action (the action is carried data the
-// rules never read), a removal of `a` or none (one also unreached), and each outcome class:
+// rules never read), `a` deleted or orphaned (and a removal unreached), and each outcome class:
 // Requested, Started, a settled one, and failures with and without a reason.
 module manifest_root_conformance {
   import manifest_root(IDS = Set()) as M from "../machines/manifest_root"
@@ -15,10 +15,13 @@ module manifest_root_conformance {
   pure val bools = Set(true, false)
   pure def maps(value: str): Set[str -> str] = Set(Map(), Map("a" -> value))
   pure def passes: Set[M::Event] = Set(Set("a"), Set("a", "b")).map(reached =>
-      Set("", "r").map(revision => bools.map(complete => maps("h").map(baselines => maps("refused").map(refusals => maps("r").map(removals =>
-        M::Applied({ revision: revision, complete: complete, reached: reached, baselines: baselines, refusals: refusals, removals: removals })))
-        .flatten()).flatten()).flatten()).flatten()).flatten()
+      Set("", "r").map(revision => bools.map(complete => maps("h").map(baselines => maps("refused").map(refusals =>
+        M::Applied({ revision: revision, complete: complete, reached: reached, baselines: baselines, refusals: refusals, removals: Map() }))).flatten()).flatten()).flatten()).flatten()
     .union(Set(M::Applied({ revision: "r", complete: false, reached: Set(), baselines: Map("a" -> "h"), refusals: Map(), removals: Map() })))
+    // Removals follow the rule baselines and refusals follow, so two passes reach them without
+    // crossing the whole pass domain again (#3992): `a` deleted, and `a` orphaned.
+    .union(Set(M::Applied({ revision: "r", complete: true, reached: Set("a"), baselines: Map(), refusals: Map(), removals: Map("a" -> "r") })))
+    .union(Set(M::Applied({ revision: "r", complete: true, reached: Set("a"), baselines: Map("a" -> "h"), refusals: Map("a" -> "refused"), removals: Map("a" -> "r") })))
     .union(Set(M::Applied({ revision: "r", complete: false, reached: Set(), baselines: Map(), refusals: Map(), removals: Map("a" -> "r") })))
   pure def outcomes: Set[M::Outcome] = Set(M::Requested, M::Started, M::Synced, M::Failed(""), M::Failed("refused"))
   pure def events: Set[M::Event] = passes
