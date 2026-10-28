@@ -139,7 +139,8 @@ impl Layout {
         let table = &mut self.set.tables[frame.table];
         table.aliases.extend(frame.old_names(name).into_iter().map(|old| (old, name.to_owned())));
         if frame.key_mode {
-            // A described row key may hold an optional part, such as a reference's host.
+            // A described row key may hold an optional part, such as a reference's host; joins on
+            // such a key must treat null as equal to null.
             let nullable = described && (!required || !frame.scopes.is_empty());
             let mut column = ColumnDef::new(name, ty, nullable);
             column.add_role("key");
