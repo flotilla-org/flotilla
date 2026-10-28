@@ -82,34 +82,11 @@ routing remains part of the federation work tracked in #1188.
    lives in comments or your head does not count: crews read bodies. After
    any grill, split, or re-scope, rewrite the body *before* dispatching or
    marking anything ready.
-2. Declare any needs the issue did not capture; admission picks the minimal covering fulfilment kind:
-   ```sh
-   flotilla convoy start --project <proj> --issue <N> --no-attach
-   ```
-   Use `--need <capability>` for a dispatch-specific constraint. To pin a
-   broader kind, pass `--fulfilment <kind> --escalation-reason <reason>`.
-   When the plan already names several deliverables, state them as promises
-   instead of brief prose: `--promise pr:api-split --promise pr:ui-split`.
-   Each is owned by the workflow's deliverer unless you add `@vessel/role`, and
-   the convoy cannot land until every promise is kept or retracted.
-3. Pick the harness when the default is wrong. Workflows name capabilities,
-   not harnesses; `--agent [capability=]adapter[:model]` binds one for this
-   dispatch and is repeatable, with the bare form applying to `code`:
-   ```sh
-   flotilla convoy start --project <proj> --issue <N> \
-       --agent claude-code:opus --no-attach
-
-   flotilla convoy start --project <proj> --issue <N> \
-       --agent claude-code:sonnet \
-       --agent review=codex --no-attach
-   ```
-   This is the budget lever: when one subscription's weekly window is spent,
-   route coding work to a harness that still has headroom, and drop from opus
-   to sonnet where the work does not need the bigger model. An adapter
-   override does not inherit the seeded model, and placement admission checks
-   the *effective* adapter — a host without it refuses the dispatch by name.
-   See [configuration](../configuration.md#dispatch-time-agent-selection).
-4. Crews are briefed automatically (assignment, delivery contract, crew
+2. Dispatch with `flotilla convoy start` following the `flotilla-dispatch`
+   skill ([skills/flotilla-dispatch/SKILL.md](../../skills/flotilla-dispatch/SKILL.md)):
+   naming, model and harness per capability, placement pins and needs,
+   instructions and promises.
+3. Crews are briefed automatically (assignment, delivery contract, crew
    verbs). Delivery is part of the assignment: implement, push, PR,
    shepherd until checks pass, submit the PR and decision ledger. A crew’s
    part ends when its promises are kept or retracted; merge settles its PR promise.

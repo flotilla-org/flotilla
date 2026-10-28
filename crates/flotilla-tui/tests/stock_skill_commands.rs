@@ -45,6 +45,8 @@ fn stock_skill_commands_match_clap_tree() {
             assert!(check_file(&path) > 0, "{} has executable examples", path.display());
         }
     }
+    let dispatch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/flotilla-dispatch/SKILL.md");
+    assert!(check_file(&dispatch) > 0, "dispatch skill has executable examples");
 }
 
 // Issue #2982: the shipped project declaration selects both stock skills for
