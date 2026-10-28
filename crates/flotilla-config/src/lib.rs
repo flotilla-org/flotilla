@@ -14,7 +14,7 @@ pub mod provider_config;
 use std::{
     collections::{BTreeMap, HashMap},
     future::Future,
-    num::NonZeroUsize,
+    num::{NonZeroU64, NonZeroUsize},
     path::PathBuf,
     sync::{Mutex, OnceLock},
 };
@@ -415,6 +415,60 @@ pub struct DaemonConfig {
     /// means unbounded, as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_vessels: Option<u32>,
+    /// Bounds this host's Docker vessels together; absent leaves each at its placement share.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker_vessels: Option<DockerVesselsConfig>,
+}
+
+/// `[docker_vessels]` in `daemon.toml`: every Docker vessel starts under `slice`,
+/// and each may use up to `memory_ceiling_gib` with no swap.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "RawDockerVesselsConfig", into = "RawDockerVesselsConfig")]
+pub struct DockerVesselsConfig {
+    slice: String,
+    memory_ceiling_gib: NonZeroU64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawDockerVesselsConfig {
+    slice: String,
+    memory_ceiling_gib: u64,
+}
+
+impl DockerVesselsConfig {
+    /// A systemd slice unit name, whose dashes nest it inside its parent slices.
+    pub fn slice(&self) -> &str {
+        &self.slice
+    }
+    pub fn memory_ceiling_bytes(&self) -> u64 {
+        self.memory_ceiling_gib.get() << 30
+    }
+}
+
+impl TryFrom<RawDockerVesselsConfig> for DockerVesselsConfig {
+    type Error = String;
+    fn try_from(raw: RawDockerVesselsConfig) -> Result<Self, String> {
+        let stem = raw.slice.strip_suffix(".slice").unwrap_or_default();
+        if stem.is_empty()
+            || stem.starts_with('-')
+            || stem.ends_with('-')
+            || stem.contains("--")
+            || !stem.bytes().all(|byte| byte.is_ascii_alphanumeric() || b":_.-".contains(&byte))
+        {
+            return Err(format!("[docker_vessels] slice {:?} is not a systemd slice name ending in .slice", raw.slice));
+        }
+        let memory_ceiling_gib = NonZeroU64::new(raw.memory_ceiling_gib)
+            .filter(|gib| gib.get() <= u64::MAX >> 30)
+            .ok_or("[docker_vessels] memory_ceiling_gib must be a positive number of GiB")?;
+        Ok(Self { slice: raw.slice, memory_ceiling_gib })
+    }
+}
+
+impl From<DockerVesselsConfig> for RawDockerVesselsConfig {
+    fn from(config: DockerVesselsConfig) -> Self {
+        Self { slice: config.slice, memory_ceiling_gib: config.memory_ceiling_gib.get() }
+    }
 }
 
 /// `[tracing]` enables OTLP/HTTP protobuf span export.
@@ -488,6 +542,7 @@ impl Default for DaemonConfig {
             primitives: None,
             http: HttpListenerConfig::default(),
             max_vessels: None,
+            docker_vessels: None,
         }
     }
 }
