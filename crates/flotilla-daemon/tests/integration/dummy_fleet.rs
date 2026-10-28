@@ -1524,7 +1524,7 @@ impl DummyDaemon {
         tokio::task::yield_now().await;
         let config = Arc::new(ConfigStore::with_base(_dir.path().join("config")));
         let mut discovery = fake_discovery(false);
-        fleet.install(&mut discovery.factories);
+        fleet.install(&mut discovery);
         let daemon = InProcessDaemon::new_with_resource_backend(
             vec![],
             Arc::clone(&config),

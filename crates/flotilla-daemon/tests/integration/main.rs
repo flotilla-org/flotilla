@@ -5,6 +5,7 @@ mod convergence_property;
 mod convoy_create_cli;
 mod crew_skills;
 mod dummy_fleet;
+mod dummy_fleet_writes;
 mod overlay_replication;
 mod peer_connect_flow;
 mod project_cli;

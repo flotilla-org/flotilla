@@ -30,7 +30,7 @@ pub fn install_dummy_fleet(config: &DaemonConfig, discovery: &mut DiscoveryRunti
         );
     }
     let fleet = DummyFleet::new(config);
-    fleet.install(&mut discovery.factories);
+    fleet.install(discovery);
     Some(fleet)
 }
 

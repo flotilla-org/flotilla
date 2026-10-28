@@ -21,8 +21,8 @@ impl FactoryRegistry {
     pub fn default_all() -> Self {
         Self {
             vcs: vcs_factories(),
-            change_requests: vec![Box::new(GitHubChangeRequestFactory), Box::new(ForgejoChangeRequestFactory)],
-            issue_trackers: vec![Box::new(GitHubIssueProviderFactory), Box::new(ForgejoIssueProviderFactory)],
+            change_requests: vec![Box::new(GitHubChangeRequestFactory), Box::new(ForgejoChangeRequestFactory::default())],
+            issue_trackers: vec![Box::new(GitHubIssueProviderFactory), Box::new(ForgejoIssueProviderFactory::default())],
             cloud_agents: vec![Box::new(ClaudeCodingAgentFactory), Box::new(CursorCodingAgentFactory), Box::new(CodexCodingAgentFactory)],
             ai_utilities: vec![Box::new(ClaudeApiAiUtilityFactory), Box::new(ClaudeCliAiUtilityFactory)],
             terminal_pools: terminal_pool_factories(),
@@ -85,10 +85,11 @@ mod tests {
             .with(EnvironmentAssertion::auth_file("forgejo", dir.path().join("lab-forgejo-coder-token")));
         let root = ExecutionEnvironmentPath::new("/repo");
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let issues = ForgejoIssueProviderFactory.probe(&bag, &config, &root, runner.clone()).await.expect("Forgejo issue source");
-        let changes = ForgejoChangeRequestFactory.probe(&bag, &config, &root, runner).await.expect("Forgejo CR source");
+        let issues =
+            ForgejoIssueProviderFactory::default().probe(&bag, &config, &root, runner.clone()).await.expect("Forgejo issue source");
+        let changes = ForgejoChangeRequestFactory::default().probe(&bag, &config, &root, runner).await.expect("Forgejo CR source");
         assert!(issues.supports(&IssueSource { service: "https://forgejo.lab.flotilla.work".into(), scope: "lab/flotilla".into() }));
-        assert_eq!(ForgejoChangeRequestFactory.descriptor().implementation, "forgejo");
+        assert_eq!(ForgejoChangeRequestFactory::default().descriptor().implementation, "forgejo");
         let _ = changes;
     }
 }
