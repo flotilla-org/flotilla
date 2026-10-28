@@ -7,7 +7,6 @@
 mod connector;
 mod observations;
 use super::{agent::AgentRunner, vessel_ops::UnavailableAgent, *};
-use crate::environment::runner::{contained_credential_exclusions, CONTAINED_CODEX_HOME, CONTAINED_WRITABLE_CONFIG_BASE};
 use ::drydock::{
     agent::{AgentLink, AgentReach, AgentReport},
     api::ProviderApi,
@@ -15,7 +14,6 @@ use ::drydock::{
 use drydock_agent::{Endpoint, GuestForward};
 use drydock_protocol as wire;
 use flotilla_protocol::provider::AgentConnectionReport;
-const CHECKPOINT_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 use sha2::Digest;
 use std::{collections::BTreeMap, sync::RwLock, time::Duration};
 
@@ -185,10 +183,8 @@ impl DrydockEnvironmentProvider {
             capabilities: self.capabilities(),
             directory: self.directory.clone(),
             created_for_setup: std::sync::atomic::AtomicBool::new(false),
-            checkpoint: std::sync::Mutex::new(None),
             agent,
             report,
-            checkpoint_error: Default::default(),
         }))
     }
 
@@ -372,28 +368,6 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
         handle.created_for_setup.store(created, std::sync::atomic::Ordering::Release);
         let setup = async {
             self.set_up(&handle).await?;
-            // Checkpoints are advisory recovery material. Neither the first archive
-            // nor a refresh may delay adoption or trigger setup rollback.
-            let checkpoint = keydir.join("checkpoint.tar");
-            let weak = Arc::downgrade(&handle);
-            let root = handle.capabilities.workspace_root.clone();
-            *handle.checkpoint.lock().expect("checkpoint task") = Some(tokio::spawn(async move {
-                let mut refresh = tokio::time::interval(Duration::from_secs(30));
-                refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    refresh.tick().await;
-                    let Some(handle) = weak.upgrade() else {
-                        break;
-                    };
-                    if matches!(handle.observe().await.state, ObservationState::Gone { .. }) {
-                        break;
-                    }
-                    let result = write_checkpoint(handle.runner(), &checkpoint, &root).await;
-                    *handle.checkpoint_error.write().expect("checkpoint health") = result.err();
-                    // Do not hold the environment alive while waiting for the next refresh.
-                    drop(handle);
-                }
-            }));
             Ok::<_, String>(())
         }
         .await;
@@ -521,80 +495,18 @@ struct DrydockEnvironment {
     capabilities: ProviderCapabilities,
     descriptor: flotilla_resources::EnvironmentProviderDescriptor,
     created_for_setup: std::sync::atomic::AtomicBool,
-    checkpoint: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     directory: PathBuf,
     /// The vessel's agent, for a handle provision adopted.
     agent: Option<Arc<AgentRunner>>,
     /// What drydock reports it chose for the agent's latest connection:
     /// recorded and shown, never decided on.
     report: Arc<std::sync::Mutex<Option<AgentReport>>>,
-    checkpoint_error: RwLock<Option<String>>,
     watch: observations::Watch,
 }
-impl Drop for DrydockEnvironment {
-    fn drop(&mut self) {
-        if let Some(task) = self.checkpoint.get_mut().expect("checkpoint task").take() {
-            task.abort();
-        }
-    }
-}
-/// Capture recoverable guest state through its runner, publishing only a complete archive.
-pub async fn write_checkpoint(runner: Arc<dyn CommandRunner>, target: &Path, root: &Path) -> Result<(), String> {
-    let temporary = target.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-    // Synchronous drop cleanup also runs when the async task is cancelled.
-    struct PartialArchive(PathBuf);
-    impl Drop for PartialArchive {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-    let _partial = PartialArchive(temporary.clone());
-    let paths = [
-        root.to_string_lossy().into_owned(),
-        "/root".into(),
-        CONTAINED_WRITABLE_CONFIG_BASE.into(),
-        CONTAINED_CODEX_HOME.into(),
-        "/var/lib/flotilla/cleat".into(),
-    ];
-    let script = checkpoint_script(&paths);
-    runner.run_to_file("sh", &["-c", &script], Path::new("/"), &temporary).await?;
-    tokio::fs::rename(temporary, target).await.map_err(|cause| cause.to_string())
-}
-fn checkpoint_script(paths: &[String]) -> String {
-    // Exclude reproducible build output and caches from both the preflight and
-    // the archive. Stage remotely and check the exact archive size before any
-    // bytes cross SSH; the runner's stream bound remains defence in depth.
-    let excludes = ["target", "node_modules", ".cache", ".cargo/registry", ".cargo/git", ".rustup", ".npm", ".uv"];
-    let credentials = contained_credential_exclusions();
-    let excludes = excludes
-        .iter()
-        .copied()
-        .chain(credentials.iter().map(String::as_str))
-        .map(|p| format!("--exclude={}", flotilla_protocol::arg::shell_quote(p)))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let paths = paths.iter().map(|p| flotilla_protocol::arg::shell_quote(p)).collect::<Vec<_>>().join(" ");
-    format!(
-        "flotilla_checkpoint_size=$(du -sb {excludes} -- {paths} 2>/dev/null | awk '{{n += $1}} END {{printf \"%.0f\", n}}'); \
-         test \"$flotilla_checkpoint_size\" -le {CHECKPOINT_LIMIT_BYTES} || exit 1; \
-         flotilla_checkpoint_free=$(df -PB1 /tmp | awk 'NR == 2 {{print $4}}'); \
-         test \"$flotilla_checkpoint_free\" -ge \"$((flotilla_checkpoint_size + 1048576))\" || exit 1; \
-         flotilla_checkpoint_tmp=$(mktemp /tmp/flotilla-checkpoint.XXXXXXXX) || exit 1; \
-         trap 'rm -f -- \"$flotilla_checkpoint_tmp\"' EXIT; \
-         tar --ignore-failed-read {excludes} -cf \"$flotilla_checkpoint_tmp\" -- {paths}; \
-         flotilla_tar_status=$?; test \"$flotilla_tar_status\" -le 1 || exit 1; \
-         test \"$(stat -c%s \"$flotilla_checkpoint_tmp\")\" -le {CHECKPOINT_LIMIT_BYTES} || exit 1; \
-         cat -- \"$flotilla_checkpoint_tmp\""
-    )
-}
-
 #[async_trait]
 impl ProvisionedEnvironment for DrydockEnvironment {
     async fn detect_readiness(&self) -> ProviderReadiness {
         ProviderReadiness::Ready
-    }
-    fn health_message(&self) -> Option<String> {
-        self.checkpoint_error.read().expect("checkpoint health").clone().map(|reason| format!("checkpoint stale: {reason}"))
     }
     fn created_for_setup(&self) -> bool {
         self.created_for_setup.load(std::sync::atomic::Ordering::Acquire)
@@ -619,10 +531,7 @@ impl ProvisionedEnvironment for DrydockEnvironment {
         self.capabilities.clone()
     }
     fn survivors(&self) -> Option<flotilla_resources::EnvironmentSurvivors> {
-        Some(flotilla_resources::EnvironmentSurvivors {
-            host_checkpoint: Some(key_dir(&self.directory, &self.id).join("checkpoint.tar").to_string_lossy().into_owned()),
-            ..Default::default()
-        })
+        Some(flotilla_resources::EnvironmentSurvivors { ..Default::default() })
     }
     fn provider_descriptor(&self) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
         let agent_connection = self.report.lock().expect("agent report").clone().map(|report| AgentConnectionReport {
@@ -681,11 +590,6 @@ impl ProvisionedEnvironment for DrydockEnvironment {
         if let Some(agent) = &self.agent {
             agent.close().await;
         }
-        if let Some(task) = self.checkpoint.lock().expect("checkpoint task").take() {
-            task.abort();
-        }
-        // Keep the last complete checkpoint for recovery; it is a declared
-        // survivor, not scratch. The operator removes it after continue/abandon.
         remove_keys(&key_dir(&self.directory, &self.id)).await
     }
 }

@@ -498,7 +498,7 @@ async fn cloud_unknown_does_not_abort_gone_sibling() {
             flotilla_environment::environment::ProviderReadiness::Ready
         }
         fn health_message(&self) -> Option<String> {
-            Some("checkpoint stale: injected failure".into())
+            Some("degraded: injected failure".into())
         }
         async fn observe(&self) -> ProviderObservation {
             ProviderObservation::new(self.state.clone())
@@ -577,7 +577,7 @@ async fn cloud_unknown_does_not_abort_gone_sibling() {
     let stale = environments.get("c-stale").await.unwrap().status.unwrap();
     assert!(stale.ready);
     assert_eq!(stale.phase, EnvironmentPhase::Ready);
-    assert!(stale.message.unwrap().contains("checkpoint stale"));
+    assert!(stale.message.unwrap().contains("degraded"));
 }
 
 // #3780: bound active cloud work, admit queued siblings in order as slots free,

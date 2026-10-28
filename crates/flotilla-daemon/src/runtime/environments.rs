@@ -630,5 +630,4 @@ pub(super) async fn mark_unavailable_environment(
 }
 
 // Allow the 60-second SSH/agent connect budget plus asset and credential setup.
-// Checkpoint streaming runs independently of adoption.
 pub(super) const ENVIRONMENT_ADOPTION_TIMEOUT: Duration = Duration::from_secs(120);

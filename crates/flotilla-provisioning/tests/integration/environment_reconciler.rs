@@ -690,7 +690,7 @@ impl EnvironmentRuntime for CloudRuntime {
                 agent_connection: None,
             })),
             survivors: Some(flotilla_resources::EnvironmentSurvivors {
-                host_checkpoint: Some("controller-checkpoint".into()),
+                persistent_storage: Some("controller-storage".into()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -735,7 +735,7 @@ async fn cloud_ready_and_finalization_use_generic_backing() {
     assert_eq!(status.backing_id.as_deref(), Some("opaque-cloud-backing"));
     assert!(status.docker_container_id.is_none());
     assert_eq!(status.provider_descriptor.as_ref().unwrap().instance, "daytona");
-    assert_eq!(status.survivors.as_ref().unwrap().host_checkpoint.as_deref(), Some("controller-checkpoint"));
+    assert_eq!(status.survivors.as_ref().unwrap().persistent_storage.as_deref(), Some("controller-storage"));
     environments.update_status(&environment.metadata.name, &environment.metadata.resource_version, &status).await.unwrap();
     let ready = environments.get(&environment.metadata.name).await.unwrap();
     reconciler.run_finalizer(&ready).await.unwrap();

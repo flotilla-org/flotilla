@@ -91,17 +91,6 @@ pub async fn home_base(runner: &dyn CommandRunner) -> Result<PathBuf, String> {
     Ok(base)
 }
 
-/// Delivery-derived exclusions; auth links are excluded at every depth too.
-#[cfg(unix)]
-pub(crate) fn contained_credential_exclusions() -> Vec<String> {
-    let paths = CredentialDeliveryPaths::new(CONTAINED_WRITABLE_CONFIG_BASE.into());
-    [paths.base.join("credentials"), paths.skill_source_dir(), paths.base.join(flotilla_resources::account_access::REQUESTER_MATERIAL_DIR)]
-        .into_iter()
-        .map(|p| p.to_string_lossy().trim_start_matches('/').to_string())
-        .chain(HARNESS_AUTH_FILES.iter().map(|p| p.to_string()))
-        .collect()
-}
-
 /// A `CommandRunner` decorator that executes all commands inside a Docker container
 /// via `docker exec`. Absolute working directories are forwarded as `-w`; relative
 /// paths use the container's configured working directory. The host-side cwd is `/`.
