@@ -271,7 +271,6 @@ async fn checkout_observations_do_not_copy_engine_phase_into_drifted_status() {
     assert_eq!(obj.status.as_ref().expect("status").phase, CheckoutPhase::Failed);
     let held = home.get("checkout-a").expect("held");
     assert_eq!(held.state(), &LifecycleState::Realised { identity: "/work/feature".into() });
-    assert_eq!(CheckoutBinding::copy(&obj, &held), None);
 }
 
 // Behaviour (#3719 look-over ruling 4): a checkout's request names who it is held for, its
@@ -488,7 +487,6 @@ async fn environment_failure_uses_engine_readiness_without_a_copy() {
                 } else {
                     assert!(matches!(held.state(), LifecycleState::GaveUp { cause: actual } if actual.detail == cause));
                 }
-                assert_eq!(EnvironmentBinding::copy(&obj, &held), None);
                 assert_eq!(obj.status, old_status);
                 let repeated = decide::<EnvironmentBinding>(home.as_ref(), &obj, None, Utc::now());
                 assert!(repeated.ended);
@@ -535,7 +533,6 @@ async fn image_build_failures_follow_the_build_policy() {
         let decision = decide::<ImageBuildBinding>(home.as_ref(), &obj, Some(infrastructure.clone()), Utc::now());
         assert_eq!(decision.ended, attempt == 5, "attempt {attempt}");
         assert_eq!(decision.patch, Some(infrastructure), "the accepted observation retains its real failure class");
-        assert!(ImageBuildBinding::copy(&obj, &home.get("image-a").expect("held")).is_none());
     }
     assert!(matches!(home.get("image-a").expect("held").state(), LifecycleState::GaveUp { .. }));
 
@@ -666,8 +663,17 @@ async fn each_launch_of_a_session_is_its_own_resource() {
     assert_eq!(reconcile(&engine, &mut obj).await.patch, None);
     assert_eq!(state(1), Some(LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released }));
 
-    // The old path resumes it in place (crew_ops' MarkStarting): the next run is a new launch.
+    // Stale Starting is not restart intent; only an explicit predecessor request creates a launch.
     TerminalSessionStatusPatch::MarkStarting.apply(obj.status.as_mut().expect("status"));
+    assert_eq!(reconcile(&engine, &mut obj).await.patch, None);
+    assert!(state(2).is_none());
+    home.replace_launch(
+        name,
+        &launch(name, 1),
+        TerminalSessionBinding::request(&obj, HOME).expect("request"),
+        flotilla_schema::Timestamp(10),
+    )
+    .expect("next requested");
     reconcile(&engine, &mut obj).await;
     assert_eq!(
         state(1),
@@ -679,6 +685,13 @@ async fn each_launch_of_a_session_is_its_own_resource() {
     reconcile(&engine, &mut obj).await;
     assert_eq!(obj.status.as_ref().map(|status| status.phase), Some(TerminalSessionPhase::Lost));
     assert_eq!(state(2), Some(LifecycleState::Realised { identity: "s2".into() }), "unobservable stays Realised");
+    home.replace_launch(
+        name,
+        &launch(name, 2),
+        TerminalSessionBinding::request(&obj, HOME).expect("request"),
+        flotilla_schema::Timestamp(20),
+    )
+    .expect("replacement requested");
     reconcile(&engine, &mut obj).await;
     assert_eq!(
         state(2),
@@ -692,7 +705,7 @@ async fn each_launch_of_a_session_is_its_own_resource() {
 // Behaviour (layer 7): a launch that fails before it runs gives up at once; a later start of the
 // same old session is a new launch.
 #[tokio::test]
-async fn a_failed_launch_gives_up_and_the_next_start_is_a_new_launch() {
+async fn a_failed_launch_gives_up_and_does_not_restart_from_status() {
     use flotilla_resources::{TerminalSessionPhase, TerminalSessionStatusPatch};
 
     use super::{launch, terminal_session::TerminalSessionBinding};
@@ -705,8 +718,11 @@ async fn a_failed_launch_gives_up_and_the_next_start_is_a_new_launch() {
     let mut obj = session_object(TerminalSessionPhase::Starting);
     assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(failed));
     assert!(matches!(home.get(&launch("terminal-vessel-a-coder", 1)).expect("held").state(), LifecycleState::GaveUp { .. }));
-    // Failed is ended for the old path too: the next reconcile writes nothing.
+    // Neither a stale initial phase nor a lost status write is another launch request.
+    TerminalSessionStatusPatch::MarkStarting.apply(obj.status.as_mut().expect("status"));
     assert_eq!(reconcile(&engine, &mut obj).await.patch, None);
+    assert_eq!(engine.inner().prepared.load(Ordering::SeqCst), 1);
+    assert!(home.get(&launch("terminal-vessel-a-coder", 2)).is_none());
 }
 
 // Behaviour (#3629 layer 9): every old phase of each kind maps to a stored state, as the import's
@@ -893,7 +909,7 @@ fn the_rehearsal_lists_records_with_no_mapping() {
 fn the_latest_launch_is_found_and_an_old_name_may_hold_a_hash() {
     use flotilla_resources::TerminalSessionPhase;
 
-    use super::{at, current, launch, launched, next_launch, terminal_session::TerminalSessionBinding};
+    use super::{at, current, launch, launched, terminal_session::TerminalSessionBinding};
     let home = lifecycles::<TerminalSessionBinding>();
     let mut obj = session_object(TerminalSessionPhase::Starting);
     obj.metadata.name = "odd#5".into();
@@ -903,7 +919,8 @@ fn the_latest_launch_is_found_and_an_old_name_may_hold_a_hash() {
         home.request(&launch("odd#5", n), request.clone(), at(DateTime::UNIX_EPOCH)).expect("request");
         assert_eq!(current::<TerminalSessionBinding>(home.as_ref(), &obj).0, launch("odd#5", n));
     }
-    assert_eq!(next_launch("odd#5#13"), "odd#5#14");
+    home.step("odd#5#13", &Step::Released, at(DateTime::UNIX_EPOCH)).expect("release");
+    assert_eq!(home.replace_launch("odd#5", "odd#5#13", request, at(DateTime::UNIX_EPOCH)).expect("next launch"), "odd#5#14");
     assert_eq!(launched("odd#5#13"), "odd#5");
 }
 

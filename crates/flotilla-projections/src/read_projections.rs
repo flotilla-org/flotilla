@@ -1090,6 +1090,13 @@ impl ReadProjections<'_> {
         }
         let sessions =
             self.backend.query_declared::<ResourceTerminalSession>(namespace, &terminal_query).await.map_err(|error| error.to_string())?;
+        let sessions = flotilla_resources::ReadResourceList {
+            items: sessions
+                .items
+                .iter()
+                .map(|source| flotilla_resources::terminal_launches::read_source(self.lifecycles, source).map(|(source, _)| source))
+                .collect::<Result<_, _>>()?,
+        };
         let convoys = self.backend.query_declared::<ResourceConvoy>(namespace, &convoy_query).await.map_err(|error| error.to_string())?;
         let context_convoy = if !scoped || project.is_some() {
             None
@@ -1538,7 +1545,12 @@ impl ReadProjections<'_> {
             })
             .collect();
 
-        let observed_sessions = receivers.terminals();
+        let selected_sessions_readings = receivers
+            .terminals()
+            .iter()
+            .map(|source| flotilla_resources::terminal_launches::read_source(self.lifecycles, source).map(|(source, _)| source))
+            .collect::<Result<Vec<_>, _>>()?;
+        let observed_sessions = selected_sessions_readings.as_slice();
         let unclaimed_work = explained_unclaimed_work(convoy.status.as_ref(), observed_sessions, name);
         let selected_sessions = flotilla_resources::select_convoy_children(&convoy, observed_sessions);
         let queued_turns = convoy

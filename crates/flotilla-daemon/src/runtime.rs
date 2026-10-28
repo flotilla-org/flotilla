@@ -1324,15 +1324,20 @@ async fn open_provisioning_lifecycles(
         .await
         .map_err(|error| error.to_string())??;
     daemon.resource_backend().install_engine_records(Arc::new(projects));
+    let backend = daemon.resource_backend();
     tokio::task::spawn_blocking(move || {
         let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
         let log = || StoreLog::new(Arc::clone(&store));
+        let terminal_sessions = Arc::new(LifecycleHome::new(&home, open_home(log())?));
+        backend.install_terminal_launches(Arc::new(flotilla_provisioning::engine::terminal_session::EngineTerminalLaunches {
+            lifecycles: terminal_sessions.clone(),
+        }));
         Ok(ProvisioningLifecycles {
             environments: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
             image_builds: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
             clones: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
             checkouts: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
-            terminal_sessions: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
+            terminal_sessions,
             vessels: Arc::new(PlacementLifecycles::new(&home, open_home(log())?)?),
         })
     })

@@ -195,6 +195,11 @@ impl FleetService {
 
         let session_list =
             backend.including_replicas::<ResourceTerminalSession>(namespace).list().await.map_err(|err| err.to_string())?.items;
+        let session_list = if let Some(reads) = backend.terminal_readings() {
+            flotilla_store::read_terminal_sources(reads, session_list).await.map_err(|error| error.to_string())?
+        } else {
+            session_list
+        };
         let host_sources = backend.including_replicas::<ResourceHost>(namespace).list().await.map_err(|err| err.to_string())?;
         let result_sets = vec![self.aggregator_projection_state.result_set().await];
         let placement_by_convoy = result_sets

@@ -1,7 +1,7 @@
-//! The provisioning reconcilers' write path through the engine, behind `[primitives]` (#3629 layer 3).
+//! The provisioning reconcilers' write path through the engine, behind `[primitives]`.
 //!
 //! With the switch on, the engine is the single writer of each provisioning resource it holds
-//! (#3587 ruling of 2026-10-22). [`Engine`] wraps a kind's old reconciler, which keeps doing the
+//! through their homes. [`Engine`] wraps a kind's old reconciler, which keeps doing the
 //! work (cloning, provisioning, building, checking out) and keeps reporting what it saw as an old
 //! status patch. A [`Binding`] reads that patch as lifecycle [`Step`]s, and the kind's
 //! [`Lifecycles`] home applies them. The engine's answer decides:
@@ -10,9 +10,9 @@
 //! - a step refused: no lifecycle patch may overrule the engine;
 //! - a resource the engine has ended (Gone or GaveUp): the old reconciler is not run.
 //!
-//! Clone, Checkout, Environment and ImageBuild consumers read the engine directly and their bindings emit
-//! no status copy. Bindings whose readers have not moved retain a one-way, rebuildable copy;
-//! that copy is removed with the kind's last legacy phase reader.
+//! Lifecycle consumers read the engine directly; no binding writes a status copy.
+//! Terminal restarts explicitly request the next launch, naming its predecessor.
+//! An unheld terminal is requested before runtime work, independent of legacy observations.
 //!
 //! In progress, suspect and next attempt are judgements, never stored: a reconciler's in-progress
 //! patches (cloning, waiting for an image build, a build's reservation) carry no step, and its
@@ -139,6 +139,12 @@ pub trait Lifecycles<K: LifecycleKind>: Send + Sync {
     /// Requests `name`; it starts Requested.
     fn request(&self, name: &str, request: K::Request, at: Timestamp) -> Result<Resource<Lifecycle<K>>, EngineError>;
 
+    /// Requests a successor named by its predecessor, serialized with this home's writes.
+    fn replace_launch(&self, name: &str, replaces: &str, request: K::Request, at: Timestamp) -> Result<String, EngineError>;
+
+    /// Finish the predecessor ending implied by a durable successor request before provider work.
+    fn finish_launch_request(&self, name: &str, at: Timestamp) -> Result<(), EngineError>;
+
     /// Applies `step` to `name` with the step's own evidence. A failed attempt is followed by a
     /// give-up with its cause, kept only if the engine accepts it.
     fn step(&self, name: &str, step: &Step, at: Timestamp) -> Result<Resource<Lifecycle<K>>, EngineError>;
@@ -180,6 +186,29 @@ fn evidence(name: &str, step: &Step) -> MemoryLifecycleWorld {
     world
 }
 
+fn finish_predecessor<K: LifecycleKind, L: Log<Lifecycle<K>>>(
+    home: &mut Home<Lifecycle<K>, L>,
+    name: &str,
+    at: Timestamp,
+) -> Result<(), EngineError> {
+    let Some((old, n)) = name.rsplit_once('#').and_then(|(old, n)| Some((old, n.parse::<u32>().ok()?))) else { return Ok(()) };
+    if n <= 1 {
+        return Ok(());
+    }
+    let previous = launch(old, n - 1);
+    let held = home.get(&previous).ok_or(EngineError::Unknown)?;
+    match held.state() {
+        LifecycleState::Realised { .. } => {
+            let cause = flotilla_state_machines::machines::lifecycle::VanishCause::Lost;
+            let step = Step::Vanished { cause: cause.clone() };
+            home.apply(&previous, Vanish { cause, observed: Ref::new(&previous) }, &evidence(&previous, &step), at)?;
+            Ok(())
+        }
+        LifecycleState::Gone { .. } | LifecycleState::GaveUp { .. } => Ok(()),
+        LifecycleState::Requested { .. } => Err(EngineError::Failed("predecessor is still requested".into())),
+    }
+}
+
 impl<K, L> Lifecycles<K> for LifecycleHome<K, L>
 where
     K: LifecycleKind,
@@ -198,6 +227,39 @@ where
         let mut home = self.home.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         home.create(name, request, &MemoryLifecycleWorld::default(), at)?;
         Ok(home.get(name).cloned().expect("created"))
+    }
+
+    fn replace_launch(&self, name: &str, replaces: &str, request: K::Request, at: Timestamp) -> Result<String, EngineError> {
+        let mut home = self.home.lock().map_err(|_| EngineError::Failed("lifecycle home lock poisoned".into()))?;
+        let (latest, held) = latest_launch(name, |key| home.get(key).cloned());
+        let next = replaces
+            .rsplit_once('#')
+            .filter(|(old, _)| *old == name)
+            .and_then(|(_, n)| n.parse::<u32>().ok())
+            .filter(|n| *n > 0 && launch(name, *n) == replaces)
+            .and_then(|n| n.checked_add(1))
+            .map(|n| launch(name, n))
+            .ok_or_else(|| EngineError::Failed("replacement names an invalid predecessor launch".into()))?;
+        if latest == next && held.as_ref().is_some_and(|resource| matches!(resource.state(), LifecycleState::Requested { .. })) {
+            finish_predecessor(&mut home, &next, at)?;
+            return Ok(next);
+        }
+        if latest != replaces {
+            return Err(EngineError::Failed(format!("launch {replaces} is no longer latest ({latest})")));
+        }
+        let held = held.ok_or(EngineError::Unknown)?;
+        if matches!(held.state(), LifecycleState::Requested { .. }) {
+            return Err(EngineError::Failed("cannot replace a launch that is still requested".into()));
+        }
+        // Only the durable Requested record authorizes ending its predecessor.
+        home.create(&next, request, &MemoryLifecycleWorld::default(), at)?;
+        finish_predecessor(&mut home, &next, at)?;
+        Ok(next)
+    }
+
+    fn finish_launch_request(&self, name: &str, at: Timestamp) -> Result<(), EngineError> {
+        let mut home = self.home.lock().map_err(|_| EngineError::Failed("lifecycle home lock poisoned".into()))?;
+        finish_predecessor(&mut home, name, at)
     }
 
     fn step(&self, name: &str, step: &Step, at: Timestamp) -> Result<Resource<Lifecycle<K>>, EngineError> {
@@ -276,18 +338,17 @@ pub trait Binding: Send + Sync + 'static {
         false
     }
 
+    /// Observation housekeeping permitted after this frame explicitly requested a successor.
+    fn launch_reset(_patch: &Patch<Self::Old>) -> bool {
+        false
+    }
+
     /// The lifecycle steps `patch` reports, in order.
     fn steps(obj: &ResourceObject<Self::Old>, patch: &Patch<Self::Old>) -> Vec<Step>;
 
     /// Interpret a report using the engine state when the resource is already held.
     fn steps_with_state(obj: &ResourceObject<Self::Old>, patch: &Patch<Self::Old>, _state: Option<&LifecycleState>) -> Vec<Step> {
         Self::steps(obj, patch)
-    }
-
-    /// The old status the engine's `resource` implies, when `obj`'s status does not already say
-    /// it: the one-way copy.
-    fn copy(_obj: &ResourceObject<Self::Old>, _resource: &Resource<Lifecycle<Self::Kind>>) -> Option<Patch<Self::Old>> {
-        None
     }
 }
 
@@ -314,19 +375,26 @@ pub fn current<B: Binding>(
     if !B::LAUNCHES {
         return (name.clone(), lifecycles.get(name));
     }
+    latest_launch(name, |key| lifecycles.get(key))
+}
+
+fn latest_launch<K: LifecycleKind>(
+    name: &str,
+    mut get: impl FnMut(&str) -> Option<Resource<Lifecycle<K>>>,
+) -> (String, Option<Resource<Lifecycle<K>>>) {
     // Launches are numbered from 1 without gaps, so the latest is found by doubling past it and
     // halving back: O(log launches) reads, not one per launch.
-    let Some(first) = lifecycles.get(&launch(name, 1)) else { return (launch(name, 1), None) };
+    let Some(first) = get(&launch(name, 1)) else { return (launch(name, 1), None) };
     let (mut held, mut found) = ((1, first), 2);
     let mut absent = loop {
-        match lifecycles.get(&launch(name, found)) {
+        match get(&launch(name, found)) {
             Some(resource) => (held, found) = ((found, resource), found.saturating_mul(2)),
             None => break found,
         }
     };
     while absent - held.0 > 1 {
         let mid = held.0 + (absent - held.0) / 2;
-        match lifecycles.get(&launch(name, mid)) {
+        match get(&launch(name, mid)) {
             Some(resource) => held = (mid, resource),
             None => absent = mid,
         }
@@ -340,23 +408,14 @@ pub fn launch(name: &str, n: u32) -> String {
 }
 
 /// The old object a launch key (`<old>#<n>`) is of, split at the last `#` like
-/// [`next_launch`], so an old name holding a `#` of its own is kept whole.
+/// [`launch`], so an old name holding a `#` of its own is kept whole.
 pub fn launched(name: &str) -> &str {
     name.rsplit_once('#').map_or(name, |(old, _)| old)
 }
 
-/// The launch after `name`'s (`<old>#<n>`). It splits at the last `#`, so an old name that holds
-/// a `#` of its own still parses: launch keys always end in `#<n>`.
-fn next_launch(name: &str) -> String {
-    match name.rsplit_once('#').and_then(|(old, n)| Some((old, n.parse::<u32>().ok()?))) {
-        Some((old, n)) => launch(old, n + 1),
-        None => launch(name, 1),
-    }
-}
-
 /// What the engine answers to `patch`, a patch an old writer would make to `obj`: the patch it
 /// may write, which is `patch` when the engine took its steps (or holds nothing for `obj`), and
-/// otherwise the copy of the engine's state. The decision behind [`Engine`], shared with
+/// otherwise no lifecycle patch. The decision behind [`Engine`], shared with
 /// writers outside a reconciler (an observer marking an environment lost).
 pub fn decide<B: Binding>(
     lifecycles: &dyn Lifecycles<B::Kind>,
@@ -364,19 +423,22 @@ pub fn decide<B: Binding>(
     patch: Option<Patch<B::Old>>,
     now: DateTime<Utc>,
 ) -> Decision<B::Old> {
+    let (name, held) = current::<B>(lifecycles, obj);
+    decide_launch::<B>(lifecycles, obj, patch, now, name, held)
+}
+
+fn decide_launch<B: Binding>(
+    lifecycles: &dyn Lifecycles<B::Kind>,
+    obj: &ResourceObject<B::Old>,
+    patch: Option<Patch<B::Old>>,
+    now: DateTime<Utc>,
+    current: String,
+    held: Option<Resource<Lifecycle<B::Kind>>>,
+) -> Decision<B::Old> {
     let kind = <B::Kind as LifecycleKind>::NAME;
-    let (mut current, held) = current::<B>(lifecycles, obj);
     let steps =
         patch.as_ref().map(|patch| B::steps_with_state(obj, patch, held.as_ref().map(|resource| resource.state()))).unwrap_or_default();
     let requesting = !steps.is_empty() || patch.as_ref().is_some_and(|patch| B::requests(obj, patch));
-    // A kind with launches restarted in place: the ended launch stays ended, and this is the next.
-    let held = match held {
-        Some(resource) if B::LAUNCHES && ended(&resource) && !steps.is_empty() && B::initial(obj) => {
-            current = next_launch(&current);
-            None
-        }
-        held => held,
-    };
     let name = &current;
     let mut resource = match held {
         Some(resource) => resource,
@@ -411,14 +473,8 @@ pub fn decide<B: Binding>(
         }
     }
     let ended = ended(&resource);
-    // The old patch is written when, written, it says what the engine holds; otherwise the copy.
-    let agrees = accepted && patch.is_some() && B::copy(&patched(obj, patch.as_ref()), &resource).is_none();
-    if agrees {
-        Decision { patch, ended }
-    } else {
-        // A patch with no step (an observation) still passes when the copy cannot say more.
-        Decision { patch: B::copy(obj, &resource).or(if steps.is_empty() { patch } else { None }), ended }
-    }
+    // Observations carry no step; a refused lifecycle report cannot overrule the engine.
+    Decision { patch: if accepted || steps.is_empty() { patch } else { None }, ended }
 }
 
 /// `obj` as `patch` leaves its status.
@@ -474,31 +530,36 @@ where
 
     async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         let Some(lifecycles) = &self.lifecycles else { return Ok(Prepared::Old(self.inner.prepare(obj).await?)) };
-        // The engine has ended it: the old reconciler does not act on it again, unless it is
-        // starting a new launch of it. The read takes the home's lock, which a step may hold for
-        // its write: off the async workers too.
-        let restarting = B::LAUNCHES && B::initial(obj);
+        // An ended resource does no more provider work. Capture the launch before preparation:
+        // a concurrent replacement cannot receive this launch's delayed report. Home reads may
+        // wait for a write, so they run off the async workers.
         let owned = ResourceObject { metadata: obj.metadata.clone(), spec: obj.spec.clone(), status: obj.status.clone() };
         let home = Arc::clone(lifecycles);
-        let ended_copy = tokio::task::spawn_blocking(move || {
+        let (prepared_launch, terminal) = tokio::task::spawn_blocking(move || {
             let (name, mut held) = current::<B>(home.as_ref(), &owned);
-            let mut completed_attempt = false;
+            // The first launch is ordinary intent, not a predecessorless restart. Establish it
+            // before the reader runs, so a legacy Stopped/Lost observation cannot strand it.
+            if B::LAUNCHES && held.is_none() {
+                let request = B::request(&owned, home.home()).map_err(ResourceError::other)?;
+                held = Some(home.request(&name, request, at(Utc::now())).map_err(|error| ResourceError::other(error.to_string()))?);
+            }
+            if B::LAUNCHES && held.as_ref().is_some_and(|resource| matches!(resource.state(), LifecycleState::Requested { .. })) {
+                home.finish_launch_request(&name, at(Utc::now()))
+                    .map_err(|error| ResourceError::other(format!("engine predecessor recovery: {error}")))?;
+            }
             // A committed failed attempt must finish before any provider work resumes.
             if let Some(reads::Judgement::Exhausted { last }) = held.as_ref().map(|resource| reads::judge::<B::Kind>(resource.state())) {
-                completed_attempt = true;
                 held = Some(
                     home.step(&name, &Step::Attempted(Outcome::Failed { cause: last, retryable: false }), at(Utc::now()))
                         .map_err(|error| ResourceError::other(format!("engine GiveUp recovery: {error}")))?,
                 );
             }
-            Ok::<_, ResourceError>(
-                held.filter(ended).filter(|_| completed_attempt || !restarting).map(|resource| B::copy(&owned, &resource)),
-            )
+            Ok::<_, ResourceError>((name, held.as_ref().is_some_and(ended)))
         })
         .await
         .map_err(|error| ResourceError::other(format!("engine read: {error}")))??;
-        if let Some(copy) = ended_copy {
-            return Ok(Prepared::Decided(Mutex::new(Some(ReconcileOutcome::new(copy)))));
+        if terminal {
+            return Ok(Prepared::Decided(Mutex::new(Some(ReconcileOutcome::new(None)))));
         }
         let prepared = self.inner.prepare(obj).await?;
         // The old reconciler's pure reconcile runs here, at the moment the engine records its
@@ -509,9 +570,27 @@ where
         // Each step is one short SQLite transaction; it runs off the async workers.
         let owned = ResourceObject { metadata: obj.metadata.clone(), spec: obj.spec.clone(), status: obj.status.clone() };
         let (lifecycles, patch) = (Arc::clone(lifecycles), outcome.patch.take());
-        let decision = tokio::task::spawn_blocking(move || decide::<B>(lifecycles.as_ref(), &owned, patch, now))
-            .await
-            .map_err(|error| ResourceError::other(format!("engine decision: {error}")))?;
+        let decision = tokio::task::spawn_blocking(move || {
+            let (name, held) = current::<B>(lifecycles.as_ref(), &owned);
+            if B::LAUNCHES && name != prepared_launch {
+                // A newly Requested launch may still need its runtime observations reset.
+                // This carries no lifecycle evidence and cannot create another launch.
+                if held.as_ref().is_some_and(|resource| matches!(resource.state(), LifecycleState::Requested { .. }))
+                    && patch.as_ref().is_some_and(B::launch_reset)
+                {
+                    return Some(Decision { patch, ended: false });
+                }
+                return None;
+            }
+            Some(decide_launch::<B>(lifecycles.as_ref(), &owned, patch, now, name, held))
+        })
+        .await
+        .map_err(|error| ResourceError::other(format!("engine decision: {error}")))?;
+        let Some(decision) = decision else {
+            let mut retry = ReconcileOutcome::new(None);
+            retry.requeue_after = Some(std::time::Duration::ZERO);
+            return Ok(Prepared::Decided(Mutex::new(Some(retry))));
+        };
         outcome.patch = decision.patch;
         if decision.ended {
             outcome.requeue_after = None;

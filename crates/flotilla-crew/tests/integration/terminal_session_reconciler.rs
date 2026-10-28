@@ -66,7 +66,7 @@ use tracing::instrument::WithSubscriber;
 
 use crate::common;
 
-async fn create_ready_environment(backend: &ResourceBackend, name: &str) {
+pub(super) async fn create_ready_environment(backend: &ResourceBackend, name: &str) {
     let environments = backend.clone().using::<flotilla_resources::Environment>("flotilla");
     let environment = environments
         .create(

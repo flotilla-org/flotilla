@@ -46,6 +46,9 @@ impl InProcessDaemon {
         for namespace in namespaces {
             let sessions = self.resource_backend.using::<TerminalSession>(&namespace).list().await.map_err(|error| error.to_string())?;
             for session in sessions.items.into_iter().filter(|session| session.spec.pool == "cleat") {
+                let (session, _) = flotilla_store::read_terminal_session(self.lifecycle_reads(), &session, None)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 // Stopped records are retained history, not live daemon inventory.
                 if session.status.as_ref().is_none_or(|status| status.phase != TerminalSessionPhase::Running) {
                     continue;

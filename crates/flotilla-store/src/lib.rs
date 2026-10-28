@@ -25,6 +25,8 @@ pub use definition::*;
 pub use manifest_roots::{OldStoreManifestRoots, SwitchedManifestRoots};
 mod event;
 pub use event::*;
+mod terminal_lifecycle;
+pub use terminal_lifecycle::*;
 mod image_build;
 pub use image_build::*;
 pub mod message_query;

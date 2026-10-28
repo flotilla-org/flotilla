@@ -23,6 +23,12 @@ pub enum ProvisioningKind {
 /// impl LifecycleReads for Incomplete {}
 /// ```
 pub trait LifecycleReads: Send + Sync {
+    /// No home is configured, so consumers can preserve the no-engine path without
+    /// dispatching a blocking read. Active adapters default to checked reads.
+    fn is_disabled(&self) -> bool {
+        false
+    }
+
     /// A read failure is distinct from an unheld resource and must not select legacy status.
     fn try_reading(
         &self,
@@ -31,11 +37,20 @@ pub trait LifecycleReads: Send + Sync {
         origin: Option<&str>,
     ) -> Result<Option<flotilla_protocol::LifecycleReading>, String>;
 
+    /// Current launch identity alongside its checked judgement. Adapters serving terminal
+    /// lifecycles must provide the key; synthesising one could restart the wrong launch.
+    fn try_terminal_launch(&self, name: &str, origin: Option<&str>) -> Result<Option<crate::terminal_launches::TerminalLaunch>, String> {
+        match self.try_reading(ProvisioningKind::TerminalSession, name, origin)? {
+            None => Ok(None),
+            Some(_) => Err("terminal lifecycle reader does not provide launch identity".into()),
+        }
+    }
+
     /// The reading of `name` homed at `origin` (a replica's origin root; `None` for this home), or
     /// `None` when the engine holds no such resource: the switch is off, or it was written before.
     ///
-    /// Compatibility adapter for readers that still have a status copy. Readers without a copy
-    /// use `try_reading` so a read failure cannot select stale status.
+    /// Lossy compatibility adapter. Authoritative lifecycle consumers use `try_reading`
+    /// so a read failure cannot select stale status.
     fn reading(&self, kind: ProvisioningKind, name: &str, origin: Option<&str>) -> Option<flotilla_protocol::LifecycleReading> {
         match self.try_reading(kind, name, origin) {
             Ok(reading) => reading,
@@ -51,6 +66,10 @@ pub trait LifecycleReads: Send + Sync {
 pub struct NoLifecycleReads;
 
 impl LifecycleReads for NoLifecycleReads {
+    fn is_disabled(&self) -> bool {
+        true
+    }
+
     fn try_reading(&self, _: ProvisioningKind, _: &str, _: Option<&str>) -> Result<Option<flotilla_protocol::LifecycleReading>, String> {
         Ok(None)
     }
@@ -77,6 +96,14 @@ impl LateLifecycleReads {
 }
 
 impl LifecycleReads for LateLifecycleReads {
+    fn is_disabled(&self) -> bool {
+        self.installed.get().is_none_or(|reads| reads.is_disabled())
+    }
+
+    fn try_terminal_launch(&self, name: &str, origin: Option<&str>) -> Result<Option<crate::terminal_launches::TerminalLaunch>, String> {
+        self.installed.get().map_or(Ok(None), |reads| reads.try_terminal_launch(name, origin))
+    }
+
     fn try_reading(
         &self,
         kind: ProvisioningKind,

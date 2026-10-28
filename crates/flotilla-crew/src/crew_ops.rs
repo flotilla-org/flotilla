@@ -659,12 +659,11 @@ impl CrewService {
                 ..Default::default()
             }
         };
-        let session_list = self
-            .resource_backend
-            .query_declared::<ResourceTerminalSession>(&namespace, &query)
+        let session_list =
+            self.resource_backend.query_declared::<ResourceTerminalSession>(&namespace, &query).await.map_err(|err| err.to_string())?.items;
+        let session_list = flotilla_store::read_terminal_sources(Arc::clone(&self.lifecycle_reads), session_list)
             .await
-            .map_err(|err| err.to_string())?
-            .items
+            .map_err(|error| error.to_string())?
             .into_iter()
             .map(|source| source.object)
             .collect::<Vec<_>>();
@@ -939,19 +938,56 @@ impl CrewService {
         namespace: &str,
         vessel_ref: &str,
     ) -> Result<BTreeMap<String, flotilla_resources::ReadResourceObject<ResourceTerminalSession>>, String> {
-        if let Some(seats) = self.vessel_seats.get() {
-            return seats.seats(namespace, vessel_ref).await;
+        let sources = if let Some(seats) = self.vessel_seats.get() {
+            seats.seats(namespace, vessel_ref).await?
+        } else {
+            self.resource_backend
+                .including_replicas::<ResourceTerminalSession>(namespace)
+                .list_matching_labels(&BTreeMap::from([(VESSEL_REF_LABEL.to_string(), vessel_ref.to_owned())]))
+                .await
+                .map_err(|error| error.to_string())?
+                .items
+                .into_iter()
+                .map(|source| (source.object.spec.role.clone(), source))
+                .collect()
+        };
+        let mut selected = BTreeMap::new();
+        for (role, source) in sources {
+            selected.insert(role, self.terminal_source(source).await?.0);
         }
-        Ok(self
-            .resource_backend
-            .including_replicas::<ResourceTerminalSession>(namespace)
-            .list_matching_labels(&BTreeMap::from([(VESSEL_REF_LABEL.to_string(), vessel_ref.to_owned())]))
+        Ok(selected)
+    }
+
+    async fn terminal_source(
+        &self,
+        mut source: flotilla_resources::ReadResourceObject<ResourceTerminalSession>,
+    ) -> Result<(flotilla_resources::ReadResourceObject<ResourceTerminalSession>, Option<String>), String> {
+        let origin = match &source.provenance {
+            ResourceProvenance::Local => None,
+            ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.as_str()),
+        };
+        let (object, launch) = flotilla_store::read_terminal_session(Arc::clone(&self.lifecycle_reads), &source.object, origin)
             .await
-            .map_err(|err| err.to_string())?
-            .items
-            .into_iter()
-            .map(|session| (session.object.spec.role.clone(), session))
-            .collect())
+            .map_err(|error| error.to_string())?;
+        source.object = object;
+        Ok((source, launch))
+    }
+
+    async fn restart_terminal(
+        &self,
+        namespace: &str,
+        obj: &ResourceObject<ResourceTerminalSession>,
+        replaces: Option<&str>,
+    ) -> Result<(), String> {
+        self.resource_backend.request_terminal_replacement(obj, replaces, self.clock.now()).await.map_err(|error| error.to_string())?;
+        apply_resource_status_patch(
+            &self.resource_backend.using::<ResourceTerminalSession>(namespace),
+            &obj.metadata.name,
+            &TerminalSessionStatusPatch::MarkStarting,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
     }
 
     // Crew handoff consumes process state independently of the live island charter.
@@ -2116,6 +2152,10 @@ impl CrewService {
             let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, &context.namespace, &receiver)
                 .await
                 .map_err(|error| error.to_string())?;
+            let holder = match holder {
+                Some(holder) => Some(self.terminal_source(holder).await?.0),
+                None => None,
+            };
             if holder.as_ref().is_some_and(|holder| {
                 holder.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Failed)
             }) {
@@ -2196,6 +2236,13 @@ impl CrewService {
                 Err(ResourceError::NotFound { .. }) => None,
                 Err(error) => return Err(error.to_string()),
             };
+        let (target_source, target_launch) = match target_source {
+            Some(source) => {
+                let (source, launch) = self.terminal_source(source).await?;
+                (Some(source), launch)
+            }
+            None => (None, None),
+        };
         let target_origin = target_source.as_ref().and_then(|session| match &session.provenance {
             ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.clone()),
             ResourceProvenance::Local => None,
@@ -2301,20 +2348,22 @@ impl CrewService {
                     Ok(existing) if existing.spec.env_ref != environment_ref => {
                         Err(format!("crew target `{target}` moved to another environment during credential staging"))
                     }
-                    Ok(existing) => match existing.status.as_ref().map(|status| status.phase) {
-                        Some(ResourceTerminalSessionPhase::Running) => send().await.map(|_| ()),
-                        Some(ResourceTerminalSessionPhase::Stopped | ResourceTerminalSessionPhase::Lost) => {
-                            send().await.map(|_| ())?;
-                            apply_resource_status_patch(&sessions, &terminal_name, &TerminalSessionStatusPatch::MarkStarting)
-                                .await
-                                .map(|_| ())
-                                .map_err(|err| err.to_string())
+                    Ok(existing) => {
+                        let (existing, _) = flotilla_store::read_terminal_session(Arc::clone(&self.lifecycle_reads), &existing, None)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        match existing.status.as_ref().map(|status| status.phase) {
+                            Some(ResourceTerminalSessionPhase::Running) => send().await.map(|_| ()),
+                            Some(ResourceTerminalSessionPhase::Stopped | ResourceTerminalSessionPhase::Lost) => {
+                                send().await.map(|_| ())?;
+                                self.restart_terminal(&context.namespace, &existing, target_launch.as_deref()).await
+                            }
+                            Some(ResourceTerminalSessionPhase::Failed) => {
+                                Err(format!("crew target `{target}` failed provisioning and cannot be revived"))
+                            }
+                            Some(ResourceTerminalSessionPhase::Starting) | None => send().await.map(|_| ()),
                         }
-                        Some(ResourceTerminalSessionPhase::Failed) => {
-                            Err(format!("crew target `{target}` failed provisioning and cannot be revived"))
-                        }
-                        Some(ResourceTerminalSessionPhase::Starting) | None => send().await.map(|_| ()),
-                    },
+                    }
                     Err(ResourceError::NotFound { .. }) => {
                         let anchor = anchor.ok_or_else(|| format!("crew target `{target}` disappeared during credential staging"))?;
                         let current_convoy = convoys.get(&context.convoy).await.map_err(|error| error.to_string())?;
@@ -2549,7 +2598,6 @@ impl CrewService {
             .and_then(|crew| crew.get(&role))
             .map(|state| state.phase)
             .expect("selected candidate has crew work");
-        let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(namespace);
         let session = self
             .resource_backend
             .including_replicas::<ResourceTerminalSession>(namespace)
@@ -2561,6 +2609,15 @@ impl CrewService {
             .await
             .map_err(|err| err.to_string())
             .map(|list| list.items.into_iter().next());
+        let mut session_launch = None;
+        let session = match session {
+            Ok(Some(source)) => {
+                let (source, launch) = self.terminal_source(source).await?;
+                session_launch = launch;
+                Ok(Some(source))
+            }
+            other => other,
+        };
         // Fresh idle evidence is a turn boundary, including crews already idle when queued.
         let at_turn_boundary = session.as_ref().ok().and_then(Option::as_ref).is_some_and(|session| {
             session.object.status.as_ref().is_some_and(|status| {
@@ -2707,9 +2764,7 @@ impl CrewService {
         self.reconcile_or_restore_crew_work(namespace, &session.spec.env_ref, &convoys, name, status.clone(), &reopened).await?;
         let delivery_result: Result<(), String> = async {
             if session.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Stopped) {
-                apply_resource_status_patch(&sessions, &session.metadata.name, &TerminalSessionStatusPatch::MarkStarting)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                self.restart_terminal(namespace, &session, session_launch.as_deref()).await?;
             }
             self.publish_message_intent(namespace, &message_name, &resume_intent).await?;
             Ok(())
@@ -3080,6 +3135,13 @@ impl CrewService {
         let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, &request.namespace, &receiver)
             .await
             .map_err(|error| error.to_string())?;
+        let (holder, holder_launch) = match holder {
+            Some(holder) => {
+                let (holder, launch) = self.terminal_source(holder).await?;
+                (Some(holder), launch)
+            }
+            None => (None, None),
+        };
         // This is the observed admission rung, not a transport or session receipt.
         let rung = if holder
             .as_ref()
@@ -3152,13 +3214,7 @@ impl CrewService {
                                 matches!(status.phase, ResourceTerminalSessionPhase::Stopped | ResourceTerminalSessionPhase::Lost)
                             })
                         {
-                            apply_resource_status_patch(
-                                &self.resource_backend.using::<ResourceTerminalSession>(&request.namespace),
-                                &holder.object.metadata.name,
-                                &TerminalSessionStatusPatch::MarkStarting,
-                            )
-                            .await
-                            .map_err(|error| error.to_string())?;
+                            self.restart_terminal(&request.namespace, &holder.object, holder_launch.as_deref()).await?;
                         }
                     }
                 }

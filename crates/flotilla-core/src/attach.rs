@@ -529,6 +529,7 @@ impl<'a> AttachResolver<'a> {
         }
         let mut candidates = Vec::new();
         for session in sessions_by_name.into_values() {
+            let (session, _) = flotilla_resources::terminal_launches::read(self.lifecycle_reads, &session, None)?;
             let convoy_address = session_convoy_address(&session, None, &convoy_addresses);
             candidates.push(AttachCandidate {
                 label: attach_reference_label(&session.metadata.name, &session.metadata.labels, convoy_address.map(String::as_str)),
@@ -542,6 +543,7 @@ impl<'a> AttachResolver<'a> {
             let ResourceProvenance::Replica { origin_root, .. } = replicated.provenance else {
                 unreachable!("local durable sessions were partitioned above");
             };
+            let (session, _) = flotilla_resources::terminal_launches::read(self.lifecycle_reads, &session, Some(origin_root.as_str()))?;
             let Some(host) = self.host_registry.live_routed_host_name(&origin_root).await else {
                 continue;
             };

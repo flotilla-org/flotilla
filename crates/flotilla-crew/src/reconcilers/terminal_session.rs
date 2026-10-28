@@ -178,6 +178,7 @@ pub trait TerminalRuntime: Send + Sync {
 }
 
 pub struct TerminalSessionReconciler<R> {
+    backend: ResourceBackend,
     runtime: Arc<R>,
     clock: Arc<dyn flotilla_resources::Clock>,
     lifecycle_reads: Arc<dyn LifecycleReads>,
@@ -194,6 +195,7 @@ pub struct TerminalSessionReconciler<R> {
 impl<R> TerminalSessionReconciler<R> {
     pub fn new(runtime: Arc<R>, backend: ResourceBackend, namespace: &str) -> Self {
         Self {
+            backend: backend.clone(),
             runtime,
             clock: Arc::new(flotilla_resources::SystemClock),
             lifecycle_reads: Arc::new(NoLifecycleReads),
@@ -354,6 +356,7 @@ enum TerminalOwnerState {
 }
 
 pub enum TerminalPrepared {
+    Engine { obj: Box<ResourceObject<TerminalSession>>, prepared: Box<TerminalPrepared> },
     None,
     Waiting,
     BriefWaiting,
@@ -414,14 +417,8 @@ fn launch_brief_message_id(source: &TerminalSessionSource) -> Option<&str> {
     }
 }
 
-impl<R> Reconciler for TerminalSessionReconciler<R>
-where
-    R: TerminalRuntime + 'static,
-{
-    type Resource = TerminalSession;
-    type Prepared = TerminalPrepared;
-
-    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+impl<R: TerminalRuntime + 'static> TerminalSessionReconciler<R> {
+    async fn prepare_observation(&self, obj: &ResourceObject<TerminalSession>) -> Result<TerminalPrepared, ResourceError> {
         if !self.actuates(obj) {
             return Ok(TerminalPrepared::None);
         }
@@ -733,6 +730,26 @@ where
             Err(err) => TerminalPrepared::Failed(err),
         })
     }
+}
+
+impl<R> Reconciler for TerminalSessionReconciler<R>
+where
+    R: TerminalRuntime + 'static,
+{
+    type Resource = TerminalSession;
+    type Prepared = TerminalPrepared;
+
+    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        if !self.actuates(obj) {
+            return Ok(TerminalPrepared::None);
+        }
+        let (selected, launch) = flotilla_store::read_terminal_session(Arc::clone(&self.lifecycle_reads), obj, None).await?;
+        let prepared = self.prepare_observation(&selected).await?;
+        if matches!(prepared, TerminalPrepared::RecoverLost) && launch.is_some() {
+            self.backend.request_terminal_replacement(obj, launch.as_deref(), self.clock.now()).await?;
+        }
+        Ok(if launch.is_some() { TerminalPrepared::Engine { obj: Box::new(selected), prepared: Box::new(prepared) } } else { prepared })
+    }
 
     fn reconcile(
         &self,
@@ -740,6 +757,9 @@ where
         prepared: &Self::Prepared,
         now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
+        if let TerminalPrepared::Engine { obj, prepared } = prepared {
+            return self.reconcile(obj, prepared, now);
+        }
         if matches!(prepared, TerminalPrepared::OwnerMissing) {
             return ReconcileOutcome::with_actuations(
                 None,
@@ -815,7 +835,8 @@ where
                 | TerminalPrepared::DaemonReach(_)
                 | TerminalPrepared::OwnerMissing
                 | TerminalPrepared::OwnerTerminal
-                | TerminalPrepared::EnvironmentLost(_) => None,
+                | TerminalPrepared::EnvironmentLost(_)
+                | TerminalPrepared::Engine { .. } => None,
             },
             (TerminalSessionPhase::Running, _) if matches!(prepared, TerminalPrepared::Stopped | TerminalPrepared::AgentExited(_)) => {
                 Some(TerminalSessionStatusPatch::MarkStopped {
@@ -1042,6 +1063,8 @@ where
     }
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        let (selected, _) = flotilla_store::read_terminal_session(Arc::clone(&self.lifecycle_reads), obj, None).await?;
+        let obj = &selected;
         if !self.actuates(obj) {
             return Ok(());
         }

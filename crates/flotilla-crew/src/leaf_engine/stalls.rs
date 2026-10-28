@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use flotilla_change_request::observation::ChangeRequestKey;
@@ -417,7 +418,15 @@ impl ReconcilerWake {
         let projects = views.projects.snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
         let available_convoys = views.convoys.snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
         let available_ensures = views.ensures.snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
-        let sessions_list = views.sessions.snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
+        let sessions_snapshot = views.sessions.snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
+        let sessions_list = Arc::new(flotilla_resources::ReadResourceList {
+            items: flotilla_store::read_terminal_sources(
+                Arc::clone(&self.subscriptions.inner.lifecycle_reads),
+                sessions_snapshot.items.clone(),
+            )
+            .await
+            .map_err(|error| error.to_string())?,
+        });
         let sessions = &sessions_list.items;
         let observation_list = views.change_requests.shared_list().await.map_err(|error| error.to_string())?;
         let progress_observations = freshest_change_request_refs(&observation_list.items);

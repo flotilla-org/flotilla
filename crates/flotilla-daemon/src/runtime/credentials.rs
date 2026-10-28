@@ -155,12 +155,22 @@ pub(super) async fn reconcile_work_credentials_filtered(
                 .is_none_or(|target| vessel.status.as_ref().and_then(|status| status.environment_ref.as_deref()) == Some(target))
         })
         .collect::<Vec<_>>();
-    let live_crew_vessels = backend
+    let raw_sessions = backend
         .using::<TerminalSession>(namespace)
         .list()
         .await
         .map_err(|error| format!("list crew terminal sessions for credential delivery: {error}"))?
-        .items
+        .items;
+    let mut selected_sessions = Vec::with_capacity(raw_sessions.len());
+    for session in raw_sessions {
+        selected_sessions.push(
+            flotilla_store::read_terminal_session(state.daemon.lifecycle_reads(), &session, None)
+                .await
+                .map_err(|error| error.to_string())?
+                .0,
+        );
+    }
+    let live_crew_vessels = selected_sessions
         .into_iter()
         .filter_map(|session| {
             let TerminalSessionSource::Agent { context, .. } = &session.spec.source else { return None };

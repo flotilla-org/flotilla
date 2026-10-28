@@ -48,14 +48,18 @@ where
         Self { home, reads, store }
     }
 
+    pub fn name(&self, obj: &ResourceObject<B::Old>) -> String {
+        flotilla_provisioning::engine::current::<B>(self.home.as_ref(), obj).0
+    }
+
     pub fn request(&self, obj: &ResourceObject<B::Old>) {
-        self.home.request(&obj.metadata.name, B::request(obj, "home").expect("request"), Timestamp(1_000_000)).expect("requested");
+        self.home.request(&self.name(obj), B::request(obj, "home").expect("request"), Timestamp(1_000_000)).expect("requested");
     }
 
     pub fn retry(&self, obj: &ResourceObject<B::Old>, cause: &str) {
         self.home
             .step(
-                &obj.metadata.name,
+                &self.name(obj),
                 &Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Transient, cause), retryable: true }),
                 Timestamp(2_000_000),
             )
@@ -65,9 +69,9 @@ where
     /// Persist only Attempted, modelling a restart before GiveUp; later assertions use the store read port.
     pub fn exhaust_before_give_up(&self, obj: &ResourceObject<B::Old>, cause: &str) {
         let mut home = Home::<Lifecycle<B::Kind>, _>::with_log("home", StoreLog::new(Arc::clone(&self.store))).expect("home");
-        home.restore(self.home.get(&obj.metadata.name).expect("requested resource")).expect("restore");
+        home.restore(self.home.get(&self.name(obj)).expect("requested resource")).expect("restore");
         home.apply(
-            &obj.metadata.name,
+            &self.name(obj),
             Attempted { outcome: Outcome::Failed { cause: Cause::new(CauseCategory::Refused, cause), retryable: false } },
             &MemoryLifecycleWorld::default(),
             Timestamp(2_000_000),
@@ -76,7 +80,8 @@ where
     }
 
     pub fn finish(&self, obj: &ResourceObject<B::Old>, ending: Ending<'_>) {
-        let name = &obj.metadata.name;
+        let name = self.name(obj);
+        let name = name.as_str();
         let step = match ending {
             Ending::Ready(identity) => Step::Realised { identity: identity.into() },
             Ending::Lost(identity) => {
@@ -89,7 +94,11 @@ where
             }
             Ending::Released => Step::Released,
             Ending::Failed(reason) => {
-                self.home.step(name, &Step::Realised { identity: "backing".into() }, Timestamp(3_000_000)).expect("ready");
+                if !self.home.get(name).is_some_and(|resource| {
+                    matches!(resource.state(), flotilla_state_machines::machines::lifecycle::LifecycleState::Realised { .. })
+                }) {
+                    self.home.step(name, &Step::Realised { identity: "backing".into() }, Timestamp(3_000_000)).expect("ready");
+                }
                 Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Failed { reason: reason.into() } }
             }
             Ending::GaveUp(cause) => {
@@ -97,7 +106,16 @@ where
             }
         };
         self.home.step(name, &step, Timestamp(4_000_000)).expect("ending");
-        assert!(B::copy(obj, &self.home.get(name).expect("held")).is_none(), "a migrated binding emits no copy");
+    }
+
+    /// Restore the controller's home from SQLite after an interrupted write sequence.
+    pub fn reopen(&self) -> Arc<dyn Lifecycles<B::Kind>>
+    where
+        flotilla_state_machines::Resource<Lifecycle<B::Kind>>: flotilla_schema::Kind,
+    {
+        let home: Home<Lifecycle<B::Kind>, StoreLog> =
+            flotilla_engine_store::open_home(StoreLog::new(Arc::clone(&self.store))).expect("restore home");
+        Arc::new(LifecycleHome::new("home", home))
     }
 
     pub fn poison(&self) {
@@ -181,4 +199,91 @@ pub fn image_build(phase: flotilla_resources::ImageBuildPhase) -> ResourceObject
             ..Default::default()
         },
     )
+}
+
+/// Contradictory terminal observations; launch identity is selected separately from the engine.
+pub fn terminal_session(phase: flotilla_resources::TerminalSessionPhase) -> ResourceObject<flotilla_resources::TerminalSession> {
+    use flotilla_resources::{TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus};
+    object(
+        "terminal-a",
+        TerminalSessionSpec {
+            env_ref: "env".into(),
+            role: "coder".into(),
+            source: TerminalSessionSource::Tool { command: "bash".into() },
+            cwd: "/work".into(),
+            pool: "cleat".into(),
+            env: Default::default(),
+        },
+        TerminalSessionStatus {
+            phase,
+            session_id: Some("old".into()),
+            message: Some("stale reason".into()),
+            stopped_at: Some(chrono::DateTime::UNIX_EPOCH),
+            ..Default::default()
+        },
+    )
+}
+
+pub type TerminalFixture = LifecycleFixture<flotilla_provisioning::engine::terminal_session::TerminalSessionBinding>;
+
+impl TerminalFixture {
+    pub fn replace(&self, obj: &ResourceObject<flotilla_resources::TerminalSession>, predecessor: &str) -> Result<String, String> {
+        use flotilla_resources::terminal_launches::TerminalLaunches;
+        flotilla_provisioning::engine::terminal_session::EngineTerminalLaunches { lifecycles: self.home.clone() }.replace(
+            obj,
+            predecessor,
+            chrono::DateTime::UNIX_EPOCH + chrono::Duration::seconds(10),
+        )
+    }
+}
+
+impl TerminalFixture {
+    /// Inject a storage-boundary failure, forwarding every successful write to the actual SQLite log.
+    pub fn replacement_write_failures(
+        &self,
+        obj: &ResourceObject<flotilla_resources::TerminalSession>,
+        create: bool,
+        count: usize,
+    ) -> Arc<dyn Lifecycles<flotilla_provisioning::stored::terminal_session::TerminalSessionKind>> {
+        use flotilla_state_machines::machines::lifecycle::LifecycleEdgeKind;
+        use flotilla_state_machines::{EdgeEventOf, InputRead, LogError, Resource, StoredState, Version};
+        type Machine = Lifecycle<flotilla_provisioning::stored::terminal_session::TerminalSessionKind>;
+        struct FailedWrites {
+            inner: StoreLog,
+            create: bool,
+            remaining: usize,
+        }
+        impl Log<Machine> for FailedWrites {
+            fn create(
+                &mut self,
+                writer: &str,
+                at: Timestamp,
+                resource: &Resource<Machine>,
+                reads: &[InputRead],
+            ) -> Result<Version, LogError> {
+                if self.create && self.remaining > 0 {
+                    self.remaining -= 1;
+                    return Err(LogError::new("injected successor create failure"));
+                }
+                self.inner.create(writer, at, resource, reads)
+            }
+            fn edge(
+                &mut self,
+                previous: &StoredState<Machine>,
+                next: &Resource<Machine>,
+                event: &EdgeEventOf<Machine>,
+            ) -> Result<Version, LogError> {
+                if !self.create && self.remaining > 0 && matches!(&event.edge, LifecycleEdgeKind::Vanish) {
+                    self.remaining -= 1;
+                    return Err(LogError::new("injected predecessor ending failure"));
+                }
+                self.inner.edge(previous, next, event)
+            }
+        }
+        let mut home =
+            Home::<Machine, _>::with_log("home", FailedWrites { inner: StoreLog::new(self.store.clone()), create, remaining: count })
+                .expect("home");
+        home.restore(self.home.get(&self.name(obj)).expect("predecessor")).expect("restore");
+        Arc::new(LifecycleHome::new("home", home))
+    }
 }
