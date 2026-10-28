@@ -19,9 +19,9 @@ A system for improving multi-agent developer workflows. Consists of a daemon mes
 
 ### Plane-A freeze (transition in progress)
 
-Flotilla is consolidating its provider integrations and k8s-isomorphic control plane around resources. Provider refreshes still gather adapter data, while discovered checkout facts are projected into a second, ephemeral `ResourceBackend` by `crates/flotilla-observation/src/observed_resources.rs`. The Aggregator combines observed and durable resources into query result sets for the TUI. See `docs/roadmap.md`, `CONTEXT.md`, and the ADRs in `docs/adr/`; the umbrella is flotilla-org/flotilla#604.
+Flotilla is consolidating its provider integrations and k8s-isomorphic control plane around resources. Provider refreshes still gather adapter data, while discovered checkout facts are projected into a second, ephemeral `ResourceBackend` by `crates/flotilla-observation/src/observed_resources.rs`. The Aggregator combines observed and durable resources into query result sets for the TUI. The umbrella is flotilla-org/flotilla#604.
 
-**The remaining Plane-A peer layer is bugfix-only.** Do not add net-new features to the peer-merge subsystem (`crates/flotilla-daemon/src/peer/`); it is slated for deletion as multi-host behavior finishes moving to resource-store federation. Bugfixes and tests are fine. New multi-host capability belongs in resource replication and the eventual Tender. If a change feels like it grows peer-merge, stop and check the roadmap.
+**The remaining Plane-A peer layer is bugfix-only.** Do not add net-new features to the peer-merge subsystem (`crates/flotilla-daemon/src/peer/`); it is slated for deletion as multi-host behavior finishes moving to resource-store federation. Bugfixes and tests are fine. New multi-host capability belongs in resource replication and the eventual Tender. If a change feels like it grows peer-merge, stop and ask.
 
 The TUI is *factored, not frozen* — keep it maintained, but extract the surface-agnostic view-model rather than duplicating presentation logic per surface.
 
@@ -95,7 +95,7 @@ subscribers. Keep tests that require process-wide state (such as a global alloca
 
 ## Testing Philosophy
 
-- Outbound HTTP code must be tested against an in-process stand-in that enforces the remote service's documented request requirements, or against a recorded replay fixture. Mock-only coverage that accepts arbitrary requests is insufficient. Document justified exceptions beside the affected tests; the [HTTP audit](docs/http-request-contract-audit.md) indexes coverage and exceptions. Use test identities and signing keys for credential contracts; never record live token mints.
+- Outbound HTTP code must be tested against an in-process stand-in that enforces the remote service's documented request requirements, or against a recorded replay fixture. Mock-only coverage that accepts arbitrary requests is insufficient. Document justified exceptions beside the affected tests. Use test identities and signing keys for credential contracts; never record live token mints.
 
 - Prefer behavior tests that run through injected collaborators over tests that depend on real filesystem state, subprocess orchestration, sockets, or live multi-host setup.
 - When a subsystem has multiple storage or transport implementations, specify the behavior once and run the same contract tests against each implementation.
@@ -115,11 +115,6 @@ This fork exists for Claude Code Web sessions. Two things to be aware of:
 - **No local servers**: The sandbox blocks binding ports, so MCP servers and visualization tools that start local HTTP servers won't work.
 
 ## Architecture
-
-### Environment provider lifecycle
-
-See [ADR 0058](docs/adr/0058-environment-providers-own-lifecycle-and-runtime-capabilities.md)
-for provider selection, preparation ownership, host adoption and image capability boundaries.
 
 
 `flotilla-observation` is a shared layer below the capability crates. It turns provider facts into observed resources through forge-neutral query ports; core supplies provider discovery and keeps the observed-checkout reconciliation lock.
@@ -422,7 +417,7 @@ Canonical triage roles map to repo labels; `ready-for-agent` maps to the existin
 
 ### Domain docs
 
-Single-context: one `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+Single-context: one `CONTEXT.md` at the repo root. See `docs/agents/domain.md`.
 
 ## Testing Providers with Record/Replay
 
@@ -544,4 +539,4 @@ let session = replay::test_session(&fixture("my.yaml"), masks);
 
 **Important:** Register longer (more specific) values first. Shorter values can partially match longer ones.
 
-Feature-anchor maintenance and release-build trade-offs are documented in `docs/measurements/2747-build-graph.md`. The contributor changing a dependency owns its anchor update; the guard prints the feature-context differences to reconcile.
+The contributor changing a dependency owns its anchor update; the guard prints the feature-context differences to reconcile.

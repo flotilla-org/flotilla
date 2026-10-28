@@ -132,7 +132,6 @@ Repo root is auto-detected from the current directory. Multiple repos can be man
 - [Keybindings](docs/keybindings.md)
 - [Workspace templates](docs/workspace-templates.md)
 - [Configuration](docs/configuration.md)
-- [Architecture](docs/architecture/README.md)
 
 ## Future direction
 
