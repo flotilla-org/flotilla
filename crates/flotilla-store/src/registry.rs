@@ -189,8 +189,7 @@ pub const RETIRED_RESOURCE_KINDS: &[RetiredResourceKind] = &[
     // Retired by #3943 (shipped in r887); remove one roll later, once the corpus is refreshed (#4014).
     // The stored-corpus test reads each entry's r355 file, so retiring r355 forces this removal.
     RetiredResourceKind { kind: "Usage", plural: "usages", api_version: "flotilla.work/v1" },
-    // Retired by #3824 layer 4b-i; nothing authors it since ADR 0062 composed images. Remove one
-    // roll after it ships, once the corpus is refreshed (#4014).
+    // Remove one roll after it ships, once the corpus is refreshed.
     RetiredResourceKind { kind: "CrewImageBaseline", plural: "crewimagebaselines", api_version: "flotilla.work/v1" },
 ];
 

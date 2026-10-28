@@ -1826,8 +1826,6 @@ async fn docker_refuses_unsupported_requested_guest_before_execution() {
     }
 }
 
-// A Docker Environment runs a pinned digest; a mutable tag is refused before any Docker call. The
-// CrewImageBaseline exception that once admitted a controller-verified tag is retired (#3824 layer 4b-i).
 #[tokio::test]
 #[cfg(unix)]
 async fn a_mutable_tag_is_refused_before_any_docker_call() {

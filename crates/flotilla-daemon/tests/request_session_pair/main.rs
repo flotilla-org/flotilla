@@ -1413,8 +1413,6 @@ fn generated_convoy_admission_is_homed_on_placement(tc: hegel::TestCase) {
 
 #[tokio::test]
 async fn router_duplicate_create_scenarios_admit_one_generation_at_the_requested_host() {
-    // Concurrent duplicate requests race through real routing and admission: one generation is
-    // admitted, at the requested host.
     for (name, remote) in [("duplicate-local-create", false), ("duplicate-routed-create", true)] {
         let leader = empty_daemon_named("desk").await;
         let follower = empty_daemon_named("placement").await;
