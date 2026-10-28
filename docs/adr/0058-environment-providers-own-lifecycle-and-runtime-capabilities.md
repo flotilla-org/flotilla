@@ -133,7 +133,7 @@ Rules:
 
 - the interim cloud-sandbox fields as approved here, with checkout strategy inside the cloud-sandbox policy input until #3108.
 - a provider's settings are declared fields of its request, never entries smuggled through the guest environment map.
-- **Owner ruling on #3765 (2026-10-23):** Environment specs carry no crew identity. Each member's crew material is prepared at member start, keyed by that member (#3785), rather than per harness kind at environment provisioning. Do not add declared/required adapter sets to the cloud spec. #3981 retired the `FLOTILLA_REQUIRED_AGENT_ADAPTERS` env control with the Docker carrier: the crew's launch checks its own adapter, and the decode shim accepts and drops the control, with the carrier's credential and skill entries, for one roll.
+- **Owner ruling on #3765 (2026-10-23):** Environment specs carry no crew identity. Each member's crew material is prepared at member start, keyed by that member (#3785), rather than per harness kind at environment provisioning. Do not add declared/required adapter sets to the cloud spec; the existing `FLOTILLA_REQUIRED_AGENT_ADAPTERS` env control remains until #3785 retires it and is excluded from the decode shim.
 - Cloud placement facts are stored typed: `CloudSandboxEnvironmentSpec.probe_needs` and `PlacementDecision.provider_workspace_root`. The preceding generation's `FLOTILLA_CLOUD_IMAGE_NEEDS` is lifted on decode for one roll. The existing stored descriptor capabilities still require owner look-over; this ruling does not approve or reshape them.
 
 - **Docker's stored fields fold into the kind-neutral shape once,** when Environment moves to the generated tables (#3108), with the schema review.

@@ -2,9 +2,10 @@
 //! prepared and provisioned by its own provider. Where the provider's vessels
 //! receive the generation's tools, the vessel layer (#3956 Q4) then lands
 //! through the vessel agent alone: the tools, the crew socket and the
-//! environment that names them. Interior discovery registers the vessel, and its
-//! image is checked against the typed probe needs its Environment declares.
-//! Nothing here names a provider or interprets a reach.
+//! environment that names them, added to what the provider configured. Interior
+//! discovery registers the vessel, and its image is checked against the typed
+//! probe needs its Environment declares. Nothing here names a provider or
+//! interprets a reach.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -15,10 +16,13 @@ use std::{
 use async_trait::async_trait;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_environment::environment::{
-    EnvironmentHandle, EnvironmentProvisionError, EnvironmentToolAssetKind, EnvironmentVariableUpdate, DAEMON_SOCKET_ENV,
+    EnvironmentHandle, EnvironmentProvisionError, EnvironmentToolAssetKind, EnvironmentVariableUpdate, VesselAgent, DAEMON_SOCKET_ENV,
 };
 use flotilla_protocol::EnvironmentId;
-use flotilla_provider_runtime::execution_context::{AccountVariables, BaseLayer, ObservationContext, LOCALE_VARIABLES};
+use flotilla_provider_runtime::{
+    execution_context::{AccountVariables, BaseLayer, ObservationContext, LOCALE_VARIABLES},
+    ChannelLabel,
+};
 use flotilla_provisioning::reconcilers::EnvironmentProvisioning;
 use flotilla_resources::EnvironmentSpec;
 use sha2::Digest;
@@ -30,7 +34,7 @@ use crate::environment_tools::{EnvironmentToolContext, DOCKER_PROVIDER_KIND};
 
 /// The crew socket's file name in the vessel.
 const CREW_SOCKET: &str = "flotilla.sock";
-/// The `PATH` a vessel's tools prepend to when its Environment declares none.
+/// The `PATH` a vessel's tools prepend to when the vessel has none of its own.
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Provision `name` through its own provider, then deliver its vessel layer.
@@ -83,8 +87,9 @@ pub(super) async fn provision(
 
 /// The vessel layer, through the vessel agent: the generation's tools pushed,
 /// the crew socket served in the vessel from this environment's own socket
-/// here, and the environment naming both on top of what the Environment
-/// declares. Each step is idempotent, so re-adoption delivers it again.
+/// here, and the environment naming both, added to what the provider
+/// configured. Each step is idempotent, so re-adoption delivers it again; a
+/// step that fails on a retained backing leaves the earlier ones for the retry.
 async fn deliver_vessel_layer(
     state: &ControllerRuntimeState,
     id: &EnvironmentId,
@@ -100,24 +105,31 @@ async fn deliver_vessel_layer(
     agent.create_dir(&directory, 0o700).await?;
     let guest = directory.join(CREW_SOCKET);
     let cpus = spec.cloud_sandbox.as_ref().map(|cloud| cloud.size.cpus as usize);
-    // The generation's tools in the contained layout, under `/opt/flotilla`.
+    // The generation's tools in the contained layout, under `/opt/flotilla`,
+    // which is what the tool provisioner's Docker kind names.
     let mut tools = state.environment_tools.prepare(DOCKER_PROVIDER_KIND, id.as_str(), &DeclaredSize { state, cpus }).await?;
-    let mut environment = spec.cloud_sandbox.as_ref().map(|cloud| cloud.env.clone()).unwrap_or_default();
+    let mut environment = BTreeMap::new();
     for tool in &mut tools {
         // The crew socket is the layer's own forward, not a pushed file.
         tool.assets.retain(|asset| asset.kind != EnvironmentToolAssetKind::UnixSocket);
         for update in &tool.environment {
-            apply(&mut environment, update, &guest.to_string_lossy());
+            apply(&mut environment, update, &guest.to_string_lossy(), agent.as_ref()).await?;
         }
     }
     agent.forward_controller_socket(&guest, controller.as_path()).await.map_err(|error| format!("forward crew socket: {error}"))?;
     agent.push_tools(&tools).await.map_err(|error| format!("push vessel tools: {error}"))?;
-    agent.configure_environment(environment).await.map_err(|error| format!("configure vessel environment: {error}"))
+    agent.extend_environment(environment).await.map_err(|error| format!("configure vessel environment: {error}"))
 }
 
 /// One tool's update to the vessel's environment. The daemon socket variable
-/// always names the vessel's own crew socket.
-fn apply(environment: &mut BTreeMap<String, String>, update: &EnvironmentVariableUpdate, socket: &str) {
+/// always names the vessel's own crew socket. A path prepends to the vessel's
+/// own value, from its image or its provider, as its agent reports it.
+async fn apply(
+    environment: &mut BTreeMap<String, String>,
+    update: &EnvironmentVariableUpdate,
+    socket: &str,
+    agent: &dyn VesselAgent,
+) -> Result<(), String> {
     match update {
         EnvironmentVariableUpdate::Set { name, .. } if name == DAEMON_SOCKET_ENV => {
             environment.insert(name.clone(), socket.to_string());
@@ -126,11 +138,33 @@ fn apply(environment: &mut BTreeMap<String, String>, update: &EnvironmentVariabl
             environment.insert(name.clone(), value.clone());
         }
         EnvironmentVariableUpdate::PrependPath { name, value } => {
-            let existing = environment.get(name).map(String::as_str).unwrap_or(if name == "PATH" { DEFAULT_PATH } else { "" });
-            let joined = if existing.is_empty() { value.clone() } else { format!("{value}:{existing}") };
+            let existing = match environment.get(name) {
+                Some(existing) => existing.clone(),
+                None => vessel_variable(agent, name).await?,
+            };
+            // Only a vessel with no `PATH` at all takes the conventional one.
+            let existing = if existing.is_empty() && name == "PATH" { DEFAULT_PATH.to_string() } else { existing };
+            let joined = if existing.is_empty() {
+                value.clone()
+            } else if existing.split(':').any(|entry| entry == value) {
+                existing
+            } else {
+                format!("{value}:{existing}")
+            };
             environment.insert(name.clone(), joined);
         }
     }
+    Ok(())
+}
+
+/// The value `name` has for the vessel's commands, empty where it is unset.
+async fn vessel_variable(agent: &dyn VesselAgent, name: &str) -> Result<String, String> {
+    let commands = agent.commands();
+    let value = commands
+        .run("sh", &["-c", "printenv \"$1\" || :", "sh", name], Path::new("/"), &ChannelLabel::Default)
+        .await
+        .map_err(|error| format!("read vessel {name}: {error}"))?;
+    Ok(value.trim_end_matches('\n').to_string())
 }
 
 /// Build limits from the backing's declared size, or this host's where it declares none.

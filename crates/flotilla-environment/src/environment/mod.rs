@@ -292,8 +292,9 @@ pub trait VesselAgent: Send + Sync {
         let _ = controller;
         Err(format!("this vessel agent cannot serve {} from the controller", guest.display()))
     }
-    /// Replace the environment every command in the vessel runs with.
-    async fn configure_environment(&self, environment: std::collections::BTreeMap<String, String>) -> Result<(), String> {
+    /// Add `environment` to what every command in the vessel runs with, over
+    /// what its provider configured there.
+    async fn extend_environment(&self, environment: std::collections::BTreeMap<String, String>) -> Result<(), String> {
         let _ = environment;
         Err("this vessel agent cannot configure its environment".into())
     }
