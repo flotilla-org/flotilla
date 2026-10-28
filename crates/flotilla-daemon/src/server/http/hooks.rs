@@ -183,8 +183,8 @@ impl HookKey {
     }
 }
 
-/// What a host-direct crew launch needs to deliver its hooks over HTTP: the hook routes'
-/// base URL on the loopback listener and its terminal's token.
+/// What a crew launch needs to deliver its hooks over HTTP: the hook routes' base URL, on
+/// the loopback listener or a vessel's agent forward, and its terminal's token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HookLaunch {
     pub base_url: String,
