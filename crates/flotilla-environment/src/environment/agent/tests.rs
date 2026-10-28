@@ -574,7 +574,7 @@ async fn conflicting_upgrade_upload_fails_promptly_with_the_refusal() {
 
 // Transient failures are retried with growing pauses, and the deadline reports
 // the last real failure rather than the timeout that cut the last attempt.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn transient_failures_back_off_and_report_the_last_error() {
     let times = Mutex::new(Vec::new());
     let started = tokio::time::Instant::now();
@@ -594,9 +594,8 @@ async fn transient_failures_back_off_and_report_the_last_error() {
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     assert!(error.to_string().contains("not listening"), "{error}");
     let times = times.into_inner();
-    assert!(times.len() >= 3 && times.len() <= 8, "{times:?}");
-    let gaps: Vec<_> = times.windows(2).map(|w| w[1] - w[0]).collect();
-    assert!(gaps.last().unwrap() > gaps.first().unwrap(), "{gaps:?}");
+    let ms = |n| Duration::from_millis(n);
+    assert_eq!(times, [ms(0), ms(50), ms(150), ms(350)]);
 }
 
 // Generated lifecycle sequences interleave empty/binary material writes, reads,

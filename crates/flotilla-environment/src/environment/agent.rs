@@ -103,6 +103,8 @@ fn is_transient(error: &io::Error) -> bool {
                 | ErrorKind::Unsupported
         );
     }
+    // A plain PermissionDenied is not listed: an ssh-level denial can clear
+    // while the host is still being provisioned. The agent's own refusal is final.
     !matches!(
         error.kind(),
         io::ErrorKind::InvalidData
@@ -145,9 +147,12 @@ where
             Ok(client) => return Ok(client),
             Err(error) if !is_transient(&error) => return Err(error),
             Err(error) => {
-                // The client's own timeout is the deadline cutting the attempt
-                // short; it says less than what failed before.
-                let cut = error.kind() == io::ErrorKind::TimedOut && drydock_agent::AgentError::of(&error).is_none();
+                // The client's own timeout, once the deadline has passed, is
+                // the deadline cutting the attempt short; it says less than
+                // what failed before. A transport timeout earlier is real.
+                let cut = error.kind() == io::ErrorKind::TimedOut
+                    && drydock_agent::AgentError::of(&error).is_none()
+                    && tokio::time::Instant::now() >= deadline;
                 if !cut || last.is_none() {
                     last = Some(error);
                 }
