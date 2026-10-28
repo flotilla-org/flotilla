@@ -221,6 +221,7 @@ impl ManifestRoots for OldStoreManifestRoots {
                 observed_at: chrono::Utc::now(),
                 resolved_token: None,
                 resolution_outcome: None,
+                removed_in: None,
             });
             state.resolved_token = Some(token.to_string());
             state.resolution_outcome = Some(ResolutionOutcome::Started);

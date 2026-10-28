@@ -99,6 +99,9 @@ pub struct DocumentState {
     pub resolved_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_outcome: Option<ResolutionOutcome>,
+    /// The revision that no longer declared the document: set while it is Deleted or Orphaned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_in: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +120,11 @@ pub enum DocumentPhase {
     Refused,
     Drifted,
     Suspended,
+    /// No longer declared, and the resource the root applied for it was deleted.
+    Deleted,
+    /// No longer declared, but its resource was kept (edited since its last apply, suspended, or
+    /// its delete refused) and awaits an operator; the reason says why.
+    Orphaned,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

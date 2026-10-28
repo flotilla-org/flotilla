@@ -30,6 +30,7 @@ async fn contract(backend: ResourceBackend) {
             observed_at: Utc::now(),
             resolved_token: None,
             resolution_outcome: None,
+            removed_in: None,
         },
     );
     let status_updated = roots.update_status("host-a", &updated.metadata.resource_version, &status).await.expect("publish status");

@@ -50,9 +50,10 @@ pub struct PassReport {
     /// The source revision the pass read.
     pub revision: String,
     /// Whether the pass reached every declared document, refused or not: only a complete pass
-    /// advances the applied revision and drops the records of documents no longer declared.
+    /// advances the applied revision and drops the records of documents it did not reach.
     pub complete: bool,
-    /// Each reached document's state: its phase, reason, hashes and resolution outcome.
+    /// Each reached document's state: its phase, reason, hashes and resolution outcome. A document
+    /// no longer declared is reached while its removal is reported (Deleted or Orphaned).
     pub documents: BTreeMap<DocumentKey, DocumentState>,
     /// When the pass ran.
     pub at: DateTime<Utc>,
@@ -93,13 +94,25 @@ pub trait ManifestRoots: Send + Sync {
     async fn set_suspended(&self, namespace: &str, name: &str, key: &DocumentKey, suspended: bool) -> Result<(), String>;
 }
 
-/// The documents `pass` refused, with their reasons: the refusal records it leaves.
+/// Whether `document` awaits an operator: refused, or orphaned (no longer declared, its resource
+/// kept). Each leaves a refusal record with its reason, and together they make the root's stall.
+pub fn awaits_operator(document: &DocumentState) -> bool {
+    matches!(document.phase, crate::DocumentPhase::Refused | crate::DocumentPhase::Orphaned)
+}
+
+/// The documents `pass` refused or orphaned, with their reasons: the refusal records it leaves.
 pub fn refusals(pass: &PassReport) -> BTreeMap<DocumentKey, String> {
     pass.documents
         .iter()
-        .filter(|(_, document)| document.phase == crate::DocumentPhase::Refused)
+        .filter(|(_, document)| awaits_operator(document))
         .map(|(key, document)| (key.clone(), document.reason.clone().unwrap_or_else(|| "manifest document refused".to_owned())))
         .collect()
+}
+
+/// The documents `pass` judged no longer declared, with the revision that removed each: the
+/// removal records it leaves.
+pub fn removals(pass: &PassReport) -> BTreeMap<DocumentKey, String> {
+    pass.documents.iter().filter_map(|(key, document)| Some((key.clone(), document.removed_in.clone()?))).collect()
 }
 
 /// The keys of `documents`, for the documents a pass reached.
@@ -167,7 +180,7 @@ pub fn pass_status(previous: Option<&ManifestRootStatus>, pass: &PassReport, nam
     }
     let refused: BTreeMap<_, _> = documents
         .iter()
-        .filter(|(_, document)| document.phase == crate::DocumentPhase::Refused)
+        .filter(|(_, document)| awaits_operator(document))
         .map(|(key, document)| (key.clone(), document.reason.clone().unwrap_or_else(|| "manifest document refused".to_owned())))
         .collect();
     let evidence = refusal_evidence(refused.iter().map(|(key, reason)| (key, reason.as_str())));

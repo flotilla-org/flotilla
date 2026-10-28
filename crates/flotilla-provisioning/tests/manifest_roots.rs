@@ -41,6 +41,23 @@ fn document(phase: DocumentPhase, hash: &str, reason: Option<&str>) -> DocumentS
         observed_at: Utc.timestamp_opt(1_700_000_000, 0).single().expect("time"),
         resolved_token: None,
         resolution_outcome: None,
+        removed_in: None,
+    }
+}
+
+/// A document no longer declared, removed in `revision`: Deleted, or Orphaned with its baseline
+/// kept and the reason it awaits an operator.
+fn removed(revision: &str, orphaned: Option<(&str, &str)>) -> DocumentState {
+    DocumentState {
+        phase: if orphaned.is_some() { DocumentPhase::Orphaned } else { DocumentPhase::Deleted },
+        reason: orphaned.map(|(_, reason)| reason.to_owned()),
+        live_hash: orphaned.map(|_| "edited".to_owned()),
+        desired_hash: None,
+        baseline_hash: orphaned.map(|(baseline, _)| baseline.to_owned()),
+        observed_at: Utc.timestamp_opt(1_700_000_000, 0).single().expect("time"),
+        resolved_token: None,
+        resolution_outcome: None,
+        removed_in: Some(revision.into()),
     }
 }
 
@@ -135,6 +152,20 @@ async fn contract(roots: &dyn ManifestRoots) {
     assert_eq!(root.baseline(&a), Some("ha3"));
     assert_eq!(root.baseline(&b), Some("hb"));
 
+    // A complete pass that reports `a` deleted and `b` orphaned records the revision that removed
+    // each; the orphan keeps its baseline, and its reason makes the root's stall.
+    let edited = "live spec edited since its last apply";
+    let removal = pass("r4", true, vec![(a.clone(), removed("r4", None)), (b.clone(), removed("r4", Some(("hb", edited))))]);
+    roots.record_pass(NS, ROOT, removal).await.expect("pass");
+    let root = roots.root(NS, ROOT).await.expect("read").expect("root");
+    assert_eq!(root.status.documents[&a].phase, DocumentPhase::Deleted);
+    assert_eq!(root.status.documents[&a].removed_in.as_deref(), Some("r4"));
+    assert_eq!(root.baseline(&a), None);
+    assert_eq!(root.status.documents[&b].phase, DocumentPhase::Orphaned);
+    assert_eq!(root.status.documents[&b].removed_in.as_deref(), Some("r4"));
+    assert_eq!(root.baseline(&b), Some("hb"));
+    assert!(root.status.stalled.as_ref().expect("stall").evidence.contains(&format!("b.yaml: {edited}")));
+
     // Suspension is the operator's, and is undone the same way.
     roots.set_suspended(NS, ROOT, &a, true).await.expect("suspend");
     assert!(roots.root(NS, ROOT).await.expect("read").expect("root").spec.suspended.contains(&a));
@@ -180,8 +211,8 @@ async fn the_engine_keeps_the_manifest_roots_contract() {
 }
 
 // Behaviour (ADR 0064): the engine's records survive a restart: a home opened again over its store
-// reads its roots' revision, baselines and refusals as they were, though the last pass's judgement
-// (kept in memory) is gone.
+// reads its roots' revision, baselines, refusals and removals as they were, though the last pass's
+// judgement (kept in memory) is gone.
 #[tokio::test]
 async fn an_engine_root_reads_back_after_a_restart() {
     let directory = tempfile::tempdir().expect("temp dir");
@@ -193,6 +224,7 @@ async fn an_engine_root_reads_back_after_a_restart() {
     };
     let a = key("a.yaml");
     let b = key("b.yaml");
+    let (deleted, orphaned) = (key("deleted.yaml"), key("orphaned.yaml"));
     {
         let roots = open();
         roots.declare(NS, ROOT, declaration(None)).await.expect("declare");
@@ -202,6 +234,8 @@ async fn an_engine_root_reads_back_after_a_restart() {
             vec![
                 (a.clone(), document(DocumentPhase::Applied, "ha", None)),
                 (b.clone(), document(DocumentPhase::Refused, "hb", Some("unmanaged object"))),
+                (deleted.clone(), removed("r1", None)),
+                (orphaned.clone(), removed("r1", Some(("ho", "suspended")))),
             ],
         );
         roots.record_pass(NS, ROOT, report).await.expect("pass");
@@ -212,4 +246,10 @@ async fn an_engine_root_reads_back_after_a_restart() {
     assert_eq!(root.baseline(&a), Some("ha"));
     assert_eq!(root.status.documents[&b].phase, DocumentPhase::Refused);
     assert_eq!(root.status.documents[&a].live_hash, None, "the judgement is not stored");
+    let removal = |key: &DocumentKey| {
+        let document = &root.status.documents[key];
+        (document.phase, document.removed_in.as_deref(), document.reason.as_deref())
+    };
+    assert_eq!(removal(&deleted), (DocumentPhase::Deleted, Some("r1"), None));
+    assert_eq!(removal(&orphaned), (DocumentPhase::Orphaned, Some("r1"), Some("suspended")));
 }

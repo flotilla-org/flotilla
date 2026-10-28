@@ -49,6 +49,7 @@ This mirrors Argo CD's `Application` and Flux's `Kustomization`: reconciliation 
 - **The daemon materialises one ManifestRoot per root its host declares in config.** Its **home is the host whose checkout it reads.** It replicates read-only, so every host and surface can show refusals.
 - **Document identity** is the root-relative path plus the declared `(kind, namespace, name)`. A moved or renamed document is a new key, and a key whose object is no longer authored drops out.
 - **Removing a root doesn't delete what it applied.** Objects keep their provenance and become unmanaged. Prune policy is a separate, explicit decision.
+- **Removing a document prunes what the root applied for it** (amended by #3992). When an applied revision no longer declares a document the root reached before, the root deletes the resource it owns (by its `manifest-reconciler-root` and `manifest-path` annotations) through the kind's normal delete path, so lifecycle gates and finalizers apply, but only while the live spec still matches the root's baseline. A resource edited since, suspended, or whose delete is refused is kept and reported `orphaned` with the reason, which stalls the root for an operator. `status.documents` reports a deletion (`deleted`) or an orphan with `removed_in`, the revision that removed it, until the document is declared again (or, for an orphan, its resource is gone or no longer the root's).
 
 ### 4. Stalls
 

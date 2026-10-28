@@ -87,6 +87,7 @@ fn every_edge_of_a_root_reads_back_from_the_store() {
             reached: docs(&["a.yaml", "b.yaml"]),
             baselines: hashes(&[("a.yaml", "ha")]),
             refusals: hashes(&[("b.yaml", "unmanaged object")]),
+            removals: BTreeMap::new(),
         };
         home.apply("root", pass, &(), at).expect("applied");
     });
@@ -117,11 +118,12 @@ fn every_edge_of_a_root_reads_back_from_the_store() {
         let pass = Applied {
             revision: "r2".into(),
             complete: true,
-            reached: docs(&["a.yaml"]),
+            reached: docs(&["a.yaml", "b.yaml"]),
             baselines: hashes(&[("a.yaml", "ha2")]),
             refusals: BTreeMap::new(),
+            removals: hashes(&[("b.yaml", "r2")]),
         };
-        home.apply("root", pass, &(), at).expect("pruned");
+        home.apply("root", pass, &(), at).expect("removed");
     });
     step(&mut home, 11, &|home, at| {
         home.apply("root", Retire {}, &(), at).expect("retired");
@@ -159,11 +161,12 @@ mod import {
 
     // Every shape the old reconciler writes (resource_manifest.rs `reconcile_document`): Applied
     // with live, desired and baseline equal; Drifted with the baseline off the live hash, which is
-    // off the desired one; Refused with any hashes, a reason or none; Suspended with any.
+    // off the desired one; Refused with any hashes, a reason or none; Suspended with any; Deleted
+    // with no hashes; Orphaned with its live hash off its baseline.
     fn document(tc: &TestCase, index: usize) -> Old {
         let key =
             DocumentKey { path: format!("d{index}.yaml"), kind: "Forge".into(), namespace: "flotilla".into(), name: format!("f{index}") };
-        let (phase, live, desired, baseline, reason) = match tc.draw(gs::integers::<u8>().min_value(0).max_value(3)) {
+        let (phase, live, desired, baseline, reason) = match tc.draw(gs::integers::<u8>().min_value(0).max_value(5)) {
             0 => {
                 let h = hash(tc);
                 (DocumentPhase::Applied, Some(h.clone()), Some(h.clone()), Some(h), None)
@@ -173,7 +176,9 @@ mod import {
                 let reason = tc.draw(gs::booleans()).then(|| "unmanaged object".to_owned());
                 (DocumentPhase::Refused, Some(hash(tc)), Some(hash(tc)), tc.draw(gs::booleans()).then(|| hash(tc)), reason)
             }
-            _ => (DocumentPhase::Suspended, Some(hash(tc)), Some(hash(tc)), tc.draw(gs::booleans()).then(|| hash(tc)), None),
+            3 => (DocumentPhase::Suspended, Some(hash(tc)), Some(hash(tc)), tc.draw(gs::booleans()).then(|| hash(tc)), None),
+            4 => (DocumentPhase::Deleted, None, None, None, None),
+            _ => (DocumentPhase::Orphaned, Some("live".into()), None, Some(hash(tc)), Some("live spec edited since its last apply".into())),
         };
         let observed_at = Utc.timestamp_opt(1_700_000_000 + index as i64, 0).single().expect("time");
         let state = DocumentState {
@@ -185,6 +190,7 @@ mod import {
             observed_at,
             resolved_token: None,
             resolution_outcome: None,
+            removed_in: matches!(phase, DocumentPhase::Deleted | DocumentPhase::Orphaned).then(|| "r1".to_owned()),
         };
         Old { key, state, suspended: phase == DocumentPhase::Suspended }
     }
@@ -235,6 +241,8 @@ mod import {
                 DocumentPhase::Drifted => Phase::Drifted,
                 DocumentPhase::Refused => Phase::Refused,
                 DocumentPhase::Suspended => Phase::Suspended,
+                DocumentPhase::Deleted => Phase::Deleted,
+                DocumentPhase::Orphaned => Phase::Orphaned,
             };
             let judged = phase(
                 imported.spec(),
@@ -271,6 +279,7 @@ mod import {
                     observed_at: Utc.timestamp_opt(1_700_000_000, 0).single().expect("time"),
                     resolved_token: None,
                     resolution_outcome: None,
+                    removed_in: None,
                 },
                 suspended: false,
             })

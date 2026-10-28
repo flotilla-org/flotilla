@@ -133,6 +133,13 @@ CREATE TABLE "manifest_root_resolutions" (
       THEN "outcome_reason" IS NOT NULL
       END)
 ) STRICT, WITHOUT ROWID;
+CREATE TABLE "manifest_root_removals" (
+  "manifest_root" INTEGER NOT NULL,
+  "key" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "value" TEXT NOT NULL,
+  PRIMARY KEY ("manifest_root", "key"),
+  FOREIGN KEY ("manifest_root") REFERENCES "manifest_root" ("id") ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
 CREATE INDEX "manifest_root_bound_by_host" ON "manifest_root" ("host") WHERE "state" IN ('bd');
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('mr', 'state', 'bd', 'Bound'),
@@ -197,6 +204,11 @@ CREATE VIEW "manifest_root_resolutions_view" AS SELECT
   (SELECT "name" FROM "codes" WHERE "kind" = 'mr' AND "field" = 'resolutions.outcome' AND "code" = "manifest_root_resolutions"."outcome") AS "outcome",
   "manifest_root_resolutions"."outcome_reason"
 FROM "manifest_root_resolutions";
+CREATE VIEW "manifest_root_removals_view" AS SELECT
+  "manifest_root_removals"."manifest_root",
+  (SELECT "s" FROM "strings" WHERE "id" = "manifest_root_removals"."key") AS "key",
+  "manifest_root_removals"."value"
+FROM "manifest_root_removals";
 CREATE VIEW "log_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "l"."home") AS "home",
   "l"."home_seq",

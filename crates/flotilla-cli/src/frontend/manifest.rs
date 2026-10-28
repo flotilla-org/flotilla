@@ -83,8 +83,12 @@ fn format_manifest_status_row(row: &serde_json::Value, resolution_action: Option
     let key = &row["document"];
     let phase = row["state"]["phase"].as_str().unwrap_or("unknown");
     let reason = row["state"]["reason"].as_str().unwrap_or("");
-    let reason =
-        row["applied_revision"].as_str().map(|revision| format!("{reason} (applied {revision})")).unwrap_or_else(|| reason.to_string());
+    let reason = match row["state"]["removed_in"].as_str() {
+        Some(revision) if reason.is_empty() => format!("removed in {revision}"),
+        Some(revision) => format!("removed in {revision}: {reason}"),
+        None => reason.to_string(),
+    };
+    let reason = row["applied_revision"].as_str().map(|revision| format!("{reason} (applied {revision})")).unwrap_or(reason);
     let pending = row["pending_resolution"].as_str().map(|action| format!("pending {action}")).unwrap_or_default();
     let reason = if resolution_action == Some(flotilla_resources::ResolutionAction::Adopt)
         && row["state"]["resolution_outcome"].get("failed").is_some()
@@ -255,6 +259,28 @@ mod tests {
         assert_eq!(
             super::format_manifest_status_row(&row, Some(flotilla_resources::ResolutionAction::Adopt)),
             "manifest-123\tpolicy.yaml\tPlacementPolicy/flotilla/adopt-me\trefused\t\tlive spec changed while adopting; adoption may have rewritten the source file; inspect it before retrying with a new token"
+        );
+    }
+
+    // Behaviour (#3992): a removed document's row names the revision that removed it.
+    #[test]
+    fn manifest_status_names_the_revision_that_removed_a_document() {
+        let row = |state: serde_json::Value| {
+            serde_json::json!({
+                "root": "manifest-123",
+                "document": {"path": "grant.json", "kind": "CredentialGrant", "namespace": "flotilla", "name": "grant"},
+                "state": state,
+                "pending_resolution": null
+            })
+        };
+        assert_eq!(
+            super::format_manifest_status_row(&row(serde_json::json!({"phase": "deleted", "removed_in": "f451954"})), None),
+            "manifest-123\tgrant.json\tCredentialGrant/flotilla/grant\tdeleted\t\tremoved in f451954"
+        );
+        let orphaned = serde_json::json!({"phase": "orphaned", "reason": "live spec edited", "removed_in": "f451954"});
+        assert_eq!(
+            super::format_manifest_status_row(&row(orphaned), None),
+            "manifest-123\tgrant.json\tCredentialGrant/flotilla/grant\torphaned\t\tremoved in f451954: live spec edited"
         );
     }
 

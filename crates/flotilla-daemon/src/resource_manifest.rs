@@ -1,7 +1,9 @@
-//! Additive, ownership-aware application of resource manifest directories.
+//! Ownership-aware application of resource manifest directories.
 //!
-//! This reconciler intentionally does not prune objects whose source documents
-//! disappear. Deletion and adoption are separate, explicit lifecycle acts.
+//! A document the root applied and a later revision no longer declares is pruned (#3992): the
+//! root deletes the resource it owns (by its root and path annotations) while the live spec still
+//! matches the root's baseline, through the kind's normal delete path, and otherwise keeps it and
+//! reports it orphaned for an operator. Adoption remains an explicit operator act.
 
 #[cfg(test)]
 use flotilla_store_memory::InMemoryBackend;
@@ -21,8 +23,8 @@ use flotilla_resources::{
     ResolutionOutcome, ResourceError, MANAGED_BY_LABEL,
 };
 use flotilla_store::{
-    apply_manifest_resource_document, get_resource_kind, resource_document_spec_hash, validate_resource_document, EventRecorder,
-    OldStoreManifestRoots, ResourceBackend,
+    apply_manifest_resource_document, delete_resource_kind, get_resource_kind, resource_document_spec_hash, validate_resource_document,
+    EventRecorder, OldStoreManifestRoots, ResourceBackend,
 };
 use flotilla_vcs::vcs::Vcs;
 use serde::Deserialize;
@@ -89,6 +91,10 @@ pub struct ManifestPassReport {
     pub unchanged: usize,
     pub drifted: usize,
     pub unmanaged: usize,
+    /// Documents no longer declared whose resources this pass deleted.
+    pub deleted: usize,
+    /// Documents no longer declared whose resources are kept for an operator.
+    pub orphaned: usize,
     pub errors: Vec<ManifestDocumentError>,
 }
 
@@ -230,7 +236,7 @@ impl ResourceManifestReconciler {
             for error in &report.errors {
                 warn!(path = %error.path.display(), reason = %error.reason, "manifest document rejected");
             }
-            if report.created > 0 || report.updated > 0 {
+            if report.created > 0 || report.updated > 0 || report.deleted > 0 {
                 info!(
                     root = %self.root.display(),
                     created = report.created,
@@ -238,6 +244,8 @@ impl ResourceManifestReconciler {
                     unchanged = report.unchanged,
                     drifted = report.drifted,
                     unmanaged = report.unmanaged,
+                    deleted = report.deleted,
+                    orphaned = report.orphaned,
                     errors = report.errors.len(),
                     "manifest reconciliation pass applied desired state"
                 );
@@ -385,11 +393,15 @@ impl ResourceManifestReconciler {
         let mut report = ManifestPassReport::default();
         let previous = root_resource.status.documents.clone();
         let mut documents = BTreeMap::new();
+        // Files this revision holds but that did not yield every document's identity: they may
+        // still declare a document the root applied, so none of theirs is judged removed.
+        let mut unread = BTreeSet::new();
         for (path, parsed) in files {
             let relative = path.strip_prefix(&self.root).unwrap_or(&path).to_path_buf();
             let parsed = match parsed {
                 Ok(parsed) => parsed,
                 Err(reason) => {
+                    unread.insert(relative.to_string_lossy().into_owned());
                     let key = DocumentKey {
                         path: relative.to_string_lossy().into_owned(),
                         kind: String::new(),
@@ -411,12 +423,15 @@ impl ResourceManifestReconciler {
                         namespace: identity.namespace.clone(),
                         name: identity.name.clone(),
                     },
-                    Err(_) => DocumentKey {
-                        path: relative.to_string_lossy().into_owned(),
-                        kind: String::new(),
-                        namespace: String::new(),
-                        name: format!("#{}", index + 1),
-                    },
+                    Err(_) => {
+                        unread.insert(relative.to_string_lossy().into_owned());
+                        DocumentKey {
+                            path: relative.to_string_lossy().into_owned(),
+                            kind: String::new(),
+                            namespace: String::new(),
+                            name: format!("#{}", index + 1),
+                        }
+                    }
                 };
                 let document_revision = document
                     .pointer("/metadata/annotations/flotilla.work~1charter-revision")
@@ -453,9 +468,32 @@ impl ResourceManifestReconciler {
         if let Some(desired) = &charter_layers {
             self.prune_charter_image_layers(desired).await?;
         }
-        // Every declared document has a state by now, refused or not: the pass is complete, so it
-        // advances the applied revision and prunes the records of documents no longer declared
-        // (the ManifestRoot spec's rule). Refusals and drift are judged from the records it leaves.
+        // A resource still declared, under another path, is not removed.
+        let declared: BTreeSet<_> = documents.keys().map(|key| (key.kind.clone(), key.namespace.clone(), key.name.clone())).collect();
+        for (key, state) in &previous {
+            if documents.contains_key(key) || declared.contains(&(key.kind.clone(), key.namespace.clone(), key.name.clone())) {
+                continue;
+            }
+            if unread.contains(&key.path) {
+                documents.insert(key.clone(), state.clone());
+                continue;
+            }
+            match self.judge_removed(key, state, &root_resource.spec, &revision, &mut report).await {
+                Ok(Some(judged)) => {
+                    documents.insert(key.clone(), judged);
+                }
+                Ok(None) => {}
+                Err(reason) => {
+                    // Judged again by the next pass; until then its records stand.
+                    documents.insert(key.clone(), state.clone());
+                    report.errors.push(ManifestDocumentError { path: PathBuf::from(&key.path), reason });
+                }
+            }
+        }
+        // Every declared document has a state by now, refused or not, and every removed one the root
+        // still reports: the pass is complete, so it advances the applied revision and prunes the
+        // records of the documents it did not reach (the ManifestRoot spec's rule). Refusals, drift
+        // and orphans are judged from the records it leaves.
         let pass = PassReport { revision, complete: true, documents, at: chrono::Utc::now() };
         self.roots.record_pass(&self.default_namespace, &self.root_name(), pass).await?;
         Ok(report)
@@ -521,6 +559,82 @@ impl ResourceManifestReconciler {
             }
         }
         Ok(())
+    }
+
+    /// Judges `key`, which the root reached before (`previous`) and this revision no longer
+    /// declares (#3992). Its resource, while this root still owns it at that path, is deleted
+    /// through the kind's delete path when its live spec matches the root's baseline, and is
+    /// otherwise kept and reported Orphaned with the reason; both carry the revision that removed
+    /// it. A Deleted report stands until the document is declared again. A document whose resource
+    /// is gone, or is no longer this root's at that path, is no longer the root's to report.
+    async fn judge_removed(
+        &self,
+        key: &DocumentKey,
+        previous: &DocumentState,
+        spec: &ManifestRootSpec,
+        revision: &str,
+        report: &mut ManifestPassReport,
+    ) -> Result<Option<DocumentState>, String> {
+        if previous.phase == DocumentPhase::Deleted {
+            return Ok(Some(previous.clone()));
+        }
+        if key.kind.is_empty() {
+            // A document refused before its identity was read names no resource.
+            return Ok(None);
+        }
+        let identity = ObjectIdentity { kind: key.kind.clone(), namespace: key.namespace.clone(), name: key.name.clone() };
+        let live = match get_resource_kind(&self.backend, &key.namespace, &key.kind, &key.name).await {
+            Ok(live) => live.value,
+            Err(ResourceError::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(format!("{identity}: {error}")),
+        };
+        let annotations = string_map(&live, "annotations")?;
+        if annotations.get(MANIFEST_RECONCILER_ROOT_ANNOTATION) != Some(&self.root_name())
+            || annotations.get(MANIFEST_PATH_ANNOTATION) != Some(&key.path)
+        {
+            return Ok(None);
+        }
+        let removed_in = previous.removed_in.clone().unwrap_or_else(|| revision.to_owned());
+        let removed = |phase, reason, live_hash, baseline| {
+            let mut state = document_state(phase, reason, live_hash, None, baseline, Some(previous));
+            state.removed_in = Some(removed_in.clone());
+            state
+        };
+        if live.pointer("/metadata/deletionTimestamp").is_some_and(|stamp| !stamp.is_null()) {
+            // Deleting already: its finalizers hold it until they finish.
+            return Ok(Some(removed(DocumentPhase::Deleted, None, None, None)));
+        }
+        let live_hash = resource_document_spec_hash(&live).map_err(|error| format!("{identity}: {error}"))?;
+        let baseline = previous.baseline_hash.clone();
+        // Why the resource is kept: a stable cause (the event is recorded when it changes) and
+        // the reason the root reports. An operator releases an orphan by deleting the resource,
+        // by declaring the document again, or (for an edit) by restoring the applied spec.
+        let kept = if spec.suspended.contains(key) {
+            Some(("suspended", "suspended; resume it to delete the resource".to_owned()))
+        } else if baseline.is_none() {
+            Some(("unbaselined", "no baseline recorded for it, so its spec cannot be shown unchanged; the resource is kept".to_owned()))
+        } else if baseline.as_deref() != Some(live_hash.as_str()) {
+            Some(("edited", "live spec edited since its last apply; the resource is kept".to_owned()))
+        } else {
+            // Accepted race: the store's delete takes no version precondition, so an edit landing
+            // between the read above and this delete is deleted rather than orphaned.
+            match delete_resource_kind(&self.backend, &key.namespace, &key.kind, &key.name).await {
+                Ok(_) | Err(ResourceError::NotFound { .. }) => None,
+                Err(error) => Some(("refused", format!("delete refused: {error}"))),
+            }
+        };
+        let Some((cause, reason)) = kept else {
+            info!(object = %identity, source = %self.source, path = %key.path, revision = %removed_in, "manifest document removed; deleted its resource");
+            report.deleted += 1;
+            return Ok(Some(removed(DocumentPhase::Deleted, None, None, None)));
+        };
+        let previous_cause = (previous.phase == DocumentPhase::Orphaned).then(|| previous.reason.as_deref().map(orphan_cause)).flatten();
+        if previous_cause != Some(cause) {
+            self.record_refusal_event(&identity, "ManifestPruneRefused", format!("{}: removed in {removed_in}: {reason}", key.path)).await;
+            warn!(object = %identity, source = %self.source, path = %key.path, %reason, "manifest document removed; its resource is orphaned");
+        }
+        report.orphaned += 1;
+        Ok(Some(removed(DocumentPhase::Orphaned, Some(reason), Some(live_hash), baseline)))
     }
 
     async fn publish_source_failure(&self, error: &str) -> Result<(), String> {
@@ -883,6 +997,20 @@ impl ResourceManifestReconciler {
     }
 }
 
+/// The cause an orphan's reason (as [`ResourceManifestReconciler::judge_removed`] writes it)
+/// names, so a delete error whose text varies between passes is one cause.
+fn orphan_cause(reason: &str) -> &'static str {
+    if reason.starts_with("suspended") {
+        "suspended"
+    } else if reason.starts_with("no baseline") {
+        "unbaselined"
+    } else if reason.starts_with("live spec edited") {
+        "edited"
+    } else {
+        "refused"
+    }
+}
+
 /// A definition's baseline as its annotations record it. ADR 0047 N→N+1: the annotations stay the
 /// first source while definitions carry them (they move onto the engine without them, #3824 layer
 /// 2b-ii); the root's baseline record, the same hash, answers for a definition without them.
@@ -914,6 +1042,7 @@ fn document_state(
         observed_at: chrono::Utc::now(),
         resolved_token: previous.and_then(|state| state.resolved_token.clone()),
         resolution_outcome: previous.and_then(|state| state.resolution_outcome.clone()),
+        removed_in: None,
     };
     if let Some(previous) = previous {
         if state.phase == previous.phase
@@ -2241,21 +2370,186 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removing_a_manifest_does_not_prune_its_object() {
+    async fn deleting_a_root_does_not_prune_its_objects() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("policy.yaml");
-        write(&path, &manifest("retained", "one"));
+        write(&dir.path().join("policy.yaml"), &manifest("retained", "one"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
-        std::fs::remove_file(path).expect("remove manifest");
 
-        reconciler.reconcile_once_for_test().await.expect("additive pass");
-
-        backend.using::<PlacementPolicy>(NAMESPACE).get("retained").await.expect("object must not be pruned");
         let root = test_root(&backend).await;
         backend.using::<ManifestRoot>(NAMESPACE).delete(&root.metadata.name).await.expect("remove declared root");
         backend.using::<PlacementPolicy>(NAMESPACE).get("retained").await.expect("root deletion must not prune object");
+    }
+
+    fn forge_manifest(host: &str) -> String {
+        format!(
+            "apiVersion: flotilla.work/v1\nkind: Forge\nmetadata:\n  name: lab\nspec:\n  forge_id: lab\n  kind: forgejo\n  hosts: [{host}]\n  https_url: https://lab.example\n  git_ssh_host: lab.example\n"
+        )
+    }
+
+    /// A store a root's pruning runs over: its name, the directory it lives in, and its backend and roots.
+    type PruningStore = (&'static str, Option<tempfile::TempDir>, ResourceBackend, Arc<dyn ManifestRoots>);
+
+    /// The two stores a root's pruning runs over: the old store's roots and definitions, and the
+    /// engine's (behind `[primitives]`).
+    fn pruning_stores() -> Vec<PruningStore> {
+        use flotilla_provisioning::engine::{definitions::EngineDefinitions, manifest_root::EngineManifestRoots};
+        let old = ResourceBackend::new(InMemoryBackend::default());
+        let old_roots: Arc<dyn ManifestRoots> = Arc::new(OldStoreManifestRoots::new(old.clone()));
+        let store = tempfile::tempdir().expect("store dir");
+        let mut kinds = flotilla_schema::KindRegistry::new();
+        flotilla_provisioning::stored::manifest_root::register(&mut kinds).expect("register roots");
+        flotilla_provisioning::stored::definition::register(&mut kinds).expect("register definitions");
+        let service =
+            Arc::new(flotilla_schema_sqlite::stream::Service::open(&store.path().join("decided.sqlite"), "home", kinds).expect("store"));
+        let clock: Arc<dyn flotilla_resources::Clock> = Arc::new(flotilla_resources::SystemClock);
+        let engine_roots: Arc<dyn ManifestRoots> =
+            Arc::new(EngineManifestRoots::open(Arc::clone(&service), Arc::clone(&clock)).expect("roots"));
+        let engine = ResourceBackend::new(InMemoryBackend::default());
+        engine.install_engine_records(Arc::new(EngineDefinitions::open(service, clock).expect("definitions")));
+        vec![("old store", None, old, old_roots), ("engine", Some(store), engine, engine_roots)]
+    }
+
+    fn forge_key() -> DocumentKey {
+        DocumentKey { path: "forge.yaml".into(), kind: "Forge".into(), namespace: NAMESPACE.into(), name: "lab".into() }
+    }
+
+    // Behaviour (#3992): a revision that no longer declares a document the root applied deletes
+    // the resource it owns, and the root reports the deletion with that revision; on both stores.
+    #[tokio::test]
+    async fn removing_a_document_deletes_its_resource_and_reports_the_revision() {
+        for (store, _directory, backend, roots) in pruning_stores() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write(&dir.path().join("forge.yaml"), &forge_manifest("lab.example"));
+            let forges = backend.definitions::<flotilla_resources::Forge>(NAMESPACE);
+            let mut reconciler =
+                ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path()).with_roots(Arc::clone(&roots)).with_revision("r1");
+            reconciler.reconcile_once_for_test().await.expect("creation");
+            forges.get("lab").await.expect("applied");
+
+            std::fs::remove_file(dir.path().join("forge.yaml")).expect("remove document");
+            let mut reconciler = reconciler.with_revision("r2");
+            let report = reconciler.reconcile_once_for_test().await.expect("removal pass");
+            assert_eq!(report.deleted, 1, "{store}: {report:?}");
+            assert!(matches!(forges.get("lab").await, Err(ResourceError::NotFound { .. })), "{store}: the resource is deleted");
+            let root = roots.root(NAMESPACE, &reconciler.root_name()).await.expect("read").expect("root");
+            let state = &root.status.documents[&forge_key()];
+            assert_eq!((state.phase, state.removed_in.as_deref()), (DocumentPhase::Deleted, Some("r2")), "{store}");
+            assert!(root.status.stalled.is_none(), "{store}: {:?}", root.status.stalled);
+        }
+    }
+
+    // Behaviour (#3992): a removed document whose resource was edited since the root last applied
+    // it keeps the resource, and the root reports it orphaned, with the reason and the revision
+    // that removed it, for an operator; on both stores.
+    #[tokio::test]
+    async fn removing_a_live_edited_document_keeps_its_resource_and_reports_it_orphaned() {
+        for (store, _directory, backend, roots) in pruning_stores() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write(&dir.path().join("forge.yaml"), &forge_manifest("lab.example"));
+            let forges = backend.definitions::<flotilla_resources::Forge>(NAMESPACE);
+            let mut reconciler =
+                ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path()).with_roots(Arc::clone(&roots)).with_revision("r1");
+            reconciler.reconcile_once_for_test().await.expect("creation");
+            let current = forges.get("lab").await.expect("applied");
+            let mut live = current.spec.clone();
+            live.hosts.insert("live.example".into());
+            forges.apply(&InputMeta::from(&current.metadata), &live).await.expect("live edit");
+
+            std::fs::remove_file(dir.path().join("forge.yaml")).expect("remove document");
+            let mut reconciler = reconciler.with_revision("r2");
+            let report = reconciler.reconcile_once_for_test().await.expect("removal pass");
+            assert_eq!((report.deleted, report.orphaned), (0, 1), "{store}: {report:?}");
+            assert!(forges.get("lab").await.expect("kept").spec.hosts.contains("live.example"), "{store}: the edit stands");
+            let root = roots.root(NAMESPACE, &reconciler.root_name()).await.expect("read").expect("root");
+            let state = &root.status.documents[&forge_key()];
+            assert_eq!((state.phase, state.removed_in.as_deref()), (DocumentPhase::Orphaned, Some("r2")), "{store}");
+            let reason = state.reason.as_deref().expect("reason");
+            assert!(reason.contains("edited since its last apply"), "{store}: {reason}");
+            assert!(root.status.stalled.as_ref().expect("stall").evidence.contains("forge.yaml"), "{store}");
+        }
+    }
+
+    /// A reconciler over `dir` that has applied `policy.yaml` declaring `name`, and its backend.
+    async fn applied_policy(dir: &Path, name: &str) -> (ResourceBackend, ResourceManifestReconciler) {
+        write(&dir.join("policy.yaml"), &manifest(name, "one"));
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir).with_revision("r1");
+        reconciler.reconcile_once_for_test().await.expect("creation");
+        (backend, reconciler)
+    }
+
+    // Behaviour (#3992): a source that does not load is not a revision that removed its
+    // documents: the pass is refused before any is judged, and nothing is deleted.
+    #[tokio::test]
+    async fn a_source_that_does_not_load_prunes_nothing() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let dir = parent.path().join("manifests");
+        std::fs::create_dir(&dir).expect("manifest directory");
+        let (backend, mut reconciler) = applied_policy(&dir, "kept").await;
+        std::fs::remove_dir_all(&dir).expect("remove the source");
+
+        reconciler.reconcile_once_for_test().await.expect_err("the source does not load");
+        backend.using::<PlacementPolicy>(NAMESPACE).get("kept").await.expect("nothing is pruned");
+        assert_eq!(test_root(&backend).await.status.expect("status").documents[&key("kept")].phase, DocumentPhase::Applied);
+    }
+
+    // Behaviour (#3992): a file this revision holds but cannot parse may still declare its
+    // documents, so their records stand and their resources are kept.
+    #[tokio::test]
+    async fn an_unparsed_file_keeps_its_documents_records_and_resources() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (backend, mut reconciler) = applied_policy(dir.path(), "kept").await;
+        write(&dir.path().join("policy.yaml"), "invalid: [");
+
+        let report = reconciler.reconcile_once_for_test().await.expect("refusal pass");
+        assert_eq!((report.deleted, report.orphaned), (0, 0), "{report:?}");
+        backend.using::<PlacementPolicy>(NAMESPACE).get("kept").await.expect("nothing is pruned");
+        let status = test_root(&backend).await.status.expect("status");
+        assert!(status.documents[&key("kept")].baseline_hash.is_some(), "its baseline stands");
+    }
+
+    // Behaviour (#3992): a document moved to another file is still declared, so its resource is
+    // not judged removed under the old path, even while the new path reads it as drift.
+    #[tokio::test]
+    async fn a_moved_document_is_not_pruned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (backend, mut reconciler) = applied_policy(dir.path(), "moved").await;
+        let policies = backend.using::<PlacementPolicy>(NAMESPACE);
+        let current = policies.get("moved").await.expect("applied");
+        let live = PlacementPolicySpec::builder().pool("live".to_string()).build();
+        policies.update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &live).await.expect("live edit");
+        std::fs::rename(dir.path().join("policy.yaml"), dir.path().join("moved.yaml")).expect("move document");
+
+        let report = reconciler.reconcile_once_for_test().await.expect("move pass");
+        assert_eq!((report.drifted, report.deleted, report.orphaned), (1, 0, 0), "{report:?}");
+        assert_eq!(policies.get("moved").await.expect("nothing is pruned").spec.pool, "live");
+        let documents = test_root(&backend).await.status.expect("status").documents;
+        assert!(!documents.contains_key(&key("moved")), "the old key is dropped: {documents:?}");
+    }
+
+    // Behaviour (#3992): a suspended document that is removed is orphaned, not deleted; resuming
+    // it lets the next pass delete its unchanged resource.
+    #[tokio::test]
+    async fn a_removed_suspended_document_is_deleted_once_resumed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (backend, reconciler) = applied_policy(dir.path(), "paused").await;
+        set_suspended(&backend, key("paused"), true).await;
+        std::fs::remove_file(dir.path().join("policy.yaml")).expect("remove document");
+        let mut reconciler = reconciler.with_revision("r2");
+
+        assert_eq!(reconciler.reconcile_once_for_test().await.expect("suspended pass").orphaned, 1);
+        backend.using::<PlacementPolicy>(NAMESPACE).get("paused").await.expect("kept while suspended");
+        let state = test_root(&backend).await.status.expect("status").documents[&key("paused")].clone();
+        assert_eq!(state.phase, DocumentPhase::Orphaned);
+        assert!(state.reason.as_deref().is_some_and(|reason| reason.starts_with("suspended")), "{state:?}");
+
+        set_suspended(&backend, key("paused"), false).await;
+        assert_eq!(reconciler.reconcile_once_for_test().await.expect("resumed pass").deleted, 1);
+        assert!(matches!(backend.using::<PlacementPolicy>(NAMESPACE).get("paused").await, Err(ResourceError::NotFound { .. })));
+        let state = &test_root(&backend).await.status.expect("status").documents[&key("paused")];
+        assert_eq!((state.phase, state.removed_in.as_deref()), (DocumentPhase::Deleted, Some("r2")));
     }
 
     #[tokio::test]
