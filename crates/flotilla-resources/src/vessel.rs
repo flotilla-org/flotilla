@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{ConfiguredResourceLimits, PlacementDecision};
+use flotilla_protocol::{ConfiguredResourceLimits, LifecycleReading, PlacementDecision};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    resource::define_resource, status_patch::StatusPatch, ControllerRetry, LandingCredentialScope, ReplicationClass, RepositoryKey, Stance,
+    lifecycle_reads::{LifecycleReads, ProvisioningKind},
+    resource::define_resource,
+    status_patch::StatusPatch,
+    ControllerRetry, LandingCredentialScope, ReplicationClass, RepositoryKey, ResourceObject, Stance,
 };
 
 define_resource!(
@@ -183,6 +186,44 @@ pub enum VesselStatusPatch {
     },
 }
 
+impl VesselPhase {
+    /// The phase the engine's reading decides; without a reading, the stored phase.
+    pub fn from_reading(reading: Option<&LifecycleReading>, status: Option<&VesselStatus>) -> Self {
+        match reading {
+            Some(LifecycleReading::Lost | LifecycleReading::Released) => Self::Lost,
+            Some(LifecycleReading::Failed { .. } | LifecycleReading::GaveUp { .. }) => Self::Failed,
+            Some(LifecycleReading::Ready { .. }) if status.is_some_and(|status| !status.interrupted_roles.is_empty()) => Self::Interrupted,
+            Some(LifecycleReading::Ready { .. }) => Self::Ready,
+            // Exhausted still holds a Requested lease until GiveUp commits.
+            Some(LifecycleReading::InProgress | LifecycleReading::Retrying { .. } | LifecycleReading::Exhausted { .. }) => {
+                Self::Provisioning
+            }
+            None => status.map(|status| status.phase).unwrap_or_default(),
+        }
+    }
+}
+
+/// A read view whose phase the engine decides. Never publish it back as stored status.
+/// An ending or readiness replaces the stored message; a live phase keeps the reconciler's own.
+pub fn project_reading(obj: &ResourceObject<Vessel>, reading: Option<&LifecycleReading>) -> ResourceObject<Vessel> {
+    let mut obj = obj.clone();
+    let Some(reading) = reading else { return obj };
+    let phase = VesselPhase::from_reading(Some(reading), obj.status.as_ref());
+    let status = obj.status.get_or_insert_with(Default::default);
+    if status.phase != phase {
+        status.phase = phase;
+        if matches!(phase, VesselPhase::Ready | VesselPhase::Lost | VesselPhase::Failed) {
+            status.message = reading.reason();
+        }
+    }
+    obj
+}
+
+/// The engine's view of `obj` homed at `origin`, or `obj` itself when the engine holds no record.
+pub fn read(reads: &dyn LifecycleReads, obj: &ResourceObject<Vessel>, origin: Option<&str>) -> Result<ResourceObject<Vessel>, String> {
+    Ok(project_reading(obj, reads.try_reading(ProvisioningKind::Vessel, &obj.metadata.name, origin)?.as_ref()))
+}
+
 impl StatusPatch<VesselStatus> for VesselStatusPatch {
     fn apply(&self, status: &mut VesselStatus) {
         match self {
@@ -346,6 +387,67 @@ mod image_tests {
             let after = status.clone();
             patch.apply(&mut status);
             assert_eq!(status, after, "recording the same image twice is idempotent");
+        }
+    }
+}
+
+#[cfg(test)]
+mod reading_tests {
+    use super::*;
+
+    fn vessel(phase: VesselPhase, interrupted_roles: BTreeSet<String>) -> ResourceObject<Vessel> {
+        ResourceObject {
+            metadata: crate::ObjectMeta {
+                name: "vessel".into(),
+                namespace: "flotilla".into(),
+                resource_version: "1".into(),
+                labels: Default::default(),
+                annotations: Default::default(),
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: chrono::DateTime::UNIX_EPOCH,
+                merge: None,
+            },
+            spec: VesselSpec {
+                convoy_ref: "convoy".into(),
+                vessel_name: "work".into(),
+                fulfilment_kind_ref: "local".into(),
+                adopted_checkout_refs: Default::default(),
+            },
+            status: Some(VesselStatus { phase, message: Some("stored".into()), interrupted_roles, ..Default::default() }),
+        }
+    }
+
+    #[test]
+    fn the_engine_reading_decides_phase_and_ending_message() {
+        let at = chrono::DateTime::UNIX_EPOCH;
+        let roles = BTreeSet::from(["coder".to_string()]);
+        let cases = [
+            (LifecycleReading::InProgress, BTreeSet::new(), VesselPhase::Provisioning, Some("stored")),
+            (
+                LifecycleReading::Retrying { failures: 1, next: at, cause: "c".into() },
+                BTreeSet::new(),
+                VesselPhase::Provisioning,
+                Some("stored"),
+            ),
+            (LifecycleReading::Exhausted { cause: "c".into() }, BTreeSet::new(), VesselPhase::Provisioning, Some("stored")),
+            (LifecycleReading::Ready { identity: "env".into() }, BTreeSet::new(), VesselPhase::Ready, None),
+            (LifecycleReading::Ready { identity: "env".into() }, roles, VesselPhase::Interrupted, Some("stored")),
+            (LifecycleReading::Lost, BTreeSet::new(), VesselPhase::Lost, Some("observed absent")),
+            (LifecycleReading::Released, BTreeSet::new(), VesselPhase::Lost, Some("released")),
+            (LifecycleReading::Failed { reason: "boom".into() }, BTreeSet::new(), VesselPhase::Failed, Some("boom")),
+            (LifecycleReading::GaveUp { cause: "host gone".into() }, BTreeSet::new(), VesselPhase::Failed, Some("host gone")),
+        ];
+        for stored in [VesselPhase::Pending, VesselPhase::Provisioning, VesselPhase::Ready] {
+            for (reading, interrupted_roles, phase, message) in &cases {
+                let status = project_reading(&vessel(stored, interrupted_roles.clone()), Some(reading)).status.expect("status");
+                assert_eq!(status.phase, *phase, "{stored:?} {reading:?}");
+                let message = if stored == *phase { Some("stored") } else { *message };
+                assert_eq!(status.message.as_deref(), message, "{stored:?} {reading:?}");
+            }
+            let unread = vessel(stored, BTreeSet::new());
+            assert_eq!(project_reading(&unread, None).status, unread.status);
         }
     }
 }

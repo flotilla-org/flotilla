@@ -2456,14 +2456,26 @@ impl CrewService {
                             // create its session concurrently. A session that now exists in
                             // the same environment receives the message like a starting one;
                             // one without a status yet is that session, before its first launch.
-                            Err(ResourceError::Conflict { .. })
-                                if sessions.get(&terminal_name).await.is_ok_and(|existing| {
+                            Err(error @ ResourceError::Conflict { .. }) => {
+                                let existing = match sessions.get(&terminal_name).await {
+                                    Ok(existing) => Some(
+                                        flotilla_store::read_terminal_session(Arc::clone(&self.lifecycle_reads), &existing, None)
+                                            .await
+                                            .map_err(|error| error.to_string())?
+                                            .0,
+                                    ),
+                                    Err(_) => None,
+                                };
+                                if !existing.is_some_and(|existing| {
                                     existing.spec.env_ref == anchor_environment
                                         && existing
                                             .status
                                             .as_ref()
                                             .is_none_or(|status| status.phase != ResourceTerminalSessionPhase::Failed)
-                                }) => {}
+                                }) {
+                                    return Err(error.to_string());
+                                }
+                            }
                             Err(error) => return Err(error.to_string()),
                         }
                         send().await.map(|_| ())

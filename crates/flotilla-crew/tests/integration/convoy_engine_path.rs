@@ -300,11 +300,18 @@ impl flotilla_crew::ports::EngineMessages for Turns {
 // Behaviour (#3894): with the engine deciding, a crew whose promises are all kept
 // derives Done only once no turn to its live session is undelivered; while one
 // is, the reconciler holds the Done and rechecks soon, since no Message watch
-// wakes it when the turn is delivered.
+// wakes it when the turn is delivered. The engine's reading of the session's
+// launch decides whether it is live, whatever its stored phase says.
 #[tokio::test]
 async fn an_undelivered_turn_holds_the_engines_derived_done() {
+    use flotilla_provisioning_testkit::{Ending, TerminalFixture};
     use flotilla_resources::{TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus, CONVOY_LABEL};
-    for awaiting in [true, false] {
+    for (awaiting, ending, stored) in [
+        (true, Ending::Ready("sid"), TerminalSessionPhase::Stopped),
+        (false, Ending::Ready("sid"), TerminalSessionPhase::Stopped),
+        (true, Ending::Released, TerminalSessionPhase::Running),
+    ] {
+        let live = matches!(ending, Ending::Ready(_));
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut convoy = ledger_convoy(&backend).await;
         // Handed over: the engine holds the kept promises; the stored status holds none.
@@ -335,18 +342,30 @@ async fn an_undelivered_turn_holds_the_engines_derived_done() {
             )
             .await
             .expect("session");
-        let running = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() };
-        sessions.update_status("coder-session", &session.metadata.resource_version, &running).await.expect("running");
+        let session = sessions
+            .update_status(
+                "coder-session",
+                &session.metadata.resource_version,
+                &TerminalSessionStatus { phase: stored, ..Default::default() },
+            )
+            .await
+            .expect("stored phase");
+        let fixture = TerminalFixture::new(false);
+        fixture.request(&session);
+        fixture.finish(&session, ending);
         let messages: flotilla_crew::ports::MessagePath = Arc::new(OnceLock::new());
         let turns: Arc<dyn flotilla_crew::ports::EngineMessages> = Arc::new(Turns { backend: backend.clone(), awaiting });
         assert!(messages.set(turns).is_ok());
         let engine = Arc::new(Recording { holds: true, held: Some(held), ..Default::default() });
-        let reconciler = reconciler(&backend, engine).with_terminal_sessions(sessions).with_messages(messages);
+        let reconciler = reconciler(&backend, engine)
+            .with_terminal_sessions(sessions)
+            .with_messages(messages)
+            .with_lifecycle_reads(fixture.reads.clone());
         let prepared = reconciler.prepare(&convoy).await.expect("prepare");
         let outcome = reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
         let derived = matches!(outcome.patch, Some(ConvoyStatusPatch::DeriveCrewDone { .. }));
-        assert_eq!(derived, !awaiting, "awaiting {awaiting}: {:?}", outcome.patch);
-        if awaiting {
+        assert_eq!(derived, !(awaiting && live), "awaiting {awaiting}, live {live}: {:?}", outcome.patch);
+        if awaiting && live {
             assert_eq!(outcome.requeue_after, Some(std::time::Duration::from_secs(1)), "a held Done rechecks soon");
         }
     }

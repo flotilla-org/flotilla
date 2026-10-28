@@ -58,6 +58,7 @@ pub struct ConvoyReconciler {
     engine: EngineConvoyPath,
     /// The `[primitives]` switch's Message path; empty while it is off.
     messages: crate::ports::MessagePath,
+    lifecycle_reads: Arc<dyn lifecycle_reads::LifecycleReads>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +107,7 @@ impl ConvoyReconciler {
             teardown_runtime: None,
             engine: EngineConvoyPath::default(),
             messages: crate::ports::MessagePath::default(),
+            lifecycle_reads: Arc::new(lifecycle_reads::NoLifecycleReads),
         }
     }
 
@@ -121,10 +123,16 @@ impl ConvoyReconciler {
         self
     }
 
+    /// The engine's lifecycle readings of vessels and sessions; none while `[primitives]` is off.
+    pub fn with_lifecycle_reads(mut self, reads: Arc<dyn lifecycle_reads::LifecycleReads>) -> Self {
+        self.lifecycle_reads = reads;
+        self
+    }
+
     /// A live crew session has an engine turn not yet delivered to it (#3894).
     async fn turn_awaits(&self, obj: &ResourceObject<Convoy>, vessel: &str, role: &str) -> Result<bool, ResourceError> {
         let (Some(messages), Some(sessions)) = (self.messages.get(), &self.terminal_sessions) else { return Ok(false) };
-        let live = sessions
+        let sessions = sessions
             .list_matching_labels(&BTreeMap::from([
                 (CONVOY_LABEL.to_string(), obj.metadata.name.clone()),
                 (VESSEL_LABEL.to_string(), vessel.to_string()),
@@ -132,8 +140,13 @@ impl ConvoyReconciler {
             ]))
             .await?
             .items
+            .into_iter()
+            .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local })
+            .collect();
+        let live = flotilla_store::read_terminal_sources(Arc::clone(&self.lifecycle_reads), sessions)
+            .await?
             .iter()
-            .any(|session| session.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running));
+            .any(|session| session.object.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running));
         if !live {
             return Ok(false);
         }
@@ -472,17 +485,18 @@ impl Reconciler for ConvoyReconciler {
         };
         let vessels = match (&self.federated_vessels, &self.vessels) {
             (Some(vessels), _) if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() => {
-                federated_children(vessels, obj).await?
+                select_convoy_child_sources(obj, &vessels.list().await?.items).into_values().collect()
             }
             (None, Some(vessels)) if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() => vessels
                 .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), obj.metadata.name.clone())]))
                 .await?
                 .items
                 .into_iter()
-                .map(|workspace| (workspace.metadata.name.clone(), workspace))
+                .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local })
                 .collect(),
-            _ => BTreeMap::new(),
+            _ => Vec::new(),
         };
+        let vessels = select_convoy_children(obj, &flotilla_store::read_vessel_sources(Arc::clone(&self.lifecycle_reads), vessels).await?);
 
         let checkouts = match (&self.federated_checkouts, &self.checkouts) {
             (Some(checkouts), _) if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() => {

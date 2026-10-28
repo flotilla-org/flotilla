@@ -1943,6 +1943,76 @@ fn pending_launch_progress_is_bounded_and_recovers(tc: hegel::TestCase) {
     });
 }
 
+// A vessel the engine realises is launch progress even while its stored status still says Provisioning.
+#[tokio::test]
+async fn engine_vessel_progress_resets_the_launch_bound() {
+    use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
+    use flotilla_provisioning_testkit::{object, Ending, VesselFixture};
+    let (backend, wake, _) = actor_nudge_scenario(&[]).await;
+    let fixture = VesselFixture::new(false);
+    let wake = ReconcilerWake::new(wake.subscriptions.with_lifecycle_reads(fixture.reads.clone()));
+    backend.using::<TerminalSession>("flotilla").delete("resumed-coder").await.expect("no launch yet");
+    let start = Utc::now();
+    update_convoy(&backend, "stalled-work", |status| {
+        status.started_at = Some(start);
+        let work = status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("crew");
+        work.phase = CrewWorkPhase::Pending;
+        work.task_assigned = true;
+    })
+    .await;
+    let vessel = object::<flotilla_resources::Vessel>(
+        "stalled-work-work",
+        flotilla_resources::VesselSpec {
+            convoy_ref: "stalled-work".into(),
+            vessel_name: "work".into(),
+            fulfilment_kind_ref: "local".into(),
+            adopted_checkout_refs: Default::default(),
+        },
+        flotilla_resources::VesselStatus {
+            phase: flotilla_resources::VesselPhase::Provisioning,
+            placement_decision: Some(
+                PlacementDecision::builder()
+                    .kind("local".into())
+                    .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved("host"), display_name: "host".into() })
+                    .build(),
+            ),
+            ..Default::default()
+        },
+    );
+    let vessels = backend.using::<flotilla_resources::Vessel>("flotilla");
+    let created = vessels
+        .create(
+            &InputMeta::builder()
+                .name(vessel.metadata.name.clone())
+                .labels(BTreeMap::from([(CONVOY_LABEL.into(), "stalled-work".into())]))
+                .build(),
+            &vessel.spec,
+        )
+        .await
+        .expect("vessel");
+    vessels
+        .update_status(&vessel.metadata.name, &created.metadata.resource_version, vessel.status.as_ref().expect("status"))
+        .await
+        .expect("stored");
+    fixture.request(&vessel);
+    let judge = |seconds| {
+        let backend = backend.clone();
+        let wake = &wake;
+        async move {
+            let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
+            wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), start + chrono::Duration::seconds(seconds))
+                .await
+                .expect("judge");
+            backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy").status.expect("status").attention
+        }
+    };
+    assert!(judge(0).await.is_none());
+    fixture.finish(&vessel, Ending::Ready("env"));
+    assert!(judge(600).await.is_none());
+    assert!(judge(1499).await.is_none(), "the engine's Ready restarted the bound");
+    assert_eq!(judge(1500).await.expect("bounded from the engine's progress").source, "launch-progress");
+}
+
 // Supervision has a crew or convoy subject, and only a recipient with an inbox awaits a reply.
 #[tokio::test]
 async fn supervision_records_have_a_subject_and_operator_notices_expect_nothing() {

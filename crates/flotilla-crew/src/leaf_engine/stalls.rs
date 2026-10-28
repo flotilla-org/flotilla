@@ -9,10 +9,10 @@ use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
     actor_obligation,
     address::{leaf_address, record_name},
-    select_convoy_children, Convoy, ConvoyAttention, ConvoyPhase, ConvoyStatus, CrewWorkPhase, LeafMaker, NudgeObligation, ResourceObject,
-    StallEvidenceSource, StallNudge, StallRung, StallSupervisor, StalledCondition, SupervisionTarget, TerminalAttention,
-    TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TurnDeliveryRule,
-    WorkPhase, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    select_convoy_child_sources, select_convoy_children, Convoy, ConvoyAttention, ConvoyPhase, ConvoyStatus, CrewWorkPhase, LeafMaker,
+    NudgeObligation, ResourceObject, StallEvidenceSource, StallNudge, StallRung, StallSupervisor, StalledCondition, SupervisionTarget,
+    TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
+    TurnDeliveryRule, WorkPhase, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 
 use super::sources::freshest_change_request_refs;
@@ -520,7 +520,15 @@ impl ReconcilerWake {
             let Some(status) = &convoy.status else { continue };
             let selected_sessions = select_convoy_children(convoy, sessions);
             self.observe_queued_turns_from_messages(namespace, convoy, &selected_sessions, messages, now).await?;
-            let selected_vessels = select_convoy_children(convoy, vessels);
+            let selected_vessels = select_convoy_children(
+                convoy,
+                &flotilla_store::read_vessel_sources(
+                    Arc::clone(&self.subscriptions.inner.lifecycle_reads),
+                    select_convoy_child_sources(convoy, vessels).into_values().collect(),
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+            );
             let selected_checkouts = select_convoy_children(convoy, checkouts);
             self.observe_launch_progress(convoy, &selected_vessels, &selected_sessions, now).await?;
             let mut obligations = status.nudge_obligations.clone();
