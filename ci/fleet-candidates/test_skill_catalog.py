@@ -68,8 +68,8 @@ class CatalogTests(unittest.TestCase):
             output = Path(temporary) / "catalog.json"
             validation.validate_skill_source_paths(manifest, output)
             catalog = [entry for entry in json.loads(output.read_text()) if entry["source"] == "flotilla"]
-        self.assertEqual({entry["name"] for entry in catalog}, {"crew-review", "flotilla-commands"})
-        self.assertEqual({entry["path"] for entry in catalog}, {"skills/crew-review", "skills/flotilla-commands"})
+        self.assertEqual({entry["name"] for entry in catalog}, {"crew-review", "flotilla-commands", "flotilla-dispatch"})
+        self.assertEqual({entry["path"] for entry in catalog}, {"skills/crew-review", "skills/flotilla-commands", "skills/flotilla-dispatch"})
 
     def test_invalid_frontmatter_cannot_produce_a_catalog(self):
         # Intended: absent names, unsafe names, and duplicate names refuse catalog
