@@ -45,6 +45,22 @@ class Refusals(unittest.TestCase):
                     self.assertIn('generation sha256=', errors[0])
                     self.assertEqual(writes, [])
 
+    # Contract: a generation whose manifest pairs a Cleat older than the
+    # declared CLEAT_NEW_REVISION is refused, naming both revisions (#4051).
+    def test_older_cleat_pairing_refused(self):
+        declared = preroll.cleat_pairing.declared_revision(ROOT)
+        older = '1' * 40
+        def git(args, **kwargs):
+            # Fake the git boundary: the older pin is not a descendant.
+            return subprocess.CompletedProcess(args, 1 if args[0] == 'merge-base' else 0, '', '')
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / 'generation.json'
+            manifest.write_text(json.dumps({'generation': 'gen-1', 'sources': {'cleat': older}}))
+            errors = preroll.check(ROOT, 'gen-1', [], False, lambda host, request: [], manifest, git)
+        self.assertEqual(len(errors), 1)
+        self.assertIn(older, errors[0])
+        self.assertIn(declared, errors[0])
+
     # Contract: either bootstrap file drifting refuses; explicit repair sends
     # both generation files together, never just the mismatching member.
     def test_bootstrap_matrix(self):
@@ -233,7 +249,10 @@ os.replace, os.fsync = replace, fsync
                                'mapped = "str(pathlib.Path(" + repr(root) + ") / " + repr(sys.argv[1]) + " / p.lstrip(chr(126) + chr(47)))"\n' +
                                'exec(program.replace("os.path.expanduser(p)", mapped))\n')
             wrapper.chmod(0o755)
+            manifest = fixture / 'generation.json'
+            manifest.write_text(json.dumps({'generation': 'gen-1', 'sources': {'cleat': preroll.cleat_pairing.declared_revision(ROOT)}}))
             command = [str(ROOT / 'scripts/fleet-preroll-checks.sh'), 'gen-1', '--consumer', 'feta',
+                       '--manifest', str(manifest),
                        '--host-command', str(wrapper)]
             def invoke(*extra):
                 return subprocess.run(command + list(extra), text=True, capture_output=True)

@@ -8,8 +8,8 @@ on:
         required: true
         type: string
       cleat_sha:
-        description: Exact 40-character commit from flotilla-org/cleat
-        required: true
+        description: Exact 40-character commit from flotilla-org/cleat, equal to or a descendant of the flotilla revision's CLEAT_NEW_REVISION; empty selects CLEAT_NEW_REVISION
+        required: false
         type: string
       mattpocock_skills_sha:
         description: Exact 40-character commit from the lab mattpocock-skills fork
@@ -61,6 +61,9 @@ jobs:
           set -euo pipefail
           source orchestration/ci/fleet-candidates/build-candidate.sh
           fetch_exact https://github.com/flotilla-org/flotilla.git "$FLEET_FLOTILLA_SHA" "$PWD/sources/flotilla"
+          # Later steps and build-candidate.sh use the validated pin.
+          FLEET_CLEAT_SHA="$(python3 orchestration/ci/fleet-candidates/cleat_pairing.py sources/flotilla "$FLEET_CLEAT_SHA")"
+          echo "FLEET_CLEAT_SHA=$FLEET_CLEAT_SHA" >>"$GITHUB_ENV"
           fetch_exact https://github.com/flotilla-org/cleat.git "$FLEET_CLEAT_SHA" "$PWD/sources/cleat"
           key="$(python3 orchestration/ci/fleet-candidates/dependency_cache.py key sources)"
           echo "key=$key" >>"$GITHUB_OUTPUT"
