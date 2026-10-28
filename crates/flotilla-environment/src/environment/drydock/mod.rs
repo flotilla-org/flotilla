@@ -530,9 +530,6 @@ impl ProvisionedEnvironment for DrydockEnvironment {
     fn capabilities(&self) -> ProviderCapabilities {
         self.capabilities.clone()
     }
-    fn survivors(&self) -> Option<flotilla_resources::EnvironmentSurvivors> {
-        Some(flotilla_resources::EnvironmentSurvivors { ..Default::default() })
-    }
     fn provider_descriptor(&self) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
         let agent_connection = self.report.lock().expect("agent report").clone().map(|report| AgentConnectionReport {
             provider: report.provider,
