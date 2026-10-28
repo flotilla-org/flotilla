@@ -16,7 +16,8 @@ use async_trait::async_trait;
 use flotilla_protocol::{EnvironmentId, ImageId};
 
 use super::{
-    runner::DockerEnvironmentRunner, EnvironmentBacking, EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount,
+    docker_vessels::DockerVessels, runner::DockerEnvironmentRunner, EnvironmentBacking, EnvironmentHandle, EnvironmentProvider,
+    ProvisionedEnvironment, ProvisionedMount,
 };
 #[cfg(any(unix, test))]
 use super::{
@@ -90,6 +91,12 @@ impl DockerEnvironmentProvider {
             #[cfg(unix)]
             preparation_owner: Arc::new(()),
         }
+    }
+
+    /// Configure before sharing this provider. Panics if another Arc already owns its inner state.
+    pub fn with_vessel_slice(mut self, vessels: Option<DockerVessels>) -> Self {
+        Arc::get_mut(&mut self.inner).expect("configure before sharing provider").vessels = vessels;
+        self
     }
 }
 
@@ -489,6 +496,7 @@ fn protected_git_mount(mount: &ProvisionedMount) -> bool {
 
 pub(super) struct DockerEnvironmentProviderInner {
     pub(super) runner: Arc<dyn CommandRunner>,
+    vessels: Option<DockerVessels>,
     #[cfg(unix)]
     agent_settings: DockerAgentSettings,
     #[cfg(unix)]
@@ -503,6 +511,7 @@ impl DockerEnvironmentProviderInner {
     fn new(runner: Arc<dyn CommandRunner>) -> Self {
         Self {
             runner,
+            vessels: None,
             #[cfg(unix)]
             agent_settings: DockerAgentSettings {
                 runtime_root: PathBuf::from("/tmp/flotilla-drydock"),
@@ -824,6 +833,8 @@ struct DockerMemoryInfo {
     mem_total: u64,
     memory_limit: bool,
     swap_limit: bool,
+    #[serde(default)]
+    cgroup_driver: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -858,6 +869,8 @@ struct DockerHostConfig {
     cpu_period: u64,
     memory: u64,
     memory_swap: i64,
+    #[serde(default)]
+    cgroup_parent: String,
 }
 
 /// Full inspect is necessary: the OOM flag alone misses userspace oomd kills.
@@ -888,8 +901,12 @@ async fn provider_observation(runner: &dyn CommandRunner, container: &str) -> Re
     if observation.termination.is_none() {
         // The systemd cgroup path is optional; unavailable/non-systemd hosts
         // retain their previous sample rather than inventing a zero-byte usage.
-        if inspect.id.len() == 64 && inspect.id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            let path = format!("/sys/fs/cgroup/system.slice/docker-{}.scope/memory.current", inspect.id);
+        let slice = match inspect.host_config.cgroup_parent.as_str() {
+            "" => Some("system.slice".to_string()),
+            parent => super::docker_vessels::slice_cgroup_path(parent),
+        };
+        if let Some(slice) = slice.filter(|_| inspect.id.len() == 64 && inspect.id.bytes().all(|byte| byte.is_ascii_hexdigit())) {
+            let path = format!("/sys/fs/cgroup/{slice}/docker-{}.scope/memory.current", inspect.id);
             if let Ok(raw) = runner.run("cat", &[&path], Path::new("/"), &ChannelLabel::Default).await {
                 observation.memory_usage_bytes = raw.trim().parse().ok();
                 if observation.memory_usage_bytes.is_some() {
@@ -1029,7 +1046,13 @@ impl DockerEnvironmentProvider {
         if !info.memory_limit || !info.swap_limit {
             return Err("Docker host cannot enforce memory and swap limits".into());
         }
-        let limits = opts.memory_policy.resolve(info.mem_total)?;
+        let limits = match &self.inner.vessels {
+            Some(vessels) => {
+                vessels.verify(self.inner.runner.as_ref(), &info.cgroup_driver).await?;
+                flotilla_protocol::EnvironmentMemoryLimits { memory_bytes: vessels.memory_ceiling_bytes(), swap_bytes: 0 }
+            }
+            None => opts.memory_policy.resolve(info.mem_total)?,
+        };
         let memory = limits.memory_bytes.to_string();
         // Docker wants RAM + swap; equal values explicitly disable swap.
         let memory_swap = (limits.memory_bytes + limits.swap_bytes).to_string();
@@ -1139,6 +1162,9 @@ impl DockerEnvironmentProvider {
         ]);
         let cpu_shares = CREW_CPU_SHARES.to_string();
         args.extend(["--memory", memory.as_str(), "--memory-swap", memory_swap.as_str(), "--cpu-shares", &cpu_shares]);
+        if let Some(vessels) = &self.inner.vessels {
+            args.extend(["--cgroup-parent", vessels.slice()]);
+        }
         let cpu_limit = opts.cpu_limit.map(|limit| limit.to_string());
         if let Some(limit) = cpu_limit.as_deref() {
             args.extend(["--cpus", limit]);

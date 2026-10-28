@@ -58,6 +58,7 @@ struct RecordingRunner {
     result: Result<String, String>,
     image_environment: Mutex<VecDeque<Result<String, String>>>,
     memory_info: Option<Result<String, String>>,
+    slice_show: Result<String, String>,
     tags: LocalImageTags,
     dockerfiles: Mutex<Vec<String>>,
 }
@@ -69,6 +70,7 @@ impl RecordingRunner {
             result: Ok(output.to_string()),
             image_environment: Mutex::new(VecDeque::new()),
             memory_info: None,
+            slice_show: Err("systemctl not expected".into()),
             tags: Default::default(),
             dockerfiles: Mutex::new(vec![]),
         }
@@ -80,6 +82,7 @@ impl RecordingRunner {
             result: Err(msg.to_string()),
             image_environment: Mutex::new(VecDeque::new()),
             memory_info: None,
+            slice_show: Err("systemctl not expected".into()),
             tags: Default::default(),
             dockerfiles: Mutex::new(vec![]),
         }
@@ -123,6 +126,9 @@ impl CommandRunner for RecordingRunner {
                 .unwrap_or_else(|| Ok(r#"{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":true}"#.into()));
         }
         self.calls.lock().expect("calls mutex").push((cmd.to_string(), args.iter().map(|a| a.to_string()).collect(), cwd.to_path_buf()));
+        if cmd == "systemctl" {
+            return self.slice_show.clone();
+        }
         if let ("docker", ["tag", id, tag]) = (cmd, args) {
             return self.tags.tag(id, tag);
         }
@@ -1581,6 +1587,65 @@ async fn create_uses_configured_memory_policy() {
     let args = docker_run_args(&runner);
     assert!(args.windows(2).any(|pair| pair == ["--memory", "8589934592"]));
     assert!(args.windows(2).any(|pair| pair == ["--memory-swap", "9663676416"]));
+    assert!(!args.iter().any(|arg| arg == "--cgroup-parent"));
+    assert!(!runner.calls().iter().any(|(cmd, _, _)| cmd == "systemctl"));
+}
+
+// With [docker_vessels], a crew starts under the slice with memory = memory-swap
+// = the ceiling whatever the policy's share, and only once the slice is loaded
+// with a finite MemoryMax under Docker's systemd driver. Otherwise provisioning
+// refuses, naming the slice, before any container runs. The generator spans a
+// healthy slice, a missing one, unbounded or absent MemoryMax, an unreadable
+// unit, the cgroupfs driver, and ceilings and policies whose share falls above
+// or below the ceiling.
+#[hegel::test]
+fn docker_vessels_set_parent_and_ceiling_or_refuse(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let shows: [(Result<&str, &str>, bool); 6] = [
+        (Ok("MemoryMax=55834574848\nLoadState=loaded\n"), true),
+        (Ok("LoadState=loaded\nMemoryMax=47244640256\n"), true),
+        (Ok("LoadState=not-found\nMemoryMax=infinity\n"), false),
+        (Ok("LoadState=loaded\nMemoryMax=infinity\n"), false),
+        (Ok("LoadState=loaded\n"), false),
+        (Err("Failed to connect to bus"), false),
+    ];
+    let (show, show_ok) = shows[tc.draw(gs::integers::<usize>().min_value(0).max_value(shows.len() - 1))];
+    let systemd = tc.draw(gs::booleans());
+    let gib = tc.draw(gs::integers::<u64>().min_value(1).max_value(256));
+    let policy = flotilla_resources::EnvironmentMemoryPolicy {
+        host_memory_percent: tc.draw(gs::integers::<u8>().min_value(1).max_value(100)),
+        expected_concurrent_crews: tc.draw(gs::integers::<u32>().min_value(1).max_value(20)),
+        swap_bytes: tc.draw(gs::integers::<u64>().min_value(0).max_value(1 << 30)),
+    };
+    let slice = "flotilla-crews.slice";
+    let mut runner = RecordingRunner::new_ok("container-id");
+    let driver = if systemd { "systemd" } else { "cgroupfs" };
+    runner.memory_info = Some(Ok(format!(r#"{{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":true,"CgroupDriver":"{driver}"}}"#)));
+    runner.slice_show = show.map(str::to_string).map_err(str::to_string);
+    let runner = Arc::new(runner);
+    let vessels = toml::from_str(&format!("slice = {slice:?}\nmemory_ceiling_gib = {gib}\n")).expect("table");
+    let vessels = super::docker_vessels::DockerVessels::parse(vessels).expect("valid [docker_vessels]");
+    let provider = DockerEnvironmentProvider::new(runner.clone()).with_vessel_slice(Some(vessels));
+    let mut opts = path_prepending_opts(ImagePullPolicy::Never);
+    opts.tools.clear();
+    opts.memory_policy = policy;
+    let created = tokio::runtime::Runtime::new().expect("runtime").block_on(provider.create(
+        EnvironmentId::new("sliced"),
+        &flotilla_protocol::ImageId::new("image"),
+        opts,
+    ));
+    if show_ok && systemd {
+        created.expect("healthy slice provisions");
+        let args = docker_run_args(&runner);
+        let ceiling = (gib << 30).to_string();
+        assert!(args.windows(2).any(|pair| pair == ["--cgroup-parent", slice]), "{args:?}");
+        assert!(args.windows(2).any(|pair| pair == ["--memory", ceiling.as_str()]), "{args:?}");
+        assert!(args.windows(2).any(|pair| pair == ["--memory-swap", ceiling.as_str()]), "{args:?}");
+    } else {
+        let error = created.err().expect("unusable slice refuses provisioning");
+        assert!(error.contains(slice), "{error}");
+        assert!(!runner.calls().iter().any(|(cmd, args, _)| cmd == "docker" && args.first().is_some_and(|arg| arg == "run")));
+    }
 }
 
 // #2653: unavailable capacity or unsupported enforcement must never run an
@@ -1605,11 +1670,20 @@ async fn create_refuses_unenforceable_memory_limits() {
     }
 }
 
-// Last-known RAM usage comes from the cgroup counter. Generate zero, large
-// counters, unavailable/empty, malformed and overflowing responses explicitly.
+// Last-known RAM usage comes from the cgroup counter under the container's own
+// slice. Generate zero, large counters, unavailable/empty, malformed and
+// overflowing responses, and default, top-level, nested and non-slice parents.
 #[hegel::test]
 fn running_memory_samples_do_not_invent_usage(tc: hegel::TestCase) {
     use hegel::generators as gs;
+    let parents = [
+        ("", Some("system.slice")),
+        ("crews.slice", Some("crews.slice")),
+        ("flotilla-crews.slice", Some("flotilla.slice/flotilla-crews.slice")),
+        ("a-b-c.slice", Some("a.slice/a-b.slice/a-b-c.slice")),
+        ("/docker", None),
+    ];
+    let (parent, slice) = parents[tc.draw(gs::integers::<usize>().min_value(0).max_value(parents.len() - 1))];
     let choice = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
     let bytes = tc.draw(gs::integers::<u64>().min_value(0).max_value(u64::MAX));
     let (usage, expected) = match choice {
@@ -1619,20 +1693,23 @@ fn running_memory_samples_do_not_invent_usage(tc: hegel::TestCase) {
         3 => (Some("not a counter".into()), None),
         _ => (Some("18446744073709551616".into()), None),
     };
+    let expected = expected.filter(|_| slice.is_some());
     // A synthetic running state derived from the real inspect shape; death
     // recordings remain verbatim. The subprocess counter is the varied boundary.
     let mut inspect: serde_json::Value = serde_json::from_str(include_str!("fixtures/cgroup-oomkilled.json")).expect("fixture");
     inspect[0]["State"]["Status"] = "running".into();
+    inspect[0]["HostConfig"]["CgroupParent"] = parent.into();
+    let id = inspect[0]["Id"].as_str().expect("container id").to_string();
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     runtime.block_on(async {
-        let provider = DockerEnvironmentProvider::new(Arc::new(InspectionRunner {
-            inspect: inspect.to_string(),
-            usage,
-            oomd: None,
-            calls: Mutex::new(Vec::new()),
-        }));
+        let runner = Arc::new(InspectionRunner { inspect: inspect.to_string(), usage, oomd: None, calls: Mutex::new(Vec::new()) });
+        let provider = DockerEnvironmentProvider::new(runner.clone());
         let handles = provider.list().await.expect("list");
         let observation = handles[0].observe().await.runtime.expect("Docker observation");
+        let read: Vec<_> =
+            runner.calls.lock().expect("calls").iter().filter(|(cmd, _)| cmd == "cat").map(|(_, args)| args.clone()).collect();
+        let path = slice.map(|slice| vec![format!("/sys/fs/cgroup/{slice}/docker-{id}.scope/memory.current")]);
+        assert_eq!(read, path.into_iter().collect::<Vec<_>>());
         assert_eq!(observation.memory_usage_bytes, expected);
         assert_eq!(observation.memory_observed_at.is_some(), expected.is_some());
         assert!(observation.termination.is_none());
