@@ -757,7 +757,6 @@ pub fn project_panels(address: &ViewAddress, data: &TableRows<'_>) -> Result<Vec
     }
 
     if let Some(awareness) = awareness {
-        apply_family_summary(&mut checkouts, awareness, AwarenessFamily::Checkouts);
         apply_family_summary(&mut issues, awareness, AwarenessFamily::Issues);
         apply_family_summary(&mut independents, awareness, AwarenessFamily::Independents);
     }
@@ -2170,11 +2169,6 @@ mod tests {
                 AwarenessFamilySummary::builder()
                     .family(AwarenessFamily::Convoys)
                     .salience(Salience::Urgent)
-                    .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
-                    .build(),
-                AwarenessFamilySummary::builder()
-                    .family(AwarenessFamily::Checkouts)
-                    .salience(Salience::None)
                     .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
                     .build(),
                 AwarenessFamilySummary::builder()

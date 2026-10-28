@@ -58,20 +58,6 @@ fn pane_stamp_patch_round_trips() {
 }
 
 #[test]
-fn tab_entity_patch_round_trips() {
-    let patch = assert_patch_round_trips("patch_tab_entity.json");
-    // Workspace IDs read UUID hex in either case and write lowercase hyphenated UUIDs.
-    let id: WorkspaceId = "01920A6B7C3D7E4F8A1B2C3D4E5F6A7B".parse().unwrap();
-    assert_eq!(patch.target, MetadataTarget::Tab(id));
-    assert_eq!(serde_json::to_value(id).unwrap(), "01920a6b-7c3d-7e4f-8a1b-2c3d4e5f6a7b");
-    assert!(serde_json::from_str::<WorkspaceId>("7").is_err());
-    assert!("01920a6b-7c3d-7e4f-8a1b-2c3d4e5f6a7z".parse::<WorkspaceId>().is_err());
-    assert_eq!(patch.set["entity.id"].value, MetadataValue::Text("dev/manifest-extraction/implement@feta".to_owned()));
-    assert!(!patch.set.contains_key("action.primary.target"));
-    assert!(!patch.set.contains_key("tab.scope"));
-}
-
-#[test]
 fn value_variant_patch_round_trips() {
     let patch = assert_patch_round_trips("patch_value_variants.json");
     // Generated references must retain their provider through the mirror.
@@ -79,7 +65,6 @@ fn value_variant_patch_round_trips() {
         panic!("entity refs");
     };
     assert_eq!(refs[0].provider, "fixture-provider");
-    assert_eq!(patch.target, MetadataTarget::Root);
     assert_eq!(patch.set["status.attention"].value, MetadataValue::Bool(true));
     assert_eq!(patch.set["ordinal"].precedence, Some(5));
     assert_eq!(patch.set["ordinal"].ordinal, Some(-100));
@@ -113,7 +98,7 @@ fn observed_identities_parse_merges_concatenated_responses() {
 #[test]
 fn pipe_payload_is_the_tagged_compact_envelope() {
     let patch = MetadataPatch {
-        target: MetadataTarget::Root,
+        target: MetadataTarget::Entity(EntityRef::new("convoy", "dev/empty@fleet")),
         source_id: "flotilla\nconnector\rstream".to_owned(),
         set: BTreeMap::new(),
         unset: vec![],
@@ -179,14 +164,19 @@ fn entity_refs_do_not_prevent_older_consumers_receiving_existing_facts() {
 
 #[test]
 fn empty_patch_keeps_its_existing_delivery_behavior() {
-    let patch = MetadataPatch { target: MetadataTarget::Root, source_id: "flotilla".to_owned(), set: BTreeMap::new(), unset: vec![] };
+    let patch = MetadataPatch {
+        target: MetadataTarget::Entity(EntityRef::new("convoy", "dev/empty@fleet")),
+        source_id: "flotilla".to_owned(),
+        set: BTreeMap::new(),
+        unset: vec![],
+    };
     assert_eq!(patch.compatibility_patches(), vec![patch]);
 }
 
 #[test]
 fn edge_only_patch_needs_one_delivery() {
     let patch = MetadataPatch {
-        target: MetadataTarget::Root,
+        target: MetadataTarget::Entity(EntityRef::new("convoy", "dev/empty@fleet")),
         source_id: "flotilla".to_owned(),
         set: BTreeMap::from([(
             "flotilla.subject.produces".to_owned(),

@@ -13,16 +13,16 @@ use std::collections::BTreeMap;
 use flotilla_protocol::AttachBinding;
 
 use crate::{
-    entity::{self, EntityRef},
+    entity,
     keys::{
         KEY_ATTACH_REF, KEY_CONVOY, KEY_CREW_ROLE, KEY_ENTITY_ID, KEY_ENTITY_KIND, KEY_HOST, KEY_NAMESPACE, KEY_SESSION, KEY_SOURCE,
-        KEY_VESSEL, SOURCE_ACTUATOR, SOURCE_ATTACH, SOURCE_FLOTILLA,
+        KEY_VESSEL, SOURCE_ATTACH, SOURCE_FLOTILLA,
     },
-    wire::{MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate, PaneTarget, WorkspaceId},
+    wire::{MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate, PaneTarget},
 };
 
 /// Parse a pane id as PMs expose it to child processes: a plain integer
-/// (`ZELLIJ_PANE_ID`, `WHEELHOUSE_PANE_ID`) or display form (`terminal_42`).
+/// (`WHEELHOUSE_PANE_ID`) or display form (`terminal_42`).
 pub fn parse_pane_id(value: &str) -> Option<u32> {
     let text = value.trim();
     let text = text.strip_prefix("terminal_").unwrap_or(text);
@@ -72,25 +72,6 @@ pub fn pane_stamp(pane: PaneTarget, attach_ref: &str, binding: Option<&AttachBin
     MetadataPatch { target: MetadataTarget::Pane(pane), source_id: SOURCE_ATTACH.to_owned(), set, unset: vec![] }
 }
 
-/// What the workspace creator stamps onto a workspace/tab it materialises —
-/// the tab-id two-step's payload (create → capture id → one Tab-target
-/// patch, the git-watcher's factory pattern).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkspaceStamp {
-    /// The canonical catalog entity represented by this workspace.
-    pub entity: EntityRef,
-}
-
-/// The Tab-target patch published after workspace creation. No TTL — the
-/// stamp is a fact about the tab, not about any daemon being alive.
-pub fn tab_stamp(tab_id: WorkspaceId, stamp: &WorkspaceStamp) -> MetadataPatch {
-    let mut set = BTreeMap::new();
-    set.insert(KEY_SOURCE.to_owned(), MetadataValueUpdate::new(MetadataValue::text(SOURCE_FLOTILLA), None));
-    set.insert(KEY_ENTITY_KIND.to_owned(), MetadataValueUpdate::new(MetadataValue::text(stamp.entity.kind.clone()), None));
-    set.insert(KEY_ENTITY_ID.to_owned(), MetadataValueUpdate::new(MetadataValue::text(stamp.entity.id.clone()), None));
-    MetadataPatch { target: MetadataTarget::Tab(tab_id), source_id: SOURCE_ACTUATOR.to_owned(), set, unset: vec![] }
-}
-
 #[cfg(test)]
 mod tests {
     use flotilla_protocol::HostName;
@@ -128,21 +109,6 @@ mod tests {
         assert_eq!(patch.set[KEY_ATTACH_REF].value, MetadataValue::text("implement/coder"));
         assert_eq!(patch.set[KEY_SOURCE].value, MetadataValue::text(SOURCE_FLOTILLA));
         assert!(patch.set.values().all(|update| update.ttl_ms.is_none()), "pane stamps carry no TTL");
-    }
-
-    #[test]
-    fn tab_stamp_carries_kind_and_canonical_entity_without_ttl() {
-        use crate::keys::{KEY_SOURCE, SOURCE_ACTUATOR, SOURCE_FLOTILLA};
-        let stamp = WorkspaceStamp { entity: entity::vessel("dev", "manifest-extraction", "implement", "feta") };
-        let patch = tab_stamp("01920a6b-7c3d-7e4f-8a1b-2c3d4e5f6a7b".parse().unwrap(), &stamp);
-
-        assert_eq!(patch.target, MetadataTarget::Tab("01920a6b-7c3d-7e4f-8a1b-2c3d4e5f6a7b".parse().unwrap()));
-        assert_eq!(patch.source_id, SOURCE_ACTUATOR);
-        assert_eq!(patch.set[KEY_ENTITY_KIND].value, MetadataValue::text("vessel"));
-        assert_eq!(patch.set[KEY_ENTITY_ID].value, MetadataValue::text("dev/manifest-extraction/implement@feta"));
-        assert_eq!(patch.set[KEY_SOURCE].value, MetadataValue::text(SOURCE_FLOTILLA));
-        assert_eq!(patch.set.len(), 3);
-        assert!(patch.set.values().all(|update| update.ttl_ms.is_none()), "tab stamps carry no TTL");
     }
 
     #[test]

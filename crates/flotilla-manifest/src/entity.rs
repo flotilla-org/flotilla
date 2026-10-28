@@ -89,10 +89,6 @@ pub fn session(session_ref: &str) -> EntityRef {
     EntityRef::new("session", session_ref)
 }
 
-pub fn checkout(checkout_ref: &str) -> EntityRef {
-    EntityRef::new("checkout", checkout_ref)
-}
-
 #[cfg(test)]
 mod tests {
     use flotilla_protocol::{HostName, IssueSource};

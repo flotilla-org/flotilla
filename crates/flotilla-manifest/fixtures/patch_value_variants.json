@@ -48,7 +48,12 @@
   },
   "source_id": "flotilla-connector",
   "target": {
-    "kind": "root"
+    "kind": "entity",
+    "value": {
+      "id": "dev/example@fleet",
+      "kind": "vessel",
+      "provider": ""
+    }
   },
   "type": "metadata-patch",
   "unset": []

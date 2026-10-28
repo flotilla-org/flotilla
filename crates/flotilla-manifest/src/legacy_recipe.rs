@@ -12,7 +12,6 @@ pub(crate) fn command(recipe: &Recipe) -> String {
     let (argv, literal_end) = match recipe.legacy() {
         LegacyRecipe::Attach(argv) => (argv, 3),
         LegacyRecipe::View(argv) => (argv, 2),
-        LegacyRecipe::Checkout(argv) => (argv, 4),
         LegacyRecipe::Command(argv) => (argv, 1),
     };
     argv.iter()

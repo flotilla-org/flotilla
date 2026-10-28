@@ -8,7 +8,7 @@
 //! itself never touches a PM.
 //!
 //! Wheelhouse owns connection liveness: one replacing snapshot, then atomic
-//! diffs without TTLs. Zellij retains TTL heartbeats.
+//! diffs without TTLs.
 //! Delivery uncertainty is bounded; supervised daemon loss exits for restart.
 //!
 //! Recovery preserves unrelated sources; watch snapshots must remain scoped.
@@ -123,8 +123,6 @@ where
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 pub struct PmConnectOptions {
-    pub zellij_bin: Option<String>,
-    pub plugin_url: Option<String>,
     pub wheelhouse_socket: Option<PathBuf>,
     /// Executable path or name minted into materialise recipes — what the PM
     /// runs on activation, resolved in the PM's own environment.
@@ -137,9 +135,7 @@ pub fn resolve_pm(options: &PmConnectOptions, env: &dyn Fn(&str) -> Option<Strin
     if let Some(socket) = &options.wheelhouse_socket {
         return Ok(PmInstance::wheelhouse(socket));
     }
-    PmInstance::detect(env)
-        .map(|pm| pm.with_zellij_bin(options.zellij_bin.clone()).with_plugin_url(options.plugin_url.clone()))
-        .ok_or_else(|| "no presentation manager detected: run inside one or pass --wheelhouse-socket".to_owned())
+    PmInstance::detect(env).ok_or_else(|| "no presentation manager detected: run inside one or pass --wheelhouse-socket".to_owned())
 }
 
 /// What applying one daemon event did to the connector's row state.

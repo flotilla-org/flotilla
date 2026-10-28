@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, env, fs, path::Path};
 
 use wheelhouse_core::{
     EntityRef, ExternalMessage, MetadataIdentity, MetadataPatch, MetadataTarget,
-    MetadataValue, MetadataValueUpdate, ObservedMetadataIdentity, PaneTarget, WorkspaceId,
+    MetadataValue, MetadataValueUpdate, ObservedMetadataIdentity, PaneTarget,
 };
 
 fn text(value: &str) -> MetadataValue {
@@ -99,25 +99,13 @@ fn main() {
         vec![],
     );
 
-    // 4. Tab stamp: the actuator's tab-id two-step — tab target, no TTL.
-    let tab_patch = patch(
-        MetadataTarget::Tab("01920a6b-7c3d-7e4f-8a1b-2c3d4e5f6a7b".parse::<WorkspaceId>().expect("fixture workspace UUID")),
-        "flotilla-actuator",
-        vec![
-            ("entity.kind", update(text("vessel"), None)),
-            ("entity.id", update(text("dev/manifest-extraction/implement@feta"), None)),
-            ("source", update(text("flotilla"), None)),
-        ],
-        vec![],
-    );
-
-    // 5. Value-variant coverage: bool / integer / string-list, precedence + ordinal,
-    //    plugin pane target, root target.
+    // 4. Value-variant coverage: bool / integer / string-list, precedence + ordinal,
+    //    plugin pane target.
     let mut ordinal_update = update(MetadataValue::Integer(-100), Some(30_000));
     ordinal_update.precedence = Some(5);
     ordinal_update.ordinal = Some(-100);
     let variants_patch = patch(
-        MetadataTarget::Root,
+        entity_target("vessel", "dev/example@fleet"),
         "flotilla-connector",
         vec![
             ("status.attention", update(MetadataValue::Bool(true), Some(30_000))),
@@ -137,7 +125,7 @@ fn main() {
         vec![],
     );
 
-    // 6. Observed identities: the shape the observed-identities pipe returns.
+    // 5. Observed identities: the shape the observed-identities pipe returns.
     let observed = vec![
         ObservedMetadataIdentity {
             identity: MetadataIdentity {
@@ -161,7 +149,6 @@ fn main() {
         ("patch_entity_catalog.json", serde_json::to_value(&entity_patch).expect("serialize")),
         ("patch_entity_session.json", serde_json::to_value(&session_patch).expect("serialize")),
         ("patch_pane_stamp.json", serde_json::to_value(&pane_patch).expect("serialize")),
-        ("patch_tab_entity.json", serde_json::to_value(&tab_patch).expect("serialize")),
         ("patch_value_variants.json", serde_json::to_value(&variants_patch).expect("serialize")),
         ("patch_pane_plugin.json", serde_json::to_value(&plugin_pane_patch).expect("serialize")),
         ("observed_identities.json", serde_json::to_value(&observed).expect("serialize")),
