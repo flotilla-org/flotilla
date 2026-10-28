@@ -743,12 +743,7 @@ where
         if !self.actuates(obj) {
             return Ok(TerminalPrepared::None);
         }
-        let (reads, owned) = (Arc::clone(&self.lifecycle_reads), obj.clone());
-        let (selected, launch) =
-            tokio::task::spawn_blocking(move || flotilla_resources::terminal_launches::read(reads.as_ref(), &owned, None))
-                .await
-                .map_err(|error| ResourceError::other(error.to_string()))?
-                .map_err(ResourceError::other)?;
+        let (selected, launch) = flotilla_store::read_terminal_session(Arc::clone(&self.lifecycle_reads), obj, None).await?;
         let prepared = self.prepare_observation(&selected).await?;
         if matches!(prepared, TerminalPrepared::RecoverLost) && launch.is_some() {
             self.backend.request_terminal_replacement(obj, launch.as_deref(), self.clock.now()).await?;

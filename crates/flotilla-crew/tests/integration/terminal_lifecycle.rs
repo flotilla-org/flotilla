@@ -248,6 +248,15 @@ fn phase_and_ending_views_do_not_reuse_old_phase(tc: hegel::TestCase) {
     };
     let obj = terminal_session(phase);
     let old = obj.status.clone();
+    // With no engine, selecting a view is immediate and retains observations: it must not
+    // dispatch to the OS pool or change controller/watch ordering.
+    use futures::FutureExt;
+    let (off, key) = flotilla_store::read_terminal_session(Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads), &obj, None)
+        .now_or_never()
+        .expect("disabled lifecycle reads complete without a blocking task")
+        .expect("off view");
+    assert_eq!(off.status, old);
+    assert!(key.is_none());
     let selected = flotilla_resources::terminal_launches::TerminalLaunch { name: "terminal-a#7".into(), reading }.project(&obj);
     assert_eq!(selected.status.expect("view").phase, expected);
     assert_eq!(obj.status, old, "a view does not write a status copy");

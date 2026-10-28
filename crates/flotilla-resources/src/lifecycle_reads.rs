@@ -23,6 +23,12 @@ pub enum ProvisioningKind {
 /// impl LifecycleReads for Incomplete {}
 /// ```
 pub trait LifecycleReads: Send + Sync {
+    /// No home is configured, so consumers can preserve the no-engine path without
+    /// dispatching a blocking read. Active adapters default to checked reads.
+    fn is_disabled(&self) -> bool {
+        false
+    }
+
     /// A read failure is distinct from an unheld resource and must not select legacy status.
     fn try_reading(
         &self,
@@ -60,6 +66,10 @@ pub trait LifecycleReads: Send + Sync {
 pub struct NoLifecycleReads;
 
 impl LifecycleReads for NoLifecycleReads {
+    fn is_disabled(&self) -> bool {
+        true
+    }
+
     fn try_reading(&self, _: ProvisioningKind, _: &str, _: Option<&str>) -> Result<Option<flotilla_protocol::LifecycleReading>, String> {
         Ok(None)
     }
@@ -86,6 +96,10 @@ impl LateLifecycleReads {
 }
 
 impl LifecycleReads for LateLifecycleReads {
+    fn is_disabled(&self) -> bool {
+        self.installed.get().is_none_or(|reads| reads.is_disabled())
+    }
+
     fn try_terminal_launch(&self, name: &str, origin: Option<&str>) -> Result<Option<crate::terminal_launches::TerminalLaunch>, String> {
         self.installed.get().map_or(Ok(None), |reads| reads.try_terminal_launch(name, origin))
     }

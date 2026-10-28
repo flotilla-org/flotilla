@@ -10,6 +10,9 @@ pub async fn read_terminal_session(
     obj: &ResourceObject<TerminalSession>,
     origin: Option<&str>,
 ) -> Result<(ResourceObject<TerminalSession>, Option<String>), ResourceError> {
+    if reads.is_disabled() {
+        return Ok((obj.clone(), None));
+    }
     let (obj, origin) = (obj.clone(), origin.map(str::to_owned));
     tokio::task::spawn_blocking(move || flotilla_resources::terminal_launches::read(reads.as_ref(), &obj, origin.as_deref()))
         .await
@@ -21,6 +24,9 @@ pub async fn read_terminal_sources(
     reads: Arc<dyn LifecycleReads>,
     sources: Vec<ReadResourceObject<TerminalSession>>,
 ) -> Result<Vec<ReadResourceObject<TerminalSession>>, ResourceError> {
+    if sources.is_empty() || reads.is_disabled() {
+        return Ok(sources);
+    }
     tokio::task::spawn_blocking(move || {
         sources
             .into_iter()
