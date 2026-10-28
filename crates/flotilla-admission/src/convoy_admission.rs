@@ -4275,6 +4275,40 @@ pub struct PlacementTieBreak<'a> {
     pub now: DateTime<Utc>,
 }
 
+/// Free share of a host's vessel cap; uncapped hosts count as fully free.
+#[derive(Clone, Copy, Eq)]
+struct FreeFraction {
+    free: u64,
+    cap: u64,
+}
+
+impl FreeFraction {
+    fn of(candidate: &KindCandidate) -> Self {
+        match candidate.vessel_cap.zip(candidate.free_slots) {
+            Some((cap, free)) => Self { free: u64::from(free.min(cap)), cap: u64::from(cap.max(1)) },
+            None => Self { free: 1, cap: 1 },
+        }
+    }
+}
+
+impl PartialEq for FreeFraction {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Ord for FreeFraction {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.free * other.cap).cmp(&(other.free * self.cap))
+    }
+}
+
+impl PartialOrd for FreeFraction {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl PlacementTieBreak<'_> {
     pub fn reserved(&self, candidate: &KindCandidate) -> bool {
         candidate.kind.spec.grants.iter().any(|grant| {
@@ -4308,9 +4342,7 @@ impl PlacementCandidateOrder for PlacementTieBreak<'_> {
                 candidate.image_cost,
                 candidate.kind.spec.cost_class,
                 Reverse(policy.spec.priority),
-                // Spread over capped hosts with room: most free
-                // slots first. Other hosts keep their prior order.
-                Reverse(candidate.vessel_cap.and(candidate.free_slots).unwrap_or(u32::MAX)),
+                Reverse(FreeFraction::of(candidate)),
                 candidate.kind.metadata.name.clone(),
             )
         };
@@ -6182,14 +6214,33 @@ mod tests {
             let right = candidate("right", right.3, right.0, right.1, right.2);
             assert_eq!(placement_tiebreak.compare(&left, &right).is_lt(), left_wins, "{label}");
         }
-        // #3793: among otherwise equal capped SSH hosts, the most free
-        // slots wins; uncapped kinds keep name order whatever slots they publish.
         let mut fuller = candidate("a-fuller", FulfilmentCostClass::OwnedIdle, true, None, Some(1));
         let mut emptier = candidate("b-emptier", FulfilmentCostClass::OwnedIdle, true, None, Some(3));
         assert!(placement_tiebreak.compare(&fuller, &emptier).is_lt(), "uncapped kinds are not spread by published slots");
         fuller.vessel_cap = Some(4);
         emptier.vessel_cap = Some(4);
         assert!(placement_tiebreak.compare(&fuller, &emptier).is_gt(), "capped hosts spread to the most free slots");
+
+        let mut idle_box = candidate("b-idle-box", FulfilmentCostClass::OwnedIdle, true, None, Some(1));
+        let mut big_host = candidate("a-big-host", FulfilmentCostClass::OwnedIdle, true, None, Some(14));
+        idle_box.vessel_cap = Some(1);
+        big_host.vessel_cap = Some(20);
+        assert!(
+            placement_tiebreak.compare(&idle_box, &big_host).is_lt(),
+            "an idle single-tenant host beats a larger host with a smaller free fraction"
+        );
+        big_host.vessel_cap = Some(14);
+        assert!(placement_tiebreak.compare(&big_host, &idle_box).is_lt(), "equal fractions fall back to name");
+        let mut over_reported = candidate("c-over", FulfilmentCostClass::OwnedIdle, true, None, Some(9));
+        over_reported.vessel_cap = Some(2);
+        big_host.vessel_cap = Some(20);
+        assert!(placement_tiebreak.compare(&over_reported, &big_host).is_lt(), "free slots above the cap count as fully free");
+        let mut zero_cap = candidate("a-zero", FulfilmentCostClass::OwnedIdle, true, None, Some(0));
+        zero_cap.vessel_cap = Some(0);
+        assert!(placement_tiebreak.compare(&zero_cap, &big_host).is_gt(), "a zero cap ranks last");
+        let uncapped = candidate("c-uncapped", FulfilmentCostClass::OwnedIdle, true, None, Some(2));
+        big_host.vessel_cap = Some(20);
+        assert!(placement_tiebreak.compare(&uncapped, &big_host).is_lt(), "uncapped ranks fully free, ahead of a partly used capped host");
     }
 
     // Issue #3645: tracker labels are untrusted hints; malformed needs must
