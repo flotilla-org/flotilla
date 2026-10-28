@@ -104,7 +104,7 @@ pub struct FulfilmentAllocationCandidate {
     pub host_ready: bool,
     pub sleeping_until: Option<chrono::DateTime<chrono::Utc>>,
     pub free_vessel_slots: Option<u32>,
-    /// The vessel cap an agentless SSH host declares (#3793). Absent in
+    /// The vessel cap an SSH host declares (#3793). Absent in
     /// previous-generation convoy statuses (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_vessels: Option<u32>,

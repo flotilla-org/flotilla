@@ -69,7 +69,7 @@ pub const KEY_WORK_PHASE: &str = "flotilla.work.phase";
 /// Host whose daemon acts on a convoy vessel; attach recipes address it.
 pub const KEY_VESSEL_HOST: &str = "flotilla.vessel.host";
 /// Machine a convoy vessel runs on, as information only; differs from
-/// [`KEY_VESSEL_HOST`] when an agentless SSH host carries the vessel.
+/// [`KEY_VESSEL_HOST`] when an SSH host carries the vessel.
 pub const KEY_VESSEL_CARRIED_BY: &str = "flotilla.vessel.carried_by";
 /// Host currently carrying an independent terminal session.
 pub const KEY_INDEPENDENT_HOST: &str = "flotilla.independent.host";

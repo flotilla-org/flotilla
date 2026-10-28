@@ -27,7 +27,7 @@ session state from display variables or launchd, and capacity from discovered
 terminal pools. Command failure or missing detection leaves that observation
 unknown without suppressing unrelated successful observations.
 
-Detection belongs to the provider. Local and agentless SSH observations use
+Detection belongs to the provider. Local and SSH host observations use
 the injected endpoint; image observations run in the resolved image without
 pulling or network access. Detection requires target Bash for owned process
 groups; missing Bash leaves detection unknown. Startup files, exported shell

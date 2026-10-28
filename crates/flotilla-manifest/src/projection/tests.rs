@@ -372,7 +372,7 @@ fn direct_cleat_recipe_contract_covers_remote_local_fallback_and_withdrawal() {
     assert!(withdrawal.unset.contains(&KEY_PRIMARY_ACTION_RECIPE.to_owned()));
 }
 
-// #4021: a vessel on an agentless SSH host opens through its acting daemon's
+// #4021: a vessel on an SSH host opens through its acting daemon's
 // recipe. The machine it runs on is information, never a direct path (#3995).
 #[test]
 fn vessel_on_another_machine_attaches_through_its_acting_daemon_only() {

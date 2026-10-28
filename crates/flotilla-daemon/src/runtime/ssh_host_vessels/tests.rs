@@ -97,12 +97,12 @@ impl AgentConnector for LocalConnector {
 
 #[async_trait]
 impl VesselAgents for LocalAgents {
-    async fn host_refusals(&self, _profile: &AgentlessSshProfile) -> Vec<HostRefusal> {
+    async fn host_refusals(&self, _profile: &SshHostProfile) -> Vec<HostRefusal> {
         Vec::new()
     }
     async fn open(
         &self,
-        profile: &AgentlessSshProfile,
+        profile: &SshHostProfile,
         _: &HostPlatform,
         paths: &VesselPaths,
         local: &Path,
@@ -118,7 +118,7 @@ impl VesselAgents for LocalAgents {
         &self,
         _discovery: &DiscoveryRuntime,
         _config: &ConfigStore,
-        _profile: &AgentlessSshProfile,
+        _profile: &SshHostProfile,
         _handle: &dyn VesselHandle,
         _environment: &BTreeMap<String, String>,
     ) -> Result<Arc<ProviderRegistry>, String> {
@@ -156,7 +156,7 @@ struct Host {
     _runtime: flotilla_test_support::TestSocketDir,
     home: flotilla_test_support::TestSocketDir,
     state: flotilla_test_support::TestSocketDir,
-    profile: AgentlessSshProfile,
+    profile: SshHostProfile,
 }
 
 fn host(runner: Arc<dyn CommandRunner>) -> Host {
@@ -165,7 +165,7 @@ fn host(runner: Arc<dyn CommandRunner>) -> Host {
     // daemon sockets: both are socket directories (SUN_LEN).
     let home = flotilla_test_support::TestSocketDir::new();
     let state = flotilla_test_support::TestSocketDir::new();
-    let profile = AgentlessSshProfile {
+    let profile = SshHostProfile {
         provisioning: LocalProvisioningProfile {
             environment_providers: Vec::new(),
             host_id: "b1".into(),
@@ -195,12 +195,12 @@ fn host(runner: Arc<dyn CommandRunner>) -> Host {
     Host { _runtime: runtime, home, state, profile }
 }
 
-async fn access(vessels: &AgentlessVessels, host: &Host, vessel: &str) -> Result<Arc<VesselAccess>, String> {
+async fn access(vessels: &SshHostVessels, host: &Host, vessel: &str) -> Result<Arc<VesselAccess>, String> {
     access_with(vessels, host, vessel, EnvironmentToolProvisioner::new(Vec::new())).await
 }
 
 async fn access_with(
-    vessels: &AgentlessVessels,
+    vessels: &SshHostVessels,
     host: &Host,
     vessel: &str,
     tools: EnvironmentToolProvisioner,
@@ -237,7 +237,7 @@ async fn two_vessels_on_one_host_each_get_their_own_agent_and_socket() {
     let host = host(Arc::new(ProcessCommandRunner));
     let agents = Arc::new(LocalAgents::default());
     let (sockets, mut received) = recording_sockets(host.state.path());
-    let vessels = AgentlessVessels::new(agents.clone(), sockets, host.state.path().join("vessels"));
+    let vessels = SshHostVessels::new(agents.clone(), sockets, host.state.path().join("vessels"));
     let a = access(&vessels, &host, "convoy-1-work").await.expect("vessel a");
     let b = access(&vessels, &host, "convoy-2-work").await.expect("vessel b");
     assert_eq!(agents.agents.lock().unwrap().len(), 2, "one agent per vessel");
@@ -287,7 +287,7 @@ async fn retiring_a_vessel_removes_it_without_touching_its_neighbour() {
     let host = host(Arc::new(ProcessCommandRunner));
     let agents = Arc::new(LocalAgents::default());
     let (sockets, _received) = recording_sockets(host.state.path());
-    let vessels = AgentlessVessels::new(agents.clone(), sockets, host.state.path().join("vessels"));
+    let vessels = SshHostVessels::new(agents.clone(), sockets, host.state.path().join("vessels"));
     let gone = access(&vessels, &host, "convoy-1-work").await.expect("vessel");
     let kept = access(&vessels, &host, "convoy-2-work").await.expect("neighbour");
 
@@ -319,12 +319,12 @@ async fn a_restarted_controller_retires_vessels_removed_while_it_was_down() {
     let agents = Arc::new(LocalAgents::default());
     let paths = {
         let (sockets, _received) = recording_sockets(host.state.path());
-        let before = AgentlessVessels::new(agents.clone(), sockets, host.state.path().join("vessels"));
+        let before = SshHostVessels::new(agents.clone(), sockets, host.state.path().join("vessels"));
         access(&before, &host, "convoy-1-work").await.expect("vessel").paths.clone()
     };
     assert!(paths.agent.join("vessel.json").is_file() && paths.state.join("vessel.json").is_file());
     let (sockets, _received) = recording_sockets(host.state.path());
-    let restarted = AgentlessVessels::new(agents, sockets, host.state.path().join("vessels"));
+    let restarted = SshHostVessels::new(agents, sockets, host.state.path().join("vessels"));
     restarted.retire_absent(&host.profile, &BTreeSet::new()).await.expect("retire absent");
     assert!(!paths.agent.exists() && !paths.state.exists());
 }
@@ -358,7 +358,7 @@ async fn an_unreachable_host_does_not_block_teardown() {
     let mut host = host(Arc::new(ProcessCommandRunner));
     let agents = Arc::new(LocalAgents::default());
     let (sockets, _received) = recording_sockets(host.state.path());
-    let vessels = AgentlessVessels::new(agents, sockets, host.state.path().join("vessels"));
+    let vessels = SshHostVessels::new(agents, sockets, host.state.path().join("vessels"));
     let vessel = access(&vessels, &host, "convoy-1-work").await.expect("vessel");
     host.profile.runner = Arc::new(Unreachable);
     vessels.retire(&host.profile, "convoy-1-work").await;
@@ -448,7 +448,7 @@ fn crew_spec(vessel: &str) -> TerminalSessionSpec {
 }
 
 // A convoy homed on another daemon may place its vessel on this daemon's
-// agentless host: its replicated session keeps the vessel's agent alive.
+// SSH host: its replicated session keeps the vessel's agent alive.
 // Mutation check: listing local records only retires that agent.
 #[tokio::test]
 async fn a_replicated_tool_session_keeps_its_vessel_live() {
@@ -482,7 +482,7 @@ struct MissingLayer;
 #[async_trait]
 impl crate::environment_tools::EnvironmentToolFactory for MissingLayer {
     fn provider_kinds(&self) -> &[crate::environment_tools::EnvironmentToolProviderKind] {
-        &[AGENTLESS_SSH_PROVIDER_KIND]
+        &[SSH_HOST_PROVIDER_KIND]
     }
     async fn prepare(
         &self,
@@ -500,7 +500,7 @@ async fn missing_tools_refuse_before_opening_an_agent() {
     let host = host(Arc::new(ProcessCommandRunner));
     let agents = Arc::new(LocalAgents::default());
     let (sockets, _received) = recording_sockets(host.state.path());
-    let vessels = AgentlessVessels::new(agents.clone(), sockets, host.state.path().join("vessels"));
+    let vessels = SshHostVessels::new(agents.clone(), sockets, host.state.path().join("vessels"));
     let error = access_with(&vessels, &host, "convoy-1-work", EnvironmentToolProvisioner::new(vec![Arc::new(MissingLayer)]))
         .await
         .err()
@@ -545,7 +545,7 @@ async fn a_failed_marker_listing_still_retires_known_vessels() {
     let mut host = host(Arc::new(ProcessCommandRunner));
     let agents = Arc::new(LocalAgents::default());
     let (sockets, _received) = recording_sockets(host.state.path());
-    let vessels = AgentlessVessels::new(agents, sockets, host.state.path().join("vessels"));
+    let vessels = SshHostVessels::new(agents, sockets, host.state.path().join("vessels"));
     let gone = access(&vessels, &host, "convoy-1-work").await.expect("vessel");
     host.profile.runner = Arc::new(MarkersUnlisted);
     let error = vessels.retire_absent(&host.profile, &BTreeSet::new()).await.expect_err("markers unlisted");

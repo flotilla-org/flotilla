@@ -708,8 +708,8 @@ impl EnvironmentRuntime for DockerControllerRuntime {
     }
 
     async fn cleanup(&self, environment_ref: &str) -> Result<(), String> {
-        // An agentless host's vessel agents go with its Environment (#3792).
-        if let (Some(vessels), Some(profile)) = (&self.state.agentless_vessels, self.state.agentless_ssh.get(environment_ref)) {
+        // An SSH host's vessel agents go with its Environment (#3792).
+        if let (Some(vessels), Some(profile)) = (&self.state.ssh_host_vessels, self.state.ssh_host.get(environment_ref)) {
             vessels.retire_environment(profile).await;
         }
         if let Some(sockets) = &self.state.environment_sockets {

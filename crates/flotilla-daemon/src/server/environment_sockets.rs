@@ -237,7 +237,7 @@ impl EnvironmentSocketRegistry {
 pub enum SocketReach {
     /// Bind-mounted into a container: the kernel peer is the crew's own process.
     Mounted,
-    /// Carried by a vessel agent's guest forward on an agentless host (#3792):
+    /// Carried by a vessel agent's guest forward on an SSH host (#3792):
     /// the kernel peer is the controller's own agent client, so its
     /// environment is no crew evidence.
     Forwarded,
@@ -271,7 +271,7 @@ impl EnvironmentSocketService {
         self.prepare_reached(SocketKey { environment: id, vessel: None }, SocketReach::Mounted).await
     }
 
-    /// The socket one vessel's agent forwards its crews to, on an agentless
+    /// The socket one vessel's agent forwards its crews to, on an SSH
     /// host where vessels share their environment (#3792). It serves that
     /// environment.
     pub(crate) async fn prepare_vessel_forwarded(&self, id: EnvironmentId, vessel: &str) -> Result<DaemonHostPath, String> {

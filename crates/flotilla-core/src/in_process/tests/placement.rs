@@ -330,7 +330,7 @@ async fn placement_target_host_rejects_ambiguous_display_name() {
 }
 
 #[tokio::test]
-async fn agentless_ssh_host_takes_only_pinned_work_and_routes_to_its_owner() {
+async fn ssh_host_takes_only_pinned_work_and_routes_to_its_owner() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts
@@ -338,7 +338,7 @@ async fn agentless_ssh_host_takes_only_pinned_work_and_routes_to_its_owner() {
             &test_meta("ssh-host"),
             &HostSpec {
                 display_name: "beaufort".to_string(),
-                connection: flotilla_resources::HostConnection::AgentlessSsh {
+                connection: flotilla_resources::HostConnection::SshHost {
                     owning_daemon: "owner-host".to_string(),
                     destination: "crew@beaufort.example".to_string(),
                 },
@@ -358,7 +358,7 @@ async fn agentless_ssh_host_takes_only_pinned_work_and_routes_to_its_owner() {
                         serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
                     ),
                     (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!([])),
-                    ("agentless".to_string(), serde_json::json!(true)),
+                    ("ssh_host".to_string(), serde_json::json!(true)),
                     ("transport".to_string(), serde_json::json!("ssh")),
                     ("placement".to_string(), serde_json::json!("host_direct_only")),
                     ("owning_daemon".to_string(), serde_json::json!("owner-host")),
@@ -381,10 +381,10 @@ async fn agentless_ssh_host_takes_only_pinned_work_and_routes_to_its_owner() {
             .build()])
         .build();
     let unpinned = default_convoy_placement_policy(&backend, "flotilla", None, &[], &trusted, None).await.expect("placement scoring");
-    assert!(unpinned.selected.is_none(), "an unpinned convoy must not land on an agentless SSH host");
+    assert!(unpinned.selected.is_none(), "an unpinned convoy must not land on an SSH host");
     assert_eq!(unpinned.refused_candidates.len(), 1);
     assert_eq!(unpinned.refused_candidates[0].policy_name, policy.metadata.name);
-    assert_eq!(unpinned.refused_candidates[0].reason, "agentless SSH host takes only convoys that pin its placement");
+    assert_eq!(unpinned.refused_candidates[0].reason, "SSH host takes only convoys that pin its placement");
     validate_workflow_agent_adapters(&backend, "flotilla", &trusted, Some(&policy), false)
         .await
         .expect("pinned trusted work is admissible");
@@ -394,7 +394,7 @@ async fn agentless_ssh_host_takes_only_pinned_work_and_routes_to_its_owner() {
     let agent_workflow = flotilla_resources::single_agent_workflow_spec();
     let refused = validate_workflow_agent_adapters(&backend, "flotilla", &agent_workflow, Some(&policy), false)
         .await
-        .expect_err("agentless SSH host cannot run a local agent adapter");
+        .expect_err("SSH host cannot run a local agent adapter");
     assert!(refused.contains("agent adapter `codex`"), "{refused}");
 
     let observed = hosts.get("ssh-host").await.expect("SSH Host");

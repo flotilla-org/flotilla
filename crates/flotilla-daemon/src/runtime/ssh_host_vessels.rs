@@ -1,4 +1,4 @@
-//! #3792: agentless SSH hosts run each vessel through drydock's vessel agent,
+//! #3792: SSH hosts run each vessel through drydock's vessel agent,
 //! as Docker vessels do since #3756. Flotilla keeps owning the host: its
 //! lifecycle, capacity and placement. Only the way commands, files, forwards
 //! and tool layers reach the host changes.
@@ -45,8 +45,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OnceCell};
 use tracing::{info, warn};
 
-use super::discovery::AgentlessSshProfile;
-use crate::environment_tools::{EnvironmentToolContext, EnvironmentToolProvisioner, AGENTLESS_SSH_PROVIDER_KIND};
+use super::discovery::SshHostProfile;
+use crate::environment_tools::{EnvironmentToolContext, EnvironmentToolProvisioner, SSH_HOST_PROVIDER_KIND};
 use crate::server::environment_sockets::EnvironmentSocketService;
 
 /// The guest forward that carries a vessel's crews to the daemon.
@@ -67,7 +67,7 @@ const MARKER: &str = "vessel.json";
 const IDENTITY_VARIABLES: &[&str] =
     &["HOME", "USER", "LOGNAME", "SHELL", "XDG_RUNTIME_DIR", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"];
 
-/// One vessel on one agentless host's Environment.
+/// One vessel on one SSH host's Environment.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) struct VesselKey {
     pub(super) environment: String,
@@ -372,16 +372,16 @@ pub(super) struct HostRefusal {
 /// uses drydock's SSH transport; tests substitute the agent.
 #[async_trait]
 pub(super) trait VesselAgents: Send + Sync {
-    async fn observe_platform(&self, profile: &AgentlessSshProfile) -> Result<HostPlatform, String> {
+    async fn observe_platform(&self, profile: &SshHostProfile) -> Result<HostPlatform, String> {
         HostPlatform::probe(profile.runner.as_ref()).await
     }
     /// Why this controller cannot run vessels on the host, if it cannot.
-    async fn host_refusals(&self, profile: &AgentlessSshProfile) -> Vec<HostRefusal>;
+    async fn host_refusals(&self, profile: &SshHostProfile) -> Vec<HostRefusal>;
     /// A handle on one vessel's agent at `paths`, with its attach forwards
     /// bound under `local` on the controller.
     async fn open(
         &self,
-        profile: &AgentlessSshProfile,
+        profile: &SshHostProfile,
         platform: &HostPlatform,
         paths: &VesselPaths,
         local: &Path,
@@ -391,7 +391,7 @@ pub(super) trait VesselAgents: Send + Sync {
         &self,
         discovery: &DiscoveryRuntime,
         config: &ConfigStore,
-        profile: &AgentlessSshProfile,
+        profile: &SshHostProfile,
         handle: &dyn VesselHandle,
         environment: &BTreeMap<String, String>,
     ) -> Result<Arc<ProviderRegistry>, String>;
@@ -425,7 +425,7 @@ impl SshVesselAgents {
         Self { agent_build, platforms: StdMutex::default(), builds: StdMutex::default() }
     }
 
-    async fn platform(&self, profile: &AgentlessSshProfile) -> Result<HostPlatform, String> {
+    async fn platform(&self, profile: &SshHostProfile) -> Result<HostPlatform, String> {
         match HostPlatform::probe(profile.runner.as_ref()).await {
             Ok(platform) => {
                 self.platforms.lock().expect("platforms").insert(profile.environment_id.clone(), platform.clone());
@@ -446,10 +446,10 @@ impl SshVesselAgents {
 
 #[async_trait]
 impl VesselAgents for SshVesselAgents {
-    async fn observe_platform(&self, profile: &AgentlessSshProfile) -> Result<HostPlatform, String> {
+    async fn observe_platform(&self, profile: &SshHostProfile) -> Result<HostPlatform, String> {
         self.platform(profile).await
     }
-    async fn host_refusals(&self, profile: &AgentlessSshProfile) -> Vec<HostRefusal> {
+    async fn host_refusals(&self, profile: &SshHostProfile) -> Vec<HostRefusal> {
         let mut refusals = Vec::new();
         let refuse = |reason, message: String, blocks_readiness| HostRefusal {
             condition: "Transport/VesselAgent",
@@ -481,7 +481,7 @@ impl VesselAgents for SshVesselAgents {
 
     async fn open(
         &self,
-        profile: &AgentlessSshProfile,
+        profile: &SshHostProfile,
         platform: &HostPlatform,
         paths: &VesselPaths,
         local: &Path,
@@ -507,7 +507,7 @@ impl VesselAgents for SshVesselAgents {
         &self,
         discovery: &DiscoveryRuntime,
         config: &ConfigStore,
-        profile: &AgentlessSshProfile,
+        profile: &SshHostProfile,
         handle: &dyn VesselHandle,
         environment: &BTreeMap<String, String>,
     ) -> Result<Arc<ProviderRegistry>, String> {
@@ -546,8 +546,8 @@ struct VesselSlot {
     prepared: Mutex<Option<Arc<VesselAccess>>>,
 }
 
-/// The vessel agents on this controller's agentless hosts.
-pub(super) struct AgentlessVessels {
+/// The vessel agents on this controller's SSH hosts.
+pub(super) struct SshHostVessels {
     agents: Arc<dyn VesselAgents>,
     sockets: EnvironmentSocketService,
     /// Controller-side directories for attach forwards, one per vessel.
@@ -555,16 +555,16 @@ pub(super) struct AgentlessVessels {
     vessels: Mutex<HashMap<VesselKey, Arc<VesselSlot>>>,
     /// Tombstones for retired vessels: a late observation of one of their
     /// sessions must not resurrect the agent. A vessel live in the store again
-    /// is admitted by [`AgentlessVessels::retire_absent`].
+    /// is admitted by [`SshHostVessels::retire_absent`].
     retired: Mutex<HashSet<VesselKey>>,
 }
 
-impl AgentlessVessels {
+impl SshHostVessels {
     pub(super) fn new(agents: Arc<dyn VesselAgents>, sockets: EnvironmentSocketService, local_root: PathBuf) -> Self {
         Self { agents, sockets, local_root, vessels: Mutex::default(), retired: Mutex::default() }
     }
 
-    pub(super) async fn host_refusals(&self, profile: &AgentlessSshProfile) -> Vec<HostRefusal> {
+    pub(super) async fn host_refusals(&self, profile: &SshHostProfile) -> Vec<HostRefusal> {
         self.agents.host_refusals(profile).await
     }
 
@@ -573,7 +573,7 @@ impl AgentlessVessels {
     pub(super) async fn access(
         &self,
         preparation: &VesselPreparation<'_>,
-        profile: &AgentlessSshProfile,
+        profile: &SshHostProfile,
         vessel: &str,
     ) -> Result<Arc<VesselAccess>, String> {
         let key = VesselKey::new(&profile.environment_id, vessel);
@@ -598,17 +598,12 @@ impl AgentlessVessels {
         Ok(access)
     }
 
-    async fn prepare(
-        &self,
-        preparation: &VesselPreparation<'_>,
-        profile: &AgentlessSshProfile,
-        key: VesselKey,
-    ) -> Result<VesselAccess, String> {
+    async fn prepare(&self, preparation: &VesselPreparation<'_>, profile: &SshHostProfile, key: VesselKey) -> Result<VesselAccess, String> {
         let paths = VesselPaths::new(&profile.env_bag, &key)?;
         let local = self.local_directory(&key)?;
         let platform = self.agents.observe_platform(profile).await?;
         let context = LayerContext { prefix: paths.state.clone(), platform: platform.drydock() };
-        let tools = preparation.tools.prepare(AGENTLESS_SSH_PROVIDER_KIND, &key.environment, &context).await?;
+        let tools = preparation.tools.prepare(SSH_HOST_PROVIDER_KIND, &key.environment, &context).await?;
         let handle = self.agents.open(profile, &platform, &paths, &local).await?;
         // A failed preparation closes its handle at once: its listeners and
         // connection never linger beside the next attempt's.
@@ -627,7 +622,7 @@ impl AgentlessVessels {
     async fn prepare_opened(
         &self,
         preparation: &VesselPreparation<'_>,
-        profile: &AgentlessSshProfile,
+        profile: &SshHostProfile,
         key: &VesselKey,
         paths: &VesselPaths,
         handle: &Arc<dyn VesselHandle>,
@@ -676,8 +671,8 @@ impl AgentlessVessels {
 
     /// Remove a vessel: its forwards, its agent and its directories. An agent
     /// that is stopped or unreachable is logged and does not block teardown;
-    /// a later [`AgentlessVessels::retire_absent`] retries the host cleanup.
-    pub(super) async fn retire(&self, profile: &AgentlessSshProfile, vessel: &str) {
+    /// a later [`SshHostVessels::retire_absent`] retries the host cleanup.
+    pub(super) async fn retire(&self, profile: &SshHostProfile, vessel: &str) {
         let key = VesselKey::new(&profile.environment_id, vessel);
         let slot = {
             let mut vessels = self.vessels.lock().await;
@@ -707,7 +702,7 @@ impl AgentlessVessels {
     /// Retire every vessel of `profile`'s host that is not in `live`: those
     /// this controller prepared, and those it finds marked on the host, which
     /// a restarted controller never prepared. Vessels live again are admitted.
-    pub(super) async fn retire_absent(&self, profile: &AgentlessSshProfile, live: &BTreeSet<String>) -> Result<(), String> {
+    pub(super) async fn retire_absent(&self, profile: &SshHostProfile, live: &BTreeSet<String>) -> Result<(), String> {
         let environment = profile.environment_id.to_string();
         self.retired.lock().await.retain(|key| key.environment != environment || !live.contains(&key.vessel));
         let known = self
@@ -737,7 +732,7 @@ impl AgentlessVessels {
     }
 
     /// Environment teardown: retire every vessel this controller knows on it.
-    pub(super) async fn retire_environment(&self, profile: &AgentlessSshProfile) {
+    pub(super) async fn retire_environment(&self, profile: &SshHostProfile) {
         let environment = profile.environment_id.to_string();
         let known =
             self.vessels.lock().await.keys().filter(|key| key.environment == environment).map(|key| key.vessel.clone()).collect::<Vec<_>>();
@@ -749,12 +744,12 @@ impl AgentlessVessels {
     /// Vessels with a marker under the host's vessel roots.
     ///
     /// The sweep assumes this controller is the host's one owning daemon, as
-    /// its Host's `AgentlessSsh { owning_daemon }` connection declares: a
+    /// its Host's `SshHost { owning_daemon }` connection declares: a
     /// marker for this environment whose vessel this controller's store does
-    /// not hold is retired. Two daemons configured with the same agentless
+    /// not hold is retired. Two daemons configured with the same SSH
     /// host would retire each other's vessels; registering one host from two
     /// daemons is already unsupported.
-    async fn marked(&self, profile: &AgentlessSshProfile) -> Result<Vec<VesselKey>, String> {
+    async fn marked(&self, profile: &SshHostProfile) -> Result<Vec<VesselKey>, String> {
         let mut roots = Vec::new();
         for root in [agent_root(&profile.env_bag), state_root(&profile.env_bag)].into_iter().flatten() {
             roots.push(root.to_string_lossy().into_owned());
@@ -794,7 +789,7 @@ pub(super) async fn live_vessels(backend: &ResourceBackend, namespace: &str, env
     Ok(live)
 }
 
-/// Core's way into sessions on agentless hosts: their files and attach go
+/// Core's way into sessions on SSH hosts: their files and attach go
 /// through the vessel's agent.
 pub(super) struct VesselSessions {
     pub(super) state: std::sync::Weak<super::state::ControllerRuntimeState>,
@@ -803,16 +798,16 @@ pub(super) struct VesselSessions {
 impl VesselSessions {
     async fn access(&self, spec: TerminalSessionTarget<'_>) -> Option<Result<Arc<VesselAccess>, String>> {
         let state = self.state.upgrade()?;
-        let profile = state.agentless_ssh.get(&spec.env_ref)?;
+        let profile = state.ssh_host.get(&spec.env_ref)?;
         let Some(vessel) = spec.vessel_ref else {
-            return Some(Err(format!("agentless host {} requires a session vessel identity", spec.env_ref)));
+            return Some(Err(format!("SSH host {} requires a session vessel identity", spec.env_ref)));
         };
         Some(state.vessel_access(profile, vessel).await)
     }
 }
 
 #[async_trait]
-impl flotilla_core::in_process::AgentlessVesselAccess for VesselSessions {
+impl flotilla_core::in_process::SshHostVesselAccess for VesselSessions {
     async fn runner(&self, spec: TerminalSessionTarget<'_>) -> Option<Result<Arc<dyn CommandRunner>, String>> {
         Some(self.access(spec).await?.map(|access| access.runner()))
     }
@@ -884,7 +879,7 @@ impl EnvironmentToolContext for LayerContext {
 /// The vessel's environment, pushed to its agent: the login identity, the
 /// prepared base layer and flotilla's own variables. Crews reach the daemon
 /// through the vessel's forward.
-pub(super) fn vessel_environment(profile: &AgentlessSshProfile, paths: &VesselPaths) -> Result<BTreeMap<String, String>, String> {
+pub(super) fn vessel_environment(profile: &SshHostProfile, paths: &VesselPaths) -> Result<BTreeMap<String, String>, String> {
     let bag = &profile.env_bag;
     let base = vessel_base(profile, paths)?;
     let mut environment = IDENTITY_VARIABLES
@@ -913,7 +908,7 @@ pub(super) fn vessel_environment(profile: &AgentlessSshProfile, paths: &VesselPa
 }
 
 /// The vessel's base layer: its generation layer, then the host's.
-pub(super) fn vessel_base(profile: &AgentlessSshProfile, paths: &VesselPaths) -> Result<BaseLayer, String> {
+pub(super) fn vessel_base(profile: &SshHostProfile, paths: &VesselPaths) -> Result<BaseLayer, String> {
     profile.preparer(paths.generation_path()).base().map_err(|error| error.for_environment(profile.environment_id.as_str()))
 }
 
@@ -928,7 +923,7 @@ pub(super) fn apply_reach_environment(env: &mut Vec<(String, String)>, environme
     ]);
 }
 
-/// The last step before an agentless session starts: the vessel's prepared
+/// The last step before an SSH host session starts: the vessel's prepared
 /// context rendered onto the launch, with `bound` the crew's account
 /// material. Nothing after it adds to `PATH` or sets a base variable.
 ///
@@ -940,7 +935,7 @@ pub(super) fn compose_session_environment(
     env: &mut Vec<(String, String)>,
     command: &str,
     paths: &VesselPaths,
-    profile: &AgentlessSshProfile,
+    profile: &SshHostProfile,
     bound: BoundLayer,
 ) -> Result<String, String> {
     let environment = &profile.environment_id;
@@ -952,5 +947,5 @@ pub(super) fn compose_session_environment(
 }
 
 #[cfg(test)]
-#[path = "agentless_vessels/tests.rs"]
+#[path = "ssh_host_vessels/tests.rs"]
 mod tests;

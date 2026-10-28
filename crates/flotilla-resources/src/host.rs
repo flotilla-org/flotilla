@@ -35,7 +35,10 @@ pub const CREDENTIAL_EXPIRY_CAPABILITY: &str = "credential_expiry";
 /// is held material without a `CredentialSpec` declaring it.
 pub const AMBIENT_CLAUDE_CREDENTIAL_SCOPE: &str = "ambient:claude";
 pub const TERMINAL_POOLS_CAPABILITY: &str = "terminal_pools";
-pub const AGENTLESS_CAPABILITY: &str = "agentless";
+pub const SSH_HOST_CAPABILITY: &str = "ssh_host";
+/// The capability key SSH hosts published before #4001.
+// ADR 0047: remove the agentless capability alias one fleet roll after #4001.
+const LEGACY_SSH_HOST_CAPABILITY: &str = "agentless";
 pub const TRANSPORT_CAPABILITY: &str = "transport";
 pub const PLACEMENT_CAPABILITY: &str = "placement";
 pub const OWNING_DAEMON_CAPABILITY: &str = "owning_daemon";
@@ -85,12 +88,12 @@ pub struct HostSpec {
     /// ADR 0047: absent means placement-host builds; retain default for one roll.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_build_capacity: Option<crate::ImageBuildCapacity>,
-    /// The vessels an agentless SSH host declares it can hold (#3793). A
+    /// The vessels an SSH host declares it can hold (#3793). A
     /// capped host takes unpinned convoys; an uncapped one takes only pinned
     /// work. Previous-generation Host records omit it (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_vessels: Option<u32>,
-    /// An agentless SSH host declared dedicated and single-tenant (#4002):
+    /// An SSH host declared dedicated and single-tenant (#4002):
     /// the whole VM is the sandbox boundary, so least-privilege placement
     /// ranks its host reach as contained. Previous-generation Host records
     /// omit it (ADR 0047).
@@ -117,12 +120,12 @@ impl Default for HostSpec {
 
 impl HostSpec {
     /// The cap that bounds a placement of `realisation` here: every placement
-    /// on an agentless SSH host (#3793), and Docker per-vessel placements on
+    /// on an SSH host (#3793), and Docker per-vessel placements on
     /// a daemon's host (#4002). `None` is unbounded, or pin-only on an
-    /// agentless host.
+    /// SSH host.
     pub fn vessel_cap(&self, realisation: &crate::FulfilmentRealisation) -> Option<u32> {
         match (&self.connection, realisation) {
-            (HostConnection::AgentlessSsh { .. }, _) | (_, crate::FulfilmentRealisation::DockerPerVessel { .. }) => self.max_vessels,
+            (HostConnection::SshHost { .. }, _) | (_, crate::FulfilmentRealisation::DockerPerVessel { .. }) => self.max_vessels,
             _ => None,
         }
     }
@@ -138,10 +141,9 @@ impl HostSpec {
 pub enum HostConnection {
     #[default]
     Daemon,
-    AgentlessSsh {
-        owning_daemon: String,
-        destination: String,
-    },
+    // ADR 0047: remove the agentless_ssh alias one fleet roll after #4001.
+    #[serde(alias = "agentless_ssh")]
+    SshHost { owning_daemon: String, destination: String },
 }
 
 impl HostConnection {
@@ -150,12 +152,12 @@ impl HostConnection {
     }
 }
 
-/// The host whose daemon acts on work placed on `host`: an agentless SSH
+/// The host whose daemon acts on work placed on `host`: an SSH host
 /// host's declared owning daemon, otherwise the host itself. Admission routing
 /// and the vessel projection share this mapping (#4021).
 pub fn acting_daemon_ref(host: &crate::ResourceObject<Host>) -> CanonicalHostId {
     match &host.spec.connection {
-        HostConnection::AgentlessSsh { owning_daemon, .. } => CanonicalHostId::resolved(owning_daemon.clone()),
+        HostConnection::SshHost { owning_daemon, .. } => CanonicalHostId::resolved(owning_daemon.clone()),
         HostConnection::Daemon => CanonicalHostId::resolved(host.metadata.name.clone()),
     }
 }
@@ -338,14 +340,16 @@ impl HostStatus {
         Some(summary)
     }
 
-    pub fn is_agentless_ssh(&self) -> bool {
-        self.capabilities.get(AGENTLESS_CAPABILITY) == Some(&serde_json::Value::Bool(true))
+    pub fn is_ssh_host(&self) -> bool {
+        [SSH_HOST_CAPABILITY, LEGACY_SSH_HOST_CAPABILITY]
+            .iter()
+            .any(|key| self.capabilities.get(*key) == Some(&serde_json::Value::Bool(true)))
             && self.capabilities.get(TRANSPORT_CAPABILITY).and_then(serde_json::Value::as_str) == Some("ssh")
             && self.capabilities.get(PLACEMENT_CAPABILITY).and_then(serde_json::Value::as_str) == Some("host_direct_only")
     }
 
-    pub fn agentless_ssh_owner(&self) -> Option<&str> {
-        self.is_agentless_ssh().then(|| self.capabilities.get(OWNING_DAEMON_CAPABILITY)).flatten()?.as_str()
+    pub fn ssh_host_owner(&self) -> Option<&str> {
+        self.is_ssh_host().then(|| self.capabilities.get(OWNING_DAEMON_CAPABILITY)).flatten()?.as_str()
     }
 
     pub fn agent_adapters(&self) -> Result<BTreeSet<String>, serde_json::Error> {
@@ -419,17 +423,17 @@ mod vessel_cap_tests {
     use super::{HostConnection, HostSpec};
     use crate::FulfilmentRealisation;
 
-    // #3793, #4002: an agentless host's cap bounds every placement there; a
+    // #3793, #4002: an SSH host's cap bounds every placement there; a
     // daemon host's cap bounds only its Docker per-vessel placements.
     #[test]
     fn vessel_cap_by_connection_and_realisation() {
-        let agentless = HostConnection::AgentlessSsh { owning_daemon: "owner".into(), destination: "crew@b1".into() };
+        let ssh_host = HostConnection::SshHost { owning_daemon: "owner".into(), destination: "crew@b1".into() };
         let docker = FulfilmentRealisation::DockerPerVessel { image: None };
         let direct = FulfilmentRealisation::HostDirect;
         let cloud = FulfilmentRealisation::CloudSandboxPerVessel { image: "sandbox".into() };
         for (connection, realisation, capped) in [
-            (agentless.clone(), &direct, true),
-            (agentless, &docker, true),
+            (ssh_host.clone(), &direct, true),
+            (ssh_host, &docker, true),
             (HostConnection::Daemon, &docker, true),
             (HostConnection::Daemon, &direct, false),
             (HostConnection::Daemon, &cloud, false),
@@ -766,6 +770,27 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #4001, ADR 0047: Host records stored before the rename name the SSH host
+    // connection and capability by their retired names for one roll.
+    #[test]
+    fn previous_generation_ssh_host_decodes_and_new_writes_use_the_new_names() {
+        let connection: HostConnection =
+            serde_json::from_value(serde_json::json!({ "kind": "agentless_ssh", "owning_daemon": "udder", "destination": "crew@b1" }))
+                .expect("previous connection");
+        assert_eq!(connection, HostConnection::SshHost { owning_daemon: "udder".into(), destination: "crew@b1".into() });
+        assert_eq!(serde_json::to_value(&connection).expect("new connection")["kind"], "ssh_host");
+        let status = HostStatus {
+            capabilities: BTreeMap::from([
+                ("agentless".to_string(), serde_json::json!(true)),
+                (TRANSPORT_CAPABILITY.to_string(), serde_json::json!("ssh")),
+                (PLACEMENT_CAPABILITY.to_string(), serde_json::json!("host_direct_only")),
+                (OWNING_DAEMON_CAPABILITY.to_string(), serde_json::json!("udder")),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(status.ssh_host_owner(), Some("udder"));
+    }
 
     // Stored N records lack the new decision. Decode conservatively, while
     // every newly serialized record writes its explicit classification.

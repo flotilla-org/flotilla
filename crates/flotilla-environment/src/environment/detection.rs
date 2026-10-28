@@ -325,7 +325,7 @@ case "$1" in success|failure)
         assert!(!marker.with_extension("leak").exists(), "no surviving child may recreate state");
     }
 
-    // The same sentinel contract exercises local, agentless SSH, and image
+    // The same sentinel contract exercises local, SSH host, and image
     // targets, including nonzero exits and cancellation during a live process.
     #[tokio::test]
     async fn detection_isolates_and_cleans_every_provider_target() {

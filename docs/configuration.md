@@ -93,7 +93,7 @@ model are separate axes: `--agent claude-code:opus` and
 
 ## Convoy placement admission
 
-### Agentless SSH hosts
+### SSH hosts
 
 An owning daemon can place a trusted, host-direct crew on an SSH host without
 running `flotillad` there. Add the host to the owning daemon's
@@ -103,7 +103,7 @@ running `flotillad` there. Add the host to the owning daemon's
 [hosts.beaufort]
 hostname = "beaufort.example"
 user = "gui-session-user"
-agentless_ssh = true
+ssh_host = true
 
 [hosts.beaufort.vessel_agent]
 identity_file = "~/.ssh/flotilla-beaufort"
@@ -118,7 +118,7 @@ The remote account needs a writable `HOME`, a `XDG_RUNTIME_DIR` in its SSH
 login, Git, and the selected agent adapter. SSH access must work in batch
 mode. The owning daemon probes the host, publishes its stable Host identity and
 a `host-direct-<host-id>` PlacementPolicy, and provisions the checkout through
-its SSH connection. Agentless hosts are excluded from the daemon peer mesh and
+its SSH connection. SSH hosts are excluded from the daemon peer mesh and
 from contained placement. No container image is built or pulled.
 
 Each vessel on the host runs through its own drydock vessel agent, as a Docker
@@ -149,10 +149,10 @@ vessel's commands, files, forwards and tool layers:
   unreachable host does not block teardown, and a later pass retries.
 
 Checkouts and host probes (free space, platform, model facts) still run over
-the daemon's SSH connection. Only crew sessions run on an agentless host; a
+the daemon's SSH connection. Only crew sessions run on an SSH host; a
 tool session, which names no vessel, is refused.
 
-A crew on an agentless host takes the same harness path as a Docker crew
+A crew on an SSH host takes the same harness path as a Docker crew
 (#3655). Its session names its environment (`FLOTILLA_ENVIRONMENT_ID`), and its
 harness runs from a flotilla-owned home, not from the login user's own
 configuration. Homes live under the login user's durable state base,
@@ -181,11 +181,11 @@ reboot clears and the next launch fills again (#4012):
 Flotilla never writes the login user's `~/.claude`, `~/.claude.json` or
 `~/.codex/config.toml`. The linked Codex `auth.json` is the exception by
 design: a crew that refreshes its token updates the host's one login file.
-Skills are not staged on agentless hosts yet.
+Skills are not staged on SSH hosts yet.
 
 #### Host supplies
 
-Flotilla never reads the login user's shell profile on an agentless host
+Flotilla never reads the login user's shell profile on an SSH host
 (#3722). Every command it runs there (probes, staging, checkout, crew
 launches and attach) starts in a non-login `sh -c` with an environment flotilla
 composes itself. The host's own tools are declared, not discovered from the
@@ -195,7 +195,7 @@ profile:
 [hosts.b1]
 hostname = "b1.example"
 user = "flotilla"
-agentless_ssh = true
+ssh_host = true
 supplies = [
   { name = "rust", path = ["~/.cargo/bin"], env = { RUSTUP_HOME = "~/.rustup", CARGO_HOME = "~/.cargo" } },
   { name = "gh",   path = ["~/.local/opt/gh/bin"] },
@@ -247,7 +247,7 @@ without a login shell (#3761).
 
 #### Vessel cap
 
-An agentless host without a cap takes only convoys that pin its placement
+An SSH host without a cap takes only convoys that pin its placement
 (`--fulfilment host-direct-<host-id>`). Declare how many vessels it can hold and
 it takes ordinary, unpinned placement within that cap (#3793):
 
@@ -255,11 +255,11 @@ it takes ordinary, unpinned placement within that cap (#3793):
 [hosts.b1]
 hostname = "b1.example"
 user = "flotilla"
-agentless_ssh = true
+ssh_host = true
 max_vessels = 1
 ```
 
-The owning daemon is the only daemon that places on its agentless hosts, and it
+The owning daemon is the only daemon that places on its SSH hosts, and it
 counts their vessels. A vessel holds its slot from its convoy's admission until
 its teardown finishes, so a crash mid-teardown does not free the slot early.
 Every vessel a convoy's workflow places on the host counts, created or not, and
@@ -285,7 +285,7 @@ is raised.
 
 #### Single-tenant hosts
 
-An agentless host's host-direct kind grants `account:host` and `network:host`,
+An SSH host's host-direct kind grants `account:host` and `network:host`,
 a strict superset of a Docker crew image's `network:scoped`, so least-privilege
 placement never chooses it while a Docker kind is available. A host that is a
 dedicated, single-tenant machine (nothing else lives there and its user exists
@@ -296,7 +296,7 @@ only for crews) can declare so; the whole VM is then the sandbox boundary
 [hosts.b1]
 hostname = "b1.example"
 user = "flotilla"
-agentless_ssh = true
+ssh_host = true
 max_vessels = 2
 single_tenant = true
 ```
@@ -323,7 +323,7 @@ max_vessels = 6
 ```
 
 Its Docker kinds' free slots are then counted from the vessels placed on the
-host, as for an agentless host, and a convoy that finds every candidate full
+host, as for an SSH host, and a convoy that finds every candidate full
 waits in the same capacity stall. Host-direct placements on the daemon's host
 are not capped, though its vessels count against the Docker cap. Without a cap
 Docker placement stays unbounded. The daemon reads `max_vessels` from

@@ -1,4 +1,4 @@
-//! #3618 and #3792 acceptance through a real `DaemonServer`: an agentless
+//! #3618 and #3792 acceptance through a real `DaemonServer`: an SSH
 //! host's crews reach the controller only through their vessel agent's guest
 //! forward to a per-vessel environment socket.
 //!
@@ -95,7 +95,7 @@ impl Fixture {
         }
         // The fixture's crews run in the daemon's own environment so the
         // artifact dispatcher can read their files through a real runner, as it
-        // reads an agentless crew's files through its vessel's agent.
+        // reads an SSH host crew's files through its vessel's agent.
         let environment = daemon.local_environment_id().to_string();
         for crew in crews {
             place_crew(&daemon, &environment, PlacedCrew { ..*crew }).await;
@@ -206,7 +206,7 @@ async fn non_crew_requests_refused(fixture: &Fixture, socket: &Path) -> Result<(
     Ok(())
 }
 
-// #3618 acceptance: one crew on an agentless host. Its hook, crew command and
+// #3618 acceptance: one crew on an SSH host. Its hook, crew command and
 // artifact put reach the controller and are attributed to it; requests that
 // are not crew-scoped are refused.
 #[tokio::test]

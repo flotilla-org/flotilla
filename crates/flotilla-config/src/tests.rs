@@ -291,28 +291,37 @@ hostname = "desktop.local"
     assert_eq!(config.hosts["desktop"].hostname, "desktop.local");
     assert_eq!(config.hosts["desktop"].expected_host_name, "desktop");
     assert_eq!(config.hosts["desktop"].expected_node_id, None);
-    assert!(!config.hosts["desktop"].agentless_ssh);
+    assert!(!config.hosts["desktop"].ssh_host);
 }
 
 #[test]
-fn parse_agentless_ssh_host_reuses_peer_ssh_destination_fields() {
-    let config: HostsConfig = toml::from_str("[hosts.beaufort]\nhostname = \"beaufort.example\"\nuser = \"crew\"\nagentless_ssh = true\n")
-        .expect("agentless SSH host config");
+fn parse_ssh_host_reuses_peer_ssh_destination_fields() {
+    let config: HostsConfig =
+        toml::from_str("[hosts.beaufort]\nhostname = \"beaufort.example\"\nuser = \"crew\"\nssh_host = true\n").expect("SSH host config");
     let host = &config.hosts["beaufort"];
-    assert!(host.agentless_ssh);
+    assert!(host.ssh_host);
     assert_eq!(host.expected_host_name, "beaufort");
     assert_eq!(ssh_destination(&host.hostname, host.user.as_deref()), "crew@beaufort.example");
 }
 
+// #4001, ADR 0047: hosts.toml files written before the rename still declare
+// SSH hosts with `agentless_ssh` for one roll.
+#[test]
+fn parse_ssh_host_from_the_retired_key() {
+    let config: HostsConfig =
+        toml::from_str("[hosts.b1]\nhostname = \"b1.example\"\nagentless_ssh = true\n").expect("hosts config with the retired key");
+    assert!(config.hosts["b1"].ssh_host);
+}
+
 // #3722: the supplies format agreed with drydock#55, exactly as declared.
 #[test]
-fn parse_agentless_host_supplies_in_declaration_order() {
+fn parse_ssh_host_supplies_in_declaration_order() {
     let config: HostsConfig = toml::from_str(
         r#"
 [hosts.b1]
 hostname = "b1.example"
 user = "flotilla"
-agentless_ssh = true
+ssh_host = true
 supplies = [
   { name = "rust", path = ["~/.cargo/bin"], env = { RUSTUP_HOME = "~/.rustup", CARGO_HOME = "~/.cargo" } },
   { name = "gh",   path = ["~/.local/opt/gh/bin"] },
@@ -333,17 +342,17 @@ supplies = [
     );
 }
 
-// #3793, #4002: an agentless host may declare how many vessels it holds and
+// #3793, #4002: an SSH host may declare how many vessels it holds and
 // that it is single-tenant; a daemon declares its own host's Docker cap.
 // Each declaration is optional and absent means today's behaviour.
 #[test]
 fn parse_host_vessel_caps_and_tenancy() {
     let config: HostsConfig =
-        toml::from_str("[hosts.b1]\nhostname = \"b1.example\"\nagentless_ssh = true\nmax_vessels = 1\nsingle_tenant = true\n")
+        toml::from_str("[hosts.b1]\nhostname = \"b1.example\"\nssh_host = true\nmax_vessels = 1\nsingle_tenant = true\n")
             .expect("hosts config with a vessel cap");
     assert_eq!((config.hosts["b1"].max_vessels, config.hosts["b1"].single_tenant), (Some(1), true));
     let uncapped: HostsConfig =
-        toml::from_str("[hosts.b2]\nhostname = \"b2.example\"\nagentless_ssh = true\n").expect("hosts config without a vessel cap");
+        toml::from_str("[hosts.b2]\nhostname = \"b2.example\"\nssh_host = true\n").expect("hosts config without a vessel cap");
     assert_eq!((uncapped.hosts["b2"].max_vessels, uncapped.hosts["b2"].single_tenant), (None, false));
     let daemon: DaemonConfig = toml::from_str("max_vessels = 6\n").expect("daemon config with a vessel cap");
     assert_eq!(daemon.max_vessels, Some(6));
@@ -354,7 +363,7 @@ fn parse_host_vessel_caps_and_tenancy() {
 #[test]
 fn hosts_without_supplies_parse_as_an_empty_list() {
     let config: HostsConfig =
-        toml::from_str("[hosts.b1]\nhostname = \"b1.example\"\nagentless_ssh = true\n").expect("hosts config without supplies");
+        toml::from_str("[hosts.b1]\nhostname = \"b1.example\"\nssh_host = true\n").expect("hosts config without supplies");
     assert!(config.hosts["b1"].supplies.is_empty());
     let daemon: DaemonConfig = toml::from_str("[environments.box]\nhostname = \"box.example\"\n").expect("daemon config");
     assert!(daemon.environments["box"].supplies.is_empty());
@@ -362,12 +371,12 @@ fn hosts_without_supplies_parse_as_an_empty_list() {
 
 // #3792: the vessel agent's SSH recipe is explicit, never ambient SSH config.
 #[test]
-fn parse_agentless_host_vessel_agent_reach() {
+fn parse_ssh_host_vessel_agent_reach() {
     let config: HostsConfig = toml::from_str(
         r#"
 [hosts.b1]
 hostname = "b1"
-agentless_ssh = true
+ssh_host = true
 [hosts.b1.vessel_agent]
 identity_file = "~/.ssh/flotilla-b1"
 host_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleOnly"
@@ -386,7 +395,7 @@ address = "b1.example"
     );
     // Hosts written before #3792 still parse, and take no vessels.
     let previous: HostsConfig =
-        toml::from_str("[hosts.b1]\nhostname = \"b1.example\"\nagentless_ssh = true\n").expect("hosts config without an agent reach");
+        toml::from_str("[hosts.b1]\nhostname = \"b1.example\"\nssh_host = true\n").expect("hosts config without an agent reach");
     assert_eq!(previous.hosts["b1"].vessel_agent, None);
     let error = toml::from_str::<HostsConfig>(
         "[hosts.b1]\nhostname = \"b1\"\n[hosts.b1.vessel_agent]\nidentity_file = \"k\"\nhost_key = \"ssh-ed25519 AAAA\"\nknown_hosts = \"x\"\n",

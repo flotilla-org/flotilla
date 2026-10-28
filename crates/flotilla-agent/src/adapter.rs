@@ -704,12 +704,12 @@ enum AdapterFlavor {
 }
 
 /// Names the flotilla environment a session runs in. Docker vessels and
-/// agentless hosts with daemon reach applied carry it; a host-direct session on
+/// SSH hosts with daemon reach applied carry it; a host-direct session on
 /// the daemon's own host does not.
 pub const FLOTILLA_ENVIRONMENT_ID_ENV: &str = "FLOTILLA_ENVIRONMENT_ID";
 
 /// Containment is a property of the session, not of the host it was
-/// discovered on (#3655): an agentless host's discovery bag is its login
+/// discovered on (#3655): an SSH host's discovery bag is its login
 /// environment, which never names a flotilla environment, while its sessions
 /// do. A contained session gets a flotilla-owned harness home; the host user's
 /// own harness configuration is never selected or written.
@@ -2601,7 +2601,7 @@ mod tests {
     // `~/.claude.json` or `~/.codex/config.toml`, whatever the discovery bag
     // says. Generator: both harnesses; a host bag with and without explicit
     // config homes; a bag that does or does not itself claim containment (an
-    // agentless login environment never does); repeated preparation.
+    // SSH host login environment never does); repeated preparation.
     #[hegel::test]
     fn a_contained_session_prepares_only_its_own_harness_home(tc: hegel::TestCase) {
         use hegel::generators as gs;

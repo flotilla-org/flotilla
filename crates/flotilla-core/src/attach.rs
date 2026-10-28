@@ -101,8 +101,8 @@ pub(super) struct AttachResolver<'a> {
     pub(super) namespace: &'a std::sync::RwLock<String>,
     /// The engine's provisioning readings behind `[primitives]` (#3629 layer 4).
     pub(super) lifecycle_reads: &'a dyn flotilla_projections::ports::LifecycleReads,
-    /// Sessions on agentless hosts attach through their vessel's agent (#3792).
-    pub(super) agentless_vessels: Option<Arc<dyn super::AgentlessVesselAccess>>,
+    /// Sessions on SSH hosts attach through their vessel's agent (#3792).
+    pub(super) ssh_host_vessels: Option<Arc<dyn super::SshHostVesselAccess>>,
 }
 
 impl<'a> AttachResolver<'a> {
@@ -675,7 +675,7 @@ impl<'a> AttachResolver<'a> {
         {
             // #3792: a session in a vessel attaches through the vessel's agent,
             // as a Docker vessel's does; the owning daemon resolves it.
-            if let Some(access) = &self.agentless_vessels {
+            if let Some(access) = &self.ssh_host_vessels {
                 let target = terminal_session_attach_target_with_stale_status(session)?;
                 if let Some(attach) = access.attach(session.into(), target.session_id, seat).await {
                     let (socket, name) = attach?;
@@ -684,7 +684,7 @@ impl<'a> AttachResolver<'a> {
             }
             let cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
             let attach_args = self.terminal_pool_attach_args(reads, session, &environment, &cwd, seat).await?;
-            let plan = agentless_ssh_attach_plan(destination, &host_environment, attach_args);
+            let plan = ssh_host_attach_plan(destination, &host_environment, attach_args);
             // The owning daemon resolves future attach requests; the target
             // has no flotillad to receive a recursive attach command.
             return Ok((plan, self.host_name.clone()));
@@ -907,10 +907,10 @@ impl<'a> AttachResolver<'a> {
 
 use flotilla_projections::ports::ResolvedAttach;
 
-/// Attach to a session on an agentless SSH host: the terminal pool's attach
+/// Attach to a session on an SSH host: the terminal pool's attach
 /// command runs in the host's composed environment, never its login profile
 /// (#3722).
-fn agentless_ssh_attach_plan(destination: String, host_environment: &HostEnvironment, attach_args: Vec<Arg>) -> ResolvedAttachPlan {
+fn ssh_host_attach_plan(destination: String, host_environment: &HostEnvironment, attach_args: Vec<Arg>) -> ResolvedAttachPlan {
     let mut remote = vec![Arg::Literal(host_environment.shell_prelude())];
     remote.extend(attach_args);
     ResolvedAttachPlan::command(vec![
@@ -1427,12 +1427,12 @@ mod tests {
         assert!(read().expect_err("read error").contains("poisoned"));
     }
 
-    // #3722: attach to an agentless session runs its command in the host's
+    // #3722: attach to an SSH host session runs its command in the host's
     // composed environment. The plan's remote part runs here as sshd runs it,
     // with a login profile that must not be read.
     #[cfg(unix)]
     #[test]
-    fn agentless_attach_composes_the_host_environment_without_its_login_profile() {
+    fn ssh_host_attach_composes_the_host_environment_without_its_login_profile() {
         use flotilla_protocol::{arg::flatten, attach_plan::ResolvedAttachAction};
         use flotilla_provider_runtime::host_environment::HostSupply;
 
@@ -1441,7 +1441,7 @@ mod tests {
         let host =
             HostEnvironment::new(vec![HostSupply { name: "cleat".into(), path: vec!["~/.local/opt/cleat/bin".into()], env: Vec::new() }])
                 .expect("declared supply");
-        let plan = agentless_ssh_attach_plan("crew@b1".into(), &host, vec![Arg::Literal("printf '%s' \"$PATH\"".into())]);
+        let plan = ssh_host_attach_plan("crew@b1".into(), &host, vec![Arg::Literal("printf '%s' \"$PATH\"".into())]);
         let [ResolvedAttachAction::Command(args)] = plan.0.as_slice() else { panic!("one command: {plan:?}") };
         assert_eq!(flatten(&args[..5], 0), "ssh -tt -o BatchMode=yes 'crew@b1'");
         // sshd hands the rest of the command line to the user's shell.

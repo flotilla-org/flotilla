@@ -1,4 +1,4 @@
-//! #3655 slice 1: agentless crews take the contained harness path. A crew on a
+//! #3655 slice 1: SSH host crews take the contained harness path. A crew on a
 //! bare host launches with a flotilla-owned harness home under the host
 //! runner's writable base, seeded with onboarding and workspace trust for its
 //! checkout, and the host user's own harness configuration is never written.
@@ -15,7 +15,7 @@ use flotilla_provider_runtime::host_environment::{HostEnvironment, HostSupply};
 use flotilla_provider_runtime::ssh_runner::SshCommandRunner;
 
 use super::super::account_access::reconcile_place_provisions;
-use super::agentless_vessels::{VesselKey, VesselPaths};
+use super::ssh_host_vessels::{VesselKey, VesselPaths};
 use super::vessel_support::{store_entry, vessels_over, ArtifactArrival, RunnerVesselAgents};
 
 const HOST_HOME: &str = "/home/crew";
@@ -177,7 +177,7 @@ const HOST_HARNESS_FILES: &[(&str, &str)] = &[
     ("/home/crew/.codex/auth.json", r#"{"tokens":"host-login"}"#),
 ];
 
-struct AgentlessLaunch {
+struct SshHostLaunch {
     host: Arc<FakeHost>,
     env: TerminalEnvVars,
     command: String,
@@ -186,27 +186,27 @@ struct AgentlessLaunch {
     artifacts: Vec<(String, ArtifactArrival)>,
 }
 
-impl AgentlessLaunch {
+impl SshHostLaunch {
     fn value(&self, name: &str) -> Option<String> {
         self.env.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone())
     }
 }
 
-/// Launch one crew of `adapter` on an agentless host whose `claude` and
+/// Launch one crew of `adapter` on an SSH host whose `claude` and
 /// `codex` have never been run, through the terminal runtime's real launch
 /// path with the fake host behind the SSH runner.
-async fn launch_on_agentless_host(adapter: &str) -> AgentlessLaunch {
-    try_launch_on_agentless_host(adapter, adapter == "claude-code").await.expect("launch agentless crew")
+async fn launch_on_ssh_host(adapter: &str) -> SshHostLaunch {
+    try_launch_on_ssh_host(adapter, adapter == "claude-code").await.expect("launch SSH host crew")
 }
 
-/// As [`launch_on_agentless_host`], optionally without the Claude credential grant.
-async fn try_launch_on_agentless_host(adapter: &str, grant_claude: bool) -> Result<AgentlessLaunch, String> {
+/// As [`launch_on_ssh_host`], optionally without the Claude credential grant.
+async fn try_launch_on_ssh_host(adapter: &str, grant_claude: bool) -> Result<SshHostLaunch, String> {
     // The forwarded daemon socket needs a short real directory (SUN_LEN).
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
-    let launched = launch_agentless(agentless_host(&host, &runtime_dir), adapter, grant_claude).await;
+    let launched = launch_ssh_host(ssh_host(&host, &runtime_dir), adapter, grant_claude).await;
     match launched {
-        Ok(session) => Ok(AgentlessLaunch {
+        Ok(session) => Ok(SshHostLaunch {
             host,
             env: session.env_vars,
             command: session.command,
@@ -214,17 +214,17 @@ async fn try_launch_on_agentless_host(adapter: &str, grant_claude: bool) -> Resu
             artifacts: session.artifacts,
         }),
         Err(error) => {
-            let refused = AgentlessLaunch { host, env: Vec::new(), command: String::new(), deliveries: Vec::new(), artifacts: Vec::new() };
+            let refused = SshHostLaunch { host, env: Vec::new(), command: String::new(), deliveries: Vec::new(), artifacts: Vec::new() };
             assert_host_harness_untouched(&refused);
             Err(error)
         }
     }
 }
 
-/// `host` as an agentless host whose `claude` and `codex` have never been run, its crew
+/// `host` as an SSH host whose `claude` and `codex` have never been run, its crew
 /// frozen with one skill.
-fn agentless_host(host: &Arc<FakeHost>, runtime_dir: &flotilla_test_support::TestSocketDir) -> AgentlessHost {
-    // The agentless host's discovery bag is its SSH login environment: it
+fn ssh_host(host: &Arc<FakeHost>, runtime_dir: &flotilla_test_support::TestSocketDir) -> SshHost {
+    // The SSH host's discovery bag is its SSH login environment: it
     // never names a flotilla environment.
     let bag = EnvironmentBag::new()
         .with(EnvironmentAssertion::env_var("HOME", HOST_HOME))
@@ -233,7 +233,7 @@ fn agentless_host(host: &Arc<FakeHost>, runtime_dir: &flotilla_test_support::Tes
         .with(EnvironmentAssertion::binary("git", "/usr/bin/git"))
         .with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude"))
         .with(EnvironmentAssertion::binary("codex", "/usr/local/bin/codex"));
-    AgentlessHost {
+    SshHost {
         runner: host.clone(),
         bag,
         host_environment: HostEnvironment::default(),
@@ -243,8 +243,8 @@ fn agentless_host(host: &Arc<FakeHost>, runtime_dir: &flotilla_test_support::Tes
     }
 }
 
-/// The agentless host a launch runs against.
-struct AgentlessHost {
+/// The SSH host a launch runs against.
+struct SshHost {
     /// The host's runner, as the SSH environment registers it.
     runner: Arc<dyn CommandRunner>,
     /// The host's discovery bag.
@@ -267,8 +267,8 @@ struct LaunchedSession {
     artifacts: Vec<(String, ArtifactArrival)>,
 }
 
-/// The terminal runtime, agentless host and crew session spec a launch runs with.
-struct AgentlessRuntime {
+/// The terminal runtime, SSH host and crew session spec a launch runs with.
+struct SshHostRuntime {
     _temp: TempDir,
     daemon: Arc<InProcessDaemon>,
     state: Arc<ControllerRuntimeState>,
@@ -280,11 +280,11 @@ struct AgentlessRuntime {
 
 /// The runtime for one crew of `adapter` on `host`, with the Claude credential
 /// declared but not yet bound.
-async fn agentless_runtime(host: AgentlessHost, adapter: &str) -> AgentlessRuntime {
+async fn ssh_host_runtime(host: SshHost, adapter: &str) -> SshHostRuntime {
     let temp = TempDir::new().expect("tempdir");
     let config_dir = temp.path().join("config");
     fs::create_dir_all(&config_dir).expect("config directory");
-    fs::write(config_dir.join("daemon.toml"), "machine_id = \"agentless-harness-test\"\n").expect("daemon config");
+    fs::write(config_dir.join("daemon.toml"), "machine_id = \"ssh-host-harness-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_dir));
     let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
     let local_host_id = daemon.local_host_id().expect("local host ID").to_string();
@@ -305,7 +305,7 @@ async fn agentless_runtime(host: AgentlessHost, adapter: &str) -> AgentlessRunti
         .await
         .expect("Claude credential declaration");
 
-    let AgentlessHost { runner, bag, host_environment, checkout, session_env, skills } = host;
+    let SshHost { runner, bag, host_environment, checkout, session_env, skills } = host;
     let environment_id = EnvironmentId::new(ENVIRONMENT);
     daemon
         .register_direct_environment_for_test(
@@ -314,7 +314,7 @@ async fn agentless_runtime(host: AgentlessHost, adapter: &str) -> AgentlessRunti
             bag.clone(),
             Some(flotilla_protocol::qualified_path::HostId::new("b3")),
         )
-        .expect("register agentless environment");
+        .expect("register SSH host environment");
     let pool = Arc::new(FakeTerminalPool::new());
     let mut registry = ProviderRegistry::new();
     registry.agent_adapters = AgentAdapterRegistry::discover(&bag, Arc::clone(&runner));
@@ -324,8 +324,8 @@ async fn agentless_runtime(host: AgentlessHost, adapter: &str) -> AgentlessRunti
         Arc::clone(&pool) as Arc<dyn TerminalPool>,
     );
     let registry = Arc::new(registry);
-    daemon.set_direct_environment_registry(&environment_id, Arc::clone(&registry)).expect("register agentless providers");
-    let profile = AgentlessSshProfile {
+    daemon.set_direct_environment_registry(&environment_id, Arc::clone(&registry)).expect("register SSH host providers");
+    let profile = SshHostProfile {
         provisioning: LocalProvisioningProfile { host_direct_pool: "cleat".to_string(), ..manual_profile("b3", false) },
         environment_id: environment_id.clone(),
         destination: "crew@b3.example".to_string(),
@@ -337,7 +337,7 @@ async fn agentless_runtime(host: AgentlessHost, adapter: &str) -> AgentlessRunti
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
         vessel_agent: Err("the test's vessel agents run on the host runner".into()),
     };
-    register_agentless_ssh_resources(&backend, NAMESPACE, &local_host_id, &profile).await.expect("register agentless resources");
+    register_ssh_host_resources(&backend, NAMESPACE, &local_host_id, &profile).await.expect("register SSH host resources");
     let source = LocalSkillSource::new(temp.path(), "research");
     let skills = if skills { vec![source.selected.clone()] } else { Vec::new() };
     freeze_crew(&backend, "demo", "demo-work", "coder", adapter, skills).await;
@@ -360,10 +360,10 @@ async fn agentless_runtime(host: AgentlessHost, adapter: &str) -> AgentlessRunti
             local_host_id.clone(),
             format!("host-direct-{local_host_id}"),
         )
-        .with_agentless_ssh(vec![profile])
+        .with_ssh_host(vec![profile])
         // #3792: the crew runs in its vessel's agent, which here runs its
         // commands through the host runner, as the real agent runs them there.
-        .with_agentless_vessels(Some(vessels_over(agents.clone(), temp.path())))
+        .with_ssh_host_vessels(Some(vessels_over(agents.clone(), temp.path())))
         .with_environment_tools(EnvironmentToolProvisioner::new(Vec::new()))
         .with_credential_store(credential_store)
         .with_agent_material(Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([(
@@ -394,22 +394,22 @@ async fn agentless_runtime(host: AgentlessHost, adapter: &str) -> AgentlessRunti
         env: session_env,
         pool: "cleat".to_string(),
     };
-    AgentlessRuntime { _temp: temp, daemon, state, pool, agents, vessel, spec }
+    SshHostRuntime { _temp: temp, daemon, state, pool, agents, vessel, spec }
 }
 
 /// Launch one crew of `adapter` on `host` through the terminal runtime's real
 /// launch path, with a fake terminal pool recording what it would start.
-async fn launch_agentless(host: AgentlessHost, adapter: &str, grant_claude: bool) -> Result<LaunchedSession, String> {
-    let runtime = agentless_runtime(host, adapter).await;
+async fn launch_ssh_host(host: SshHost, adapter: &str, grant_claude: bool) -> Result<LaunchedSession, String> {
+    let runtime = ssh_host_runtime(host, adapter).await;
     if grant_claude {
         bind_account(&runtime.daemon.resource_backend(), "demo", "coder", "claude-max", "crew@example.com").await;
     }
     runtime.launch().await
 }
 
-impl AgentlessRuntime {
+impl SshHostRuntime {
     async fn launch(&self) -> Result<LaunchedSession, String> {
-        let AgentlessRuntime { state, pool, agents, vessel, spec, .. } = self;
+        let SshHostRuntime { state, pool, agents, vessel, spec, .. } = self;
         let before = pool.ensured.lock().await.len();
         let launched =
             TerminalControllerRuntime { state: Arc::clone(state) }.ensure_session("terminal-demo-work-coder", spec.into(), &[]).await;
@@ -448,7 +448,7 @@ impl AgentlessRuntime {
 /// cache and linked exactly the home its harness launches with to them, and recorded what
 /// landed there. #3909: the vessel fetched the adapter's pinned harness by digest from its
 /// upstream URL into that home, and the launch runs it.
-fn assert_staged_into_launched_home(launch: &AgentlessLaunch, variable: &str, adapter: &str) {
+fn assert_staged_into_launched_home(launch: &SshHostLaunch, variable: &str, adapter: &str) {
     let home = launch.value(variable).expect("launched home");
     let Some(HostEntry::Link(entry)) = launch.host.entry(format!("{home}/skills")) else { panic!("no skills link in the launched home") };
     let skills = ArtifactArrival::Pushed(vec![".flotilla-sources.json".into(), "research/SKILL.md".into()]);
@@ -481,7 +481,7 @@ fn assert_staged_into_launched_home(launch: &AgentlessLaunch, variable: &str, ad
 }
 
 /// No launch writes the host user's harness configuration; it reads as it did.
-fn assert_host_harness_untouched(launch: &AgentlessLaunch) {
+fn assert_host_harness_untouched(launch: &SshHostLaunch) {
     for (path, content) in HOST_HARNESS_FILES {
         assert_eq!(launch.host.entry(path), Some(HostEntry::File(content.to_string())), "{path} changed");
     }
@@ -493,7 +493,7 @@ fn assert_host_harness_untouched(launch: &AgentlessLaunch) {
 }
 
 /// Contract 3: the image's harness environment reaches the session.
-fn assert_image_harness_environment(launch: &AgentlessLaunch) {
+fn assert_image_harness_environment(launch: &SshHostLaunch) {
     for (name, value) in
         [("DISABLE_AUTOUPDATER", "1"), ("DISABLE_INSTALLATION_CHECKS", "1"), ("GH_NO_UPDATE_NOTIFIER", "1"), ("LANG", "en_US.UTF-8")]
     {
@@ -508,8 +508,8 @@ fn assert_image_harness_environment(launch: &AgentlessLaunch) {
 // dialog can appear. Its token lies on the runtime base, outside the home.
 // The host user's `~/.claude.json` and `~/.claude` are never written.
 #[tokio::test]
-async fn agentless_claude_crew_starts_in_a_prepared_flotilla_home() {
-    let launch = launch_on_agentless_host("claude-code").await;
+async fn ssh_host_claude_crew_starts_in_a_prepared_flotilla_home() {
+    let launch = launch_on_ssh_host("claude-code").await;
     // #3929: the launched home is the recorded requester home, not a level below it.
     let home = format!("{HOST_BASE}/agent-homes/requesters/demo/coder/claude");
 
@@ -538,15 +538,15 @@ async fn agentless_claude_crew_starts_in_a_prepared_flotilla_home() {
     assert_host_harness_untouched(&launch);
 }
 
-// Acceptance (#3655, #3964): a Codex crew on an agentless host starts with
+// Acceptance (#3655, #3964): a Codex crew on an SSH host starts with
 // `CODEX_HOME` at its own flotilla-owned home under the host's durable state base, its
 // frozen skills staged there, with
 // workspace trust for the checkout in that home's own `config.toml`. The host
 // login is linked, never copied, and the host's `~/.codex/config.toml` is
 // never written.
 #[tokio::test]
-async fn agentless_codex_crew_starts_in_a_prepared_flotilla_home() {
-    let launch = launch_on_agentless_host("codex").await;
+async fn ssh_host_codex_crew_starts_in_a_prepared_flotilla_home() {
+    let launch = launch_on_ssh_host("codex").await;
     let home = format!("{HOST_BASE}/agent-homes/requesters/demo/coder/codex");
 
     assert_eq!(launch.value("CODEX_HOME").as_deref(), Some(home.as_str()));
@@ -567,18 +567,18 @@ async fn agentless_codex_crew_starts_in_a_prepared_flotilla_home() {
     assert_host_harness_untouched(&launch);
 }
 
-// Review #3659, #3907 contract 8: an agentless Claude crew has no ambient-login
+// Review #3659, #3907 contract 8: an SSH host Claude crew has no ambient-login
 // fallback. Without an account binding the launch is refused with the reason,
 // and nothing starts or touches the host's configuration.
 #[tokio::test]
-async fn agentless_claude_crew_without_a_delivered_credential_is_refused_with_the_reason() {
-    let Err(error) = try_launch_on_agentless_host("claude-code", false).await else {
-        panic!("an agentless Claude crew without a credential must not launch");
+async fn ssh_host_claude_crew_without_a_delivered_credential_is_refused_with_the_reason() {
+    let Err(error) = try_launch_on_ssh_host("claude-code", false).await else {
+        panic!("an SSH host Claude crew without a credential must not launch");
     };
     assert_eq!(error, "crew `coder` has no account binding for `claude:subscription`: its harness home is never left to an ambient login");
 }
 
-/// Stands in for `ssh` to an agentless host and its sshd: the remote command
+/// Stands in for `ssh` to an SSH host and its sshd: the remote command
 /// string runs in `/bin/sh -c`, as sshd runs it for a user whose shell is
 /// POSIX, in a clean login environment whose home is a temporary directory.
 struct LoopbackSshHost {
@@ -658,7 +658,7 @@ fn write_executable(path: &Path, script: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("executable mode");
 }
 
-// Acceptance (#3722): an agentless crew's harness sees flotilla's composed
+// Acceptance (#3722): an SSH host crew's harness sees flotilla's composed
 // environment, never the host login profile's. The host's profile prepends
 // `~/.local/bin`, which holds a plain `gh` and a stale `flotilla`; the host
 // declares a `rust` supply. The launch runs through the real SSH runner, and
@@ -672,7 +672,7 @@ fn write_executable(path: &Path, script: &str) {
 // check: `sh -lc` in the SSH runner fails it.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn agentless_harness_path_is_composed_and_never_the_login_profile() {
+async fn ssh_host_harness_path_is_composed_and_never_the_login_profile() {
     // The home holds the vessel's cleat runtime, a socket directory (SUN_LEN).
     let remote = flotilla_test_support::TestSocketDir::new();
     let home = remote.path().join("home");
@@ -734,14 +734,14 @@ async fn agentless_harness_path_is_composed_and_never_the_login_profile() {
         "#!/bin/sh\n{ printf '%s\\n' \"$PATH\"; command -v gh; command -v flotilla; printf '%s\\n' \"${RUSTUP_HOME-unset}\"; } > \"$HOME/harness-report\"\n",
     );
 
-    let session = launch_agentless(
+    let session = launch_ssh_host(
         // A real shell stands in for the host here, so the crew selects no skills to fetch.
-        AgentlessHost { runner, bag, host_environment, checkout: checkout.display().to_string(), session_env, skills: false },
+        SshHost { runner, bag, host_environment, checkout: checkout.display().to_string(), session_env, skills: false },
         "claude-code",
         true,
     )
     .await
-    .expect("launch agentless crew");
+    .expect("launch SSH host crew");
 
     // cleat starts the command through `$SHELL -lc` with the launch's
     // environment over the login basics.
@@ -784,19 +784,12 @@ async fn a_supply_overriding_a_flotilla_variable_is_a_host_configuration_error()
         .with(EnvironmentAssertion::env_var("XDG_RUNTIME_DIR", runtime_dir.path().display().to_string()))
         .with(EnvironmentAssertion::binary("git", "/usr/bin/git"))
         .with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude"));
-    // The harness environment flotilla gives every agentless session sets LANG.
+    // The harness environment flotilla gives every SSH host session sets LANG.
     let host_environment =
         HostEnvironment::new(vec![HostSupply { name: "locale".into(), path: Vec::new(), env: vec![("LANG".into(), "C.UTF-8".into())] }])
             .expect("declared supply");
-    let Err(error) = launch_agentless(
-        AgentlessHost {
-            runner: host.clone(),
-            bag,
-            host_environment,
-            checkout: CHECKOUT.to_string(),
-            session_env: BTreeMap::new(),
-            skills: true,
-        },
+    let Err(error) = launch_ssh_host(
+        SshHost { runner: host.clone(), bag, host_environment, checkout: CHECKOUT.to_string(), session_env: BTreeMap::new(), skills: true },
         "claude-code",
         true,
     )
@@ -825,15 +818,8 @@ async fn a_supply_setting_a_family_account_variable_is_a_host_configuration_erro
         env: vec![("CLAUDE_CONFIG_DIR".into(), "~/.claude".into())],
     }])
     .expect("well-formed supply");
-    let Err(error) = launch_agentless(
-        AgentlessHost {
-            runner: host.clone(),
-            bag,
-            host_environment,
-            checkout: CHECKOUT.to_string(),
-            session_env: BTreeMap::new(),
-            skills: true,
-        },
+    let Err(error) = launch_ssh_host(
+        SshHost { runner: host.clone(), bag, host_environment, checkout: CHECKOUT.to_string(), session_env: BTreeMap::new(), skills: true },
         "claude-code",
         true,
     )
@@ -847,18 +833,18 @@ async fn a_supply_setting_a_family_account_variable_is_a_host_configuration_erro
     );
 }
 
-/// A Claude crew on an agentless host bound to `claude-box-a`, whose token is the host-local
+/// A Claude crew on an SSH host bound to `claude-box-a`, whose token is the host-local
 /// file `token`: launched once, with its TerminalSession recorded.
-async fn bound_agentless_crew(token: &Path) -> (AgentlessRuntime, Arc<FakeHost>, flotilla_test_support::TestSocketDir) {
-    bound_agentless_crew_with(token, None).await
+async fn bound_ssh_host_crew(token: &Path) -> (SshHostRuntime, Arc<FakeHost>, flotilla_test_support::TestSocketDir) {
+    bound_ssh_host_crew_with(token, None).await
 }
 
-/// As [`bound_agentless_crew`], with the binding replicated from another home whose clock runs
+/// As [`bound_ssh_host_crew`], with the binding replicated from another home whose clock runs
 /// `skew` ahead of this host's.
-async fn bound_agentless_crew_with(
+async fn bound_ssh_host_crew_with(
     token: &Path,
     skew: Option<(&str, chrono::Duration)>,
-) -> (AgentlessRuntime, Arc<FakeHost>, flotilla_test_support::TestSocketDir) {
+) -> (SshHostRuntime, Arc<FakeHost>, flotilla_test_support::TestSocketDir) {
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
     let bag = EnvironmentBag::new()
@@ -867,8 +853,8 @@ async fn bound_agentless_crew_with(
         .with(EnvironmentAssertion::env_var("XDG_RUNTIME_DIR", runtime_dir.path().display().to_string()))
         .with(EnvironmentAssertion::binary("git", "/usr/bin/git"))
         .with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude"));
-    let runtime = agentless_runtime(
-        AgentlessHost {
+    let runtime = ssh_host_runtime(
+        SshHost {
             runner: host.clone(),
             bag,
             host_environment: HostEnvironment::default(),
@@ -925,11 +911,11 @@ async fn a_refreshed_token_is_pushed_into_the_bound_home_without_moving_the_bind
     let tokens = TempDir::new().expect("token dir");
     let token = tokens.path().join("box-a");
     fs::write(&token, "generation-one\n").expect("token");
-    let (runtime, host, _runtime_dir) = bound_agentless_crew(&token).await;
+    let (runtime, host, _runtime_dir) = bound_ssh_host_crew(&token).await;
     let backend = runtime.daemon.resource_backend();
     let binding = backend.using::<flotilla_resources::AccountBinding>(NAMESPACE).get(BINDING).await.expect("binding").spec;
     let delivered = provision(&backend).await.expect("provision recorded at launch");
-    assert_eq!((delivered.place.as_str(), delivered.environment_kind.as_str()), (ENVIRONMENT, "agentless-ssh"));
+    assert_eq!((delivered.place.as_str(), delivered.environment_kind.as_str()), (ENVIRONMENT, "ssh-host"));
     assert_eq!(delivered.home, BOUND_MATERIAL, "the provision records where the copy lies");
     assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), Some(HostEntry::File("generation-one".into())));
 
@@ -953,7 +939,7 @@ async fn a_revoked_binding_stops_the_session_and_deletes_its_copy() {
     let tokens = TempDir::new().expect("token dir");
     let token = tokens.path().join("box-a");
     fs::write(&token, "box-a-token").expect("token");
-    let (runtime, host, _runtime_dir) = bound_agentless_crew(&token).await;
+    let (runtime, host, _runtime_dir) = bound_ssh_host_crew(&token).await;
     let backend = runtime.daemon.resource_backend();
     let bindings = backend.using::<flotilla_resources::AccountBinding>(NAMESPACE);
     let binding = bindings.get(BINDING).await.expect("binding");
@@ -987,7 +973,7 @@ async fn a_rebound_requester_loses_its_old_copy_and_session() {
     let tokens = TempDir::new().expect("token dir");
     let token = tokens.path().join("box-a");
     fs::write(&token, "box-a-token").expect("token");
-    let (runtime, host, _runtime_dir) = bound_agentless_crew(&token).await;
+    let (runtime, host, _runtime_dir) = bound_ssh_host_crew(&token).await;
     let backend = runtime.daemon.resource_backend();
     let bindings = backend.using::<flotilla_resources::AccountBinding>(NAMESPACE);
     let binding = bindings.get(BINDING).await.expect("binding");
@@ -1015,7 +1001,7 @@ async fn a_restart_keeps_the_account_and_a_gone_place_is_swept() {
     let tokens = TempDir::new().expect("token dir");
     let token = tokens.path().join("box-a");
     fs::write(&token, "box-a-token").expect("token");
-    let (runtime, _host, _runtime_dir) = bound_agentless_crew(&token).await;
+    let (runtime, _host, _runtime_dir) = bound_ssh_host_crew(&token).await;
     let backend = runtime.daemon.resource_backend();
     let mut old_place = provision(&backend).await.expect("provision");
     old_place.place = "replaced-vessel-env".into();
@@ -1044,7 +1030,7 @@ async fn a_relaunch_moves_a_copy_recorded_in_the_old_home() {
     let tokens = TempDir::new().expect("token dir");
     let token = tokens.path().join("box-a");
     fs::write(&token, "box-a-token").expect("token");
-    let (runtime, host, _runtime_dir) = bound_agentless_crew(&token).await;
+    let (runtime, host, _runtime_dir) = bound_ssh_host_crew(&token).await;
     let backend = runtime.daemon.resource_backend();
     let provisions = backend.using::<flotilla_resources::AccountProvision>(NAMESPACE);
     let name = format!("{BINDING}.{ENVIRONMENT}");
@@ -1069,7 +1055,7 @@ async fn a_replica_binding_from_a_clock_ahead_keeps_its_fresh_copy() {
     let tokens = TempDir::new().expect("token dir");
     let token = tokens.path().join("box-a");
     fs::write(&token, "box-a-token").expect("token");
-    let (runtime, host, _runtime_dir) = bound_agentless_crew_with(&token, Some(("udder-root", chrono::Duration::hours(1)))).await;
+    let (runtime, host, _runtime_dir) = bound_ssh_host_crew_with(&token, Some(("udder-root", chrono::Duration::hours(1)))).await;
     let backend = runtime.daemon.resource_backend();
     let delivered = provision(&backend).await.expect("provision recorded at launch");
     assert_eq!(delivered.binding.home, "udder-root", "the provision names the binding's home");
@@ -1088,7 +1074,7 @@ async fn a_withdrawal_waits_for_a_delivery_in_progress() {
     let tokens = TempDir::new().expect("token dir");
     let token = tokens.path().join("box-a");
     fs::write(&token, "box-a-token").expect("token");
-    let (runtime, host, _runtime_dir) = bound_agentless_crew(&token).await;
+    let (runtime, host, _runtime_dir) = bound_ssh_host_crew(&token).await;
     let backend = runtime.daemon.resource_backend();
     let bindings = backend.using::<flotilla_resources::AccountBinding>(NAMESPACE);
     let binding = bindings.get(BINDING).await.expect("binding");
@@ -1116,7 +1102,7 @@ async fn a_withdrawal_waits_for_a_delivery_in_progress() {
 async fn failed_delivery_waits_for_its_retry_and_is_cleared_once_delivered() {
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
-    let runtime = agentless_runtime(agentless_host(&host, &runtime_dir), "claude-code").await;
+    let runtime = ssh_host_runtime(ssh_host(&host, &runtime_dir), "claude-code").await;
     runtime.launch().await.expect_err("no account is bound");
     let retry = |deliveries: Vec<flotilla_protocol::ExplainedAccessDelivery>| {
         let [delivery] = deliveries.as_slice() else { panic!("one access: {deliveries:?}") };
@@ -1147,7 +1133,7 @@ async fn failed_delivery_waits_for_its_retry_and_is_cleared_once_delivered() {
 async fn a_permanent_refusal_is_recorded_and_never_retried() {
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
-    let runtime = agentless_runtime(agentless_host(&host, &runtime_dir), "codex").await;
+    let runtime = ssh_host_runtime(ssh_host(&host, &runtime_dir), "codex").await;
     let supply = runtime._temp.path().join("generation/skills/.flotilla-sources.json");
     let other =
         serde_json::json!({"schema_version": 5, "sources": [{"name": "other", "repository": "/elsewhere", "revision": "3".repeat(40)}]});
@@ -1173,7 +1159,7 @@ async fn a_permanent_refusal_is_recorded_and_never_retried() {
 async fn access_status_goes_with_its_convoy() {
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
-    let runtime = agentless_runtime(agentless_host(&host, &runtime_dir), "codex").await;
+    let runtime = ssh_host_runtime(ssh_host(&host, &runtime_dir), "codex").await;
     runtime.launch().await.expect("delivered");
     let backend = runtime.daemon.resource_backend();
     let records = backend.clone().using::<flotilla_resources::AccessDelivery>(NAMESPACE);

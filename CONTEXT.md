@@ -1167,6 +1167,12 @@ inspection and destruction. A **Provider Instance** identifies one host-local
 runtime endpoint or namespace. Host-direct is an adoption provider; cloud-agent
 vessels follow a separate creation route.
 
+**SSH Host**:
+A **Host** with no flotillad of its own, declared `ssh_host = true` in its
+owning daemon's `hosts.toml`. The owning daemon reaches it over SSH, runs each
+vessel there through drydock's vessel agent, and is the only daemon that places
+on it. It stays outside the peer mesh (#3792, #3956).
+
 **Local Image Cache**:
 The image inventory owned by one **Provider Instance** on one **Host**.
 A digest held in one cache does not imply it is available in another cache on

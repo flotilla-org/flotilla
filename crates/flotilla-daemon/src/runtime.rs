@@ -2,7 +2,6 @@
 
 mod access_layer;
 mod account_access;
-pub(crate) mod agentless_vessels;
 pub(crate) mod archive;
 mod credentials;
 mod discovery;
@@ -13,6 +12,7 @@ mod message;
 mod ports;
 mod primitives;
 mod seed;
+pub(crate) mod ssh_host_vessels;
 mod state;
 mod tasks;
 mod terminal;
@@ -57,8 +57,7 @@ use self::credentials::{
     RuntimeSessionCapabilities, RuntimeWorkCredentialReconciler,
 };
 use self::discovery::{
-    apply_agentless_ssh_observation, build_local_profile, discover_agentless_ssh_profiles, probe_local_provider_registry,
-    register_agentless_ssh_resources,
+    apply_ssh_host_observation, build_local_profile, discover_ssh_host_profiles, probe_local_provider_registry, register_ssh_host_resources,
 };
 use self::docker::DockerControllerRuntime;
 use self::environments::reconcile_provisioned_environments;
@@ -231,7 +230,7 @@ impl DaemonRuntime {
             }
             Err(error) => warn!(%error, "checkout archive sweep could not load observation roots"),
         }
-        let ssh_profiles = phase("discover_agentless_ssh_profiles", discover_agentless_ssh_profiles(&daemon, &config)).await;
+        let ssh_profiles = phase("discover_ssh_host_profiles", discover_ssh_host_profiles(&daemon, &config)).await;
         daemon.set_admission_free_space_path(PathBuf::from(&profile.repo_default_dir));
         let credential_store = Arc::new(CredentialStore::new(
             daemon.resource_backend(),
@@ -287,35 +286,31 @@ impl DaemonRuntime {
             .await
         })
         .await?;
-        // #3792: agentless hosts run each vessel through its own drydock agent,
+        // #3792: SSH hosts run each vessel through its own drydock agent,
         // whose guest forward carries crews to a per-vessel environment socket.
-        let agentless_vessels = options.environment_sockets.as_ref().map(|sockets| {
+        let ssh_host_vessels = options.environment_sockets.as_ref().map(|sockets| {
             use sha2::Digest;
             let state = config.state_dir().as_path().to_string_lossy().into_owned();
             // Short, like Docker's agent root: attach sockets live below it.
             let local = std::path::Path::new("/tmp").join(&format!("fv-{:x}", sha2::Sha256::digest(state.as_bytes()))[..23]);
-            Arc::new(agentless_vessels::AgentlessVessels::new(
-                Arc::new(agentless_vessels::SshVesselAgents::default()),
-                sockets.clone(),
-                local,
-            ))
+            Arc::new(ssh_host_vessels::SshHostVessels::new(Arc::new(ssh_host_vessels::SshVesselAgents::default()), sockets.clone(), local))
         });
         let mut registered_ssh_profiles = Vec::new();
         for ssh in ssh_profiles {
-            if let Err(error) = retry_phase("register_agentless_ssh_resources", || async {
-                register_agentless_ssh_resources(&daemon.resource_backend(), &options.namespace, &profile.host_id, &ssh).await
+            if let Err(error) = retry_phase("register_ssh_host_resources", || async {
+                register_ssh_host_resources(&daemon.resource_backend(), &options.namespace, &profile.host_id, &ssh).await
             })
             .await
             {
-                warn!(host = %ssh.provisioning.host_id, %error, "failed to register agentless SSH host; continuing startup");
+                warn!(host = %ssh.provisioning.host_id, %error, "failed to register SSH host; continuing startup");
                 continue;
             }
-            if let Err(error) = retry_phase("apply_agentless_ssh_observation", || {
-                apply_agentless_ssh_observation(&daemon, &options.namespace, &ssh, Some(&credential_store), agentless_vessels.as_deref())
+            if let Err(error) = retry_phase("apply_ssh_host_observation", || {
+                apply_ssh_host_observation(&daemon, &options.namespace, &ssh, Some(&credential_store), ssh_host_vessels.as_deref())
             })
             .await
             {
-                warn!(host = %ssh.provisioning.host_id, %error, "failed to observe agentless SSH host; continuing startup");
+                warn!(host = %ssh.provisioning.host_id, %error, "failed to observe SSH host; continuing startup");
             }
             registered_ssh_profiles.push(ssh);
         }
@@ -394,26 +389,25 @@ impl DaemonRuntime {
             let namespace = options.namespace.clone();
             let ssh = ssh.clone();
             let credential_store = Arc::clone(&credential_store);
-            let agentless_vessels = agentless_vessels.clone();
+            let ssh_host_vessels = ssh_host_vessels.clone();
             tasks.push(spawn_periodic_task(options.heartbeat_interval, PeriodicTaskStart::AfterInterval, move || {
                 let daemon = Arc::clone(&daemon);
                 let namespace = namespace.clone();
                 let ssh = ssh.clone();
                 let credential_store = Arc::clone(&credential_store);
-                let agentless_vessels = agentless_vessels.clone();
+                let ssh_host_vessels = ssh_host_vessels.clone();
                 async move {
                     if let Err(error) =
-                        apply_agentless_ssh_observation(&daemon, &namespace, &ssh, Some(&credential_store), agentless_vessels.as_deref())
-                            .await
+                        apply_ssh_host_observation(&daemon, &namespace, &ssh, Some(&credential_store), ssh_host_vessels.as_deref()).await
                     {
                         warn!(host = %ssh.provisioning.host_id, %error, "failed to publish SSH host observation");
                     }
                     // #3792: a removed vessel's agent goes with it, including
                     // one removed while this daemon was down.
-                    if let Some(vessels) = &agentless_vessels {
+                    if let Some(vessels) = &ssh_host_vessels {
                         let retired = async {
-                            let live = agentless_vessels::live_vessels(&daemon.resource_backend(), &namespace, ssh.environment_id.as_str())
-                                .await?;
+                            let live =
+                                ssh_host_vessels::live_vessels(&daemon.resource_backend(), &namespace, ssh.environment_id.as_str()).await?;
                             vessels.retire_absent(&ssh, &live).await
                         }
                         .await;
@@ -539,11 +533,11 @@ impl DaemonRuntime {
                     profile.host_direct_environment_name(),
                 )
                 .with_environment_sockets(options.environment_sockets.clone())
-                .with_agentless_vessels(agentless_vessels.clone())
+                .with_ssh_host_vessels(ssh_host_vessels.clone())
                 .with_hook_endpoint(options.hook_endpoint.clone())
                 .with_checkout_removal_concurrency(daemon_config.checkout_removal_concurrency)
                 .with_namespace(options.namespace.clone())
-                .with_agentless_ssh(ssh_profiles.clone())
+                .with_ssh_host(ssh_profiles.clone())
                 .with_credential_store(Arc::clone(&credential_store))
                 .with_agent_material(agent_material)
                 .with_blob_store(Arc::clone(&blob_store))
@@ -553,8 +547,8 @@ impl DaemonRuntime {
                 .with_controller_metrics(Arc::clone(&controller_metrics))
                 .with_provisioning_lifecycles(provisioning_lifecycles.clone()),
             );
-            if state.agentless_vessels.is_some() {
-                daemon.set_agentless_vessel_access(Arc::new(agentless_vessels::VesselSessions { state: Arc::downgrade(&state) }));
+            if state.ssh_host_vessels.is_some() {
+                daemon.set_ssh_host_vessel_access(Arc::new(ssh_host_vessels::VesselSessions { state: Arc::downgrade(&state) }));
             }
             phase(
                 "set_operator_reconciler",
@@ -883,7 +877,7 @@ fn spawn_controller_loops(
             backend.clone(),
             namespace_string.clone(),
             state.local_host_ref.clone(),
-            state.agentless_host_refs(),
+            state.ssh_host_refs(),
             supervision.clone(),
             runtime_health.clone(),
         ),
@@ -904,7 +898,7 @@ fn spawn_controller_loops(
             let state = Arc::clone(&state);
             move |backend: ResourceBackend, namespace_string: String| {
                 let local_host_ref = state.local_host_ref.clone();
-                let additional_host_refs = state.agentless_host_refs();
+                let additional_host_refs = state.ssh_host_refs();
                 let lifecycle_reads = state.daemon.lifecycle_reads();
                 let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.environments));
                 let state = Arc::clone(&state);
@@ -969,7 +963,7 @@ fn spawn_controller_loops(
             let state = Arc::clone(&state);
             move |backend: ResourceBackend, namespace_string: String| {
                 let local_host_ref = state.local_host_ref.clone();
-                let additional_host_refs = state.agentless_host_refs();
+                let additional_host_refs = state.ssh_host_refs();
                 let state = Arc::clone(&state);
                 let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.terminal_sessions));
                 let reads = state.daemon.lifecycle_reads();
@@ -990,7 +984,7 @@ fn spawn_controller_loops(
             let state = Arc::clone(&state);
             let config_dir = state.config.base_path().as_path().to_path_buf();
             let local_host_ref = state.local_host_ref.clone();
-            let additional_host_refs = state.agentless_host_refs();
+            let additional_host_refs = state.ssh_host_refs();
             move |backend: ResourceBackend, namespace_string: String| {
                 let config_dir = config_dir.clone();
                 let local_host_ref = local_host_ref.clone();

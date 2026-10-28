@@ -61,7 +61,7 @@ pub enum EnvironmentKind {
     /// A container vessel; its vessel agent writes into it (#3756).
     Docker,
     /// A bare host reached over SSH through its vessel agent (#3792).
-    AgentlessSsh,
+    SshHost,
     /// The daemon's own host, written by the daemon.
     HostDirect,
     /// A provider-hosted sandbox.
@@ -72,30 +72,30 @@ impl EnvironmentKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Docker => "docker",
-            Self::AgentlessSsh => "agentless-ssh",
+            Self::SshHost => "ssh-host",
             Self::HostDirect => "host-direct",
             Self::CloudSandbox => "cloud-sandbox",
         }
     }
 
-    /// A fulfilment kind's realisation, on a host that is or is not agentless.
-    pub fn of_realisation(realisation: &FulfilmentRealisation, agentless_host: bool) -> Self {
+    /// A fulfilment kind's realisation, on a host that is or is not an SSH host.
+    pub fn of_realisation(realisation: &FulfilmentRealisation, ssh_host: bool) -> Self {
         match realisation {
             FulfilmentRealisation::CloudSandboxPerVessel { .. } => Self::CloudSandbox,
             FulfilmentRealisation::DockerPerVessel { .. } => Self::Docker,
-            FulfilmentRealisation::HostDirect if agentless_host => Self::AgentlessSsh,
+            FulfilmentRealisation::HostDirect if ssh_host => Self::SshHost,
             FulfilmentRealisation::HostDirect => Self::HostDirect,
         }
     }
 
     /// A placement policy's realisation.
-    pub fn of_policy(spec: &PlacementPolicySpec, agentless_host: bool) -> Self {
+    pub fn of_policy(spec: &PlacementPolicySpec, ssh_host: bool) -> Self {
         if spec.cloud_sandbox_per_vessel.is_some() {
             Self::CloudSandbox
         } else if spec.docker_per_vessel.is_some() {
             Self::Docker
-        } else if agentless_host {
-            Self::AgentlessSsh
+        } else if ssh_host {
+            Self::SshHost
         } else {
             Self::HostDirect
         }
@@ -272,7 +272,7 @@ mod tests {
     // the same wherever the crew is placed, a cloud sandbox included.
     #[test]
     fn the_claude_plan_is_the_same_for_every_kind() {
-        let kinds = [EnvironmentKind::Docker, EnvironmentKind::AgentlessSsh, EnvironmentKind::HostDirect, EnvironmentKind::CloudSandbox];
+        let kinds = [EnvironmentKind::Docker, EnvironmentKind::SshHost, EnvironmentKind::HostDirect, EnvironmentKind::CloudSandbox];
         let plans = kinds.map(|kind| ClaudeDirect.plan(kind).expect("a plan"));
         assert!(plans.iter().all(|plan| *plan == plans[0]), "{plans:?}");
     }

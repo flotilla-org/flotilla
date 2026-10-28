@@ -5849,7 +5849,7 @@ pub(super) async fn place_crew(daemon: &InProcessDaemon, environment: &str, plac
         .expect("crew identity");
 }
 
-mod agentless_forward;
+mod ssh_host_forward;
 
 // #3270: the transport's environment constrains every request, independently of
 // command context. Exercise the real store and dispatcher over in-memory framing.

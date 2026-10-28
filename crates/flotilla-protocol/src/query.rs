@@ -434,7 +434,7 @@ pub struct FulfilmentRow {
     pub toolchains: BTreeMap<String, String>,
     pub gui_session_logged_in: Option<bool>,
     pub free_vessel_slots: Option<u32>,
-    /// An agentless SSH host's declared vessel cap (#3793).
+    /// An SSH host's declared vessel cap (#3793).
     #[serde(default)]
     pub max_vessels: Option<u32>,
     pub image: Option<String>,

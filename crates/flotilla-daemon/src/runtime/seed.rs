@@ -58,9 +58,9 @@ pub(super) async fn ensure_host_exists(
                         image_build_capacity: existing.spec.image_build_capacity.clone(),
                         // This path seeds the local daemon Host only, whose cap
                         // bounds its Docker placements and which is never a
-                        // single-tenant agentless box (#4002). Agentless hosts,
+                        // single-tenant SSH host box (#4002). SSH hosts,
                         // their cap and tenancy are written by
-                        // `register_agentless_ssh_resources`.
+                        // `register_ssh_host_resources`.
                         max_vessels,
                         single_tenant: false,
                     },
@@ -384,7 +384,7 @@ pub(super) async fn migrate_listed_placement_policies(
                 updated.grants = existing.spec.grants.clone();
                 updated.cost_class = existing.spec.cost_class;
                 // Platform is a host fact. Correct an initial local-OS
-                // registration when an agentless SSH host reports its own OS.
+                // registration when an SSH host reports its own OS.
                 updated.grants.retain(|grant| !grant.0.starts_with("platform:"));
                 updated.grants.extend(spec.grants.iter().filter(|grant| grant.0.starts_with("platform:")).cloned());
                 if updated != existing.spec {

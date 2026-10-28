@@ -1,4 +1,4 @@
-//! The image harness environment an agentless session takes (#3655), read from the stdlib image
+//! The image harness environment an SSH host session takes (#3655), read from the stdlib image
 //! layers' fragments. The layers themselves are built-in definitions from the code
 //! (`flotilla_resources::stdlib`, #3824 layer 2a).
 use flotilla_resources::stdlib::{EmbeddedLayerDirectory, STDLIB_IMAGE_LAYERS};
@@ -15,7 +15,7 @@ const HOST_OWNED_ENVIRONMENT: &[&str] = &["PATH", "SHELL"];
 static HARNESS_SESSION_ENVIRONMENT: std::sync::LazyLock<Vec<(String, String)>> =
     std::sync::LazyLock::new(|| harness_environment_from(STDLIB_IMAGE_LAYERS));
 
-/// The image harness environment an agentless session receives.
+/// The image harness environment an SSH host session receives.
 pub(crate) fn harness_session_environment() -> &'static [(String, String)] {
     &HARNESS_SESSION_ENVIRONMENT
 }
@@ -58,11 +58,11 @@ fn harness_environment_from(directories: &[EmbeddedLayerDirectory]) -> Vec<(Stri
 mod tests {
     use super::*;
 
-    // #3655 contract 3: agentless sessions get exactly the image's harness
+    // #3655 contract 3: SSH host sessions get exactly the image's harness
     // environment, read from the shipped layer fragments. A new literal ENV in
     // a harness layer fails here, so reaching bare hosts is a decision.
     #[test]
-    fn shipped_harness_layers_define_the_agentless_session_environment() {
+    fn shipped_harness_layers_define_the_ssh_host_session_environment() {
         let mut environment = harness_session_environment().to_vec();
         environment.sort();
         assert_eq!(

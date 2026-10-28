@@ -286,19 +286,19 @@ pub fn check_placement_capacity(target_host: &PlacementTargetHost, capacity: Opt
     crate::admission::check_measured_free_space(&target_host.display_name, free_bytes, floor_bytes)
 }
 
-/// Agentless SSH hosts run crews in an account the owning daemon does not
+/// SSH hosts run crews in an account the owning daemon does not
 /// control, so an uncapped one takes only convoys that name its placement
 /// deliberately. A host that declares `max_vessels` takes unpinned convoys
 /// within that cap (#3793).
-pub const AGENTLESS_SSH_PIN_ONLY: &str = "agentless SSH host takes only convoys that pin its placement";
+pub const SSH_HOST_PIN_ONLY: &str = "SSH host takes only convoys that pin its placement";
 
-pub fn is_agentless_ssh_host(host: &ResourceObject<ResourceHost>) -> bool {
-    matches!(host.spec.connection, flotilla_resources::HostConnection::AgentlessSsh { .. })
+pub fn is_ssh_host(host: &ResourceObject<ResourceHost>) -> bool {
+    matches!(host.spec.connection, flotilla_resources::HostConnection::SshHost { .. })
 }
 
 /// What each of `hosts` holds against its cap, read from every convoy and
 /// vessel the store sees, listed once for all of them. The owning daemon is
-/// the only placer on its agentless hosts, so its store holds every convoy
+/// the only placer on its SSH hosts, so its store holds every convoy
 /// admitted there.
 pub async fn host_occupancies(
     backend: &ResourceBackend,
@@ -344,14 +344,11 @@ pub async fn host_occupancy(backend: &ResourceBackend, namespace: &str, host: &s
     Ok(occupancies.remove(host).unwrap_or_default())
 }
 
-pub async fn policy_targets_agentless_ssh(backend: &ResourceBackend, namespace: &str, policy: &ResourceObject<PlacementPolicy>) -> bool {
+pub async fn policy_targets_ssh_host(backend: &ResourceBackend, namespace: &str, policy: &ResourceObject<PlacementPolicy>) -> bool {
     let Ok(target) = placement_target_host(backend, namespace, policy).await else {
         return false;
     };
-    authoritative_placement_host(backend, namespace, &target, &policy.metadata.name)
-        .await
-        .ok()
-        .is_some_and(|host| is_agentless_ssh_host(&host))
+    authoritative_placement_host(backend, namespace, &target, &policy.metadata.name).await.ok().is_some_and(|host| is_ssh_host(&host))
 }
 
 /// Validate and freeze one provider for this vessel's placement snapshot.

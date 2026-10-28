@@ -62,8 +62,8 @@ conditions as well as every currently readiness-blocking category:
 | `Daemon/RestartTracking` / history unavailable | no | Restart-history diagnostics are independent of forge I/O. |
 | `Daemon/AbnormalRestarts` | no | Historical failures do not disable the current live reader. |
 | `Filesystem/AvailableSpace` / failed probe | no | Unmeasured admission capacity does not demonstrate a forge failure. |
-| `Capacity/FreeSpace` / unavailable measurement | no | Agentless capacity does not affect the owning daemon reader. |
-| `Transport/SSH` / unreachable | no | Agentless hosts are never forge observers; their daemon remains independent. |
+| `Capacity/FreeSpace` / unavailable measurement | no | SSH host capacity does not affect the owning daemon reader. |
+| `Transport/SSH` / unreachable | no | SSH hosts are never forge observers; their daemon remains independent. |
 | `SleepInhibition` / inhibitor not held | no | An awake daemon can read; sleep is detected by heartbeat expiry. |
 | `FileDescriptors` / pressure warning | no | Pressure is not a demonstrated read failure; lag handover is #3414. |
 | `ResourceStore/DecodeQuarantine` | only for forge-related kinds | Corrupt Host/Forge/Project/Repository, demand/result, Issue or ChangeRequest records affect observation; unrelated actuator records do not. |
@@ -82,7 +82,7 @@ unchanged.
 
 ## Deliberate withdrawal audit
 
-The production Host-status writers are the runtime heartbeat, agentless SSH
+The production Host-status writers are the runtime heartbeat, SSH host
 observation, image inventory, fulfilment observation and sleep-inhibitor patch.
 No production pause/drain command or shutdown path writes `ready=false` as an
 observation withdrawal. `DaemonRuntime::shutdown` and `Drop`
@@ -154,7 +154,7 @@ an observation-blocking condition on an otherwise admission-ready Host.
 The compatibility test decodes old blocking and advisory conditions, and checks
 that new writes carry the explicit field. The compile-fail doctest verifies that
 omitting the builder decision cannot compile. The authoring-boundary test rejects missing, null and string decisions while accepting both boolean choices; stored legacy documents still decode. Existing election scenarios retain
-heartbeat expiry, replica, startup-grace and agentless coverage.
+heartbeat expiry, replica, startup-grace and SSH host coverage.
 
 ## Load diagnostics
 

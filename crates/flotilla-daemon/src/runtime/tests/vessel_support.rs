@@ -1,10 +1,10 @@
-//! #3792 test doubles for agentless vessels: a vessel agent that runs its
+//! #3792 test doubles for SSH host vessels: a vessel agent that runs its
 //! commands through the host runner it is given, as the real agent runs them
 //! on the host, and records what the controller configured.
 
 use super::*;
 
-use super::agentless_vessels::{AgentlessVessels, HostRefusal, VesselAgents, VesselHandle, VesselPaths};
+use super::ssh_host_vessels::{HostRefusal, SshHostVessels, VesselAgents, VesselHandle, VesselPaths};
 use crate::server::environment_sockets::{EnvironmentSocketRegistry, EnvironmentSocketService};
 use flotilla_discovery::DiscoveryRuntime;
 use flotilla_environment::environment::{vessel_ops::RunnerVesselAgent, EntryKind, EnvironmentTool, VesselAgent};
@@ -152,16 +152,16 @@ impl VesselHandle for RunnerVessel {
 #[async_trait]
 impl VesselAgents for RunnerVesselAgents {
     // This process-boundary fake models a Linux amd64 host without invoking uname.
-    async fn observe_platform(&self, _: &AgentlessSshProfile) -> Result<super::agentless_vessels::HostPlatform, String> {
-        Ok(super::agentless_vessels::HostPlatform::from_uname("Linux", "x86_64"))
+    async fn observe_platform(&self, _: &SshHostProfile) -> Result<super::ssh_host_vessels::HostPlatform, String> {
+        Ok(super::ssh_host_vessels::HostPlatform::from_uname("Linux", "x86_64"))
     }
-    async fn host_refusals(&self, _profile: &AgentlessSshProfile) -> Vec<HostRefusal> {
+    async fn host_refusals(&self, _profile: &SshHostProfile) -> Vec<HostRefusal> {
         self.refusals.lock().expect("refusals").clone()
     }
     async fn open(
         &self,
-        _profile: &AgentlessSshProfile,
-        _: &super::agentless_vessels::HostPlatform,
+        _profile: &SshHostProfile,
+        _: &super::ssh_host_vessels::HostPlatform,
         paths: &VesselPaths,
         _local: &Path,
     ) -> Result<Arc<dyn VesselHandle>, String> {
@@ -171,7 +171,7 @@ impl VesselAgents for RunnerVesselAgents {
         &self,
         _discovery: &DiscoveryRuntime,
         _config: &ConfigStore,
-        _profile: &AgentlessSshProfile,
+        _profile: &SshHostProfile,
         _handle: &dyn VesselHandle,
         _environment: &BTreeMap<String, String>,
     ) -> Result<Arc<ProviderRegistry>, String> {
@@ -194,6 +194,6 @@ pub(super) fn held_socket_service(state: &Path) -> EnvironmentSocketService {
 }
 
 /// The vessel manager over `agents`, with sockets and attach directories in `state`.
-pub(super) fn vessels_over(agents: Arc<dyn VesselAgents>, state: &Path) -> Arc<AgentlessVessels> {
-    Arc::new(AgentlessVessels::new(agents, held_socket_service(state), state.join("vessels")))
+pub(super) fn vessels_over(agents: Arc<dyn VesselAgents>, state: &Path) -> Arc<SshHostVessels> {
+    Arc::new(SshHostVessels::new(agents, held_socket_service(state), state.join("vessels")))
 }
