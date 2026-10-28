@@ -14,12 +14,32 @@ use serde_json::Value;
 // corpus is refreshed; never regenerate the corpus to accommodate retirement.
 const PURGED_CORPUS_KINDS: [&str; 1] = ["Presentation"];
 
+// ManifestRoot, CrewDefaults, ImageLayer, ImageBuild (#2728), Message (#2716) and FleetDesignation (#2718) were introduced
+// after r355, as were DispatchHold and DispatchDeployment (#2782), ForgeRead (#2868), ForgeReadHeartbeat (#2928),
+// AccountBinding and AccountProvision (#3907), and AccessDelivery (#3964). Remove exemptions when the corpus is refreshed
+// after the next fleet roll (ADR 0047).
+const AFTER_R355_KINDS: [&str; 13] = [
+    "ManifestRoot",
+    "CrewDefaults",
+    "ImageLayer",
+    "ImageBuild",
+    "FleetDesignation",
+    "DispatchHold",
+    "AccountBinding",
+    "AccountProvision",
+    "AccessDelivery",
+    "DispatchDeployment",
+    "Message",
+    "ForgeRead",
+    "ForgeReadHeartbeat",
+];
+
 fn retired_corpus_files(generation: &str) -> BTreeSet<String> {
     if generation == "r355" {
         PURGED_CORPUS_KINDS
             .iter()
             .copied()
-            .chain(RETIRED_RESOURCE_KINDS.iter().map(|retired| retired.kind))
+            .chain(RETIRED_RESOURCE_KINDS.iter().map(|retired| retired.kind).filter(|kind| !AFTER_R355_KINDS.contains(kind)))
             .map(|kind| format!("{kind}.json"))
             .collect()
     } else {
@@ -47,10 +67,13 @@ fn retired_corpus_kinds_decode_as_dropped_and_purged_ones_refuse() {
             assert!(decode_stored_resource_document(&document).is_err(), "purged {kind} has no runtime decoder");
         }
     }
-    let fixed: Value = serde_json::from_str(include_str!("../fixtures/retired-usage.json")).unwrap();
+    let usage: Value = serde_json::from_str(include_str!("../fixtures/retired-usage.json")).unwrap();
+    let dispatch: Vec<Value> = serde_json::from_str(include_str!("../fixtures/retired-dispatch.json")).unwrap();
+    let fixed = || std::iter::once(usage.clone()).chain(dispatch.iter().cloned());
     for retired in RETIRED_RESOURCE_KINDS {
         assert!(!REGISTERED_RESOURCE_KINDS.iter().any(|registered| registered.kind == retired.kind), "{} is retired", retired.kind);
-        let documents = recorded(retired.kind).into_iter().chain((fixed["kind"] == retired.kind).then(|| fixed.clone()));
+        let recorded = if AFTER_R355_KINDS.contains(&retired.kind) { Vec::new() } else { recorded(retired.kind) };
+        let documents = recorded.into_iter().chain(fixed().filter(|document| document["kind"] == retired.kind));
         let mut decoded = 0;
         for document in documents {
             assert_eq!(decode_stored_resource_document(&document).expect("retired decoder"), StoredRecord::Retired(retired));
@@ -59,7 +82,7 @@ fn retired_corpus_kinds_decode_as_dropped_and_purged_ones_refuse() {
         assert!(decoded > 0, "{} has a recorded or fixed record", retired.kind);
     }
     // Dropped, not unchecked: a retired row whose status is not an object is corrupt.
-    let mut corrupt = fixed;
+    let mut corrupt = usage;
     corrupt["status"] = Value::String("corrupt".into());
     assert!(decode_stored_resource_document(&corrupt).is_err(), "a retired row's status is still an object");
 }
@@ -99,29 +122,9 @@ fn deployed_stored_records_still_decode() {
             continue;
         }
         generation_count += 1;
-        // ManifestRoot, CrewDefaults, ImageLayer, ImageBuild (#2728), Message (#2716) and FleetDesignation (#2718) were introduced
-        // after this deployed generation, as were DispatchHold and DispatchDeployment (#2782), ForgeRead (#2868),
-        // ForgeReadHeartbeat (#2928), AccountBinding and AccountProvision (#3907), and AccessDelivery (#3964). Remove exemptions when the corpus is refreshed after the next fleet roll (ADR 0047).
         let mut expected: BTreeSet<_> = REGISTERED_RESOURCE_KINDS
             .iter()
-            .filter(|kind| {
-                !matches!(
-                    kind.kind,
-                    "ManifestRoot"
-                        | "CrewDefaults"
-                        | "ImageLayer"
-                        | "ImageBuild"
-                        | "FleetDesignation"
-                        | "DispatchHold"
-                        | "AccountBinding"
-                        | "AccountProvision"
-                        | "AccessDelivery"
-                        | "DispatchDeployment"
-                        | "Message"
-                        | "ForgeRead"
-                        | "ForgeReadHeartbeat"
-                )
-            })
+            .filter(|kind| !AFTER_R355_KINDS.contains(&kind.kind))
             .map(|kind| format!("{}.json", kind.kind))
             .collect();
         expected.extend(retired_corpus_files(generation.file_name().and_then(|name| name.to_str()).expect("UTF-8 generation")));
@@ -132,24 +135,7 @@ fn deployed_stored_records_still_decode() {
         assert_eq!(actual, expected, "{} must cover every registered resource kind", generation.display());
         let mut document_count = 0;
         let mut status_count = 0;
-        for kind in REGISTERED_RESOURCE_KINDS.iter().filter(|kind| {
-            !matches!(
-                kind.kind,
-                "ManifestRoot"
-                    | "CrewDefaults"
-                    | "ImageLayer"
-                    | "ImageBuild"
-                    | "FleetDesignation"
-                    | "DispatchHold"
-                    | "AccountBinding"
-                    | "AccountProvision"
-                    | "AccessDelivery"
-                    | "DispatchDeployment"
-                    | "Message"
-                    | "ForgeRead"
-                    | "ForgeReadHeartbeat"
-            )
-        }) {
+        for kind in REGISTERED_RESOURCE_KINDS.iter().filter(|kind| !AFTER_R355_KINDS.contains(&kind.kind)) {
             let file = generation.join(format!("{}.json", kind.kind));
             let content = fs::read_to_string(&file).unwrap_or_else(|error| panic!("{}: {error}", file.display()));
             let documents: Vec<Value> = serde_json::from_str(&content).unwrap_or_else(|error| panic!("{}: {error}", file.display()));

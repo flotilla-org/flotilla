@@ -1,0 +1,44 @@
+[
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "DispatchObservation",
+    "metadata": { "name": "dispatch-5f1c", "namespace": "flotilla", "resourceVersion": "1", "creationTimestamp": "2026-10-20T00:01:30Z" },
+    "spec": {
+      "project_ref": "widgets",
+      "convoy_ref": "fix-2",
+      "issue": { "source": { "service": "https://github.com", "scope": "acme/widgets" }, "id": "2" },
+      "workflow_ref": "review-and-fix",
+      "placement_policy": "docker-local",
+      "ready_observed_at": "2026-10-20T00:00:00Z",
+      "dispatched_at": "2026-10-20T00:01:00Z",
+      "time_from_ready_seconds": 60,
+      "observed_at": "2026-10-20T00:01:30Z",
+      "provenance": "dispatch-reconciler"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "DispatchHold",
+    "metadata": { "name": "serialise", "namespace": "flotilla", "resourceVersion": "2", "creationTimestamp": "2026-10-20T00:00:00Z" },
+    "spec": {
+      "project_ref": "widgets",
+      "issue": { "source": { "service": "https://github.com", "scope": "acme/widgets" }, "id": "2" },
+      "land_after": { "source": { "service": "https://github.com", "scope": "acme/widgets" }, "id": "1" },
+      "reason": "shared interface",
+      "author": "governor",
+      "clear_when": { "kind": "deployed", "installation": "lab" }
+    },
+    "status": { "cleared_at": "2026-10-21T00:00:00Z" }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "DispatchDeployment",
+    "metadata": { "name": "lab-1", "namespace": "flotilla", "resourceVersion": "1", "creationTimestamp": "2026-10-21T00:00:00Z" },
+    "spec": {
+      "issue": { "source": { "service": "https://github.com", "scope": "acme/widgets" }, "id": "1" },
+      "installation": "lab",
+      "revision": "abc123",
+      "deployed_at": "2026-10-21T00:00:00Z"
+    }
+  }
+]

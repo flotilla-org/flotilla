@@ -15,22 +15,22 @@ use flotilla_protocol::{
     DispatchIssueFacts, Issue, IssueRef, IssueState,
 };
 use flotilla_resources::{
-    content_hash, pinned_workflow_ref, Clock, Convoy, ConvoyPhase, DispatchDeployment, DispatchHold, DispatchHoldStatusPatch,
-    DispatchObservation, DispatchObservationSpec, DispatchPolicy, DispatchQueueAttention, DispatchQueueEntry, HoldClearWhen, InputMeta,
-    Project, ProjectStatusPatch, ReadWatchEvent, ResolvedIssueSourceBinding, ResourceError, ResourceObject, SystemClock, WorkflowTemplate,
-    DISPATCH_RECONCILER_PROVENANCE,
+    pinned_workflow_ref, Clock, Convoy, DispatchPolicy, DispatchQueueAttention, DispatchQueueEntry, Project, ProjectStatusPatch,
+    ReadWatchEvent, ResolvedIssueSourceBinding, ResourceError, ResourceObject, SystemClock,
 };
-use flotilla_store::{apply_status_patch, ResourceBackend};
+use flotilla_store::{apply_status_patch, load_metrics::HistogramSnapshot, load_metrics::LatencyHistogram, ResourceBackend};
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tracing::{info, warn};
 
 const ISSUE_PAGE_SIZE: usize = 100;
+const DISPATCH_RECONCILER_PROVENANCE: &str = "dispatch-reconciler";
 
 pub(crate) struct ProjectBoardInput {
     readiness: Result<Vec<Issue>, String>,
     boards: Vec<MissionSourceSnapshot>,
 }
 type ProjectBoards = BTreeMap<String, Result<ProjectBoardInput, String>>;
+type ProjectConvoys = BTreeMap<String, Vec<Arc<ResourceObject<Convoy>>>>;
 
 #[derive(Default)]
 struct MissionState {
@@ -54,70 +54,26 @@ struct PassIssueReads {
     issues: BTreeMap<IssueRef, Result<Issue, String>>,
 }
 
-// An unavailable shared inventory conservatively pauses enabled Projects.
-// Publish per-Project errors without discarding queues; disabled scopes still clear.
-struct PassInventories {
-    error: Option<String>,
-    project_convoys: BTreeMap<String, Vec<Arc<ResourceObject<Convoy>>>>,
-    landed_issues: HashSet<IssueRef>,
-    holds: Vec<ResourceObject<DispatchHold>>,
-    deployments: Vec<ResourceObject<DispatchDeployment>>,
-    workflows: HashSet<String>,
-    observations: HashSet<String>,
+/// Time from ready to dispatch, by Project and workflow, for this process.
+#[derive(Debug, Default)]
+pub(crate) struct DispatchMetrics {
+    time_from_ready: std::sync::Mutex<BTreeMap<(String, String), Arc<LatencyHistogram>>>,
 }
 
-#[async_trait]
-trait DispatchResourceSource: Send + Sync {
-    async fn holds(&self) -> Result<Vec<ResourceObject<DispatchHold>>, String>;
-    async fn deployments(&self) -> Result<Vec<ResourceObject<DispatchDeployment>>, String>;
-    async fn workflows(&self) -> Result<HashSet<String>, String>;
-    async fn observations(&self) -> Result<HashSet<String>, String>;
-}
+impl DispatchMetrics {
+    pub(crate) fn global() -> Arc<Self> {
+        static METRICS: std::sync::OnceLock<Arc<DispatchMetrics>> = std::sync::OnceLock::new();
+        Arc::clone(METRICS.get_or_init(Arc::default))
+    }
 
-struct BackendDispatchResources {
-    backend: ResourceBackend,
-    namespace: String,
-}
+    pub(crate) fn record(&self, project: &str, workflow: &str, time_from_ready: std::time::Duration) {
+        let mut histograms = self.time_from_ready.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        histograms.entry((project.to_string(), workflow.to_string())).or_default().record(time_from_ready);
+    }
 
-#[async_trait]
-impl DispatchResourceSource for BackendDispatchResources {
-    async fn holds(&self) -> Result<Vec<ResourceObject<DispatchHold>>, String> {
-        self.backend.definitions::<DispatchHold>(&self.namespace).list().await.map_err(|e| e.to_string())
-    }
-    async fn deployments(&self) -> Result<Vec<ResourceObject<DispatchDeployment>>, String> {
-        Ok(self
-            .backend
-            .including_replicas::<DispatchDeployment>(&self.namespace)
-            .list()
-            .await
-            .map_err(|e| e.to_string())?
-            .items
-            .into_iter()
-            .map(|record| record.object)
-            .collect())
-    }
-    async fn workflows(&self) -> Result<HashSet<String>, String> {
-        Ok(self
-            .backend
-            .definitions::<WorkflowTemplate>(&self.namespace)
-            .list()
-            .await
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(|object| object.metadata.name)
-            .collect())
-    }
-    async fn observations(&self) -> Result<HashSet<String>, String> {
-        Ok(self
-            .backend
-            .using::<DispatchObservation>(&self.namespace)
-            .list()
-            .await
-            .map_err(|e| e.to_string())?
-            .items
-            .into_iter()
-            .map(|object| object.metadata.name)
-            .collect())
+    pub(crate) fn snapshot(&self) -> BTreeMap<(String, String), HistogramSnapshot> {
+        let histograms = self.time_from_ready.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        histograms.iter().map(|(labels, histogram)| (labels.clone(), histogram.snapshot())).collect()
     }
 }
 
@@ -223,7 +179,7 @@ fn ready_issue_query(binding: &ResolvedIssueSourceBinding) -> IssueQuery {
 pub(crate) struct ReconcilePass {
     pub queued: usize,
     pub blocked: usize,
-    pub observations_recorded: usize,
+    pub dispatches_observed: usize,
     pub project_errors: usize,
 }
 
@@ -233,14 +189,13 @@ pub(crate) struct DispatchReconciler {
     issues: Arc<dyn DispatchIssueSource>,
     clock: Arc<dyn Clock>,
     mission: tokio::sync::Mutex<MissionState>,
-    resources: Arc<dyn DispatchResourceSource>,
+    metrics: Arc<DispatchMetrics>,
 }
 
 impl DispatchReconciler {
     pub(crate) fn new(backend: ResourceBackend, namespace: impl Into<String>, issues: Arc<dyn DispatchIssueSource>) -> Self {
         let namespace = namespace.into();
-        let resources = Arc::new(BackendDispatchResources { backend: backend.clone(), namespace: namespace.clone() });
-        Self { backend, namespace, issues, clock: Arc::new(SystemClock), mission: Default::default(), resources }
+        Self { backend, namespace, issues, clock: Arc::new(SystemClock), mission: Default::default(), metrics: DispatchMetrics::global() }
     }
 
     #[cfg(test)]
@@ -249,40 +204,25 @@ impl DispatchReconciler {
         self
     }
 
+    #[cfg(test)]
+    fn with_metrics(mut self, metrics: Arc<DispatchMetrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
     #[tracing::instrument(name = "dispatch_reconciler", skip_all)]
     pub(crate) async fn reconcile_once(&self) -> Result<ReconcilePass, String> {
         let projects = self.backend.clone().using::<Project>(&self.namespace).list().await.map_err(|error| error.to_string())?;
         let mut mission = self.mission.lock().await;
         let before = (mission.boards.rebuilds(), mission.boards.updated_issues(), mission.occupancy_rebuilds, mission.convoy_lists);
+        // An unavailable convoy inventory conservatively pauses enabled Projects.
         let convoy_error = self.refresh_convoys(&mut mission).await.err();
-        let mut project_convoys = BTreeMap::<String, Vec<Arc<ResourceObject<Convoy>>>>::new();
-        let mut landed_issues = HashSet::new();
+        let mut project_convoys = ProjectConvoys::new();
         for convoy in mission.convoys.values() {
-            if convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landed) {
-                landed_issues.extend(convoy.spec.issues.iter().map(|issue| issue.reference.clone()));
-            }
             if let Some(project) = &convoy.spec.project_ref {
                 project_convoys.entry(project.clone()).or_default().push(convoy.clone());
             }
         }
-        let holds = self.resources.holds().await;
-        let deployments = self.resources.deployments().await;
-        let workflows = self.resources.workflows().await;
-        let observations = self.resources.observations().await;
-        let error = convoy_error
-            .or_else(|| holds.as_ref().err().cloned())
-            .or_else(|| deployments.as_ref().err().cloned())
-            .or_else(|| workflows.as_ref().err().cloned())
-            .or_else(|| observations.as_ref().err().cloned());
-        let inventories = PassInventories {
-            error,
-            project_convoys,
-            landed_issues,
-            holds: holds.unwrap_or_default(),
-            deployments: deployments.unwrap_or_default(),
-            workflows: workflows.unwrap_or_default(),
-            observations: observations.unwrap_or_default(),
-        };
         let local = self.backend.local_root().map_err(|e| e.to_string())?;
         let mut homes = BTreeMap::new();
         for record in
@@ -328,11 +268,21 @@ impl DispatchReconciler {
         let mut total = ReconcilePass::default();
         let mut reads = PassIssueReads::default();
         for project in projects {
-            match self.reconcile_project(&project, self.clock.now(), &boards, &inventories, &mut mission, &mut reads).await {
+            match self
+                .reconcile_project(
+                    &project,
+                    self.clock.now(),
+                    &boards,
+                    convoy_error.as_ref().map_or(Ok(&project_convoys), Err),
+                    &mut mission,
+                    &mut reads,
+                )
+                .await
+            {
                 Ok(outcome) => {
                     total.queued += outcome.queued;
                     total.blocked += outcome.blocked;
-                    total.observations_recorded += outcome.observations_recorded;
+                    total.dispatches_observed += outcome.dispatches_observed;
                 }
                 Err(error) => {
                     warn!(project = %project.metadata.name, %error, "dispatch reconciliation failed for project; continuing pass");
@@ -376,7 +326,7 @@ impl DispatchReconciler {
         project: &ResourceObject<Project>,
         now: DateTime<Utc>,
         boards: &ProjectBoards,
-        inventories: &PassInventories,
+        project_convoys: Result<&ProjectConvoys, &String>,
         mission: &mut MissionState,
         reads: &mut PassIssueReads,
     ) -> Result<ReconcilePass, String> {
@@ -386,18 +336,13 @@ impl DispatchReconciler {
             return Ok(ReconcilePass::default());
         };
 
-        if let Some(error) = &inventories.error {
-            return Err(format!("dispatch pass inventory unavailable: {error}"));
-        }
-        let existing = inventories.project_convoys.get(&project.metadata.name).map(Vec::as_slice).unwrap_or_default();
-        let held = self.active_holds(project, now, inventories, reads).await?;
+        let project_convoys = project_convoys.map_err(|error| format!("dispatch pass inventory unavailable: {error}"))?;
+        let existing = project_convoys.get(&project.metadata.name).map(Vec::as_slice).unwrap_or_default();
         let previous_queue = project.status.as_ref().map(|status| status.dispatch_queue.as_slice()).unwrap_or_default();
-        let observations_recorded = self.observe_dispatches(project, previous_queue, existing, now, inventories).await?;
-        let dispatched = existing
-            .iter()
-            .filter(|convoy| !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()))
-            .flat_map(|convoy| convoy.spec.issues.iter().map(|issue| issue.reference.clone()))
-            .collect::<HashSet<_>>();
+        let live =
+            existing.iter().filter(|convoy| !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal())).collect::<Vec<_>>();
+        let dispatched =
+            live.iter().flat_map(|convoy| convoy.spec.issues.iter().map(|issue| issue.reference.clone())).collect::<HashSet<_>>();
         let previous_by_issue = previous_queue.iter().map(|entry| (entry.issue.clone(), entry)).collect::<BTreeMap<_, _>>();
 
         let input = boards[&project.metadata.name].as_ref().map_err(Clone::clone)?;
@@ -422,10 +367,6 @@ impl DispatchReconciler {
         let mut blocked = 0;
         for issue in ready {
             if dispatched.contains(&issue.reference) {
-                continue;
-            }
-            if held.contains(&issue.reference) {
-                blocked += 1;
                 continue;
             }
             let facts = self.cached_facts(&issue.reference, reads).await?;
@@ -494,6 +435,7 @@ impl DispatchReconciler {
         let previous_attention = project.status.as_ref().and_then(|status| status.dispatch_queue_attention.as_ref());
         let attention = dispatch_queue_attention(&queue, policy, previous_attention, now);
         self.replace_queue(project, queue.clone(), attention).await?;
+        let dispatches_observed = self.observe_dispatches(project, previous_queue, &live);
         if project.status.as_ref().is_some_and(|status| status.dispatch_queue_error.is_some()) {
             apply_status_patch(
                 &self.backend.clone().using::<Project>(&self.namespace),
@@ -504,7 +446,7 @@ impl DispatchReconciler {
             .map_err(|error| error.to_string())?;
         }
 
-        Ok(ReconcilePass { queued: queue.len(), blocked, observations_recorded, ..ReconcilePass::default() })
+        Ok(ReconcilePass { queued: queue.len(), blocked, dispatches_observed, ..ReconcilePass::default() })
     }
 
     async fn cached_facts(&self, reference: &IssueRef, reads: &mut PassIssueReads) -> Result<DispatchIssueFacts, String> {
@@ -512,48 +454,6 @@ impl DispatchReconciler {
             reads.facts.insert(reference.clone(), self.issues.dispatch_facts(reference).await);
         }
         reads.facts[reference].clone()
-    }
-
-    async fn active_holds(
-        &self,
-        project: &ResourceObject<Project>,
-        now: DateTime<Utc>,
-        inventories: &PassInventories,
-        reads: &mut PassIssueReads,
-    ) -> Result<HashSet<IssueRef>, String> {
-        let mut active = HashSet::new();
-        for hold in &inventories.holds {
-            if hold.spec.project_ref != project.metadata.name || hold.status.as_ref().is_some_and(|status| status.cleared_at.is_some()) {
-                continue;
-            }
-            let cleared = match &hold.spec.clear_when {
-                HoldClearWhen::Landed => {
-                    let convoy_landed = inventories.landed_issues.contains(&hold.spec.land_after);
-                    convoy_landed || self.cached_facts(&hold.spec.land_after, reads).await.map(|facts| facts.landed).unwrap_or(false)
-                }
-                HoldClearWhen::Deployed { installation } => inventories
-                    .deployments
-                    .iter()
-                    .any(|deployment| deployment.spec.issue == hold.spec.land_after && deployment.spec.installation == *installation),
-            };
-            if cleared {
-                // Clear only on the authoring store; replicas can project the satisfied
-                // relationship immediately and receive its durable latch on replication.
-                let local = self.backend.clone().using::<DispatchHold>(&project.metadata.namespace);
-                match local.get(&hold.metadata.name).await {
-                    Ok(_) => {
-                        apply_status_patch(&local, &hold.metadata.name, &DispatchHoldStatusPatch::Clear { at: now })
-                            .await
-                            .map_err(|error| error.to_string())?;
-                    }
-                    Err(ResourceError::NotFound { .. }) => {}
-                    Err(error) => return Err(error.to_string()),
-                }
-            } else {
-                active.insert(hold.spec.issue.clone());
-            }
-        }
-        Ok(active)
     }
 
     async fn refresh_convoys(&self, state: &mut MissionState) -> Result<(), String> {
@@ -616,65 +516,35 @@ impl DispatchReconciler {
         }
     }
 
-    async fn observe_dispatches(
+    /// Times each issue the previous queue held that a live convoy now serves. Called only after the
+    /// queue without it is written, so the next pass cannot time it again.
+    fn observe_dispatches(
         &self,
         project: &ResourceObject<Project>,
         previous_queue: &[DispatchQueueEntry],
-        convoys: &[Arc<ResourceObject<Convoy>>],
-        now: DateTime<Utc>,
-        inventories: &PassInventories,
-    ) -> Result<usize, String> {
-        let queued = previous_queue.iter().map(|entry| (&entry.issue, entry)).collect::<BTreeMap<_, _>>();
-        let observations = self.backend.clone().using::<DispatchObservation>(&project.metadata.namespace);
-        let mut recorded = 0;
-        let mut seen = HashSet::new();
-        for convoy in convoys {
+        live: &[&Arc<ResourceObject<Convoy>>],
+    ) -> usize {
+        let mut queued = previous_queue.iter().map(|entry| (&entry.issue, entry)).collect::<BTreeMap<_, _>>();
+        let mut observed = 0;
+        for convoy in live {
             for issue in &convoy.spec.issues {
-                let Some(queue_entry) = queued.get(&issue.reference) else { continue };
-                let identity = serde_json::json!({
-                    "project": project.metadata.name,
-                    "convoy": convoy.metadata.name,
-                    "issue": issue.reference,
-                });
-                let name = format!("dispatch-{}", content_hash(&identity).map_err(|error| error.to_string())?);
-                if inventories.observations.contains(&name) || !seen.insert(name.clone()) {
-                    continue;
-                }
-                if !inventories.workflows.contains(pinned_workflow_ref(convoy)) {
-                    warn!(
-                        project = %project.metadata.name,
-                        convoy = %convoy.metadata.name,
-                        issue = ?issue.reference,
-                        workflow = %pinned_workflow_ref(convoy),
-                        reason = "absent from pass inventory",
-                        "cannot record dispatch observation without its workflow"
-                    );
-                    continue;
-                }
-                let dispatched_at = convoy.metadata.creation_timestamp;
-                let time_from_ready_seconds =
-                    dispatched_at.signed_duration_since(queue_entry.ready_observed_at).num_seconds().max(0) as u64;
-                let spec = DispatchObservationSpec::builder()
-                    .project_ref(project.metadata.name.clone())
-                    .convoy_ref(convoy.metadata.name.clone())
-                    .issue(issue.reference.clone())
-                    .workflow_ref(convoy.spec.workflow_ref.clone())
-                    .maybe_placement_policy(convoy.spec.placement_policy.clone())
-                    .ready_observed_at(queue_entry.ready_observed_at)
-                    .dispatched_at(dispatched_at)
-                    .time_from_ready_seconds(time_from_ready_seconds)
-                    .observed_at(now)
-                    .provenance(DISPATCH_RECONCILER_PROVENANCE.to_string())
-                    .build();
-                observations
-                    .create(&InputMeta::builder().name(name).build(), &spec)
-                    .await
-                    .map_err(|error| format!("record dispatch observation for convoy {}: {error}", convoy.metadata.name))?;
-                info!(project = %project.metadata.name, convoy = %convoy.metadata.name, issue = %issue.reference.id, "recorded dispatch observation");
-                recorded += 1;
+                let Some(queue_entry) = queued.remove(&issue.reference) else { continue };
+                let workflow = pinned_workflow_ref(convoy);
+                let time_from_ready =
+                    convoy.metadata.creation_timestamp.signed_duration_since(queue_entry.ready_observed_at).to_std().unwrap_or_default();
+                self.metrics.record(&project.metadata.name, workflow, time_from_ready);
+                info!(
+                    project = %project.metadata.name,
+                    convoy = %convoy.metadata.name,
+                    issue = %issue.reference.id,
+                    workflow,
+                    time_from_ready_seconds = time_from_ready.as_secs(),
+                    "queued issue dispatched"
+                );
+                observed += 1;
             }
         }
-        Ok(recorded)
+        observed
     }
 
     async fn replace_queue(
@@ -722,9 +592,10 @@ mod tests {
     use std::{collections::HashMap, sync::Mutex};
 
     use flotilla_protocol::IssueSource;
-    use flotilla_resources::single_agent_workflow_spec;
     use flotilla_resources::ConvoyIssue;
+    use flotilla_resources::ConvoyPhase;
     use flotilla_resources::ConvoySpec;
+    use flotilla_resources::InputMeta;
     use flotilla_resources::InputValue;
     use flotilla_resources::IssueSnapshot;
     use flotilla_resources::ProjectSpec;
@@ -946,43 +817,13 @@ mod tests {
         (backend, issues, clock, reconciler)
     }
 
-    struct CountedInventories {
-        real: BackendDispatchResources,
-        calls: Mutex<[usize; 4]>,
-        fail_holds: Mutex<bool>,
-    }
-
-    #[async_trait]
-    impl DispatchResourceSource for CountedInventories {
-        async fn holds(&self) -> Result<Vec<ResourceObject<DispatchHold>>, String> {
-            self.calls.lock().expect("counts")[0] += 1;
-            if *self.fail_holds.lock().expect("failure") {
-                return Err("injected hold inventory outage".into());
-            }
-            self.real.holds().await
-        }
-        async fn deployments(&self) -> Result<Vec<ResourceObject<DispatchDeployment>>, String> {
-            self.calls.lock().expect("counts")[1] += 1;
-            self.real.deployments().await
-        }
-        async fn workflows(&self) -> Result<HashSet<String>, String> {
-            self.calls.lock().expect("counts")[2] += 1;
-            self.real.workflows().await
-        }
-        async fn observations(&self) -> Result<HashSet<String>, String> {
-            self.calls.lock().expect("counts")[3] += 1;
-            self.real.observations().await
-        }
-    }
-
     // #2860/#2859: overlapping Projects share inventories; unchanged passes do
     // no graph/occupancy work. Convoy add/update/remove and watch recovery affect
     // occupancy independently of graph topology and preserve readiness aging.
     #[tokio::test]
     async fn pass_inventories_and_convoy_deltas_have_bounded_work() {
         use flotilla_resources::ConvoyStatus;
-        let (backend, issues, clock, mut reconciler) =
-            harness(vec![issue("1", &["ready"], None, IssueState::Open)], vec![], policy(60)).await;
+        let (backend, issues, clock, reconciler) = harness(vec![issue("1", &["ready"], None, IssueState::Open)], vec![], policy(60)).await;
         let spec = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").spec;
         for id in 0..12 {
             backend
@@ -991,18 +832,11 @@ mod tests {
                 .await
                 .expect("overlap");
         }
-        let counted = Arc::new(CountedInventories {
-            real: BackendDispatchResources { backend: backend.clone(), namespace: NAMESPACE.into() },
-            calls: Mutex::new([0; 4]),
-            fail_holds: Mutex::new(false),
-        });
-        reconciler.resources = counted.clone();
         assert_eq!(reconciler.reconcile_once().await.expect("initial pass").queued, 13);
         let initial = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status").dispatch_queue[0]
             .ready_observed_at;
         clock.advance(Duration::seconds(120));
         assert_eq!(reconciler.reconcile_once().await.expect("unchanged pass").queued, 13);
-        assert_eq!(*counted.calls.lock().expect("counts"), [2; 4]);
         assert_eq!(*issues.facts_calls.lock().expect("fact counts"), 2, "one unique issue read per pass across 13 Projects");
         {
             let state = reconciler.mission.lock().await;
@@ -1055,14 +889,11 @@ mod tests {
         // real in-memory resource inventory; no live fleet is involved.
         reconciler.mission.lock().await.watch = Some(futures::stream::empty().boxed());
         assert_eq!(reconciler.reconcile_once().await.expect("scoped watch error").project_errors, 13);
-        reconciler.reconcile_once().await.expect("watch recovery");
-        assert_eq!(reconciler.mission.lock().await.convoy_lists, 2);
-        *counted.fail_holds.lock().expect("failure") = true;
-        assert_eq!(reconciler.reconcile_once().await.expect("scoped inventory error").project_errors, 13);
         let unavailable = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
         assert!(unavailable.dispatch_queue_error.is_some());
         assert_eq!(unavailable.dispatch_queue[0].ready_observed_at, initial);
-        *counted.fail_holds.lock().expect("failure") = false;
+        reconciler.reconcile_once().await.expect("watch recovery");
+        assert_eq!(reconciler.mission.lock().await.convoy_lists, 2);
         *issues.failing_collection.lock().expect("collection failure") = true;
         assert_eq!(reconciler.reconcile_once().await.expect("source inventory outage").project_errors, 13);
         let unavailable = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
@@ -1232,25 +1063,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_dispatch_of_a_queued_issue_records_the_a_decision_and_drops_it_from_the_queue() {
+    async fn dispatching_a_queued_issue_times_it_once_and_drops_it_from_the_queue() {
         let ready = issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open);
         let (backend, _, clock, reconciler) = harness(vec![ready.clone()], vec![], policy(300)).await;
+        let metrics = Arc::new(DispatchMetrics::default());
+        let reconciler = reconciler.with_metrics(Arc::clone(&metrics));
         reconciler.reconcile_once().await.expect("queue pass");
-        let workflow_root = flotilla_protocol::NodeId::new("workflow-authority");
-        let workflow_authority =
-            ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(workflow_root.clone());
-        workflow_authority
-            .definitions::<WorkflowTemplate>(NAMESPACE)
-            .apply(&InputMeta::builder().name("review-and-fix".to_string()).build(), &single_agent_workflow_spec())
-            .await
-            .expect("workflow");
-        backend
-            .replica_writer::<WorkflowTemplate>(workflow_root, NAMESPACE)
-            .replace(&workflow_authority.using::<WorkflowTemplate>(NAMESPACE).list().await.expect("workflow authority log"), Utc::now())
-            .await
-            .expect("replicate workflow");
-        assert!(backend.using::<WorkflowTemplate>(NAMESPACE).list().await.expect("local workflows").items.is_empty());
-        backend
+        let ready_at = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status").dispatch_queue[0]
+            .ready_observed_at;
+        let convoy = backend
             .clone()
             .using::<Convoy>(NAMESPACE)
             .create(
@@ -1288,9 +1109,9 @@ mod tests {
             .expect("manual convoy");
         clock.advance(Duration::seconds(90));
 
-        let outcome = reconciler.reconcile_once().await.expect("observation pass");
+        let outcome = reconciler.reconcile_once().await.expect("dispatch pass");
 
-        assert_eq!(outcome.observations_recorded, 1);
+        assert_eq!(outcome.dispatches_observed, 1);
         assert!(backend
             .using::<Project>(NAMESPACE)
             .get("widgets")
@@ -1300,19 +1121,17 @@ mod tests {
             .expect("status")
             .dispatch_queue
             .is_empty());
-        let observations = backend.using::<DispatchObservation>(NAMESPACE).list().await.expect("observations");
-        assert_eq!(observations.items.len(), 1);
-        let observation = &observations.items[0].spec;
-        assert_eq!(observation.issue, ready.reference);
-        assert_eq!(observation.workflow_ref, "review-and-fix");
-        assert_eq!(observation.placement_policy.as_deref(), Some("docker-local"));
-        assert_eq!(
-            observation.time_from_ready_seconds,
-            observation.dispatched_at.signed_duration_since(observation.ready_observed_at).num_seconds().max(0) as u64
-        );
+        let timed = |metrics: &DispatchMetrics| {
+            let snapshot = metrics.snapshot();
+            assert_eq!(snapshot.keys().collect::<Vec<_>>(), [&("widgets".to_string(), "review-and-fix".to_string())]);
+            let histogram = snapshot.into_values().next().expect("histogram");
+            (histogram.count(), histogram.sum_micros())
+        };
+        let expected = convoy.metadata.creation_timestamp.signed_duration_since(ready_at).to_std().expect("dispatched after ready");
+        assert_eq!(timed(&metrics), (1, u64::try_from(expected.as_micros()).expect("micros")));
         // Only live convoys serve an issue; terminal history cannot suppress a
         // reopened/retriaged issue forever. Every lifecycle phase is covered.
-        use flotilla_resources::{ConvoyPhase, ConvoyStatus};
+        use flotilla_resources::ConvoyStatus;
         let convoys = backend.clone().using::<Convoy>(NAMESPACE);
         for phase in [
             ConvoyPhase::Pending,
@@ -1330,10 +1149,11 @@ mod tests {
                 .expect("phase");
             assert_eq!(reconciler.reconcile_once().await.expect("phase pass").queued, usize::from(phase.is_terminal()));
         }
+        assert_eq!(timed(&metrics).0, 1);
     }
 
     #[tokio::test]
-    async fn a_missing_observation_workflow_does_not_freeze_the_queue_or_staleness_attention() {
+    async fn a_dispatched_issue_counts_toward_occupancy_while_the_rest_stay_queued() {
         let dispatched = issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open);
         let waiting = issue("3", &[READY_ISSUE_LABEL], None, IssueState::Open);
         let (backend, issues, clock, reconciler) = harness(vec![dispatched.clone(), waiting.clone()], vec![], policy(60)).await;
@@ -1376,10 +1196,10 @@ mod tests {
             .expect("manual convoy");
         clock.advance(Duration::seconds(60));
 
-        let outcome = reconciler.reconcile_once().await.expect("resilient observation pass");
+        let outcome = reconciler.reconcile_once().await.expect("dispatch pass");
 
         assert_eq!(outcome.queued, 1);
-        assert_eq!(outcome.observations_recorded, 0);
+        assert_eq!(outcome.dispatches_observed, 1);
         let status = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
         assert_eq!(status.dispatch_queue.iter().map(|entry| &entry.issue).collect::<Vec<_>>(), vec![&waiting.reference]);
         assert_eq!(status.dispatch_queue[0].score.as_ref().expect("score").project_active_crews, 1);
@@ -1624,7 +1444,6 @@ mod tests {
                     issue_type: if ideation >= 4 { kinds[ideation].map(str::to_string) } else { None },
                     blockers: if native_blocked { vec![IssueRef { source: source(), id: "9".into() }] } else { vec![] },
                     has_open_pull_request: serving_pr,
-                    landed: false,
                 },
             );
             assert_eq!(
@@ -1633,56 +1452,5 @@ mod tests {
             );
             assert!(backend.using::<Convoy>(NAMESPACE).list().await.expect("convoys").items.is_empty());
         });
-    }
-
-    // Land-after is a separate relationship, retained as a cleared audit record.
-    // Deploy-dependent holds require positive evidence for their installation;
-    // neither issue closure, merge, nor another installation's receipt suffices.
-    #[tokio::test]
-    async fn holds_clear_on_landing_or_matching_deployment_and_stay_cleared() {
-        use flotilla_resources::{DispatchDeploymentSpec, DispatchHoldSpec};
-        for deploy in [false, true] {
-            let candidate = issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open);
-            let target = issue("9", &[], None, IssueState::Closed);
-            let reference = candidate.reference.clone();
-            let after = target.reference.clone();
-            let (backend, issues, clock, reconciler) = harness(vec![candidate], vec![target], policy(300)).await;
-            let spec = DispatchHoldSpec::builder()
-                .project_ref("widgets".into())
-                .issue(reference)
-                .land_after(after.clone())
-                .reason("shared interface".into())
-                .author("governor".into())
-                .clear_when(if deploy { HoldClearWhen::Deployed { installation: "lab".into() } } else { HoldClearWhen::Landed })
-                .build();
-            let holds = backend.clone().using::<DispatchHold>(NAMESPACE);
-            holds.create(&InputMeta::builder().name("serialise".into()).build(), &spec).await.expect("hold");
-            assert_eq!(reconciler.reconcile_once().await.expect("closed only").queued, 0);
-            issues.facts.lock().expect("facts").insert(after.clone(), DispatchIssueFacts { landed: true, ..Default::default() });
-            if deploy {
-                assert_eq!(reconciler.reconcile_once().await.expect("merged only").queued, 0);
-                let receipts = backend.clone().using::<DispatchDeployment>(NAMESPACE);
-                for installation in ["other", "lab"] {
-                    receipts
-                        .create(
-                            &InputMeta::builder().name(installation.into()).build(),
-                            &DispatchDeploymentSpec::builder()
-                                .issue(after.clone())
-                                .installation(installation.into())
-                                .revision("abc123".into())
-                                .deployed_at(clock.now())
-                                .build(),
-                        )
-                        .await
-                        .expect("receipt");
-                    assert_eq!(reconciler.reconcile_once().await.expect("deployment").queued, usize::from(installation == "lab"));
-                }
-            } else {
-                assert_eq!(reconciler.reconcile_once().await.expect("landed").queued, 1);
-            }
-            assert!(holds.get("serialise").await.expect("hold").status.expect("status").cleared_at.is_some());
-            issues.facts.lock().expect("facts").clear();
-            assert_eq!(reconciler.reconcile_once().await.expect("latched clear").queued, 1);
-        }
     }
 }
