@@ -4,7 +4,7 @@ Status: decisions 1, 2 and 4 approved by the owner on 2026-10-26. Decision 3 was
 
 ## Ruled
 
-- This is the only skills path, for Docker, cloud and agentless SSH vessels.
+- This is the only skills path, for Docker, cloud and SSH host vessels.
 - Skill trees never enter the fleet generation.
 - The convoy's controlling daemon fetches each frozen SHA through `Vcs`. Source credentials stay on that daemon's host.
 - Delivery puts a digest-named archive into the vessel agent's content cache and links the crew home's `skills` to it (2026-10-27). Flotilla passes only a digest, a destination path and a member; where the cache keeps an entry is drydock's.
@@ -66,7 +66,7 @@ Nothing else in the home is touched: no crew config, authentication, history or 
 
 - **Repeats.** When the home's delivery record already names the need's digest, the executor plans `Keep`, and nothing is built, pushed or linked.
 - **Harnesses follow the link.** Claude Code 2.1.287 was checked with `CLAUDE_CONFIG_DIR` pointing at a home whose `skills` is a link: its debug log reports `Loading skills from: … user=<home>/skills` and loads the linked skills.
-- **Places without a content cache.** Docker, cloud and agentless SSH vessels all run a drydock agent. An agent without a content cache, such as the in-process runner agent, refuses the push, and the failure is recorded and retried like any transient one.
+- **Places without a content cache.** Docker, cloud and SSH host vessels all run a drydock agent. An agent without a content cache, such as the in-process runner agent, refuses the push, and the failure is recorded and retried like any transient one.
 - **Retention of cache entries** is drydock's. Removing old skill digests from the cache is a drydock follow-up.
 
 ### Failures and retries
@@ -99,6 +99,6 @@ Each diagnostic names the source, the revision and, for a private source, the cr
 
 - **Delivery** runs through the executor and a fake vessel agent that records its calls: a first delivery pushes the archive and links the home's `skills` to it, after moving a legacy directory aside; a repeat with the same digest pushes nothing; a later delivery finds a link and moves nothing aside. A refused tree reaches the executor as permanent.
 - **Archive canonicality** is a Hegel property: the digest is independent of input order, and changes when any file's content or executable bit changes; the bytes unpack to exactly the files built.
-- **Launch scenarios** run the real launch path: through a real drydock agent (the cloud scenario), whose cache and link the harness home resolves; through the agentless SSH host model; and through a contained vessel whose agent models the cache. An agentless scenario shows a permanent refusal recorded once and never retried.
+- **Launch scenarios** run the real launch path: through a real drydock agent (the cloud scenario), whose cache and link the harness home resolves; through the SSH host model; and through a contained vessel whose agent models the cache. An SSH host scenario shows a permanent refusal recorded once and never retried.
 - **`fetch_commit`** runs against real local Git remotes, one that allows reachable-SHA wants and one that refuses them.
 - **The tree policy, bounds, old pins, the empty selection and minting on every delivery** are covered in `skill_trees`.

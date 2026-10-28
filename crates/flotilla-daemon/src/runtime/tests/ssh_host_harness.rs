@@ -789,14 +789,7 @@ async fn a_supply_overriding_a_flotilla_variable_is_a_host_configuration_error()
         HostEnvironment::new(vec![HostSupply { name: "locale".into(), path: Vec::new(), env: vec![("LANG".into(), "C.UTF-8".into())] }])
             .expect("declared supply");
     let Err(error) = launch_ssh_host(
-        SshHost {
-            runner: host.clone(),
-            bag,
-            host_environment,
-            checkout: CHECKOUT.to_string(),
-            session_env: BTreeMap::new(),
-            skills: true,
-        },
+        SshHost { runner: host.clone(), bag, host_environment, checkout: CHECKOUT.to_string(), session_env: BTreeMap::new(), skills: true },
         "claude-code",
         true,
     )
@@ -826,14 +819,7 @@ async fn a_supply_setting_a_family_account_variable_is_a_host_configuration_erro
     }])
     .expect("well-formed supply");
     let Err(error) = launch_ssh_host(
-        SshHost {
-            runner: host.clone(),
-            bag,
-            host_environment,
-            checkout: CHECKOUT.to_string(),
-            session_env: BTreeMap::new(),
-            skills: true,
-        },
+        SshHost { runner: host.clone(), bag, host_environment, checkout: CHECKOUT.to_string(), session_env: BTreeMap::new(), skills: true },
         "claude-code",
         true,
     )
