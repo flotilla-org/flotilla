@@ -10,7 +10,6 @@ use flotilla_environment::environment::runner::{CONTAINED_CODEX_AUTH_FILE, HARNE
 use flotilla_environment::environment::ProvisionedMount;
 use flotilla_environment::environment::ProvisionedMountMode;
 use flotilla_environment::environment::{EntryKind, VesselAgent};
-use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
 use futures::future::BoxFuture;
@@ -63,48 +62,46 @@ pub struct HarnessHome {
     pub name: &'static str,
 }
 
-/// The login a crew links into its own home: from the vessel's delivered home, or,
-/// without one, the target's ambient login. Credentials are linked, never copied, so
-/// a refresh in one place reaches every crew (#1906).
+/// The login a crew's own home holds: a home credential delivery prepared (a model API
+/// key), linked so a refresh there reaches every crew, or, without one, a read-only copy of
+/// the owning daemon's central login (#4037). A target's ambient login is never linked.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HarnessLogin {
-    base: Option<PathBuf>,
+pub enum HarnessLogin {
+    /// The home credential delivery prepared, whose login files the crew's home links.
+    Delivered(PathBuf),
+    /// The central login's crew copy (see [`crew_copy`]).
+    Central(Vec<u8>),
 }
 
+/// Marks a login need whose digest names a central-login copy, so rotation finds the homes
+/// holding one.
+const CENTRAL_LOGIN_DIGEST: &str = "central:";
+
 impl HarnessLogin {
-    /// Content identity of what the crew's home links to.
+    /// Content identity of what the crew's home holds: a central copy by its bytes, so a
+    /// rotation changes it.
     pub fn digest(&self) -> String {
-        match &self.base {
-            Some(base) => format!("delivered:{}", base.display()),
-            None => "ambient".to_string(),
+        use sha2::{Digest, Sha256};
+        match self {
+            Self::Delivered(base) => format!("delivered:{}", base.display()),
+            Self::Central(copy) => format!("{CENTRAL_LOGIN_DIGEST}{:x}", Sha256::digest(copy)),
         }
     }
 
-    /// Link the login into `home` through the vessel's agent. A delivered home's static
-    /// config seeds the crew once; later edits there never overwrite the crew's own.
-    /// Credentials are linked, never copied, so a refresh reaches every crew. Without a
-    /// delivered home, the target's ambient login is linked only when the home has
-    /// none, and the host user's configuration is never copied or written.
-    pub async fn link(&self, home: &Path, agent: &dyn VesselAgent) -> Result<(), String> {
-        let failed = |error: String| format!("link harness login into {}: {error}", home.display());
-        let Some(base) = &self.base else {
-            let ambient = agent
-                .commands()
-                .run(
-                    "sh",
-                    &["-c", r#"printf '%s' "${CODEX_HOME:-$HOME/.codex}""#, "flotilla-ambient-home"],
-                    Path::new("/"),
-                    &ChannelLabel::Default,
-                )
-                .await
-                .map_err(failed)?;
-            let (link, login) = (home.join("auth.json"), Path::new(ambient.trim()).join("auth.json"));
-            if agent.stat(&link).await.map_err(failed)?.is_none()
-                && matches!(agent.stat(&login).await.map_err(failed)?, Some(EntryKind::File | EntryKind::Symlink))
-            {
-                agent.symlink(&link, &login).await.map_err(failed)?;
-            }
-            return Ok(());
+    /// Whether a login need's recorded `digest` names a central copy.
+    pub fn is_central(digest: &str) -> bool {
+        digest.starts_with(CENTRAL_LOGIN_DIGEST)
+    }
+
+    /// Deliver the login into `home` through the vessel's agent. A delivered home's static
+    /// config seeds the crew once; later edits there never overwrite the crew's own, and its
+    /// credentials are linked, never copied. A central copy replaces whatever `auth.json`
+    /// the home held, a link included, atomically and read-only.
+    pub async fn deliver(&self, home: &Path, agent: &dyn VesselAgent) -> Result<(), String> {
+        let failed = |error: String| format!("deliver harness login into {}: {error}", home.display());
+        let base = match self {
+            Self::Delivered(base) => base,
+            Self::Central(copy) => return agent.write(&home.join(CODEX_AUTH_FILE), copy.clone(), CODEX_AUTH_MODE).await.map_err(failed),
         };
         for file in ["config.toml", "settings.json", ".claude.json"] {
             if agent.stat(&home.join(file)).await.map_err(failed)?.is_none() {
@@ -131,7 +128,9 @@ trait AgentMaterialAdapter: Send + Sync {
     fn id(&self) -> &'static str;
     fn fragment(&self, environment: &BTreeMap<String, String>) -> Option<Fragment>;
     fn config_home_variable(&self) -> &'static str;
-    fn is_managed_config_home(&self, config_home: &Path, config_base: &Path) -> bool;
+    /// Whether `config_home` is a home credential delivery prepared under `config_base`,
+    /// whose login a crew links rather than taking the central login's copy.
+    fn is_delivered_login_home(&self, config_home: &Path, config_base: &Path) -> bool;
     fn externally_managed_home_opts_out_of_skills(&self) -> bool;
 
     /// Whether this harness's crews run in their requesters' bound homes (#3907).
@@ -223,24 +222,37 @@ impl AgentMaterialRegistry {
             .map(|material| HarnessHome { variable: material.config_home_variable(), name: material.host_home_name() })
     }
 
-    /// The login a crew of `adapter` links into its own home, when its harness has one
-    /// to share: the managed home the vessel's credential delivery resolved
-    /// (`environment` is the resolved launch environment), otherwise the target's
-    /// ambient login. Never one whose crews run on a bound account (#3907).
-    pub fn harness_login(&self, adapter: &str, environment: &[(String, String)], config_base: &Path) -> Option<HarnessLogin> {
-        let material = self.adapters.get(adapter)?;
+    /// The login a crew of `adapter` holds in its own home, when its harness has one to
+    /// share: the home the vessel's credential delivery prepared (`environment` is the
+    /// resolved launch environment), otherwise the central login's crew copy. Never one
+    /// whose crews run on a bound account (#3907).
+    pub async fn harness_login(
+        &self,
+        adapter: &str,
+        environment: &[(String, String)],
+        config_base: &Path,
+    ) -> Result<Option<HarnessLogin>, String> {
+        let Some(material) = self.adapters.get(adapter) else { return Ok(None) };
         if material.requester_bound() {
-            return None;
+            return Ok(None);
         }
         let variable = material.config_home_variable();
-        let base = environment.iter().rev().find(|(name, _)| name == variable).map(|(_, home)| PathBuf::from(home)).filter(|home| {
+        let delivered = environment.iter().rev().find(|(name, _)| name == variable).map(|(_, home)| PathBuf::from(home)).filter(|home| {
             // `starts_with` compares components lexically, so a `..` could climb out of
             // the base while appearing inside it.
             home.is_absolute()
                 && home.components().all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
-                && material.is_managed_config_home(home, config_base)
+                && material.is_delivered_login_home(home, config_base)
         });
-        Some(HarnessLogin { base })
+        match delivered {
+            Some(base) => Ok(Some(HarnessLogin::Delivered(base))),
+            None => self.central_login().await.map(Some),
+        }
+    }
+
+    /// The central login's crew copy as it stands now, for a launch or a rotation.
+    pub async fn central_login(&self) -> Result<HarnessLogin, String> {
+        read_crew_copy(&self.codex_central_auth_path).await.map(HarnessLogin::Central)
     }
 
     /// A crew's frozen skill selection, resolved once against this generation's
@@ -303,7 +315,7 @@ impl AgentMaterialRegistry {
             if !fs::try_exists(&home).await.map_err(|error| format!("inspect Codex home {}: {error}", home.display()))? {
                 return Ok(false);
             }
-            let credential = read_central_credential(&self.codex_central_auth_path).await?;
+            let credential = read_crew_copy(&self.codex_central_auth_path).await?;
             install_read_only_copy(&credential, &home.join(CODEX_AUTH_FILE)).await
         })
     }
@@ -446,9 +458,9 @@ impl AgentMaterialRegistry {
 /// per-crew read-only copy.
 ///
 /// There is no pool: one login serves every crew because exactly one refresher
-/// ever touches its single-use refresh token, so a crew handed a comfortably
-/// fresh access token never refreshes and never writes `auth.json`
-/// (flotilla-org/flotilla#1906). The delivery is a *copy* rather than a mount of
+/// ever touches its single-use refresh token. A crew's copy carries none
+/// ([`crew_copy`]), so it can never refresh, and its file is read-only
+/// (flotilla-org/flotilla#1906, #4037). The delivery is a *copy* rather than a mount of
 /// the central file because the refresher rotates it by atomic temp+rename; a
 /// bind-mount would pin the pre-rotation inode and rot.
 ///
@@ -526,14 +538,35 @@ async fn copy_template_entry(source: &Path, destination: &Path) -> Result<(), St
     Ok(())
 }
 
-async fn read_central_credential(source: &Path) -> Result<Vec<u8>, String> {
-    fs::read(source).await.map_err(|error| {
+/// The central login at `source`, as a crew copy.
+async fn read_crew_copy(source: &Path) -> Result<Vec<u8>, String> {
+    let central = fs::read(source).await.map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             format!("central Codex credential {} is not provisioned on this host", source.display())
         } else {
             format!("read central Codex credential {}: {error}", source.display())
         }
-    })
+    })?;
+    crew_copy(&central).map_err(|error| format!("central Codex credential {}: {error}", source.display()))
+}
+
+/// A crew's copy of the central login (#4037): the central `auth.json` with its refresh
+/// token blanked, so the refresher alone ever holds it. codex-rs requires the field but
+/// accepts it empty (`TokenData::refresh_token` in `codex-rs/login/src/token_data.rs`,
+/// verified at openai/codex@133c11db), loading the copy as ChatGPT auth that runs on its
+/// access token. A refresh it then attempts sends the empty token, which the endpoint
+/// rejects, and `logout` revokes nothing (`codex-rs/login/src/auth/revoke.rs`). However long
+/// pushes fail, a copy fails closed at its access token's expiry and can never consume,
+/// rotate or revoke the central lineage. Docker and SSH-host crews take the same copy.
+fn crew_copy(central: &[u8]) -> Result<Vec<u8>, String> {
+    let mut auth: serde_json::Value = serde_json::from_slice(central).map_err(|_| "is not valid JSON".to_string())?;
+    if let Some(tokens) = auth.get_mut("tokens").and_then(serde_json::Value::as_object_mut) {
+        tokens.insert("refresh_token".to_string(), serde_json::Value::String(String::new()));
+    }
+    // A login without `tokens` (an API-key `auth.json`) holds no refresh token to withhold.
+    let mut copy = serde_json::to_vec_pretty(&auth).map_err(|error| format!("encode crew copy: {error}"))?;
+    copy.push(b'\n');
+    Ok(copy)
 }
 
 /// Installs `contents` at `destination` as a read-only copy, replacing any
@@ -612,8 +645,8 @@ impl AgentMaterialAdapter for CodexMaterialAdapter {
         "CODEX_HOME"
     }
 
-    fn is_managed_config_home(&self, config_home: &Path, config_base: &Path) -> bool {
-        config_home.starts_with(Path::new(CONTAINER_CODEX_HOME)) || config_home.starts_with(config_base.join("agent-homes"))
+    fn is_delivered_login_home(&self, config_home: &Path, config_base: &Path) -> bool {
+        config_home.starts_with(config_base.join("agent-homes"))
     }
 
     fn host_home_name(&self) -> &'static str {
@@ -637,7 +670,7 @@ impl AgentMaterialAdapter for CodexMaterialAdapter {
         }
         // Read the host credential before touching the filesystem, so a host
         // whose refresher has never run fails without leaving a crew home behind.
-        let credential = read_central_credential(&self.central_auth_path).await?;
+        let credential = read_crew_copy(&self.central_auth_path).await?;
         let home = self.homes_dir.join(environment_ref).join(CODEX_ADAPTER_ID);
         fs::create_dir_all(&home).await.map_err(|error| format!("create persistent Codex home {}: {error}", home.display()))?;
         self.seed_scratch(&home).await?;
@@ -669,7 +702,7 @@ impl AgentMaterialAdapter for ClaudeCodeMaterialAdapter {
         "CLAUDE_CONFIG_DIR"
     }
 
-    fn is_managed_config_home(&self, config_home: &Path, config_base: &Path) -> bool {
+    fn is_delivered_login_home(&self, config_home: &Path, config_base: &Path) -> bool {
         config_home.starts_with(config_base)
     }
 
@@ -699,7 +732,7 @@ pub(crate) mod tests {
     use std::{os::unix::fs::PermissionsExt, path::Path};
 
     use flotilla_discovery_testkit::TestEnvVars;
-    use flotilla_provider_runtime::CommandOutput;
+    use flotilla_provider_runtime::{ChannelLabel, CommandOutput};
 
     use super::*;
     use crate::skill_trees::SKILL_BUNDLE_MANIFEST;
@@ -751,7 +784,8 @@ pub(crate) mod tests {
     fn write_central_auth(home: &Path, access_token: &str) -> PathBuf {
         let path = home.join(".config/flotilla/credentials/codex-central/auth.json");
         std::fs::create_dir_all(path.parent().expect("central credential directory")).expect("create central credential directory");
-        std::fs::write(&path, format!("{{\"tokens\":{{\"access_token\":\"{access_token}\"}}}}")).expect("write central auth");
+        std::fs::write(&path, format!("{{\"tokens\":{{\"access_token\":\"{access_token}\",\"refresh_token\":\"central-refresh\"}}}}"))
+            .expect("write central auth");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("protect central auth");
         path
     }
@@ -849,7 +883,7 @@ pub(crate) mod tests {
                 assert_eq!(deliveries.len(), 1);
                 assert_eq!(
                     std::fs::read(deliveries[0].mount.host_path.as_path().join(CODEX_AUTH_FILE)).expect("delivered auth"),
-                    std::fs::read(registry.codex_credential_source()).expect("central auth"),
+                    crew_copy(&std::fs::read(registry.codex_credential_source()).expect("central auth")).expect("crew copy"),
                 );
             } else {
                 assert_eq!(
@@ -902,8 +936,8 @@ pub(crate) mod tests {
         let delivered = deliveries[0].mount.host_path.as_path().join(CODEX_AUTH_FILE);
         assert_eq!(
             std::fs::read(&delivered).expect("delivered credential"),
-            std::fs::read(&central).expect("central credential"),
-            "the crew must receive the refresher's own auth.json byte for byte"
+            crew_copy(&std::fs::read(&central).expect("central credential")).expect("crew copy"),
+            "the crew must receive the refresher's auth.json less its refresh token"
         );
         assert_eq!(delivered_auth_mode(&delivered), CODEX_AUTH_MODE, "the delivered credential must be read-only");
         let composed = crate::vessel_config::compose(
@@ -931,9 +965,8 @@ pub(crate) mod tests {
         assert_eq!(homes.len(), 3, "every crew must get its own writable Codex home");
         for home in &homes {
             assert_eq!(
-                std::fs::read_to_string(home.join(CODEX_AUTH_FILE)).expect("delivered credential"),
-                std::fs::read_to_string(temp.path().join(".config/flotilla/credentials/codex-central/auth.json"))
-                    .expect("central credential")
+                std::fs::read(home.join(CODEX_AUTH_FILE)).expect("delivered credential"),
+                crew_copy(&std::fs::read(registry.codex_credential_source()).expect("central credential")).expect("crew copy")
             );
         }
     }
@@ -1266,28 +1299,47 @@ pub(crate) mod tests {
         assert!(!temp.path().join(".local/share/flotilla/agent-homes").exists());
     }
 
-    // home; a personal, escaping or absent home falls back to the target's ambient login.
-    // Claude crews run on their bound account and link no login.
-    #[test]
-    fn harness_login_links_only_a_managed_delivered_home() {
-        let registry = test_registry(Arc::new(TestEnvVars::new([("HOME", "/controller-home")])));
+    // #3655, #3964, #4037: a Codex crew links the login of the vessel's delivered home only
+    // when credential delivery prepared that home under the target's writable base. Every
+    // other home, the contained Codex home and a personal, escaping or absent one included,
+    // takes the central login's crew copy; the target's ambient login is never linked.
+    // Claude crews run on their bound account and hold no login.
+    #[tokio::test]
+    async fn harness_login_links_only_a_credential_delivered_home() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_central_auth(temp.path(), "access-token-one");
+        let registry = registry(temp.path());
+        let central = registry.central_login().await.expect("central crew copy");
         let base = Path::new("/host/state/flotilla");
-        let login = |adapter: &str, delivered: Option<&str>| {
-            let environment = delivered.map(|home| vec![("CODEX_HOME".to_string(), home.to_string())]).unwrap_or_default();
-            registry.harness_login(adapter, &environment, base).map(|login| login.digest())
-        };
-        for (delivered, expected) in [
-            (Some("/host/state/flotilla/agent-homes/codex-key/codex"), "delivered:/host/state/flotilla/agent-homes/codex-key/codex"),
-            (Some(CONTAINER_CODEX_HOME), "delivered:/tmp/flotilla-codex"),
-            (Some("/home/crew/.codex"), "ambient"),
-            (Some("/host/state/flotilla/agent-homes/../../../home/crew/.codex"), "ambient"),
-            (Some("relative/codex"), "ambient"),
-            (None, "ambient"),
+        let delivered = "/host/state/flotilla/agent-homes/codex-key/codex";
+        for (home, expected) in [
+            (Some(delivered), HarnessLogin::Delivered(PathBuf::from(delivered))),
+            (Some(CONTAINER_CODEX_HOME), central.clone()),
+            (Some("/home/crew/.codex"), central.clone()),
+            (Some("/host/state/flotilla/agent-homes/../../../home/crew/.codex"), central.clone()),
+            (Some("relative/codex"), central.clone()),
+            (None, central.clone()),
         ] {
-            assert_eq!(login(CODEX_ADAPTER_ID, delivered).as_deref(), Some(expected), "{delivered:?}");
+            let environment = home.map(|home| vec![("CODEX_HOME".to_string(), home.to_string())]).unwrap_or_default();
+            assert_eq!(registry.harness_login(CODEX_ADAPTER_ID, &environment, base).await.expect("login"), Some(expected), "{home:?}");
         }
-        assert_eq!(login(CLAUDE_CODE_ADAPTER_ID, None), None);
-        assert_eq!(login("unmanaged-harness", None), None);
+        assert!(HarnessLogin::is_central(&central.digest()));
+        assert_eq!(registry.harness_login(CLAUDE_CODE_ADAPTER_ID, &[], base).await.expect("no login"), None);
+        assert_eq!(registry.harness_login("unmanaged-harness", &[], base).await.expect("no login"), None);
+    }
+
+    // #4037 contract 3: a crew's copy can never refresh the central lineage, however long
+    // pushes fail: it carries no refresh token, and it keeps everything else Codex reads.
+    #[test]
+    fn a_crew_copy_never_carries_the_central_refresh_token() {
+        let central = br#"{"auth_mode":"chatgpt","tokens":{"access_token":"access","refresh_token":"central-refresh","id_token":"id","account_id":"acct"},"last_refresh":"2026-10-27T00:00:00Z"}"#;
+
+        let copy: serde_json::Value = serde_json::from_slice(&crew_copy(central).expect("crew copy")).expect("JSON copy");
+
+        let mut expected: serde_json::Value = serde_json::from_slice(central).expect("JSON central");
+        expected["tokens"]["refresh_token"] = serde_json::Value::String(String::new());
+        assert_eq!(copy, expected);
+        assert!(crew_copy(b"not json").is_err(), "an unreadable central login is never delivered");
     }
 
     // Issue #2672: crews sharing a harness and vessel each link the vessel's delivered
@@ -1295,44 +1347,43 @@ pub(crate) mod tests {
     // login reaches every crew.
     #[tokio::test]
     async fn crews_in_one_vessel_share_the_login() {
-        for api_key in [false, true] {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let registry = registry(temp.path());
-            let runner = ContainedRunner { config_base: temp.path().join("config") };
-            let base = if api_key { runner.config_base.join("agent-homes/model-api/codex") } else { runner.config_base.join("codex") };
-            std::fs::create_dir_all(&base).expect("base home");
-            std::fs::write(base.join("settings.json"), "{}").expect("settings");
-            std::fs::write(base.join("auth.json"), "first-token").expect("auth");
-            let delivered = if api_key { base.display().to_string() } else { CONTAINER_CODEX_HOME.to_string() };
-            let login = registry
-                .harness_login(CODEX_ADAPTER_ID, &[("CODEX_HOME".into(), delivered)], &runner.config_base)
-                .expect("Codex links a login");
-            let home = |role: &str| runner.config_base.join("agent-homes/requesters/shared").join(role).join("codex");
-            // The vessel's file facilities over this process's own shell and files.
-            let agent = flotilla_environment::environment::vessel_ops::RunnerVesselAgent(Arc::new(runner.clone()));
-            let crews = ["coder", "reviewer"];
-            for role in crews {
-                std::fs::create_dir_all(home(role)).expect("crew home");
-                login.link(&home(role), &agent).await.expect("link login");
-            }
-            for role in crews {
-                assert_eq!(std::fs::read_to_string(home(role).join("settings.json")).expect("settings"), "{}");
-                assert_eq!(std::fs::read_to_string(home(role).join("auth.json")).expect("linked auth"), "first-token");
-            }
-            std::fs::write(base.join("settings.json"), "base changed").expect("base update");
-            std::fs::write(home("coder").join("settings.json"), "crew edited").expect("crew edit");
-            login.link(&home("coder"), &agent).await.expect("relink");
-            assert_eq!(
-                std::fs::read_to_string(home("coder").join("settings.json")).expect("crew settings"),
-                "crew edited",
-                "base changes never overwrite crew scratch"
-            );
-            let replacement = base.join("auth.new");
-            std::fs::write(&replacement, "refreshed-token").expect("new auth");
-            std::fs::rename(replacement, base.join("auth.json")).expect("atomic refresh");
-            for role in crews {
-                assert_eq!(std::fs::read_to_string(home(role).join("auth.json")).expect("refreshed linked auth"), "refreshed-token");
-            }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let runner = ContainedRunner { config_base: temp.path().join("config") };
+        let base = runner.config_base.join("agent-homes/model-api/codex");
+        std::fs::create_dir_all(&base).expect("base home");
+        std::fs::write(base.join("settings.json"), "{}").expect("settings");
+        std::fs::write(base.join("auth.json"), "first-token").expect("auth");
+        let login = registry
+            .harness_login(CODEX_ADAPTER_ID, &[("CODEX_HOME".into(), base.display().to_string())], &runner.config_base)
+            .await
+            .expect("login")
+            .expect("Codex links a login");
+        let home = |role: &str| runner.config_base.join("agent-homes/requesters/shared").join(role).join("codex");
+        // The vessel's file facilities over this process's own shell and files.
+        let agent = flotilla_environment::environment::vessel_ops::RunnerVesselAgent(Arc::new(runner.clone()));
+        let crews = ["coder", "reviewer"];
+        for role in crews {
+            std::fs::create_dir_all(home(role)).expect("crew home");
+            login.deliver(&home(role), &agent).await.expect("link login");
+        }
+        for role in crews {
+            assert_eq!(std::fs::read_to_string(home(role).join("settings.json")).expect("settings"), "{}");
+            assert_eq!(std::fs::read_to_string(home(role).join("auth.json")).expect("linked auth"), "first-token");
+        }
+        std::fs::write(base.join("settings.json"), "base changed").expect("base update");
+        std::fs::write(home("coder").join("settings.json"), "crew edited").expect("crew edit");
+        login.deliver(&home("coder"), &agent).await.expect("relink");
+        assert_eq!(
+            std::fs::read_to_string(home("coder").join("settings.json")).expect("crew settings"),
+            "crew edited",
+            "base changes never overwrite crew scratch"
+        );
+        let replacement = base.join("auth.new");
+        std::fs::write(&replacement, "refreshed-token").expect("new auth");
+        std::fs::rename(replacement, base.join("auth.json")).expect("atomic refresh");
+        for role in crews {
+            assert_eq!(std::fs::read_to_string(home(role).join("auth.json")).expect("refreshed linked auth"), "refreshed-token");
         }
     }
 }

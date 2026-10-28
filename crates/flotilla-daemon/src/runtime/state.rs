@@ -18,6 +18,7 @@ use flotilla_config::DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_credentials::{AgentMaterialRegistry, CredentialStore};
 use flotilla_discovery::registry::ProviderRegistry;
+use flotilla_environment::environment::{vessel_ops::RunnerVesselAgent, VesselAgent};
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::{CanonicalHostId, EnvironmentId};
 use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
@@ -197,6 +198,39 @@ impl ControllerRuntimeState {
             config: &self.config,
         };
         vessels.access(&preparation, profile, vessel).await
+    }
+
+    /// The vessel agent at `env_ref` a crew's access layer runs through: its SSH host
+    /// vessel's own when given, else the provisioned environment's, else, for an
+    /// environment without a provisioned handle, its host's, in process through the host
+    /// runner.
+    pub(super) async fn vessel_agent(
+        &self,
+        env_ref: &str,
+        vessel: Option<&super::ssh_host_vessels::VesselAccess>,
+    ) -> Result<Arc<dyn VesselAgent>, String> {
+        if let Some(access) = vessel {
+            return Ok(access.handle.agent());
+        }
+        // Provisioned environments register under their resource name, so the
+        // `env_ref` is their handle id; host environments fall through to the
+        // resolved runner below.
+        let id = EnvironmentId::new(env_ref);
+        let handle = self
+            .provisioned_environments
+            .lock()
+            .await
+            .values()
+            .find(|active| active.handle.id() == &id)
+            .map(|active| active.handle.clone());
+        Ok(match handle {
+            Some(handle) => handle.agent(),
+            None => Arc::new(RunnerVesselAgent(
+                self.daemon
+                    .command_runner_for_environment_ref(env_ref)
+                    .ok_or_else(|| format!("command runner unavailable for environment {env_ref}"))?,
+            )),
+        })
     }
 
     /// The Rust linker wrapper for a session in `env_ref`, staged on an

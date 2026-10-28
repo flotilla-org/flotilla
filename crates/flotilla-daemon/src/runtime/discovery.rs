@@ -27,8 +27,8 @@ use flotilla_provider_runtime::EnvVars;
 use flotilla_resources::{
     host_direct_environment_name, ConditionValue, FulfilmentFacts, FulfilmentKind, FulfilmentRealisation, Host, HostCondition,
     HostConnection, HostSpec, HostStatus, InputMeta, ModelProbeState, Platform, ResourceError, ResourceObject, AGENT_ADAPTERS_CAPABILITY,
-    CREDENTIAL_EXPIRY_CAPABILITY, DOCKER_POLICY_NAME_PREFIX, HELD_CREDENTIALS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
-    SSH_HOST_CAPABILITY, TRANSPORT_CAPABILITY,
+    CODEX_CENTRAL_LOGIN_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, DOCKER_POLICY_NAME_PREFIX, HELD_CREDENTIALS_CAPABILITY,
+    OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, SSH_HOST_CAPABILITY, TRANSPORT_CAPABILITY,
 };
 use flotilla_store::{ResourceBackend, TypedResolver};
 use serde_json::json;
@@ -375,6 +375,7 @@ pub(super) async fn apply_ssh_host_observation(
             })
             .collect(),
     };
+    let codex_central_login = flotilla_credentials::has_codex_central_login(&*daemon.discovery_runtime().env).await;
     let status = HostStatus {
         capabilities: BTreeMap::from([
             (flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.to_string(), json!(providers)),
@@ -386,6 +387,8 @@ pub(super) async fn apply_ssh_host_observation(
             (TRANSPORT_CAPABILITY.to_string(), json!("ssh")),
             (PLACEMENT_CAPABILITY.to_string(), json!("host_direct_only")),
             (OWNING_DAEMON_CAPABILITY.to_string(), json!(daemon.local_host_id().map(|id| id.to_string()))),
+            // #4037: the host's Codex crews take a copy of the owner's central login.
+            (CODEX_CENTRAL_LOGIN_CAPABILITY.to_string(), json!(codex_central_login)),
         ]),
         fulfilment_facts,
         model_probes: ModelProbeState::default(),

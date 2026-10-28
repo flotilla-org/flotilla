@@ -724,6 +724,10 @@ pub(super) fn spawn_codex_credential_redelivery_task(
             if let Err(error) = redeliver_codex_credentials(&state, &namespace).await {
                 warn!(%error, "failed to redeliver the central Codex credential to live crews");
             }
+            // #4037: every crew home holding a copy, on Docker and SSH hosts alike.
+            if let Err(error) = super::access_layer::redeliver_central_logins(&state, &namespace).await {
+                warn!(%error, "failed to push the central Codex login into live crew homes");
+            }
         }
     })
 }

@@ -2,8 +2,8 @@
 //!
 //! Codex only refreshes an `auth.json` on use, and only once its access
 //! token is within 5 minutes of expiry (`should_refresh_proactively` in
-//! codex-rs). A crew handed a read-only `auth.json` therefore never
-//! refreshes it itself. This module runs the same direct OAuth
+//! codex-rs). A crew's read-only copy carries no refresh token, so it can
+//! never refresh (`crew_copy` in `agent_material.rs`, #4037). This module runs the same direct OAuth
 //! `grant_type=refresh_token` exchange `scripts/codex-token-refresh`
 //! performs, on a host-owned timer, so a single central login's
 //! `auth.json` stays fresh forever. flotilla-org/flotilla#1912 delivers the
@@ -50,6 +50,12 @@ pub fn codex_central_auth_path(env: &dyn EnvVars) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/var/lib/flotilla"))
         .join(".config/flotilla/credentials/codex-central/auth.json")
+}
+
+/// Whether this host keeps a central Codex login: what Codex crews on the SSH hosts it
+/// owns are delivered (#4037).
+pub async fn has_codex_central_login(env: &dyn EnvVars) -> bool {
+    tokio::fs::metadata(codex_central_auth_path(env)).await.is_ok_and(|metadata| metadata.is_file())
 }
 
 #[derive(Debug, Default, Clone)]
