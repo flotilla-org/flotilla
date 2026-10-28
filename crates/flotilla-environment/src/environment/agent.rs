@@ -78,9 +78,55 @@ impl AgentConnector for UnixAgentConnector {
     }
 }
 
+/// First pause between connect attempts, doubled up to [`MAX_BACKOFF`].
+const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
+const MAX_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Whether trying again could succeed. A socket that is not listening yet or
+/// a hello that has not arrived are transient; a refusal from the agent that
+/// states the request itself cannot be accepted (an upload already in
+/// progress, too large, no space) is the same on every attempt.
+fn is_transient(error: &io::Error) -> bool {
+    use drydock_agent::{AgentError, ErrorKind};
+    if let Some(refusal) = AgentError::of(error) {
+        return !matches!(
+            refusal.kind,
+            ErrorKind::Conflict
+                | ErrorKind::AlreadyExists
+                | ErrorKind::FileTooLarge
+                | ErrorKind::PayloadTooLarge
+                | ErrorKind::StorageFull
+                | ErrorKind::QuotaExceeded
+                | ErrorKind::PermissionDenied
+                | ErrorKind::InvalidData
+                | ErrorKind::InvalidInput
+                | ErrorKind::Unsupported
+        );
+    }
+    // A plain PermissionDenied is not listed: an ssh-level denial can clear
+    // while the host is still being provisioned. The agent's own refusal is final.
+    !matches!(
+        error.kind(),
+        io::ErrorKind::InvalidData
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::Unsupported
+            | io::ErrorKind::AlreadyExists
+            | io::ErrorKind::FileTooLarge
+            | io::ErrorKind::StorageFull
+            | io::ErrorKind::QuotaExceeded
+    )
+}
+
 /// Initial socket/hello failures are normal while a provider starts the
 /// detached supervisor. Drydock itself handles mismatches and post-upgrade
 /// reconnects. `platform` is the one the vessel's `executable` was built for.
+///
+/// Transient failures are retried with exponential backoff until `timeout`;
+/// a failure that cannot change (see [`is_transient`]) is returned at once.
+/// When the deadline passes, the error is the last one an attempt reported,
+/// not the timeout that cut the final attempt short. Each attempt opens the
+/// transports drydock needs: a transport is consumed by its hello and an
+/// upgrade restarts the agent, so none can be shared between attempts.
 pub async fn connect_current<F, Fut>(mut open: F, platform: &Platform, executable: &[u8], timeout: Duration) -> io::Result<Client>
 where
     F: FnMut() -> Fut,
@@ -90,24 +136,38 @@ where
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "current agent executable is empty"));
     }
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut last = "no hello".to_string();
+    let mut last: Option<io::Error> = None;
+    let mut backoff = INITIAL_BACKOFF;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, format!("agent hello: {last}")));
+            return Err(deadline_error(last));
         }
         match Client::connect_current(&mut open, platform, executable, remaining).await {
             Ok(client) => return Ok(client),
-            Err(error)
-                if error.kind() == io::ErrorKind::InvalidData
-                    || error.kind() == io::ErrorKind::InvalidInput
-                    || error.kind() == io::ErrorKind::Unsupported =>
-            {
-                return Err(error)
+            Err(error) if !is_transient(&error) => return Err(error),
+            Err(error) => {
+                // The client's own timeout, once the deadline has passed, is
+                // the deadline cutting the attempt short; it says less than
+                // what failed before. A transport timeout earlier is real.
+                let cut = error.kind() == io::ErrorKind::TimedOut
+                    && drydock_agent::AgentError::of(&error).is_none()
+                    && tokio::time::Instant::now() >= deadline;
+                if !cut || last.is_none() {
+                    last = Some(error);
+                }
             }
-            Err(error) => last = error.to_string(),
         }
-        tokio::time::sleep(Duration::from_millis(50).min(remaining)).await;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::sleep(backoff.min(remaining)).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
+fn deadline_error(last: Option<io::Error>) -> io::Error {
+    match last {
+        Some(error) => io::Error::new(io::ErrorKind::TimedOut, format!("agent hello: {error}")),
+        None => io::Error::new(io::ErrorKind::TimedOut, "agent hello: no hello"),
     }
 }
 

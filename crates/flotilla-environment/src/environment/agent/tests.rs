@@ -540,6 +540,64 @@ async fn missing_hello_is_bounded() {
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
 }
 
+// An agent that refuses the upgrade upload (an upload of this digest is already
+// in progress) refuses it on every attempt. Connect fails at once with that
+// refusal, having opened one transport for the hello and none to retry.
+#[tokio::test]
+async fn conflicting_upgrade_upload_fails_promptly_with_the_refusal() {
+    let agent = MemoryAgent::new(true);
+    let executable = agent.current.clone();
+    let digest = format!("{:x}", Sha256::digest(&executable));
+    let first = Client::connect(agent.open().await.unwrap(), String::new()).await.unwrap();
+    first.create_upload(&digest, Some(executable.len() as u64), tokio::io::empty(), false).await.unwrap();
+    drop(first);
+
+    let opens = AtomicUsize::new(0);
+    let started = std::time::Instant::now();
+    let error = connect_current(
+        || {
+            opens.fetch_add(1, Ordering::SeqCst);
+            agent.open()
+        },
+        &Platform::current(),
+        &executable,
+        Duration::from_secs(30),
+    )
+    .await
+    .err()
+    .expect("conflict");
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    assert_eq!(drydock_agent::AgentError::of(&error).map(|e| e.kind), Some(drydock_agent::ErrorKind::Conflict), "{error}");
+    assert!(error.to_string().contains("resume it"), "{error}");
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+}
+
+// Transient failures are retried with growing pauses, and the deadline reports
+// the last real failure rather than the timeout that cut the last attempt.
+#[tokio::test(start_paused = true)]
+async fn transient_failures_back_off_and_report_the_last_error() {
+    let times = Mutex::new(Vec::new());
+    let started = tokio::time::Instant::now();
+    let error = connect_current(
+        || {
+            let mut times = times.try_lock().unwrap();
+            times.push(started.elapsed());
+            async { Err(io::Error::new(io::ErrorKind::ConnectionRefused, "not listening")) }
+        },
+        &Platform::current(),
+        b"current",
+        Duration::from_millis(700),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(error.to_string().contains("not listening"), "{error}");
+    let times = times.into_inner();
+    let ms = |n| Duration::from_millis(n);
+    assert_eq!(times, [ms(0), ms(50), ms(150), ms(350)]);
+}
+
 // Generated lifecycle sequences interleave empty/binary material writes, reads,
 // duplicate CLI pushes and invalid modes. After every operation, visible files
 // match the model and the compatible agent remains the same incarnation.
