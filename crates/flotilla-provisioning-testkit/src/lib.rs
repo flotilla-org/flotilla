@@ -269,6 +269,7 @@ impl TerminalFixture {
             }
             fn edge(
                 &mut self,
+                writer: &str,
                 previous: &StoredState<Machine>,
                 next: &Resource<Machine>,
                 event: &EdgeEventOf<Machine>,
@@ -277,7 +278,7 @@ impl TerminalFixture {
                     self.remaining -= 1;
                     return Err(LogError::new("injected predecessor ending failure"));
                 }
-                self.inner.edge(previous, next, event)
+                self.inner.edge(writer, previous, next, event)
             }
         }
         let mut home =
