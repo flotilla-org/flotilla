@@ -249,18 +249,15 @@ mod tests {
         unsafe { std::env::set_var("PATH", &path) };
         let mut terminal = NativeTerminal::new("frontend::attach::tests::native_crew_probe");
         let session = terminal.endpoint.session.clone();
-        let env = |daemon: &str| {
-            let mut args = vec![Arg::Literal("env".into())];
+        // The vessel form: a socket attachment cannot follow a redirect to a
+        // host-local path, so handover must end it with 75.
+        let attach = |socket: &std::path::Path| {
+            let mut args = vec![Arg::Literal("env".into()), Arg::Literal("-u".into()), Arg::Literal("CLEAT_DAEMON".into())];
             for (key, value) in &terminal.baseline {
                 args.push(Arg::EnvAssignment { key: key.clone(), value: value.clone() });
             }
-            args.push(Arg::EnvAssignment { key: "CLEAT_DAEMON".into(), value: daemon.into() });
-            args
-        };
-        // The attach needs a terminal; python's pty module supplies one and
-        // passes the client's exit status through.
-        let attach = |daemon: &str| {
-            let mut args = env(daemon);
+            // The attach needs a terminal; python's pty module supplies one and
+            // passes the client's exit status through.
             for part in [
                 "python3",
                 "-c",
@@ -268,12 +265,16 @@ mod tests {
                 "cleat",
                 "attach",
                 session.as_str(),
+                "--socket",
+                &socket.to_string_lossy(),
             ] {
                 args.push(Arg::Literal(part.into()));
             }
             ResolvedAttachPlan(vec![ResolvedAttachAction::Command(args)])
         };
-        let daemon = terminal.baseline["CLEAT_DAEMON"].clone();
+        let root = std::path::PathBuf::from(&terminal.endpoint.runtime_root);
+        let before = root.join(&terminal.endpoint.daemon).join("socket");
+        let after = root.join("moved@1").join("socket");
         let calls = RefCell::new(0);
         let mover = std::thread::spawn({
             let session = session.clone();
@@ -288,13 +289,17 @@ mod tests {
                 run(&["kill", &session]);
             }
         });
-        let code = attach_until_settled(|_| {
-            let first = *calls.borrow() == 0;
-            *calls.borrow_mut() += 1;
-            let plan = attach(if first { &daemon } else { "moved" });
-            async move { Ok(Some(plan)) }
-        })
+        let code = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            attach_until_settled(|_| {
+                let first = *calls.borrow() == 0;
+                *calls.borrow_mut() += 1;
+                let plan = attach(if first { &before } else { &after });
+                async move { Ok(Some(plan)) }
+            }),
+        )
         .await
+        .expect("attach settled within the deadline")
         .expect("attach settles");
         mover.join().expect("mover");
         assert!(*calls.borrow() >= 2, "handover must make the attach resolve again (status {code:?})");

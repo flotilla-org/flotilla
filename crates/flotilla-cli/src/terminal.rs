@@ -214,26 +214,34 @@ pub fn exec_attach_plan(plan: &ResolvedAttachPlan) -> Result<Infallible, String>
 pub fn run_attach_plan_waiting(plan: &ResolvedAttachPlan) -> Result<Option<i32>, String> {
     let (program, args) = attach_argv(plan)?;
     // Installed before the spawn so no signal can take the default action in
-    // between; until the child exists the handler drops them.
+    // between; until the child exists the handler ignores them (the request is lost).
     #[cfg(unix)]
     let forward = signal_forward::install();
     let mut child = Command::new(&program).args(args).spawn().map_err(|error| format!("could not start {program} attach hop: {error}"))?;
     #[cfg(unix)]
     forward.child(child.id());
     let status = child.wait().map_err(|error| format!("could not wait for {program} attach hop: {error}"))?;
+    // A termination request ends the attach, whatever status cleat then picks.
+    #[cfg(unix)]
+    if forward.terminated() {
+        return Ok(None);
+    }
     Ok(status.code())
 }
 
 #[cfg(unix)]
 mod signal_forward {
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
     static CHILD: AtomicI32 = AtomicI32::new(0);
     const SIGNALS: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGHUP];
 
+    static TERMINATED: AtomicBool = AtomicBool::new(false);
+
     extern "C" fn forward(signal: libc::c_int) {
         let pid = CHILD.load(Ordering::SeqCst);
         if pid > 0 {
+            TERMINATED.store(true, Ordering::SeqCst);
             // SAFETY: kill is async-signal-safe; the pid is our live child's.
             unsafe { libc::kill(pid, signal) };
         }
@@ -244,6 +252,10 @@ mod signal_forward {
     pub struct Guard([libc::sighandler_t; 2]);
 
     impl Guard {
+        pub fn terminated(&self) -> bool {
+            TERMINATED.load(Ordering::SeqCst)
+        }
+
         pub fn child(&self, pid: u32) {
             CHILD.store(pid as i32, Ordering::SeqCst);
         }
@@ -251,6 +263,7 @@ mod signal_forward {
 
     pub fn install() -> Guard {
         CHILD.store(0, Ordering::SeqCst);
+        TERMINATED.store(false, Ordering::SeqCst);
         let mut previous = [libc::SIG_DFL; 2];
         for (slot, signal) in previous.iter_mut().zip(SIGNALS) {
             // SAFETY: installing a handler that only calls async-signal-safe kill.
@@ -263,7 +276,7 @@ mod signal_forward {
         fn drop(&mut self) {
             CHILD.store(0, Ordering::SeqCst);
             for (previous, signal) in self.0.iter().zip(SIGNALS) {
-                // SAFETY: restoring the handlers saved in `to`.
+                // SAFETY: restoring the handlers saved in `self.0`.
                 unsafe { libc::signal(signal, *previous) };
             }
         }
@@ -397,23 +410,30 @@ mod tests {
     }
 
     // Direct argv has no shell boundary: assignment values retain their bytes.
-    // Glue: one mapping from the structured assignment to env's argv element.
-    // Direct argv rejects the same invalid identifiers as shell flattening,
-    // while reporting a recoverable error to the caller.
     #[cfg(unix)]
     #[test]
     fn termination_sent_to_the_parent_reaches_the_attach_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("terminated");
         let plan = ResolvedAttachPlan(vec![flotilla_protocol::ResolvedAttachAction::Command(
-            ["sh", "-c", "trap 'exit 7' TERM; while :; do sleep 0.05; done"].into_iter().map(|part| Arg::Literal(part.into())).collect(),
+            ["sh", "-c", "trap 'touch \"$1\"; exit 7' TERM; while :; do sleep 0.05; done", "sh", marker.to_str().expect("marker path")]
+                .into_iter()
+                .map(|part| Arg::Literal(part.into()))
+                .collect(),
         )]);
         std::thread::spawn(|| {
             std::thread::sleep(std::time::Duration::from_millis(500));
             // SAFETY: signalling our own process; the forwarding handler is installed.
             unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
         });
-        assert_eq!(super::run_attach_plan_waiting(&plan).expect("attach child runs"), Some(7));
+        // A termination request ends the attach even though the child chose a status.
+        assert_eq!(super::run_attach_plan_waiting(&plan).expect("attach child runs"), None);
+        assert!(marker.exists(), "the child received the forwarded SIGTERM");
     }
 
+    // Glue: one mapping from the structured assignment to env's argv element.
+    // Direct argv rejects the same invalid identifiers as shell flattening,
+    // while reporting a recoverable error to the caller.
     #[test]
     fn env_assignment_rejects_invalid_argv_keys() {
         for key in ["", "A=B", "FOO-BAR", "9KEY", "A;cmd"] {
