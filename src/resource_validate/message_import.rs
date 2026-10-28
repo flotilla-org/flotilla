@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use flotilla_core::primitives::{
     convert::Conversion,
-    import::{import_all, rehearse, ImportRefusal, ImportReport, OldMessage, ReadRecords},
+    import::{import_all, rehearse, ImportRefusal, ImportReport, Imported, OldMessage, ReadRecords},
     roles::FleetRoles,
     OldStoreRecords,
 };
@@ -103,11 +103,17 @@ impl Documents {
             sessions,
         };
         let results = import_all(messages.iter().map(|(record, home)| OldMessage { record, home: home.clone() }), &conversion, &world);
-        let imported: Vec<_> = results.iter().filter_map(|result| result.as_ref().ok().cloned()).collect();
+        let imported: Vec<_> = results
+            .iter()
+            .filter_map(|result| match result {
+                Ok(Imported::Message(message)) => Some((**message).clone()),
+                _ => None,
+            })
+            .collect();
         let failed = rehearse(&imported);
         for result in &results {
             match result {
-                Ok(message) if failed.iter().any(|refusal| refusal.record == message.record) => {}
+                Ok(Imported::Message(message)) if failed.iter().any(|refusal| refusal.record == message.record) => {}
                 other => report.record(other),
             }
         }
@@ -118,11 +124,19 @@ impl Documents {
 
 /// One line of counts, then one line per named refusal.
 pub(super) fn print(namespace: &str, report: &ImportReport) {
-    if report.total() == 0 && report.refused.is_empty() {
+    if report.total() == 0 && report.dropped.is_empty() && report.refused.is_empty() {
         return;
     }
-    let counts = report.imported.iter().map(|(label, count)| format!("{label} {count}")).collect::<Vec<_>>().join(", ");
-    println!("message import rehearsal {namespace}: {} imported ({counts}), {} refused", report.total(), report.refused.len());
+    let counts =
+        |counts: &BTreeMap<&str, usize>| counts.iter().map(|(label, count)| format!("{label} {count}")).collect::<Vec<_>>().join(", ");
+    let dropped: usize = report.dropped.values().sum();
+    println!(
+        "message import rehearsal {namespace}: {} imported ({}), {dropped} dropped ({}), {} refused",
+        report.total(),
+        counts(&report.imported),
+        counts(&report.dropped),
+        report.refused.len()
+    );
     for refusal in &report.refused {
         println!("message import rehearsal {namespace}: {refusal}");
     }
@@ -204,9 +218,13 @@ mod tests {
     }
 
     // Behaviour: the rehearsal imports the daemon's Messages into a temporary
-    // store, counts them by new state, and names each refusal.
+    // store, counts them by new state, counts drops by reason, and names each refusal.
     #[test]
-    fn rehearsal_counts_imports_and_names_refusals() {
+    fn rehearsal_counts_imports_and_drops_and_names_refusals() {
+        let mut settled_elsewhere = message("settled-elsewhere", "system:turn-rules", "flotilla/demo/work/coder", "satisfied", Value::Null);
+        settled_elsewhere["status"]["resolved_receiver"] = serde_json::json!({
+            "crew_id": "crew-gone", "session": "session-gone", "delivered_at": "2026-10-19T00:00:00Z", "evidence": "turn confirmed",
+        });
         let mut documents = Documents::default();
         documents.0.insert(
             "fleetdesignations".into(),
@@ -221,6 +239,7 @@ mod tests {
             vec![
                 message("waiting", "system:turn-rules", "flotilla/demo/work/coder", "accepted", Value::Null),
                 message("from-a-person", "principal:alice", "flotilla/demo/work/coder", "accepted", Value::Null),
+                settled_elsewhere,
                 message(
                     "orphan-reply",
                     "flotilla/demo/work/coder",
@@ -233,6 +252,7 @@ mod tests {
         let report = documents.rehearse("flotilla");
         // A person sends as the operator role of the crew's project (#3938).
         assert_eq!(report.imported.get("pending"), Some(&2), "{report:?}");
+        assert_eq!(report.dropped, BTreeMap::from([("its delivered session is gone", 1)]), "{report:?}");
         let refused: Vec<_> = report.refused.iter().map(|refusal| refusal.record.as_str()).collect();
         assert_eq!(refused, ["orphan-reply"], "{report:?}");
         // A designation prerequisite refusal must preserve earlier Message decode

@@ -416,6 +416,9 @@ Message does not reference it. These refusals fail the enabled gate; a shared
 record may also appear in the lifecycle report. Without a decoded Message, the
 Message rehearsal skips those dependencies; general stored-record validation
 still checks their decodability.
+A settled Message whose delivered session, successor or referenced record is
+gone is counted as dropped, by reason, beside the refusals; drops do not fail
+the gate. An open Message with the same gap stays a refusal.
 A malformed `daemon.toml` is a fatal validation error; it cannot silently disable
 the gate.
 

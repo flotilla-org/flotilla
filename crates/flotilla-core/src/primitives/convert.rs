@@ -34,6 +34,12 @@ pub const UNBOUND_AFTER: chrono::Duration = chrono::Duration::hours(24);
 pub trait ReferenceAddresses: Send + Sync {
     fn address(&self, reference: &MessageReference) -> Result<Address, String>;
 
+    /// Why `reference` cannot be addressed when the record it names is not
+    /// held or its kind has no address; `None` when only its value is at fault.
+    fn missing(&self, _reference: &MessageReference) -> Option<&'static str> {
+        None
+    }
+
     /// The project a convoy belongs to, if it declares one.
     fn convoy_project(&self, _convoy: &str) -> Option<String> {
         None

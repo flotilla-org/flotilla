@@ -6,12 +6,17 @@ use std::{collections::BTreeMap, fs, path::Path};
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_core::primitives::{
     convert::{Conversion, NoRecords},
-    import::{admission_order, check, import_all, import_message, ImportRefusal, ImportedMessage, OldMessage, ReadRecords},
+    import::{
+        admission_order, check, import_all, import_message, ImportDrop, ImportRefusal, Imported, ImportedMessage, OldMessage, ReadRecords,
+    },
     roles::FleetRoles,
+    view::ViewLookups,
+    OldStoreRecords,
 };
+use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
-    Message, MessageExpectation, MessagePhase, MessageRelation, MessageSpec, MessageStatus, ObjectMeta, ResolvedMessageReceiver,
-    ResourceObject,
+    Message, MessageExpectation, MessagePhase, MessageReference, MessageRelation, MessageSpec, MessageStatus, ObjectMeta, RepositorySpec,
+    ResolvedMessageReceiver, ResourceObject,
 };
 use flotilla_state_machines::machines::{
     consumer::{ConsumerKind, Receiver},
@@ -98,12 +103,26 @@ fn world(records: &[ResourceObject<Message>]) -> ReadRecords<'_> {
 }
 
 /// Imports `records` and returns the result for the named record.
-fn import_named(records: &[ResourceObject<Message>], name: &str) -> Result<ImportedMessage, ImportRefusal> {
+fn outcome(records: &[ResourceObject<Message>], name: &str) -> Result<Imported, ImportRefusal> {
     let roles = FleetRoles::declared("fleet").expect("roles");
     let conversion = Conversion { roles: &roles, forges: &[], records: &NoRecords };
     let world = world(records);
     let old = records.iter().find(|record| record.metadata.name == name).expect("named record");
     import_message(&OldMessage { record: old, home: HOME.into() }, 1, &conversion, &world)
+}
+
+fn import_named(records: &[ResourceObject<Message>], name: &str) -> Result<ImportedMessage, ImportRefusal> {
+    match outcome(records, name)? {
+        Imported::Message(message) => Ok(*message),
+        Imported::Dropped(drop) => panic!("{name} dropped: {}", drop.reason),
+    }
+}
+
+fn dropped(result: &Result<Imported, ImportRefusal>) -> Option<&'static str> {
+    match result {
+        Ok(Imported::Dropped(ImportDrop { reason, .. })) => Some(reason),
+        _ => None,
+    }
 }
 
 fn imported(records: &[ResourceObject<Message>], name: &str) -> ImportedMessage {
@@ -236,24 +255,205 @@ fn person_records_import_as_the_operator_role_of_their_context() {
     }
 }
 
-// Behaviour: a successor-less supersession and a missing delivered session
-// are refused with the record named, never guessed.
+// Behaviour: Delivered expecting nothing is settled at its delivered session.
 #[test]
-fn unmappable_records_are_refused_by_name() {
+fn delivered_expecting_nothing_imports_as_settled() {
+    let records = [record(
+        "message-a",
+        spec(RECEIVER, "system:turn-rules", MessageExpectation::None),
+        status(MessagePhase::Delivered, Some(1), Some(delivered())),
+    )];
+    assert_eq!(*imported(&records, "message-a").resource.state(), MessageState::Settled { receiver: Some(session_receiver()) });
+}
+
+fn settled(record: &ResourceObject<Message>) -> bool {
+    let phase = record.status.as_ref().expect("status").phase;
+    matches!(
+        phase,
+        MessagePhase::Satisfied
+            | MessagePhase::Answered
+            | MessagePhase::OutcomeMet
+            | MessagePhase::Expired
+            | MessagePhase::Superseded
+            | MessagePhase::DeadLettered
+    ) || record.spec.expectation == MessageExpectation::None && phase == MessagePhase::Delivered
+}
+
+fn gone_session() -> ResolvedMessageReceiver {
+    ResolvedMessageReceiver { session: "session-gone".into(), ..delivered() }
+}
+
+fn expectation(tc: &TestCase) -> MessageExpectation {
+    match tc.draw(gs::integers::<u8>().max_value(2)) {
+        0 => MessageExpectation::None,
+        1 => MessageExpectation::Reply,
+        _ => MessageExpectation::Outcome { condition: leaf() },
+    }
+}
+
+// Behaviour: a record delivered to a session that is gone is dropped when
+// settled and refused, by name, when it still awaits its receiver.
+#[hegel::test(test_cases = 100)]
+fn a_gone_session_drops_settled_records_and_refuses_open_ones(tc: TestCase) {
+    let phase = tc.draw(
+        gs::sampled_from(MessagePhase::ALL.iter().copied().filter(|phase| phase.has_delivery_evidence()).collect::<Vec<_>>())
+            .print_as_debug(),
+    );
+    let records =
+        [record("message-a", spec(RECEIVER, "system:turn-rules", expectation(&tc)), status(phase, Some(1), Some(gone_session())))];
+    let result = outcome(&records, "message-a");
+    if settled(&records[0]) {
+        assert_eq!(dropped(&result), Some("its delivered session is gone"), "{phase:?}: {result:?}");
+    } else {
+        let refusal = result.expect_err("an awaiting record with a gone session is refused");
+        assert_eq!(refusal.record, "message-a");
+        assert!(refusal.reason.contains("session-gone"), "{refusal}");
+    }
+}
+
+// Behaviour: a supersession whose successor is unrecorded or gone is dropped.
+#[test]
+fn superseded_records_without_their_successor_are_dropped() {
     let orphan = [record(
         "message-s",
         spec(RECEIVER, "system:turn-rules", MessageExpectation::None),
         status(MessagePhase::Superseded, Some(1), None),
     )];
-    assert_eq!(import_named(&orphan, "message-s").expect_err("no successor").record, "message-s");
-    let mut lost = delivered();
-    lost.session = "session-gone".into();
-    let unknown = [record(
-        "message-d",
-        spec(RECEIVER, "system:nudge", MessageExpectation::Reply),
-        status(MessagePhase::Delivered, Some(1), Some(lost)),
-    )];
-    assert_eq!(import_named(&unknown, "message-d").expect_err("unknown session").record, "message-d");
+    assert_eq!(dropped(&outcome(&orphan, "message-s")), Some("superseded with no recorded successor"));
+    let mut named = status(MessagePhase::Superseded, Some(1), None);
+    named.canonical_predecessor = Some(ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "message-gone"));
+    let lost = [record("message-s", spec(RECEIVER, "system:turn-rules", MessageExpectation::None), named)];
+    assert_eq!(dropped(&outcome(&lost, "message-s")), Some("its successor is gone"));
+}
+
+// Behaviour: an expiry the old store recorded with no deadline is dropped.
+#[test]
+fn expired_without_a_deadline_is_dropped() {
+    let records =
+        [record("message-a", spec(RECEIVER, "system:turn-rules", MessageExpectation::Reply), status(MessagePhase::Expired, Some(1), None))];
+    assert_eq!(dropped(&outcome(&records, "message-a")), Some("expired without a deadline"));
+}
+
+// Behaviour: a reply to a message that was not read is dropped when settled
+// and refused when open.
+#[test]
+fn a_gone_replied_to_message_drops_settled_records_and_refuses_open_ones() {
+    let mut reply = spec(RECEIVER, "system:turn-rules", MessageExpectation::None);
+    reply.in_reply_to = Some("message-gone".into());
+    let records = [
+        record("message-settled", reply.clone(), status(MessagePhase::Satisfied, Some(1), Some(delivered()))),
+        record("message-open", reply, status(MessagePhase::Deliverable, Some(2), None)),
+    ];
+    assert_eq!(dropped(&outcome(&records, "message-settled")), Some("a message it names is gone"));
+    let refusal = outcome(&records, "message-open").expect_err("an open reply to a gone message is refused");
+    assert_eq!(refusal.record, "message-open");
+    assert!(refusal.reason.contains("message-gone"), "{refusal}");
+}
+
+fn control_record(kind: &str, name: &str) -> MessageReference {
+    MessageReference::ControlRecord { resource: ResourceRef::new("flotilla.work/v1", kind, "flotilla", name), revision: "7".into() }
+}
+
+// Behaviour: a Project reference maps to its project address and back; a
+// TerminalSession reference has no address and a missing artifact or
+// repository is gone, so each drops a settled record and refuses an open one;
+// a malformed reference is refused even when settled.
+#[test]
+fn record_references_map_drop_or_refuse() {
+    let roles = FleetRoles::declared("fleet").expect("roles");
+    let local = ResourceObject {
+        metadata: meta("repository-local", 1),
+        spec: RepositorySpec::local("host-a", "/repo/.git").expect("local repository"),
+        status: None,
+    };
+    let records = OldStoreRecords::from_records("flotilla", Vec::new(), Vec::new(), Vec::new(), Vec::new(), vec![local], Vec::new());
+    let conversion = Conversion { roles: &roles, forges: &[], records: &records };
+    let referring = |name: &str, reference: MessageReference, phase: MessagePhase, receiver: Option<ResolvedMessageReceiver>| {
+        let mut spec = spec(RECEIVER, "system:turn-rules", MessageExpectation::None);
+        spec.references = vec![reference];
+        record(name, spec, status(phase, Some(1), receiver))
+    };
+    let olds = [
+        referring("to-project", control_record("Project", "flotilla"), MessagePhase::Satisfied, Some(delivered())),
+        referring("settled-to-session", control_record("TerminalSession", "terminal-1"), MessagePhase::Satisfied, Some(delivered())),
+        referring("open-to-session", control_record("TerminalSession", "terminal-1"), MessagePhase::Accepted, None),
+        referring(
+            "to-artifact",
+            MessageReference::Artifact {
+                resource: ResourceRef::new("flotilla.work/v1", "Artifact", "flotilla", "artifact-gone"),
+                revision: "1".into(),
+            },
+            MessagePhase::Satisfied,
+            Some(delivered()),
+        ),
+        referring(
+            "to-commit",
+            MessageReference::Commit {
+                repository: ResourceRef::new("flotilla.work/v1", "Repository", "flotilla", "repository-gone"),
+                revision: "abc".into(),
+            },
+            MessagePhase::Satisfied,
+            Some(delivered()),
+        ),
+        referring(
+            "to-unaddressable-commit",
+            MessageReference::Commit {
+                repository: ResourceRef::new("flotilla.work/v1", "Repository", "flotilla", "repository-local"),
+                revision: "abc".into(),
+            },
+            MessagePhase::Satisfied,
+            Some(delivered()),
+        ),
+    ];
+    let world = world(&olds);
+    let import = |name: &str| {
+        let old = olds.iter().find(|record| record.metadata.name == name).expect("named");
+        import_message(&OldMessage { record: old, home: HOME.into() }, 1, &conversion, &world)
+    };
+    let Ok(Imported::Message(project)) = import("to-project") else { panic!("the Project reference maps") };
+    let reference = &project.resource.spec().references[0];
+    assert_eq!(reference.address.as_str(), "project:flotilla");
+    assert_eq!(records.record(&reference.address, &reference.revision), Some(control_record("Project", "flotilla")));
+    assert_eq!(dropped(&import("settled-to-session")), Some("it references a kind with no address"));
+    assert_eq!(dropped(&import("to-artifact")), Some("a referenced artifact is gone"));
+    assert_eq!(dropped(&import("to-commit")), Some("a referenced repository is gone"));
+    let held = import("to-unaddressable-commit").expect_err("a held record it cannot address is refused even when settled");
+    assert_eq!(held.record, "to-unaddressable-commit");
+    let refusal = import("open-to-session").expect_err("an open record with an unaddressable reference is refused");
+    assert_eq!(refusal.record, "open-to-session");
+}
+
+// Behaviour: a settled record naming a dropped message is dropped in turn;
+// an open one naming it is refused.
+#[test]
+fn records_naming_a_dropped_message_drop_when_settled_and_refuse_when_open() {
+    let mut reply = spec(RECEIVER, "system:turn-rules", MessageExpectation::None);
+    reply.in_reply_to = Some("message-old".into());
+    let records = [
+        record(
+            "message-old",
+            spec(RECEIVER, "system:nudge", MessageExpectation::Reply),
+            status(MessagePhase::Answered, Some(1), Some(gone_session())),
+        ),
+        record("message-settled", reply.clone(), status(MessagePhase::Satisfied, Some(2), Some(delivered()))),
+        record("message-open", reply, status(MessagePhase::Accepted, Some(3), None)),
+    ];
+    let roles = FleetRoles::declared("fleet").expect("roles");
+    let conversion = Conversion { roles: &roles, forges: &[], records: &NoRecords };
+    let world = world(&records);
+    let results = import_all(records.iter().map(|record| OldMessage { record, home: HOME.into() }), &conversion, &world);
+    let named = |name: &str| {
+        results
+            .iter()
+            .find(|result| match result {
+                Ok(Imported::Message(message)) => message.record == name,
+                Ok(Imported::Dropped(ImportDrop { record, .. })) | Err(ImportRefusal { record, .. }) => record == name,
+            })
+            .expect("named result")
+    };
+    assert_eq!(dropped(named("message-old")), Some("its delivered session is gone"));
+    assert_eq!(dropped(named("message-settled")), Some("a message it names is gone"));
+    assert!(named("message-open").is_err(), "{:?}", named("message-open"));
 }
 
 fn generated(tc: &TestCase, index: usize) -> ResourceObject<Message> {
@@ -267,12 +467,7 @@ fn generated(tc: &TestCase, index: usize) -> ResourceObject<Message> {
     ]));
     let sender =
         tc.draw(gs::sampled_from(vec!["system:turn-rules", "system:nudge", "system:hold", "flotilla/demo/work/coder", "principal:op"]));
-    let expectation = match tc.draw(gs::integers::<u8>().max_value(2)) {
-        0 => MessageExpectation::None,
-        1 => MessageExpectation::Reply,
-        _ => MessageExpectation::Outcome { condition: leaf() },
-    };
-    let mut spec = spec(receiver, sender, expectation);
+    let mut spec = spec(receiver, sender, expectation(tc));
     if tc.draw(gs::booleans()) {
         spec.deadline = Some(at(tc.draw(gs::integers::<i64>().min_value(1).max_value(100))));
     }
@@ -292,8 +487,8 @@ fn generated(tc: &TestCase, index: usize) -> ResourceObject<Message> {
 }
 
 // Behaviour: every generated old record imports to a state the machine
-// accepts or is refused with its own name; each home's admission order is
-// 1..n in old acceptance order.
+// accepts, is dropped only when settled, or is refused with its own name;
+// each home's admission order is 1..n in old acceptance order.
 #[hegel::test(test_cases = 200)]
 fn generated_records_import_or_are_refused_by_name(tc: TestCase) {
     let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(8));
@@ -306,7 +501,11 @@ fn generated_records_import_or_are_refused_by_name(tc: TestCase) {
     assert_eq!(results.len(), records.len());
     for result in &results {
         match result {
-            Ok(imported) => {
+            Ok(Imported::Dropped(drop)) => {
+                let record = records.iter().find(|record| record.metadata.name == drop.record).expect("named");
+                assert!(settled(record), "an open record was dropped: {drop:?}");
+            }
+            Ok(Imported::Message(imported)) => {
                 check(&imported.resource).expect("an imported state is one the machine accepts");
                 assert!(records.iter().any(|record| record.metadata.name == imported.record));
                 assert!(imported.resource.name().ends_with(&format!("/message:{}", imported.record)));
@@ -402,8 +601,11 @@ async fn named_designation_imports_fleet_role_messages() {
     let world = world(&records);
     let imported = import_all(records.iter().map(|record| OldMessage { record, home: HOME.into() }), &conversion, &world)
         .into_iter()
-        .collect::<Result<Vec<_>, _>>()
-        .expect("all messages import");
+        .map(|result| match result {
+            Ok(Imported::Message(message)) => *message,
+            other => panic!("not imported: {other:?}"),
+        })
+        .collect::<Vec<_>>();
     assert_eq!(imported.len(), 2);
     let to_crew = imported.iter().find(|item| item.record == "to-crew").expect("crew message");
     assert_eq!(to_crew.resource.spec().sender.as_str(), "fleet:lab/role:nudge");

@@ -473,10 +473,19 @@ fn the_import_carries_each_definition_to_the_homes_that_declare_it() {
     assert_eq!(place(records), vec![row("flotilla", "f", "beta", 0)]);
     assert_eq!(report.notes.len(), 1);
 
-    // Two homes' concurrent values: a conflict, refused.
-    let (records, report) = homes(&[at_home("alpha", None, forge_spec("https://x"), 1), at_home("beta", None, forge_spec("https://y"), 1)]);
-    assert!(records.is_empty());
-    assert_eq!(report.refused.iter().map(|refusal| refusal.record.as_str()).collect::<Vec<_>>(), ["f"]);
+    // Two homes' concurrent values: a conflict, imported with the merged value and noted.
+    let conflicting = [at_home("alpha", None, forge_spec("https://x"), 1), at_home("beta", None, forge_spec("https://y"), 1)];
+    let mut report = ImportReport::default();
+    let records = import_kind::<ForgeDefinition>(&conflicting, &mut report);
+    let merged = flotilla_store::merge_definition_copies(
+        conflicting.iter().map(|copy| (copy.object.clone(), flotilla_protocol::NodeId::new(copy.home.clone()))).collect(),
+    )
+    .expect("the copies merge");
+    assert!(merged.metadata.merge.as_ref().is_some_and(|merge| !merge.conflicts.is_empty()), "the copies conflict");
+    assert!(report.refused.is_empty(), "{report:?}");
+    assert_eq!(records.iter().map(|record| record.record.clone()).collect::<Vec<_>>(), [ForgeDefinition::new(&merged.spec)]);
+    let note = report.notes.iter().find(|note| note.contains("merge conflict")).expect("the conflict is noted");
+    assert!(note.contains("https://x") && note.contains("https://y") && note.contains("`f`"), "{note}");
 
     // Deleted: dropped and counted.
     let mut deleted = at_home("alpha", None, forge_spec("https://x"), 1);
