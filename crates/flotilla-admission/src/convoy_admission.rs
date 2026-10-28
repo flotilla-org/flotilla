@@ -4305,7 +4305,7 @@ pub struct PlacementTieBreak<'a> {
 }
 
 /// Free share of a host's vessel cap; uncapped hosts count as fully free.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Eq)]
 struct FreeFraction {
     free: u64,
     cap: u64,
@@ -4317,6 +4317,12 @@ impl FreeFraction {
             Some((cap, free)) => Self { free: u64::from(free.min(cap)), cap: u64::from(cap.max(1)) },
             None => Self { free: 1, cap: 1 },
         }
+    }
+}
+
+impl PartialEq for FreeFraction {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
     }
 }
 
@@ -6253,6 +6259,13 @@ mod tests {
         );
         big_host.vessel_cap = Some(14);
         assert!(placement_tiebreak.compare(&big_host, &idle_box).is_lt(), "equal fractions fall back to name");
+        let mut over_reported = candidate("c-over", FulfilmentCostClass::OwnedIdle, true, None, Some(9));
+        over_reported.vessel_cap = Some(2);
+        big_host.vessel_cap = Some(20);
+        assert!(placement_tiebreak.compare(&over_reported, &big_host).is_lt(), "free slots above the cap count as fully free");
+        let mut zero_cap = candidate("a-zero", FulfilmentCostClass::OwnedIdle, true, None, Some(0));
+        zero_cap.vessel_cap = Some(0);
+        assert!(placement_tiebreak.compare(&zero_cap, &big_host).is_gt(), "a zero cap ranks last");
         let uncapped = candidate("c-uncapped", FulfilmentCostClass::OwnedIdle, true, None, Some(2));
         big_host.vessel_cap = Some(20);
         assert!(placement_tiebreak.compare(&uncapped, &big_host).is_lt(), "uncapped ranks fully free, ahead of a partly used capped host");
