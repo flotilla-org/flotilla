@@ -141,6 +141,7 @@ pub enum HostDirectPlacementPolicyCheckout {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StoredDockerPerVessel")]
 pub struct DockerPerVesselPlacementPolicySpec {
     pub host_ref: String,
     /// Omitted means the vessel's composed image (ADR 0062): admission writes a
@@ -162,6 +163,56 @@ pub struct DockerPerVesselPlacementPolicySpec {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub checkout: DockerCheckoutStrategy,
+}
+
+/// A Docker policy as stored, with the provenance an admission snapshot froze from a retired
+/// CrewImageBaseline. That snapshot's image is the baseline's mutable tag, which Docker
+/// realisation refuses without the retired bridge, so it decodes as the vessel's composed image,
+/// as a live policy's `{image_baseline_ref}` does (#3824 layer 4b-i; remove one roll after it).
+#[derive(Deserialize)]
+struct StoredDockerPerVessel {
+    host_ref: String,
+    #[serde(default, deserialize_with = "decode_optional_image_source")]
+    image: Option<DockerImageSource>,
+    #[serde(default)]
+    pull_policy: DockerImagePullPolicy,
+    #[serde(default)]
+    memory_policy: crate::environment::EnvironmentMemoryPolicy,
+    #[serde(default)]
+    agent_adapters: BTreeSet<String>,
+    #[serde(default)]
+    default_cwd: Option<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    checkout: DockerCheckoutStrategy,
+    #[serde(default)]
+    legacy_image_baseline_ref: Option<String>,
+}
+
+impl From<StoredDockerPerVessel> for DockerPerVesselPlacementPolicySpec {
+    fn from(stored: StoredDockerPerVessel) -> Self {
+        let image = match stored.legacy_image_baseline_ref {
+            Some(baseline) => {
+                tracing::warn!(
+                    %baseline,
+                    host_ref = %stored.host_ref,
+                    "a placement froze its image from a retired CrewImageBaseline; it runs the vessel's composed image"
+                );
+                None
+            }
+            None => stored.image,
+        };
+        Self {
+            host_ref: stored.host_ref,
+            image,
+            pull_policy: stored.pull_policy,
+            memory_policy: stored.memory_policy,
+            agent_adapters: stored.agent_adapters,
+            default_cwd: stored.default_cwd,
+            env: stored.env,
+            checkout: stored.checkout,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,7 +261,13 @@ pub(crate) fn decode_optional_image_source<'de, D: serde::Deserializer<'de>>(
         Some(serde_json::Value::Object(object)) if object.contains_key("composition") => {
             Ok(retired_composition_image(&object["composition"]))
         }
-        Some(serde_json::Value::Object(object)) if object.contains_key("image_baseline_ref") => Ok(None),
+        Some(serde_json::Value::Object(object)) if object.contains_key("image_baseline_ref") => {
+            tracing::warn!(
+                baseline = %object["image_baseline_ref"],
+                "an image names a retired CrewImageBaseline; it runs the vessel's composed image"
+            );
+            Ok(None)
+        }
         Some(value) => serde_json::from_value(value).map(Some).map_err(serde::de::Error::custom),
     }
 }
@@ -310,6 +367,20 @@ mod image_source_tests {
         }))
         .expect("old fulfilment kind decodes");
         assert_eq!(kind.realisation, crate::FulfilmentRealisation::DockerPerVessel { image: None });
+    }
+
+    // ADR 0047 (#3824 layer 4b-i): a snapshot admission froze from a retired CrewImageBaseline holds
+    // the baseline's mutable tag and its provenance. It decodes as the vessel's composed image, and
+    // its encoding carries neither.
+    #[test]
+    fn a_snapshot_frozen_from_a_baseline_runs_the_composed_image() {
+        let mut frozen = policy(Some(serde_json::json!("registry.test/crew:baseline")));
+        frozen["docker_per_vessel"]["legacy_image_baseline_ref"] = serde_json::json!("fleet-crew");
+        let spec: PlacementPolicySpec = serde_json::from_value(frozen).expect("snapshot decodes");
+        assert_eq!(spec.docker_per_vessel.as_ref().expect("docker").image, None);
+        let encoded = serde_json::to_value(&spec).expect("encode");
+        assert!(encoded["docker_per_vessel"].get("image").is_none());
+        assert!(encoded["docker_per_vessel"].get("legacy_image_baseline_ref").is_none());
     }
 }
 
