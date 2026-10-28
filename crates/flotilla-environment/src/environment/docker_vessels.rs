@@ -53,13 +53,19 @@ impl DockerVessels {
     }
 
     /// Docker's systemd driver creates a missing slice silently and unbounded,
-    /// so the slice must already be loaded with a finite `MemoryMax` that
-    /// leaves room for at least one vessel at the ceiling.
+    /// so the slice must already be loaded with a finite `MemoryMax`. That
+    /// limit and the host's RAM must each leave room for one vessel at the ceiling.
     #[cfg(any(unix, test))]
-    pub(super) async fn verify(&self, runner: &dyn CommandRunner, cgroup_driver: &str) -> Result<(), String> {
+    pub(super) async fn verify(&self, runner: &dyn CommandRunner, cgroup_driver: &str, host_memory_bytes: u64) -> Result<(), String> {
         let slice = &self.slice;
         if cgroup_driver != "systemd" {
             return Err(format!("Docker vessel slice {slice} requires Docker's systemd cgroup driver, not {cgroup_driver:?}"));
+        }
+        if self.memory_ceiling_bytes() > host_memory_bytes {
+            return Err(format!(
+                "Docker vessel memory ceiling {} bytes for slice {slice} exceeds the host's {host_memory_bytes} bytes of RAM",
+                self.memory_ceiling_bytes()
+            ));
         }
         let shown = runner
             .run("systemctl", &["show", slice, "--property=LoadState", "--property=MemoryMax"], Path::new("/"), &ChannelLabel::Default)

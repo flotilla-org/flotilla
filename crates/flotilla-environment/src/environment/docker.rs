@@ -1048,7 +1048,7 @@ impl DockerEnvironmentProvider {
         }
         let limits = match &self.inner.vessels {
             Some(vessels) => {
-                vessels.verify(self.inner.runner.as_ref(), &info.cgroup_driver).await?;
+                vessels.verify(self.inner.runner.as_ref(), &info.cgroup_driver, info.mem_total).await?;
                 flotilla_protocol::EnvironmentMemoryLimits { memory_bytes: vessels.memory_ceiling_bytes(), swap_bytes: 0 }
             }
             None => opts.memory_policy.resolve(info.mem_total)?,

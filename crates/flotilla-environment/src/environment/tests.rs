@@ -1594,9 +1594,10 @@ async fn create_uses_configured_memory_policy() {
 // With [docker_vessels], a crew starts under the slice with memory = memory-swap
 // = the ceiling whatever the policy's share, and only once the slice is loaded
 // under Docker's systemd driver with a finite MemoryMax no lower than the
-// ceiling. Otherwise provisioning refuses, naming the slice, before any
-// container runs. Each case draws the ceiling and the policy, then tries every
-// systemctl answer (MemoryMax one GiB below, at and above the ceiling, in either
+// ceiling, on a host with at least the ceiling in RAM. Otherwise provisioning
+// refuses, naming the slice, before any container runs. Each case draws the
+// ceiling and the policy, then tries host RAM one GiB below, at and above the
+// ceiling against every systemctl answer (MemoryMax one GiB below, at and above the ceiling, in either
 // property order; a missing slice; `infinity`, u64::MAX and absent MemoryMax;
 // an unreadable unit) under both cgroup drivers.
 #[hegel::test]
@@ -1623,32 +1624,32 @@ fn docker_vessels_set_parent_and_ceiling_or_refuse(tc: hegel::TestCase) {
         (Err("Failed to connect to bus".into()), false),
     ]);
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
-    for (show, show_ok) in shows {
-        for driver in ["systemd", "cgroupfs"] {
-            let mut runner = RecordingRunner::new_ok("container-id");
-            runner.memory_info =
-                Some(Ok(format!(r#"{{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":true,"CgroupDriver":"{driver}"}}"#)));
-            runner.slice_show = show.clone();
-            let runner = Arc::new(runner);
-            let vessels = toml::from_str(&format!("slice = {slice:?}\nmemory_ceiling_gib = {gib}\n")).expect("table");
-            let vessels = super::docker_vessels::DockerVessels::parse(vessels).expect("valid [docker_vessels]");
-            let provider = DockerEnvironmentProvider::new(runner.clone()).with_vessel_slice(Some(vessels));
-            let mut opts = path_prepending_opts(ImagePullPolicy::Never);
-            opts.tools.clear();
-            opts.memory_policy = policy.clone();
-            let created = runtime.block_on(provider.create(EnvironmentId::new("sliced"), &flotilla_protocol::ImageId::new("image"), opts));
-            if show_ok && driver == "systemd" {
-                created.unwrap_or_else(|error| panic!("{show:?} should provision: {error}"));
-                let args = docker_run_args(&runner);
-                let ceiling = (gib << 30).to_string();
-                assert!(args.windows(2).any(|pair| pair == ["--cgroup-parent", slice]), "{args:?}");
-                assert!(args.windows(2).any(|pair| pair == ["--memory", ceiling.as_str()]), "{args:?}");
-                assert!(args.windows(2).any(|pair| pair == ["--memory-swap", ceiling.as_str()]), "{args:?}");
-            } else {
-                let error = created.err().unwrap_or_else(|| panic!("{show:?} under {driver} should refuse"));
-                assert!(error.contains(slice), "{error}");
-                assert!(!runner.calls().iter().any(|(cmd, args, _)| cmd == "docker" && args.first().is_some_and(|arg| arg == "run")));
-            }
+    for ((show, show_ok), driver, ram_gib) in shows.iter().flat_map(|show| {
+        ["systemd", "cgroupfs"].into_iter().flat_map(move |driver| [gib - 1, gib, gib + 1].map(|ram_gib| (show.clone(), driver, ram_gib)))
+    }) {
+        let mut runner = RecordingRunner::new_ok("container-id");
+        let ram = ram_gib << 30;
+        runner.memory_info = Some(Ok(format!(r#"{{"MemTotal":{ram},"MemoryLimit":true,"SwapLimit":true,"CgroupDriver":"{driver}"}}"#)));
+        runner.slice_show = show.clone();
+        let runner = Arc::new(runner);
+        let vessels = toml::from_str(&format!("slice = {slice:?}\nmemory_ceiling_gib = {gib}\n")).expect("table");
+        let vessels = super::docker_vessels::DockerVessels::parse(vessels).expect("valid [docker_vessels]");
+        let provider = DockerEnvironmentProvider::new(runner.clone()).with_vessel_slice(Some(vessels));
+        let mut opts = path_prepending_opts(ImagePullPolicy::Never);
+        opts.tools.clear();
+        opts.memory_policy = policy.clone();
+        let created = runtime.block_on(provider.create(EnvironmentId::new("sliced"), &flotilla_protocol::ImageId::new("image"), opts));
+        if show_ok && driver == "systemd" && ram_gib >= gib {
+            created.unwrap_or_else(|error| panic!("{show:?} should provision: {error}"));
+            let args = docker_run_args(&runner);
+            let ceiling = (gib << 30).to_string();
+            assert!(args.windows(2).any(|pair| pair == ["--cgroup-parent", slice]), "{args:?}");
+            assert!(args.windows(2).any(|pair| pair == ["--memory", ceiling.as_str()]), "{args:?}");
+            assert!(args.windows(2).any(|pair| pair == ["--memory-swap", ceiling.as_str()]), "{args:?}");
+        } else {
+            let error = created.err().unwrap_or_else(|| panic!("{show:?} under {driver} with {ram_gib} GiB should refuse"));
+            assert!(error.contains(slice), "{error}");
+            assert!(!runner.calls().iter().any(|(cmd, args, _)| cmd == "docker" && args.first().is_some_and(|arg| arg == "run")));
         }
     }
 }
