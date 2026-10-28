@@ -5,7 +5,10 @@
 use std::{
     io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -17,6 +20,7 @@ use drydock_transport::{
     Limits, Transport,
 };
 use flotilla_provider_runtime::{execution_context::BaseLayer, ChannelLabel, CommandRunner};
+use sha2::{Digest, Sha256};
 use tokio::sync::OnceCell;
 
 use super::{connect_current, AgentConnector};
@@ -122,6 +126,8 @@ pub struct HostAgentConnector {
     executable_bytes: Arc<OnceCell<Vec<u8>>>,
     timeout: Duration,
     base: Vec<String>,
+    /// The vessel this agent serves, as its abandoned upgrades are logged.
+    vessel: String,
 }
 
 impl HostAgentConnector {
@@ -138,7 +144,14 @@ impl HostAgentConnector {
         base: &BaseLayer,
     ) -> Self {
         let base = base.environment().into_iter().map(|(name, value)| format!("{name}={value}")).collect();
-        Self { host, transport, directory, platform, executable, executable_bytes: Arc::new(OnceCell::new()), timeout, base }
+        let vessel = directory.display().to_string();
+        Self { host, transport, directory, platform, executable, executable_bytes: Arc::new(OnceCell::new()), timeout, base, vessel }
+    }
+
+    /// Name the vessel in this connector's logs; its directory otherwise.
+    pub fn with_vessel(mut self, vessel: impl Into<String>) -> Self {
+        self.vessel = vessel.into();
+        self
     }
 
     /// Share one read of the agent build between a host's vessels.
@@ -223,16 +236,102 @@ impl HostAgentConnector {
 impl AgentConnector for HostAgentConnector {
     async fn connect(&self) -> Result<Client, String> {
         let executable = self.executable().await?;
+        let watch = UpgradeWatch { connector: self, reached: AtomicBool::new(false), armed: true };
+        let connected = self.connect_with(executable, &watch.reached).await;
+        watch.settle(connected.as_ref().err());
+        connected
+    }
+}
+
+/// How long the report of an abandoned upgrade waits for the agent's answer.
+const ABANDONED_UPGRADE_PROBE: Duration = Duration::from_secs(10);
+
+/// One connect, which may upload an agent upgrade. A connect that reached the
+/// agent and then fails, or is dropped before it finishes, asks the agent how
+/// much of this build's upload it holds, and logs an upgrade it left partway
+/// (#4054). A connect that never reached the agent uploaded nothing.
+struct UpgradeWatch<'a> {
+    connector: &'a HostAgentConnector,
+    /// Whether any transport to the agent opened during this connect.
+    reached: AtomicBool,
+    armed: bool,
+}
+
+impl UpgradeWatch<'_> {
+    fn settle(mut self, error: Option<&String>) {
+        self.armed = false;
+        if let Some(error) = error {
+            self.report(error.clone());
+        }
+    }
+
+    fn report(&self, reason: String) {
+        if !self.reached.load(Ordering::SeqCst) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
+        let (transport, socket, vessel) = (self.connector.transport.clone(), self.connector.socket(), self.connector.vessel.clone());
+        let build = self.connector.executable_bytes.clone();
+        runtime.spawn(async move {
+            // Hashed here, off the failing caller's path: a connect that
+            // succeeds pays nothing.
+            let Ok(Some((digest, length))) =
+                tokio::task::spawn_blocking(move || build.get().map(|bytes| (format!("{:x}", Sha256::digest(bytes)), bytes.len() as u64)))
+                    .await
+            else {
+                return;
+            };
+            let progress = tokio::time::timeout(ABANDONED_UPGRADE_PROBE, async {
+                let client = Client::connect(transport.open(&socket).await?, digest.clone()).await?;
+                client.upload_offset(&digest).await
+            })
+            .await;
+            match progress {
+                Ok(Ok((sent, false))) if sent > 0 => tracing::warn!(
+                    %vessel,
+                    %digest,
+                    bytes_sent = sent,
+                    bytes_total = length,
+                    %reason,
+                    "vessel agent upgrade abandoned partway; its partial upload remains"
+                ),
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::debug!(%vessel, %digest, %reason, %error, "could not ask the vessel agent for its upgrade upload")
+                }
+                Err(_) => tracing::debug!(%vessel, %digest, %reason, "the vessel agent did not report its upgrade upload in time"),
+            }
+        });
+    }
+}
+
+impl Drop for UpgradeWatch<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.report("the connect was dropped before it finished".into());
+        }
+    }
+}
+
+impl HostAgentConnector {
+    async fn connect_with(&self, executable: &[u8], reached: &AtomicBool) -> Result<Client, String> {
         let socket = self.socket();
+        let open = || async {
+            let transport = self.transport.open(&socket).await;
+            if transport.is_ok() {
+                reached.store(true, Ordering::SeqCst);
+            }
+            transport
+        };
         // An agent from an earlier connect normally still runs under its
         // supervisor: try it once before touching the host.
-        match Client::connect_current(|| self.transport.open(&socket), &self.platform, executable, self.timeout).await {
+        match Client::connect_current(open, &self.platform, executable, self.timeout).await {
             Ok(client) => return Ok(client),
             Err(error) if error.kind() == io::ErrorKind::Unsupported => return Err(error.to_string()),
             Err(error) => tracing::debug!(socket = %socket.display(), %error, "vessel agent did not answer; bootstrapping"),
         }
         self.bootstrap().await?;
-        connect_current(|| self.transport.open(&socket), &self.platform, executable, self.timeout)
+        connect_current(open, &self.platform, executable, self.timeout)
             .await
             .map_err(|error| format!("vessel agent at {}: {error}", socket.display()))
     }

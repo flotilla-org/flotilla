@@ -377,11 +377,12 @@ pub(super) trait VesselAgents: Send + Sync {
     }
     /// Why this controller cannot run vessels on the host, if it cannot.
     async fn host_refusals(&self, profile: &SshHostProfile) -> Vec<HostRefusal>;
-    /// A handle on one vessel's agent at `paths`, with its attach forwards
+    /// A handle on `vessel`'s agent at `paths`, with its attach forwards
     /// bound under `local` on the controller.
     async fn open(
         &self,
         profile: &SshHostProfile,
+        vessel: &VesselKey,
         platform: &HostPlatform,
         paths: &VesselPaths,
         local: &Path,
@@ -482,6 +483,7 @@ impl VesselAgents for SshVesselAgents {
     async fn open(
         &self,
         profile: &SshHostProfile,
+        vessel: &VesselKey,
         platform: &HostPlatform,
         paths: &VesselPaths,
         local: &Path,
@@ -498,7 +500,8 @@ impl VesselAgents for SshVesselAgents {
             Duration::from_secs(60),
             &vessel_base(profile, paths)?,
         )
-        .with_executable_cache(cache);
+        .with_executable_cache(cache)
+        .with_vessel(format!("{}/{}", vessel.environment, vessel.vessel));
         let runner = AgentRunner::new(Arc::new(connector), local.into()).with_writable_bases(WritableBases::Host);
         Ok(Arc::new(AgentVessel { agent: Arc::new(runner), host: profile.runner.clone() }))
     }
@@ -541,6 +544,11 @@ pub(super) struct VesselPreparation<'a> {
     pub(super) config: &'a ConfigStore,
 }
 
+/// Lends a [`VesselPreparation`] to a preparation that outlives its caller.
+pub(super) trait VesselPreparer: Send + Sync + 'static {
+    fn preparation(&self) -> VesselPreparation<'_>;
+}
+
 #[derive(Default)]
 struct VesselSlot {
     prepared: Mutex<Option<Arc<VesselAccess>>>,
@@ -570,7 +578,29 @@ impl SshHostVessels {
 
     /// The vessel, prepared on first use. Every later use checks the agent
     /// first: one killed between commands is bootstrapped again here.
+    ///
+    /// The work runs in its own task, so a caller that stops waiting, such as
+    /// an attach request past its deadline (#4054), does not cut off the
+    /// agent's connect or upgrade partway. The prepared vessel still lands in
+    /// its slot for the next caller.
+    ///
+    /// Nothing owns the task but its slot. It is bounded by the connector's
+    /// own timeouts (the agent connect's 60 s, SSH's 30 s). A [`Self::retire`]
+    /// meanwhile marks the vessel retired, then waits on the slot lock and
+    /// closes whatever the preparation stored, so nothing outlives teardown.
     pub(super) async fn access(
+        self: &Arc<Self>,
+        preparer: Arc<dyn VesselPreparer>,
+        profile: &SshHostProfile,
+        vessel: &str,
+    ) -> Result<Arc<VesselAccess>, String> {
+        let (vessels, profile, name) = (Arc::clone(self), profile.clone(), vessel.to_string());
+        tokio::spawn(async move { vessels.access_here(&preparer.preparation(), &profile, &name).await })
+            .await
+            .map_err(|error| format!("vessel {vessel} preparation stopped: {error}"))?
+    }
+
+    async fn access_here(
         &self,
         preparation: &VesselPreparation<'_>,
         profile: &SshHostProfile,
@@ -604,7 +634,7 @@ impl SshHostVessels {
         let platform = self.agents.observe_platform(profile).await?;
         let context = LayerContext { prefix: paths.state.clone(), platform: platform.drydock() };
         let tools = preparation.tools.prepare(SSH_HOST_PROVIDER_KIND, &key.environment, &context).await?;
-        let handle = self.agents.open(profile, &platform, &paths, &local).await?;
+        let handle = self.agents.open(profile, &key, &platform, &paths, &local).await?;
         // A failed preparation closes its handle at once: its listeners and
         // connection never linger beside the next attempt's.
         match self.prepare_opened(preparation, profile, &key, &paths, &handle, &tools).await {

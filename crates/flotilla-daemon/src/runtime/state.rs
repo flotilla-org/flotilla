@@ -172,18 +172,13 @@ impl ControllerRuntimeState {
 
     /// The prepared vessel on an SSH host (#3792).
     pub(super) async fn vessel_access(
-        &self,
+        self: &Arc<Self>,
         profile: &SshHostProfile,
         vessel: &str,
     ) -> Result<Arc<super::ssh_host_vessels::VesselAccess>, String> {
         let vessels =
             self.ssh_host_vessels.as_ref().ok_or("EnvironmentSocketUnavailable: SSH host vessels require a crew socket server")?;
-        let preparation = super::ssh_host_vessels::VesselPreparation {
-            tools: &self.environment_tools,
-            discovery: self.daemon.discovery_runtime(),
-            config: &self.config,
-        };
-        vessels.access(&preparation, profile, vessel).await
+        vessels.access(Arc::clone(self) as Arc<dyn super::ssh_host_vessels::VesselPreparer>, profile, vessel).await
     }
 
     /// The Rust linker wrapper for a session in `env_ref`, staged on an
@@ -393,6 +388,16 @@ impl ControllerRuntimeState {
         ));
         self.environment_tools = environment_tools;
         self
+    }
+}
+
+impl super::ssh_host_vessels::VesselPreparer for ControllerRuntimeState {
+    fn preparation(&self) -> super::ssh_host_vessels::VesselPreparation<'_> {
+        super::ssh_host_vessels::VesselPreparation {
+            tools: &self.environment_tools,
+            discovery: self.daemon.discovery_runtime(),
+            config: &self.config,
+        }
     }
 }
 
