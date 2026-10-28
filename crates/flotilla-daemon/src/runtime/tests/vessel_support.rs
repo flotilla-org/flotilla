@@ -161,6 +161,7 @@ impl VesselAgents for RunnerVesselAgents {
     async fn open(
         &self,
         _profile: &SshHostProfile,
+        _: &super::ssh_host_vessels::VesselKey,
         _: &super::ssh_host_vessels::HostPlatform,
         paths: &VesselPaths,
         _local: &Path,

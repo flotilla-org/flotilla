@@ -282,6 +282,182 @@ async fn a_stopped_controller_leaves_nothing_forwarding() {
     assert!(tokio::time::timeout(Duration::from_millis(500), listener.accept()).await.is_err(), "nothing reaches the daemon endpoint");
 }
 
+/// Dials the agent socket directly, holding the first connection's bytes
+/// once `limit` have passed, as a slow link holds an upgrade's upload.
+struct HeldTransport {
+    limit: usize,
+    held: Arc<tokio::sync::Notify>,
+    opened: AtomicUsize,
+}
+#[async_trait]
+impl AgentTransport for HeldTransport {
+    async fn open(&self, socket: &Path) -> io::Result<Transport> {
+        let stream = UnixStream::connect(socket).await?;
+        if self.opened.fetch_add(1, Ordering::SeqCst) > 0 {
+            return Transport::yamux(Box::new(stream), true, Limits::default()).await;
+        }
+        let held = Held { stream, room: self.limit, held: Arc::clone(&self.held) };
+        Transport::yamux(Box::new(held), true, Limits::default()).await
+    }
+}
+struct Held {
+    stream: UnixStream,
+    room: usize,
+    held: Arc<tokio::sync::Notify>,
+}
+impl tokio::io::AsyncRead for Held {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+impl tokio::io::AsyncWrite for Held {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<io::Result<usize>> {
+        if self.room == 0 {
+            self.held.notify_one();
+            return std::task::Poll::Pending;
+        }
+        let room = self.room.min(buf.len());
+        let written = std::pin::Pin::new(&mut self.stream).poll_write(cx, &buf[..room]);
+        if let std::task::Poll::Ready(Ok(written)) = &written {
+            self.room -= written;
+        }
+        written
+    }
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+/// Log lines written while a test runs.
+#[derive(Clone, Default)]
+struct Logged(Arc<StdMutex<Vec<u8>>>);
+impl io::Write for Logged {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+impl Logged {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+// #4054: a connect dropped partway through its agent upgrade's upload logs
+// the abandoned upgrade: the vessel, the build's digest, how many bytes the
+// agent holds and why. Mutation check: without the connect's upgrade watch
+// the drop leaves no log line and this scenario fails.
+#[tokio::test]
+async fn a_connect_dropped_partway_through_an_upgrade_logs_it_abandoned() {
+    let logged = Logged::default();
+    let writer = logged.clone();
+    let subscriber = tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish();
+    let _logging = tracing::subscriber::set_default(subscriber);
+
+    let root = tempfile::Builder::new().prefix("fvu-").tempdir_in("/tmp").unwrap();
+    let directory = root.path().join("vessel");
+    std::fs::create_dir(&directory).unwrap();
+    let build = (0..2 * 1024 * 1024).map(|byte: u32| byte as u8).collect::<Vec<_>>();
+    let executable = root.path().join("drydock-agent-build");
+    std::fs::write(&executable, &build).unwrap();
+    let _agent = SocketAgent::start(directory.join(AGENT_SOCKET), &build, true);
+    let held = Arc::new(tokio::sync::Notify::new());
+    let transport = Arc::new(HeldTransport { limit: 512 * 1024, held: Arc::clone(&held), opened: AtomicUsize::new(0) });
+    let connector = Arc::new(
+        HostAgentConnector::new(
+            FakeHost::new(),
+            transport,
+            directory.clone(),
+            Platform::current(),
+            executable,
+            Duration::from_secs(30),
+            &BaseLayer::default(),
+        )
+        .with_vessel("host-direct-b1/convoy-1-work"),
+    );
+
+    let connecting = tokio::spawn({
+        let connector = Arc::clone(&connector);
+        async move { connector.connect().await.map(drop) }
+    });
+    tokio::time::timeout(Duration::from_secs(10), held.notified()).await.expect("the upload reaches the hold");
+    connecting.abort();
+    assert!(connecting.await.is_err_and(|error| error.is_cancelled()));
+
+    let digest = format!("{:x}", Sha256::digest(&build));
+    let line = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(line) = logged.text().lines().find(|line| line.contains("vessel agent upgrade abandoned partway")) {
+                return line.to_string();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the abandoned upgrade is logged");
+    assert!(line.contains("vessel=host-direct-b1/convoy-1-work"), "{line}");
+    assert!(line.contains(&format!("digest={digest}")), "{line}");
+    assert!(line.contains(&format!("bytes_total={}", build.len())), "{line}");
+    assert!(line.contains("reason=the connect was dropped before it finished"), "{line}");
+    let sent = line.split("bytes_sent=").nth(1).and_then(|rest| rest.split_whitespace().next()).and_then(|sent| sent.parse::<usize>().ok());
+    assert!(sent.is_some_and(|sent| sent > 0 && sent < build.len()), "{line}");
+}
+
+/// A host whose agent link never opens, as when SSH is unreachable.
+#[derive(Default)]
+struct Unreachable {
+    opened: AtomicUsize,
+}
+#[async_trait]
+impl AgentTransport for Unreachable {
+    async fn open(&self, _socket: &Path) -> io::Result<Transport> {
+        self.opened.fetch_add(1, Ordering::SeqCst);
+        Err(io::Error::new(io::ErrorKind::ConnectionRefused, "unreachable"))
+    }
+}
+
+// #4054 review: a connect that never reached the agent uploaded nothing, so
+// its failure opens no second link to ask how far an upgrade got.
+#[tokio::test]
+async fn a_connect_that_never_reached_the_agent_asks_nothing_after_failing() {
+    let root = tempfile::Builder::new().prefix("fvn-").tempdir_in("/tmp").unwrap();
+    let executable = root.path().join("drydock-agent-build");
+    std::fs::write(&executable, STUB_AGENT).unwrap();
+    let transport = Arc::new(Unreachable::default());
+    let connector = HostAgentConnector::new(
+        FakeHost::new(),
+        transport.clone(),
+        root.path().join("vessel"),
+        Platform::current(),
+        executable,
+        Duration::from_millis(200),
+        &BaseLayer::default(),
+    );
+    connector.connect().await.map(drop).expect_err("the host is unreachable");
+    let attempts = transport.opened.load(Ordering::SeqCst);
+    // Every task the connect spawned has finished, so a probe it started has
+    // already opened its link.
+    let runtime = tokio::runtime::Handle::current();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while runtime.metrics().num_alive_tasks() > 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the connect's tasks finish");
+    assert_eq!(transport.opened.load(Ordering::SeqCst), attempts, "no probe follows a connect that never reached the agent");
+}
+
 #[test]
 fn uname_names_map_to_drydock_platforms() {
     assert_eq!(platform_from_uname("Linux\n", "x86_64\n"), Platform::new("linux", "amd64"));

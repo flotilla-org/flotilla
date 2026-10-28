@@ -33,6 +33,16 @@ struct LocalAgents {
     opened: AtomicUsize,
     /// Every handle opened, to check what teardown and failures close.
     handles: StdMutex<Vec<Arc<AgentRunner>>>,
+    /// Agents start from an older build, which the controller's upgrades.
+    upgrade: Option<Upgrade>,
+    upgrades: Arc<AtomicUsize>,
+}
+
+/// The controller's own agent build, newer than the one its agents start
+/// from, and the gate its bytes to the agents pass through.
+struct Upgrade {
+    build: Vec<u8>,
+    gate: Arc<Gate>,
 }
 
 impl Drop for LocalAgents {
@@ -48,6 +58,13 @@ impl Drop for LocalAgents {
 const BUILD: &[u8] = b"local drydock agent";
 
 impl LocalAgents {
+    /// Agents that the controller upgrades to `build` on first connect.
+    fn upgrading(build: Vec<u8>, gate: Arc<Gate>) -> Self {
+        let mut agents = Self::default();
+        agents.upgrade = Some(Upgrade { build, gate });
+        agents
+    }
+
     fn serve(&self, directory: &Path) {
         let mut agents = self.agents.lock().expect("agents");
         let socket = directory.join("agent.sock");
@@ -60,34 +77,133 @@ impl LocalAgents {
             stopped.abort();
         }
         std::fs::create_dir_all(directory).expect("agent directory");
-        let listener = UnixListener::bind(&socket).expect("agent socket");
+        let mut listener = Some(UnixListener::bind(&socket).expect("agent socket"));
         let installed = directory.join("drydock-agent");
         std::fs::write(&installed, BUILD).expect("agent executable");
         let peer = directory.join("host.sock");
-        let fingerprint = format!("{:x}", Sha256::digest(BUILD));
+        let mut fingerprint = format!("{:x}", Sha256::digest(BUILD));
+        if self.upgrade.is_some() {
+            fingerprint = "older-build".into();
+        }
+        let upgrades = Arc::clone(&self.upgrades);
         agents.insert(
             directory.into(),
             tokio::spawn(async move {
-                let connections = drydock_transport::native::UnixConnections::new(listener, peer);
-                let transport = drydock_transport::Transport::native(Arc::new(connections), drydock_transport::Limits::default()).unwrap();
-                let _ = drydock_agent::Agent::new(transport, fingerprint, installed).run().await;
+                // An activated upgrade re-executes the agent on the same
+                // socket, as its supervisor restarts it.
+                loop {
+                    let listener = match listener.take() {
+                        Some(listener) => listener,
+                        None => {
+                            let _ = std::fs::remove_file(&socket);
+                            UnixListener::bind(&socket).expect("agent socket")
+                        }
+                    };
+                    let connections = drydock_transport::native::UnixConnections::new(listener, peer.clone());
+                    let transport =
+                        drydock_transport::Transport::native(Arc::new(connections), drydock_transport::Limits::default()).unwrap();
+                    let Ok(upgrade) = drydock_agent::Agent::new(transport, fingerprint.clone(), installed.clone()).run().await else {
+                        return;
+                    };
+                    fingerprint = format!("{:x}", Sha256::digest(std::fs::read(&upgrade).expect("upgrade image")));
+                    std::fs::rename(upgrade, &installed).expect("install upgrade");
+                    upgrades.fetch_add(1, Ordering::SeqCst);
+                }
             }),
         );
     }
 }
 
-struct LocalConnector(PathBuf);
+/// Holds the controller's bytes to its agents once `limit` have passed, as a
+/// slow link to a hosted box holds an upload partway.
+struct Gate {
+    limit: std::sync::atomic::AtomicU64,
+    written: std::sync::atomic::AtomicU64,
+    waiting: StdMutex<Vec<std::task::Waker>>,
+    held: tokio::sync::Notify,
+}
+
+impl Gate {
+    fn closing_after(limit: u64) -> Arc<Self> {
+        Arc::new(Self { limit: limit.into(), written: 0.into(), waiting: StdMutex::default(), held: tokio::sync::Notify::new() })
+    }
+
+    fn open(&self) {
+        self.limit.store(u64::MAX, Ordering::SeqCst);
+        for waker in self.waiting.lock().expect("waiting").drain(..) {
+            waker.wake();
+        }
+    }
+
+    fn room(&self) -> u64 {
+        self.limit.load(Ordering::SeqCst).saturating_sub(self.written.load(Ordering::SeqCst))
+    }
+}
+
+struct Gated {
+    stream: UnixStream,
+    gate: Arc<Gate>,
+}
+
+impl tokio::io::AsyncRead for Gated {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for Gated {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.gate.room() == 0 {
+            self.gate.waiting.lock().expect("waiting").push(cx.waker().clone());
+            self.gate.held.notify_one();
+            // Opened while the waker was registered: write now.
+            if self.gate.room() == 0 {
+                return std::task::Poll::Pending;
+            }
+        }
+        let room = usize::try_from(self.gate.room()).unwrap_or(usize::MAX).min(buf.len());
+        let written = std::pin::Pin::new(&mut self.stream).poll_write(cx, &buf[..room]);
+        if let std::task::Poll::Ready(Ok(written)) = &written {
+            self.gate.written.fetch_add(*written as u64, Ordering::SeqCst);
+        }
+        written
+    }
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+struct LocalConnector {
+    socket: PathBuf,
+    build: Vec<u8>,
+    gate: Option<Arc<Gate>>,
+}
 
 #[async_trait]
 impl AgentConnector for LocalConnector {
     async fn connect(&self) -> Result<drydock_agent::Client, String> {
         connect_current(
             || async {
-                let stream = UnixStream::connect(&self.0).await?;
-                drydock_transport::Transport::yamux(Box::new(stream), true, drydock_transport::Limits::default()).await
+                let stream = UnixStream::connect(&self.socket).await?;
+                let stream: drydock_transport::ByteStream = match &self.gate {
+                    Some(gate) => Box::new(Gated { stream, gate: Arc::clone(gate) }),
+                    None => Box::new(stream),
+                };
+                drydock_transport::Transport::yamux(stream, true, drydock_transport::Limits::default()).await
             },
             &drydock_protocol::Platform::current(),
-            BUILD,
+            &self.build,
             Duration::from_secs(5),
         )
         .await
@@ -103,13 +219,18 @@ impl VesselAgents for LocalAgents {
     async fn open(
         &self,
         profile: &SshHostProfile,
+        _: &VesselKey,
         _: &HostPlatform,
         paths: &VesselPaths,
         local: &Path,
     ) -> Result<Arc<dyn VesselHandle>, String> {
         self.opened.fetch_add(1, Ordering::SeqCst);
         self.serve(&paths.agent);
-        let connector = LocalConnector(paths.agent.join("agent.sock"));
+        let connector = LocalConnector {
+            socket: paths.agent.join("agent.sock"),
+            build: self.upgrade.as_ref().map_or_else(|| BUILD.to_vec(), |upgrade| upgrade.build.clone()),
+            gate: self.upgrade.as_ref().map(|upgrade| Arc::clone(&upgrade.gate)),
+        };
         let agent = Arc::new(AgentRunner::new(Arc::new(connector), local.into()).with_writable_bases(WritableBases::Host));
         self.handles.lock().expect("handles").push(Arc::clone(&agent));
         Ok(Arc::new(AgentVessel { agent, host: Arc::clone(&profile.runner) }))
@@ -195,19 +316,47 @@ fn host(runner: Arc<dyn CommandRunner>) -> Host {
     Host { _runtime: runtime, home, state, profile }
 }
 
-async fn access(vessels: &SshHostVessels, host: &Host, vessel: &str) -> Result<Arc<VesselAccess>, String> {
+/// What the controller lends a preparation, owned here.
+struct Preparer {
+    tools: EnvironmentToolProvisioner,
+    discovery: DiscoveryRuntime,
+    config: ConfigStore,
+}
+
+impl VesselPreparer for Preparer {
+    fn preparation(&self) -> VesselPreparation<'_> {
+        VesselPreparation { tools: &self.tools, discovery: &self.discovery, config: &self.config }
+    }
+}
+
+/// An attach request preparing `vessel` in its own task, which the test can
+/// abort as a request past its deadline is.
+fn attaching(vessels: &Arc<SshHostVessels>, host: &Host, vessel: &str) -> tokio::task::JoinHandle<Result<Arc<VesselAccess>, String>> {
+    let (vessels, profile, vessel) = (Arc::clone(vessels), host.profile.clone(), vessel.to_string());
+    let preparer = Preparer {
+        tools: EnvironmentToolProvisioner::new(Vec::new()),
+        discovery: flotilla_discovery_testkit::fake_discovery(false),
+        config: ConfigStore::with_base(host.state.path().join("config")),
+    };
+    tokio::spawn(async move { vessels.access(Arc::new(preparer), &profile, &vessel).await })
+}
+
+async fn access(vessels: &Arc<SshHostVessels>, host: &Host, vessel: &str) -> Result<Arc<VesselAccess>, String> {
     access_with(vessels, host, vessel, EnvironmentToolProvisioner::new(Vec::new())).await
 }
 
 async fn access_with(
-    vessels: &SshHostVessels,
+    vessels: &Arc<SshHostVessels>,
     host: &Host,
     vessel: &str,
     tools: EnvironmentToolProvisioner,
 ) -> Result<Arc<VesselAccess>, String> {
-    let discovery = flotilla_discovery_testkit::fake_discovery(false);
-    let config = ConfigStore::with_base(host.state.path().join("config"));
-    vessels.access(&VesselPreparation { tools: &tools, discovery: &discovery, config: &config }, &host.profile, vessel).await
+    let preparer = Preparer {
+        tools,
+        discovery: flotilla_discovery_testkit::fake_discovery(false),
+        config: ConfigStore::with_base(host.state.path().join("config")),
+    };
+    vessels.access(Arc::new(preparer), &host.profile, vessel).await
 }
 
 async fn shell(access: &VesselAccess, script: &str) -> String {
@@ -237,7 +386,7 @@ async fn two_vessels_on_one_host_each_get_their_own_agent_and_socket() {
     let host = host(Arc::new(ProcessCommandRunner));
     let agents = Arc::new(LocalAgents::default());
     let (sockets, mut received) = recording_sockets(host.state.path());
-    let vessels = SshHostVessels::new(agents.clone(), sockets, host.state.path().join("vessels"));
+    let vessels = Arc::new(SshHostVessels::new(agents.clone(), sockets, host.state.path().join("vessels")));
     let a = access(&vessels, &host, "convoy-1-work").await.expect("vessel a");
     let b = access(&vessels, &host, "convoy-2-work").await.expect("vessel b");
     assert_eq!(agents.agents.lock().unwrap().len(), 2, "one agent per vessel");
@@ -278,6 +427,80 @@ async fn two_vessels_on_one_host_each_get_their_own_agent_and_socket() {
     assert_eq!(agents.opened.load(Ordering::SeqCst), 2);
 }
 
+// #4054: an attach request past its deadline stops waiting while the vessel's
+// agent is partway through its upgrade upload. The preparation is not the
+// caller's to cut off: the upgrade finishes, and the next caller finds the
+// vessel prepared, with its agent on the new build. Mutation check: awaiting
+// the preparation in the caller's own future drops the upload partway, and
+// the next preparation is refused by the agent's partial upload.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_that_stops_waiting_does_not_cut_off_its_vessels_agent_upgrade() {
+    let host = host(Arc::new(ProcessCommandRunner));
+    let build = (0..4 * 1024 * 1024).map(|byte: u32| byte as u8).collect::<Vec<_>>();
+    let gate = Gate::closing_after(1024 * 1024);
+    let agents = Arc::new(LocalAgents::upgrading(build.clone(), Arc::clone(&gate)));
+    let (sockets, _received) = recording_sockets(host.state.path());
+    let vessels = Arc::new(SshHostVessels::new(agents.clone(), sockets, host.state.path().join("vessels")));
+
+    let attach = attaching(&vessels, &host, "convoy-1-work");
+    tokio::time::timeout(Duration::from_secs(10), gate.held.notified()).await.expect("the upload reaches the gate");
+    attach.abort();
+    assert!(attach.await.is_err_and(|error| error.is_cancelled()));
+    assert_eq!(agents.upgrades.load(Ordering::SeqCst), 0, "the upload is partway");
+
+    gate.open();
+    let vessel = tokio::time::timeout(Duration::from_secs(10), access(&vessels, &host, "convoy-1-work"))
+        .await
+        .expect("preparation finishes")
+        .expect("the vessel is prepared");
+    assert_eq!(agents.upgrades.load(Ordering::SeqCst), 1, "the upgrade ran to completion");
+    assert_eq!(agents.opened.load(Ordering::SeqCst), 1, "the next caller found the first preparation");
+    assert_eq!(std::fs::read(vessel.paths.agent.join("drydock-agent")).unwrap(), build);
+    assert_eq!(shell(&vessel, "printf ready").await, "ready");
+}
+
+// #4054 review: retiring a vessel while a preparation no caller waits for is
+// partway through its upgrade waits for the preparation, then closes what it
+// prepared. Nothing outlives the retire. Mutation check: a retire that doesn't
+// wait for the slot lock tears the vessel down under its unfinished upgrade.
+#[tokio::test(flavor = "multi_thread")]
+async fn retiring_a_vessel_mid_preparation_closes_what_the_preparation_leaves() {
+    let host = host(Arc::new(ProcessCommandRunner));
+    let build = (0..4 * 1024 * 1024).map(|byte: u32| byte as u8).collect::<Vec<_>>();
+    let gate = Gate::closing_after(1024 * 1024);
+    let agents = Arc::new(LocalAgents::upgrading(build, Arc::clone(&gate)));
+    let (sockets, _received) = recording_sockets(host.state.path());
+    let vessels = Arc::new(SshHostVessels::new(agents.clone(), sockets, host.state.path().join("vessels")));
+
+    let attach = attaching(&vessels, &host, "convoy-1-work");
+    tokio::time::timeout(Duration::from_secs(10), gate.held.notified()).await.expect("the upload reaches the gate");
+    attach.abort();
+    assert!(attach.await.is_err_and(|error| error.is_cancelled()));
+
+    let key = VesselKey::new(&host.profile.environment_id, "convoy-1-work");
+    let retire = tokio::spawn({
+        let (vessels, profile) = (Arc::clone(&vessels), host.profile.clone());
+        async move { vessels.retire(&profile, "convoy-1-work").await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !vessels.retired.lock().await.contains(&key) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the retire takes the vessel's slot");
+    assert!(!retire.is_finished(), "the retire waits for the preparation");
+
+    gate.open();
+    tokio::time::timeout(Duration::from_secs(10), retire).await.expect("the retire finishes").expect("retire");
+    assert_eq!(agents.upgrades.load(Ordering::SeqCst), 1, "the preparation finished before the retire");
+    let handles = agents.handles.lock().unwrap().clone();
+    assert_eq!(handles.len(), 1);
+    assert!(handles[0].is_closed(), "the retire closed what the preparation stored");
+    let error = access(&vessels, &host, "convoy-1-work").await.err().expect("not resurrected");
+    assert!(error.contains("torn down"), "{error}");
+}
+
 // #3792 contract 6: removing a vessel removes its forward, stops its agent
 // and removes its directories, and a late observation cannot resurrect it.
 // The other vessel keeps working. A vessel live in the store again is
@@ -287,7 +510,7 @@ async fn retiring_a_vessel_removes_it_without_touching_its_neighbour() {
     let host = host(Arc::new(ProcessCommandRunner));
     let agents = Arc::new(LocalAgents::default());
     let (sockets, _received) = recording_sockets(host.state.path());
-    let vessels = SshHostVessels::new(agents.clone(), sockets, host.state.path().join("vessels"));
+    let vessels = Arc::new(SshHostVessels::new(agents.clone(), sockets, host.state.path().join("vessels")));
     let gone = access(&vessels, &host, "convoy-1-work").await.expect("vessel");
     let kept = access(&vessels, &host, "convoy-2-work").await.expect("neighbour");
 
@@ -319,12 +542,12 @@ async fn a_restarted_controller_retires_vessels_removed_while_it_was_down() {
     let agents = Arc::new(LocalAgents::default());
     let paths = {
         let (sockets, _received) = recording_sockets(host.state.path());
-        let before = SshHostVessels::new(agents.clone(), sockets, host.state.path().join("vessels"));
+        let before = Arc::new(SshHostVessels::new(agents.clone(), sockets, host.state.path().join("vessels")));
         access(&before, &host, "convoy-1-work").await.expect("vessel").paths.clone()
     };
     assert!(paths.agent.join("vessel.json").is_file() && paths.state.join("vessel.json").is_file());
     let (sockets, _received) = recording_sockets(host.state.path());
-    let restarted = SshHostVessels::new(agents, sockets, host.state.path().join("vessels"));
+    let restarted = Arc::new(SshHostVessels::new(agents, sockets, host.state.path().join("vessels")));
     restarted.retire_absent(&host.profile, &BTreeSet::new()).await.expect("retire absent");
     assert!(!paths.agent.exists() && !paths.state.exists());
 }
@@ -358,7 +581,7 @@ async fn an_unreachable_host_does_not_block_teardown() {
     let mut host = host(Arc::new(ProcessCommandRunner));
     let agents = Arc::new(LocalAgents::default());
     let (sockets, _received) = recording_sockets(host.state.path());
-    let vessels = SshHostVessels::new(agents, sockets, host.state.path().join("vessels"));
+    let vessels = Arc::new(SshHostVessels::new(agents, sockets, host.state.path().join("vessels")));
     let vessel = access(&vessels, &host, "convoy-1-work").await.expect("vessel");
     host.profile.runner = Arc::new(Unreachable);
     vessels.retire(&host.profile, "convoy-1-work").await;
@@ -500,7 +723,7 @@ async fn missing_tools_refuse_before_opening_an_agent() {
     let host = host(Arc::new(ProcessCommandRunner));
     let agents = Arc::new(LocalAgents::default());
     let (sockets, _received) = recording_sockets(host.state.path());
-    let vessels = SshHostVessels::new(agents.clone(), sockets, host.state.path().join("vessels"));
+    let vessels = Arc::new(SshHostVessels::new(agents.clone(), sockets, host.state.path().join("vessels")));
     let error = access_with(&vessels, &host, "convoy-1-work", EnvironmentToolProvisioner::new(vec![Arc::new(MissingLayer)]))
         .await
         .err()
@@ -545,7 +768,7 @@ async fn a_failed_marker_listing_still_retires_known_vessels() {
     let mut host = host(Arc::new(ProcessCommandRunner));
     let agents = Arc::new(LocalAgents::default());
     let (sockets, _received) = recording_sockets(host.state.path());
-    let vessels = SshHostVessels::new(agents, sockets, host.state.path().join("vessels"));
+    let vessels = Arc::new(SshHostVessels::new(agents, sockets, host.state.path().join("vessels")));
     let gone = access(&vessels, &host, "convoy-1-work").await.expect("vessel");
     host.profile.runner = Arc::new(MarkersUnlisted);
     let error = vessels.retire_absent(&host.profile, &BTreeSet::new()).await.expect_err("markers unlisted");
