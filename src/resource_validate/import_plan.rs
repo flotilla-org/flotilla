@@ -53,8 +53,7 @@ pub(super) const PLAN: &[(&str, Plan)] = &[
     ("Repository", Plan::Imported("Repository import (#3824 layer 3a)")),
     ("FulfilmentKind", Plan::Imported("placement import (#3824 layer 4a)")),
     ("Host", Plan::Moving("#3824 layer 4c")),
-    // Converted into FulfilmentKinds of the same names, not dropped (ADR 0046 carry, 2026-10-26);
-    // their settings are code constants (2026-10-27).
+    // Each policy becomes a FulfilmentKind of its name.
     ("PlacementPolicy", Plan::Imported("placement import (#3824 layer 4a)")),
     ("ChangeRequest", Plan::Moving("#3824 layer 5")),
     ("Issue", Plan::Moving("#3824 layer 5")),

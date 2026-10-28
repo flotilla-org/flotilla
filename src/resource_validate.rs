@@ -320,7 +320,6 @@ async fn validate_daemon_with_preview(
     let repositories = repository_documents.rehearse();
     failed |= probes.require_import && !repositories.refused.is_empty();
     repository_import::print(&repositories);
-    // Placement likewise, each policy into a kind of its name (#3824 layer 4a).
     let placement = placement_documents.rehearse();
     failed |= probes.require_import && !placement.refused.is_empty();
     placement_import::print(&placement);
