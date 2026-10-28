@@ -84,3 +84,64 @@ async fn the_engine_keeps_the_artifact_contract() {
     contract(&backend).await;
     assert!(backend.store().list_raw(flotilla_store::ResourceKind::of::<Artifact>(), NS).await.expect("old rows").items.is_empty());
 }
+
+fn home(directory: &tempfile::TempDir, home: &str) -> (Arc<Service>, Arc<EngineArtifacts>) {
+    let mut kinds = flotilla_schema::KindRegistry::new();
+    flotilla_provisioning::stored::artifact::register(&mut kinds).expect("register");
+    let service = Arc::new(Service::open(&directory.path().join(format!("{home}.sqlite")), home, kinds).expect("store"));
+    let records = EngineArtifacts::open(Arc::clone(&service), Arc::new(SystemClock) as Arc<dyn Clock>).expect("open");
+    (service, Arc::new(records))
+}
+
+/// One round of `from`'s stream applied at `to`, as a follower does; a reset round when `cursor` is none.
+fn pump(from: &Service, from_home: &str, to: &Service, cursor: Option<u64>) -> u64 {
+    let mut frames = Vec::new();
+    let next = from
+        .serve(cursor, flotilla_schema::Timestamp::from_datetime(&Utc::now()), |frame| {
+            frames.push(frame.to_vec());
+            Ok(())
+        })
+        .expect("serve");
+    to.with_store(|store| {
+        flotilla_schema_sqlite::stream::Follower::new(store).receive(from_home, |sink| frames.iter().try_for_each(|frame| sink(frame)))
+    })
+    .expect("follow");
+    next
+}
+
+// Behaviour (one home writes, every home reads): an artifact another home wrote reads at this home
+// once its log arrives; a name both homes hold reads as this home's own, every home's copies are
+// listed as sources, and only this home's own copy is deleted here.
+#[tokio::test]
+async fn another_homes_artifacts_read_here_and_this_homes_own_win() {
+    use flotilla_resources::engine_records::EngineRecords;
+    let directory = tempfile::tempdir().expect("temp dir");
+    let (zeta, zeta_records) = home(&directory, "zeta");
+    let (beta, beta_records) = home(&directory, "beta");
+    let put = |records: &Arc<EngineArtifacts>, name: &'static str, digest: &'static str| {
+        let records = Arc::clone(records);
+        async move {
+            let value = serde_json::to_value(spec("demo", digest)).expect("spec");
+            records.apply("Artifact", name, &BTreeMap::new(), &BTreeMap::new(), value).await.expect("put")
+        }
+    };
+    put(&beta_records, "shared", "beta").await;
+    put(&beta_records, "remote", "beta").await;
+    put(&zeta_records, "shared", "zeta").await;
+    let cursor = pump(&beta, "beta", &zeta, None);
+
+    let digest = |object: Option<flotilla_resources::engine_records::EngineObject>| {
+        object.map(|object| (object.home, object.spec["digest"].as_str().unwrap_or_default().to_owned()))
+    };
+    assert_eq!(digest(zeta_records.get("Artifact", "shared").await.expect("get")), Some(("zeta".into(), "zeta".into())));
+    assert_eq!(digest(zeta_records.get("Artifact", "remote").await.expect("get")), Some(("beta".into(), "beta".into())));
+    assert_eq!(zeta_records.list("Artifact").await.expect("list").len(), 2);
+    assert_eq!(zeta_records.sources("Artifact").await.expect("sources").len(), 3);
+
+    zeta_records.delete("Artifact", "shared").await.expect("delete own");
+    zeta_records.delete("Artifact", "remote").await.expect("another home's copy is not this home's to delete");
+    assert_eq!(digest(zeta_records.get("Artifact", "shared").await.expect("get")), Some(("beta".into(), "beta".into())));
+    beta_records.delete("Artifact", "remote").await.expect("delete at its home");
+    pump(&beta, "beta", &zeta, Some(cursor));
+    assert_eq!(zeta_records.get("Artifact", "remote").await.expect("get"), None);
+}

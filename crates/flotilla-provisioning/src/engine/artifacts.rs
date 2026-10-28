@@ -175,6 +175,7 @@ impl EngineArtifacts {
     /// Writes this home's record `name` as `value`, created or replaced, re-reading and trying
     /// again when another writer of the name wins the race.
     fn write(&self, name: &str, value: &ArtifactRecord) -> Result<EngineObject, String> {
+        let mut lost = None;
         for _ in 0..WRITE_ATTEMPTS {
             let current = self.log.get::<ArtifactRecord>(name, &self.home).map_err(|error| error.to_string())?;
             let written = match current {
@@ -183,11 +184,12 @@ impl EngineArtifacts {
             };
             match written {
                 Ok(version) => return object(name.to_owned(), self.home.clone(), version, value),
-                Err(PlainError::Conflict { .. } | PlainError::Exists { .. } | PlainError::Missing { .. }) => continue,
+                Err(error @ (PlainError::Conflict { .. } | PlainError::Exists { .. } | PlainError::Missing { .. })) => lost = Some(error),
                 Err(error) => return Err(format!("write {KIND} {name}: {error}")),
             }
         }
-        Err(format!("write {KIND} {name}: lost {WRITE_ATTEMPTS} races with concurrent writers"))
+        let last = lost.map(|error| error.to_string()).unwrap_or_default();
+        Err(format!("write {KIND} {name}: lost {WRITE_ATTEMPTS} races with concurrent writers, the last: {last}"))
     }
 }
 
