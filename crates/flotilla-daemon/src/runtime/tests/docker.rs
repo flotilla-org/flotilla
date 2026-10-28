@@ -1390,14 +1390,14 @@ async fn cloud_image_probe_refuses_missing_harness() {
         destroyed: Arc::new(AtomicBool::new(false)),
     });
     let bag = EnvironmentBag::new();
-    assert!(super::super::docker::verify_cloud_image_needs(&BTreeSet::new(), "cloud-image", &handle, &bag, &Default::default())
+    assert!(super::super::provider_path::verify_cloud_image_needs(&BTreeSet::new(), "cloud-image", &handle, &bag, &Default::default())
         .await
         .is_ok());
     let needs = [flotilla_resources::CapabilityNeed::Harness { adapter: "missing-harness".into(), minimum_version: "1.0.0".into() }]
         .into_iter()
         .collect();
     let error =
-        super::super::docker::verify_cloud_image_needs(&needs, "cloud-image", &handle, &bag, &Default::default()).await.unwrap_err();
+        super::super::provider_path::verify_cloud_image_needs(&needs, "cloud-image", &handle, &bag, &Default::default()).await.unwrap_err();
     assert!(error.contains("missing-harness"), "{error}");
 }
 

@@ -6,11 +6,7 @@
 //! never interprets a reach, opens SSH or names a provider.
 mod connector;
 mod observations;
-use super::{
-    agent::{AgentRunner, ForwardFailure},
-    vessel_ops::UnavailableAgent,
-    *,
-};
+use super::{agent::AgentRunner, vessel_ops::UnavailableAgent, *};
 use crate::environment::runner::{contained_credential_exclusions, CONTAINED_CODEX_HOME, CONTAINED_WRITABLE_CONFIG_BASE};
 use ::drydock::{
     agent::{AgentLink, AgentReach, AgentReport},
@@ -196,41 +192,18 @@ impl DrydockEnvironmentProvider {
         }))
     }
 
-    /// Bring the vessel to what this provision asks: its environment, its tools
-    /// pushed, its sockets forwarded and the lab service reachable, all through
-    /// the agent. Every step is idempotent, so re-adoption runs it again.
-    async fn set_up(&self, handle: &DrydockEnvironment, tools: &[EnvironmentTool]) -> Result<(), String> {
+    /// Bring the vessel to what this provision asks: its environment and the lab
+    /// service reachable, through the agent. Every step is idempotent, so
+    /// re-adoption runs it again. Tools and sockets are the vessel layer's.
+    async fn set_up(&self, handle: &DrydockEnvironment) -> Result<(), String> {
         let agent = handle.agent.as_ref().ok_or("inventory handle has no vessel agent")?;
         let environment = handle.env.read().expect("environment").clone();
         agent.configure_environment(environment).await?;
-        // A socket is a guest forward to the controller. Writable shared material
-        // has no host mount here: the guest gets an initial copy.
-        let mut pushed = Vec::with_capacity(tools.len());
-        for tool in tools {
-            let mut tool = tool.clone();
-            for asset in std::mem::take(&mut tool.assets) {
-                if asset.kind == EnvironmentToolAssetKind::UnixSocket {
-                    forward_socket(agent, &asset).await.map_err(|failure| failure.to_string())?;
-                } else {
-                    tool.assets.push(EnvironmentToolAsset { access: EnvironmentToolAssetAccess::ReadOnly, ..asset });
-                }
-            }
-            pushed.push(tool);
-        }
-        VesselAgent::push_tools(agent, &pushed).await?;
         if let Some((hostname, port)) = &self.lab_reach {
             forward_lab(agent, hostname, *port, &self.lab_guest).await?;
         }
         ensure_directory(agent, &handle.capabilities.workspace_root).await
     }
-}
-
-/// The guest socket of `asset` serves the controller socket it names.
-async fn forward_socket(agent: &AgentRunner, asset: &EnvironmentToolAsset) -> Result<(), ForwardFailure> {
-    let guest = asset.environment_path.as_path();
-    let id = format!("socket-{}", &format!("{:x}", sha2::Sha256::digest(guest.as_os_str().as_encoded_bytes()))[..16]);
-    let forward = GuestForward { id, unix: guest.into(), tcp: None };
-    agent.put_guest_forward(forward, Endpoint::Unix(asset.host_path.as_path().into())).await
 }
 
 /// The lab service, reached from the controller, at its own name and port 443
@@ -351,6 +324,9 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
         if !opts.provisioned_mounts.is_empty() {
             return Err("cloud sandbox does not support Shared material".into());
         }
+        if !opts.tools.is_empty() {
+            return Err("cloud sandbox tools are delivered by the vessel layer, through the agent".into());
+        }
         let keydir = key_dir(&self.directory, &id);
         ::drydock::local::private_dir(&keydir)?;
         let public = if keydir.join("id_ed25519.pub").is_file() && keydir.join("id_ed25519").is_file() {
@@ -382,49 +358,20 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
         };
         let mut env = prepared.spec.env.clone();
         env.extend(opts.tokens);
-        // Retired control entries may remain in preceding-generation records.
-        // They are never guest variables, even while those records decode.
-        env.retain(|name, _| {
-            !matches!(
-                name.as_str(),
-                "FLOTILLA_REQUIRED_AGENT_ADAPTERS"
-                    | "FLOTILLA_CLOUD_IMAGE_NEEDS"
-                    | "FLOTILLA_DRYDOCK_LAB_FORWARD"
-                    | flotilla_resources::CREDENTIAL_REFS_ENV
-                    | flotilla_resources::CREDENTIAL_SCOPES_ENV
-                    | flotilla_resources::CREDENTIAL_PERMISSIONS_ENV
-                    | flotilla_resources::CREW_SKILLS_ENV
-                    | flotilla_resources::RETIRED_CREW_HOME_KEYS_ENV
-            )
-        });
-        for tool in &opts.tools {
-            for update in &tool.environment {
-                match update {
-                    EnvironmentVariableUpdate::Set { name, value, .. } => {
-                        env.insert(name.clone(), value.clone());
-                    }
-                    EnvironmentVariableUpdate::PrependPath { name, value } => {
-                        let existing =
-                            env.get(name).map(String::as_str).unwrap_or("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-                        env.insert(name.clone(), format!("{value}:{existing}"));
-                    }
-                }
-            }
-        }
         let active = self.active.lock().await.get(&id).and_then(std::sync::Weak::upgrade);
         if let Some(handle) = active {
             if handle.backing == environment.id && handle.image.as_str() == prepared.spec.image {
                 handle.created_for_setup.store(false, std::sync::atomic::Ordering::Release);
-                // Re-adoption must apply rotated tokens and tool environments.
+                // Re-adoption must apply rotated tokens.
                 *handle.env.write().expect("environment") = env;
-                self.set_up(&handle, &opts.tools).await.map_err(EnvironmentProvisionError::RetryAdoption)?;
+                self.set_up(&handle).await.map_err(EnvironmentProvisionError::RetryAdoption)?;
                 return Ok(handle);
             }
         }
         let handle = self.handle(environment, prepared.spec.image.clone(), env, true)?;
         handle.created_for_setup.store(created, std::sync::atomic::Ordering::Release);
         let setup = async {
-            self.set_up(&handle, &opts.tools).await?;
+            self.set_up(&handle).await?;
             // Checkpoints are advisory recovery material. Neither the first archive
             // nor a refresh may delay adoption or trigger setup rollback.
             let checkpoint = keydir.join("checkpoint.tar");

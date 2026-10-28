@@ -124,6 +124,19 @@ impl ControllerRuntimeState {
         Ok(address)
     }
 
+    /// The provider instance that owns the Environment `name`.
+    pub(super) async fn provider_for_environment(
+        &self,
+        name: &str,
+    ) -> Result<Arc<dyn flotilla_environment::environment::EnvironmentProvider>, String> {
+        use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
+        let environment =
+            self.daemon.resource_backend().using::<Environment>(&self.namespace).get(name).await.map_err(|error| error.to_string())?;
+        let instance = environment.metadata.labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str);
+        let address = self.provider_address(name, &environment.spec, instance).await?;
+        self.environment_providers.get(&address)
+    }
+
     pub(super) fn with_environment_sockets(mut self, sockets: Option<EnvironmentSocketService>) -> Self {
         self.environment_sockets = sockets;
         self

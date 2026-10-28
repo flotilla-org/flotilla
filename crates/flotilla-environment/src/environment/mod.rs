@@ -286,6 +286,18 @@ pub trait VesselAgent: Send + Sync {
     async fn ready(&self) -> Result<(), String>;
     async fn forward_socket(&self, guest: &Path) -> Result<PathBuf, String>;
     async fn push_tools(&self, tools: &[EnvironmentTool]) -> Result<(), String>;
+    /// Serve the socket `guest` in the vessel, carrying each connection to the
+    /// controller's Unix socket `controller`: the reverse of [`Self::forward_socket`].
+    async fn forward_controller_socket(&self, guest: &Path, controller: &Path) -> Result<(), String> {
+        let _ = controller;
+        Err(format!("this vessel agent cannot serve {} from the controller", guest.display()))
+    }
+    /// Add `environment` to what every command in the vessel runs with, over
+    /// what its provider configured there.
+    async fn extend_environment(&self, environment: std::collections::BTreeMap<String, String>) -> Result<(), String> {
+        let _ = environment;
+        Err("this vessel agent cannot configure its environment".into())
+    }
     /// Run commands in the vessel, through the agent.
     fn commands(&self) -> Arc<dyn CommandRunner>;
     /// The base under which this vessel's writable state lives: the contained

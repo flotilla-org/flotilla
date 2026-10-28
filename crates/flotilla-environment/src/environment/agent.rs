@@ -419,6 +419,18 @@ impl AgentRunner {
         Ok(())
     }
 
+    /// Add `environment` to what the vessel's commands run with, over what is
+    /// already configured there.
+    pub async fn extend_environment(&self, environment: BTreeMap<String, String>) -> Result<(), String> {
+        let client = self.client().await?;
+        let mut state = self.state.lock().await;
+        let mut config = state.configuration.clone();
+        config.environment.extend(environment);
+        state.etag = Some(client.configure(config.clone()).await.map_err(|e| e.to_string())?);
+        state.configuration = config;
+        Ok(())
+    }
+
     /// A guest-side socket at `guest` whose connections reach the Unix socket
     /// `host` on the controller. The agent listens; every stream is opened over this
     /// handle's own link, so the forward serves nothing while no controller
@@ -715,6 +727,14 @@ impl VesselAgent for Arc<AgentRunner> {
     }
     async fn push_tools(&self, tools: &[EnvironmentTool]) -> Result<(), String> {
         AgentRunner::push_tools(self, tools).await
+    }
+    async fn forward_controller_socket(&self, guest: &Path, controller: &Path) -> Result<(), String> {
+        let id = format!("socket-{}", &format!("{:x}", Sha256::digest(guest.as_os_str().as_encoded_bytes()))[..16]);
+        let forward = GuestForward { id, unix: guest.into(), tcp: None };
+        self.put_guest_forward(forward, Endpoint::Unix(controller.into())).await.map_err(|failure| failure.to_string())
+    }
+    async fn extend_environment(&self, environment: BTreeMap<String, String>) -> Result<(), String> {
+        AgentRunner::extend_environment(self, environment).await
     }
     async fn forward_socket(&self, guest: &Path) -> Result<PathBuf, String> {
         if !guest.is_absolute() {

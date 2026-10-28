@@ -649,7 +649,7 @@ impl VesselReconciler {
         };
         // A composed image installs exactly the harnesses its roles resolve
         // to; interior discovery verifies them instead of the policy's list.
-        if composed_image(&placement_policy, None).is_some() || placement_policy.spec.cloud_sandbox_per_vessel.is_some() {
+        if composed_image(&placement_policy, None).is_some() {
             declared_agent_adapters.clone_from(&required_adapters);
         }
         let effective_stance = strategy.effective_stance();
@@ -756,21 +756,21 @@ impl VesselReconciler {
                         }
                     }
                     Err(ResourceError::NotFound { .. }) => {
-                        let (image_ref, image_build_ref) = match environment_image(image, &self.image_baselines).await {
-                            Ok(image) => image,
-                            Err(message) => return Ok(VesselPrepared::failed(message)),
-                        };
-                        actuations.push(Actuation::CreateEnvironment {
-                            meta: owned_child_meta(&env_name, obj, environment_provider_labels(&placement_policy)),
-                            spec: cloud_environment_spec(
-                                &placement_policy,
-                                requirement
-                                    .crew
-                                    .iter()
-                                    .flat_map(|crew| &crew.needs)
-                                    .filter(|need| need.requires_guest_probe())
-                                    .cloned()
-                                    .collect(),
+                        let probe_needs = requirement
+                            .crew
+                            .iter()
+                            .flat_map(|crew| &crew.needs)
+                            .filter(|need| need.requires_guest_probe())
+                            .cloned()
+                            .collect();
+                        let spec = match cloud_environment_spec(&placement_policy, probe_needs) {
+                            Some(Ok(spec)) => spec,
+                            Some(Err(message)) => return Ok(VesselPrepared::failed(message)),
+                            None => {
+                                let (image_ref, image_build_ref) = match environment_image(image, &self.image_baselines).await {
+                                    Ok(image) => image,
+                                    Err(message) => return Ok(VesselPrepared::failed(message)),
+                                };
                                 EnvironmentSpec {
                                     cloud_sandbox: None,
                                     provider_address: Some(
@@ -823,8 +823,12 @@ impl VesselReconciler {
                                             &requirement.credential_permissions,
                                         ),
                                     }),
-                                },
-                            ),
+                                }
+                            }
+                        };
+                        actuations.push(Actuation::CreateEnvironment {
+                            meta: owned_child_meta(&env_name, obj, environment_provider_labels(&placement_policy)),
+                            spec,
                         });
                         return Ok(VesselPrepared::provisioning(
                             &placement_policy,
@@ -1256,69 +1260,59 @@ impl VesselReconciler {
                         };
                         actuations.push(Actuation::CreateEnvironment {
                             meta: owned_child_meta(&env_name, obj, environment_provider_labels(&placement_policy)),
-                            spec: cloud_environment_spec(
-                                &placement_policy,
-                                requirement
-                                    .crew
-                                    .iter()
-                                    .flat_map(|crew| &crew.needs)
-                                    .filter(|need| need.requires_guest_probe())
-                                    .cloned()
-                                    .collect(),
-                                EnvironmentSpec {
-                                    cloud_sandbox: None,
-                                    provider_address: Some(
-                                        flotilla_address::Address::root(flotilla_address::Kind::Host, host_ref)
-                                            .and_then(|place| {
-                                                place.child(
-                                                    flotilla_address::Kind::Provider,
-                                                    environment_provider_labels(&placement_policy)
-                                                        .get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL)
-                                                        .map(String::as_str)
-                                                        .unwrap_or("docker"),
+                            spec: EnvironmentSpec {
+                                cloud_sandbox: None,
+                                provider_address: Some(
+                                    flotilla_address::Address::root(flotilla_address::Kind::Host, host_ref)
+                                        .and_then(|place| {
+                                            place.child(
+                                                flotilla_address::Kind::Provider,
+                                                environment_provider_labels(&placement_policy)
+                                                    .get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL)
+                                                    .map(String::as_str)
+                                                    .unwrap_or("docker"),
+                                            )
+                                        })
+                                        .map_err(|error| ResourceError::other(error.to_string()))?,
+                                ),
+                                host_direct: None,
+                                docker: Some(DockerEnvironmentSpec {
+                                    image_build_ref,
+                                    memory_policy: placement_policy
+                                        .spec
+                                        .docker_per_vessel
+                                        .as_ref()
+                                        .map(|policy| policy.memory_policy.clone())
+                                        .unwrap_or_default(),
+                                    host_ref: host_ref.clone(),
+                                    image: image_ref.clone(),
+                                    declared_agent_adapters: declared_agent_adapters.clone(),
+                                    required_agent_adapters: required_adapters.clone(),
+                                    pull_policy: *pull_policy,
+                                    mounts,
+                                    env: environment_with_credentials(
+                                        {
+                                            let mut env = env.clone();
+                                            env.insert(
+                                                flotilla_resources::CREW_SKILLS_ENV.to_string(),
+                                                serde_json::to_string(
+                                                    &requirement
+                                                        .crew
+                                                        .iter()
+                                                        .filter(|crew| matches!(crew.source, CrewSource::Agent { .. }))
+                                                        .map(|crew| (&crew.role, &crew.skills.selected))
+                                                        .collect::<BTreeMap<_, _>>(),
                                                 )
-                                            })
-                                            .map_err(|error| ResourceError::other(error.to_string()))?,
+                                                .expect("serialize resolved skills"),
+                                            );
+                                            env
+                                        },
+                                        &requirement.credential_refs,
+                                        &requirement.credential_scopes,
+                                        &requirement.credential_permissions,
                                     ),
-                                    host_direct: None,
-                                    docker: Some(DockerEnvironmentSpec {
-                                        image_build_ref,
-                                        memory_policy: placement_policy
-                                            .spec
-                                            .docker_per_vessel
-                                            .as_ref()
-                                            .map(|policy| policy.memory_policy.clone())
-                                            .unwrap_or_default(),
-                                        host_ref: host_ref.clone(),
-                                        image: image_ref.clone(),
-                                        declared_agent_adapters: declared_agent_adapters.clone(),
-                                        required_agent_adapters: required_adapters.clone(),
-                                        pull_policy: *pull_policy,
-                                        mounts,
-                                        env: environment_with_credentials(
-                                            {
-                                                let mut env = env.clone();
-                                                env.insert(
-                                                    flotilla_resources::CREW_SKILLS_ENV.to_string(),
-                                                    serde_json::to_string(
-                                                        &requirement
-                                                            .crew
-                                                            .iter()
-                                                            .filter(|crew| matches!(crew.source, CrewSource::Agent { .. }))
-                                                            .map(|crew| (&crew.role, &crew.skills.selected))
-                                                            .collect::<BTreeMap<_, _>>(),
-                                                    )
-                                                    .expect("serialize resolved skills"),
-                                                );
-                                                env
-                                            },
-                                            &requirement.credential_refs,
-                                            &requirement.credential_scopes,
-                                            &requirement.credential_permissions,
-                                        ),
-                                    }),
-                                },
-                            ),
+                                }),
+                            },
                         });
                         return Ok(VesselPrepared::provisioning(
                             &placement_policy,
@@ -1927,38 +1921,33 @@ fn checkout_target_path(repo_default_dir: &str, convoy_slug: &str, repo_slug: &s
     format!("{}/{}/{}.{}", repo_default_dir.trim_end_matches('/'), convoy_slug, repo_slug, branch_slug)
 }
 
-// The existing contained staging plan is runtime-only. Persist the approved
-// cloud input, never a Docker input, for a cloud policy.
+/// A cloud sandbox is provisioned by its own provider instance from typed
+/// inputs alone: no Docker spec, and nothing smuggled through its env (#3981).
+/// `None` for any other placement.
 fn cloud_environment_spec(
     policy: &ResourceObject<PlacementPolicy>,
     probe_needs: BTreeSet<flotilla_resources::CapabilityNeed>,
-    mut spec: EnvironmentSpec,
-) -> EnvironmentSpec {
-    if let Some(cloud) = &policy.spec.cloud_sandbox_per_vessel {
-        let docker = spec.docker.take().expect("contained staging input");
-        if let Some(instance) = environment_provider_labels(policy).get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL) {
-            spec.provider_address = Some(
-                flotilla_address::Address::root(flotilla_address::Kind::Account, instance)
-                    .and_then(|a| a.child(flotilla_address::Kind::Provider, instance))
-                    .expect("validated instance address"),
-            );
-        }
-        spec.cloud_sandbox = Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+) -> Option<Result<EnvironmentSpec, String>> {
+    let cloud = policy.spec.cloud_sandbox_per_vessel.as_ref()?;
+    let address = environment_provider_labels(policy)
+        .get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL)
+        .ok_or_else(|| format!("cloud placement policy {} names no provider instance", policy.metadata.name))
+        .and_then(|instance| {
+            flotilla_address::Address::root(flotilla_address::Kind::Account, instance)
+                .and_then(|account| account.child(flotilla_address::Kind::Provider, instance))
+                .map_err(|error| error.to_string())
+        });
+    Some(address.map(|address| EnvironmentSpec {
+        provider_address: Some(address),
+        cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
             image: cloud.image.clone(),
             size: cloud.size.clone(),
             lifetime_cap_seconds: None,
             probe_needs,
-            env: {
-                let mut env = docker.env;
-                env.insert(
-                    "FLOTILLA_REQUIRED_AGENT_ADAPTERS".into(),
-                    serde_json::to_string(&docker.required_agent_adapters).expect("adapter names serialize"),
-                );
-                env
-            },
-        });
-    }
-    spec
+            env: cloud.env.clone(),
+        }),
+        ..EnvironmentSpec::default()
+    }))
 }
 
 fn environment_provider_labels(policy: &ResourceObject<PlacementPolicy>) -> BTreeMap<String, String> {
@@ -2320,37 +2309,28 @@ mod tests {
         );
     }
 
-    // #3765 B2: cloud staging stores typed probe needs and preserves the existing
-    // adapter env control until per-member preparation lands in #3785. One example covers this thin mapping.
+    // #3981: a cloud vessel's Environment names its provider instance and carries
+    // typed inputs only: no Docker spec, and no carrier control in its env.
     #[test]
-    fn cloud_staging_uses_declared_request_fields() {
+    fn cloud_environment_is_typed_provider_input() {
         use super::cloud_environment_spec;
-        use flotilla_resources::{EnvironmentSpec, ResourceObject};
+        use flotilla_resources::ResourceObject;
         let policy: ResourceObject<PlacementPolicy> = serde_json::from_value(serde_json::json!({
-            "metadata": { "name": "cloud", "namespace": "flotilla", "resource_version": "1", "labels": {}, "annotations": {}, "creation_timestamp": "2026-10-23T00:00:00Z" },
+            "metadata": { "name": "cloud", "namespace": "flotilla", "resource_version": "1", "annotations": {},
+                "labels": { "flotilla.work/environment-provider-instance": "daytona" }, "creation_timestamp": "2026-10-23T00:00:00Z" },
             "spec": { "pool": "cleat", "cloud_sandbox_per_vessel": {
                 "image": "image@sha256:digest", "size": { "cpus": 2, "memory_bytes": 1024, "disk_bytes": 2048 },
-                "checkout": "clone_in_vessel", "env": {} }
+                "checkout": "clone_in_vessel", "env": { "LANG": "C.UTF-8" } }
             }
         }))
         .unwrap();
-        let input = EnvironmentSpec {
-            docker: Some(
-                serde_json::from_value(serde_json::json!({
-                    "host_ref": "controller", "image": "carrier", "declared_agent_adapters": ["codex", "claude-code"],
-                    "required_agent_adapters": ["codex"], "env": { "LANG": "C.UTF-8" }
-                }))
-                .unwrap(),
-            ),
-            ..Default::default()
-        };
-        let needs = ["toolchain:rust".parse().unwrap()].into_iter().collect();
-        let mapped = cloud_environment_spec(&policy, needs, input);
-        assert!(mapped.docker.is_none());
-        let cloud = mapped.cloud_sandbox.unwrap();
-        assert_eq!(cloud.env["FLOTILLA_REQUIRED_AGENT_ADAPTERS"], r#"["codex"]"#);
-        assert_eq!(cloud.probe_needs, ["toolchain:rust".parse().unwrap()].into_iter().collect());
-        assert_eq!(cloud.env["LANG"], "C.UTF-8");
+        let needs: BTreeSet<flotilla_resources::CapabilityNeed> = ["toolchain:rust".parse().unwrap()].into_iter().collect();
+        let spec = cloud_environment_spec(&policy, needs.clone()).expect("a cloud policy").expect("a typed spec");
+        assert!(spec.docker.is_none() && spec.host_direct.is_none());
+        assert_eq!(spec.provider_address.unwrap().to_string(), "account:daytona/provider:daytona");
+        let cloud = spec.cloud_sandbox.unwrap();
+        assert_eq!(cloud.probe_needs, needs);
+        assert_eq!(cloud.env, [("LANG".to_string(), "C.UTF-8".to_string())].into());
     }
 
     #[test]
