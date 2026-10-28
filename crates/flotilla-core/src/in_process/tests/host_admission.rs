@@ -381,6 +381,7 @@ async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_rep
         .check_remote_placement_free_space_floor(
             "flotilla",
             Some(&PlacementDecision {
+                provider_instance: None,
                 provider_workspace_root: None,
                 minimal_alternatives: Vec::new(),
                 escalation_reason: None,
@@ -483,6 +484,7 @@ async fn self_targeted_admission_resolves_display_name_policy_to_live_local_host
         .check_remote_placement_free_space_floor(
             "flotilla",
             Some(&PlacementDecision {
+                provider_instance: None,
                 provider_workspace_root: None,
                 minimal_alternatives: Vec::new(),
                 escalation_reason: None,
@@ -623,6 +625,7 @@ async fn admitting_host_floor_gates_only_work_that_lands_on_it() {
     .await;
     let local = daemon.local_host_id().expect("host id").to_string();
     let decision = |host: &str| PlacementDecision {
+        provider_instance: None,
         provider_workspace_root: None,
         kind: format!("host-direct-{host}"),
         target_host: PlacementTargetHost { reference: flotilla_protocol::CanonicalHostId::resolved(host), display_name: host.into() },
@@ -885,6 +888,7 @@ async fn capped_ssh_hosts_spread_unpinned_convoys_and_queue_beyond_their_cap() {
         let selected = placement.selected.expect("unpinned placement");
         // Admission records the decision on the convoy it creates.
         let decision = PlacementDecision {
+            provider_instance: None,
             minimal_alternatives: Vec::new(),
             escalation_reason: None,
             kind: selected.metadata.name.clone(),
@@ -1014,6 +1018,7 @@ async fn placement_prefers_the_capped_host_with_most_free_slots() {
         let convoy =
             convoys.create(&test_meta(&name), &ConvoySpec::builder().workflow_ref("missing".to_string()).build()).await.expect("convoy");
         let decision = PlacementDecision {
+            provider_instance: None,
             minimal_alternatives: Vec::new(),
             escalation_reason: None,
             kind: selected.metadata.name.clone(),
@@ -1075,6 +1080,7 @@ async fn concurrent_admissions_onto_one_free_slot_provision_in_admission_order()
             .expect("placement");
         let selected = placement.selected.expect("unpinned placement");
         decisions.push(PlacementDecision {
+            provider_instance: None,
             minimal_alternatives: Vec::new(),
             escalation_reason: None,
             kind: selected.metadata.name.clone(),
@@ -1179,6 +1185,7 @@ async fn admit(daemon: &InProcessDaemon, backend: &ResourceBackend, name: &str, 
         .expect("the convoy is admitted without escalation");
     let selected = placement.selected.expect("unpinned placement");
     let decision = PlacementDecision {
+        provider_instance: None,
         minimal_alternatives: alternatives,
         escalation_reason: None,
         kind: selected.metadata.name.clone(),

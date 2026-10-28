@@ -70,6 +70,7 @@ pub const ENSURED_FROM_ANNOTATION: &str = "flotilla.work/ensured-from";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VesselPlacementPin {
+    // Drop the alias one roll after the rename.
     #[serde(alias = "policy_ref")]
     pub kind_ref: String,
     pub decision: PlacementDecision,
@@ -4300,6 +4301,7 @@ mod admission_tests {
         let alternatives = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
         let escalation = tc.draw(gs::booleans());
         let decision = PlacementDecision {
+            provider_instance: None,
             provider_workspace_root: None,
             kind: format!("policy-{identity}"),
             target_host: PlacementTargetHost {

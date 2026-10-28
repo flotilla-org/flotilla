@@ -166,6 +166,16 @@ pub fn placement_host_ref(policy: &ResourceObject<PlacementPolicy>) -> Option<&s
         .or_else(|| policy.spec.docker_per_vessel.as_ref().map(|spec| spec.host_ref.as_str()))
 }
 
+/// The provider instance frozen on `policy`, once admission has resolved one.
+pub fn provider_instance(policy: &ResourceObject<PlacementPolicy>) -> Option<&str> {
+    policy
+        .spec
+        .provider_requirements
+        .as_ref()
+        .and_then(|requirements| requirements.instance.as_deref())
+        .or_else(|| policy.metadata.labels.get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str))
+}
+
 pub async fn placement_target_host(
     backend: &ResourceBackend,
     namespace: &str,
@@ -173,9 +183,7 @@ pub async fn placement_target_host(
 ) -> Result<PlacementTargetHost, String> {
     if policy.spec.cloud_sandbox_per_vessel.is_some() {
         let hosts = backend.including_replicas::<flotilla_resources::Host>(namespace).list().await.map_err(|e| e.to_string())?;
-        let instance = policy.spec.provider_requirements.as_ref().and_then(|r| r.instance.as_deref()).or_else(|| {
-            policy.metadata.labels.get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str)
-        });
+        let instance = provider_instance(policy);
         let observed_hosts = hosts.items.iter().map(|h| h.object.metadata.name.as_str()).collect::<Vec<_>>().join(", ");
         let mut controllers = Vec::new();
         let account_classes = [flotilla_protocol::provider::EnvironmentClass::CloudSandbox];

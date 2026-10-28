@@ -47,6 +47,7 @@ pub struct PlacementTargetHost {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder, flotilla_schema::Describe)]
 pub struct PlacementRefusal {
+    // Drop the alias one roll after the rename.
     #[serde(alias = "policy_name")]
     pub kind: String,
     pub target_host: PlacementTargetHost,
@@ -55,6 +56,7 @@ pub struct PlacementRefusal {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder, flotilla_schema::Describe)]
 pub struct PlacementViableCandidate {
+    // Drop the alias one roll after the rename.
     #[serde(alias = "policy_name")]
     pub kind: String,
     pub target_host: PlacementTargetHost,
@@ -65,6 +67,10 @@ pub struct PlacementViableCandidate {
 pub struct PlacementDecision {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_workspace_root: Option<String>,
+    /// The identifier of the environment provider admission resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_instance: Option<String>,
+    // Drop the alias one roll after the rename.
     #[serde(alias = "policy_name")]
     pub kind: String,
     pub target_host: PlacementTargetHost,

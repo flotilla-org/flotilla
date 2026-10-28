@@ -26,6 +26,7 @@ pub struct VesselSpec {
     pub convoy_ref: String,
     /// The within-convoy vessel name (the requirement / work key, e.g. `implement`).
     pub vessel_name: String,
+    // Drop the alias one roll after the rename.
     #[serde(alias = "placement_policy_ref")]
     pub fulfilment_kind_ref: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -62,8 +63,10 @@ pub struct VesselStatus {
     pub placement_decision: Option<PlacementDecision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    // Drop the alias one roll after the rename.
     #[serde(default, alias = "observed_policy_ref", skip_serializing_if = "Option::is_none")]
     pub observed_kind_ref: Option<String>,
+    // Drop the alias one roll after the rename.
     #[serde(default, alias = "observed_policy_version", skip_serializing_if = "Option::is_none")]
     pub observed_kind_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

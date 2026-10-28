@@ -876,6 +876,7 @@ async fn capped_docker_kind_publishes_free_slots_from_the_hosts_vessels() {
         .await
         .expect("convoy");
     let decision = flotilla_protocol::PlacementDecision {
+        provider_instance: None,
         provider_workspace_root: None,
         kind: format!("host-direct-{host_id}"),
         target_host: flotilla_protocol::PlacementTargetHost {

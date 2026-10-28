@@ -1886,6 +1886,7 @@ mod tests {
     #[test]
     fn convoy_and_vessel_details_render_placement_decisions_with_refusals() {
         let decision = flotilla_protocol::PlacementDecision {
+            provider_instance: None,
             provider_workspace_root: None,
             minimal_alternatives: Vec::new(),
             escalation_reason: None,

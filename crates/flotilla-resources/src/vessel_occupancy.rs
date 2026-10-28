@@ -190,6 +190,7 @@ mod tests {
 
     fn decision(host: &str) -> PlacementDecision {
         PlacementDecision {
+            provider_instance: None,
             kind: format!("host-direct-{host}"),
             target_host: PlacementTargetHost { reference: CanonicalHostId::resolved(host), display_name: host.into() },
             minimal_alternatives: Vec::new(),

@@ -372,6 +372,7 @@ impl AdmissionActions<'_> {
             let placement_decision = match placement.selected.as_ref() {
                 Some(selected) => match placement_target_host(self.resource_backend, &namespace, selected).await {
                     Ok(target_host) => Some(PlacementDecision {
+                        provider_instance: crate::support::provider_instance(selected).map(str::to_owned),
                         provider_workspace_root,
                         minimal_alternatives: Vec::new(),
                         escalation_reason: None,

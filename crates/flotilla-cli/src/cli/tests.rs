@@ -525,6 +525,7 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
         skills: BTreeMap::new(),
         allocation: Vec::new(),
         placement: Some(PlacementDecision {
+            provider_instance: None,
             provider_workspace_root: None,
             kind: "macos-scarce".into(),
             target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("comte"), display_name: "comte".into() },

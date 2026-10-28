@@ -2324,6 +2324,7 @@ mod tests {
     #[test]
     fn waiting_message_replaces_the_structured_host_direct_environment_name() {
         let decision = PlacementDecision {
+            provider_instance: None,
             provider_workspace_root: None,
             minimal_alternatives: Vec::new(),
             escalation_reason: None,
@@ -2358,6 +2359,7 @@ mod tests {
             })
             .build();
         let decision = PlacementDecision {
+            provider_instance: None,
             provider_workspace_root: None,
             minimal_alternatives: Vec::new(),
             escalation_reason: None,

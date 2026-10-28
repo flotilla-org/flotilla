@@ -2754,7 +2754,8 @@ async fn capability_placement_prefers_docker_and_records_pinned_escalation() {
     let docs = start_capability_convoy(&daemon, "docs-only", |_| {}).await;
     assert!(matches!(docs, CommandValue::ConvoyStarted { .. }), "{docs:?}");
     let docs = admitted_convoy(&backend, "docs-only").await;
-    assert_eq!(docs.status.expect("admitted status").placement_decision.expect("placement").kind, "docker-test");
+    let docs = docs.status.expect("admitted status").placement_decision.expect("placement");
+    assert_eq!((docs.kind.as_str(), docs.provider_instance.as_deref()), ("docker-test", Some("fixture-1")));
 
     let refused = start_capability_convoy(&daemon, "pinned-without-reason", |intent| {
         intent.placement_policy = Some("host-direct-linux".to_string());
@@ -2772,7 +2773,7 @@ async fn capability_placement_prefers_docker_and_records_pinned_escalation() {
     assert!(matches!(escalated, CommandValue::ConvoyStarted { .. }), "{escalated:?}");
     let escalated = admitted_convoy(&backend, "pinned-with-reason").await;
     let decision = escalated.status.expect("admitted status").placement_decision.expect("placement");
-    assert_eq!(decision.kind, "host-direct-linux");
+    assert_eq!((decision.kind.as_str(), decision.provider_instance.as_deref()), ("host-direct-linux", Some("fixture-0")));
     assert_eq!(decision.minimal_alternatives, ["docker-test"]);
     assert_eq!(decision.escalation_reason.as_deref(), Some("operator needs host tools"));
 }
