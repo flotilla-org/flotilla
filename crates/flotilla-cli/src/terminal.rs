@@ -206,6 +206,15 @@ pub fn exec_attach_plan(plan: &ResolvedAttachPlan) -> Result<Infallible, String>
     std::process::exit(status.code().unwrap_or(1));
 }
 
+/// Run the attach command as a child and report how it ended (`None` when a
+/// signal killed it), so the caller can tell a cleat reattach request from an
+/// ordinary end. The child keeps the terminal; its status is the only signal.
+pub fn run_attach_plan_waiting(plan: &ResolvedAttachPlan) -> Result<Option<i32>, String> {
+    let (program, args) = attach_argv(plan)?;
+    let status = Command::new(&program).args(args).status().map_err(|error| format!("could not start {program} attach hop: {error}"))?;
+    Ok(status.code())
+}
+
 /// Translate a daemon-relative plan exactly once at the client endpoint seam.
 pub fn client_attach_plan(
     endpoint: &DaemonEndpoint,

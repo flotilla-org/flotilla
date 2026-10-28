@@ -7,3 +7,4 @@ unset TMPDIR
 ci/toolchain/assert.sh
 cargo clippy -p flotilla-terminal --all-targets --locked --features cleat-environment-contract -- -D warnings
 cargo test -p flotilla-terminal --locked --lib --features cleat-environment-contract launch_environment_contract -- --nocapture
+cargo test -p flotilla-cli --locked --lib real_cleat_handover -- --ignored --nocapture
