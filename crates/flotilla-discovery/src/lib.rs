@@ -169,6 +169,9 @@ pub struct DiscoveryRuntime {
     /// composition root supplies an isolated budget (for independent harnesses).
     #[builder(default)]
     pub admission_probe: flotilla_provider_runtime::blocking_probe::BlockingProbe,
+    /// Outbound HTTP for host-level forge calls, such as GitHub App token minting.
+    #[builder(default = Arc::new(flotilla_provider_runtime::ReqwestHttpClient::new()))]
+    pub http: Arc<dyn flotilla_provider_runtime::HttpClient>,
     /// Configure before discovery; managers retain this shared detector set.
     /// Append with `Arc::get_mut` only while uniquely owned. Once shared, replace
     /// the collection to configure a new runtime; existing managers keep their set.
@@ -337,6 +340,7 @@ impl DiscoveryRuntime {
             env: Arc::new(ProcessEnvVars),
             available_space_probe: system_available_space_probe(),
             admission_probe: Default::default(),
+            http: Arc::new(flotilla_provider_runtime::ReqwestHttpClient::new()),
             host_detectors: Arc::new(detectors::default_host_detectors()),
             repo_detectors: detectors::default_repo_detectors(),
             factories: FactoryRegistry::default_all(),

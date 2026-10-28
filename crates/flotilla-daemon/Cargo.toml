@@ -96,7 +96,10 @@ libc = { workspace = true }
 flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
 drydock-agent.workspace = true
 drydock-transport.workspace = true
+flotilla-fake-forge = { path = "../flotilla-fake-forge" }
 flotilla-forge-github = { path = "../flotilla-forge-github" }
+flotilla-forgejo-providers = { path = "../flotilla-forgejo-providers" }
+flotilla-github-providers = { path = "../flotilla-github-providers" }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
 rigging-replay-testkit = { workspace = true }
 flotilla-load-driver = { path = "../flotilla-load-driver" }

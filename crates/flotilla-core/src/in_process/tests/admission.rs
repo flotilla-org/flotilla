@@ -895,7 +895,7 @@ async fn rehearsal_binding_preserves_copied_forge_data() {
         assert_eq!(bag.find_origin_forge().map(|forge| forge.https_url.as_str()), declared.then_some(service));
         assert!(flotilla_forge_github::discovery::github_repo_slug(&bag).is_err(), "real GitHub provider must decline override");
         let root = ExecutionEnvironmentPath::new(temp.path());
-        let selected = flotilla_forgejo_providers::factories::change_request::ForgejoChangeRequestFactory
+        let selected = flotilla_forgejo_providers::factories::change_request::ForgejoChangeRequestFactory::default()
             .probe(&bag, &config, &root, daemon.discovery.runner.clone())
             .await;
         assert!(selected.is_ok(), "fake Forgejo provider must be selected: {:?}", selected.err());

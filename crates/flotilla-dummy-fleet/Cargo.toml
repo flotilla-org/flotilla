@@ -25,6 +25,8 @@ flotilla-resources = { path = "../flotilla-resources" }
 flotilla-terminal = { path = "../flotilla-terminal" }
 flotilla-vcs = { path = "../flotilla-vcs" }
 async-trait.workspace = true
+bytes.workspace = true
+http.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 reqwest.workspace = true
 serde_json.workspace = true
@@ -32,6 +34,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
 flotilla-fake-forge = { path = "../flotilla-fake-forge" }
 hegeltest = "=0.48.1"
 tempfile.workspace = true

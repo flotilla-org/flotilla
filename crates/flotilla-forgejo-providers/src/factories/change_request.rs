@@ -12,12 +12,26 @@ use flotilla_discovery_api::UnmetRequirement;
 use flotilla_forge_forgejo::discovery::bounded_forgejo_provider_config;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
-use flotilla_provider_runtime::ReqwestHttpClient;
+use flotilla_provider_runtime::{HttpClient, ReqwestHttpClient};
 
 use crate::change_request::ForgejoChangeRequestProvider;
 use flotilla_change_request::ChangeRequestTracker;
 
-pub struct ForgejoChangeRequestFactory;
+pub struct ForgejoChangeRequestFactory {
+    http: Arc<dyn HttpClient>,
+}
+
+impl ForgejoChangeRequestFactory {
+    pub fn new(http: Arc<dyn HttpClient>) -> Self {
+        Self { http }
+    }
+}
+
+impl Default for ForgejoChangeRequestFactory {
+    fn default() -> Self {
+        Self::new(Arc::new(ReqwestHttpClient::new()))
+    }
+}
 
 #[async_trait]
 impl Factory for ForgejoChangeRequestFactory {
@@ -48,7 +62,7 @@ impl Factory for ForgejoChangeRequestFactory {
         let settings = config.load_config_for_probe().await.map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?;
         let provider_config = bounded_forgejo_provider_config(env, config, &settings).await?;
         let slug = env.repo_slug().ok_or_else(|| vec![UnmetRequirement::MissingRemoteHost("origin".into())])?;
-        let mut provider = ForgejoChangeRequestProvider::new(Arc::new(ReqwestHttpClient::new()), runner, provider_config, slug);
+        let mut provider = ForgejoChangeRequestProvider::new(Arc::clone(&self.http), runner, provider_config, slug);
         if let Some(login) = settings.change_request.operator_login {
             provider = provider.with_operator_login(login);
         }

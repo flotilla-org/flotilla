@@ -14,20 +14,24 @@
 //! - the dummy change-request tracker claims repositories on the dummy forge;
 //! - with `[dummy_fleet.shared_forge]`, coders instead open change requests on
 //!   a Forgejo forge every rehearsal host shares (#3374), which the ordinary
-//!   Forgejo provider observes.
+//!   Forgejo provider observes;
+//! - the real change-request and VCS providers it keeps are wrapped read-only,
+//!   and the daemon's outbound HTTP refuses writes, so stores naming real
+//!   forges cannot be written through.
 
 mod adapter;
 pub mod catalog;
 mod crew;
 mod fleet;
 mod forge;
+mod guard;
 mod shared_forge;
 mod terminal;
 mod vcs;
 
 use std::{sync::Arc, time::Duration};
 
-use flotilla_discovery::FactoryRegistry;
+use flotilla_discovery::DiscoveryRuntime;
 use flotilla_environment::{environment::dummy::DummyEnvironmentBehaviour, factories::dummy::DummyEnvironmentFactory};
 
 pub use adapter::{DummyAgentAdapter, DUMMY_AGENT_ADAPTER, DUMMY_SCRIPT_ENV};
@@ -39,10 +43,20 @@ pub use terminal::{DummyTerminalPool, DUMMY_TERMINAL_POOL};
 pub use vcs::DummyVcs;
 
 impl DummyFleet {
-    /// Add the dummy factories. Forge and VCS factories go first so they claim
-    /// their repositories and environments ahead of the real providers; each
-    /// refuses everything outside the dummy fleet.
-    pub fn install(self: &Arc<Self>, factories: &mut FactoryRegistry) {
+    /// Add the dummy factories and make the real ones read-only. Forge and VCS
+    /// factories go first so they claim their repositories and environments
+    /// ahead of the real providers; each refuses everything outside the dummy fleet.
+    pub fn install(self: &Arc<Self>, discovery: &mut DiscoveryRuntime) {
+        discovery.http = Arc::new(guard::ReadOnlyHttp(Arc::clone(&discovery.http)));
+        let factories = &mut discovery.factories;
+        factories.change_requests = std::mem::take(&mut factories.change_requests)
+            .into_iter()
+            .map(|factory| guard::GuardedFactory::wrap(factory, guard::ReadOnlyChangeRequests::guard))
+            .collect();
+        factories.vcs = std::mem::take(&mut factories.vcs)
+            .into_iter()
+            .map(|factory| guard::GuardedFactory::wrap(factory, guard::NoPushVcs::guard))
+            .collect();
         let environment = &self.config.environment;
         let weak = Arc::downgrade(self);
         // Every install comes from this same fleet Arc. Retain its first weak

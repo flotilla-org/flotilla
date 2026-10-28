@@ -233,12 +233,13 @@ impl DaemonRuntime {
         }
         let ssh_profiles = phase("discover_ssh_host_profiles", discover_ssh_host_profiles(&daemon, &config)).await;
         daemon.set_admission_free_space_path(PathBuf::from(&profile.repo_default_dir));
-        let credential_store = Arc::new(CredentialStore::new(
+        let credential_store = Arc::new(CredentialStore::new_with_http(
             daemon.resource_backend(),
             &options.namespace,
             Arc::clone(&daemon.discovery_runtime().env),
             daemon.local_environment_bag().ok_or_else(|| "local environment bag unavailable".to_string())?,
             daemon.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?,
+            Arc::clone(&daemon.discovery_runtime().http),
             config.state_dir().as_path().to_path_buf(),
         ));
         // Cleanup must precede admitting commands that can mint new staging files.

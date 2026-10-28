@@ -12,7 +12,7 @@ use flotilla_discovery_api::UnmetRequirement;
 use flotilla_forge_forgejo::discovery::bounded_forgejo_provider_config;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
-use flotilla_provider_runtime::ReqwestHttpClient;
+use flotilla_provider_runtime::{HttpClient, ReqwestHttpClient};
 
 use crate::issue_tracker::ForgejoIssueProvider;
 use flotilla_issue_tracker::IssueProvider;
@@ -21,7 +21,21 @@ use flotilla_issue_tracker::IssueProvider;
 // ForgejoIssueProviderFactory
 // ---------------------------------------------------------------------------
 
-pub struct ForgejoIssueProviderFactory;
+pub struct ForgejoIssueProviderFactory {
+    http: Arc<dyn HttpClient>,
+}
+
+impl ForgejoIssueProviderFactory {
+    pub fn new(http: Arc<dyn HttpClient>) -> Self {
+        Self { http }
+    }
+}
+
+impl Default for ForgejoIssueProviderFactory {
+    fn default() -> Self {
+        Self::new(Arc::new(ReqwestHttpClient::new()))
+    }
+}
 
 #[async_trait]
 impl Factory for ForgejoIssueProviderFactory {
@@ -41,7 +55,7 @@ impl Factory for ForgejoIssueProviderFactory {
     ) -> Result<Arc<dyn IssueProvider>, Vec<UnmetRequirement>> {
         let settings = config.load_config_for_probe().await.map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?;
         let provider_config = bounded_forgejo_provider_config(env, config, &settings).await?;
-        Ok(Arc::new(ForgejoIssueProvider::new(Arc::new(ReqwestHttpClient::new()), runner, provider_config)))
+        Ok(Arc::new(ForgejoIssueProvider::new(Arc::clone(&self.http), runner, provider_config)))
     }
 }
 
@@ -92,7 +106,7 @@ mod tests {
         let config = TestConfig::with_settings(&config_parent.join("flotilla"), example_service(None));
         let runner = Arc::new(MockRunner::new(vec![]));
 
-        let provider = ForgejoIssueProviderFactory
+        let provider = ForgejoIssueProviderFactory::default()
             .probe(&EnvironmentBag::new(), &config, &ExecutionEnvironmentPath::new("/repo"), runner)
             .await
             .expect("Forgejo issue provider should be available");
@@ -109,7 +123,7 @@ mod tests {
         let config = TestConfig::with_settings(&config_parent.join("flotilla"), example_service(Some("planner")));
         let runner = Arc::new(MockRunner::new(vec![]));
 
-        let provider = ForgejoIssueProviderFactory
+        let provider = ForgejoIssueProviderFactory::default()
             .probe(&EnvironmentBag::new(), &config, &ExecutionEnvironmentPath::new("/repo"), runner)
             .await
             .expect("Forgejo issue provider should use configured token agent");
@@ -123,7 +137,7 @@ mod tests {
         let config = TestConfig::new(&dir.path().join("flotilla"));
         let runner = Arc::new(MockRunner::new(vec![]));
 
-        let unmet = ForgejoIssueProviderFactory
+        let unmet = ForgejoIssueProviderFactory::default()
             .probe(&EnvironmentBag::new(), &config, &ExecutionEnvironmentPath::new("/repo"), runner)
             .await
             .err()
@@ -141,7 +155,7 @@ mod tests {
         let config = TestConfig::with_settings(&dir.path().join("flotilla"), settings);
         let runner = Arc::new(MockRunner::new(vec![]));
 
-        let unmet = ForgejoIssueProviderFactory
+        let unmet = ForgejoIssueProviderFactory::default()
             .probe(&EnvironmentBag::new(), &config, &ExecutionEnvironmentPath::new("/repo"), runner)
             .await
             .err()
@@ -158,7 +172,7 @@ mod tests {
         let config = TestConfig::with_settings(&dir.path().join("flotilla"), example_service(None));
         let runner = Arc::new(MockRunner::new(vec![]));
 
-        let unmet = ForgejoIssueProviderFactory
+        let unmet = ForgejoIssueProviderFactory::default()
             .probe(&EnvironmentBag::new(), &config, &ExecutionEnvironmentPath::new("/repo"), runner)
             .await
             .err()
@@ -169,7 +183,7 @@ mod tests {
 
     #[tokio::test]
     async fn forgejo_issue_provider_factory_descriptor() {
-        let desc = ForgejoIssueProviderFactory.descriptor();
+        let desc = ForgejoIssueProviderFactory::default().descriptor();
         assert_eq!(desc.backend, "forgejo");
         assert_eq!(desc.implementation, "forgejo");
         assert_eq!(desc.display_name, "Forgejo Issues");

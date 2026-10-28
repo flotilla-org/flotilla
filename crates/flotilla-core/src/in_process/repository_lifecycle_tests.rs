@@ -407,7 +407,7 @@ async fn project_issue_binding_uses_source_forge_instead_of_mirror_transport() {
     .expect("config");
     std::fs::write(temp.path().join("lab-forgejo-source-token"), "test-token\n").expect("credential");
     let mut discovery = fake_discovery(false);
-    discovery.factories.issue_trackers = vec![Box::new(ForgejoIssueProviderFactory)];
+    discovery.factories.issue_trackers = vec![Box::new(ForgejoIssueProviderFactory::default())];
     let daemon = InProcessDaemon::new(
         Vec::new(),
         Arc::new(ConfigStore::with_base(config_dir)),
