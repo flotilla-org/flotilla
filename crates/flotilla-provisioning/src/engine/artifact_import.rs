@@ -4,7 +4,7 @@
 //! |---|---|
 //! | Deleted | dropped |
 //! | `spec` | the record's columns, times to the microsecond; the summary as one document |
-//! | A summary value that is not a string, number or boolean | refused |
+//! | A summary value that is null, an array or an object | refused: a put accepts only strings, numbers and booleans |
 //! | `status.ledger_comment_creations` | dropped: nothing asks for a reservation any more |
 //! | Owner references, labels and annotations | dropped (#3212) |
 //!
@@ -54,13 +54,13 @@ pub fn rehearse_artifacts(copies: &[ArtifactCopy], report: &mut ImportReport) {
         }
     };
     let mut namespaces = BTreeMap::<(&str, &str), BTreeSet<&str>>::new();
-    for copy in copies {
+    for copy in copies.iter().filter(|copy| copy.object.metadata.deletion_timestamp.is_none()) {
         namespaces.entry((copy.object.metadata.name.as_str(), copy.home.as_str())).or_default().insert(copy.namespace.as_str());
     }
     for copy in copies {
         let name = &copy.object.metadata.name;
         let refuse = |reason: String| ImportRefusal { kind: KIND, record: name.clone(), reason: format!("at `{}`: {reason}", copy.home) };
-        let held = &namespaces[&(name.as_str(), copy.home.as_str())];
+        let held = namespaces.get(&(name.as_str(), copy.home.as_str())).cloned().unwrap_or_default();
         if held.len() > 1 {
             let held: Vec<_> = held.iter().copied().collect();
             report.refused.push(refuse(format!("held in namespaces `{}`, and the engine has no namespaces", held.join("`, `"))));

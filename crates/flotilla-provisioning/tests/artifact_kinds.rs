@@ -123,8 +123,8 @@ fn time(tc: &hegel::TestCase) -> DateTime<Utc> {
 }
 
 // Behaviour (ADR 0047, stored data rule): every artifact the previous generation could store
-// imports and reads back from the engine as the spec it was, its times to the microsecond, at its
-// home; the record's reservations, if any, are counted as dropped.
+// imports at its home, restores into the rehearsal store (which reads it back and compares), and
+// reads as the spec it was, its times to the microsecond; its reservations, if any, count as dropped.
 #[hegel::test]
 fn every_storable_artifact_imports_and_reads_back(tc: hegel::TestCase) {
     let entries = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
@@ -157,7 +157,8 @@ fn every_storable_artifact_imports_and_reads_back(tc: hegel::TestCase) {
 
 // Behaviour (ADR 0047): the corpus's artifacts import; a deleted copy drops; a copy whose summary
 // holds a value no put accepts is refused, named; one name a home holds in two namespaces is
-// refused in both (#3212: no namespaces), while the same name at two homes imports at each.
+// refused in both (#3212: no namespaces), unless one of them is deleted, while the same name at
+// two homes imports at each.
 #[test]
 fn copies_the_engine_cannot_hold_are_dropped_or_refused() {
     let corpus = corpus();
@@ -166,20 +167,25 @@ fn copies_the_engine_cannot_hold_are_dropped_or_refused() {
     deleted.metadata.deletion_timestamp = Some(Utc::now());
     let nested = object("nested", spec(BTreeMap::from([("list".to_owned(), serde_json::json!([1]))])));
     let shared = object("shared", spec(BTreeMap::new()));
+    let gone = object("gone", spec(BTreeMap::new()));
+    let mut gone_elsewhere = gone.clone();
+    gone_elsewhere.metadata.deletion_timestamp = Some(Utc::now());
     let mut copies: Vec<_> = corpus.into_iter().map(|object| copy(object, "flotilla", "alpha")).collect();
-    let imported = copies.len() + 2;
+    let imported = copies.len() + 3;
     copies.extend([
         copy(deleted, "flotilla", "alpha"),
         copy(nested, "flotilla", "alpha"),
         copy(shared.clone(), "flotilla", "alpha"),
         copy(shared.clone(), "flotilla", "beta"),
         copy(shared.clone(), "flotilla", "gamma"),
-        copy(shared, "other", "gamma"),
+        copy(shared.clone(), "other", "gamma"),
+        copy(gone.clone(), "flotilla", "delta"),
+        copy(gone_elsewhere, "other", "delta"),
     ]);
     let mut report = ImportReport::default();
     rehearse_artifacts(&copies, &mut report);
     assert_eq!(report.imported.values().sum::<usize>(), imported, "{report:?}");
-    assert_eq!(report.dropped.values().sum::<usize>(), 1, "{report:?}");
+    assert_eq!(report.dropped.values().sum::<usize>(), 2, "{report:?}");
     let refused: Vec<_> = report.refused.iter().map(|refusal| (refusal.record.as_str(), refusal.reason.contains("`gamma`"))).collect();
     assert_eq!(refused, [("nested", false), ("shared", true), ("shared", true)], "{report:?}");
 }
