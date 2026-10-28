@@ -110,8 +110,9 @@ fn settled(record: &ResourceObject<Message>) -> bool {
 }
 
 /// Whether the convoy of the role receiving an old record has ended: the
-/// delivered holder's role, else the addressed one. A role in no convoy, or
-/// one that does not map, cannot tell.
+/// delivered holder's role when recorded, since only that holder can answer,
+/// else the addressed one. A role in no convoy, or one that does not map,
+/// cannot tell.
 fn receiver_ended(record: &ResourceObject<Message>, conversion: &Conversion<'_>) -> bool {
     let delivered = record.status.as_ref().and_then(|status| status.resolved_receiver.as_ref()?.role_address.as_deref());
     let Ok(role) = conversion.inbox(delivered.unwrap_or(&record.spec.receiver)) else {

@@ -395,6 +395,8 @@ fn the_receivers_convoy_is_the_delivered_holders_else_the_addressed_roles() {
         let refusal = outcome(name).expect_err("a live or unknown convoy keeps the refusal");
         assert_eq!(refusal.record, name);
     }
+    let refusal = outcome_holding(&records, "standing-unknown-holder", &holding(Vec::new())).expect_err("a role in no convoy cannot tell");
+    assert_eq!(refusal.record, "standing-unknown-holder");
 }
 
 // Behaviour: a supersession whose successor is unrecorded or gone is dropped.

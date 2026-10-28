@@ -1149,7 +1149,7 @@ pub struct OldStoreRecords {
     pub namespace: String,
     pub forges: Vec<ForgeSpec>,
     convoys: BTreeMap<String, ResourceObject<Convoy>>,
-    /// Convoys any read copy of which has not ended.
+    /// Convoys any read copy of which has not ended; `convoys` keeps one copy per name.
     live_convoys: BTreeSet<String>,
     terminals: BTreeMap<String, ResourceObject<TerminalSession>>,
     artifacts: BTreeMap<String, ResourceObject<Artifact>>,
