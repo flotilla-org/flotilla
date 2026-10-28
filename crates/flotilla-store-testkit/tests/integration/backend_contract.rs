@@ -660,8 +660,9 @@ async fn admission_placement_is_published_with_convoy(#[case] adapter: &str) {
     let (backend, _fixture) = backend(adapter).await;
     let convoys = backend.using::<Convoy>("flotilla");
     let decision = PlacementDecision {
+        provider_instance: None,
         provider_workspace_root: None,
-        policy_name: "admitted".into(),
+        kind: "admitted".into(),
         target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("home"), display_name: "Home".into() },
         minimal_alternatives: vec!["other-policy".into()],
         escalation_reason: Some("admission evidence".into()),
@@ -707,7 +708,7 @@ async fn admission_placement_is_published_with_convoy(#[case] adapter: &str) {
     // creation initialization, even if the admission annotation is changed.
     let mut changed_meta = InputMeta::from(&created.metadata);
     let mut changed_decision = decision;
-    changed_decision.policy_name = "later".into();
+    changed_decision.kind = "later".into();
     changed_meta.annotations.insert(ADMISSION_PLACEMENT_ANNOTATION.into(), serde_json::to_string(&changed_decision).unwrap());
     let updated = convoys.update(&changed_meta, &created.metadata.resource_version, &spec).await.expect("metadata update");
     assert_eq!(updated.status, created.status);

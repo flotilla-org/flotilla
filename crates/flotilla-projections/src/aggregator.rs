@@ -2900,8 +2900,8 @@ impl Aggregator {
             .object
             .status
             .as_ref()
-            .and_then(|status| status.observed_policy_ref.as_ref())
-            .unwrap_or(&vessel.object.spec.placement_policy_ref);
+            .and_then(|status| status.observed_kind_ref.as_ref())
+            .unwrap_or(&vessel.object.spec.fulfilment_kind_ref);
         let policy =
             self.placement_policies.get(&repository_source_key(&convoy.namespace, policy_ref, &vessel.provenance)).or_else(|| {
                 // Admission can author the frozen policy on a different home from
@@ -2918,7 +2918,7 @@ impl Aggregator {
             .object
             .status
             .as_ref()
-            .and_then(|status| status.observed_policy_version.as_ref())
+            .and_then(|status| status.observed_kind_version.as_ref())
             .is_some_and(|version| version != &policy.object.metadata.resource_version)
         {
             return None;
@@ -6580,15 +6580,15 @@ mod tests {
                 &flotilla_resources::VesselSpec {
                     convoy_ref: "convoy-a".into(),
                     vessel_name: "implement".into(),
-                    placement_policy_ref: if observed { "desired-policy" } else { "actual-policy" }.into(),
+                    fulfilment_kind_ref: if observed { "desired-policy" } else { "actual-policy" }.into(),
                     adopted_checkout_refs: Default::default(),
                 },
             )
             .await
             .expect("vessel");
         vessel.status = observed.then(|| flotilla_resources::VesselStatus {
-            observed_policy_ref: Some("actual-policy".into()),
-            observed_policy_version: Some(policy.metadata.resource_version.clone()),
+            observed_kind_ref: Some("actual-policy".into()),
+            observed_kind_version: Some(policy.metadata.resource_version.clone()),
             ..Default::default()
         });
         (vessel, policy)
@@ -6727,7 +6727,7 @@ mod tests {
                         &VesselSpec {
                             convoy_ref: convoy.metadata.name.clone(),
                             vessel_name: "implement".into(),
-                            placement_policy_ref: "local".into(),
+                            fulfilment_kind_ref: "local".into(),
                             adopted_checkout_refs: Default::default(),
                         },
                     )
@@ -6802,7 +6802,7 @@ mod tests {
                     &VesselSpec {
                         convoy_ref: convoy.metadata.name.clone(),
                         vessel_name: "implement".into(),
-                        placement_policy_ref: "local".into(),
+                        fulfilment_kind_ref: "local".into(),
                         adopted_checkout_refs: BTreeMap::new(),
                     },
                 )
@@ -7003,7 +7003,7 @@ mod tests {
                 &VesselSpec {
                     convoy_ref: convoy.metadata.name.clone(),
                     vessel_name: "implement".into(),
-                    placement_policy_ref: "local".into(),
+                    fulfilment_kind_ref: "local".into(),
                     adopted_checkout_refs: BTreeMap::new(),
                 },
             )
@@ -7261,7 +7261,7 @@ mod tests {
             VesselSpec {
                 convoy_ref: convoy.metadata.name.clone(),
                 vessel_name: definition.name.clone(),
-                placement_policy_ref: "local".into(),
+                fulfilment_kind_ref: "local".into(),
                 adopted_checkout_refs: Default::default(),
             },
             VesselStatus {
@@ -7271,7 +7271,7 @@ mod tests {
                 checkout_refs: BTreeMap::from([(flotilla_resources::RepositoryKey("stale".into()), "missing".into())]),
                 placement_decision: Some(
                     PlacementDecision::builder()
-                        .policy_name("local".into())
+                        .kind("local".into())
                         .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved("host"), display_name: "host".into() })
                         .build(),
                 ),
@@ -7569,7 +7569,7 @@ mod tests {
                 .crew
                 .push(CrewSpec::builder().role("coder".to_string()).source(CrewSource::Tool { command: "codex".to_string() }).build());
             let decision = PlacementDecision::builder()
-                .policy_name("b1".into())
+                .kind("b1".into())
                 .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved(target), display_name: machine.into() })
                 .build();
             status.work.get_mut("implement").expect("work state").placement = Some(PlacementStatus {
@@ -7583,7 +7583,7 @@ mod tests {
                     &VesselSpec {
                         convoy_ref: convoy.metadata.name.clone(),
                         vessel_name: "implement".into(),
-                        placement_policy_ref: "b1".into(),
+                        fulfilment_kind_ref: "b1".into(),
                         adopted_checkout_refs: Default::default(),
                     },
                 )

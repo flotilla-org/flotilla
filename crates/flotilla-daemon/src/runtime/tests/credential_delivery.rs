@@ -85,7 +85,7 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
             &VesselSpec {
                 convoy_ref: "credential-convoy".to_string(),
                 vessel_name: "work".to_string(),
-                placement_policy_ref: "test".to_string(),
+                fulfilment_kind_ref: "test".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
@@ -1007,7 +1007,7 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
             &VesselSpec {
                 convoy_ref: "credential-work".to_string(),
                 vessel_name: "work".to_string(),
-                placement_policy_ref: "test".to_string(),
+                fulfilment_kind_ref: "test".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )

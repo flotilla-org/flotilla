@@ -157,7 +157,7 @@ pub async fn create_workspace(
     name: &str,
     convoy_ref: &str,
     task: &str,
-    placement_policy_ref: &str,
+    fulfilment_kind_ref: &str,
     repo_url: &str,
 ) -> flotilla_resources::ResourceObject<Vessel> {
     let workspaces = backend.clone().using::<Vessel>(namespace);
@@ -169,7 +169,7 @@ pub async fn create_workspace(
             &VesselSpec {
                 convoy_ref: convoy_ref.to_string(),
                 vessel_name: task.to_string(),
-                placement_policy_ref: placement_policy_ref.to_string(),
+                fulfilment_kind_ref: fulfilment_kind_ref.to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )

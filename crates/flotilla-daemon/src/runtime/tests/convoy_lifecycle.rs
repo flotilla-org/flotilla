@@ -288,7 +288,7 @@ async fn convoy_reclaims_vessels_after_checkout_authority_collected_the_checkout
             &VesselSpec {
                 convoy_ref: "raced".to_string(),
                 vessel_name: "implement".to_string(),
-                placement_policy_ref: "host-direct-test".to_string(),
+                fulfilment_kind_ref: "host-direct-test".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )

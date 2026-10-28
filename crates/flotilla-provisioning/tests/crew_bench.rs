@@ -212,7 +212,7 @@ fn old_vessel(n: usize) -> flotilla_resources::ResourceObject<flotilla_resources
         spec: flotilla_resources::VesselSpec {
             convoy_ref: format!("convoy-{n}"),
             vessel_name: "implement".into(),
-            placement_policy_ref: "docker".into(),
+            fulfilment_kind_ref: "docker".into(),
             adopted_checkout_refs: BTreeMap::new(),
         },
         status: None,
@@ -224,13 +224,13 @@ fn pinned_life(n: usize) -> [VesselStatusPatch; 3] {
     use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
     let host = format!("host-{}", (n as u32) % HOSTS);
     let decision = PlacementDecision::builder()
-        .policy_name("docker".into())
+        .kind("docker".into())
         .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved(host.clone()), display_name: host })
         .build();
     [
         VesselStatusPatch::MarkProvisioning {
-            observed_policy_ref: "docker".into(),
-            observed_policy_version: "1".into(),
+            observed_kind_ref: "docker".into(),
+            observed_kind_version: "1".into(),
             placement_decision: Some(decision),
             started_at: chrono::DateTime::UNIX_EPOCH,
             message: None,

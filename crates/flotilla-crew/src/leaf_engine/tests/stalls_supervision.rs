@@ -481,7 +481,7 @@ async fn observed_commit_resets_budget_but_refresh_does_not() {
             &flotilla_resources::VesselSpec {
                 convoy_ref: "stalled-work".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "policy".into(),
+                fulfilment_kind_ref: "policy".into(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
@@ -1190,7 +1190,7 @@ async fn credential_delivery_and_clone_controller_rows_judge_transient_terminal_
             &flotilla_resources::VesselSpec {
                 convoy_ref: "delivery".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "test".into(),
+                fulfilment_kind_ref: "test".into(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )

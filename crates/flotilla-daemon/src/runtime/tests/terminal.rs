@@ -35,18 +35,15 @@ async fn agent_launch_reads_grants_from_its_own_vessel_pin() {
     }
     let decision = |kind: &str| {
         PlacementDecision::builder()
-            .policy_name(kind.to_string())
+            .kind(kind.to_string())
             .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved("host".to_string()), display_name: "host".to_string() })
             .build()
     };
     let pins = BTreeMap::from([
-        (
-            "work".to_string(),
-            flotilla_resources::VesselPlacementPin { policy_ref: "snapshot-work".to_string(), decision: decision("broad") },
-        ),
+        ("work".to_string(), flotilla_resources::VesselPlacementPin { kind_ref: "snapshot-work".to_string(), decision: decision("broad") }),
         (
             "ops".to_string(),
-            flotilla_resources::VesselPlacementPin { policy_ref: "snapshot-ops".to_string(), decision: decision("restricted") },
+            flotilla_resources::VesselPlacementPin { kind_ref: "snapshot-ops".to_string(), decision: decision("restricted") },
         ),
     ]);
     let convoys = backend.using::<Convoy>(NAMESPACE);
@@ -78,7 +75,7 @@ async fn agent_launch_reads_grants_from_its_own_vessel_pin() {
             &VesselSpec {
                 convoy_ref: "demo".to_string(),
                 vessel_name: "ops".to_string(),
-                placement_policy_ref: "snapshot-ops".to_string(),
+                fulfilment_kind_ref: "snapshot-ops".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )

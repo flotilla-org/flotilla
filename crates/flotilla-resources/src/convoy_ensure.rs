@@ -40,6 +40,7 @@ pub struct ConvoyEnsureSpec {
     #[builder(default)]
     #[serde(default)]
     pub workflow_ref: String,
+    /// A FulfilmentKind's name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_policy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

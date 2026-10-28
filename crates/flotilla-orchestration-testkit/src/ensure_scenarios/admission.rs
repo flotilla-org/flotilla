@@ -59,7 +59,7 @@ pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_
             &VesselSpec {
                 convoy_ref: convoy_name.clone(),
                 vessel_name: "work".to_string(),
-                placement_policy_ref: "docker".to_string(),
+                fulfilment_kind_ref: "docker".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )

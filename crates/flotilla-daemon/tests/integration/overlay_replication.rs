@@ -223,7 +223,7 @@ async fn connected_daemons_replicate_home_bound_runtime_kinds_and_deletes() {
             &VesselSpec {
                 convoy_ref: "remote-convoy".to_string(),
                 vessel_name: "work".to_string(),
-                placement_policy_ref: "host-direct".to_string(),
+                fulfilment_kind_ref: "host-direct".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )

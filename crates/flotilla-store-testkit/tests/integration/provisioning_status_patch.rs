@@ -323,10 +323,11 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
     let started_at = Utc.timestamp_opt(10, 0).single().expect("timestamp");
     let ready_at = Utc.timestamp_opt(20, 0).single().expect("timestamp");
     let placement_decision = PlacementDecision {
+        provider_instance: None,
         provider_workspace_root: None,
         minimal_alternatives: Vec::new(),
         escalation_reason: None,
-        policy_name: "docker-on-01HXYZ".to_string(),
+        kind: "docker-on-01HXYZ".to_string(),
         target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("01HXYZ"), display_name: "kiwi".to_string() },
         refused_candidates: Vec::new(),
         viable_not_selected: Vec::new(),
@@ -336,30 +337,31 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
     VesselStatusPatch::MarkProvisioning {
         image: None,
         placement_decision: Some(placement_decision.clone()),
-        observed_policy_ref: "docker-on-01HXYZ".to_string(),
-        observed_policy_version: "12".to_string(),
+        observed_kind_ref: "docker-on-01HXYZ".to_string(),
+        observed_kind_version: "12".to_string(),
         started_at,
         message: None,
     }
     .apply(&mut status);
     assert_eq!(status.phase, VesselPhase::Provisioning);
-    assert_eq!(status.observed_policy_ref.as_deref(), Some("docker-on-01HXYZ"));
+    assert_eq!(status.observed_kind_ref.as_deref(), Some("docker-on-01HXYZ"));
     assert_eq!(status.placement_decision.as_ref(), Some(&placement_decision));
 
     VesselStatusPatch::MarkProvisioning {
         image: None,
         placement_decision: Some(PlacementDecision {
+            provider_instance: None,
             provider_workspace_root: None,
             minimal_alternatives: Vec::new(),
             escalation_reason: None,
-            policy_name: "replacement-must-not-win".to_string(),
+            kind: "replacement-must-not-win".to_string(),
             target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("other"), display_name: "feta".to_string() },
             refused_candidates: Vec::new(),
             viable_not_selected: Vec::new(),
             allocation: None,
         }),
-        observed_policy_ref: "docker-on-01HXYZ".to_string(),
-        observed_policy_version: "13".to_string(),
+        observed_kind_ref: "docker-on-01HXYZ".to_string(),
+        observed_kind_version: "13".to_string(),
         started_at: Utc.timestamp_opt(11, 0).single().expect("timestamp"),
         message: Some("still waiting".to_string()),
     }

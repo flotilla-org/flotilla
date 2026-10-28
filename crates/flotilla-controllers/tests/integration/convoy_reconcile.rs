@@ -665,7 +665,7 @@ async fn reconcile_with_observed_change_request(
             &VesselSpec {
                 convoy_ref: "convoy-a".to_string(),
                 vessel_name: "implement".to_string(),
-                placement_policy_ref: "test".to_string(),
+                fulfilment_kind_ref: "test".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
@@ -992,7 +992,7 @@ fn vessel_object_with_local_image_id(
         spec: VesselSpec {
             convoy_ref: convoy_name.to_string(),
             vessel_name: task.to_string(),
-            placement_policy_ref: "laptop-docker".to_string(),
+            fulfilment_kind_ref: "laptop-docker".to_string(),
             adopted_checkout_refs: Default::default(),
         },
         status: Some(VesselStatus {
@@ -1003,8 +1003,8 @@ fn vessel_object_with_local_image_id(
             placement_decision: None,
             phase,
             message: message.map(str::to_string),
-            observed_policy_ref: Some("laptop-docker".to_string()),
-            observed_policy_version: Some("19".to_string()),
+            observed_kind_ref: Some("laptop-docker".to_string()),
+            observed_kind_version: Some("19".to_string()),
             environment_ref: Some(format!("env-{task}")),
             image_ref: Some("registry.example/crew:latest".to_string()),
             local_image_id: Some(local_image_id.to_string()),
@@ -2185,7 +2185,7 @@ async fn reconcile_terminal_bound_change_request(
                 &VesselSpec {
                     convoy_ref: "convoy-a".to_string(),
                     vessel_name: "implement".to_string(),
-                    placement_policy_ref: "test".to_string(),
+                    fulfilment_kind_ref: "test".to_string(),
                     adopted_checkout_refs: BTreeMap::new(),
                 },
             )
@@ -2785,7 +2785,7 @@ async fn ready_task_emits_vessel_creation_actuation() {
             assert_eq!(meta.owner_references[0].name, "convoy-a");
             assert_eq!(spec.convoy_ref, "convoy-a");
             assert_eq!(spec.vessel_name, "implement");
-            assert_eq!(spec.placement_policy_ref, "laptop-docker");
+            assert_eq!(spec.fulfilment_kind_ref, "laptop-docker");
         }
         other => panic!("expected task workspace actuation, got {other:?}"),
     }

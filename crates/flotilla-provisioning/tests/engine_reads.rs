@@ -322,17 +322,17 @@ fn a_vessel_written_through_the_binding_reads_by_its_old_name() {
         spec: OldVesselSpec {
             convoy_ref: "convoy-a".into(),
             vessel_name: "implement".into(),
-            placement_policy_ref: "docker".into(),
+            fulfilment_kind_ref: "docker".into(),
             adopted_checkout_refs: BTreeMap::new(),
         },
         status: None,
     };
     let provisioning = VesselStatusPatch::MarkProvisioning {
-        observed_policy_ref: "docker".into(),
-        observed_policy_version: "1".into(),
+        observed_kind_ref: "docker".into(),
+        observed_kind_version: "1".into(),
         placement_decision: Some(
             PlacementDecision::builder()
-                .policy_name("docker".into())
+                .kind("docker".into())
                 .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved("feta"), display_name: "feta".into() })
                 .build(),
         ),

@@ -1296,15 +1296,14 @@ fn convoy_description(row: &ConvoySummary) -> Vec<DetailField> {
     ];
     fields.extend(readiness_details(&row.readiness));
     if let Some(decision) = &row.placement_decision {
-        fields
-            .push(DetailField { label: "Placement", value: format!("{} on {}", decision.policy_name, decision.target_host.display_name) });
+        fields.push(DetailField { label: "Placement", value: format!("{} on {}", decision.kind, decision.target_host.display_name) });
         if !decision.refused_candidates.is_empty() {
             fields.push(DetailField {
                 label: "Placement refusals",
                 value: decision
                     .refused_candidates
                     .iter()
-                    .map(|refusal| format!("{} on {}: {}", refusal.policy_name, refusal.target_host.display_name, refusal.reason))
+                    .map(|refusal| format!("{} on {}: {}", refusal.kind, refusal.target_host.display_name, refusal.reason))
                     .collect::<Vec<_>>()
                     .join("\n"),
             });
@@ -1315,7 +1314,7 @@ fn convoy_description(row: &ConvoySummary) -> Vec<DetailField> {
                 value: decision
                     .viable_not_selected
                     .iter()
-                    .map(|candidate| format!("{} on {}: {}", candidate.policy_name, candidate.target_host.display_name, candidate.reason))
+                    .map(|candidate| format!("{} on {}: {}", candidate.kind, candidate.target_host.display_name, candidate.reason))
                     .collect::<Vec<_>>()
                     .join("\n"),
             });
@@ -1480,15 +1479,14 @@ fn vessel_description(row: &VesselProjection) -> Vec<DetailField> {
     ];
     fields.extend(readiness_details(&row.vessel.readiness));
     if let Some(decision) = &row.vessel.placement_decision {
-        fields
-            .push(DetailField { label: "Placement", value: format!("{} on {}", decision.policy_name, decision.target_host.display_name) });
+        fields.push(DetailField { label: "Placement", value: format!("{} on {}", decision.kind, decision.target_host.display_name) });
         if !decision.refused_candidates.is_empty() {
             fields.push(DetailField {
                 label: "Placement refusals",
                 value: decision
                     .refused_candidates
                     .iter()
-                    .map(|refusal| format!("{} on {}: {}", refusal.policy_name, refusal.target_host.display_name, refusal.reason))
+                    .map(|refusal| format!("{} on {}: {}", refusal.kind, refusal.target_host.display_name, refusal.reason))
                     .collect::<Vec<_>>()
                     .join("\n"),
             });
@@ -1499,7 +1497,7 @@ fn vessel_description(row: &VesselProjection) -> Vec<DetailField> {
                 value: decision
                     .viable_not_selected
                     .iter()
-                    .map(|candidate| format!("{} on {}: {}", candidate.policy_name, candidate.target_host.display_name, candidate.reason))
+                    .map(|candidate| format!("{} on {}: {}", candidate.kind, candidate.target_host.display_name, candidate.reason))
                     .collect::<Vec<_>>()
                     .join("\n"),
             });
@@ -1888,16 +1886,17 @@ mod tests {
     #[test]
     fn convoy_and_vessel_details_render_placement_decisions_with_refusals() {
         let decision = flotilla_protocol::PlacementDecision {
+            provider_instance: None,
             provider_workspace_root: None,
             minimal_alternatives: Vec::new(),
             escalation_reason: None,
-            policy_name: "host-direct-kiwi".into(),
+            kind: "host-direct-kiwi".into(),
             target_host: flotilla_protocol::PlacementTargetHost {
                 reference: flotilla_protocol::CanonicalHostId::resolved("01HXYZ"),
                 display_name: "kiwi".into(),
             },
             refused_candidates: vec![flotilla_protocol::PlacementRefusal {
-                policy_name: "host-direct-feta".into(),
+                kind: "host-direct-feta".into(),
                 target_host: flotilla_protocol::PlacementTargetHost {
                     reference: flotilla_protocol::CanonicalHostId::resolved("02HXYZ"),
                     display_name: "feta".into(),
@@ -1905,7 +1904,7 @@ mod tests {
                 reason: "disk below admission floor".into(),
             }],
             viable_not_selected: vec![flotilla_protocol::PlacementViableCandidate {
-                policy_name: "host-direct-gouda".into(),
+                kind: "host-direct-gouda".into(),
                 target_host: flotilla_protocol::PlacementTargetHost {
                     reference: flotilla_protocol::CanonicalHostId::resolved("03HXYZ"),
                     display_name: "gouda".into(),

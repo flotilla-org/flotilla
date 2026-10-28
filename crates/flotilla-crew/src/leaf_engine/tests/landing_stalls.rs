@@ -312,7 +312,7 @@ async fn landing_discovery_window_has_an_owed_row_then_settles() {
             &flotilla_resources::VesselSpec {
                 convoy_ref: "discovering".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "policy".into(),
+                fulfilment_kind_ref: "policy".into(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )

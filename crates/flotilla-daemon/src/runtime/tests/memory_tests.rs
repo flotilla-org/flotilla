@@ -127,7 +127,7 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
             &VesselSpec {
                 convoy_ref: "memory-incident".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "test-policy".into(),
+                fulfilment_kind_ref: "test-policy".into(),
                 adopted_checkout_refs: Default::default(),
             },
         )

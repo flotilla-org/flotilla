@@ -2354,7 +2354,7 @@ async fn artifact_environment_reference_contract() {
                 &VesselSpec {
                     convoy_ref: convoy.into(),
                     vessel_name: "work".into(),
-                    placement_policy_ref: "test".into(),
+                    fulfilment_kind_ref: "test".into(),
                     adopted_checkout_refs: BTreeMap::new(),
                 },
             )
@@ -4818,7 +4818,7 @@ async fn capabilities_routing_scenario(remote: bool, workflows: bool) {
             &VesselSpec {
                 convoy_ref: "capabilities".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "policy".into(),
+                fulfilment_kind_ref: "policy".into(),
                 adopted_checkout_refs: Default::default(),
             },
         )

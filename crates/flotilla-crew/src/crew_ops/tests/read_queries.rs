@@ -15,7 +15,7 @@ async fn create_vessel(backend: &ResourceBackend) {
             &VesselSpec {
                 convoy_ref: "crew".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "test".into(),
+                fulfilment_kind_ref: "test".into(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )

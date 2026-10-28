@@ -70,7 +70,7 @@ fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
                 &VesselSpec {
                     convoy_ref: "crew".into(),
                     vessel_name: "work".into(),
-                    placement_policy_ref: "test".into(),
+                    fulfilment_kind_ref: "test".into(),
                     adopted_checkout_refs: BTreeMap::new(),
                 },
             )
@@ -595,7 +595,7 @@ async fn lost_vessel_resume_explains_rehydration() {
             &flotilla_resources::VesselSpec {
                 convoy_ref: "crew".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "policy".into(),
+                fulfilment_kind_ref: "policy".into(),
                 adopted_checkout_refs: Default::default(),
             },
         )
@@ -1364,7 +1364,7 @@ fn lost_environment_resume_reports_cause(tc: hegel::TestCase) {
                 &VesselSpec {
                     convoy_ref: "crew".into(),
                     vessel_name: "work".into(),
-                    placement_policy_ref: "policy".into(),
+                    fulfilment_kind_ref: "policy".into(),
                     adopted_checkout_refs: Default::default(),
                 },
             )

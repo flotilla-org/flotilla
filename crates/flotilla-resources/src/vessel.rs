@@ -26,7 +26,9 @@ pub struct VesselSpec {
     pub convoy_ref: String,
     /// The within-convoy vessel name (the requirement / work key, e.g. `implement`).
     pub vessel_name: String,
-    pub placement_policy_ref: String,
+    // Drop the alias one roll after the rename.
+    #[serde(alias = "placement_policy_ref")]
+    pub fulfilment_kind_ref: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub adopted_checkout_refs: BTreeMap<RepositoryKey, String>,
 }
@@ -61,10 +63,12 @@ pub struct VesselStatus {
     pub placement_decision: Option<PlacementDecision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub observed_policy_ref: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub observed_policy_version: Option<String>,
+    // Drop the alias one roll after the rename.
+    #[serde(default, alias = "observed_policy_ref", skip_serializing_if = "Option::is_none")]
+    pub observed_kind_ref: Option<String>,
+    // Drop the alias one roll after the rename.
+    #[serde(default, alias = "observed_policy_version", skip_serializing_if = "Option::is_none")]
+    pub observed_kind_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -140,8 +144,8 @@ pub enum VesselStatusPatch {
         message: String,
     },
     MarkProvisioning {
-        observed_policy_ref: String,
-        observed_policy_version: String,
+        observed_kind_ref: String,
+        observed_kind_version: String,
         placement_decision: Option<PlacementDecision>,
         started_at: DateTime<Utc>,
         message: Option<String>,
@@ -189,13 +193,13 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
             Self::CredentialDelivery { retry } => status.credential_delivery_retry = retry.clone(),
             Self::CredentialRefresh { retry } => status.credential_refresh_retry = retry.clone(),
             Self::RequireEnvironmentRecreation { message } => status.message = Some(message.clone()),
-            Self::MarkProvisioning { observed_policy_ref, observed_policy_version, placement_decision, started_at, message, image } => {
+            Self::MarkProvisioning { observed_kind_ref, observed_kind_version, placement_decision, started_at, message, image } => {
                 if let Some(image) = image {
                     record_image(status, image);
                 }
                 status.phase = VesselPhase::Provisioning;
-                status.observed_policy_ref = Some(observed_policy_ref.clone());
-                status.observed_policy_version = Some(observed_policy_version.clone());
+                status.observed_kind_ref = Some(observed_kind_ref.clone());
+                status.observed_kind_version = Some(observed_kind_version.clone());
                 if let Some(placement_decision) = placement_decision {
                     status.placement_decision.get_or_insert_with(|| placement_decision.clone());
                 }

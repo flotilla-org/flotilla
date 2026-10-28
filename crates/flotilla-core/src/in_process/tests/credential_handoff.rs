@@ -98,7 +98,7 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
             &flotilla_resources::VesselSpec {
                 convoy_ref: "convoy-two-crew".to_string(),
                 vessel_name: "work".to_string(),
-                placement_policy_ref: "contained".to_string(),
+                fulfilment_kind_ref: "contained".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
@@ -319,7 +319,7 @@ async fn a_handoff_delivers_to_a_target_session_created_concurrently() {
             &flotilla_resources::VesselSpec {
                 convoy_ref: "convoy-concurrent".to_string(),
                 vessel_name: "work".to_string(),
-                placement_policy_ref: "contained".to_string(),
+                fulfilment_kind_ref: "contained".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
