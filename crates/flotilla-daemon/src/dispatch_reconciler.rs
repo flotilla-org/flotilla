@@ -54,7 +54,8 @@ struct PassIssueReads {
     issues: BTreeMap<IssueRef, Result<Issue, String>>,
 }
 
-/// Time from ready to dispatch, by Project and workflow, for this process.
+/// Time from ready to dispatch, by Project and workflow, for this process. Never evicted: both keys
+/// are operator-authored names, a small set.
 #[derive(Debug, Default)]
 pub(crate) struct DispatchMetrics {
     time_from_ready: std::sync::Mutex<BTreeMap<(String, String), Arc<LatencyHistogram>>>,
@@ -517,7 +518,8 @@ impl DispatchReconciler {
     }
 
     /// Times each issue the previous queue held that a live convoy now serves. Called only after the
-    /// queue without it is written, so the next pass cannot time it again.
+    /// queue without it is written, so the next pass cannot time it again. An issue dispatched without
+    /// ever being queued has no ready time and is not timed.
     fn observe_dispatches(
         &self,
         project: &ResourceObject<Project>,
