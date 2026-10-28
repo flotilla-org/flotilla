@@ -384,9 +384,10 @@ fn compare_numbers(a: &serde_json::Number, b: &serde_json::Number) -> Ordering {
         (Some(a), Some(b)) => a.cmp(&b),
         (Some(a), None) => compare_integer_float(a, b.as_f64().unwrap_or(f64::NAN)),
         (None, Some(b)) => compare_integer_float(b, a.as_f64().unwrap_or(f64::NAN)).reverse(),
-        (None, None) => a.as_f64().unwrap_or(f64::NAN).total_cmp(&b.as_f64().unwrap_or(f64::NAN)),
+        (None, None) => a.as_f64().partial_cmp(&b.as_f64()).unwrap_or(Ordering::Equal),
     }
 }
+/// JSON carries no NaN, so the `unwrap_or` fallbacks above are unreachable.
 fn compare_integer_float(integer: i128, float: f64) -> Ordering {
     const LIMIT: f64 = 1.7014118346046923e38;
     if float >= LIMIT {
@@ -403,6 +404,7 @@ fn compare(a: &Value, b: &Value) -> Ordering {
         (Value::String(a), Value::String(b)) => a.cmp(b),
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
         (Value::Number(a), Value::Number(b)) => compare_numbers(a, b),
+        // Same-rank arrays and objects tie-break on their text; other mismatched pairs order by rank.
         _ => rank(a).cmp(&rank(b)).then_with(|| if rank(a) >= 4 { a.to_string().cmp(&b.to_string()) } else { Ordering::Equal }),
     }
 }
@@ -1006,6 +1008,14 @@ mod properties {
         assert_eq!(query.compare(&values, &query.values(&row)), Ordering::Equal);
         assert!(query.project(&row).contains_key(KEY));
         assert!(resumed.after("other-table").is_err());
+    }
+
+    #[test]
+    fn numbers_compare_exactly_at_integer_float_boundaries() {
+        assert_eq!(compare(&json!(u64::MAX), &json!(1.8446744073709552e19)), Ordering::Less);
+        assert_eq!(compare(&json!(i64::MAX), &json!(9.223372036854776e18)), Ordering::Less);
+        assert_eq!(compare(&json!(-0.0), &json!(0)), Ordering::Equal);
+        assert_eq!(compare(&json!(-0.0), &json!(0.0)), Ordering::Equal);
     }
 
     fn numeric_value(tc: &hegel::TestCase) -> Value {
