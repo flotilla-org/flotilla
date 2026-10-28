@@ -2,7 +2,7 @@
 
 use proc_macro2::{Span, TokenStream};
 use quote::ToTokens;
-use syn::{parenthesized, Attribute, LitStr};
+use syn::{parenthesized, spanned::Spanned, Attribute, LitStr};
 
 /// The closed attribute list, named by every refusal. `flotilla-schema` repeats this text in its
 /// trait diagnostics and a test there keeps the two equal.
@@ -45,6 +45,8 @@ pub(crate) struct FieldAttrs {
     pub shape: Option<FieldAttr>,
     pub alias: Option<LitStr>,
     pub domain: Option<LitStr>,
+    /// `#[shape(key)]`: the field's columns are its described row's key; storage refuses it.
+    pub key: Option<Span>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +104,7 @@ pub(crate) enum ShapeAttr {
     Flatten,
     Intern(LitStr),
     Code(LitStr),
+    Key,
 }
 
 /// Parse the shape namespace once. Storage policy never reaches the storage parser through it.
@@ -112,17 +115,19 @@ pub(crate) fn validate_shape_attr(attr: &Attribute) -> syn::Result<Vec<ShapeAttr
             ShapeAttr::Code(meta.value()?.parse()?)
         } else if meta.path.is_ident("intern") {
             ShapeAttr::Intern(meta.value()?.parse()?)
-        } else if meta.path.is_ident("child") || meta.path.is_ident("flatten") {
+        } else if meta.path.is_ident("child") || meta.path.is_ident("flatten") || meta.path.is_ident("key") {
             if !meta.input.is_empty() && !meta.input.peek(syn::Token![,]) {
-                return Err(meta.error("child and flatten take no arguments"));
+                return Err(meta.error("child, flatten and key take no arguments"));
             }
             if meta.path.is_ident("child") {
                 ShapeAttr::Child
+            } else if meta.path.is_ident("key") {
+                ShapeAttr::Key
             } else {
                 ShapeAttr::Flatten
             }
         } else {
-            return Err(meta.error("shape attributes are child, intern, flatten and code; storage attributes belong in #[store(...)]"));
+            return Err(meta.error("shape attributes are child, intern, flatten, key and code; storage attributes belong in #[store(...)]"));
         };
         parsed.push(value);
         Ok(())
@@ -206,7 +211,16 @@ pub(crate) fn type_attrs(attrs: &[Attribute]) -> syn::Result<TypeAttrs> {
 }
 
 pub(crate) fn field_attrs(attrs: &[Attribute]) -> syn::Result<FieldAttrs> {
-    let mut found = FieldAttrs { shape: None, alias: None, domain: None };
+    let found = described_field_attrs(attrs)?;
+    if let Some(span) = found.key {
+        return Err(refuse_at(span, "`key` declares a described row's key; a stored kind's root is keyed by its identity"));
+    }
+    Ok(found)
+}
+
+/// [`field_attrs`] for `#[derive(Describe)]`, which also accepts `#[shape(key)]`.
+pub(crate) fn described_field_attrs(attrs: &[Attribute]) -> syn::Result<FieldAttrs> {
+    let mut found = FieldAttrs { shape: None, alias: None, domain: None, key: None };
     for attr in store_attrs(attrs) {
         attr.parse_nested_meta(|meta| {
             let name = path_name(&meta.path);
@@ -258,6 +272,12 @@ pub(crate) fn field_attrs(attrs: &[Attribute]) -> syn::Result<FieldAttrs> {
                     FieldAttr::Intern
                 }
                 ShapeAttr::Code(_) => return Err(refuse(attr, "code belongs on enum variants and kinds, not fields")),
+                ShapeAttr::Key => {
+                    if found.key.replace(attr.span()).is_some() {
+                        return Err(syn::Error::new_spanned(attr, "`key` is given twice"));
+                    }
+                    continue;
+                }
             };
             if let Some(previous) = found.shape.replace(parsed) {
                 return Err(refuse(

@@ -134,11 +134,14 @@ impl Layout {
     /// scope's CHECKs require it where its value is present.
     pub fn column(&mut self, name: &str, ty: ColumnType, required: bool) {
         let name = if name.is_empty() { "value" } else { name };
+        let described = self.set.mode == SchemaMode::DescribeOnly;
         let frame = self.frames.last_mut().expect("layout has a current table");
         let table = &mut self.set.tables[frame.table];
         table.aliases.extend(frame.old_names(name).into_iter().map(|old| (old, name.to_owned())));
         if frame.key_mode {
-            let mut column = ColumnDef::new(name, ty, false);
+            // A described row key may hold an optional part, such as a reference's host.
+            let nullable = described && (!required || !frame.scopes.is_empty());
+            let mut column = ColumnDef::new(name, ty, nullable);
             column.add_role("key");
             if column.ty == ColumnType::Ref {
                 column.add_role("ref");
@@ -268,19 +271,20 @@ impl Layout {
 
     /// Declares a nested table storing `field` of the current table; `f` declares its own key and
     /// its columns. Its inherited key is the parent's key, with the parent's own key columns renamed
-    /// `<parent field>_<column>`.
+    /// `<parent field>_<column>`, or `<root table>_<column>` under a described root.
     pub fn table(&mut self, field: &str, role: TableRole, f: impl FnOnce(&mut Layout)) {
         assert!(role != TableRole::Root, "only the kind declares the root table");
         let frame = self.frames.last().expect("layout has a current table");
         let (parent_index, field_aliases) = (frame.table, frame.old_names(field));
         let parent = &self.set.tables[parent_index];
         let inherited = parent.key.len() - parent.own_key;
+        let prefix = if parent.parent.is_none() { &parent.name } else { &parent.field };
         let key = parent
             .key
             .iter()
             .enumerate()
             .map(|(position, column)| {
-                let name = if position < inherited { column.name.clone() } else { Layout::join(&parent.field, &column.name) };
+                let name = if position < inherited { column.name.clone() } else { Layout::join(prefix, &column.name) };
                 ColumnDef { name, ..column.clone() }
             })
             .collect();

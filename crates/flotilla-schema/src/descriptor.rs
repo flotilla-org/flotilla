@@ -331,6 +331,9 @@ pub enum DescriptorError {
     /// A `records` or `history` table whose first data column is not the version stamp.
     #[error("kind {kind}: table {table} does not start with the version stamp column")]
     MissingStamp { kind: String, table: String },
+    /// A described table below a root that declares no row key: its rows name no parent row.
+    #[error("kind {kind}: table {table} has a parent but the root declares no row key")]
+    UnkeyedParent { kind: String, table: String },
     #[error("kind {kind}: index {index}: {problem}")]
     Index { kind: String, index: String, problem: IndexProblem },
     /// An alias (`#[store(alias = "old")]`) that names something else of its table or row too: a
@@ -390,6 +393,9 @@ impl TableSet {
                     (RESERVED_RECORD_COLUMNS, &table.columns[1..])
                 }
             };
+            if !stored && table.parent.is_some() && self.tables[0].key.is_empty() {
+                return Err(DescriptorError::UnkeyedParent { kind: kind(), table: table.name.clone() });
+            }
             let parent_key = table.parent.is_some() && (stored || matches!(table.role, TableRole::Records | TableRole::History));
             for column in table.key.iter().chain(data) {
                 if reserved.contains(&column.name.as_str()) || (parent_key && column.name == self.parent_key_column()) {
@@ -549,7 +555,8 @@ impl TableSet {
 impl TableSet {
     /// The shared event table as seen for this kind. Structural roles are declared here,
     /// alongside the columns, rather than inferred by a viewer from their names.
-    /// This describes the existing log; it does not add a per-kind stored table.
+    /// This describes the existing log; it does not add a per-kind stored table. The sqlite
+    /// backend tests it against the `log` table it creates.
     pub fn log_table(&self) -> Table {
         let mut layout = crate::Layout::description("Log");
         layout.key(|layout| {
@@ -557,6 +564,7 @@ impl TableSet {
             layout.column("home_seq", ColumnType::Integer, true);
             layout.role("sequence");
         });
+        layout.column("change", ColumnType::Integer, true);
         layout.column("resource", ColumnType::Ref, false);
         layout.reference(&self.tables[0].name);
         layout.column("prev_seq", ColumnType::Integer, true);
@@ -579,9 +587,7 @@ impl TableSet {
         layout.categories("to", labels, false);
         layout.role("transition-to");
         layout.column("about", ColumnType::Ref, false);
-        layout.column("writer", ColumnType::Interned(crate::WRITER_DOMAIN), true);
-        layout.column("at", ColumnType::Timestamp, true);
-        layout.column("payload", ColumnType::Cbor, false);
+        layout.column("arguments", ColumnType::Cbor, false);
         layout.column("effect", ColumnType::Cbor, true);
         layout.column("topic", ColumnType::Text, true);
         layout.finish().tables.remove(0)

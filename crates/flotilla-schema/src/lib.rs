@@ -24,7 +24,9 @@
 //! and `#[shape(code = "value")]` describe query rows through the same [`Layout`], without a
 //! storage codec or write handles. `Stored` also accepts these shape attributes; existing
 //! `#[store(...)]` annotations remain supported. Storage policy (`records`, `history`, `frozen`)
-//! belongs only to `Stored`. Descriptions keep Rust field names, including when Serde applies
+//! belongs only to `Stored`, and `#[shape(key)]`, a described row's key, only to `Describe`: a
+//! described table below the root inherits that key as `<root>_<column>`, and a description with
+//! child tables needs one. A described variant's `code` equals its Serde name. Descriptions keep Rust field names, including when Serde applies
 //! `rename_all_fields`, variant-level `rename_all` or field `rename`. Enum category values follow
 //! Serde's serialization-side variant renaming; deserialization aliases do not change categories.
 //! SQL rendering and its extension traits live in `flotilla-schema-sqlite`.
@@ -59,7 +61,7 @@ mod code;
 mod codec;
 mod describe;
 mod descriptor;
-pub use describe::{Describe, DescribeChild};
+pub use describe::{Describe, DescribeChild, DescribeElement};
 mod edge;
 mod event;
 mod frozen;

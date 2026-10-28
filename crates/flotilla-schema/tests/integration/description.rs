@@ -1,10 +1,12 @@
 use flotilla_schema::{ColumnType, Describe, Element, KindCode, Layout, Stored};
 
-#[derive(Stored, Describe)]
+#[derive(Stored, Describe, serde::Serialize)]
 enum Phase {
     #[shape(code = "a")]
+    #[serde(rename = "a")]
     Active,
     #[shape(code = "z")]
+    #[serde(rename = "z")]
     Finished,
 }
 
@@ -14,11 +16,13 @@ struct Part {
     count: Option<u32>,
 }
 
-#[derive(Stored, Describe)]
+#[derive(Stored, Describe, serde::Serialize)]
 enum Detail {
     #[shape(code = "a")]
+    #[serde(rename = "a")]
     First { value: u32, note: Option<String> },
     #[shape(code = "z")]
+    #[serde(rename = "z")]
     Last { value: Option<u32> },
 }
 
@@ -145,4 +149,53 @@ fn scalar_map_keys_and_values_compose_in_child_tables() {
     }
     let nested = set.tables.iter().find(|table| table.name == "map_rows_nested_items").unwrap();
     assert_eq!(nested.key.iter().map(|column| column.name.as_str()).collect::<Vec<_>>(), ["nested_key", "key"]);
+}
+
+#[derive(Describe)]
+#[allow(dead_code)]
+struct Source {
+    service: String,
+    #[shape(flatten)]
+    host: Option<String>,
+}
+
+#[derive(Describe)]
+#[allow(dead_code)]
+struct Keyed {
+    #[shape(key)]
+    source: Source,
+    #[shape(key)]
+    id: u32,
+    #[shape(child)]
+    labels: Vec<String>,
+    #[shape(child)]
+    groups: std::collections::BTreeMap<String, Vec<u32>>,
+}
+
+#[derive(Describe)]
+#[allow(dead_code)]
+struct Unkeyed {
+    id: u32,
+    #[shape(child)]
+    labels: Vec<String>,
+}
+
+#[test]
+fn described_child_tables_carry_their_root_key() {
+    let set = Keyed::table_set();
+    set.validate().unwrap();
+    let names = |table: &str| {
+        let table = set.tables.iter().find(|candidate| candidate.name == table).unwrap();
+        table.key.iter().map(|column| (column.name.as_str(), column.nullable)).collect::<Vec<_>>()
+    };
+    assert_eq!(names("keyed"), [("source_service", false), ("source_host", true), ("id", false)]);
+    assert!(set.tables[0].columns.is_empty());
+    let inherited = [("keyed_source_service", false), ("keyed_source_host", true), ("keyed_id", false)];
+    assert_eq!(names("keyed_labels"), [&inherited[..], &[("pos", false)]].concat());
+    assert_eq!(names("keyed_groups"), [&inherited[..], &[("key", false)]].concat());
+    assert_eq!(names("keyed_groups_items"), [&inherited[..], &[("groups_key", false), ("pos", false)]].concat());
+    assert!(matches!(
+        Unkeyed::table_set().validate(),
+        Err(flotilla_schema::DescriptorError::UnkeyedParent { table, .. }) if table == "unkeyed_labels"
+    ));
 }

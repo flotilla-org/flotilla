@@ -8,7 +8,7 @@ fn shape(field: &syn::Field) -> syn::Result<crate::attrs::FieldAttrs> {
     if let Some(attr) = field.attrs.iter().find(|attr| attr.path().is_ident("store")) {
         return Err(syn::Error::new_spanned(attr, "describe-only fields use #[shape(...)], not storage attributes"));
     }
-    crate::attrs::field_attrs(&field.attrs)
+    crate::attrs::described_field_attrs(&field.attrs)
 }
 
 fn field(field: &syn::Field, prefix: TokenStream, fallback: &str) -> syn::Result<TokenStream> {
@@ -16,6 +16,12 @@ fn field(field: &syn::Field, prefix: TokenStream, fallback: &str) -> syn::Result
     let ty = &field.ty;
     let name = quote!(&::flotilla_schema::Layout::join(#prefix, #name));
     let attrs = shape(field)?;
+    if attrs.key.is_some() {
+        if crate::shape::option_inner(ty).is_some() || attrs.shape == Some(crate::attrs::FieldAttr::Child) {
+            return Err(syn::Error::new_spanned(field, "a row key is a required column-shaped field, not an option or a child table"));
+        }
+        return Ok(quote!(layout.key(|layout| <#ty as ::flotilla_schema::Describe>::describe(layout, #name, true));));
+    }
     Ok(match attrs.shape {
         Some(crate::attrs::FieldAttr::Child) => quote!(<#ty as ::flotilla_schema::DescribeChild>::describe_child(layout, #name);),
         Some(crate::attrs::FieldAttr::Intern) => {
@@ -56,7 +62,7 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
             let mut carried = Vec::new();
             for variant in &data.variants {
                 let label = variant.ident.unraw().to_string();
-                let mut value =
+                let value =
                     serialization_name(&variant.attrs, "rename")?.map(|name| name.value()).unwrap_or_else(|| rename_all.apply(&label));
                 for attr in &variant.attrs {
                     if attr.path().is_ident("store") {
@@ -67,7 +73,12 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
                             let crate::attrs::ShapeAttr::Code(code) = shape else {
                                 return Err(syn::Error::new_spanned(attr, "expected code"));
                             };
-                            value = code.value();
+                            if code.value() != value {
+                                return Err(syn::Error::new_spanned(
+                                    code,
+                                    format!("a described variant's code is the value Serde writes, `{value}`; rename it with #[serde(rename = ...)]"),
+                                ));
+                            }
                         }
                     }
                 }
@@ -84,6 +95,9 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
                     let key = datum.ident.as_ref().map(|ident| ident.unraw().to_string()).unwrap_or(fallback);
                     let inner = crate::shape::option_inner(&datum.ty).unwrap_or(&datum.ty);
                     let attrs = shape(datum)?;
+                    if attrs.key.is_some() {
+                        return Err(syn::Error::new_spanned(datum, "a row key belongs on a struct field"));
+                    }
                     let domain = attrs.domain.as_ref().map(LitStr::value);
                     let signature = format!("{} {:?} {:?}", quote!(#inner), attrs.shape, domain);
                     let optional = crate::shape::option_inner(&datum.ty).is_some();
@@ -205,6 +219,66 @@ mod tests {
             ),
         ] {
             assert!(expand(&syn::parse2(input).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn a_described_variant_code_is_its_serialized_name() {
+        let accepted = quote!(
+            #[serde(rename_all = "snake_case")]
+            enum Phase {
+                #[shape(code = "in_flight")]
+                InFlight,
+                #[serde(rename = "z")]
+                #[shape(code = "z")]
+                Done,
+            }
+        );
+        assert!(expand(&syn::parse2(accepted).unwrap()).is_ok());
+        let refused = quote!(
+            enum Phase {
+                #[shape(code = "a")]
+                Active,
+            }
+        );
+        let error = expand(&syn::parse2(refused).unwrap()).unwrap_err().to_string();
+        assert!(error.contains("`Active`"), "{error}");
+    }
+
+    #[test]
+    fn a_row_key_is_a_required_struct_field_of_a_described_row() {
+        let accepted = quote!(
+            struct Row {
+                #[shape(key)]
+                id: String,
+            }
+        );
+        assert!(expand(&syn::parse2(accepted.clone()).unwrap()).is_ok());
+        let error = crate::expand(&syn::parse2(accepted).unwrap()).unwrap_err().to_string();
+        assert!(error.contains("`key` declares a described row's key"), "{error}");
+        for refused in [
+            quote!(
+                struct Row {
+                    #[shape(key)]
+                    id: Option<String>,
+                }
+            ),
+            quote!(
+                struct Row {
+                    #[shape(key, child)]
+                    ids: Vec<String>,
+                }
+            ),
+            quote!(
+                enum Row {
+                    One {
+                        #[shape(key)]
+                        id: String,
+                    },
+                }
+            ),
+        ] {
+            assert!(expand(&syn::parse2(refused).unwrap()).is_err());
         }
     }
 }

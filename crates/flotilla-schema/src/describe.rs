@@ -59,20 +59,36 @@ impl<K: crate::Kind> Describe for crate::Ref<K> {
 pub trait DescribeChild {
     fn describe_child(layout: &mut Layout, name: &str);
 }
-impl<T: Describe> DescribeChild for Vec<T> {
+
+/// A list element or map value: a value's columns, or a nested collection's child table.
+/// A collection is a child table only here or under `#[shape(child)]`, never as a bare field:
+/// ```compile_fail
+/// #[derive(flotilla_schema::Describe)]
+/// struct MissingMapShape { values: std::collections::BTreeMap<String, u32> }
+/// ```
+pub trait DescribeElement {
+    fn describe_element(layout: &mut Layout, name: &str);
+}
+impl<T: Describe> DescribeElement for T {
+    fn describe_element(layout: &mut Layout, name: &str) {
+        T::describe(layout, name, true);
+    }
+}
+
+impl<T: DescribeElement> DescribeChild for Vec<T> {
     fn describe_child(layout: &mut Layout, name: &str) {
         layout.table(name, TableRole::Child, |layout| {
             layout.key(|layout| layout.column("pos", ColumnType::Integer, true));
-            T::describe(layout, "", true);
+            T::describe_element(layout, "");
         });
     }
 }
 macro_rules! maps {
-    ($($map:ident),*) => {$(impl<K: Describe, V: Describe> DescribeChild for std::collections::$map<K,V> {
+    ($($map:ident),*) => {$(impl<K: Describe, V: DescribeElement> DescribeChild for std::collections::$map<K,V> {
         fn describe_child(layout: &mut Layout, name: &str) {
             layout.table(name, TableRole::Child, |layout| {
                 layout.key(|layout| K::describe(layout, "key", true));
-                V::describe(layout, "", true);
+                V::describe_element(layout, "");
             });
         }
     })*};
@@ -87,6 +103,22 @@ macro_rules! sets {
 }
 sets!(BTreeSet, HashSet);
 
+// An unnamed nested collection's table is named `items`.
+macro_rules! elements {
+    ($($collection:ty => [$($param:ident),*]),* $(,)?) => {$(impl<$($param),*> DescribeElement for $collection where $collection: DescribeChild {
+        fn describe_element(layout: &mut Layout, name: &str) {
+            <$collection as DescribeChild>::describe_child(layout, if name.is_empty() { "items" } else { name });
+        }
+    })*};
+}
+elements!(
+    Vec<T> => [T],
+    std::collections::BTreeMap<K, V> => [K, V],
+    std::collections::HashMap<K, V> => [K, V],
+    std::collections::BTreeSet<T> => [T],
+    std::collections::HashSet<T> => [T],
+);
+
 impl Describe for usize {
     fn describe(layout: &mut Layout, name: &str, required: bool) {
         layout.column(name, ColumnType::Integer, required);
@@ -100,15 +132,6 @@ impl Describe for std::path::PathBuf {
 impl Describe for serde_json::Value {
     fn describe(layout: &mut Layout, name: &str, required: bool) {
         layout.column(name, ColumnType::Cbor, required);
-    }
-}
-
-// Nested collections retain a child table at every level rather than becoming object columns.
-// A BTreeMap used as an unnamed collection element uses the explicit fallback table name `items`;
-// named map fields keep their field name. Other collections require #[shape(child)] on a field.
-impl<K: Describe, V: Describe> Describe for std::collections::BTreeMap<K, V> {
-    fn describe(layout: &mut Layout, name: &str, _required: bool) {
-        <Self as DescribeChild>::describe_child(layout, if name.is_empty() { "items" } else { name });
     }
 }
 
