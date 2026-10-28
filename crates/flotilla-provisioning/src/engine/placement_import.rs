@@ -96,7 +96,6 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
             .or_insert_with(|| KindEntry { namespaces: BTreeSet::new(), record });
         entry.namespaces.insert(copy.namespace.clone());
     }
-    let mut shares = BTreeMap::<(String, String), BTreeMap<String, Vec<String>>>::new();
     for copy in &copies.policies {
         let name = &copy.object.metadata.name;
         let spec = &copy.object.spec;
@@ -156,20 +155,9 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
         if spec.cloud_sandbox_per_vessel.is_some() {
             *report.dropped.entry((POLICIES, "a cloud sandbox's settings")).or_default() += 1;
         }
-        if let Some(docker) = &spec.docker_per_vessel {
-            let memory = &docker.memory_policy;
-            let share = format!(
-                "{}% of host memory over {} crews, {} bytes of swap each",
-                memory.host_memory_percent, memory.expected_concurrent_crews, memory.swap_bytes
-            );
-            shares.entry((copy.home.clone(), docker.host_ref.clone())).or_default().entry(share).or_default().push(name.clone());
+        if spec.docker_per_vessel.is_some() {
+            *report.dropped.entry((POLICIES, "a Docker memory share")).or_default() += 1;
         }
-    }
-    // The memory share becomes one capacity per host, so a host with several must choose.
-    for ((home, host), by_share) in shares {
-        let each: Vec<String> = by_share.iter().map(|(share, policies)| format!("{share} (`{}`)", policies.join("`, `"))).collect();
-        let several = if by_share.len() > 1 { "several memory shares, one to choose for its capacity" } else { "memory share" };
-        report.notes.push(format!("host `{host}` at `{home}`: {several}: {}", each.join("; ")));
     }
     // The engine has no namespaces, so a name held in several is refused in all of them.
     for ((name, home), KindEntry { namespaces, record }) in kinds {

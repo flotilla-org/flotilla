@@ -15,7 +15,7 @@ pub fn host_direct_checkout() -> HostDirectPlacementPolicyCheckout {
     HostDirectPlacementPolicyCheckout::Worktree
 }
 
-/// The memory share is not compared: it becomes its host's capacity, not a constant.
+/// The memory share is not compared: it is dropped, not held as a constant.
 pub fn differing_settings(spec: &PlacementPolicySpec) -> Vec<&'static str> {
     let mut differing = Vec::new();
     if let Some(docker) = &spec.docker_per_vessel {
