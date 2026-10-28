@@ -1,6 +1,8 @@
 #[cfg(unix)]
 mod account_import;
 #[cfg(unix)]
+mod artifact_import;
+#[cfg(unix)]
 mod definition_import;
 #[cfg(unix)]
 pub(crate) mod frozen;
@@ -162,6 +164,7 @@ async fn validate_daemon_with_preview(
     let mut definition_documents = definition_import::Documents::default();
     let mut repository_documents = repository_import::Documents::default();
     let mut placement_documents = placement_import::Documents::default();
+    let mut artifact_documents = artifact_import::Documents::default();
     let mut root_documents = BTreeMap::<String, manifest_root_import::Documents>::new();
     for (store_base, kind, namespaces) in collections {
         let replication = REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.plural == kind).map(|entry| entry.replication_class);
@@ -242,6 +245,9 @@ async fn validate_daemon_with_preview(
                 }
                 if store_base == base && kind == repository_import::KIND {
                     repository_documents.0.push((namespace.clone(), item.clone()));
+                }
+                if store_base == base && kind == artifact_import::KIND {
+                    artifact_documents.0.push((namespace.clone(), item.clone()));
                 }
                 if store_base == base && lifecycle_import::KINDS.contains(&kind.as_str()) {
                     lifecycle_documents.entry(namespace.clone()).or_default().0.entry(kind.clone()).or_default().push(item.clone());
@@ -327,6 +333,9 @@ async fn validate_daemon_with_preview(
     let placement = placement_documents.rehearse();
     failed |= probes.require_import && !placement.refused.is_empty();
     placement_import::print(&placement);
+    let artifacts = artifact_documents.rehearse();
+    failed |= probes.require_import && !artifacts.refused.is_empty();
+    artifact_import::print(&artifacts);
     // Every kind the daemon holds rows of is imported, dropped or still moving (#3824).
     for (namespace, report) in &import_plans {
         failed |= probes.require_import && report.blocks_import();

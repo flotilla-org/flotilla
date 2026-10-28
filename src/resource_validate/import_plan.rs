@@ -58,7 +58,7 @@ pub(super) const PLAN: &[(&str, Plan)] = &[
     ("ChangeRequest", Plan::Moving("#3824 layer 5")),
     ("Issue", Plan::Moving("#3824 layer 5")),
     ("ForgeRead", Plan::Moving("#3824 layer 5")),
-    ("Artifact", Plan::Moving("#3824 layer 7")),
+    ("Artifact", Plan::Imported("Artifact import (#3824 layer 7)")),
     ("Demand", Plan::Moving("#3824 layer 8")),
     ("Regard", Plan::Moving("#3938")),
     // A plain record beside AccountProvision; its type already derives `Stored` (#3964).
@@ -165,12 +165,12 @@ mod tests {
         report.count("dispatchholds", 3);
         report.count("events", 2);
         report.count("usages", 2);
-        report.count("artifacts", 0);
+        report.count("demands", 0);
         report.count("messages", 9);
         assert_eq!(report.dropped, BTreeMap::from([("DispatchHold", 3), ("Event", 2), ("Usage", 2)]));
         assert!(!report.blocks_import(), "dropped and imported rows never block the import");
-        report.count("artifacts", 1);
-        assert_eq!(report.moving, BTreeMap::from([("Artifact", ("#3824 layer 7", 1))]));
+        report.count("demands", 1);
+        assert_eq!(report.moving, BTreeMap::from([("Demand", ("#3824 layer 8", 1))]));
         assert!(!report.blocks_import(), "a kind still moving stays on the old store until its layer");
         let mut unknown = Report::default();
         unknown.count("widgets", 1);

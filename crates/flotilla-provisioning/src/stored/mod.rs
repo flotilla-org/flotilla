@@ -30,6 +30,7 @@
 //! [`Lifecycle`]: flotilla_state_machines::machines::lifecycle::Lifecycle
 
 pub mod account;
+pub mod artifact;
 pub mod checkout;
 pub mod clone;
 pub mod definition;
