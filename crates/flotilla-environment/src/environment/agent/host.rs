@@ -269,6 +269,7 @@ impl UpgradeWatch<'_> {
         if !self.reached.load(Ordering::SeqCst) {
             return;
         }
+        // A connect dropped as the runtime shuts down has nowhere to report from.
         let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
         let (transport, socket, vessel) = (self.connector.transport.clone(), self.connector.socket(), self.connector.vessel.clone());
         let build = self.connector.executable_bytes.clone();
