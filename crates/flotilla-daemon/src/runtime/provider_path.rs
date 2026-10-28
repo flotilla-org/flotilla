@@ -30,10 +30,13 @@ use sha2::Digest;
 use super::docker::{discard_failed_environment, probe_provisioned_environment};
 use super::environments::ActiveProvisionedEnvironment;
 use super::state::ControllerRuntimeState;
-use crate::environment_tools::{EnvironmentToolContext, DOCKER_PROVIDER_KIND};
+use crate::environment_tools::{EnvironmentToolContext, EnvironmentToolProviderKind, DOCKER_PROVIDER_KIND};
 
 /// The crew socket's file name in the vessel.
 const CREW_SOCKET: &str = "flotilla.sock";
+/// The contained tool layout, under `/opt/flotilla`: a layout the tool
+/// provisioner keys by its Docker kind, not the vessel's provider.
+const CONTAINED_TOOL_LAYOUT: EnvironmentToolProviderKind = DOCKER_PROVIDER_KIND;
 /// The `PATH` a vessel's tools prepend to when the vessel has none of its own.
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -105,9 +108,7 @@ async fn deliver_vessel_layer(
     agent.create_dir(&directory, 0o700).await?;
     let guest = directory.join(CREW_SOCKET);
     let cpus = spec.cloud_sandbox.as_ref().map(|cloud| cloud.size.cpus as usize);
-    // The generation's tools in the contained layout, under `/opt/flotilla`,
-    // which is what the tool provisioner's Docker kind names.
-    let mut tools = state.environment_tools.prepare(DOCKER_PROVIDER_KIND, id.as_str(), &DeclaredSize { state, cpus }).await?;
+    let mut tools = state.environment_tools.prepare(CONTAINED_TOOL_LAYOUT, id.as_str(), &DeclaredSize { state, cpus }).await?;
     let mut environment = BTreeMap::new();
     for tool in &mut tools {
         // The crew socket is the layer's own forward, not a pushed file.
@@ -123,7 +124,8 @@ async fn deliver_vessel_layer(
 
 /// One tool's update to the vessel's environment. The daemon socket variable
 /// always names the vessel's own crew socket. A path prepends to the vessel's
-/// own value, from its image or its provider, as its agent reports it.
+/// own value, from its image or its provider, as its agent reports it; once per
+/// variable, since later updates prepend to the value already gathered.
 async fn apply(
     environment: &mut BTreeMap<String, String>,
     update: &EnvironmentVariableUpdate,
