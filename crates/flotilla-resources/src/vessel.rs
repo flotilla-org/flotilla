@@ -204,6 +204,7 @@ impl VesselPhase {
 }
 
 /// A read view whose phase the engine decides. Never publish it back as stored status.
+/// An ending or readiness replaces the stored message; a live phase keeps the reconciler's own.
 pub fn project_reading(obj: &ResourceObject<Vessel>, reading: Option<&LifecycleReading>) -> ResourceObject<Vessel> {
     let mut obj = obj.clone();
     let Some(reading) = reading else { return obj };
@@ -386,6 +387,67 @@ mod image_tests {
             let after = status.clone();
             patch.apply(&mut status);
             assert_eq!(status, after, "recording the same image twice is idempotent");
+        }
+    }
+}
+
+#[cfg(test)]
+mod reading_tests {
+    use super::*;
+
+    fn vessel(phase: VesselPhase, interrupted_roles: BTreeSet<String>) -> ResourceObject<Vessel> {
+        ResourceObject {
+            metadata: crate::ObjectMeta {
+                name: "vessel".into(),
+                namespace: "flotilla".into(),
+                resource_version: "1".into(),
+                labels: Default::default(),
+                annotations: Default::default(),
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: chrono::DateTime::UNIX_EPOCH,
+                merge: None,
+            },
+            spec: VesselSpec {
+                convoy_ref: "convoy".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "local".into(),
+                adopted_checkout_refs: Default::default(),
+            },
+            status: Some(VesselStatus { phase, message: Some("stored".into()), interrupted_roles, ..Default::default() }),
+        }
+    }
+
+    #[test]
+    fn the_engine_reading_decides_phase_and_ending_message() {
+        let at = chrono::DateTime::UNIX_EPOCH;
+        let roles = BTreeSet::from(["coder".to_string()]);
+        let cases = [
+            (LifecycleReading::InProgress, BTreeSet::new(), VesselPhase::Provisioning, Some("stored")),
+            (
+                LifecycleReading::Retrying { failures: 1, next: at, cause: "c".into() },
+                BTreeSet::new(),
+                VesselPhase::Provisioning,
+                Some("stored"),
+            ),
+            (LifecycleReading::Exhausted { cause: "c".into() }, BTreeSet::new(), VesselPhase::Provisioning, Some("stored")),
+            (LifecycleReading::Ready { identity: "env".into() }, BTreeSet::new(), VesselPhase::Ready, None),
+            (LifecycleReading::Ready { identity: "env".into() }, roles, VesselPhase::Interrupted, Some("stored")),
+            (LifecycleReading::Lost, BTreeSet::new(), VesselPhase::Lost, Some("observed absent")),
+            (LifecycleReading::Released, BTreeSet::new(), VesselPhase::Lost, Some("released")),
+            (LifecycleReading::Failed { reason: "boom".into() }, BTreeSet::new(), VesselPhase::Failed, Some("boom")),
+            (LifecycleReading::GaveUp { cause: "host gone".into() }, BTreeSet::new(), VesselPhase::Failed, Some("host gone")),
+        ];
+        for stored in [VesselPhase::Pending, VesselPhase::Provisioning, VesselPhase::Ready] {
+            for (reading, interrupted_roles, phase, message) in &cases {
+                let status = project_reading(&vessel(stored, interrupted_roles.clone()), Some(reading)).status.expect("status");
+                assert_eq!(status.phase, *phase, "{stored:?} {reading:?}");
+                let message = if stored == *phase { Some("stored") } else { *message };
+                assert_eq!(status.message.as_deref(), message, "{stored:?} {reading:?}");
+            }
+            let unread = vessel(stored, BTreeSet::new());
+            assert_eq!(project_reading(&unread, None).status, unread.status);
         }
     }
 }

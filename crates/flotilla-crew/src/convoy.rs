@@ -123,6 +123,7 @@ impl ConvoyReconciler {
         self
     }
 
+    /// The engine's lifecycle readings of vessels and sessions; none while `[primitives]` is off.
     pub fn with_lifecycle_reads(mut self, reads: Arc<dyn lifecycle_reads::LifecycleReads>) -> Self {
         self.lifecycle_reads = reads;
         self
@@ -138,12 +139,14 @@ impl ConvoyReconciler {
                 (ROLE_LABEL.to_string(), role.to_string()),
             ]))
             .await?
-            .items;
-        let mut live = false;
-        for session in &sessions {
-            let (session, _) = flotilla_store::read_terminal_session(Arc::clone(&self.lifecycle_reads), session, None).await?;
-            live |= session.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running);
-        }
+            .items
+            .into_iter()
+            .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local })
+            .collect();
+        let live = flotilla_store::read_terminal_sources(Arc::clone(&self.lifecycle_reads), sessions)
+            .await?
+            .iter()
+            .any(|session| session.object.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running));
         if !live {
             return Ok(false);
         }
