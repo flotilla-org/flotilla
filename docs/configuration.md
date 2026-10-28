@@ -782,7 +782,6 @@ Flotilla auto-detects available tools. Nothing is strictly required beyond git, 
 | [git](https://git-scm.com/) | Repo detection, branches, worktrees | Yes |
 | [gh](https://cli.github.com/) | GitHub PRs and issues | No |
 | [claude](https://docs.anthropic.com/en/docs/claude-code) | Agent sessions, branch name generation | No |
-| [cmux](https://cmux.dev) | Terminal workspace manager | No |
 
 ## Checkout paths
 

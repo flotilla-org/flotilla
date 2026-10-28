@@ -1,6 +1,6 @@
 # Flotilla
 
-A system for improving multi-agent developer workflows. Consists of a daemon mesh, CLI, and TUI dashboard — managing development workspaces across git worktrees, code review (GitHub PRs), issue trackers, cloud agents (Claude Code, Codex, Cursor), terminal persistence (cleat), and multiplexers (cmux, zellij).
+A system for improving multi-agent developer workflows. Consists of a daemon mesh, CLI, and TUI dashboard — managing development workspaces across git worktrees, code review (GitHub PRs), issue trackers, cloud agents (Claude Code, Codex, Cursor), terminal persistence (cleat).
 
 ## Development Phase
 

@@ -12,7 +12,7 @@ fn sample_bag() -> EnvironmentBag {
         .with(EnvironmentAssertion::remote_host("github.com", "acme", "widgets", "upstream"))
         .with(EnvironmentAssertion::remote_host("github.com", "fork-owner", "widgets", "origin"))
         .with(EnvironmentAssertion::auth_file("github", "/home/user/.config/gh/hosts.yml"))
-        .with(EnvironmentAssertion::socket("cmux", "/tmp/cmux.sock"))
+        .with(EnvironmentAssertion::socket("fixture", "/tmp/fixture.sock"))
 }
 
 #[test]
@@ -102,7 +102,7 @@ fn merge_combines_assertions() {
 #[test]
 fn find_socket_returns_path() {
     let bag = sample_bag();
-    assert_eq!(bag.find_socket("cmux"), Some(&DaemonHostPath::new("/tmp/cmux.sock")));
+    assert_eq!(bag.find_socket("fixture"), Some(&DaemonHostPath::new("/tmp/fixture.sock")));
     assert_eq!(bag.find_socket("nonexistent"), None);
 }
 
