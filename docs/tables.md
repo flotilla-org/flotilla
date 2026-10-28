@@ -2,7 +2,7 @@
 
 flotillad serves its resource kinds and engine kinds as self-describing tables. A client reads a table's description, then a stream of row messages.
 
-Fenced blocks tagged `list <name>` below are checked against the code by a test.
+Fenced blocks tagged `list <name>` below (routes, messages, column types) are checked against the code by a test.
 
 ## Routes
 
@@ -24,7 +24,7 @@ A format comes from `?format=` or, when that is absent, from `Accept` (media ran
 
 | Route | `?format=` | `Accept` / response type |
 |---|---|---|
-| `/tables` | none (use `Accept`) | `application/json`, `application/cbor` |
+| `/tables` | ignored; use `Accept` | `application/json`, `application/cbor` |
 | `/tables/{table}` | `json`, `jsonl`, `cbor`, `markdown`, `mermaid`, `observed` | `application/json`, `application/cbor`, `text/markdown`, `text/vnd.mermaid` |
 | `/tables/{table}/rows` | `json`, `jsonl`, `cbor` | `application/x-ndjson`, `application/json`, `application/jsonl`, `application/cbor-seq` |
 
@@ -151,7 +151,7 @@ A column with a `reference` produces a `foreignKeys` entry naming the target tab
 
 ### Properties in use
 
-```list properties
+```text
 roles
 title
 sortable

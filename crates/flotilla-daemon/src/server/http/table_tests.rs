@@ -628,6 +628,6 @@ fn tables_doc_lists_the_routes_of_the_code() {
         .filter_map(|line| line.trim().strip_prefix(".route(\"")?.split('"').next())
         .filter(|path| path.starts_with("/tables"))
         .collect();
-    assert!(!routes.is_empty());
+    assert_eq!(routes.len(), source.matches("\"/tables").count());
     assert_eq!(sorted(routes), sorted(documented("routes")));
 }
