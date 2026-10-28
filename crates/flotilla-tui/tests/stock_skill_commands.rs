@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 use clap::{error::ErrorKind, CommandFactory, FromArgMatches};
 use flotilla_cli::cli::args::{Cli, SubCommand};
@@ -31,22 +35,32 @@ fn check_file(path: &Path) -> usize {
 }
 
 // Issue #2982: every stock command example must agree with the real clap tree,
-// including required arguments and value parsers. Check every area on disk so
-// adding a reference extends coverage without maintaining a second command list.
-// Keep examples as single-line commands in unindented fenced blocks, without
-// list prefixes or shell continuations; this scanner does not join shell lines.
+// including required arguments and value parsers. Check every stock skill and
+// reference on disk so adding a skill or reference extends coverage without
+// maintaining a second list. Keep examples as single-line commands in unindented
+// fenced blocks, without list prefixes or shell continuations; this scanner does
+// not join shell lines.
 #[test]
 fn stock_skill_commands_match_clap_tree() {
-    let skill = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/flotilla-commands");
-    assert!(check_file(&skill.join("SKILL.md")) > 0, "entrypoint has crew essentials");
-    for entry in fs::read_dir(skill.join("references")).expect("reference directory") {
-        let path = entry.expect("reference file").path();
-        if path.extension().is_some_and(|extension| extension == "md") {
-            assert!(check_file(&path) > 0, "{} has executable examples", path.display());
+    let skills = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills");
+    let mut entrypoint_examples = BTreeMap::new();
+    for entry in fs::read_dir(&skills).expect("stock skills directory") {
+        let skill = entry.expect("skill directory").path();
+        let name = skill.file_name().expect("skill name").to_string_lossy().into_owned();
+        entrypoint_examples.insert(name, check_file(&skill.join("SKILL.md")));
+        let Ok(references) = fs::read_dir(skill.join("references")) else { continue };
+        for reference in references {
+            let path = reference.expect("reference file").path();
+            if path.extension().is_some_and(|extension| extension == "md") {
+                assert!(check_file(&path) > 0, "{} has executable examples", path.display());
+            }
         }
     }
-    let dispatch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/flotilla-dispatch/SKILL.md");
-    assert!(check_file(&dispatch) > 0, "dispatch skill has executable examples");
+    // The command-teaching skills must keep examples, so an emptied entrypoint
+    // cannot pass vacuously.
+    for name in ["flotilla-commands", "flotilla-dispatch"] {
+        assert!(entrypoint_examples.get(name).is_some_and(|count| *count > 0), "{name} entrypoint has executable examples");
+    }
 }
 
 // Issue #2982: the shipped project declaration selects both stock skills for

@@ -48,8 +48,12 @@ flotilla convoy start --project PROJECT --issue NUMBER --name NAME --agent ADAPT
   address on every surface.
 - **Model**: name the model on every dispatch, as `--agent
   [capability=]adapter:model`; the bare form applies to the `code` capability.
-  A dispatch naming no model gets the harness's own default. Repeat the flag
-  per capability, for example `--agent review=codex:gpt-6.1-sol`.
+  A dispatch naming no model gets the harness's own default, and an adapter
+  override does not inherit the model the seeded capability table pairs with
+  it ([dispatch-time agent selection](https://github.com/flotilla-org/flotilla/blob/main/docs/configuration.md#dispatch-time-agent-selection)).
+  Repeat the flag per capability, for example `--agent review=codex:gpt-6.1-sol`.
+  `flotilla fulfilment list` shows the harnesses and models each kind offers;
+  check it before dispatching, because the model names below go stale.
   - Ordinary code: `claude-code:claude-sonnet-5-5` or `codex:gpt-6.1-sol`.
   - Substrate, design-heavy or concurrency-sensitive code: `claude-code:claude-opus-5-5`.
   - Spec and design-judgement work: Opus or Fable.
@@ -62,8 +66,11 @@ flotilla convoy start --project PROJECT --issue NUMBER --name NAME --agent ADAPT
   fulfilment list` shows each kind's harnesses, toolchains and free slots. When
   the work needs something the hosted boxes lack (Codex, Docker, Node), pin a
   host that has it: `--fulfilment docker-crew-image-feta --escalation-reason
-  REASON`. Add `--need CAPABILITY` for a dispatch-specific constraint the
-  issue doesn't capture.
+  REASON`. Admission refuses a pin above the least-privileged alternatives,
+  or onto capacity reserved for platform work, unless it carries
+  `--escalation-reason`; the flag is refused without `--fulfilment`. Add
+  `--need CAPABILITY` for a dispatch-specific constraint the issue doesn't
+  capture.
 - **Instruction**: free text appended to the crew's brief, for
   dispatch-specific direction. A good default: "You choose test seams and
   design details yourself and record them in the decision ledger."
