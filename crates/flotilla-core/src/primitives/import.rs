@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_address::Address;
-use flotilla_resources::{Message, MessageExpectation, MessagePhase, MessageReference, ResolvedMessageReceiver, ResourceObject};
+use flotilla_resources::{Message, MessageExpectation, MessagePhase, ResolvedMessageReceiver, ResourceObject};
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::{
@@ -143,14 +143,8 @@ fn convert(
         }
     }
     for reference in &old.record.spec.references {
-        if matches!(
-            reference,
-            MessageReference::Commit { .. }
-                | MessageReference::Ref { .. }
-                | MessageReference::Artifact { .. }
-                | MessageReference::ControlRecord { .. }
-        ) {
-            conversion.reference(reference, false).map_err(|detail| missing("a record it references is gone or has no address", detail))?;
+        if let Some(reason) = conversion.records.missing(reference) {
+            return Err(missing(reason, conversion.records.address(reference).err().unwrap_or_else(|| reason.to_owned())));
         }
     }
     let reference = |name: &str| -> Result<MessageRef, String> {
@@ -172,7 +166,7 @@ fn convert(
     let kept = || status.resolved_receiver.as_ref().map(|_| receiver()).transpose();
     let state = match status.phase {
         MessagePhase::Accepted | MessagePhase::WaitingOnReferences | MessagePhase::Deliverable => MessageState::Pending,
-        MessagePhase::Delivered if spec.expectation == Expectation::Nothing => MessageState::Settled { receiver: Some(receiver()?) },
+        MessagePhase::Delivered if settled(old.record) => MessageState::Settled { receiver: Some(receiver()?) },
         MessagePhase::Delivered => MessageState::Awaiting { receiver: receiver()? },
         MessagePhase::Satisfied | MessagePhase::Answered | MessagePhase::OutcomeMet => MessageState::Settled { receiver: kept()? },
         MessagePhase::Expired if spec.deadline.is_none() => {
@@ -351,16 +345,19 @@ pub fn import_all<'a>(
     loop {
         let view = Without { world, gone: &gone };
         let results: Vec<_> = ordered.iter().map(|(version, old)| import_message(old, *version, conversion, &view)).collect();
-        let before = gone.len();
-        let mut next = gone.clone();
-        next.extend(results.iter().filter_map(|result| match result {
-            Ok(Imported::Message(_)) => None,
-            Ok(Imported::Dropped(ImportDrop { record, .. })) | Err(ImportRefusal { record, .. }) => Some(record.clone()),
-        }));
-        if next.len() == before {
+        let unimported: Vec<_> = results
+            .iter()
+            .filter_map(|result| match result {
+                Ok(Imported::Message(_)) => None,
+                Ok(Imported::Dropped(ImportDrop { record, .. })) | Err(ImportRefusal { record, .. }) => Some(record),
+            })
+            .filter(|record| !gone.contains(*record))
+            .cloned()
+            .collect();
+        if unimported.is_empty() {
             return results;
         }
-        gone = next;
+        gone.extend(unimported);
     }
 }
 

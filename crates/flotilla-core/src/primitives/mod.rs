@@ -1265,6 +1265,19 @@ impl OldStoreRecords {
 }
 
 impl ReferenceAddresses for OldStoreRecords {
+    fn missing(&self, reference: &OldReference) -> Option<&'static str> {
+        match reference {
+            OldReference::ControlRecord { resource, .. } if matches!(resource.kind.as_str(), "Convoy" | "Project") => None,
+            OldReference::ControlRecord { .. } => Some("it references a kind with no address"),
+            OldReference::Artifact { resource, .. } => {
+                (!self.artifacts.contains_key(&resource.name)).then_some("a referenced artifact is gone")
+            }
+            OldReference::Commit { repository, .. } | OldReference::Ref { repository, .. } => {
+                (!self.repositories.iter().any(|held| held.metadata.name == repository.name)).then_some("a referenced repository is gone")
+            }
+            _ => None,
+        }
+    }
     fn convoy_project(&self, convoy: &str) -> Option<String> {
         OldStoreRecords::convoy_project(self, convoy)
     }

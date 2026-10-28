@@ -9,7 +9,7 @@
 //! | Under a built-in's name (layer 2a) | dropped: the built-in is served from the code |
 //! | Deleted (the merge reads it as deleted) | dropped |
 //! | A retired ADR 0053 image layer | dropped: inert for resolution |
-//! | With a field still in merge conflict | refused, with the fields named |
+//! | With a field still in merge conflict | the merged value readers see, noted with its sibling values |
 //! | Declared by a manifest at one or more homes | one record at each declaring home |
 //! | Declared by none | one record at the home that created it; the other copies fold into it |
 //!
@@ -188,10 +188,17 @@ where
                 continue;
             }
         };
-        if let Some(conflicts) = merged.metadata.merge.as_ref().map(|merge| &merge.conflicts).filter(|conflicts| !conflicts.is_empty()) {
-            let fields: Vec<_> = conflicts.keys().map(String::as_str).collect();
-            report.refused.push(refuse(format!("unresolved merge conflict in {}", fields.join(", "))));
-            continue;
+        if let Some(merge) = &merged.metadata.merge {
+            let spec = serde_json::to_value(&merged.spec).unwrap_or_default();
+            for (field, siblings) in &merge.conflicts {
+                let chosen = field.strip_prefix("spec.").and_then(|field| spec.get(field)).map_or("absent".to_owned(), ToString::to_string);
+                let siblings: Vec<_> =
+                    siblings.iter().map(|sibling| format!("{} from {}", sibling.value, sibling.dot.author_root)).collect();
+                report.notes.push(format!(
+                    "{kind} `{name}`: `{field}` is in merge conflict; imported the merged value {chosen}, of the sibling values {}",
+                    siblings.join(", ")
+                ));
+            }
         }
         if !definition_is_live(&merged) {
             *report.dropped.entry((kind, "deleted")).or_default() += copies.len();

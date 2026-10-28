@@ -15,7 +15,7 @@ use flotilla_core::primitives::{
 };
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
-    Message, MessageExpectation, MessagePhase, MessageReference, MessageRelation, MessageSpec, MessageStatus, ObjectMeta,
+    Message, MessageExpectation, MessagePhase, MessageReference, MessageRelation, MessageSpec, MessageStatus, ObjectMeta, RepositorySpec,
     ResolvedMessageReceiver, ResourceObject,
 };
 use flotilla_state_machines::machines::{
@@ -268,8 +268,15 @@ fn delivered_expecting_nothing_imports_as_settled() {
 
 fn settled(record: &ResourceObject<Message>) -> bool {
     let phase = record.status.as_ref().expect("status").phase;
-    !matches!(phase, MessagePhase::Accepted | MessagePhase::WaitingOnReferences | MessagePhase::Deliverable | MessagePhase::Delivered)
-        || record.spec.expectation == MessageExpectation::None && phase == MessagePhase::Delivered
+    matches!(
+        phase,
+        MessagePhase::Satisfied
+            | MessagePhase::Answered
+            | MessagePhase::OutcomeMet
+            | MessagePhase::Expired
+            | MessagePhase::Superseded
+            | MessagePhase::DeadLettered
+    ) || record.spec.expectation == MessageExpectation::None && phase == MessagePhase::Delivered
 }
 
 fn gone_session() -> ResolvedMessageReceiver {
@@ -348,12 +355,18 @@ fn control_record(kind: &str, name: &str) -> MessageReference {
 }
 
 // Behaviour: a Project reference maps to its project address and back; a
-// TerminalSession reference has no address, so it drops a settled record and
-// refuses an open one.
+// TerminalSession reference has no address and a missing artifact or
+// repository is gone, so each drops a settled record and refuses an open one;
+// a malformed reference is refused even when settled.
 #[test]
-fn project_references_map_and_terminal_session_references_drop_or_refuse() {
+fn record_references_map_drop_or_refuse() {
     let roles = FleetRoles::declared("fleet").expect("roles");
-    let records = OldStoreRecords::from_records("flotilla", Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let local = ResourceObject {
+        metadata: meta("repository-local", 1),
+        spec: RepositorySpec::local("host-a", "/repo/.git").expect("local repository"),
+        status: None,
+    };
+    let records = OldStoreRecords::from_records("flotilla", Vec::new(), Vec::new(), Vec::new(), Vec::new(), vec![local], Vec::new());
     let conversion = Conversion { roles: &roles, forges: &[], records: &records };
     let referring = |name: &str, reference: MessageReference, phase: MessagePhase, receiver: Option<ResolvedMessageReceiver>| {
         let mut spec = spec(RECEIVER, "system:turn-rules", MessageExpectation::None);
@@ -364,6 +377,33 @@ fn project_references_map_and_terminal_session_references_drop_or_refuse() {
         referring("to-project", control_record("Project", "flotilla"), MessagePhase::Satisfied, Some(delivered())),
         referring("settled-to-session", control_record("TerminalSession", "terminal-1"), MessagePhase::Satisfied, Some(delivered())),
         referring("open-to-session", control_record("TerminalSession", "terminal-1"), MessagePhase::Accepted, None),
+        referring(
+            "to-artifact",
+            MessageReference::Artifact {
+                resource: ResourceRef::new("flotilla.work/v1", "Artifact", "flotilla", "artifact-gone"),
+                revision: "1".into(),
+            },
+            MessagePhase::Satisfied,
+            Some(delivered()),
+        ),
+        referring(
+            "to-commit",
+            MessageReference::Commit {
+                repository: ResourceRef::new("flotilla.work/v1", "Repository", "flotilla", "repository-gone"),
+                revision: "abc".into(),
+            },
+            MessagePhase::Satisfied,
+            Some(delivered()),
+        ),
+        referring(
+            "to-unaddressable-commit",
+            MessageReference::Commit {
+                repository: ResourceRef::new("flotilla.work/v1", "Repository", "flotilla", "repository-local"),
+                revision: "abc".into(),
+            },
+            MessagePhase::Satisfied,
+            Some(delivered()),
+        ),
     ];
     let world = world(&olds);
     let import = |name: &str| {
@@ -374,7 +414,11 @@ fn project_references_map_and_terminal_session_references_drop_or_refuse() {
     let reference = &project.resource.spec().references[0];
     assert_eq!(reference.address.as_str(), "project:flotilla");
     assert_eq!(records.record(&reference.address, &reference.revision), Some(control_record("Project", "flotilla")));
-    assert_eq!(dropped(&import("settled-to-session")), Some("a record it references is gone or has no address"));
+    assert_eq!(dropped(&import("settled-to-session")), Some("it references a kind with no address"));
+    assert_eq!(dropped(&import("to-artifact")), Some("a referenced artifact is gone"));
+    assert_eq!(dropped(&import("to-commit")), Some("a referenced repository is gone"));
+    let held = import("to-unaddressable-commit").expect_err("a held record it cannot address is refused even when settled");
+    assert_eq!(held.record, "to-unaddressable-commit");
     let refusal = import("open-to-session").expect_err("an open record with an unaddressable reference is refused");
     assert_eq!(refusal.record, "open-to-session");
 }
