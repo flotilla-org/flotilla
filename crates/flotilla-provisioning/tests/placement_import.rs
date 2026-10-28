@@ -172,6 +172,11 @@ fn what_the_move_cannot_carry_is_refused() {
             copy::<PlacementPolicy>("baseline", "kiwi", &[], &[], baseline),
             copy::<PlacementPolicy>("constrained", "kiwi", &[], &[], constrained),
             copy::<PlacementPolicy>("orphan-host-direct", "feta", &[], &[], host_direct_policy()),
+            {
+                let mut elsewhere = copy::<PlacementPolicy>("orphan-host-direct", "feta", &[], &[], host_direct_policy());
+                elsewhere.namespace = "other".into();
+                elsewhere
+            },
             copy::<PlacementPolicy>("half", "kiwi", &[], &[], crew_image(50)),
             copy::<PlacementPolicy>("quarter", "kiwi", &[], &[], crew_image(25)),
             copy::<PlacementPolicy>("adapters", "udder", &[], &[], adapters),
@@ -189,6 +194,11 @@ fn what_the_move_cannot_carry_is_refused() {
         assert!(refused.iter().any(|line| line.contains(record) && line.contains(reason)), "{record}: {reason} in {refused:#?}");
     }
     assert_eq!(refused.len(), 4, "{refused:#?}");
+    // A copy refused on its own and held in two namespaces gives both reasons.
+    assert!(
+        refused.iter().any(|line| line.contains("orphan-host-direct") && line.contains("the engine has no namespaces")),
+        "{refused:#?}"
+    );
     assert_eq!(report.dropped.get(&("PlacementPolicy", "deleted")), Some(&1));
     assert_eq!(report.dropped.get(&("PlacementPolicy", "agent adapters, an image fact the host probes")), Some(&1));
     assert!(
