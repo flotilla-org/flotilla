@@ -167,7 +167,7 @@ pub struct DockerPerVesselPlacementPolicySpec {
 }
 
 /// A snapshot frozen from a retired CrewImageBaseline holds its mutable tag, which Docker refuses,
-/// so it decodes as the vessel's composed image.
+/// so it decodes as the vessel's composed image. Remove one roll after CrewImageBaseline retires.
 #[derive(Deserialize)]
 struct StoredDockerPerVessel {
     host_ref: String,
@@ -248,7 +248,8 @@ pub enum DockerImageSource {
 /// Decode an optional image source, dropping the ADR 0053
 /// `{composition: {selection…}}` form as omitted. ADR 0047: remove the
 /// composition shim one roll after ADR 0062 images land. A retired
-/// CrewImageBaseline reference decodes as omitted too.
+/// CrewImageBaseline reference decodes as omitted too; remove that arm one roll
+/// after CrewImageBaseline retires.
 pub(crate) fn decode_optional_image_source<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<DockerImageSource>, D::Error> {
