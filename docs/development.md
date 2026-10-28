@@ -1,8 +1,5 @@
 # Development
 
-For the post-r591 provider and label cleanup, see the
-[compatibility retirement acceptance checks](compatibility-retirement-acceptance.md).
-
 ## Rust tests
 
 Install the CI-pinned nextest version locally:
@@ -418,8 +415,7 @@ Dirty main or subagent worktrees, stashes and unpublished local-ref or detached
 worktree commits preserve the clone;
 worktrees outside the vessel directory refuse reclamation.
 
-See the [placement-policy reference](placement-policy.md) for the stored strategy
-shape and the deliberate per-host switch after a fleet roll. Existing
+Existing
 `worktree_on_host_and_mount` policies remain readable and keep the behavior below
 until the host operator switches them; host-direct placements do not change.
 
