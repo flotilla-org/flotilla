@@ -375,7 +375,7 @@ impl AdmissionActions<'_> {
                         provider_workspace_root,
                         minimal_alternatives: Vec::new(),
                         escalation_reason: None,
-                        policy_name: selected.metadata.name.clone(),
+                        kind: selected.metadata.name.clone(),
                         target_host,
                         refused_candidates: placement.refused_candidates.clone(),
                         viable_not_selected: placement.viable_not_selected.clone(),

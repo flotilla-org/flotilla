@@ -47,14 +47,16 @@ pub struct PlacementTargetHost {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder, flotilla_schema::Describe)]
 pub struct PlacementRefusal {
-    pub policy_name: String,
+    #[serde(alias = "policy_name")]
+    pub kind: String,
     pub target_host: PlacementTargetHost,
     pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder, flotilla_schema::Describe)]
 pub struct PlacementViableCandidate {
-    pub policy_name: String,
+    #[serde(alias = "policy_name")]
+    pub kind: String,
     pub target_host: PlacementTargetHost,
     pub reason: String,
 }
@@ -63,7 +65,8 @@ pub struct PlacementViableCandidate {
 pub struct PlacementDecision {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_workspace_root: Option<String>,
-    pub policy_name: String,
+    #[serde(alias = "policy_name")]
+    pub kind: String,
     pub target_host: PlacementTargetHost,
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

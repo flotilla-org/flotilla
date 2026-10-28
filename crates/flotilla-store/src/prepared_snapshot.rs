@@ -48,7 +48,7 @@ impl PreparedSnapshotGarbageCollector {
             }
             if let Some(encoded) = convoy.metadata.annotations.get(crate::VESSEL_PLACEMENTS_ANNOTATION) {
                 if let Ok(pins) = serde_json::from_str::<BTreeMap<String, crate::VesselPlacementPin>>(encoded) {
-                    placement_refs.extend(pins.into_values().map(|pin| pin.policy_ref));
+                    placement_refs.extend(pins.into_values().map(|pin| pin.kind_ref));
                 }
             }
         }

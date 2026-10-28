@@ -41,7 +41,7 @@ async fn convoy_waits_for_selected_minimal_kind_with_legacy_host_alias_and_resum
         .expect("convoy");
     let decision = PlacementDecision {
         provider_workspace_root: None,
-        policy_name: "linux-docker".to_string(),
+        kind: "linux-docker".to_string(),
         target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("host-id"), display_name: "feta".to_string() },
         minimal_alternatives: vec!["large-host".to_string()],
         escalation_reason: None,

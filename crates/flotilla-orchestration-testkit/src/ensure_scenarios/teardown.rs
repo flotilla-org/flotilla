@@ -38,7 +38,7 @@ pub async fn refused_convoy_reclaim_leaves_runtime_children_untouched(factory: &
             &flotilla_resources::VesselSpec {
                 convoy_ref: convoy_name.to_string(),
                 vessel_name: "work".to_string(),
-                placement_policy_ref: "contained".to_string(),
+                fulfilment_kind_ref: "contained".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
@@ -490,7 +490,7 @@ pub async fn convoy_teardown_removes_its_managed_children(factory: &dyn EnsureSc
             &flotilla_resources::VesselSpec {
                 convoy_ref: convoy_ref.clone(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "default".into(),
+                fulfilment_kind_ref: "default".into(),
                 adopted_checkout_refs: Default::default(),
             },
         )

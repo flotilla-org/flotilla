@@ -795,7 +795,7 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
                         } else {
                             format!("; {} viable not selected", decision.viable_not_selected.len())
                         };
-                        format!("{} on {}{refusals}{viable}", decision.policy_name, decision.target_host.display_name)
+                        format!("{} on {}{refusals}{viable}", decision.kind, decision.target_host.display_name)
                     },
                 )),
                 Cell::new(format_fleet_staleness(&row.staleness)),
@@ -977,7 +977,7 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         }
     }
     let mut write_placement = |label: &str, placement: &flotilla_protocol::PlacementDecision| {
-        let _ = writeln!(output, "{label}: {} on {}", placement.policy_name, placement.target_host.display_name);
+        let _ = writeln!(output, "{label}: {} on {}", placement.kind, placement.target_host.display_name);
         if !placement.minimal_alternatives.is_empty() {
             let _ = writeln!(output, "Minimal alternatives: {}", placement.minimal_alternatives.join(", "));
         }
@@ -985,7 +985,7 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
             let _ = writeln!(output, "Escalation: {reason}");
         }
         for refusal in &placement.refused_candidates {
-            let _ = writeln!(output, "  Refused {} on {}: {}", refusal.policy_name, refusal.target_host.display_name, refusal.reason);
+            let _ = writeln!(output, "  Refused {} on {}: {}", refusal.kind, refusal.target_host.display_name, refusal.reason);
         }
         if let Some(allocation) = &placement.allocation {
             if let Some(reason) = &allocation.reservation_reason {

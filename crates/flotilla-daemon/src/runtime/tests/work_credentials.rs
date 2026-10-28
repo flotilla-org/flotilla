@@ -93,7 +93,7 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
             &VesselSpec {
                 convoy_ref: "credential-work".to_string(),
                 vessel_name: "work".to_string(),
-                placement_policy_ref: "test".to_string(),
+                fulfilment_kind_ref: "test".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
@@ -194,7 +194,7 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
             &VesselSpec {
                 convoy_ref: "unavailable-credential-work".to_string(),
                 vessel_name: "unavailable".to_string(),
-                placement_policy_ref: "test".to_string(),
+                fulfilment_kind_ref: "test".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
@@ -287,7 +287,7 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
             &VesselSpec {
                 convoy_ref: "conflicting-credential-work".to_string(),
                 vessel_name: "other-work".to_string(),
-                placement_policy_ref: "test".to_string(),
+                fulfilment_kind_ref: "test".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )

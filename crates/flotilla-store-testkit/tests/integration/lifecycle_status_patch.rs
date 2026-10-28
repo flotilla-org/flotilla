@@ -402,8 +402,8 @@ fn patch_variants_exhaustively_declare_their_lifecycle_classes() {
         vessel_patch_kind(&VesselStatusPatch::MarkProvisioning {
             image: None,
             placement_decision: None,
-            observed_policy_ref: "docker".to_string(),
-            observed_policy_version: "2".to_string(),
+            observed_kind_ref: "docker".to_string(),
+            observed_kind_version: "2".to_string(),
             started_at: ts(30),
             message: None,
         }),
@@ -830,8 +830,8 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                 let patch = VesselStatusPatch::MarkProvisioning {
                     image: None,
                     placement_decision: None,
-                    observed_policy_ref: "docker".to_string(),
-                    observed_policy_version: "2".to_string(),
+                    observed_kind_ref: "docker".to_string(),
+                    observed_kind_version: "2".to_string(),
                     started_at: ts(30),
                     message: None,
                 };

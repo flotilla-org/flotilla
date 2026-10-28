@@ -67,7 +67,7 @@ async fn vessel_metadata_and_status_roundtrip() {
     let spec = VesselSpec {
         convoy_ref: "fix-bug-123".to_string(),
         vessel_name: "implement".to_string(),
-        placement_policy_ref: "docker-on-01HXYZ".to_string(),
+        fulfilment_kind_ref: "docker-on-01HXYZ".to_string(),
         adopted_checkout_refs: Default::default(),
     };
     let created = resolver.create(&vessel_meta("convoy-fix-bug-123-implement"), &spec).await.expect("create should succeed");
@@ -83,8 +83,8 @@ async fn vessel_metadata_and_status_roundtrip() {
                 placement_decision: None,
                 phase: VesselPhase::Ready,
                 message: None,
-                observed_policy_ref: Some("docker-on-01HXYZ".to_string()),
-                observed_policy_version: Some("12".to_string()),
+                observed_kind_ref: Some("docker-on-01HXYZ".to_string()),
+                observed_kind_version: Some("12".to_string()),
                 environment_ref: Some("env-a".to_string()),
                 image_ref: Some("registry.example/crew:latest".to_string()),
                 local_image_id: Some("sha256:test-image".to_string()),

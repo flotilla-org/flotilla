@@ -33,7 +33,7 @@ async fn vessel_finalizer_contract(backend: ResourceBackend) {
             &VesselSpec {
                 convoy_ref: "convoy-surrogate".to_string(),
                 vessel_name: "work".to_string(),
-                placement_policy_ref: "unused".to_string(),
+                fulfilment_kind_ref: "unused".to_string(),
                 adopted_checkout_refs: Default::default(),
             },
         )
@@ -243,7 +243,7 @@ fn restart_vessel_spec() -> VesselSpec {
     VesselSpec {
         convoy_ref: "convoy-restart".to_string(),
         vessel_name: "implement".to_string(),
-        placement_policy_ref: "policy-restart".to_string(),
+        fulfilment_kind_ref: "policy-restart".to_string(),
         adopted_checkout_refs: Default::default(),
     }
 }

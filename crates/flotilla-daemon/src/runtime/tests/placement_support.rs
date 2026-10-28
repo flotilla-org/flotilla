@@ -225,7 +225,7 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
                     provider_workspace_root: None,
                     minimal_alternatives: Vec::new(),
                     escalation_reason: None,
-                    policy_name: policy_name.to_string(),
+                    kind: policy_name.to_string(),
                     target_host: PlacementTargetHost {
                         reference: CanonicalHostId::resolved(feta_host_ref.clone()),
                         display_name: "feta".to_string(),

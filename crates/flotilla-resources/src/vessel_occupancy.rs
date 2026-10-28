@@ -190,7 +190,7 @@ mod tests {
 
     fn decision(host: &str) -> PlacementDecision {
         PlacementDecision {
-            policy_name: format!("host-direct-{host}"),
+            kind: format!("host-direct-{host}"),
             target_host: PlacementTargetHost { reference: CanonicalHostId::resolved(host), display_name: host.into() },
             minimal_alternatives: Vec::new(),
             escalation_reason: None,
@@ -254,7 +254,7 @@ mod tests {
                     spec: VesselSpec {
                         convoy_ref: name.clone(),
                         vessel_name: format!("v{vessel}"),
-                        placement_policy_ref: format!("host-direct-{}", HOSTS[convoy.host]),
+                        fulfilment_kind_ref: format!("host-direct-{}", HOSTS[convoy.host]),
                         adopted_checkout_refs: Default::default(),
                     },
                     status: None,

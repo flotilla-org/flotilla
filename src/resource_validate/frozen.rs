@@ -694,7 +694,7 @@ mod tests {
                 &VesselSpec {
                     convoy_ref: "governor".into(),
                     vessel_name: "work".into(),
-                    placement_policy_ref: "contained".into(),
+                    fulfilment_kind_ref: "contained".into(),
                     adopted_checkout_refs: BTreeMap::new(),
                 },
             )
@@ -817,7 +817,7 @@ mod tests {
                 &VesselSpec {
                     convoy_ref: "governor".into(),
                     vessel_name: "work".into(),
-                    placement_policy_ref: "contained".into(),
+                    fulfilment_kind_ref: "contained".into(),
                     adopted_checkout_refs: BTreeMap::new(),
                 },
             )

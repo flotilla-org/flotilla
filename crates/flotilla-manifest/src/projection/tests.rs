@@ -2693,7 +2693,7 @@ fn placement_catalog_preserves_raw_facts(tc: hegel::TestCase) {
         .iter()
         .map(|policy| {
             flotilla_protocol::PlacementViableCandidate::builder()
-                .policy_name(policy.clone())
+                .kind(policy.clone())
                 .target_host(
                     PlacementTargetHost::builder().reference(CanonicalHostId::resolved("host-kiwi")).display_name("kiwi".into()).build(),
                 )
@@ -2708,7 +2708,7 @@ fn placement_catalog_preserves_raw_facts(tc: hegel::TestCase) {
     let kind = if contained { "docker-crew-image-feta" } else { "host-direct-feta" };
     row.placement_decision = Some(
         PlacementDecision::builder()
-            .policy_name("policy-work".into())
+            .kind("policy-work".into())
             .target_host(
                 PlacementTargetHost::builder().reference(CanonicalHostId::resolved("host-feta")).display_name("feta".into()).build(),
             )

@@ -384,7 +384,7 @@ async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_rep
                 provider_workspace_root: None,
                 minimal_alternatives: Vec::new(),
                 escalation_reason: None,
-                policy_name: "self-targeted".to_string(),
+                kind: "self-targeted".to_string(),
                 target_host: PlacementTargetHost {
                     reference: flotilla_protocol::CanonicalHostId::resolved(host_id),
                     display_name: "local-host".to_string(),
@@ -486,7 +486,7 @@ async fn self_targeted_admission_resolves_display_name_policy_to_live_local_host
                 provider_workspace_root: None,
                 minimal_alternatives: Vec::new(),
                 escalation_reason: None,
-                policy_name: "self-targeted".to_string(),
+                kind: "self-targeted".to_string(),
                 target_host: target,
                 refused_candidates: Vec::new(),
                 viable_not_selected: Vec::new(),
@@ -624,7 +624,7 @@ async fn admitting_host_floor_gates_only_work_that_lands_on_it() {
     let local = daemon.local_host_id().expect("host id").to_string();
     let decision = |host: &str| PlacementDecision {
         provider_workspace_root: None,
-        policy_name: format!("host-direct-{host}"),
+        kind: format!("host-direct-{host}"),
         target_host: PlacementTargetHost { reference: flotilla_protocol::CanonicalHostId::resolved(host), display_name: host.into() },
         minimal_alternatives: Vec::new(),
         escalation_reason: None,
@@ -857,7 +857,7 @@ async fn capped_ssh_hosts_spread_unpinned_convoys_and_queue_beyond_their_cap() {
     let vessel_spec = |convoy: &str, policy: &str| flotilla_resources::VesselSpec {
         convoy_ref: convoy.into(),
         vessel_name: "work".into(),
-        placement_policy_ref: policy.into(),
+        fulfilment_kind_ref: policy.into(),
         adopted_checkout_refs: BTreeMap::new(),
     };
     let mut placed: Vec<(String, PlacementDecision)> = Vec::new();
@@ -872,7 +872,7 @@ async fn capped_ssh_hosts_spread_unpinned_convoys_and_queue_beyond_their_cap() {
                             .name(format!("{name}-work"))
                             .finalizers(vec!["flotilla.work/vessel-workspace-teardown".into()])
                             .build(),
-                        &vessel_spec(name, &decision.policy_name),
+                        &vessel_spec(name, &decision.kind),
                     )
                     .await
                     .expect("provisioned vessel");
@@ -887,7 +887,7 @@ async fn capped_ssh_hosts_spread_unpinned_convoys_and_queue_beyond_their_cap() {
         let decision = PlacementDecision {
             minimal_alternatives: Vec::new(),
             escalation_reason: None,
-            policy_name: selected.metadata.name.clone(),
+            kind: selected.metadata.name.clone(),
             target_host: placement_target_host(&backend, "flotilla", &selected).await.expect("target host"),
             refused_candidates: placement.refused_candidates,
             viable_not_selected: placement.viable_not_selected,
@@ -943,7 +943,7 @@ async fn capped_ssh_hosts_spread_unpinned_convoys_and_queue_beyond_their_cap() {
     // Tear down the convoy on the fourth's host: its vessel holds the slot
     // until its teardown finishes.
     let (holder, _) = placed[..3].iter().find(|(_, decision)| decision.target_host == placed[3].1.target_host).expect("holder");
-    let vessel_spec = vessel_spec(holder, &placed[3].1.policy_name);
+    let vessel_spec = vessel_spec(holder, &placed[3].1.kind);
     let holder_convoy = convoys.get(holder).await.expect("holder");
     let mut landed = holder_convoy.status.clone().expect("holder status");
     landed.phase = ConvoyPhase::Landed;
@@ -985,7 +985,7 @@ async fn uncapped_ssh_host_still_refuses_unpinned_convoys() {
         .await
         .expect("the capped host takes the convoy");
     assert_eq!(placement.selected.expect("placement").metadata.name, "host-direct-b1");
-    let refusal = placement.refused_candidates.iter().find(|refusal| refusal.policy_name == "host-direct-b9").expect("b9 refused");
+    let refusal = placement.refused_candidates.iter().find(|refusal| refusal.kind == "host-direct-b9").expect("b9 refused");
     assert_eq!(refusal.reason, "SSH host takes only convoys that pin its placement");
 }
 
@@ -1016,7 +1016,7 @@ async fn placement_prefers_the_capped_host_with_most_free_slots() {
         let decision = PlacementDecision {
             minimal_alternatives: Vec::new(),
             escalation_reason: None,
-            policy_name: selected.metadata.name.clone(),
+            kind: selected.metadata.name.clone(),
             target_host,
             refused_candidates: Vec::new(),
             viable_not_selected: Vec::new(),
@@ -1077,7 +1077,7 @@ async fn concurrent_admissions_onto_one_free_slot_provision_in_admission_order()
         decisions.push(PlacementDecision {
             minimal_alternatives: Vec::new(),
             escalation_reason: None,
-            policy_name: selected.metadata.name.clone(),
+            kind: selected.metadata.name.clone(),
             target_host: placement_target_host(&backend, "flotilla", &selected).await.expect("target host"),
             refused_candidates: Vec::new(),
             viable_not_selected: Vec::new(),
@@ -1181,7 +1181,7 @@ async fn admit(daemon: &InProcessDaemon, backend: &ResourceBackend, name: &str, 
     let decision = PlacementDecision {
         minimal_alternatives: alternatives,
         escalation_reason: None,
-        policy_name: selected.metadata.name.clone(),
+        kind: selected.metadata.name.clone(),
         target_host: placement_target_host(backend, "flotilla", &selected).await.expect("target host"),
         refused_candidates: placement.refused_candidates,
         viable_not_selected: placement.viable_not_selected,
@@ -1241,7 +1241,7 @@ async fn capped_docker_host_at_its_cap_overflows_to_a_box() {
     // The first convoy fills feta's one slot.
     admit(&daemon, &backend, "first", Some("docker-feta")).await;
     let second = admit(&daemon, &backend, "second", None).await;
-    assert_eq!(second.policy_name, "host-direct-b1");
+    assert_eq!(second.kind, "host-direct-b1");
     let feta = allocation_candidate(&second, "docker-feta");
     assert_eq!((feta.free_vessel_slots, feta.max_vessels, feta.available), (Some(0), Some(1), false));
 }
@@ -1262,7 +1262,7 @@ async fn all_candidates_full_means_the_convoy_waits() {
     let allocation = third.allocation.as_ref().expect("allocation");
     assert!(allocation.candidates.iter().all(|candidate| !candidate.available), "{allocation:?}");
     // Equal candidates break ties by name, so the Docker host's gate is the one under test.
-    assert_eq!(third.policy_name, "docker-feta");
+    assert_eq!(third.kind, "docker-feta");
     let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(backend.definitions::<flotilla_resources::WorkflowTemplate>("flotilla"))
         .with_hosts(backend.including_replicas::<ResourceHost>("flotilla"))
         .with_convoys(backend.including_replicas::<ResourceConvoy>("flotilla"))

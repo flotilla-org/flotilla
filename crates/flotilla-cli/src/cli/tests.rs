@@ -526,7 +526,7 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
         allocation: Vec::new(),
         placement: Some(PlacementDecision {
             provider_workspace_root: None,
-            policy_name: "macos-scarce".into(),
+            kind: "macos-scarce".into(),
             target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("comte"), display_name: "comte".into() },
             minimal_alternatives: Vec::new(),
             escalation_reason: None,

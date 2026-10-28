@@ -419,22 +419,22 @@ impl PlacementStrategy {
 enum PlannedPatch {
     None,
     Provisioning {
-        observed_policy_ref: String,
-        observed_policy_version: String,
+        observed_kind_ref: String,
+        observed_kind_version: String,
         placement_decision: Option<PlacementDecision>,
         waiting_for: String,
         image: Option<VesselImage>,
     },
     EnvironmentRecreation {
-        observed_policy_ref: String,
-        observed_policy_version: String,
+        observed_kind_ref: String,
+        observed_kind_version: String,
         placement_decision: Option<PlacementDecision>,
         message: String,
         image: Option<VesselImage>,
     },
     CheckoutChurn {
-        observed_policy_ref: String,
-        observed_policy_version: String,
+        observed_kind_ref: String,
+        observed_kind_version: String,
         placement_decision: Option<PlacementDecision>,
         message: String,
         image: Option<VesselImage>,
@@ -520,8 +520,8 @@ impl VesselPrepared {
         Self {
             phase: None,
             patch: PlannedPatch::CheckoutChurn {
-                observed_policy_ref: placement_policy.metadata.name.clone(),
-                observed_policy_version: placement_policy.metadata.resource_version.clone(),
+                observed_kind_ref: placement_policy.metadata.name.clone(),
+                observed_kind_version: placement_policy.metadata.resource_version.clone(),
                 placement_decision,
                 message: format!("checkout {checkout_name} is missing shortly after a create attempt; retrying after backoff"),
                 image: composed_image(placement_policy, None),
@@ -604,10 +604,10 @@ impl VesselReconciler {
             }
         }
 
-        let placement_policy = match self.placement_dependency(obj, &obj.spec.placement_policy_ref).await {
+        let placement_policy = match self.placement_dependency(obj, &obj.spec.fulfilment_kind_ref).await {
             Ok(policy) => policy,
             Err(ResourceError::NotFound { .. }) => {
-                return Ok(VesselPrepared::failed(format!("placement policy {} not found", obj.spec.placement_policy_ref)))
+                return Ok(VesselPrepared::failed(format!("placement policy {} not found", obj.spec.fulfilment_kind_ref)))
             }
             Err(err) => return Err(err),
         };
@@ -1193,8 +1193,8 @@ impl VesselReconciler {
                             return Ok(VesselPrepared {
                                 phase: None,
                                 patch: PlannedPatch::EnvironmentRecreation {
-                                    observed_policy_ref: placement_policy.metadata.name.clone(),
-                                    observed_policy_version: placement_policy.metadata.resource_version.clone(),
+                                    observed_kind_ref: placement_policy.metadata.name.clone(),
+                                    observed_kind_version: placement_policy.metadata.resource_version.clone(),
                                     placement_decision: placement_decision.clone(),
                                     message: format!(
                                         "environment {env_name} Git checkout membership or protection mounts changed; \
@@ -1641,77 +1641,76 @@ impl Reconciler for VesselReconciler {
         prepared: &Self::Prepared,
         now: DateTime<Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
-        let patch = match &prepared.patch {
-            PlannedPatch::None => None,
-            PlannedPatch::Provisioning { observed_policy_ref, observed_policy_version, placement_decision, waiting_for, image } => {
-                Some(VesselStatusPatch::MarkProvisioning {
-                    observed_policy_ref: observed_policy_ref.clone(),
-                    observed_policy_version: observed_policy_version.clone(),
-                    placement_decision: placement_decision.clone(),
-                    started_at: now,
-                    message: provisioning_stuck_message(obj, prepared.phase, waiting_for, now),
-                    image: image.clone(),
-                })
-            }
-            PlannedPatch::EnvironmentRecreation { message, .. } if prepared.phase == Some(VesselPhase::Ready) => {
-                (obj.status.as_ref().and_then(|status| status.message.as_deref()) != Some(message))
-                    .then(|| VesselStatusPatch::RequireEnvironmentRecreation { message: message.clone() })
-            }
-            PlannedPatch::CheckoutChurn { observed_policy_ref, observed_policy_version, placement_decision, message, image }
-            | PlannedPatch::EnvironmentRecreation { observed_policy_ref, observed_policy_version, placement_decision, message, image } => {
-                if obj
-                    .status
-                    .as_ref()
-                    .is_some_and(|status| prepared.phase == Some(VesselPhase::Provisioning) && status.message.as_deref() == Some(message))
-                {
-                    None
-                } else {
+        let patch =
+            match &prepared.patch {
+                PlannedPatch::None => None,
+                PlannedPatch::Provisioning { observed_kind_ref, observed_kind_version, placement_decision, waiting_for, image } => {
                     Some(VesselStatusPatch::MarkProvisioning {
-                        observed_policy_ref: observed_policy_ref.clone(),
-                        observed_policy_version: observed_policy_version.clone(),
+                        observed_kind_ref: observed_kind_ref.clone(),
+                        observed_kind_version: observed_kind_version.clone(),
                         placement_decision: placement_decision.clone(),
                         started_at: now,
-                        message: Some(message.clone()),
+                        message: provisioning_stuck_message(obj, prepared.phase, waiting_for, now),
                         image: image.clone(),
                     })
                 }
-            }
-            PlannedPatch::Ready {
-                configured_limits,
-                placement_decision,
-                environment_ref,
-                image,
-                checkout_refs,
-                terminal_session_refs,
-                requested_stance,
-                effective_stance,
-            } => Some(VesselStatusPatch::MarkReady {
-                configured_limits: configured_limits.clone(),
-                placement_decision: placement_decision.clone(),
-                environment_ref: Some(environment_ref.clone()),
-                image_ref: image.as_ref().map(|image| image.image_ref.clone()),
-                local_image_id: image.as_ref().map(|image| image.local_image_id.clone()),
-                registry_digest: image.as_ref().and_then(|image| image.registry_digest.clone()),
-                checkout_refs: checkout_refs.clone(),
-                terminal_session_refs: terminal_session_refs.clone(),
-                requested_stance: *requested_stance,
-                effective_stance: *effective_stance,
-                ready_at: now,
-                image: image.as_ref().and_then(|image| image.composed.clone()),
-            }),
-            PlannedPatch::Interrupted { roles, message }
-                if obj.status.as_ref().is_none_or(|status| {
-                    prepared.phase != Some(VesselPhase::Interrupted)
-                        || status.interrupted_roles != *roles
-                        || status.message.as_deref() != Some(message.as_str())
-                }) =>
-            {
-                Some(VesselStatusPatch::MarkInterrupted { roles: roles.clone(), message: message.clone() })
-            }
-            PlannedPatch::Interrupted { .. } => None,
-            PlannedPatch::Lost { message } => Some(VesselStatusPatch::MarkLost { message: message.clone() }),
-            PlannedPatch::Failed { message } => Some(VesselStatusPatch::MarkFailed { message: message.clone() }),
-        };
+                PlannedPatch::EnvironmentRecreation { message, .. } if prepared.phase == Some(VesselPhase::Ready) => {
+                    (obj.status.as_ref().and_then(|status| status.message.as_deref()) != Some(message))
+                        .then(|| VesselStatusPatch::RequireEnvironmentRecreation { message: message.clone() })
+                }
+                PlannedPatch::CheckoutChurn { observed_kind_ref, observed_kind_version, placement_decision, message, image }
+                | PlannedPatch::EnvironmentRecreation { observed_kind_ref, observed_kind_version, placement_decision, message, image } => {
+                    if obj.status.as_ref().is_some_and(|status| {
+                        prepared.phase == Some(VesselPhase::Provisioning) && status.message.as_deref() == Some(message)
+                    }) {
+                        None
+                    } else {
+                        Some(VesselStatusPatch::MarkProvisioning {
+                            observed_kind_ref: observed_kind_ref.clone(),
+                            observed_kind_version: observed_kind_version.clone(),
+                            placement_decision: placement_decision.clone(),
+                            started_at: now,
+                            message: Some(message.clone()),
+                            image: image.clone(),
+                        })
+                    }
+                }
+                PlannedPatch::Ready {
+                    configured_limits,
+                    placement_decision,
+                    environment_ref,
+                    image,
+                    checkout_refs,
+                    terminal_session_refs,
+                    requested_stance,
+                    effective_stance,
+                } => Some(VesselStatusPatch::MarkReady {
+                    configured_limits: configured_limits.clone(),
+                    placement_decision: placement_decision.clone(),
+                    environment_ref: Some(environment_ref.clone()),
+                    image_ref: image.as_ref().map(|image| image.image_ref.clone()),
+                    local_image_id: image.as_ref().map(|image| image.local_image_id.clone()),
+                    registry_digest: image.as_ref().and_then(|image| image.registry_digest.clone()),
+                    checkout_refs: checkout_refs.clone(),
+                    terminal_session_refs: terminal_session_refs.clone(),
+                    requested_stance: *requested_stance,
+                    effective_stance: *effective_stance,
+                    ready_at: now,
+                    image: image.as_ref().and_then(|image| image.composed.clone()),
+                }),
+                PlannedPatch::Interrupted { roles, message }
+                    if obj.status.as_ref().is_none_or(|status| {
+                        prepared.phase != Some(VesselPhase::Interrupted)
+                            || status.interrupted_roles != *roles
+                            || status.message.as_deref() != Some(message.as_str())
+                    }) =>
+                {
+                    Some(VesselStatusPatch::MarkInterrupted { roles: roles.clone(), message: message.clone() })
+                }
+                PlannedPatch::Interrupted { .. } => None,
+                PlannedPatch::Lost { message } => Some(VesselStatusPatch::MarkLost { message: message.clone() }),
+                PlannedPatch::Failed { message } => Some(VesselStatusPatch::MarkFailed { message: message.clone() }),
+            };
 
         let mut outcome = ReconcileOutcome::with_actuations(patch, prepared.actuations.clone());
         if matches!(&prepared.patch, PlannedPatch::CheckoutChurn { .. }) {
@@ -1859,8 +1858,8 @@ fn provisioning_patch(
     waiting_for: String,
 ) -> PlannedPatch {
     PlannedPatch::Provisioning {
-        observed_policy_ref: placement_policy.metadata.name.clone(),
-        observed_policy_version: placement_policy.metadata.resource_version.clone(),
+        observed_kind_ref: placement_policy.metadata.name.clone(),
+        observed_kind_version: placement_policy.metadata.resource_version.clone(),
         placement_decision,
         waiting_for,
         image: composed_image(placement_policy, None),
@@ -2234,7 +2233,7 @@ mod tests {
                     &VesselSpec {
                         convoy_ref: "convoy".to_string(),
                         vessel_name: "work".to_string(),
-                        placement_policy_ref: snapshot_name.to_string(),
+                        fulfilment_kind_ref: snapshot_name.to_string(),
                         adopted_checkout_refs: BTreeMap::new(),
                     },
                 )
@@ -2328,7 +2327,7 @@ mod tests {
             provider_workspace_root: None,
             minimal_alternatives: Vec::new(),
             escalation_reason: None,
-            policy_name: "host-direct-test".to_string(),
+            kind: "host-direct-test".to_string(),
             target_host: PlacementTargetHost {
                 reference: flotilla_protocol::CanonicalHostId::resolved("01HXYZ"),
                 display_name: "kiwi".to_string(),
@@ -2362,7 +2361,7 @@ mod tests {
             provider_workspace_root: None,
             minimal_alternatives: Vec::new(),
             escalation_reason: None,
-            policy_name: "host-direct-udder".to_string(),
+            kind: "host-direct-udder".to_string(),
             target_host: PlacementTargetHost {
                 reference: flotilla_protocol::CanonicalHostId::resolved("1c8df992"),
                 display_name: "udder".to_string(),
@@ -2470,14 +2469,14 @@ mod tests {
             VesselSpec {
                 convoy_ref: "convoy".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "local".into(),
+                fulfilment_kind_ref: "local".into(),
                 adopted_checkout_refs: Default::default(),
             },
             VesselStatus {
                 phase: VesselPhase::Lost,
                 placement_decision: Some(
                     PlacementDecision::builder()
-                        .policy_name("local".into())
+                        .kind("local".into())
                         .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved("host"), display_name: "host".into() })
                         .build(),
                 ),

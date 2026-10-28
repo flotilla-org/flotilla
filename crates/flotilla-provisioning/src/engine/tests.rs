@@ -931,7 +931,7 @@ fn vessel_object() -> ResourceObject<flotilla_resources::Vessel> {
         spec: VesselSpec {
             convoy_ref: "convoy-a".into(),
             vessel_name: "implement".into(),
-            placement_policy_ref: "docker".into(),
+            fulfilment_kind_ref: "docker".into(),
             adopted_checkout_refs: BTreeMap::new(),
         },
         status: None,
@@ -941,11 +941,11 @@ fn vessel_object() -> ResourceObject<flotilla_resources::Vessel> {
 fn provisioning(host: Option<&str>) -> flotilla_resources::VesselStatusPatch {
     use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
     flotilla_resources::VesselStatusPatch::MarkProvisioning {
-        observed_policy_ref: "docker".into(),
-        observed_policy_version: "1".into(),
+        observed_kind_ref: "docker".into(),
+        observed_kind_version: "1".into(),
         placement_decision: host.map(|host| {
             PlacementDecision::builder()
-                .policy_name("docker".into())
+                .kind("docker".into())
                 .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved(host), display_name: host.into() })
                 .build()
         }),

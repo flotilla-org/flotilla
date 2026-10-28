@@ -495,7 +495,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
             &VesselSpec {
                 convoy_ref: "refused-claim".to_string(),
                 vessel_name: "work".to_string(),
-                placement_policy_ref: "test".to_string(),
+                fulfilment_kind_ref: "test".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )

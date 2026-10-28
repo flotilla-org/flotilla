@@ -3960,7 +3960,7 @@ mod vessel_ending_tests {
             VesselSpec {
                 convoy_ref: "convoy".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "local".into(),
+                fulfilment_kind_ref: "local".into(),
                 adopted_checkout_refs: Default::default(),
             },
             VesselStatus {
@@ -3968,7 +3968,7 @@ mod vessel_ending_tests {
                 message: Some("stale".into()),
                 placement_decision: Some(
                     PlacementDecision::builder()
-                        .policy_name("local".into())
+                        .kind("local".into())
                         .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved("host"), display_name: "host".into() })
                         .build(),
                 ),

@@ -686,7 +686,7 @@ mod tests {
                         provider_workspace_root: None,
                         minimal_alternatives: Vec::new(),
                         escalation_reason: None,
-                        policy_name: "test-policy".to_string(),
+                        kind: "test-policy".to_string(),
                         target_host: PlacementTargetHost { reference: CanonicalHostId::resolved(host), display_name: host.to_string() },
                         refused_candidates: vec![],
                         viable_not_selected: vec![],
@@ -861,7 +861,7 @@ mod tests {
                         provider_workspace_root: None,
                         minimal_alternatives: Vec::new(),
                         escalation_reason: None,
-                        policy_name: "test-policy".to_string(),
+                        kind: "test-policy".to_string(),
                         target_host: PlacementTargetHost {
                             reference: CanonicalHostId::resolved("other-host"),
                             display_name: "other-host".to_string(),
@@ -892,7 +892,7 @@ mod tests {
                 &VesselSpec {
                     convoy_ref: "winding-down".to_string(),
                     vessel_name: "work".to_string(),
-                    placement_policy_ref: "test-policy".to_string(),
+                    fulfilment_kind_ref: "test-policy".to_string(),
                     adopted_checkout_refs: BTreeMap::new(),
                 },
             )

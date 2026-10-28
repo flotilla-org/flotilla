@@ -23,7 +23,7 @@ fn layer(name: &str, tier: ImageLayerTier, provides: &[&str]) -> ImageLayerSpec 
 /// The composed image a convoy's vessel placement froze.
 async fn frozen_image(backend: &ResourceBackend, convoy: &ResourceObject<Convoy>) -> DockerImageSource {
     let snapshot = flotilla_resources::vessel_placement_pin(convoy, "work")
-        .map(|pin| pin.policy_ref)
+        .map(|pin| pin.kind_ref)
         .unwrap_or_else(|| convoy.metadata.annotations[flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION].clone());
     let policy = backend.using::<PlacementPolicy>("flotilla").get(&snapshot).await.expect("placement snapshot");
     policy.spec.docker_per_vessel.expect("docker").image.expect("admission freezes the composed image")

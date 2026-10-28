@@ -209,7 +209,7 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
             &VesselSpec {
                 convoy_ref: "nudge-convoy".to_string(),
                 vessel_name: "work".to_string(),
-                placement_policy_ref: "placement-policy".to_string(),
+                fulfilment_kind_ref: "placement-policy".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )

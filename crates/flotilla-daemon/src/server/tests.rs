@@ -5373,7 +5373,7 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
             &VesselSpec {
                 convoy_ref: "live-credential-work".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "test".into(),
+                fulfilment_kind_ref: "test".into(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
@@ -5804,7 +5804,7 @@ pub(super) async fn place_crew(daemon: &InProcessDaemon, environment: &str, plac
             &flotilla_resources::VesselSpec {
                 convoy_ref: placed.convoy.into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "policy".into(),
+                fulfilment_kind_ref: "policy".into(),
                 adopted_checkout_refs: Default::default(),
             },
         )
@@ -6087,7 +6087,7 @@ pub(super) async fn supervisor_daemon() -> (tempfile::TempDir, Arc<InProcessDaem
                 &flotilla_resources::VesselSpec {
                     convoy_ref: convoy.into(),
                     vessel_name: "work".into(),
-                    placement_policy_ref: "policy".into(),
+                    fulfilment_kind_ref: "policy".into(),
                     adopted_checkout_refs: Default::default(),
                 },
             )

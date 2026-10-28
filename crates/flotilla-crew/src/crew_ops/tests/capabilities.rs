@@ -40,7 +40,7 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
             &VesselSpec {
                 convoy_ref: "crew".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "policy".into(),
+                fulfilment_kind_ref: "policy".into(),
                 adopted_checkout_refs: Default::default(),
             },
         )
@@ -270,7 +270,7 @@ async fn previous_generation_gets_full_card_once_then_delivered_deltas() {
             &VesselSpec {
                 convoy_ref: "crew".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "policy".into(),
+                fulfilment_kind_ref: "policy".into(),
                 adopted_checkout_refs: Default::default(),
             },
         )
@@ -346,7 +346,7 @@ async fn refresh_after_reaped_message_recovers_with_full_card() {
             &VesselSpec {
                 convoy_ref: "crew".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "policy".into(),
+                fulfilment_kind_ref: "policy".into(),
                 adopted_checkout_refs: Default::default(),
             },
         )
@@ -462,7 +462,7 @@ async fn failing_source_never_publishes_an_empty_card() {
             &VesselSpec {
                 convoy_ref: "crew".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "policy".into(),
+                fulfilment_kind_ref: "policy".into(),
                 adopted_checkout_refs: Default::default(),
             },
         )

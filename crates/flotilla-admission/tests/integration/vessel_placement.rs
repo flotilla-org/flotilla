@@ -36,7 +36,7 @@ async fn placed_replica_is_projected_into_the_actuation_hosts_local_store() {
                     provider_workspace_root: None,
                     minimal_alternatives: Vec::new(),
                     escalation_reason: None,
-                    policy_name: "host-direct-feta".to_string(),
+                    kind: "host-direct-feta".to_string(),
                     target_host: PlacementTargetHost {
                         reference: CanonicalHostId::resolved("feta-host"),
                         display_name: "feta".to_string(),
@@ -59,7 +59,7 @@ async fn placed_replica_is_projected_into_the_actuation_hosts_local_store() {
             &VesselSpec {
                 convoy_ref: "remote-placement".to_string(),
                 vessel_name: "work".to_string(),
-                placement_policy_ref: "host-direct-feta".to_string(),
+                fulfilment_kind_ref: "host-direct-feta".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
@@ -152,7 +152,7 @@ async fn owning_daemon_projects_a_vessel_placed_on_its_ssh_host() {
                     provider_workspace_root: None,
                     minimal_alternatives: Vec::new(),
                     escalation_reason: None,
-                    policy_name: "host-direct-ssh-host".to_string(),
+                    kind: "host-direct-ssh-host".to_string(),
                     target_host: PlacementTargetHost {
                         reference: CanonicalHostId::resolved("ssh-host"),
                         display_name: "beaufort".to_string(),
@@ -173,7 +173,7 @@ async fn owning_daemon_projects_a_vessel_placed_on_its_ssh_host() {
             &VesselSpec {
                 convoy_ref: "ssh-placement".to_string(),
                 vessel_name: "work".to_string(),
-                placement_policy_ref: "host-direct-ssh-host".to_string(),
+                fulfilment_kind_ref: "host-direct-ssh-host".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
@@ -261,7 +261,7 @@ async fn placement_status_churn_does_not_spin() {
                         provider_workspace_root: None,
                         minimal_alternatives: Vec::new(),
                         escalation_reason: None,
-                        policy_name: "host-direct".into(),
+                        kind: "host-direct".into(),
                         target_host: PlacementTargetHost {
                             reference: CanonicalHostId::resolved(format!("host-{update}")),
                             display_name: "target".into(),

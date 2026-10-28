@@ -279,7 +279,7 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
             &VesselSpec {
                 convoy_ref: "convoy-scratch".to_string(),
                 vessel_name: "work".to_string(),
-                placement_policy_ref: "policy-scratch".to_string(),
+                fulfilment_kind_ref: "policy-scratch".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
@@ -713,7 +713,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
             &VesselSpec {
                 convoy_ref: "convoy-multi".to_string(),
                 vessel_name: "implement".to_string(),
-                placement_policy_ref: "policy-multi".to_string(),
+                fulfilment_kind_ref: "policy-multi".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
@@ -962,7 +962,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
             &VesselSpec {
                 convoy_ref: "convoy-multi-docker".to_string(),
                 vessel_name: "implement".to_string(),
-                placement_policy_ref: "policy-multi-docker".to_string(),
+                fulfilment_kind_ref: "policy-multi-docker".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
@@ -1106,7 +1106,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
             &VesselSpec {
                 convoy_ref: "convoy-multi-docker".to_string(),
                 vessel_name: "implement".to_string(),
-                placement_policy_ref: "policy-multi-docker".to_string(),
+                fulfilment_kind_ref: "policy-multi-docker".to_string(),
                 adopted_checkout_refs: BTreeMap::from([(repositories[0].key(), "checkout-workspace-multi-docker-flotilla".to_string())]),
             },
         )
@@ -1249,7 +1249,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
             &VesselSpec {
                 convoy_ref: "convoy-multi-fresh".to_string(),
                 vessel_name: "implement".to_string(),
-                placement_policy_ref: "policy-multi-fresh".to_string(),
+                fulfilment_kind_ref: "policy-multi-fresh".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
@@ -1371,7 +1371,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
             &VesselSpec {
                 convoy_ref: "convoy-scoped".to_string(),
                 vessel_name: "implement".to_string(),
-                placement_policy_ref: "policy-scoped".to_string(),
+                fulfilment_kind_ref: "policy-scoped".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
@@ -1442,7 +1442,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
             &VesselSpec {
                 convoy_ref: "convoy-scoped".to_string(),
                 vessel_name: "implement".to_string(),
-                placement_policy_ref: "policy-scoped".to_string(),
+                fulfilment_kind_ref: "policy-scoped".to_string(),
                 adopted_checkout_refs: BTreeMap::from([(cleat.key(), "adopted-cleat-scoped".to_string())]),
             },
         )
@@ -1904,7 +1904,7 @@ async fn docker_worktree_rejects_an_adopted_checkout_without_shared_clone_metada
             &VesselSpec {
                 convoy_ref: "convoy-adopted-docker".to_string(),
                 vessel_name: "implement".to_string(),
-                placement_policy_ref: "policy-adopted-docker".to_string(),
+                fulfilment_kind_ref: "policy-adopted-docker".to_string(),
                 adopted_checkout_refs: BTreeMap::from([(repo_ref, "adopted-checkout-convoy-adopted-docker".to_string())]),
             },
         )
@@ -2302,7 +2302,7 @@ async fn adopted_checkout_ref_reuses_checkout_without_creating_clone_or_checkout
             &VesselSpec {
                 convoy_ref: "convoy-adopted".to_string(),
                 vessel_name: "implement".to_string(),
-                placement_policy_ref: "policy-adopted".to_string(),
+                fulfilment_kind_ref: "policy-adopted".to_string(),
                 adopted_checkout_refs: BTreeMap::from([(repo_ref, "adopted-checkout-convoy-adopted".to_string())]),
             },
         )
@@ -2391,7 +2391,7 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
             &VesselSpec {
                 convoy_ref: "convoy-crew".to_string(),
                 vessel_name: "implement".to_string(),
-                placement_policy_ref: "policy-crew".to_string(),
+                fulfilment_kind_ref: "policy-crew".to_string(),
                 adopted_checkout_refs: BTreeMap::from([(repo_ref.clone(), "adopted-checkout-convoy-crew".to_string())]),
             },
         )
@@ -2511,7 +2511,7 @@ async fn vessel_waits_for_admission_brief_envelope_then_pins_its_digest() {
             &VesselSpec {
                 convoy_ref: "convoy-artifact".to_string(),
                 vessel_name: "implement".to_string(),
-                placement_policy_ref: "policy-artifact".to_string(),
+                fulfilment_kind_ref: "policy-artifact".to_string(),
                 adopted_checkout_refs: BTreeMap::from([(repo_ref, "adopted-artifact".to_string())]),
             },
         )
@@ -2609,7 +2609,7 @@ async fn repo_level_brief_template_override_changes_one_block_for_that_repo_conv
             &VesselSpec {
                 convoy_ref: "convoy-repo-override".to_string(),
                 vessel_name: "implement".to_string(),
-                placement_policy_ref: "policy-repo-override".to_string(),
+                fulfilment_kind_ref: "policy-repo-override".to_string(),
                 adopted_checkout_refs: BTreeMap::from([(repo_ref, "adopted-checkout-convoy-repo-override".to_string())]),
             },
         )
@@ -2714,7 +2714,7 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
             &VesselSpec {
                 convoy_ref: "convoy-issue-brief".to_string(),
                 vessel_name: "work".to_string(),
-                placement_policy_ref: "policy-issue-brief".to_string(),
+                fulfilment_kind_ref: "policy-issue-brief".to_string(),
                 adopted_checkout_refs: BTreeMap::from([(repository_key, "adopted-checkout-issue-brief".to_string())]),
             },
         )

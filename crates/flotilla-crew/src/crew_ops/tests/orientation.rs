@@ -33,7 +33,7 @@ fn orientation_follows_live_project(tc: hegel::TestCase) {
                 &VesselSpec {
                     convoy_ref: "crew".into(),
                     vessel_name: "work".into(),
-                    placement_policy_ref: "test".into(),
+                    fulfilment_kind_ref: "test".into(),
                     adopted_checkout_refs: BTreeMap::new(),
                 },
             )
@@ -174,7 +174,7 @@ async fn crew_list_never_reads_message_history() {
             &flotilla_resources::VesselSpec {
                 convoy_ref: "crew".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "policy".into(),
+                fulfilment_kind_ref: "policy".into(),
                 adopted_checkout_refs: Default::default(),
             },
         )
@@ -261,7 +261,7 @@ async fn crew_list_reads_a_vessels_seats_through_one_port() {
             &flotilla_resources::VesselSpec {
                 convoy_ref: "crew".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "test".into(),
+                fulfilment_kind_ref: "test".into(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )

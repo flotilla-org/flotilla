@@ -229,13 +229,13 @@ mod tests {
                 document(
                     "Vessel",
                     "convoy-a-implement",
-                    serde_json::json!({"convoy_ref": "convoy-a", "vessel_name": "implement", "placement_policy_ref": "p"}),
+                    serde_json::json!({"convoy_ref": "convoy-a", "vessel_name": "implement", "fulfilment_kind_ref": "p"}),
                     Value::Null,
                 ),
                 document(
                     "Vessel",
                     "convoy-b-implement",
-                    serde_json::json!({"convoy_ref": "convoy-b", "vessel_name": "implement", "placement_policy_ref": "p"}),
+                    serde_json::json!({"convoy_ref": "convoy-b", "vessel_name": "implement", "fulfilment_kind_ref": "p"}),
                     serde_json::json!({
                         "phase": "Ready",
                         "environment_ref": "env-b",
@@ -302,7 +302,7 @@ mod tests {
             vec![document(
                 "Vessel",
                 "unlisted-vessel",
-                serde_json::json!({"convoy_ref": "missing-convoy", "vessel_name": "work", "placement_policy_ref": "p"}),
+                serde_json::json!({"convoy_ref": "missing-convoy", "vessel_name": "work", "fulfilment_kind_ref": "p"}),
                 Value::Null,
             )],
         );

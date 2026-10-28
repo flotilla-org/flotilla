@@ -67,7 +67,7 @@ async fn crew_fail_requires_operator_force() {
             &VesselSpec {
                 convoy_ref: "operator-failure".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "test".into(),
+                fulfilment_kind_ref: "test".into(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
@@ -698,7 +698,7 @@ async fn promise_retractions_and_named_completion_advisory() {
             &VesselSpec {
                 convoy_ref: "promise-crew".into(),
                 vessel_name: "work".into(),
-                placement_policy_ref: "test".into(),
+                fulfilment_kind_ref: "test".into(),
                 adopted_checkout_refs: BTreeMap::new(),
             },
         )
