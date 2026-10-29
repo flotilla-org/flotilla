@@ -72,6 +72,7 @@ pub(super) struct MessageDelivery {
     pub(super) state: Arc<ControllerRuntimeState>,
     pub(super) primitives: Arc<MessagePrimitives>,
     pub(super) namespace: String,
+    health: super::health::RuntimeHealth,
     bound: BTreeSet<(Address, Receiver)>,
     sessions: BTreeSet<String>,
     inflight: BTreeMap<String, InFlight>,
@@ -83,11 +84,17 @@ pub(super) struct MessageDelivery {
 }
 
 impl MessageDelivery {
-    pub(super) fn new(state: Arc<ControllerRuntimeState>, primitives: Arc<MessagePrimitives>, namespace: String) -> Self {
+    pub(super) fn new(
+        state: Arc<ControllerRuntimeState>,
+        primitives: Arc<MessagePrimitives>,
+        namespace: String,
+        health: super::health::RuntimeHealth,
+    ) -> Self {
         Self {
             state,
             primitives,
             namespace,
+            health,
             bound: BTreeSet::new(),
             sessions: BTreeSet::new(),
             inflight: BTreeMap::new(),
@@ -108,6 +115,11 @@ impl MessageDelivery {
     }
 
     pub(super) async fn pass(&mut self) -> Result<(), String> {
+        let wait = self.primitives.delivery_wait(&self.namespace).await?;
+        self.health.report_delivery_wait(wait.clone());
+        if wait.is_some() {
+            return Ok(());
+        }
         let now = Timestamp::from_datetime(&Utc::now());
         // Receipts first: a turn confirmed before its session's teardown records
         // its receipt before rebind unbinds and ends that session (#3894).

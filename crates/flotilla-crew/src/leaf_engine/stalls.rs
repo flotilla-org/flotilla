@@ -411,6 +411,12 @@ impl ReconcilerWake {
         convoys: &HashMap<String, impl ConvoyRead>,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
+        if let Some(primitives) = self.subscriptions.message_primitives() {
+            if let Some(wait) = primitives.delivery_wait(namespace).await? {
+                tracing::debug!(namespace, %wait, "stall judging waits");
+                return Ok(());
+            }
+        }
         let backend = &self.subscriptions.inner.backend;
         let cell = self.views(namespace).await?;
         let views = cell.get().expect("initialized views");

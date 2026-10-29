@@ -36,6 +36,8 @@ use crate::{
     supervisor::RestartBudgetExhausted,
 };
 
+const FLEET_DESIGNATION_CONDITION_TYPE: &str = "Message/FleetDesignation";
+
 /// An engine-held build's failure and cause come from the same judgement.
 pub(super) fn image_build_failure_condition(
     build: &flotilla_resources::ResourceObject<flotilla_resources::ImageBuild>,
@@ -199,6 +201,33 @@ impl RuntimeHealth {
             .blocks_forge_observation(exhausted.controller == AGGREGATOR_CONTROLLER)
             .build();
         self.failures.lock().expect("runtime health lock poisoned").insert(condition_type, condition);
+    }
+
+    /// Names the FleetDesignation message delivery waits for, or clears the wait.
+    pub(super) fn report_delivery_wait(&self, wait: Option<String>) {
+        let mut failures = self.failures.lock().expect("runtime health lock poisoned");
+        match wait {
+            Some(message) => {
+                if failures.get(FLEET_DESIGNATION_CONDITION_TYPE).is_some_and(|existing| existing.message == message) {
+                    return;
+                }
+                failures.insert(
+                    FLEET_DESIGNATION_CONDITION_TYPE.to_string(),
+                    HostCondition::builder()
+                        .condition_type(FLEET_DESIGNATION_CONDITION_TYPE)
+                        .value(ConditionValue::False)
+                        .reason("FleetDesignationUnavailable")
+                        .message(message)
+                        .observed_at(Utc::now())
+                        .blocks_readiness(false)
+                        .blocks_forge_observation(false)
+                        .build(),
+                );
+            }
+            None => {
+                failures.remove(FLEET_DESIGNATION_CONDITION_TYPE);
+            }
+        }
     }
 
     pub(super) fn report_controller_loop_stall(&self, name: &str, elapsed: Duration) {

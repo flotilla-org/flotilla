@@ -713,7 +713,8 @@ impl StartupRestoration {
             )));
         }
         if let (Some(primitives), Some(state)) = (daemon.message_primitives(), self.state.as_ref()) {
-            let delivery = self::primitives::MessageDelivery::new(Arc::clone(state), primitives, options.namespace.clone());
+            let delivery =
+                self::primitives::MessageDelivery::new(Arc::clone(state), primitives, options.namespace.clone(), runtime_health.clone());
             let interval = options.controller_resync_interval.min(Duration::from_secs(1));
             controller_tasks.push(AbortOnDropHandle::new(tokio::spawn(async move {
                 if let Err(error) = delivery.run(interval).await {

@@ -54,6 +54,8 @@ pub trait EngineMessages: Send + Sync {
         kind: &str,
         about: Option<&str>,
     ) -> Result<bool, String>;
+    /// Why delivery waits, when the fleet's FleetDesignation is missing or invalid.
+    async fn delivery_wait(&self, namespace: &str) -> Result<Option<String>, String>;
     /// Withdraws this home's open stall records about `seats` (crew role
     /// addresses) once the old stall status shows them not stalled (#3730
     /// review); a seat that shares `stalled`'s record subject keeps its

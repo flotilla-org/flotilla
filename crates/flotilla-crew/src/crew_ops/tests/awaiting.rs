@@ -103,6 +103,9 @@ impl EngineMessages for RecordingMessages {
     async fn awaits_delivery(&self, _namespace: &str, _receiver: &str) -> Result<bool, String> {
         Ok(false)
     }
+    async fn delivery_wait(&self, _namespace: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
     fn charter_notices(self: Arc<Self>, namespace: &str) -> Box<dyn flotilla_messaging::CharterNotices> {
         Box::new(flotilla_messaging::MessageInbox::new(self.backend.clone(), namespace))
     }

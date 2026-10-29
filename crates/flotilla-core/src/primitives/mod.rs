@@ -552,11 +552,34 @@ impl MessagePrimitives {
 
     /// The fleet roles of `namespace`, using the designation's fleet identity.
     pub async fn roles(&self, namespace: &str) -> Result<FleetRoles, String> {
-        let roles = designated_fleet_roles(&self.backend, namespace)
-            .await
-            .map_err(|error| format!("the fleet roles are read from the FleetDesignation record: {error}"))?;
+        self.roles_or_wait(namespace).await?.map_err(|wait| format!("the fleet roles are read from the FleetDesignation record: {wait}"))
+    }
+
+    /// The fleet roles, or the plain-words reason delivery waits when the FleetDesignation is missing or invalid.
+    pub async fn roles_or_wait(&self, namespace: &str) -> Result<Result<FleetRoles, String>, String> {
+        let roles = match designated_fleet_roles(&self.backend, namespace).await {
+            Ok(roles) => roles,
+            Err(ResourceError::NotFound { .. }) => {
+                return Ok(Err(format!(
+                    "FleetDesignation `{}` is missing; message delivery waits for it",
+                    flotilla_resources::FLEET_DESIGNATION_NAME
+                )))
+            }
+            Err(ResourceError::Invalid { message }) => {
+                return Ok(Err(format!(
+                    "FleetDesignation `{}` is invalid ({message}); message delivery waits for a valid one",
+                    flotilla_resources::FLEET_DESIGNATION_NAME
+                )))
+            }
+            Err(error) => return Err(format!("the fleet roles are read from the FleetDesignation record: {error}")),
+        };
         self.system.lock().expect("system sender").get_or_insert_with(|| roles.address("turn-rules").expect("a declared default"));
-        Ok(roles)
+        Ok(Ok(roles))
+    }
+
+    /// Why delivery waits, when the FleetDesignation is missing or invalid.
+    pub async fn delivery_wait(&self, namespace: &str) -> Result<Option<String>, String> {
+        Ok(self.roles_or_wait(namespace).await?.err())
     }
 
     /// Admits an old-shaped intent at this home, its receiver's: maps it onto
@@ -992,7 +1015,8 @@ impl MessagePrimitives {
     /// less than one delivery hold. A turn still undelivered after that no
     /// longer holds its recipient; the stall judge reports a quiet crew.
     pub async fn awaits_delivery(&self, namespace: &str, receiver: &str) -> Result<bool, String> {
-        let roles = self.roles(namespace).await?;
+        // Nothing is admitted until the fleet is designated.
+        let Ok(roles) = self.roles_or_wait(namespace).await? else { return Ok(false) };
         let records = self.records(namespace).await.map_err(|error| error.to_string())?;
         let inbox = Conversion { roles: &roles, forges: &records.forges, records: &*records }.inbox(receiver)?;
         let hold = flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.num_microseconds().expect("a bounded hold");
@@ -1099,6 +1123,9 @@ impl flotilla_crew::ports::EngineMessages for MessagePrimitives {
     }
     async fn awaits_delivery(&self, namespace: &str, receiver: &str) -> Result<bool, String> {
         MessagePrimitives::awaits_delivery(self, namespace, receiver).await
+    }
+    async fn delivery_wait(&self, namespace: &str) -> Result<Option<String>, String> {
+        MessagePrimitives::delivery_wait(self, namespace).await
     }
     fn charter_notices(self: Arc<Self>, namespace: &str) -> Box<dyn flotilla_messaging::CharterNotices> {
         Box::new(EngineCharterNotices { primitives: self, namespace: namespace.to_owned() })
