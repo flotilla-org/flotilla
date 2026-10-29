@@ -365,10 +365,19 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
             // Another daemon on this host (a canary, say) shares Docker; its containers'
             // agent directories lie outside this provider's runtime root, and are never adopted.
             #[cfg(unix)]
-            if let Some(mount) = provisioned_mounts.iter().find(|mount: &&ProvisionedMount| {
-                mount.environment_path.as_path() == Path::new("/run/drydock")
-                    && mount.host_path.as_path().parent().and_then(Path::parent) == Some(self.inner.agent_settings.runtime_root.as_path())
-            }) {
+            let agent_mount = provisioned_mounts
+                .iter()
+                .find(|mount: &&ProvisionedMount| mount.environment_path.as_path() == Path::new("/run/drydock"))
+                .filter(|mount| {
+                    let owned =
+                        mount.host_path.as_path().parent().and_then(Path::parent) == Some(self.inner.agent_settings.runtime_root.as_path());
+                    if !owned {
+                        tracing::debug!(container = %container_name, agent = %mount.host_path, "not adopting another daemon's container");
+                    }
+                    owned
+                });
+            #[cfg(unix)]
+            if let Some(mount) = agent_mount {
                 let directory = mount.host_path.as_path().parent().map(Path::to_path_buf);
                 let inner = self.inner.clone();
                 let (backing, name, id, base, mounts, index) =
