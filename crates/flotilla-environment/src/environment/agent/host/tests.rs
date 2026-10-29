@@ -93,9 +93,8 @@ impl CommandRunner for FakeHost {
 struct LocalTransport;
 #[async_trait]
 impl AgentTransport for LocalTransport {
-    async fn open(&self, socket: &Path) -> io::Result<Transport> {
-        let stream = UnixStream::connect(socket).await?;
-        Transport::yamux(Box::new(stream), true, Limits::default()).await
+    async fn open(&self, socket: &Path) -> io::Result<ByteStream> {
+        Ok(Box::new(UnixStream::connect(socket).await?))
     }
 }
 
@@ -264,7 +263,7 @@ async fn a_stopped_controller_leaves_nothing_forwarding() {
     let daemon = root.path().join("daemon.sock");
     let listener = UnixListener::bind(&daemon).unwrap();
     let guest = root.path().join("flotilla.sock");
-    runner.add_guest_forward("flotilla-daemon", &guest, &daemon).await.unwrap();
+    runner.add_outward_forward("flotilla-daemon", &guest, &daemon).await.unwrap();
     let mut crew = UnixStream::connect(&guest).await.unwrap();
     crew.write_all(b"ping").await.unwrap();
     let (mut accepted, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
@@ -294,7 +293,9 @@ async fn a_stopped_controller_leaves_nothing_forwarding() {
         let _ = crew.write_all(b"ping").await;
         let mut buffer = [0; 1];
         let read = tokio::time::timeout(Duration::from_secs(2), crew.read(&mut buffer)).await;
-        assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))), "the guest socket carries nothing: {read:?}");
+        // The agent outlives the controller and holds the unclaimed connection
+        // until its claim deadline, so silence is as good as a close.
+        assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_)) | Err(_)), "the guest socket carries nothing: {read:?}");
     }
     assert!(tokio::time::timeout(Duration::from_millis(500), listener.accept()).await.is_err(), "nothing reaches the daemon endpoint");
 }
@@ -308,13 +309,13 @@ struct HeldTransport {
 }
 #[async_trait]
 impl AgentTransport for HeldTransport {
-    async fn open(&self, socket: &Path) -> io::Result<Transport> {
+    async fn open(&self, socket: &Path) -> io::Result<ByteStream> {
         let stream = UnixStream::connect(socket).await?;
         if self.opened.fetch_add(1, Ordering::SeqCst) > 0 {
-            return Transport::yamux(Box::new(stream), true, Limits::default()).await;
+            return Ok(Box::new(stream));
         }
         let held = Held { stream, room: self.limit, held: Arc::clone(&self.held) };
-        Transport::yamux(Box::new(held), true, Limits::default()).await
+        Ok(Box::new(held))
     }
 }
 struct Held {
@@ -437,7 +438,7 @@ struct Unreachable {
 }
 #[async_trait]
 impl AgentTransport for Unreachable {
-    async fn open(&self, _socket: &Path) -> io::Result<Transport> {
+    async fn open(&self, _socket: &Path) -> io::Result<ByteStream> {
         self.opened.fetch_add(1, Ordering::SeqCst);
         Err(io::Error::new(io::ErrorKind::ConnectionRefused, "unreachable"))
     }

@@ -15,10 +15,7 @@ use std::{
 use async_trait::async_trait;
 use drydock_agent::Client;
 use drydock_protocol::Platform;
-use drydock_transport::{
-    ssh::{GuestStreams, SshConfig},
-    Limits, Transport,
-};
+use drydock_transport::{ssh::SshConfig, ByteStream};
 use flotilla_provider_runtime::{execution_context::BaseLayer, ChannelLabel, CommandRunner};
 use sha2::{Digest, Sha256};
 use tokio::sync::OnceCell;
@@ -84,12 +81,12 @@ pub struct SshAgentReach {
 /// connection attempt, including the reconnects after an upgrade.
 #[async_trait]
 pub trait AgentTransport: Send + Sync {
-    async fn open(&self, socket: &Path) -> io::Result<Transport>;
+    async fn open(&self, socket: &Path) -> io::Result<ByteStream>;
 }
 
 /// Drydock's SSH transport over a local forward to the agent socket. No sshd
 /// configuration changes: hosts without root cannot permit remote Unix-socket
-/// forwards, and guest-opened streams share the forward's yamux link instead.
+/// forwards; the agent never dials out, drydockd claims outward connections.
 pub struct SshAgentTransport {
     reach: SshAgentReach,
     connect_timeout: Duration,
@@ -103,7 +100,7 @@ impl SshAgentTransport {
 
 #[async_trait]
 impl AgentTransport for SshAgentTransport {
-    async fn open(&self, socket: &Path) -> io::Result<Transport> {
+    async fn open(&self, socket: &Path) -> io::Result<ByteStream> {
         let config = SshConfig {
             connect_timeout: self.connect_timeout,
             host: self.reach.address.clone(),
@@ -112,9 +109,8 @@ impl AgentTransport for SshAgentTransport {
             host_key: self.reach.host_key.clone(),
             identity_file: self.reach.identity_file.clone(),
             agent_socket: socket.into(),
-            guest_streams: GuestStreams::OverLocalForward,
         };
-        drydock_transport::ssh::connect(config, Limits::default()).await
+        drydock_transport::ssh::connect(config).await
     }
 }
 

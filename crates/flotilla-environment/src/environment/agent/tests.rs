@@ -1,6 +1,6 @@
 use super::*;
 use drydock_agent::Agent;
-use drydock_transport::{Opener, Purpose};
+use drydock_transport::{ByteStream, MemoryDialer};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -11,11 +11,10 @@ use tokio::{
 /// The composition-root fake reloads Agent after run returns an upgrade path;
 /// drydock's actual files/upgrade/hello handlers decide that path and its bytes.
 pub(crate) struct MemoryAgent {
-    transports: mpsc::Sender<drydock_transport::ByteStream>,
+    dialer: Arc<std::sync::Mutex<MemoryDialer>>,
     current: Vec<u8>,
     pub(crate) starts: Arc<AtomicUsize>,
     pub(crate) upgrades: Arc<AtomicUsize>,
-    guest: Arc<Mutex<Option<Opener>>>,
     task: tokio::task::JoinHandle<()>,
     _directory: tempfile::TempDir,
 }
@@ -25,52 +24,37 @@ impl MemoryAgent {
         let installed = directory.path().join("agent");
         let current = b"current drydock executable".to_vec();
         std::fs::write(&installed, b"previous drydock executable").unwrap();
-        let (transports, receiver) = mpsc::channel::<drydock_transport::ByteStream>(8);
-        let connections = Arc::new(MemoryConnections { incoming: Mutex::new(receiver) });
+        let (first, mut listener) = drydock_transport::memory();
+        let dialer = Arc::new(std::sync::Mutex::new(first));
         let starts = Arc::new(AtomicUsize::new(0));
         let upgrades = Arc::new(AtomicUsize::new(0));
         let (started, upgraded) = (starts.clone(), upgrades.clone());
-        let guest = Arc::new(Mutex::new(None));
-        let opener = guest.clone();
+        let published = dialer.clone();
         let mut fingerprint = if mismatched { "previous-build".to_string() } else { format!("{:x}", Sha256::digest(&current)) };
         let task = tokio::spawn(async move {
             loop {
-                let transport = Transport::native(connections.clone(), Limits::default()).unwrap();
-                *opener.lock().await = Some(transport.opener.clone());
                 started.fetch_add(1, Ordering::SeqCst);
-                if let Ok(path) = Agent::new(transport, fingerprint.clone(), installed.clone()).run().await {
+                if let Ok(path) = Agent::new(listener, fingerprint.clone(), installed.clone()).run().await {
                     let bytes = tokio::fs::read(&path).await.unwrap();
                     fingerprint = format!("{:x}", Sha256::digest(&bytes));
                     upgraded.fetch_add(1, Ordering::SeqCst);
                     tokio::fs::rename(path, &installed).await.unwrap();
                 }
+                // Each incarnation listens on its own memory socket; a dial
+                // before the swap finds the old one closed and is retried.
+                let (dialer, next) = drydock_transport::memory();
+                *published.lock().unwrap() = dialer;
+                listener = next;
             }
         });
-        Arc::new(Self { transports, current, starts, upgrades, guest, task, _directory: directory })
+        Arc::new(Self { dialer, current, starts, upgrades, task, _directory: directory })
     }
     pub(crate) fn stop(&self) {
         self.task.abort();
     }
-    async fn open(&self) -> io::Result<Transport> {
-        let (host, guest) = tokio::io::duplex(8192);
-        self.transports.send(Box::new(guest)).await.map_err(|_| io::Error::other("test agent stopped"))?;
-        Transport::yamux(Box::new(host), true, Limits::default()).await
-    }
-
-    async fn guest(&self) -> Opener {
-        self.guest.lock().await.as_ref().unwrap().clone()
-    }
-}
-struct MemoryConnections {
-    incoming: Mutex<mpsc::Receiver<drydock_transport::ByteStream>>,
-}
-#[async_trait]
-impl drydock_transport::Connections for MemoryConnections {
-    async fn connect(&self) -> io::Result<drydock_transport::ByteStream> {
-        Err(io::Error::new(io::ErrorKind::NotConnected, "use accepted multiplexed link"))
-    }
-    async fn accept(&self) -> io::Result<drydock_transport::ByteStream> {
-        self.incoming.lock().await.recv().await.ok_or_else(|| io::Error::other("test transport closed"))
+    async fn open(&self) -> io::Result<ByteStream> {
+        let dialer = self.dialer.lock().unwrap().clone();
+        dialer.connect().await
     }
 }
 impl Drop for MemoryAgent {
@@ -119,15 +103,12 @@ impl SocketAgent {
         let upgrades = Arc::new(AtomicUsize::new(0));
         let (started, upgraded, path) = (starts.clone(), upgrades.clone(), socket.clone());
         let mut fingerprint = if mismatched { "previous-build".to_string() } else { format!("{:x}", Sha256::digest(current)) };
-        let peer = directory.path().join("host.sock");
         let task = tokio::spawn(async move {
             loop {
                 let _ = std::fs::remove_file(&path);
                 let listener = UnixListener::bind(&path).unwrap();
-                let connections = drydock_transport::native::UnixConnections::new(listener, peer.clone());
-                let transport = Transport::native(Arc::new(connections), Limits::default()).unwrap();
                 started.fetch_add(1, Ordering::SeqCst);
-                match Agent::new(transport, fingerprint.clone(), installed.clone()).run().await {
+                match Agent::new(listener, fingerprint.clone(), installed.clone()).run().await {
                     Ok(upgrade) => {
                         let bytes = tokio::fs::read(&upgrade).await.unwrap();
                         fingerprint = format!("{:x}", Sha256::digest(&bytes));
@@ -459,11 +440,10 @@ async fn pushing_new_cli_layer_does_not_reexec_agent(agent: Arc<dyn TestAgent>) 
     }
 }
 
-// The guest sees only its own forward IDs. A pathname or another vessel's ID
-// is never treated as a host destination; one host endpoint cannot be registered
-// by two vessel clients, including through a symlink alias.
+// One host endpoint cannot be registered by two vessel clients, including
+// through a symlink alias.
 #[tokio::test]
-async fn vessels_cannot_cross_forward_registries_or_open_host_control() {
+async fn one_host_endpoint_cannot_be_claimed_by_two_vessels() {
     let a = MemoryAgent::new(false);
     let b = MemoryAgent::new(false);
     let dir = tempfile::tempdir().unwrap();
@@ -476,18 +456,6 @@ async fn vessels_cannot_cross_forward_registries_or_open_host_control() {
     let alias = dir.path().join("alias");
     std::os::unix::fs::symlink(&endpoint, &alias).unwrap();
     assert!(cb.register_host_endpoint("alias".into(), Endpoint::Unix(alias)).is_err());
-    for id in ["vessel-a".to_string(), endpoint.to_string_lossy().into_owned(), "/run/flotilla/control.sock".into()] {
-        let mut stream = b.guest().await.open(Purpose::Forward { id }).await.unwrap();
-        let length = stream.read_u32().await.unwrap();
-        assert!(length < 64 * 1024);
-        let mut result = vec![0; length as usize];
-        stream.read_exact(&mut result).await.unwrap();
-        let result: Result<(), drydock_agent::AgentError> = serde_json::from_slice(&result).unwrap();
-        assert!(result.is_err());
-    }
-    let mut control = b.guest().await.open(Purpose::Control).await.unwrap();
-    let read = tokio::time::timeout(Duration::from_secs(1), control.read_u8()).await.unwrap();
-    assert!(read.is_err(), "the host client must not serve a guest control API");
 }
 
 // Attach is an opaque host-to-guest forward. The service fake stands in for
@@ -855,18 +823,18 @@ fn layer_identity_cache_skips_reads_and_detects_atomic_replacement() {
 // reach the host endpoint over this handle's own link; adding it again is a
 // no-op, a reconnect claims the endpoint again and keeps the listener, and
 // removing it closes the guest socket.
-over_each_transport!(guest_forward_reaches_host_endpoint_across_reconnects);
-async fn guest_forward_reaches_host_endpoint_across_reconnects(agent: Arc<dyn TestAgent>) {
+over_each_transport!(outward_forward_reaches_host_endpoint_across_reconnects);
+async fn outward_forward_reaches_host_endpoint_across_reconnects(agent: Arc<dyn TestAgent>) {
     let directory = tempfile::Builder::new().prefix("fgf-").tempdir_in("/tmp").unwrap();
     let runner = runner_for(&agent, directory.path());
     let endpoint = directory.path().join("daemon.sock");
     let listener = UnixListener::bind(&endpoint).unwrap();
     let guest = directory.path().join("flotilla.sock");
-    runner.add_guest_forward("flotilla-daemon", &guest, &endpoint).await.unwrap();
-    runner.add_guest_forward("flotilla-daemon", &guest, &endpoint).await.unwrap();
+    runner.add_outward_forward("flotilla-daemon", &guest, &endpoint).await.unwrap();
+    runner.add_outward_forward("flotilla-daemon", &guest, &endpoint).await.unwrap();
     let other = directory.path().join("other.sock");
     let _other = UnixListener::bind(&other).unwrap();
-    assert!(runner.add_guest_forward("flotilla-daemon", &guest, &other).await.is_err());
+    assert!(runner.add_outward_forward("flotilla-daemon", &guest, &other).await.is_err());
     for round in 0..2u8 {
         if round == 1 {
             // A dropped connection: the next use reconnects.
@@ -885,7 +853,7 @@ async fn guest_forward_reaches_host_endpoint_across_reconnects(agent: Arc<dyn Te
         crew.read_exact(&mut reply).await.unwrap();
         assert_eq!(&reply, b"reply");
     }
-    runner.remove_guest_forward("flotilla-daemon").await.unwrap();
+    runner.remove_outward_forward("flotilla-daemon").await.unwrap();
     assert!(UnixStream::connect(&guest).await.is_err(), "a removed forward leaves no guest listener");
     assert_eq!(agent.starts(), 1);
     // A closed handle never connects again (teardown, #3792).
@@ -935,13 +903,9 @@ async fn recorded_platform_mismatch_refuses_before_upload() {
         || {
             opens += 1;
             async {
-                let (host, guest) = tokio::io::duplex(4096);
-                let (host, guest) = tokio::join!(
-                    Transport::yamux(Box::new(host), true, Default::default()),
-                    Transport::yamux(Box::new(guest), false, Default::default())
-                );
-                tokio::spawn(drydock_agent::Agent::new(guest?, "older".into(), "/unused".into()).run());
-                host
+                let (dialer, listener) = drydock_transport::memory();
+                tokio::spawn(drydock_agent::Agent::new(listener, "older".into(), "/unused".into()).run());
+                dialer.connect().await
             }
         },
         &recorded,
@@ -1019,7 +983,7 @@ async fn health_check_restores_state_an_agent_lost(agent: Arc<dyn TestAgent>) {
     let endpoint = directory.path().join("daemon.sock");
     let listener = UnixListener::bind(&endpoint).unwrap();
     let guest = directory.path().join("flotilla.sock");
-    runner.add_guest_forward("flotilla-daemon", &guest, &endpoint).await.unwrap();
+    runner.add_outward_forward("flotilla-daemon", &guest, &endpoint).await.unwrap();
     // Forwards are resources of their own: adding one leaves the configuration
     // tag alone, so a health check after it sees no restart.
     let pushed = runner.state.lock().await.etag.clone().unwrap();
@@ -1029,7 +993,7 @@ async fn health_check_restores_state_an_agent_lost(agent: Arc<dyn TestAgent>) {
     assert_eq!(runner.state.lock().await.etag.clone().unwrap(), pushed, "an unchanged tag pushes nothing");
     // What a restart leaves behind the same link: empty configuration and no forwards.
     let client = runner.state.lock().await.client.clone().unwrap();
-    client.remove_guest_forward("flotilla-daemon").await.unwrap();
+    client.remove_outward_forward("flotilla-daemon").await.unwrap();
     client.configure(Configuration::default()).await.unwrap();
     assert!(UnixStream::connect(&guest).await.is_err());
     assert!(runner.healthy().await);
@@ -1046,18 +1010,28 @@ async fn health_check_restores_state_an_agent_lost(agent: Arc<dyn TestAgent>) {
 
 // A refused guest forward releases the host endpoint it claimed, on the same
 // client: correcting the request and retrying succeeds, and nothing is cached.
-over_each_transport!(refused_guest_forward_releases_its_endpoint);
-async fn refused_guest_forward_releases_its_endpoint(agent: Arc<dyn TestAgent>) {
+over_each_transport!(refused_outward_forward_releases_its_endpoint);
+async fn refused_outward_forward_releases_its_endpoint(agent: Arc<dyn TestAgent>) {
     let directory = tempfile::Builder::new().prefix("frg-").tempdir_in("/tmp").unwrap();
     let runner = runner_for(&agent, directory.path());
     let endpoint = directory.path().join("daemon.sock");
     let _listener = UnixListener::bind(&endpoint).unwrap();
     let occupied = directory.path().join("occupied");
     std::fs::write(&occupied, b"not a socket").unwrap();
-    assert!(runner.add_guest_forward("flotilla-daemon", &occupied, &endpoint).await.is_err());
-    assert!(runner.state.lock().await.guest_forwards.is_empty());
+    assert!(runner.add_outward_forward("flotilla-daemon", &occupied, &endpoint).await.is_err());
+    assert!(runner.state.lock().await.outward_forwards.is_empty());
     let guest = directory.path().join("flotilla.sock");
-    runner.add_guest_forward("flotilla-daemon", &guest, &endpoint).await.unwrap();
+    runner.add_outward_forward("flotilla-daemon", &guest, &endpoint).await.unwrap();
     UnixStream::connect(&guest).await.unwrap();
     assert_eq!(agent.starts(), 1, "the refusal did not need a new client");
+}
+
+// A socket that is not there yet, or refusing, is a vessel still starting;
+// an agent's refusal of the request itself is final.
+#[test]
+fn connect_errors_of_a_starting_vessel_are_transient() {
+    for kind in [io::ErrorKind::NotFound, io::ErrorKind::ConnectionRefused] {
+        assert!(is_transient(&io::Error::from(kind)), "{kind:?}");
+    }
+    assert!(!is_transient(&io::Error::from(io::ErrorKind::InvalidInput)));
 }

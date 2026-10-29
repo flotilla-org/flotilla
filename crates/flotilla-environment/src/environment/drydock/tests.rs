@@ -69,7 +69,7 @@ impl HostFixture {
         std::fs::write(root.join("hosts"), "127.0.0.1 localhost\n").unwrap();
         // The provider prepares linux/amd64 guests, so the stand-in vessel
         // reports that platform on any test host.
-        let gateway = Gateway::start_as(&root.join("vessel"), false, BUILD, crate::guest_tools::linux_amd64()).unwrap();
+        let gateway = Gateway::start_as(&root.join("vessel"), BUILD, crate::guest_tools::linux_amd64()).unwrap();
         let socket = root.join("host.sock");
         let serving = socket.clone();
         let host = tokio::spawn(async move {
@@ -98,7 +98,7 @@ impl HostFixture {
     }
     async fn start_daemon(&mut self) {
         let text = format!(
-            "[providers.reference]\nmodule='reference'\nagent_link='local_forward'\ncredential={{file='{}'}}\n\
+            "[providers.reference]\nmodule='reference'\ncredential={{file='{}'}}\n\
              settings={{fixture=true, agent=true, poll_interval_ms=10, workspace_root='{}', \
              reach={{kind='ssh', endpoint='gateway.test:22', user='minted-gateway-user', host_key='ssh-ed25519 AAAA'}}}}\n",
             self.root.join("credential").display(),
@@ -409,7 +409,7 @@ async fn independent_provisions_and_rotated_tokens() {
     }
     #[async_trait]
     impl SshDialer for Held {
-        async fn dial(&self, config: drydock_transport::ssh::SshConfig) -> std::io::Result<drydock_transport::Transport> {
+        async fn dial(&self, config: drydock_transport::ssh::SshConfig) -> std::io::Result<drydock_transport::ByteStream> {
             if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 self.entered.notify_one();
                 self.release.notified().await;
