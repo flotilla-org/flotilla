@@ -36,9 +36,9 @@ use crate::{
     supervisor::RestartBudgetExhausted,
 };
 
-/// An engine-held build's failure and cause come from the same judgement.
 const FLEET_DESIGNATION_CONDITION_TYPE: &str = "Message/FleetDesignation";
 
+/// An engine-held build's failure and cause come from the same judgement.
 pub(super) fn image_build_failure_condition(
     build: &flotilla_resources::ResourceObject<flotilla_resources::ImageBuild>,
     lifecycles: &dyn flotilla_resources::lifecycle_reads::LifecycleReads,
@@ -208,6 +208,9 @@ impl RuntimeHealth {
         let mut failures = self.failures.lock().expect("runtime health lock poisoned");
         match wait {
             Some(message) => {
+                if failures.get(FLEET_DESIGNATION_CONDITION_TYPE).is_some_and(|existing| existing.message == message) {
+                    return;
+                }
                 failures.insert(
                     FLEET_DESIGNATION_CONDITION_TYPE.to_string(),
                     HostCondition::builder()

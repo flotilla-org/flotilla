@@ -5718,7 +5718,10 @@ impl InProcessDaemon {
             explanation.warnings.extend(failures.into_iter().filter(|(service, _)| services.contains(service)).map(|(_, error)| error));
         }
         if let Some(primitives) = self.message_primitives() {
-            explanation.warnings.extend(primitives.delivery_wait(&namespace).await?);
+            match primitives.delivery_wait(&namespace).await {
+                Ok(wait) => explanation.warnings.extend(wait),
+                Err(error) => explanation.warnings.push(format!("message delivery readiness is unknown: {error}")),
+            }
         }
         match self.convoy_dispatch_scores(&namespace, &convoy).await {
             Ok(scores) => explanation.dispatch_scores = scores,
