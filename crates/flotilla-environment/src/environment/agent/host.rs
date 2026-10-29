@@ -86,7 +86,7 @@ pub trait AgentTransport: Send + Sync {
 
 /// Drydock's SSH transport over a local forward to the agent socket. No sshd
 /// configuration changes: hosts without root cannot permit remote Unix-socket
-/// forwards: the agent never dials out, drydockd claims outward connections.
+/// forwards; the agent never dials out, drydockd claims outward connections.
 pub struct SshAgentTransport {
     reach: SshAgentReach,
     connect_timeout: Duration,

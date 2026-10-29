@@ -444,8 +444,8 @@ impl AgentRunner {
     /// A guest-side socket at `guest` whose connections reach the Unix socket
     /// `host` on the controller. The agent listens and announces each
     /// connection on its event stream; this handle's client claims it, so the
-    /// forward serves nothing while no controller is connected. It survives reconnects, and its endpoint stays claimed
-    /// by this vessel alone.
+    /// forward serves nothing while no controller is connected. It survives
+    /// reconnects, and its endpoint stays claimed by this vessel alone.
     pub async fn add_outward_forward(&self, id: &str, guest: &Path, host: &Path) -> Result<(), String> {
         let forward = OutwardForward { id: id.into(), unix: guest.into(), tcp: None };
         self.put_outward_forward(forward, Endpoint::Unix(host.into())).await.map_err(|failure| failure.to_string())

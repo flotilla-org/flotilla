@@ -1025,3 +1025,13 @@ async fn refused_outward_forward_releases_its_endpoint(agent: Arc<dyn TestAgent>
     UnixStream::connect(&guest).await.unwrap();
     assert_eq!(agent.starts(), 1, "the refusal did not need a new client");
 }
+
+// A socket that is not there yet, or refusing, is a vessel still starting;
+// an agent's refusal of the request itself is final.
+#[test]
+fn connect_errors_of_a_starting_vessel_are_transient() {
+    for kind in [io::ErrorKind::NotFound, io::ErrorKind::ConnectionRefused] {
+        assert!(is_transient(&io::Error::from(kind)), "{kind:?}");
+    }
+    assert!(!is_transient(&io::Error::from(io::ErrorKind::InvalidInput)));
+}
