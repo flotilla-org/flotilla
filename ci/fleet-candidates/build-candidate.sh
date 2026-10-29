@@ -165,7 +165,11 @@ python3 "$(dirname "$0")/generation_validation.py" codex-home "$codex_home_bundl
   export FLOTILLA_BUILD_ID="${flotilla_sha:0:12}"
   cargo build --locked --release --bin flotilla --bin flotillad
   # flotillad embeds the drydock daemon, which finds provider hosts beside itself.
-  cargo build --locked --release -p drydock-host --bin drydock-host
+  # drydock-host is only a dev-dependency here, which cargo cannot build as a package.
+  drydock_rev="$(sed -n 's/^drydock-host = .*rev = "\([0-9a-f]\{40\}\)".*/\1/p' Cargo.toml)"
+  [[ -n "$drydock_rev" ]]
+  cargo install --locked --force --git https://github.com/flotilla-org/drydock --rev "$drydock_rev" \
+    --root "$flotilla_root/target/drydock-host-install" --bin drydock-host drydock-host
   if [[ "$platform" == linux-* ]]; then
     cargo build --locked --release -p flotilla-cli --bin flotilla-vessel
     cargo build --locked --release -p drydock-agent --bin drydock-agent
@@ -184,7 +188,7 @@ python3 "$(dirname "$0")/generation_validation.py" codex-home "$codex_home_bundl
 
 install -m 0755 "$flotilla_root/target/release/flotilla" "$bundle/bin/flotilla"
 install -m 0755 "$flotilla_root/target/release/flotillad" "$bundle/bin/flotillad"
-install -m 0755 "$flotilla_root/target/release/drydock-host" "$bundle/bin/drydock-host"
+install -m 0755 "$flotilla_root/target/drydock-host-install/bin/drydock-host" "$bundle/bin/drydock-host"
 if [[ "$platform" == linux-* ]]; then
   install -m 0755 "$flotilla_root/target/release/flotilla-vessel" "$bundle/bin/flotilla-vessel"
   install -m 0755 "$flotilla_root/target/release/drydock-agent" "$bundle/bin/drydock-agent"
