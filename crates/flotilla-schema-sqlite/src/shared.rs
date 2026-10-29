@@ -486,8 +486,40 @@ pub(crate) const WATERMARK_STARTUP: &str =
 
 #[cfg(test)]
 mod tests {
-    use super::stored_codes;
-    use flotilla_schema::{ColumnDef, ColumnType};
+    use super::{stored_codes, SHARED_DDL};
+    use flotilla_schema::{ColumnDef, ColumnType, KindCode, Layout};
+    use rusqlite::Connection;
+
+    #[test]
+    fn log_description_matches_the_log_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SHARED_DDL).unwrap();
+        let mut pragma = conn.prepare("SELECT name, type, \"notnull\", pk FROM pragma_table_info('log') ORDER BY cid").unwrap();
+        let stored: Vec<(String, String, bool, bool)> = pragma
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, i64>(3)? > 0)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let log = Layout::root("Probe", KindCode::new("pr")).finish().log_table();
+        let described: Vec<(String, String, bool, bool)> = log
+            .key
+            .iter()
+            .map(|column| (column, true))
+            .chain(log.columns.iter().map(|column| (column, false)))
+            .map(|(column, key)| {
+                let sql = crate::ddl::column(column);
+                let ty = sql.split_whitespace().nth(1).unwrap().to_owned();
+                (column.name.clone(), ty, !column.nullable, key)
+            })
+            .collect();
+        assert_eq!(described, stored);
+        let sql: String =
+            conn.query_row("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'log'", [], |row| row.get(0)).unwrap();
+        let cause = log.columns.iter().find(|column| column.name == "cause").unwrap();
+        let ColumnType::Code(codes) = &cause.ty else { panic!("cause is a code column") };
+        assert_eq!(stored_codes(&sql, "cause").as_ref(), Some(codes));
+        assert_eq!(cause.categories.iter().map(|(code, _)| code).collect::<Vec<_>>(), codes.iter().collect::<Vec<_>>());
+    }
 
     // Behaviour (#3972): the codes `ddl::column` writes into a coded column's CHECK read back in
     // order, beside other CHECKs in the table, and a hand-written bare-column CHECK reads too.

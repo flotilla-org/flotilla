@@ -22,8 +22,11 @@ pub struct DispatchQueueResponse {
 pub struct DispatchQueueRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<crate::DispatchScore>,
+    #[shape(key)]
     pub namespace: String,
+    #[shape(key)]
     pub project: String,
+    #[shape(key)]
     pub issue: crate::IssueRef,
     pub title: String,
     pub ready_observed_at: DateTime<Utc>,

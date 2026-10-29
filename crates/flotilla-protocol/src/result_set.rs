@@ -698,6 +698,7 @@ pub struct AwarenessEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder, flotilla_schema::Describe)]
 pub struct AwarenessNode {
+    #[shape(key)]
     pub id: String,
     pub kind: AwarenessKind,
     pub label: String,
@@ -756,6 +757,7 @@ fn is_zero(value: &usize) -> bool {
 /// One row in an `issues{scope}` result set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
 pub struct IssueRow {
+    #[shape(key)]
     pub reference: IssueRef,
     pub issue: Issue,
 }
@@ -765,6 +767,7 @@ pub struct IssueRow {
 #[builder(on(String, into))]
 #[derive(flotilla_schema::Describe)]
 pub struct CheckoutRow {
+    #[shape(key)]
     pub resource: ResourceRef,
     /// Canonical Repository identity used for joins.
     pub repo: RepositoryKey,
@@ -825,6 +828,7 @@ impl fmt::Display for SessionPhase {
 #[derive(flotilla_schema::Describe)]
 pub struct IndependentRow {
     /// Row identity and merge key across hosts.
+    #[shape(key)]
     pub resource: ResourceRef,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -862,6 +866,7 @@ pub struct CleatEndpoint {
 pub struct ProjectRepositoriesRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ResourceRef>,
+    #[shape(key)]
     pub resource: ResourceRef,
     pub display_name: String,
     #[shape(child)]
@@ -885,6 +890,7 @@ pub struct ProjectRepositoryMembership {
 #[derive(flotilla_schema::Describe)]
 pub struct StandingRoleRow {
     /// The `ConvoyEnsure`; row identity and merge key across hosts.
+    #[shape(key)]
     pub resource: ResourceRef,
     pub project_ref: String,
     pub role: String,
@@ -1092,6 +1098,7 @@ pub struct ConvoyRow {
     #[shape(child)]
     pub admission_blockers: Vec<ReadinessBlocker>,
     /// Row identity and merge key across hosts.
+    #[shape(key)]
     pub resource: ResourceRef,
     /// Stable role identity when this record participates in role addressing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1589,10 +1596,22 @@ mod description_tests {
         let state = issue.tables[0].columns.iter().find(|column| column.name == "issue_state").unwrap();
         assert_eq!(state.ty, ColumnType::Code(vec!["open".into(), "closed".into()]));
         assert_eq!(state.categories, [("open".into(), "Open".into()), ("closed".into(), "Closed".into())]);
+        let names = |columns: &[flotilla_schema::ColumnDef]| columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&issue.tables[0].key), ["reference_source_service", "reference_source_scope", "reference_id"]);
         let labels = issue.tables.iter().find(|table| table.name == "issue_row_issue_labels").unwrap();
         assert_eq!((labels.role, labels.parent), (TableRole::Child, Some(0)));
-        assert_eq!(labels.key[0].name, "pos");
-        assert_eq!(labels.key[0].properties["roles"], serde_json::json!(["key"]));
+        assert_eq!(
+            names(&labels.key),
+            ["issue_row_reference_source_service", "issue_row_reference_source_scope", "issue_row_reference_id", "pos"]
+        );
+        assert_eq!(labels.key[3].properties["roles"], serde_json::json!(["key"]));
+        assert_eq!(
+            issue.frictionless(labels)["foreignKeys"],
+            serde_json::json!([{
+                "fields": ["issue_row_reference_source_service", "issue_row_reference_source_scope", "issue_row_reference_id"],
+                "reference": {"resource": "issue_row", "fields": ["reference_source_service", "reference_source_scope", "reference_id"]}
+            }])
+        );
         assert_eq!((labels.columns[0].name.as_str(), &labels.columns[0].ty), ("value", &ColumnType::Text));
         let projects = ProjectRepositoriesRow::table_set();
         let repositories = &projects.tables[1];
@@ -1601,6 +1620,64 @@ mod description_tests {
             repositories.columns.iter().map(|column| (column.name.as_str(), column.nullable)).collect::<Vec<_>>(),
             [("key", false), ("slug", true), ("subpath", true)]
         );
+    }
+
+    fn flatten(prefix: &str, value: &serde_json::Value, out: &mut BTreeMap<String, serde_json::Value>) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                for (name, value) in fields {
+                    flatten(&flotilla_schema::Layout::join(prefix, name), value, out);
+                }
+            }
+            value => {
+                out.insert(prefix.to_owned(), value.clone());
+            }
+        }
+    }
+
+    /// The key of each label row, read through the descriptor: the parent's key columns name the
+    /// row's own serialized fields, and `pos` is the label's position.
+    fn label_keys(row: &IssueRow) -> Vec<Vec<serde_json::Value>> {
+        let set = IssueRow::table_set();
+        let labels = set.tables.iter().find(|table| table.name == "issue_row_issue_labels").unwrap();
+        let mut fields = BTreeMap::new();
+        flatten("", &serde_json::to_value(row).unwrap(), &mut fields);
+        let parent: Vec<_> = set.tables[0].key.iter().map(|column| fields[&column.name].clone()).collect();
+        assert_eq!(labels.parent_key().len(), parent.len());
+        row.issue.labels.iter().enumerate().map(|(pos, _)| parent.iter().cloned().chain([serde_json::json!(pos)]).collect()).collect()
+    }
+
+    #[hegel::test]
+    fn label_rows_of_different_issues_have_different_keys(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let text = || gs::text().min_size(1).max_size(4);
+        let reference = |tc: &hegel::TestCase| IssueRef {
+            source: crate::IssueSource { service: tc.draw(text()), scope: tc.draw(text()) },
+            id: tc.draw(text()),
+        };
+        let (first, second) = (reference(&tc), reference(&tc));
+        tc.assume(first != second);
+        let row = |reference: IssueRef, labels: Vec<String>| IssueRow {
+            issue: crate::Issue {
+                reference: reference.clone(),
+                title: "t".into(),
+                body: None,
+                state: crate::IssueState::Open,
+                labels,
+                assignees: vec![],
+                as_of: chrono::DateTime::UNIX_EPOCH,
+                observed_at: None,
+                provider_name: String::new(),
+                provider_display_name: String::new(),
+            },
+            reference,
+        };
+        let labels = || gs::vecs(text()).min_size(1).max_size(3);
+        let keys: Vec<_> =
+            label_keys(&row(first, tc.draw(labels()))).into_iter().chain(label_keys(&row(second, tc.draw(labels())))).collect();
+        let distinct: std::collections::BTreeSet<_> =
+            keys.iter().map(|key| key.iter().map(ToString::to_string).collect::<Vec<_>>()).collect();
+        assert_eq!(distinct.len(), keys.len());
     }
 
     // Every named-query root, including the Awareness nested lists, must produce a descriptor.

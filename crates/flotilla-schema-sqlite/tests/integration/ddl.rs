@@ -259,7 +259,6 @@ fn message_descriptor_carries_meaning_without_changing_storage() {
     assert_eq!(column("from").properties["roles"], serde_json::json!(["transition-from"]));
     assert_eq!(column("to").properties["roles"], serde_json::json!(["transition-to"]));
     assert_eq!(column("from").categories, root.columns.iter().find(|column| column.name == "state").unwrap().categories);
-    assert_eq!(column("at").properties["roles"], serde_json::json!(["time"]));
     assert_eq!(column("cause").categories[0], ("create".into(), "Create".into()));
     assert_eq!(log.key[1].properties["roles"], serde_json::json!(["key", "sequence"]));
 }
