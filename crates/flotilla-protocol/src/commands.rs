@@ -214,9 +214,9 @@ pub enum EvidenceFreshness {
 pub enum CheckoutArchiveStatus {
     Archived,
     NothingToArchive,
+    Failed,
     /// The checkout lives on another host, whose teardown archives it there.
     ArchivingOnHost,
-    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
