@@ -457,3 +457,25 @@ fn drydock_sockets_fit_sun_path_for_any_state_directory(tc: hegel::TestCase) {
     assert!(longest.as_os_str().len() < 104, "{}", longest.display());
     assert_ne!(run, super::super::drydock_run_directory(&state.join("other")));
 }
+
+// Review of #4119: the run directory's name can be guessed, so drydock must
+// refuse one another user could have made for it: one open to others, or a
+// symbolic link in its place.
+#[tokio::test]
+async fn drydock_refuses_a_run_directory_it_cannot_trust() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir_in("/tmp").expect("tempdir");
+    let open = temp.path().join("open");
+    fs::create_dir(&open).expect("open directory");
+    fs::set_permissions(&open, fs::Permissions::from_mode(0o755)).expect("mode");
+    let private = temp.path().join("private");
+    fs::create_dir(&private).expect("private directory");
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).expect("mode");
+    let link = temp.path().join("link");
+    std::os::unix::fs::symlink(&private, &link).expect("link");
+    for run in [open, link] {
+        let started =
+            Daemon::start_with_seams(Default::default(), &run, temp.path().join("keys"), vec![], Seams::new(Arc::new(Digests))).await;
+        assert!(started.is_err(), "{} is refused", run.display());
+    }
+}

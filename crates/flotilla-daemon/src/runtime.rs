@@ -1487,7 +1487,7 @@ async fn compose_drydock(config: &ConfigStore, registry: &mut ProviderRegistry) 
 fn drydock_run_directory(state: &std::path::Path) -> PathBuf {
     use sha2::Digest;
     let digest = format!("{:x}", sha2::Sha256::digest(state.as_os_str().as_encoded_bytes()));
-    PathBuf::from(format!("/tmp/flotilla-drydock-{}", &digest[..12]))
+    PathBuf::from(format!("/tmp/flotilla-drydock-{}", &digest[..16]))
 }
 
 /// The installed generation's agent companion: the build the adapter pushes
