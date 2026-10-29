@@ -44,10 +44,20 @@ class BootstrapValidationTests(unittest.TestCase):
                 self.assertNotIn(path, validation.REQUIRED_PAYLOAD)
         self.assertFalse(validation.allowed_payload("bin/../drydock-agent", "linux-x86_64"))
 
-    def test_drydock_host_is_required_on_every_platform(self):
-        self.assertIn("bin/drydock-host", validation.REQUIRED_PAYLOAD)
+    def test_drydock_host_is_required_at_production_and_optional_at_consumption(self):
+        self.assertNotIn("bin/drydock-host", validation.REQUIRED_PAYLOAD)
         for platform in validation.PLATFORMS:
             self.assertTrue(validation.allowed_payload("bin/drydock-host", platform))
+        with self.assertRaisesRegex(validation.ValidationError, "missing executable bin/drydock-host"):
+            validation.validate_produced_payload(self.root)
+        host = self.root / "bin" / "drydock-host"
+        host.parent.mkdir()
+        host.write_bytes(b"host")
+        host.chmod(0o644)
+        with self.assertRaises(validation.ValidationError):
+            validation.validate_produced_payload(self.root)
+        host.chmod(0o755)
+        validation.validate_produced_payload(self.root)
 
     # cleat's database and license are release data. Earlier generations may
     # omit them so health rollback remains valid.

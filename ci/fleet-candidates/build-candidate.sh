@@ -232,6 +232,8 @@ cp "$flotilla_root/scripts/fleet-canary-agent.sh" "$bundle/fleet-canary-agent.sh
 cp "$flotilla_root/ci/fleet-candidates/generation_validation.py" "$bundle/generation_validation.py"
 chmod 0755 "$bundle/install.sh" "$bundle/generation_validation.py"
 
+python3 "$(dirname "$0")/generation_validation.py" produced-payload "$bundle"
+
 wire_generation="${flotilla_sha:0:12}"
 "$bundle/bin/flotilla" --version | grep -F "wire=$wire_generation"
 "$bundle/bin/flotillad" --version | grep -F "wire=$wire_generation"

@@ -320,7 +320,7 @@ verify_darwin_signatures() {
   identity="$(manifest_value "$generation_manifest" central_signing.signing.identity)"
   requirement="=designated => anchor apple generic and certificate leaf[subject.OU] = \"$TRUSTED_APPLE_TEAM_ID\""
   codesign="$(codesign_program)"
-  local targets=("$release"/lib/*.dylib "$release"/bin/flotilla "$release"/bin/flotillad "$release"/bin/cleat)
+  local targets=("$release"/lib/*.dylib "$release"/bin/flotilla "$release"/bin/flotillad "$release"/bin/drydock-host "$release"/bin/cleat)
   local path relative verification details entitlements
   for path in "${targets[@]}"; do
     [[ -f "$path" ]] || continue
