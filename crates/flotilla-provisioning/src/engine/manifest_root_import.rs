@@ -22,7 +22,9 @@ use flotilla_resources::{DocumentKey, DocumentPhase, ManifestRoot as OldRoot, Re
 use flotilla_schema::{State, Timestamp};
 use flotilla_state_machines::{Resource, Version};
 
-use super::import::{ImportRefusal, ImportReport};
+use flotilla_engine_store::ImportTarget;
+
+use super::import::{created, ImportRefusal, ImportReport};
 use crate::stored::manifest_root::{
     self as stored, Act, DocumentName, ManifestRoot, Outcome, RefusalRecord, ResolutionRecord, RootSpec, RootState,
 };
@@ -107,19 +109,22 @@ pub fn import_root(old: &ResourceObject<OldRoot>) -> Result<Resource<ManifestRoo
 /// Maps every old root in `roots` (each with its home) onto the engine and rehearses them into a
 /// temporary store, counted as `bound`; refusals are named.
 pub fn rehearse_roots(roots: &[(ResourceObject<OldRoot>, String)], report: &mut ImportReport) {
-    let rehearsal = stored::registry().map_err(|error| format!("registry: {error:?}")).and_then(flotilla_engine_store::Rehearsal::open);
-    let mut rehearsal = match rehearsal {
-        Ok(rehearsal) => rehearsal,
-        Err(reason) => {
-            report.refused.extend(roots.iter().map(|(root, _)| ImportRefusal {
-                kind: "ManifestRoot",
-                record: root.metadata.name.clone(),
-                reason: reason.clone(),
-            }));
-            return;
-        }
-    };
+    match stored::registry().map_err(|error| format!("registry: {error:?}")).and_then(flotilla_engine_store::Rehearsal::open) {
+        Ok(mut rehearsal) => import_roots(roots, &mut rehearsal, report),
+        Err(reason) => report.refused.extend(roots.iter().map(|(root, _)| ImportRefusal {
+            kind: "ManifestRoot",
+            record: root.metadata.name.clone(),
+            reason: reason.clone(),
+        })),
+    }
+}
+
+/// Maps every root at a home `target` imports onto the engine and writes it, at its creation time.
+pub fn import_roots(roots: &[(ResourceObject<OldRoot>, String)], target: &mut impl ImportTarget, report: &mut ImportReport) {
     for (old, home) in roots {
+        if !target.imports(home) {
+            continue;
+        }
         let refuse = |reason: String| ImportRefusal { kind: "ManifestRoot", record: old.metadata.name.clone(), reason };
         let resource = match import_root(old) {
             Ok(resource) => resource,
@@ -128,7 +133,7 @@ pub fn rehearse_roots(roots: &[(ResourceObject<OldRoot>, String)], report: &mut 
                 continue;
             }
         };
-        match rehearsal.restore(home, &old.metadata.name, 1, &resource) {
+        match target.write(home, &old.metadata.name, &created(old), &resource) {
             Ok(()) => *report.imported.entry(("ManifestRoot", "bound")).or_default() += 1,
             Err(reason) => report.refused.push(refuse(reason)),
         }

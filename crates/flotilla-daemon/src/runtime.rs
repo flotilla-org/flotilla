@@ -1216,13 +1216,20 @@ mod decided_kinds_tests {
     }
 }
 
-/// Opens the engine path behind `[primitives]` (#3317): the decided store
+/// Opens the engine path behind `[primitives]` (#3317): the decided store, filled from the old
+/// store at its first start ([`crate::engine_import::first_start`]),
 /// with the [`decided_registry`] kinds, homed at this daemon's node id, and the
 /// Message path over it. Installed before peer tasks start, so every peer's
 /// log is followed from the first connection.
 async fn open_message_primitives(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Result<(), String> {
-    let path = config.state_dir().as_path().join("decided.sqlite");
+    let state_dir = config.state_dir().as_path().to_path_buf();
+    let path = state_dir.join(crate::engine_import::ENGINE_STORE);
     let home = daemon.node_id().as_str().to_owned();
+    // Before this daemon serves or connects to a peer, so an importing host neither sends nor receives records.
+    let importing = home.clone();
+    tokio::task::spawn_blocking(move || crate::engine_import::first_start(&state_dir, &importing))
+        .await
+        .map_err(|error| error.to_string())??;
     let registry = decided_registry().map_err(|error| format!("decided store registry: {error:?}"))?;
     let service = Arc::new(
         flotilla_schema_sqlite::stream::Service::open(&path, &home, registry)

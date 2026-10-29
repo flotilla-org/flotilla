@@ -38,10 +38,10 @@ use std::{
 use async_trait::async_trait;
 use flotilla_address::{Address, Kind as AddressKind};
 use flotilla_admission::convoy_ensure::EngineEnsures;
-use flotilla_engine_store::{open_home, StoreLog};
+use flotilla_engine_store::{open_home, ImportTarget, StoreLog, IMPORT_WRITER};
 use flotilla_resources::convoy::engine::standing_name;
 use flotilla_resources::{Clock, ConvoyEnsure, ConvoyEnsureStatusPatch, ResourceObject};
-use flotilla_schema::Timestamp;
+use flotilla_schema::{NewChange, Timestamp};
 use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::{
     machines::ensure::{
@@ -264,25 +264,36 @@ pub fn import_ensure(ensure: &ResourceObject<ConvoyEnsure>, convoy_live: bool) -
 pub fn rehearse_ensures(
     ensures: &[(ResourceObject<ConvoyEnsure>, String, bool)],
 ) -> (BTreeMap<&'static str, usize>, Vec<(String, String)>) {
-    let mut refused = Vec::new();
-    let mut imported = Vec::new();
-    for (ensure, home, convoy_live) in ensures {
-        match import_ensure(ensure, *convoy_live) {
-            Ok(resource) => imported.push((home.clone(), resource)),
-            Err(reason) => refused.push((ensure.metadata.name.clone(), reason)),
-        }
-    }
     let mut kinds = flotilla_schema::KindRegistry::new();
-    if let Err(error) = flotilla_engine_store::register_crew(&mut kinds) {
-        refused.extend(imported.iter().map(|(_, resource)| (resource.name().to_owned(), format!("registry: {error:?}"))));
-        return (BTreeMap::new(), refused);
+    let rehearsal = flotilla_engine_store::register_crew(&mut kinds)
+        .map_err(|error| format!("registry: {error:?}"))
+        .and_then(|()| flotilla_engine_store::Rehearsal::open(kinds));
+    match rehearsal {
+        Ok(mut rehearsal) => import_ensures(ensures, &mut rehearsal),
+        Err(reason) => (BTreeMap::new(), ensures.iter().map(|(ensure, _, _)| (ensure.metadata.name.clone(), reason.clone())).collect()),
     }
-    let mut failed: BTreeMap<usize, String> = flotilla_engine_store::rehearse(kinds, &imported).into_iter().collect();
+}
+
+/// Imports the `ensures` homed where `target` imports (each an old ConvoyEnsure, its home, and
+/// whether the convoy it records is live) into it, each at its creation time. Returns the counts
+/// by stored state and each refused record named, with why.
+pub fn import_ensures(
+    ensures: &[(ResourceObject<ConvoyEnsure>, String, bool)],
+    target: &mut impl ImportTarget,
+) -> (BTreeMap<&'static str, usize>, Vec<(String, String)>) {
+    let mut refused = Vec::new();
     let mut counts = BTreeMap::new();
-    for (index, (_, resource)) in imported.iter().enumerate() {
-        match failed.remove(&index) {
-            Some(reason) => refused.push((resource.name().to_owned(), reason)),
-            None => *counts.entry(ensure_label(resource.state())).or_default() += 1,
+    for (ensure, home, convoy_live) in ensures {
+        if !target.imports(home) {
+            continue;
+        }
+        let written = import_ensure(ensure, *convoy_live).and_then(|resource| {
+            let change = NewChange::new(IMPORT_WRITER, resource.since());
+            target.write(home, resource.name(), &change, &resource).map(|()| resource)
+        });
+        match written {
+            Ok(resource) => *counts.entry(ensure_label(resource.state())).or_default() += 1,
+            Err(reason) => refused.push((ensure.metadata.name.clone(), reason)),
         }
     }
     (counts, refused)

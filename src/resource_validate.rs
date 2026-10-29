@@ -1,25 +1,5 @@
 #[cfg(unix)]
-mod account_import;
-#[cfg(unix)]
-mod artifact_import;
-#[cfg(unix)]
-mod definition_import;
-#[cfg(unix)]
 pub(crate) mod frozen;
-#[cfg(unix)]
-mod import_plan;
-#[cfg(unix)]
-mod import_rows;
-#[cfg(unix)]
-mod lifecycle_import;
-#[cfg(unix)]
-mod manifest_root_import;
-#[cfg(unix)]
-mod message_import;
-#[cfg(unix)]
-mod placement_import;
-#[cfg(unix)]
-mod repository_import;
 #[cfg(unix)]
 mod retirement;
 
@@ -35,6 +15,8 @@ use flotilla_charter::ops_entry::{parse_operational_entry, OperationalEntryFile}
 use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE;
 #[cfg(unix)]
 use flotilla_core::repository_inspection::GitRepositoryInspector;
+#[cfg(unix)]
+use flotilla_daemon::engine_import;
 #[cfg(unix)]
 use flotilla_environment::environment::{command_provider, EnvironmentInput};
 #[cfg(unix)]
@@ -56,6 +38,10 @@ use serde_json::Value;
 
 #[cfg(unix)]
 const VALIDATION_INSPECTION_HOST: &str = "candidate-validation";
+
+/// The home the rehearsal gives the daemon's own records, which list without an origin root.
+#[cfg(unix)]
+const LOCAL_HOME: &str = "local";
 
 /// Candidate host configuration and optional probes for pre-roll validation.
 #[cfg(unix)]
@@ -157,15 +143,7 @@ async fn validate_daemon_with_preview(
     let mut retirement_inventory_failed = false;
     let has_templates = collections.iter().any(|(store, kind, _)| store == base && kind == "workflowtemplates");
     let mut charter_namespaces = std::collections::BTreeSet::new();
-    let mut message_documents = BTreeMap::<String, message_import::Documents>::new();
-    let mut lifecycle_documents = BTreeMap::<String, lifecycle_import::Documents>::new();
-    let mut import_plans = BTreeMap::<String, import_plan::Report>::new();
-    let mut account_documents = BTreeMap::<String, account_import::Documents>::new();
-    let mut definition_documents = definition_import::Documents::default();
-    let mut repository_documents = repository_import::Documents::default();
-    let mut placement_documents = placement_import::Documents::default();
-    let mut artifact_documents = artifact_import::Documents::default();
-    let mut root_documents = BTreeMap::<String, manifest_root_import::Documents>::new();
+    let mut import_rows = Vec::new();
     for (store_base, kind, namespaces) in collections {
         let replication = REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.plural == kind).map(|entry| entry.replication_class);
         let query = if replication.is_some_and(|class| class != ReplicationClass::None) { "?replicaSources=true" } else { "" };
@@ -199,9 +177,6 @@ async fn validate_daemon_with_preview(
             }
             let document: Value = response.json().await.map_err(|error| eyre!("decode {label} list: {error}"))?;
             let items = document.get("items").and_then(Value::as_array).ok_or_else(|| eyre!("{label}: daemon list has no items array"))?;
-            if store_base == base {
-                import_plans.entry(namespace.clone()).or_default().count(&kind, items.len());
-            }
             for item in items {
                 count += 1;
                 let name = item.pointer("/metadata/name").and_then(Value::as_str).unwrap_or("<unnamed>");
@@ -220,37 +195,23 @@ async fn validate_daemon_with_preview(
                         }
                     }
                 }
+                if store_base == base {
+                    let home =
+                        item.pointer("/metadata/annotations/flotilla.work~1origin-root").and_then(Value::as_str).unwrap_or(LOCAL_HOME);
+                    import_rows.push(engine_import::Row {
+                        namespace: namespace.clone(),
+                        plural: kind.clone(),
+                        home: home.to_owned(),
+                        document: item.clone(),
+                    });
+                }
                 // A retired kind's rows are dropped by the import; this candidate has no decoder for them.
-                if import_plan::is_retired(&kind) {
+                if engine_import::plan::is_retired(&kind) {
                     continue;
                 }
                 if let Err(error) = validate_stored_record(item) {
                     eprintln!("{label}/{name}: {error}");
                     failed = true;
-                }
-                if store_base == base && message_import::KINDS.contains(&kind.as_str()) {
-                    message_documents.entry(namespace.clone()).or_default().0.entry(kind.clone()).or_default().push(item.clone());
-                }
-                if store_base == base && account_import::KINDS.contains(&kind.as_str()) {
-                    account_documents.entry(namespace.clone()).or_default().0.entry(kind.clone()).or_default().push(item.clone());
-                }
-                if store_base == base && kind == manifest_root_import::KIND {
-                    root_documents.entry(namespace.clone()).or_default().0.entry(kind.clone()).or_default().push(item.clone());
-                }
-                if store_base == base && definition_import::KINDS.contains(&kind.as_str()) {
-                    definition_documents.0.push((namespace.clone(), kind.clone(), item.clone()));
-                }
-                if store_base == base && placement_import::KINDS.contains(&kind.as_str()) {
-                    placement_documents.0.push((namespace.clone(), kind.clone(), item.clone()));
-                }
-                if store_base == base && kind == repository_import::KIND {
-                    repository_documents.0.push((namespace.clone(), item.clone()));
-                }
-                if store_base == base && kind == artifact_import::KIND {
-                    artifact_documents.0.push((namespace.clone(), item.clone()));
-                }
-                if store_base == base && lifecycle_import::KINDS.contains(&kind.as_str()) {
-                    lifecycle_documents.entry(namespace.clone()).or_default().0.entry(kind.clone()).or_default().push(item.clone());
                 }
             }
             let frozen_collection = store_base == base
@@ -300,47 +261,11 @@ async fn validate_daemon_with_preview(
             }
         }
     }
-    // Rehearse before every roll; the candidate host configuration controls enforcement.
-    for (namespace, documents) in &message_documents {
-        let report = documents.rehearse(namespace);
-        failed |= probes.require_import && !report.refused.is_empty();
-        message_import::print(namespace, &report);
-    }
-    // Only the named, deliberate non-import classes are exempt.
-    for (namespace, documents) in &lifecycle_documents {
-        let report = documents.rehearse();
-        failed |= probes.require_import && report.refused.iter().any(|refusal| !lifecycle_import::exempt(refusal));
-        lifecycle_import::print(namespace, &report);
-    }
-    for (namespace, documents) in &account_documents {
-        let report = documents.rehearse();
-        failed |= probes.require_import && !report.refused.is_empty();
-        account_import::print(namespace, &report);
-    }
-    for (namespace, documents) in &root_documents {
-        let report = manifest_root_import::rehearse(documents);
-        failed |= probes.require_import && !report.refused.is_empty();
-        manifest_root_import::print(namespace, &report);
-    }
-    // One rehearsal over every namespace: the engine has no namespaces (#3824 layer 2b).
-    let definitions = definition_documents.rehearse();
-    failed |= probes.require_import && !definitions.refused.is_empty();
-    definition_import::print(&definitions);
-    // Repository likewise, over every namespace (#3824 layer 3a).
-    let repositories = repository_documents.rehearse();
-    failed |= probes.require_import && !repositories.refused.is_empty();
-    repository_import::print(&repositories);
-    let placement = placement_documents.rehearse();
-    failed |= probes.require_import && !placement.refused.is_empty();
-    placement_import::print(&placement);
-    let artifacts = artifact_documents.rehearse();
-    failed |= probes.require_import && !artifacts.refused.is_empty();
-    artifact_import::print(&artifacts);
-    // Every kind the daemon holds rows of is imported, dropped or still moving (#3824).
-    for (namespace, report) in &import_plans {
-        failed |= probes.require_import && report.blocks_import();
-        import_plan::print(namespace, report);
-    }
+    // Rehearse before every roll, as this host's first start with `[primitives]` imports; the
+    // candidate host configuration controls enforcement.
+    let summary = engine_import::rehearse(&engine_import::Source::new(import_rows), LOCAL_HOME);
+    failed |= probes.require_import && summary.refused();
+    print_import(&summary);
     if !retirement_inventory_failed {
         match retirement::preview(&retirement_templates, &retirement_projects, &retirement_designations) {
             Ok(preview) => {
@@ -467,6 +392,23 @@ async fn validate_daemon_with_preview(
         }
         println!("validated {count} stored records");
         Ok(count)
+    }
+}
+
+/// One line per kind, then the kinds still on the old store, each note and each refusal.
+#[cfg(unix)]
+fn print_import(summary: &engine_import::Summary) {
+    for (kind, counts) in &summary.kinds {
+        println!("import rehearsal: {kind}: {} imported, {} dropped, {} refused", counts.imported, counts.dropped, counts.refused);
+    }
+    for (kind, (layer, rows)) in &summary.staying {
+        println!("import rehearsal: {kind}: {rows} not imported yet, stays on the old store ({layer})");
+    }
+    for note in &summary.notes {
+        println!("import rehearsal: note: {note}");
+    }
+    for refusal in &summary.refusals {
+        println!("import rehearsal: {} `{}` refused: {}", refusal.kind, refusal.name, refusal.reason);
     }
 }
 

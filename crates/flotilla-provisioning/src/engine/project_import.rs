@@ -20,9 +20,9 @@
 
 use std::collections::BTreeSet;
 
-use flotilla_engine_store::Rehearsal;
+use flotilla_engine_store::{ImportTarget, IMPORT_WRITER};
 use flotilla_resources::{Project, ProjectSpec};
-use flotilla_schema::Kind;
+use flotilla_schema::{Kind, NewChange, Timestamp};
 
 use super::{
     definition_import::{DefinitionCopy, DefinitionKind, Mapped},
@@ -43,12 +43,14 @@ pub struct ImportedOps {
     pub name: String,
     pub home: String,
     pub record: ProjectOpsRecord,
+    /// When its copy was created.
+    pub created: Timestamp,
 }
 
 /// The ProjectOps records the copies' statuses import to, beside the Projects `imported` names by
 /// `(namespace, name)`. Each status holding a dispatch queue counts one drop.
-pub fn import_ops(
-    copies: &[DefinitionCopy<Project>],
+pub fn import_ops<'a>(
+    copies: impl IntoIterator<Item = &'a DefinitionCopy<Project>>,
     imported: &BTreeSet<(String, String)>,
     report: &mut ImportReport,
 ) -> Vec<ImportedOps> {
@@ -65,22 +67,25 @@ pub fn import_ops(
             *report.dropped.entry((kind, "its Project does not import")).or_default() += 1;
             continue;
         }
-        records.push(ImportedOps { name: name.clone(), home: copy.home.clone(), record });
+        let created = Timestamp::from_datetime(&copy.object.metadata.creation_timestamp);
+        records.push(ImportedOps { name: name.clone(), home: copy.home.clone(), record, created });
     }
     records
 }
 
-/// Restores the ProjectOps records of `copies` beside the Projects already restored, `projects`.
-pub(super) fn rehearse_project_ops(
+/// Writes the ProjectOps records of the `copies` at homes `target` imports, beside the Projects
+/// already written, `projects`, each at its copy's creation time.
+pub(super) fn write_project_ops(
     copies: &[DefinitionCopy<Project>],
     projects: &BTreeSet<(String, String)>,
-    rehearsal: &mut Rehearsal,
+    target: &mut impl ImportTarget,
     report: &mut ImportReport,
 ) {
     let kind = <ProjectOpsRecord as Kind>::KIND;
-    for ops in import_ops(copies, projects, report) {
-        // Version 1, as every imported record.
-        match rehearsal.restore(&ops.home, &ops.name, 1, &ops.record) {
+    let ours: Vec<_> = copies.iter().filter(|copy| target.imports(&copy.home)).collect();
+    for ops in import_ops(ours, projects, report) {
+        let change = NewChange::new(IMPORT_WRITER, ops.created);
+        match target.write(&ops.home, &ops.name, &change, &ops.record) {
             Ok(()) => *report.imported.entry((kind, "observed")).or_default() += 1,
             Err(reason) => report.refused.push(ImportRefusal { kind, record: ops.name, reason: format!("at `{}`: {reason}", ops.home) }),
         }

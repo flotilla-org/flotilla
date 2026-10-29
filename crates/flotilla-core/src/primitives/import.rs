@@ -18,8 +18,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_address::{Address, Kind};
+use flotilla_engine_store::{ImportTarget, IMPORT_WRITER};
 use flotilla_resources::{Message, MessageExpectation, MessagePhase, ResolvedMessageReceiver, ResourceObject};
-use flotilla_schema::Timestamp;
+use flotilla_schema::{NewChange, Timestamp};
 use flotilla_state_machines::{
     machines::{
         consumer::{ConsumerKind, Receiver},
@@ -28,7 +29,7 @@ use flotilla_state_machines::{
             Settle, Settlement, Supersedes,
         },
     },
-    Home, Ref, Resource, StoredState, Transport,
+    Home, Ref, Resource, StoredState, Transport, Version,
 };
 
 use super::convert::{timestamp, Conversion};
@@ -56,6 +57,8 @@ pub struct ImportedMessage {
     pub record: String,
     pub home: String,
     pub resource: Resource<Machine>,
+    /// When the old record was created: the time of the import's change.
+    pub created: Timestamp,
 }
 
 /// A record the import refuses, named.
@@ -136,7 +139,10 @@ pub fn import_message(
 ) -> Result<Imported, ImportRefusal> {
     let record = old.record.metadata.name.clone();
     match convert(old, version, conversion, world) {
-        Ok(resource) => Ok(Imported::Message(Box::new(ImportedMessage { record, home: old.home.clone(), resource }))),
+        Ok(resource) => {
+            let created = Timestamp::from_datetime(&old.record.metadata.creation_timestamp);
+            Ok(Imported::Message(Box::new(ImportedMessage { record, home: old.home.clone(), resource, created })))
+        }
         Err(Unimported::Missing { reason, .. }) if settled(old.record) || receiver_ended(old.record, conversion) => {
             Ok(Imported::Dropped(ImportDrop { record, reason }))
         }
@@ -424,55 +430,58 @@ impl ImportWorld for ReadRecords<'_> {
 /// A message whose replied-to or superseded message is not imported is
 /// refused, as is one the store refuses or reads back differently.
 pub fn rehearse(imported: &[ImportedMessage]) -> Vec<ImportRefusal> {
-    use flotilla_schema::{Encoder, Kind};
     let refuse = |record: &str, reason: String| ImportRefusal { record: record.to_owned(), reason };
-    let registry = match flotilla_engine_store::registry() {
-        Ok(registry) => registry,
-        Err(error) => return imported.iter().map(|message| refuse(&message.record, format!("registry: {error:?}"))).collect(),
-    };
-    let connection = match rusqlite::Connection::open_in_memory() {
-        Ok(connection) => connection,
-        Err(error) => return imported.iter().map(|message| refuse(&message.record, error.to_string())).collect(),
-    };
-    // Homed nowhere imported, so every message restores as another home's.
-    let mut store = match flotilla_schema_sqlite::Store::open(connection, "import-rehearsal", registry) {
-        Ok(store) => store,
-        Err(error) => return imported.iter().map(|message| refuse(&message.record, error.to_string())).collect(),
-    };
+    let rehearsal =
+        flotilla_engine_store::registry().map_err(|error| format!("registry: {error:?}")).and_then(flotilla_engine_store::Rehearsal::open);
+    match rehearsal {
+        Ok(mut rehearsal) => write_messages(imported, &mut rehearsal),
+        Err(reason) => imported.iter().map(|message| refuse(&message.record, reason.clone())).collect(),
+    }
+}
+
+/// Writes the `imported` messages homed where `target` imports, each admitted at the version it
+/// is written at, reads each back and checks it against the machine. A message is written after
+/// the messages it replies to or supersedes: those written here, or another home's that import
+/// there and reach this store by replication. One whose replied-to or superseded message is not
+/// imported is refused, as is one the target refuses or reads back differently.
+pub fn write_messages(imported: &[ImportedMessage], target: &mut impl ImportTarget) -> Vec<ImportRefusal> {
+    let refuse = |record: &str, reason: String| ImportRefusal { record: record.to_owned(), reason };
+    let elsewhere: BTreeSet<(&str, &str)> = imported
+        .iter()
+        .filter(|message| !target.imports(&message.home))
+        .map(|message| (message.resource.name(), message.home.as_str()))
+        .collect();
     let mut refusals = Vec::new();
-    let mut waiting: Vec<&ImportedMessage> = imported.iter().collect();
-    let mut restored = BTreeMap::<(String, String), ()>::new();
-    // Referenced messages restore first: their identities are foreign keys.
+    let mut waiting: Vec<&ImportedMessage> = imported.iter().filter(|message| target.imports(&message.home)).collect();
+    let mut written = BTreeSet::<(String, String)>::new();
+    // Referenced messages are written first: their identities are foreign keys.
     loop {
         let before = waiting.len();
         let mut next = Vec::new();
         for message in waiting {
             let spec = message.resource.spec();
-            let ready = [&spec.in_reply_to, &spec.supersedes]
-                .into_iter()
-                .flatten()
-                .all(|reference| restored.contains_key(&(reference.name.clone(), reference.home.clone())));
+            let ready = [&spec.in_reply_to, &spec.supersedes].into_iter().flatten().all(|reference| {
+                written.contains(&(reference.name.clone(), reference.home.clone()))
+                    || elsewhere.contains(&(reference.name.as_str(), reference.home.as_str()))
+            });
             if !ready {
                 next.push(message);
                 continue;
             }
-            let result = Encoder::encode(&message.resource).map_err(|error| error.to_string()).and_then(|rows| {
-                let snapshot = flotilla_schema_sqlite::Snapshot {
-                    kind: Resource::<Machine>::CODE,
-                    name: message.resource.name().to_owned(),
-                    home: message.home.clone(),
-                    version: message.resource.version().0,
-                    rows,
-                };
-                let mut write = store.write().map_err(|error| error.to_string())?;
-                write.restore(&snapshot).map_err(|error| error.to_string())?;
-                write.commit().map_err(|error| error.to_string())
+            let change = NewChange::new(IMPORT_WRITER, message.created);
+            let result = target.write_with(&message.home, message.resource.name(), &change, message.resource.version().0, |version| {
+                let mut spec = message.resource.spec().clone();
+                spec.admitted_seq = version;
+                Resource::stored(message.resource.name(), spec, message.resource.stored_state().clone(), Version(version))
             });
             match result {
-                Ok(()) => {
-                    restored.insert((message.resource.name().to_owned(), message.home.clone()), ());
+                Ok(written_message) => {
+                    written.insert((message.resource.name().to_owned(), message.home.clone()));
+                    if let Err(reason) = check(&written_message) {
+                        refusals.push(refuse(&message.record, reason));
+                    }
                 }
-                Err(error) => refusals.push(refuse(&message.record, format!("the store refuses its restore: {error}"))),
+                Err(error) => refusals.push(refuse(&message.record, format!("the store refuses it: {error}"))),
             }
         }
         waiting = next;
@@ -482,25 +491,6 @@ pub fn rehearse(imported: &[ImportedMessage]) -> Vec<ImportRefusal> {
     }
     for message in waiting {
         refusals.push(refuse(&message.record, "a message it replies to or supersedes is not imported".into()));
-    }
-    for message in imported {
-        if !restored.contains_key(&(message.resource.name().to_owned(), message.home.clone())) {
-            continue;
-        }
-        let read = store.read().and_then(|mut read| {
-            let id = read.resolve(Resource::<Machine>::CODE, message.resource.name(), &message.home)?;
-            id.map(|id| read.load::<Resource<Machine>>(id)).transpose().map(Option::flatten)
-        });
-        match read {
-            Ok(Some(loaded)) if loaded.value == message.resource => {
-                if let Err(reason) = check(&loaded.value) {
-                    refusals.push(refuse(&message.record, reason));
-                }
-            }
-            Ok(Some(_)) => refusals.push(refuse(&message.record, "the store reads back another message".into())),
-            Ok(None) => refusals.push(refuse(&message.record, "the restored message is missing".into())),
-            Err(error) => refusals.push(refuse(&message.record, error.to_string())),
-        }
     }
     refusals
 }

@@ -22,7 +22,9 @@ use flotilla_resources::{
     Repository, RepositoryKey, ResourceObject,
 };
 
-use super::import::{ImportRefusal, ImportReport};
+use flotilla_engine_store::ImportTarget;
+
+use super::import::{created, ImportRefusal, ImportReport};
 use crate::stored::repository::{self as stored, RepositoryRecord, VerificationProvenance};
 
 const KIND: &str = "Repository";
@@ -65,20 +67,21 @@ pub fn import_repository(old: &ResourceObject<Repository>) -> Result<Imported, S
     Ok(Imported::Record(Box::new(record)))
 }
 
-/// Maps every copy onto the engine and rehearses the records into a temporary store, counted as
-/// `observed`; drops are counted and refusals named in `report`.
+/// [`import_repositories`] into a temporary store of their own.
 pub fn rehearse_repositories(copies: &[RepositoryCopy], report: &mut ImportReport) {
-    let rehearsal = stored::registry().map_err(|error| format!("registry: {error:?}")).and_then(flotilla_engine_store::Rehearsal::open);
-    let mut rehearsal = match rehearsal {
-        Ok(rehearsal) => rehearsal,
-        Err(reason) => {
-            report.refused.push(ImportRefusal { kind: KIND, record: "<all>".to_owned(), reason });
-            return;
-        }
-    };
+    match stored::registry().map_err(|error| format!("registry: {error:?}")).and_then(flotilla_engine_store::Rehearsal::open) {
+        Ok(mut rehearsal) => import_repositories(copies, &mut rehearsal, report),
+        Err(reason) => report.refused.push(ImportRefusal { kind: KIND, record: "<all>".to_owned(), reason }),
+    }
+}
+
+/// Maps every copy at a home `target` imports onto the engine and writes the records, counted as
+/// `observed`, each at its copy's creation time; drops are counted and refusals named in `report`.
+pub fn import_repositories(copies: &[RepositoryCopy], target: &mut impl ImportTarget, report: &mut ImportReport) {
+    let copies: Vec<_> = copies.iter().filter(|copy| target.imports(&copy.home)).collect();
     // The engine has no namespaces: a key a home holds in several is refused in all of them.
     let mut namespaces = BTreeMap::<(&str, &str), BTreeSet<&str>>::new();
-    for copy in copies {
+    for copy in &copies {
         namespaces.entry((copy.object.metadata.name.as_str(), copy.home.as_str())).or_default().insert(copy.namespace.as_str());
     }
     // The live copies each home holds, which a superseded copy's target must be among.
@@ -89,7 +92,7 @@ pub fn rehearse_repositories(copies: &[RepositoryCopy], report: &mut ImportRepor
         })
         .map(|copy| (copy.object.metadata.name.as_str(), copy.home.as_str()))
         .collect();
-    for copy in copies {
+    for copy in &copies {
         let name = &copy.object.metadata.name;
         let refuse = |reason: String| ImportRefusal { kind: KIND, record: name.clone(), reason: format!("at `{}`: {reason}", copy.home) };
         let held = &namespaces[&(name.as_str(), copy.home.as_str())];
@@ -105,8 +108,8 @@ pub fn rehearse_repositories(copies: &[RepositoryCopy], report: &mut ImportRepor
             }
         }
         match import_repository(&copy.object) {
-            // Version 1: each record starts at its home as a fresh write; its old versions are not carried.
-            Ok(Imported::Record(record)) => match rehearsal.restore(&copy.home, name, 1, &*record) {
+            // Each record starts at its home as a fresh write; its old versions are not carried.
+            Ok(Imported::Record(record)) => match target.write(&copy.home, name, &created(&copy.object), &*record) {
                 Ok(()) => *report.imported.entry((KIND, "observed")).or_default() += 1,
                 Err(reason) => report.refused.push(refuse(reason)),
             },

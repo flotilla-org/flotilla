@@ -577,34 +577,49 @@ pub fn requester_name(binding: &BindingSpec) -> Option<String> {
     requester_parts(&binding.requester).map(|(convoy, role)| binding_name(&convoy, &role, &binding.requirement))
 }
 
-/// Maps the old store's bindings and provisions (each with its home) onto the engine and
-/// rehearses them into one temporary store, bindings first, so each provision's reference finds
-/// its binding (ADR 0047: the previous generation's records decode). A binding takes its engine
-/// name from its requester and opening; a provision is re-pointed at that name. Counted by kind
-/// and state; refusals are named.
+/// [`import_accounts`] into a temporary store of their own.
 pub fn rehearse_accounts(
     bindings: &[(flotilla_resources::ResourceObject<flotilla_resources::AccountBinding>, String)],
     provisions: &[(flotilla_resources::ResourceObject<flotilla_resources::AccountProvision>, String)],
     report: &mut super::import::ImportReport,
 ) {
     use super::import::ImportRefusal;
-    use flotilla_state_machines::Version;
     let mut kinds = flotilla_schema::KindRegistry::new();
     let rehearsal = stored::register(&mut kinds)
         .map_err(|error| format!("registry: {error:?}"))
         .and_then(|()| flotilla_engine_store::Rehearsal::open(kinds));
-    let mut rehearsal = match rehearsal {
-        Ok(rehearsal) => rehearsal,
+    match rehearsal {
+        Ok(mut rehearsal) => import_accounts(bindings, provisions, &mut rehearsal, report),
         Err(reason) => {
             let refuse = |kind, record: &str| ImportRefusal { kind, record: record.to_owned(), reason: reason.clone() };
             report.refused.extend(bindings.iter().map(|(binding, _)| refuse("AccountBinding", &binding.metadata.name)));
             report.refused.extend(provisions.iter().map(|(provision, _)| refuse("AccountProvision", &provision.metadata.name)));
-            return;
         }
+    }
+}
+
+/// Maps the old store's bindings and provisions (each with its home) onto the engine and writes
+/// them into `target`, bindings first, so each provision's reference finds its binding (ADR 0047:
+/// the previous generation's records decode). A binding takes its engine name from its requester
+/// and opening; a provision is re-pointed at that name. Counted by kind and state; refusals are
+/// named. Records of a home `target` does not import are left to that home.
+pub fn import_accounts(
+    bindings: &[(flotilla_resources::ResourceObject<flotilla_resources::AccountBinding>, String)],
+    provisions: &[(flotilla_resources::ResourceObject<flotilla_resources::AccountProvision>, String)],
+    target: &mut impl flotilla_engine_store::ImportTarget,
+    report: &mut super::import::ImportReport,
+) {
+    use super::import::ImportRefusal;
+    use flotilla_state_machines::Version;
+    let change = |old: &flotilla_resources::ObjectMeta| {
+        NewChange::new(flotilla_engine_store::IMPORT_WRITER, Timestamp::from_datetime(&old.creation_timestamp))
     };
     let mut renamed = BTreeMap::new();
     let mut taken = BTreeSet::new();
     for (old, home) in bindings {
+        if !target.imports(home) {
+            continue;
+        }
         let refuse = |reason: String| ImportRefusal { kind: "AccountBinding", record: old.metadata.name.clone(), reason };
         // An r879 binding's home-key label (#3953) is dropped (ADR 0047).
         let spec = binding_spec(&old.spec);
@@ -624,8 +639,14 @@ pub fn rehearse_accounts(
             BindingState::Revoked { .. } => "revoked",
         };
         let resource = Resource::<AccountBinding>::stored(name.clone(), spec, State::new(state, old.spec.state.since), Version(1));
-        match rehearsal.restore(home, &name, 1, &resource) {
-            Ok(()) => {
+        // The store stamps every epoch row with the create's version.
+        let written = target.write_with(home, &name, &change(&old.metadata), 1, |version| {
+            let mut spec = resource.spec().clone();
+            spec.epochs.restamp(version);
+            resource.clone().with_spec(spec)
+        });
+        match written {
+            Ok(_) => {
                 *report.imported.entry(("AccountBinding", label)).or_default() += 1;
                 renamed.insert((home.clone(), old.metadata.name.clone()), (home.clone(), name));
             }
@@ -633,6 +654,9 @@ pub fn rehearse_accounts(
         }
     }
     for (old, home) in provisions {
+        if !target.imports(home) {
+            continue;
+        }
         let refuse = |reason: String| ImportRefusal { kind: "AccountProvision", record: old.metadata.name.clone(), reason };
         // A daemon's own records list without an origin root; a provision names its binding's
         // home by node id, so a binding listed as this daemon's is found by name alone.
@@ -649,7 +673,7 @@ pub fn rehearse_accounts(
         let mut spec = provision_spec(&old.spec);
         spec.binding = Ref::new(binding.clone(), binding_home.clone());
         let label = if spec.delivered.is_some() { "delivered" } else { "recorded" };
-        match rehearsal.holds::<Resource<AccountBinding>>(&spec.binding.name, &spec.binding.home) {
+        match target.holds::<Resource<AccountBinding>>(&spec.binding.name, &spec.binding.home) {
             Ok(true) => {}
             Ok(false) => {
                 report.refused.push(refuse(format!("its binding `{}` at `{}` is not restored", spec.binding.name, spec.binding.home)));
@@ -660,7 +684,7 @@ pub fn rehearse_accounts(
                 continue;
             }
         }
-        match rehearsal.restore(home, &old.metadata.name, 1, &spec) {
+        match target.write(home, &old.metadata.name, &change(&old.metadata), &spec) {
             Ok(()) => *report.imported.entry(("AccountProvision", label)).or_default() += 1,
             Err(reason) => report.refused.push(refuse(reason)),
         }

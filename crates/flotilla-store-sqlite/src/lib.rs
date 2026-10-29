@@ -3,8 +3,10 @@ use flotilla_resources::{digest, error, resource, retention};
 use flotilla_store::*;
 use flotilla_store::{replica, watch};
 mod sqlite;
+mod stored_rows;
 pub use sqlite::statements::{ConnectionCounters, PrepareCounters};
 pub use sqlite::*;
+pub use stored_rows::{read_stored_rows, StoredRow};
 
 #[cfg(test)]
 mod overload_contract {

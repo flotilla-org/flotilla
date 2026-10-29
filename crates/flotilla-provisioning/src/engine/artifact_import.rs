@@ -16,7 +16,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_resources::{Artifact, ResourceObject};
 
-use super::import::{ImportRefusal, ImportReport};
+use flotilla_engine_store::ImportTarget;
+
+use super::import::{created, ImportRefusal, ImportReport};
 use crate::stored::artifact::{self as stored, ArtifactRecord};
 
 const KIND: &str = "Artifact";
@@ -43,22 +45,23 @@ pub fn import_artifact(old: &ResourceObject<Artifact>) -> Result<Imported, Strin
     ArtifactRecord::from_spec(&old.spec).map(|record| Imported::Record(Box::new(record)))
 }
 
-/// Maps every copy onto the engine and rehearses the records into a temporary store, counted as
-/// `stored`; drops are counted and refusals named in `report`.
+/// [`import_artifacts`] into a temporary store of their own.
 pub fn rehearse_artifacts(copies: &[ArtifactCopy], report: &mut ImportReport) {
-    let rehearsal = stored::registry().map_err(|error| format!("registry: {error:?}")).and_then(flotilla_engine_store::Rehearsal::open);
-    let mut rehearsal = match rehearsal {
-        Ok(rehearsal) => rehearsal,
-        Err(reason) => {
-            report.refused.push(ImportRefusal { kind: KIND, record: "<all>".to_owned(), reason });
-            return;
-        }
-    };
+    match stored::registry().map_err(|error| format!("registry: {error:?}")).and_then(flotilla_engine_store::Rehearsal::open) {
+        Ok(mut rehearsal) => import_artifacts(copies, &mut rehearsal, report),
+        Err(reason) => report.refused.push(ImportRefusal { kind: KIND, record: "<all>".to_owned(), reason }),
+    }
+}
+
+/// Maps every copy at a home `target` imports onto the engine and writes the records, counted as
+/// `stored`, each at its copy's creation time; drops are counted and refusals named in `report`.
+pub fn import_artifacts(copies: &[ArtifactCopy], target: &mut impl ImportTarget, report: &mut ImportReport) {
+    let copies: Vec<_> = copies.iter().filter(|copy| target.imports(&copy.home)).collect();
     let mut namespaces = BTreeMap::<(&str, &str), BTreeSet<&str>>::new();
     for copy in copies.iter().filter(|copy| copy.object.metadata.deletion_timestamp.is_none()) {
         namespaces.entry((copy.object.metadata.name.as_str(), copy.home.as_str())).or_default().insert(copy.namespace.as_str());
     }
-    for copy in copies {
+    for copy in &copies {
         let name = &copy.object.metadata.name;
         let refuse = |reason: String| ImportRefusal { kind: KIND, record: name.clone(), reason: format!("at `{}`: {reason}", copy.home) };
         let held = namespaces.get(&(name.as_str(), copy.home.as_str())).cloned().unwrap_or_default();
@@ -68,8 +71,8 @@ pub fn rehearse_artifacts(copies: &[ArtifactCopy], report: &mut ImportReport) {
             continue;
         }
         match import_artifact(&copy.object) {
-            // Version 1: each record starts at its home as a fresh write; its old versions are not carried.
-            Ok(Imported::Record(record)) => match rehearsal.restore(&copy.home, name, 1, &*record) {
+            // Each record starts at its home as a fresh write; its old versions are not carried.
+            Ok(Imported::Record(record)) => match target.write(&copy.home, name, &created(&copy.object), &*record) {
                 Ok(()) => {
                     *report.imported.entry((KIND, "stored")).or_default() += 1;
                     if copy.object.status.as_ref().is_some_and(|status| !status.ledger_comment_creations.is_empty()) {

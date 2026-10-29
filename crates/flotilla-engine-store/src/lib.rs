@@ -195,24 +195,9 @@ where
 /// The rehearsal store's own home: no record is authored there.
 pub const REHEARSAL_HOME: &str = "import-rehearsal";
 
-/// The pre-roll import rehearsal (#3629 layer 9): writes each `(home, resource)` into a temporary
-/// store over `kinds` as a restore at its home, reads it back and compares. Returns each resource
-/// the store refused, or read back differently, by its index in `imported`, with the reason: two
-/// homes' resources of one name are told apart. The store's own home is
-/// [`REHEARSAL_HOME`], so every resource restores as another home's; one claiming that home is refused.
-pub fn rehearse<M>(kinds: KindRegistry, imported: &[(String, Resource<M>)]) -> Vec<(usize, String)>
-where
-    M: Machine,
-    M::Spec: PartialEq,
-    Resource<M>: Kind,
-{
-    let records: Vec<_> =
-        imported.iter().map(|(home, resource)| (home.clone(), resource.name().to_owned(), resource.version().0, resource)).collect();
-    rehearse_records(kinds, &records)
-}
-
-/// [`rehearse`] for a plain kind ([`plain`]): each `(home, name, version, spec)` restored and read
-/// back as its spec.
+/// The pre-roll import rehearsal for a plain kind ([`plain`]): each `(home, name, version, spec)`
+/// restored into a [`Rehearsal`] and read back as its spec. Returns each refused, or read back
+/// differently, by its index in `imported`, with the reason.
 pub fn rehearse_plain<K: Kind + PartialEq>(kinds: KindRegistry, imported: &[(String, String, u64, K)]) -> Vec<(usize, String)> {
     let records: Vec<_> = imported.iter().map(|(home, name, version, spec)| (home.clone(), name.clone(), *version, spec)).collect();
     rehearse_records(kinds, &records)
@@ -230,6 +215,54 @@ fn rehearse_records<K: Kind + PartialEq>(kinds: KindRegistry, imported: &[(Strin
             rehearsal.restore(home, name, *version, *value).err().map(|reason| (index, reason))
         })
         .collect()
+}
+
+/// The writer of every change the cut-over import makes.
+pub const IMPORT_WRITER: &str = "import";
+
+/// Where the cut-over import writes the records it maps: a [`Rehearsal`], which restores every
+/// home's records into a temporary store, or an [`Import`], which creates the records homed at its
+/// store's own home and leaves every other home's to that home.
+pub trait ImportTarget {
+    /// Whether records homed at `home` are written here.
+    fn imports(&self, home: &str) -> bool;
+
+    /// Writes the value `make` builds as `name` at `home`, as part of `change`, reads it back and
+    /// compares; the value written, or the reason it was refused or read back differently. `make`
+    /// is given the version the value is written at: `version` in a rehearsal, which restores, and
+    /// the home sequence its create takes in an import.
+    fn write_with<K: Kind + PartialEq>(
+        &mut self,
+        home: &str,
+        name: &str,
+        change: &NewChange,
+        version: u64,
+        make: impl FnOnce(u64) -> K,
+    ) -> Result<K, String>;
+
+    /// [`Self::write_with`] for a value written whatever its version (version 1 in a rehearsal).
+    fn write<K: Kind + PartialEq + Clone>(&mut self, home: &str, name: &str, change: &NewChange, value: &K) -> Result<(), String> {
+        self.write_with(home, name, change, 1, |_| value.clone()).map(drop)
+    }
+
+    /// Whether a live `K` named `name` at `home` was written: a reference's target, say.
+    fn holds<K: Kind>(&mut self, name: &str, home: &str) -> Result<bool, String>;
+}
+
+fn read_back<K: Kind + PartialEq>(store: &mut Store, home: &str, name: &str, value: &K) -> Result<(), String> {
+    let mut read = store.read().map_err(|error| error.to_string())?;
+    let id = read.resolve(K::CODE, name, home).map_err(|error| error.to_string())?.ok_or("not written")?;
+    let loaded = read.load::<K>(id).map_err(|error| error.to_string())?.ok_or("not loaded")?;
+    if &loaded.value.with_identity(&loaded.name, loaded.version) != value {
+        return Err("reads back differently".to_owned());
+    }
+    Ok(())
+}
+
+fn holds<K: Kind>(store: &mut Store, name: &str, home: &str) -> Result<bool, String> {
+    let mut read = store.read().map_err(|error| error.to_string())?;
+    let Some(id) = read.resolve(K::CODE, name, home).map_err(|error| error.to_string())? else { return Ok(false) };
+    Ok(read.load::<K>(id).map_err(|error| error.to_string())?.is_some())
 }
 
 /// A temporary store the import rehearsal restores into, homed at [`REHEARSAL_HOME`], so every
@@ -257,20 +290,87 @@ impl Rehearsal {
         let mut write = self.store.write().map_err(|error| error.to_string())?;
         write.restore(&snapshot).map_err(|error| error.to_string())?;
         write.commit().map_err(|error| error.to_string())?;
-        let mut read = self.store.read().map_err(|error| error.to_string())?;
-        let id = read.resolve(K::CODE, name, home).map_err(|error| error.to_string())?.ok_or("not restored")?;
-        let loaded = read.load::<K>(id).map_err(|error| error.to_string())?.ok_or("not loaded")?;
-        if &loaded.value.with_identity(&loaded.name, loaded.version) != value {
-            return Err("reads back differently".to_owned());
-        }
-        Ok(())
+        read_back(&mut self.store, home, name, value)
+    }
+}
+
+impl ImportTarget for Rehearsal {
+    fn imports(&self, home: &str) -> bool {
+        home != REHEARSAL_HOME
     }
 
-    /// Whether a live `K` named `name` at `home` was restored: a reference's target, say.
-    pub fn holds<K: Kind>(&mut self, name: &str, home: &str) -> Result<bool, String> {
-        let mut read = self.store.read().map_err(|error| error.to_string())?;
-        let Some(id) = read.resolve(K::CODE, name, home).map_err(|error| error.to_string())? else { return Ok(false) };
-        Ok(read.load::<K>(id).map_err(|error| error.to_string())?.is_some())
+    fn write_with<K: Kind + PartialEq>(
+        &mut self,
+        home: &str,
+        name: &str,
+        _: &NewChange,
+        version: u64,
+        make: impl FnOnce(u64) -> K,
+    ) -> Result<K, String> {
+        let value = make(version);
+        self.restore(home, name, version, &value)?;
+        Ok(value)
+    }
+
+    fn holds<K: Kind>(&mut self, name: &str, home: &str) -> Result<bool, String> {
+        holds::<K>(&mut self.store, name, home)
+    }
+}
+
+/// The cut-over import's writes into an engine store: each record homed at the store's home is
+/// created through its change, as the write path creates one, so its log entry carries the
+/// change's time and replicates to peers like any other create.
+pub struct Import {
+    store: Store,
+}
+
+impl Import {
+    /// A new engine store file at `path` over `kinds`, homed at `home`, in rollback-journal mode
+    /// so that, once dropped, it is whole in that one file.
+    pub fn create(path: &std::path::Path, home: &str, kinds: KindRegistry) -> Result<Self, String> {
+        let connection = rusqlite::Connection::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+        Ok(Self { store: Store::open(connection, home, kinds).map_err(|error| format!("open {}: {error}", path.display()))? })
+    }
+
+    /// An engine store in memory over `kinds`, homed at `home`: a rehearsal of what an import there writes.
+    pub fn in_memory(home: &str, kinds: KindRegistry) -> Result<Self, String> {
+        let connection = rusqlite::Connection::open_in_memory().map_err(|error| error.to_string())?;
+        Ok(Self { store: Store::open(connection, home, kinds).map_err(|error| error.to_string())? })
+    }
+
+    pub fn store(&mut self) -> &mut Store {
+        &mut self.store
+    }
+}
+
+impl ImportTarget for Import {
+    fn imports(&self, home: &str) -> bool {
+        home == self.store.home()
+    }
+
+    fn write_with<K: Kind + PartialEq>(
+        &mut self,
+        home: &str,
+        name: &str,
+        change: &NewChange,
+        _: u64,
+        make: impl FnOnce(u64) -> K,
+    ) -> Result<K, String> {
+        if !self.imports(home) {
+            return Err(format!("homed at `{home}`, another home's to import"));
+        }
+        let mut write = self.store.write().map_err(|error| error.to_string())?;
+        let change = write.open_change(change).map_err(|error| error.to_string())?;
+        let version = write.last_sequence(home).map_err(|error| error.to_string())? + 1;
+        let value = make(version).with_identity(name, version);
+        write.insert(name, &value, change).map_err(|error| error.to_string())?;
+        write.commit().map_err(|error| error.to_string())?;
+        read_back(&mut self.store, home, name, &value)?;
+        Ok(value)
+    }
+
+    fn holds<K: Kind>(&mut self, name: &str, home: &str) -> Result<bool, String> {
+        holds::<K>(&mut self.store, name, home)
     }
 }
 

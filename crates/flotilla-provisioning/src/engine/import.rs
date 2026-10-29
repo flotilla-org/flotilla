@@ -2,8 +2,8 @@
 //!
 //! One function per kind maps an old record's status onto a stored lifecycle state; the request is
 //! the kind's [`Binding::request`], as the write path makes it. A record that cannot be mapped is
-//! refused with the record named, and the pre-roll rehearsal ([`rehearse`]) writes every mapped
-//! resource into a temporary store as a restore, reads it back, and lists what it refused.
+//! refused with the record named. [`import_records`] writes every mapped resource into an
+//! [`ImportTarget`], reads it back, and lists what it refused.
 //!
 //! | Kind | Old phase | Stored state |
 //! |---|---|---|
@@ -39,12 +39,13 @@
 
 use std::collections::BTreeMap;
 
+use flotilla_engine_store::{ImportTarget, Rehearsal, IMPORT_WRITER};
 use flotilla_resources::{
     Checkout as OldCheckout, CheckoutPhase, Clone as OldClone, ClonePhase, Environment as OldEnvironment, EnvironmentPhase,
     ImageBuild as OldImageBuild, ImageBuildFailureClass, ImageBuildPhase, ResourceObject, TerminalSession as OldTerminalSession,
     TerminalSessionPhase, Vessel as OldVessel, VesselPhase,
 };
-use flotilla_schema::{Kind, State, Timestamp};
+use flotilla_schema::{Kind, NewChange, State, Timestamp};
 use flotilla_state_machines::{
     machines::lifecycle::{Ending, Lifecycle, LifecycleKind, LifecycleState},
     Cause, CauseCategory, Failure, Resource, Version,
@@ -129,62 +130,89 @@ pub fn label(state: &LifecycleState) -> &'static str {
     }
 }
 
-/// Writes `imported` into a temporary store holding the provisioning stored kinds, TerminalSession
-/// and the engine's crew kinds (Vessel, Ensure), each as a restore at its home, reads each back and compares
-/// ([`flotilla_engine_store::rehearse`]). A resource the store refuses, or reads back differently,
-/// is refused with its record named, keyed by its index in `imported`.
+/// The import's change for old record `obj`: made at its creation time.
+pub fn created<R: flotilla_resources::Resource>(obj: &ResourceObject<R>) -> NewChange {
+    NewChange::new(IMPORT_WRITER, Timestamp::from_datetime(&obj.metadata.creation_timestamp))
+}
+
+/// A temporary store holding the provisioning stored kinds, TerminalSession and the engine's crew
+/// kinds (Vessel, Ensure), for a rehearsal of their import.
+pub fn rehearsal() -> Result<Rehearsal, String> {
+    let mut kinds = flotilla_schema::KindRegistry::new();
+    crate::stored::register(&mut kinds)
+        .and_then(|()| flotilla_engine_store::register_crew(&mut kinds))
+        .map_err(|error| format!("registry: {error:?}"))?;
+    Rehearsal::open(kinds)
+}
+
+/// Writes `imported` into a [`rehearsal`], each as a restore at its home, reads each back and
+/// compares. A resource the store refuses, or reads back differently, is refused with its record
+/// named, keyed by its index in `imported`.
 pub fn rehearse<K>(imported: &[ImportedResource<K>]) -> BTreeMap<usize, ImportRefusal>
 where
     K: LifecycleKind,
-    K::Request: PartialEq,
-    Resource<Lifecycle<K>>: Kind,
+    Resource<Lifecycle<K>>: Kind + PartialEq + Clone,
 {
-    let mut kinds = flotilla_schema::KindRegistry::new();
-    if let Err(error) = crate::stored::register(&mut kinds).and_then(|()| flotilla_engine_store::register_crew(&mut kinds)) {
-        let reason = format!("registry: {error:?}");
-        return imported
-            .iter()
-            .enumerate()
-            .map(|(index, resource)| (index, ImportRefusal { kind: K::NAME, record: resource.record.clone(), reason: reason.clone() }))
-            .collect();
-    }
-    let resources: Vec<_> = imported.iter().map(|resource| (resource.home.clone(), resource.resource.clone())).collect();
-    flotilla_engine_store::rehearse(kinds, &resources)
-        .into_iter()
-        .map(|(index, reason)| (index, ImportRefusal { kind: K::NAME, record: imported[index].record.clone(), reason }))
+    let refuse = |index: usize, reason: String| (index, ImportRefusal { kind: K::NAME, record: imported[index].record.clone(), reason });
+    let mut rehearsal = match rehearsal() {
+        Ok(rehearsal) => rehearsal,
+        Err(reason) => return (0..imported.len()).map(|index| refuse(index, reason.clone())).collect(),
+    };
+    imported
+        .iter()
+        .enumerate()
+        .filter_map(|(index, resource)| {
+            let change = NewChange::new(IMPORT_WRITER, resource.resource.since());
+            rehearsal.write(&resource.home, resource.resource.name(), &change, &resource.resource).err().map(|reason| refuse(index, reason))
+        })
         .collect()
 }
 
-/// Imports and rehearses `records` (each an old record and its home) of `B`'s kind into `report`:
-/// a refused import, or a resource the rehearsal refuses, is listed; the rest are counted.
-pub fn rehearse_records<B>(records: &[(ResourceObject<B::Old>, String)], report: &mut ImportReport)
+/// Imports `records` (each an old record and its home) of `B`'s kind into `target`, each created
+/// at its old creation time: a refused import, or a resource the target refuses, is listed; the
+/// rest are counted. Records of a home `target` does not import are left to that home.
+pub fn import_records<B>(records: &[(ResourceObject<B::Old>, String)], target: &mut impl ImportTarget, report: &mut ImportReport)
 where
     B: Imported,
-    <B::Kind as LifecycleKind>::Request: PartialEq,
-    Resource<Lifecycle<B::Kind>>: Kind,
+    Resource<Lifecycle<B::Kind>>: Kind + PartialEq + Clone,
 {
-    let mut imported = Vec::new();
     for (record, home) in records {
-        match import::<B>(record, home) {
-            Ok(resource) => imported.push(resource),
-            Err(refusal) => report.refused.push(refusal),
+        if !target.imports(home) {
+            continue;
         }
-    }
-    let mut failed = rehearse(&imported);
-    for (index, resource) in imported.into_iter().enumerate() {
-        match failed.remove(&index) {
-            Some(refusal) => report.refused.push(refusal),
-            None => report.record(&Ok(resource)),
-        }
+        let result =
+            import::<B>(record, home).and_then(|imported| {
+                let change = NewChange::new(IMPORT_WRITER, imported.resource.since());
+                target.write(home, imported.resource.name(), &change, &imported.resource).map(|()| imported).map_err(|reason| {
+                    ImportRefusal { kind: <B::Kind as LifecycleKind>::NAME, record: record.metadata.name.clone(), reason }
+                })
+            });
+        report.record(&result);
     }
 }
 
-/// Imports and rehearses old Vessel `records` into `report` (#3629 Q6). A vessel that was placed
-/// is a lease granted on its pinned host; one never placed held no lease and is not stored, so it
-/// is noted rather than refused: a waiting one is taken on by the write path once it is placed.
-pub fn rehearse_vessels(records: &[(ResourceObject<OldVessel>, String)], report: &mut ImportReport) {
+/// [`import_records`] into a [`rehearsal`] of its own.
+pub fn rehearse_records<B>(records: &[(ResourceObject<B::Old>, String)], report: &mut ImportReport)
+where
+    B: Imported,
+    Resource<Lifecycle<B::Kind>>: Kind + PartialEq + Clone,
+{
+    match rehearsal() {
+        Ok(mut rehearsal) => import_records::<B>(records, &mut rehearsal, report),
+        Err(reason) => report.refused.extend(records.iter().map(|(record, _)| ImportRefusal {
+            kind: <B::Kind as LifecycleKind>::NAME,
+            record: record.metadata.name.clone(),
+            reason: reason.clone(),
+        })),
+    }
+}
+
+/// Imports old Vessel `records` into `target` (#3629 Q6). A vessel that was placed is a lease
+/// granted on its pinned host; one never placed held no lease and is not stored, so it is noted
+/// rather than refused: a waiting one is taken on by the write path once it is placed.
+pub fn import_vessels(records: &[(ResourceObject<OldVessel>, String)], target: &mut impl ImportTarget, report: &mut ImportReport) {
     let mut placed = Vec::new();
-    for (vessel, home) in records {
+    for (vessel, home) in records.iter().filter(|(_, home)| target.imports(home)) {
         let name = &vessel.metadata.name;
         if VesselBinding::pinned_host(vessel).is_some() {
             if vessel.status.as_ref().is_some_and(|status| status.phase == VesselPhase::Pending) {
@@ -208,7 +236,15 @@ pub fn rehearse_vessels(records: &[(ResourceObject<OldVessel>, String)], report:
             }),
         }
     }
-    rehearse_records::<VesselBinding>(&placed, report);
+    import_records::<VesselBinding>(&placed, target, report);
+}
+
+/// [`import_vessels`] into a [`rehearsal`] of its own.
+pub fn rehearse_vessels(records: &[(ResourceObject<OldVessel>, String)], report: &mut ImportReport) {
+    match rehearsal() {
+        Ok(mut rehearsal) => import_vessels(records, &mut rehearsal, report),
+        Err(reason) => report.refused.push(ImportRefusal { kind: "Vessel", record: "<all>".to_owned(), reason }),
+    }
 }
 
 fn failed_by(detail: Option<&str>, fallback: &str) -> Cause {
