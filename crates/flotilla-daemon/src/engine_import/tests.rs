@@ -919,3 +919,20 @@ fn attentions_of_two_namespaces_at_one_home_take_distinct_admission_sequences() 
     let summary = rehearse(&source, HERE);
     assert_eq!(summary.kinds["Demand"], Counts { imported: 2, dropped: 0, refused: 0 }, "{summary:?}");
 }
+
+#[test]
+fn a_credential_group_with_no_vessel_drops_every_demand_for_that_reason() {
+    let credential = flotilla_resources::CREDENTIAL_REFRESH_REASON_ANNOTATION;
+    let vessel = flotilla_resources::CREDENTIAL_REFRESH_VESSEL_ANNOTATION;
+    let mut records: Vec<Value> = attention_records().into_iter().filter(|record| record["kind"] != "Demand").collect();
+    records.extend([
+        demand("credential-refresh-demo-gone-a", ("Convoy", "demo"), &[(credential, "refused"), (vessel, "gone")], "raised"),
+        demand("credential-refresh-demo-gone-b", ("Convoy", "demo"), &[(credential, "refused"), (vessel, "gone")], "raised"),
+    ]);
+    let source = rows(records);
+    let mut target = Import::in_memory(HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
+    let mut report = ImportReport::default();
+    attentions::attentions(&source, &mut target, &mut Carried::default(), &mut report);
+    assert_eq!(report.dropped.get(&("Demand", "its vessel is gone")), Some(&2), "{report:?}");
+    assert!(report.imported.is_empty() && report.refused.is_empty(), "{report:?}");
+}
