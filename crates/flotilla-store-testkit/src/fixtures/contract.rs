@@ -436,6 +436,40 @@ pub async fn assert_replica_events_ignore_stale_writes_and_deletes_with_backend(
     );
 }
 
+/// #4137: an origin's resource versions only grow, so a replica keeps the newer
+/// body when an older version arrives later, by the event log or by a digest
+/// repair whose cut predates it. A full snapshot stays authoritative.
+pub async fn assert_replica_keeps_newer_resource_version_with_backend(backend: ResourceBackend) {
+    let origin = flotilla_protocol::NodeId::new("udder-root");
+    let source = ResourceBackend::new(InMemoryBackend::default()).using::<Convoy>("flotilla");
+    let meta = convoy_meta("remote");
+    let older = source.create(&meta, &convoy_spec("older")).await.expect("create source convoy");
+    let newer = source.update(&meta, &older.metadata.resource_version, &convoy_spec("newer")).await.expect("update source convoy");
+    let workflow =
+        || async { backend.including_replicas::<Convoy>("flotilla").get("remote").await.expect("replica").object.spec.workflow_ref };
+    let writer = backend.replica_writer::<Convoy>(origin, "flotilla");
+    let synced_at = Utc::now();
+    writer.apply(WatchEvent::Added(newer.clone()), synced_at).await.expect("apply newer replica");
+
+    let later = |seconds| synced_at + chrono::Duration::seconds(seconds);
+    writer.apply(WatchEvent::Modified(older.clone()), later(1)).await.expect("offer older body");
+    assert_eq!(workflow().await, "newer", "a later-arriving older version must not replace the newer body");
+    writer.apply(WatchEvent::Deleted(older.clone()), later(2)).await.expect("offer older delete");
+    assert_eq!(workflow().await, "newer", "a delete older than the held body must not remove it");
+
+    let bucket = flotilla_resources::digest_bucket("remote");
+    let stale_cut = flotilla_resources::ResourceList {
+        items: vec![older.clone()],
+        resource_version: older.metadata.resource_version.clone(),
+        generation: None,
+    };
+    writer.replace_bucket(bucket, &stale_cut, later(3)).await.expect("repair from an older cut");
+    assert_eq!(workflow().await, "newer", "a digest repair cut must not regress a newer body");
+
+    writer.replace(&stale_cut, later(4)).await.expect("authoritative snapshot");
+    assert_eq!(workflow().await, "older", "a full snapshot is authoritative");
+}
+
 pub async fn assert_missing_authority_delete_tombstones_replica_with_backend(backend: ResourceBackend) {
     let origin = flotilla_protocol::NodeId::new("authority-root");
     let backend = backend.with_local_root(origin.clone());

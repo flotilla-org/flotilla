@@ -21,7 +21,7 @@ use tokio::sync::Mutex;
 use crate::{
     error::ResourceError,
     field_ownership::FieldOwnershipViolation,
-    replica::{StoredReplicaEvent, StoredReplicaEventKind},
+    replica::{replica_body_is_newer, StoredReplicaEvent, StoredReplicaEventKind},
     resource::{InputMeta, MergeMetadata, ObjectMeta, ResourceObject},
     retention::{EventRetention, ResourceStoreDiagnostics, FIELD_OWNERSHIP_VIOLATION_TTL_HOURS, MAX_FIELD_OWNERSHIP_VIOLATIONS},
     watch::WatchChannel,
@@ -682,6 +682,15 @@ impl InMemoryBackend {
         let mut events = Vec::new();
         for (object, encoded) in accepted {
             let name = &object.metadata.name;
+            // A digest repair cut can predate an event the log already
+            // applied; keep the newer body (#4137). A full snapshot is
+            // authoritative and may start a new origin generation.
+            if bucket.is_some() && old.objects.get(name).is_some_and(|held| replica_body_is_newer(held, &encoded)) {
+                if let Some(held) = old.objects.remove(name) {
+                    objects.insert(name.clone(), held);
+                }
+                continue;
+            }
             state.quarantines.remove(&(replica_key.clone(), name.clone()));
             let unchanged = old.objects.get(name) == Some(&encoded);
             queries.update(name, Some(&encoded));
@@ -761,26 +770,28 @@ impl InMemoryBackend {
             return Ok(());
         }
         let partition = state.partitions.entry(replica_key).or_default();
-        let unchanged = match kind {
-            StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
-                match (partition.objects.get(&object.metadata.name), partition.synced_at_by_name.get(&object.metadata.name)) {
-                    (_, Some(existing_synced_at)) if existing_synced_at > &synced_at => true,
-                    (Some(existing), Some(existing_synced_at)) if existing_synced_at == &synced_at => {
-                        serde_json::to_string(existing)
-                            .map_err(|error| ResourceError::decode(format!("encode existing replica: {error}")))?
-                            >= serde_json::to_string(&encoded)
-                                .map_err(|error| ResourceError::decode(format!("encode incoming replica: {error}")))?
+        let held_is_newer = partition.objects.get(&object.metadata.name).is_some_and(|held| replica_body_is_newer(held, &encoded));
+        let unchanged = held_is_newer
+            || match kind {
+                StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
+                    match (partition.objects.get(&object.metadata.name), partition.synced_at_by_name.get(&object.metadata.name)) {
+                        (_, Some(existing_synced_at)) if existing_synced_at > &synced_at => true,
+                        (Some(existing), Some(existing_synced_at)) if existing_synced_at == &synced_at => {
+                            serde_json::to_string(existing)
+                                .map_err(|error| ResourceError::decode(format!("encode existing replica: {error}")))?
+                                >= serde_json::to_string(&encoded)
+                                    .map_err(|error| ResourceError::decode(format!("encode incoming replica: {error}")))?
+                        }
+                        (None, Some(existing_synced_at)) if existing_synced_at == &synced_at => true,
+                        _ => false,
                     }
-                    (None, Some(existing_synced_at)) if existing_synced_at == &synced_at => true,
-                    _ => false,
                 }
-            }
-            StoredReplicaEventKind::Deleted => match partition.synced_at_by_name.get(&object.metadata.name) {
-                Some(existing_synced_at) if existing_synced_at > &synced_at => true,
-                Some(existing_synced_at) if existing_synced_at == &synced_at => !partition.objects.contains_key(&object.metadata.name),
-                _ => false,
-            },
-        };
+                StoredReplicaEventKind::Deleted => match partition.synced_at_by_name.get(&object.metadata.name) {
+                    Some(existing_synced_at) if existing_synced_at > &synced_at => true,
+                    Some(existing_synced_at) if existing_synced_at == &synced_at => !partition.objects.contains_key(&object.metadata.name),
+                    _ => false,
+                },
+            };
         if unchanged {
             return Ok(());
         }
@@ -825,11 +836,13 @@ impl InMemoryBackend {
         let encoded = Self::encode_tombstone(resource_kind, tombstone);
         let mut state = self.replicas.lock().await;
         let partition = state.partitions.entry(replica_key).or_default();
-        let unchanged = match partition.synced_at_by_name.get(&tombstone.name) {
-            Some(existing_synced_at) if existing_synced_at > &synced_at => true,
-            Some(existing_synced_at) if existing_synced_at == &synced_at => !partition.objects.contains_key(&tombstone.name),
-            _ => false,
-        };
+        let held_is_newer = partition.objects.get(&tombstone.name).is_some_and(|held| replica_body_is_newer(held, &encoded));
+        let unchanged = held_is_newer
+            || match partition.synced_at_by_name.get(&tombstone.name) {
+                Some(existing_synced_at) if existing_synced_at > &synced_at => true,
+                Some(existing_synced_at) if existing_synced_at == &synced_at => !partition.objects.contains_key(&tombstone.name),
+                _ => false,
+            };
         if unchanged {
             return Ok(());
         }
