@@ -65,7 +65,13 @@ fn record_name(document: &Value) -> String {
     document.pointer("/metadata/name").and_then(Value::as_str).unwrap_or("<unnamed>").to_owned()
 }
 
+/// Where a stored body that is not JSON keeps its parse error, so its importer refuses it by name.
+const UNREADABLE: &str = "flotilla.work/unreadable-body";
+
 fn decode<R: Resource>(document: &Value) -> Result<ResourceObject<R>, String> {
+    if let Some(error) = document.get(UNREADABLE).and_then(Value::as_str) {
+        return Err(format!("its stored body is not JSON: {error}"));
+    }
     let object = serde_json::from_value::<K8sResourceObject<R>>(document.clone()).map_err(|error| error.to_string())?;
     ResourceObject::from_k8s_object(object).map_err(|error| error.to_string())
 }
@@ -92,8 +98,8 @@ impl Source {
                                 .map(|retired| retired.plural)
                         })
                         .map_or_else(|| row.kind.clone(), str::to_owned);
-                    // A body that is not JSON is refused by its kind's importer, as one that does not decode.
-                    let document = serde_json::from_str(&row.body).unwrap_or(Value::Null);
+                    let document = serde_json::from_str(&row.body)
+                        .unwrap_or_else(|error| serde_json::json!({"metadata": {"name": row.name}, UNREADABLE: error.to_string()}));
                     Row { namespace: row.namespace, plural, home: row.origin_root.unwrap_or_else(|| home.to_owned()), document }
                 })
                 .collect(),
@@ -230,7 +236,15 @@ fn plan_rows(source: &Source, target: &impl ImportTarget, summary: &mut Summary)
             Some((_, Plan::Imported(_))) => {}
             Some((kind, Plan::Retired(_))) => summary.kinds.entry(kind.to_owned()).or_default().dropped += 1,
             Some((kind, Plan::Moving(layer))) => summary.staying.entry(kind).or_insert((layer, 0)).1 += 1,
-            None => summary.refuse(&row.plural, record_name(&row.document), "no import plan for its kind".to_owned()),
+            None => {
+                let unreadable =
+                    row.document.get(UNREADABLE).and_then(Value::as_str).map(|error| format!("; its stored body is not JSON: {error}"));
+                summary.refuse(
+                    &row.plural,
+                    record_name(&row.document),
+                    format!("no import plan for its kind{}", unreadable.unwrap_or_default()),
+                )
+            }
         }
     }
 }
@@ -309,7 +323,11 @@ fn remove_store(path: &Path) -> Result<(), String> {
 fn write_report(state_dir: &Path, report: &Report) -> Result<PathBuf, String> {
     let path = state_dir.join(format!("import-{}.json", chrono::Utc::now().format("%Y%m%dT%H%M%S%.6fZ")));
     let body = serde_json::to_vec_pretty(report).map_err(|error| error.to_string())?;
-    std::fs::write(&path, body).map_err(|error| format!("write {}: {error}", path.display()))?;
+    let write = |path: &Path| {
+        use std::io::Write;
+        std::fs::OpenOptions::new().write(true).create_new(true).open(path).and_then(|mut file| file.write_all(&body))
+    };
+    write(&path).map_err(|error| format!("write {}: {error}", path.display()))?;
     Ok(path)
 }
 
@@ -360,6 +378,8 @@ pub fn first_start(state_dir: &Path, home: &str) -> Result<Option<PathBuf>, Stri
         ));
     }
     std::fs::rename(&importing, &engine).map_err(|error| format!("rename {} to {}: {error}", importing.display(), engine.display()))?;
+    // A crash before this sync can lose the rename; the next start then imports again from the old store, untouched.
+    #[cfg(unix)]
     std::fs::File::open(state_dir).and_then(|dir| dir.sync_all()).map_err(|error| format!("sync {}: {error}", state_dir.display()))?;
     Ok(Some(report))
 }

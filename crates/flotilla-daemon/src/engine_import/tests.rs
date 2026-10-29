@@ -600,3 +600,34 @@ fn another_hosts_records_are_read_beside_ours_but_neither_written_nor_counted() 
     assert_eq!(summary.kinds.keys().collect::<Vec<_>>(), ["Artifact"]);
     assert_eq!(summary.kinds["Artifact"].imported, 1);
 }
+
+#[tokio::test]
+async fn an_import_left_by_a_crash_is_replaced_by_a_clean_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _held = populated(dir.path()).await;
+    std::fs::write(dir.path().join(IMPORTING), b"half an import").expect("stale import");
+    std::fs::write(dir.path().join(format!("{IMPORTING}-journal")), b"stale journal").expect("stale journal");
+    let written = report(&first_start(dir.path(), HERE).expect("imports").expect("a report"));
+    assert_eq!(written["outcome"], "imported", "{written:#}");
+    assert!(!dir.path().join(IMPORTING).exists());
+    assert_eq!(engine(dir.path()).home(), HERE);
+}
+
+#[test]
+fn a_stored_body_that_is_not_json_is_refused_by_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(OLD_STORE);
+    drop(SqliteBackend::open(&path).expect("old store"));
+    let connection = rusqlite::Connection::open(&path).expect("raw");
+    connection
+        .execute(
+            "INSERT INTO resource_objects (group_name, version, kind, namespace, name, resource_version, body_json) VALUES ('flotilla.work', 'v1', 'Artifact', 'flotilla', 'garbled', 1, '{not json')",
+            [],
+        )
+        .expect("garbled row");
+    drop(connection);
+    let summary = rehearse(&Source::read(&path, HERE).expect("source"), HERE);
+    let [refusal] = summary.refusals.as_slice() else { panic!("{summary:?}") };
+    assert_eq!((refusal.kind.as_str(), refusal.name.as_str()), ("Artifact", "garbled"));
+    assert!(refusal.reason.contains("not JSON"), "{refusal:?}");
+}
