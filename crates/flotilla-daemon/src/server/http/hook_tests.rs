@@ -661,7 +661,7 @@ type Seen = Arc<std::sync::Mutex<Vec<(Option<CallerAuth>, axum::http::HeaderMap,
 
 /// One Docker vessel's agent forward to flotillad: the vessel's forwarded environment
 /// socket, served the daemon's router as the accept loop serves it, and a real drydock
-/// agent and client, with only their link in memory, whose guest forward listens on
+/// agent and client, with only their link in memory, whose outward forward listens on
 /// loopback TCP and reaches that socket.
 struct ForwardedVessel {
     tcp: SocketAddr,
@@ -708,7 +708,7 @@ impl ForwardedVessel {
         let client = drydock_agent::Client::connect(link, "vessel agent").await.expect("agent hello");
         let tcp = std::net::TcpListener::bind("127.0.0.1:0").and_then(|probe| probe.local_addr()).expect("free port");
         let forward = drydock_agent::OutwardForward { id: "flotillad".into(), unix: directory.path().join("guest.sock"), tcp: Some(tcp) };
-        client.put_outward_forward(forward, drydock_agent::Endpoint::Unix(socket)).await.expect("guest forward");
+        client.put_outward_forward(forward, drydock_agent::Endpoint::Unix(socket)).await.expect("outward forward");
         Self { tcp, seen, _client: client, tasks: vec![serving, agent], _directory: directory }
     }
 

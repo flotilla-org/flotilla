@@ -179,6 +179,7 @@ struct StandIn {
     state: Arc<ControllerRuntimeState>,
     backend: ResourceBackend,
     pool: Arc<FakeTerminalPool>,
+    /// Held for its lifetime: dropping the gateway stops the vessel's agent.
     _gateway: Arc<Gateway>,
     host: tokio::task::JoinHandle<()>,
     crew_connections: tokio::sync::mpsc::UnboundedReceiver<(EnvironmentId, SocketReach, tokio::net::UnixStream)>,

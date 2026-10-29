@@ -98,7 +98,7 @@ impl HostFixture {
     }
     async fn start_daemon(&mut self) {
         let text = format!(
-            "[providers.reference]\nmodule='reference'\nagent_link='local_forward'\ncredential={{file='{}'}}\n\
+            "[providers.reference]\nmodule='reference'\ncredential={{file='{}'}}\n\
              settings={{fixture=true, agent=true, poll_interval_ms=10, workspace_root='{}', \
              reach={{kind='ssh', endpoint='gateway.test:22', user='minted-gateway-user', host_key='ssh-ed25519 AAAA'}}}}\n",
             self.root.join("credential").display(),

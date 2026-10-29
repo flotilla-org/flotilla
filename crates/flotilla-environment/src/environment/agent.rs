@@ -179,7 +179,7 @@ struct Connection {
     /// restarts, even behind a link that survived the restart.
     etag: Option<String>,
     targets: BTreeMap<String, PathBuf>,
-    /// Each guest forward with the host endpoint it reaches, pushed again
+    /// Each outward forward with the host endpoint it reaches, pushed again
     /// with the configuration to every new client or restarted agent.
     outward_forwards: BTreeMap<String, (OutwardForward, Endpoint)>,
 }
@@ -190,7 +190,7 @@ impl Connection {
             client
                 .put_outward_forward(forward.clone(), endpoint.clone())
                 .await
-                .map_err(|e| format!("guest forward {}: {e}", forward.id))?;
+                .map_err(|e| format!("outward forward {}: {e}", forward.id))?;
         }
         for (id, path) in &self.targets {
             client
@@ -202,7 +202,7 @@ impl Connection {
     }
 }
 
-/// A guest forward the vessel agent did not establish.
+/// An outward forward the vessel agent did not establish.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForwardFailure {
     pub id: String,
@@ -212,7 +212,7 @@ pub struct ForwardFailure {
 
 impl std::fmt::Display for ForwardFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "guest forward {} at {}: {}", self.id, self.guest.display(), self.reason)
+        write!(f, "outward forward {} at {}: {}", self.id, self.guest.display(), self.reason)
     }
 }
 
@@ -442,9 +442,9 @@ impl AgentRunner {
     }
 
     /// A guest-side socket at `guest` whose connections reach the Unix socket
-    /// `host` on the controller. The agent listens; every stream is opened over this
-    /// handle's own link, so the forward serves nothing while no controller
-    /// is connected. It survives reconnects, and its endpoint stays claimed
+    /// `host` on the controller. The agent listens and announces each
+    /// connection on its event stream; this handle's client claims it, so the
+    /// forward serves nothing while no controller is connected. It survives reconnects, and its endpoint stays claimed
     /// by this vessel alone.
     pub async fn add_outward_forward(&self, id: &str, guest: &Path, host: &Path) -> Result<(), String> {
         let forward = OutwardForward { id: id.into(), unix: guest.into(), tcp: None };
@@ -458,7 +458,7 @@ impl AgentRunner {
     pub async fn put_outward_forward(&self, forward: OutwardForward, host: Endpoint) -> Result<(), ForwardFailure> {
         let failed = |reason: String| ForwardFailure { id: forward.id.clone(), guest: forward.unix.clone(), reason };
         if !forward.unix.is_absolute() {
-            return Err(failed("guest forward path must be absolute".into()));
+            return Err(failed("outward forward path must be absolute".into()));
         }
         let client = self.client().await.map_err(failed)?;
         let mut state = self.state.lock().await;
