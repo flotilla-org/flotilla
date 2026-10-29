@@ -320,34 +320,36 @@ impl<'a> AttachResolver<'a> {
         });
         let mut connectable = Vec::new();
         for source in candidates {
-            let sessions = sessions_by_convoy.get(&source.object.metadata.name).expect("candidate convoy has a session");
-            let mut reachable = false;
+            let sessions = sessions_by_convoy.get_mut(&source.object.metadata.name).expect("candidate convoy has a session");
+            // A crew normally runs on one host; sorting by name keeps the choice stable if it ever does not.
+            sessions.sort_by(|(left, _), (right, _)| left.metadata.name.cmp(&right.metadata.name));
+            // The crew's TerminalSession, not the Convoy, decides where attach routes.
+            let mut reachable = None;
             for (session, provenance) in sessions {
                 reachable = match provenance {
                     ResourceProvenance::Local => self
                         .attach_plan_for_session(&observations.reads, &session.metadata.name, session, AttachMode::Default)
                         .await
-                        .is_ok(),
-                    ResourceProvenance::Replica { origin_root, .. } => {
-                        self.host_registry.live_routed_host_name(origin_root).await.is_some()
-                    }
+                        .is_ok()
+                        .then(|| self.host_name.clone()),
+                    ResourceProvenance::Replica { origin_root, .. } => self.host_registry.live_routed_host_name(origin_root).await,
                 };
-                if reachable {
+                if reachable.is_some() {
                     break;
                 }
             }
-            if reachable {
-                connectable.push(source);
+            if let Some(session_host) = reachable {
+                connectable.push((source, session_host));
             }
         }
         let candidates = connectable;
-        let unique_projects = candidates.iter().map(|source| &source.object.spec.project_ref).collect::<BTreeSet<_>>();
+        let unique_projects = candidates.iter().map(|(source, _)| &source.object.spec.project_ref).collect::<BTreeSet<_>>();
         match candidates.as_slice() {
             [] if explicit && !matching_convoy_exists => Err(format!("no live convoy matches `{reference}`")),
             [] => Ok(None),
-            [source, ..]
+            [(source, owner_host), ..]
                 if unique_projects.len() == 1
-                    && candidates.get(1).is_none_or(|next| source.object.spec.generation > next.object.spec.generation) =>
+                    && candidates.get(1).is_none_or(|(next, _)| source.object.spec.generation > next.object.spec.generation) =>
             {
                 let project = source
                     .object
@@ -355,24 +357,16 @@ impl<'a> AttachResolver<'a> {
                     .project_ref
                     .clone()
                     .ok_or_else(|| format!("live convoy {} has no project identity", source.object.metadata.name))?;
-                let owner_host = match &source.provenance {
-                    ResourceProvenance::Local => self.host_name.clone(),
-                    ResourceProvenance::Replica { origin_root, .. } => self
-                        .host_registry
-                        .live_routed_host_name(origin_root)
-                        .await
-                        .ok_or_else(|| format!("owner host for {role}@{project} is unreachable"))?,
-                };
                 Ok(Some(LiveConvoyRecord {
                     address: RoleAddress { project, role: role.to_string() },
                     record_name: source.object.metadata.name.clone(),
-                    owner_host,
+                    owner_host: owner_host.clone(),
                 }))
             }
             candidates => {
                 let addresses = candidates
                     .iter()
-                    .filter_map(|source| {
+                    .filter_map(|(source, _)| {
                         source
                             .object
                             .spec
