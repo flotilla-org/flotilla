@@ -293,7 +293,9 @@ async fn a_stopped_controller_leaves_nothing_forwarding() {
         let _ = crew.write_all(b"ping").await;
         let mut buffer = [0; 1];
         let read = tokio::time::timeout(Duration::from_secs(2), crew.read(&mut buffer)).await;
-        assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))), "the guest socket carries nothing: {read:?}");
+        // The agent outlives the controller and holds the unclaimed connection
+        // until its claim deadline, so silence is as good as a close.
+        assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_)) | Err(_)), "the guest socket carries nothing: {read:?}");
     }
     assert!(tokio::time::timeout(Duration::from_millis(500), listener.accept()).await.is_err(), "nothing reaches the daemon endpoint");
 }
