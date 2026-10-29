@@ -1415,6 +1415,53 @@ async fn docker_kind_environment_uses_constant_pull_policy_and_decided_instance(
     assert_eq!(environment, ("rootless".to_string(), "flotilla-dev-env:latest".to_string(), DockerImagePullPolicy::Always));
 }
 
+// Discovery offers the canary adapter only where a vessel's environment enables it.
+#[rstest]
+#[case::canary("fleet-canary", Some("1"))]
+#[case::ordinary("claude-code", None)]
+#[tokio::test]
+async fn docker_environment_enables_the_adapters_its_crew_requires(#[case] adapter: &str, #[case] enabled: Option<&str>) {
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-adapter", "implement", REPO_URL, GIT_REF).await;
+    let mut status = convoy.status.expect("convoy status");
+    status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels[0].crew = vec![CrewSpec::builder()
+        .role("probe".to_string())
+        .source(CrewSource::Agent {
+            selector: Selector { adapter: Some(adapter.to_string()), ..Selector::for_capability("code") },
+            prompt: None,
+            brief_template: None,
+        })
+        .build()];
+    backend.using::<Convoy>(NAMESPACE).update_status("convoy-adapter", &convoy.metadata.resource_version, &status).await.expect("crew");
+    create_docker_kind(
+        &backend,
+        NAMESPACE,
+        DockerKindFixture::builder()
+            .name("kind-adapter".to_string())
+            .host_ref(HOST_REF.to_string())
+            .pool("cleat".to_string())
+            .image("flotilla-dev-env:latest".to_string())
+            .build(),
+    )
+    .await;
+    create_ready_host_worktree(&backend, "convoy-adapter", "workspace-adapter").await;
+    let vessel = create_workspace(&backend, NAMESPACE, "workspace-adapter", "convoy-adapter", "implement", "kind-adapter", REPO_URL).await;
+
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let deps = reconciler.prepare(&vessel).await.expect("deps should load");
+    let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
+    let docker = outcome
+        .actuations
+        .iter()
+        .find_map(|actuation| match actuation {
+            Actuation::CreateEnvironment { spec, .. } => spec.docker.clone(),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("docker environment should be created: {:?}", outcome.patch));
+    assert_eq!(docker.required_agent_adapters, BTreeSet::from([adapter.to_string()]));
+    assert_eq!(docker.env.get("FLOTILLA_FLEET_CANARY").map(String::as_str), enabled);
+}
+
 // ADR 0047: for one roll a vessel whose convoy froze a PlacementPolicy snapshot
 // still provisions; the policy's instance label pins the environment and its
 // stored settings give way to the realisation constants.

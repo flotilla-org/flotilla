@@ -13,8 +13,8 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use flotilla_agent::adapter::{
-    append_convoy_work_context, build_convoy_crew_brief_with_options, required_agent_adapters, CrewAssignment, CrewBriefMember,
-    CrewBriefTemplateResolver,
+    adapter_enabling_env, append_convoy_work_context, build_convoy_crew_brief_with_options, required_agent_adapters, CrewAssignment,
+    CrewBriefMember, CrewBriefTemplateResolver,
 };
 use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, LifecycleReading, PlacementDecision};
@@ -1167,7 +1167,11 @@ impl VesselReconciler {
                         // Preserve absolute host paths in both mount domains so
                         // .git pointers and host registration backlinks remain valid.
                         mounts.extend(git_mounts);
-                        let mut env = BTreeMap::new();
+                        let mut env = required_adapters
+                            .iter()
+                            .filter_map(|adapter| adapter_enabling_env(adapter))
+                            .map(|(name, value)| (name.to_string(), value.to_string()))
+                            .collect::<BTreeMap<_, _>>();
                         if let Err(message) = configure_contained_tracking(&mut env, &contained_branches) {
                             return Ok(VesselPrepared::failed(message));
                         }

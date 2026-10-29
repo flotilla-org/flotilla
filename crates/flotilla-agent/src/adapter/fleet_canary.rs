@@ -79,4 +79,14 @@ mod tests {
         }
         assert_eq!(HARNESS.binary, "bash");
     }
+
+    #[test]
+    fn a_vessel_environment_carrying_the_enabling_variable_offers_the_canary() {
+        let (name, value) = adapter_enabling_env("fleet-canary").expect("the canary is offered only on request");
+        let bag = EnvironmentBag::new().with(flotilla_discovery_api::EnvironmentAssertion::env_var(name, value));
+        let registry = AgentAdapterRegistry::discover(&bag, Arc::new(flotilla_provider_runtime::ProcessCommandRunner));
+        assert!(registry.get("fleet-canary").is_some());
+        assert_eq!(adapter_enabling_env("claude-code"), None);
+        assert_eq!(adapter_enabling_env("codex"), None);
+    }
 }

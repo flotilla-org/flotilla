@@ -1271,6 +1271,12 @@ pub fn built_in_harnesses(env: &dyn flotilla_provider_runtime::EnvVars) -> impl 
 /// Enables the credential-free canary adapter.
 const FLEET_CANARY_ENV: &str = "FLOTILLA_FLEET_CANARY";
 
+/// The variable a vessel's environment must set for its discovery to offer `adapter`,
+/// where discovery offers it only on request.
+pub fn adapter_enabling_env(adapter: &str) -> Option<(&'static str, &'static str)> {
+    (adapter == fleet_canary::HARNESS.adapter).then_some((FLEET_CANARY_ENV, "1"))
+}
+
 /// Claude Code's login and configuration home, and the variables that
 /// authenticate it directly.
 pub const CLAUDE_CODE_ACCOUNT_STATE: AccountState = AccountState::new("claude-code")
