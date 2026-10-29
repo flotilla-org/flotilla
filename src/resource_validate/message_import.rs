@@ -218,14 +218,30 @@ mod tests {
     }
 
     // Behaviour: the rehearsal imports the daemon's Messages into a temporary
-    // store, counts them by new state, counts drops by reason, and names each refusal.
+    // store, counts them by new state, counts drops by reason, and names each
+    // refusal. A convoy no longer held has ended, like a Landed one.
     #[test]
     fn rehearsal_counts_imports_and_drops_and_names_refusals() {
         let mut settled_elsewhere = message("settled-elsewhere", "system:turn-rules", "flotilla/demo/work/coder", "satisfied", Value::Null);
         settled_elsewhere["status"]["resolved_receiver"] = serde_json::json!({
             "crew_id": "crew-gone", "session": "session-gone", "delivered_at": "2026-10-19T00:00:00Z", "evidence": "turn confirmed",
         });
+        let awaiting = |name: &str, convoy: &str| {
+            let mut record = message(name, "system:turn-rules", &format!("flotilla/{convoy}/work/coder"), "delivered", Value::Null);
+            record["spec"]["expectation"] = serde_json::json!({"kind": "reply"});
+            record["status"]["resolved_receiver"] = settled_elsewhere["status"]["resolved_receiver"].clone();
+            record
+        };
+        let convoy = |name: &str, phase: &str| {
+            serde_json::json!({
+                "apiVersion": "flotilla.work/v1", "kind": "Convoy",
+                "metadata": {"name": name, "namespace": "flotilla", "resourceVersion": "1", "creationTimestamp": "2026-10-19T00:00:00Z"},
+                "spec": flotilla_resources::ConvoySpec::builder().workflow_ref("w".into()).project_ref("flotilla".into()).build(),
+                "status": {"phase": phase},
+            })
+        };
         let mut documents = Documents::default();
+        documents.0.insert("convoys".into(), vec![convoy("landed", "Landed"), convoy("live", "Active")]);
         documents.0.insert(
             "fleetdesignations".into(),
             vec![serde_json::json!({
@@ -239,6 +255,9 @@ mod tests {
             vec![
                 message("waiting", "system:turn-rules", "flotilla/demo/work/coder", "accepted", Value::Null),
                 message("from-a-person", "principal:alice", "flotilla/demo/work/coder", "accepted", Value::Null),
+                awaiting("awaiting-in-landed", "landed"),
+                awaiting("awaiting-in-unheld", "demo"),
+                awaiting("awaiting-in-live", "live"),
                 settled_elsewhere,
                 message(
                     "orphan-reply",
@@ -252,9 +271,9 @@ mod tests {
         let report = documents.rehearse("flotilla");
         // A person sends as the operator role of the crew's project (#3938).
         assert_eq!(report.imported.get("pending"), Some(&2), "{report:?}");
-        assert_eq!(report.dropped, BTreeMap::from([("its delivered session is gone", 1)]), "{report:?}");
+        assert_eq!(report.dropped, BTreeMap::from([("its delivered session is gone", 3)]), "{report:?}");
         let refused: Vec<_> = report.refused.iter().map(|refusal| refusal.record.as_str()).collect();
-        assert_eq!(refused, ["orphan-reply"], "{report:?}");
+        assert_eq!(refused, ["awaiting-in-live", "orphan-reply"], "{report:?}");
         // A designation prerequisite refusal must preserve earlier Message decode
         // diagnostics, and report the missing identity once rather than per Message.
         documents.0.get_mut("messages").expect("messages").push(serde_json::json!({"metadata":{"name":"broken"},"spec":7}));

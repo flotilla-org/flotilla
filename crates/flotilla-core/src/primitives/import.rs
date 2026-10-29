@@ -1,9 +1,9 @@
 //! The Message import (#3317): one function maps an old record onto the new
 //! spec and state, written directly as a restore and then checked against the
 //! machine. Anything that cannot be mapped is refused with the record named,
-//! except a settled record whose receiver session, successor or referenced
-//! record is gone: settled history the engine never reads is dropped, counted
-//! by reason.
+//! except a record whose receiver session, successor or referenced record is
+//! gone and that nobody can still act on: settled, or received in a convoy
+//! that has ended. Such a record is dropped, counted by reason.
 //!
 //! | Old phase | New state |
 //! |---|---|
@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_address::Address;
+use flotilla_address::{Address, Kind};
 use flotilla_resources::{Message, MessageExpectation, MessagePhase, ResolvedMessageReceiver, ResourceObject};
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
@@ -71,7 +71,7 @@ impl std::fmt::Display for ImportRefusal {
     }
 }
 
-/// A settled record not carried onto the engine, with the reason it is not.
+/// A record not carried onto the engine, with the reason it is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportDrop {
     pub record: String,
@@ -86,7 +86,7 @@ pub enum Imported {
 }
 
 /// Why a record does not import: refused, or something it names is missing,
-/// which drops a settled record and refuses an open one.
+/// which drops a record nobody can still act on and refuses any other.
 enum Unimported {
     Refused(String),
     Missing { reason: &'static str, detail: String },
@@ -109,6 +109,18 @@ fn settled(record: &ResourceObject<Message>) -> bool {
     })
 }
 
+/// Whether the convoy of the role receiving an old record has ended: the
+/// delivered holder's role when recorded, since only that holder can answer,
+/// else the addressed one. A role in no convoy, or one that does not map,
+/// cannot tell.
+fn receiver_ended(record: &ResourceObject<Message>, conversion: &Conversion<'_>) -> bool {
+    let delivered = record.status.as_ref().and_then(|status| status.resolved_receiver.as_ref()?.role_address.as_deref());
+    let Ok(role) = conversion.inbox(delivered.unwrap_or(&record.spec.receiver)) else {
+        return false;
+    };
+    role.get(Kind::Convoy).is_some_and(|convoy| conversion.records.convoy_ended(convoy))
+}
+
 /// The address an imported message takes: its old record name, under its inbox.
 pub fn imported_name(inbox: &Address, record: &str) -> Result<String, String> {
     Address::message(inbox, record).map(|address| address.as_str().to_owned()).map_err(|error| error.to_string())
@@ -125,7 +137,9 @@ pub fn import_message(
     let record = old.record.metadata.name.clone();
     match convert(old, version, conversion, world) {
         Ok(resource) => Ok(Imported::Message(Box::new(ImportedMessage { record, home: old.home.clone(), resource }))),
-        Err(Unimported::Missing { reason, .. }) if settled(old.record) => Ok(Imported::Dropped(ImportDrop { record, reason })),
+        Err(Unimported::Missing { reason, .. }) if settled(old.record) || receiver_ended(old.record, conversion) => {
+            Ok(Imported::Dropped(ImportDrop { record, reason }))
+        }
         Err(Unimported::Missing { detail: reason, .. } | Unimported::Refused(reason)) => Err(ImportRefusal { record, reason }),
     }
 }
