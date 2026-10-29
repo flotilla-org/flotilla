@@ -481,14 +481,20 @@ where
         if has_convoy_owner {
             let mut live_checkouts = Vec::new();
             for other in self.checkouts.list().await?.items {
-                if continuing
-                    && other.metadata.labels.contains_key(CONVOY_LABEL)
-                    && self.owning_convoy(&other).await?.is_none_or(|owner| {
-                        owner.metadata.deletion_timestamp.is_some()
-                            || owner.status.as_ref().is_some_and(|status| status.phase.is_terminal())
-                    })
-                {
-                    continue;
+                // A terminal or deleting convoy reserves no branch in any member repo; an
+                // unresolvable owner is also released when continuing.
+                if other.metadata.labels.contains_key(CONVOY_LABEL) {
+                    let owner = self.owning_convoy(&other).await?;
+                    let released = match &owner {
+                        Some(owner) => {
+                            owner.metadata.deletion_timestamp.is_some()
+                                || owner.status.as_ref().is_some_and(|status| status.phase.is_terminal())
+                        }
+                        None => continuing,
+                    };
+                    if released {
+                        continue;
+                    }
                 }
                 let other_phase = checkout_phase(&other, self.lifecycle(&other)?.as_ref());
                 live_checkouts.push((other, other_phase));

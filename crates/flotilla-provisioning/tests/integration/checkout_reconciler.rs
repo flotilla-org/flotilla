@@ -1685,6 +1685,60 @@ fn continued_checkout_reservation_follows_owner_lifecycle(tc: hegel::TestCase) {
     });
 }
 
+// #4139: a terminal convoy's checkouts reserve no branch in member repos other than the continued PR's repo.
+#[tokio::test]
+async fn terminal_owner_reserves_no_branch_in_non_continued_member_repo() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let repo = RepositoryKey(repo_key(REPO_URL));
+    let convoys = backend.using::<Convoy>(NAMESPACE);
+    convoys.create(&meta("old-owner"), &ConvoySpec::builder().workflow_ref("dev".into()).build()).await.expect("old convoy");
+    convoys
+        .create(
+            &meta("new-owner"),
+            &ConvoySpec::builder().workflow_ref("dev".into()).continuation(RepositoryKey("other-repo".into())).build(),
+        )
+        .await
+        .expect("new convoy");
+    create_ready_clone(&backend, NAMESPACE, "clone", REPO_URL, "host", "/clone").await;
+    let checkouts = backend.using::<Checkout>(NAMESPACE);
+    let spec = |path: &str| {
+        CheckoutSpec::Worktree(
+            CheckoutWorktreeSpec::builder()
+                .repo_ref(repo.clone())
+                .env_ref("host".into())
+                .r#ref("continued".into())
+                .base_ref("main".into())
+                .clone_ref("clone".into())
+                .target_path(path.into())
+                .build(),
+        )
+    };
+    let labelled = |name: &str, owner: &str| {
+        InputMeta::builder().name(name.into()).labels(BTreeMap::from([(CONVOY_LABEL.into(), owner.into())])).build()
+    };
+    let old = checkouts.create(&labelled("old-checkout", "old-owner"), &spec("/checkout/old")).await.expect("old");
+    checkouts
+        .update_status(
+            "old-checkout",
+            &old.metadata.resource_version,
+            &CheckoutStatus { phase: CheckoutPhase::Ready, ..Default::default() },
+        )
+        .await
+        .expect("ready old");
+    let new = checkouts.create(&labelled("new-checkout", "new-owner"), &spec("/checkout/new")).await.expect("new");
+    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend.clone(), NAMESPACE);
+    let live = reconciler.prepare(&new).await.expect("live");
+    assert!(matches!(live, CheckoutPrepared::Failed(_)), "live owner reserves the branch");
+    let old = convoys.get("old-owner").await.expect("owner");
+    convoys
+        .update_status("old-owner", &old.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() })
+        .await
+        .expect("fail owner");
+    // The recording runtime refuses creation, so only the reservation outcome is asserted.
+    let prepared = reconciler.prepare(&new).await.expect("terminal");
+    assert!(!matches!(&prepared, CheckoutPrepared::Failed(message) if message.contains("conflicts with Checkout")));
+}
+
 // #3090: a local clone waits for its managed Clone, materialises on the host,
 // preserves provenance and copy degradation, then uses clone removal at teardown.
 #[tokio::test]
