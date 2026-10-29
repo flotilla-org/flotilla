@@ -1,7 +1,7 @@
 # Verbs on typed things: prior art
 
 **Date:** 2026-10-29
-**Status:** complete (research; no code changes)
+**Status:** complete (research; no code changes). The recommendation and its YAML examples are illustrative input to the verbs-as-data design, not a spec; the `verbs` table it proposes still goes through schema review before it is built.
 **For:** flotilla#4107, part of mission flotilla#4105 (decision 3: row actions are verbs on subject kinds)
 
 ## Question
@@ -56,7 +56,7 @@ Leave out inheritance, gestures, per-row actions, predicate code and per-verb UR
 - **Apple App Intents:** https://developer.apple.com/documentation/appintents
 - **Apple Services Implementation Guide** (archived 2016).
 - **DMTF Redfish-Publications** at commit `fa6d23d`: `csdl/RedfishExtensions_v1.xml`, `json-schema/ActionInfo.v1_5_0.json`.
-- **Client asks:** the Actions and edits section of flotilla-org/wheelhouse#505, and the binnacle viewer survey (flotilla-org/binnacle, branch `research/described-tables`, `docs/research/11`, #289 section). The binnacle file was not reachable from here, so the list relayed by the operator was used.
+- **Client asks:** the Actions and edits section of https://github.com/flotilla-org/wheelhouse/issues/505, and the binnacle viewer survey (https://github.com/flotilla-org/binnacle/tree/research/described-tables/docs/research, file 11, the https://github.com/flotilla-org/binnacle/issues/289 section). The binnacle file was not reachable from here, so the list relayed by the operator was used.
 - **flotilla** at commit `14875d157`.
 
 ---
@@ -430,7 +430,7 @@ Leave out `regex`, min/max and step. They are cheap to add later if a real verb 
 
 ### Applicability
 
-- `when` uses the existing condition grammar. The client evaluates it against the row's cells, and the server evaluates it again on invocation, answering `not_applicable` with the failing condition.
+- `when` uses the existing condition grammar, the one `where` parses (`crates/flotilla-address/src/condition.rs`); it is not a second grammar. The client evaluates it against the row's cells, and the server evaluates it again on invocation, answering `not_applicable` with the failing condition.
 - The client **greys out** verbs whose `when` fails, with the failing condition as the tooltip, and hides only verbs of unknown `kind`/`relation` or verbs blocked by the view's read-only status.
 - The grammar lacks `in` and `or`. For now, state sets are written as a conjunction of `!=`.
   - Add `in` to `condition.rs` when the first verb needs a positive set. It is a small, local addition.
