@@ -67,18 +67,26 @@ impl PreparedSnapshotGarbageCollector {
             }
         }
 
-        let placements = self.backend.clone().using::<PlacementPolicy>(&self.namespace);
+        result.placements_deleted += self.collect_placements::<FulfilmentKind>(&placement_refs).await?;
+        // ADR 0047: placement snapshots written before kinds; remove with PlacementPolicy.
+        result.placements_deleted += self.collect_placements::<PlacementPolicy>(&placement_refs).await?;
+        Ok(result)
+    }
+
+    async fn collect_placements<T: Resource>(&self, referenced: &BTreeSet<String>) -> Result<usize, ResourceError> {
+        let placements = self.backend.clone().using::<T>(&self.namespace);
+        let mut deleted = 0;
         for placement in placements.list().await?.items {
             if is_prepared_snapshot(&placement.metadata.name, &placement.metadata.labels, PLACEMENT_SNAPSHOT_KIND)
-                && !placement_refs.contains(&placement.metadata.name)
+                && !referenced.contains(&placement.metadata.name)
             {
                 match placements.delete(&placement.metadata.name).await {
-                    Ok(()) => result.placements_deleted += 1,
+                    Ok(()) => deleted += 1,
                     Err(ResourceError::NotFound { .. }) => {}
                     Err(error) => return Err(error),
                 }
             }
         }
-        Ok(result)
+        Ok(deleted)
     }
 }

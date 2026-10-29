@@ -16,6 +16,8 @@ pub const SOURCE_REPOSITORY_ANNOTATION: &str = "flotilla.work/source-repository"
 pub const SOURCE_COMMIT_ANNOTATION: &str = "flotilla.work/source-commit";
 pub const SOURCE_ENTRY_PATH_ANNOTATION: &str = "flotilla.work/source-entry-path";
 pub const PROJECT_IMAGE_MANAGER: &str = "project-image";
+/// The managed-by value of the FulfilmentKinds a daemon seeds for its own host.
+pub const SEEDING_MANAGER: &str = "seeding";
 
 /// Repository's provenance keys (#3824 layer 3a): the project whose operational entries declare a
 /// repository's verification commands, those entries' provenance, and the record a forge-split

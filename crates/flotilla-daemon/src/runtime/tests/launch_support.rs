@@ -172,7 +172,6 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
                     host_direct: None,
                     docker: Some(flotilla_resources::DockerEnvironmentSpec {
                         image_build_ref: None,
-                        memory_policy: Default::default(),
                         host_ref: "host-test".into(),
                         image: "contained-image".into(),
                         declared_agent_adapters: BTreeSet::from(["claude-code".into()]),

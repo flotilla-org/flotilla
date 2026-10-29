@@ -5,9 +5,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use flotilla_agent::adapter::{AgentAdapter, AgentAdapterFactory, AgentLaunchPlan, AgentLaunchRequest, TRUSTED_IMPLICIT_STANCE};
+use flotilla_agent::adapter::{AgentAdapter, AgentAdapterFactory, AgentLaunchPlan, AgentLaunchRequest, Harness, TRUSTED_IMPLICIT_STANCE};
 use flotilla_discovery_api::EnvironmentBag;
-use flotilla_environment::environment::dummy::DUMMY_FLEET_ENV;
+use flotilla_environment::environment::dummy::{DUMMY_CREW_BINARY, DUMMY_FLEET_ENV};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{TerminalAttentionState, TerminalBrief};
@@ -20,7 +20,6 @@ pub const DUMMY_AGENT_ADAPTER: &str = "dummy";
 pub const DUMMY_SCRIPT_ENV: &str = "FLOTILLA_DUMMY_SCRIPT";
 pub(crate) const SCREEN_WORKING: &str = "working";
 pub(crate) const SCREEN_IDLE: &str = "idle";
-const LAUNCH_COMMAND: &str = "flotilla-dummy-crew";
 
 pub struct DummyAgentAdapter {
     long_runner_turns: u32,
@@ -46,7 +45,7 @@ impl AgentAdapter for DummyAgentAdapter {
         let script = CrewScript::from_brief(&request.brief.content, self.long_runner_turns)?;
         let mut env = request.environment.clone();
         env.push((DUMMY_SCRIPT_ENV.into(), script.render()));
-        Ok(AgentLaunchPlan { command: LAUNCH_COMMAND.into(), env, stance: TRUSTED_IMPLICIT_STANCE.into() })
+        Ok(AgentLaunchPlan { command: DUMMY_CREW_BINARY.into(), env, stance: TRUSTED_IMPLICIT_STANCE.into() })
     }
 
     fn classify_screen_attention(&self, screen: &str) -> Option<TerminalAttentionState> {
@@ -68,6 +67,10 @@ impl AgentAdapterFactory for DummyAgentAdapterFactory {
     fn probe(&self, env: &EnvironmentBag, _runner: Arc<dyn CommandRunner>) -> Option<Arc<dyn AgentAdapter>> {
         env.find_env_var(DUMMY_FLEET_ENV)
             .map(|_| Arc::new(DummyAgentAdapter { long_runner_turns: self.long_runner_turns }) as Arc<dyn AgentAdapter>)
+    }
+
+    fn harness(&self) -> Option<Harness> {
+        Some(Harness { adapter: DUMMY_AGENT_ADAPTER, binary: DUMMY_CREW_BINARY })
     }
 }
 

@@ -1,7 +1,11 @@
 use flotilla_store_http::HttpBackend;
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_sqlite::SqliteBackend;
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
@@ -9,8 +13,9 @@ use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{Command, CommandAction, CommandValue, ConvoyAutoAttach, ConvoyStartIntent, DaemonEvent, HostName};
 use flotilla_resources::{
-    single_agent_workflow_spec, Convoy, CrewSource, InputMeta, Project, ProjectSpec, ResourceObject, ResourceProvenance, WorkflowTemplate,
-    WorkflowTemplateSpec, WORKFLOW_SNAPSHOT_ANNOTATION,
+    single_agent_workflow_spec, Convoy, CrewSource, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host,
+    HostSpec, HostStatus, InputMeta, Project, ProjectSpec, ResourceObject, ResourceProvenance, WorkflowTemplate, WorkflowTemplateSpec,
+    ENVIRONMENT_PROVIDERS_CAPABILITY, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 use flotilla_store::ResourceBackend;
 use flotilla_test_support::TestSocketDir;
@@ -86,6 +91,44 @@ async fn governor_snapshot(daemon: &InProcessDaemon) -> (ResourceObject<Convoy>,
     (convoy, snapshot.spec)
 }
 
+async fn register_host_direct_kind(daemon: &InProcessDaemon) {
+    let backend = daemon.resource_backend();
+    let host_id = daemon.local_host_id().expect("local host id").to_string();
+    let hosts = backend.using::<Host>("flotilla");
+    let host = hosts.create(&InputMeta::builder().name(host_id.clone()).build(), &HostSpec::default()).await.expect("admission host");
+    hosts
+        .update_status(
+            &host_id,
+            &host.metadata.resource_version,
+            &HostStatus {
+                capabilities: BTreeMap::from([(
+                    ENVIRONMENT_PROVIDERS_CAPABILITY.to_string(),
+                    serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                )]),
+                heartbeat_at: Some(chrono::Utc::now()),
+                ready: true,
+                disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
+                admission_free_space_floor_bytes: Some(0),
+                ..HostStatus::default()
+            },
+        )
+        .await
+        .expect("ready admission host");
+    backend
+        .using::<FulfilmentKind>("flotilla")
+        .create(
+            &InputMeta::builder().name(format!("host-direct-{host_id}")).build(),
+            &FulfilmentKindSpec::builder()
+                .host_ref(host_id)
+                .pool("cleat".to_string())
+                .grants(BTreeSet::from([FulfilmentGrant::platform("linux".to_string()), FulfilmentGrant::host_account_reach()]))
+                .realisation(FulfilmentRealisation::HostDirect)
+                .build(),
+        )
+        .await
+        .expect("admission fulfilment kind");
+}
+
 #[tokio::test]
 async fn in_memory_http_relays_governor_template_across_three_roots() {
     governor_relay_contract(TestBackend::InMemory).await;
@@ -158,6 +201,7 @@ async fn governor_relay_contract(storage: TestBackend) {
         .await
         .expect("create admission project");
     assert!(matches!(admit_governor(udder).await, CommandValue::Error { message } if message.contains("workflow template governor")));
+    register_host_direct_kind(udder).await;
 
     let mut workflow = single_agent_workflow_spec();
     workflow.exit = None;

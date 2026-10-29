@@ -17,7 +17,7 @@ use flotilla_protocol::arg::{flatten, Arg};
 use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
 use flotilla_resources::{
     account_access::{AccessName, ProvisionPlan, UpdateMode},
-    CredentialConsumer, EnvironmentSpec, FulfilmentRealisation, PlacementPolicySpec,
+    CredentialConsumer, EnvironmentSpec, FulfilmentRealisation,
 };
 
 /// An item's registered account requirement (#3879 "Requirement, not a switch").
@@ -85,19 +85,6 @@ impl EnvironmentKind {
             FulfilmentRealisation::DockerPerVessel { .. } => Self::Docker,
             FulfilmentRealisation::HostDirect if ssh_host => Self::SshHost,
             FulfilmentRealisation::HostDirect => Self::HostDirect,
-        }
-    }
-
-    /// A placement policy's realisation.
-    pub fn of_policy(spec: &PlacementPolicySpec, ssh_host: bool) -> Self {
-        if spec.cloud_sandbox_per_vessel.is_some() {
-            Self::CloudSandbox
-        } else if spec.docker_per_vessel.is_some() {
-            Self::Docker
-        } else if ssh_host {
-            Self::SshHost
-        } else {
-            Self::HostDirect
         }
     }
 

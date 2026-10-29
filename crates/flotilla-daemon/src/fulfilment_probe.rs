@@ -3,6 +3,7 @@
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use chrono::Utc;
+use flotilla_agent::adapter::Harness;
 use flotilla_environment::environment::EnvironmentProvider;
 use flotilla_provider_runtime::{execution_context::ObservationContext, CommandRunner, EnvVars};
 use flotilla_resources::{
@@ -10,7 +11,6 @@ use flotilla_resources::{
 };
 
 const TOOLCHAINS: &[&str] = &["rustc", "cargo", "node", "python3"];
-const HARNESSES: &[(&str, &str)] = &[("claude-code", "claude"), ("codex", "codex")];
 
 pub(crate) struct DetectionTarget<'a> {
     pub(crate) image: Option<&'a str>,
@@ -18,6 +18,8 @@ pub(crate) struct DetectionTarget<'a> {
     /// The target's prepared base layer: what its crews run with, minus
     /// their account material.
     pub(crate) context: &'a ObservationContext,
+    /// The harnesses to look for: the built-in ones and those registered adapters contribute.
+    pub(crate) harnesses: &'a [Harness],
 }
 
 async fn run_in_realisation(
@@ -53,9 +55,11 @@ fn harness_version(stdout: &str) -> String {
 /// model request participates; an absent version leaves this harness unknown.
 async fn harness_facts(target: &DetectionTarget<'_>, scratch: &Path) -> BTreeMap<String, HarnessFacts> {
     let mut facts = BTreeMap::new();
-    let outputs =
-        futures::future::join_all(HARNESSES.iter().map(|(_, binary)| run_in_realisation(target, binary, &["--version"], scratch))).await;
-    for ((harness, _), output) in HARNESSES.iter().zip(outputs) {
+    let outputs = futures::future::join_all(
+        target.harnesses.iter().map(|harness| run_in_realisation(target, harness.binary, &["--version"], scratch)),
+    )
+    .await;
+    for (Harness { adapter: harness, .. }, output) in target.harnesses.iter().zip(outputs) {
         if let Ok(output) = output {
             let version = harness_version(&output.stdout);
             if output.success() && !version.is_empty() {
@@ -154,6 +158,7 @@ pub(crate) async fn probe_kind(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flotilla_agent::adapter::built_in_harnesses;
     use flotilla_discovery_testkit::{DiscoveryMockRunner, TestEnvVars};
     use flotilla_environment::environment::{command_provider, EnvironmentInput, EnvironmentProvisionError};
     use flotilla_provider_runtime::{ChannelLabel, CommandOutput};
@@ -216,6 +221,7 @@ mod tests {
             let stdout = match binary {
                 "claude" => "2.1.300 (Claude Code)",
                 "codex" => "codex-cli 0.160.0",
+                "contributed-crew" => "contributed-crew 3.1.0",
                 "node" => "v24.0.0",
                 _ => return Err("unavailable".into()),
             };
@@ -240,7 +246,12 @@ mod tests {
         let mut state = ModelProbeState { total_requests: 8, ..Default::default() };
         let facts = probe_kind(
             &spec,
-            DetectionTarget { image: None, provider: provider.as_ref(), context: &Default::default() },
+            DetectionTarget {
+                image: None,
+                provider: provider.as_ref(),
+                context: &Default::default(),
+                harnesses: &built_in_harnesses().collect::<Vec<_>>(),
+            },
             false,
             runner.as_ref(),
             &TestEnvVars::new([("HOME", "/fake-operator"), ("ANTHROPIC_API_KEY", "fake-unrelated-account")]),
@@ -255,8 +266,40 @@ mod tests {
         assert_eq!(facts.toolchains["node"], "v24.0.0");
         assert_eq!(facts.free_vessel_slots, Some(0));
         assert_eq!(state, ModelProbeState::default());
-        assert_eq!(runner.calls.lock().expect("calls").len(), TOOLCHAINS.len() + HARNESSES.len());
+        assert_eq!(runner.calls.lock().expect("calls").len(), TOOLCHAINS.len() + built_in_harnesses().count());
         assert_eq!(runner.inference_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    // A harness a registered adapter contributes is looked for beside the built-in ones,
+    // under its adapter's id; one no adapter contributes is never asked for.
+    #[tokio::test]
+    async fn contributed_harnesses_are_probed_under_their_adapter() {
+        let runner = Arc::new(NoInference::default());
+        let provider = command_provider(EnvironmentInput::HostDirect, runner.clone());
+        let spec = FulfilmentKindSpec::builder()
+            .host_ref("host".into())
+            .pool("cleat".into())
+            .realisation(FulfilmentRealisation::HostDirect)
+            .build();
+        let contributed = Harness { adapter: "contributed", binary: "contributed-crew" };
+        for harnesses in [built_in_harnesses().collect::<Vec<_>>(), built_in_harnesses().chain([contributed]).collect()] {
+            let facts = probe_kind(
+                &spec,
+                DetectionTarget { image: None, provider: provider.as_ref(), context: &Default::default(), harnesses: &harnesses },
+                true,
+                runner.as_ref(),
+                &TestEnvVars::new([("HOME", "/fake-operator")]),
+                Path::new("/tmp/probe"),
+                &mut ModelProbeState::default(),
+            )
+            .await
+            .expect("facts");
+            assert_eq!(
+                facts.harnesses.get("contributed").map(|harness| harness.version.as_str()),
+                harnesses.contains(&contributed).then_some("3.1.0")
+            );
+            assert_eq!(facts.harnesses["claude-code"].version, "2.1.300");
+        }
     }
 
     // A failed image inventory cannot suppress independent detection. A
@@ -273,7 +316,12 @@ mod tests {
                 .build();
             let facts = probe_kind(
                 &spec,
-                DetectionTarget { image: Some("crew:test"), provider: provider.as_ref(), context: &Default::default() },
+                DetectionTarget {
+                    image: Some("crew:test"),
+                    provider: provider.as_ref(),
+                    context: &Default::default(),
+                    harnesses: &built_in_harnesses().collect::<Vec<_>>(),
+                },
                 true,
                 runner.as_ref(),
                 &TestEnvVars::default(),
@@ -347,7 +395,12 @@ mod tests {
         let mut models = ModelProbeState::default();
         let facts = super::probe_kind(
             &spec,
-            DetectionTarget { image: None, provider: &provider, context: &Default::default() },
+            DetectionTarget {
+                image: None,
+                provider: &provider,
+                context: &Default::default(),
+                harnesses: &built_in_harnesses().collect::<Vec<_>>(),
+            },
             true,
             runner.as_ref(),
             &TestEnvVars::default(),

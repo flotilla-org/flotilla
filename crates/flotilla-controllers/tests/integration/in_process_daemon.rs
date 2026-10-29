@@ -103,8 +103,8 @@ use flotilla_resources::{
     single_agent_workflow_spec, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     Convoy as ResourceConvoy, ConvoyPhase, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec,
     CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, DockerCheckoutStrategy,
-    DockerPerVesselPlacementPolicySpec, FulfilmentFacts, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, HarnessFacts,
-    Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta,
+    DockerPerVesselPlacementPolicySpec, FulfilmentFacts, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation,
+    HarnessFacts, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta,
     LifecycleAuthority, ModelFact, ModelFactSource, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
     ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositoryKey, RepositoryRelation,
     RepositorySpec, ResourceError, Stance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
@@ -1977,7 +1977,7 @@ async fn resource_watch_streams_current_update_and_resumed_delete_without_loss()
     daemon.cancel(resumed_command_id).await.expect("cancel resumed watch");
 }
 
-async fn create_test_contained_policy(backend: &flotilla_store::ResourceBackend, image: &str, agent_adapters: BTreeSet<String>) {
+async fn create_test_docker_kind(backend: &flotilla_store::ResourceBackend, image: &str, agent_adapters: BTreeSet<String>) {
     let hosts = backend.clone().using::<ResourceHost>("flotilla");
     let host = match hosts.get("host-test").await {
         Ok(host) => host,
@@ -1995,7 +1995,6 @@ async fn create_test_contained_policy(backend: &flotilla_store::ResourceBackend,
         FulfilmentFacts {
             harnesses: agent_adapters
                 .iter()
-                .filter(|adapter| adapter.as_str() == "codex")
                 .map(|adapter| (adapter.clone(), HarnessFacts { version: "1.0.0".into(), models: BTreeMap::new() }))
                 .collect(),
             ..Default::default()
@@ -2010,31 +2009,17 @@ async fn create_test_contained_policy(backend: &flotilla_store::ResourceBackend,
     status.disk_free_bytes = Some(100 * 1024 * 1024 * 1024);
     status.admission_free_space_floor_bytes = Some(20 * 1024 * 1024 * 1024);
     hosts.update_status("host-test", &host.metadata.resource_version, &status).await.expect("publish test placement host capacity");
-    let policy = PlacementPolicySpec::builder()
-        .pool("passthrough".to_string())
-        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-            memory_policy: Default::default(),
-            host_ref: "host-test".into(),
-            image: Some(image.into()),
-            pull_policy: Default::default(),
-            agent_adapters,
-            default_cwd: Some("/workspace".into()),
-            env: Default::default(),
-            checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".into() },
-        })
-        .build();
-    backend
-        .clone()
-        .using::<PlacementPolicy>("flotilla")
-        .create(&InputMeta::builder().name("docker-test".to_string()).build(), &policy)
-        .await
-        .expect("contained policy create");
     backend
         .clone()
         .using::<FulfilmentKind>("flotilla")
         .create(
             &InputMeta::builder().name("docker-test".to_string()).build(),
-            &FulfilmentKindSpec::from_policy(&policy, "linux").expect("docker kind"),
+            &FulfilmentKindSpec::builder()
+                .host_ref("host-test".to_string())
+                .pool("passthrough".to_string())
+                .grants(BTreeSet::from([FulfilmentGrant::platform("linux".to_string()), FulfilmentGrant::network("scoped".to_string())]))
+                .realisation(FulfilmentRealisation::DockerPerVessel { image: Some(image.into()) })
+                .build(),
         )
         .await
         .expect("docker kind create");
@@ -2048,7 +2033,7 @@ async fn create_test_convoy_project(backend: &flotilla_store::ResourceBackend, i
         .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
         .await
         .expect("repository create");
-    create_test_contained_policy(backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
+    create_test_docker_kind(backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
     backend
         .clone()
         .using::<Project>("flotilla")
@@ -2104,7 +2089,7 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
         .await
         .expect("repository create");
-    create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string(), "claude-code".to_string()])).await;
+    create_test_docker_kind(&backend, "flotilla-test", BTreeSet::from(["codex".to_string(), "claude-code".to_string()])).await;
     backend
         .clone()
         .definitions::<CredentialSpec>("flotilla")
@@ -2316,7 +2301,7 @@ async fn exercise_existing_pr_admission(continuing: bool) {
         .create(&InputMeta::builder().name(repository_key.to_string()).build(), &repository_spec)
         .await
         .expect("repository create");
-    create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
+    create_test_docker_kind(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
     backend
         .clone()
         .using::<Project>("flotilla")
@@ -2585,11 +2570,10 @@ async fn fork_stance_refuses_change_request_merge_without_calling_provider() {
     assert_eq!(request.status, flotilla_protocol::ChangeRequestStatus::Open);
 }
 
-async fn create_test_host_direct_policy(
+async fn create_test_host_direct_kind(
     backend: &flotilla_store::ResourceBackend,
-    policy_name: &str,
+    kind_name: &str,
     host_ref: &str,
-    priority: i32,
     agent_adapters: BTreeSet<String>,
 ) {
     let hosts = backend.clone().using::<ResourceHost>("flotilla");
@@ -2600,7 +2584,7 @@ async fn create_test_host_direct_policy(
             &host.metadata.resource_version,
             &HostStatus {
                 fulfilment_facts: BTreeMap::from([(
-                    policy_name.to_string(),
+                    kind_name.to_string(),
                     FulfilmentFacts {
                         harnesses: agent_adapters
                             .iter()
@@ -2629,26 +2613,21 @@ async fn create_test_host_direct_policy(
         )
         .await
         .expect("host status update");
-    let policy = PlacementPolicySpec::builder()
-        .pool("passthrough".to_string())
-        .priority(priority)
-        .host_direct(HostDirectPlacementPolicySpec {
-            host_ref: host_ref.to_string(),
-            checkout: HostDirectPlacementPolicyCheckout::Worktree,
-        })
-        .build();
-    backend
-        .clone()
-        .using::<PlacementPolicy>("flotilla")
-        .create(&InputMeta::builder().name(policy_name.to_string()).build(), &policy)
-        .await
-        .expect("host-direct policy create");
     backend
         .clone()
         .using::<FulfilmentKind>("flotilla")
         .create(
-            &InputMeta::builder().name(policy_name.to_string()).build(),
-            &FulfilmentKindSpec::from_policy(&policy, "linux").expect("direct kind"),
+            &InputMeta::builder().name(kind_name.to_string()).build(),
+            &FulfilmentKindSpec::builder()
+                .host_ref(host_ref.to_string())
+                .pool("passthrough".to_string())
+                .grants(BTreeSet::from([
+                    FulfilmentGrant::platform("linux".to_string()),
+                    FulfilmentGrant::host_account_reach(),
+                    FulfilmentGrant::network("host".to_string()),
+                ]))
+                .realisation(FulfilmentRealisation::HostDirect)
+                .build(),
         )
         .await
         .expect("host-direct kind create");
@@ -2675,7 +2654,7 @@ async fn capability_admission_names_unobserved_kind_facts() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
-    create_test_host_direct_policy(&backend, "host-direct-unobserved", "unobserved", 100, BTreeSet::from(["codex".to_string()])).await;
+    create_test_host_direct_kind(&backend, "host-direct-unobserved", "unobserved", BTreeSet::from(["codex".to_string()])).await;
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts.get("unobserved").await.expect("host");
     let mut status = host.status.expect("status");
@@ -2721,14 +2700,7 @@ async fn unknown_model_entitlement_still_requires_a_scoped_credential() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
-    create_test_host_direct_policy(
-        &backend,
-        "host-direct-model-unknown",
-        "model-unknown",
-        100,
-        BTreeSet::from(["claude-code".to_string()]),
-    )
-    .await;
+    create_test_host_direct_kind(&backend, "host-direct-model-unknown", "model-unknown", BTreeSet::from(["claude-code".to_string()])).await;
 
     let result = start_capability_convoy(&daemon, "model-not-yet-observed", |intent| {
         intent.agent_overrides.push(flotilla_protocol::AgentOverride {
@@ -2749,7 +2721,7 @@ async fn capability_placement_prefers_docker_and_records_pinned_escalation() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
-    create_test_host_direct_policy(&backend, "host-direct-linux", "direct-linux", 100, BTreeSet::from(["codex".to_string()])).await;
+    create_test_host_direct_kind(&backend, "host-direct-linux", "direct-linux", BTreeSet::from(["codex".to_string()])).await;
 
     let docs = start_capability_convoy(&daemon, "docs-only", |_| {}).await;
     assert!(matches!(docs, CommandValue::ConvoyStarted { .. }), "{docs:?}");
@@ -2783,7 +2755,7 @@ async fn capability_admission_queues_on_sleeping_minimal_host() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
-    create_test_host_direct_policy(&backend, "host-direct-sleeping", "sleeping-host", 0, BTreeSet::from(["codex".to_string()])).await;
+    create_test_host_direct_kind(&backend, "host-direct-sleeping", "sleeping-host", BTreeSet::from(["codex".to_string()])).await;
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts.get("sleeping-host").await.expect("host");
     let mut status = host.status.expect("host status");
@@ -2810,7 +2782,7 @@ async fn capability_admission_refuses_unready_host_without_sleep_intent() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
-    create_test_host_direct_policy(&backend, "host-direct-stopped", "stopped-host", 0, BTreeSet::from(["codex".to_string()])).await;
+    create_test_host_direct_kind(&backend, "host-direct-stopped", "stopped-host", BTreeSet::from(["codex".to_string()])).await;
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts.get("stopped-host").await.expect("host");
     let mut status = host.status.expect("host status");
@@ -2845,14 +2817,14 @@ async fn capability_admission_prefers_linux_when_macos_is_reserved() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
-    create_test_host_direct_policy(&backend, "macos-scarce", "comte", 0, BTreeSet::from(["codex".to_string()])).await;
+    create_test_host_direct_kind(&backend, "macos-scarce", "comte", BTreeSet::from(["codex".to_string()])).await;
     let kinds = backend.using::<FulfilmentKind>("flotilla");
     let kind = kinds.get("macos-scarce").await.expect("macOS kind");
     let mut spec = kind.spec.clone();
     spec.grants.remove(&FulfilmentGrant::platform("linux".to_string()));
     spec.grants.insert(FulfilmentGrant::platform("macos".to_string()));
     kinds.update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &spec).await.expect("macOS grants");
-    create_test_host_direct_policy(&backend, "linux-available", "feta", 0, BTreeSet::from(["codex".to_string()])).await;
+    create_test_host_direct_kind(&backend, "linux-available", "feta", BTreeSet::from(["codex".to_string()])).await;
 
     let started = start_capability_convoy(&daemon, "reserved-unpinned", |intent| {
         intent.needs.push("host_account_reach".to_string());
@@ -2870,7 +2842,7 @@ async fn capability_admission_uses_only_macos_without_escalation_and_explains_fa
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
-    create_test_host_direct_policy(&backend, "macos-scarce", "comte", 0, BTreeSet::from(["codex".to_string()])).await;
+    create_test_host_direct_kind(&backend, "macos-scarce", "comte", BTreeSet::from(["codex".to_string()])).await;
     let kinds = backend.using::<FulfilmentKind>("flotilla");
     let kind = kinds.get("macos-scarce").await.expect("macOS kind");
     let mut spec = kind.spec.clone();
@@ -2898,8 +2870,8 @@ async fn capability_admission_pin_to_macos_requires_escalation_when_linux_exists
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
-    create_test_host_direct_policy(&backend, "macos-scarce", "comte", 0, BTreeSet::from(["codex".to_string()])).await;
-    create_test_host_direct_policy(&backend, "linux-available", "feta", 0, BTreeSet::from(["codex".to_string()])).await;
+    create_test_host_direct_kind(&backend, "macos-scarce", "comte", BTreeSet::from(["codex".to_string()])).await;
+    create_test_host_direct_kind(&backend, "linux-available", "feta", BTreeSet::from(["codex".to_string()])).await;
     let kinds = backend.using::<FulfilmentKind>("flotilla");
     let kind = kinds.get("macos-scarce").await.expect("macOS kind");
     let mut spec = kind.spec.clone();
@@ -2932,7 +2904,7 @@ async fn capability_placement_selects_each_vessel_from_its_own_role_needs() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
-    create_test_host_direct_policy(&backend, "host-direct-tools", "direct-tools", 0, BTreeSet::new()).await;
+    create_test_host_direct_kind(&backend, "host-direct-tools", "direct-tools", BTreeSet::new()).await;
     let workflow = flotilla_resources::WorkflowTemplateSpec::builder()
         .vessels(vec![
             flotilla_resources::VesselRequirement::builder()
@@ -3145,7 +3117,7 @@ async fn allocation_separates_linux_coder_from_gui_verifier() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
-    create_test_host_direct_policy(&backend, "host-direct-gui", "gui-host", 0, BTreeSet::new()).await;
+    create_test_host_direct_kind(&backend, "host-direct-gui", "gui-host", BTreeSet::new()).await;
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts.get("gui-host").await.expect("host");
     let mut status = host.status.expect("host status");
@@ -3194,7 +3166,7 @@ async fn allocation_expands_project_platform_matrix() {
     projects.update(&InputMeta::from(&project.metadata), &project.metadata.resource_version, &project_spec).await.expect("update matrix");
     for platform in ["macos", "windows"] {
         let kind_name = format!("direct-{platform}");
-        create_test_host_direct_policy(&backend, &kind_name, &format!("host-{platform}"), 0, BTreeSet::new()).await;
+        create_test_host_direct_kind(&backend, &kind_name, &format!("host-{platform}"), BTreeSet::new()).await;
         let kinds = backend.using::<FulfilmentKind>("flotilla");
         let kind = kinds.get(&kind_name).await.expect("kind");
         let mut spec = kind.spec.clone();
@@ -3227,8 +3199,8 @@ async fn allocation_backtracks_a_legacy_union_no_kind_covers() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
-    create_test_host_direct_policy(&backend, "direct-linux", "host-linux", 0, BTreeSet::new()).await;
-    create_test_host_direct_policy(&backend, "direct-macos", "host-macos", 0, BTreeSet::new()).await;
+    create_test_host_direct_kind(&backend, "direct-linux", "host-linux", BTreeSet::new()).await;
+    create_test_host_direct_kind(&backend, "direct-macos", "host-macos", BTreeSet::new()).await;
     let kinds = backend.using::<FulfilmentKind>("flotilla");
     let kind = kinds.get("direct-macos").await.expect("kind");
     let mut spec = kind.spec.clone();
@@ -3322,7 +3294,7 @@ async fn codex_admission_refuses_old_host_and_explains_version_gap() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
-    create_test_host_direct_policy(&backend, "old-codex", "old-host", 0, BTreeSet::from(["codex".into()])).await;
+    create_test_host_direct_kind(&backend, "old-codex", "old-host", BTreeSet::from(["codex".into()])).await;
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts.get("old-host").await.expect("host");
     let mut status = host.status.expect("status");
@@ -3356,7 +3328,7 @@ async fn requested_model_ignores_legacy_account_evidence_and_uses_only_selected_
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
-    create_test_host_direct_policy(&backend, "host-direct-model", "direct-model", 0, BTreeSet::from(["claude-code".to_string()])).await;
+    create_test_host_direct_kind(&backend, "host-direct-model", "direct-model", BTreeSet::from(["claude-code".to_string()])).await;
     backend
         .clone()
         .definitions::<CredentialSpec>("flotilla")
@@ -3641,9 +3613,9 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
         )
         .await
         .expect("project create");
-    create_test_host_direct_policy(&backend, "host-direct-a-empty", "empty-host", 200, BTreeSet::new()).await;
-    create_test_host_direct_policy(&backend, "host-direct-b-remote", "remote-host", 100, BTreeSet::from(["codex".to_string()])).await;
-    create_test_host_direct_policy(&backend, "host-direct-z-local", &local_host_ref, -100, BTreeSet::from(["codex".to_string()])).await;
+    create_test_host_direct_kind(&backend, "host-direct-a-empty", "empty-host", BTreeSet::new()).await;
+    create_test_host_direct_kind(&backend, "host-direct-b-remote", "remote-host", BTreeSet::from(["codex".to_string()])).await;
+    create_test_host_direct_kind(&backend, "host-direct-z-local", &local_host_ref, BTreeSet::from(["codex".to_string()])).await;
 
     let mut events = daemon.subscribe();
     let implicit_command_id = daemon
@@ -3748,7 +3720,7 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
     let decision =
         convoy.status.and_then(|status| status.placement_decision).expect("admission should persist the complete placement decision");
     assert_eq!(decision.kind, "host-direct-b-remote");
-    assert_eq!(decision.refused_candidates.len(), 1);
+    assert_eq!(decision.refused_candidates.len(), 1, "{:?}", decision.refused_candidates);
     assert_eq!(decision.refused_candidates[0].kind, "host-direct-a-empty");
     assert!(decision.refused_candidates[0].reason.contains("harness:codex>=0.160.0"));
     assert_eq!(decision.viable_not_selected.len(), 1);
@@ -3776,7 +3748,7 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
         .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
         .await
         .expect("repository create");
-    create_test_contained_policy(&backend, "ubuntu:24.04", BTreeSet::new()).await;
+    create_test_docker_kind(&backend, "ubuntu:24.04", BTreeSet::new()).await;
     backend
         .clone()
         .using::<Project>("flotilla")
@@ -3892,12 +3864,11 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
     .await
     .expect("legacy create command should finish");
 
-    assert_eq!(
-        legacy_result,
-        CommandValue::Error {
-            message: "workflow requires agent adapter `codex`, which is not available in placement `docker-test` (image `ubuntu:24.04`)"
-                .to_string()
-        }
+    assert!(
+        matches!(&legacy_result, CommandValue::Error { message } if message.ends_with(
+            "candidates: docker-test: workflow requires agent adapter `codex`, which is not available in placement `docker-test` (image `ubuntu:24.04`)"
+        )),
+        "{legacy_result:?}"
     );
     assert!(matches!(
         backend.using::<ResourceConvoy>("flotilla").get("missing-adapter-legacy").await,
@@ -3924,7 +3895,7 @@ async fn convoy_start_accepts_project_list_identifier() {
         .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
         .await
         .expect("repository create");
-    create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
+    create_test_docker_kind(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
     backend
         .clone()
         .definitions::<Project>("flotilla")
@@ -4047,7 +4018,7 @@ async fn convoy_start_freezes_dispatch_promises_and_refuses_unresolvable_ones() 
         .create(&InputMeta::builder().name("no-deliverer".to_string()).build(), &no_deliverer)
         .await
         .expect("workflow create");
-    create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
+    create_test_docker_kind(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
     backend
         .clone()
         .definitions::<Project>("flotilla")
@@ -4235,7 +4206,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             .await
             .expect("repository create");
     }
-    create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
+    create_test_docker_kind(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
     backend
         .clone()
         .using::<Project>("flotilla")
@@ -4864,7 +4835,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
         .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
         .await
         .expect("repository create");
-    create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
+    create_test_docker_kind(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
     backend
         .clone()
         .using::<Project>("flotilla")
@@ -7330,7 +7301,7 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
 
     let expected = front.clone().on_forge(&forge).expect("canonical forge identity").key();
     let host_ref = "host-udder".to_string();
-    create_test_host_direct_policy(&daemon.resource_backend(), "governor-host", &host_ref, 1, BTreeSet::from(["codex".to_string()])).await;
+    create_test_host_direct_kind(&daemon.resource_backend(), "governor-host", &host_ref, BTreeSet::from(["codex".to_string()])).await;
     let hosts = daemon.resource_backend().using::<ResourceHost>("flotilla");
     let host = hosts.get(&host_ref).await.expect("governor host");
     let mut status = host.status.expect("governor host status");
@@ -10467,8 +10438,7 @@ mod account_bindings {
     async fn claude_world(daemon: &InProcessDaemon, credentials: &[(&str, &str)], grants: &[(&str, &[&str])]) {
         let backend = daemon.resource_backend();
         create_test_convoy_project(&backend, None).await;
-        create_test_host_direct_policy(&backend, "host-direct-accounts", "accounts-host", 0, BTreeSet::from(["claude-code".to_string()]))
-            .await;
+        create_test_host_direct_kind(&backend, "host-direct-accounts", "accounts-host", BTreeSet::from(["claude-code".to_string()])).await;
         for (name, account) in credentials {
             declare(&backend, name, account, 1).await;
         }

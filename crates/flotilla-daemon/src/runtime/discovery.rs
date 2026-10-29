@@ -25,10 +25,11 @@ use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
 use flotilla_resources::{
-    host_direct_environment_name, ConditionValue, FulfilmentFacts, FulfilmentKind, FulfilmentRealisation, Host, HostCondition,
-    HostConnection, HostSpec, HostStatus, InputMeta, ModelProbeState, Platform, ResourceError, ResourceObject, AGENT_ADAPTERS_CAPABILITY,
-    CODEX_CENTRAL_LOGIN_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, DOCKER_POLICY_NAME_PREFIX, HELD_CREDENTIALS_CAPABILITY,
-    OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, SSH_HOST_CAPABILITY, TRANSPORT_CAPABILITY,
+    host_direct_environment_name, is_prepared_snapshot, ConditionValue, FulfilmentFacts, FulfilmentKind, FulfilmentRealisation, Host,
+    HostCondition, HostConnection, HostSpec, HostStatus, InputMeta, ModelProbeState, Platform, ResourceError, ResourceObject,
+    AGENT_ADAPTERS_CAPABILITY, CODEX_CENTRAL_LOGIN_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, DOCKER_POLICY_NAME_PREFIX,
+    HELD_CREDENTIALS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, PLACEMENT_SNAPSHOT_KIND, SSH_HOST_CAPABILITY,
+    TRANSPORT_CAPABILITY,
 };
 use flotilla_store::{ResourceBackend, TypedResolver};
 use serde_json::json;
@@ -38,9 +39,7 @@ use tracing::{debug, warn};
 use crate::fulfilment_probe::{probe_kind, DetectionTarget};
 use crate::stdlib_image_layers::harness_session_environment;
 
-use super::seed::{
-    empty_meta, ensure_default_policies, ensure_host_direct_environment_exists, kind_belongs_to_host, migrate_live_placement_policies,
-};
+use super::seed::{empty_meta, ensure_default_kinds, ensure_host_direct_environment_exists, kind_belongs_to_host};
 use super::ssh_host_vessels::SshHostVessels;
 use super::tasks::FULFILMENT_CHANGE_CHECK_INTERVAL;
 use flotilla_environment::environment::agent::host::SshAgentReach;
@@ -244,9 +243,8 @@ pub(super) async fn register_ssh_host_resources(
         Err(error) => return Err(error.to_string()),
     }
     ensure_host_direct_environment_exists(backend, namespace, provisioning).await?;
-    ensure_default_policies(backend, namespace, provisioning).await?;
     let platform = ssh_host_platform(profile.runner.as_ref()).await;
-    migrate_live_placement_policies(backend, namespace, &provisioning.host_id, &platform).await
+    ensure_default_kinds(backend, namespace, provisioning, &platform).await
 }
 
 pub(super) async fn ssh_host_platform(runner: &dyn CommandRunner) -> String {
@@ -328,7 +326,7 @@ pub(super) async fn apply_ssh_host_observation(
     }
     if probe_succeeded {
         let platform = ssh_host_platform(ssh.runner.as_ref()).await;
-        migrate_live_placement_policies(&daemon.resource_backend(), namespace, &profile.host_id, &platform).await?;
+        ensure_default_kinds(&daemon.resource_backend(), namespace, profile, &platform).await?;
     }
     let mut ready = ready;
     if probe_succeeded {
@@ -553,6 +551,7 @@ pub(super) struct FulfilmentProbeContext<'a> {
     pub(super) scratch: &'a Path,
     /// The host's prepared base layer and isolation.
     pub(super) observation: &'a ObservationContext,
+    pub(super) harnesses: &'a [flotilla_agent::adapter::Harness],
 }
 
 /// The daemon's own host declares its environment through the daemon
@@ -580,7 +579,9 @@ pub(super) async fn observe_fulfilment_facts(
     let all_kinds = backend.clone().using::<FulfilmentKind>(namespace).list().await.map_err(|error| error.to_string())?.items;
     let mut kinds = Vec::new();
     for kind in all_kinds {
-        if kind.metadata.deletion_timestamp.is_some() {
+        if kind.metadata.deletion_timestamp.is_some()
+            || is_prepared_snapshot(&kind.metadata.name, &kind.metadata.labels, PLACEMENT_SNAPSHOT_KIND)
+        {
             continue;
         }
         if kind_belongs_to_host(&hosts.items, &kind, host_ref, "fact observation") {
@@ -670,7 +671,12 @@ pub(super) async fn observe_fulfilment_facts(
                 deadline.min(tokio::time::Instant::now() + Duration::from_secs(45)),
                 probe_kind(
                     &kind.spec,
-                    DetectionTarget { image: image.as_deref(), provider: provider.as_ref(), context: probe.observation },
+                    DetectionTarget {
+                        image: image.as_deref(),
+                        provider: provider.as_ref(),
+                        context: probe.observation,
+                        harnesses: probe.harnesses,
+                    },
                     pool_available,
                     probe.runner,
                     probe.env,

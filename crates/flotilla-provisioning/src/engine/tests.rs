@@ -368,7 +368,6 @@ fn environment_object(docker: bool) -> ResourceObject<flotilla_resources::Enviro
                 declared_agent_adapters: Default::default(),
                 required_agent_adapters: Default::default(),
                 pull_policy: Default::default(),
-                memory_policy: Default::default(),
                 mounts: vec![],
                 // A declared value, and what the vessel reconciler adds at launch today.
                 env: [

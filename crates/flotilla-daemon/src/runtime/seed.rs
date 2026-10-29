@@ -1,4 +1,4 @@
-//! Startup resource seeding and placement-policy migration.
+//! Startup resource seeding: this host's own resources and fulfilment kinds.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -7,12 +7,12 @@ use std::{
 
 use flotilla_core::in_process::InProcessDaemon;
 
-use flotilla_admission::placement_policy::reconcile_registered_policy;
+use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_resources::{
-    canonical_host_id, descriptive_repo_slug, is_prepared_snapshot, Clone, CloneSpec, DockerCheckoutStrategy,
-    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, FulfilmentKind, FulfilmentKindSpec, Host, HostDirectEnvironmentSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, InputMeta, PlacementPolicy, PlacementPolicySpec,
-    Repository, ResourceError, ResourceObject, PLACEMENT_SNAPSHOT_KIND,
+    canonical_host_id, definition_provenance::SEEDING_MANAGER, descriptive_repo_slug, is_prepared_snapshot, Clone, CloneSpec,
+    DockerImageSource, Environment, EnvironmentSpec, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host,
+    HostDirectEnvironmentSpec, HostSpec, InputMeta, PlacementPolicy, Platform, Repository, ResourceError, ResourceObject,
+    DOCKER_POLICY_NAME_PREFIX, HOST_DIRECT_NAME_PREFIX, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND,
 };
 use flotilla_store::ResourceBackend;
 use tracing::warn;
@@ -32,7 +32,9 @@ pub(super) async fn register_startup_resources(
         .await
         .map_err(|error| format!("ensure_host_direct_environment_exists: {error}"))?;
     discover_local_clones(daemon, &backend, namespace, profile).await.map_err(|error| format!("discover_local_clones: {error}"))?;
-    ensure_default_policies(&backend, namespace, profile).await.map_err(|error| format!("ensure_default_policies: {error}"))?;
+    ensure_default_kinds(&backend, namespace, profile, std::env::consts::OS)
+        .await
+        .map_err(|error| format!("ensure_default_kinds: {error}"))?;
     Ok(())
 }
 
@@ -197,64 +199,74 @@ pub(super) async fn discover_local_clones(
     Ok(())
 }
 
-pub(super) async fn ensure_default_policies(
+/// Seed this host's kinds: host-direct always, and Docker when it is available. Seeding owns
+/// their topology; grants others refine are kept, and the platform is the host's.
+pub(super) async fn ensure_default_kinds(
     backend: &ResourceBackend,
     namespace: &str,
     profile: &LocalProvisioningProfile,
+    platform: &str,
 ) -> Result<(), String> {
-    let host_direct_name = profile.host_direct_policy_name();
-    reconcile_registered_policy(
-        backend,
-        namespace,
-        &host_direct_name,
-        &PlacementPolicySpec::builder()
-            .pool(profile.host_direct_pool.clone())
-            .host_direct(HostDirectPlacementPolicySpec {
-                host_ref: profile.host_id.clone(),
-                checkout: HostDirectPlacementPolicyCheckout::Worktree,
-            })
-            .build(),
-    )
-    .await?;
-
+    let host_direct = FulfilmentKindSpec {
+        host_ref: profile.host_id.clone(),
+        pool: profile.host_direct_pool.clone(),
+        cost_class: Default::default(),
+        grants: BTreeSet::from([
+            FulfilmentGrant::platform(platform.to_owned()),
+            FulfilmentGrant::host_account_reach(),
+            FulfilmentGrant::network("host".to_owned()),
+        ]),
+        realisation: FulfilmentRealisation::HostDirect,
+    };
+    seed_kind(backend, namespace, &profile.host_direct_policy_name(), host_direct).await?;
     if profile.docker_available {
-        let docker_name = profile.docker_policy_name();
-        reconcile_registered_policy(
-            backend,
-            namespace,
-            &docker_name,
-            &PlacementPolicySpec::builder()
-                .pool(profile.docker_pool.clone())
-                .maybe_provider_requirements({
-                    // Seed the only per-vessel instance, including dummy fleets.
-                    // Multiple instances stay unpinned and admission fails closed.
-                    let mut providers = profile.environment_providers.iter().filter(|provider| provider.capabilities.per_vessel);
-                    let first = providers.next();
-                    first.filter(|_| providers.next().is_none()).map(|provider| flotilla_resources::ProviderRequirements {
-                        instance: Some(provider.instance.clone()),
-                        ..Default::default()
-                    })
-                })
-                .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                    memory_policy: Default::default(),
-                    host_ref: profile.host_id.clone(),
-                    image: Some(DEFAULT_DOCKER_IMAGE.into()),
-                    pull_policy: Default::default(),
-                    agent_adapters: BTreeSet::new(),
-                    default_cwd: Some("/workspace".to_string()),
-                    env: BTreeMap::new(),
-                    checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
-                })
-                .build(),
-        )
-        .await?;
+        let docker = FulfilmentKindSpec {
+            host_ref: profile.host_id.clone(),
+            pool: profile.docker_pool.clone(),
+            cost_class: Default::default(),
+            grants: BTreeSet::from([FulfilmentGrant::platform(Platform::Linux.to_string()), FulfilmentGrant::network("scoped".to_owned())]),
+            realisation: FulfilmentRealisation::DockerPerVessel { image: Some(DockerImageSource::Literal(DEFAULT_DOCKER_IMAGE.into())) },
+        };
+        seed_kind(backend, namespace, &profile.docker_policy_name(), docker).await?;
     }
-
-    migrate_live_placement_policies(backend, namespace, &profile.host_id, std::env::consts::OS).await
+    migrate_live_placement_policies(backend, namespace, &profile.host_id, platform).await
 }
 
-/// A1 runs beside the policy-based admission path. Existing policy names are
-/// retained so operators can inspect the corresponding kind during rollout.
+async fn seed_kind(backend: &ResourceBackend, namespace: &str, name: &str, desired: FulfilmentKindSpec) -> Result<(), String> {
+    let kinds = backend.clone().using::<FulfilmentKind>(namespace);
+    let seeded = BTreeMap::from([(MANAGED_BY_LABEL.to_owned(), SEEDING_MANAGER.to_owned())]);
+    match kinds.get(name).await {
+        Ok(existing) if existing.metadata.deletion_timestamp.is_some() => Ok(()),
+        Ok(existing) if existing.metadata.labels.get(MANAGED_BY_LABEL).is_some_and(|manager| manager != SEEDING_MANAGER) => {
+            warn!(kind = %name, "leaving a managed fulfilment kind untouched during seeding");
+            Ok(())
+        }
+        Ok(existing) => {
+            let mut spec = desired.clone();
+            spec.cost_class = existing.spec.cost_class;
+            spec.grants = existing.spec.grants.iter().filter(|grant| !grant.0.starts_with("platform:")).cloned().collect();
+            spec.grants.extend(desired.grants.iter().filter(|grant| grant.0.starts_with("platform:")).cloned());
+            if spec == existing.spec && existing.metadata.labels.contains_key(MANAGED_BY_LABEL) {
+                return Ok(());
+            }
+            let labels = merged_labels(&existing.metadata.labels, &seeded);
+            kinds
+                .update(&meta_from_existing(&existing, labels), &existing.metadata.resource_version, &spec)
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("seed fulfilment kind {name}: {error}"))
+        }
+        Err(ResourceError::NotFound { .. }) => kinds
+            .create(&empty_meta_with_labels(name, seeded), &desired)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("seed fulfilment kind {name}: {error}")),
+        Err(error) => Err(format!("inspect fulfilment kind {name}: {error}")),
+    }
+}
+
+/// Each live policy an operator or a manifest still holds becomes the kind of its name, until
+/// PlacementPolicy retires. Seeded names are seeding's own kinds.
 pub(super) async fn migrate_live_placement_policies(
     backend: &ResourceBackend,
     namespace: &str,
@@ -296,7 +308,12 @@ pub(super) async fn migrate_listed_placement_policies(
     let kinds = backend.clone().using::<FulfilmentKind>(namespace);
     for policy in policies {
         let cloud_controller = if policy.spec.cloud_sandbox_per_vessel.is_some() {
-            match flotilla_admission::support::placement_target_host(backend, namespace, &policy).await {
+            let Ok(spec) = FulfilmentKindSpec::from_policy(&policy.spec, platform) else { continue };
+            let mut kind = ResourceObject::<FulfilmentKind> { metadata: policy.metadata.clone(), spec, status: None };
+            if let Some(instance) = policy.spec.provider_requirements.as_ref().and_then(|requirements| requirements.instance.clone()) {
+                kind.metadata.labels.insert(ENVIRONMENT_PROVIDER_INSTANCE_LABEL.to_owned(), instance);
+            }
+            match flotilla_admission::support::placement_target_host(backend, namespace, &kind).await {
                 Ok(host) => Some(host.reference.to_string()),
                 Err(_) => continue,
             }
@@ -321,19 +338,10 @@ pub(super) async fn migrate_listed_placement_policies(
         if canonical != host_ref {
             continue;
         }
-        if is_prepared_snapshot(&policy.metadata.name, &policy.metadata.labels, PLACEMENT_SNAPSHOT_KIND) {
-            // Earlier migrations created kinds under frozen policy names. A
-            // matching snapshot policy is the proof of origin for cleanup;
-            // leave the policy itself for existing convoy references.
-            match kinds.get(&policy.metadata.name).await {
-                Ok(kind) => {
-                    if kind_belongs_to_host(hosts, &kind, host_ref, "snapshot cleanup") {
-                        kinds.delete(&policy.metadata.name).await.map_err(|error| format!("delete snapshot fulfilment kind: {error}"))?;
-                    }
-                }
-                Err(ResourceError::NotFound { .. }) => {}
-                Err(error) => return Err(format!("inspect snapshot fulfilment kind: {error}")),
-            }
+        if is_prepared_snapshot(&policy.metadata.name, &policy.metadata.labels, PLACEMENT_SNAPSHOT_KIND)
+            || policy.metadata.name.starts_with(DOCKER_POLICY_NAME_PREFIX)
+            || policy.metadata.name.starts_with(HOST_DIRECT_NAME_PREFIX)
+        {
             continue;
         }
         if policy.metadata.deletion_timestamp.is_some() {
@@ -403,7 +411,10 @@ pub(super) async fn migrate_listed_placement_policies(
     // This is idempotent; after the first successful pass the stored ref is
     // already the canonical Host resource name.
     for kind in kinds.list().await.map_err(|error| error.to_string())?.items {
-        if kind.metadata.deletion_timestamp.is_some() || kind.spec.host_ref == host_ref {
+        if kind.metadata.deletion_timestamp.is_some()
+            || kind.spec.host_ref == host_ref
+            || is_prepared_snapshot(&kind.metadata.name, &kind.metadata.labels, PLACEMENT_SNAPSHOT_KIND)
+        {
             continue;
         }
         if kind_belongs_to_host(hosts, &kind, host_ref, "kind canonicalization") {

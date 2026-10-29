@@ -2930,7 +2930,6 @@ async fn skill_failure_vessel(convoy: &flotilla_resources::ResourceObject<Convoy
                     host_ref: "host".into(),
                     image: "test".into(),
                     image_build_ref: None,
-                    memory_policy: Default::default(),
                     declared_agent_adapters: Default::default(),
                     required_agent_adapters: Default::default(),
                     pull_policy: Default::default(),

@@ -191,6 +191,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
                 env: &TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]),
                 scratch: Path::new("/tmp/flotilla-probe-test"),
                 observation: &Default::default(),
+                harnesses: &flotilla_agent::adapter::built_in_harnesses().collect::<Vec<_>>(),
             },
             &mut ModelProbeState::default(),
         )
@@ -276,6 +277,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
             env: &TestEnvVars::default(),
             scratch: Path::new("/tmp/flotilla-probe-test"),
             observation: &Default::default(),
+            harnesses: &flotilla_agent::adapter::built_in_harnesses().collect::<Vec<_>>(),
         },
         &mut model_probes,
     )
@@ -303,6 +305,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
             env: &TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]),
             scratch: Path::new("/tmp/flotilla-probe-test"),
             observation: &Default::default(),
+            harnesses: &flotilla_agent::adapter::built_in_harnesses().collect::<Vec<_>>(),
         },
         &mut model_probes,
     )
@@ -505,8 +508,8 @@ async fn peer_summary_does_not_author_transitional_host_or_policy_rows() {
 
     let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
     assert!(matches!(hosts.get("feta-host").await, Err(ResourceError::NotFound { .. })));
-    let policies = daemon.resource_backend().using::<PlacementPolicy>(NAMESPACE);
-    assert!(matches!(policies.get("host-direct-feta-host").await, Err(ResourceError::NotFound { .. })));
+    let kinds = daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE);
+    assert!(matches!(kinds.get("host-direct-feta-host").await, Err(ResourceError::NotFound { .. })));
 }
 
 // Subprocess boundary stand-in: unresolved provider selection must not invoke a
@@ -594,6 +597,7 @@ fn unresolved_fulfilment_provider_publishes_unknown(tc: hegel::TestCase) {
                 env: &TestEnvVars::default(),
                 scratch: Path::new("/tmp/probe"),
                 observation: &Default::default(),
+                harnesses: &flotilla_agent::adapter::built_in_harnesses().collect::<Vec<_>>(),
             },
             &mut model_probes,
         )
@@ -778,11 +782,7 @@ async fn headless_host_is_not_granted_a_gui_session() {
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
     let host_id = daemon.local_host_id().expect("local host id").to_string();
     ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "b1", None).await.expect("host registration");
-    let policy = PlacementPolicySpec::builder()
-        .pool("passthrough".to_string())
-        .host_direct(HostDirectPlacementPolicySpec { host_ref: host_id.clone(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
-        .build();
-    let mut stored = FulfilmentKindSpec::from_policy(&policy, "linux").expect("host-direct kind");
+    let mut stored = host_direct_kind_spec(&host_id, "linux");
     stored.grants.insert(FulfilmentGrant::gui_session());
     let kinds = daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE);
     kinds.create(&empty_meta("host-direct-b1"), &stored).await.expect("stored kind");
@@ -801,6 +801,7 @@ async fn headless_host_is_not_granted_a_gui_session() {
                 env: &env,
                 scratch: Path::new("/tmp/flotilla-probe-test"),
                 observation: &Default::default(),
+                harnesses: &flotilla_agent::adapter::built_in_harnesses().collect::<Vec<_>>(),
             },
             &mut ModelProbeState::default(),
         )
@@ -822,23 +823,20 @@ async fn capped_docker_kind_publishes_free_slots_from_the_hosts_vessels() {
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
     let host_id = daemon.local_host_id().expect("local host id").to_string();
     ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "feta", Some(2)).await.expect("host registration");
-    let policy = PlacementPolicySpec::builder()
-        .pool("cleat".to_string())
-        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-            memory_policy: Default::default(),
-            host_ref: host_id.clone(),
-            image: Some("crew:test".into()),
-            pull_policy: Default::default(),
-            agent_adapters: BTreeSet::new(),
-            default_cwd: None,
-            env: BTreeMap::new(),
-            checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
-        })
-        .build();
     daemon
         .resource_backend()
         .using::<FulfilmentKind>(NAMESPACE)
-        .create(&empty_meta("docker-feta"), &FulfilmentKindSpec::from_policy(&policy, "linux").expect("Docker kind"))
+        .create(
+            &empty_meta("docker-feta"),
+            &FulfilmentKindSpec::builder()
+                .host_ref(host_id.clone())
+                .pool("cleat".to_string())
+                .grants(BTreeSet::from([FulfilmentGrant::platform("linux".to_string()), FulfilmentGrant::network("scoped".to_string())]))
+                .realisation(FulfilmentRealisation::DockerPerVessel {
+                    image: Some(flotilla_resources::DockerImageSource::Literal("crew:test".into())),
+                })
+                .build(),
+        )
         .await
         .expect("Docker kind");
     let runner = Arc::new(DiscoveryMockRunner::builder().build());
@@ -859,6 +857,7 @@ async fn capped_docker_kind_publishes_free_slots_from_the_hosts_vessels() {
                     env: &TestEnvVars::default(),
                     scratch: Path::new("/tmp/flotilla-probe-test"),
                     observation: &Default::default(),
+                    harnesses: &flotilla_agent::adapter::built_in_harnesses().collect::<Vec<_>>(),
                 },
                 &mut ModelProbeState::default(),
             )
@@ -918,11 +917,7 @@ async fn unknown_observation_keeps_a_gui_grant() {
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
     let host_id = daemon.local_host_id().expect("local host id").to_string();
     ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi", None).await.expect("host registration");
-    let policy = PlacementPolicySpec::builder()
-        .pool("passthrough".to_string())
-        .host_direct(HostDirectPlacementPolicySpec { host_ref: host_id.clone(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
-        .build();
-    let mut observed = FulfilmentKindSpec::from_policy(&policy, "macos").expect("host-direct kind");
+    let mut observed = host_direct_kind_spec(&host_id, "macos");
     observed.grants.insert(FulfilmentGrant::gui_session());
     let kinds = daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE);
     kinds.create(&empty_meta("host-direct-kiwi"), &observed).await.expect("kind with an observed GUI");
@@ -939,6 +934,7 @@ async fn unknown_observation_keeps_a_gui_grant() {
             env: &TestEnvVars::default(),
             scratch: Path::new("/tmp/flotilla-probe-test"),
             observation: &Default::default(),
+            harnesses: &flotilla_agent::adapter::built_in_harnesses().collect::<Vec<_>>(),
         },
         &mut ModelProbeState::default(),
     )
@@ -947,4 +943,17 @@ async fn unknown_observation_keeps_a_gui_grant() {
     assert!(!facts["host-direct-kiwi"].gui_session_logged_in, "the published fact is unknown");
     let kind = kinds.get("host-direct-kiwi").await.expect("kind");
     assert!(kind.spec.grants.contains(&FulfilmentGrant::gui_session()), "{:?}", kind.spec.grants);
+}
+
+fn host_direct_kind_spec(host_id: &str, platform: &str) -> FulfilmentKindSpec {
+    FulfilmentKindSpec::builder()
+        .host_ref(host_id.to_string())
+        .pool("passthrough".to_string())
+        .grants(BTreeSet::from([
+            FulfilmentGrant::platform(platform.to_string()),
+            FulfilmentGrant::host_account_reach(),
+            FulfilmentGrant::network("host".to_string()),
+        ]))
+        .realisation(FulfilmentRealisation::HostDirect)
+        .build()
 }

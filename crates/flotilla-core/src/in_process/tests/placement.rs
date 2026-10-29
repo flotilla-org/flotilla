@@ -8,9 +8,9 @@ use flotilla_config::ConfigStore;
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
     Convoy as ResourceConvoy, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
-    CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, Host as ResourceHost,
-    HostCondition, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, PlacementPolicy,
-    PlacementPolicySpec, Project, ProjectSpec, ResourceProvenance, Selector, TerminalSession as ResourceTerminalSession,
+    CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, FulfilmentFacts,
+    FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, Host as ResourceHost, HostCondition, HostSpec, HostStatus,
+    InputMeta, Project, ProjectSpec, ResourceProvenance, Selector, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
     TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
     AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL,
@@ -18,18 +18,35 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 
 use super::support::{
-    create_host_direct_placement, create_identity_convoy, create_running_session, create_test_environment, placement_policy, test_meta,
+    create_host_direct_placement, create_identity_convoy, create_running_session, create_test_environment, host_direct_kind, test_meta,
     trusted_codex_workflow,
 };
 use crate::in_process::{placement_actuator_host_ref, placement_target_host, ConditionValue, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;
 use flotilla_admission::convoy_admission::{
-    default_convoy_placement_policy, placement_agent_adapters, resolve_workflow_credentials, validate_workflow_agent_adapters,
-    validate_workflow_credentials,
+    placement_agent_adapters, resolve_workflow_credentials, validate_workflow_agent_adapters, validate_workflow_credentials,
+    PlacementResolution,
 };
 
+/// Resolves an unpinned convoy's placement over `backend` through admission's
+/// capability path.
+async fn created_convoy_placement(backend: &ResourceBackend, workflow: &WorkflowTemplateSpec) -> Result<PlacementResolution, String> {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"placement-resolver\"\n").expect("daemon config");
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("placement-resolver"),
+        backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    daemon.admission.resolve_created_convoy_placement("flotilla", None, &[], workflow, None).await
+}
+
 #[tokio::test]
-async fn default_remote_placement_resolves_replicated_credentials_before_admission() {
+async fn remote_placement_resolves_replicated_credentials_before_admission() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"local-host\"\n").expect("daemon config");
     let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -122,6 +139,17 @@ async fn default_remote_placement_resolves_replicated_credentials_before_admissi
                 .collect(),
                 heartbeat_at: Some(Utc::now()),
                 ready: true,
+                fulfilment_facts: BTreeMap::from([(
+                    "docker-udder-id".to_string(),
+                    FulfilmentFacts {
+                        harnesses: BTreeMap::from([(
+                            "claude-code".to_string(),
+                            HarnessFacts { version: "2.0.0".to_string(), models: BTreeMap::new() },
+                        )]),
+                        observed_at: Utc::now(),
+                        ..Default::default()
+                    },
+                )]),
                 ..HostStatus::default()
             },
         )
@@ -129,30 +157,24 @@ async fn default_remote_placement_resolves_replicated_credentials_before_admissi
         .expect("remote host capabilities");
     let placement_source = ResourceBackend::new(InMemoryBackend::default());
     placement_source
-        .using::<PlacementPolicy>("flotilla")
+        .using::<FulfilmentKind>("flotilla")
         .create(
             &test_meta("docker-udder-id"),
-            &PlacementPolicySpec::builder()
+            &FulfilmentKindSpec::builder()
+                .host_ref("udder-id".to_string())
                 .pool("passthrough".to_string())
-                .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
-                    memory_policy: Default::default(),
-                    host_ref: "udder-id".to_string(),
-                    image: Some("crew:latest".into()),
-                    pull_policy: Default::default(),
-                    agent_adapters: BTreeSet::from(["claude-code".to_string()]),
-                    default_cwd: None,
-                    env: BTreeMap::new(),
-                    checkout: flotilla_resources::DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+                .realisation(FulfilmentRealisation::DockerPerVessel {
+                    image: Some(flotilla_resources::DockerImageSource::Literal("crew:latest".to_string())),
                 })
                 .build(),
         )
         .await
         .expect("remote placement");
     backend
-        .replica_writer::<PlacementPolicy>(NodeId::new("udder-root"), "flotilla")
-        .replace(&placement_source.using::<PlacementPolicy>("flotilla").list().await.expect("list remote placement policies"), Utc::now())
+        .replica_writer::<FulfilmentKind>(NodeId::new("udder-root"), "flotilla")
+        .replace(&placement_source.using::<FulfilmentKind>("flotilla").list().await.expect("list remote kinds"), Utc::now())
         .await
-        .expect("replicate remote placement policy");
+        .expect("replicate remote kind");
 
     let intent = flotilla_protocol::ConvoyStartIntent::builder().project_ref("andamento".to_string()).build();
     let (_, mut resolved_workflow) = daemon
@@ -166,7 +188,7 @@ async fn default_remote_placement_resolves_replicated_credentials_before_admissi
         .await
         .expect("resolve admission workflow");
     let placement =
-        backend.including_replicas::<PlacementPolicy>("flotilla").get("docker-udder-id").await.expect("placement replica").object;
+        backend.including_replicas::<FulfilmentKind>("flotilla").get("docker-udder-id").await.expect("placement replica").object;
     resolve_workflow_credentials(&backend, "flotilla", Some("andamento"), &[], &mut resolved_workflow)
         .await
         .expect("resolve replicated credential grant");
@@ -197,106 +219,49 @@ async fn default_remote_placement_resolves_replicated_credentials_before_admissi
 async fn placement_candidates_and_refusals_agree_across_roots() {
     let kiwi = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("kiwi-root"));
     let feta = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("feta-root"));
-    placement_policy(&kiwi, "kiwi-policy", "kiwi").await;
-    placement_policy(&feta, "feta-policy", "feta").await;
+    host_direct_kind(&kiwi, "kiwi-kind", "kiwi").await;
+    host_direct_kind(&feta, "feta-kind", "feta").await;
     let synced_at = Utc::now();
     for (destination, source, origin) in [(&kiwi, &feta, "feta-root"), (&feta, &kiwi, "kiwi-root")] {
         destination
-            .replica_writer::<PlacementPolicy>(NodeId::new(origin), "flotilla")
-            .replace(&source.using::<PlacementPolicy>("flotilla").list().await.expect("local policies"), synced_at)
+            .replica_writer::<FulfilmentKind>(NodeId::new(origin), "flotilla")
+            .replace(&source.using::<FulfilmentKind>("flotilla").list().await.expect("local kinds"), synced_at)
             .await
-            .expect("replicate policies");
+            .expect("replicate kinds");
     }
     let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
-    let left = default_convoy_placement_policy(&kiwi, "flotilla", None, &[], &workflow, None).await.expect("kiwi candidates");
-    let right = default_convoy_placement_policy(&feta, "flotilla", None, &[], &workflow, None).await.expect("feta candidates");
-    assert_eq!(left.refused_candidates, right.refused_candidates);
-    assert_eq!(
-        left.refused_candidates.iter().map(|candidate| candidate.kind.as_str()).collect::<Vec<_>>(),
-        vec!["feta-policy", "kiwi-policy"]
-    );
+    let left = created_convoy_placement(&kiwi, &workflow).await.expect_err("kiwi candidates");
+    let right = created_convoy_placement(&feta, &workflow).await.expect_err("feta candidates");
+    assert_eq!(left, right);
+    assert!(left.find("feta-kind").expect("feta refused") < left.find("kiwi-kind").expect("kiwi refused"), "{left}");
     for backend in [&kiwi, &feta] {
-        assert_eq!(backend.using::<PlacementPolicy>("flotilla").list().await.expect("controller view").items.len(), 1);
+        assert_eq!(backend.using::<FulfilmentKind>("flotilla").list().await.expect("controller view").items.len(), 1);
     }
-    let replica = kiwi.including_replicas::<PlacementPolicy>("flotilla").get("feta-policy").await.expect("replica provenance");
+    let replica = kiwi.including_replicas::<FulfilmentKind>("flotilla").get("feta-kind").await.expect("replica provenance");
     assert_eq!(replica.provenance, ResourceProvenance::Replica { origin_root: NodeId::new("feta-root"), last_synced_at: synced_at });
 }
 
 #[tokio::test]
 async fn placement_decision_prefers_local_home_copy_over_same_name_replica() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let hosts = backend.using::<ResourceHost>("flotilla");
-    for host in ["local-host", "replica-host"] {
-        let object = hosts
-            .create(&test_meta(host), &HostSpec { display_name: host.to_string(), connection: Default::default(), ..HostSpec::default() })
-            .await
-            .expect("placement host");
-        hosts
-            .update_status(
-                host,
-                &object.metadata.resource_version,
-                &HostStatus {
-                    capabilities: [(
-                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
-                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
-                    )]
-                    .into_iter()
-                    .collect(),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-    }
-
-    backend
-        .using::<PlacementPolicy>("flotilla")
-        .create(
-            &test_meta("shared-policy"),
-            &PlacementPolicySpec::builder()
-                .pool("passthrough".to_string())
-                .priority(0)
-                .host_direct(HostDirectPlacementPolicySpec {
-                    host_ref: "local-host".to_string(),
-                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                })
-                .build(),
-        )
-        .await
-        .expect("local home policy");
+    create_host_direct_placement(&backend, "shared-kind", "local-host", BTreeSet::new()).await;
     let replica_source = ResourceBackend::new(InMemoryBackend::default());
-    replica_source
-        .using::<PlacementPolicy>("flotilla")
-        .create(
-            &test_meta("shared-policy"),
-            &PlacementPolicySpec::builder()
-                .pool("passthrough".to_string())
-                .priority(100)
-                .host_direct(HostDirectPlacementPolicySpec {
-                    host_ref: "replica-host".to_string(),
-                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                })
-                .build(),
-        )
-        .await
-        .expect("replica policy source");
+    create_host_direct_placement(&replica_source, "shared-kind", "replica-host", BTreeSet::new()).await;
+    let replica_host = replica_source.using::<ResourceHost>("flotilla").list().await.expect("replica host");
     backend
-        .replica_writer::<PlacementPolicy>(NodeId::new("remote-root"), "flotilla")
-        .replace(&replica_source.using::<PlacementPolicy>("flotilla").list().await.expect("list replica policy"), Utc::now())
+        .replica_writer::<ResourceHost>(NodeId::new("remote-root"), "flotilla")
+        .replace(&replica_host, Utc::now())
         .await
-        .expect("replicate colliding policy");
+        .expect("replicate replica host");
+    backend
+        .replica_writer::<FulfilmentKind>(NodeId::new("remote-root"), "flotilla")
+        .replace(&replica_source.using::<FulfilmentKind>("flotilla").list().await.expect("list replica kind"), Utc::now())
+        .await
+        .expect("replicate colliding kind");
 
-    let resolution = default_convoy_placement_policy(
-        &backend,
-        "flotilla",
-        None,
-        &[],
-        &WorkflowTemplateSpec::builder().vessels(Vec::new()).build(),
-        None,
-    )
-    .await
-    .expect("resolve placement");
-    let selected = resolution.selected.expect("select local home policy");
+    let resolution =
+        created_convoy_placement(&backend, &WorkflowTemplateSpec::builder().vessels(Vec::new()).build()).await.expect("resolve placement");
+    let selected = resolution.selected.expect("select local home kind");
 
     assert_eq!(placement_host_ref(&selected), Some("local-host"));
     assert!(resolution.viable_not_selected.is_empty(), "same-name replica must not remain as a second candidate");
@@ -305,7 +270,7 @@ async fn placement_decision_prefers_local_home_copy_over_same_name_replica() {
 #[tokio::test]
 async fn placement_target_host_rejects_unknown_display_name() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let policy = placement_policy(&backend, "unknown-host", "missing-host").await;
+    let policy = host_direct_kind(&backend, "unknown-host", "missing-host").await;
     let error = placement_target_host(&backend, "flotilla", &policy).await.expect_err("unknown host alias must be rejected");
     assert_eq!(error, "placement `unknown-host` references unknown host `missing-host`");
 }
@@ -323,7 +288,7 @@ async fn placement_target_host_rejects_ambiguous_display_name() {
             .await
             .expect("host");
     }
-    let policy = placement_policy(&backend, "ambiguous-host", "shared-name").await;
+    let policy = host_direct_kind(&backend, "ambiguous-host", "shared-name").await;
     let error = placement_target_host(&backend, "flotilla", &policy).await.expect_err("ambiguous host alias must be rejected");
     assert_eq!(error, "placement `ambiguous-host` host reference `shared-name` is ambiguous");
 }
@@ -369,7 +334,7 @@ async fn ssh_host_takes_only_pinned_work_and_routes_to_its_owner() {
         )
         .await
         .expect("SSH observation");
-    let policy = placement_policy(&backend, "host-direct-ssh-host", "ssh-host").await;
+    let policy = host_direct_kind(&backend, "host-direct-ssh-host", "ssh-host").await;
     let trusted = WorkflowTemplateSpec::builder()
         .vessels(vec![flotilla_resources::VesselRequirement::builder()
             .name("work".to_string())
@@ -379,11 +344,9 @@ async fn ssh_host_takes_only_pinned_work_and_routes_to_its_owner() {
                 .build()])
             .build()])
         .build();
-    let unpinned = default_convoy_placement_policy(&backend, "flotilla", None, &[], &trusted, None).await.expect("placement scoring");
-    assert!(unpinned.selected.is_none(), "an unpinned convoy must not land on an SSH host");
-    assert_eq!(unpinned.refused_candidates.len(), 1);
-    assert_eq!(unpinned.refused_candidates[0].kind, policy.metadata.name);
-    assert_eq!(unpinned.refused_candidates[0].reason, "SSH host takes only convoys that pin its placement");
+    let unpinned = created_convoy_placement(&backend, &trusted).await.expect_err("an unpinned convoy must not land on an SSH host");
+    assert!(unpinned.contains(&policy.metadata.name), "{unpinned}");
+    assert!(unpinned.contains("SSH host takes only convoys that pin its placement"), "{unpinned}");
     validate_workflow_agent_adapters(&backend, "flotilla", &trusted, Some(&policy), false)
         .await
         .expect("pinned trusted work is admissible");
@@ -428,7 +391,7 @@ async fn codex_crews_place_on_an_ssh_host_only_while_its_owner_has_a_central_log
             .extend(central_login.map(|held| (flotilla_resources::CODEX_CENTRAL_LOGIN_CAPABILITY.to_string(), serde_json::json!(held))));
         let status = HostStatus { capabilities, heartbeat_at: Some(Utc::now()), ready: true, ..HostStatus::default() };
         hosts.update_status(&host.metadata.name, &host.metadata.resource_version, &status).await.expect("SSH observation");
-        let policy = placement_policy(&backend, "host-direct-ssh-host", "ssh-host").await;
+        let policy = host_direct_kind(&backend, "host-direct-ssh-host", "ssh-host").await;
 
         let placed =
             validate_workflow_agent_adapters(&backend, "flotilla", &flotilla_resources::single_agent_workflow_spec(), Some(&policy), false)
@@ -446,52 +409,9 @@ async fn codex_crews_place_on_an_ssh_host_only_while_its_owner_has_a_central_log
 }
 
 #[tokio::test]
-async fn default_placement_prefers_local_host_referenced_by_display_name() {
+async fn placement_refuses_unknown_host_without_blocking_tool_workflow() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    create_host_direct_placement(&backend, "host-direct-a-remote", "remote-host", BTreeSet::from(["codex".to_string()])).await;
-    let hosts = backend.using::<ResourceHost>("flotilla");
-    let local = hosts
-        .create(
-            &test_meta("local-host-id"),
-            &HostSpec { display_name: "local-host".to_string(), connection: Default::default(), ..HostSpec::default() },
-        )
-        .await
-        .expect("local host");
-    hosts
-        .update_status(
-            &local.metadata.name,
-            &local.metadata.resource_version,
-            &HostStatus {
-                capabilities: [
-                    (
-                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
-                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
-                    ),
-                    (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"])),
-                ]
-                .into_iter()
-                .collect(),
-                heartbeat_at: Some(Utc::now()),
-                ready: true,
-                ..HostStatus::default()
-            },
-        )
-        .await
-        .expect("local host status");
-    placement_policy(&backend, "host-direct-z-local", "local-host").await;
-
-    let local_host_id = flotilla_protocol::CanonicalHostId::resolved("local-host-id");
-    let resolution = default_convoy_placement_policy(&backend, "flotilla", None, &[], &trusted_codex_workflow(), Some(&local_host_id))
-        .await
-        .expect("default placement");
-    assert_eq!(resolution.selected.expect("viable placement").metadata.name, "host-direct-z-local");
-    assert_eq!(resolution.viable_not_selected[0].reason, "fallback ordering preferred local policy `host-direct-z-local`");
-}
-
-#[tokio::test]
-async fn default_placement_refuses_unknown_host_without_blocking_tool_workflow() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    placement_policy(&backend, "a-unknown-host", "deleted-host").await;
+    host_direct_kind(&backend, "a-unknown-host", "deleted-host").await;
     create_host_direct_placement(&backend, "z-clean", "clean-host", BTreeSet::new()).await;
     let workflow = flotilla_resources::WorkflowTemplateSpec::builder()
         .vessels(vec![flotilla_resources::VesselRequirement::builder()
@@ -503,13 +423,13 @@ async fn default_placement_refuses_unknown_host_without_blocking_tool_workflow()
             .build()])
         .build();
 
-    let resolution = default_convoy_placement_policy(&backend, "flotilla", None, &[], &workflow, None).await.expect("clean candidate");
+    let resolution = created_convoy_placement(&backend, &workflow).await.expect("clean candidate");
     assert_eq!(resolution.selected.expect("clean placement").metadata.name, "z-clean");
     assert_eq!(resolution.refused_candidates[0].kind, "a-unknown-host");
 }
 
 #[tokio::test]
-async fn default_placement_error_lists_each_refusal_and_failed_host_condition_reason() {
+async fn placement_error_lists_each_refusal_and_failed_host_condition_reason() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     for (policy_name, host_name, condition_reason, condition_message) in [
         ("host-direct-feta", "feta", "StoredObjectDecodeFailed", "ConvoyEnsure/quarantined-record failed typed decode"),
@@ -543,22 +463,22 @@ async fn default_placement_error_lists_each_refusal_and_failed_host_condition_re
             .expect("degraded host status");
     }
 
-    let error = default_convoy_placement_policy(&backend, "flotilla", None, &[], &trusted_codex_workflow(), None)
-        .await
-        .expect_err("all placement candidates should be refused");
+    let error =
+        created_convoy_placement(&backend, &trusted_codex_workflow()).await.expect_err("all placement candidates should be refused");
 
-    assert_eq!(
-        error,
-        "no placement policy satisfies adapter `codex`; candidates:\n\
-- `host-direct-feta`: placement `host-direct-feta` host `feta` generation `feta-generation` is not ready: \
-StoredObjectDecodeFailed: ConvoyEnsure/quarantined-record failed typed decode\n\
-- `host-direct-udder`: placement `host-direct-udder` host `udder` generation `udder-generation` is not ready: \
-RestartBudgetExhausted: resource controller stopped after repeated failures"
-    );
+    assert!(error.starts_with("no fulfilment kind covers"), "{error}");
+    for refusal in [
+        "host-direct-feta: placement `host-direct-feta` host `feta` generation `feta-generation` is not ready: \
+StoredObjectDecodeFailed: ConvoyEnsure/quarantined-record failed typed decode",
+        "host-direct-udder: placement `host-direct-udder` host `udder` generation `udder-generation` is not ready: \
+RestartBudgetExhausted: resource controller stopped after repeated failures",
+    ] {
+        assert!(error.contains(refusal), "{error}");
+    }
 }
 
 #[tokio::test]
-async fn default_placement_accepts_a_host_with_an_authorship_collision() {
+async fn placement_accepts_a_host_with_an_authorship_collision() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     create_host_direct_placement(&backend, "host-direct-feta", "feta", BTreeSet::from(["codex".to_string()])).await;
     let hosts = backend.using::<ResourceHost>("flotilla");
@@ -587,7 +507,7 @@ async fn default_placement_accepts_a_host_with_an_authorship_collision() {
         .await
         .expect("host status with advisory collision");
 
-    let resolution = default_convoy_placement_policy(&backend, "flotilla", None, &[], &trusted_codex_workflow(), None)
+    let resolution = created_convoy_placement(&backend, &trusted_codex_workflow())
         .await
         .expect("standing authorship collisions must not freeze dispatch placement");
 

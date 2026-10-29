@@ -34,7 +34,6 @@ async fn daemon_reads_environment_readiness_and_identity_without_a_copy() {
                             host_ref: "host".into(),
                             image: "image".into(),
                             image_build_ref: None,
-                            memory_policy: Default::default(),
                             declared_agent_adapters: BTreeSet::new(),
                             required_agent_adapters: BTreeSet::new(),
                             pull_policy: Default::default(),

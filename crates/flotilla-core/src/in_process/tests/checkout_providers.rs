@@ -70,6 +70,73 @@ async fn checkout_vcs_discovery_is_cached_per_checkout() {
     assert!(Arc::ptr_eq(&first, &first_again));
     assert!(!Arc::ptr_eq(&first, &second));
 }
+/// Claims a path only when its bag names the remote on `forge.example`.
+struct RemoteClaiming(FakeVcsFactory);
+
+#[async_trait::async_trait]
+impl flotilla_discovery_api::Factory for RemoteClaiming {
+    type Descriptor = flotilla_discovery_api::ProviderDescriptor;
+    type Output = dyn flotilla_vcs::vcs::Vcs;
+
+    fn descriptor(&self) -> Self::Descriptor {
+        self.0.descriptor()
+    }
+
+    async fn probe(
+        &self,
+        env: &flotilla_discovery_api::EnvironmentBag,
+        config: &dyn flotilla_discovery_api::provider_config::ProviderConfigView,
+        repo_root: &flotilla_paths::path_context::ExecutionEnvironmentPath,
+        runner: Arc<dyn flotilla_provider_runtime::CommandRunner>,
+    ) -> Result<Arc<dyn flotilla_vcs::vcs::Vcs>, Vec<flotilla_discovery_api::UnmetRequirement>> {
+        if env.find_remote_host("forge.example").is_none() {
+            return Err(vec![flotilla_discovery_api::UnmetRequirement::MissingRemoteHost("forge.example".into())]);
+        }
+        self.0.probe(env, config, repo_root, runner).await
+    }
+}
+
+// A path not yet cloned has no remote to detect: discovery takes the remote from the
+// Clone recorded for that path on this host, and from nothing else.
+#[tokio::test]
+async fn checkout_vcs_discovery_names_the_repository_a_clone_is_for() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"clone-remote-test\"\n").expect("daemon config");
+    let cloned = temp.path().join("cloned");
+    let unrecorded = temp.path().join("unrecorded");
+    let mut discovery = fake_discovery(false);
+    discovery.factories.vcs = [&cloned, &unrecorded]
+        .into_iter()
+        .map(|path| Box::new(RemoteClaiming(FakeVcsFactory::new(FakeVcsState::builder(path).build()))) as Box<_>)
+        .collect();
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        discovery,
+        HostName::new("local-host"),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    let repository = RepositorySpec::remote("https://forge.example/team/repo").expect("repository");
+    daemon
+        .resource_backend
+        .using::<flotilla_resources::Clone>("flotilla")
+        .create(
+            &test_meta("clone"),
+            &flotilla_resources::CloneSpec {
+                repo_ref: repository.key(),
+                url: "https://forge.example/team/repo".into(),
+                env_ref: flotilla_resources::host_direct_environment_name(daemon.environment_manager.local_host_id().as_str()),
+                path: cloned.to_string_lossy().into(),
+            },
+        )
+        .await
+        .expect("clone");
+    assert!(daemon.local_vcs_for_checkout(&cloned).await.is_ok());
+    let error = daemon.local_vcs_for_checkout(&unrecorded).await.err().expect("no remote");
+    assert!(error.contains("forge.example"), "{error}");
+}
+
 #[tokio::test]
 async fn repository_watch_evicts_deleted_providers_and_relist_preserves_live_providers() {
     let temp = tempfile::tempdir().expect("tempdir");

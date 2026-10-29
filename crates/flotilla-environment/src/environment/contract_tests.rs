@@ -65,6 +65,9 @@ impl CommandRunner for DockerEngine {
         if cmd == "cat" {
             return Err("no cgroup sample".into());
         }
+        if cmd == "systemctl" {
+            return Ok(super::docker_vessels::TEST_SLICE_SHOW.into());
+        }
         assert_eq!(cmd, "docker");
         if self.unavailable.load(Ordering::Acquire) {
             return Err("provider API unavailable".into());
@@ -77,7 +80,7 @@ impl CommandRunner for DockerEngine {
             ["exec", "--user", "0", ..]
             | ["exec", _, "/opt/drydock/drydock-agent", "--supervise", "--socket", "/run/drydock/agent.sock"] => Ok(String::new()),
             ["inspect", "--format", "{{json .Config.Env}}", _] => Ok(r#"["HOME=/tmp","PATH=/usr/bin:/bin"]"#.into()),
-            ["info", "--format", "{{json .}}"] => Ok(r#"{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":true}"#.into()),
+            ["info", "--format", "{{json .}}"] => Ok(super::docker_vessels::TEST_DOCKER_INFO.into()),
             ["run", ..] => {
                 let name = args.windows(2).find(|pair| pair[0] == "--name").unwrap()[1];
                 let id = args.iter().find_map(|arg| arg.strip_prefix("FLOTILLA_ENVIRONMENT_ID=")).unwrap();
@@ -131,6 +134,7 @@ pub(super) fn docker_provider(runner: Arc<dyn CommandRunner>) -> docker::DockerE
     let keep = directory.clone();
     let agents = Mutex::new(BTreeMap::<std::path::PathBuf, Arc<MemoryAgent>>::new());
     docker::DockerEnvironmentProvider::new(runner)
+        .with_vessel_slice(Some(super::docker_vessels::DockerVessels::for_tests()))
         .with_agent_settings(docker::DockerAgentSettings {
             runtime_root: directory.path().into(),
             executable: directory.path().join("current-agent"),
@@ -336,7 +340,8 @@ fn docker_readiness_reports_endpoint_host_requirements(tc: hegel::TestCase) {
             if case == 4 { Err("runtime socket denied".into()) } else { Ok("{}".into()) },
         )
         .build();
-    let provider = docker::DockerEnvironmentProvider::new(Arc::new(runner));
+    let provider =
+        docker::DockerEnvironmentProvider::new(Arc::new(runner)).with_vessel_slice(Some(super::docker_vessels::DockerVessels::for_tests()));
     let readiness = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(provider.detect_readiness());
     match case {
         0 => assert!(matches!(readiness, ProviderReadiness::MissingTool { reason } if reason.contains("runtime absent"))),

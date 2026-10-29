@@ -173,7 +173,6 @@ fn docker_environment_metadata_decodes_non_empty_credential_scopes() {
     let expected = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository]))]);
     let spec = flotilla_resources::DockerEnvironmentSpec {
         image_build_ref: None,
-        memory_policy: Default::default(),
         host_ref: "host-a".to_string(),
         image: "crew:latest".to_string(),
         declared_agent_adapters: BTreeSet::new(),
@@ -463,7 +462,6 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_pushed_into(
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
                     image_build_ref: None,
-                    memory_policy: Default::default(),
                     host_ref: "host-test".into(),
                     image: "contained-image".into(),
                     declared_agent_adapters: BTreeSet::from(["claude-code".into()]),
@@ -644,7 +642,6 @@ async fn codex_adapter_delivers_the_central_credential_in_a_writable_codex_home(
     );
     let spec = flotilla_resources::DockerEnvironmentSpec {
         image_build_ref: None,
-        memory_policy: Default::default(),
         host_ref: "host-test".to_string(),
         image: "contained-image".to_string(),
         declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
@@ -794,7 +791,6 @@ async fn codex_credential_and_agent_material_conflict_before_container_creation(
     );
     let spec = flotilla_resources::DockerEnvironmentSpec {
         image_build_ref: None,
-        memory_policy: Default::default(),
         host_ref: "host-test".to_string(),
         image: "contained-image".to_string(),
         declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
@@ -887,7 +883,6 @@ async fn an_unprovisioned_central_codex_credential_fails_before_registry_preflig
     );
     let spec = flotilla_resources::DockerEnvironmentSpec {
         image_build_ref: None,
-        memory_policy: Default::default(),
         host_ref: "host-test".to_string(),
         image: "registry.example/crew:latest".to_string(),
         declared_agent_adapters: BTreeSet::from(["codex".to_string()]),

@@ -455,12 +455,9 @@ pub async fn ensure_dependency_fingerprint_tracks_replicated_placement_changes(f
         .await
         .expect("absent fingerprint");
     let source = ResourceBackend::new(InMemoryBackend::default());
-    let mut policy = placement_policy(&source, "remote-policy", "other-host").await;
-    let writer = backend.replica_writer::<PlacementPolicy>(NodeId::new("other-root"), "flotilla");
-    writer
-        .replace(&source.using::<PlacementPolicy>("flotilla").list().await.expect("policies"), Utc::now())
-        .await
-        .expect("replicate policy");
+    let mut kind = placement_kind(&source, "remote-policy", "other-host").await;
+    let writer = backend.replica_writer::<FulfilmentKind>(NodeId::new("other-root"), "flotilla");
+    writer.replace(&source.using::<FulfilmentKind>("flotilla").list().await.expect("kinds"), Utc::now()).await.expect("replicate kind");
     let present = factory
         .dependency_hash(
             daemon.as_ref(),
@@ -473,14 +470,14 @@ pub async fn ensure_dependency_fingerprint_tracks_replicated_placement_changes(f
         .await
         .expect("replica fingerprint");
     assert_ne!(absent, present, "arrival must invalidate an admission refusal");
-    policy.spec.priority = 42;
+    kind.spec.cost_class = flotilla_resources::FulfilmentCostClass::Metered;
     source
-        .using::<PlacementPolicy>("flotilla")
-        .update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &policy.spec)
+        .using::<FulfilmentKind>("flotilla")
+        .update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &kind.spec)
         .await
-        .expect("change policy");
+        .expect("change kind");
     writer
-        .replace(&source.using::<PlacementPolicy>("flotilla").list().await.expect("updated policies"), Utc::now())
+        .replace(&source.using::<FulfilmentKind>("flotilla").list().await.expect("updated kinds"), Utc::now())
         .await
         .expect("replicate change");
     assert_ne!(
@@ -656,6 +653,7 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
         )
         .await
         .expect("root B host resource");
+    create_host_direct_placement(&target, "host-direct-root-b-vessels", "root-b-vessels").await;
     let source = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
     let repository_spec = RepositorySpec::remote("https://github.com/acme/cross-root").expect("repository spec");
     let repository_key = repository_spec.key();
@@ -880,6 +878,7 @@ pub async fn off_home_driver_admits_an_ensure_from_replicated_project_definition
     std::fs::write(driver_temp.path().join("daemon.toml"), "machine_id = \"driver-test\"\n").expect("driver config");
     let driver_backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("driver-root"));
     let home_root = NodeId::new("home-root");
+    create_host_direct_placement(&driver_backend, "host-direct-driver-vessels", "driver-vessels").await;
     driver_backend
         .replica_writer::<Project>(home_root.clone(), "flotilla")
         .replace(&home_backend.using::<Project>("flotilla").list().await.expect("home projects"), Utc::now())

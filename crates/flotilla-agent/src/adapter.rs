@@ -1247,6 +1247,23 @@ pub trait AgentAdapterFactory: Send + Sync {
     fn account_state(&self) -> Option<AccountState> {
         None
     }
+
+    /// The contributed harness, which fulfilment probes look for in each realisation.
+    fn harness(&self) -> Option<Harness> {
+        None
+    }
+}
+
+/// An adapter id and the executable its harness runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Harness {
+    pub adapter: &'static str,
+    pub binary: &'static str,
+}
+
+/// The built-in harnesses, each running its [`harness_binary`].
+pub fn built_in_harnesses() -> impl Iterator<Item = Harness> {
+    ["claude-code", "codex"].into_iter().filter_map(|adapter| Some(Harness { adapter, binary: harness_binary(adapter)? }))
 }
 
 /// Claude Code's login and configuration home, and the variables that

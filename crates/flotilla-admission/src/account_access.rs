@@ -17,7 +17,7 @@ use flotilla_resources::{
         binding_name, requester_address, requester_parts, AccessName, AccountBindingSpec, AccountRecords, BindingRecord, BindingState,
         CredentialName, EpochEntry, GrantName, GrantScope, PendingBinding, Selection,
     },
-    Convoy, ConvoyRepositorySpec, CredentialGrant, CredentialSpec, CrewSource, Host as ResourceHost, PlacementPolicy, PlacementPolicySpec,
+    Convoy, ConvoyRepositorySpec, CredentialGrant, CredentialSpec, CrewSource, FulfilmentKind, FulfilmentKindSpec, Host as ResourceHost,
     Repository, RepositoryKey, RepositoryTrust, ResourceError, ResourceObject, WorkflowTemplateSpec,
 };
 use flotilla_schema::{Records, State, Timestamp};
@@ -70,9 +70,9 @@ const ACCOUNT_SCOPE: &str = "account";
 /// Who pinned a binding chosen from `convoy start --account`.
 pub const CONVOY_START_PIN: &str = "convoy start --account";
 
-/// The candidate environment kind a placement policy resolves to on its target host.
-pub fn placement_environment_kind(spec: &PlacementPolicySpec, host: Option<&ResourceObject<ResourceHost>>) -> EnvironmentKind {
-    EnvironmentKind::of_policy(spec, host.is_some_and(is_ssh_host))
+/// The candidate environment kind a fulfilment kind resolves to on its target host.
+pub fn placement_environment_kind(spec: &FulfilmentKindSpec, host: Option<&ResourceObject<ResourceHost>>) -> EnvironmentKind {
+    EnvironmentKind::of_realisation(&spec.realisation, host.is_some_and(is_ssh_host))
 }
 
 /// The reason a candidate environment kind is refused: some requester's access has no plan
@@ -262,7 +262,7 @@ pub fn check_placement(
     Ok(())
 }
 
-/// Resolve alternatives and check them against a placement policy, as admission does for each
+/// Resolve alternatives and check them against a fulfilment kind, as admission does for each
 /// candidate placement.
 pub async fn validate_account_access(
     backend: &ResourceBackend,
@@ -270,7 +270,7 @@ pub async fn validate_account_access(
     project_ref: Option<&str>,
     repositories: &[ConvoyRepositorySpec],
     workflow: &WorkflowTemplateSpec,
-    placement: Option<&ResourceObject<PlacementPolicy>>,
+    placement: Option<&ResourceObject<FulfilmentKind>>,
 ) -> Result<Vec<RequesterAlternatives>, String> {
     let mut alternatives = authorized_alternatives(backend, namespace, project_ref, repositories, workflow).await?;
     if alternatives.is_empty() {
@@ -286,7 +286,7 @@ async fn check_at_host(
     backend: &ResourceBackend,
     namespace: &str,
     alternatives: &mut [RequesterAlternatives],
-    spec: &PlacementPolicySpec,
+    spec: &FulfilmentKindSpec,
     target: &PlacementTargetHost,
     placement_name: &str,
 ) -> Result<(), String> {
@@ -371,8 +371,8 @@ pub async fn choose_bindings(
     repositories: &[ConvoyRepositorySpec],
     convoy: &str,
     workflow: &WorkflowTemplateSpec,
-    placements: &BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>,
-    fallback: Option<(&PlacementPolicySpec, &PlacementDecision)>,
+    placements: &BTreeMap<String, (FulfilmentKindSpec, PlacementDecision)>,
+    fallback: Option<(&FulfilmentKindSpec, &PlacementDecision)>,
     pins: &BTreeMap<String, String>,
     random: &dyn RandomSource,
     now: Timestamp,

@@ -76,6 +76,7 @@ pub struct DiscoveryMockRunnerBuilder {
     responses: ResponseMap,
     tool_exists: HashMap<String, bool>,
     files: HashMap<PathBuf, String>,
+    host_directories: bool,
 }
 
 pub struct DiscoveryMockRunner {
@@ -84,7 +85,11 @@ pub struct DiscoveryMockRunner {
     files: Mutex<HashMap<PathBuf, String>>,
     seen_cwds: Mutex<Vec<PathBuf>>,
     exists_calls: Mutex<Vec<(String, String)>>,
+    host_directories: bool,
 }
+
+/// The directory commands a runner with host directories runs for real.
+const DIRECTORY_COMMANDS: &[&str] = &["mkdir", "rmdir", "mv"];
 
 pub struct MergedPrProcessRunner {
     pr_number: u64,
@@ -141,7 +146,12 @@ impl Default for TestEnvVars {
 
 impl DiscoveryMockRunner {
     pub fn builder() -> DiscoveryMockRunnerBuilder {
-        DiscoveryMockRunnerBuilder { responses: HashMap::new(), tool_exists: HashMap::new(), files: HashMap::new() }
+        DiscoveryMockRunnerBuilder {
+            responses: HashMap::new(),
+            tool_exists: HashMap::new(),
+            files: HashMap::new(),
+            host_directories: false,
+        }
     }
 
     #[allow(dead_code)]
@@ -238,6 +248,13 @@ impl DiscoveryMockRunnerBuilder {
         self
     }
 
+    /// Directories are the host's own: `mkdir`, `rmdir`, `mv`, `rm -rf` and path
+    /// checks reach the real filesystem, as the daemon's own checks of its host do.
+    pub fn with_host_directories(mut self) -> Self {
+        self.host_directories = true;
+        self
+    }
+
     pub fn build(self) -> DiscoveryMockRunner {
         DiscoveryMockRunner {
             responses: Mutex::new(self.responses),
@@ -245,6 +262,7 @@ impl DiscoveryMockRunnerBuilder {
             files: Mutex::new(self.files),
             seen_cwds: Mutex::new(Vec::new()),
             exists_calls: Mutex::new(Vec::new()),
+            host_directories: self.host_directories,
         }
     }
 }
@@ -281,6 +299,9 @@ impl CommandRunner for DiscoveryMockRunner {
         self.seen_cwds.lock().expect("lock poisoned").push(cwd.to_path_buf());
         if cmd == "pwd" && args == ["-P"] {
             return Ok(format!("{}\n", cwd.display()));
+        }
+        if self.host_directories && (DIRECTORY_COMMANDS.contains(&cmd) || cmd == "rm" && args.starts_with(&["-rf"])) {
+            return ProcessCommandRunner.run(cmd, args, cwd, _label).await;
         }
         let key = (cmd.to_string(), args.join(" "));
         let mut map = self.responses.lock().expect("lock poisoned");
@@ -348,7 +369,10 @@ impl CommandRunner for DiscoveryMockRunner {
         self.tool_exists.get(cmd).copied().unwrap_or(false)
     }
 
-    async fn path_exists(&self, _path: &Path) -> Result<bool, String> {
+    async fn path_exists(&self, path: &Path) -> Result<bool, String> {
+        if self.host_directories {
+            return tokio::fs::try_exists(path).await.map_err(|error| error.to_string());
+        }
         Ok(true)
     }
 
@@ -385,6 +409,16 @@ pub fn fake_discovery(_legacy_mode: bool) -> flotilla_discovery::DiscoveryRuntim
 pub fn fake_discovery_on_host_os(legacy_mode: bool, host_os: &str) -> flotilla_discovery::DiscoveryRuntime {
     let mut discovery = fake_discovery(legacy_mode);
     discovery.env = std::sync::Arc::new(TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]).with_host_os(host_os));
+    discovery
+}
+
+/// Like [`fake_discovery`], but the host's directories are real and its home is `home`,
+/// so checkouts the daemon provisions on its host land under `home`.
+pub fn fake_discovery_with_host_directories(home: &Path) -> flotilla_discovery::DiscoveryRuntime {
+    let mut discovery = minimal_discovery_runtime(std::sync::Arc::new(
+        DiscoveryMockRunner::builder().on_run("git", &["--version"], Ok("git version 2.43.0".into())).with_host_directories().build(),
+    ));
+    discovery.env = std::sync::Arc::new(TestEnvVars::new([("FLOTILLA_PROBE_MODELS", String::new()), ("HOME", home.display().to_string())]));
     discovery
 }
 

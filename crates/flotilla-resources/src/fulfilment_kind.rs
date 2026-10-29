@@ -7,8 +7,8 @@ use crate::{
     Platform, ReplicationClass,
 };
 
-// A1 keeps policy snapshots for already admitted convoys. Kinds are authored
-// on their host and replicated read-only, like today's live policies.
+// Kinds are authored at their home and replicated read-only; admission's
+// placement snapshots are kinds too.
 define_resource!(
     FulfilmentKind,
     "fulfilmentkinds",
@@ -341,7 +341,7 @@ pub enum FulfilmentRealisation {
 }
 
 impl FulfilmentKindSpec {
-    /// Translate live policy topology without changing admission's policy path.
+    /// The kind a live policy's topology describes, with the grants its realisation implies.
     /// Operator-authored grants may subsequently refine this initial set.
     pub fn from_policy(policy: &PlacementPolicySpec, host_platform: &str) -> Result<Self, String> {
         let (host_ref, realisation, grants) = match (&policy.docker_per_vessel, &policy.host_direct, &policy.cloud_sandbox_per_vessel) {

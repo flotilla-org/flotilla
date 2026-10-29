@@ -345,6 +345,7 @@ pub(super) fn spawn_local_fulfilment_probe_task(
             // `observed_at` may lag until the heartbeat folds a refresh in.
             let previous = observations.fulfilment_facts().await.unwrap_or_else(|| status.fulfilment_facts.clone());
             let mut model_probes = status.model_probes.clone();
+            let harnesses = discovery.factories.harnesses();
             let observation = match super::discovery::local_observation(discovery) {
                 Ok(observation) => observation,
                 Err(error) => {
@@ -364,6 +365,7 @@ pub(super) fn spawn_local_fulfilment_probe_task(
                     env: discovery.env.as_ref(),
                     scratch: &scratch,
                     observation: &observation,
+                    harnesses: &harnesses,
                 },
                 &mut model_probes,
             )
@@ -425,6 +427,7 @@ pub(super) fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, name
                     return;
                 }
             };
+            let harnesses = daemon.discovery_runtime().factories.harnesses();
             let observation = match ssh.preparer(Vec::new()).observation() {
                 Ok(observation) => observation,
                 Err(error) => {
@@ -445,6 +448,7 @@ pub(super) fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, name
                     env: &BagEnvVars(&ssh.env_bag),
                     scratch: &scratch,
                     observation: &observation,
+                    harnesses: &harnesses,
                 },
                 &mut model_probes,
             )
@@ -822,7 +826,7 @@ pub(super) async fn convoy_ensure_dependency_watches(
         "Project",
         "Repository",
         "WorkflowTemplate",
-        "PlacementPolicy",
+        "FulfilmentKind",
         "CredentialGrant",
         "CredentialSpec",
         "Host",

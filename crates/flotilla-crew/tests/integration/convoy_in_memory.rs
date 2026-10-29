@@ -1,9 +1,9 @@
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_protocol::{IssueRef, IssueSource, IssueState};
 use flotilla_resources::{
-    external_patches, reconcile, Checkout, CheckoutSpec, Convoy, ConvoyIssue, ConvoyPhase, Event, FreshCloneCheckoutSpec, InputMeta,
-    IssueSnapshot, LifecycleAuthority, PlacementPolicy, PlacementPolicySpec, RepositoryKey, RepositorySpec, ResourceError, Vessel,
-    VesselPhase, VesselStatus, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, PLACEMENT_SNAPSHOT_ANNOTATION,
+    external_patches, reconcile, Checkout, CheckoutSpec, Convoy, ConvoyIssue, ConvoyPhase, Event, FreshCloneCheckoutSpec, FulfilmentKind,
+    FulfilmentKindSpec, FulfilmentRealisation, InputMeta, IssueSnapshot, LifecycleAuthority, RepositoryKey, RepositorySpec, ResourceError,
+    Vessel, VesselPhase, VesselStatus, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, PLACEMENT_SNAPSHOT_ANNOTATION,
     PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_KIND,
 };
 use flotilla_store::{apply_status_patch, controller::ControllerLoop, PreparedSnapshotGarbageCollector, ResourceBackend};
@@ -343,10 +343,14 @@ async fn controller_loop_finalizer_deletes_vessels_and_checkouts() {
         .expect("workflow snapshot create should succeed");
     backend
         .clone()
-        .using::<PlacementPolicy>("flotilla")
+        .using::<FulfilmentKind>("flotilla")
         .create(
             &InputMeta::builder().name(placement_snapshot_name.to_string()).labels(snapshot_labels(PLACEMENT_SNAPSHOT_KIND)).build(),
-            &PlacementPolicySpec::builder().pool("remote".to_string()).build(),
+            &FulfilmentKindSpec::builder()
+                .host_ref("remote-host".to_string())
+                .pool("remote".to_string())
+                .realisation(FulfilmentRealisation::HostDirect)
+                .build(),
         )
         .await
         .expect("placement snapshot create should succeed");
@@ -478,7 +482,7 @@ async fn controller_loop_finalizer_deletes_vessels_and_checkouts() {
                     Err(ResourceError::NotFound { .. })
                 )
                 && matches!(
-                    backend.clone().using::<PlacementPolicy>("flotilla").get(placement_snapshot_name).await,
+                    backend.clone().using::<FulfilmentKind>("flotilla").get(placement_snapshot_name).await,
                     Err(ResourceError::NotFound { .. })
                 )
             {

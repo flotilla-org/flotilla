@@ -59,7 +59,8 @@ fn provisioning_kind_codes_are_pinned() {
     assert_eq!(held("Project"), Some(KindCode::new("pj")));
     assert_eq!(held("ProjectOps"), Some(KindCode::new("po")));
     assert_eq!(held("Artifact"), Some(KindCode::new("af")));
-    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 19);
+    assert_eq!(held("FulfilmentKind"), Some(KindCode::new("fk")));
+    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 20);
     // The definition kinds (#3824 layer 2b), in the decided store with their writers (2b-ii).
     for (kind, code) in [
         ("Forge", "fo"),
@@ -170,7 +171,6 @@ fn each_kind_survives_the_codec() {
         declared_adapters: BTreeSet::from(["claude-code".into(), "codex".into()]),
         required_adapters: BTreeSet::from(["claude-code".into()]),
         pull_policy: Default::default(),
-        memory_policy: Default::default(),
         mounts: vec![],
         env: BTreeMap::from([("A".into(), "1".into())]),
     };
@@ -242,7 +242,6 @@ fn a_docker_recipe_holds_one_image_choice_and_nothing_derived_at_launch() {
         declared_adapters: BTreeSet::new(),
         required_adapters: BTreeSet::new(),
         pull_policy: Default::default(),
-        memory_policy: Default::default(),
         mounts: vec![],
         env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
     };
@@ -274,20 +273,15 @@ fn a_host_direct_recipe_names_its_checkout_root() {
 }
 
 // Behaviour (#3719 review): a recipe's content hash is stable, so a frozen recipe is stored once
-// and replicas agree on its object: the canonical encoding fixes the field order, and numbers
-// round-trip exactly.
+// and replicas agree on its object: the canonical encoding fixes the field order. A recipe stored
+// with the retired memory share still reads (ADR 0047).
 #[test]
-fn a_recipe_hashes_stably_and_round_trips_its_numbers() {
+fn a_recipe_hashes_stably_and_reads_its_previous_shape() {
     let docker = DockerRecipe {
         image: DockerImage::Pinned { reference: "registry/flotilla@sha256:00".into() },
         declared_adapters: BTreeSet::from(["codex".into(), "claude-code".into()]),
         required_adapters: BTreeSet::new(),
         pull_policy: Default::default(),
-        memory_policy: flotilla_resources::EnvironmentMemoryPolicy {
-            host_memory_percent: 80,
-            expected_concurrent_crews: 4,
-            swap_bytes: u64::MAX >> 1,
-        },
         mounts: vec![],
         env: BTreeMap::from([("Z".into(), "1".into()), ("A".into(), "2".into())]),
     };
@@ -301,7 +295,11 @@ fn a_recipe_hashes_stably_and_round_trips_its_numbers() {
     );
     let read = Frozen::<Recipe>::from_stored(frozen.hash(), frozen.bytes()).expect("stored").value().read::<DockerRecipe>().expect("read");
     assert_eq!(read, docker);
-    assert_eq!(read.memory_policy.swap_bytes, u64::MAX >> 1);
+    let mut previous = serde_json::to_value(&docker).expect("encode");
+    previous["memory_policy"] = serde_json::json!({"host_memory_percent": 80, "expected_concurrent_crews": 4, "swap_bytes": u64::MAX >> 1});
+    let previous = Frozen::new(serde_json::from_value::<Recipe>(previous).expect("recipe")).expect("freeze previous");
+    let read = Frozen::<Recipe>::from_stored(previous.hash(), previous.bytes()).expect("stored").value().read::<DockerRecipe>();
+    assert_eq!(read.expect("the previous shape reads"), docker);
 }
 
 /// How many consecutive retryable failures kind `K` takes before its request may give up, within

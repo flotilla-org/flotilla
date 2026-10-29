@@ -15,8 +15,8 @@ use flotilla_protocol::{EnvironmentId, LifecycleReading};
 use flotilla_resources::checkout_path::checkout_path;
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::{
-    Checkout as ResourceCheckout, CheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, ReadResourceObject, Repository, RepositoryKey,
-    ResourceError, ResourceObject, ResourceProvenance, WatchEvent, WatchStart,
+    Checkout as ResourceCheckout, CheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Clone as ResourceClone, ReadResourceObject,
+    Repository, RepositoryKey, ResourceError, ResourceObject, ResourceProvenance, WatchEvent, WatchStart,
 };
 use flotilla_store::ResourceBackend;
 use futures::StreamExt;
@@ -75,6 +75,7 @@ impl CheckoutProviders {
         let checkouts = self.checkout_provider_facts(&namespace).await?;
         let observed = checkouts.iter().find(|(_, key)| key.path == path && key.environment == *env_id);
         let Some((observed, key)) = observed else {
+            let clone_url = self.clone_url(&namespace, env_id, path).await?;
             return discover_vcs_for_checkout(
                 &self.environment_manager,
                 &self.discovery,
@@ -82,6 +83,7 @@ impl CheckoutProviders {
                 &self.local_environment_id,
                 env_id,
                 path,
+                clone_url.as_deref(),
             )
             .await
             .map(Arc::new);
@@ -107,9 +109,17 @@ impl CheckoutProviders {
                 .map_err(|error| error.to_string())?
                 .object;
             scoped_config.set_checkout_config(&ExecutionEnvironmentPath::new(path), repository.spec.vcs().clone());
-            discover_vcs_for_checkout(&self.environment_manager, &self.discovery, &scoped_config, &self.local_environment_id, env_id, path)
-                .await
-                .map(Arc::new)
+            discover_vcs_for_checkout(
+                &self.environment_manager,
+                &self.discovery,
+                &scoped_config,
+                &self.local_environment_id,
+                env_id,
+                path,
+                repository.spec.remotes().first().map(String::as_str),
+            )
+            .await
+            .map(Arc::new)
         };
         let provider = cell.get_or_try_init(discover).await.map(Arc::clone)?;
         // Discovery may have awaited I/O while the Checkout was retired. Keep
@@ -119,6 +129,22 @@ impl CheckoutProviders {
         // propagate that failure rather than masking it behind a usable provider.
         self.retire_checkout_providers().await?;
         Ok(provider)
+    }
+
+    /// The URL of this host's Clone at `path` in `env_id`, if one is recorded.
+    async fn clone_url(&self, namespace: &str, env_id: &EnvironmentId, path: &Path) -> Result<Option<String>, String> {
+        let clones = self.resource_backend.clone().using::<ResourceClone>(namespace).list().await.map_err(|error| error.to_string())?;
+        Ok(clones
+            .items
+            .into_iter()
+            .find(|clone| {
+                Path::new(&clone.spec.path) == path
+                    && self
+                        .environment_manager
+                        .resolve_environment_ref(&clone.spec.env_ref)
+                        .is_some_and(|environment| environment.id == *env_id)
+            })
+            .map(|clone| clone.spec.url))
     }
 
     async fn cached_checkout_provider(

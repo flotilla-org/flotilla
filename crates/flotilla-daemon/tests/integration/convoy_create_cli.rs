@@ -13,8 +13,8 @@ use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName, PrincipalRef};
 use flotilla_resources::{
-    single_agent_workflow_spec, Convoy, ConvoyPhase, CrewSource, PlacementPolicy, WatchEvent, WatchStart, WorkflowTemplate,
-    MANAGED_BY_LABEL, ROLE_LABEL,
+    single_agent_workflow_spec, Convoy, ConvoyPhase, CrewSource, FulfilmentKind, FulfilmentRealisation, WatchEvent, WatchStart,
+    WorkflowTemplate, MANAGED_BY_LABEL, ROLE_LABEL,
 };
 use flotilla_store::ResourceBackend;
 
@@ -152,15 +152,15 @@ async fn builtin_template_is_the_code_spec_at_dispatch() {
     let builtin = templates.get("single-agent").await.expect("builtin should be readable");
     assert_eq!(builtin.spec, single_agent_workflow_spec());
 
-    let host_direct_policy = backend
-        .using::<PlacementPolicy>("flotilla")
+    let host_direct_kind = backend
+        .using::<FulfilmentKind>("flotilla")
         .list()
         .await
-        .expect("placement policies should list")
+        .expect("fulfilment kinds should list")
         .items
         .into_iter()
-        .find(|policy| policy.spec.host_direct.is_some())
-        .expect("host-direct policy should be seeded")
+        .find(|kind| kind.spec.realisation == FulfilmentRealisation::HostDirect)
+        .expect("host-direct kind should be seeded")
         .metadata
         .name;
     let mut rx = daemon.subscribe();
@@ -174,7 +174,7 @@ async fn builtin_template_is_the_code_spec_at_dispatch() {
                     repository_url: None,
                     r#ref: None,
                     project_ref: None,
-                    placement_policy: Some(host_direct_policy.clone()),
+                    placement_policy: Some(host_direct_kind.clone()),
                     adopted_checkout: None,
                 })
                 .build(),

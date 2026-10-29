@@ -195,7 +195,7 @@ mod tests {
         let config = Arc::new(flotilla_config::ConfigStore::with_base(dir.path().to_path_buf()));
         std::fs::write(dir.path().join("daemon.toml"), "machine_id = \"metrics-host\"\n[dummy_fleet]\n").unwrap();
         let daemon_config = config.load_daemon_config().unwrap();
-        let mut discovery = flotilla_discovery_testkit::fake_discovery(false);
+        let mut discovery = flotilla_discovery_testkit::fake_discovery_with_host_directories(dir.path());
         let fleet = crate::dummy_fleet::install_dummy_fleet(&daemon_config, &mut discovery).unwrap();
         let sqlite = flotilla_store_sqlite::SqliteBackend::open_in_memory().unwrap();
         let metrics = Arc::new(LoadMetrics::new(sqlite.load_metrics()));
@@ -235,8 +235,8 @@ mod tests {
         // Run one real dummy crew before scraping, through the same catalog
         // and command port used by the fleet integration harness.
         use flotilla_daemon_api::daemon::DaemonHandle;
-        use flotilla_dummy_fleet::catalog::{self, CrewMix, DUMMY_PLACEMENT_POLICY};
-        use flotilla_resources::{Host, InputMeta, PlacementPolicy, Repository, WorkflowTemplate};
+        use flotilla_dummy_fleet::catalog::{self, CrewMix, DUMMY_FULFILMENT_KIND};
+        use flotilla_resources::{FulfilmentKind, Host, InputMeta, Repository, WorkflowTemplate};
         let backend = daemon.resource_backend();
         let host = backend.clone().using::<Host>("flotilla").list().await.unwrap().items.remove(0);
         let repository = catalog::repository(&forge).unwrap();
@@ -244,11 +244,8 @@ mod tests {
         repositories.create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository).await.unwrap();
         backend
             .clone()
-            .using::<PlacementPolicy>("flotilla")
-            .create(
-                &InputMeta::builder().name(DUMMY_PLACEMENT_POLICY.into()).labels(catalog::placement_policy_labels()).build(),
-                &catalog::placement_policy(&host.metadata.name),
-            )
+            .using::<FulfilmentKind>("flotilla")
+            .create(&InputMeta::builder().name(DUMMY_FULFILMENT_KIND.into()).build(), &catalog::fulfilment_kind(&host.metadata.name))
             .await
             .unwrap();
         backend
@@ -267,6 +264,19 @@ mod tests {
         })
         .await
         .unwrap();
+        let hosts = backend.clone().using::<Host>("flotilla");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !hosts.get(&host.metadata.name).await.ok().and_then(|host| host.status).is_some_and(|status| {
+                status
+                    .fulfilment_facts
+                    .get(DUMMY_FULFILMENT_KIND)
+                    .is_some_and(|facts| facts.harnesses.contains_key(flotilla_dummy_fleet::DUMMY_AGENT_ADAPTER))
+            }) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the dummy kind's harness is observed");
         daemon
             .execute(
                 flotilla_protocol::Command::builder()
@@ -277,7 +287,7 @@ mod tests {
                         repository_url: Some(catalog::repository_url(&forge)),
                         r#ref: Some("main".into()),
                         project_ref: None,
-                        placement_policy: Some(DUMMY_PLACEMENT_POLICY.into()),
+                        placement_policy: Some(DUMMY_FULFILMENT_KIND.into()),
                         adopted_checkout: None,
                     })
                     .build(),

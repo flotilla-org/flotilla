@@ -10,7 +10,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use common::{
-    controller_meta, create_convoy_with_single_task, create_host_direct_policy, create_ready_clone, create_ready_host_direct_environment,
+    controller_meta, create_convoy_with_single_task, create_host_direct_kind, create_ready_clone, create_ready_host_direct_environment,
     create_workspace, ControllerLoopHarness,
 };
 use flotilla_crew::reconcilers::terminal_session::{TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler};
@@ -234,7 +234,7 @@ async fn controller_loops_drive_host_direct_workspace_to_ready() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_host(&backend, "01HXYZ").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, "01HXYZ", "/Users/alice/dev/flotilla-repos").await;
-    create_host_direct_policy(&backend, NAMESPACE, "policy-a", "01HXYZ", "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "kind-a", "01HXYZ", "cleat").await;
     let repository_url = "git@github.com:flotilla-org/flotilla.git";
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-a", "implement", repository_url, "feat/task-provisioning").await;
     let repository_spec = RepositorySpec::remote(canonicalize_repo_url(repository_url).expect("repository URL should canonicalize"))
@@ -245,7 +245,7 @@ async fn controller_loops_drive_host_direct_workspace_to_ready() {
         .delete(&repository_spec.key().to_string())
         .await
         .expect("destination should start without the convoy repository");
-    create_workspace(&backend, NAMESPACE, "workspace-a", "convoy-a", "implement", "policy-a", repository_url).await;
+    create_workspace(&backend, NAMESPACE, "workspace-a", "convoy-a", "implement", "kind-a", repository_url).await;
 
     let harness = full_controller_harness(backend.clone());
 
@@ -298,7 +298,7 @@ async fn controller_materializes_a_missing_repository_for_a_multi_repository_con
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_host(&backend, "01HXYZ").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, "01HXYZ", "/Users/alice/dev/flotilla-repos").await;
-    create_host_direct_policy(&backend, NAMESPACE, "policy-multi", "01HXYZ", "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "kind-multi", "01HXYZ", "cleat").await;
 
     let known = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("known repository");
     let missing = RepositorySpec::remote("https://github.com/flotilla-org/cleat").expect("missing repository");
@@ -384,7 +384,7 @@ async fn controller_materializes_a_missing_repository_for_a_multi_repository_con
         "workspace-multi",
         "convoy-multi",
         "implement",
-        "policy-multi",
+        "kind-multi",
         "https://github.com/flotilla-org/flotilla",
     )
     .await;
@@ -571,7 +571,6 @@ async fn environment_controller_marks_docker_environment_ready() {
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
                     image_build_ref: None,
-                    memory_policy: Default::default(),
                     host_ref: "01HXYZ".to_string(),
                     image: "ghcr.io/flotilla/dev:latest".to_string(),
                     declared_agent_adapters: Default::default(),

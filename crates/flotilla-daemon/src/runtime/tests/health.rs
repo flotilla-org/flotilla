@@ -167,7 +167,19 @@ async fn field_ownership_violation_is_exposed_in_fleet_diagnosis() {
     register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("register resources");
 
     let policies = daemon.resource_backend().using::<PlacementPolicy>(NAMESPACE);
-    let policy = policies.get(&profile.host_direct_policy_name()).await.expect("registered policy");
+    let policy = policies
+        .create(
+            &empty_meta(&profile.host_direct_policy_name()),
+            &PlacementPolicySpec::builder()
+                .pool(profile.host_direct_pool.clone())
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: host_id.clone(),
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build(),
+        )
+        .await
+        .expect("policy under a seeded name");
     policies
         .write_spec(
             &flotilla_resources::WriterIdentity::operator(),

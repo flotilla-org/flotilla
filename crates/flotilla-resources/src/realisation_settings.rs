@@ -1,11 +1,14 @@
 //! Realisation settings every live policy carries, held as code constants rather than stored.
 
-use crate::{DockerCheckoutStrategy, DockerImagePullPolicy, HostDirectPlacementPolicyCheckout, PlacementPolicySpec};
+use crate::{CloudSandboxSize, DockerCheckoutStrategy, DockerImagePullPolicy, HostDirectPlacementPolicyCheckout, PlacementPolicySpec};
 
 /// Where a Docker vessel's checkout is mounted, and its working directory.
 pub const DOCKER_WORKSPACE: &str = "/workspace";
 
 pub const DOCKER_PULL_POLICY: DockerImagePullPolicy = DockerImagePullPolicy::Always;
+
+/// The size every cloud sandbox is provisioned at.
+pub const CLOUD_SANDBOX_SIZE: CloudSandboxSize = CloudSandboxSize { cpus: 2, memory_bytes: 4 << 30, disk_bytes: 10 << 30 };
 
 pub fn docker_checkout() -> DockerCheckoutStrategy {
     DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: DOCKER_WORKSPACE.to_owned() }

@@ -64,12 +64,7 @@ impl EnvironmentProvider for HostDirectEnvironmentProvider {
         opts: ProvisionOpts,
     ) -> Result<EnvironmentHandle, super::EnvironmentProvisionError> {
         prepared.get::<()>(&self.owner)?;
-        if !opts.tokens.is_empty()
-            || !opts.provisioned_mounts.is_empty()
-            || !opts.tools.is_empty()
-            || opts.cpu_limit.is_some()
-            || opts.memory_policy != Default::default()
-        {
+        if !opts.tokens.is_empty() || !opts.provisioned_mounts.is_empty() || !opts.tools.is_empty() || opts.cpu_limit.is_some() {
             return Err("host-direct adoption cannot install tokens, mounts, tools, or resource limits".into());
         }
         let mut handles = self.handles.lock().expect("host adoption lock");

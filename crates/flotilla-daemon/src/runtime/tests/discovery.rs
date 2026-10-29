@@ -104,7 +104,7 @@ async fn bad_ssh_host_does_not_block_daemon_startup_or_other_hosts() {
     assert!(hosts.get("bad-ssh-host").await.is_err(), "host without a persistent terminal pool must be skipped");
     let good = hosts.get("good-ssh-host").await.expect("other SSH host remains registered");
     assert!(good.status.expect("other SSH observation").ready);
-    assert!(daemon.resource_backend().using::<PlacementPolicy>(NAMESPACE).get("host-direct-good-ssh-host").await.is_ok());
+    assert!(daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE).get("host-direct-good-ssh-host").await.is_ok());
 
     runtime.shutdown();
 }
@@ -195,19 +195,19 @@ async fn ssh_host_provisions_clone_and_worktree_through_its_runner() {
     assert_eq!(status.fulfilment_facts.get("host-direct-ssh-test-host").and_then(|facts| facts.free_vessel_slots), Some(2));
     assert!(status.ready);
     assert!(status.credential_expiry().expect("SSH credential expiry").contains_key(flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE));
-    assert!(daemon.resource_backend().using::<PlacementPolicy>(NAMESPACE).get("host-direct-ssh-test-host").await.is_ok());
-    let policies = daemon.resource_backend().using::<PlacementPolicy>(NAMESPACE);
-    let policy = policies.get("host-direct-ssh-test-host").await.expect("SSH policy");
-    let mut changed = policy.spec.clone();
-    changed.pool = "alternate-pool".to_string();
-    policies
-        .update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &changed)
+    let kinds = daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE);
+    let kind = kinds.get("host-direct-ssh-test-host").await.expect("SSH kind");
+    assert_eq!(kind.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some("seeding"));
+    assert!(daemon.resource_backend().using::<PlacementPolicy>(NAMESPACE).get("host-direct-ssh-test-host").await.is_err());
+    let mut changed = kind.spec.clone();
+    changed.grants.insert(flotilla_resources::FulfilmentGrant::toolchain("rust".to_string()));
+    kinds
+        .update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &changed)
         .await
-        .expect("edit SSH policy while the daemon runs");
+        .expect("edit SSH kind while the daemon runs");
     apply_ssh_host_observation(&daemon, NAMESPACE, &profile, None, None).await.expect("refresh SSH observation");
-    let kind =
-        daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE).get("host-direct-ssh-test-host").await.expect("refreshed SSH kind");
-    assert_eq!(kind.spec.pool, "alternate-pool");
+    let kind = kinds.get("host-direct-ssh-test-host").await.expect("refreshed SSH kind");
+    assert_eq!(kind.spec, changed, "the operator's grant survives the SSH refresh");
     let mut unreachable = profile.clone();
     unreachable.runner = Arc::new(DiscoveryMockRunner::builder().on_run("rustc", &["--version"], Ok("rustc 9".into())).build());
     apply_ssh_host_observation(&daemon, NAMESPACE, &unreachable, None, None).await.expect("publish unreachable SSH observation");

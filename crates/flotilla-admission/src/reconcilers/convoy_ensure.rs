@@ -24,9 +24,9 @@ use flotilla_protocol::{PlacementTargetHost, PrincipalRef, ResourceRef};
 use flotilla_resources::{
     api_version, Clock, ConditionValue, ControllerRetry, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition,
     ConvoyEnsureConfigDrift, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyEnsureStatusPatch, ConvoyPhase,
-    Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, Host as ResourceHost, InputMeta,
-    ObjectEvent, PlacementPolicy, Project, ReadResourceObject, Repository, Resource, ResourceError, ResourceObject, ResourceProvenance,
-    WorkflowTemplate, DRIVER_ADMISSION_CONDITION_TYPE,
+    Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, FulfilmentKind,
+    Host as ResourceHost, InputMeta, ObjectEvent, Project, ReadResourceObject, Repository, Resource, ResourceError, ResourceObject,
+    ResourceProvenance, WorkflowTemplate, DRIVER_ADMISSION_CONDITION_TYPE,
 };
 use flotilla_store::{apply_status_patch as apply_resource_status_patch, EventRecorder, ResourceBackend, StoreQuery};
 use sha2::{Digest, Sha256};
@@ -571,13 +571,10 @@ impl EnsurePass<'_> {
             versions.insert(format!("WorkflowTemplate/{name}"), version);
         }
         if let Some(name) = &ensure.spec.placement_policy {
-            let policies = self.resource_backend.including_replicas::<PlacementPolicy>(namespace);
-            let version = policies
-                .get(name)
-                .await
-                .map(|policy| policy.object.metadata.resource_version)
-                .unwrap_or_else(|error| format!("absent:{error}"));
-            versions.insert(format!("PlacementPolicy/{name}"), version);
+            let kinds = self.resource_backend.including_replicas::<FulfilmentKind>(namespace);
+            let version =
+                kinds.get(name).await.map(|kind| kind.object.metadata.resource_version).unwrap_or_else(|error| format!("absent:{error}"));
+            versions.insert(format!("FulfilmentKind/{name}"), version);
         }
         let encoded = serde_json::to_vec(&versions).map_err(|error| format!("serialize ensure admission dependencies: {error}"))?;
         Ok(format!("{:x}", Sha256::digest(encoded)))

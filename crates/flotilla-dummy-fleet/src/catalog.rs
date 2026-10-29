@@ -1,25 +1,23 @@
-//! The definitions a dummy fleet runs against: its forge, a placement policy
-//! that selects the dummy environment provider, and one workflow per crew mix.
+//! The definitions a dummy fleet runs against: its forge, a fulfilment kind
+//! the dummy environment provider realises, and one workflow per crew mix.
 //! Load drivers and scenarios create these resources before dispatching.
 
-use std::collections::BTreeMap;
-
 use flotilla_resources::{
-    CrewSource, CrewSpec, DockerCheckoutStrategy, DockerImageSource, DockerPerVesselPlacementPolicySpec, ExitDeclaration, ForgeKind,
-    ForgeSpec, PlacementPolicySpec, RepositorySpec, Selector, VesselRequirement, WorkflowTemplateSpec,
+    CrewSource, CrewSpec, DockerImageSource, ExitDeclaration, ForgeKind, ForgeSpec, FulfilmentGrant, FulfilmentKindSpec,
+    FulfilmentRealisation, Platform, RepositorySpec, Selector, VesselRequirement, WorkflowTemplateSpec,
 };
 
 use crate::{
     crew::{CrewScript, SCRIPT_LINE_PREFIX},
-    DUMMY_AGENT_ADAPTER, DUMMY_ENVIRONMENT_INSTANCE, DUMMY_TERMINAL_POOL,
+    DUMMY_AGENT_ADAPTER, DUMMY_TERMINAL_POOL,
 };
 
 /// Forge definition name; subjects on the dummy forge carry it as their service.
 pub const DUMMY_FORGE_ID: &str = "dummy-forge";
 /// Repository every dummy crew works on, as `owner/name` on the dummy forge.
 pub const DUMMY_REPOSITORY: &str = "dummy/fleet";
-/// PlacementPolicy name selecting dummy environments.
-pub const DUMMY_PLACEMENT_POLICY: &str = "dummy-crews";
+/// FulfilmentKind name selecting dummy environments.
+pub const DUMMY_FULFILMENT_KIND: &str = "dummy-crews";
 /// Image named by dummy environments; nothing pulls it.
 pub const DUMMY_IMAGE: &str = "dummy/crew:latest";
 
@@ -144,28 +142,13 @@ pub fn repository_url(forge: &ForgeSpec) -> String {
     format!("{}/{DUMMY_REPOSITORY}.git", forge.https_url.trim_end_matches('/'))
 }
 
-/// Labels for the dummy placement policy: they select the dummy provider instance.
-pub fn placement_policy_labels() -> BTreeMap<String, String> {
-    BTreeMap::from([(
-        flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL.to_string(),
-        DUMMY_ENVIRONMENT_INSTANCE.to_string(),
-    )])
-}
-
 /// Per-vessel dummy environments on `host_ref`, crews in the dummy pool.
-pub fn placement_policy(host_ref: &str) -> PlacementPolicySpec {
-    PlacementPolicySpec::builder()
+pub fn fulfilment_kind(host_ref: &str) -> FulfilmentKindSpec {
+    FulfilmentKindSpec::builder()
+        .host_ref(host_ref.into())
         .pool(DUMMY_TERMINAL_POOL.to_string())
-        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-            host_ref: host_ref.into(),
-            image: Some(DockerImageSource::Literal(DUMMY_IMAGE.into())),
-            pull_policy: Default::default(),
-            memory_policy: Default::default(),
-            agent_adapters: [DUMMY_AGENT_ADAPTER.to_string()].into(),
-            default_cwd: None,
-            env: BTreeMap::new(),
-            checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".into() },
-        })
+        .grants([FulfilmentGrant::platform(Platform::Linux.to_string()), FulfilmentGrant::network("scoped".into())].into())
+        .realisation(FulfilmentRealisation::DockerPerVessel { image: Some(DockerImageSource::Literal(DUMMY_IMAGE.into())) })
         .build()
 }
 

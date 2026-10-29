@@ -55,8 +55,9 @@ pub(super) async fn provision(
             deliver_vessel_layer(state, &id, spec, &handle).await?;
             let (bag, registry) = probe_provisioned_environment(state, &id, &handle).await?;
             if let Some(cloud) = &spec.cloud_sandbox {
-                let accounts = state.daemon.discovery_runtime().factories.account_variables();
-                verify_cloud_image_needs(&cloud.probe_needs, &cloud.image, &handle, &bag, &accounts).await?;
+                let factories = &state.daemon.discovery_runtime().factories;
+                let accounts = factories.account_variables();
+                verify_cloud_image_needs(&cloud.probe_needs, &cloud.image, &handle, &bag, &accounts, &factories.harnesses()).await?;
             }
             state
                 .daemon
@@ -200,6 +201,7 @@ pub(super) async fn verify_cloud_image_needs(
     handle: &EnvironmentHandle,
     bag: &EnvironmentBag,
     accounts: &AccountVariables,
+    harnesses: &[flotilla_agent::adapter::Harness],
 ) -> Result<(), String> {
     if needs.is_empty() {
         return Ok(());
@@ -227,7 +229,7 @@ pub(super) async fn verify_cloud_image_needs(
     };
     let facts = crate::fulfilment_probe::probe_kind(
         &kind,
-        crate::fulfilment_probe::DetectionTarget { image: None, provider: detector.as_ref(), context: &observation },
+        crate::fulfilment_probe::DetectionTarget { image: None, provider: detector.as_ref(), context: &observation, harnesses },
         true,
         &*handle.runner(),
         &GuestProbeEnvironment(bag),

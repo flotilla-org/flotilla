@@ -38,6 +38,13 @@ impl TryFrom<RawDockerVessels> for DockerVessels {
 }
 
 impl DockerVessels {
+    /// A one-GiB ceiling under `flotilla-crews.slice`, which a test runner answers with
+    /// `docker info` = [`TEST_DOCKER_INFO`] and `systemctl show` = [`TEST_SLICE_SHOW`].
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self { slice: "flotilla-crews.slice".into(), memory_ceiling_gib: NonZeroU64::MIN }
+    }
+
     pub fn parse(table: toml::Table) -> Result<Self, String> {
         toml::Value::Table(table).try_into().map_err(|error| format!("[docker_vessels] in daemon.toml: {error}"))
     }
@@ -89,6 +96,11 @@ impl DockerVessels {
         Ok(())
     }
 }
+
+#[cfg(test)]
+pub(crate) const TEST_DOCKER_INFO: &str = r#"{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":true,"CgroupDriver":"systemd"}"#;
+#[cfg(test)]
+pub(crate) const TEST_SLICE_SHOW: &str = "LoadState=loaded\nMemoryMax=68719476736\n";
 
 /// The cgroup v2 directory of a systemd slice, whose dashes nest it in its
 /// parents; `None` for anything that is not a plain slice name. Escapes such

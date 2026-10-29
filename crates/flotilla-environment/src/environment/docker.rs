@@ -100,6 +100,9 @@ impl DockerEnvironmentProvider {
     }
 }
 
+/// A crew never runs unbounded: Docker vessels need the slice that bounds their memory.
+const NO_DOCKER_VESSELS: &str = "[docker_vessels] is not set in daemon.toml, so nothing bounds a Docker vessel's memory";
+
 /// These are host facts, supplied by discovery. Neither a vessel nor its image
 /// chooses the current agent executable or the host runtime directory.
 #[cfg(unix)]
@@ -157,6 +160,9 @@ fn host_user() -> String {
 #[async_trait]
 impl EnvironmentProvider for DockerEnvironmentProvider {
     async fn detect_readiness(&self) -> super::ProviderReadiness {
+        if self.inner.vessels.is_none() {
+            return super::ProviderReadiness::MissingTool { reason: NO_DOCKER_VESSELS.into() };
+        }
         // Probe the provider endpoint's host, which can be reached over SSH.
         if let Err(reason) = self.inner.runner.run("docker", &["--version"], Path::new("/"), &ChannelLabel::Default).await {
             return super::ProviderReadiness::MissingTool { reason };
@@ -283,7 +289,6 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
                         provisioned_mounts: mounts,
                         tools,
                         cpu_limit: opts.cpu_limit,
-                        memory_policy: opts.memory_policy,
                         image_pull_policy: ImagePullPolicy::Never,
                         prepared_auth: Default::default(),
                     },
@@ -1013,6 +1018,7 @@ impl DockerEnvironmentProvider {
         runtime_image: &ImageId,
         opts: CreateOpts,
     ) -> Result<EnvironmentHandle, String> {
+        let vessels = self.inner.vessels.as_ref().ok_or(NO_DOCKER_VESSELS)?;
         let info = self
             .inner
             .runner
@@ -1023,16 +1029,8 @@ impl DockerEnvironmentProvider {
         if !info.memory_limit || !info.swap_limit {
             return Err("Docker host cannot enforce memory and swap limits".into());
         }
-        let limits = match &self.inner.vessels {
-            Some(vessels) => {
-                vessels.verify(self.inner.runner.as_ref(), &info.cgroup_driver, info.mem_total).await?;
-                flotilla_protocol::EnvironmentMemoryLimits { memory_bytes: vessels.memory_ceiling_bytes(), swap_bytes: 0 }
-            }
-            None => opts.memory_policy.resolve(info.mem_total)?,
-        };
-        let memory = limits.memory_bytes.to_string();
-        // Docker wants RAM + swap; equal values explicitly disable swap.
-        let memory_swap = (limits.memory_bytes + limits.swap_bytes).to_string();
+        vessels.verify(self.inner.runner.as_ref(), &info.cgroup_driver, info.mem_total).await?;
+        let (memory, slice) = (vessels.memory_ceiling_bytes().to_string(), vessels.slice());
         let container_name = format!("flotilla-env-{}", id);
 
         let requested_mounts = opts.provisioned_mounts;
@@ -1138,10 +1136,8 @@ impl DockerEnvironmentProvider {
             &env_id_env,
         ]);
         let cpu_shares = CREW_CPU_SHARES.to_string();
-        args.extend(["--memory", memory.as_str(), "--memory-swap", memory_swap.as_str(), "--cpu-shares", &cpu_shares]);
-        if let Some(vessels) = &self.inner.vessels {
-            args.extend(["--cgroup-parent", vessels.slice()]);
-        }
+        // Equal memory and memory-swap values disable swap.
+        args.extend(["--memory", memory.as_str(), "--memory-swap", memory.as_str(), "--cpu-shares", &cpu_shares, "--cgroup-parent", slice]);
         let cpu_limit = opts.cpu_limit.map(|limit| limit.to_string());
         if let Some(limit) = cpu_limit.as_deref() {
             args.extend(["--cpus", limit]);
@@ -1604,12 +1600,15 @@ mod agent_contract_tests {
             if program == "cat" && args.first().is_some_and(|path| path.starts_with("/sys/fs/cgroup/")) {
                 return Err("no cgroup fixture".into());
             }
+            if program == "systemctl" {
+                return Ok(super::super::docker_vessels::TEST_SLICE_SHOW.into());
+            }
             assert_eq!(program, "docker");
             self.calls.lock().unwrap().push(args.iter().map(|s| s.to_string()).collect());
             match args {
                 ["image", "inspect", BASE] => Ok("[]".into()),
                 ["tag", id, tag] => self.tags.tag(id, tag),
-                ["info", "--format", "{{json .}}"] => Ok(r#"{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":true}"#.into()),
+                ["info", "--format", "{{json .}}"] => Ok(super::super::docker_vessels::TEST_DOCKER_INFO.into()),
                 ["run", "-d", "--init", ..] => {
                     assert_eq!(&args[args.len() - 3..], [PREPARED, "sleep", "infinity"]);
                     assert!(!args.contains(&"--entrypoint"));
@@ -1770,6 +1769,7 @@ mod agent_contract_tests {
         let memory = MemoryAgent::new(true);
         let shared = memory.clone();
         let provider = DockerEnvironmentProvider::new(engine.clone())
+            .with_vessel_slice(Some(super::super::docker_vessels::DockerVessels::for_tests()))
             .with_agent_settings(DockerAgentSettings { runtime_root: root.path().into(), executable: source.clone() })
             .with_agent_connector(Arc::new(move |_| shared.clone()));
         let spec = super::super::legacy_environment_spec(&flotilla_protocol::EnvironmentSpec {
@@ -1806,6 +1806,7 @@ mod agent_contract_tests {
         std::fs::write(&executable, b"agent").unwrap();
         let memory = MemoryAgent::new(true);
         let provider = DockerEnvironmentProvider::new(engine.clone())
+            .with_vessel_slice(Some(super::super::docker_vessels::DockerVessels::for_tests()))
             .with_agent_settings(DockerAgentSettings { runtime_root: root.join("runtime"), executable })
             .with_agent_connector(Arc::new(move |_| memory.clone()));
         let spec = super::super::legacy_environment_spec(&flotilla_protocol::EnvironmentSpec {

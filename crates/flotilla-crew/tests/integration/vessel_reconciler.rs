@@ -8,26 +8,26 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use common::{
-    create_convoy_with_single_task, create_docker_worktree_policy, create_host_direct_policy, create_policy, create_ready_checkout,
-    create_ready_clone, create_ready_docker_environment, create_ready_host_direct_environment, create_stopped_terminal, create_workspace,
-    labeled_meta, meta, vessel_meta, work_state, DockerWorktreePolicyFixture, ReadyCheckoutFixture, StoppedTerminalFixture,
+    create_convoy_with_single_task, create_docker_kind, create_host_direct_kind, create_kind, create_ready_checkout, create_ready_clone,
+    create_ready_docker_environment, create_ready_host_direct_environment, create_stopped_terminal, create_workspace, labeled_meta, meta,
+    vessel_meta, work_state, DockerKindFixture, ReadyCheckoutFixture, StoppedTerminalFixture,
 };
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_crew::reconcilers::vessel::VesselReconciler;
 use flotilla_crew::reconcilers::vessel::WorktreeMetadataResolver;
-use flotilla_protocol::{IssueRef, IssueSource, IssueState};
+use flotilla_protocol::{CanonicalHostId, IssueRef, IssueSource, IssueState, PlacementDecision, PlacementTargetHost};
 use flotilla_resources::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_resources::{
     canonicalize_repo_url, clone_key, interactive_single_workflow_spec, Artifact, ArtifactSpec, BoundChangeRequest, Checkout,
     CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, ClaimExit, Convoy, ConvoyIssue, ConvoyPhase, ConvoyRepositorySpec,
     ConvoySpec, ConvoyStatus, ConvoyTeardownRuntime, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, DockerCheckoutStrategy,
     DockerEnvironmentSpec, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ExitDeclaration,
-    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus, InputMeta,
-    IssueSnapshot, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Repository, RepositorySpec,
-    ResourceError, Selector, Stance, StatusPatch, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus,
-    WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_SCOPES_ANNOTATION,
-    CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    FulfilmentKindSpec, FulfilmentRealisation, HostDirectEnvironmentSpec, InnerCommandStatus, InputMeta, IssueSnapshot, LifecycleAuthority,
+    ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Repository, RepositorySpec, ResourceError, Selector, Stance, StatusPatch,
+    TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
+    TerminalSessionStatus, Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowSnapshot,
+    WorkflowTemplate, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_SCOPES_ANNOTATION, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 use flotilla_store::{
     controller::{ControllerLoop, Reconciler},
@@ -82,7 +82,7 @@ async fn landed_convoy_does_not_recreate_a_missing_checkout() {
     let mut status = convoy.status.expect("convoy status");
     status.phase = ConvoyPhase::Landed;
     convoys.update_status("convoy-landed", &convoy.metadata.resource_version, &status).await.expect("mark landed");
-    create_host_direct_policy(&backend, NAMESPACE, "policy-landed", HOST_REF, "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "policy-landed", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/tmp/convoy-landed").await;
     let vessel =
         create_workspace(&backend, NAMESPACE, "convoy-landed-implement", "convoy-landed", "implement", "policy-landed", REPO_URL).await;
@@ -114,7 +114,7 @@ async fn landed_convoy_does_not_recreate_a_missing_checkout() {
 async fn repeated_checkout_removal_backs_off_and_reports_the_conflict() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-churn", "implement", REPO_URL, GIT_REF).await;
-    create_host_direct_policy(&backend, NAMESPACE, "policy-churn", HOST_REF, "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "policy-churn", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/tmp/convoy-churn").await;
     create_workspace(&backend, NAMESPACE, "convoy-churn-implement", "convoy-churn", "implement", "policy-churn", REPO_URL).await;
     let vessels = backend.clone().using::<Vessel>(NAMESPACE);
@@ -269,7 +269,7 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
         )
         .await
         .expect("convoy status should update");
-    create_host_direct_policy(&backend, NAMESPACE, "policy-scratch", HOST_REF, "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "policy-scratch", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
     let vessel = backend
         .clone()
@@ -304,7 +304,7 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
 async fn host_direct_placement_is_not_refused_by_template_stance() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-contained", "implement", REPO_URL, GIT_REF).await;
-    create_host_direct_policy(&backend, NAMESPACE, "policy-host", HOST_REF, "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "policy-host", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
     let workspace =
         create_workspace(&backend, NAMESPACE, "workspace-contained", "convoy-contained", "implement", "policy-host", REPO_URL).await;
@@ -320,7 +320,7 @@ async fn host_direct_placement_is_not_refused_by_template_stance() {
 async fn ready_vessel_records_requested_and_effective_stance() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-stance", "implement", REPO_URL, GIT_REF).await;
-    create_host_direct_policy(&backend, NAMESPACE, "policy-stance", HOST_REF, "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "policy-stance", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
     let clone_name =
         format!("clone-{}", clone_key(&canonicalize_repo_url(REPO_URL).expect("repo canonicalization"), &host_direct_env_name()));
@@ -397,7 +397,7 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
         title: "Existing PR".to_string(),
     });
     convoys.update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec).await.expect("bind change request");
-    create_host_direct_policy(&backend, NAMESPACE, "policy-shared", HOST_REF, "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "policy-shared", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
     let clone_name =
         format!("clone-{}", clone_key(&canonicalize_repo_url(REPO_URL).expect("repo canonicalization"), &host_direct_env_name()));
@@ -474,7 +474,7 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
 async fn stuck_provisioning_vessel_surfaces_the_statusless_checkout_it_is_retrying() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-stuck", "implement", REPO_URL, GIT_REF).await;
-    create_host_direct_policy(&backend, NAMESPACE, "policy-stuck", HOST_REF, "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "policy-stuck", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
     let clone_name =
         format!("clone-{}", clone_key(&canonicalize_repo_url(REPO_URL).expect("repo canonicalization"), &host_direct_env_name()));
@@ -533,7 +533,7 @@ async fn unrelated_convoys_with_the_same_branch_use_distinct_worktree_paths() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-one", "implement", REPO_URL, GIT_REF).await;
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-two", "implement", REPO_URL, GIT_REF).await;
-    create_host_direct_policy(&backend, NAMESPACE, "policy-shared-branch", HOST_REF, "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "policy-shared-branch", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
     let clone_name =
         format!("clone-{}", clone_key(&canonicalize_repo_url(REPO_URL).expect("repo canonicalization"), &host_direct_env_name()));
@@ -684,7 +684,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
         )
         .await
         .expect("convoy status should update");
-    create_host_direct_policy(&backend, NAMESPACE, "policy-multi", HOST_REF, "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "policy-multi", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
     for (repository, url) in [
         (&repository_specs[0], "https://github.com/flotilla-org/flotilla"),
@@ -891,15 +891,14 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
         )
         .await
         .expect("convoy status should update");
-    create_docker_worktree_policy(
+    create_docker_kind(
         &backend,
         NAMESPACE,
-        DockerWorktreePolicyFixture::builder()
+        DockerKindFixture::builder()
             .name("policy-multi-docker".to_string())
             .host_ref(HOST_REF.to_string())
             .pool("cleat".to_string())
             .image("ghcr.io/flotilla/dev:latest".to_string())
-            .mount_path("/workspace".to_string())
             .build(),
     )
     .await;
@@ -1122,164 +1121,6 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
 }
 
 #[tokio::test]
-async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let repositories = [
-        RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("flotilla repository"),
-        RepositorySpec::remote("https://github.com/flotilla-org/cleat").expect("cleat repository"),
-    ];
-    for repository in &repositories {
-        ensure_repository(&backend.clone().using::<Repository>(NAMESPACE), &repository.key(), repository)
-            .await
-            .expect("repository should create");
-    }
-    let convoy = backend
-        .clone()
-        .using::<Convoy>(NAMESPACE)
-        .create(
-            &meta("convoy-multi-fresh"),
-            &ConvoySpec {
-                continuation: None,
-                subjects: Vec::new(),
-                role: String::new(),
-                generation: 1,
-                workflow_ref: "wf".to_string(),
-                dispatching_principal_ref: Default::default(),
-                inputs: BTreeMap::new(),
-                placement_policy: None,
-                repositories: vec![
-                    ConvoyRepositorySpec {
-                        url: "https://github.com/flotilla-org/flotilla".to_string(),
-                        repo_ref: repositories[0].key(),
-                        source_ref: "main".to_string(),
-                        target_ref: "main".to_string(),
-                        workspace_slug: "flotilla".to_string(),
-                        subpaths: Vec::new(),
-                    },
-                    ConvoyRepositorySpec {
-                        url: "https://github.com/flotilla-org/cleat".to_string(),
-                        repo_ref: repositories[1].key(),
-                        source_ref: "main".to_string(),
-                        target_ref: "main".to_string(),
-                        workspace_slug: "cleat".to_string(),
-                        subpaths: Vec::new(),
-                    },
-                ],
-                r#ref: Some("feature/multi".to_string()),
-                project_ref: Some("flotilla-suite".to_string()),
-                adopted_checkout_refs: BTreeMap::new(),
-                issues: Vec::new(),
-                change_request: None,
-                instruction: None,
-                promises: Vec::new(),
-            },
-        )
-        .await
-        .expect("convoy should create");
-    backend
-        .clone()
-        .using::<Convoy>(NAMESPACE)
-        .update_status(
-            "convoy-multi-fresh",
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                workflow_snapshot: Some(WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![VesselRequirement {
-                        needs: Default::default(),
-                        name: "implement".to_string(),
-                        depends_on: Vec::new(),
-                        repository_refs: None,
-                        credential_refs: Default::default(),
-                        credential_scopes: Default::default(),
-                        credential_permissions: Default::default(),
-                        crew: Vec::new(),
-                    }],
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("convoy status should update");
-    create_policy(
-        &backend,
-        NAMESPACE,
-        "policy-multi-fresh",
-        PlacementPolicySpec::builder()
-            .pool("cleat".to_string())
-            .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                memory_policy: Default::default(),
-                host_ref: HOST_REF.to_string(),
-                image: Some("ghcr.io/flotilla/dev:latest".into()),
-                pull_policy: Default::default(),
-                agent_adapters: Default::default(),
-                default_cwd: None,
-                env: Default::default(),
-                checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace/".to_string() },
-            })
-            .build(),
-    )
-    .await;
-    create_ready_docker_environment(
-        &backend,
-        NAMESPACE,
-        "env-workspace-multi-fresh",
-        DockerEnvironmentSpec {
-            image_build_ref: None,
-            memory_policy: Default::default(),
-            host_ref: HOST_REF.to_string(),
-            image: "ghcr.io/flotilla/dev:latest".to_string(),
-            declared_agent_adapters: Default::default(),
-            required_agent_adapters: Default::default(),
-            pull_policy: Default::default(),
-            mounts: Vec::new(),
-            env: Default::default(),
-        },
-    )
-    .await;
-    let vessel = backend
-        .clone()
-        .using::<Vessel>(NAMESPACE)
-        .create(
-            &meta("workspace-multi-fresh"),
-            &VesselSpec {
-                convoy_ref: "convoy-multi-fresh".to_string(),
-                vessel_name: "implement".to_string(),
-                fulfilment_kind_ref: "policy-multi-fresh".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("vessel should create");
-
-    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
-    let deps = reconciler.prepare(&vessel).await.expect("deps should load");
-    let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
-    let checkout_paths = outcome
-        .actuations
-        .iter()
-        .filter_map(|actuation| match actuation {
-            Actuation::CreateCheckout { spec: CheckoutSpec::FreshClone(spec), .. } => Some(spec.target_path.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(checkout_paths, ["/workspace/flotilla", "/workspace/cleat"]);
-    for actuation in &outcome.actuations {
-        let Actuation::CreateCheckout { meta, spec: CheckoutSpec::FreshClone(_) } = actuation else {
-            continue;
-        };
-        assert_eq!(meta.labels.get(CONVOY_LABEL).map(String::as_str), Some("convoy-multi-fresh"));
-        assert_eq!(meta.owner_references.len(), 1);
-        assert_eq!(meta.owner_references[0].kind, "Convoy");
-        assert_eq!(meta.owner_references[0].name, "convoy-multi-fresh");
-    }
-}
-
-#[tokio::test]
 async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let flotilla = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("flotilla repository");
@@ -1361,7 +1202,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
         )
         .await
         .expect("convoy status should update");
-    create_host_direct_policy(&backend, NAMESPACE, "policy-scoped", HOST_REF, "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "policy-scoped", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
     let vessel = backend
         .clone()
@@ -1474,53 +1315,24 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
         .update_status("convoy-docker-stance", &convoy.metadata.resource_version, &status)
         .await
         .expect("convoy status should update");
-    create_policy(
+    create_docker_kind(
         &backend,
         NAMESPACE,
-        "policy-docker-stance",
-        PlacementPolicySpec::builder()
+        DockerKindFixture::builder()
+            .name("kind-docker-stance".to_string())
+            .host_ref(HOST_REF.to_string())
             .pool("cleat".to_string())
-            .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                memory_policy: Default::default(),
-                host_ref: HOST_REF.to_string(),
-                image: Some("ghcr.io/flotilla/dev:latest".into()),
-                pull_policy: Default::default(),
-                agent_adapters: Default::default(),
-                default_cwd: None,
-                env: Default::default(),
-                checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
-            })
+            .image("ghcr.io/flotilla/dev:latest".to_string())
             .build(),
     )
     .await;
+    create_ready_host_worktree(&backend, "convoy-docker-stance", "workspace-docker-stance").await;
     let environment_ref = "env-workspace-docker-stance";
     create_ready_docker_environment(
         &backend,
         NAMESPACE,
         environment_ref,
-        DockerEnvironmentSpec {
-            image_build_ref: None,
-            memory_policy: Default::default(),
-            host_ref: HOST_REF.to_string(),
-            image: "ghcr.io/flotilla/dev:latest".to_string(),
-            declared_agent_adapters: Default::default(),
-            required_agent_adapters: Default::default(),
-            pull_policy: Default::default(),
-            mounts: Vec::new(),
-            env: Default::default(),
-        },
-    )
-    .await;
-    create_ready_checkout(
-        &backend,
-        NAMESPACE,
-        ReadyCheckoutFixture::builder()
-            .name("checkout-workspace-docker-stance".to_string())
-            .env_ref(environment_ref.to_string())
-            .git_ref(GIT_REF.to_string())
-            .path("/workspace".to_string())
-            .maybe_fresh_clone(Some(fresh_clone_checkout_spec(environment_ref, GIT_REF, "/workspace", REPO_URL)))
-            .build(),
+        docker_worktree_environment("workspace-docker-stance", Default::default()),
     )
     .await;
     create_running_terminal(
@@ -1540,7 +1352,7 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
         "workspace-docker-stance",
         "convoy-docker-stance",
         "implement",
-        "policy-docker-stance",
+        "kind-docker-stance",
         REPO_URL,
     )
     .await;
@@ -1561,78 +1373,125 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
     ));
 }
 
+// The created environment takes the constant pull policy and is pinned to the
+// provider instance admission froze into the placement decision.
 #[tokio::test]
-async fn contained_docker_placement_propagates_never_pull_policy_to_environment() {
+async fn docker_kind_environment_uses_constant_pull_policy_and_decided_instance() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_convoy_with_single_task(&backend, NAMESPACE, "convoy-local-image", "implement", REPO_URL, GIT_REF).await;
-    create_policy(
+    let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-decided", "implement", REPO_URL, GIT_REF).await;
+    let mut status = convoy.status.expect("convoy status");
+    status.placement_decision = Some(PlacementDecision {
+        provider_instance: Some("rootless".to_string()),
+        provider_workspace_root: None,
+        minimal_alternatives: Vec::new(),
+        escalation_reason: None,
+        kind: "kind-decided".to_string(),
+        target_host: PlacementTargetHost { reference: CanonicalHostId::resolved(HOST_REF), display_name: HOST_REF.to_string() },
+        refused_candidates: Vec::new(),
+        viable_not_selected: Vec::new(),
+        allocation: None,
+    });
+    backend
+        .clone()
+        .using::<Convoy>(NAMESPACE)
+        .update_status("convoy-decided", &convoy.metadata.resource_version, &status)
+        .await
+        .expect("convoy status should update");
+    create_docker_kind(
         &backend,
         NAMESPACE,
-        "policy-local-image",
-        PlacementPolicySpec::builder()
+        DockerKindFixture::builder()
+            .name("kind-decided".to_string())
+            .host_ref(HOST_REF.to_string())
             .pool("cleat".to_string())
-            .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                memory_policy: flotilla_resources::EnvironmentMemoryPolicy {
-                    host_memory_percent: 30,
-                    expected_concurrent_crews: 3,
-                    swap_bytes: 0,
-                },
-                host_ref: HOST_REF.to_string(),
-                image: Some("flotilla-dev-env:latest".into()),
-                pull_policy: DockerImagePullPolicy::Never,
-                agent_adapters: Default::default(),
-                default_cwd: None,
-                env: Default::default(),
-                checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
-            })
+            .image("flotilla-dev-env:latest".to_string())
             .build(),
     )
     .await;
-    // Placement freezes the exact runtime instance into the created environment
-    // so later provisioning and recovery cannot switch to a different endpoint.
+    create_ready_host_worktree(&backend, "convoy-decided", "workspace-decided").await;
+    let vessel = create_workspace(&backend, NAMESPACE, "workspace-decided", "convoy-decided", "implement", "kind-decided", REPO_URL).await;
+
+    let environment = created_docker_environment(&backend, &vessel).await;
+    assert_eq!(environment, ("rootless".to_string(), "flotilla-dev-env:latest".to_string(), DockerImagePullPolicy::Always));
+}
+
+// ADR 0047: for one roll a vessel whose convoy froze a PlacementPolicy snapshot
+// still provisions; the policy's instance label pins the environment and its
+// stored settings give way to the realisation constants.
+#[tokio::test]
+async fn vessel_naming_a_frozen_placement_policy_still_provisions() {
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    create_convoy_with_single_task(&backend, NAMESPACE, "convoy-policy", "implement", REPO_URL, GIT_REF).await;
     let instance_key = flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
-    let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
-    let policy = policies.get("policy-local-image").await.expect("placement policy");
-    policies
-        .update(
-            &InputMeta::builder()
-                .name("policy-local-image".into())
-                .labels(BTreeMap::from([(instance_key.into(), "rootless".into())]))
+    backend
+        .clone()
+        .using::<PlacementPolicy>(NAMESPACE)
+        .create(
+            &labeled_meta("placement-snapshot-0123456789ab", [(instance_key.to_string(), "rootless".to_string())]),
+            &PlacementPolicySpec::builder()
+                .pool("cleat".to_string())
+                .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                    memory_policy: flotilla_resources::EnvironmentMemoryPolicy {
+                        host_memory_percent: 30,
+                        expected_concurrent_crews: 3,
+                        swap_bytes: 0,
+                    },
+                    host_ref: HOST_REF.to_string(),
+                    image: Some("flotilla-dev-env:latest".into()),
+                    pull_policy: DockerImagePullPolicy::Never,
+                    agent_adapters: Default::default(),
+                    default_cwd: None,
+                    env: Default::default(),
+                    checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+                })
                 .build(),
-            &policy.metadata.resource_version,
-            &policy.spec,
         )
         .await
-        .expect("bind runtime instance");
-    let vessel =
-        create_workspace(&backend, NAMESPACE, "workspace-local-image", "convoy-local-image", "implement", "policy-local-image", REPO_URL)
-            .await;
+        .expect("policy snapshot create should succeed");
+    create_ready_host_worktree(&backend, "convoy-policy", "workspace-policy").await;
+    let vessel = create_workspace(
+        &backend,
+        NAMESPACE,
+        "workspace-policy",
+        "convoy-policy",
+        "implement",
+        "placement-snapshot-0123456789ab",
+        REPO_URL,
+    )
+    .await;
 
-    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
-    let deps = reconciler.prepare(&vessel).await.expect("deps should load");
-    let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
+    let environment = created_docker_environment(&backend, &vessel).await;
+    assert_eq!(environment, ("rootless".to_string(), "flotilla-dev-env:latest".to_string(), DockerImagePullPolicy::Always));
+}
 
-    assert!(outcome.actuations.iter().any(|actuation| {
-        matches!(
-            actuation,
-            Actuation::CreateEnvironment { spec, meta }
-                if meta.labels.get(instance_key).map(String::as_str) == Some("rootless") && matches!(
-                    spec.docker.as_ref(),
-                    Some(docker)
-                        if docker.image == "flotilla-dev-env:latest"
-                            && docker.pull_policy == DockerImagePullPolicy::Never
-                            && docker.memory_policy.host_memory_percent == 30
-                            && docker.memory_policy.expected_concurrent_crews == 3
+async fn created_docker_environment(
+    backend: &ResourceBackend,
+    vessel: &flotilla_resources::ResourceObject<Vessel>,
+) -> (String, String, DockerImagePullPolicy) {
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let deps = reconciler.prepare(vessel).await.expect("deps should load");
+    let outcome = reconciler.reconcile(vessel, &deps, Utc::now());
+    outcome
+        .actuations
+        .iter()
+        .find_map(|actuation| match actuation {
+            Actuation::CreateEnvironment { spec, meta } => spec.docker.as_ref().map(|docker| {
+                (
+                    meta.labels.get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL).cloned().unwrap_or_default(),
+                    docker.image.clone(),
+                    docker.pull_policy,
                 )
-        )
-    }));
+            }),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("docker environment should be created: {:?}", outcome.patch))
 }
 
 #[tokio::test]
-async fn missing_placement_policy_marks_workspace_failed() {
+async fn missing_fulfilment_kind_marks_workspace_failed() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-a", "implement", REPO_URL, GIT_REF).await;
-    let workspace = create_workspace(&backend, NAMESPACE, "workspace-a", "convoy-a", "implement", "policy-missing", REPO_URL).await;
+    let workspace = create_workspace(&backend, NAMESPACE, "workspace-a", "convoy-a", "implement", "kind-missing", REPO_URL).await;
 
     let reconciler = test_vessel_reconciler(backend, NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
@@ -1641,7 +1500,7 @@ async fn missing_placement_policy_marks_workspace_failed() {
     assert!(matches!(
         outcome.patch,
         Some(flotilla_resources::VesselStatusPatch::MarkFailed { ref message })
-            if message.contains("placement policy policy-missing not found")
+            if message.contains("fulfilment kind kind-missing not found")
     ));
 }
 
@@ -1649,7 +1508,7 @@ async fn missing_placement_policy_marks_workspace_failed() {
 async fn reuses_existing_clone_by_deterministic_name() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-b", "implement", REPO_URL, GIT_REF).await;
-    create_host_direct_policy(&backend, NAMESPACE, "policy-a", HOST_REF, "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "policy-a", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
 
     let canonical_repo = canonicalize_repo_url(REPO_URL).expect("repo canonicalization");
@@ -1680,15 +1539,14 @@ async fn reuses_existing_clone_by_deterministic_name() {
 async fn docker_worktree_waits_for_checkout_before_creating_environment() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-c", "implement", REPO_URL, GIT_REF).await;
-    create_docker_worktree_policy(
+    create_docker_kind(
         &backend,
         NAMESPACE,
-        DockerWorktreePolicyFixture::builder()
+        DockerKindFixture::builder()
             .name("policy-worktree".to_string())
             .host_ref(HOST_REF.to_string())
             .pool("cleat".to_string())
             .image("ghcr.io/flotilla/dev:latest".to_string())
-            .mount_path("/workspace".to_string())
             .build(),
     )
     .await;
@@ -1881,15 +1739,14 @@ async fn docker_worktree_rejects_an_adopted_checkout_without_shared_clone_metada
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-adopted-docker", "implement", REPO_URL, GIT_REF).await;
     let repo_ref = convoy.spec.repositories[0].repo_ref.clone();
-    create_docker_worktree_policy(
+    create_docker_kind(
         &backend,
         NAMESPACE,
-        DockerWorktreePolicyFixture::builder()
+        DockerKindFixture::builder()
             .name("policy-adopted-docker".to_string())
             .host_ref(HOST_REF.to_string())
             .pool("cleat".to_string())
             .image("ghcr.io/flotilla/dev:latest".to_string())
-            .mount_path("/workspace".to_string())
             .build(),
     )
     .await;
@@ -1926,15 +1783,14 @@ async fn docker_worktree_rejects_an_adopted_checkout_without_shared_clone_metada
 async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failure() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-missing-clone", "implement", REPO_URL, GIT_REF).await;
-    create_docker_worktree_policy(
+    create_docker_kind(
         &backend,
         NAMESPACE,
-        DockerWorktreePolicyFixture::builder()
+        DockerKindFixture::builder()
             .name("policy-missing-clone".to_string())
             .host_ref(HOST_REF.to_string())
             .pool("cleat".to_string())
             .image("ghcr.io/flotilla/dev:latest".to_string())
-            .mount_path("/workspace".to_string())
             .build(),
     )
     .await;
@@ -1981,122 +1837,88 @@ async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failu
 #[rstest]
 #[case::host_direct(
     "workspace-host",
-    PlacementPolicySpec::builder()
-        .pool("cleat".to_string())
-        .host_direct(HostDirectPlacementPolicySpec {
-            host_ref: HOST_REF.to_string(),
-            checkout: HostDirectPlacementPolicyCheckout::Worktree,
-        })
-        .build(),
+    FulfilmentRealisation::HostDirect,
     "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-host",
     "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-host",
-    None,
+    None
 )]
 #[case::docker_worktree(
     "workspace-docker-worktree",
-    PlacementPolicySpec::builder()
-        .pool("cleat".to_string())
-        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-            memory_policy: Default::default(),
-            host_ref: HOST_REF.to_string(),
-            image: Some("ghcr.io/flotilla/dev:latest".into()),
-            pull_policy: Default::default(),
-            agent_adapters: BTreeSet::from(["codex".to_string()]),
-            default_cwd: None,
-            env: Default::default(),
-            checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
-        })
-        .build(),
+    FulfilmentRealisation::DockerPerVessel { image: Some("ghcr.io/flotilla/dev:latest".into()) },
     "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-docker-worktree",
     "/workspace",
-    Some(DockerEnvironmentSpec {
-        image_build_ref: None,
-        memory_policy: Default::default(),
-        host_ref: HOST_REF.to_string(),
-        image: "ghcr.io/flotilla/dev:latest".to_string(),
-        declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
-        required_agent_adapters: BTreeSet::from(["codex".to_string()]),
-        pull_policy: Default::default(),
-        mounts: vec![
-            flotilla_resources::EnvironmentMount {
-                source_path: "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-docker-worktree".to_string(),
-                target_path: "/workspace".to_string(),
-                mode: flotilla_resources::EnvironmentMountMode::Rw,
-            },
-            flotilla_resources::EnvironmentMount {
-                source_path: "/Users/alice/dev/flotilla-repos/clone/.git".to_string(),
-                target_path: "/Users/alice/dev/flotilla-repos/clone/.git".to_string(),
-                mode: flotilla_resources::EnvironmentMountMode::Rw,
-            },
-            flotilla_resources::EnvironmentMount {
-                source_path: "/Users/alice/dev/flotilla-repos/clone/.git/config".to_string(),
-                target_path: "/Users/alice/dev/flotilla-repos/clone/.git/config".to_string(),
-                mode: flotilla_resources::EnvironmentMountMode::Ro,
-            },
-            flotilla_resources::EnvironmentMount {
-                source_path: "/Users/alice/dev/flotilla-repos/clone/.git/hooks".to_string(),
-                target_path: "/Users/alice/dev/flotilla-repos/clone/.git/hooks".to_string(),
-                mode: flotilla_resources::EnvironmentMountMode::Ro,
-            },
-            flotilla_resources::EnvironmentMount {
-                source_path: "/Users/alice/dev/flotilla-repos/clone/.git/worktrees".to_string(),
-                target_path: "/Users/alice/dev/flotilla-repos/clone/.git/worktrees".to_string(),
-                mode: flotilla_resources::EnvironmentMountMode::Ro,
-            },
-            flotilla_resources::EnvironmentMount {
-                source_path: "/Users/alice/dev/flotilla-repos/clone/.git/worktrees/resolved-github-com-flotilla-org-flotilla.workspace-docker-worktree".to_string(),
-                target_path: "/Users/alice/dev/flotilla-repos/clone/.git/worktrees/resolved-github-com-flotilla-org-flotilla.workspace-docker-worktree".to_string(),
-                mode: flotilla_resources::EnvironmentMountMode::Rw,
-            },
-        ],
-        env: Default::default(),
-    }),
-)]
-#[case::docker_fresh_clone(
-    "workspace-docker-fresh",
-    PlacementPolicySpec::builder()
-        .pool("cleat".to_string())
-        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-            memory_policy: Default::default(),
-            host_ref: HOST_REF.to_string(),
-            image: Some("ghcr.io/flotilla/dev:latest".into()),
-            pull_policy: Default::default(),
-            agent_adapters: Default::default(),
-            default_cwd: Some("/app".to_string()),
-            env: Default::default(),
-            checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
-        })
-        .build(),
-    "/workspace",
-    "/app",
-    Some(DockerEnvironmentSpec {
-        image_build_ref: None,
-        memory_policy: Default::default(),
-        host_ref: HOST_REF.to_string(),
-        image: "ghcr.io/flotilla/dev:latest".to_string(),
-        declared_agent_adapters: Default::default(),
-        required_agent_adapters: BTreeSet::from(["codex".to_string()]),
-        pull_policy: Default::default(),
-        mounts: Vec::new(),
-        env: Default::default(),
-    }),
+    Some(docker_worktree_environment("workspace-docker-worktree", BTreeSet::from(["codex".to_string()]))),
 )]
 #[tokio::test]
 async fn terminal_sessions_use_strategy_specific_cwd(
     #[case] workspace_name: &str,
-    #[case] policy_spec: PlacementPolicySpec,
+    #[case] realisation: FulfilmentRealisation,
     #[case] checkout_path: &str,
     #[case] expected_cwd: &str,
     #[case] docker_env: Option<DockerEnvironmentSpec>,
 ) {
-    assert_terminal_cwd_for_strategy(workspace_name, policy_spec, checkout_path, expected_cwd, docker_env).await;
+    assert_terminal_cwd_for_strategy(workspace_name, realisation, checkout_path, expected_cwd, docker_env).await;
+}
+
+async fn create_ready_host_worktree(backend: &ResourceBackend, convoy_name: &str, workspace_name: &str) {
+    create_ready_host_direct_environment(backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    let canonical_repo = canonicalize_repo_url(REPO_URL).expect("repo canonicalization");
+    let clone_name = format!("clone-{}", clone_key(&canonical_repo, &host_direct_env_name()));
+    create_ready_clone(backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone").await;
+    let path = format!("/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.{workspace_name}");
+    create_ready_checkout(
+        backend,
+        NAMESPACE,
+        ReadyCheckoutFixture::builder()
+            .name(format!("checkout-{convoy_name}"))
+            .env_ref(host_direct_env_name())
+            .git_ref(GIT_REF.to_string())
+            .path(path.clone())
+            .maybe_worktree(Some(worktree_checkout_spec(&host_direct_env_name(), GIT_REF, &path, &clone_name)))
+            .build(),
+    )
+    .await;
+}
+
+fn docker_worktree_environment(workspace_name: &str, required_agent_adapters: BTreeSet<String>) -> DockerEnvironmentSpec {
+    let mount = |source: String, target: &str, mode| flotilla_resources::EnvironmentMount {
+        target_path: if target.is_empty() { source.clone() } else { target.to_string() },
+        source_path: source,
+        mode,
+    };
+    let clone = "/Users/alice/dev/flotilla-repos/clone/.git";
+    DockerEnvironmentSpec {
+        image_build_ref: None,
+        host_ref: HOST_REF.to_string(),
+        image: "ghcr.io/flotilla/dev:latest".to_string(),
+        declared_agent_adapters: Default::default(),
+        required_agent_adapters,
+        pull_policy: Default::default(),
+        mounts: vec![
+            mount(
+                format!("/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.{workspace_name}"),
+                "/workspace",
+                flotilla_resources::EnvironmentMountMode::Rw,
+            ),
+            mount(clone.to_string(), "", flotilla_resources::EnvironmentMountMode::Rw),
+            mount(format!("{clone}/config"), "", flotilla_resources::EnvironmentMountMode::Ro),
+            mount(format!("{clone}/hooks"), "", flotilla_resources::EnvironmentMountMode::Ro),
+            mount(format!("{clone}/worktrees"), "", flotilla_resources::EnvironmentMountMode::Ro),
+            mount(
+                format!("{clone}/worktrees/resolved-github-com-flotilla-org-flotilla.{workspace_name}"),
+                "",
+                flotilla_resources::EnvironmentMountMode::Rw,
+            ),
+        ],
+        env: Default::default(),
+    }
 }
 
 #[tokio::test]
 async fn child_failure_propagates_to_workspace_failure() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-f", "implement", REPO_URL, GIT_REF).await;
-    create_host_direct_policy(&backend, NAMESPACE, "policy-f", HOST_REF, "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "policy-f", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
 
     let canonical_repo = canonicalize_repo_url(REPO_URL).expect("repo canonicalization");
@@ -2173,7 +1995,7 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
         .update_status("convoy-recover", &convoy.metadata.resource_version, &status)
         .await
         .expect("agent crew status");
-    create_host_direct_policy(&backend, NAMESPACE, "policy-recover", HOST_REF, "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "policy-recover", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
     let clone_name =
         format!("clone-{}", clone_key(&canonicalize_repo_url(REPO_URL).expect("repo canonicalization"), &host_direct_env_name()));
@@ -2291,7 +2113,7 @@ async fn adopted_checkout_ref_reuses_checkout_without_creating_clone_or_checkout
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-adopted", "implement", REPO_URL, GIT_REF).await;
     let repo_ref = convoy.spec.repositories[0].repo_ref.clone();
-    create_host_direct_policy(&backend, NAMESPACE, "policy-adopted", HOST_REF, "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "policy-adopted", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
     create_ready_adopted_checkout(&backend, NAMESPACE, "adopted-checkout-convoy-adopted", "/Users/alice/dev/flotilla-existing").await;
     let workspace = backend
@@ -2380,7 +2202,7 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
         .update_status("convoy-crew", &convoy.metadata.resource_version, &status)
         .await
         .expect("update convoy crew");
-    create_host_direct_policy(&backend, NAMESPACE, "policy-crew", HOST_REF, "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "policy-crew", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
     create_ready_adopted_checkout(&backend, NAMESPACE, "adopted-checkout-convoy-crew", "/Users/alice/dev/flotilla-existing").await;
     let workspace = backend
@@ -2501,7 +2323,7 @@ async fn vessel_waits_for_admission_brief_envelope_then_pins_its_digest() {
     patch_resource_annotation(&backend, NAMESPACE, "Convoy", "convoy-artifact", BRIEF_ARTIFACTS_ANNOTATION, "true")
         .await
         .expect("artifact admission marker");
-    create_host_direct_policy(&backend, NAMESPACE, "policy-artifact", HOST_REF, "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "policy-artifact", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
     create_ready_adopted_checkout(&backend, NAMESPACE, "adopted-artifact", "/Users/alice/dev/flotilla-existing").await;
     let vessel = backend
@@ -2592,7 +2414,7 @@ async fn repo_level_brief_template_override_changes_one_block_for_that_repo_conv
         .update_status("convoy-repo-override", &convoy.metadata.resource_version, &status)
         .await
         .expect("update convoy crew");
-    create_host_direct_policy(&backend, NAMESPACE, "policy-repo-override", HOST_REF, "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "policy-repo-override", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
     create_ready_adopted_checkout(
         &backend,
@@ -2703,7 +2525,7 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
         )
         .await
         .expect("convoy status update");
-    create_host_direct_policy(&backend, NAMESPACE, "policy-issue-brief", HOST_REF, "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "policy-issue-brief", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
     create_ready_adopted_checkout(&backend, NAMESPACE, "adopted-checkout-issue-brief", "/Users/alice/dev/flotilla-existing").await;
     let workspace = backend
@@ -2742,7 +2564,7 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
 async fn observed_checkout_at_managed_name_marks_workspace_failed() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-observed", "implement", REPO_URL, GIT_REF).await;
-    create_host_direct_policy(&backend, NAMESPACE, "policy-observed", HOST_REF, "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "policy-observed", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
 
     let canonical_repo = canonicalize_repo_url(REPO_URL).expect("repo canonicalization");
@@ -2902,7 +2724,7 @@ async fn run_finalizer_ignores_missing_children_and_cleans_partial_workspace() {
 async fn terminal_session_actuation_includes_system_and_user_labels() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_labeled_processes(&backend, NAMESPACE, "convoy-labels", REPO_URL, GIT_REF).await;
-    create_host_direct_policy(&backend, NAMESPACE, "policy-labels", HOST_REF, "cleat").await;
+    create_host_direct_kind(&backend, NAMESPACE, "policy-labels", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
 
     let canonical_repo = canonicalize_repo_url(REPO_URL).expect("repo canonicalization");
@@ -2971,56 +2793,41 @@ async fn terminal_session_actuation_includes_system_and_user_labels() {
 
 async fn assert_terminal_cwd_for_strategy(
     workspace_name: &str,
-    policy_spec: PlacementPolicySpec,
+    realisation: FulfilmentRealisation,
     checkout_path: &str,
     expected_cwd: &str,
     docker_env: Option<DockerEnvironmentSpec>,
 ) {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-cwd", "implement", REPO_URL, GIT_REF).await;
-    create_policy(&backend, NAMESPACE, "policy-cwd", policy_spec).await;
+    create_kind(
+        &backend,
+        NAMESPACE,
+        "kind-cwd",
+        FulfilmentKindSpec::builder().host_ref(HOST_REF.to_string()).pool("cleat".to_string()).realisation(realisation).build(),
+    )
+    .await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
 
     let canonical_repo = canonicalize_repo_url(REPO_URL).expect("repo canonicalization");
     let clone_name = format!("clone-{}", clone_key(&canonical_repo, &host_direct_env_name()));
-    if checkout_path != "/workspace" || docker_env.is_none() {
-        create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone")
-            .await;
-    }
+    create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone").await;
     if let Some(docker) = docker_env {
         create_ready_docker_environment(&backend, NAMESPACE, &format!("env-{workspace_name}"), docker).await;
     }
-    let checkout_env_ref = if checkout_path == "/workspace" && workspace_name == "workspace-docker-fresh" {
-        format!("env-{workspace_name}")
-    } else {
-        host_direct_env_name()
-    };
     create_ready_checkout(
         &backend,
         NAMESPACE,
         ReadyCheckoutFixture::builder()
-            .name(if checkout_path == "/workspace" && workspace_name == "workspace-docker-fresh" {
-                format!("checkout-{workspace_name}")
-            } else {
-                "checkout-convoy-cwd".to_string()
-            })
-            .env_ref(checkout_env_ref.clone())
+            .name("checkout-convoy-cwd".to_string())
+            .env_ref(host_direct_env_name())
             .git_ref(GIT_REF.to_string())
             .path(checkout_path.to_string())
-            .maybe_worktree(if checkout_path == "/workspace" && workspace_name == "workspace-docker-fresh" {
-                None
-            } else {
-                Some(worktree_checkout_spec(&checkout_env_ref, GIT_REF, checkout_path, &clone_name))
-            })
-            .maybe_fresh_clone(if checkout_path == "/workspace" && workspace_name == "workspace-docker-fresh" {
-                Some(fresh_clone_checkout_spec(&checkout_env_ref, GIT_REF, checkout_path, REPO_URL))
-            } else {
-                None
-            })
+            .maybe_worktree(Some(worktree_checkout_spec(&host_direct_env_name(), GIT_REF, checkout_path, &clone_name)))
             .build(),
     )
     .await;
-    let workspace = create_workspace(&backend, NAMESPACE, workspace_name, "convoy-cwd", "implement", "policy-cwd", REPO_URL).await;
+    let workspace = create_workspace(&backend, NAMESPACE, workspace_name, "convoy-cwd", "implement", "kind-cwd", REPO_URL).await;
 
     let reconciler = test_vessel_reconciler(backend, NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
@@ -3051,20 +2858,6 @@ fn worktree_checkout_spec(env_ref: &str, git_ref: &str, target_path: &str, clone
         base_ref: None,
         target_path: target_path.to_string(),
         clone_ref: clone_ref.to_string(),
-    }
-}
-
-fn fresh_clone_checkout_spec(env_ref: &str, git_ref: &str, target_path: &str, url: &str) -> flotilla_resources::FreshCloneCheckoutSpec {
-    flotilla_resources::FreshCloneCheckoutSpec {
-        source_clone_ref: None,
-        repo_ref: flotilla_resources::RepositoryKey(flotilla_resources::repo_key(
-            &canonicalize_repo_url(REPO_URL).expect("repo canonicalization"),
-        )),
-        env_ref: env_ref.to_string(),
-        r#ref: git_ref.to_string(),
-        base_ref: None,
-        target_path: target_path.to_string(),
-        url: url.to_string(),
     }
 }
 
@@ -3384,100 +3177,6 @@ async fn create_labeled_terminal(backend: &ResourceBackend, namespace: &str, nam
         .expect("terminal create should succeed");
 }
 
-// #3090: host clone and checkout must precede container provisioning. The vessel
-// owns a self-contained checkout and grants only a single writable workspace bind.
-#[tokio::test]
-async fn local_clone_provisioning_orders_host_checkout_before_container_and_surfaces_copy() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_convoy_with_single_task(&backend, NAMESPACE, "convoy-local", "implement", REPO_URL, GIT_REF).await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/host/repos").await;
-    create_policy(
-        &backend,
-        NAMESPACE,
-        "policy-local",
-        PlacementPolicySpec::builder()
-            .pool("cleat".into())
-            .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                host_ref: HOST_REF.into(),
-                image: Some("ghcr.io/flotilla/dev:latest".into()),
-                pull_policy: Default::default(),
-                agent_adapters: BTreeSet::from(["codex".into()]),
-                default_cwd: None,
-                env: Default::default(),
-                checkout: DockerCheckoutStrategy::LocalCloneOnHostAndMount { mount_path: "/workspace".into() },
-                memory_policy: Default::default(),
-            })
-            .build(),
-    )
-    .await;
-    let vessel = create_workspace(&backend, NAMESPACE, "convoy-local-work", "convoy-local", "implement", "policy-local", REPO_URL).await;
-    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
-    let prepared = reconciler.prepare(&vessel).await.expect("plan host checkout");
-    let outcome = reconciler.reconcile(&vessel, &prepared, Utc::now());
-    assert!(!outcome.actuations.iter().any(|action| matches!(action, Actuation::CreateEnvironment { .. })));
-    let clone = outcome
-        .actuations
-        .iter()
-        .find_map(|action| match action {
-            Actuation::CreateClone { meta, spec } => Some((meta, spec)),
-            _ => None,
-        })
-        .expect("managed clone demand");
-    let checkout = outcome
-        .actuations
-        .iter()
-        .find_map(|action| match action {
-            Actuation::CreateCheckout { meta, spec } => Some((meta, spec)),
-            _ => None,
-        })
-        .expect("checkout demand");
-    let CheckoutSpec::FreshClone(spec) = checkout.1 else { panic!("self-contained clone required") };
-    assert_eq!(spec.source_clone_ref.as_deref(), Some(clone.0.name.as_str()));
-    assert_eq!(spec.env_ref, host_direct_env_name());
-    assert!(spec.target_path.starts_with("/host/repos/convoy-local-work/"));
-    assert!(clone.1.path.starts_with("/host/repos/"));
-    assert_ne!(spec.target_path, clone.1.path);
-    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
-    let object = checkouts.create(checkout.0, checkout.1).await.expect("checkout resource");
-    checkouts
-        .update_status(
-            &object.metadata.name,
-            &object.metadata.resource_version,
-            &CheckoutStatus {
-                phase: CheckoutPhase::Ready,
-                path: Some(spec.target_path.clone()),
-                degraded: Some("objects copied across filesystems".into()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("ready local clone");
-    let prepared = reconciler.prepare(&vessel).await.expect("plan container");
-    let outcome = reconciler.reconcile(&vessel, &prepared, Utc::now());
-    let docker = outcome
-        .actuations
-        .iter()
-        .find_map(|action| match action {
-            Actuation::CreateEnvironment { spec, .. } => spec.docker.as_ref(),
-            _ => None,
-        })
-        .expect("container after checkout");
-    assert_eq!(
-        docker.mounts,
-        vec![flotilla_resources::EnvironmentMount {
-            source_path: spec.target_path.clone(),
-            target_path: "/workspace".into(),
-            mode: flotilla_resources::EnvironmentMountMode::Rw,
-        }]
-    );
-    assert!(!docker.env.contains_key("GIT_CONFIG_COUNT"), "tracking lives in the owned repository config");
-    let persisted = backend.using::<Vessel>(NAMESPACE).get(&vessel.metadata.name).await.expect("vessel");
-    assert_eq!(
-        persisted.status.unwrap().degraded.get(&object.metadata.name).map(String::as_str),
-        Some("objects copied across filesystems")
-    );
-}
-
 // ADR 0062: a composed placement's Environment names the per-identity
 // ImageBuild (the Environment reconciler supplies the digest) and declares the
 // harnesses its roles use; the vessel records the identity when provisioning
@@ -3489,25 +3188,17 @@ async fn composed_placement_records_identity_then_digest() {
     let image_build_ref = format!("image-{}-amd64", "c".repeat(40));
     let digest = format!("registry.test/crew@sha256:{}", "d".repeat(64));
     let built = DockerImageSource::Built { identity: identity.clone(), image_build_ref: image_build_ref.clone() };
-    let policy = PlacementPolicySpec::builder()
+    let kind = FulfilmentKindSpec::builder()
+        .host_ref(HOST_REF.to_string())
         .pool("cleat".to_string())
-        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-            memory_policy: Default::default(),
-            host_ref: HOST_REF.to_string(),
-            image: Some(built),
-            pull_policy: Default::default(),
-            agent_adapters: Default::default(),
-            default_cwd: None,
-            env: Default::default(),
-            checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
-        })
+        .realisation(FulfilmentRealisation::DockerPerVessel { image: Some(built) })
         .build();
 
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-composed", "implement", REPO_URL, GIT_REF).await;
-    create_policy(&backend, NAMESPACE, "policy-composed", policy.clone()).await;
-    let vessel =
-        create_workspace(&backend, NAMESPACE, "vessel-composed", "convoy-composed", "implement", "policy-composed", REPO_URL).await;
+    create_kind(&backend, NAMESPACE, "kind-composed", kind.clone()).await;
+    create_ready_host_worktree(&backend, "convoy-composed", "vessel-composed").await;
+    let vessel = create_workspace(&backend, NAMESPACE, "vessel-composed", "convoy-composed", "implement", "kind-composed", REPO_URL).await;
     let reconciler = test_vessel_reconciler(backend, NAMESPACE);
     let deps = reconciler.prepare(&vessel).await.expect("deps should load");
     let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
@@ -3530,25 +3221,14 @@ async fn composed_placement_records_identity_then_digest() {
 
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-composed", "implement", REPO_URL, GIT_REF).await;
-    create_policy(&backend, NAMESPACE, "policy-composed", policy).await;
+    create_kind(&backend, NAMESPACE, "kind-composed", kind).await;
+    create_ready_host_worktree(&backend, "convoy-composed", "vessel-composed").await;
     let environment_ref = "env-vessel-composed";
     create_ready_docker_environment(
         &backend,
         NAMESPACE,
         environment_ref,
         DockerEnvironmentSpec { image: digest.clone(), image_build_ref: Some(image_build_ref), ..environment },
-    )
-    .await;
-    create_ready_checkout(
-        &backend,
-        NAMESPACE,
-        ReadyCheckoutFixture::builder()
-            .name("checkout-vessel-composed".to_string())
-            .env_ref(environment_ref.to_string())
-            .git_ref(GIT_REF.to_string())
-            .path("/workspace".to_string())
-            .maybe_fresh_clone(Some(fresh_clone_checkout_spec(environment_ref, GIT_REF, "/workspace", REPO_URL)))
-            .build(),
     )
     .await;
     create_running_terminal(
@@ -3562,8 +3242,7 @@ async fn composed_placement_records_identity_then_digest() {
         "cleat",
     )
     .await;
-    let vessel =
-        create_workspace(&backend, NAMESPACE, "vessel-composed", "convoy-composed", "implement", "policy-composed", REPO_URL).await;
+    let vessel = create_workspace(&backend, NAMESPACE, "vessel-composed", "convoy-composed", "implement", "kind-composed", REPO_URL).await;
     let reconciler = test_vessel_reconciler(backend, NAMESPACE);
     let deps = reconciler.prepare(&vessel).await.expect("deps should load");
     let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());

@@ -1328,6 +1328,13 @@ async fn open_provisioning_lifecycles(
         .await
         .map_err(|error| error.to_string())??;
     daemon.resource_backend().install_engine_records(Arc::new(artifacts));
+    // FulfilmentKind, which admission and the vessel reconciler read and admission's snapshots write.
+    let service = daemon.decided_store()?;
+    let clock = daemon.clock_for_scenarios();
+    let kinds = tokio::task::spawn_blocking(move || flotilla_provisioning::engine::kinds::EngineKinds::open(service, clock))
+        .await
+        .map_err(|error| error.to_string())??;
+    daemon.resource_backend().install_engine_records(Arc::new(kinds));
     let backend = daemon.resource_backend();
     tokio::task::spawn_blocking(move || {
         let home = StoreLog::new(Arc::clone(&store)).home().to_owned();

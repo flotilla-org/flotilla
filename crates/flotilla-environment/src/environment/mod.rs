@@ -56,7 +56,6 @@ pub struct CreateOpts {
     pub prepared_auth: PreparedEnvironmentAuth,
     /// CPU quota for this vessel. None leaves the provider's default.
     pub cpu_limit: Option<usize>,
-    pub memory_policy: flotilla_resources::EnvironmentMemoryPolicy,
 }
 
 /// Inputs shared by environment provisioning, without image concepts.
@@ -67,7 +66,6 @@ pub struct ProvisionOpts {
     pub provisioned_mounts: Vec<ProvisionedMount>,
     pub tools: Vec<EnvironmentTool>,
     pub cpu_limit: Option<usize>,
-    pub memory_policy: flotilla_resources::EnvironmentMemoryPolicy,
 }
 
 /// Admitted operation credentials; callers never select an image through these options.
@@ -87,7 +85,6 @@ impl From<CreateOpts> for ProvisionOpts {
             provisioned_mounts: opts.provisioned_mounts,
             tools: opts.tools,
             cpu_limit: opts.cpu_limit,
-            memory_policy: opts.memory_policy,
         }
     }
 }
@@ -610,7 +607,6 @@ pub fn legacy_environment_spec(spec: &flotilla_protocol::EnvironmentSpec) -> Res
             declared_agent_adapters: Default::default(),
             required_agent_adapters: Default::default(),
             pull_policy: Default::default(),
-            memory_policy: Default::default(),
             mounts: Vec::new(),
             env: Default::default(),
         }),

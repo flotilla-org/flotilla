@@ -35,11 +35,10 @@ use flotilla_protocol::{
 use flotilla_replication::{replicate_kind_direct, ReplicationStore};
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, CrewSessionStatus, FulfilmentFacts,
-    FulfilmentKind, FulfilmentKindSpec, HarnessFacts, Host, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
-    HostStatus, InputMeta, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, ResourceError,
-    ResourceList, ResourceProvenance, Selector, StatusPatch, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession,
-    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, TerminalSessionTarget, Vessel,
-    WatchEvent, WatchStart, WorkflowTemplate,
+    FulfilmentKind, FulfilmentKindSpec, HarnessFacts, Host, HostSpec, HostStatus, InputMeta,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, ResourceError, ResourceList, ResourceProvenance, Selector, StatusPatch,
+    TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec,
+    TerminalSessionStatus, TerminalSessionStatusPatch, TerminalSessionTarget, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
 };
 use flotilla_store::{controller::ControllerLoop, list_resource_kind, ResourceBackend};
 use flotilla_test_support::TestSocketDir;
@@ -2095,6 +2094,19 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
     }
 }
 
+fn host_direct_kind(host_ref: &str) -> FulfilmentKindSpec {
+    FulfilmentKindSpec::builder()
+        .host_ref(host_ref.to_string())
+        .pool("cleat".to_string())
+        .grants(std::collections::BTreeSet::from([
+            flotilla_resources::FulfilmentGrant::platform("linux".to_string()),
+            flotilla_resources::FulfilmentGrant::host_account_reach(),
+            flotilla_resources::FulfilmentGrant::network("host".to_string()),
+        ]))
+        .realisation(flotilla_resources::FulfilmentRealisation::HostDirect)
+        .build()
+}
+
 async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option<flotilla_protocol::CommandCaller>) {
     let (_tmp, daemon) = empty_daemon().await;
     let (_remote_tmp, remote_daemon) = empty_daemon_named("feta").await;
@@ -2140,35 +2152,17 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
         .await
         .expect("replicate remote host capacity");
     let remote_policy_name = format!("host-direct-{remote_host_id}");
-    let remote_policies = remote_daemon.resource_backend().using::<PlacementPolicy>("flotilla");
-    let remote_policy = remote_policies
-        .create(
-            &InputMeta::builder().name(remote_policy_name.clone()).build(),
-            &PlacementPolicySpec::builder()
-                .pool("cleat".to_string())
-                .host_direct(HostDirectPlacementPolicySpec {
-                    host_ref: remote_host_id.clone(),
-                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                })
-                .build(),
-        )
+    let remote_kinds = remote_daemon.resource_backend().using::<FulfilmentKind>("flotilla");
+    remote_kinds
+        .create(&InputMeta::builder().name(remote_policy_name.clone()).build(), &host_direct_kind(&remote_host_id))
         .await
-        .expect("create remote placement policy at its home");
-    remote_daemon
-        .resource_backend()
-        .using::<FulfilmentKind>("flotilla")
-        .create(
-            &InputMeta::builder().name(remote_policy_name.clone()).build(),
-            &FulfilmentKindSpec::from_policy(&remote_policy.spec, "linux").expect("kind"),
-        )
-        .await
-        .expect("remote fulfilment kind");
+        .expect("remote fulfilment kind at its home");
     daemon
         .resource_backend()
-        .replica_writer::<PlacementPolicy>(node("feta"), "flotilla")
-        .replace(&remote_policies.list().await.expect("list remote placement policies"), chrono::Utc::now())
+        .replica_writer::<FulfilmentKind>(node("feta"), "flotilla")
+        .replace(&remote_kinds.list().await.expect("list remote fulfilment kinds"), chrono::Utc::now())
         .await
-        .expect("replicate remote placement policy");
+        .expect("replicate remote fulfilment kind");
     let remote_summary = HostSummary::builder()
         .environment_id(EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new(&remote_host_id)))
         .host_name(HostName::new("feta"))
@@ -2257,11 +2251,11 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
     assert_eq!(placed_convoys.items.len(), 1, "convoy is homed on the placement host");
     let convoy = &placed_convoys.items[0];
     let snapshot = &convoy.metadata.annotations[flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION];
-    placed.using::<PlacementPolicy>("flotilla").get(snapshot).await.expect("actuator owns its frozen placement");
+    placed.using::<FulfilmentKind>("flotilla").get(snapshot).await.expect("actuator owns its frozen placement");
     assert!(
         daemon
             .resource_backend()
-            .using::<PlacementPolicy>("flotilla")
+            .using::<FulfilmentKind>("flotilla")
             .list()
             .await
             .expect("origin placements")
@@ -2518,26 +2512,17 @@ async fn dispatch_execute_requires_a_route_for_unready_or_statusless_placement()
         .await
         .expect("replicate not-ready host");
     let policy_name = "host-direct-stopped-host-id";
-    let policies = remote_backend.using::<PlacementPolicy>("flotilla");
-    policies
-        .create(
-            &InputMeta::builder().name(policy_name.to_string()).build(),
-            &PlacementPolicySpec::builder()
-                .pool("cleat".to_string())
-                .host_direct(HostDirectPlacementPolicySpec {
-                    host_ref: host.metadata.name,
-                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                })
-                .build(),
-        )
+    let kinds = remote_backend.using::<FulfilmentKind>("flotilla");
+    kinds
+        .create(&InputMeta::builder().name(policy_name.to_string()).build(), &host_direct_kind(&host.metadata.name))
         .await
-        .expect("create remote placement policy");
+        .expect("create remote fulfilment kind");
     daemon
         .resource_backend()
-        .replica_writer::<PlacementPolicy>(node("stopped"), "flotilla")
-        .replace(&policies.list().await.expect("list remote placement policies"), chrono::Utc::now())
+        .replica_writer::<FulfilmentKind>(node("stopped"), "flotilla")
+        .replace(&kinds.list().await.expect("list remote fulfilment kinds"), chrono::Utc::now())
         .await
-        .expect("replicate remote placement policy");
+        .expect("replicate remote fulfilment kind");
     let router = make_remote_command_router(
         &daemon,
         &Arc::new(Mutex::new(PeerManager::new(NodeId::new("local")))),
@@ -2577,25 +2562,16 @@ async fn dispatch_execute_requires_a_route_for_unready_or_statusless_placement()
         .await
         .expect("replicate host without status");
     let statusless_policy = "host-direct-statusless-host-id";
-    policies
-        .create(
-            &InputMeta::builder().name(statusless_policy.to_string()).build(),
-            &PlacementPolicySpec::builder()
-                .pool("cleat".to_string())
-                .host_direct(HostDirectPlacementPolicySpec {
-                    host_ref: statusless.metadata.name,
-                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                })
-                .build(),
-        )
+    kinds
+        .create(&InputMeta::builder().name(statusless_policy.to_string()).build(), &host_direct_kind(&statusless.metadata.name))
         .await
-        .expect("create placement policy without host status");
+        .expect("create fulfilment kind without host status");
     daemon
         .resource_backend()
-        .replica_writer::<PlacementPolicy>(node("stopped"), "flotilla")
-        .replace(&policies.list().await.expect("list remote placement policies"), chrono::Utc::now())
+        .replica_writer::<FulfilmentKind>(node("stopped"), "flotilla")
+        .replace(&kinds.list().await.expect("list remote fulfilment kinds"), chrono::Utc::now())
         .await
-        .expect("replicate placement policy without host status");
+        .expect("replicate fulfilment kind without host status");
     let error = router
         .dispatch_execute(
             Command::builder()

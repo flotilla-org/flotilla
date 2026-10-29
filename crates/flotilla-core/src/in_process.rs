@@ -92,8 +92,8 @@ use flotilla_resources::{
     host_direct_environment_name, observed_change_request_subjects, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Clock, Convoy as ResourceConvoy, ConvoyEnsure,
     ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec,
-    CrewCompletionPending, Forge, ForgeKind, InputMeta, IssueSourceResolution, IssueSourceUnavailable, LandingCredentialScope,
-    LifecycleAuthority, ObservedChangeRequestState, PlacementPolicy, Project, Repository, RepositoryIdentity, RepositoryKey,
+    CrewCompletionPending, Forge, ForgeKind, FulfilmentKind, InputMeta, IssueSourceResolution, IssueSourceUnavailable,
+    LandingCredentialScope, LifecycleAuthority, ObservedChangeRequestState, Project, Repository, RepositoryIdentity, RepositoryKey,
     RepositorySpec, ResourceError, ResourceObject, ResourceProvenance, SystemClock, TerminalSessionTarget, TurnDeliveryRung, WatchEvent,
     WatchStart, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
 };
@@ -570,6 +570,7 @@ async fn discover_vcs_for_checkout(
     local_environment_id: &EnvironmentId,
     environment_id: &EnvironmentId,
     checkout_path: &Path,
+    repository_url: Option<&str>,
 ) -> Result<CheckoutProvider, String> {
     let runner = environment_manager
         .environment_runner(environment_id)
@@ -583,6 +584,12 @@ async fn discover_vcs_for_checkout(
     let mut bag = host_bag;
     for detector in &discovery.repo_detectors {
         bag = bag.extend(detector.detect(&checkout, &*runner, env).await);
+    }
+    // A path not yet cloned has no remote to detect; its record names the repository it is for.
+    if bag.remote_hosts().is_empty() {
+        if let Some(remote) = repository_url.and_then(|url| flotilla_vcs::providers::detection::remote_assertion(url, "origin")) {
+            bag = bag.with(remote);
+        }
     }
     let mut unmet = Vec::new();
     for factory in &discovery.factories.vcs {
@@ -1063,9 +1070,16 @@ impl InProcessDaemon {
             if repos.values().any(|state| state.contains_path(&path)) {
                 continue;
             }
-            let initial_vcs =
-                discover_vcs_for_checkout(&environment_manager, &discovery, &config, &local_environment_id, &local_environment_id, &path)
-                    .await;
+            let initial_vcs = discover_vcs_for_checkout(
+                &environment_manager,
+                &discovery,
+                &config,
+                &local_environment_id,
+                &local_environment_id,
+                &path,
+                None,
+            )
+            .await;
             let mut startup_inspection = match &initial_vcs {
                 Ok(vcs) => {
                     GitRepositoryInspector::new(
@@ -2657,11 +2671,11 @@ impl InProcessDaemon {
         let policy = self
             .resource_backend
             .clone()
-            .including_replicas::<PlacementPolicy>(namespace)
+            .including_replicas::<FulfilmentKind>(namespace)
             .get(policy_name)
             .await
             .map(|source| source.object)
-            .map_err(|error| format!("placement policy {policy_name}: {error}"))?;
+            .map_err(|error| format!("fulfilment kind {policy_name}: {error}"))?;
         let target_host = placement_target_host(&self.resource_backend, namespace, &policy).await?;
         let actuator = placement_actuator_host_ref(&self.resource_backend, namespace, &target_host).await?;
         if self.canonical_local_host_id().as_ref() == Some(&actuator) {

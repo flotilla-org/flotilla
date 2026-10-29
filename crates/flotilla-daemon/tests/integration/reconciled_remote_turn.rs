@@ -25,10 +25,10 @@ use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
     ClaimExit, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSessionStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState,
-    Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, ExitDeclaration, HostDirectEnvironmentSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, Message, MessageExpectation, MessagePhase,
-    PlacementPolicy, PlacementPolicySpec, Resource, Selector, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkState, WorkflowSnapshot, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, ExitDeclaration, FulfilmentKind, FulfilmentKindSpec,
+    FulfilmentRealisation, HostDirectEnvironmentSpec, InputMeta, Message, MessageExpectation, MessagePhase, Resource, Selector,
+    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase,
+    WorkState, WorkflowSnapshot, ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
 use flotilla_store::{controller::Reconciler, ResourceBackend};
 use futures::StreamExt;
@@ -161,20 +161,18 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         .await
         .expect("working crew");
     replicate::<Convoy>(&home, &placement, home_daemon.node_id()).await;
-    home.using::<PlacementPolicy>("flotilla")
+    home.using::<FulfilmentKind>("flotilla")
         .create(
             &meta("placement-policy"),
-            &PlacementPolicySpec::builder()
+            &FulfilmentKindSpec::builder()
+                .host_ref("placement-host".to_string())
                 .pool("cleat".to_string())
-                .host_direct(HostDirectPlacementPolicySpec {
-                    host_ref: "placement-host".to_string(),
-                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                })
+                .realisation(FulfilmentRealisation::HostDirect)
                 .build(),
         )
         .await
-        .expect("placement policy");
-    replicate::<PlacementPolicy>(&home, &placement, home_daemon.node_id()).await;
+        .expect("fulfilment kind");
+    replicate::<FulfilmentKind>(&home, &placement, home_daemon.node_id()).await;
     let environments = placement.clone().using::<Environment>("flotilla");
     let environment = environments
         .create(

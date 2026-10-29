@@ -20,7 +20,6 @@ use flotilla_charter::ops_entry::{ENSURED_FROM_ANNOTATION, MATERIALIZED_PROJECT_
 use flotilla_config::ConfigStore;
 use flotilla_discovery::{environments::Environments, AiUtilityFactory, DiscoveryRuntime};
 use flotilla_discovery_api::{provider_config::ProviderConfigView, EnvironmentBag};
-use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_observation::sources::{ChangeRequestQueryPort, IssueQueryPort, ProviderChangeRequestObservationSource};
 #[cfg(test)]
 use flotilla_paths::path_context::DaemonHostPath;
@@ -36,14 +35,14 @@ use flotilla_resources::address::{record_name, remote_change_request_address};
 use flotilla_resources::checkout_path::checkout_path;
 use flotilla_resources::convoy_address::{convoy_address, convoy_record_name};
 use flotilla_resources::{
-    api_version, capped_github_app_permissions, normalize_issue_source, AllocationDecision, BoundChangeRequest, CapabilityNeed,
-    ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, Clock, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyIssue,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewSource, CrewSpec, Forge,
-    FulfilmentGrant, FulfilmentKind, Host as ResourceHost, InputMeta, InputValue, IssueSnapshot, IssueSourceResolution,
-    IssueSourceUnavailable, ObjectMeta, ObservedChangeRequestState, PlacementPolicy, PlacementPolicySpec, Platform, Project, ProjectSpec,
-    ReadResourceObject, Repository, RepositoryKey, RepositoryTrust, Resource, ResourceError, ResourceObject, ResourceProvenance,
-    RoleHandoff, SupervisionTarget, TerminalCrewContext, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
-    BRIEF_ARTIFACTS_ANNOTATION, CODEX_CENTRAL_LOGIN_CAPABILITY, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
+    api_version, capped_github_app_permissions, is_prepared_snapshot, normalize_issue_source, AllocationDecision, BoundChangeRequest,
+    CapabilityNeed, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, Clock, Convoy as ResourceConvoy, ConvoyEnsure,
+    ConvoyIssue, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewSource,
+    CrewSpec, Forge, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host as ResourceHost, InputMeta,
+    InputValue, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, ObjectMeta, ObservedChangeRequestState, Platform, Project,
+    ProjectSpec, ReadResourceObject, Repository, RepositoryKey, RepositoryTrust, Resource, ResourceError, ResourceObject,
+    ResourceProvenance, RoleHandoff, SupervisionTarget, TerminalCrewContext, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    BRIEF_ARTIFACTS_ANNOTATION, CODEX_CENTRAL_LOGIN_CAPABILITY, GENERATION_LABEL, PLACEMENT_SNAPSHOT_KIND, PROJECT_LABEL, ROLE_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{HoldAct, RepositorySpec, SystemClock};
@@ -62,8 +61,8 @@ use crate::regard_lifecycle::{RegardLifecycle, SurfaceGestureOutcome};
 use crate::support::{
     authoritative_placement_host, check_placement_capacity, ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot,
     home_copy_wins_by_name, host_generation, host_occupancies, host_occupancy, is_ssh_host, placement_actuator_host_ref,
-    placement_host_not_ready_reason, placement_host_ref, placement_target_host, policy_targets_ssh_host, prepared_snapshot_name,
-    resolve_placement_provider, unready_placement_refusal, SSH_HOST_PIN_ONLY,
+    placement_host_not_ready_reason, placement_target_host, prepared_snapshot_name, resolve_placement_provider, unready_placement_refusal,
+    SSH_HOST_PIN_ONLY,
 };
 
 /// Routing uses replicated observations as hints; only admission may refuse on
@@ -77,19 +76,9 @@ pub enum PlacementPurpose {
 #[derive(Clone, Copy)]
 struct PlacementContext<'a> {
     namespace: &'a str,
-    project_ref: &'a str,
-    repositories: &'a [ConvoyRepositorySpec],
-    intent: &'a flotilla_protocol::ConvoyStartIntent,
-    purpose: PlacementPurpose,
-}
-
-#[derive(Clone, Copy)]
-struct PolicyPlacementContext<'a> {
-    namespace: &'a str,
     project_ref: Option<&'a str>,
     repositories: &'a [ConvoyRepositorySpec],
-    placement_policy: Option<&'a str>,
-    allow_unready: bool,
+    intent: &'a flotilla_protocol::ConvoyStartIntent,
     purpose: PlacementPurpose,
 }
 
@@ -111,7 +100,7 @@ pub struct ConvoyCreateAdmission<'a> {
     dispatching_principal_ref: Option<PrincipalRef>,
     /// Per-vessel composed-image pins when vessels resolve to different images.
     #[builder(default)]
-    vessel_placements: BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>,
+    vessel_placements: BTreeMap<String, (FulfilmentKindSpec, PlacementDecision)>,
     /// Builds for the composed images, created with the convoy.
     #[builder(default)]
     image_builds: Vec<crate::image_build::PlannedImageBuild>,
@@ -616,7 +605,6 @@ impl ConvoyAdmission {
             let mut snapshot = flotilla_store::RequestSnapshot::new(&self.backend, &namespace)?;
             // Every candidate participates in routing, including pin refusals.
             snapshot.copy::<FulfilmentKind>(&self.backend).await?;
-            snapshot.copy::<PlacementPolicy>(&self.backend).await?;
             snapshot.copy::<ResourceHost>(&self.backend).await?;
             self.reads(snapshot.finish())
         } else {
@@ -694,7 +682,7 @@ impl ConvoyAdmission {
         intent: &flotilla_protocol::ConvoyStartIntent,
     ) -> Result<(PlacementResolution, Vec<String>), String> {
         self.decide_capability_placement(
-            &PlacementContext { namespace, project_ref, repositories, intent, purpose: PlacementPurpose::Admission },
+            &PlacementContext { namespace, project_ref: Some(project_ref), repositories, intent, purpose: PlacementPurpose::Admission },
             workflow,
             needs,
         )
@@ -750,7 +738,7 @@ impl ConvoyAdmission {
                 &admission.workflow,
                 AdmittedPlacements {
                     vessels: &admission.vessel_placements,
-                    convoy: admission.placement_policy.as_ref().zip(admission.placement_decision.as_ref()),
+                    convoy: admission.placement_kind.as_ref().zip(admission.placement_decision.as_ref()),
                 },
                 &intent.account_pins,
             )
@@ -762,7 +750,7 @@ impl ConvoyAdmission {
                 evidence: BriefEvidence { definitions: &admission.evidence, convoys: &inventory },
                 spec: &admission.spec,
                 workflow: &admission.workflow,
-                placement: admission.placement_policy.as_ref(),
+                placement: admission.placement_kind.as_ref(),
                 placement_decision: admission.placement_decision,
                 vessel_placements: Some(&admission.vessel_placements),
                 image_builds: &admission.image_builds,
@@ -844,12 +832,18 @@ impl ConvoyAdmission {
         Ok(())
     }
 
-    /// Placement policies are home-bound, so identical content on different
-    /// origins must have distinct names. Always author an origin's own snapshot:
-    /// reusing a remote snapshot would let its GC race references in flight.
-    fn placement_snapshot_name(&self, spec: &serde_json::Value) -> Result<String, String> {
+    /// A convoy's own snapshot, at its own origin: reusing another's would let its GC race
+    /// references in flight, and its change names the one Convoy it was frozen for.
+    fn placement_snapshot_name(&self, convoy: &str, spec: &FulfilmentKindSpec) -> Result<String, String> {
         let root = self.backend.local_root().map_err(|error| error.to_string())?;
-        prepared_snapshot_name("placement", &serde_json::json!({ "origin": root, "spec": spec }))
+        let spec = serde_json::to_value(spec).map_err(|error| error.to_string())?;
+        prepared_snapshot_name("placement", &serde_json::json!({ "origin": root, "convoy": convoy, "spec": spec }))
+    }
+
+    async fn write_placement_snapshot(&self, namespace: &str, convoy: &str, spec: &FulfilmentKindSpec) -> Result<String, String> {
+        let name = self.placement_snapshot_name(convoy, spec)?;
+        ensure_prepared_placement_snapshot(&self.backend, namespace, &name, convoy, spec).await?;
+        Ok(name)
     }
 
     async fn create_convoy_with_workflow_snapshot(
@@ -868,13 +862,11 @@ impl ConvoyAdmission {
             annotations.insert(BRIEF_ARTIFACTS_ANNOTATION.to_string(), "true".to_string());
         }
         if let Some(placement) = placement {
-            let placement_value = serde_json::to_value(placement).map_err(|error| error.to_string())?;
-            let placement_name = self.placement_snapshot_name(&placement_value)?;
-            ensure_prepared_placement_snapshot(&self.backend, namespace, &placement_name, placement).await?;
+            let placement_name = self.write_placement_snapshot(namespace, name, placement).await?;
             annotations.insert(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION.to_string(), placement_name);
         }
         if let Some(vessel_placements) = vessel_placements {
-            annotations.extend(self.prepare_vessel_placement_annotations(namespace, vessel_placements).await?);
+            annotations.extend(self.prepare_vessel_placement_annotations(namespace, name, vessel_placements).await?);
         }
         let created = crate::image_build::create_planned_builds(&self.backend, namespace, image_builds).await?;
         let result = self.create_convoy_with_annotations(namespace, name, spec, placement_decision, dispatch_regard, annotations).await;
@@ -1294,16 +1286,15 @@ impl ConvoyAdmission {
     pub async fn prepare_vessel_placement_annotations(
         &self,
         namespace: &str,
-        placements: &BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>,
+        convoy: &str,
+        placements: &BTreeMap<String, (FulfilmentKindSpec, PlacementDecision)>,
     ) -> Result<BTreeMap<String, String>, String> {
         if placements.is_empty() {
             return Ok(BTreeMap::new());
         }
         let mut pins = BTreeMap::new();
-        for (vessel, (policy, decision)) in placements {
-            let value = serde_json::to_value(policy).map_err(|error| error.to_string())?;
-            let name = self.placement_snapshot_name(&value)?;
-            ensure_prepared_placement_snapshot(&self.backend, namespace, &name, policy).await?;
+        for (vessel, (kind, decision)) in placements {
+            let name = self.write_placement_snapshot(namespace, convoy, kind).await?;
             pins.insert(vessel.clone(), flotilla_resources::VesselPlacementPin { kind_ref: name, decision: decision.clone() });
         }
         Ok(BTreeMap::from([(
@@ -1372,41 +1363,36 @@ impl ConvoyAdmission {
         workflow: &WorkflowTemplateSpec,
         placement: &mut PlacementResolution,
         decision: Option<&PlacementDecision>,
-    ) -> Result<(BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>, Vec<crate::image_build::PlannedImageBuild>), String> {
+    ) -> Result<(BTreeMap<String, (FulfilmentKindSpec, PlacementDecision)>, Vec<crate::image_build::PlannedImageBuild>), String> {
         let joiner = PlacementBuildJoiner { backend: &self.backend };
         let (images, builds) = joiner.compose_placement_images(namespace, project_ref, workflow, placement).await?;
         Ok((apply_vessel_images(placement, images, decision)?, builds))
     }
 
-    pub async fn resolve_convoy_placement(
+    /// `convoy create`'s placement: the capability path over the workflow's own needs. Its pin
+    /// is the operator's explicit choice, so it needs no further escalation reason.
+    pub async fn resolve_created_convoy_placement(
         &self,
         namespace: &str,
         project_ref: Option<&str>,
         repositories: &[ConvoyRepositorySpec],
         workflow: &WorkflowTemplateSpec,
-        placement_policy: Option<&str>,
-        allow_unready: bool,
+        pin: Option<&str>,
     ) -> Result<PlacementResolution, String> {
-        self.decide_placement(
-            PolicyPlacementContext {
-                namespace,
-                project_ref,
-                repositories,
-                placement_policy,
-                allow_unready,
-                purpose: PlacementPurpose::Admission,
-            },
-            workflow,
-        )
-        .await
-    }
-
-    async fn decide_placement(
-        &self,
-        context: PolicyPlacementContext<'_>,
-        workflow: &WorkflowTemplateSpec,
-    ) -> Result<PlacementResolution, String> {
-        self.reads(self.backend.clone()).decide_placement(context, workflow).await
+        let intent = flotilla_protocol::ConvoyStartIntent::builder()
+            .project_ref(project_ref.unwrap_or_default().to_string())
+            .namespace(namespace.to_string())
+            .maybe_placement_policy(pin.map(str::to_owned))
+            .maybe_escalation_reason(pin.map(|pin| format!("convoy create pins `{pin}`")))
+            .build();
+        let needs = workflow
+            .vessels
+            .iter()
+            .flat_map(|vessel| vessel.needs.iter().chain(vessel.crew.iter().flat_map(|crew| &crew.needs)))
+            .cloned()
+            .collect();
+        let context = PlacementContext { namespace, project_ref, repositories, intent: &intent, purpose: PlacementPurpose::Admission };
+        self.decide_capability_placement(&context, workflow, &needs).await.map(|(placement, _)| placement)
     }
 }
 
@@ -1460,7 +1446,7 @@ impl ConvoyAdmission {
                 &admission.workflow,
                 AdmittedPlacements {
                     vessels: &admission.vessel_placements,
-                    convoy: admission.placement_policy.as_ref().zip(admission.placement_decision.as_ref()),
+                    convoy: admission.placement_kind.as_ref().zip(admission.placement_decision.as_ref()),
                 },
                 &[],
             )
@@ -1481,13 +1467,11 @@ impl ConvoyAdmission {
         {
             annotations.insert(BRIEF_ARTIFACTS_ANNOTATION.to_string(), "true".to_string());
         }
-        if let Some(placement) = &admission.placement_policy {
-            let placement_value = serde_json::to_value(placement).map_err(|error| error.to_string())?;
-            let placement_name = self.placement_snapshot_name(&placement_value)?;
-            ensure_prepared_placement_snapshot(&self.backend, namespace, &placement_name, placement).await?;
+        if let Some(placement) = &admission.placement_kind {
+            let placement_name = self.write_placement_snapshot(namespace, &admission.name, placement).await?;
             annotations.insert(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION.to_string(), placement_name);
         }
-        annotations.extend(self.prepare_vessel_placement_annotations(namespace, &admission.vessel_placements).await?);
+        annotations.extend(self.prepare_vessel_placement_annotations(namespace, &admission.name, &admission.vessel_placements).await?);
         let created = crate::image_build::create_planned_builds(&self.backend, namespace, &admission.image_builds).await?;
         let result = self
             .create_convoy_with_annotations(
@@ -1726,36 +1710,40 @@ impl ConvoyAdmission {
 
 /// The placements a convoy was admitted at: per vessel, or one for the whole convoy.
 struct AdmittedPlacements<'a> {
-    vessels: &'a BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>,
-    convoy: Option<(&'a PlacementPolicySpec, &'a PlacementDecision)>,
+    vessels: &'a BTreeMap<String, (FulfilmentKindSpec, PlacementDecision)>,
+    convoy: Option<(&'a FulfilmentKindSpec, &'a PlacementDecision)>,
 }
 
 impl PlacementBuildJoiner<'_> {
-    /// Admission only. For a docker-per-vessel placement whose policy omits
-    /// the image, resolve every vessel's composition against the
-    /// replica-inclusive catalogue, plan its ImageBuild for the placement
-    /// host's architecture, and return the policy each vessel runs (`Built`)
-    /// with the builds to create once admission commits. Literal and baseline
-    /// images return no entries. Nothing is written here.
+    /// Admission only. For a docker-per-vessel kind that omits the image,
+    /// resolve every vessel's composition against the replica-inclusive
+    /// catalogue, plan its ImageBuild for the placement host's architecture,
+    /// and return the kind each vessel runs (`Built`) with the builds to
+    /// create once admission commits. A literal image returns no entries.
+    /// Nothing is written here.
     async fn compose_placement_images(
         &self,
         namespace: &str,
         project_ref: Option<&str>,
         workflow: &WorkflowTemplateSpec,
         placement: &PlacementResolution,
-    ) -> Result<(BTreeMap<String, PlacementPolicySpec>, Vec<crate::image_build::PlannedImageBuild>), String> {
-        let Some(policy) = placement.selected.as_ref() else { return Ok(Default::default()) };
-        let Some(docker) = policy.spec.docker_per_vessel.as_ref().filter(|docker| docker.image.is_none()) else {
+    ) -> Result<(BTreeMap<String, FulfilmentKindSpec>, Vec<crate::image_build::PlannedImageBuild>), String> {
+        let Some(kind) = placement.selected.as_ref() else { return Ok(Default::default()) };
+        if kind.spec.realisation != (FulfilmentRealisation::DockerPerVessel { image: None }) {
             return Ok(Default::default());
-        };
+        }
         let resolved = resolve_vessel_images(self.backend, namespace, project_ref, workflow).await?;
         let mut images = BTreeMap::new();
         let mut builds = Vec::new();
         for (vessel, image) in resolved {
-            let planned = crate::image_build::plan_image_build(self.backend, namespace, &image, &docker.host_ref).await?;
-            let mut spec = policy.spec.clone();
-            spec.docker_per_vessel.as_mut().expect("docker placement").image =
-                Some(flotilla_resources::DockerImageSource::Built { identity: image.identity, image_build_ref: planned.name.clone() });
+            let planned = crate::image_build::plan_image_build(self.backend, namespace, &image, &kind.spec.host_ref).await?;
+            let mut spec = kind.spec.clone();
+            spec.realisation = FulfilmentRealisation::DockerPerVessel {
+                image: Some(flotilla_resources::DockerImageSource::Built {
+                    identity: image.identity,
+                    image_build_ref: planned.name.clone(),
+                }),
+            };
             images.insert(vessel, spec);
             builds.push(planned);
         }
@@ -1784,17 +1772,17 @@ fn host_direct_environment_query(local_host: &str) -> Result<StoreQuery, String>
     })
 }
 
-/// Write composed images into the placement: the convoy-level policy carries
+/// Write composed images into the placement: the convoy-level kind carries
 /// the first vessel's image, and when vessels differ every vessel gets its own
 /// pinned snapshot (identical values share one snapshot by content).
-/// The convoy-level policy takes the first vessel's image (map order) only so
+/// The convoy-level kind takes the first vessel's image (map order) only so
 /// it holds a valid spec; when vessels' images differ, the returned per-vessel
 /// placement pins are authoritative and every vessel reads its own snapshot.
 fn apply_vessel_images(
     placement: &mut PlacementResolution,
-    images: BTreeMap<String, PlacementPolicySpec>,
+    images: BTreeMap<String, FulfilmentKindSpec>,
     decision: Option<&PlacementDecision>,
-) -> Result<BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>, String> {
+) -> Result<BTreeMap<String, (FulfilmentKindSpec, PlacementDecision)>, String> {
     let Some(first) = images.values().next().cloned() else { return Ok(BTreeMap::new()) };
     if let Some(selected) = placement.selected.as_mut() {
         selected.spec = first.clone();
@@ -1942,13 +1930,8 @@ impl AdmissionReadContext<'_> {
         let matching_sources =
             sources.items.into_iter().filter(|source| source.object.metadata.name == target_host.reference.as_str()).collect::<Vec<_>>();
         let has_replica = matching_sources.iter().any(|source| matches!(source.provenance, ResourceProvenance::Replica { .. }));
-        let is_host_targeted_placement = self
-            .backend
-            .clone()
-            .including_replicas::<PlacementPolicy>(namespace)
-            .get(&placement.kind)
-            .await
-            .is_ok_and(|source| placement_host_ref(&source.object).is_some() || source.object.spec.cloud_sandbox_per_vessel.is_some());
+        let is_host_targeted_placement =
+            self.backend.clone().including_replicas::<FulfilmentKind>(namespace).get(&placement.kind).await.is_ok();
         if !has_replica && !is_host_targeted_placement {
             return Ok(());
         }
@@ -1980,7 +1963,7 @@ impl AdmissionReadContext<'_> {
             self.decide_capability_placement(
                 &PlacementContext {
                     namespace: &namespace,
-                    project_ref,
+                    project_ref: Some(project_ref),
                     repositories: &[],
                     intent: &intent,
                     purpose: PlacementPurpose::Routing,
@@ -2014,7 +1997,7 @@ impl AdmissionReadContext<'_> {
             self.decide_vessel_placements(
                 &PlacementContext {
                     namespace: &namespace,
-                    project_ref,
+                    project_ref: Some(project_ref),
                     repositories: &repositories,
                     intent: &intent,
                     purpose: PlacementPurpose::Routing,
@@ -2118,15 +2101,11 @@ impl AdmissionReadContext<'_> {
         }
         let workflows =
             backend.definitions::<WorkflowTemplate>(namespace).list_names(workflow_names).await.map_err(|error| error.to_string())?;
-        // Every kind and policy is a placement candidate or a reported refusal;
+        // Every kind is a placement candidate or a reported refusal;
         // every host supplies model/fulfilment facts for those candidate decisions.
         // Reuse these complete candidate catalogs across roles and vessels.
         let kinds = backend
             .query_declared::<FulfilmentKind>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
-            .await
-            .map_err(|error| error.to_string())?;
-        let policies = backend
-            .query_declared::<PlacementPolicy>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
             .await
             .map_err(|error| error.to_string())?;
         let hosts = backend
@@ -2170,7 +2149,6 @@ impl AdmissionReadContext<'_> {
         snapshot.insert_definitions::<ImageLayer>(image_layers)?;
         snapshot.insert::<Repository>(repository_sources)?;
         snapshot.insert::<FulfilmentKind>(kinds)?;
-        snapshot.insert::<PlacementPolicy>(policies)?;
         snapshot.insert::<CredentialGrant>(grants)?;
         snapshot.insert::<CredentialSpec>(credentials)?;
         let capped = hosts
@@ -2659,52 +2637,35 @@ impl AdmissionReadContext<'_> {
         workflow: &WorkflowTemplateSpec,
         needs: &BTreeSet<CapabilityNeed>,
     ) -> Result<(PlacementResolution, Vec<String>), String> {
-        let PlacementContext { namespace, project_ref, repositories, intent, purpose } = *context;
-        if purpose == PlacementPurpose::Routing && intent.placement_policy.is_some() {
-            return self
-                .decide_placement(
-                    PolicyPlacementContext {
-                        namespace,
-                        project_ref: Some(project_ref),
-                        repositories,
-                        placement_policy: intent.placement_policy.as_deref(),
-                        allow_unready: true,
-                        purpose,
-                    },
-                    workflow,
-                )
-                .await
-                .map(|placement| (placement, Vec::new()));
-        }
+        let PlacementContext { namespace, project_ref, repositories: _, intent, purpose } = *context;
         let pin = intent.placement_policy.as_deref();
         let escalation_reason = intent.escalation_reason.as_deref();
+        // Admission's own snapshots are kinds too, frozen for their convoys; none is a candidate.
         let kinds = home_copy_wins_by_name(
             self.backend
                 .query_declared::<FulfilmentKind>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
                 .await
                 .map_err(|error| error.to_string())?
                 .items,
-        );
-        if kinds.is_empty() {
-            if purpose == PlacementPurpose::Admission {
-                if let Some(need) = needs.iter().next() {
-                    return Err(format!("no fulfilment kind covers role need `{need}`"));
-                }
+        )
+        .into_iter()
+        .filter(|kind| !is_prepared_snapshot(&kind.metadata.name, &kind.metadata.labels, PLACEMENT_SNAPSHOT_KIND))
+        .collect::<Vec<_>>();
+        if purpose == PlacementPurpose::Routing {
+            if let Some(pin) = pin {
+                let kind = kinds.into_iter().find(|kind| kind.metadata.name == pin);
+                let kind = kind.ok_or_else(|| format!("fulfilment kind `{pin}` does not exist"))?;
+                return Ok((PlacementResolution::selected(kind), Vec::new()));
             }
-            return self
-                .decide_placement(
-                    PolicyPlacementContext {
-                        namespace,
-                        project_ref: Some(project_ref),
-                        repositories,
-                        placement_policy: pin,
-                        allow_unready: false,
-                        purpose,
-                    },
-                    workflow,
-                )
-                .await
-                .map(|placement| (placement, Vec::new()));
+            if kinds.is_empty() {
+                return Ok((PlacementResolution::none(), Vec::new()));
+            }
+        }
+        if kinds.is_empty() {
+            return Err(match needs.iter().next() {
+                Some(need) => format!("no fulfilment kind covers role need `{need}`"),
+                None => "no fulfilment kind is registered".to_string(),
+            });
         }
         let hosts = home_copy_wins_by_name(
             self.backend
@@ -2736,8 +2697,8 @@ impl AdmissionReadContext<'_> {
                     .filter(|name| !name.is_empty())
                     .unwrap_or_else(|| kind.spec.host_ref.clone()),
             };
-            let policy_name = kind.metadata.name.clone();
-            let refusal = |reason: String| PlacementRefusal { kind: policy_name.clone(), target_host: target_host.clone(), reason };
+            let kind_name = kind.metadata.name.clone();
+            let refusal = |reason: String| PlacementRefusal { kind: kind_name.clone(), target_host: target_host.clone(), reason };
             // #3907: a kind where some requester's access has no plan drops out.
             let environment_kind =
                 flotilla_agent::account_access::EnvironmentKind::of_realisation(&kind.spec.realisation, host.is_some_and(is_ssh_host));
@@ -2773,9 +2734,8 @@ impl AdmissionReadContext<'_> {
             // A kind that omits its image realises each vessel's composed
             // image: resolution provides every image need or refuses, naming it.
             let composed = match &kind.spec.realisation {
-                flotilla_resources::FulfilmentRealisation::DockerPerVessel { image: None } => {
-                    match composed_images.get_or_init(|| resolve_vessel_images(&self.backend, namespace, Some(project_ref), workflow)).await
-                    {
+                FulfilmentRealisation::DockerPerVessel { image: None } => {
+                    match composed_images.get_or_init(|| resolve_vessel_images(&self.backend, namespace, project_ref, workflow)).await {
                         Ok(images) => Some(images),
                         Err(error) => {
                             rejected.push(refusal(error.clone()));
@@ -2787,7 +2747,7 @@ impl AdmissionReadContext<'_> {
             };
             // Remote image testimony is checked inside the actual sandbox before
             // crew launch. Host privileges and other grants are never deferred.
-            let cloud_probe = matches!(kind.spec.realisation, flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { .. });
+            let cloud_probe = matches!(kind.spec.realisation, FulfilmentRealisation::CloudSandboxPerVessel { .. });
             let image_covers =
                 |need: &CapabilityNeed| composed.is_some() && need.is_image_need() || cloud_probe && need.requires_guest_probe();
             let structurally_missing = needs
@@ -2842,109 +2802,76 @@ impl AdmissionReadContext<'_> {
                 )));
                 continue;
             }
-            match self
-                .decide_placement(
-                    PolicyPlacementContext {
-                        namespace,
-                        project_ref: Some(project_ref),
-                        repositories,
-                        placement_policy: Some(&kind.metadata.name),
-                        allow_unready: true,
-                        purpose,
-                    },
-                    workflow,
-                )
-                .await
-            {
-                Ok(placement) => {
-                    let policy = placement.selected.as_ref().expect("pinned placement has a policy");
-                    let policy_host_ref = match (&kind.spec.realisation, &policy.spec.docker_per_vessel, &policy.spec.host_direct) {
-                        (flotilla_resources::FulfilmentRealisation::DockerPerVessel { .. }, Some(docker), None) => {
-                            Some(docker.host_ref.as_str())
-                        }
-                        (flotilla_resources::FulfilmentRealisation::HostDirect, None, Some(direct)) => Some(direct.host_ref.as_str()),
-                        _ => None,
-                    };
-                    let policy_host = match policy_host_ref.map(|host_ref| flotilla_resources::canonical_host_id(hosts.iter(), host_ref)) {
-                        Some(Ok(host)) => host,
-                        Some(Err(error)) => {
-                            rejected.push(refusal(error));
-                            continue;
-                        }
-                        None => None,
-                    };
-                    let image_matches = purpose == PlacementPurpose::Routing
-                        || composed.is_none()
-                        || policy.spec.docker_per_vessel.as_ref().is_some_and(|docker| docker.image.is_none());
-                    if !image_matches {
-                        rejected.push(refusal("fulfilment kind and placement policy disagree on image composition".into()));
-                        continue;
+            let mut selected = kind.clone();
+            if purpose == PlacementPurpose::Admission {
+                let checked = async {
+                    resolve_placement_provider(&self.backend, namespace, &mut selected).await?;
+                    // A literal image is checked now; composed images freeze per vessel once the
+                    // placement is final.
+                    if let FulfilmentRealisation::DockerPerVessel {
+                        image: Some(image @ flotilla_resources::DockerImageSource::Literal(_)),
+                    } = &selected.spec.realisation
+                    {
+                        image.resolve()?;
                     }
-                    let realization_matches =
-                        if matches!(kind.spec.realisation, flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { .. }) {
-                            policy.spec.cloud_sandbox_per_vessel.is_some()
-                                && Some(placement_target_host(&self.backend, namespace, policy).await?.reference) == canonical_kind_host
-                        } else {
-                            policy_host_ref.is_some() && policy_host == canonical_kind_host
-                        };
-                    if !realization_matches {
-                        rejected.push(refusal("fulfilment kind and placement policy disagree on host or realisation".into()));
-                        continue;
-                    }
-                    // A capped SSH host's slots are counted afresh: the
-                    // published fact trails the admissions just made (#3793).
-                    let free_slots = match (vessel_cap, host, purpose) {
-                        (Some(cap), Some(host), PlacementPurpose::Admission) => Some(
-                            self.vessel_occupancy(namespace, &host.metadata.name)
-                                .await?
-                                .free_slots(cap)
-                                .saturating_sub(self.placed_here(&kind.spec.host_ref)),
-                        ),
-                        _ => facts.and_then(|facts| facts.free_vessel_slots),
-                    };
-                    let host_ready = host.and_then(|host| host.status.as_ref()).is_some_and(|status| {
-                        let mut status = status.clone();
-                        status.apply_heartbeat_readiness(self.runtime.clock.now());
-                        status.ready
-                    });
-                    let sleeping_until = host.and_then(|host| host.status.as_ref()).and_then(|status| status.sleeping_until);
-                    // A sleeping host may queue work for its wake-up time. A host
-                    // that is simply not ready cannot be admitted, even when it
-                    // is the only fulfilment that covers the requested needs.
-                    if purpose == PlacementPurpose::Admission {
-                        if let Some(reason) = unready_placement_refusal(
-                            &policy.metadata.name,
-                            &kind.spec.host_ref,
-                            host.and_then(|host| host.status.as_ref()),
-                            self.runtime.clock.now(),
-                        ) {
-                            rejected.push(refusal(reason));
-                            continue;
-                        }
-                    }
-                    let image_cost = image_placement_cost(
-                        &self.backend,
-                        namespace,
-                        host,
-                        policy.metadata.labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str),
-                        &kind.spec.realisation,
-                        composed.map(|images| images.values().map(|image| image.identity.as_str()).collect::<BTreeSet<_>>()),
-                        Arc::clone(self.runtime.lifecycle_reads),
-                    )
-                    .await?;
-                    candidates.push(KindCandidate {
-                        kind,
-                        placement,
-                        free_slots,
-                        vessel_cap,
-                        single_tenant,
-                        host_ready,
-                        sleeping_until,
-                        image_cost,
-                    });
+                    validate_workflow_agent_adapters(&self.backend, namespace, workflow, Some(&selected), true).await
+                };
+                if let Err(reason) = checked.await {
+                    rejected.push(refusal(reason));
+                    continue;
                 }
-                Err(error) => rejected.push(refusal(error)),
             }
+            // A capped SSH host's slots are counted afresh: the
+            // published fact trails the admissions just made (#3793).
+            let free_slots = match (vessel_cap, host, purpose) {
+                (Some(cap), Some(host), PlacementPurpose::Admission) => Some(
+                    self.vessel_occupancy(namespace, &host.metadata.name)
+                        .await?
+                        .free_slots(cap)
+                        .saturating_sub(self.placed_here(&kind.spec.host_ref)),
+                ),
+                _ => facts.and_then(|facts| facts.free_vessel_slots),
+            };
+            let host_ready = host.and_then(|host| host.status.as_ref()).is_some_and(|status| {
+                let mut status = status.clone();
+                status.apply_heartbeat_readiness(self.runtime.clock.now());
+                status.ready
+            });
+            let sleeping_until = host.and_then(|host| host.status.as_ref()).and_then(|status| status.sleeping_until);
+            // A sleeping host may queue work for its wake-up time. A host
+            // that is simply not ready cannot be admitted, even when it
+            // is the only fulfilment that covers the requested needs.
+            if purpose == PlacementPurpose::Admission {
+                if let Some(reason) = unready_placement_refusal(
+                    &kind.metadata.name,
+                    &kind.spec.host_ref,
+                    host.and_then(|host| host.status.as_ref()),
+                    self.runtime.clock.now(),
+                ) {
+                    rejected.push(refusal(reason));
+                    continue;
+                }
+            }
+            let image_cost = image_placement_cost(
+                &self.backend,
+                namespace,
+                host,
+                crate::support::provider_instance(&selected),
+                &kind.spec.realisation,
+                composed.map(|images| images.values().map(|image| image.identity.as_str()).collect::<BTreeSet<_>>()),
+                Arc::clone(self.runtime.lifecycle_reads),
+            )
+            .await?;
+            candidates.push(KindCandidate {
+                kind,
+                placement: PlacementResolution::selected(selected),
+                free_slots,
+                vessel_cap,
+                single_tenant,
+                host_ready,
+                sleeping_until,
+                image_cost,
+            });
         }
         if candidates.is_empty() {
             let role_needs = workflow
@@ -2953,9 +2880,9 @@ impl AdmissionReadContext<'_> {
                 .flat_map(|vessel| vessel.crew.iter())
                 .flat_map(|crew| crew.needs.iter().map(move |need| format!("role {} need `{need}`", crew.role)))
                 .collect::<Vec<_>>();
+            let covered = if role_needs.is_empty() { "the workflow".to_string() } else { role_needs.join(", ") };
             return Err(format!(
-                "no fulfilment kind covers {}; candidates: {}",
-                role_needs.join(", "),
+                "no fulfilment kind covers {covered}; candidates: {}",
                 rejected.iter().map(|refusal| format!("{}: {}", refusal.kind, refusal.reason)).collect::<Vec<_>>().join("; ")
             ));
         }
@@ -3058,7 +2985,7 @@ impl AdmissionReadContext<'_> {
         (
             PlacementResolution,
             Vec<String>,
-            BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>,
+            BTreeMap<String, (FulfilmentKindSpec, PlacementDecision)>,
             Vec<crate::image_build::PlannedImageBuild>,
         ),
         String,
@@ -3066,13 +2993,6 @@ impl AdmissionReadContext<'_> {
         let PlacementContext { namespace, project_ref, repositories, intent, purpose } = *context;
         let mut vessel_placements = BTreeMap::new();
         let mut image_builds = Vec::new();
-        let has_kinds = !self
-            .backend
-            .query_declared::<FulfilmentKind>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
-            .await
-            .map_err(|error| error.to_string())?
-            .items
-            .is_empty();
         let (placement, minimal_alternatives) = if !workflow.vessels.is_empty() {
             let mut first = None;
             let mut index = 0;
@@ -3141,31 +3061,16 @@ impl AdmissionReadContext<'_> {
                     }
                 };
                 if purpose == PlacementPurpose::Admission {
-                    if has_kinds {
-                        resolve_and_validate_workflow_credentials_for_capability_admission(
-                            &self.backend,
-                            namespace,
-                            Some(project_ref),
-                            repositories,
-                            resolution.selected.as_ref(),
-                            &mut one,
-                        )
-                        .await?;
-                    } else {
-                        resolve_and_validate_workflow_credentials(
-                            &self.backend,
-                            namespace,
-                            Some(project_ref),
-                            repositories,
-                            resolution.selected.as_ref(),
-                            &mut one,
-                        )
-                        .await?;
-                    }
-                }
-                if purpose == PlacementPurpose::Admission {
-                    let (images, builds) =
-                        self.runtime.builds.compose_placement_images(namespace, Some(project_ref), &one, &resolution).await?;
+                    resolve_and_validate_workflow_credentials_for_capability_admission(
+                        &self.backend,
+                        namespace,
+                        project_ref,
+                        repositories,
+                        resolution.selected.as_ref(),
+                        &mut one,
+                    )
+                    .await?;
+                    let (images, builds) = self.runtime.builds.compose_placement_images(namespace, project_ref, &one, &resolution).await?;
                     apply_vessel_images(&mut resolution, images, None)?;
                     image_builds.extend(builds);
                 }
@@ -3200,31 +3105,16 @@ impl AdmissionReadContext<'_> {
                 .collect();
             let mut result = self.decide_capability_placement(context, workflow, &needs).await?;
             if purpose == PlacementPurpose::Admission {
-                if has_kinds {
-                    resolve_and_validate_workflow_credentials_for_capability_admission(
-                        &self.backend,
-                        namespace,
-                        Some(project_ref),
-                        repositories,
-                        result.0.selected.as_ref(),
-                        workflow,
-                    )
-                    .await?;
-                } else {
-                    resolve_and_validate_workflow_credentials(
-                        &self.backend,
-                        namespace,
-                        Some(project_ref),
-                        repositories,
-                        result.0.selected.as_ref(),
-                        workflow,
-                    )
-                    .await?;
-                }
-            }
-            if purpose == PlacementPurpose::Admission {
-                let (images, builds) =
-                    self.runtime.builds.compose_placement_images(namespace, Some(project_ref), workflow, &result.0).await?;
+                resolve_and_validate_workflow_credentials_for_capability_admission(
+                    &self.backend,
+                    namespace,
+                    project_ref,
+                    repositories,
+                    result.0.selected.as_ref(),
+                    workflow,
+                )
+                .await?;
+                let (images, builds) = self.runtime.builds.compose_placement_images(namespace, project_ref, workflow, &result.0).await?;
                 image_builds.extend(builds);
                 let decision = match result.0.selected.as_ref() {
                     Some(selected) => Some(PlacementDecision {
@@ -3245,70 +3135,6 @@ impl AdmissionReadContext<'_> {
             result
         };
         Ok((placement, minimal_alternatives, vessel_placements, image_builds))
-    }
-
-    async fn decide_placement(
-        &self,
-        context: PolicyPlacementContext<'_>,
-        workflow: &WorkflowTemplateSpec,
-    ) -> Result<PlacementResolution, String> {
-        let PolicyPlacementContext { namespace, project_ref, repositories, placement_policy, allow_unready, purpose } = context;
-        let mut placement = match placement_policy {
-            Some(policy) => {
-                let policy = required_admission_value(policy, "placement policy")?;
-                let mut resolved = self
-                    .backend
-                    .clone()
-                    .including_replicas::<PlacementPolicy>(namespace)
-                    .get(policy)
-                    .await
-                    .map(|source| source.object)
-                    .map_err(|error| format!("placement policy {policy}: {error}"))?;
-                if purpose == PlacementPurpose::Admission {
-                    resolve_placement_provider(&self.backend, namespace, &mut resolved).await?;
-                }
-                PlacementResolution {
-                    selected: Some(resolved),
-                    refused_candidates: Vec::new(),
-                    viable_not_selected: Vec::new(),
-                    allocation: None,
-                }
-            }
-            None => {
-                let local_host_id = self.runtime.local_host.clone();
-                let placement = decide_default_placement(
-                    &self.backend,
-                    namespace,
-                    project_ref,
-                    repositories,
-                    workflow,
-                    local_host_id.as_ref(),
-                    purpose,
-                )
-                .await?;
-                if placement.selected.is_none() && !placement.refused_candidates.is_empty() {
-                    let reasons = placement
-                        .refused_candidates
-                        .iter()
-                        .map(|candidate| format!("- `{}`: {}", candidate.kind, candidate.reason))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    return Err(format!("no placement policy satisfies workflow; candidates:\n{reasons}"));
-                }
-                placement
-            }
-        };
-        if purpose == PlacementPurpose::Admission {
-            if let Some(docker) = placement.selected.as_mut().and_then(|policy| policy.spec.docker_per_vessel.as_mut()) {
-                // A literal image is checked now; composed images freeze per vessel once the
-                // placement is final.
-                if let Some(image @ flotilla_resources::DockerImageSource::Literal(_)) = &docker.image {
-                    image.resolve()?;
-                }
-            }
-            validate_workflow_agent_adapters(&self.backend, namespace, workflow, placement.selected.as_ref(), allow_unready).await?;
-        }
-        Ok(placement)
     }
 
     async fn prepare_convoy_admission_with_preferences(
@@ -3505,7 +3331,7 @@ impl AdmissionReadContext<'_> {
             .decide_vessel_placements(
                 &PlacementContext {
                     namespace,
-                    project_ref,
+                    project_ref: Some(project_ref),
                     repositories: &repositories_snapshot,
                     intent,
                     purpose: PlacementPurpose::Admission,
@@ -3559,7 +3385,7 @@ impl AdmissionReadContext<'_> {
             .maybe_naming(naming)
             .spec(spec)
             .workflow(workflow)
-            .maybe_placement_policy(placement.selected.map(|placement| placement.spec))
+            .maybe_placement_kind(placement.selected.map(|placement| placement.spec))
             .maybe_placement_decision(placement_decision)
             .vessel_placements(vessel_placements)
             .image_builds(image_builds)
@@ -3585,10 +3411,10 @@ pub struct PreparedConvoyAdmission {
     pub name: String,
     pub spec: ConvoySpec,
     pub workflow: WorkflowTemplateSpec,
-    pub placement_policy: Option<PlacementPolicySpec>,
+    pub placement_kind: Option<FulfilmentKindSpec>,
     pub placement_decision: Option<PlacementDecision>,
     #[builder(default)]
-    pub vessel_placements: BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>,
+    pub vessel_placements: BTreeMap<String, (FulfilmentKindSpec, PlacementDecision)>,
     /// Builds for the composed images, created with the convoy.
     #[builder(default)]
     pub image_builds: Vec<crate::image_build::PlannedImageBuild>,
@@ -4151,9 +3977,9 @@ enum BriefReadSource<'a> {
 struct ConvoySnapshotBundle<'a> {
     pub spec: &'a ConvoySpec,
     pub workflow: &'a WorkflowTemplateSpec,
-    pub placement: Option<&'a PlacementPolicySpec>,
+    pub placement: Option<&'a FulfilmentKindSpec>,
     pub placement_decision: Option<PlacementDecision>,
-    pub vessel_placements: Option<&'a BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>>,
+    pub vessel_placements: Option<&'a BTreeMap<String, (FulfilmentKindSpec, PlacementDecision)>>,
     /// Composed images' builds, created only with the convoy (refusals before
     /// this point never leave builds behind).
     pub image_builds: &'a [crate::image_build::PlannedImageBuild],
@@ -4233,10 +4059,20 @@ pub struct RepositoryChangeRequestProvider {
 
 #[derive(Debug)]
 pub struct PlacementResolution {
-    pub selected: Option<ResourceObject<PlacementPolicy>>,
+    pub selected: Option<ResourceObject<FulfilmentKind>>,
     pub refused_candidates: Vec<PlacementRefusal>,
     pub viable_not_selected: Vec<PlacementViableCandidate>,
     pub allocation: Option<FulfilmentAllocation>,
+}
+
+impl PlacementResolution {
+    pub fn none() -> Self {
+        Self { selected: None, refused_candidates: Vec::new(), viable_not_selected: Vec::new(), allocation: None }
+    }
+
+    pub fn selected(kind: ResourceObject<FulfilmentKind>) -> Self {
+        Self { selected: Some(kind), ..Self::none() }
+    }
 }
 
 pub struct KindCandidate {
@@ -4336,174 +4172,16 @@ impl PlacementCandidateOrder for PlacementTieBreak<'_> {
 
     fn compare(&self, left: &KindCandidate, right: &KindCandidate) -> std::cmp::Ordering {
         let key = |candidate: &KindCandidate| {
-            let policy = candidate.placement.selected.as_ref().expect("candidate has a validated placement policy");
             (
                 !self.available(candidate),
                 candidate.image_cost,
                 candidate.kind.spec.cost_class,
-                Reverse(policy.spec.priority),
                 Reverse(FreeFraction::of(candidate)),
                 candidate.kind.metadata.name.clone(),
             )
         };
         key(left).cmp(&key(right))
     }
-}
-
-#[doc(hidden)]
-pub async fn default_convoy_placement_policy(
-    backend: &ResourceBackend,
-    namespace: &str,
-    project_ref: Option<&str>,
-    repositories: &[ConvoyRepositorySpec],
-    workflow: &WorkflowTemplateSpec,
-    local_host_ref: Option<&CanonicalHostId>,
-) -> Result<PlacementResolution, String> {
-    decide_default_placement(backend, namespace, project_ref, repositories, workflow, local_host_ref, PlacementPurpose::Admission).await
-}
-
-async fn decide_default_placement(
-    backend: &ResourceBackend,
-    namespace: &str,
-    project_ref: Option<&str>,
-    repositories: &[ConvoyRepositorySpec],
-    workflow: &WorkflowTemplateSpec,
-    local_host_ref: Option<&CanonicalHostId>,
-    purpose: PlacementPurpose,
-) -> Result<PlacementResolution, String> {
-    let mut policies =
-        match backend.query_declared::<PlacementPolicy>(namespace, &StoreQuery { include_replicas: true, ..Default::default() }).await {
-            Ok(list) => home_copy_wins_by_name(list.items),
-            Err(err) => {
-                warn!(%namespace, error = %err, "failed to list placement policies; convoy will remain Pending until one is registered");
-                return Ok(PlacementResolution {
-                    selected: None,
-                    refused_candidates: Vec::new(),
-                    viable_not_selected: Vec::new(),
-                    allocation: None,
-                });
-            }
-        };
-    policies.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
-    let candidate_names = policies.iter().map(|policy| policy.metadata.name.clone()).collect::<Vec<_>>();
-    let mut viable = Vec::new();
-    let mut refused_candidates = Vec::new();
-    for mut policy in policies {
-        let mut candidate_workflow = workflow.clone();
-        // Only unpinned convoys reach default placement.
-        let refusal = if policy_targets_ssh_host(backend, namespace, &policy).await {
-            Some(SSH_HOST_PIN_ONLY.to_string())
-        } else if purpose == PlacementPurpose::Routing {
-            None
-        } else if let Some(reason) =
-            crate::account_access::plan_refusal(workflow, crate::account_access::placement_environment_kind(&policy.spec, None))?
-        {
-            // #3907: a kind where some requester's access has no plan drops out.
-            Some(reason)
-        } else if let Err(reason) = resolve_placement_provider(backend, namespace, &mut policy).await {
-            Some(reason)
-        } else if let Err(reason) = validate_workflow_agent_adapters(backend, namespace, workflow, Some(&policy), false).await {
-            Some(reason)
-        } else {
-            resolve_and_validate_workflow_credentials(backend, namespace, project_ref, repositories, Some(&policy), &mut candidate_workflow)
-                .await
-                .err()
-        };
-        if let Some(reason) = refusal {
-            let target_host = placement_target_host(backend, namespace, &policy).await.unwrap_or_else(|_| PlacementTargetHost {
-                reference: CanonicalHostId::resolved(String::new()),
-                display_name: "no target host".to_string(),
-            });
-            refused_candidates.push(PlacementRefusal { kind: policy.metadata.name.clone(), target_host, reason });
-        } else {
-            viable.push(policy);
-        }
-    }
-    let mut viable_targets = HashMap::new();
-    let mut resolved_viable = Vec::with_capacity(viable.len());
-    for policy in viable {
-        match placement_target_host(backend, namespace, &policy).await {
-            Ok(target_host) => {
-                viable_targets.insert(policy.metadata.name.clone(), target_host);
-                resolved_viable.push(policy);
-            }
-            Err(reason) => refused_candidates.push(PlacementRefusal {
-                kind: policy.metadata.name.clone(),
-                target_host: PlacementTargetHost {
-                    reference: CanonicalHostId::resolved(String::new()),
-                    display_name: "no target host".to_string(),
-                },
-                reason,
-            }),
-        }
-    }
-    viable = resolved_viable;
-    viable.sort_by_key(|policy| {
-        let target_host = &viable_targets[&policy.metadata.name].reference;
-        let is_local = local_host_ref.is_some_and(|local| target_host == local);
-        let is_host_direct = policy.spec.host_direct.is_some();
-        (Reverse(policy.spec.priority), !is_local, !is_host_direct, policy.metadata.name.clone())
-    });
-    if !viable.is_empty() {
-        let selected = viable.remove(0);
-        let selected_target = viable_targets.remove(&selected.metadata.name).expect("viable placement target was resolved");
-        let mut viable_not_selected = Vec::with_capacity(viable.len());
-        for policy in viable {
-            let target_host = viable_targets.remove(&policy.metadata.name).expect("viable placement target was resolved");
-            let reason = placement_ordering_reason(&selected, &selected_target, &policy, &target_host, local_host_ref);
-            viable_not_selected.push(PlacementViableCandidate { kind: policy.metadata.name.clone(), target_host, reason });
-        }
-        return Ok(PlacementResolution { selected: Some(selected), refused_candidates, viable_not_selected, allocation: None });
-    }
-
-    let required_adapters = required_workflow_agent_adapters(workflow)?;
-    if !required_adapters.is_empty() {
-        let requirement = if required_adapters.len() == 1 {
-            format!("adapter `{}`", required_adapters.first().expect("one required adapter"))
-        } else {
-            format!("adapters {}", required_adapters.iter().map(|adapter| format!("`{adapter}`")).collect::<Vec<_>>().join(", "))
-        };
-        if refused_candidates.is_empty() {
-            return Err(format!("no placement policy satisfies {requirement}; candidates: (none)"));
-        }
-        refused_candidates.sort_by(|left, right| left.kind.cmp(&right.kind));
-        let candidates = refused_candidates
-            .iter()
-            .map(|candidate| format!("- `{}`: {}", candidate.kind, candidate.reason))
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Err(format!("no placement policy satisfies {requirement}; candidates:\n{candidates}"));
-    }
-
-    if candidate_names.is_empty() {
-        warn!(%namespace, "no placement policy found; convoy will remain Pending until one is registered");
-    }
-    Ok(PlacementResolution { selected: None, refused_candidates, viable_not_selected: Vec::new(), allocation: None })
-}
-
-fn placement_ordering_reason(
-    selected: &ResourceObject<PlacementPolicy>,
-    selected_target: &PlacementTargetHost,
-    candidate: &ResourceObject<PlacementPolicy>,
-    candidate_target: &PlacementTargetHost,
-    local_host_ref: Option<&CanonicalHostId>,
-) -> String {
-    if candidate.spec.priority != selected.spec.priority {
-        return format!(
-            "priority {} is lower than selected policy `{}` priority {}",
-            candidate.spec.priority, selected.metadata.name, selected.spec.priority
-        );
-    }
-
-    let selected_is_local = local_host_ref.is_some_and(|local| &selected_target.reference == local);
-    let candidate_is_local = local_host_ref.is_some_and(|local| &candidate_target.reference == local);
-    if selected_is_local && !candidate_is_local {
-        return format!("fallback ordering preferred local policy `{}`", selected.metadata.name);
-    }
-    if selected.spec.host_direct.is_some() && candidate.spec.host_direct.is_none() {
-        return format!("fallback ordering preferred host-direct policy `{}`", selected.metadata.name);
-    }
-    format!("fallback ordering preferred policy `{}` by name", selected.metadata.name)
 }
 
 pub fn required_admission_value<'a>(value: &'a str, field: &str) -> Result<&'a str, String> {
@@ -4591,25 +4269,29 @@ pub async fn validate_workflow_agent_adapters(
     backend: &ResourceBackend,
     namespace: &str,
     workflow: &WorkflowTemplateSpec,
-    placement: Option<&ResourceObject<PlacementPolicy>>,
+    placement: Option<&ResourceObject<FulfilmentKind>>,
     allow_unready: bool,
 ) -> Result<(), String> {
     let required_adapters = required_workflow_agent_adapters(workflow)?;
     // Cloud images are verified through interior discovery before crew launch.
     // The controller cannot run an image-local probe for a remote sandbox.
-    if placement.is_some_and(|p| p.spec.cloud_sandbox_per_vessel.is_some()) {
+    if placement.is_some_and(|kind| matches!(kind.spec.realisation, FulfilmentRealisation::CloudSandboxPerVessel { .. })) {
         return Ok(());
     }
     // A composed image derives its harness layers from these same roles.
-    if placement
-        .and_then(|policy| policy.spec.docker_per_vessel.as_ref())
-        .is_some_and(|docker| matches!(docker.image, None | Some(flotilla_resources::DockerImageSource::Built { .. })))
-    {
+    if placement.is_some_and(|kind| {
+        matches!(
+            kind.spec.realisation,
+            FulfilmentRealisation::DockerPerVessel { image: None | Some(flotilla_resources::DockerImageSource::Built { .. }) }
+        )
+    }) {
         return Ok(());
     }
     // Validate each candidate's literal image once, even for tool-only workflows.
     let capabilities = match placement {
-        Some(policy) if !required_adapters.is_empty() || policy.spec.docker_per_vessel.is_some() => {
+        Some(policy)
+            if !required_adapters.is_empty() || matches!(policy.spec.realisation, FulfilmentRealisation::DockerPerVessel { .. }) =>
+        {
             Some(placement_agent_adapters(backend, namespace, policy, allow_unready).await?)
         }
         _ => None,
@@ -4834,7 +4516,7 @@ pub async fn resolve_and_validate_workflow_credentials(
     namespace: &str,
     project_ref: Option<&str>,
     repositories: &[ConvoyRepositorySpec],
-    placement: Option<&ResourceObject<PlacementPolicy>>,
+    placement: Option<&ResourceObject<FulfilmentKind>>,
     workflow: &mut WorkflowTemplateSpec,
 ) -> Result<(), String> {
     resolve_workflow_credentials(backend, namespace, project_ref, repositories, workflow).await?;
@@ -4847,7 +4529,7 @@ pub async fn resolve_and_validate_workflow_credentials_for_capability_admission(
     namespace: &str,
     project_ref: Option<&str>,
     repositories: &[ConvoyRepositorySpec],
-    placement: Option<&ResourceObject<PlacementPolicy>>,
+    placement: Option<&ResourceObject<FulfilmentKind>>,
     workflow: &mut WorkflowTemplateSpec,
 ) -> Result<(), String> {
     resolve_workflow_credentials(backend, namespace, project_ref, repositories, workflow).await?;
@@ -4859,7 +4541,7 @@ pub async fn validate_workflow_credentials(
     backend: &ResourceBackend,
     namespace: &str,
     workflow: &WorkflowTemplateSpec,
-    placement: Option<&ResourceObject<PlacementPolicy>>,
+    placement: Option<&ResourceObject<FulfilmentKind>>,
 ) -> Result<(), String> {
     validate_workflow_credentials_for_admission(backend, namespace, workflow, placement, false).await
 }
@@ -4868,7 +4550,7 @@ pub async fn validate_workflow_credentials_for_admission(
     backend: &ResourceBackend,
     namespace: &str,
     workflow: &WorkflowTemplateSpec,
-    placement: Option<&ResourceObject<PlacementPolicy>>,
+    placement: Option<&ResourceObject<FulfilmentKind>>,
     allow_unready: bool,
 ) -> Result<(), String> {
     let required = workflow.vessels.iter().flat_map(|vessel| vessel.credential_refs.iter().cloned()).collect::<BTreeSet<_>>();
@@ -4987,21 +4669,29 @@ pub fn required_workflow_agent_adapters(workflow: &WorkflowTemplateSpec) -> Resu
 pub async fn placement_agent_adapters(
     backend: &ResourceBackend,
     namespace: &str,
-    placement: &ResourceObject<PlacementPolicy>,
+    placement: &ResourceObject<FulfilmentKind>,
     allow_unready: bool,
 ) -> Result<(BTreeSet<String>, String), String> {
-    if let Some(docker) = &placement.spec.docker_per_vessel {
-        // Adapter testimony is structural. A composed image carries exactly the
-        // harness layers its vessels' roles resolve to (resolution refuses
-        // otherwise), so `agent_adapters` constrains only literal images.
-        match &docker.image {
+    if let FulfilmentRealisation::DockerPerVessel { image } = &placement.spec.realisation {
+        // A composed image carries exactly the harness layers its vessels' roles
+        // resolve to (resolution refuses otherwise); a literal image's are what
+        // its host probed it for.
+        match image {
             None | Some(flotilla_resources::DockerImageSource::Built { .. }) => Ok((BTreeSet::new(), "composed image".to_string())),
             Some(image) => {
                 let detail = format!("image `{}`", image.resolve()?);
-                Ok((docker.agent_adapters.clone(), detail))
+                let target_host = placement_target_host(backend, namespace, placement).await?;
+                let host = authoritative_placement_host(backend, namespace, &target_host, &placement.metadata.name).await?;
+                let probed = host
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.fulfilment_facts.get(&placement.metadata.name))
+                    .map(|facts| facts.harnesses.keys().cloned().collect())
+                    .unwrap_or_default();
+                Ok((probed, detail))
             }
         }
-    } else if placement.spec.host_direct.is_some() {
+    } else if placement.spec.realisation == FulfilmentRealisation::HostDirect {
         let target_host = placement_target_host(backend, namespace, placement).await?;
         let host = authoritative_placement_host(backend, namespace, &target_host, &placement.metadata.name).await?;
         let host_label = target_host.display_name;
@@ -5262,6 +4952,54 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
     }
 }
 
+/// Registers a ready host advertising one host-direct provider and the
+/// host-direct kind admission places onto it.
+#[cfg(test)]
+pub async fn register_host_direct_kind(backend: &ResourceBackend, host: &str) {
+    use flotilla_protocol::provider::{
+        CheckoutStrategy, EnvironmentClass, MaterialMode, ProviderAdvertisement, ProviderCapabilities, ProviderKind, ProviderReadiness,
+    };
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    let created = hosts
+        .create(
+            &InputMeta::builder().name(host.into()).build(),
+            &flotilla_resources::HostSpec { display_name: host.into(), ..Default::default() },
+        )
+        .await
+        .expect("host");
+    let providers = vec![ProviderAdvertisement {
+        instance: format!("{host}-direct"),
+        kind: Some(ProviderKind::new(EnvironmentClass::HostDirect, "fixture")),
+        readiness: ProviderReadiness::Ready,
+        capabilities: ProviderCapabilities {
+            material_modes: vec![MaterialMode::Shared],
+            checkout_strategies: vec![CheckoutStrategy::HostWorktree],
+            ..Default::default()
+        },
+    }];
+    let status = flotilla_resources::HostStatus {
+        capabilities: [(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::json!(providers))].into_iter().collect(),
+        heartbeat_at: Some(chrono::Utc::now()),
+        ready: true,
+        disk_free_bytes: Some(u64::MAX),
+        admission_free_space_floor_bytes: Some(0),
+        ..Default::default()
+    };
+    hosts.update_status(host, &created.metadata.resource_version, &status).await.expect("host status");
+    backend
+        .using::<FulfilmentKind>("flotilla")
+        .create(
+            &InputMeta::builder().name(format!("host-direct-{host}")).build(),
+            &FulfilmentKindSpec::builder()
+                .host_ref(host.into())
+                .pool("passthrough".into())
+                .realisation(flotilla_resources::FulfilmentRealisation::HostDirect)
+                .build(),
+        )
+        .await
+        .expect("kind");
+}
+
 #[cfg(test)]
 pub struct HandlerContractFixture {
     pub owner: ConvoyAdmission,
@@ -5378,9 +5116,7 @@ async fn probe_admission_ai_utility(
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use flotilla_resources::{
-        FulfilmentCostClass, FulfilmentKindSpec, FulfilmentRealisation, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
-    };
+    use flotilla_resources::{FulfilmentCostClass, FulfilmentKindSpec, FulfilmentRealisation};
 
     use super::*;
     use flotilla_store_testkit::cr_name;
@@ -5640,7 +5376,7 @@ mod tests {
     // replace that evidence or add reads during the per-vessel capacity check.
     #[tokio::test]
     async fn prepared_capacity_uses_captured_evidence() {
-        use flotilla_resources::{HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus};
+        use flotilla_resources::{HostSpec, HostStatus};
         use flotilla_store_testkit::ReadCountsBackendExt;
         for (captured, current) in [(100, 0), (0, 100)] {
             let mut fixture = handler_contract_fixture().await;
@@ -5653,22 +5389,20 @@ mod tests {
             let host = hosts.update_status("remote", &host.metadata.resource_version, &capacity(captured)).await.unwrap();
             fixture
                 .backend
-                .using::<PlacementPolicy>("flotilla")
+                .using::<FulfilmentKind>("flotilla")
                 .create(
                     &InputMeta::builder().name("remote-policy".into()).build(),
-                    &PlacementPolicySpec::builder()
+                    &FulfilmentKindSpec::builder()
+                        .host_ref("remote".into())
                         .pool("passthrough".into())
-                        .host_direct(HostDirectPlacementPolicySpec {
-                            host_ref: "remote".into(),
-                            checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                        })
+                        .realisation(FulfilmentRealisation::HostDirect)
                         .build(),
                 )
                 .await
                 .unwrap();
             let mut evidence = flotilla_store::RequestSnapshot::new(&counted, "flotilla").unwrap();
             evidence.copy::<ResourceHost>(&counted).await.unwrap();
-            evidence.copy::<PlacementPolicy>(&counted).await.unwrap();
+            evidence.copy::<FulfilmentKind>(&counted).await.unwrap();
             let admission = PreparedConvoyAdmission::builder()
                 .evidence(evidence.finish())
                 .name("prepared".into())
@@ -5695,6 +5429,107 @@ mod tests {
         }
     }
 
+    // Admission's frozen snapshot kinds live beside the live kinds but are never
+    // candidates, even when one would be the minimal choice, nor pinnable.
+    #[tokio::test]
+    async fn placement_snapshot_kinds_are_never_candidates() {
+        let fixture = handler_contract_fixture().await;
+        register_host_direct_kind(&fixture.backend, "host").await;
+        let kinds = fixture.backend.using::<FulfilmentKind>("flotilla");
+        let mut live = kinds.get("host-direct-host").await.unwrap();
+        live.spec.grants = BTreeSet::from([flotilla_resources::FulfilmentGrant::network("host".into())]);
+        kinds.update(&InputMeta::from(&live.metadata), &live.metadata.resource_version, &live.spec).await.unwrap();
+        let minimal = FulfilmentKindSpec::builder()
+            .host_ref("host".into())
+            .pool("passthrough".into())
+            .realisation(FulfilmentRealisation::HostDirect)
+            .build();
+        let labelled = BTreeMap::from([(flotilla_resources::PREPARED_SNAPSHOT_LABEL.to_string(), "placement".to_string())]);
+        for (name, labels) in [("frozen-by-label", labelled), ("placement-snapshot-0123456789ab", BTreeMap::new())] {
+            kinds.create(&InputMeta::builder().name(name.into()).labels(labels).build(), &minimal).await.unwrap();
+        }
+        let workflow = WorkflowTemplateSpec::builder()
+            .vessels(vec![VesselRequirement::builder()
+                .name("work".into())
+                .crew(vec![CrewSpec::builder().role("tool".into()).source(CrewSource::Tool { command: "true".into() }).build()])
+                .build()])
+            .build();
+        let placement =
+            fixture.owner.resolve_created_convoy_placement("flotilla", None, &[], &workflow, None).await.expect("live kind places");
+        assert_eq!(placement.selected.as_ref().map(|kind| kind.metadata.name.as_str()), Some("host-direct-host"));
+        let considered = placement
+            .refused_candidates
+            .iter()
+            .map(|refusal| refusal.kind.as_str())
+            .chain(placement.viable_not_selected.iter().map(|viable| viable.kind.as_str()))
+            .chain(placement.allocation.iter().flat_map(|allocation| allocation.candidates.iter().map(|candidate| candidate.kind.as_str())))
+            .collect::<Vec<_>>();
+        assert!(
+            !considered.iter().any(|kind| ["frozen-by-label", "placement-snapshot-0123456789ab"].contains(kind)),
+            "snapshots must not be considered: {considered:?}"
+        );
+        for pin in ["frozen-by-label", "placement-snapshot-0123456789ab"] {
+            let error = fixture.owner.resolve_created_convoy_placement("flotilla", None, &[], &workflow, Some(pin)).await.err();
+            assert_eq!(error, Some(format!("fulfilment kind `{pin}` does not exist")));
+        }
+    }
+
+    // A host whose Docker provider is not ready names why in the refusal of its Docker kinds.
+    #[tokio::test]
+    async fn an_unready_docker_provider_refuses_its_kinds_with_the_reason() {
+        use flotilla_protocol::provider::{
+            CheckoutStrategy, EnvironmentClass, MaterialMode, ProviderAdvertisement, ProviderCapabilities, ProviderKind, ProviderReadiness,
+        };
+        let fixture = handler_contract_fixture().await;
+        register_host_direct_kind(&fixture.backend, "host").await;
+        let kinds = fixture.backend.using::<FulfilmentKind>("flotilla");
+        kinds.delete("host-direct-host").await.unwrap();
+        let docker = FulfilmentKindSpec::builder()
+            .host_ref("host".into())
+            .pool("cleat".into())
+            .grants(BTreeSet::from([flotilla_resources::FulfilmentGrant::network("scoped".into())]))
+            .realisation(FulfilmentRealisation::DockerPerVessel {
+                image: Some(flotilla_resources::DockerImageSource::Literal("ubuntu:24.04".into())),
+            })
+            .build();
+        kinds.create(&InputMeta::builder().name("docker-on-host".into()).build(), &docker).await.unwrap();
+        let workflow = WorkflowTemplateSpec::builder()
+            .vessels(vec![VesselRequirement::builder()
+                .name("work".into())
+                .crew(vec![CrewSpec::builder().role("tool".into()).source(CrewSource::Tool { command: "true".into() }).build()])
+                .build()])
+            .build();
+        let hosts = fixture.backend.using::<ResourceHost>("flotilla");
+        let reason = "[docker_vessels] is not set in daemon.toml, so nothing bounds a Docker vessel's memory";
+        for readiness in [ProviderReadiness::MissingTool { reason: reason.into() }, ProviderReadiness::Ready] {
+            let host = hosts.get("host").await.unwrap();
+            let mut status = host.status.clone().unwrap();
+            let providers = vec![ProviderAdvertisement {
+                instance: "docker".into(),
+                kind: Some(ProviderKind::new(EnvironmentClass::Container, "docker")),
+                readiness: readiness.clone(),
+                capabilities: ProviderCapabilities {
+                    material_modes: vec![MaterialMode::Shared],
+                    checkout_strategies: vec![CheckoutStrategy::HostWorktree],
+                    ..Default::default()
+                },
+            }];
+            status.capabilities.insert(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::json!(providers));
+            hosts.update_status("host", &host.metadata.resource_version, &status).await.unwrap();
+            let placement = fixture.owner.resolve_created_convoy_placement("flotilla", None, &[], &workflow, None).await;
+            match readiness {
+                ProviderReadiness::Ready => {
+                    let placement = placement.expect("a ready Docker provider places");
+                    assert_eq!(placement.selected.as_ref().map(|kind| kind.metadata.name.as_str()), Some("docker-on-host"));
+                }
+                _ => {
+                    let error = placement.expect_err("refused");
+                    assert!(error.contains("docker-on-host") && error.contains(reason), "{error}");
+                }
+            }
+        }
+    }
+
     // A public, grant-free GitHub project must be refused before creating work
     // when its controller has no observation credential.
     #[tokio::test(start_paused = true)]
@@ -5706,6 +5541,7 @@ mod tests {
             .build();
         Arc::get_mut(&mut fixture.owner.discovery).expect("fixture discovery").runner = Arc::new(runner);
         Arc::get_mut(&mut fixture.owner.discovery).expect("fixture discovery").observation_credentials = Default::default();
+        register_host_direct_kind(&fixture.backend, "host").await;
         let repository = flotilla_resources::RepositorySpec::remote("https://github.com/example/public").expect("repository");
         let key = repository.key();
         fixture
@@ -5773,6 +5609,7 @@ mod tests {
             let mut fixture = handler_contract_fixture().await;
             let observed = fixture.backend.clone().with_read_counts();
             fixture.owner.backend = observed.clone();
+            register_host_direct_kind(&fixture.backend, "host").await;
             let repository = RepositorySpec::remote("https://example.com/owner/repo").expect("remote identity");
             let key = repository.key();
             fixture
@@ -5967,10 +5804,7 @@ mod tests {
             status.capabilities.insert(flotilla_resources::IMAGE_DIGESTS_CAPABILITY.into(), inventory);
             hosts.update_status("host", &host.metadata.resource_version, &status).await.expect("inventory");
             let host = hosts.get("host").await.expect("host");
-            let labels = BTreeMap::from([(
-                ENVIRONMENT_PROVIDER_INSTANCE_LABEL.to_string(),
-                if other_instance { "cache-b".into() } else { "cache-a".into() },
-            )]);
+            let instance = if other_instance { "cache-b" } else { "cache-a" };
             let realisation = flotilla_resources::FulfilmentRealisation::DockerPerVessel {
                 image: Some(flotilla_resources::DockerImageSource::Literal(digest)),
             };
@@ -5978,7 +5812,7 @@ mod tests {
                 &backend,
                 "test",
                 Some(&host),
-                labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str),
+                Some(instance),
                 &realisation,
                 None,
                 Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
@@ -6126,36 +5960,20 @@ mod tests {
                 creation_timestamp: now,
                 merge: None,
             };
-            let policy = ResourceObject::<PlacementPolicy> {
-                metadata: metadata.clone(),
-                spec: PlacementPolicySpec::builder()
+            let kind = ResourceObject::<FulfilmentKind> {
+                metadata,
+                spec: FulfilmentKindSpec::builder()
+                    .host_ref("host".to_string())
                     .pool("test".to_string())
-                    .priority(0)
-                    .host_direct(HostDirectPlacementPolicySpec {
-                        host_ref: "host".to_string(),
-                        checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                    })
+                    .cost_class(cost_class)
+                    .realisation(FulfilmentRealisation::HostDirect)
                     .build(),
                 status: None,
             };
             KindCandidate {
                 image_cost: flotilla_resources::ImageAcquisitionCost::Held,
-                kind: ResourceObject::<FulfilmentKind> {
-                    metadata,
-                    spec: FulfilmentKindSpec::builder()
-                        .host_ref("host".to_string())
-                        .pool("test".to_string())
-                        .cost_class(cost_class)
-                        .realisation(FulfilmentRealisation::HostDirect)
-                        .build(),
-                    status: None,
-                },
-                placement: PlacementResolution {
-                    selected: Some(policy),
-                    refused_candidates: Vec::new(),
-                    viable_not_selected: Vec::new(),
-                    allocation: None,
-                },
+                kind: kind.clone(),
+                placement: PlacementResolution::selected(kind),
                 free_slots: slots,
                 vessel_cap: None,
                 single_tenant: false,
@@ -6344,30 +6162,17 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                let policy = PlacementPolicySpec::builder()
-                    .pool("passthrough".into())
-                    .host_direct(HostDirectPlacementPolicySpec {
-                        host_ref: platform.into(),
-                        checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                    })
-                    .provider_requirements(flotilla_resources::ProviderRequirements {
-                        class: Some(EnvironmentClass::HostDirect),
-                        egress_enforcement: Some(EgressEnforcement::Enforced),
-                        ..Default::default()
-                    })
-                    .build();
-                fixture
-                    .backend
-                    .using::<PlacementPolicy>("flotilla")
-                    .create(&InputMeta::builder().name(platform.into()).build(), &policy)
-                    .await
-                    .unwrap();
                 fixture
                     .backend
                     .using::<FulfilmentKind>("flotilla")
                     .create(
                         &InputMeta::builder().name(platform.into()).build(),
-                        &FulfilmentKindSpec::from_policy(&policy, platform).unwrap(),
+                        &FulfilmentKindSpec::builder()
+                            .host_ref(platform.into())
+                            .pool("passthrough".into())
+                            .grants(BTreeSet::from([flotilla_resources::FulfilmentGrant::platform(platform.to_string())]))
+                            .realisation(FulfilmentRealisation::HostDirect)
+                            .build(),
                     )
                     .await
                     .unwrap();
@@ -6395,7 +6200,7 @@ mod tests {
             let intent = flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".into()).build();
             let context = PlacementContext {
                 namespace: "flotilla",
-                project_ref: "project",
+                project_ref: Some("project"),
                 repositories: &[],
                 intent: &intent,
                 purpose: PlacementPurpose::Admission,
@@ -6403,10 +6208,7 @@ mod tests {
             let reads = fixture.owner.reads(fixture.backend.clone());
             let (_, _, placements, _) = reads.decide_vessel_placements(&context, &mut workflow).await.unwrap();
             for platform in ["linux", "macos"] {
-                assert_eq!(
-                    placements[platform].0.provider_requirements.as_ref().unwrap().instance.as_deref(),
-                    Some(format!("{platform}-instance").as_str())
-                );
+                assert_eq!(placements[platform].1.provider_instance.as_deref(), Some(format!("{platform}-instance").as_str()));
                 assert_eq!(placements[platform].1.target_host.reference.as_str(), platform);
             }
         });

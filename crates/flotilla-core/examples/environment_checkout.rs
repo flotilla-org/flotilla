@@ -78,7 +78,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             flotilla_environment::environment::ProvisionedMountMode::Ro,
         )],
         cpu_limit: None,
-        memory_policy: Default::default(),
     };
     let handle = provider.provision(env_id, &prepared, opts.into()).await?;
     let container = handle.container_name().unwrap_or("unknown");

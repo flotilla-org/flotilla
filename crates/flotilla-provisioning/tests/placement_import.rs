@@ -10,7 +10,8 @@ use flotilla_resources::{
         MANIFEST_SOURCE_ANNOTATION,
     },
     definitions::DefinitionOrigin,
-    FulfilmentGrant, FulfilmentKind, ObjectMeta, PlacementPolicy, Resource, ResourceObject, MANAGED_BY_LABEL, PREPARED_SNAPSHOT_LABEL,
+    FulfilmentGrant, FulfilmentKind, ObjectMeta, PlacementPolicy, Resource, ResourceObject, CONVOY_LABEL, MANAGED_BY_LABEL,
+    PREPARED_SNAPSHOT_LABEL,
 };
 use serde_json::{json, Value};
 
@@ -83,6 +84,13 @@ fn policies_become_kinds_and_their_settings_are_constants() {
         kinds: vec![
             copy::<FulfilmentKind>("docker-crew-image-kiwi", "kiwi", &labels, &annotations, migrated_kind()),
             copy::<FulfilmentKind>("host-direct-kiwi", "kiwi", &[], &[], host_direct_kind()),
+            copy::<FulfilmentKind>(
+                "placement-snapshot-ba9876543210",
+                "kiwi",
+                &[(PREPARED_SNAPSHOT_LABEL, "placement"), (CONVOY_LABEL, "convoy-0001")],
+                &[],
+                host_direct_kind(),
+            ),
         ],
         policies: vec![
             copy::<PlacementPolicy>("docker-crew-image-kiwi", "kiwi", &labels, &annotations, crew_image()),
@@ -106,6 +114,7 @@ fn policies_become_kinds_and_their_settings_are_constants() {
     let seeded = &placed("host-direct-kiwi-2").record;
     assert_eq!(seeded.realisation, KindRealisation::HostDirect);
     assert!(seeded.grants.contains(&FulfilmentGrant::platform("macos".into()).0), "{:?}", seeded.grants);
+    assert_eq!(placed("placement-snapshot-ba9876543210").origin, DefinitionOrigin::Snapshot, "admission's snapshot kind");
     let snapshot = placed("placement-snapshot-0123456789ab");
     assert_eq!(snapshot.origin, DefinitionOrigin::Snapshot);
     assert_eq!(
@@ -182,6 +191,32 @@ fn what_the_move_cannot_carry_is_refused() {
     );
     assert_eq!(report.dropped.get(&("PlacementPolicy", "deleted")), Some(&1));
     assert_eq!(report.dropped.get(&("PlacementPolicy", "agent adapters, an image fact the host probes")), Some(&1));
+}
+
+// A host-direct snapshot frozen at the admitting home for a host homed elsewhere takes that host's
+// platform from wherever its host-direct kind is homed; one whose host has none anywhere imports
+// without a platform grant, as nothing selects a snapshot by its grants.
+#[test]
+fn host_direct_snapshots_frozen_away_from_their_host_import() {
+    let snapshot = |name: &str, host: &str| {
+        copy::<PlacementPolicy>(name, "udder", &[(PREPARED_SNAPSHOT_LABEL, "placement")], &[], {
+            json!({"pool": "local", "host_direct": {"host_ref": host, "checkout": "worktree"}})
+        })
+    };
+    let copies = PlacementCopies {
+        kinds: vec![copy::<FulfilmentKind>("host-direct-kiwi", "kiwi", &[], &[], host_direct_kind())],
+        policies: vec![snapshot("placement-snapshot-005c09b60ee0", KIWI), snapshot("placement-snapshot-0123456789ab", "unknown-host")],
+    };
+    let report = rehearse_placement(&copies);
+    assert!(report.refused.is_empty(), "{:?}", report.refused);
+    let kinds = import_placement(&copies, &mut ImportReport::default()).kinds;
+    let platforms = |name: &str| {
+        let placed = kinds.iter().find(|placed| placed.name == name).unwrap_or_else(|| panic!("{name}"));
+        assert_eq!((placed.home.as_str(), &placed.origin), ("udder", &DefinitionOrigin::Snapshot));
+        placed.record.grants.iter().filter(|grant| grant.starts_with("platform:")).cloned().collect::<Vec<_>>()
+    };
+    assert_eq!(platforms("placement-snapshot-005c09b60ee0"), ["platform:macos"]);
+    assert!(platforms("placement-snapshot-0123456789ab").is_empty());
 }
 
 #[test]

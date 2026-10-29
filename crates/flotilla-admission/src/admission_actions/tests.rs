@@ -35,6 +35,7 @@ fn handlers<'a>(
 async fn direct_admission_contract_success_and_duplicate() {
     let HandlerContractFixture { owner, backend, observed, reconciliation, namespace, temp } =
         super::super::convoy_admission::handler_contract_fixture().await;
+    super::super::convoy_admission::register_host_direct_kind(&backend, "host").await;
     let worker = Worker::default();
     let recording = Arc::new(RecordingEventSink::default());
     let sink: Arc<dyn EventSink> = recording.clone();
