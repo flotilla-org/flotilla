@@ -197,7 +197,12 @@ fn classify<'r>(old: &'r OldDemand<'_>, records: &DemandRecords<'_>) -> Class<'r
     }
     let convoy = || convoy_target(record);
     let writer = if let Some(session) = name.strip_prefix(DELIVERY) {
-        Ok(Writer::Delivery { session })
+        let kind = &record.spec.originating_work_ref.kind;
+        if kind == "TerminalSession" {
+            Ok(Writer::Delivery { session })
+        } else {
+            Err(format!("it is about a {kind}, not a TerminalSession"))
+        }
     } else if name.starts_with(HOLD) {
         convoy().map(|convoy| Writer::Hold { convoy })
     } else if let Some(ensure) = name.strip_prefix(ENSURE_DRIFT_ATTENTION_PREFIX) {

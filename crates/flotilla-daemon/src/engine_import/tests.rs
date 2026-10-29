@@ -856,6 +856,7 @@ fn attention_records() -> Vec<Value> {
         demand("ensure-attention-seen", ("Convoy", "standing-gui-1"), &[(reclaim, "held")], "acknowledged"),
         demand("reclaim-refusal-gone", ("Convoy", "gone"), &[(reclaim, "refused")], "raised"),
         demand("surprise", ("Convoy", "demo"), &[], "raised"),
+        demand("terminal-delivery-misaimed", ("Convoy", "demo"), &[], "raised"),
         pooled,
     ]
 }
@@ -864,8 +865,12 @@ fn attention_records() -> Vec<Value> {
 fn open_demands_import_as_the_attentions_their_writers_send() {
     let source = rows(attention_records());
     let summary = rehearse(&source, HERE);
-    assert_eq!(summary.kinds["Demand"], Counts { imported: 5, dropped: 5, refused: 2 }, "{summary:?}");
-    assert_eq!(refused(&summary), [("Demand", "ensure-attention-pooled"), ("Demand", "surprise")], "{summary:?}");
+    assert_eq!(summary.kinds["Demand"], Counts { imported: 5, dropped: 5, refused: 3 }, "{summary:?}");
+    assert_eq!(
+        refused(&summary),
+        [("Demand", "ensure-attention-pooled"), ("Demand", "surprise"), ("Demand", "terminal-delivery-misaimed")],
+        "{summary:?}"
+    );
 
     let mut target = Import::in_memory(HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
     let imported = import(&source, &mut target);
