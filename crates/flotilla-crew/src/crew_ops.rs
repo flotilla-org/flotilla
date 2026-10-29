@@ -1941,10 +1941,9 @@ impl CrewService {
                 continue;
             };
             let checkout = &source.object;
-            let host = origin_root.to_string();
             let detail = match checkout_path(checkout) {
-                Some(path) => format!("{}; archived there on teardown", checkout_work_location(&checkout.spec, path)),
-                None => format!("on host {host}; archived there on teardown"),
+                Some(path) => format!("{}; its host archives uncommitted work on teardown", checkout_work_location(&checkout.spec, path)),
+                None => format!("on node {origin_root}; its host archives uncommitted work on teardown"),
             };
             outcomes.push(
                 CheckoutArchiveOutcome::builder()

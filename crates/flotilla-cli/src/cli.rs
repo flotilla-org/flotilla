@@ -1628,8 +1628,8 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
                     flotilla_protocol::CheckoutArchiveStatus::Archived => "archived".to_string(),
                     flotilla_protocol::CheckoutArchiveStatus::NothingToArchive => "nothing to archive".to_string(),
                     flotilla_protocol::CheckoutArchiveStatus::ArchivingOnHost => match archive.detail.as_deref() {
-                        Some(detail) if !detail.is_empty() => format!("archived by its own host's teardown: {detail}"),
-                        _ => "archived by its own host's teardown".to_string(),
+                        Some(detail) if !detail.is_empty() => format!("left to its own host's teardown: {detail}"),
+                        _ => "left to its own host's teardown".to_string(),
                     },
                     flotilla_protocol::CheckoutArchiveStatus::Failed => match archive.detail.as_deref() {
                         Some(detail) if !detail.is_empty() => format!("failed to archive: {detail}"),
