@@ -1,4 +1,5 @@
 use super::*;
+use crate::server::environment_sockets::{EnvironmentSocketRegistry, EnvironmentSocketService};
 
 pub(super) enum LaunchObservationRecord {
     Present,
@@ -207,6 +208,7 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
         pool.clone(),
     );
     let contained_registry = Arc::new(contained_registry);
+    let forwards = Arc::default();
     let handle: EnvironmentHandle = Arc::new(CachedInterior {
         inner: TestInteriorEnvironment {
             id: env_id.clone(),
@@ -216,6 +218,7 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
             destroyed: Arc::new(AtomicBool::new(false)),
         },
         cache: Arc::default(),
+        forwards: Arc::clone(&forwards),
     });
     daemon
         .register_provisioned_environment(env_id.clone(), Arc::clone(&handle), bag.clone(), Some(Arc::clone(&contained_registry)))
@@ -229,6 +232,17 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
         Arc::clone(&runner),
         config.state_dir().as_path().to_path_buf(),
     ));
+    let sockets = EnvironmentSocketService::new(
+        Arc::new(tokio::sync::Mutex::new(EnvironmentSocketRegistry::new())),
+        flotilla_protocol::DaemonHostPath::new(temp.path().join("sockets")),
+        |listener, _, _| {
+            tokio::spawn(async move {
+                let _listener = listener;
+                std::future::pending::<()>().await
+            })
+        },
+    );
+    let hooks = crate::server::HookEndpoint::listening_at("http://127.0.0.1:7878");
     let state = Arc::new(
         ControllerRuntimeState::new(
             Arc::clone(&daemon),
@@ -240,9 +254,8 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
         )
         .with_credential_store(credential_store)
         .with_agent_material(Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([] as [(&str, &str); 0])))))
-        // #3247: flotillad listens for hooks, but a vessel session keeps command hooks
-        // until its loopback forwarder (#3485).
-        .with_hook_endpoint(Some(crate::server::HookEndpoint::listening_at("http://127.0.0.1:7878"))),
+        .with_environment_sockets(Some(sockets.clone()))
+        .with_hook_endpoint(Some(hooks.clone())),
     );
     state
         .provisioned_environments
@@ -296,10 +309,34 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
     // #2706: session declarations survive, and granted credentials override conflicts.
     assert!(launch.env_vars.iter().any(|(name, value)| name == "DECLARED_VALUE" && value == "hello declared crew"));
     assert!(!launch.env_vars.iter().any(|(_, value)| value == "superseded-spec-token"));
-    assert!(
-        !launch.env_vars.iter().any(|(name, _)| name == flotilla_agent::CLAUDE_CODE_HOOK_TOKEN_ENV),
-        "a vessel session gets no hook token, so its overlay keeps command hooks"
-    );
+    // A Docker vessel's Claude Code posts its hooks through the agent's forward to the
+    // vessel's own forwarded socket. Without a terminal to bind a token to, or a Docker
+    // environment to forward into, it keeps command hooks.
+    let value = |name: &str| launch.env_vars.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone());
+    let recorded = forwards.lock().expect("forwards").clone();
+    match observation {
+        LaunchObservationRecord::Present => {
+            let expected = hooks
+                .vessel_claude_code_launch("http://127.0.0.1:15080", &backend, NAMESPACE, "terminal-demo-work-coder")
+                .await
+                .expect("token");
+            assert_eq!(value(flotilla_agent::CLAUDE_CODE_HOOK_URL_ENV), Some(expected.base_url));
+            assert_eq!(value(flotilla_agent::CLAUDE_CODE_HOOK_TOKEN_ENV), Some(expected.token));
+        }
+        LaunchObservationRecord::Missing | LaunchObservationRecord::MissingEnvironment => {
+            assert_eq!(value(flotilla_agent::CLAUDE_CODE_HOOK_TOKEN_ENV), None, "the overlay keeps command hooks");
+        }
+    }
+    if matches!(observation, LaunchObservationRecord::MissingEnvironment) {
+        assert!(recorded.is_empty(), "no Docker environment, no forward");
+    } else {
+        let host = sockets.prepare_agent_forward(env_id.clone()).await.expect("forwarded socket");
+        let guest = PathBuf::from(flotilla_environment::environment::CONTAINED_DAEMON_FORWARD_SOCKET);
+        assert_eq!(
+            recorded,
+            [(guest, Some(flotilla_environment::environment::CONTAINED_DAEMON_FORWARD_TCP), host.as_path().to_path_buf())]
+        );
+    }
     // #3907: the token reaches the process only from the plan's token file, read as it starts.
     assert!(
         !launch.env_vars.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN"),

@@ -403,7 +403,10 @@ mod tests {
                 .with_load_metrics(metrics.clone(), enabled)
                 .into_router();
             let listen = super::super::ListenAddress::resolve("127.0.0.1:0").await.unwrap();
-            let listener = super::super::TcpListener::bind(&listen, dir.path(), logins.clone()).await.unwrap();
+            let listener =
+                super::super::TcpListener::bind(&listen, dir.path(), logins.clone(), super::super::hooks::HookKey::generate().unwrap())
+                    .await
+                    .unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             let task = tokio::spawn(listener.serve(router, std::future::pending()));
             let expected = if enabled { StatusCode::OK } else { StatusCode::NOT_FOUND };

@@ -13,7 +13,8 @@ use flotilla_discovery::run_provisioned_host_detectors;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_environment::environment::{
     contained_daemon_socket_path, CreateOpts, EnvironmentHandle, EnvironmentProvisionError, EnvironmentTool, EnvironmentToolAsset,
-    EnvironmentToolAssetAccess, EnvironmentToolAssetKind, EnvironmentVariableUpdate, DAEMON_SOCKET_ENV,
+    EnvironmentToolAssetAccess, EnvironmentToolAssetKind, EnvironmentVariableUpdate, VesselAgent, CONTAINED_DAEMON_FORWARD_SOCKET,
+    CONTAINED_DAEMON_FORWARD_TCP, DAEMON_SOCKET_ENV,
 };
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ConfiguredResourceLimits, EnvironmentId};
@@ -29,6 +30,52 @@ use super::credentials::stage_agent_environment;
 use super::environments::ActiveProvisionedEnvironment;
 use super::state::ControllerRuntimeState;
 use crate::environment_tools::{EnvironmentToolContext, DOCKER_PROVIDER_KIND};
+
+/// Serve flotillad inside a Docker vessel through its agent: a guest socket and loopback
+/// TCP, for clients that cannot dial the mounted socket. The host end is the vessel's own
+/// forwarded environment socket. Every step is idempotent.
+pub(super) async fn forward_daemon_endpoint(
+    state: &ControllerRuntimeState,
+    id: &EnvironmentId,
+    agent: &dyn VesselAgent,
+) -> Result<(), String> {
+    let sockets =
+        state.environment_sockets.as_ref().ok_or("EnvironmentSocketUnavailable: a daemon forward requires a crew socket server")?;
+    let host = sockets.prepare_agent_forward(id.clone()).await?;
+    agent
+        .forward_controller_socket(Path::new(CONTAINED_DAEMON_FORWARD_SOCKET), Some(CONTAINED_DAEMON_FORWARD_TCP), host.as_path())
+        .await
+        .map_err(|error| format!("forward flotillad into {id}: {error}"))
+}
+
+/// The Claude Code hook launch for a session in a Docker vessel, posting to flotillad
+/// through the vessel agent's forward; `None` keeps command hooks.
+pub(super) async fn docker_vessel_hooks(
+    state: &ControllerRuntimeState,
+    env_ref: &str,
+    namespace: &str,
+    session_name: &str,
+) -> Option<crate::server::HookLaunch> {
+    let endpoint = state.hook_endpoint.as_ref()?;
+    let backend = state.daemon.resource_backend();
+    match backend.clone().using::<Environment>(&state.namespace).get(env_ref).await {
+        Ok(environment) if environment.spec.docker.is_some() => {}
+        Ok(_) | Err(ResourceError::NotFound { .. }) => return None,
+        Err(error) => {
+            warn!(environment = %env_ref, %error, "cannot read the vessel's environment; Claude Code keeps command hooks");
+            return None;
+        }
+    }
+    let forwarded = match state.vessel_agent(env_ref, None).await {
+        Ok(agent) => forward_daemon_endpoint(state, &EnvironmentId::new(env_ref), agent.as_ref()).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = forwarded {
+        warn!(environment = %env_ref, session = %session_name, %error, "no daemon forward in the vessel; Claude Code keeps command hooks");
+        return None;
+    }
+    endpoint.vessel_claude_code_launch(&format!("http://{CONTAINED_DAEMON_FORWARD_TCP}"), &backend, namespace, session_name).await
+}
 
 pub(super) struct DockerControllerRuntime {
     pub(super) state: Arc<ControllerRuntimeState>,

@@ -528,11 +528,13 @@ impl DaemonServer {
         let peer_resource_socket_dir = config.state_dir().as_path().join("peers");
         let logins = Arc::new(http::LoginStore::new(daemon.clock_for_scenarios()));
         let tcp_origin = http::ListenerOrigin::default();
+        let state_dir = config.state_dir().as_path().to_path_buf();
+        let hook_endpoint = http::HookEndpoint::load(&state_dir)?;
         let http_router = http::HttpRouter::for_daemon(Arc::clone(&daemon), Arc::clone(&logins), tcp_origin.clone())
+            .with_hooks(hook_endpoint.clone())
             .with_load_metrics(Arc::clone(&load_metrics), daemon_config.http.metrics)
             .with_commands(remote_command_router.clone(), shutdown_request_tx.clone(), socket_path.clone())
             .into_router();
-        let state_dir = config.state_dir().as_path().to_path_buf();
         Ok(Self {
             daemon,
             load_metrics,
@@ -556,7 +558,7 @@ impl DaemonServer {
             http_router,
             logins,
             tcp_origin,
-            hook_endpoint: http::HookEndpoint::default(),
+            hook_endpoint,
             http_listen: None,
             state_dir,
         })
@@ -577,8 +579,8 @@ impl DaemonServer {
         self.inbound_peer_rx.take()
     }
 
-    /// The hook endpoint host-direct crew launches deliver Claude Code hooks to, once the
-    /// loopback TCP listener binds.
+    /// The hook endpoint crew launches deliver Claude Code hooks to: through a vessel's
+    /// agent forward, or, for host-direct crews, the loopback TCP listener once it binds.
     pub fn hook_endpoint(&self) -> http::HookEndpoint {
         self.hook_endpoint.clone()
     }
@@ -620,7 +622,8 @@ impl DaemonServer {
         // advertises this daemon.
         let tcp_listener = match &self.http_listen {
             Some(listen) => {
-                let listener = http::TcpListener::bind(listen, &self.state_dir, Arc::clone(&self.logins)).await?;
+                let key = self.hook_endpoint.key().cloned().ok_or("hook key was not loaded")?;
+                let listener = http::TcpListener::bind(listen, &self.state_dir, Arc::clone(&self.logins), key).await?;
                 self.tcp_origin.set(listener.origin().to_owned());
                 self.hook_endpoint.publish(&listener);
                 Some(listener)

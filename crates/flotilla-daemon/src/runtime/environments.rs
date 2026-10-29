@@ -344,7 +344,8 @@ pub(super) async fn reconcile_provisioned_environment(
 
     // A container whose agent did not answer adoption keeps its tools until it does.
     let agent = handle.agent();
-    if agent.ready().await.is_ok() {
+    let agent_ready = agent.ready().await.is_ok();
+    if agent_ready {
         let context = super::docker::DockerToolContext { state, host_ref: &spec.host_ref, jobs: tokio::sync::OnceCell::new() };
         let tools = state.environment_tools.prepare(crate::environment_tools::DOCKER_PROVIDER_KIND, env_id.as_str(), &context).await?;
         agent.push_tools(&tools).await?;
@@ -354,6 +355,12 @@ pub(super) async fn reconcile_provisioned_environment(
     // A bind failure must not become a permanently skipped reconciliation step.
     if let Some(sockets) = &state.environment_sockets {
         sockets.prepare(env_id.clone()).await?;
+    }
+    // Restores the forward a restarted flotillad lost, so running crews' HTTP hooks resume.
+    if agent_ready {
+        if let Err(error) = super::docker::forward_daemon_endpoint(state, &env_id, agent.as_ref()).await {
+            warn!(environment = %env_id, %error, "daemon forward unavailable; will retry");
+        }
     }
 
     if state.daemon.environment_registry_for_environment(&env_id).is_none() {

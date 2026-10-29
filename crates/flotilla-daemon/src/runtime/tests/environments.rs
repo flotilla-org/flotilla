@@ -1,4 +1,5 @@
 use super::*;
+use crate::environment_tools::EnvironmentToolProvisioner;
 
 #[tokio::test]
 async fn standing_backing_inspection_accepts_durable_pre_provisioning_failure() {
@@ -661,4 +662,57 @@ async fn cloud_scheduler_bounds_refills_and_cancels_without_starving_siblings() 
     assert_eq!(count.load(Ordering::SeqCst), 0);
     assert_eq!(last_admitted.elapsed(), ENVIRONMENT_ADOPTION_TIMEOUT);
     assert!(batch.join_next().await.is_none());
+}
+
+// A restarted flotillad readopts a running Docker vessel and serves its agent forward
+// again, so the crews already aboard resume delivering hooks over HTTP.
+#[tokio::test]
+async fn docker_readoption_restores_the_daemon_forward() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_base = temp.path().join("config");
+    fs::create_dir_all(&config_base).expect("config directory");
+    fs::write(config_base.join("daemon.toml"), "machine_id = \"daemon-forward-readoption-test\"\n").expect("daemon config");
+    let config = Arc::new(ConfigStore::with_base(config_base));
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        Arc::clone(&config),
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+        flotilla_protocol::HostName::new("udder"),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
+    let env_id = EnvironmentId::new("env-forwarded");
+    create_ready_docker_environment(&daemon, env_id.as_str(), "test-interior", BTreeSet::new()).await;
+    let forwards = Arc::default();
+    let handle: EnvironmentHandle = Arc::new(CachedInterior {
+        inner: TestInteriorEnvironment {
+            id: env_id.clone(),
+            image: ImageId::new("contained-image"),
+            runner: Arc::new(DiscoveryMockRunner::builder().build()),
+            env_vars: HashMap::new(),
+            destroyed: Arc::new(AtomicBool::new(false)),
+        },
+        cache: Arc::default(),
+        forwards: Arc::clone(&forwards),
+    });
+    let state = Arc::new(
+        ControllerRuntimeState::new(
+            Arc::clone(&daemon),
+            config,
+            adoption_registry(vec![handle]),
+            None,
+            daemon.local_host_id().expect("local host identity").to_string(),
+            "host-direct-test".to_string(),
+        )
+        .with_environment_tools(EnvironmentToolProvisioner::new(Vec::new())),
+    );
+
+    reconcile_provisioned_environments(&state, NAMESPACE).await.expect("readopt the running vessel");
+
+    assert!(daemon.environment_registry_for_environment(&env_id).is_some());
+    let sockets = state.environment_sockets.as_ref().expect("socket server");
+    let host = sockets.prepare_agent_forward(env_id).await.expect("forwarded socket");
+    let guest = PathBuf::from(flotilla_environment::environment::CONTAINED_DAEMON_FORWARD_SOCKET);
+    let expected = (guest, Some(flotilla_environment::environment::CONTAINED_DAEMON_FORWARD_TCP), host.as_path().to_path_buf());
+    assert_eq!(*forwards.lock().expect("forwards"), [expected]);
 }

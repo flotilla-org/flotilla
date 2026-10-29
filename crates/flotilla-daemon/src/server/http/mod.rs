@@ -70,6 +70,9 @@ pub(in crate::server) struct HttpRouter {
     /// The TCP listener's origin, for login URLs; unset when no TCP listener is declared.
     #[builder(default)]
     tcp_origin: ListenerOrigin,
+    /// Verifies the hook tokens environment callers carry; without its key they are refused.
+    #[builder(default)]
+    hooks: HookEndpoint,
 }
 
 /// The TCP listener's origin, known only once it binds (its port may be chosen then). The
@@ -110,7 +113,13 @@ impl HttpRouter {
             table_store: None,
             logins,
             tcp_origin,
+            hooks: HookEndpoint::default(),
         }
+    }
+
+    pub(in crate::server) fn with_hooks(mut self, hooks: HookEndpoint) -> Self {
+        self.hooks = hooks;
+        self
     }
 
     pub(in crate::server) fn with_load_metrics(mut self, metrics: Arc<metrics::LoadMetrics>, enabled: bool) -> Self {

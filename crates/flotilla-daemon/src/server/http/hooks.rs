@@ -3,7 +3,9 @@
 //! parser and records it through the same handling the framed `AgentHook` request uses, then
 //! answers with an empty 2xx (a command hook that printed nothing).
 //!
-//! A host-direct crew session authenticates with a hook token bound to its terminal.
+//! A crew session authenticates with a hook token bound to its terminal: host-direct
+//! sessions on the loopback listener, Docker vessel sessions through their agent's
+//! forward to the vessel's environment socket.
 //! The token is an HMAC of the terminal's namespace, session name and creation
 //! timestamp under a key kept in the state directory, so it outlives flotillad restarts
 //! that replace the listener's file token, as running crews do. It authenticates only
@@ -12,14 +14,21 @@
 //! deleting or recreated sessions. Legacy v1 tokens lack the instance binding and are
 //! refused; those crews must relaunch once.
 //!
+//! A token binds an event to its terminal, but crews in one vessel share a user and so can
+//! read each other's tokens, as they can already claim each other's terminal over the
+//! mounted socket: the trust boundary is the vessel, which the environment check enforces.
+//!
+//! A Docker vessel's agent serves the forward on a fixed guest loopback port. When the
+//! forward cannot be served there, launches log a warning and keep command hooks.
+//!
 //! Tokens do not expire. To rotate the key, stop flotillad, delete `http/hook-key` beneath
 //! its state directory and start it again: a fresh key is created, every token minted
 //! under the old one is refused, and crews relaunched afterwards get new tokens. Running
 //! crews' hooks fail (non-blocking, so the agent continues) until they relaunch.
 //!
-//! The hook URL is fixed into each crew's settings at launch, so the endpoint exists only
-//! when the listen address names a fixed, non-zero port; with port 0 every start binds a
-//! different port, and launches keep command hooks. Changing the configured port (and
+//! The hook URL is fixed into each crew's settings at launch, so the host-direct endpoint
+//! exists only when the listen address names a fixed, non-zero port; with port 0 every
+//! start binds a different port, and host-direct launches keep command hooks. Changing the configured port (and
 //! restarting) strands running host-direct crews' hooks the same way until they relaunch.
 //!
 //! Claude Code reports a refused or unreachable HTTP hook as a non-blocking error and has
@@ -46,7 +55,7 @@ use flotilla_agent::{
     hooks::{ClaudeCodeParser, CodexParser},
     HarnessHookParser,
 };
-use flotilla_protocol::{AgentHarness, AgentHookEvent, AgentHookTerminalRef};
+use flotilla_protocol::{AgentHarness, AgentHookEvent, AgentHookTerminalRef, EnvironmentId};
 use flotilla_resources::{ResourceError, TerminalSession};
 use flotilla_store::ResourceBackend;
 use hmac::{Hmac, Mac};
@@ -105,15 +114,15 @@ impl HookKey {
 
     fn read(path: &Path) -> Result<Option<Self>, String> {
         match std::fs::read_to_string(path) {
-            Ok(existing) => {
-                Self::decode(existing.trim_ascii_end()).map(Some).ok_or_else(|| format!("hook key {} is malformed", path.display()))
-            }
+            Ok(existing) => Self::decode(existing.trim_ascii_end())
+                .map(Some)
+                .ok_or_else(|| format!("hook key {} is malformed; delete it to create a fresh key", path.display())),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(format!("read hook key {}: {error}", path.display())),
         }
     }
 
-    fn generate() -> Result<Self, String> {
+    pub(super) fn generate() -> Result<Self, String> {
         let mut key = [0_u8; 32];
         getrandom::getrandom(&mut key).map_err(|error| format!("generate hook key: {error}"))?;
         Ok(Self(key))
@@ -174,54 +183,97 @@ impl HookKey {
     }
 }
 
-/// What a host-direct crew launch needs to deliver its hooks over HTTP: the hook routes'
-/// base URL on the loopback listener and its terminal's token.
+/// What a crew launch needs to deliver its hooks over HTTP: the hook routes' base URL, on
+/// the loopback listener or a vessel's agent forward, and its terminal's token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HookLaunch {
     pub base_url: String,
     pub token: String,
 }
 
-/// flotillad's hook endpoint, known once the loopback TCP listener binds. The controller
+/// flotillad's hook endpoint. Its key is loaded at startup, so vessel launches mint
+/// tokens for their agent forward whether or not flotillad listens on TCP; the
+/// host-direct origin is known once the loopback TCP listener binds. The controller
 /// runtime starts before that, so it holds this handle and asks per launch; with no
-/// listener there is no endpoint, and launches keep command hooks.
+/// listener there is no host-direct endpoint, and those launches keep command hooks.
 #[derive(Clone, Default)]
-pub struct HookEndpoint(Arc<OnceLock<(String, HookKey)>>);
+pub struct HookEndpoint(Arc<HookEndpointState>);
+
+#[derive(Default)]
+struct HookEndpointState {
+    key: OnceLock<HookKey>,
+    origin: OnceLock<String>,
+}
 
 impl std::fmt::Debug for HookEndpoint {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("HookEndpoint").field("origin", &self.0.get().map(|(origin, _)| origin)).finish_non_exhaustive()
+        formatter.debug_struct("HookEndpoint").field("origin", &self.0.origin.get()).finish_non_exhaustive()
     }
 }
 
 impl HookEndpoint {
-    /// Serve hooks on `listener` when its configured port is fixed. A port-0 listener
-    /// binds a different port at each start, so a hook URL fixed into a crew's settings
-    /// would go dead at the next restart; without an endpoint, launches keep command hooks.
+    pub(in crate::server) fn with_key(key: HookKey) -> Self {
+        let endpoint = Self::default();
+        let _ = endpoint.0.key.set(key);
+        endpoint
+    }
+
+    /// The endpoint whose key lives in flotillad's HTTP directory beneath `state_dir`.
+    pub(in crate::server) fn load(state_dir: &Path) -> Result<Self, String> {
+        Ok(Self::with_key(HookKey::load_or_create(&super::tcp::prepare_token_directory(state_dir)?)?))
+    }
+
+    /// The key hook tokens are minted and verified with, once loaded.
+    pub(in crate::server) fn key(&self) -> Option<&HookKey> {
+        self.0.key.get()
+    }
+
+    /// Serve host-direct hooks on `listener` when its configured port is fixed. A port-0
+    /// listener binds a different port at each start, so a hook URL fixed into a crew's
+    /// settings would go dead at the next restart; without an origin, host-direct
+    /// launches keep command hooks.
     pub(in crate::server) fn publish(&self, listener: &TcpListener) {
         if listener.has_fixed_port() {
-            self.set(listener.origin(), listener.hook_key().clone());
+            let _ = self.0.origin.set(listener.origin().trim_end_matches('/').to_owned());
         } else {
             tracing::info!(origin = listener.origin(), "HTTP listen port is 0, so host-direct Claude Code crews keep command hooks");
         }
     }
 
-    pub(in crate::server) fn set(&self, origin: &str, key: HookKey) {
-        let _ = self.0.set((origin.trim_end_matches('/').to_owned(), key));
-    }
-
     /// An endpoint at `origin` with a fresh key, as if its listener had bound there.
     #[cfg(test)]
     pub(crate) fn listening_at(origin: &str) -> Self {
-        let endpoint = Self::default();
-        endpoint.set(origin, HookKey::generate().expect("hook key"));
+        let endpoint = Self::with_key(HookKey::generate().expect("hook key"));
+        let _ = endpoint.0.origin.set(origin.trim_end_matches('/').to_owned());
         endpoint
     }
 
-    /// The Claude Code hook URL and token for a terminal session, when flotillad listens on
-    /// loopback TCP.
+    #[cfg(test)]
+    pub(crate) fn set_origin(&self, origin: &str) {
+        let _ = self.0.origin.set(origin.trim_end_matches('/').to_owned());
+    }
+
+    /// The Claude Code hook URL and token for a host-direct terminal session, when
+    /// flotillad listens on loopback TCP.
     pub async fn claude_code_launch(&self, backend: &ResourceBackend, namespace: &str, session_name: &str) -> Option<HookLaunch> {
-        let (origin, key) = self.0.get()?;
+        let origin = self.0.origin.get()?;
+        self.launch_at(origin, backend, namespace, session_name).await
+    }
+
+    /// The Claude Code hook URL and token for a terminal session in a vessel, whose
+    /// agent serves flotillad at `origin` inside it.
+    pub async fn vessel_claude_code_launch(
+        &self,
+        origin: &str,
+        backend: &ResourceBackend,
+        namespace: &str,
+        session_name: &str,
+    ) -> Option<HookLaunch> {
+        self.launch_at(origin.trim_end_matches('/'), backend, namespace, session_name).await
+    }
+
+    async fn launch_at(&self, origin: &str, backend: &ResourceBackend, namespace: &str, session_name: &str) -> Option<HookLaunch> {
+        let key = self.0.key.get()?;
         let terminal = AgentHookTerminalRef { namespace: namespace.to_owned(), session_name: session_name.to_owned() };
         let session = match backend.clone().using::<TerminalSession>(namespace).get(session_name).await {
             Ok(session) => session,
@@ -238,10 +290,12 @@ impl HookEndpoint {
 
 /// `POST /v1/hooks/claude-code/<event>`: one Claude Code hook event.
 ///
-/// A hook token binds the event to its terminal, whose attachable it updates. The user's
-/// own callers (the main socket or the file token) post as `flotilla hook` does outside a
-/// managed terminal. An environment socket is refused for now: vessel sessions keep command
-/// hooks until their loopback forwarder (#3485). Browser sessions never post hooks.
+/// A hook token binds the event to its terminal, whose attachable it updates. On the
+/// loopback listener the token is the caller's whole identity. On an environment socket,
+/// reached through a vessel agent's forward, the token travels inside the forwarded
+/// request and must name a terminal in that environment. The user's own callers (the
+/// main socket or the file token) post as `flotilla hook` does outside a managed
+/// terminal. Browser sessions never post hooks.
 pub(super) async fn claude_code(
     State(RouterState(state)): State<RouterState>,
     Extension(caller): Extension<CallerAuth>,
@@ -272,25 +326,24 @@ async fn handle(
 ) -> Response {
     let (terminal, policy) = match caller {
         CallerAuth::Hook { terminal, generation } => {
-            // Revocation checks the live instance once per event. A deletion after this
-            // read can race an already-admitted event; subsequent events are refused.
-            let session = state.backend.clone().using::<TerminalSession>(&terminal.namespace).get(&terminal.session_name).await;
-            match session {
-                Ok(session)
-                    if session.metadata.creation_timestamp.to_rfc3339() == generation && session.metadata.deletion_timestamp.is_none() => {}
-                Ok(_) | Err(ResourceError::NotFound { .. }) => return auth::unauthenticated(),
-                Err(error) => {
-                    tracing::warn!(namespace = %terminal.namespace, session_name = %terminal.session_name, %error, "failed to validate hook token session");
-                    return auth::unauthenticated();
-                }
+            if !live_terminal(&state, &terminal, &generation, None).await {
+                return auth::unauthenticated();
+            }
+            (Some(terminal), HookIdentityPolicy::PlacedTerminal)
+        }
+        CallerAuth::Environment { environment, .. } => {
+            let verified = bearer(&headers).and_then(|token| state.hooks.key()?.verify(token));
+            let Some((terminal, generation)) = verified else {
+                return auth::unauthenticated();
+            };
+            if !live_terminal(&state, &terminal, &generation, Some(&environment)).await {
+                return auth::unauthenticated();
             }
             (Some(terminal), HookIdentityPolicy::PlacedTerminal)
         }
         CallerAuth::Socket(_) | CallerAuth::Bearer => (None, HookIdentityPolicy::NativeSession),
         CallerAuth::Anonymous => return auth::unauthenticated(),
-        CallerAuth::Environment { .. } | CallerAuth::Session(_) => {
-            return auth::refusal(StatusCode::FORBIDDEN, "agent hooks are not accepted from this caller")
-        }
+        CallerAuth::Session(_) => return auth::refusal(StatusCode::FORBIDDEN, "agent hooks are not accepted from this caller"),
     };
     let Some(agent_state_store) = state.agent_state_store.as_ref() else {
         return auth::refusal(StatusCode::SERVICE_UNAVAILABLE, "agent hooks are unavailable");
@@ -339,6 +392,37 @@ async fn handle(
         Err(error) => {
             tracing::warn!(err = %error, "failed to process agent hook event");
             auth::refusal(StatusCode::INTERNAL_SERVER_ERROR, "failed to process agent hook event")
+        }
+    }
+}
+
+/// The token of a request's single `Authorization: Bearer` header.
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let (scheme, token) = values.next()?.to_str().ok()?.split_once(' ')?;
+    (values.next().is_none() && scheme.eq_ignore_ascii_case("Bearer")).then_some(token)
+}
+
+/// Whether a token's terminal instance still exists, undeleted, and runs in
+/// `environment` when the caller is one. Revocation checks the live instance once per
+/// event. A deletion after this read can race an already-admitted event; subsequent
+/// events are refused.
+async fn live_terminal(
+    state: &super::HttpRouter,
+    terminal: &AgentHookTerminalRef,
+    generation: &str,
+    environment: Option<&EnvironmentId>,
+) -> bool {
+    match state.backend.clone().using::<TerminalSession>(&terminal.namespace).get(&terminal.session_name).await {
+        Ok(session) => {
+            session.metadata.creation_timestamp.to_rfc3339() == generation
+                && session.metadata.deletion_timestamp.is_none()
+                && environment.is_none_or(|environment| session.spec.env_ref == environment.as_str())
+        }
+        Err(ResourceError::NotFound { .. }) => false,
+        Err(error) => {
+            tracing::warn!(namespace = %terminal.namespace, session_name = %terminal.session_name, %error, "failed to validate hook token session");
+            false
         }
     }
 }

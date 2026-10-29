@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeMap,
     io,
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -728,9 +729,9 @@ impl VesselAgent for Arc<AgentRunner> {
     async fn push_tools(&self, tools: &[EnvironmentTool]) -> Result<(), String> {
         AgentRunner::push_tools(self, tools).await
     }
-    async fn forward_controller_socket(&self, guest: &Path, controller: &Path) -> Result<(), String> {
+    async fn forward_controller_socket(&self, guest: &Path, tcp: Option<SocketAddr>, controller: &Path) -> Result<(), String> {
         let id = format!("socket-{}", &format!("{:x}", Sha256::digest(guest.as_os_str().as_encoded_bytes()))[..16]);
-        let forward = GuestForward { id, unix: guest.into(), tcp: None };
+        let forward = GuestForward { id, unix: guest.into(), tcp };
         self.put_guest_forward(forward, Endpoint::Unix(controller.into())).await.map_err(|failure| failure.to_string())
     }
     async fn extend_environment(&self, environment: BTreeMap<String, String>) -> Result<(), String> {
