@@ -27,7 +27,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_engine_store::Rehearsal;
+use flotilla_engine_store::{ImportTarget, Rehearsal};
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
     builtins::is_builtin,
@@ -35,12 +35,13 @@ use flotilla_resources::{
     CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer, ImageLayerResourceSpec, ObjectMeta, Project,
     Resource, ResourceObject, WorkflowTemplate, WorkflowTemplateSpec,
 };
-use flotilla_schema::Kind;
+use flotilla_schema::{Kind, Timestamp};
 use flotilla_store::{definition_is_live, merge_definition_copies};
 
 use super::{
     import::{ImportRefusal, ImportReport},
-    project_import::rehearse_project_ops,
+    project_import::write_project_ops,
+    provenance::change_of,
 };
 use crate::stored::{
     definition::{
@@ -132,23 +133,26 @@ pub struct DefinitionCopies {
 pub fn rehearse_definitions(copies: &DefinitionCopies) -> ImportReport {
     let mut report = ImportReport::default();
     let registry = stored::registry().and_then(|mut registry| project::register(&mut registry).map(|()| registry));
-    let mut rehearsal = match registry.map_err(|error| format!("registry: {error:?}")).and_then(Rehearsal::open) {
-        Ok(rehearsal) => rehearsal,
-        Err(reason) => {
-            report.refused.push(ImportRefusal { kind: "definitions", record: "<all>".to_owned(), reason });
-            return report;
-        }
-    };
-    rehearse_kind::<ForgeDefinition>(&copies.forges, &mut rehearsal, &mut report);
-    rehearse_kind::<FleetDesignationDefinition>(&copies.fleet_designations, &mut rehearsal, &mut report);
-    rehearse_kind::<CredentialSpecDefinition>(&copies.credential_specs, &mut rehearsal, &mut report);
-    rehearse_kind::<CredentialGrantDefinition>(&copies.credential_grants, &mut rehearsal, &mut report);
-    rehearse_kind::<CrewDefaultsDefinition>(&copies.crew_defaults, &mut rehearsal, &mut report);
-    rehearse_kind::<ImageLayerDefinition>(&copies.image_layers, &mut rehearsal, &mut report);
-    rehearse_kind::<WorkflowTemplateDefinition>(&copies.workflow_templates, &mut rehearsal, &mut report);
-    let projects = rehearse_kind::<ProjectDefinition>(&copies.projects, &mut rehearsal, &mut report);
-    rehearse_project_ops(&copies.projects, &projects, &mut rehearsal, &mut report);
+    match registry.map_err(|error| format!("registry: {error:?}")).and_then(Rehearsal::open) {
+        Ok(mut rehearsal) => import_definitions(copies, &mut rehearsal, &mut report),
+        Err(reason) => report.refused.push(ImportRefusal { kind: "definitions", record: "<all>".to_owned(), reason }),
+    }
     report
+}
+
+/// Maps every copy in `copies` onto the engine and writes the records homed where `target`
+/// imports, each through the change its origin's writer makes, into `report`. A name is
+/// reported only where a copy of it is held at a home `target` imports.
+pub fn import_definitions(copies: &DefinitionCopies, target: &mut impl ImportTarget, report: &mut ImportReport) {
+    write_kind::<ForgeDefinition>(&copies.forges, target, report);
+    write_kind::<FleetDesignationDefinition>(&copies.fleet_designations, target, report);
+    write_kind::<CredentialSpecDefinition>(&copies.credential_specs, target, report);
+    write_kind::<CredentialGrantDefinition>(&copies.credential_grants, target, report);
+    write_kind::<CrewDefaultsDefinition>(&copies.crew_defaults, target, report);
+    write_kind::<ImageLayerDefinition>(&copies.image_layers, target, report);
+    write_kind::<WorkflowTemplateDefinition>(&copies.workflow_templates, target, report);
+    let projects = write_kind::<ProjectDefinition>(&copies.projects, target, report);
+    write_project_ops(&copies.projects, &projects, target, report);
 }
 
 /// One engine record the import makes: its namespace, name, home and value.
@@ -159,11 +163,27 @@ pub struct ImportedDefinition<S> {
     pub record: S,
     /// Why its home's copy was written: the import's change for it.
     pub origin: DefinitionOrigin,
+    /// When its home's copy was created: the time of the import's change.
+    pub created: Timestamp,
 }
 
 /// Maps the copies of `D`'s kind onto engine records, one group of copies per namespace and name.
 /// Drops are counted and refusals listed in `report`.
 pub fn import_kind<D: DefinitionKind>(copies: &[DefinitionCopy<D::Old>], report: &mut ImportReport) -> Vec<ImportedDefinition<D::Stored>>
+where
+    ResourceObject<D::Old>: Clone,
+{
+    import_kind_at::<D>(copies, &|_| true, report)
+}
+
+/// [`import_kind`] for the homes `imports` accepts: every copy is merged, but only records homed
+/// at an accepted home are made, and a name is counted, noted or refused only where an accepted
+/// home holds a copy of it.
+pub fn import_kind_at<D: DefinitionKind>(
+    copies: &[DefinitionCopy<D::Old>],
+    imports: &dyn Fn(&str) -> bool,
+    report: &mut ImportReport,
+) -> Vec<ImportedDefinition<D::Stored>>
 where
     ResourceObject<D::Old>: Clone,
 {
@@ -174,9 +194,13 @@ where
     }
     let mut imported = Vec::new();
     for ((namespace, name), copies) in by_name {
+        let held = copies.iter().filter(|copy| imports(&copy.home)).count();
+        if held == 0 {
+            continue;
+        }
         let refuse = |reason: String| ImportRefusal { kind, record: name.to_owned(), reason };
         if is_builtin(kind, name) {
-            *report.dropped.entry((kind, "built-in, served from the code")).or_default() += copies.len();
+            *report.dropped.entry((kind, "built-in, served from the code")).or_default() += held;
             continue;
         }
         let merged = match merge_definition_copies(
@@ -201,7 +225,7 @@ where
             }
         }
         if !definition_is_live(&merged) {
-            *report.dropped.entry((kind, "deleted")).or_default() += copies.len();
+            *report.dropped.entry((kind, "deleted")).or_default() += held;
             continue;
         }
         let live: Vec<_> = copies.iter().copied().filter(|copy| copy.object.metadata.deletion_timestamp.is_none()).collect();
@@ -232,7 +256,7 @@ where
                 kept.join(", ")
             ));
         }
-        for copy in homes {
+        for copy in homes.into_iter().filter(|copy| imports(&copy.home)) {
             let origin = match origin(&copy.object.metadata) {
                 Ok(origin) => origin,
                 Err(reason) => {
@@ -245,12 +269,13 @@ where
                     namespace: namespace.to_owned(),
                     name: name.to_owned(),
                     home: copy.home.clone(),
+                    created: Timestamp::from_datetime(&copy.object.metadata.creation_timestamp),
                     record,
                     origin,
                 }),
                 Ok(Mapped::Dropped(reason)) => {
                     // The spec is the merged one, so every home's record drops alike: count the copies once.
-                    *report.dropped.entry((kind, reason)).or_default() += copies.len();
+                    *report.dropped.entry((kind, reason)).or_default() += held;
                     break;
                 }
                 Err(reason) => report.refused.push(refuse(format!("at `{}`: {reason}", copy.home))),
@@ -282,28 +307,29 @@ where
     imported
 }
 
-/// Restores the records `copies` import to, and returns the `(namespace, name)` of each restored.
-fn rehearse_kind<D: DefinitionKind>(
+/// Writes the records `copies` import to, and returns the `(namespace, name)` of each written.
+fn write_kind<D: DefinitionKind>(
     copies: &[DefinitionCopy<D::Old>],
-    rehearsal: &mut Rehearsal,
+    target: &mut impl ImportTarget,
     report: &mut ImportReport,
 ) -> BTreeSet<(String, String)>
 where
     ResourceObject<D::Old>: Clone,
+    D::Stored: Clone,
 {
     let kind = <D::Stored as Kind>::KIND;
-    let mut restored = BTreeSet::new();
-    for imported in import_kind::<D>(copies, report) {
-        // Version 1: each record starts at its home as a fresh write, its old versions not carried.
-        match rehearsal.restore(&imported.home, &imported.name, 1, &imported.record) {
+    let mut written = BTreeSet::new();
+    for imported in import_kind_at::<D>(copies, &|home| target.imports(home), report) {
+        let change = change_of(&imported.origin, &imported.home, imported.created);
+        match target.write(&imported.home, &imported.name, &change, &imported.record) {
             Ok(()) => {
                 *report.imported.entry((kind, label(&imported.origin))).or_default() += 1;
-                restored.insert((imported.namespace, imported.name));
+                written.insert((imported.namespace, imported.name));
             }
             Err(reason) => report.refused.push(ImportRefusal { kind, record: imported.name, reason }),
         }
     }
-    restored
+    written
 }
 
 /// An origin's label, as the report counts it.

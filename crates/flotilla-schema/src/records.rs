@@ -63,6 +63,13 @@ impl<R> Records<R> {
         Ok(&self.rows[self.rows.len() - 1])
     }
 
+    /// Stamps every row with `version`, as storage stamps the rows of the write that appends them all.
+    pub fn restamp(&mut self, version: u64) {
+        for row in &mut self.rows {
+            row.version = version;
+        }
+    }
+
     /// Whether every position is taken, so the next [`Records::append`] would refuse.
     pub fn is_full(&self) -> bool {
         u32::try_from(self.rows.len()).is_err()

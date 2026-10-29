@@ -467,21 +467,39 @@ pub fn write(store: &mut flotilla_schema_sqlite::Store, convoy: &ImportedConvoy)
 /// stamps rows with the write's own home sequence, which the import cannot
 /// know beforehand.
 fn content(spec: &ConvoySpec) -> ConvoySpec {
-    fn restamp<R: Clone>(rows: &Records<R>, each: impl Fn(&R) -> R) -> Records<R> {
-        let mut out = Records::new();
-        for row in rows.iter() {
-            out.append(0, each(&row.record)).expect("fewer rows than before");
-        }
-        out
+    stamped(spec, 0)
+}
+
+/// `spec` with every record row stamped `version`, as the store stamps the rows its create holds.
+fn stamped(spec: &ConvoySpec, version: u64) -> ConvoySpec {
+    let mut seats = spec.seats.clone();
+    seats.restamp(version);
+    let mut promises = Records::new();
+    for row in spec.promises.iter() {
+        let mut promise = row.record.clone();
+        promise.submissions.restamp(version);
+        promises.append(version, promise).expect("fewer rows than before");
     }
-    ConvoySpec {
-        seats: restamp(&spec.seats, Clone::clone),
-        promises: restamp(&spec.promises, |promise| Promise {
-            submissions: restamp(&promise.submissions, Clone::clone),
-            ..promise.clone()
-        }),
-        ..spec.clone()
+    ConvoySpec { seats, promises, ..spec.clone() }
+}
+
+/// Writes one imported convoy into `target` through the creation path, at its `since` as [`write`]
+/// does, and its open stall record beside it; the convoy as written.
+pub fn write_into(target: &mut impl flotilla_engine_store::ImportTarget, convoy: &ImportedConvoy) -> Result<Resource<Convoy>, String> {
+    let stall = stall_record(convoy)?;
+    let change = flotilla_schema::NewChange::new(flotilla_engine_store::IMPORT_WRITER, convoy.resource.since());
+    let written = target.write_with(&convoy.home, convoy.resource.name(), &change, convoy.resource.version().0, |version| {
+        Resource::stored(
+            convoy.resource.name(),
+            stamped(convoy.resource.spec(), version),
+            convoy.resource.stored_state().clone(),
+            Version(version),
+        )
+    })?;
+    if let Some(stall) = &stall {
+        target.write(&convoy.home, stall.name(), &change, stall).map_err(|error| format!("stall `{}`: {error}", stall.name()))?;
     }
+    Ok(written)
 }
 
 /// A convoy the rehearsal refused, named.
@@ -570,6 +588,20 @@ pub fn rehearse_all<'a>(
     forges: &[ForgeSpec],
     world: &dyn ConvoyImportWorld,
 ) -> RehearsalReport {
+    let mut report = import_all(convoys, home, forges, world);
+    report.rehearsal = rehearse(&report.imported);
+    report
+}
+
+/// Maps every old convoy of `convoys`, homed at `home`, onto the engine: each finite convoy alone,
+/// and each standing convoy's generations folded into one stable identity. Nothing is written,
+/// so the report's `rehearsal` is empty.
+pub fn import_all<'a>(
+    convoys: impl IntoIterator<Item = &'a ResourceObject<OldConvoy>>,
+    home: &str,
+    forges: &[ForgeSpec],
+    world: &dyn ConvoyImportWorld,
+) -> RehearsalReport {
     let mut report = RehearsalReport::default();
     let mut standing: BTreeMap<String, Vec<&ResourceObject<OldConvoy>>> = BTreeMap::new();
     let mut finite = Vec::new();
@@ -648,7 +680,6 @@ pub fn rehearse_all<'a>(
             Err(refusal) => report.refused.push(refusal),
         }
     }
-    report.rehearsal = rehearse(&report.imported);
     report
 }
 
