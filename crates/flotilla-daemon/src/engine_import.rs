@@ -26,7 +26,7 @@ use flotilla_engine_store::{Import, ImportTarget};
 use flotilla_provisioning::engine::import::ImportReport;
 use flotilla_resources::{K8sResourceObject, Resource, ResourceObject};
 use flotilla_store::REGISTERED_RESOURCE_KINDS;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use self::plan::Plan;
@@ -72,7 +72,7 @@ fn decode<R: Resource>(document: &Value) -> Result<ResourceObject<R>, String> {
     if let Some(error) = document.get(UNREADABLE).and_then(Value::as_str) {
         return Err(format!("its stored body is not JSON: {error}"));
     }
-    let object = serde_json::from_value::<K8sResourceObject<R>>(document.clone()).map_err(|error| error.to_string())?;
+    let object = K8sResourceObject::<R>::deserialize(document).map_err(|error| error.to_string())?;
     ResourceObject::from_k8s_object(object).map_err(|error| error.to_string())
 }
 
@@ -115,7 +115,8 @@ impl Source {
     }
 
     /// The rows of a kind the caller imports, every home's, decoded; one homed where `target`
-    /// imports that does not decode is refused as `kind`.
+    /// imports that does not decode is refused as `kind`. Another home's is left to that home's
+    /// import and its pre-roll rehearsal.
     fn owned<R: Resource>(
         &self,
         plural: &str,
@@ -352,6 +353,8 @@ fn log_summary(summary: &Summary, report: &Path) {
 /// store, writes the report, and puts the engine store in place only if nothing was refused. A
 /// refusal is an error, leaving `decided.sqlite.importing` for inspection; the next start imports
 /// again from the beginning. Returns the report's path, or `None` when there was nothing to import.
+/// The report is written before the rename, so a failed rename leaves an `imported` report beside
+/// no engine store; the next start imports again and writes a new one.
 pub fn first_start(state_dir: &Path, home: &str) -> Result<Option<PathBuf>, String> {
     let engine = state_dir.join(ENGINE_STORE);
     let old = state_dir.join(OLD_STORE);

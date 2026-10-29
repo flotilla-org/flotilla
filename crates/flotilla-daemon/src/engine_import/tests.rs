@@ -231,7 +231,9 @@ async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
     let old = old_store(dir.path());
     let written = first_start(dir.path(), HERE).expect("imports").expect("a report");
     assert_eq!(old_store(dir.path()), old, "the old store is only read");
-    assert!(!dir.path().join(IMPORTING).exists());
+    for file in [IMPORTING, "decided.sqlite.importing-journal", "decided.sqlite.importing-wal", "decided.sqlite-wal"] {
+        assert!(!dir.path().join(file).exists(), "{file}: the engine store is whole in one file when renamed");
+    }
     let report = report(&written);
     assert_eq!(report["outcome"], "imported", "{report:#}");
     assert_eq!(report["source"], OLD_STORE);
@@ -607,10 +609,13 @@ async fn an_import_left_by_a_crash_is_replaced_by_a_clean_one() {
     let _held = populated(dir.path()).await;
     std::fs::write(dir.path().join(IMPORTING), b"half an import").expect("stale import");
     std::fs::write(dir.path().join(format!("{IMPORTING}-journal")), b"stale journal").expect("stale journal");
+    std::fs::write(dir.path().join(format!("{IMPORTING}-wal")), b"stale log").expect("stale log");
     let written = report(&first_start(dir.path(), HERE).expect("imports").expect("a report"));
     assert_eq!(written["outcome"], "imported", "{written:#}");
-    assert!(!dir.path().join(IMPORTING).exists());
-    assert_eq!(engine(dir.path()).home(), HERE);
+    for suffix in ["", "-journal", "-wal"] {
+        assert!(!dir.path().join(format!("{IMPORTING}{suffix}")).exists(), "{suffix}");
+    }
+    assert!(holds::<flotilla_provisioning::stored::artifact::ArtifactRecord>(&mut engine(dir.path()), "ours", HERE));
 }
 
 #[test]
