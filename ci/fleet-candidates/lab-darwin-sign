@@ -477,7 +477,8 @@ def validate_signing_pair(certificate, private_key):
 
 
 def sign_payloads(stage, identity, expected_team_id, entitlements, expected_entitlements, certificate, private_key):
-    paths = sorted(stage.glob("lib/*.dylib")) + [stage / path for path in (*REQUIRED_BINARIES, *sorted(validation.PRODUCED_PAYLOAD)) if (stage / path).exists()]
+    binaries = (*REQUIRED_BINARIES, *sorted(validation.PRODUCED_PAYLOAD))
+    paths = sorted(stage.glob("lib/*.dylib")) + [stage / path for path in binaries if (stage / path).exists()]
     records = []
     for path in paths:
         relative = str(path.relative_to(stage))
