@@ -573,20 +573,20 @@ pub struct ControllerLoop<R: Reconciler> {
     pub backend: ResourceBackend,
 }
 
-impl<R: Reconciler> ControllerLoop<R> {
-    const WATCH_RESTART_BACKOFF: Duration = Duration::from_millis(100);
-    const SECONDARY_BACKOFF_CAP: Duration = Duration::from_secs(30);
-    const SECONDARY_STABLE_RUN: Duration = Duration::from_secs(60);
+const WATCH_RESTART_BACKOFF: Duration = Duration::from_millis(100);
+const SECONDARY_BACKOFF_CAP: Duration = Duration::from_secs(30);
+const SECONDARY_STABLE_RUN: Duration = Duration::from_secs(60);
 
-    /// Doubles per early exit up to a cap; a watch that ran for a while starts over.
-    fn next_secondary_backoff(previous: Duration, ran_for: Duration) -> Duration {
-        if ran_for >= Self::SECONDARY_STABLE_RUN {
-            Self::WATCH_RESTART_BACKOFF
-        } else {
-            (previous * 2).min(Self::SECONDARY_BACKOFF_CAP)
-        }
+/// Doubles per early exit up to a cap; a watch that ran for a while starts over.
+fn next_secondary_backoff(previous: Duration, ran_for: Duration) -> Duration {
+    if ran_for >= SECONDARY_STABLE_RUN {
+        WATCH_RESTART_BACKOFF
+    } else {
+        previous.saturating_mul(2).min(SECONDARY_BACKOFF_CAP)
     }
+}
 
+impl<R: Reconciler> ControllerLoop<R> {
     async fn write_tolerating_not_found<T>(write: impl Future<Output = Result<T, ResourceError>>) -> Result<(), ResourceError> {
         match write.await {
             Ok(_) | Err(ResourceError::NotFound { .. }) => Ok(()),
@@ -860,7 +860,7 @@ impl<R: Reconciler> ControllerLoop<R> {
             .collect();
         let mut watches = ControllerWatches { primary: primary_watch, secondaries: secondary_watches };
         let mut secondary_started = vec![Instant::now(); secondary_templates.len()];
-        let mut secondary_backoff = vec![Self::WATCH_RESTART_BACKOFF / 2; secondary_templates.len()];
+        let mut secondary_backoff = vec![WATCH_RESTART_BACKOFF / 2; secondary_templates.len()];
         let mut resync = tokio::time::interval(resync_interval);
         resync.tick().await;
         let mut pending: VecDeque<String> = VecDeque::new();
@@ -1174,7 +1174,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                                 primary.clone(),
                                 sender.clone(),
                                 watch_exited_tx.clone(),
-                                Some(Self::WATCH_RESTART_BACKOFF),
+                                Some(WATCH_RESTART_BACKOFF),
                             );
                         }
                         WatchExited::Secondary { index, result } => {
@@ -1183,8 +1183,9 @@ impl<R: Reconciler> ControllerLoop<R> {
                             // cannot reveal a deletion missed while its watch was expired.
                             let live_names = Self::resync_all(&primary, &sender).await?;
                             finalizer_failures.retain(|name, _| live_names.contains(name));
-                            let backoff = Self::next_secondary_backoff(secondary_backoff[index], secondary_started[index].elapsed());
+                            let backoff = next_secondary_backoff(secondary_backoff[index], secondary_started[index].elapsed());
                             secondary_backoff[index] = backoff;
+                            // Counts from when the delayed spawn runs, so `elapsed()` is zero until then.
                             secondary_started[index] = Instant::now() + backoff;
                             watches.secondaries[index] = Self::spawn_secondary_watch(
                                 index,
@@ -1233,6 +1234,20 @@ pub async fn delete_lifecycle_owned_matching<T: Resource>(
 #[cfg(test)]
 mod progress_tests {
     use super::*;
+
+    #[test]
+    fn secondary_backoff_doubles_to_the_cap_and_resets_after_a_stable_run() {
+        let mut delay = WATCH_RESTART_BACKOFF / 2;
+        let mut seen = Vec::new();
+        for _ in 0..12 {
+            delay = next_secondary_backoff(delay, Duration::ZERO);
+            seen.push(delay);
+        }
+        assert_eq!(seen[..3], [Duration::from_millis(100), Duration::from_millis(200), Duration::from_millis(400)]);
+        assert_eq!(seen[11], SECONDARY_BACKOFF_CAP);
+        assert_eq!(next_secondary_backoff(delay, SECONDARY_STABLE_RUN - Duration::from_millis(1)), SECONDARY_BACKOFF_CAP);
+        assert_eq!(next_secondary_backoff(delay, SECONDARY_STABLE_RUN), WATCH_RESTART_BACKOFF);
+    }
 
     // #3412: only outstanding work without progress can stall a controller.
     // Generate duplicate queue entries, backlog sizes, and ages on both sides
