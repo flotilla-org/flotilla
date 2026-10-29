@@ -895,3 +895,27 @@ fn open_demands_import_as_the_attentions_their_writers_send() {
         &flotilla_state_machines::machines::message::MessageBody::Text("forgejo: refused\ngithub-app: expires in 2 minutes".into())
     );
 }
+
+#[test]
+fn attentions_of_two_namespaces_at_one_home_take_distinct_admission_sequences() {
+    let records = |namespace: &str| {
+        let spec = flotilla_resources::ConvoySpec::builder().workflow_ref("w".into()).project_ref(namespace.into()).build();
+        let reclaim = flotilla_resources::RECLAIM_REFUSAL_REASON_ANNOTATION;
+        [
+            designation(),
+            document("Convoy", "finished", serde_json::to_value(spec).expect("spec"), json!({"phase": "Landed"})),
+            demand("reclaim-refusal-finished", ("Convoy", "finished"), &[(reclaim, "checkout is dirty")], "raised"),
+        ]
+        .into_iter()
+        .map(|mut document| {
+            document["metadata"]["namespace"] = json!(namespace);
+            let kind = document["kind"].as_str().expect("kind").to_owned();
+            let plural = REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.kind == kind).expect("registered").plural;
+            Row { namespace: namespace.into(), plural: plural.into(), home: HERE.into(), document }
+        })
+        .collect::<Vec<_>>()
+    };
+    let source = Source::new([records("alpha"), records("beta")].concat());
+    let summary = rehearse(&source, HERE);
+    assert_eq!(summary.kinds["Demand"], Counts { imported: 2, dropped: 0, refused: 0 }, "{summary:?}");
+}

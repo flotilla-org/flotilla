@@ -23,7 +23,7 @@ pub(super) fn attentions(source: &Source, target: &mut Import, carried: &mut Car
     }
 }
 
-fn namespace_attentions(source: &Source, namespace: &str, target: &mut Import, carried: &Carried, report: &mut ImportReport) {
+fn namespace_attentions(source: &Source, namespace: &str, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
     let demands: Vec<_> = source
         .owned::<Demand>("demands", Some(namespace), KIND, target, report)
         .into_iter()
@@ -62,6 +62,10 @@ fn namespace_attentions(source: &Source, namespace: &str, target: &mut Import, c
             _ => None,
         })
         .collect();
+    for message in &imported {
+        let admitted = carried.admitted.entry(message.home.clone()).or_default();
+        *admitted = (*admitted).max(message.resource.version().0);
+    }
     let failed = write_messages(&imported, target);
     let mut counted = MessageReport::default();
     for result in &results {

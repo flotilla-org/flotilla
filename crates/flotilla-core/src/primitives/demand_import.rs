@@ -226,6 +226,7 @@ fn map(record: &ResourceObject<Demand>, conversion: &Conversion<'_>, records: &D
     let Some(convoy) = records.convoys.get(target) else { return Ok(Mapped::Dropped("its convoy is gone")) };
     let read = convoy_read(convoy, conversion)?;
     if name.starts_with(HOLD) {
+        // The ensure reconciler records a hold's reason under the reclaim-refusal key.
         let reason = reason(record, RECLAIM_REFUSAL_REASON_ANNOTATION, || format!("Standing convoy `{target}` is held."));
         return Ok(attention(Cause::Hold { convoy: read }, reason, convoy));
     }
@@ -270,13 +271,7 @@ fn credential(
         Read { address: child(&read.address, Kind::Vessel, vessel_name)?, revision: vessel.metadata.resource_version.clone() };
     Ok(Mapped::Attention(Box::new(Pending {
         id: format!("{CREDENTIAL}{}", vessel.metadata.name),
-        attention: Attention {
-            cause: Cause::CredentialRefresh { vessel: vessel_read },
-            reason: lines.join(
-                "
-",
-            ),
-        },
+        attention: Attention { cause: Cause::CredentialRefresh { vessel: vessel_read }, reason: lines.join("\n") },
         principal: principal(group[0].record),
         project: convoy.spec.project_ref.clone(),
     })))
