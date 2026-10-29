@@ -542,3 +542,92 @@ async fn table_watch_tracks_rows_outside_its_initial_page() {
         assert!(matches!(&decode(&event,cbor)[0],Message::Upsert{row,..}if row["metadata.name"]=="z"));
     }
 }
+
+const TABLES_DOC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/tables.md"));
+
+fn documented(list: &str) -> Vec<&'static str> {
+    let opening = format!("```list {list}\n");
+    let body = TABLES_DOC.split_once(&opening).unwrap_or_else(|| panic!("docs/tables.md has no `list {list}` block")).1;
+    body.split_once("```").expect("list block is closed").0.lines().collect()
+}
+
+fn sorted(mut names: Vec<&str>) -> Vec<&str> {
+    names.sort();
+    names
+}
+
+#[test]
+fn tables_doc_lists_the_message_kinds_of_the_code() {
+    fn kind(message: &Message) -> &'static str {
+        match message {
+            Message::Table { .. } => "table",
+            Message::Rows { .. } => "rows",
+            Message::Synced { .. } => "synced",
+            Message::Upsert { .. } => "upsert",
+            Message::Delete { .. } => "delete",
+            Message::Progress { .. } => "progress",
+            Message::Resync { .. } => "resync",
+            Message::Count { .. } => "count",
+        }
+    }
+    let samples = [
+        Message::Table { table: String::new(), schema: json!({}), incarnation: String::new(), sequence: 0 },
+        Message::Rows { rows: vec![], sequence: 0, partial: false, cursor: None },
+        Message::Synced { sequence: 0 },
+        Message::Upsert { key: vec![], row: Default::default(), sequence: 0 },
+        Message::Delete { key: vec![], sequence: 0 },
+        Message::Progress { sequence: 0 },
+        Message::Resync { reason: String::new() },
+        Message::Count { count: 0, estimate: false, sequence: 0 },
+    ];
+    for sample in &samples {
+        assert_eq!(serde_json::to_value(sample).unwrap()["type"], kind(sample));
+    }
+    assert_eq!(sorted(samples.iter().map(kind).collect()), sorted(documented("messages")));
+}
+
+#[test]
+fn tables_doc_lists_the_column_types_of_the_code() {
+    use flotilla_schema::ColumnType;
+    fn name(ty: &ColumnType) -> &'static str {
+        match ty {
+            ColumnType::Integer => "integer",
+            ColumnType::Number => "number",
+            ColumnType::Bool => "bool",
+            ColumnType::Text => "text",
+            ColumnType::Blob => "blob",
+            ColumnType::Timestamp => "timestamp",
+            ColumnType::Code(_) => "code",
+            ColumnType::Interned(_) => "interned",
+            ColumnType::Ref => "ref",
+            ColumnType::Frozen => "frozen",
+            ColumnType::Cbor => "cbor",
+        }
+    }
+    let all = [
+        ColumnType::Integer,
+        ColumnType::Number,
+        ColumnType::Bool,
+        ColumnType::Text,
+        ColumnType::Blob,
+        ColumnType::Timestamp,
+        ColumnType::Code(vec![]),
+        ColumnType::Interned(flotilla_schema::HOME_DOMAIN),
+        ColumnType::Ref,
+        ColumnType::Frozen,
+        ColumnType::Cbor,
+    ];
+    assert_eq!(sorted(all.iter().map(name).collect()), sorted(documented("column-types")));
+}
+
+#[test]
+fn tables_doc_lists_the_routes_of_the_code() {
+    let source = include_str!("mod.rs");
+    let routes: Vec<&str> = source
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(".route(\"")?.split('"').next())
+        .filter(|path| path.starts_with("/tables"))
+        .collect();
+    assert_eq!(routes.len(), source.matches("\"/tables").count());
+    assert_eq!(sorted(routes), sorted(documented("routes")));
+}
