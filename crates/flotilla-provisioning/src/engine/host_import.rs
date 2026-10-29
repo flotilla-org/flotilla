@@ -11,7 +11,8 @@
 //! | `status.fulfilment_facts` | facts by FulfilmentKind name: GUI login, image and its presence, harness and toolchain versions; each fact's observation time, free vessel slots and model facts dropped, as judgements or kept by nothing |
 //! | Heartbeat time, readiness, `sleeping_until`, model probes | dropped: readiness is a judgement, and nothing sets the others |
 //! | The host summary (but its architecture), daemon version and start time, sleep inhibition state | dropped: display only; the sleep condition carries what readiness needs |
-//! | Disk, memory, store and blob-sync figures, `io_pressure`, `store_read_retries`, `forge_budgets` | dropped: metrics |
+//! | Free disk and the free-space floor | only whether free disk is below the floor |
+//! | Memory, store and blob-sync figures, `io_pressure`, `store_read_retries`, `forge_budgets` | dropped: metrics |
 //! | `terminal_pools`, `docker` and `os` capabilities | dropped: no decision reads them |
 //! | The SSH capability markers | dropped: the connection carries them |
 //!
@@ -124,14 +125,14 @@ fn observation(
     status: &HostStatus,
     dropped: &mut Vec<(&'static str, &'static str)>,
 ) -> Result<HostObservation, String> {
-    let mut drop = |reason: &'static str| {
+    let mut uncarried = |reason: &'static str| {
         if !dropped.contains(&(OBSERVATION, reason)) {
             dropped.push((OBSERVATION, reason));
         }
     };
     for key in status.capabilities.keys() {
-        match DROPPED_CAPABILITIES.iter().find(|(dropped, _)| dropped == key) {
-            Some((_, reason)) => drop(reason),
+        match DROPPED_CAPABILITIES.iter().find(|(capability, _)| capability == key) {
+            Some((_, reason)) => uncarried(reason),
             None if CARRIED_CAPABILITIES.contains(&key.as_str()) => {}
             None => return Err(format!("its capability `{key}` has no import mapping")),
         }
@@ -161,38 +162,36 @@ fn observation(
     let codex_central_login: Option<bool> = capability(status, CODEX_CENTRAL_LOGIN_CAPABILITY)?;
     let description = status.description.as_ref();
     if description.is_some() {
-        drop("the host summary but its architecture, display only");
+        uncarried("the host summary but its architecture, display only");
     }
     if status.daemon_version.is_some() || status.daemon_started_at.is_some() {
-        drop("the daemon's version and start time, display only");
+        uncarried("the daemon's version and start time, display only");
     }
     if status.sleep_inhibition != Default::default() {
-        drop("the sleep inhibition state, which its condition carries");
+        uncarried("the sleep inhibition state, which its condition carries");
     }
     if status.heartbeat_at.is_some() || status.ready {
-        drop("heartbeat time and readiness, a judgement");
+        uncarried("heartbeat time and readiness, a judgement");
     }
     if status.sleeping_until.is_some() {
-        drop("sleeping_until, which nothing sets");
+        uncarried("sleeping_until, which nothing sets");
     }
     if status.model_probes != ModelProbeState::default() {
-        drop("model probes, which nothing keeps");
+        uncarried("model probes, which nothing keeps");
     }
-    if status.disk_free_bytes.is_some()
-        || status.daemon_rss_bytes.is_some()
-        || status.resource_store.is_some()
-        || status.blob_sync.is_some()
-        || status.admission_free_space_floor_bytes.is_some()
-    {
-        drop("metrics");
+    if status.disk_free_bytes.is_some() || status.admission_free_space_floor_bytes.is_some() {
+        uncarried("the disk figures, carried only as the free-space floor flag");
+    }
+    if status.daemon_rss_bytes.is_some() || status.resource_store.is_some() || status.blob_sync.is_some() {
+        uncarried("metrics");
     }
     for facts in status.fulfilment_facts.values() {
-        drop("each fact's observation time, a judgement");
+        uncarried("each fact's observation time, a judgement");
         if facts.free_vessel_slots.is_some() {
-            drop("free vessel slots, a judgement");
+            uncarried("free vessel slots, a judgement");
         }
         if facts.harnesses.values().any(|harness| !harness.models.is_empty()) {
-            drop("model facts, which nothing keeps");
+            uncarried("model facts, which nothing keeps");
         }
     }
     Ok(HostObservation {
@@ -257,20 +256,22 @@ pub fn import_hosts(copies: &HostCopies, target: &mut impl ImportTarget, report:
         match import_host(&copy.object, own_host) {
             Ok(Imported::Records { host, observation, dropped }) => {
                 // Each record starts at its home as a fresh write; its old versions are not carried.
+                // A copy counts only once both are written: a refusal fails the whole import, so a
+                // Host written without its observation is never put in place.
                 let change = created(&copy.object);
-                if let Err(reason) = target.write(&copy.home, name, &change, &*host) {
-                    report.refused.push(refuse(reason));
+                let written = target.write(&copy.home, name, &change, &*host).map_err(refuse).and_then(|()| match &observation {
+                    Some(observation) => target
+                        .write(&copy.home, name, &change, &**observation)
+                        .map_err(|reason| ImportRefusal { kind: OBSERVATION, ..refuse(reason) }),
+                    None => Ok(()),
+                });
+                if let Err(refusal) = written {
+                    report.refused.push(refusal);
                     continue;
                 }
                 *report.imported.entry((HOST, "spec")).or_default() += 1;
-                if let Some(observation) = observation {
-                    match target.write(&copy.home, name, &change, &*observation) {
-                        Ok(()) => *report.imported.entry((OBSERVATION, "observed")).or_default() += 1,
-                        Err(reason) => {
-                            report.refused.push(ImportRefusal { kind: OBSERVATION, ..refuse(reason) });
-                            continue;
-                        }
-                    }
+                if observation.is_some() {
+                    *report.imported.entry((OBSERVATION, "observed")).or_default() += 1;
                 }
                 for key in dropped {
                     *report.dropped.entry(key).or_default() += 1;

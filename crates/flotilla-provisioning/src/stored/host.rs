@@ -279,6 +279,7 @@ pub struct HostObservation {
     pub protocol_fingerprint: Option<String>,
     /// The image architecture (`amd64`, `arm64`); none for an SSH host.
     pub architecture: Option<String>,
+    /// Free disk is below admission's floor; false when either figure is unknown.
     pub below_free_space_floor: bool,
     /// An SSH host's owning daemon keeps a central Codex login.
     pub codex_central_login: bool,

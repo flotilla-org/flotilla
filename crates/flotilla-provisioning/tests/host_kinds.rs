@@ -206,6 +206,7 @@ fn the_corpus_imports_at_each_hosts_own_home() {
         "terminal pools, read only for display",
         "heartbeat time and readiness, a judgement",
         "metrics",
+        "the disk figures, carried only as the free-space floor flag",
     ] {
         assert!(report.dropped.keys().any(|(_, dropped)| *dropped == reason), "{reason}: {report:?}");
     }
