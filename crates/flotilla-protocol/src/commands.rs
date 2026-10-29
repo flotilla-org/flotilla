@@ -1304,11 +1304,6 @@ pub enum CommandAction {
         kind: String,
         name: String,
     },
-    ArtifactReserveLedgerComment {
-        namespace: String,
-        name: String,
-        address: crate::LeafAddress,
-    },
     ResourceApply {
         namespace: String,
         document: serde_json::Value,
@@ -1504,7 +1499,6 @@ impl Command {
             CommandAction::QueryResourceList { .. } => "query resource list",
             CommandAction::QueryManifestRoots { .. } => "query manifest roots",
             CommandAction::QueryResourceGet { .. } => "query resource get",
-            CommandAction::ArtifactReserveLedgerComment { .. } => "reserve ledger comment creation",
             CommandAction::ResourceApply { .. } => "apply resource",
             CommandAction::ResourceManifestResolve { resolution, .. } => match resolution {
                 ManifestResolution::Sync => "sync manifest resource",
@@ -1585,9 +1579,6 @@ pub enum CommandValue {
         session: String,
         #[serde(with = "frame_bytes")]
         frame: Vec<u8>,
-    },
-    LedgerCommentCreationReserved {
-        granted: bool,
     },
     Ok,
     CrewFollowUpDelivered,

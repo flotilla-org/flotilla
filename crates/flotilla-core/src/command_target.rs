@@ -101,7 +101,6 @@ impl InProcessDaemon {
             | A::CrewStall { .. }
             | A::CrewHandoff { .. }
             | A::CrewSupervise { .. }
-            | A::ArtifactReserveLedgerComment { .. }
             | A::ResourceApply { .. }
             | A::ResourceManifestResolve { .. }
             | A::ConvoyEnsureRoll { .. }

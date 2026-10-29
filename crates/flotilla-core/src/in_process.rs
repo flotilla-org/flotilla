@@ -5011,7 +5011,6 @@ impl InProcessDaemon {
             | CommandAction::ResourceStatusPatch { namespace, kind, name, .. }
             | CommandAction::ResourceManifestResolve { namespace, kind, name, .. }
             | CommandAction::ResourceReconcileNow { namespace, kind, name } => Some((namespace.as_str(), kind.as_str(), name.as_str())),
-            CommandAction::ArtifactReserveLedgerComment { namespace, name, .. } => Some((namespace.as_str(), "Artifact", name.as_str())),
             CommandAction::RepositoryRemoteRemove { namespace, name, .. } => Some((namespace.as_str(), "Repository", name.as_str())),
             CommandAction::ResourceApply { namespace, document } => match (
                 document.get("kind").and_then(serde_json::Value::as_str),
@@ -5535,9 +5534,6 @@ impl InProcessDaemon {
         let projections = self.projections_actions();
         let executor = self.executor_actions();
         match &command.action {
-            CommandAction::ArtifactReserveLedgerComment { .. } => {
-                return boxed_action!(crew.execute_action_artifact_reserve_ledger_comment(id, &command))
-            }
             CommandAction::ResourceApply { .. } => return boxed_action!(executor.execute_action_resource_apply(id, &command)),
             CommandAction::RepositoryRemoteRemove { .. } => {
                 return boxed_action!(executor.execute_action_repository_remote_remove(id, &command))

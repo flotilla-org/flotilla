@@ -92,6 +92,7 @@ pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     definition::register(registry)?;
     repository::register(registry)?;
     project::register(registry)?;
+    artifact::register(registry)?;
     Ok(())
 }
 

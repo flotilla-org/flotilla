@@ -1236,6 +1236,18 @@ impl DummyDaemon {
         log.create("transport", &record, &change).expect("project record");
         let ops = flotilla_provisioning::stored::project::ProjectOpsRecord { refused: None, entries: None };
         log.create("transport", &ops, &change).expect("project ops record");
+        let artifact = flotilla_resources::ArtifactSpec::builder()
+            .convoy("transport-convoy".into())
+            .producer("coder".into())
+            .kind("brief".into())
+            .subject("transport-convoy".into())
+            .digest("ef37".into())
+            .size(1)
+            .media_type("text/markdown".into())
+            .expires_at(chrono::DateTime::UNIX_EPOCH)
+            .build();
+        let record = flotilla_provisioning::stored::artifact::ArtifactRecord::from_spec(&artifact).expect("artifact");
+        log.create("transport-artifact", &record, &change).expect("artifact record");
     }
 
     fn transport_binding(&self, at: flotilla_schema::Timestamp) -> flotilla_provisioning::stored::account::BindingSpec {
@@ -1343,6 +1355,7 @@ impl DummyDaemon {
                 collect!(stored flotilla_provisioning::stored::repository::RepositoryRecord);
                 collect!(stored flotilla_provisioning::stored::project::ProjectDefinition);
                 collect!(stored flotilla_provisioning::stored::project::ProjectOpsRecord);
+                collect!(stored flotilla_provisioning::stored::artifact::ArtifactRecord);
                 assert_eq!(covered, registered, "every registered engine kind needs a transport fixture");
                 Ok(snapshots)
             })

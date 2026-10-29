@@ -112,6 +112,7 @@ impl BriefArtifactWriter for SystemBriefArtifactWriter {
             .digest(digest.as_str().to_string())
             .size(content.len() as u64)
             .media_type("text/markdown".to_string())
+            .recorded_at(Utc::now())
             .expires_at(expires_at)
             .pinned(prior.as_ref().is_some_and(|artifact| artifact.spec.pinned))
             .build();
