@@ -15,7 +15,6 @@ use flotilla_resources::{
     ForgeReadRequest, ForgeReadSpec, ForgeReadStatus, Host, HostStatus, InputMeta, IssueSourceResolution, Project, ReadWatchEvent,
     Repository, ResourceError, ResourceProvenance, SystemClock,
 };
-use flotilla_store::resolve_project_issue_sources;
 use flotilla_store::ResourceBackend;
 use futures::StreamExt;
 use serde::{de::DeserializeOwned, Serialize};
@@ -161,20 +160,61 @@ fn observer_ready(status: &HostStatus) -> bool {
     !status.conditions.iter().any(|condition| condition.blocks_forge_observation())
 }
 
-/// Shared sources elect once, regardless of how many Projects bind them.
-/// Unknown host health preserves the preferred owner during startup; only
-/// observer-unready/stale evidence or expiry of the startup grace permits
-/// fallback. Admission readiness never withdraws forge observation.
-pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &IssueSource) -> Result<Option<NodeId>, String> {
-    let mut source = canonical_source(source);
-    for forge in backend.definitions::<flotilla_resources::Forge>(namespace).list().await.map_err(|e| e.to_string())? {
-        if forge.spec.forge_id == source.service {
-            source.service = forge.spec.https_url;
-            break;
+/// What declares a source's observer: the forges, each Project with its declaration (its earliest
+/// creation and the home that made it), and the repositories the Projects name, by key.
+pub struct Declarations<H> {
+    pub forges: Vec<flotilla_resources::ForgeSpec>,
+    pub projects: Vec<(flotilla_resources::ProjectSpec, (DateTime<Utc>, H))>,
+    pub repositories: BTreeMap<String, Result<flotilla_resources::ResourceObject<Repository>, ResourceError>>,
+}
+
+impl<H: Ord + Clone> Declarations<H> {
+    /// The earliest declaration of a Project bound to `source`, by an issue-source binding, a
+    /// resolved binding, or a member repository's forge identity; its home is the preferred observer.
+    pub fn preferred_observer(&self, source: &IssueSource) -> Option<(DateTime<Utc>, H)> {
+        let mut source = canonical_source(source);
+        if let Some(forge) = self.forges.iter().find(|forge| forge.forge_id == source.service) {
+            source.service = forge.https_url.clone();
         }
+        let source = normalize_issue_source(&source);
+        let mut homes = Vec::new();
+        for (project, declaration) in &self.projects {
+            if project.issue_source_bindings.iter().any(|binding| !binding.exclude && canonical_source(&binding.source) == source) {
+                homes.push(declaration.clone());
+            }
+            if let IssueSourceResolution::Available { bindings } =
+                flotilla_resources::resolve_project_issue_sources_from_inventory(&self.repositories, project)
+            {
+                if bindings.iter().any(|binding| canonical_source(&binding.source) == source) {
+                    homes.push(declaration.clone());
+                }
+            }
+            // PR observation follows Repository forge identity even if its issue
+            // source has been overridden or excluded.
+            for member in &project.repositories {
+                if let Some(Ok(repository)) = self.repositories.get(&member.repo.to_string()) {
+                    if repository.spec.forge().is_some_and(|forge| {
+                        normalize_issue_source(&IssueSource { service: forge.service_url.clone(), scope: forge.repository.clone() })
+                            == source
+                    }) {
+                        homes.push(declaration.clone());
+                    }
+                }
+            }
+        }
+        homes.into_iter().min()
     }
-    let source = normalize_issue_source(&source);
-    let now = Utc::now();
+}
+
+async fn declarations(backend: &ResourceBackend, namespace: &str) -> Result<Declarations<NodeId>, String> {
+    let forges = backend
+        .definitions::<flotilla_resources::Forge>(namespace)
+        .list()
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|forge| forge.spec)
+        .collect();
     // Recover every declaration home in one store listing, rather than listing
     // every Project's replica sources again for each binding and repository.
     let mut project_homes = BTreeMap::new();
@@ -183,36 +223,31 @@ pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &I
         let entry = project_homes.entry(record.object.metadata.name).or_insert_with(|| candidate.clone());
         *entry = candidate.min(entry.clone());
     }
-    let mut homes = Vec::new();
-    let repositories = backend.including_replicas::<Repository>(namespace);
+    let resolver = backend.including_replicas::<Repository>(namespace);
+    let mut projects = Vec::new();
+    let mut repositories = BTreeMap::new();
     for project in backend.definitions::<Project>(namespace).list().await.map_err(|e| e.to_string())? {
-        if project.spec.issue_source_bindings.iter().any(|binding| !binding.exclude && canonical_source(&binding.source) == source) {
-            if let Some(home) = project_homes.get(&project.metadata.name) {
-                homes.push(home.clone());
-            }
-        }
-        if let IssueSourceResolution::Available { bindings } = resolve_project_issue_sources(&repositories, &project.spec).await {
-            if bindings.iter().any(|binding| canonical_source(&binding.source) == source) {
-                if let Some(home) = project_homes.get(&project.metadata.name) {
-                    homes.push(home.clone());
-                }
-            }
-        }
-        // PR observation follows Repository forge identity even if its issue
-        // source has been overridden or excluded.
         for member in &project.spec.repositories {
-            if let Ok(repository) = repositories.get(&member.repo.to_string()).await {
-                if repository.object.spec.forge().is_some_and(|forge| {
-                    normalize_issue_source(&IssueSource { service: forge.service_url.clone(), scope: forge.repository.clone() }) == source
-                }) {
-                    if let Some(home) = project_homes.get(&project.metadata.name) {
-                        homes.push(home.clone());
-                    }
-                }
+            let key = member.repo.to_string();
+            if let std::collections::btree_map::Entry::Vacant(entry) = repositories.entry(key) {
+                let repository = resolver.get(entry.key()).await.map(|record| record.object);
+                entry.insert(repository);
             }
+        }
+        if let Some(home) = project_homes.get(&project.metadata.name) {
+            projects.push((project.spec, home.clone()));
         }
     }
-    let preferred = homes.into_iter().min();
+    Ok(Declarations { forges, projects, repositories })
+}
+
+/// Shared sources elect once, regardless of how many Projects bind them.
+/// Unknown host health preserves the preferred owner during startup; only
+/// observer-unready/stale evidence or expiry of the startup grace permits
+/// fallback. Admission readiness never withdraws forge observation.
+pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &IssueSource) -> Result<Option<NodeId>, String> {
+    let now = Utc::now();
+    let preferred = declarations(backend, namespace).await?.preferred_observer(source);
     let mut ready = BTreeMap::new();
     for host in backend.including_replicas::<Host>(namespace).list_replica_sources().await.map_err(|e| e.to_string())?.items {
         if !matches!(host.object.spec.connection, flotilla_resources::HostConnection::Daemon) {

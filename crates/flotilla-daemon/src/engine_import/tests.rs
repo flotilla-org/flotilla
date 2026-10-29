@@ -3,6 +3,7 @@ use std::path::Path;
 use chrono::Utc;
 use flotilla_engine_store::ImportTarget;
 use flotilla_protocol::NodeId;
+use flotilla_provisioning::stored::forge_observation::{ChangeRequestRecord, ForgeReadRecord, IssueRecord};
 use flotilla_resources::{
     Artifact, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure, CredentialSpec, FleetDesignation, Forge, FulfilmentKind, InputMeta,
     Message, Project, Repository, RepositorySpec, Resource, TerminalSession, Vessel,
@@ -635,4 +636,130 @@ fn a_stored_body_that_is_not_json_is_refused_by_name() {
     let [refusal] = summary.refusals.as_slice() else { panic!("{summary:?}") };
     assert_eq!((refusal.kind.as_str(), refusal.name.as_str()), ("Artifact", "garbled"));
     assert!(refusal.reason.contains("not JSON"), "{refusal:?}");
+}
+
+fn observed<T>(value: T) -> flotilla_resources::Observation<T> {
+    flotilla_resources::Observation { value: Some(value), observed_at: Utc::now() }
+}
+
+fn change_request(number: u64, authority: &str, state: flotilla_resources::ObservedChangeRequestState) -> Value {
+    let status = flotilla_resources::ChangeRequestStatus {
+        title: observed("Layer 5".to_owned()),
+        author: observed("coder".to_owned()),
+        review_decision: observed(flotilla_resources::ObservedReviewDecision::Required),
+        review_requested_from_owner: observed(false),
+        state: observed(state),
+        head_sha: observed("abc".to_owned()),
+        checks: observed(flotilla_resources::ObservedChecks::Pass),
+        review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: observed(false) },
+        mergeable: observed(flotilla_resources::ObservedMergeability::Mergeable),
+    };
+    document(
+        "ChangeRequest",
+        &format!("cr-flotilla-{number}"),
+        json!({"service": "github.com", "scope": "flotilla-org/flotilla", "number": number, "observing_authority": authority}),
+        serde_json::to_value(status).expect("status"),
+    )
+}
+
+fn issue(number: u64) -> Value {
+    let status = flotilla_resources::IssueStatus {
+        title: observed("Remaining kinds".to_owned()),
+        assignees: observed(vec![]),
+        state: observed(flotilla_resources::ObservedIssueState::Open),
+        labels: observed(vec!["enhancement".to_owned()]),
+        updated_at: observed(Utc::now()),
+    };
+    document(
+        "Issue",
+        &format!("issue-lab-{number}"),
+        json!({"service": "lab", "scope": "team/repo", "number": number, "observing_authority": THERE}),
+        serde_json::to_value(status).expect("status"),
+    )
+}
+
+fn forge_read() -> Value {
+    let source = flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
+    let request = flotilla_resources::ForgeReadRequest::Board;
+    document(
+        "ForgeRead",
+        &flotilla_resources::forge_read_name(&source, &request),
+        json!({"source": source, "request": request, "demanded_at": Utc::now()}),
+        json!({"authority": HERE, "attempted_at": Utc::now(), "observed_at": Utc::now(), "value": {"repositories": []}, "error": null, "retry_at": null}),
+    )
+}
+
+fn project(name: &str, created: &str, bindings: Value) -> Value {
+    let mut project = document(
+        "Project",
+        name,
+        json!({"default_workflow_ref": "single-agent-contained", "display_name": name, "issue_source_bindings": bindings, "repositories": []}),
+        Value::Null,
+    );
+    project["metadata"]["creationTimestamp"] = json!(created);
+    project
+}
+
+fn homed(home: &str, mut document: Value) -> Value {
+    if home != HERE {
+        document["metadata"]["annotations"] = json!({"flotilla.work/origin-root": home});
+    }
+    document
+}
+
+// Behaviour (#3824 layer 5, operator correction 1): hosts whose old stores hold different copies of
+// the same observations, each importing only what is homed at itself, write each subject once, at
+// the host whose Project declares its source first; the others write nothing for it.
+#[test]
+fn hosts_importing_together_write_each_observation_once_at_its_observer() {
+    const ELSEWHERE: &str = "host-c";
+    let flotilla = json!([{"source": {"service": "https://github.com", "scope": "flotilla-org/flotilla"}}]);
+    let lab = json!([{"source": {"service": "https://forge.example.invalid", "scope": "team/repo"}}]);
+    let declarations = |home: &str| {
+        vec![
+            homed(THERE, project("flotilla", "2026-10-01T00:00:00Z", flotilla.clone())),
+            homed(ELSEWHERE, project("flotilla", "2026-10-02T00:00:00Z", flotilla.clone())),
+            homed(ELSEWHERE, project("flotilla-fork", "2026-10-03T00:00:00Z", flotilla.clone())),
+            homed(ELSEWHERE, project("lab", "2026-10-01T00:00:00Z", lab.clone())),
+            homed(home, forge()),
+        ]
+    };
+    use flotilla_resources::ObservedChangeRequestState::{Merged, Open};
+    let stores = [
+        (
+            HERE,
+            vec![
+                homed(HERE, change_request(1, HERE, Merged)),
+                homed(HERE, issue(2)),
+                homed(HERE, forge_read()),
+                homed(THERE, change_request(1, THERE, Open)),
+            ],
+        ),
+        (THERE, vec![homed(THERE, change_request(1, THERE, Open)), homed(HERE, issue(2)), homed(HERE, forge_read())]),
+        (ELSEWHERE, vec![homed(HERE, change_request(1, HERE, Merged)), homed(HERE, issue(2))]),
+    ];
+    let mut written: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (home, observations) in stores {
+        let mut documents = declarations(home);
+        documents.extend(observations);
+        let source = rows(documents);
+        let mut target = Import::in_memory(home, crate::runtime::decided_registry().expect("registry")).expect("store");
+        let summary = import(&source, &mut target);
+        assert!(summary.refusals.is_empty(), "{home}: {:?}", summary.refusals);
+        let mut read = target.store().read().expect("read");
+        let held = [
+            ("ChangeRequest", read.scan::<ChangeRequestRecord>(home, None, 64).expect("scan").ids.len()),
+            ("Issue", read.scan::<IssueRecord>(home, None, 64).expect("scan").ids.len()),
+            ("ForgeRead", read.scan::<ForgeReadRecord>(home, None, 64).expect("scan").ids.len()),
+        ];
+        for (kind, count) in held {
+            written.entry(kind.to_owned()).or_default().extend(std::iter::repeat_n(home.to_owned(), count));
+        }
+    }
+    let expected = BTreeMap::from([
+        ("ChangeRequest".to_owned(), vec![THERE.to_owned()]),
+        ("ForgeRead".to_owned(), vec![THERE.to_owned()]),
+        ("Issue".to_owned(), vec![ELSEWHERE.to_owned()]),
+    ]);
+    assert_eq!(written, expected);
 }

@@ -60,7 +60,10 @@ fn provisioning_kind_codes_are_pinned() {
     assert_eq!(held("ProjectOps"), Some(KindCode::new("po")));
     assert_eq!(held("Artifact"), Some(KindCode::new("af")));
     assert_eq!(held("FulfilmentKind"), Some(KindCode::new("fk")));
-    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 20);
+    assert_eq!(held("ChangeRequest"), Some(KindCode::new("cq")));
+    assert_eq!(held("Issue"), Some(KindCode::new("iu")));
+    assert_eq!(held("ForgeRead"), Some(KindCode::new("fr")));
+    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 23);
     // The definition kinds (#3824 layer 2b), in the decided store with their writers (2b-ii).
     for (kind, code) in [
         ("Forge", "fo"),

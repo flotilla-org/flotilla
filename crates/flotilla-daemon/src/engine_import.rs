@@ -14,6 +14,7 @@ mod convoys;
 mod definitions;
 mod lifecycle;
 mod messages;
+mod observations;
 pub mod plan;
 mod records;
 
@@ -172,6 +173,7 @@ pub const STEPS: &[Step] = &[
     Step { name: "definitions", kinds: &definitions::KINDS, run: definitions::definitions },
     Step { name: "repositories", kinds: &["repositories"], run: records::repositories },
     Step { name: "artifacts", kinds: &["artifacts"], run: records::artifacts },
+    Step { name: "forge observations", kinds: &observations::KINDS, run: observations::observations },
     Step { name: "accounts", kinds: &records::ACCOUNT_KINDS, run: records::accounts },
     Step { name: "messages", kinds: &["messages"], run: messages::messages },
     Step { name: "convoys", kinds: &["convoys"], run: convoys::convoys },

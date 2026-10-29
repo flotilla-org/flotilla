@@ -35,6 +35,7 @@ pub mod checkout;
 pub mod clone;
 pub mod definition;
 pub mod environment;
+pub mod forge_observation;
 pub mod image_build;
 pub mod manifest_root;
 pub mod placement;
@@ -93,6 +94,7 @@ pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     repository::register(registry)?;
     project::register(registry)?;
     artifact::register(registry)?;
+    forge_observation::register(registry)?;
     placement::register(registry)?;
     Ok(())
 }

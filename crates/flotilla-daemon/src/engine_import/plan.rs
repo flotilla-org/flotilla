@@ -55,9 +55,9 @@ pub const PLAN: &[(&str, Plan)] = &[
     ("Host", Plan::Moving("#3824 layer 4c")),
     // Each policy becomes a FulfilmentKind of its name.
     ("PlacementPolicy", Plan::Moving("the layer that serves FulfilmentKind from the engine")),
-    ("ChangeRequest", Plan::Moving("#3824 layer 5")),
-    ("Issue", Plan::Moving("#3824 layer 5")),
-    ("ForgeRead", Plan::Moving("#3824 layer 5")),
+    ("ChangeRequest", Plan::Imported("forge observations import (#3824 layer 5)")),
+    ("Issue", Plan::Imported("forge observations import (#3824 layer 5)")),
+    ("ForgeRead", Plan::Imported("forge observations import (#3824 layer 5)")),
     ("Artifact", Plan::Imported("Artifact import (#3824 layer 7)")),
     ("Demand", Plan::Moving("#3824 layer 8")),
     ("Regard", Plan::Moving("#3938")),
