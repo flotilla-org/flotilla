@@ -368,6 +368,6 @@ fn every_environment_class_is_stored() {
         (EnvironmentClass::CloudSandbox, Class::CloudSandbox),
         (EnvironmentClass::Dummy, Class::Dummy),
     ] {
-        assert_eq!(Class::new(class), stored);
+        assert_eq!(Class::new(class), Ok(stored));
     }
 }

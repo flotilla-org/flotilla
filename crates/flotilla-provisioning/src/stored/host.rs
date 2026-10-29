@@ -169,8 +169,10 @@ pub enum Class {
 
 impl Class {
     /// By the class's serialized name, so no code branches on a descriptive class (ADR 0058).
-    pub fn new(class: EnvironmentClass) -> Self {
-        serde_json::to_value(class).and_then(serde_json::from_value).expect("every environment class has a stored class")
+    pub fn new(class: EnvironmentClass) -> Result<Self, String> {
+        serde_json::to_value(class)
+            .and_then(serde_json::from_value)
+            .map_err(|error| format!("class {class:?} has no stored class: {error}"))
     }
 }
 
@@ -211,11 +213,11 @@ pub struct Provider {
 }
 
 impl Provider {
-    /// Refused for a workspace root that is not UTF-8.
+    /// Refused for a class with no stored class, or a workspace root that is not UTF-8.
     pub fn new(advertisement: &ProviderAdvertisement) -> Result<Self, String> {
         let root = &advertisement.capabilities.workspace_root;
         Ok(Self {
-            class: advertisement.kind.as_ref().map(|kind| Class::new(kind.class)),
+            class: advertisement.kind.as_ref().map(|kind| Class::new(kind.class)).transpose()?,
             implementation: advertisement.kind.as_ref().map(|kind| kind.implementation.clone()),
             readiness: (&advertisement.readiness).into(),
             workspace_root: root.to_str().ok_or_else(|| format!("workspace root {} is not UTF-8", root.display()))?.to_owned(),
