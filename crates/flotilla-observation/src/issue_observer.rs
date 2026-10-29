@@ -207,6 +207,8 @@ impl IssueRefresher {
             Err(error) => return Err(error.to_string()),
         }
 
+        // Under the engine the record is first written by the refresh loop spawned below, after
+        // the subject is in `active`; `sweep_undemanded` relies on that order.
         let mut active = self.inner.active.lock().await;
         if let Some(refresh) = active.get_mut(&subject) {
             refresh.demands.insert(subscription_id, freshness);
