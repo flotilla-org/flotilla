@@ -739,6 +739,9 @@ pub struct InProcessDaemon {
     /// installed behind `[primitives]`.
     accounts: Arc<flotilla_store::SwitchedAccounts>,
     manifest_roots: Arc<flotilla_store::SwitchedManifestRoots>,
+    /// The forge observers, which the engine's observation records switch to observer-only writes.
+    change_request_observer: flotilla_observation::change_request_observer::ChangeRequestRefresher,
+    issue_observer: flotilla_observation::issue_observer::IssueRefresher,
     repos: Arc<RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
     event_source: Arc<BroadcastEventSink>,
@@ -1273,6 +1276,8 @@ impl InProcessDaemon {
         let convoy_engine_path = flotilla_resources::convoy::engine::EngineConvoyPath::default();
         let vessel_seats_path = flotilla_resources::vessel_seats::VesselSeatsPath::default();
         let lifecycle_reads = Arc::new(flotilla_resources::lifecycle_reads::LateLifecycleReads::default());
+        let change_request_observer = change_request_refresher.clone();
+        let issue_observer = issue_refresher.clone();
         let leaf_subscriptions =
             LeafSubscriptionTable::with_issues(resource_backend.clone(), event_sink.clone(), change_request_refresher, issue_refresher)
                 .with_clock(Arc::clone(&clock))
@@ -1404,6 +1409,8 @@ impl InProcessDaemon {
             lifecycle_reads: Arc::clone(&lifecycle_reads),
             accounts,
             manifest_roots,
+            change_request_observer,
+            issue_observer,
             resource_backend: resource_backend.clone(),
             observed_resource_backend: observed_resource_backend.clone(),
             observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),
@@ -2252,6 +2259,30 @@ impl InProcessDaemon {
     /// The account kinds' records: the engine's once installed, the old store's before.
     pub fn account_records(&self) -> Arc<dyn flotilla_resources::account_access::AccountRecords> {
         self.accounts.clone()
+    }
+
+    /// Serves ChangeRequest and Issue from the engine's records behind `[primitives]`, and switches
+    /// the observers to write only what they observe. Records nothing demands after one lease are
+    /// swept.
+    pub fn install_observation_records(
+        &self,
+        records: Arc<dyn flotilla_resources::engine_records::EngineRecords>,
+        failures: Arc<dyn flotilla_resources::engine_records::ObservationFailures>,
+    ) -> Result<(), String> {
+        self.resource_backend().install_engine_records(records);
+        self.change_request_observer.engine().install(Arc::clone(&failures))?;
+        self.issue_observer.engine().install(failures)?;
+        let (change_requests, issues) = (self.change_request_observer.clone(), self.issue_observer.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(change_requests.stale_after()).await;
+            if let Err(error) = change_requests.sweep_undemanded().await {
+                tracing::warn!(%error, "sweep undemanded change request observations");
+            }
+            if let Err(error) = issues.sweep_undemanded().await {
+                tracing::warn!(%error, "sweep undemanded issue observations");
+            }
+        });
+        Ok(())
     }
 
     /// Installs the engine's ManifestRoots during composition (#3824 layer 2c).

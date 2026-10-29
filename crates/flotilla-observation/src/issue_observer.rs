@@ -13,6 +13,10 @@ use tokio::{
     task::JoinHandle,
 };
 
+use crate::engine_observers::EngineObservers;
+
+const KIND: &str = "Issue";
+
 /// One issue observed in one namespace: the issue observer's key.
 ///
 /// Its identity is the issue's [`Address`], so every spelling of one issue
@@ -117,6 +121,7 @@ struct IssueRefresherInner {
     observation_errors: Mutex<HashMap<IssueKey, String>>,
     relay_healthy: std::sync::atomic::AtomicBool,
     relay_wake: Notify,
+    engine: EngineObservers,
 }
 
 impl IssueRefresher {
@@ -131,12 +136,38 @@ impl IssueRefresher {
                 observation_errors: Mutex::new(HashMap::new()),
                 relay_healthy: std::sync::atomic::AtomicBool::new(false),
                 relay_wake: Notify::new(),
+                engine: EngineObservers::default(),
             }),
         }
     }
 
     pub fn stale_after(&self) -> Duration {
         self.inner.cadence.stale_after
+    }
+
+    /// The engine's observation records, which composition installs behind `[primitives]`.
+    pub fn engine(&self) -> &EngineObservers {
+        &self.inner.engine
+    }
+
+    /// Deletes this home's records nothing demands: under the engine, records outlive a restart
+    /// and their demand returns within one lease, after which the rest are orphans.
+    pub async fn sweep_undemanded(&self) -> Result<(), String> {
+        let namespaces = self.inner.backend.local_namespaces::<Issue>().await.map_err(|error| error.to_string())?;
+        for namespace in namespaces {
+            let records = self.inner.backend.using::<Issue>(&namespace);
+            let demanded: std::collections::HashSet<String> = self.inner.active.lock().await.keys().map(IssueKey::record_name).collect();
+            for record in records.list().await.map_err(|error| error.to_string())?.items {
+                if demanded.contains(&record.metadata.name) {
+                    continue;
+                }
+                match records.delete(&record.metadata.name).await {
+                    Ok(()) | Err(flotilla_resources::ResourceError::NotFound { .. }) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn observation_error(&self, subject: &IssueKey) -> Option<String> {
@@ -154,7 +185,13 @@ impl IssueRefresher {
         if !self.owns_record(subject, false, create_missing).await? {
             return Ok(());
         }
-        let status = self.inner.source.observe(subject).await?;
+        let status = match self.inner.source.observe(subject).await {
+            Ok(status) => status,
+            Err(error) => {
+                self.inner.engine.failed(KIND, &name).await;
+                return Err(error);
+            }
+        };
         self.publish(subject, &name, status, true, false, create_missing).await
     }
 
@@ -162,6 +199,7 @@ impl IssueRefresher {
         let name = subject.record_name();
         match self.inner.backend.including_replicas::<Issue>(&subject.namespace).get(&name).await {
             Ok(_) => {}
+            Err(flotilla_resources::ResourceError::NotFound { .. }) if self.inner.engine.installed() => {}
             Err(flotilla_resources::ResourceError::NotFound { .. }) => self.ensure_record(&subject, &name).await?,
             Err(error) => return Err(error.to_string()),
         }
@@ -324,6 +362,7 @@ impl IssueRefresher {
                 }
                 Err(error) => {
                     self.inner.observation_errors.lock().await.insert(subject.clone(), error.clone());
+                    self.inner.engine.failed(KIND, &record_name).await;
                     tracing::warn!(issue = %subject.address(), %error, "issue observation failed");
                     if !self.wait_for_next(&subject, self.inner.cadence.state).await {
                         break;
@@ -594,5 +633,48 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         refresher.release(demand).await;
         assert_eq!(records.get(&name).await.expect("foreign record preserved").spec.observing_authority, "owner");
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordedFailures(std::sync::Mutex<Vec<(String, String)>>);
+
+    #[async_trait]
+    impl flotilla_resources::engine_records::ObservationFailures for RecordedFailures {
+        async fn failing(&self, kind: &str, name: &str) -> Result<(), String> {
+            self.0.lock().expect("failures").push((kind.to_owned(), name.to_owned()));
+            Ok(())
+        }
+    }
+
+    struct FailingSource;
+
+    #[async_trait]
+    impl IssueObservationSource for FailingSource {
+        async fn observe(&self, _subject: &IssueKey) -> Result<IssueStatus, String> {
+            Err("unavailable".into())
+        }
+    }
+
+    // Behaviour (age as a judgement): under the engine, the observer records a failed read on its
+    // record, from its refresh loop and from a claim-time refresh alike.
+    #[tokio::test]
+    async fn under_the_engine_a_failed_read_is_recorded() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let refresher = IssueRefresher::new(backend, "authority".into(), Arc::new(FailingSource), IssueRefreshCadence::default());
+        let failures = Arc::new(RecordedFailures::default());
+        refresher.engine().install(failures.clone()).expect("engine");
+        let subject = subject();
+        assert!(refresher.refresh_once(&subject).await.is_err());
+        assert_eq!(failures.0.lock().expect("failures").as_slice(), [("Issue".to_owned(), subject.record_name())]);
+        let demand = uuid::Uuid::new_v4();
+        refresher.demand(demand, subject.clone(), Some(Utc::now())).await.expect("demand");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while failures.0.lock().expect("failures").len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the refresh loop's failed read is recorded");
+        refresher.release(demand).await;
     }
 }

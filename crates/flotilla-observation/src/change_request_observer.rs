@@ -16,6 +16,10 @@ use flotilla_resources::{
     ResourceError, ResourceProvenance,
 };
 use flotilla_store::{watch_resource_kind_including_replicas, ResourceBackend, StoreQuery};
+
+use crate::engine_observers::EngineObservers;
+
+const KIND: &str = "ChangeRequest";
 #[cfg(test)]
 use flotilla_store_http::HttpBackend;
 #[cfg(test)]
@@ -79,6 +83,7 @@ struct ChangeRequestRefresherInner {
     relay_healthy: std::sync::atomic::AtomicBool,
     relay_wake: Notify,
     grace_schedule_reads: std::sync::atomic::AtomicUsize,
+    engine: EngineObservers,
 }
 
 impl ChangeRequestRefresher {
@@ -102,6 +107,7 @@ impl ChangeRequestRefresher {
                 relay_healthy: std::sync::atomic::AtomicBool::new(false),
                 relay_wake: Notify::new(),
                 grace_schedule_reads: Default::default(),
+                engine: EngineObservers::default(),
             }),
         }
     }
@@ -342,6 +348,36 @@ impl ChangeRequestRefresher {
         self.inner.cadence.stale_after
     }
 
+    /// The engine's observation records, which composition installs behind `[primitives]`.
+    pub fn engine(&self) -> &EngineObservers {
+        &self.inner.engine
+    }
+
+    /// Deletes this home's records nothing demands: under the engine, records outlive a restart
+    /// and their demand returns within one lease, after which the rest are orphans.
+    pub async fn sweep_undemanded(&self) -> Result<(), String> {
+        let namespaces = self.inner.backend.local_namespaces::<ChangeRequest>().await.map_err(|error| error.to_string())?;
+        for namespace in namespaces {
+            let records = self.inner.backend.using::<ChangeRequest>(&namespace);
+            let forges = self.forges(&namespace).await?;
+            for record in records.list().await.map_err(|error| error.to_string())?.items {
+                let Ok(subject) = record.spec.address(&forges).and_then(|address| ChangeRequestKey::new(namespace.clone(), address)) else {
+                    continue;
+                };
+                let lock = self.subject_lock(&subject).await;
+                let _guard = lock.lock().await;
+                if self.inner.active.lock().await.contains_key(&subject) {
+                    continue;
+                }
+                match records.delete(&record.metadata.name).await {
+                    Ok(()) | Err(ResourceError::NotFound { .. }) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// A consumer gets the observer's next scheduled refresh plus one cadence.
     /// Missing local demand (for example a remote owner) starts with the ordinary
     /// configured cadence; no judge-specific fixed delay is invented.
@@ -444,6 +480,7 @@ impl ChangeRequestRefresher {
             }
             Err(error) => {
                 self.inner.observation_errors.lock().await.insert(subject.clone(), error.clone());
+                self.inner.engine.failed(KIND, &record_name).await;
                 return Err(error);
             }
         };
@@ -461,6 +498,7 @@ impl ChangeRequestRefresher {
         let name = subject.record_name();
         match self.inner.backend.including_replicas::<ChangeRequest>(subject.namespace()).get(&name).await {
             Ok(_) => {}
+            Err(ResourceError::NotFound { .. }) if self.inner.engine.installed() => {}
             Err(ResourceError::NotFound { .. }) => self.ensure_record(&subject, &name).await?,
             Err(error) => return Err(error.to_string()),
         }
@@ -689,6 +727,9 @@ impl ChangeRequestRefresher {
 
     // Caller holds the subject lock, shared by demand admission and unlink cleanup.
     async fn record_convoy_history_locked(&self, subject: &ChangeRequestKey) -> Result<(), String> {
+        if self.inner.engine.installed() {
+            return Ok(());
+        }
         let convoys = self.inner.backend.using::<Convoy>(subject.namespace()).list().await.map_err(|error| error.to_string())?;
         let forges = self.forges(subject.namespace()).await?;
         let mut history = Vec::new();
@@ -920,6 +961,7 @@ impl ChangeRequestRefresher {
                         }
                     }
                     self.inner.observation_errors.lock().await.insert(subject.clone(), error.clone());
+                    self.inner.engine.failed(KIND, &record_name).await;
                     tracing::warn!(change_request = %subject.address(), %error, "change request observation failed");
                     let retained = self.inner.active.lock().await.get(&subject).is_some_and(|refresh| refresh.demands.is_empty());
                     let ordinary_delay = if retained { RETAINED_REFRESH_INTERVAL } else { self.inner.cadence.checks_pending };
@@ -2299,6 +2341,128 @@ mod tests {
         let deadline = refresher.refresh_grace_deadline(&subject, Some(now), now).await;
         assert!(deadline >= now + chrono::Duration::seconds(19));
         assert!(deadline <= now + chrono::Duration::seconds(21));
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordedFailures(std::sync::Mutex<Vec<(String, String)>>);
+
+    #[async_trait]
+    impl flotilla_resources::engine_records::ObservationFailures for RecordedFailures {
+        async fn failing(&self, kind: &str, name: &str) -> Result<(), String> {
+            self.0.lock().expect("failures").push((kind.to_owned(), name.to_owned()));
+            Ok(())
+        }
+    }
+
+    // Behaviour (observation ruling): under the engine, a host that does not observe
+    // a change request writes nothing for it: no local copy and no convoy history, however a
+    // local convoy links it. The old store's copy of both is `remote_observer_does_not_lose_local_convoy_history`.
+    #[tokio::test]
+    async fn under_the_engine_only_the_observer_writes() {
+        use flotilla_protocol::{IssueSource, NodeId, Relationship, Subject, SubjectKind};
+        use flotilla_resources::{Convoy, ConvoySpec, DeclaredSubject};
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let remote = ResourceBackend::new(InMemoryBackend::default());
+        let subject = ChangeRequestKey::new(
+            "ops",
+            flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 42, &[]).expect("address"),
+        )
+        .expect("key");
+        let remote_records = remote.using::<ChangeRequest>("ops");
+        let spec = ChangeRequestSpec::builder()
+            .service(subject.stored_service_scope().0)
+            .scope(subject.stored_service_scope().1)
+            .number(subject.number())
+            .observing_authority("remote".into())
+            .build();
+        let record = remote_records.create(&InputMeta::builder().name(subject.record_name()).build(), &spec).await.expect("remote record");
+        let observed = parse_gh_observation(r#"{"state":"OPEN"}"#, Utc::now()).expect("observation");
+        remote_records.update_status(&subject.record_name(), &record.metadata.resource_version, &observed).await.expect("observation");
+        backend
+            .replica_writer::<ChangeRequest>(NodeId::new("remote"), "ops")
+            .replace(&remote_records.list().await.expect("remote list"), Utc::now())
+            .await
+            .expect("replica");
+        let produces = DeclaredSubject {
+            subject: Subject {
+                kind: SubjectKind::ChangeRequest,
+                source: IssueSource { service: subject.stored_service_scope().0, scope: subject.stored_service_scope().1 },
+                id: "42".into(),
+            },
+            relationship: Relationship::Produces,
+            issue: None,
+            change_request: None,
+        };
+        let convoy = ConvoySpec::builder().workflow_ref("dev".into()).role("coder".into()).subjects(vec![produces]).build();
+        backend.using::<Convoy>("ops").create(&InputMeta::builder().name("producer".into()).build(), &convoy).await.expect("convoy");
+        let refresher = ChangeRequestRefresher::new(
+            "kiwi".into(),
+            backend.clone(),
+            "local".into(),
+            Arc::new(UnavailableSource),
+            ChangeRequestRefreshCadence::default(),
+        );
+        refresher.engine().install(Arc::new(RecordedFailures::default())).expect("engine");
+        let demand = uuid::Uuid::new_v4();
+        refresher.demand(demand, subject.clone(), None).await.expect("demand");
+        refresher.record_convoy_history(&subject).await.expect("history is the convoys' under the engine");
+
+        // A change request no home holds yet, whose source a Project at `remote` declares: the
+        // demand leaves its record to `remote`.
+        let binding = flotilla_resources::IssueSourceBindingSpec::builder()
+            .source(IssueSource { service: "https://github.com".into(), scope: "org/repo".into() })
+            .build();
+        let project = flotilla_resources::ProjectSpec::builder().display_name("ops".into()).issue_source_bindings(vec![binding]).build();
+        let projects = remote.using::<flotilla_resources::Project>("ops");
+        projects.create(&InputMeta::builder().name("ops".into()).build(), &project).await.expect("remote project");
+        backend
+            .replica_writer::<flotilla_resources::Project>(NodeId::new("remote"), "ops")
+            .replace(&projects.list().await.expect("remote projects"), Utc::now())
+            .await
+            .expect("project replica");
+        let unheld = ChangeRequestKey::new(
+            "ops",
+            flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 43, &[]).expect("address"),
+        )
+        .expect("key");
+        let unheld_demand = uuid::Uuid::new_v4();
+        refresher.demand(unheld_demand, unheld, None).await.expect("demand");
+        tokio::task::yield_now().await;
+        assert!(backend.using::<ChangeRequest>("ops").list().await.expect("local records").items.is_empty());
+        refresher.release(demand).await;
+        refresher.release(unheld_demand).await;
+    }
+
+    // Behaviour (age as a judgement): under the engine, the observer records a failed
+    // read on its record, so readers age its values from the first failure.
+    #[tokio::test]
+    async fn under_the_engine_a_failed_read_is_recorded() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
+            backend,
+            "authority".to_string(),
+            Arc::new(UnavailableSource),
+            ChangeRequestRefreshCadence::default(),
+        );
+        let failures = Arc::new(RecordedFailures::default());
+        refresher.engine().install(failures.clone()).expect("engine");
+        let subject = ChangeRequestKey::new(
+            "flotilla",
+            flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 1699, &[]).expect("address"),
+        )
+        .expect("key");
+        let demand = uuid::Uuid::new_v4();
+        refresher.demand(demand, subject.clone(), Some(Utc::now())).await.expect("demand");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while failures.0.lock().expect("failures").is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the failed read is recorded");
+        assert_eq!(failures.0.lock().expect("failures")[0], ("ChangeRequest".to_owned(), subject.record_name()));
+        refresher.release(demand).await;
     }
 
     #[tokio::test]
