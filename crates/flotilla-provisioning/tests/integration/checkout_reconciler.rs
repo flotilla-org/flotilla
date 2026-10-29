@@ -1739,14 +1739,8 @@ async fn terminal_owner_reserves_no_branch_in_non_continued_member_repo() {
         .expect("fail owner");
     // The recording runtime refuses creation, so only the reservation outcome is asserted.
     let prepared = reconciler.prepare(&new).await.expect("terminal");
-    assert!(
-        matches!(&prepared, CheckoutPrepared::Failed(message) if message == "creation is outside this test scope"),
-        "{}",
-        match &prepared {
-            CheckoutPrepared::Failed(m) => m.as_str(),
-            _ => "not failed",
-        }
-    );
+    let CheckoutPrepared::Failed(message) = prepared else { panic!("expected the runtime's creation refusal") };
+    assert_eq!(message, "creation is outside this test scope");
 }
 
 // #3090: a local clone waits for its managed Clone, materialises on the host,
