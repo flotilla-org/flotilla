@@ -4,7 +4,7 @@
 use flotilla_core::primitives::{
     convert::Conversion,
     demand_import::{import_demands, DemandRecords, OldDemand},
-    import::{write_messages, ImportReport as MessageReport, Imported},
+    import::{write_messages, ImportRefusal as MessageRefusal, ImportReport as MessageReport, Imported},
 };
 use flotilla_engine_store::{Import, ImportTarget};
 use flotilla_provisioning::engine::import::{ImportRefusal, ImportReport};
@@ -57,24 +57,28 @@ fn namespace_attentions(source: &Source, namespace: &str, target: &mut Import, c
     let results = import_demands(&old, &next, &conversion, &named);
     let imported: Vec<_> = results
         .iter()
-        .filter_map(|result| match result {
+        .filter_map(|import| match &import.result {
             Ok(Imported::Message(message)) => Some((**message).clone()),
             _ => None,
         })
         .collect();
-    for message in &imported {
+    let failed = write_messages(&imported, target);
+    let failure = |record: &str| failed.iter().find(|refusal| refusal.record == record);
+    for message in imported.iter().filter(|message| failure(&message.record).is_none()) {
         let admitted = carried.admitted.entry(message.home.clone()).or_default();
         *admitted = (*admitted).max(message.resource.version().0);
     }
-    let failed = write_messages(&imported, target);
     let mut counted = MessageReport::default();
-    for result in &results {
-        match result {
-            Ok(Imported::Message(message)) if failed.iter().any(|refusal| refusal.record == message.record) => {}
-            other => counted.record(other),
+    for import in &results {
+        match (&import.result, import.folded_into.as_deref().and_then(failure)) {
+            (Ok(Imported::Message(message)), _) if failure(&message.record).is_some() => {}
+            (Ok(Imported::Dropped(dropped)), Some(refusal)) => {
+                counted.refused.push(MessageRefusal { record: dropped.record.clone(), reason: refusal.reason.clone() })
+            }
+            (result, _) => counted.record(result),
         }
     }
-    counted.refused.extend(failed);
+    counted.refused.extend(failed.iter().cloned());
     for (label, count) in counted.imported {
         *report.imported.entry((KIND, label)).or_default() += count;
     }

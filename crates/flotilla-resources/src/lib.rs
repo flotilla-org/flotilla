@@ -204,7 +204,7 @@ pub use principal_attention::{
     Demand, DemandAddressee, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandPoolRef, DemandResponseOption, DemandSpec,
     DemandState, DemandStatus, DemandStatusPatch, DemandTransition, DemandVerdict, DemandVerdictDisposition, HumanGateContext, Regard,
     RegardExpiryPolicy, RegardSource, RegardSpec, RegardStatus, RegardStatusPatch, CREDENTIAL_REFRESH_REASON_ANNOTATION,
-    CREDENTIAL_REFRESH_VESSEL_ANNOTATION, RECLAIM_REFUSAL_REASON_ANNOTATION,
+    CREDENTIAL_REFRESH_VESSEL_ANNOTATION, ENSURE_HOLD_REASON_ANNOTATION, RECLAIM_REFUSAL_REASON_ANNOTATION,
 };
 pub use project::{
     normalize_issue_source, normalize_project_spec, resolve_project_issue_sources_from_inventory, DeclarationRefusedCondition,

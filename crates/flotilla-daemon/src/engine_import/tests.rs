@@ -936,3 +936,20 @@ fn a_credential_group_with_no_vessel_drops_every_demand_for_that_reason() {
     assert_eq!(report.dropped.get(&("Demand", "its vessel is gone")), Some(&2), "{report:?}");
     assert!(report.imported.is_empty() && report.refused.is_empty(), "{report:?}");
 }
+
+#[test]
+fn a_credential_group_addressed_to_different_people_is_refused_whole() {
+    let credential = flotilla_resources::CREDENTIAL_REFRESH_REASON_ANNOTATION;
+    let vessel = flotilla_resources::CREDENTIAL_REFRESH_VESSEL_ANNOTATION;
+    let mut records: Vec<Value> = attention_records().into_iter().filter(|record| record["kind"] != "Demand").collect();
+    let mut other = demand("credential-refresh-demo-work-b", ("Convoy", "demo"), &[(credential, "refused"), (vessel, "work")], "raised");
+    other["status"]["raised"]["as_of"] = json!("2026-10-21T00:00:00Z");
+    other["spec"]["addressee"]["principal_ref"]["name"] = json!("alice");
+    records.extend([
+        demand("credential-refresh-demo-work-a", ("Convoy", "demo"), &[(credential, "refused"), (vessel, "work")], "raised"),
+        other,
+    ]);
+    let summary = rehearse(&rows(records), HERE);
+    assert_eq!(summary.kinds["Demand"], Counts { imported: 0, dropped: 0, refused: 2 }, "{summary:?}");
+    assert!(summary.refusals.iter().all(|refusal| refusal.reason.contains("different people")), "{summary:?}");
+}

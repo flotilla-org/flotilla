@@ -185,14 +185,15 @@ fn every_generated_demand_is_converted_dropped_or_refused_once(tc: TestCase) {
         let name = &record.metadata.name;
         let result = results
             .iter()
+            .map(|import| &import.result)
             .find(|result| match result {
                 Ok(Imported::Message(message)) => &message.record == name,
                 Ok(Imported::Dropped(dropped)) => &dropped.record == name,
                 Err(refusal) => &refusal.record == name,
             })
             .unwrap_or_else(|| panic!("{name} is accounted for"));
-        let shape_refused = drawn.pooled || drawn.options || drawn.verdict || drawn.writer == Writer::Unknown;
         let resolved = matches!(drawn.state, DemandState::Satisfied | DemandState::Acknowledged);
+        let shape_refused = !resolved && (drawn.pooled || drawn.options || drawn.verdict || drawn.writer == Writer::Unknown);
         let held_by_another_record = matches!(drawn.writer, Writer::TerminalAttention | Writer::DeclarationRefused);
         match result {
             Err(refusal) => assert!(shape_refused, "{name} refused: {}", refusal.reason),

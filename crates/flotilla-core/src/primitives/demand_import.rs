@@ -20,7 +20,7 @@ use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
     delivery_hold::DELIVERY_HOLD_REASON_ANNOTATION, Convoy, ConvoyEnsure, Demand, DemandAddressee, DemandState, MessageReference,
     ResourceObject, TerminalSession, Vessel, CONVOY_LABEL, CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION,
-    RECLAIM_REFUSAL_REASON_ANNOTATION, ROLE_LABEL,
+    ENSURE_HOLD_REASON_ANNOTATION, RECLAIM_REFUSAL_REASON_ANNOTATION, ROLE_LABEL,
 };
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
@@ -93,6 +93,13 @@ enum Class<'r> {
     Refused(String),
 }
 
+/// One demand's import, and the demand whose attention it was folded into, if it was.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DemandImport {
+    pub result: Result<Imported, ImportRefusal>,
+    pub folded_into: Option<String>,
+}
+
 /// Imports `demands`, each home's attentions admitted in the order they were raised from `next(home)`.
 /// A vessel's credential demands become one attention, admitted at its first demand's place.
 pub fn import_demands(
@@ -100,7 +107,7 @@ pub fn import_demands(
     next: &dyn Fn(&str) -> u64,
     conversion: &Conversion<'_>,
     records: &DemandRecords<'_>,
-) -> Vec<Result<Imported, ImportRefusal>> {
+) -> Vec<DemandImport> {
     let mut ordered: Vec<&OldDemand<'_>> = demands.iter().collect();
     ordered.sort_by_key(|old| (old.home.clone(), raised(old.record), old.record.metadata.name.clone()));
     let classes: Vec<_> = ordered.iter().map(|old| classify(old, records)).collect();
@@ -129,27 +136,33 @@ pub fn import_demands(
     let mut results = Vec::new();
     for (old, class) in ordered.iter().zip(classes) {
         match class {
-            Class::Open { writer, principal } => results.push(admit(old, map(old.record, writer, principal, conversion, records))),
-            Class::Dropped(reason) => results.push(admit(old, Ok(Mapped::Dropped(reason)))),
-            Class::Refused(reason) => results.push(admit(old, Err(reason))),
+            Class::Open { writer, principal } => results.push(alone(admit(old, map(old.record, writer, principal, conversion, records)))),
+            Class::Dropped(reason) => results.push(alone(admit(old, Ok(Mapped::Dropped(reason))))),
+            Class::Refused(reason) => results.push(alone(admit(old, Err(reason)))),
             Class::Credential { group, principal } => {
                 let Some(members) = groups.remove(&group) else { continue };
                 let first = admit(old, credential(group, &members, principal, conversion, records));
                 for folded in &members[1..] {
                     let record = folded.record.metadata.name.clone();
-                    results.push(match &first {
+                    let folded_into = Some(old.record.metadata.name.clone());
+                    let result = match &first {
                         Ok(Imported::Message(_)) => {
                             Ok(Imported::Dropped(ImportDrop { record, reason: "folded into its vessel's attention" }))
                         }
                         Ok(Imported::Dropped(dropped)) => Ok(Imported::Dropped(ImportDrop { record, reason: dropped.reason })),
                         Err(refusal) => Err(ImportRefusal { record, reason: refusal.reason.clone() }),
-                    });
+                    };
+                    results.push(DemandImport { result, folded_into });
                 }
-                results.push(first);
+                results.push(alone(first));
             }
         }
     }
     results
+}
+
+fn alone(result: Result<Imported, ImportRefusal>) -> DemandImport {
+    DemandImport { result, folded_into: None }
 }
 
 fn raised(record: &ResourceObject<Demand>) -> chrono::DateTime<chrono::Utc> {
@@ -162,11 +175,13 @@ fn classify<'r>(old: &'r OldDemand<'_>, records: &DemandRecords<'_>) -> Class<'r
     let record = old.record;
     let name = record.metadata.name.as_str();
     let spec = &record.spec;
-    let principal = match &spec.addressee {
-        DemandAddressee::Principal { principal_ref } => format!("principal:{}", principal_ref.name),
-        DemandAddressee::Pool { pool_ref } => {
-            return Class::Refused(format!("it is addressed to pool `{}`; no live writer raises one", pool_ref.0))
-        }
+    let resolved = matches!(record.status.as_ref().map(|status| status.state), Some(DemandState::Acknowledged | DemandState::Satisfied));
+    if resolved {
+        return Class::Dropped("resolved");
+    }
+    let principal = match addressed(record) {
+        Ok(principal) => principal,
+        Err(reason) => return Class::Refused(reason),
     };
     if !spec.response_options.is_empty() || spec.human_gate.is_some() {
         return Class::Refused("it is a human gate with response options; no live writer raises one".into());
@@ -180,7 +195,6 @@ fn classify<'r>(old: &'r OldDemand<'_>, records: &DemandRecords<'_>) -> Class<'r
     if name.starts_with(DECLARATION_REFUSED) {
         return Class::Dropped("its Project's operations hold the refusal");
     }
-    let resolved = matches!(record.status.as_ref().map(|status| status.state), Some(DemandState::Acknowledged | DemandState::Satisfied));
     let convoy = || convoy_target(record);
     let writer = if let Some(session) = name.strip_prefix(DELIVERY) {
         Ok(Writer::Delivery { session })
@@ -196,7 +210,6 @@ fn classify<'r>(old: &'r OldDemand<'_>, records: &DemandRecords<'_>) -> Class<'r
         };
         return match convoy() {
             Err(reason) => Class::Refused(reason),
-            Ok(_) if resolved => Class::Dropped("resolved"),
             Ok(convoy) if !records.convoys.contains_key(convoy) => Class::Dropped("its convoy is gone"),
             Ok(convoy) => Class::Credential { group: (old.home.as_str(), convoy, vessel.as_str()), principal },
         };
@@ -205,8 +218,15 @@ fn classify<'r>(old: &'r OldDemand<'_>, records: &DemandRecords<'_>) -> Class<'r
     };
     match writer {
         Err(reason) => Class::Refused(reason),
-        Ok(_) if resolved => Class::Dropped("resolved"),
         Ok(writer) => Class::Open { writer, principal },
+    }
+}
+
+/// The person a demand is addressed to; a pool is refused.
+fn addressed(record: &ResourceObject<Demand>) -> Result<String, String> {
+    match &record.spec.addressee {
+        DemandAddressee::Principal { principal_ref } => Ok(format!("principal:{}", principal_ref.name)),
+        DemandAddressee::Pool { pool_ref } => Err(format!("it is addressed to pool `{}`; no live writer raises one", pool_ref.0)),
     }
 }
 
@@ -253,29 +273,28 @@ fn map(
         let Some(convoy) = records.convoys.get(name) else { return Ok(None) };
         Ok(Some((*convoy, convoy_read(convoy, conversion)?)))
     };
-    const CONVOY_GONE: Mapped = Mapped::Dropped("its convoy is gone");
+    let gone = || Ok(Mapped::Dropped("its convoy is gone"));
     match writer {
         Writer::Delivery { session } => {
             let Some(terminal) = records.terminals.get(session) else { return Ok(Mapped::Dropped("its TerminalSession is gone")) };
             let label = |key| terminal.metadata.labels.get(key).ok_or_else(|| format!("TerminalSession `{session}` has no `{key}` label"));
-            let Some((held, read)) = convoy(label(CONVOY_LABEL)?)? else { return Ok(CONVOY_GONE) };
+            let Some((held, read)) = convoy(label(CONVOY_LABEL)?)? else { return gone() };
             let role = Read { address: child(&read.address, Kind::Role, label(ROLE_LABEL)?)?, revision: read.revision };
             let reason = reason(record, DELIVERY_HOLD_REASON_ANNOTATION, || "Turn delivery is held until a person rules.".into());
             Ok(attention(Cause::DeliveryHeld { role }, reason, held))
         }
         Writer::Hold { convoy: target } => {
-            let Some((held, read)) = convoy(target)? else { return Ok(CONVOY_GONE) };
-            // The ensure reconciler records a hold's reason under the reclaim-refusal key.
-            let reason = reason(record, RECLAIM_REFUSAL_REASON_ANNOTATION, || format!("Standing convoy `{target}` is held."));
+            let Some((held, read)) = convoy(target)? else { return gone() };
+            let reason = reason(record, ENSURE_HOLD_REASON_ANNOTATION, || format!("Standing convoy `{target}` is held."));
             Ok(attention(Cause::Hold { convoy: read }, reason, held))
         }
         Writer::Reclaim { convoy: target } => {
-            let Some((held, read)) = convoy(target)? else { return Ok(CONVOY_GONE) };
+            let Some((held, read)) = convoy(target)? else { return gone() };
             let reason = reason(record, RECLAIM_REFUSAL_REASON_ANNOTATION, || format!("Reclaim of convoy `{target}` is refused."));
             Ok(attention(Cause::ReclaimRefused { convoy: read }, reason, held))
         }
         Writer::Drift { ensure, convoy: target } => {
-            let Some((held, read)) = convoy(target)? else { return Ok(CONVOY_GONE) };
+            let Some((held, read)) = convoy(target)? else { return gone() };
             let Some(ensure) = records.ensures.get(ensure) else { return Ok(Mapped::Dropped("its ConvoyEnsure is gone")) };
             let project =
                 Address::project(&ensure.spec.project_ref).map_err(|error| format!("project `{}`: {error}", ensure.spec.project_ref))?;
@@ -295,6 +314,9 @@ fn credential(
     conversion: &Conversion<'_>,
     records: &DemandRecords<'_>,
 ) -> Result<Mapped, String> {
+    if group.iter().any(|old| addressed(old.record).ok().as_ref() != Some(&principal)) {
+        return Err("its vessel's credential demands are addressed to different people".into());
+    }
     let Some(convoy) = records.convoys.get(convoy) else { return Ok(Mapped::Dropped("its convoy is gone")) };
     let Some(vessel) =
         records.vessels.iter().find(|vessel| vessel.spec.convoy_ref == convoy.metadata.name && vessel.spec.vessel_name == vessel_name)
