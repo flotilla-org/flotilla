@@ -34,7 +34,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_core = { version = "1", features = ["alloc"] }
-serde_json = { version = "1", features = ["raw_value"] }
+serde_json = { version = "1", features = ["alloc", "raw_value"] }
 smallvec = { version = "1", default-features = false, features = ["const_generics", "const_new"] }
 subtle = { version = "2" }
 tokio = { version = "1", features = ["full"] }

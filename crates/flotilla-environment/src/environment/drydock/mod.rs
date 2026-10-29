@@ -1,131 +1,109 @@
-//! Provider-neutral Drydock adapter. The composition root owns host supervision;
-//! this adapter accepts the same ProviderApi for embedded and socket-backed use.
+//! Provider-neutral Drydock adapter. The composition root owns drydock's
+//! daemon; this adapter accepts the same ProviderApi for embedded and
+//! socket-backed use.
 //!
-//! Drydock owns the connection to each vessel's agent (ADR 0070): the adapter
-//! asks [`AgentReach`] for a connected agent and uses only the agent's API. It
-//! never interprets a reach, opens SSH or names a provider.
+//! Drydock owns each vessel's connections (ADR 0070, drydock#132): the adapter
+//! asks it for standing exposures and connects to the local sockets they give.
+//! It never interprets a reach, holds a vessel key, opens SSH or names a provider.
 mod connector;
+mod exposures;
 mod observations;
+mod vessel_agent;
 use super::{agent::AgentRunner, vessel_ops::UnavailableAgent, *};
-use ::drydock::{
-    agent::{AgentLink, AgentReach, AgentReport},
-    api::ProviderApi,
-};
-use drydock_agent::{Endpoint, GuestForward};
+use ::drydock::api::ProviderApi;
+pub use connector::installed_agent_build;
 use drydock_protocol as wire;
 use flotilla_protocol::provider::AgentConnectionReport;
-use sha2::Digest;
 use std::{collections::BTreeMap, sync::RwLock, time::Duration};
 
-/// Where the guest serves the lab service.
-struct LabGuest {
-    /// The loopback address its name resolves to in the guest.
-    tcp: std::net::SocketAddr,
-    /// The forward's guest socket, beside its TCP listener.
-    socket: PathBuf,
-    /// The hosts file that names it.
-    hosts: PathBuf,
+/// Where the guest's agent and lab service are.
+struct GuestLayout {
+    /// The agent's socket.
+    agent: PathBuf,
+    /// The port the lab service's name answers on.
+    lab_port: u16,
 }
 
-impl Default for LabGuest {
+impl Default for GuestLayout {
     fn default() -> Self {
-        Self {
-            tcp: std::net::SocketAddr::from(([127, 0, 0, 1], 443)),
-            socket: "/run/drydock/flotilla-forgejo.sock".into(),
-            hosts: "/etc/hosts".into(),
-        }
+        Self { agent: "/run/drydock/agent.sock".into(), lab_port: 443 }
     }
 }
-/// The lab service's name inside the guest; it resolves to the guest's loopback.
+/// The lab service's name inside the guest.
 const LAB_HOSTNAME: &str = "forgejo.lab.flotilla.work";
-/// Where per-vessel attach sockets live on the controller: short, for SUN_LEN.
-const ATTACH_ROOT: &str = "/tmp/flotilla-cloud-agents";
+/// How long one agent connection may take, the vessel's boot included.
+const AGENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct DrydockEnvironmentProvider {
     api: Arc<dyn ProviderApi>,
-    reach: AgentReach,
     instance: String,
     module: String,
     lab_reach: Option<(String, u16)>,
-    lab_guest: LabGuest,
+    guest: GuestLayout,
+    agent_timeout: Duration,
     owner: Arc<()>,
-    directory: PathBuf,
-    attach_root: PathBuf,
     executable: Arc<tokio::sync::OnceCell<Vec<u8>>>,
     declaration: RwLock<Option<wire::ProviderDeclaration>>,
-    host: Option<Arc<::drydock::HostHandle>>,
     versions: RwLock<(String, String)>,
     provision_locks: std::sync::Mutex<HashMap<EnvironmentId, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     observations: std::sync::OnceLock<Arc<observations::Hub>>,
     active: tokio::sync::Mutex<HashMap<EnvironmentId, std::sync::Weak<DrydockEnvironment>>>,
 }
 impl DrydockEnvironmentProvider {
-    pub fn new(api: Arc<dyn ProviderApi>, instance: String, module: String, directory: PathBuf) -> Self {
+    pub fn new(api: Arc<dyn ProviderApi>, instance: String, module: String) -> Self {
         Self {
             api,
-            reach: AgentReach::new(AgentLink::default()),
             instance,
             module,
             lab_reach: None,
-            lab_guest: LabGuest::default(),
+            guest: GuestLayout::default(),
+            agent_timeout: AGENT_CONNECT_TIMEOUT,
             owner: Arc::new(()),
-            directory,
-            attach_root: ATTACH_ROOT.into(),
             executable: Default::default(),
             declaration: RwLock::new(None),
-            host: None,
             versions: Default::default(),
             provision_locks: Default::default(),
             observations: Default::default(),
             active: Default::default(),
         }
     }
-    /// How this instance reaches its vessels' agents: drydock's, under the
-    /// provider's configured link preference.
-    pub fn with_agent_reach(mut self, reach: AgentReach) -> Self {
-        self.reach = reach;
-        self
-    }
     /// The agent build this instance's vessels run, instead of the installed
-    /// generation's companion: for hosts and tests without one.
+    /// generation's companion: for hosts and tests without one. Drydock must be
+    /// given the same build.
     pub fn with_agent_build(mut self, build: Vec<u8>) -> Self {
         self.executable = Arc::new(tokio::sync::OnceCell::new_with(Some(build)));
         self
     }
-    /// Where attach sockets for this instance's vessels live on the controller.
-    pub fn with_attach_root(mut self, root: PathBuf) -> Self {
-        self.attach_root = root;
+    /// Where the guest's agent listens, for a stand-in vessel that is not a
+    /// drydock guest.
+    pub fn with_guest_agent_socket(mut self, socket: PathBuf) -> Self {
+        self.guest.agent = socket;
         self
     }
     pub fn with_lab_reach(mut self, reach: Option<(String, u16)>) -> Self {
         self.lab_reach = reach;
         self
     }
-    pub fn with_host(mut self, host: Arc<::drydock::HostHandle>) -> Self {
-        self.host = Some(host);
-        self
-    }
+    /// The instance as drydock declares it. A daemon reports an instance its
+    /// host cannot serve with the reason, and conservative capabilities.
     async fn declaration(&self) -> Result<wire::ProviderDeclaration, String> {
-        if let Some(host) = &self.host {
-            let status = host.status.borrow();
-            let instance_readiness = host.instances().get(&self.instance).cloned().unwrap_or_else(|| status.readiness.clone());
-            if !matches!(instance_readiness, wire::Readiness::Ready) {
-                return Ok(wire::ProviderDeclaration {
-                    provider: self.instance.clone(),
-                    module: self.module.clone(),
-                    capabilities: empty_capabilities(),
-                    readiness: instance_readiness,
-                    rate_limits: vec![],
-                });
-            }
-        }
         let hello = self.api.hello().await.map_err(api_error)?;
         if !hello.is_compatible() {
             return Err("drydock protocol version mismatch".into());
         }
-        let declaration = hello.providers.into_iter().find(|p| p.provider == self.instance).ok_or("instance absent from drydock hello")?;
-        let module_version =
-            hello.modules.iter().find(|m| m.name == declaration.module).map(|m| m.version.clone()).unwrap_or_else(|| "unknown".into());
+        let declaration = match self.api.provider(&self.instance).await {
+            Ok(declaration) => declaration,
+            Err(::drydock::client::Error::Protocol(wire::ProtocolError::NotFound { .. })) => {
+                return Err("instance absent from drydock".into());
+            }
+            Err(error) => return Err(api_error(error)),
+        };
+        let module_version = hello
+            .loadable_modules
+            .iter()
+            .find(|m| m.name == declaration.module)
+            .map(|m| m.version.clone())
+            .unwrap_or_else(|| "unknown".into());
         *self.versions.write().expect("version lock") = (hello.host_version, module_version);
         *self.declaration.write().expect("declaration lock") = Some(declaration.clone());
         Ok(declaration)
@@ -143,19 +121,19 @@ impl DrydockEnvironmentProvider {
         let id = EnvironmentId::new(label.clone());
         let platform = environment.platform.ok_or("guest platform unknown in recorded drydock environment")?;
         let report = Arc::new(std::sync::Mutex::new(None));
+        let exposures = exposures::Exposures { api: self.api.clone(), instance: self.instance.clone(), backing: environment.id.clone() };
         let agent = provisioned.then(|| {
             let connector = connector::DrydockAgentConnector {
-                api: self.api.clone(),
-                reach: self.reach.clone(),
-                instance: self.instance.clone(),
-                backing: environment.id.clone(),
-                identity: key_dir(&self.directory, &id).join("id_ed25519"),
+                exposures: exposures.clone(),
+                module: self.module.clone(),
+                socket: self.guest.agent.clone(),
+                timeout: self.agent_timeout,
                 platform: platform.clone(),
                 executable: self.executable.clone(),
                 report: report.clone(),
             };
-            let attach = self.attach_root.join(&format!("{:x}", sha2::Sha256::digest(id.as_str().as_bytes()))[..24]);
-            Arc::new(AgentRunner::new(Arc::new(connector), attach))
+            // Attach sockets are drydock's exposures, never this runner's forwards.
+            Arc::new(AgentRunner::new(Arc::new(connector), PathBuf::new()))
         });
         Ok(Arc::new(DrydockEnvironment {
             api: self.api.clone(),
@@ -181,51 +159,37 @@ impl DrydockEnvironmentProvider {
             image: ImageId::new(image),
             env: RwLock::new(env),
             capabilities: self.capabilities(),
-            directory: self.directory.clone(),
+            exposures,
             created_for_setup: std::sync::atomic::AtomicBool::new(false),
             agent,
             report,
         }))
     }
 
-    /// Bring the vessel to what this provision asks: its environment and the lab
-    /// service reachable, through the agent. Every step is idempotent, so
-    /// re-adoption runs it again. Tools and sockets are the vessel layer's.
+    /// Bring the vessel to what this provision asks: its environment, through
+    /// the agent, and the lab service reachable. Each step is idempotent, so
+    /// re-adoption runs it again; a lab exposure already standing is left as
+    /// drydock keeps it. Tools and sockets are the vessel layer's.
     async fn set_up(&self, handle: &DrydockEnvironment) -> Result<(), String> {
         let agent = handle.agent.as_ref().ok_or("inventory handle has no vessel agent")?;
         let environment = handle.env.read().expect("environment").clone();
         agent.configure_environment(environment).await?;
         if let Some((hostname, port)) = &self.lab_reach {
-            forward_lab(agent, hostname, *port, &self.lab_guest).await?;
+            handle.exposures.outward("lab", lab_request(hostname, *port, self.guest.lab_port)?).await?;
         }
         ensure_directory(agent, &handle.capabilities.workspace_root).await
     }
 }
 
-/// The lab service, reached from the controller, at its own name and port 443
-/// inside the guest. TLS stays end to end; the guest receives no reach credential.
-async fn forward_lab(agent: &Arc<AgentRunner>, hostname: &str, port: u16, guest: &LabGuest) -> Result<(), String> {
-    // The agent's TCP endpoint names one address, so take the first in the
-    // resolver's order (RFC 6724 destination selection, as a plain connect tries first).
-    let address = tokio::net::lookup_host((hostname, port))
-        .await
-        .map_err(|error| format!("resolve lab service {hostname}:{port}: {error}"))?
-        .next()
-        .ok_or_else(|| format!("lab service {hostname}:{port} resolves to no address"))?;
-    let forward = GuestForward { id: "lab".into(), unix: guest.socket.clone(), tcp: Some(guest.tcp) };
-    agent.put_guest_forward(forward, Endpoint::Tcp(address)).await.map_err(|failure| failure.to_string())?;
-    // Provision holds this label's lock through set-up, so no two runs append at once.
-    let script = lab_hosts_script(&guest.hosts);
-    agent
-        .run("sh", &["-c", &script], Path::new("/"), &flotilla_provider_runtime::ChannelLabel::Default)
-        .await
-        .map(drop)
-        .map_err(|error| format!("lab hosts entry in {}: {error}", guest.hosts.display()))
-}
-
-fn lab_hosts_script(hosts: &Path) -> String {
-    let hosts = flotilla_protocol::arg::shell_quote(&hosts.to_string_lossy());
-    format!("grep -q '^127.0.0.1 {LAB_HOSTNAME}$' {hosts} || printf '\\n127.0.0.1 {LAB_HOSTNAME}\\n' >> {hosts}")
+/// The lab service, reached from drydock's machine, at its own name inside the
+/// guest. TLS stays end to end; the guest receives no reach credential.
+fn lab_request(hostname: &str, port: u16, guest_port: u16) -> Result<wire::OutwardRequest, String> {
+    let name = wire::HostAddress::try_from(LAB_HOSTNAME.to_owned()).map_err(|error| format!("lab service name: {error}"))?;
+    let guest_port = wire::Port::new(guest_port).ok_or("lab service guest port must be nonzero")?;
+    Ok(wire::OutwardRequest {
+        guest: wire::Guest::Name { name, port: guest_port },
+        destination: wire::OutwardDestination::Tcp(format!("{hostname}:{port}")),
+    })
 }
 
 /// `mkdir -p`: a missing directory is created 0755; an existing one keeps its mode.
@@ -323,22 +287,6 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
         if !opts.tools.is_empty() {
             return Err("cloud sandbox tools are delivered by the vessel layer, through the agent".into());
         }
-        let keydir = key_dir(&self.directory, &id);
-        ::drydock::local::private_dir(&keydir)?;
-        let public = if keydir.join("id_ed25519.pub").is_file() && keydir.join("id_ed25519").is_file() {
-            tokio::fs::read_to_string(keydir.join("id_ed25519.pub")).await.map_err(|cause| cause.to_string())?
-        } else {
-            // An existing backing still trusts the original key. Regenerating
-            // here cannot rotate that key through label-idempotent provision.
-            let backings = self.api.list(&self.instance).await.map_err(|cause| {
-                EnvironmentProvisionError::RetryAdoption(format!("cannot verify backing before SSH key repair: {}", api_error(cause)))
-            })?;
-            if backings.iter().any(|backing| backing.label.as_deref() == Some(id.as_str())) {
-                return Err(EnvironmentProvisionError::RetryAdoption("SSH keypair incomplete or missing for adopted backing; restore the controller key files; public-key rotation on adoption is unsupported".into()));
-            }
-            remove_keys(&keydir).await?;
-            ::drydock::launch::keypair(&keydir).await.map_err(api_error)?.1
-        };
         // Preserve HTTP's creation result: label-idempotent POST may adopt a
         // live backing after a restart. Only 201 grants setup rollback.
         let request = wire::ProvisionRequest {
@@ -346,9 +294,21 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
             prepared: prepared.prepared.clone(),
             size: size(&prepared.spec.size),
             egress: wire::EgressRequest::Open,
-            ssh_public_key: Some(public),
+            // Drydock makes and holds the vessel's key under this label.
+            ssh_public_key: None,
         };
-        let (created, environment) = match self.api.provision(&self.instance, &request).await.map_err(api_error)? {
+        let provisioned = match self.api.provision(&self.instance, &request).await {
+            Ok(provisioned) => provisioned,
+            // A backing this label names, whose key drydock does not hold (one an
+            // earlier generation provisioned with its own key), keeps its work.
+            Err(::drydock::client::Error::Protocol(wire::ProtocolError::Refused { reason }))
+                if self.list_backings().await.is_ok_and(|backings| backings.iter().any(|b| b.environment_id == id)) =>
+            {
+                return Err(EnvironmentProvisionError::RetryAdoption(format!("drydock refused to adopt the existing backing: {reason}")));
+            }
+            Err(error) => return Err(api_error(error).into()),
+        };
+        let (created, environment) = match provisioned {
             ::drydock::api::Provisioned::Created(environment) => (true, environment),
             ::drydock::api::Provisioned::Existing(environment) => (false, environment),
         };
@@ -409,38 +369,11 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
                 return handle.destroy().await;
             }
         }
-        let environment = self.api.inspect(&self.instance, backing_id).await.ok();
-        self.api.destroy(&self.instance, backing_id).await.map_err(api_error)?;
-        if let Some(label) = environment.and_then(|e| e.label) {
-            remove_keys(&key_dir(&self.directory, &EnvironmentId::new(label))).await?;
-        }
-        Ok(())
+        self.api.destroy(&self.instance, backing_id).await.map_err(api_error)
     }
-}
-// Hash IDs instead of allowing resource names to select filesystem paths.
-fn key_dir(directory: &Path, id: &EnvironmentId) -> PathBuf {
-    directory.join(format!("{:x}", sha2::Sha256::digest(directory.join(id.as_str()).as_os_str().as_encoded_bytes())))
 }
 fn size(s: &flotilla_resources::CloudSandboxSize) -> wire::Size {
     wire::Size { cpus: f64::from(s.cpus), memory_bytes: s.memory_bytes, disk_bytes: s.disk_bytes }
-}
-fn empty_capabilities() -> wire::Capabilities {
-    wire::Capabilities {
-        agent: false,
-        platforms: vec![],
-        material_modes: vec![],
-        checkout_strategies: vec![],
-        workspace_root: String::new(),
-        suspend_resume: false,
-        suspend_preserves_memory: None,
-        export: false,
-        egress: wire::EgressCapability { enforcement: wire::Enforcement::Advisory, routes: vec![wire::EgressRoute::Open] },
-        fallback_runner: false,
-        bootstrap: wire::BootstrapRoute::Bake,
-        image_routes: vec![],
-        usage: false,
-        quota: false,
-    }
 }
 fn readiness(r: wire::Readiness) -> ProviderReadiness {
     match r {
@@ -495,12 +428,12 @@ struct DrydockEnvironment {
     capabilities: ProviderCapabilities,
     descriptor: flotilla_resources::EnvironmentProviderDescriptor,
     created_for_setup: std::sync::atomic::AtomicBool,
-    directory: PathBuf,
+    /// The vessel's connections drydock keeps.
+    exposures: exposures::Exposures,
     /// The vessel's agent, for a handle provision adopted.
     agent: Option<Arc<AgentRunner>>,
-    /// What drydock reports it chose for the agent's latest connection:
-    /// recorded and shown, never decided on.
-    report: Arc<std::sync::Mutex<Option<AgentReport>>>,
+    /// Where the agent's latest connection went: recorded and shown, never decided on.
+    report: Arc<std::sync::Mutex<Option<AgentConnectionReport>>>,
     watch: observations::Watch,
 }
 #[async_trait]
@@ -531,13 +464,7 @@ impl ProvisionedEnvironment for DrydockEnvironment {
         self.capabilities.clone()
     }
     fn provider_descriptor(&self) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
-        let agent_connection = self.report.lock().expect("agent report").clone().map(|report| AgentConnectionReport {
-            provider: report.provider,
-            module: report.module,
-            vessel: report.environment,
-            endpoint: report.endpoint,
-            mode: report.link.to_string(),
-        });
+        let agent_connection = self.report.lock().expect("agent report").clone();
         Some(flotilla_resources::EnvironmentProviderDescriptor { agent_connection, ..self.descriptor.clone() })
     }
 
@@ -578,7 +505,7 @@ impl ProvisionedEnvironment for DrydockEnvironment {
     }
     fn agent(&self) -> Arc<dyn VesselAgent> {
         match &self.agent {
-            Some(agent) => Arc::new(agent.clone()),
+            Some(agent) => Arc::new(vessel_agent::DrydockVesselAgent { runner: agent.clone(), exposures: self.exposures.clone() }),
             None => Arc::new(UnavailableAgent("inventory handle requires provision before guest access".into())),
         }
     }
@@ -587,7 +514,7 @@ impl ProvisionedEnvironment for DrydockEnvironment {
         if let Some(agent) = &self.agent {
             agent.close().await;
         }
-        remove_keys(&key_dir(&self.directory, &self.id)).await
+        Ok(())
     }
 }
 
@@ -653,16 +580,6 @@ impl CommandRunner for InventoryRunner {
     }
 }
 
-async fn remove_keys(directory: &Path) -> Result<(), String> {
-    for file in ["id_ed25519", "id_ed25519.pub"] {
-        match tokio::fs::remove_file(directory.join(file)).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.to_string()),
-        }
-    }
-    Ok(())
-}
 fn api_error(cause: ::drydock::client::Error) -> String {
     use ::drydock::client::Error;
     match cause {

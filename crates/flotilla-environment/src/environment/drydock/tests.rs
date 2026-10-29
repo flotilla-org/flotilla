@@ -3,88 +3,177 @@ use ::drydock::{
     agent::{stand_in::Gateway, SshDialer},
     client::Client,
     conformance,
+    daemon::{AgentBuilds, Daemon, HostOption, Seams},
 };
 use hegel::generators as gs;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{UnixListener, UnixStream},
+};
 
-/// The agent build the stand-in vessel runs and the provider pushes.
+/// The agent build the stand-in vessel runs, and drydock and the provider push.
 const BUILD: &[u8] = b"flotilla drydock test agent";
 
-/// A real Rust drydock host with the reference module, whose vessels declare
-/// an agent reached over SSH, and an in-process gateway serving a real agent
-/// under that reach's forwarding rules. The stand-in vessel is this host: its
-/// workspace root is the fixture's.
+/// Drydock's agent build seam, given the provider's own build.
+struct Build;
+#[async_trait]
+impl AgentBuilds for Build {
+    async fn build(&self, _: &wire::Platform) -> Result<Vec<u8>, String> {
+        Ok(BUILD.to_vec())
+    }
+}
+
+/// Tag-free images: prepare already names digests.
+struct Digests;
+#[async_trait]
+impl ::drydock::launch::ImageResolver for Digests {
+    async fn resolve(&self, image: &str) -> Result<String, ::drydock::client::Error> {
+        Ok(image.into())
+    }
+}
+
+/// Drydock's daemon, as flotillad embeds it, over a real Rust host with the
+/// reference module, whose vessels declare an agent reached over SSH, and an
+/// in-process gateway serving a real agent. The stand-in vessel is this host:
+/// its workspace root, agent socket, hosts file and guest sockets are the
+/// fixture's.
 struct HostFixture {
     _directory: tempfile::TempDir,
     root: PathBuf,
-    runtime: ::drydock::runtime::Runtime,
-    client: Client,
     gateway: Arc<Gateway>,
-    task: tokio::task::JoinHandle<()>,
+    dialer: Arc<dyn SshDialer>,
+    host: tokio::task::JoinHandle<()>,
+    daemon: Option<(Arc<Daemon>, tokio::task::JoinHandle<()>)>,
+    /// The daemon's API socket, as a socket-backed caller sees it.
+    client: Client,
 }
 impl Drop for HostFixture {
     fn drop(&mut self) {
-        self.task.abort();
+        self.host.abort();
+        if let Some((_, server)) = self.daemon.take() {
+            server.abort();
+        }
     }
 }
 impl HostFixture {
     async fn start() -> Self {
-        Self::with_gateway(false).await
+        Self::start_through(|gateway| gateway).await
     }
-    /// `reverse_forwards`: whether the provider's SSH server accepts them.
-    async fn with_gateway(reverse_forwards: bool) -> Self {
+    /// With drydock's SSH link to the vessel made by `dialer`, given the gateway.
+    async fn start_through(dialer: impl FnOnce(Arc<Gateway>) -> Arc<dyn SshDialer>) -> Self {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let root = directory.path().to_path_buf();
-        let socket = root.join("host.sock");
-        // The main server's runtime behind drydock's public router, as an
-        // embedding or socket-backed caller sees it.
-        let runtime = ::drydock::runtime::Runtime::new(drydock_host::reference::registry());
-        let router = ::drydock::api::router(Arc::new(runtime.clone()), runtime.stopping());
-        let listener = rigging_http_serve::UnixServer::bind(&socket, 0o600).await.unwrap();
-        let task = tokio::spawn(async move {
-            listener.serve(router, rigging_http_serve::Caller::<()>::Unix, std::future::pending()).await.unwrap();
-        });
-        let client = Client::unix(socket).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while client.hello().await.is_err() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        let reach = serde_json::json!({"kind": "ssh", "endpoint": "gateway.test:22", "user": "minted-gateway-user",
-            "host_key": "ssh-ed25519 AAAA", "reverse_forwards": reverse_forwards});
-        let configuration = serde_json::from_value(serde_json::json!({
-            "modules":[{"name":"memory","entrypoint":"reference"}],
-            "providers":[{"name":"reference","module":"memory","settings":{"fixture":true,"agent":true,"reach":reach,
-                "workspace_root":root.join("workspace")},"credential":{"mode":"direct","credential_reference":"test"}}]
-        }))
-        .unwrap();
-        runtime.configure(&configuration).await.unwrap();
         std::fs::create_dir(root.join("vessel")).unwrap();
+        std::fs::write(root.join("hosts"), "127.0.0.1 localhost\n").unwrap();
         // The provider prepares linux/amd64 guests, so the stand-in vessel
         // reports that platform on any test host.
-        let gateway = Gateway::start_as(&root.join("vessel"), reverse_forwards, BUILD, crate::guest_tools::linux_amd64()).unwrap();
+        let gateway = Gateway::start_as(&root.join("vessel"), false, BUILD, crate::guest_tools::linux_amd64()).unwrap();
+        let socket = root.join("host.sock");
+        let serving = socket.clone();
+        let host = tokio::spawn(async move {
+            drydock_host::Host::new(drydock_host::reference::registry()).serve_unix(serving, std::future::pending()).await.unwrap();
+        });
         let bin = root.join("bin");
         std::fs::create_dir(&bin).unwrap();
         // A file for the tool-asset test to push.
         std::fs::write(bin.join("tar"), "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(bin.join("tar"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        Self { _directory: directory, root, runtime, client, gateway, task }
+        let dialer = dialer(gateway.clone());
+        let mut fixture =
+            Self { _directory: directory, root, gateway, dialer, host, daemon: None, client: Client::unix("/nonexistent").unwrap() };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Client::unix(&socket).unwrap().hello().await.is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        fixture.start_daemon().await;
+        fixture
     }
+    fn daemon(&self) -> Arc<Daemon> {
+        self.daemon.as_ref().expect("drydock runs").0.clone()
+    }
+    async fn start_daemon(&mut self) {
+        let text = format!(
+            "[providers.reference]\nmodule='reference'\nagent_link='local_forward'\ncredential={{file='{}'}}\n\
+             settings={{fixture=true, agent=true, poll_interval_ms=10, workspace_root='{}', \
+             reach={{kind='ssh', endpoint='gateway.test:22', user='minted-gateway-user', host_key='ssh-ed25519 AAAA'}}}}\n",
+            self.root.join("credential").display(),
+            self.root.join("workspace").display()
+        );
+        let run = self.root.join("run");
+        let seams = Seams {
+            dialer: self.dialer.clone(),
+            builds: Arc::new(Build),
+            guest: ::drydock::exposures::GuestLayout { hosts: self.root.join("hosts"), sockets: self.root.join("guest") },
+            timing: ::drydock::exposures::Timing {
+                connect: Duration::from_secs(3),
+                retry: Duration::from_millis(100),
+                heartbeat: Duration::from_millis(200),
+            },
+            ..Seams::new(Arc::new(Digests))
+        };
+        let option = HostOption {
+            optional: false,
+            name: "rust".into(),
+            connection: ::drydock::HostConnection::ExternalUnix { path: self.root.join("host.sock") },
+        };
+        let config = ::drydock::config::Config::parse(&text).unwrap();
+        let daemon = Daemon::start_with_seams(config, &run, run.join("keys"), vec![option], seams).await.unwrap();
+        let (serving, socket) = (daemon.clone(), run.join("api.sock"));
+        let path = socket.clone();
+        let server = tokio::spawn(async move { serving.serve(&path, std::future::pending()).await.unwrap() });
+        self.client = Client::unix(&socket).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.client.hello().await.is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        self.daemon = Some((daemon, server));
+    }
+    /// Drydock stops, closing what it held, and starts again from its files.
+    /// Every provider and handle on the old daemon must be dropped first.
+    async fn restart_daemon(&mut self) {
+        let (daemon, server) = self.daemon.take().unwrap();
+        server.abort();
+        let _ = server.await;
+        // Closing the client's connections ends the server's tasks for them.
+        self.client = Client::unix("/nonexistent").unwrap();
+        // Aborted tasks release their clones once the runtime drops them.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&daemon) > 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("nothing else holds the stopped daemon");
+        drop(daemon);
+        self.start_daemon().await;
+    }
+    /// Give the provider its credential where drydock reads it, and wait for
+    /// drydock to report it ready.
     async fn ready(&self) {
-        self.runtime.credential("reference", wire::Secret::new("reference-only-test-key")).await.unwrap();
+        let daemon = self.daemon();
+        std::fs::write(self.root.join("credential"), "reference-only-test-key").unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !matches!(ProviderApi::provider(&*daemon, "reference").await.map(|p| p.readiness), Ok(wire::Readiness::Ready)) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("drydock reports the delivered credential");
     }
     fn provider(&self) -> DrydockEnvironmentProvider {
-        self.provider_through(self.gateway.clone())
-    }
-    fn provider_through(&self, dialer: Arc<dyn SshDialer>) -> DrydockEnvironmentProvider {
-        DrydockEnvironmentProvider::new(Arc::new(self.client.clone()), "reference".into(), "reference".into(), self.root.join("keys"))
-            .with_agent_reach(AgentReach::new(AgentLink::default()).with_dialer(dialer).with_timeout(Duration::from_secs(2)))
-            .with_agent_build(BUILD.to_vec())
-            .with_attach_root(self.root.join("attach"))
+        let mut provider =
+            DrydockEnvironmentProvider::new(self.daemon(), "reference".into(), "reference".into()).with_agent_build(BUILD.to_vec());
+        provider.guest = GuestLayout { agent: self.root.join("vessel/agent.sock"), lab_port: 443 };
+        provider.agent_timeout = Duration::from_secs(5);
+        provider
     }
     /// Provision inputs whose guest processes find the faked tools first.
     fn opts(&self) -> ProvisionOpts {
@@ -136,6 +225,39 @@ pub(super) async fn fixture_prepared_spec(
         .unwrap();
     PreparedEnvironment::new(&provider.owner, Prepared { prepared, spec })
 }
+/// Bytes written on `from` arrive at what `accept` yields, and its reply comes back.
+async fn round_trip<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin, F: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut from: S,
+    accept: impl std::future::Future<Output = F>,
+) {
+    from.write_all(b"ping").await.unwrap();
+    let mut far = tokio::time::timeout(Duration::from_secs(5), accept).await.expect("the far end is reached");
+    let mut ping = [0; 4];
+    far.read_exact(&mut ping).await.unwrap();
+    assert_eq!(&ping, b"ping");
+    far.write_all(b"pong").await.unwrap();
+    let mut pong = [0; 4];
+    from.read_exact(&mut pong).await.unwrap();
+    assert_eq!(&pong, b"pong");
+}
+
+/// Exposure names drydock announces within `window`.
+async fn announced(events: &mut ::drydock::api::ObservationStream, window: Duration) -> Vec<String> {
+    use futures::StreamExt;
+    let mut names = Vec::new();
+    let _ = tokio::time::timeout(window, async {
+        while let Some(Ok(record)) = events.next().await {
+            if let wire::ObserveRecord::Event { event } = record {
+                if let wire::EventKind::Exposure { name, .. } = event.event {
+                    names.push(name);
+                }
+            }
+        }
+    })
+    .await;
+    names
+}
+
 // #3620: missing credentials stay visible and not-ready; hello becomes ready
 // after the credential seam delivers a value, without recreating the provider.
 #[tokio::test]
@@ -147,7 +269,7 @@ async fn reference_readiness_tracks_credential_delivery() {
     assert!(provider.prepare(&spec(), &Default::default()).await.is_err());
     host.ready().await;
     assert_eq!(provider.detect_readiness().await, ProviderReadiness::Ready);
-    let declared = provider.declaration.read().unwrap().clone().expect("readiness loaded the real hello");
+    let declared = provider.declaration.read().unwrap().clone().expect("readiness loaded the real declaration");
     assert_eq!(provider.capabilities().material_modes, capabilities(&declared.capabilities).material_modes);
     assert!(provider.capabilities().material_modes.contains(&MaterialMode::Pushed));
     assert!(!provider.capabilities().material_modes.contains(&MaterialMode::Shared));
@@ -175,11 +297,7 @@ async fn reference_lifecycle_through_environment_provider() {
         provider.list_backings().await.unwrap(),
         vec![EnvironmentBacking { environment_id: EnvironmentId::new("crew"), backing_id: first.backing_id().into() }]
     );
-    let private = key_dir(&provider.directory, first.id());
-    use std::os::unix::fs::PermissionsExt;
-    assert_eq!(std::fs::metadata(&private).unwrap().permissions().mode() & 0o777, 0o700);
     provider.destroy(first.backing_id()).await.unwrap();
-    assert!(!private.join("id_ed25519").exists());
     provider.destroy(first.backing_id()).await.unwrap();
     assert!(provider.list_backings().await.unwrap().is_empty());
 }
@@ -261,56 +379,24 @@ fn terminal_observations_are_gone(tc: hegel::TestCase) {
     ));
 }
 
-struct NoTools;
-#[async_trait]
-impl ::drydock::ToolDetector for NoTools {
-    async fn available(&self, _: &str) -> bool {
-        false
-    }
-}
-// #3620: a configured instance remains advertised as missing-tool when its
-// managed language host cannot start. The real supervisor owns this detection.
+// #3620: a configured instance remains advertised as missing-tool when the
+// host that would load its module cannot start. Drydock's daemon owns this.
 #[tokio::test]
 async fn missing_host_binary_is_not_ready() {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
-    let mut supervisor =
-        ::drydock::Supervisor::new(directory.path().join("hosts"), Arc::new(::drydock::credentials::BuiltinCredentials::default()));
-    supervisor.detector = Arc::new(NoTools);
-    let host = Arc::new(
-        supervisor
-            .start(::drydock::HostSpec {
-                name: "missing".into(),
-                connection: ::drydock::HostConnection::Managed {
-                    command: vec!["missing-language-host".into()],
-                    runtime: Some("missing-runtime".into()),
-                    proxy_environment: Default::default(),
-                },
-                configuration: wire::HostConfiguration { modules: vec![], providers: vec![] },
-                credentials: Default::default(),
-            })
-            .await
-            .unwrap(),
-    );
-    let provider = DrydockEnvironmentProvider::new(
-        Arc::new(host.client.clone()),
-        "configured".into(),
-        "daytona".into(),
-        directory.path().join("keys"),
-    )
-    .with_host(host);
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if matches!(provider.detect_readiness().await, ProviderReadiness::MissingTool { .. }) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    let option = HostOption {
+        name: "missing".into(),
+        optional: true,
+        connection: ::drydock::HostConnection::Managed { command: vec!["missing-language-host".into()], runtime: None },
+    };
+    let config = ::drydock::config::Config::parse("[providers.configured]\nmodule='daytona'\n").unwrap();
+    let run = directory.path().join("run");
+    let daemon = Daemon::start_with_seams(config, &run, run.join("keys"), vec![option], Seams::new(Arc::new(Digests))).await.unwrap();
+    let provider = DrydockEnvironmentProvider::new(daemon, "configured".into(), "daytona".into());
+    assert!(matches!(provider.detect_readiness().await, ProviderReadiness::MissingTool { .. }));
 }
 
-// One slow agent connection must not block another label; repeated adoption
+// One slow vessel connection must not block another label; repeated adoption
 // must refresh the existing guest's environment without reconnecting it.
 #[tokio::test]
 async fn independent_provisions_and_rotated_tokens() {
@@ -331,15 +417,16 @@ async fn independent_provisions_and_rotated_tokens() {
             self.gateway.dial(config).await
         }
     }
-    let host = HostFixture::start().await;
+    let held = std::sync::OnceLock::new();
+    let host = HostFixture::start_through(|gateway| {
+        let dialer = Arc::new(Held { gateway, calls: Default::default(), entered: Default::default(), release: Default::default() });
+        held.set(dialer.clone()).ok();
+        dialer
+    })
+    .await;
+    let held = held.get().unwrap().clone();
     host.ready().await;
-    let held = Arc::new(Held {
-        gateway: host.gateway.clone(),
-        calls: Default::default(),
-        entered: Default::default(),
-        release: Default::default(),
-    });
-    let provider = host.provider_through(held.clone());
+    let provider = host.provider();
     let prepared = Arc::new(fixture_prepared(&host, &provider).await);
     let provider = Arc::new(provider);
     let task = {
@@ -360,7 +447,7 @@ async fn independent_provisions_and_rotated_tokens() {
     opts.tokens.push(("TEST_TOKEN".into(), "rotated".into()));
     let adopted = provider.provision(EnvironmentId::new("fast"), &prepared, opts).await.unwrap();
     assert_eq!(adopted.backing_id(), fast.backing_id());
-    assert_eq!(held.calls.load(std::sync::atomic::Ordering::SeqCst), 2, "adoption reuses the live agent link");
+    assert_eq!(held.calls.load(std::sync::atomic::Ordering::SeqCst), 2, "adoption reuses the live vessel link");
     assert_eq!(adopted.env_vars().await.unwrap().get("TEST_TOKEN").map(String::as_str), Some("rotated"));
     fast.destroy().await.unwrap();
 }
@@ -382,35 +469,25 @@ async fn restart_failed_adoption_preserves_backing() {
     let prepared = fixture_prepared(&host, &restarted).await;
     let failure = restarted.provision(EnvironmentId::new("survivor"), &prepared, host.opts()).await.err().expect("no agent answers");
     assert!(
-        matches!(&failure, EnvironmentProvisionError::RetryAdoption(diagnostic) if diagnostic.contains("did not complete its hello")),
+        matches!(&failure, EnvironmentProvisionError::RetryAdoption(diagnostic) if diagnostic.contains("agent through drydock")),
         "{failure}"
     );
     assert_eq!(host.client.inspect("reference", &backing).await.unwrap().id, backing);
 }
 
 // #3765 S3: an agent that stops answering makes the vessel Unknown, never Gone.
-// Once one answers again, liveness reconnects through drydock and restores the
-// configured environment and the lab forward without recreating the provider;
-// refreshing the lab name never duplicates its hosts entry.
+// Once one answers again, drydock re-establishes the vessel's link and liveness
+// reconnects through its exposure, restoring the configured environment,
+// without recreating the provider.
 #[tokio::test]
 async fn lost_agent_reconnects_on_liveness() {
     let host = HostFixture::start().await;
     host.ready().await;
-    let lab = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let guest_port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let hosts = host.root.join("hosts");
-    tokio::fs::write(&hosts, b"127.0.0.1 localhost\n").await.unwrap();
-    let mut provider = host.provider().with_lab_reach(Some(("127.0.0.1".into(), lab.local_addr().unwrap().port())));
-    provider.lab_guest = LabGuest {
-        tcp: std::net::SocketAddr::from(([127, 0, 0, 1], guest_port)),
-        socket: host.root.join("vessel/lab.sock"),
-        hosts: hosts.clone(),
-    };
+    let provider = host.provider();
     let prepared = fixture_prepared(&host, &provider).await;
     let mut opts = host.opts();
     opts.tokens.push(("TOKEN".into(), "rotated".into()));
-    let handle = provider.provision(EnvironmentId::new("recovery"), &prepared, opts.clone()).await.unwrap();
-    provider.provision(EnvironmentId::new("recovery"), &prepared, opts).await.unwrap();
+    let handle = provider.provision(EnvironmentId::new("recovery"), &prepared, opts).await.unwrap();
     assert!(matches!(handle.observe().await.state, ObservationState::Running));
     host.gateway.stop();
     assert!(matches!(handle.observe().await.state, ObservationState::Unknown { .. }));
@@ -419,51 +496,7 @@ async fn lost_agent_reconnects_on_liveness() {
     let observation = handle.observe().await;
     assert!(matches!(observation.state, ObservationState::Running), "{observation:?}");
     assert_eq!(handle.env_vars().await.unwrap().get("TOKEN").map(String::as_str), Some("rotated"));
-    let mut guest = tokio::net::TcpStream::connect(("127.0.0.1", guest_port)).await.unwrap();
-    guest.write_all(b"lab").await.unwrap();
-    let (mut service, _) = tokio::time::timeout(Duration::from_secs(5), lab.accept()).await.unwrap().unwrap();
-    let mut received = [0; 3];
-    service.read_exact(&mut received).await.unwrap();
-    assert_eq!(&received, b"lab");
-    let names = tokio::fs::read_to_string(&hosts).await.unwrap();
-    assert_eq!(names.matches(LAB_HOSTNAME).count(), 1, "{names}");
     handle.destroy().await.unwrap();
-}
-
-// #3765 F4 / review 4: incomplete adoption keys cannot be rotated by a
-// label-idempotent POST. Preserve the existing pair and backing, report the
-// missing key distinctly, and allow recovery after the original key is restored.
-#[tokio::test]
-async fn incomplete_adoption_keypair_requires_restore() {
-    let host = HostFixture::start().await;
-    host.ready().await;
-    let provider = host.provider();
-    let prepared = fixture_prepared(&host, &provider).await;
-    for (index, missing) in ["id_ed25519", "id_ed25519.pub"].into_iter().enumerate() {
-        let id = EnvironmentId::new(format!("repair-{index}"));
-        let first = provider.provision(id.clone(), &prepared, host.opts()).await.unwrap();
-        let directory = key_dir(&provider.directory, &id);
-        let original = tokio::fs::read(directory.join(missing)).await.unwrap();
-        tokio::fs::remove_file(directory.join(missing)).await.unwrap();
-        let failure = provider.provision(id.clone(), &prepared, host.opts()).await.err().expect("adoption must not regenerate keys");
-        assert!(matches!(failure, EnvironmentProvisionError::RetryAdoption(_)));
-        assert!(failure.to_string().contains("SSH keypair incomplete or missing for adopted backing"));
-        assert!(!directory.join(missing).exists());
-        assert_eq!(host.client.inspect("reference", first.backing_id()).await.unwrap().id, first.backing_id());
-        tokio::fs::write(directory.join(missing), original).await.unwrap();
-        let recovered = provider.provision(id, &prepared, host.opts()).await.unwrap();
-        assert_eq!(first.backing_id(), recovered.backing_id());
-        recovered.destroy().await.unwrap();
-    }
-    // With no existing backing, a stale public half is safe to replace.
-    let id = EnvironmentId::new("fresh-half-pair");
-    let directory = key_dir(&provider.directory, &id);
-    ::drydock::local::private_dir(&directory).unwrap();
-    tokio::fs::write(directory.join("id_ed25519.pub"), "stale public half").await.unwrap();
-    let fresh = provider.provision(id, &prepared, host.opts()).await.unwrap();
-    assert!(directory.join("id_ed25519").is_file());
-    assert_ne!(tokio::fs::read_to_string(directory.join("id_ed25519.pub")).await.unwrap(), "stale public half");
-    fresh.destroy().await.unwrap();
 }
 
 // #3765 liveness: an inventory snapshot collected before creation must not
@@ -482,58 +515,145 @@ async fn stale_snapshot_absence_is_confirmed_by_inspect() {
     handle.destroy().await.unwrap();
 }
 
-// Behaviour (#3980 contracts 2, 3 and 7; #3981): through either agent link
-// drydock chooses, the vessel agent serves a controller socket at a guest path
-// the guest dials, and pushes tool files. A forward the agent refuses fails
-// naming the forward, without waiting. What drydock chose (#3980 contract 9)
-// is recorded in the provider descriptor.
+// drydock#132 case 4, drive the agent: the provider holds no vessel key and
+// opens no link of its own. Its agent is reached through the inward exposure
+// of the agent's socket, which it reports, and pushes tool files.
 #[tokio::test]
-async fn guest_sockets_are_agent_forwards_through_either_link() {
-    for (reverse_forwards, link) in [(false, "local_forward"), (true, "reverse_forward")] {
-        let host = HostFixture::with_gateway(reverse_forwards).await;
-        host.ready().await;
-        let provider = host.provider();
-        let prepared = fixture_prepared(&host, &provider).await;
-        let daemon = tokio::net::UnixListener::bind(host.root.join("daemon.sock")).unwrap();
-        let guest_socket = host.root.join("vessel/run/daemon.sock");
-        let handle = provider.provision(EnvironmentId::new("forwards"), &prepared, host.opts()).await.unwrap();
-        let report = handle.provider_descriptor().unwrap().agent_connection.expect("drydock's report is recorded");
-        let expected = flotilla_protocol::provider::AgentConnectionReport {
-            provider: "reference".into(),
-            module: "memory".into(),
-            vessel: handle.backing_id().into(),
-            endpoint: "gateway.test:22".into(),
-            mode: link.into(),
-        };
-        assert_eq!(report, expected);
-        let agent = handle.agent();
-        agent.forward_controller_socket(&guest_socket, None, &host.root.join("daemon.sock")).await.unwrap();
-        let tool = EnvironmentTool::new("flotilla", host.root.join("vessel/opt/flotilla")).with_asset(EnvironmentToolAsset::new(
-            host.root.join("bin/tar"),
-            host.root.join("vessel/opt/flotilla/tool"),
-            EnvironmentToolAssetKind::File,
-            EnvironmentToolAssetAccess::ReadOnly,
-            "a tool",
-        ));
-        agent.push_tools(&[tool]).await.unwrap();
-        let mut guest = tokio::net::UnixStream::connect(&guest_socket).await.unwrap();
-        guest.write_all(b"crew").await.unwrap();
-        let (mut controller, _) = tokio::time::timeout(Duration::from_secs(5), daemon.accept()).await.unwrap().unwrap();
-        let mut received = [0; 4];
-        controller.read_exact(&mut received).await.unwrap();
-        assert_eq!(&received, b"crew");
-        use std::os::unix::fs::PermissionsExt;
-        let pushed = std::fs::metadata(host.root.join("vessel/opt/flotilla/tool")).unwrap();
-        assert_eq!(pushed.permissions().mode() & 0o777, 0o755);
-        // A guest path whose parent is a file cannot be listened on.
-        std::fs::write(host.root.join("hosts-file"), b"").unwrap();
-        let (unservable, daemon_path) = (host.root.join("hosts-file/daemon.sock"), host.root.join("daemon.sock"));
-        let refused = agent.forward_controller_socket(&unservable, None, &daemon_path);
-        let message = tokio::time::timeout(Duration::from_secs(5), refused)
-            .await
-            .expect("a refused forward never hangs")
-            .expect_err("a refused forward fails");
-        assert!(message.contains("guest forward socket-") && message.contains("hosts-file/daemon.sock"), "{message}");
-        handle.destroy().await.unwrap();
-    }
+async fn the_agent_is_driven_through_an_inward_exposure() {
+    let host = HostFixture::start().await;
+    host.ready().await;
+    let provider = host.provider();
+    let prepared = fixture_prepared(&host, &provider).await;
+    let handle = provider.provision(EnvironmentId::new("driven"), &prepared, host.opts()).await.unwrap();
+    let agent = host.daemon().inward("reference", handle.backing_id(), "agent").await.unwrap();
+    assert_eq!(agent.target, wire::InwardTarget::Unix(host.root.join("vessel/agent.sock").display().to_string()));
+    let wire::Local::Unix(local) = agent.local;
+    let expected = AgentConnectionReport {
+        provider: "reference".into(),
+        module: "reference".into(),
+        vessel: handle.backing_id().into(),
+        endpoint: local,
+        mode: "inward_exposure".into(),
+    };
+    assert_eq!(handle.provider_descriptor().unwrap().agent_connection, Some(expected));
+    let tool = EnvironmentTool::new("flotilla", host.root.join("vessel/opt/flotilla")).with_asset(EnvironmentToolAsset::new(
+        host.root.join("bin/tar"),
+        host.root.join("vessel/opt/flotilla/tool"),
+        EnvironmentToolAssetKind::File,
+        EnvironmentToolAssetAccess::ReadOnly,
+        "a tool",
+    ));
+    handle.agent().push_tools(&[tool]).await.unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let pushed = std::fs::metadata(host.root.join("vessel/opt/flotilla/tool")).unwrap();
+    assert_eq!(pushed.permissions().mode() & 0o777, 0o755);
+    handle.destroy().await.unwrap();
+}
+
+// drydock#132 case 1, attach to cleat: the socket the provider hands back is
+// the local end of an inward exposure, which reaches cleat's socket in the vessel.
+#[tokio::test]
+async fn cleat_attach_is_an_inward_exposure() {
+    let host = HostFixture::start().await;
+    host.ready().await;
+    let provider = host.provider();
+    let prepared = fixture_prepared(&host, &provider).await;
+    let handle = provider.provision(EnvironmentId::new("attach"), &prepared, host.opts()).await.unwrap();
+    let guest = host.root.join("vessel/cleat.sock");
+    let cleat = UnixListener::bind(&guest).unwrap();
+    let local = handle.agent().forward_socket(&guest).await.unwrap();
+    let exposed = host.daemon().inwards("reference", handle.backing_id()).await.unwrap();
+    assert!(exposed.iter().any(|inward| inward.local == wire::Local::Unix(local.display().to_string())), "{exposed:?}");
+    round_trip(UnixStream::connect(&local).await.unwrap(), async { cleat.accept().await.unwrap().0 }).await;
+    assert_eq!(handle.agent().forward_socket(&guest).await.unwrap(), local, "a standing exposure is reused");
+    handle.destroy().await.unwrap();
+}
+
+// drydock#132 case 2, crew talks back: the guest socket is an outward exposure
+// reaching the controller's socket. One drydock cannot set up fails naming the
+// guest path, without waiting; a guest TCP listener is refused.
+#[tokio::test]
+async fn crew_talks_back_through_an_outward_exposure() {
+    let host = HostFixture::start().await;
+    host.ready().await;
+    let provider = host.provider();
+    let prepared = fixture_prepared(&host, &provider).await;
+    let handle = provider.provision(EnvironmentId::new("crew"), &prepared, host.opts()).await.unwrap();
+    let (controller, guest) = (host.root.join("daemon.sock"), host.root.join("vessel/run/daemon.sock"));
+    let daemon = UnixListener::bind(&controller).unwrap();
+    let agent = handle.agent();
+    agent.create_dir(&host.root.join("vessel/run"), 0o700).await.unwrap();
+    agent.forward_controller_socket(&guest, None, &controller).await.unwrap();
+    round_trip(UnixStream::connect(&guest).await.unwrap(), async { daemon.accept().await.unwrap().0 }).await;
+    // A guest path whose parent is a file cannot be listened on.
+    std::fs::write(host.root.join("hosts-file"), b"").unwrap();
+    let unservable = host.root.join("hosts-file/daemon.sock");
+    let refused = agent.forward_controller_socket(&unservable, None, &controller);
+    let message = tokio::time::timeout(Duration::from_secs(10), refused)
+        .await
+        .expect("a refused exposure never hangs")
+        .expect_err("a refused exposure fails");
+    assert!(message.contains("hosts-file/daemon.sock"), "{message}");
+    let tcp = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
+    assert!(agent.forward_controller_socket(&guest, Some(tcp), &controller).await.is_err());
+    handle.destroy().await.unwrap();
+}
+
+// drydock#132 case 3, lab service: the lab's name in the guest is an outward
+// exposure drydock gives an address and a hosts line, reaching the lab from
+// drydock's machine. Re-adoption leaves the standing exposure as it is.
+#[tokio::test]
+async fn the_lab_service_is_a_named_outward_exposure() {
+    let host = HostFixture::start().await;
+    host.ready().await;
+    let lab = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let guest_port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let mut provider = host.provider().with_lab_reach(Some(("127.0.0.1".into(), lab.local_addr().unwrap().port())));
+    provider.guest.lab_port = guest_port;
+    let prepared = fixture_prepared(&host, &provider).await;
+    let handle = provider.provision(EnvironmentId::new("lab"), &prepared, host.opts()).await.unwrap();
+    let names = tokio::fs::read_to_string(host.root.join("hosts")).await.unwrap();
+    let line = names.lines().find(|line| line.contains(LAB_HOSTNAME)).unwrap_or_else(|| panic!("{names}"));
+    let address: std::net::IpAddr = line.split_whitespace().next().unwrap().parse().unwrap();
+    round_trip(tokio::net::TcpStream::connect((address, guest_port)).await.unwrap(), async { lab.accept().await.unwrap().0 }).await;
+    let mut events = ProviderApi::observe(&*host.daemon(), None).await.unwrap();
+    provider.provision(EnvironmentId::new("lab"), &prepared, host.opts()).await.unwrap();
+    assert!(!announced(&mut events, Duration::from_millis(500)).await.contains(&"lab".to_owned()), "re-adoption sets no lab exposure");
+    let names = tokio::fs::read_to_string(host.root.join("hosts")).await.unwrap();
+    assert_eq!(names.matches(LAB_HOSTNAME).count(), 1, "{names}");
+    handle.destroy().await.unwrap();
+}
+
+// Drydock keeps a vessel's exposures across its own restart, as flotillad's
+// restart restarts it: the crew still talks back with nothing set up again,
+// and a restarted provider adopts the vessel and drives its agent.
+#[tokio::test]
+async fn exposures_outlast_a_drydock_restart() {
+    let mut host = HostFixture::start().await;
+    host.ready().await;
+    let provider = host.provider();
+    let prepared = fixture_prepared(&host, &provider).await;
+    let handle = provider.provision(EnvironmentId::new("restart"), &prepared, host.opts()).await.unwrap();
+    let (controller, guest) = (host.root.join("daemon.sock"), host.root.join("vessel/crew.sock"));
+    let daemon = UnixListener::bind(&controller).unwrap();
+    handle.agent().forward_controller_socket(&guest, None, &controller).await.unwrap();
+    let backing = handle.backing_id().to_owned();
+    drop((handle, provider, prepared));
+    host.restart_daemon().await;
+    // Drydock takes its exposures up again in its own time; nothing here sets one.
+    let drydock = host.daemon();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !drydock.outwards("reference", &backing).await.is_ok_and(|outwards| outwards.iter().all(|outward| outward.ready)) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("drydock re-establishes the crew socket");
+    round_trip(UnixStream::connect(&guest).await.unwrap(), async { daemon.accept().await.unwrap().0 }).await;
+    let provider = host.provider();
+    let prepared = fixture_prepared(&host, &provider).await;
+    let adopted = provider.provision(EnvironmentId::new("restart"), &prepared, host.opts()).await.unwrap();
+    assert!(!adopted.created_for_setup());
+    assert!(adopted.env_vars().await.unwrap().contains_key("PATH"));
+    adopted.destroy().await.unwrap();
 }

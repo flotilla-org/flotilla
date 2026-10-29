@@ -1,13 +1,16 @@
 //! #3981: a cloud vessel is provisioned through the generic provider path and
 //! reaches launch on its vessel and access layers alone. The drydock stand-in is
-//! the real main-server runtime with the reference module, whose vessels declare
-//! an agent reached over SSH, and drydock's in-process gateway, which serves a
-//! real agent under that reach's forwarding rules. The stand-in vessel is this
-//! host, so guest paths land here.
+//! drydock's daemon, as flotillad embeds it, over a real host with the reference
+//! module, whose vessels declare an agent reached over SSH, and drydock's
+//! in-process gateway, which serves a real agent under that reach's forwarding
+//! rules. The stand-in vessel is this host, so guest paths land here.
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
-use ::drydock::agent::{stand_in::Gateway, AgentLink, AgentReach};
+use ::drydock::{
+    agent::{stand_in::Gateway, AgentLink},
+    daemon::{AgentBuilds, Daemon, HostOption, Seams},
+};
 use flotilla_discovery_api::HostDetector;
 use flotilla_environment::environment::{
     drydock::DrydockEnvironmentProvider, EnvironmentProvisionError, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess,
@@ -29,7 +32,7 @@ const BUILD: &[u8] = b"drydock launch scenario agent";
 // provider's environment kept, and the crew socket, which reaches this
 // environment's own socket here. A crew aboard then launches through the real
 // launch path with its home and skills from the access layer, and explain shows
-// what drydock reports it chose.
+// how the agent is reached: through drydock's exposure, over the link drydock chose.
 #[tokio::test]
 async fn cloud_vessel_reaches_launch_through_the_generic_provider_path() {
     // The provider declares the vessel's PATH, or the image keeps its own (here, this host's).
@@ -41,7 +44,7 @@ async fn cloud_vessel_reaches_launch_through_the_generic_provider_path() {
 }
 
 async fn launch_through_the_provider_path(reverse_forwards: bool, link: AgentLink, declared_path: Option<&str>) {
-    let mut stand_in = stand_in(reverse_forwards, declared_path).await;
+    let mut stand_in = stand_in(reverse_forwards, link, declared_path).await;
     let env_id = stand_in.env_id.clone();
     let root = stand_in.root().to_path_buf();
     let provisioned = DockerControllerRuntime { state: Arc::clone(&stand_in.state) }
@@ -132,7 +135,7 @@ async fn launch_through_the_provider_path(reverse_forwards: bool, link: AgentLin
     assert_eq!(mechanisms.get("home"), Some(&"agent-push"));
     assert_eq!(mechanisms.get("skills"), Some(&"agent-push"));
     let connection = delivery.agent_connection.as_ref().expect("explain shows drydock's report");
-    assert_eq!((connection.provider.as_str(), connection.mode.as_str()), ("stand-in", link.as_str()));
+    assert_eq!((connection.provider.as_str(), connection.mode.as_str()), ("stand-in", "inward_exposure"));
     assert_eq!(connection.vessel, handle.backing_id());
     let dialled = stand_in.gateway.links();
     assert!(dialled.iter().all(|dialled| *dialled == link), "never a link the gateway refuses: {dialled:?}");
@@ -146,7 +149,7 @@ async fn launch_through_the_provider_path(reverse_forwards: bool, link: AgentLin
 // the retry.
 #[tokio::test]
 async fn a_failed_vessel_layer_discards_only_a_vessel_it_created() {
-    let stand_in = stand_in(false, None).await;
+    let stand_in = stand_in(false, AgentLink::LocalForward, None).await;
     let runtime = DockerControllerRuntime { state: Arc::clone(&stand_in.state) };
     let name = stand_in.env_id.as_str();
     let provider = stand_in.state.provider_for_environment(name).await.expect("provider");
@@ -181,6 +184,7 @@ struct StandIn {
     backend: ResourceBackend,
     pool: Arc<FakeTerminalPool>,
     gateway: Arc<Gateway>,
+    host: tokio::task::JoinHandle<()>,
     crew_connections: tokio::sync::mpsc::UnboundedReceiver<(EnvironmentId, SocketReach, tokio::net::UnixStream)>,
     refuse_tools: Arc<AtomicBool>,
 }
@@ -198,6 +202,7 @@ impl StandIn {
     /// The stand-in vessel is this host: remove what this environment left at
     /// its contained base, and nothing another test shares there.
     fn clean_up(&self) {
+        self.host.abort();
         let base = Path::new(flotilla_environment::environment::runner::CONTAINED_WRITABLE_CONFIG_BASE);
         let _ = fs::remove_dir_all(base.join("agent-material/requesters").join(&self.convoy));
         let digest = format!("{:x}", sha2::Sha256::digest(self.env_id.as_str().as_bytes()));
@@ -205,33 +210,86 @@ impl StandIn {
     }
 }
 
-async fn stand_in(reverse_forwards: bool, declared_path: Option<&str>) -> StandIn {
+/// Drydock's agent build seam, given the provider's own build.
+struct Build;
+#[async_trait]
+impl AgentBuilds for Build {
+    async fn build(&self, _: &drydock_protocol::Platform) -> Result<Vec<u8>, String> {
+        Ok(BUILD.to_vec())
+    }
+}
+
+/// Prepare already names digests.
+struct Digests;
+#[async_trait]
+impl ::drydock::launch::ImageResolver for Digests {
+    async fn resolve(&self, image: &str) -> Result<String, ::drydock::client::Error> {
+        Ok(image.into())
+    }
+}
+
+async fn stand_in(reverse_forwards: bool, link: AgentLink, declared_path: Option<&str>) -> StandIn {
     let temp = tempfile::Builder::new().prefix("dl-").tempdir_in("/tmp").expect("tempdir");
     let root = temp.path();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700)).expect("private root");
+    }
     let convoy = format!("drydock-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     let env_id = EnvironmentId::new(format!("env-{convoy}"));
 
-    let runtime = ::drydock::runtime::Runtime::new(drydock_host::reference::registry());
-    let reach = json!({"kind": "ssh", "endpoint": "gateway.test:22", "user": "minted", "host_key": "ssh-ed25519 AAAA",
-        "reverse_forwards": reverse_forwards});
-    let configuration = serde_json::from_value(json!({
-        "modules": [{"name": "memory", "entrypoint": "reference"}],
-        "providers": [{"name": "stand-in", "module": "memory",
-            "settings": {"agent": true, "reach": reach, "workspace_root": root.join("workspace")},
-            "credential": {"mode": "direct", "credential_reference": "test"}}]
-    }))
-    .expect("configuration");
-    runtime.configure(&configuration).await.expect("configure drydock");
-    runtime.credential("stand-in", drydock_protocol::Secret::new("stand-in-key")).await.expect("credential");
+    let socket = root.join("host.sock");
+    let serving = socket.clone();
+    let host = tokio::spawn(async move {
+        drydock_host::Host::new(drydock_host::reference::registry()).serve_unix(serving, std::future::pending()).await.expect("host");
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ::drydock::api::ProviderApi::hello(&::drydock::client::Client::unix(&socket).expect("client")).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("reference host");
+    fs::write(root.join("credential"), "stand-in-key").expect("credential");
+    fs::write(root.join("hosts"), "127.0.0.1 localhost\n").expect("hosts file");
+    let text = format!(
+        "[providers.stand-in]\nmodule='reference'\nagent_link='{}'\ncredential={{file='{}'}}\n\
+         settings={{agent=true, poll_interval_ms=10, workspace_root='{}', reach={{kind='ssh', endpoint='gateway.test:22', \
+         user='minted', host_key='ssh-ed25519 AAAA', reverse_forwards={reverse_forwards}}}}}\n",
+        link.as_str(),
+        root.join("credential").display(),
+        root.join("workspace").display()
+    );
     fs::create_dir(root.join("vessel")).expect("vessel directory");
     // The provider prepares linux/amd64 guests, so the stand-in vessel reports
     // that platform on any test host.
     let gateway = Gateway::start_as(&root.join("vessel"), reverse_forwards, BUILD, flotilla_environment::guest_tools::linux_amd64())
         .expect("gateway");
-    let provider = DrydockEnvironmentProvider::new(Arc::new(runtime.clone()), "stand-in".into(), "reference".into(), root.join("keys"))
-        .with_agent_reach(AgentReach::new(AgentLink::default()).with_dialer(gateway.clone()).with_timeout(Duration::from_secs(5)))
+    let seams = Seams {
+        dialer: gateway.clone(),
+        builds: Arc::new(Build),
+        guest: ::drydock::exposures::GuestLayout { hosts: root.join("hosts"), sockets: root.join("guest") },
+        ..Seams::new(Arc::new(Digests))
+    };
+    let option = HostOption { optional: false, name: "rust".into(), connection: ::drydock::HostConnection::ExternalUnix { path: socket } };
+    let run = root.join("run");
+    let drydock =
+        Daemon::start_with_seams(::drydock::config::Config::parse(&text).expect("config"), &run, run.join("keys"), vec![option], seams)
+            .await
+            .expect("drydock");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(
+            ::drydock::api::ProviderApi::provider(&*drydock, "stand-in").await.map(|p| p.readiness),
+            Ok(drydock_protocol::Readiness::Ready)
+        ) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stand-in ready");
+    let provider = DrydockEnvironmentProvider::new(drydock, "stand-in".into(), "reference".into())
         .with_agent_build(BUILD.to_vec())
-        .with_attach_root(root.join("attach"));
+        .with_guest_agent_socket(root.join("vessel/agent.sock"));
 
     // The daemon: interior discovery finds the harness and the terminal pool.
     let config_base = root.join("config");
@@ -332,7 +390,7 @@ async fn stand_in(reverse_forwards: bool, declared_path: Option<&str>) -> StandI
     let tools = GenerationCli { root: root.to_path_buf(), refused: Arc::clone(&refuse_tools) };
     state.environment_tools = EnvironmentToolProvisioner::new(vec![Arc::new(tools)]);
     let state = Arc::new(state);
-    StandIn { temp, convoy, env_id, spec, state, backend, pool, gateway, crew_connections, refuse_tools }
+    StandIn { temp, convoy, env_id, spec, state, backend, pool, gateway, host, crew_connections, refuse_tools }
 }
 
 /// The vessel's harness, as interior discovery finds it.

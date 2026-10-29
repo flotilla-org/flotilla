@@ -21,7 +21,7 @@ generic-array = { version = "0.14", default-features = false, features = ["more_
 memchr = { version = "2" }
 serde = { version = "1", features = ["alloc", "derive"] }
 serde_core = { version = "1", features = ["alloc"] }
-serde_json = { version = "1", features = ["raw_value"] }
+serde_json = { version = "1", features = ["alloc", "raw_value"] }
 sha2 = { workspace = true, features = ["oid"] }
 subtle = { version = "2" }
 zeroize = { version = "1", features = ["derive"] }
