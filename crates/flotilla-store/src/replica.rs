@@ -31,13 +31,27 @@ pub struct ReplicaDeletion {
     pub last_synced_at: DateTime<Utc>,
 }
 
+/// A replica body's origin resource version, when it is numeric.
+pub fn replica_version(body: &serde_json::Value) -> Option<u64> {
+    body.get("metadata")?.get("resourceVersion")?.as_str()?.parse().ok()
+}
+
 /// Whether a held replica body is newer than an arriving one by its origin's
 /// resource version. An origin's versions only grow within a generation, so
 /// the newer body wins whatever the arrival order or the receiver's clock
 /// (#4137). Bodies without a numeric version fall back to sync-time ordering.
 pub fn replica_body_is_newer(held: &serde_json::Value, arriving: &serde_json::Value) -> bool {
-    fn version(body: &serde_json::Value) -> Option<u64> {
-        body.get("metadata")?.get("resourceVersion")?.as_str()?.parse().ok()
+    replica_version_is_newer(replica_version(held), arriving)
+}
+
+/// [`replica_body_is_newer`] for a held version already read from storage.
+pub fn replica_version_is_newer(held: Option<u64>, arriving: &serde_json::Value) -> bool {
+    match (held, replica_version(arriving)) {
+        (Some(held), Some(arriving)) => held > arriving,
+        (None, None) => false,
+        (held, arriving) => {
+            tracing::warn!(?held, ?arriving, "replica resource version is not numeric on one side; ordering by sync time");
+            false
+        }
     }
-    version(held).zip(version(arriving)).is_some_and(|(held, arriving)| held > arriving)
 }

@@ -35,13 +35,15 @@ use flotilla_store::{
     ReplicaReadResolver, ResourceBackend, TypedResolver,
 };
 use sha2::{Digest, Sha256};
-use tracing::warn;
+use tracing::{debug, warn};
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
 const REPO_LABEL: &str = "flotilla.work/repo";
 const ENV_LABEL: &str = "flotilla.work/env";
 const VESSEL_PROVISIONING_REQUEUE_AFTER: Duration = Duration::from_secs(5);
 const VESSEL_INTERRUPTED_REQUEUE_AFTER: Duration = Duration::from_millis(250);
+/// A vessel older than this still waiting for its convoy's snapshot is stuck, not racing admission.
+const VESSEL_SNAPSHOT_WAIT_WARN_AFTER: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
 const VESSEL_PROVISIONING_STUCK_SECONDS: i64 = 2 * 60;
 const CHECKOUT_RECREATE_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -679,6 +681,12 @@ impl VesselReconciler {
         // A convoy read without its snapshot is not ready yet: admission has
         // not frozen it, or a replica briefly holds an older body (#4137).
         let Some(snapshot) = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()) else {
+            let waited = Utc::now() - obj.metadata.creation_timestamp;
+            if waited > VESSEL_SNAPSHOT_WAIT_WARN_AFTER {
+                warn!(vessel = %obj.metadata.name, convoy = %obj.spec.convoy_ref, %waited, "vessel still waiting for its convoy's workflow snapshot");
+            } else {
+                debug!(vessel = %obj.metadata.name, convoy = %obj.spec.convoy_ref, "vessel waiting for its convoy's workflow snapshot");
+            }
             return Ok(VesselPrepared::waiting());
         };
         let (vessel_index, requirement) = match snapshot.vessels.iter().enumerate().find(|(_, vessel)| vessel.name == obj.spec.vessel_name)
@@ -2130,8 +2138,6 @@ mod tests {
         }
     }
 
-    // A vessel no admission froze an instance for takes the one provider its kind's host
-    // advertises for the realisation, and none before any is observed; a frozen instance wins.
     // #4137: a vessel reading its convoy from a replica that lacks the frozen snapshot
     // waits for it, leaving the vessel untouched; a snapshot without the vessel fails it.
     #[tokio::test]
@@ -2204,6 +2210,8 @@ mod tests {
         );
     }
 
+    // A vessel no admission froze an instance for takes the one provider its kind's host
+    // advertises for the realisation, and none before any is observed; a frozen instance wins.
     #[tokio::test]
     async fn an_unfrozen_vessel_takes_the_one_provider_its_host_advertises() {
         use flotilla_protocol::provider::{

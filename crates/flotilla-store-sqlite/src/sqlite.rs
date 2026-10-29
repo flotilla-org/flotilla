@@ -31,7 +31,7 @@ use tokio_rusqlite::Connection;
 
 use crate::{
     error::ResourceError,
-    replica::{replica_body_is_newer, StoredReplicaEvent, StoredReplicaEventKind},
+    replica::{replica_version_is_newer, StoredReplicaEvent, StoredReplicaEventKind},
     resource::{InputMeta, MergeMetadata, ObjectMeta, ResourceObject},
     retention::{
         EventRetention, ResourceDecodeQuarantine, ResourceEventDecodeQuarantine, ResourceStoreDiagnostics,
@@ -2185,18 +2185,18 @@ impl SqliteBackend {
                 let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite replica replacement"))?;
                 let old = {
                     let sql=if bucket.is_some() {
-                        "SELECT o.name,o.body_json,o.last_synced_at FROM digest_entries d JOIN replica_objects o
+                        "SELECT o.name,o.body_json,o.last_synced_at,json_extract(o.body_json,'$.metadata.resourceVersion') FROM digest_entries d JOIN replica_objects o
                          ON o.origin_root=d.origin AND o.group_name=d.group_name AND o.version=d.version AND o.kind=d.kind AND o.namespace=d.namespace AND o.name=d.name
                          WHERE d.origin=?1 AND d.group_name=?2 AND d.version=?3 AND d.kind=?4 AND d.namespace=?5 AND d.bucket=?6"
                     } else {
-                        "SELECT name,body_json,last_synced_at FROM replica_objects
+                        "SELECT name,body_json,last_synced_at,json_extract(body_json,'$.metadata.resourceVersion') FROM replica_objects
                          WHERE origin_root=?1 AND group_name=?2 AND version=?3 AND kind=?4 AND namespace=?5 AND ?6 IS NULL"
                     };
                     let mut statement = tx.prepare_cached(sql)
                         .map_err(|err| Self::map_sqlite(err, "prepare old sqlite replicas"))?;
                     let rows = statement
                         .query_map(params![origin, key.0, key.1, key.2, key.3, bucket], |row| {
-                            Ok((row.get::<_, String>(0)?, (row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+                            Ok((row.get::<_, String>(0)?, (row.get::<_, String>(1)?, row.get::<_, String>(2)?, Self::stored_replica_version(row.get(3)?))))
                         })
                         .map_err(|err| Self::map_sqlite(err, "query old sqlite replicas"))?;
                     rows.collect::<Result<HashMap<_, _>, _>>().map_err(|err| Self::map_sqlite(err, "read old sqlite replica row"))?
@@ -2205,17 +2205,13 @@ impl SqliteBackend {
                 for (name, body) in &encoded {
                     let mutation = ReplicaMutation { kind: StoredReplicaEventKind::Added, name: name.clone(), value: serde_json::from_str(body).map_err(|err| ResourceError::decode(err.to_string()))?, synced_at };
                     let applied = Self::apply_replica_record(&tx, resource_kind, &key, &origin, &mutation, || {
-                    if old.get(name).is_some_and(|(old_body, _)| old_body == body) {
+                    if old.get(name).is_some_and(|(old_body, _, _)| old_body == body) {
                         return Ok(true);
                     }
                     // A digest repair cut can predate an event the log already
                     // applied; keep the newer body (#4137). A full snapshot is
                     // authoritative and may start a new origin generation.
-                    if bucket.is_some()
-                        && old.get(name).is_some_and(|(old_body, _)| {
-                            serde_json::from_str::<Value>(old_body).is_ok_and(|old_body| replica_body_is_newer(&old_body, &mutation.value))
-                        })
-                    {
+                    if bucket.is_some() && old.get(name).is_some_and(|(_, _, held_version)| replica_version_is_newer(*held_version, &mutation.value)) {
                         return Ok(false);
                     }
                     tx.execute_cached(
@@ -2269,7 +2265,7 @@ impl SqliteBackend {
 
                 let mut events = encoded
                     .into_iter()
-                    .filter(|(name, body)| accepted.contains(name) && old.get(name).is_none_or(|(old_body, _)| old_body != body))
+                    .filter(|(name, body)| accepted.contains(name) && old.get(name).is_none_or(|(old_body, _, _)| old_body != body))
                     .map(|(name, body)| {
                         let kind = if old.contains_key(&name) { StoredReplicaEventKind::Modified } else { StoredReplicaEventKind::Added };
                         Ok((
@@ -2278,7 +2274,7 @@ impl SqliteBackend {
                         ))
                     })
                     .collect::<Result<Vec<_>, ResourceError>>()?;
-                for (name, (body, _)) in old {
+                for (name, (body, _, _)) in old {
                     if !new_names.contains(&name) {
                         events.push((
                             StoredReplicaEventKind::Deleted,
@@ -2362,6 +2358,11 @@ impl SqliteBackend {
         }
     }
 
+    /// A held replica body's numeric resource version, read in SQL so the body is not re-parsed.
+    fn stored_replica_version(version: Option<String>) -> Option<u64> {
+        version.and_then(|version| version.parse().ok())
+    }
+
     fn write_replica_mutation(
         tx: &rusqlite::Transaction<'_>,
         key: &StoreKey,
@@ -2374,12 +2375,12 @@ impl SqliteBackend {
         let existing = tx
             .query_row_cached(
                 r#"
-            SELECT body_json, last_synced_at
+            SELECT body_json, last_synced_at, json_extract(body_json, '$.metadata.resourceVersion')
             FROM replica_objects
             WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6
             "#,
                 params![origin, key.0, key.1, key.2, key.3, name],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, Self::stored_replica_version(row.get(2)?))),
             )
             .optional()
             .map_err(|err| Self::map_replica_sqlite(err, "read existing sqlite replica event object"))?;
@@ -2395,20 +2396,18 @@ impl SqliteBackend {
             )
             .optional()
             .map_err(|err| Self::map_replica_sqlite(err, "read sqlite replica tombstone"))?;
-        let held_is_newer = existing.as_ref().is_some_and(|(existing_body, _)| {
-            serde_json::from_str::<Value>(existing_body).is_ok_and(|existing_body| replica_body_is_newer(&existing_body, value))
-        });
+        let held_is_newer = existing.as_ref().is_some_and(|(_, _, held_version)| replica_version_is_newer(*held_version, value));
         let unchanged = held_is_newer
             || match kind {
                 StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
                     tombstone_synced_at.as_ref().is_some_and(|existing_synced| existing_synced >= &synced)
-                        || existing.as_ref().is_some_and(|(existing_body, existing_synced)| {
+                        || existing.as_ref().is_some_and(|(existing_body, existing_synced, _)| {
                             existing_synced > &synced || (existing_synced == &synced && existing_body >= &body)
                         })
                 }
                 StoredReplicaEventKind::Deleted => {
                     tombstone_synced_at.as_ref().is_some_and(|existing_synced| existing_synced >= &synced)
-                        || existing.as_ref().is_some_and(|(_, existing_synced)| existing_synced > &synced)
+                        || existing.as_ref().is_some_and(|(_, existing_synced, _)| existing_synced > &synced)
                 }
             };
         if unchanged {
