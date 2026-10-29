@@ -357,3 +357,17 @@ fn a_status_the_engine_cannot_hold_is_refused() {
     assert_eq!(report.refused.len(), 2, "{report:?}");
     assert!(report.refused.iter().all(|refusal| refusal.reason.contains("no namespaces")), "{report:?}");
 }
+
+// Behaviour (ADR 0058): every environment class has its stored class, by name.
+#[test]
+fn every_environment_class_is_stored() {
+    for (class, stored) in [
+        (EnvironmentClass::HostDirect, Class::HostDirect),
+        (EnvironmentClass::Container, Class::Container),
+        (EnvironmentClass::MicroVm, Class::MicroVm),
+        (EnvironmentClass::CloudSandbox, Class::CloudSandbox),
+        (EnvironmentClass::Dummy, Class::Dummy),
+    ] {
+        assert_eq!(Class::new(class), stored);
+    }
+}

@@ -10,6 +10,7 @@ use flotilla_resources::{
     ConditionValue, FulfilmentFacts, HostCondition, HostConnection, HostSpec, ImageBuildCapacity, ImageBuildReservation,
 };
 use flotilla_schema::{KindRegistry, RegistryError, Stored, Timestamp};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 pub enum Connection {
@@ -151,7 +152,8 @@ impl Condition {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Stored)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Stored, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Class {
     #[store(code = "hd")]
     HostDirect,
@@ -165,15 +167,10 @@ pub enum Class {
     Dummy,
 }
 
-impl From<EnvironmentClass> for Class {
-    fn from(class: EnvironmentClass) -> Self {
-        match class {
-            EnvironmentClass::HostDirect => Class::HostDirect,
-            EnvironmentClass::Container => Class::Container,
-            EnvironmentClass::MicroVm => Class::MicroVm,
-            EnvironmentClass::CloudSandbox => Class::CloudSandbox,
-            EnvironmentClass::Dummy => Class::Dummy,
-        }
+impl Class {
+    /// By the class's serialized name, so no code branches on a descriptive class (ADR 0058).
+    pub fn new(class: EnvironmentClass) -> Self {
+        serde_json::to_value(class).and_then(serde_json::from_value).expect("every environment class has a stored class")
     }
 }
 
@@ -218,7 +215,7 @@ impl Provider {
     pub fn new(advertisement: &ProviderAdvertisement) -> Result<Self, String> {
         let root = &advertisement.capabilities.workspace_root;
         Ok(Self {
-            class: advertisement.kind.as_ref().map(|kind| kind.class.into()),
+            class: advertisement.kind.as_ref().map(|kind| Class::new(kind.class)),
             implementation: advertisement.kind.as_ref().map(|kind| kind.implementation.clone()),
             readiness: (&advertisement.readiness).into(),
             workspace_root: root.to_str().ok_or_else(|| format!("workspace root {} is not UTF-8", root.display()))?.to_owned(),
