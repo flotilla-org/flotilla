@@ -248,7 +248,7 @@ impl VesselHandle for AgentVessel {
         self.agent.configure_environment(environment).await
     }
     async fn forward_daemon(&self, guest: &Path, host: &Path) -> Result<(), String> {
-        self.agent.add_guest_forward(DAEMON_FORWARD, guest, host).await
+        self.agent.add_outward_forward(DAEMON_FORWARD, guest, host).await
     }
     async fn close(&self) {
         self.agent.close().await;

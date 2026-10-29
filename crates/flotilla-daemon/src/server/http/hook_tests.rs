@@ -699,17 +699,16 @@ impl ForwardedVessel {
                 });
             }
         });
-        let (host, guest) = tokio::io::duplex(64 * 1024);
+        let (dialer, listener) = drydock_transport::memory();
         let executable = directory.path().join("agent");
         let agent = tokio::spawn(async move {
-            let transport = drydock_transport::Transport::yamux(Box::new(guest), false, Default::default()).await.expect("guest link");
-            let _ = drydock_agent::Agent::new(transport, "vessel agent".into(), executable).run().await;
+            let _ = drydock_agent::Agent::new(listener, "vessel agent".into(), executable).run().await;
         });
-        let link = drydock_transport::Transport::yamux(Box::new(host), true, Default::default()).await.expect("host link");
+        let link = dialer.connect().await.expect("agent link");
         let client = drydock_agent::Client::connect(link, "vessel agent").await.expect("agent hello");
         let tcp = std::net::TcpListener::bind("127.0.0.1:0").and_then(|probe| probe.local_addr()).expect("free port");
-        let forward = drydock_agent::GuestForward { id: "flotillad".into(), unix: directory.path().join("guest.sock"), tcp: Some(tcp) };
-        client.put_guest_forward(forward, drydock_agent::Endpoint::Unix(socket)).await.expect("guest forward");
+        let forward = drydock_agent::OutwardForward { id: "flotillad".into(), unix: directory.path().join("guest.sock"), tcp: Some(tcp) };
+        client.put_outward_forward(forward, drydock_agent::Endpoint::Unix(socket)).await.expect("guest forward");
         Self { tcp, seen, _client: client, tasks: vec![serving, agent], _directory: directory }
     }
 

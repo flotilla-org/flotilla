@@ -11,11 +11,11 @@ use std::{
 
 use async_trait::async_trait;
 use drydock_agent::{
-    ArtifactSource, Client, Configuration, Endpoint, Exec, ExecEvent, ExitStatus, Fetch, FileOptions, GuestForward, HostForward, Rename,
-    Unpack,
+    ArtifactSource, Client, Configuration, Endpoint, Exec, ExecEvent, ExitStatus, Fetch, FileOptions, InwardForward, OutwardForward,
+    Rename, Unpack,
 };
 use drydock_protocol::Platform;
-use drydock_transport::{Limits, Transport};
+use drydock_transport::ByteStream;
 use flotilla_provider_runtime::{ChannelLabel, CommandOutput, CommandRunner};
 use flotilla_resources::PinUnpack;
 use sha2::{Digest, Sha256};
@@ -68,7 +68,7 @@ impl AgentConnector for UnixAgentConnector {
         connect_current(
             || async {
                 let stream = UnixStream::connect(&self.socket).await?;
-                Transport::yamux(Box::new(stream), true, Limits::default()).await
+                Ok(Box::new(stream) as ByteStream)
             },
             &self.platform,
             executable,
@@ -131,7 +131,7 @@ fn is_transient(error: &io::Error) -> bool {
 pub async fn connect_current<F, Fut>(mut open: F, platform: &Platform, executable: &[u8], timeout: Duration) -> io::Result<Client>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = io::Result<Transport>>,
+    Fut: std::future::Future<Output = io::Result<ByteStream>>,
 {
     if executable.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "current agent executable is empty"));
@@ -181,17 +181,20 @@ struct Connection {
     targets: BTreeMap<String, PathBuf>,
     /// Each guest forward with the host endpoint it reaches, pushed again
     /// with the configuration to every new client or restarted agent.
-    guest_forwards: BTreeMap<String, (GuestForward, Endpoint)>,
+    outward_forwards: BTreeMap<String, (OutwardForward, Endpoint)>,
 }
 impl Connection {
     async fn push(&mut self, client: &Client) -> Result<(), String> {
         self.etag = Some(client.configure(self.configuration.clone()).await.map_err(|e| e.to_string())?);
-        for (forward, endpoint) in self.guest_forwards.values() {
-            client.put_guest_forward(forward.clone(), endpoint.clone()).await.map_err(|e| format!("guest forward {}: {e}", forward.id))?;
+        for (forward, endpoint) in self.outward_forwards.values() {
+            client
+                .put_outward_forward(forward.clone(), endpoint.clone())
+                .await
+                .map_err(|e| format!("guest forward {}: {e}", forward.id))?;
         }
         for (id, path) in &self.targets {
             client
-                .put_host_forward(HostForward { id: id.clone(), endpoint: Endpoint::Unix(path.clone()) })
+                .put_inward_forward(InwardForward { id: id.clone(), endpoint: Endpoint::Unix(path.clone()) })
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -355,7 +358,7 @@ impl AgentRunner {
                 configuration: Configuration::default(),
                 etag: None,
                 targets: BTreeMap::new(),
-                guest_forwards: BTreeMap::new(),
+                outward_forwards: BTreeMap::new(),
             }),
             forwards: Mutex::default(),
             host_directory,
@@ -443,23 +446,23 @@ impl AgentRunner {
     /// handle's own link, so the forward serves nothing while no controller
     /// is connected. It survives reconnects, and its endpoint stays claimed
     /// by this vessel alone.
-    pub async fn add_guest_forward(&self, id: &str, guest: &Path, host: &Path) -> Result<(), String> {
-        let forward = GuestForward { id: id.into(), unix: guest.into(), tcp: None };
-        self.put_guest_forward(forward, Endpoint::Unix(host.into())).await.map_err(|failure| failure.to_string())
+    pub async fn add_outward_forward(&self, id: &str, guest: &Path, host: &Path) -> Result<(), String> {
+        let forward = OutwardForward { id: id.into(), unix: guest.into(), tcp: None };
+        self.put_outward_forward(forward, Endpoint::Unix(host.into())).await.map_err(|failure| failure.to_string())
     }
 
     /// Register `forward` in the guest, reaching `host` on the controller, as
-    /// [`Self::add_guest_forward`] does for a Unix socket. The guest may also
+    /// [`Self::add_outward_forward`] does for a Unix socket. The guest may also
     /// listen on a loopback TCP address. A refusal, or no answer within the
     /// push timeout, is a failure naming the forward.
-    pub async fn put_guest_forward(&self, forward: GuestForward, host: Endpoint) -> Result<(), ForwardFailure> {
+    pub async fn put_outward_forward(&self, forward: OutwardForward, host: Endpoint) -> Result<(), ForwardFailure> {
         let failed = |reason: String| ForwardFailure { id: forward.id.clone(), guest: forward.unix.clone(), reason };
         if !forward.unix.is_absolute() {
             return Err(failed("guest forward path must be absolute".into()));
         }
         let client = self.client().await.map_err(failed)?;
         let mut state = self.state.lock().await;
-        match state.guest_forwards.get(&forward.id) {
+        match state.outward_forwards.get(&forward.id) {
             Some(existing) if *existing == (forward.clone(), host.clone()) => return Ok(()),
             Some(_) => return Err(failed("already serves another endpoint".into())),
             None => {}
@@ -467,27 +470,27 @@ impl AgentRunner {
         // The cached client may have been replaced while this call waited.
         let current = state.client.clone().unwrap_or(client);
         // A refused upsert releases its endpoint claim.
-        match tokio::time::timeout(PUSH_TIMEOUT, current.put_guest_forward(forward.clone(), host.clone())).await {
+        match tokio::time::timeout(PUSH_TIMEOUT, current.put_outward_forward(forward.clone(), host.clone())).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return Err(failed(error.to_string())),
             Err(_) => return Err(failed(format!("no answer within {PUSH_TIMEOUT:?}"))),
         }
-        state.guest_forwards.insert(forward.id.clone(), (forward, host));
+        state.outward_forwards.insert(forward.id.clone(), (forward, host));
         Ok(())
     }
 
-    pub async fn remove_guest_forward(&self, id: &str) -> Result<(), String> {
+    pub async fn remove_outward_forward(&self, id: &str) -> Result<(), String> {
         let client = self.client().await?;
         let mut state = self.state.lock().await;
-        if !state.guest_forwards.contains_key(id) {
+        if !state.outward_forwards.contains_key(id) {
             return Ok(());
         }
         let current = state.client.clone().unwrap_or(client);
-        match current.remove_guest_forward(id).await {
+        match current.remove_outward_forward(id).await {
             Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.to_string()),
             _ => {}
         }
-        state.guest_forwards.remove(id);
+        state.outward_forwards.remove(id);
         Ok(())
     }
 
@@ -737,8 +740,8 @@ impl VesselAgent for Arc<AgentRunner> {
     }
     async fn forward_controller_socket(&self, guest: &Path, tcp: Option<SocketAddr>, controller: &Path) -> Result<(), String> {
         let id = format!("socket-{}", &format!("{:x}", Sha256::digest(guest.as_os_str().as_encoded_bytes()))[..16]);
-        let forward = GuestForward { id, unix: guest.into(), tcp };
-        self.put_guest_forward(forward, Endpoint::Unix(controller.into())).await.map_err(|failure| failure.to_string())
+        let forward = OutwardForward { id, unix: guest.into(), tcp };
+        self.put_outward_forward(forward, Endpoint::Unix(controller.into())).await.map_err(|failure| failure.to_string())
     }
     async fn extend_environment(&self, environment: BTreeMap<String, String>) -> Result<(), String> {
         AgentRunner::extend_environment(self, environment).await
@@ -770,7 +773,10 @@ impl VesselAgent for Arc<AgentRunner> {
         let mut cleanup = SocketCleanup(Some(path.clone()));
         drydock_agent::socket::protect(&path).map_err(|e| e.to_string())?;
         let client = self.client().await?;
-        client.put_host_forward(HostForward { id: id.clone(), endpoint: Endpoint::Unix(guest.into()) }).await.map_err(|e| e.to_string())?;
+        client
+            .put_inward_forward(InwardForward { id: id.clone(), endpoint: Endpoint::Unix(guest.into()) })
+            .await
+            .map_err(|e| e.to_string())?;
         self.state.lock().await.targets.insert(id.clone(), guest.into());
         let weak = Arc::downgrade(self);
         let task = tokio::spawn(async move {
@@ -781,7 +787,7 @@ impl VesselAgent for Arc<AgentRunner> {
                 let id = id.clone();
                 tokio::spawn(async move {
                     if let Ok(client) = agent.client().await {
-                        if let Ok(mut stream) = client.forward(&id).await {
+                        if let Ok(mut stream) = client.open_inward(&id).await {
                             // EOF in either direction drops both streams, so cleat
                             // observes viewer loss and releases its controller seat.
                             let (mut vr, mut vw) = tokio::io::split(&mut viewer);

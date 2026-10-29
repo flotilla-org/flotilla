@@ -80,7 +80,6 @@ impl LocalAgents {
         let mut listener = Some(UnixListener::bind(&socket).expect("agent socket"));
         let installed = directory.join("drydock-agent");
         std::fs::write(&installed, BUILD).expect("agent executable");
-        let peer = directory.join("host.sock");
         let mut fingerprint = format!("{:x}", Sha256::digest(BUILD));
         if self.upgrade.is_some() {
             fingerprint = "older-build".into();
@@ -99,10 +98,7 @@ impl LocalAgents {
                             UnixListener::bind(&socket).expect("agent socket")
                         }
                     };
-                    let connections = drydock_transport::native::UnixConnections::new(listener, peer.clone());
-                    let transport =
-                        drydock_transport::Transport::native(Arc::new(connections), drydock_transport::Limits::default()).unwrap();
-                    let Ok(upgrade) = drydock_agent::Agent::new(transport, fingerprint.clone(), installed.clone()).run().await else {
+                    let Ok(upgrade) = drydock_agent::Agent::new(listener, fingerprint.clone(), installed.clone()).run().await else {
                         return;
                     };
                     fingerprint = format!("{:x}", Sha256::digest(std::fs::read(&upgrade).expect("upgrade image")));
@@ -200,7 +196,7 @@ impl AgentConnector for LocalConnector {
                     Some(gate) => Box::new(Gated { stream, gate: Arc::clone(gate) }),
                     None => Box::new(stream),
                 };
-                drydock_transport::Transport::yamux(stream, true, drydock_transport::Limits::default()).await
+                Ok(stream)
             },
             &drydock_protocol::Platform::current(),
             &self.build,
@@ -364,15 +360,19 @@ async fn shell(access: &VesselAccess, script: &str) -> String {
 }
 
 /// A crew's request through its vessel's daemon forward, and the reply. A
-/// forward that nothing serves refuses, breaks or closes: no reply.
+/// forward that nothing serves refuses, breaks or closes: no reply. A vessel
+/// agent that outlives its controller holds the connection unclaimed until its
+/// claim deadline, which is no reply either.
 async fn crew_request(access: &VesselAccess, byte: u8) -> Vec<u8> {
     let Ok(mut crew) = UnixStream::connect(access.paths.daemon_socket()).await else { return Vec::new() };
     if crew.write_all(&[byte]).await.is_err() {
         return Vec::new();
     }
     let mut reply = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), crew.read_to_end(&mut reply)).await.expect("reply").ok();
-    reply
+    match tokio::time::timeout(Duration::from_secs(5), crew.read_to_end(&mut reply)).await {
+        Ok(_) => reply,
+        Err(_) => Vec::new(),
+    }
 }
 
 // #3792 acceptance: two vessels on one host each get their own agent and

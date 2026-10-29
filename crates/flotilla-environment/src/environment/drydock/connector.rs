@@ -4,7 +4,7 @@
 use super::*;
 use crate::environment::agent::{connect_current, AgentConnector};
 use drydock_agent::Client;
-use drydock_transport::{ByteStream, Connections, Limits, Transport};
+use drydock_transport::ByteStream;
 use flotilla_protocol::provider::AgentConnectionReport;
 
 /// What the adapter reports for the agent's latest connection.
@@ -28,13 +28,11 @@ impl AgentConnector for DrydockAgentConnector {
     async fn connect(&self) -> Result<Client, String> {
         let build = agent_build(&self.executable, &self.platform).await?;
         let (local, error) = self.exposures.inward("agent", wire::InwardTarget::Unix(exposures::unix(&self.socket))).await?;
-        // Each stream is its own connection to the agent: a multiplexed session
-        // would become the agent's preferred link for its own streams, which
-        // carry drydock's outward exposures.
+        // Each attempt is its own connection to the agent's socket.
         let connected = connect_current(
             || {
                 let local = local.clone();
-                async move { Transport::native(Arc::new(Streams(local)), Limits::default()) }
+                async move { Ok(Box::new(tokio::net::UnixStream::connect(&local).await?) as ByteStream) }
             },
             &self.platform,
             build,
@@ -53,19 +51,6 @@ impl AgentConnector for DrydockAgentConnector {
             mode: EXPOSURE_MODE.into(),
         });
         Ok(connected)
-    }
-}
-
-/// Opens each stream to the agent as a connection to the exposure's local
-/// socket. The agent never opens one this way, so nothing is accepted.
-struct Streams(PathBuf);
-#[async_trait]
-impl Connections for Streams {
-    async fn connect(&self) -> std::io::Result<ByteStream> {
-        Ok(Box::new(tokio::net::UnixStream::connect(&self.0).await?))
-    }
-    async fn accept(&self) -> std::io::Result<ByteStream> {
-        std::future::pending().await
     }
 }
 
