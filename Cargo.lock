@@ -907,7 +907,7 @@ dependencies = [
 [[package]]
 name = "drydock"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=7545cea752a19ff265993bf952d15b95bd57f998#7545cea752a19ff265993bf952d15b95bd57f998"
+source = "git+https://github.com/flotilla-org/drydock?rev=eaa572c35529429be03aec685394aa34e88ea1cb#eaa572c35529429be03aec685394aa34e88ea1cb"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -946,7 +946,7 @@ dependencies = [
 [[package]]
 name = "drydock-agent"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=7545cea752a19ff265993bf952d15b95bd57f998#7545cea752a19ff265993bf952d15b95bd57f998"
+source = "git+https://github.com/flotilla-org/drydock?rev=eaa572c35529429be03aec685394aa34e88ea1cb#eaa572c35529429be03aec685394aa34e88ea1cb"
 dependencies = [
  "axum",
  "bytes",
@@ -979,7 +979,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tokio-vsock",
- "tower-http",
+ "tower-http 0.6.8",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -989,36 +989,43 @@ dependencies = [
 [[package]]
 name = "drydock-client"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=7545cea752a19ff265993bf952d15b95bd57f998#7545cea752a19ff265993bf952d15b95bd57f998"
+source = "git+https://github.com/flotilla-org/drydock?rev=eaa572c35529429be03aec685394aa34e88ea1cb#eaa572c35529429be03aec685394aa34e88ea1cb"
 dependencies = [
  "async-stream",
  "async-trait",
+ "axum",
  "bytes",
  "drydock-protocol",
  "drydock-provider",
  "futures",
  "http",
+ "json-patch",
  "reqwest 0.13.2",
  "rigging-http-client",
  "rigging-stream",
  "rigging-tls",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "thiserror 2.0.18",
  "tokio",
+ "tower-http 0.7.1",
+ "tracing",
+ "utoipa",
+ "utoipa-axum",
 ]
 
 [[package]]
 name = "drydock-host"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=7545cea752a19ff265993bf952d15b95bd57f998#7545cea752a19ff265993bf952d15b95bd57f998"
+source = "git+https://github.com/flotilla-org/drydock?rev=eaa572c35529429be03aec685394aa34e88ea1cb#eaa572c35529429be03aec685394aa34e88ea1cb"
 dependencies = [
- "async-stream",
  "async-trait",
  "axum",
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "drydock-client",
  "drydock-protocol",
  "drydock-provider",
  "futures",
@@ -1039,7 +1046,7 @@ dependencies = [
 [[package]]
 name = "drydock-protocol"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=7545cea752a19ff265993bf952d15b95bd57f998#7545cea752a19ff265993bf952d15b95bd57f998"
+source = "git+https://github.com/flotilla-org/drydock?rev=eaa572c35529429be03aec685394aa34e88ea1cb#eaa572c35529429be03aec685394aa34e88ea1cb"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -1053,11 +1060,10 @@ dependencies = [
 [[package]]
 name = "drydock-provider"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=7545cea752a19ff265993bf952d15b95bd57f998#7545cea752a19ff265993bf952d15b95bd57f998"
+source = "git+https://github.com/flotilla-org/drydock?rev=eaa572c35529429be03aec685394aa34e88ea1cb#eaa572c35529429be03aec685394aa34e88ea1cb"
 dependencies = [
  "async-trait",
  "axum",
- "chrono",
  "drydock-protocol",
  "hyper",
  "hyper-util",
@@ -1073,7 +1079,7 @@ dependencies = [
 [[package]]
 name = "drydock-transport"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=7545cea752a19ff265993bf952d15b95bd57f998#7545cea752a19ff265993bf952d15b95bd57f998"
+source = "git+https://github.com/flotilla-org/drydock?rev=eaa572c35529429be03aec685394aa34e88ea1cb#eaa572c35529429be03aec685394aa34e88ea1cb"
 dependencies = [
  "async-trait",
  "axum",
@@ -1622,7 +1628,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tower",
- "tower-http",
+ "tower-http 0.6.8",
  "tracing",
  "tracing-core",
  "zeroize",
@@ -4672,6 +4678,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "json-patch"
+version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7421438de105a0827e44fadd05377727847d717c80ce29a229f85fd04c427b72"
+dependencies = [
+ "jsonptr",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "jsonptr"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5a3cc660ba5d72bce0b3bb295bf20847ccbb40fd423f3f05b61273672e561fe"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "jsonwebtoken"
 version = "11.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5313,6 +5341,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
 name = "pem"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5938,7 +5972,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tower",
- "tower-http",
+ "tower-http 0.6.8",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -5982,7 +6016,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tower",
- "tower-http",
+ "tower-http 0.6.8",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -7239,6 +7273,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tower-http"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08a05a66a4fdd61cbbe0a1d755ffe0ca6aba159dd4820936a0ff8a8278245b9c"
+dependencies = [
+ "bitflags 2.11.0",
+ "bytes",
+ "http",
+ "percent-encoding",
+ "pin-project-lite",
+ "tower-layer",
+ "tower-service",
+]
+
+[[package]]
 name = "tower-layer"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7504,6 +7553,19 @@ dependencies = [
  "serde",
  "serde_json",
  "utoipa-gen",
+]
+
+[[package]]
+name = "utoipa-axum"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c25bae5bccc842449ec0c5ddc5cbb6a3a1eaeac4503895dc105a1138f8234a0"
+dependencies = [
+ "axum",
+ "paste",
+ "tower-layer",
+ "tower-service",
+ "utoipa",
 ]
 
 [[package]]

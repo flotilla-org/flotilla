@@ -1432,14 +1432,12 @@ mod test_git_repo;
 #[cfg(test)]
 mod tests;
 
-/// Optional provider-only Drydock configuration. Supervision remains at the
-/// composition root; the adapter sees only ProviderApi and host readiness.
+/// Optional provider-only Drydock configuration, served by drydock's daemon
+/// embedded here: it supervises the hosts and keeps each vessel's key and
+/// exposures under the state directory, across restarts. The adapter sees only
+/// ProviderApi.
 #[cfg(unix)]
-async fn compose_drydock(
-    config: &ConfigStore,
-    registry: &mut ProviderRegistry,
-    env: &dyn flotilla_provider_runtime::EnvVars,
-) -> Result<(), String> {
+async fn compose_drydock(config: &ConfigStore, registry: &mut ProviderRegistry) -> Result<(), String> {
     use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
     use flotilla_environment::environment::{drydock::DrydockEnvironmentProvider, EnvironmentProvider};
     let path = config.base_path().as_path().join("drydock.toml");
@@ -1450,61 +1448,35 @@ async fn compose_drydock(
     };
     let (provider_text, lab_reach) = flotilla_config::drydock::split_configuration(&text)?;
     let configuration = drydock::config::Config::parse(&provider_text)?;
-    if configuration.provider.is_empty() {
+    if configuration.providers.is_empty() {
         return Ok(());
     }
-    let mut providers = Vec::new();
-    let mut credentials = std::collections::BTreeMap::new();
-    let mut modules = std::collections::BTreeMap::new();
-    for (name, provider) in &configuration.provider {
-        modules.insert(
-            provider.module.clone(),
-            drydock_protocol::ModuleConfiguration { name: provider.module.clone(), entrypoint: provider.module.clone() },
-        );
-        credentials.insert(name.clone(), provider.credential.reference(env)?);
-        providers.push(drydock_protocol::ProviderConfiguration {
-            name: name.clone(),
-            module: provider.module.clone(),
-            settings: provider.settings.clone(),
-            credential: drydock_protocol::CredentialMode::Direct { credential_reference: name.clone() },
-        });
-    }
-    let binary = drydock::local::companion("drydock-host", "DRYDOCK_HOST_BIN").unwrap_or_else(|_| PathBuf::from("drydock-host"));
-    let supervisor = drydock::Supervisor::new(
-        config.state_dir().as_path().join("drydock-hosts"),
-        Arc::new(drydock::credentials::BuiltinCredentials::default()),
-    );
-    let host = Arc::new(
-        supervisor
-            .start(drydock::HostSpec {
-                name: "rust".into(),
-                connection: drydock::HostConnection::Managed {
-                    command: vec![binary.to_string_lossy().into_owned()],
-                    runtime: None,
-                    proxy_environment: Default::default(),
-                },
-                configuration: drydock_protocol::HostConfiguration { modules: modules.into_values().collect(), providers },
-                credentials,
-            })
-            .await
-            .map_err(|error| error.to_string())?,
-    );
-    for (name, provider) in configuration.provider {
+    let instances: Vec<(String, String)> = configuration.providers.iter().map(|(name, p)| (name.clone(), p.module.clone())).collect();
+    // A missing bundled host leaves its providers advertised as missing-tool.
+    let hosts = drydock::daemon::HostOption::installed().await.unwrap_or_else(|error| {
+        warn!(%error, "drydock's bundled host is not installed; its providers stay missing-tool unless drydock-host is on PATH");
+        vec![drydock::daemon::HostOption {
+            name: "rust".into(),
+            optional: true,
+            connection: drydock::HostConnection::Managed { command: vec!["drydock-host".into()], runtime: None },
+        }]
+    });
+    let state = config.state_dir().as_path().to_path_buf();
+    let run = drydock_run_directory(&state);
+    let seams = drydock::daemon::Seams {
+        builds: Arc::new(InstalledAgentBuilds),
+        ..drydock::daemon::Seams::new(Arc::new(drydock::launch::RegistryResolver::new().map_err(|error| error.to_string())?))
+    };
+    // Keys and exposure records are durable state; the run directory holds
+    // only sockets, which drydock makes again when it starts.
+    let daemon = drydock::daemon::Daemon::start_with_seams(configuration, &run, state.join("drydock").join("keys"), hosts, seams).await?;
+    for (name, module) in instances {
         if registry.environment_providers.contains_key(&name) {
             return Err(format!("duplicate environment provider instance {name}"));
         }
-        // Drydock's configuration owns how its vessels' agents are reached.
-        let reach = drydock::agent::AgentReach::new(provider.agent_link);
         let adapter: Arc<dyn EnvironmentProvider> = Arc::new(
-            DrydockEnvironmentProvider::new(
-                Arc::new(host.client.clone()),
-                name.clone(),
-                provider.module,
-                config.state_dir().as_path().join("drydock-keys"),
-            )
-            .with_agent_reach(reach)
-            .with_host(host.clone())
-            .with_lab_reach(lab_reach.get(&name).map(|reach| (reach.hostname.clone(), reach.port))),
+            DrydockEnvironmentProvider::new(daemon.clone(), name.clone(), module)
+                .with_lab_reach(lab_reach.get(&name).map(|reach| (reach.hostname.clone(), reach.port))),
         );
         adapter.detect_readiness().await;
         registry.environment_providers.insert(
@@ -1514,4 +1486,26 @@ async fn compose_drydock(
         );
     }
     Ok(())
+}
+
+/// Where drydock's sockets live: the exposures' local ends and its hosts'.
+/// Short and fixed below `/tmp`, as `sun_path` allows 104 bytes on macOS
+/// whatever the state directory, and one per state directory.
+#[cfg(unix)]
+fn drydock_run_directory(state: &std::path::Path) -> PathBuf {
+    use sha2::Digest;
+    let digest = format!("{:x}", sha2::Sha256::digest(state.as_os_str().as_encoded_bytes()));
+    PathBuf::from(format!("/tmp/flotilla-drydock-{}", &digest[..16]))
+}
+
+/// The installed generation's agent companion: the build the adapter pushes
+/// too, so drydock and flotilla never upgrade a vessel's agent past each other.
+#[cfg(unix)]
+struct InstalledAgentBuilds;
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl drydock::daemon::AgentBuilds for InstalledAgentBuilds {
+    async fn build(&self, platform: &drydock_protocol::Platform) -> Result<Vec<u8>, String> {
+        flotilla_environment::environment::drydock::installed_agent_build(platform).await
+    }
 }

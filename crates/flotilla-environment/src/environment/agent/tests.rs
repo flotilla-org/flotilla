@@ -540,11 +540,10 @@ async fn missing_hello_is_bounded() {
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
 }
 
-// An agent that refuses the upgrade upload (an upload of this digest is already
-// in progress) refuses it on every attempt. Connect fails at once with that
-// refusal, having opened one transport for the hello and none to retry.
+// An upgrade upload an earlier attempt left partial is resumed (drydock#124),
+// not refused: the next connect completes the upgrade promptly.
 #[tokio::test]
-async fn conflicting_upgrade_upload_fails_promptly_with_the_refusal() {
+async fn a_partial_upgrade_upload_is_resumed() {
     let agent = MemoryAgent::new(true);
     let executable = agent.current.clone();
     let digest = format!("{:x}", Sha256::digest(&executable));
@@ -552,24 +551,10 @@ async fn conflicting_upgrade_upload_fails_promptly_with_the_refusal() {
     first.create_upload(&digest, Some(executable.len() as u64), tokio::io::empty(), false).await.unwrap();
     drop(first);
 
-    let opens = AtomicUsize::new(0);
     let started = std::time::Instant::now();
-    let error = connect_current(
-        || {
-            opens.fetch_add(1, Ordering::SeqCst);
-            agent.open()
-        },
-        &Platform::current(),
-        &executable,
-        Duration::from_secs(30),
-    )
-    .await
-    .err()
-    .expect("conflict");
+    let client = connect_current(|| agent.open(), &Platform::current(), &executable, Duration::from_secs(30)).await.expect("resumed");
     assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
-    assert_eq!(drydock_agent::AgentError::of(&error).map(|e| e.kind), Some(drydock_agent::ErrorKind::Conflict), "{error}");
-    assert!(error.to_string().contains("resume it"), "{error}");
-    assert_eq!(opens.load(Ordering::SeqCst), 1);
+    assert!(!client.hello().boot_id.is_empty());
 }
 
 // Transient failures are retried with growing pauses, and the deadline reports

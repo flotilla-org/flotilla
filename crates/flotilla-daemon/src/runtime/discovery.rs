@@ -462,7 +462,7 @@ pub(super) async fn probe_local_provider_registry(
         .unwrap_or_else(|| ExecutionEnvironmentPath::new("/"));
     let mut registry = daemon.discovery_runtime().factories.probe_all(&local_bag, config, &probe_root, runner).await;
     #[cfg(unix)]
-    super::compose_drydock(config, &mut registry, daemon.discovery_runtime().env.as_ref()).await?;
+    super::compose_drydock(config, &mut registry).await?;
     Ok(Arc::new(registry))
 }
 

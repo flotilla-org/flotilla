@@ -29,6 +29,14 @@ pub fn split_configuration(text: &str) -> Result<(String, BTreeMap<String, LabRe
     }
     let integration = toml::from_str::<Settings>(text).map_err(|error| format!("invalid Flotilla Drydock settings: {error}"))?.flotilla;
     document.remove("flotilla");
+    // Drydock's table was `provider` before its configuration document became
+    // `providers` (drydock#129). Accept the old name for one roll; remove after it.
+    if let Some(providers) = document.remove("provider") {
+        if document.contains_key("providers") {
+            return Err("drydock configuration names both `provider` and `providers`".into());
+        }
+        document.insert("providers".into(), providers);
+    }
     let mut reach = BTreeMap::new();
     for (name, provider) in integration.provider {
         if let Some(lab) = provider.lab_reach {
@@ -44,6 +52,7 @@ pub fn split_configuration(text: &str) -> Result<(String, BTreeMap<String, LabRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hegel::generators as gs;
     #[test]
     fn errors_preserve_source_location() {
         for text in ["[provider\n", "[flotilla.provider.daytona.lab_reach]\nhostname='host'\nport='wrong'\n"] {
@@ -54,17 +63,19 @@ mod tests {
 
     // #3765 B2: controller reach is host-local and never becomes provider or
     // guest settings. Generated ports cover invalid zero and the valid range.
+    // The provider table's earlier name is read as drydock's current one.
     #[hegel::test]
     fn lab_reach_is_split_from_provider_settings(tc: hegel::TestCase) {
         let port = tc.draw(hegel::generators::integers::<u16>());
-        let text = format!("[provider.daytona]\nmodule='daytona'\n[flotilla.provider.daytona.lab_reach]\nhostname='forgejo.lab.flotilla.work'\nport={port}\n");
+        let table = tc.draw(gs::sampled_from(vec!["provider", "providers"]));
+        let text = format!("[{table}.daytona]\nmodule='daytona'\n[flotilla.provider.daytona.lab_reach]\nhostname='forgejo.lab.flotilla.work'\nport={port}\n");
         let result = split_configuration(&text);
         if port == 0 {
             assert!(result.is_err());
         } else {
             let (provider, reach) = result.unwrap();
             assert!(!provider.contains("flotilla"));
-            assert!(provider.contains("daytona"));
+            assert!(provider.contains("[providers.daytona]"), "{provider}");
             assert_eq!(reach["daytona"].port, port);
         }
     }

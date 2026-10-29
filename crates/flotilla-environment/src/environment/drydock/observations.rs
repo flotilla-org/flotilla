@@ -38,8 +38,10 @@ impl Hub {
                             wire::ObserveRecord::Event { event } => {
                                 cursor = Some(event.cursor);
                                 if event.provider == provider {
-                                    if let Some(state) = states.get(&event.id).and_then(std::sync::Weak::upgrade) {
-                                        *state.write().expect("observation lock") = Some(event_observation(event.event));
+                                    if let (Some(state), Some(observed)) =
+                                        (states.get(&event.id).and_then(std::sync::Weak::upgrade), event_observation(event.event))
+                                    {
+                                        *state.write().expect("observation lock") = Some(observed);
                                     }
                                 }
                             }
@@ -88,15 +90,17 @@ fn snapshot_state(
             .unwrap_or(ObservationState::Gone { cause: GoneCause::MissingOnList }),
     )
 }
-fn event_observation(event: wire::EventKind) -> ObservationState {
-    match event {
+/// The vessel's state an event reports; an exposure's event reports none.
+fn event_observation(event: wire::EventKind) -> Option<ObservationState> {
+    Some(match event {
         wire::EventKind::Running { .. } | wire::EventKind::Resumed => ObservationState::Running,
         wire::EventKind::Stopped { cause } | wire::EventKind::Paused { cause } => observation(wire::Observation::Stopped { cause }),
         wire::EventKind::Gone { cause } => observation(wire::Observation::Gone { cause }),
         wire::EventKind::Created => ObservationState::Unknown {
             reason: UnknownReason::ProviderApiError { message: "environment created; awaiting running".into() },
         },
-    }
+        wire::EventKind::Exposure { .. } => return None,
+    })
 }
 
 #[cfg(test)]
@@ -111,6 +115,18 @@ mod tests {
     impl ProviderApi for Api {
         async fn hello(&self) -> Result<wire::Hello, Error> {
             Err(unused())
+        }
+        async fn configure(&self, _: ::drydock::api::ConfigUpdate) -> Result<(), Error> {
+            Err(unused())
+        }
+        async fn providers(&self) -> Result<Vec<wire::ProviderDeclaration>, Error> {
+            Err(unused())
+        }
+        async fn provider(&self, _: &str) -> Result<wire::ProviderDeclaration, Error> {
+            Err(unused())
+        }
+        fn with_credential(&self, _: wire::Secret) -> Arc<dyn ProviderApi> {
+            unreachable!("only observation is served")
         }
         async fn observe(&self, since: Option<&str>) -> Result<::drydock::api::ObservationStream, Error> {
             self.cursors.lock().unwrap().push(since.map(str::to_owned));
