@@ -444,3 +444,16 @@ impl EnvironmentToolFactory for GenerationCli {
             .with_environment(EnvironmentVariableUpdate::set(DAEMON_SOCKET_ENV, "/run/flotilla-daemon/flotilla.sock", "the daemon socket")))
     }
 }
+
+// Review of #4119: drydock's sockets, the longest an exposure's local end
+// (`exposures/<16>/<22-byte name>.sock`), fit macOS's 104-byte `sun_path`
+// whatever the state directory, and each state directory gets its own.
+#[hegel::test]
+fn drydock_sockets_fit_sun_path_for_any_state_directory(tc: hegel::TestCase) {
+    let depth = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(40));
+    let state = PathBuf::from("/Users").join("a-long-home-directory-name".repeat(depth)).join(".local/state/flotilla");
+    let run = super::super::drydock_run_directory(&state);
+    let longest = run.join("exposures").join("0123456789abcdef").join(format!("cleat-{}.sock", "f".repeat(16)));
+    assert!(longest.as_os_str().len() < 104, "{}", longest.display());
+    assert_ne!(run, super::super::drydock_run_directory(&state.join("other")));
+}

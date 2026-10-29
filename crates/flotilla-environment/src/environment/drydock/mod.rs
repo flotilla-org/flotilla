@@ -133,7 +133,7 @@ impl DrydockEnvironmentProvider {
                 report: report.clone(),
             };
             // Attach sockets are drydock's exposures, never this runner's forwards.
-            Arc::new(AgentRunner::new(Arc::new(connector), PathBuf::new()))
+            Arc::new(AgentRunner::without_attach_forwards(Arc::new(connector)))
         });
         Ok(Arc::new(DrydockEnvironment {
             api: self.api.clone(),

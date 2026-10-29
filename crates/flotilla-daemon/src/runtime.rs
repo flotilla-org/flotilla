@@ -1445,19 +1445,23 @@ async fn compose_drydock(config: &ConfigStore, registry: &mut ProviderRegistry) 
     }
     let instances: Vec<(String, String)> = configuration.providers.iter().map(|(name, p)| (name.clone(), p.module.clone())).collect();
     // A missing bundled host leaves its providers advertised as missing-tool.
-    let hosts = drydock::daemon::HostOption::installed().await.unwrap_or_else(|_| {
+    let hosts = drydock::daemon::HostOption::installed().await.unwrap_or_else(|error| {
+        warn!(%error, "drydock's bundled host is not installed; its providers stay missing-tool unless drydock-host is on PATH");
         vec![drydock::daemon::HostOption {
             name: "rust".into(),
             optional: true,
             connection: drydock::HostConnection::Managed { command: vec!["drydock-host".into()], runtime: None },
         }]
     });
-    let run = config.state_dir().as_path().join("drydock");
+    let state = config.state_dir().as_path().to_path_buf();
+    let run = drydock_run_directory(&state);
     let seams = drydock::daemon::Seams {
         builds: Arc::new(InstalledAgentBuilds),
         ..drydock::daemon::Seams::new(Arc::new(drydock::launch::RegistryResolver::new().map_err(|error| error.to_string())?))
     };
-    let daemon = drydock::daemon::Daemon::start_with_seams(configuration, &run, run.join("keys"), hosts, seams).await?;
+    // Keys and exposure records are durable state; the run directory holds
+    // only sockets, which drydock makes again when it starts.
+    let daemon = drydock::daemon::Daemon::start_with_seams(configuration, &run, state.join("drydock").join("keys"), hosts, seams).await?;
     for (name, module) in instances {
         if registry.environment_providers.contains_key(&name) {
             return Err(format!("duplicate environment provider instance {name}"));
@@ -1474,6 +1478,16 @@ async fn compose_drydock(config: &ConfigStore, registry: &mut ProviderRegistry) 
         );
     }
     Ok(())
+}
+
+/// Where drydock's sockets live: the exposures' local ends and its hosts'.
+/// Short and fixed below `/tmp`, as `sun_path` allows 104 bytes on macOS
+/// whatever the state directory, and one per state directory.
+#[cfg(unix)]
+fn drydock_run_directory(state: &std::path::Path) -> PathBuf {
+    use sha2::Digest;
+    let digest = format!("{:x}", sha2::Sha256::digest(state.as_os_str().as_encoded_bytes()));
+    PathBuf::from(format!("/tmp/flotilla-drydock-{}", &digest[..12]))
 }
 
 /// The installed generation's agent companion: the build the adapter pushes

@@ -365,6 +365,12 @@ impl AgentRunner {
         }
     }
 
+    /// A runner whose vessel's sockets are carried by something else, as a
+    /// drydock vessel's exposures are: it makes no attach forwards of its own.
+    pub fn without_attach_forwards(connector: Arc<dyn AgentConnector>) -> Self {
+        Self::new(connector, PathBuf::new())
+    }
+
     pub fn with_writable_bases(mut self, bases: WritableBases) -> Self {
         self.bases = bases;
         self
