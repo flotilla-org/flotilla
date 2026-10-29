@@ -47,6 +47,7 @@ impl PeerConnection {
         node_id: NodeId,
         display_name: String,
         session_id: uuid::Uuid,
+        primitives: bool,
     ) {
         if protocol_version != PROTOCOL_VERSION {
             warn!(
@@ -58,6 +59,8 @@ impl PeerConnection {
             return;
         }
 
+        let local_primitives = self.daemon.primitives_switch();
+        let mismatch = flotilla_protocol::primitives_mismatch(&display_name, primitives, local_primitives);
         if session
             .write(Message::Hello {
                 protocol_version: PROTOCOL_VERSION,
@@ -67,10 +70,19 @@ impl PeerConnection {
                 connection_role: None,
                 surface: None,
                 crew_claims: Default::default(),
+                primitives: local_primitives,
             })
             .await
             .is_err()
         {
+            return;
+        }
+
+        if let Some(reason) = mismatch {
+            warn!(peer = %node_id, %reason, "refusing peer");
+            self.daemon
+                .publish_peer_connection_status(&NodeInfo::new(node_id, display_name), PeerConnectionState::Rejected { reason })
+                .await;
             return;
         }
 

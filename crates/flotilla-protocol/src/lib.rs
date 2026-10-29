@@ -628,6 +628,17 @@ pub fn crew_claims_from(lookup: impl Fn(&str) -> Option<String>) -> std::collect
         .collect()
 }
 
+/// The refusal reason when two peers disagree on `[primitives]`.
+pub fn primitives_mismatch(peer: &str, peer_on: bool, local_on: bool) -> Option<String> {
+    let word = |on: bool| if on { "on" } else { "off" };
+    (peer_on != local_on).then(|| format!("peer {peer} has [primitives] {}, this host has it {}", word(peer_on), word(local_on)))
+}
+
+/// Whether a dial error is a [`primitives_mismatch`] refusal.
+pub fn is_primitives_mismatch(error: &str) -> bool {
+    error.starts_with("peer ") && error.contains(" has [primitives] ")
+}
+
 /// Top-level message envelope for the JSON protocol.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -656,6 +667,9 @@ pub enum Message {
         /// already placed in the socket's Environment; other sockets ignore them.
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         crew_claims: std::collections::BTreeMap<String, String>,
+        /// Whether the sender runs with `[primitives]` on; peers refuse a mismatch.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        primitives: bool,
     },
     #[serde(rename = "peer")]
     Peer(Box<PeerWireMessage>),

@@ -91,7 +91,12 @@ async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat
         Some(SubCommand::Logs(LogsArgs { host, since, level, target })) => run_logs(&cli, host.as_deref(), since, level, target).await,
         Some(SubCommand::Fleet { command: None }) => run_fleet_health(&cli, format).await,
         Some(SubCommand::Fleet { command: Some(FleetSubCommand::Check) }) => {
-            flotilla_projections::fleet_health::check(query_installer_health(&cli).await).map_err(|error| color_eyre::eyre::eyre!(error))
+            let refused = flotilla_projections::fleet_health::check(query_installer_health(&cli).await)
+                .map_err(|error| color_eyre::eyre::eyre!(error))?;
+            for line in refused {
+                eprintln!("{line}");
+            }
+            Ok(())
         }
         Some(SubCommand::Fleet { command: Some(FleetSubCommand::Spread) }) => {
             let result = query_installer_health(&cli).await;

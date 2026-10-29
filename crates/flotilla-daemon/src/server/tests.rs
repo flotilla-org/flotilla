@@ -734,6 +734,7 @@ fn current_client_hello() -> Message {
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
         crew_claims: Default::default(),
+        primitives: false,
     }
 }
 
@@ -3886,6 +3887,7 @@ async fn handle_client_forwards_peer_link_state_and_registers_peer() {
         connection_role: None,
         surface: None,
         crew_claims: Default::default(),
+        primitives: false,
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
 
@@ -3956,6 +3958,7 @@ async fn silent_peer_session_is_reaped_at_idle_deadline() {
         connection_role: None,
         surface: None,
         crew_claims: Default::default(),
+        primitives: false,
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write peer hello");
     assert!(matches!(
@@ -4430,6 +4433,7 @@ async fn assert_client_hello_rejected(protocol_version: u32, display_name: Strin
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
         crew_claims: Default::default(),
+        primitives: false,
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
 
@@ -4473,6 +4477,7 @@ async fn wire_generation_mismatched_client_can_request_shutdown() {
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
         crew_claims: Default::default(),
+        primitives: false,
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write client hello");
     let hello = reader.next_line().await.expect("read hello").expect("hello payload");
@@ -4506,6 +4511,7 @@ async fn wire_generation_mismatched_client_cannot_request_rich_rpc() {
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
         crew_claims: Default::default(),
+        primitives: false,
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write client hello");
     let _hello = reader.next_line().await.expect("read hello").expect("hello payload");
@@ -4997,6 +5003,7 @@ async fn handle_client_relays_outbound_peer_messages() {
         connection_role: None,
         surface: None,
         crew_claims: Default::default(),
+        primitives: false,
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
     let _ = reader.next_line().await.expect("read hello").expect("line");
@@ -5117,6 +5124,7 @@ async fn duplicate_inbound_peer_receives_goodbye_on_rejection() {
             connection_role: None,
             surface: None,
             crew_claims: Default::default(),
+            primitives: false,
         };
         flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
 
@@ -5849,6 +5857,7 @@ pub(super) async fn place_crew(daemon: &InProcessDaemon, environment: &str, plac
         .expect("crew identity");
 }
 
+mod primitives_peering;
 mod ssh_host_forward;
 
 // #3270: the transport's environment constrains every request, independently of

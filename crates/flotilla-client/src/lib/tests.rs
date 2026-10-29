@@ -25,6 +25,7 @@ async fn hello_result(
                 connection_role: Some(ConnectionRole::Client),
                 surface: None,
                 crew_claims: Default::default(),
+                primitives: false,
             })
             .await
             .expect("write daemon hello");

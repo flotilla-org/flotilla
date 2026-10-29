@@ -764,6 +764,8 @@ pub struct InProcessDaemon {
     convoy_ensure_reconciler: RwLock<Option<Arc<dyn ConvoyEnsureReconciler>>>,
     crew: Arc<CrewService>,
     leaf_subscription_diagnostics: projection_ports::LeafSubscriptionDiagnostics,
+    /// Whether `[primitives]` is on, as peers compare it at their handshake.
+    primitives_switch: std::sync::atomic::AtomicBool,
     /// The `[primitives]` Message path, installed once at composition.
     message_path: crate::primitives::MessagePath,
     /// The same path, as crew code reaches it: through its EngineMessages port.
@@ -1372,6 +1374,7 @@ impl InProcessDaemon {
             crew: Arc::clone(&crew),
             leaf_subscription_diagnostics: projection_ports::LeafSubscriptionDiagnostics(leaf_subscriptions),
             message_receivers: projection_ports::MessageReceivers(Arc::clone(&message_path)),
+            primitives_switch: std::sync::atomic::AtomicBool::new(false),
             message_path,
             crew_message_path,
             convoy_engine_path,
@@ -2280,6 +2283,14 @@ impl InProcessDaemon {
     /// The `[primitives]` Convoy path: empty until the switch's primitives are installed.
     pub fn convoy_engine_path(&self) -> flotilla_resources::convoy::engine::EngineConvoyPath {
         Arc::clone(&self.convoy_engine_path)
+    }
+
+    pub fn set_primitives_switch(&self, on: bool) {
+        self.primitives_switch.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn primitives_switch(&self) -> bool {
+        self.primitives_switch.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The `[primitives]` Message path, when the switch is on.

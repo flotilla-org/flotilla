@@ -314,8 +314,15 @@ impl PeerManager {
                 PeerReconnectStatus { attempt: backoff.attempt, next_dial_in_seconds }
             });
             let connected = self.transport_peers.contains_key(label);
+            let refusal = self
+                .peer_dial_status
+                .get(label)
+                .and_then(|status| status.last_error.clone())
+                .filter(|error| flotilla_protocol::is_primitives_mismatch(error));
             let connection_status = if connected {
                 PeerConnectionState::Connected
+            } else if let Some(reason) = refusal {
+                PeerConnectionState::Rejected { reason }
             } else if reconnect.is_some() {
                 PeerConnectionState::Reconnecting
             } else {
