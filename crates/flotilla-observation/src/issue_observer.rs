@@ -156,15 +156,18 @@ impl IssueRefresher {
         let namespaces = self.inner.backend.local_namespaces::<Issue>().await.map_err(|error| error.to_string())?;
         for namespace in namespaces {
             let records = self.inner.backend.using::<Issue>(&namespace);
-            let demanded: std::collections::HashSet<String> = self.inner.active.lock().await.keys().map(IssueKey::record_name).collect();
             for record in records.list().await.map_err(|error| error.to_string())?.items {
-                if demanded.contains(&record.metadata.name) {
+                // Demand is admitted under this lock before its record is written, so holding it
+                // across the delete keeps a newly demanded issue's record.
+                let active = self.inner.active.lock().await;
+                if active.keys().any(|subject| subject.namespace == namespace && subject.record_name() == record.metadata.name) {
                     continue;
                 }
                 match records.delete(&record.metadata.name).await {
                     Ok(()) | Err(flotilla_resources::ResourceError::NotFound { .. }) => {}
                     Err(error) => return Err(error.to_string()),
                 }
+                drop(active);
             }
         }
         Ok(())
@@ -675,6 +678,36 @@ mod tests {
         })
         .await
         .expect("the refresh loop's failed read is recorded");
+        refresher.release(demand).await;
+    }
+
+    // Behaviour: the sweep deletes this home's records nothing demands, and keeps a demanded one.
+    #[tokio::test]
+    async fn the_sweep_keeps_demanded_records_and_deletes_the_rest() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let refresher = IssueRefresher::new(backend.clone(), "authority".into(), Arc::new(FailingSource), IssueRefreshCadence::default());
+        refresher.engine().install(Arc::new(RecordedFailures::default())).expect("engine");
+        let records = backend.using::<Issue>("flotilla");
+        let demanded = subject();
+        let orphan = IssueKey::new(
+            "flotilla",
+            flotilla_resources::address::stored_issue_address("github.com", "flotilla-org/flotilla", 9, &[]).expect("address"),
+        )
+        .expect("issue key");
+        for key in [&demanded, &orphan] {
+            let spec = IssueSpec::builder()
+                .service(key.stored_service_scope().0)
+                .scope(key.stored_service_scope().1)
+                .number(key.number())
+                .observing_authority("authority".into())
+                .build();
+            records.create(&InputMeta::builder().name(key.record_name()).build(), &spec).await.expect("record");
+        }
+        let demand = uuid::Uuid::new_v4();
+        refresher.demand(demand, demanded.clone(), None).await.expect("demand");
+        refresher.sweep_undemanded().await.expect("sweep");
+        let left: Vec<_> = records.list().await.expect("list").items.into_iter().map(|record| record.metadata.name).collect();
+        assert_eq!(left, [demanded.record_name()]);
         refresher.release(demand).await;
     }
 }

@@ -54,6 +54,71 @@ impl Held {
             Self::Issue(_, record) => record.failing_since,
         }
     }
+
+    fn version(&self) -> u64 {
+        match self {
+            Self::ChangeRequest(version, _) | Self::Issue(version, _) => *version,
+        }
+    }
+}
+
+/// One of the two observation records, as the port writes it.
+trait Observed: Kind + PartialEq + Clone {
+    type Spec: serde::de::DeserializeOwned;
+    type Status: serde::de::DeserializeOwned;
+
+    /// The record of `spec`'s subject, keeping `current`'s observed values when there is one.
+    fn of_subject(current: Option<Self>, spec: &Self::Spec) -> Self;
+    /// `self`'s subject as observed in `status`, which a successful read wrote, so not failing.
+    fn observed(&self, home: &str, status: &Self::Status) -> Self;
+    fn failing_since(&self) -> Option<Timestamp>;
+    fn failing(self, since: Timestamp) -> Self;
+}
+
+impl Observed for ChangeRequestRecord {
+    type Spec = ChangeRequestSpec;
+    type Status = ChangeRequestStatus;
+
+    fn of_subject(current: Option<Self>, spec: &ChangeRequestSpec) -> Self {
+        let mut record = current.unwrap_or_else(|| Self::unobserved(spec));
+        (record.service, record.scope, record.number) = (spec.service.clone(), spec.scope.clone(), spec.number);
+        record
+    }
+
+    fn observed(&self, home: &str, status: &ChangeRequestStatus) -> Self {
+        Self::from_old(&self.old_spec(home), status)
+    }
+
+    fn failing_since(&self) -> Option<Timestamp> {
+        self.failing_since
+    }
+
+    fn failing(self, since: Timestamp) -> Self {
+        Self { failing_since: Some(since), ..self }
+    }
+}
+
+impl Observed for IssueRecord {
+    type Spec = IssueSpec;
+    type Status = IssueStatus;
+
+    fn of_subject(current: Option<Self>, spec: &IssueSpec) -> Self {
+        let mut record = current.unwrap_or_else(|| Self::unobserved(spec));
+        (record.service, record.scope, record.number) = (spec.service.clone(), spec.scope.clone(), spec.number);
+        record
+    }
+
+    fn observed(&self, home: &str, status: &IssueStatus) -> Self {
+        Self::from_old(&self.old_spec(home), status)
+    }
+
+    fn failing_since(&self) -> Option<Timestamp> {
+        self.failing_since
+    }
+
+    fn failing(self, since: Timestamp) -> Self {
+        Self { failing_since: Some(since), ..self }
+    }
 }
 
 /// Every home's records, by kind, name and home.
@@ -62,6 +127,8 @@ type Records = BTreeMap<(&'static str, String, String), Held>;
 struct Resident {
     follower: Follower,
     records: Records,
+    /// Records already reported as not encoding, by kind, name, home and version: each is reported once.
+    warned: std::collections::BTreeSet<(&'static str, String, String, u64)>,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -149,11 +216,12 @@ impl EngineObservations {
         let log = PlainLog::new(service.store());
         let home = log.home().to_owned();
         let follower = Follower::new([CHANGE_REQUEST_CODE, ISSUE_CODE]);
-        let opened = Self { service, home, log, resident: Mutex::new(Resident { follower, records: Records::new() }), clock };
+        let resident = Resident { follower, records: Records::new(), warned: Default::default() };
+        let opened = Self { service, home, log, resident: Mutex::new(resident), clock };
         let homes = opened.service.homes();
         {
             let mut resident = locked(&opened.resident);
-            let Resident { follower, records } = &mut *resident;
+            let Resident { follower, records, .. } = &mut *resident;
             opened
                 .service
                 .with_store(|store| {
@@ -174,7 +242,7 @@ impl EngineObservations {
         let mut resident = locked(&self.resident);
         let homes = self.service.homes();
         {
-            let Resident { follower, records } = &mut *resident;
+            let Resident { follower, records, .. } = &mut *resident;
             self.service
                 .with_store(|store| {
                     let mut read = store.read()?;
@@ -241,19 +309,33 @@ impl EngineObservations {
         Ok((confirmed, object))
     }
 
-    /// Every home's copy of `kind`'s records, as objects with when each was last confirmed.
-    fn copies(&self, kind: &'static str) -> Result<Vec<(DateTime<Utc>, EngineObject)>, String> {
-        let resident = self.refresh()?;
-        Ok(resident
-            .records
-            .iter()
-            .filter(|((held_kind, _, _), _)| *held_kind == kind)
-            .filter_map(|((_, name, home), held)| {
-                self.object(name, home, held)
-                    .map_err(|error| tracing::warn!(%error, "skipping an observation record that does not encode"))
-                    .ok()
-            })
-            .collect())
+    /// Every home's copy of `kind`'s records, or of its record `name` alone, as objects with when
+    /// each was last confirmed. A record that does not encode is reported once and not read.
+    fn copies(&self, kind: &'static str, name: Option<&str>) -> Result<Vec<(DateTime<Utc>, EngineObject)>, String> {
+        let mut resident = self.refresh()?;
+        let Resident { records, warned, .. } = &mut *resident;
+        let held = match name {
+            Some(name) => {
+                let from = (kind, name.to_owned(), String::new());
+                records
+                    .range(from..)
+                    .take_while(|((held_kind, held_name, _), _)| *held_kind == kind && held_name == name)
+                    .collect::<Vec<_>>()
+            }
+            None => records.iter().filter(|((held_kind, _, _), _)| *held_kind == kind).collect(),
+        };
+        let mut copies = Vec::with_capacity(held.len());
+        for ((_, name, home), held) in held {
+            match self.object(name, home, held) {
+                Ok(copy) => copies.push(copy),
+                Err(error) => {
+                    if warned.insert((kind, name.clone(), home.clone(), held.version())) {
+                        tracing::warn!(%error, "an observation record does not encode; it is not read");
+                    }
+                }
+            }
+        }
+        Ok(copies)
     }
 
     /// Each name's copy as several homes' resolve: the most recently confirmed, this home's on a tie.
@@ -280,6 +362,37 @@ impl EngineObservations {
         written.map_err(|error| format!("write {} {name}: {error}", K::KIND))
     }
 
+    fn apply_as<K: Observed>(&self, kind: &'static str, name: &str, spec: Value) -> Result<EngineObject, String> {
+        let spec: K::Spec = serde_json::from_value(spec).map_err(|error| format!("{kind} spec: {error}"))?;
+        let current = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())?.map(|current| current.spec);
+        self.write(name, &K::of_subject(current, &spec))?;
+        self.written(kind, name)
+    }
+
+    fn set_status_as<K: Observed>(&self, kind: &'static str, name: &str, status: Value) -> Result<EngineObject, String> {
+        let status: K::Status = serde_json::from_value(status).map_err(|error| format!("{kind} status: {error}"))?;
+        let current = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())?;
+        let current = current.ok_or_else(|| format!("{kind} {name} is not held at {}", self.home))?;
+        self.write(name, &current.spec.observed(&self.home, &status))?;
+        self.written(kind, name)
+    }
+
+    fn delete_as<K: Observed>(&self, kind: &'static str, name: &str) -> Result<(), String> {
+        let Some(current) = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())? else { return Ok(()) };
+        match self.log.delete::<K>(name, current.version, &self.change()) {
+            Ok(()) | Err(PlainError::Missing { .. }) => Ok(()),
+            Err(error) => Err(format!("delete {kind} {name}: {error}")),
+        }
+    }
+
+    fn failing_as<K: Observed>(&self, name: &str) -> Result<(), String> {
+        let Some(current) = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())? else { return Ok(()) };
+        if current.spec.failing_since().is_none() {
+            self.write(name, &current.spec.failing(self.now()))?;
+        }
+        Ok(())
+    }
+
     fn written(&self, kind: &'static str, name: &str) -> Result<EngineObject, String> {
         let resident = self.refresh()?;
         let held =
@@ -299,16 +412,15 @@ impl EngineRecords for EngineObservations {
     }
 
     async fn get(&self, kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
-        let copies = self.copies(kind_of(kind)?)?.into_iter().filter(|(_, copy)| copy.name == name).collect();
-        Ok(self.resolve(copies).into_values().next())
+        Ok(self.resolve(self.copies(kind_of(kind)?, Some(name))?).into_values().next())
     }
 
     async fn list(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-        Ok(self.resolve(self.copies(kind_of(kind)?)?).into_values().collect())
+        Ok(self.resolve(self.copies(kind_of(kind)?, None)?).into_values().collect())
     }
 
     async fn sources(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-        Ok(self.copies(kind_of(kind)?)?.into_iter().map(|(_, copy)| copy).collect())
+        Ok(self.copies(kind_of(kind)?, None)?.into_iter().map(|(_, copy)| copy).collect())
     }
 
     async fn apply(
@@ -319,60 +431,23 @@ impl EngineRecords for EngineObservations {
         _annotations: &BTreeMap<String, String>,
         spec: Value,
     ) -> Result<EngineObject, String> {
-        let kind = kind_of(kind)?;
-        match kind {
-            CHANGE_REQUEST => {
-                let spec: ChangeRequestSpec = serde_json::from_value(spec).map_err(|error| format!("{kind} spec: {error}"))?;
-                let current = self.log.get::<ChangeRequestRecord>(name, &self.home).map_err(|error| error.to_string())?;
-                let mut record = current.map(|current| current.spec).unwrap_or_else(|| ChangeRequestRecord::unobserved(&spec));
-                (record.service, record.scope, record.number) = (spec.service, spec.scope, spec.number);
-                self.write(name, &record)?;
-            }
-            _ => {
-                let spec: IssueSpec = serde_json::from_value(spec).map_err(|error| format!("{kind} spec: {error}"))?;
-                let current = self.log.get::<IssueRecord>(name, &self.home).map_err(|error| error.to_string())?;
-                let mut record = current.map(|current| current.spec).unwrap_or_else(|| IssueRecord::unobserved(&spec));
-                (record.service, record.scope, record.number) = (spec.service, spec.scope, spec.number);
-                self.write(name, &record)?;
-            }
+        match kind_of(kind)? {
+            CHANGE_REQUEST => self.apply_as::<ChangeRequestRecord>(CHANGE_REQUEST, name, spec),
+            _ => self.apply_as::<IssueRecord>(ISSUE, name, spec),
         }
-        self.written(kind, name)
     }
 
     async fn set_status(&self, kind: &str, name: &str, status: Value) -> Result<EngineObject, String> {
-        let kind = kind_of(kind)?;
-        let missing = || format!("{kind} {name} is not held at {}", self.home);
-        match kind {
-            CHANGE_REQUEST => {
-                let status: ChangeRequestStatus = serde_json::from_value(status).map_err(|error| format!("{kind} status: {error}"))?;
-                let current =
-                    self.log.get::<ChangeRequestRecord>(name, &self.home).map_err(|error| error.to_string())?.ok_or_else(missing)?;
-                self.write(name, &ChangeRequestRecord::from_old(&current.spec.old_spec(&self.home), &status))?;
-            }
-            _ => {
-                let status: IssueStatus = serde_json::from_value(status).map_err(|error| format!("{kind} status: {error}"))?;
-                let current = self.log.get::<IssueRecord>(name, &self.home).map_err(|error| error.to_string())?.ok_or_else(missing)?;
-                self.write(name, &IssueRecord::from_old(&current.spec.old_spec(&self.home), &status))?;
-            }
+        match kind_of(kind)? {
+            CHANGE_REQUEST => self.set_status_as::<ChangeRequestRecord>(CHANGE_REQUEST, name, status),
+            _ => self.set_status_as::<IssueRecord>(ISSUE, name, status),
         }
-        self.written(kind, name)
     }
 
     async fn delete(&self, kind: &str, name: &str) -> Result<(), String> {
-        let kind = kind_of(kind)?;
-        let deleted = match kind {
-            CHANGE_REQUEST => match self.log.get::<ChangeRequestRecord>(name, &self.home).map_err(|error| error.to_string())? {
-                Some(current) => self.log.delete::<ChangeRequestRecord>(name, current.version, &self.change()),
-                None => return Ok(()),
-            },
-            _ => match self.log.get::<IssueRecord>(name, &self.home).map_err(|error| error.to_string())? {
-                Some(current) => self.log.delete::<IssueRecord>(name, current.version, &self.change()),
-                None => return Ok(()),
-            },
-        };
-        match deleted {
-            Ok(()) | Err(PlainError::Missing { .. }) => Ok(()),
-            Err(error) => Err(format!("delete {kind} {name}: {error}")),
+        match kind_of(kind)? {
+            CHANGE_REQUEST => self.delete_as::<ChangeRequestRecord>(CHANGE_REQUEST, name),
+            _ => self.delete_as::<IssueRecord>(ISSUE, name),
         }
     }
 
@@ -398,26 +473,12 @@ impl EngineRecords for EngineObservations {
 
 #[async_trait::async_trait]
 impl ObservationFailures for EngineObservations {
+    /// A subject with no record here has no values to age: its observer creates the record before
+    /// it first reads, so only another home's subject is absent.
     async fn failing(&self, kind: &str, name: &str) -> Result<(), String> {
-        let since = Some(self.now());
         match kind_of(kind)? {
-            CHANGE_REQUEST => {
-                let Some(current) = self.log.get::<ChangeRequestRecord>(name, &self.home).map_err(|error| error.to_string())? else {
-                    return Ok(());
-                };
-                if current.spec.failing_since.is_none() {
-                    self.write(name, &ChangeRequestRecord { failing_since: since, ..current.spec })?;
-                }
-            }
-            _ => {
-                let Some(current) = self.log.get::<IssueRecord>(name, &self.home).map_err(|error| error.to_string())? else {
-                    return Ok(());
-                };
-                if current.spec.failing_since.is_none() {
-                    self.write(name, &IssueRecord { failing_since: since, ..current.spec })?;
-                }
-            }
+            CHANGE_REQUEST => self.failing_as::<ChangeRequestRecord>(name),
+            _ => self.failing_as::<IssueRecord>(name),
         }
-        Ok(())
     }
 }

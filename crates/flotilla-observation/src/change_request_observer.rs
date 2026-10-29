@@ -2433,6 +2433,45 @@ mod tests {
         refresher.release(unheld_demand).await;
     }
 
+    // Behaviour: the sweep deletes this home's records nothing demands, and keeps a demanded one.
+    #[tokio::test]
+    async fn the_sweep_keeps_demanded_records_and_deletes_the_rest() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let refresher = ChangeRequestRefresher::new(
+            "fleet".into(),
+            backend.clone(),
+            "authority".into(),
+            Arc::new(UnavailableSource),
+            ChangeRequestRefreshCadence::default(),
+        );
+        refresher.engine().install(Arc::new(RecordedFailures::default())).expect("engine");
+        let records = backend.using::<ChangeRequest>("flotilla");
+        let key = |number| {
+            ChangeRequestKey::new(
+                "flotilla",
+                flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", number, &[])
+                    .expect("address"),
+            )
+            .expect("key")
+        };
+        let (demanded, orphan) = (key(1), key(2));
+        for subject in [&demanded, &orphan] {
+            let spec = ChangeRequestSpec::builder()
+                .service(subject.stored_service_scope().0)
+                .scope(subject.stored_service_scope().1)
+                .number(subject.number())
+                .observing_authority("authority".into())
+                .build();
+            records.create(&InputMeta::builder().name(subject.record_name()).build(), &spec).await.expect("record");
+        }
+        let demand = uuid::Uuid::new_v4();
+        refresher.demand(demand, demanded.clone(), None).await.expect("demand");
+        refresher.sweep_undemanded().await.expect("sweep");
+        let left: Vec<_> = records.list().await.expect("list").items.into_iter().map(|record| record.metadata.name).collect();
+        assert_eq!(left, [demanded.record_name()]);
+        refresher.release(demand).await;
+    }
+
     // Behaviour (age as a judgement): under the engine, the observer records a failed
     // read on its record, so readers age its values from the first failure.
     #[tokio::test]
