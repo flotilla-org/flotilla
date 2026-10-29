@@ -18,19 +18,18 @@ use flotilla_agent::adapter::{
 };
 use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, LifecycleReading, PlacementDecision};
-use flotilla_resources::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_resources::{
     address::artifact_slot_record_name, canonicalize_repo_url, host_direct_environment_name, is_prepared_snapshot,
     repository_workspace_slugs, Artifact, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy,
-    CrewSource, CrewWorkPhase, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerImageSource, Environment,
-    EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Repository,
-    RepositoryKey, RepositorySpec, Resource, ResourceError, ResourceObject, ResourceProvenance, Stance, TerminalSession,
-    TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, Vessel, VesselImage, VesselPhase, VesselStatusPatch, WorkPhase,
-    ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
-    CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
-    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND, VESSEL_REF_LABEL,
+    CrewSource, CrewWorkPhase, DockerEnvironmentSpec, DockerImageSource, Environment, EnvironmentMount, EnvironmentMountMode,
+    EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, InputMeta,
+    LifecycleAuthority, OwnerReference, PlacementPolicy, Repository, RepositoryKey, RepositorySpec, Resource, ResourceError,
+    ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec,
+    Vessel, VesselImage, VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION,
+    CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND, VESSEL_REF_LABEL,
 };
+use flotilla_resources::{realisation_settings, BRIEF_ARTIFACTS_ANNOTATION};
 use flotilla_store::{
     controller::{delete_lifecycle_owned_matching, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
     ReplicaReadResolver, ResourceBackend, TypedResolver,
@@ -87,14 +86,16 @@ pub struct VesselReconciler {
     accounts: Arc<dyn AccountRecords>,
     convoys: TypedResolver<Convoy>,
     repositories: TypedResolver<Repository>,
-    placement_policies: TypedResolver<PlacementPolicy>,
+    kinds: TypedResolver<FulfilmentKind>,
+    policies: TypedResolver<PlacementPolicy>,
     environments: TypedResolver<Environment>,
     clones: TypedResolver<Clone>,
     checkouts: TypedResolver<Checkout>,
     terminal_sessions: TypedResolver<TerminalSession>,
     artifacts: ReplicaReadResolver<Artifact>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
-    federated_placement_policies: Option<ReplicaReadResolver<PlacementPolicy>>,
+    federated_kinds: Option<ReplicaReadResolver<FulfilmentKind>>,
+    federated_policies: Option<ReplicaReadResolver<PlacementPolicy>>,
     local_host_ref: Option<CanonicalHostId>,
     additional_host_refs: std::collections::BTreeSet<CanonicalHostId>,
     namespace: String,
@@ -125,14 +126,16 @@ impl VesselReconciler {
             accounts: Arc::new(flotilla_store::OldStoreAccounts::new(backend.clone())),
             convoys: backend.clone().using::<Convoy>(namespace),
             repositories: backend.clone().using::<Repository>(namespace),
-            placement_policies: backend.clone().using::<PlacementPolicy>(namespace),
+            kinds: backend.clone().using::<FulfilmentKind>(namespace),
+            policies: backend.clone().using::<PlacementPolicy>(namespace),
             environments: backend.clone().using::<Environment>(namespace),
             clones: backend.clone().using::<Clone>(namespace),
             checkouts: backend.clone().using::<Checkout>(namespace),
             terminal_sessions: backend.clone().using::<TerminalSession>(namespace),
             artifacts: backend.including_replicas::<Artifact>(namespace),
             federated_convoys: None,
-            federated_placement_policies: None,
+            federated_kinds: None,
+            federated_policies: None,
             local_host_ref: None,
             additional_host_refs: Default::default(),
             namespace: namespace.to_string(),
@@ -296,7 +299,8 @@ impl VesselReconciler {
 
     pub fn with_federated_dependencies(mut self, backend: &ResourceBackend, local_host_ref: CanonicalHostId) -> Self {
         self.federated_convoys = Some(backend.including_replicas::<Convoy>(&self.namespace));
-        self.federated_placement_policies = Some(backend.including_replicas::<PlacementPolicy>(&self.namespace));
+        self.federated_kinds = Some(backend.including_replicas::<FulfilmentKind>(&self.namespace));
+        self.federated_policies = Some(backend.including_replicas::<PlacementPolicy>(&self.namespace));
         self.local_host_ref = Some(local_host_ref);
         self
     }
@@ -342,14 +346,16 @@ impl VesselReconciler {
             .ok_or_else(|| ResourceError::not_found(name))
     }
 
-    async fn placement_dependency(
-        &self,
+    /// `name` as this vessel reads it, or, as a placement snapshot, from whichever origin wrote it.
+    async fn snapshot_dependency<T: Resource>(
+        local: &TypedResolver<T>,
+        federated: Option<&ReplicaReadResolver<T>>,
         vessel: &ResourceObject<Vessel>,
         name: &str,
-    ) -> Result<ResourceObject<PlacementPolicy>, ResourceError> {
-        match Self::dependency(&self.placement_policies, self.federated_placement_policies.as_ref(), vessel, name).await {
+    ) -> Result<ResourceObject<T>, ResourceError> {
+        match Self::dependency(local, federated, vessel, name).await {
             Err(ResourceError::NotFound { .. }) => {
-                let Some(federated) = &self.federated_placement_policies else {
+                let Some(federated) = federated else {
                     return Err(ResourceError::not_found(name));
                 };
                 let source = federated.get(name).await?;
@@ -361,6 +367,58 @@ impl VesselReconciler {
             }
             result => result,
         }
+    }
+
+    async fn placement_dependency(
+        &self,
+        vessel: &ResourceObject<Vessel>,
+        name: &str,
+        decision: Option<&PlacementDecision>,
+    ) -> Result<Result<Placement, String>, ResourceError> {
+        let frozen = decision.and_then(|decision| decision.provider_instance.clone());
+        match Self::snapshot_dependency(&self.kinds, self.federated_kinds.as_ref(), vessel, name).await {
+            Ok(kind) => match frozen {
+                Some(instance) => Ok(Ok(Placement { kind, instance: Some(instance) })),
+                None if kind.spec.realisation == FulfilmentRealisation::HostDirect => Ok(Ok(Placement { kind, instance: None })),
+                None => Ok(self.unfrozen_instance(&kind).await?.map(|instance| Placement { kind, instance })),
+            },
+            // ADR 0047: a convoy admitted before kinds froze its placement as a PlacementPolicy.
+            // Remove one roll after this ships, with PlacementPolicy.
+            Err(ResourceError::NotFound { .. }) => {
+                let policy = Self::snapshot_dependency(&self.policies, self.federated_policies.as_ref(), vessel, name).await?;
+                let instance = frozen
+                    .or_else(|| policy.metadata.labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).cloned())
+                    .or_else(|| policy.spec.provider_requirements.as_ref().and_then(|requirements| requirements.instance.clone()));
+                Ok(FulfilmentKindSpec::from_policy(&policy.spec, "linux")
+                    .map(|spec| Placement { kind: ResourceObject { metadata: policy.metadata, spec, status: None }, instance }))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// A vessel no admission froze an instance for takes the one provider on its kind's
+    /// host that realises the kind, as admission would have chosen; with no advertisements
+    /// observed it names none.
+    async fn unfrozen_instance(&self, kind: &ResourceObject<FulfilmentKind>) -> Result<Result<Option<String>, String>, ResourceError> {
+        let hosts = self.backend.including_replicas::<flotilla_resources::Host>(&self.namespace).list().await?.items;
+        let hosts = hosts.into_iter().map(|host| host.object).collect::<Vec<_>>();
+        let host = match flotilla_resources::canonical_host_id(hosts.iter(), &kind.spec.host_ref) {
+            Ok(Some(id)) => hosts.iter().find(|host| host.metadata.name == id.as_str()),
+            Ok(None) => hosts.iter().find(|host| host.metadata.name == kind.spec.host_ref),
+            Err(error) => return Ok(Err(error)),
+        };
+        let Some(advertised) = host
+            .and_then(|host| host.status.as_ref())
+            .and_then(|status| status.capabilities.get(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY))
+        else {
+            return Ok(Ok(None));
+        };
+        let providers: Vec<flotilla_protocol::provider::ProviderAdvertisement> = match serde_json::from_value(advertised.clone()) {
+            Ok(providers) => providers,
+            Err(error) => return Ok(Err(format!("{}: invalid provider advertisements: {error}", kind.spec.host_ref))),
+        };
+        Ok(flotilla_resources::provider_placement::match_provider(&kind.spec.host_ref, &kind.spec.realisation, None, &providers)
+            .map(|provider| Some(provider.instance.clone())))
     }
 
     fn missing_host_local_environment(&self, environment_ref: &str, placement_host_ref: &str) -> String {
@@ -378,31 +436,17 @@ impl VesselReconciler {
     }
 }
 
+/// What a vessel is realised from: its kind, and the provider instance admission froze for it.
+struct Placement {
+    kind: ResourceObject<FulfilmentKind>,
+    instance: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 enum PlacementStrategy {
-    HostDirect {
-        host_ref: String,
-        pool: String,
-    },
-    DockerHostCheckoutAndMount {
-        local_clone: bool,
-        host_ref: String,
-        pool: String,
-        image: Option<DockerImageSource>,
-        pull_policy: DockerImagePullPolicy,
-        env: BTreeMap<String, String>,
-        mount_path: String,
-        default_cwd: Option<String>,
-    },
-    CloneInVessel {
-        host_ref: String,
-        pool: String,
-        image: Option<DockerImageSource>,
-        pull_policy: DockerImagePullPolicy,
-        env: BTreeMap<String, String>,
-        clone_path: String,
-        default_cwd: Option<String>,
-    },
+    HostDirect { host_ref: String, pool: String },
+    DockerHostCheckoutAndMount { host_ref: String, pool: String, image: Option<DockerImageSource> },
+    CloneInVessel { host_ref: String, pool: String, image: String, clone_path: String },
 }
 
 impl PlacementStrategy {
@@ -471,10 +515,12 @@ struct ImageStamp {
 }
 
 /// The composed identity a placement froze at admission (ADR 0062).
-fn composed_image(placement_policy: &ResourceObject<PlacementPolicy>, digest: Option<String>) -> Option<VesselImage> {
-    match placement_policy.spec.docker_per_vessel.as_ref()?.image.as_ref()? {
-        DockerImageSource::Built { identity, .. } => Some(VesselImage { identity: identity.clone(), digest }),
-        DockerImageSource::Literal(_) => None,
+fn composed_image(placement: &Placement, digest: Option<String>) -> Option<VesselImage> {
+    match &placement.kind.spec.realisation {
+        FulfilmentRealisation::DockerPerVessel { image: Some(DockerImageSource::Built { identity, .. }) } => {
+            Some(VesselImage { identity: identity.clone(), digest })
+        }
+        _ => None,
     }
 }
 
@@ -502,17 +548,17 @@ impl VesselPrepared {
     }
 
     fn provisioning(
-        placement_policy: &ResourceObject<PlacementPolicy>,
+        placement: &Placement,
         placement_decision: Option<PlacementDecision>,
         waiting_for: impl Into<String>,
         actuations: Vec<Actuation>,
     ) -> Self {
         let waiting_for = legible_waiting_for(waiting_for.into(), placement_decision.as_ref());
-        Self { phase: None, patch: provisioning_patch(placement_policy, placement_decision, waiting_for), actuations }
+        Self { phase: None, patch: provisioning_patch(placement, placement_decision, waiting_for), actuations }
     }
 
     fn checkout_churn(
-        placement_policy: &ResourceObject<PlacementPolicy>,
+        placement: &Placement,
         placement_decision: Option<PlacementDecision>,
         checkout_name: &str,
         actuations: Vec<Actuation>,
@@ -520,11 +566,11 @@ impl VesselPrepared {
         Self {
             phase: None,
             patch: PlannedPatch::CheckoutChurn {
-                observed_kind_ref: placement_policy.metadata.name.clone(),
-                observed_kind_version: placement_policy.metadata.resource_version.clone(),
+                observed_kind_ref: placement.kind.metadata.name.clone(),
+                observed_kind_version: placement.kind.metadata.resource_version.clone(),
                 placement_decision,
                 message: format!("checkout {checkout_name} is missing shortly after a create attempt; retrying after backoff"),
-                image: composed_image(placement_policy, None),
+                image: composed_image(placement, None),
             },
             actuations,
         }
@@ -604,30 +650,25 @@ impl VesselReconciler {
             }
         }
 
-        let placement_policy = match self.placement_dependency(obj, &obj.spec.fulfilment_kind_ref).await {
-            Ok(policy) => policy,
+        let placement = match self.placement_dependency(obj, &obj.spec.fulfilment_kind_ref, placement_decision.as_ref()).await {
+            Ok(Ok(placement)) => placement,
+            Ok(Err(message)) => return Ok(VesselPrepared::failed(message)),
             Err(ResourceError::NotFound { .. }) => {
-                return Ok(VesselPrepared::failed(format!("placement policy {} not found", obj.spec.fulfilment_kind_ref)))
+                return Ok(VesselPrepared::failed(format!("fulfilment kind {} not found", obj.spec.fulfilment_kind_ref)))
             }
             Err(err) => return Err(err),
         };
-        let mut strategy = match placement_strategy(&placement_policy.spec) {
-            Ok(strategy) => strategy,
-            Err(message) => return Ok(VesselPrepared::failed(message)),
-        };
-        if placement_policy.spec.cloud_sandbox_per_vessel.is_some() {
+        let mut strategy = placement_strategy(&placement.kind.spec);
+        if let PlacementStrategy::CloneInVessel { clone_path, .. } = &mut strategy {
             let Some(root) = placement_decision.as_ref().and_then(|decision| decision.provider_workspace_root.as_ref()) else {
                 return Ok(VesselPrepared::failed("cloud provider workspace root missing from frozen placement"));
             };
-            if let PlacementStrategy::CloneInVessel { clone_path, .. } = &mut strategy {
-                root.clone_into(clone_path);
-            }
+            root.clone_into(clone_path);
         }
         if let Some(decision) = placement_decision.as_ref() {
             strategy.canonicalize_host_ref(decision.target_host.reference.as_str());
         }
-        let mut declared_agent_adapters =
-            placement_policy.spec.docker_per_vessel.as_ref().map(|docker| docker.agent_adapters.clone()).unwrap_or_default();
+        let mut declared_agent_adapters = BTreeSet::new();
 
         let (vessel_index, requirement) = match convoy
             .status
@@ -643,8 +684,8 @@ impl VesselReconciler {
             Err(message) => return Ok(VesselPrepared::failed(message)),
         };
         // A composed image installs exactly the harnesses its roles resolve
-        // to; interior discovery verifies them instead of the policy's list.
-        if composed_image(&placement_policy, None).is_some() {
+        // to; interior discovery verifies them.
+        if composed_image(&placement, None).is_some() {
             declared_agent_adapters.clone_from(&required_adapters);
         }
         let effective_stance = strategy.effective_stance();
@@ -707,7 +748,7 @@ impl VesselReconciler {
             };
             if !self.environment_dependency(&clone_env)?.ready {
                 return Ok(VesselPrepared::provisioning(
-                    &placement_policy,
+                    &placement,
                     placement_decision.clone(),
                     format!("environment {clone_env_ref} to become ready"),
                     actuations,
@@ -719,7 +760,7 @@ impl VesselReconciler {
         };
 
         let precreated_environment = match &strategy {
-            PlacementStrategy::CloneInVessel { host_ref, image, pull_policy, env, .. } => {
+            PlacementStrategy::CloneInVessel { image, .. } => {
                 let env_name = environment_name(&obj.metadata.name);
                 let image = match self.environments.get(&env_name).await {
                     Ok(existing) => {
@@ -729,23 +770,13 @@ impl VesselReconciler {
                         }
                         if !dependency.ready {
                             let waiting_for = dependency.waiting.unwrap_or_else(|| format!("environment {env_name} to become ready"));
-                            return Ok(VesselPrepared::provisioning(
-                                &placement_policy,
-                                placement_decision.clone(),
-                                waiting_for,
-                                actuations,
-                            ));
+                            return Ok(VesselPrepared::provisioning(&placement, placement_decision.clone(), waiting_for, actuations));
                         }
-                        match image_stamp(&existing, &placement_policy) {
+                        match image_stamp(&existing, &placement) {
                             Ok(image) => image,
                             Err(message) if dependency.engine_held => {
                                 // Readiness can commit before the provider's image observations are published.
-                                return Ok(VesselPrepared::provisioning(
-                                    &placement_policy,
-                                    placement_decision.clone(),
-                                    message,
-                                    actuations,
-                                ));
+                                return Ok(VesselPrepared::provisioning(&placement, placement_decision.clone(), message, actuations));
                             }
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         }
@@ -758,75 +789,16 @@ impl VesselReconciler {
                             .filter(|need| need.requires_guest_probe())
                             .cloned()
                             .collect();
-                        let spec = match cloud_environment_spec(&placement_policy, probe_needs) {
-                            Some(Ok(spec)) => spec,
-                            Some(Err(message)) => return Ok(VesselPrepared::failed(message)),
-                            None => {
-                                let (image_ref, image_build_ref) = match environment_image(image) {
-                                    Ok(image) => image,
-                                    Err(message) => return Ok(VesselPrepared::failed(message)),
-                                };
-                                EnvironmentSpec {
-                                    cloud_sandbox: None,
-                                    provider_address: Some(
-                                        flotilla_address::Address::root(flotilla_address::Kind::Host, host_ref)
-                                            .and_then(|place| {
-                                                place.child(
-                                                    flotilla_address::Kind::Provider,
-                                                    environment_provider_labels(&placement_policy)
-                                                        .get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL)
-                                                        .map(String::as_str)
-                                                        .unwrap_or("docker"),
-                                                )
-                                            })
-                                            .map_err(|error| ResourceError::other(error.to_string()))?,
-                                    ),
-                                    host_direct: None,
-                                    docker: Some(DockerEnvironmentSpec {
-                                        image_build_ref,
-                                        memory_policy: placement_policy
-                                            .spec
-                                            .docker_per_vessel
-                                            .as_ref()
-                                            .map(|policy| policy.memory_policy.clone())
-                                            .unwrap_or_default(),
-                                        host_ref: host_ref.clone(),
-                                        image: image_ref.clone(),
-                                        declared_agent_adapters: declared_agent_adapters.clone(),
-                                        required_agent_adapters: required_adapters.clone(),
-                                        pull_policy: *pull_policy,
-                                        mounts: Vec::new(),
-                                        env: environment_with_credentials(
-                                            {
-                                                let mut env = env.clone();
-                                                env.insert(
-                                                    flotilla_resources::CREW_SKILLS_ENV.to_string(),
-                                                    serde_json::to_string(
-                                                        &requirement
-                                                            .crew
-                                                            .iter()
-                                                            .filter(|crew| matches!(crew.source, CrewSource::Agent { .. }))
-                                                            .map(|crew| (&crew.role, &crew.skills.selected))
-                                                            .collect::<BTreeMap<_, _>>(),
-                                                    )
-                                                    .expect("serialize resolved skills"),
-                                                );
-                                                env
-                                            },
-                                            &requirement.credential_refs,
-                                            &requirement.credential_scopes,
-                                            &requirement.credential_permissions,
-                                        ),
-                                    }),
-                                }
-                            }
+                        let spec = match cloud_environment_spec(&placement, image, probe_needs) {
+                            Ok(spec) => spec,
+                            Err(message) => return Ok(VesselPrepared::failed(message)),
                         };
                         actuations.push(Actuation::CreateEnvironment {
-                            meta: owned_child_meta(&env_name, obj, environment_provider_labels(&placement_policy)),
+                            meta: owned_child_meta(&env_name, obj, environment_provider_labels(&placement)),
                             spec,
                         });
                         return Ok(VesselPrepared::provisioning(
-                            &placement_policy,
+                            &placement,
                             placement_decision.clone(),
                             format!("environment {env_name} to become ready"),
                             actuations,
@@ -839,11 +811,7 @@ impl VesselReconciler {
             _ => None,
         };
 
-        let workspace_convoy_slug = if matches!(strategy, PlacementStrategy::DockerHostCheckoutAndMount { local_clone: true, .. }) {
-            obj.metadata.name.as_str()
-        } else {
-            convoy_checkout_slug.as_str()
-        };
+        let workspace_convoy_slug = convoy_checkout_slug.as_str();
         let workspace_root = if multi_repository {
             match &strategy {
                 PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerHostCheckoutAndMount { .. } => {
@@ -953,12 +921,6 @@ impl VesselReconciler {
                 None
             };
             let checkout_name = adopted_checkout_ref.clone().unwrap_or_else(|| match &strategy {
-                PlacementStrategy::DockerHostCheckoutAndMount { local_clone: true, .. } => checkout_name(
-                    &obj.metadata.name,
-                    &convoy_repository.workspace_slug,
-                    multi_repository,
-                    checkout_placement_scope(&convoy, self.local_host_ref.as_ref().map(|_| strategy.host_ref())).as_deref(),
-                ),
                 PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerHostCheckoutAndMount { .. } => checkout_name(
                     &convoy.metadata.name,
                     &convoy_repository.workspace_slug,
@@ -1023,7 +985,7 @@ impl VesselReconciler {
                         let Some(path) = dependency.path else {
                             return Ok(VesselPrepared::failed(format!("checkout {checkout_name} is ready but has no target path")));
                         };
-                        if matches!(&strategy, PlacementStrategy::DockerHostCheckoutAndMount { local_clone: false, .. }) {
+                        if matches!(&strategy, PlacementStrategy::DockerHostCheckoutAndMount { .. }) {
                             if let CheckoutSpec::Worktree(spec) = &existing.spec {
                                 contained_branches.insert(spec.r#ref.strip_prefix("refs/heads/").unwrap_or(&spec.r#ref).to_string());
                             }
@@ -1050,27 +1012,11 @@ impl VesselReconciler {
                     recent.retain(|_, created_at| now.duration_since(*created_at) < CHECKOUT_RECREATE_BACKOFF);
                     if recent.contains_key(&checkout_name) {
                         warn!(checkout = %checkout_name, convoy = %convoy.metadata.name, "checkout is missing shortly after a create attempt; backing off");
-                        return Ok(VesselPrepared::checkout_churn(
-                            &placement_policy,
-                            placement_decision.clone(),
-                            &checkout_name,
-                            actuations,
-                        ));
+                        return Ok(VesselPrepared::checkout_churn(&placement, placement_decision.clone(), &checkout_name, actuations));
                     }
                     recent.insert(checkout_name.clone(), now);
                     drop(recent);
                     let spec = match &strategy {
-                        PlacementStrategy::DockerHostCheckoutAndMount { local_clone: true, .. } => {
-                            CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
-                                source_clone_ref: clone_name.clone(),
-                                repo_ref: repository_key.clone(),
-                                env_ref: clone_env_ref.clone(),
-                                r#ref: git_ref.clone().expect("repository checkout requires a convoy ref"),
-                                base_ref: Some(convoy_repository.source_ref.clone()),
-                                target_path: checkout_target_path,
-                                url: convoy_repository.url.clone(),
-                            })
-                        }
                         PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerHostCheckoutAndMount { .. } => {
                             CheckoutSpec::Worktree(CheckoutWorktreeSpec {
                                 repo_ref: repository_key.clone(),
@@ -1111,7 +1057,7 @@ impl VesselReconciler {
         if !waiting_for_checkouts.is_empty() {
             let checkout_label = if waiting_for_checkouts.len() == 1 { "checkout" } else { "checkouts" };
             return Ok(VesselPrepared::provisioning(
-                &placement_policy,
+                &placement,
                 placement_decision.clone(),
                 format!("{checkout_label} {} to become ready", waiting_for_checkouts.join(", ")),
                 actuations,
@@ -1149,7 +1095,7 @@ impl VesselReconciler {
                 }
                 if !dependency.ready {
                     return Ok(VesselPrepared::provisioning(
-                        &placement_policy,
+                        &placement,
                         placement_decision.clone(),
                         format!("environment {env_name} to become ready"),
                         actuations,
@@ -1157,13 +1103,13 @@ impl VesselReconciler {
                 }
                 (env_name, None)
             }
-            PlacementStrategy::DockerHostCheckoutAndMount { local_clone, host_ref, image, pull_policy, env, mount_path, .. } => {
-                let git_mounts =
-                    match if *local_clone { Ok(Vec::new()) } else { self.contained_git_mounts(&contained_worktree_checkouts).await } {
-                        Ok(mounts) => mounts,
-                        Err(ResourceError::Invalid { message }) => return Ok(VesselPrepared::failed(message)),
-                        Err(error) => return Err(error),
-                    };
+            PlacementStrategy::DockerHostCheckoutAndMount { host_ref, image, .. } => {
+                let mount_path = realisation_settings::DOCKER_WORKSPACE;
+                let git_mounts = match self.contained_git_mounts(&contained_worktree_checkouts).await {
+                    Ok(mounts) => mounts,
+                    Err(ResourceError::Invalid { message }) => return Ok(VesselPrepared::failed(message)),
+                    Err(error) => return Err(error),
+                };
                 let env_name = environment_name(&obj.metadata.name);
                 let image = match self.environments.get(&env_name).await {
                     Ok(existing) => {
@@ -1173,34 +1119,20 @@ impl VesselReconciler {
                             .spec
                             .docker
                             .as_ref()
-                            .map(|docker| {
-                                docker.mounts.iter().filter(|mount| mount.target_path != *mount_path).cloned().collect::<Vec<_>>()
-                            })
+                            .map(|docker| docker.mounts.iter().filter(|mount| mount.target_path != mount_path).cloned().collect::<Vec<_>>())
                             .unwrap_or_default();
-                        let local_workspace_mount_matches = !*local_clone || {
-                            let actual = existing
-                                .spec
-                                .docker
-                                .as_ref()
-                                .and_then(|docker| docker.mounts.iter().find(|mount| mount.target_path == *mount_path));
-                            match (has_repositories, actual) {
-                                (true, Some(mount)) => mount.source_path == workspace_root && mount.mode == EnvironmentMountMode::Rw,
-                                (false, None) => true,
-                                _ => false,
-                            }
-                        };
-                        if !local_workspace_mount_matches || !git_mounts_match(&existing_git_mounts, &git_mounts) {
+                        if !git_mounts_match(&existing_git_mounts, &git_mounts) {
                             return Ok(VesselPrepared {
                                 phase: None,
                                 patch: PlannedPatch::EnvironmentRecreation {
-                                    observed_kind_ref: placement_policy.metadata.name.clone(),
-                                    observed_kind_version: placement_policy.metadata.resource_version.clone(),
+                                    observed_kind_ref: placement.kind.metadata.name.clone(),
+                                    observed_kind_version: placement.kind.metadata.resource_version.clone(),
                                     placement_decision: placement_decision.clone(),
                                     message: format!(
                                         "environment {env_name} Git checkout membership or protection mounts changed; \
                                          stop crews and recreate the environment before launching crews"
                                     ),
-                                    image: composed_image(&placement_policy, None),
+                                    image: composed_image(&placement, None),
                                 },
                                 actuations,
                             });
@@ -1212,23 +1144,13 @@ impl VesselReconciler {
                         }
                         if !dependency.ready {
                             let waiting_for = dependency.waiting.unwrap_or_else(|| format!("environment {env_name} to become ready"));
-                            return Ok(VesselPrepared::provisioning(
-                                &placement_policy,
-                                placement_decision.clone(),
-                                waiting_for,
-                                actuations,
-                            ));
+                            return Ok(VesselPrepared::provisioning(&placement, placement_decision.clone(), waiting_for, actuations));
                         }
-                        match image_stamp(&existing, &placement_policy) {
+                        match image_stamp(&existing, &placement) {
                             Ok(image) => image,
                             Err(message) if dependency.engine_held => {
                                 // Readiness can commit before the provider's image observations are published.
-                                return Ok(VesselPrepared::provisioning(
-                                    &placement_policy,
-                                    placement_decision.clone(),
-                                    message,
-                                    actuations,
-                                ));
+                                return Ok(VesselPrepared::provisioning(&placement, placement_decision.clone(), message, actuations));
                             }
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         }
@@ -1237,7 +1159,7 @@ impl VesselReconciler {
                         let mut mounts = has_repositories
                             .then(|| EnvironmentMount {
                                 source_path: workspace_root.clone(),
-                                target_path: mount_path.clone(),
+                                target_path: mount_path.to_owned(),
                                 mode: EnvironmentMountMode::Rw,
                             })
                             .into_iter()
@@ -1245,7 +1167,7 @@ impl VesselReconciler {
                         // Preserve absolute host paths in both mount domains so
                         // .git pointers and host registration backlinks remain valid.
                         mounts.extend(git_mounts);
-                        let mut env = env.clone();
+                        let mut env = BTreeMap::new();
                         if let Err(message) = configure_contained_tracking(&mut env, &contained_branches) {
                             return Ok(VesselPrepared::failed(message));
                         }
@@ -1254,7 +1176,7 @@ impl VesselReconciler {
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         };
                         actuations.push(Actuation::CreateEnvironment {
-                            meta: owned_child_meta(&env_name, obj, environment_provider_labels(&placement_policy)),
+                            meta: owned_child_meta(&env_name, obj, environment_provider_labels(&placement)),
                             spec: EnvironmentSpec {
                                 cloud_sandbox: None,
                                 provider_address: Some(
@@ -1262,7 +1184,7 @@ impl VesselReconciler {
                                         .and_then(|place| {
                                             place.child(
                                                 flotilla_address::Kind::Provider,
-                                                environment_provider_labels(&placement_policy)
+                                                environment_provider_labels(&placement)
                                                     .get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL)
                                                     .map(String::as_str)
                                                     .unwrap_or("docker"),
@@ -1273,17 +1195,11 @@ impl VesselReconciler {
                                 host_direct: None,
                                 docker: Some(DockerEnvironmentSpec {
                                     image_build_ref,
-                                    memory_policy: placement_policy
-                                        .spec
-                                        .docker_per_vessel
-                                        .as_ref()
-                                        .map(|policy| policy.memory_policy.clone())
-                                        .unwrap_or_default(),
                                     host_ref: host_ref.clone(),
                                     image: image_ref.clone(),
                                     declared_agent_adapters: declared_agent_adapters.clone(),
                                     required_agent_adapters: required_adapters.clone(),
-                                    pull_policy: *pull_policy,
+                                    pull_policy: realisation_settings::DOCKER_PULL_POLICY,
                                     mounts,
                                     env: environment_with_credentials(
                                         {
@@ -1310,7 +1226,7 @@ impl VesselReconciler {
                             },
                         });
                         return Ok(VesselPrepared::provisioning(
-                            &placement_policy,
+                            &placement,
                             placement_decision.clone(),
                             format!("environment {env_name} to become ready"),
                             actuations,
@@ -1325,7 +1241,7 @@ impl VesselReconciler {
                 (environment_ref, Some(image))
             }
         };
-        let terminal_cwd = strategy.terminal_cwd(&workspace_root, multi_repository, has_repositories);
+        let terminal_cwd = strategy.terminal_cwd(&workspace_root, has_repositories);
         let issue_repository_refs = convoy.spec.issues.iter().map(|issue| issue.repository_ref.as_ref()).collect::<Vec<_>>();
         let copy_to_all_repositories = issue_repository_refs.iter().any(|repository_ref| repository_ref.is_none());
         let brief_copies = checkout_paths
@@ -1336,11 +1252,12 @@ impl VesselReconciler {
                     || issue_repository_refs.iter().flatten().any(|relevant| *relevant == *repo_ref)
             })
             .map(|(repo_ref, path)| match &strategy {
-                PlacementStrategy::DockerHostCheckoutAndMount { mount_path, .. } => {
+                PlacementStrategy::DockerHostCheckoutAndMount { .. } => {
+                    let mount_path = realisation_settings::DOCKER_WORKSPACE;
                     if multi_repository {
                         format!("{}/{}", mount_path.trim_end_matches('/'), workspace_slugs[repo_ref])
                     } else {
-                        mount_path.clone()
+                        mount_path.to_owned()
                     }
                 }
                 PlacementStrategy::HostDirect { .. } | PlacementStrategy::CloneInVessel { .. } => path.clone(),
@@ -1417,7 +1334,7 @@ impl VesselReconciler {
                     }
                     if phase == Some(TerminalSessionPhase::Starting) || (should_start && phase != Some(TerminalSessionPhase::Running)) {
                         return Ok(VesselPrepared::provisioning(
-                            &placement_policy,
+                            &placement,
                             placement_decision.clone(),
                             format!("terminal session {terminal_name} to become running"),
                             actuations,
@@ -1431,7 +1348,7 @@ impl VesselReconciler {
                     // #3907: a requester whose binding was revoked waits with the
                     // reason; only a rebind or a new authorization starts it again.
                     if let Some(reason) = self.account_wait(&obj.spec.convoy_ref, process).await? {
-                        return Ok(VesselPrepared::provisioning(&placement_policy, placement_decision.clone(), reason, actuations));
+                        return Ok(VesselPrepared::provisioning(&placement, placement_decision.clone(), reason, actuations));
                     }
                     let source = match &process.source {
                         CrewSource::Tool { command } => flotilla_resources::TerminalSessionSource::Tool { command: command.clone() },
@@ -1479,7 +1396,7 @@ impl VesselReconciler {
                                     Ok(artifact) => artifact.object,
                                     Err(ResourceError::NotFound { .. }) => {
                                         return Ok(VesselPrepared::provisioning(
-                                            &placement_policy,
+                                            &placement,
                                             placement_decision.clone(),
                                             format!("brief artifact {name} to replicate"),
                                             actuations,
@@ -1571,7 +1488,7 @@ impl VesselReconciler {
                         },
                     });
                     return Ok(VesselPrepared::provisioning(
-                        &placement_policy,
+                        &placement,
                         placement_decision.clone(),
                         format!("terminal session {terminal_name} to become running"),
                         actuations,
@@ -1726,10 +1643,7 @@ impl Reconciler for VesselReconciler {
     }
 }
 
-fn image_stamp(
-    environment: &ResourceObject<Environment>,
-    placement_policy: &ResourceObject<PlacementPolicy>,
-) -> Result<ImageStamp, String> {
+fn image_stamp(environment: &ResourceObject<Environment>, placement: &Placement) -> Result<ImageStamp, String> {
     let status =
         environment.status.as_ref().ok_or_else(|| format!("environment {} awaiting image observations", environment.metadata.name))?;
     let image_ref =
@@ -1742,7 +1656,7 @@ fn image_stamp(
         .docker
         .as_ref()
         .and_then(|docker| docker.image_build_ref.as_ref())
-        .and_then(|_| composed_image(placement_policy, Some(image_ref.clone())));
+        .and_then(|_| composed_image(placement, Some(image_ref.clone())));
     Ok(ImageStamp { image_ref, local_image_id, registry_digest: status.registry_digest.clone(), composed })
 }
 
@@ -1792,64 +1706,27 @@ fn environment_with_credentials(
     env
 }
 
-fn placement_strategy(spec: &PlacementPolicySpec) -> Result<PlacementStrategy, String> {
-    if let Some(cloud) = &spec.cloud_sandbox_per_vessel {
-        if spec.host_direct.is_some() || spec.docker_per_vessel.is_some() {
-            return Err("placement must select exactly one strategy".into());
+fn placement_strategy(spec: &FulfilmentKindSpec) -> PlacementStrategy {
+    let (host_ref, pool) = (spec.host_ref.clone(), spec.pool.clone());
+    match &spec.realisation {
+        FulfilmentRealisation::HostDirect => PlacementStrategy::HostDirect { host_ref, pool },
+        FulfilmentRealisation::DockerPerVessel { image } => {
+            PlacementStrategy::DockerHostCheckoutAndMount { host_ref, pool, image: image.clone() }
         }
-        return Ok(PlacementStrategy::CloneInVessel {
-            host_ref: String::new(),
-            pool: spec.pool.clone(),
-            image: Some(DockerImageSource::Literal(cloud.image.clone())),
-            pull_policy: DockerImagePullPolicy::IfNotPresent,
-            env: cloud.env.clone(),
-            clone_path: "/workspace".into(),
-            default_cwd: None,
-        });
+        // The guest's root comes from the frozen decision.
+        FulfilmentRealisation::CloudSandboxPerVessel { image } => {
+            PlacementStrategy::CloneInVessel { host_ref: String::new(), pool, image: image.clone(), clone_path: String::new() }
+        }
     }
-    if let Some(HostDirectPlacementPolicySpec { host_ref, checkout: HostDirectPlacementPolicyCheckout::Worktree }) = &spec.host_direct {
-        return Ok(PlacementStrategy::HostDirect { host_ref: host_ref.clone(), pool: spec.pool.clone() });
-    }
-
-    if let Some(docker) = &spec.docker_per_vessel {
-        return match &docker.checkout {
-            DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path }
-            | DockerCheckoutStrategy::LocalCloneOnHostAndMount { mount_path } => Ok(PlacementStrategy::DockerHostCheckoutAndMount {
-                local_clone: matches!(docker.checkout, DockerCheckoutStrategy::LocalCloneOnHostAndMount { .. }),
-                host_ref: docker.host_ref.clone(),
-                pool: spec.pool.clone(),
-                image: docker.image.clone(),
-                pull_policy: docker.pull_policy,
-                env: docker.env.clone(),
-                mount_path: mount_path.clone(),
-                default_cwd: docker.default_cwd.clone(),
-            }),
-            DockerCheckoutStrategy::FreshCloneInContainer { clone_path } => Ok(PlacementStrategy::CloneInVessel {
-                host_ref: docker.host_ref.clone(),
-                pool: spec.pool.clone(),
-                image: docker.image.clone(),
-                pull_policy: docker.pull_policy,
-                env: docker.env.clone(),
-                clone_path: clone_path.clone(),
-                default_cwd: docker.default_cwd.clone(),
-            }),
-        };
-    }
-
-    Err("placement policy must define exactly one supported strategy".to_string())
 }
 
-fn provisioning_patch(
-    placement_policy: &ResourceObject<PlacementPolicy>,
-    placement_decision: Option<PlacementDecision>,
-    waiting_for: String,
-) -> PlannedPatch {
+fn provisioning_patch(placement: &Placement, placement_decision: Option<PlacementDecision>, waiting_for: String) -> PlannedPatch {
     PlannedPatch::Provisioning {
-        observed_kind_ref: placement_policy.metadata.name.clone(),
-        observed_kind_version: placement_policy.metadata.resource_version.clone(),
+        observed_kind_ref: placement.kind.metadata.name.clone(),
+        observed_kind_version: placement.kind.metadata.resource_version.clone(),
         placement_decision,
         waiting_for,
-        image: composed_image(placement_policy, None),
+        image: composed_image(placement, None),
     }
 }
 
@@ -1904,42 +1781,33 @@ fn checkout_target_path(repo_default_dir: &str, convoy_slug: &str, repo_slug: &s
 
 /// A cloud sandbox is provisioned by its own provider instance from typed
 /// inputs alone: no Docker spec, and nothing smuggled through its env (#3981).
-/// `None` for any other placement.
 fn cloud_environment_spec(
-    policy: &ResourceObject<PlacementPolicy>,
+    placement: &Placement,
+    image: &str,
     probe_needs: BTreeSet<flotilla_resources::CapabilityNeed>,
-) -> Option<Result<EnvironmentSpec, String>> {
-    let cloud = policy.spec.cloud_sandbox_per_vessel.as_ref()?;
-    let address = environment_provider_labels(policy)
-        .get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL)
-        .ok_or_else(|| format!("cloud placement policy {} names no provider instance", policy.metadata.name))
-        .and_then(|instance| {
-            flotilla_address::Address::root(flotilla_address::Kind::Account, instance)
-                .and_then(|account| account.child(flotilla_address::Kind::Provider, instance))
-                .map_err(|error| error.to_string())
-        });
-    Some(address.map(|address| EnvironmentSpec {
+) -> Result<EnvironmentSpec, String> {
+    let instance = placement
+        .instance
+        .as_ref()
+        .ok_or_else(|| format!("cloud placement {} names no provider instance", placement.kind.metadata.name))?;
+    let address = flotilla_address::Address::root(flotilla_address::Kind::Account, instance)
+        .and_then(|account| account.child(flotilla_address::Kind::Provider, instance))
+        .map_err(|error| error.to_string())?;
+    Ok(EnvironmentSpec {
         provider_address: Some(address),
         cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
-            image: cloud.image.clone(),
-            size: cloud.size.clone(),
+            image: image.to_owned(),
+            size: realisation_settings::CLOUD_SANDBOX_SIZE,
             lifetime_cap_seconds: None,
             probe_needs,
-            env: cloud.env.clone(),
+            env: BTreeMap::new(),
         }),
         ..EnvironmentSpec::default()
-    }))
+    })
 }
 
-fn environment_provider_labels(policy: &ResourceObject<PlacementPolicy>) -> BTreeMap<String, String> {
-    policy
-        .metadata
-        .labels
-        .get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL)
-        .or_else(|| policy.spec.provider_requirements.as_ref().and_then(|requirements| requirements.instance.as_ref()))
-        .map(|instance| (ENVIRONMENT_PROVIDER_INSTANCE_LABEL.into(), instance.clone()))
-        .into_iter()
-        .collect()
+fn environment_provider_labels(placement: &Placement) -> BTreeMap<String, String> {
+    placement.instance.iter().map(|instance| (ENVIRONMENT_PROVIDER_INSTANCE_LABEL.into(), instance.clone())).collect()
 }
 
 fn owned_child_meta(name: &str, workspace: &ResourceObject<Vessel>, mut extra_labels: BTreeMap<String, String>) -> InputMeta {
@@ -2010,27 +1878,12 @@ impl PlacementStrategy {
         !matches!(self, Self::CloneInVessel { .. })
     }
 
-    fn terminal_cwd(&self, workspace_root: &str, multi_repository: bool, has_repositories: bool) -> String {
+    fn terminal_cwd(&self, workspace_root: &str, has_repositories: bool) -> String {
         match self {
             Self::HostDirect { .. } => workspace_root.to_string(),
-            Self::DockerHostCheckoutAndMount { mount_path, default_cwd, .. } => {
-                if !has_repositories {
-                    default_cwd.clone().unwrap_or_else(|| "/".to_string())
-                } else if multi_repository {
-                    mount_path.clone()
-                } else {
-                    default_cwd.clone().unwrap_or_else(|| mount_path.clone())
-                }
-            }
-            Self::CloneInVessel { clone_path, default_cwd, .. } => {
-                if !has_repositories {
-                    default_cwd.clone().unwrap_or_else(|| "/".to_string())
-                } else if multi_repository {
-                    clone_path.clone()
-                } else {
-                    default_cwd.clone().unwrap_or_else(|| clone_path.clone())
-                }
-            }
+            Self::DockerHostCheckoutAndMount { .. } => realisation_settings::DOCKER_WORKSPACE.to_string(),
+            Self::CloneInVessel { clone_path, .. } if has_repositories => clone_path.clone(),
+            Self::CloneInVessel { .. } => "/".to_string(),
         }
     }
 }
@@ -2044,9 +1897,9 @@ mod tests {
 
     use flotilla_protocol::{NodeId, PlacementDecision, PlacementTargetHost};
     use flotilla_resources::{
-        Convoy, ConvoySpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, PlacementPolicy,
-        PlacementPolicySpec, ResourceError, Vessel, VesselSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, PLACEMENT_SNAPSHOT_KIND,
-        PREPARED_SNAPSHOT_LABEL,
+        Convoy, ConvoySpec, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HostDirectPlacementPolicyCheckout,
+        HostDirectPlacementPolicySpec, InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceError, Vessel, VesselSpec,
+        ACTUATOR_SOURCE_ROOT_ANNOTATION, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL,
     };
     use flotilla_store::ResourceBackend;
 
@@ -2177,35 +2030,61 @@ mod tests {
         }
     }
 
+    fn snapshot_meta(name: &str) -> InputMeta {
+        InputMeta::builder()
+            .name(name.to_string())
+            .labels(BTreeMap::from([(PREPARED_SNAPSHOT_LABEL.to_string(), PLACEMENT_SNAPSHOT_KIND.to_string())]))
+            .build()
+    }
+
+    fn decision(provider_instance: Option<&str>) -> PlacementDecision {
+        PlacementDecision {
+            provider_instance: provider_instance.map(str::to_owned),
+            provider_workspace_root: None,
+            minimal_alternatives: Vec::new(),
+            escalation_reason: None,
+            kind: "kind".to_string(),
+            target_host: PlacementTargetHost {
+                reference: flotilla_protocol::CanonicalHostId::resolved("host"),
+                display_name: "host".into(),
+            },
+            refused_candidates: Vec::new(),
+            viable_not_selected: Vec::new(),
+            allocation: None,
+        }
+    }
+
+    // A vessel reads its placement snapshot from whichever origin froze it, as a kind, or for
+    // one roll as the PlacementPolicy a convoy admitted before kinds froze. Only snapshots are
+    // read from another origin. The provider instance is the decision's, else the old snapshot's.
     #[tokio::test]
     async fn vessel_resolves_prepared_placement_snapshot_from_a_third_origin() {
         let author = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("author"));
         let driver = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("driver"));
-        let snapshot_name = "placement-snapshot-012345abcdef";
-        author
-            .using::<PlacementPolicy>("flotilla")
-            .create(
-                &InputMeta::builder()
-                    .name(snapshot_name.to_string())
-                    .labels(BTreeMap::from([(PREPARED_SNAPSHOT_LABEL.to_string(), PLACEMENT_SNAPSHOT_KIND.to_string())]))
-                    .build(),
-                &PlacementPolicySpec::builder().pool("passthrough".to_string()).build(),
-            )
+        let kind_snapshot = "placement-snapshot-012345abcdef";
+        let policy_snapshot = "placement-snapshot-fedcba543210";
+        let kind = |pool: &str| {
+            FulfilmentKindSpec::builder().host_ref("h".into()).pool(pool.into()).realisation(FulfilmentRealisation::HostDirect).build()
+        };
+        let kinds = author.using::<FulfilmentKind>("flotilla");
+        kinds.create(&snapshot_meta(kind_snapshot), &kind("passthrough")).await.expect("author kind snapshot");
+        kinds.create(&InputMeta::builder().name("ordinary-kind".into()).build(), &kind("cleat")).await.expect("author ordinary kind");
+        let policy = PlacementPolicySpec::builder()
+            .pool("zellij".to_string())
+            .host_direct(HostDirectPlacementPolicySpec { host_ref: "h".into(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
+            .provider_requirements(flotilla_resources::ProviderRequirements { instance: Some("frozen".into()), ..Default::default() })
+            .build();
+        author.using::<PlacementPolicy>("flotilla").create(&snapshot_meta(policy_snapshot), &policy).await.expect("author policy snapshot");
+        driver
+            .replica_writer::<FulfilmentKind>(NodeId::new("author"), "flotilla")
+            .replace(&kinds.list().await.expect("author kinds"), chrono::Utc::now())
             .await
-            .expect("author snapshot");
-        author
-            .using::<PlacementPolicy>("flotilla")
-            .create(
-                &InputMeta::builder().name("ordinary-policy".to_string()).build(),
-                &PlacementPolicySpec::builder().pool("cleat".to_string()).build(),
-            )
-            .await
-            .expect("author ordinary policy");
+            .expect("replicate kinds");
         driver
             .replica_writer::<PlacementPolicy>(NodeId::new("author"), "flotilla")
             .replace(&author.using::<PlacementPolicy>("flotilla").list().await.expect("author policies"), chrono::Utc::now())
             .await
-            .expect("replicate snapshot");
+            .expect("replicate policies");
         let reconciler = VesselReconciler::new(driver.clone(), "flotilla")
             .with_federated_dependencies(&driver, flotilla_protocol::CanonicalHostId::resolved("driver-host"));
         for (name, origin) in [("local-vessel", None), ("remote-vessel", Some("convoy-origin"))] {
@@ -2220,18 +2099,89 @@ mod tests {
                     &VesselSpec {
                         convoy_ref: "convoy".to_string(),
                         vessel_name: "work".to_string(),
-                        fulfilment_kind_ref: snapshot_name.to_string(),
+                        fulfilment_kind_ref: kind_snapshot.to_string(),
                         adopted_checkout_refs: BTreeMap::new(),
                     },
                 )
                 .await
                 .expect("vessel");
-            assert_eq!(
-                reconciler.placement_dependency(&vessel, snapshot_name).await.expect("resolve shared snapshot").spec.pool,
-                "passthrough"
-            );
-            assert!(matches!(reconciler.placement_dependency(&vessel, "ordinary-policy").await, Err(ResourceError::NotFound { .. })));
+            let resolve = |name: &'static str, decision: Option<PlacementDecision>| {
+                let (reconciler, vessel) = (&reconciler, &vessel);
+                async move { reconciler.placement_dependency(vessel, name, decision.as_ref()).await }
+            };
+            let placement = resolve(kind_snapshot, Some(decision(Some("decided")))).await.expect("kind snapshot").expect("a kind");
+            assert_eq!((placement.kind.spec.pool.as_str(), placement.instance.as_deref()), ("passthrough", Some("decided")));
+            let placement = resolve(policy_snapshot, None).await.expect("policy snapshot").expect("its kind");
+            assert_eq!((placement.kind.spec.pool.as_str(), placement.instance.as_deref()), ("zellij", Some("frozen")));
+            assert_eq!(placement.kind.spec.realisation, FulfilmentRealisation::HostDirect);
+            let placement = resolve(policy_snapshot, Some(decision(Some("decided")))).await.expect("policy snapshot").expect("its kind");
+            assert_eq!(placement.instance.as_deref(), Some("decided"));
+            assert!(matches!(resolve("ordinary-kind", None).await, Err(ResourceError::NotFound { .. })));
         }
+    }
+
+    // A vessel no admission froze an instance for takes the one provider its kind's host
+    // advertises for the realisation, and none before any is observed; a frozen instance wins.
+    #[tokio::test]
+    async fn an_unfrozen_vessel_takes_the_one_provider_its_host_advertises() {
+        use flotilla_protocol::provider::{
+            CheckoutStrategy, EnvironmentClass, MaterialMode, ProviderAdvertisement, ProviderCapabilities, ProviderKind, ProviderReadiness,
+        };
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let hosts = backend.using::<flotilla_resources::Host>("flotilla");
+        let host = hosts
+            .create(
+                &InputMeta::builder().name("h".into()).build(),
+                &flotilla_resources::HostSpec { display_name: "h".into(), ..Default::default() },
+            )
+            .await
+            .expect("host");
+        let reconciler = VesselReconciler::new(backend.clone(), "flotilla");
+        let kind = FulfilmentKindSpec::builder()
+            .host_ref("h".into())
+            .pool("cleat".into())
+            .realisation(FulfilmentRealisation::DockerPerVessel { image: None })
+            .build();
+        backend.using::<FulfilmentKind>("flotilla").create(&InputMeta::builder().name("docker".into()).build(), &kind).await.expect("kind");
+        let vessel = backend
+            .using::<Vessel>("flotilla")
+            .create(
+                &InputMeta::builder().name("vessel".into()).build(),
+                &VesselSpec {
+                    convoy_ref: "convoy".into(),
+                    vessel_name: "work".into(),
+                    fulfilment_kind_ref: "docker".into(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+            )
+            .await
+            .expect("vessel");
+        let unobserved = reconciler.placement_dependency(&vessel, "docker", None).await.expect("read").expect("a placement");
+        assert_eq!(unobserved.instance, None);
+        let providers = [("host-direct", EnvironmentClass::HostDirect), ("only", EnvironmentClass::Dummy)].map(|(instance, class)| {
+            ProviderAdvertisement {
+                instance: instance.into(),
+                kind: Some(ProviderKind::new(class, "fixture")),
+                readiness: ProviderReadiness::Ready,
+                capabilities: ProviderCapabilities {
+                    material_modes: vec![MaterialMode::Shared],
+                    checkout_strategies: vec![CheckoutStrategy::HostWorktree],
+                    ..Default::default()
+                },
+            }
+        });
+        let status = flotilla_resources::HostStatus {
+            capabilities: [(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::json!(providers))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        hosts.update_status("h", &host.metadata.resource_version, &status).await.expect("host status");
+        let placement = reconciler.placement_dependency(&vessel, "docker", None).await.expect("read").expect("a provider");
+        assert_eq!(placement.instance.as_deref(), Some("only"));
+        let placement =
+            reconciler.placement_dependency(&vessel, "docker", Some(&decision(Some("frozen")))).await.expect("read").expect("frozen");
+        assert_eq!(placement.instance.as_deref(), Some("frozen"));
     }
 
     #[tokio::test]
@@ -2259,53 +2209,39 @@ mod tests {
         );
     }
 
-    // Glue: a frozen per-vessel spec must carry its selected identity into
-    // Environment metadata even when snapshot metadata has no provider label.
-    #[tokio::test]
-    async fn frozen_spec_provider_identity_reaches_environment_metadata() {
-        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        let spec = PlacementPolicySpec::builder()
-            .pool("cleat".into())
-            .provider_requirements(flotilla_resources::ProviderRequirements {
-                instance: Some("selected-instance".into()),
-                ..Default::default()
-            })
-            .build();
-        let policy = backend
-            .using::<PlacementPolicy>("flotilla")
-            .create(&InputMeta::builder().name("snapshot".into()).build(), &spec)
-            .await
-            .unwrap();
-        assert_eq!(
-            environment_provider_labels(&policy)
-                .get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL)
-                .map(String::as_str),
-            Some("selected-instance")
-        );
-    }
-
-    // #3981: a cloud vessel's Environment names its provider instance and carries
-    // typed inputs only: no Docker spec, and no carrier control in its env.
+    // #3981: a cloud vessel's Environment names its frozen provider instance and carries
+    // typed inputs only: no Docker spec, nothing in its env, and the constant size.
     #[test]
     fn cloud_environment_is_typed_provider_input() {
-        use super::cloud_environment_spec;
-        use flotilla_resources::ResourceObject;
-        let policy: ResourceObject<PlacementPolicy> = serde_json::from_value(serde_json::json!({
-            "metadata": { "name": "cloud", "namespace": "flotilla", "resource_version": "1", "annotations": {},
-                "labels": { "flotilla.work/environment-provider-instance": "daytona" }, "creation_timestamp": "2026-10-23T00:00:00Z" },
-            "spec": { "pool": "cleat", "cloud_sandbox_per_vessel": {
-                "image": "image@sha256:digest", "size": { "cpus": 2, "memory_bytes": 1024, "disk_bytes": 2048 },
-                "checkout": "clone_in_vessel", "env": { "LANG": "C.UTF-8" } }
-            }
+        use super::{cloud_environment_spec, Placement};
+        let spec = FulfilmentKindSpec::builder()
+            .host_ref(String::new())
+            .pool("cleat".into())
+            .realisation(FulfilmentRealisation::CloudSandboxPerVessel { image: "image@sha256:digest".into() })
+            .build();
+        let kind: flotilla_resources::ResourceObject<FulfilmentKind> = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "cloud", "namespace": "flotilla", "resource_version": "1", "annotations": {}, "labels": {},
+                "creation_timestamp": "2026-10-23T00:00:00Z" },
+            "spec": spec
         }))
         .unwrap();
         let needs: BTreeSet<flotilla_resources::CapabilityNeed> = ["toolchain:rust".parse().unwrap()].into_iter().collect();
-        let spec = cloud_environment_spec(&policy, needs.clone()).expect("a cloud policy").expect("a typed spec");
+        let unfrozen = Placement { kind: kind.clone(), instance: None };
+        assert!(cloud_environment_spec(&unfrozen, "image@sha256:digest", needs.clone())
+            .unwrap_err()
+            .contains("names no provider instance"));
+        let placement = Placement { kind, instance: Some("daytona".into()) };
+        let spec = cloud_environment_spec(&placement, "image@sha256:digest", needs.clone()).expect("a typed spec");
         assert!(spec.docker.is_none() && spec.host_direct.is_none());
         assert_eq!(spec.provider_address.unwrap().to_string(), "account:daytona/provider:daytona");
+        assert_eq!(
+            environment_provider_labels(&placement).get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL),
+            Some(&"daytona".to_string())
+        );
         let cloud = spec.cloud_sandbox.unwrap();
         assert_eq!(cloud.probe_needs, needs);
-        assert_eq!(cloud.env, [("LANG".to_string(), "C.UTF-8".to_string())].into());
+        assert_eq!(cloud.size, flotilla_resources::realisation_settings::CLOUD_SANDBOX_SIZE);
+        assert!(cloud.env.is_empty());
     }
 
     #[test]
@@ -2338,12 +2274,10 @@ mod tests {
 
     #[test]
     fn placement_strategy_replaces_display_name_alias_with_canonical_host_reference() {
-        let policy = PlacementPolicySpec::builder()
+        let kind = FulfilmentKindSpec::builder()
+            .host_ref("udder".to_string())
             .pool("cleat".to_string())
-            .host_direct(HostDirectPlacementPolicySpec {
-                host_ref: "udder".to_string(),
-                checkout: HostDirectPlacementPolicyCheckout::Worktree,
-            })
+            .realisation(FulfilmentRealisation::HostDirect)
             .build();
         let decision = PlacementDecision {
             provider_instance: None,
@@ -2359,7 +2293,7 @@ mod tests {
             viable_not_selected: Vec::new(),
             allocation: None,
         };
-        let mut strategy = placement_strategy(&policy).expect("host-direct policy should produce a placement strategy");
+        let mut strategy = placement_strategy(&kind);
 
         strategy.canonicalize_host_ref(decision.target_host.reference.as_str());
 

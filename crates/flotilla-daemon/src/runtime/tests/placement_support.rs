@@ -18,13 +18,13 @@ pub(super) async fn replicate_local_kind<T: Resource>(source: &InProcessDaemon, 
 pub(super) async fn bridge_runtime_resource_stores(first: &InProcessDaemon, second: &InProcessDaemon) {
     replicate_local_kind::<Convoy>(first, second).await;
     replicate_local_kind::<Vessel>(first, second).await;
-    replicate_local_kind::<PlacementPolicy>(first, second).await;
+    replicate_local_kind::<FulfilmentKind>(first, second).await;
     replicate_local_kind::<ResourceCheckout>(first, second).await;
     replicate_local_kind::<TerminalSession>(first, second).await;
 
     replicate_local_kind::<Convoy>(second, first).await;
     replicate_local_kind::<Vessel>(second, first).await;
-    replicate_local_kind::<PlacementPolicy>(second, first).await;
+    replicate_local_kind::<FulfilmentKind>(second, first).await;
     replicate_local_kind::<ResourceCheckout>(second, first).await;
     replicate_local_kind::<TerminalSession>(second, first).await;
 }
@@ -156,34 +156,20 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
         .await
         .expect("create workflow");
     let policy_name = if docker { "remote-docker-feta" } else { "remote-host-direct-feta" };
-    let policy = if docker {
-        PlacementPolicySpec::builder()
-            .pool("passthrough".to_string())
-            .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                memory_policy: Default::default(),
-                host_ref: feta_host_ref.clone(),
-                image: Some("test-image".into()),
-                pull_policy: Default::default(),
-                agent_adapters: BTreeSet::new(),
-                default_cwd: Some("/workspace".to_string()),
-                env: BTreeMap::new(),
-                checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
-            })
-            .build()
-    } else {
-        PlacementPolicySpec::builder()
-            .pool("passthrough".to_string())
-            .host_direct(HostDirectPlacementPolicySpec {
-                host_ref: feta_host_ref.clone(),
-                checkout: HostDirectPlacementPolicyCheckout::Worktree,
-            })
-            .build()
-    };
+    let kind = FulfilmentKindSpec::builder()
+        .host_ref(feta_host_ref.clone())
+        .pool("passthrough".to_string())
+        .realisation(if docker {
+            FulfilmentRealisation::DockerPerVessel { image: Some(flotilla_resources::DockerImageSource::Literal("test-image".into())) }
+        } else {
+            FulfilmentRealisation::HostDirect
+        })
+        .build();
     kiwi.resource_backend()
-        .using::<PlacementPolicy>(NAMESPACE)
-        .create(&empty_meta(policy_name), &policy)
+        .using::<FulfilmentKind>(NAMESPACE)
+        .create(&empty_meta(policy_name), &kind)
         .await
-        .expect("create remote placement policy");
+        .expect("create remote fulfilment kind");
     let convoys = kiwi.resource_backend().using::<Convoy>(NAMESPACE);
     let convoy = convoys
         .create(

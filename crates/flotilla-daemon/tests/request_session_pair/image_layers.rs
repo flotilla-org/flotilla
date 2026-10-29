@@ -1,6 +1,6 @@
 use flotilla_resources::{
-    image_build_name, single_agent_workflow_spec, DockerImageSource, ImageBuild, ImageDelivery, ImageLayer, ImageLayerSource,
-    ImageLayerSpec, ImageLayerTier, Project, ResourceObject,
+    image_build_name, single_agent_workflow_spec, DockerImageSource, FulfilmentGrant, FulfilmentRealisation, ImageBuild, ImageDelivery,
+    ImageLayer, ImageLayerSource, ImageLayerSpec, ImageLayerTier, Project, ResourceObject,
 };
 
 use super::*;
@@ -25,8 +25,11 @@ async fn frozen_image(backend: &ResourceBackend, convoy: &ResourceObject<Convoy>
     let snapshot = flotilla_resources::vessel_placement_pin(convoy, "work")
         .map(|pin| pin.kind_ref)
         .unwrap_or_else(|| convoy.metadata.annotations[flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION].clone());
-    let policy = backend.using::<PlacementPolicy>("flotilla").get(&snapshot).await.expect("placement snapshot");
-    policy.spec.docker_per_vessel.expect("docker").image.expect("admission freezes the composed image")
+    let kind = backend.using::<FulfilmentKind>("flotilla").get(&snapshot).await.expect("placement snapshot");
+    let FulfilmentRealisation::DockerPerVessel { image } = kind.spec.realisation else {
+        panic!("the composed kind freezes as a Docker kind: {:?}", kind.spec.realisation);
+    };
+    image.expect("admission freezes the composed image")
 }
 
 // Behaviour (ADR 0062): a composed policy resolves each vessel's image at
@@ -75,30 +78,15 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
     status.capabilities.insert("docker".into(), serde_json::json!(true));
     status.capabilities.insert("os".into(), serde_json::json!("linux"));
     backend.using::<Host>("flotilla").update_status(&host_id, &host.metadata.resource_version, &status).await.expect("Docker capacity");
-    let policy = PlacementPolicySpec::builder()
+    let kind = FulfilmentKindSpec::builder()
+        .host_ref(host_id.clone())
         .pool("cleat".into())
-        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-            host_ref: host_id.clone(),
-            image: None,
-            pull_policy: Default::default(),
-            memory_policy: Default::default(),
-            agent_adapters: BTreeSet::new(),
-            default_cwd: None,
-            env: BTreeMap::new(),
-            checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".into() },
-        })
+        .grants(BTreeSet::from([FulfilmentGrant::platform("linux".into()), FulfilmentGrant::network("scoped".into())]))
+        .realisation(FulfilmentRealisation::DockerPerVessel { image: None })
         .build();
     backend
-        .using::<PlacementPolicy>("flotilla")
-        .create(&InputMeta::builder().name("composed-docker".into()).build(), &policy)
-        .await
-        .expect("policy");
-    backend
         .using::<FulfilmentKind>("flotilla")
-        .create(
-            &InputMeta::builder().name("composed-docker".into()).build(),
-            &FulfilmentKindSpec::from_policy(&policy, "linux").expect("kind"),
-        )
+        .create(&InputMeta::builder().name("composed-docker".into()).build(), &kind)
         .await
         .expect("kind");
     let catalogue = [
@@ -159,8 +147,7 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
     eventually(Duration::from_secs(5), Duration::from_millis(10), "image catalogue and placement replicate", || async {
         let issuer = mesh.hosts[issuer].resource_backend();
         let mut replicated = issuer.including_replicas::<Host>("flotilla").get(&host_id).await.is_ok()
-            && issuer.including_replicas::<FulfilmentKind>("flotilla").get("composed-docker").await.is_ok()
-            && issuer.including_replicas::<PlacementPolicy>("flotilla").get("composed-docker").await.is_ok();
+            && issuer.including_replicas::<FulfilmentKind>("flotilla").get("composed-docker").await.is_ok();
         for spec in &catalogue {
             replicated &= issuer.definitions::<ImageLayer>("flotilla").get(&spec.resource_name()).await.is_ok();
         }

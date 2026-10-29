@@ -65,14 +65,21 @@ struct KindEntry {
     record: Result<(FulfilmentKindDefinition, DefinitionOrigin), String>,
 }
 
-/// `host_platform` is the platform grant of the host's host-direct kind.
-fn kind_of(spec: &PlacementPolicySpec, host_platform: Option<&FulfilmentGrant>) -> Result<FulfilmentKindSpec, String> {
-    if spec.host_direct.is_some() {
-        let platform = host_platform.ok_or("a host-direct policy needs its host's platform, and its host has no host-direct kind")?;
-        let platform = platform.0.strip_prefix("platform:").unwrap_or(&platform.0);
-        return FulfilmentKindSpec::from_policy(spec, platform);
+/// `host_platform` is the platform grant of the host's host-direct kind. A snapshot whose host
+/// has none anywhere takes no platform grant: nothing selects a snapshot by its grants.
+fn kind_of(spec: &PlacementPolicySpec, host_platform: Option<&FulfilmentGrant>, snapshot: bool) -> Result<FulfilmentKindSpec, String> {
+    if spec.host_direct.is_none() {
+        return FulfilmentKindSpec::from_policy(spec, "linux");
     }
-    FulfilmentKindSpec::from_policy(spec, "linux")
+    match host_platform {
+        Some(platform) => FulfilmentKindSpec::from_policy(spec, platform.0.strip_prefix("platform:").unwrap_or(&platform.0)),
+        None if snapshot => {
+            let mut kind = FulfilmentKindSpec::from_policy(spec, "unknown")?;
+            kind.grants.retain(|grant| !grant.0.starts_with("platform:"));
+            Ok(kind)
+        }
+        None => Err("a host-direct policy needs its host's platform, and its host has no host-direct kind".into()),
+    }
 }
 
 pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> ImportedPlacement {
@@ -85,7 +92,12 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
             continue;
         }
         let spec = &copy.object.spec;
-        let record = origin(&copy.object.metadata).and_then(|origin| Ok((FulfilmentKindDefinition::new(spec)?, origin)));
+        let metadata = &copy.object.metadata;
+        let kind_origin = match is_prepared_snapshot(&metadata.name, &metadata.labels, PLACEMENT_SNAPSHOT_KIND) {
+            true => Ok(DefinitionOrigin::Snapshot),
+            false => origin(metadata),
+        };
+        let record = kind_origin.and_then(|origin| Ok((FulfilmentKindDefinition::new(spec)?, origin)));
         if let (Ok(_), FulfilmentRealisation::HostDirect, Some(platform)) =
             (&record, &spec.realisation, spec.grants.iter().find(|grant| grant.0.starts_with("platform:")))
         {
@@ -128,8 +140,12 @@ pub fn import_placement(copies: &PlacementCopies, report: &mut ImportReport) -> 
             // The daemon already migrated it to this kind.
             entry.namespaces.insert(copy.namespace.clone());
         } else {
-            let host = (copy.home.clone(), host_ref(spec).to_owned());
-            let record = kind_of(spec, platforms.get(&host))
+            // A snapshot is often frozen at the admitting home for a host homed elsewhere.
+            let host = host_ref(spec);
+            let platform = platforms
+                .get(&(copy.home.clone(), host.to_owned()))
+                .or_else(|| platforms.iter().find(|((_, held), _)| held == host).map(|(_, platform)| platform));
+            let record = kind_of(spec, platform, snapshot)
                 .and_then(|kind| FulfilmentKindDefinition::new(&kind))
                 .map(|record| (record, policy_origin))
                 .map_err(|reason| format!("its kind: {reason}"));

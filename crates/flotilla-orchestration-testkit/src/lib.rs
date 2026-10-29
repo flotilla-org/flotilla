@@ -44,13 +44,10 @@ use flotilla_resources::EnvironmentSpec as ResourceEnvironmentSpec;
 use flotilla_resources::EnvironmentStatus as ResourceEnvironmentStatus;
 use flotilla_resources::Event;
 use flotilla_resources::FulfilmentKindSpec;
+use flotilla_resources::FulfilmentRealisation;
 use flotilla_resources::HarnessFacts;
-use flotilla_resources::HostDirectPlacementPolicyCheckout;
-use flotilla_resources::HostDirectPlacementPolicySpec;
 use flotilla_resources::HostSpec;
 use flotilla_resources::HostStatus;
-use flotilla_resources::PlacementPolicy;
-use flotilla_resources::PlacementPolicySpec;
 use flotilla_resources::ProjectRepositoryRole;
 use flotilla_resources::ProjectRepositorySpec;
 use flotilla_resources::RepositoryStatus;
@@ -125,11 +122,11 @@ async fn assert_independent_placement_snapshots(factory: &dyn EnsureScenarioCont
     // Exercise both simultaneous first admissions and an already-visible replica.
     first.reconcile_convoy_ensures_once("flotilla").await.expect("first admission");
     if replica_before_admission {
-        let mut snapshots = first.resource_backend().using::<PlacementPolicy>("flotilla").list().await.expect("first placements");
-        snapshots.items.retain(|policy| policy.metadata.name.starts_with("placement-snapshot-"));
+        let mut snapshots = first.resource_backend().using::<FulfilmentKind>("flotilla").list().await.expect("first placements");
+        snapshots.items.retain(|kind| kind.metadata.name.starts_with("placement-snapshot-"));
         second
             .resource_backend()
-            .replica_writer::<PlacementPolicy>(first.node_id().clone(), "flotilla")
+            .replica_writer::<FulfilmentKind>(first.node_id().clone(), "flotilla")
             .replace(&snapshots, Utc::now())
             .await
             .expect("replicate before second admission");
@@ -140,10 +137,10 @@ async fn assert_independent_placement_snapshots(factory: &dyn EnsureScenarioCont
     for (source, destination, root) in
         [(&first_store, &second_store, first.node_id().clone()), (&second_store, &first_store, second.node_id().clone())]
     {
-        let mut snapshots = source.using::<PlacementPolicy>("flotilla").list().await.expect("placement log");
-        snapshots.items.retain(|policy| policy.metadata.name.starts_with("placement-snapshot-"));
+        let mut snapshots = source.using::<FulfilmentKind>("flotilla").list().await.expect("placement log");
+        snapshots.items.retain(|kind| kind.metadata.name.starts_with("placement-snapshot-"));
         destination
-            .replica_writer::<PlacementPolicy>(root, "flotilla")
+            .replica_writer::<FulfilmentKind>(root, "flotilla")
             .replace(&snapshots, Utc::now())
             .await
             .expect("exchange placement snapshots");
@@ -165,7 +162,7 @@ async fn assert_independent_placement_snapshots(factory: &dyn EnsureScenarioCont
         "origins must own distinct snapshot identities even when replicas are visible"
     );
     let snapshot = &second_convoy.metadata.annotations[flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION];
-    second_store.using::<PlacementPolicy>("flotilla").get(snapshot).await.expect("second origin retains its placement");
+    second_store.using::<FulfilmentKind>("flotilla").get(snapshot).await.expect("second origin retains its placement");
 }
 
 async fn create_identity_convoy(backend: &ResourceBackend, record: &str, role: &str, project: Option<&str>) {
@@ -240,6 +237,7 @@ async fn standing_ensure_fixture_for(
     let repository_spec = RepositorySpec::remote("https://github.com/acme/standing").expect("repository spec");
     let repository_key = repository_spec.key();
     backend.using::<Repository>("flotilla").create(&test_meta(&repository_key.to_string()), &repository_spec).await.expect("repository");
+    create_host_direct_placement(&backend, &format!("host-direct-{host}-vessels"), &format!("{host}-vessels")).await;
     if materialize_ensure {
         backend
             .definitions::<Project>("flotilla")
@@ -385,12 +383,6 @@ async fn fail_latest_ensured_generation(backend: &ResourceBackend, clock: &Virtu
 
 async fn configure_standing_ensure_agent(backend: &ResourceBackend, overrides: Vec<flotilla_protocol::AgentOverride>) {
     create_docker_placement(backend, "standing-agent", "standing-agent-host", BTreeSet::new()).await;
-    let policy = backend.using::<PlacementPolicy>("flotilla").get("standing-agent").await.expect("policy");
-    backend
-        .using::<FulfilmentKind>("flotilla")
-        .create(&test_meta("standing-agent"), &FulfilmentKindSpec::from_policy(&policy.spec, "linux").expect("kind"))
-        .await
-        .expect("kind");
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts.get("standing-agent-host").await.expect("standing agent host");
     let mut status = host.status.expect("standing agent host status");
@@ -401,9 +393,7 @@ async fn configure_standing_ensure_agent(backend: &ResourceBackend, overrides: V
             ..Default::default()
         },
     );
-    status.disk_free_bytes = Some(100 * 1024 * 1024 * 1024);
-    status.admission_free_space_floor_bytes = Some(20 * 1024 * 1024 * 1024);
-    hosts.update_status(&host.metadata.name, &host.metadata.resource_version, &status).await.expect("standing agent host capacity");
+    hosts.update_status(&host.metadata.name, &host.metadata.resource_version, &status).await.expect("standing agent host facts");
     let workflows = backend.using::<WorkflowTemplate>("flotilla");
     let mut workflow = workflows.get("standing-project--quartermaster").await.expect("standing workflow");
     workflow.spec.vessels[0].crew = vec![CrewSpec::builder()
@@ -474,25 +464,25 @@ async fn set_ensure_driver(backend: &ResourceBackend, driver_ref: &str) {
     ensures.update(&InputMeta::from(&ensure.metadata), &ensure.metadata.resource_version, &spec).await.expect("set ensure driver");
 }
 
-async fn placement_policy(backend: &ResourceBackend, name: &str, host_ref: &str) -> ResourceObject<PlacementPolicy> {
+async fn placement_kind(backend: &ResourceBackend, name: &str, host_ref: &str) -> ResourceObject<FulfilmentKind> {
     backend
-        .using::<PlacementPolicy>("flotilla")
+        .using::<FulfilmentKind>("flotilla")
         .create(
             &test_meta(name),
-            &PlacementPolicySpec::builder()
+            &FulfilmentKindSpec::builder()
+                .host_ref(host_ref.to_string())
                 .pool("passthrough".to_string())
-                .host_direct(HostDirectPlacementPolicySpec {
-                    host_ref: host_ref.to_string(),
-                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                })
+                .realisation(FulfilmentRealisation::HostDirect)
                 .build(),
         )
         .await
-        .expect("placement policy")
+        .expect("fulfilment kind")
 }
 
-async fn create_docker_placement(backend: &ResourceBackend, policy_name: &str, host_ref: &str, held_credentials: BTreeSet<String>) {
-    let hosts = backend.clone().using::<ResourceHost>("flotilla");
+/// A ready host with room for vessels, advertising the fixture providers. Its
+/// heartbeat stays fresh however far a scenario advances its virtual clock.
+async fn create_placement_host(backend: &ResourceBackend, host_ref: &str, capabilities: BTreeMap<String, serde_json::Value>) {
+    let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts
         .create(
             &test_meta(host_ref),
@@ -500,51 +490,63 @@ async fn create_docker_placement(backend: &ResourceBackend, policy_name: &str, h
         )
         .await
         .expect("host create");
+    let mut capabilities = capabilities;
+    capabilities.insert(
+        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+    );
     hosts
         .update_status(
             &host.metadata.name,
             &host.metadata.resource_version,
             &HostStatus {
-                capabilities: [
-                    (flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(held_credentials)),
-                    (
-                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
-                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
-                    ),
-                    ("docker".to_string(), serde_json::json!(true)),
-                    ("os".to_string(), serde_json::json!("linux")),
-                ]
-                .into_iter()
-                .collect(),
-                heartbeat_at: Some(Utc::now()),
+                capabilities,
+                heartbeat_at: Some(Utc::now() + ChronoDuration::days(365)),
                 ready: true,
-                resource_store: None,
+                disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
+                admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
                 ..HostStatus::default()
             },
         )
         .await
         .expect("host status update");
+}
+
+/// Registers the host-direct kind standing convoys place onto.
+async fn create_host_direct_placement(backend: &ResourceBackend, kind_name: &str, host_ref: &str) {
+    create_placement_host(backend, host_ref, BTreeMap::new()).await;
+    placement_kind(backend, kind_name, host_ref).await;
+}
+
+async fn create_docker_placement(backend: &ResourceBackend, kind_name: &str, host_ref: &str, held_credentials: BTreeSet<String>) {
+    create_placement_host(
+        backend,
+        host_ref,
+        BTreeMap::from([
+            (flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(held_credentials)),
+            ("docker".to_string(), serde_json::json!(true)),
+            ("os".to_string(), serde_json::json!("linux")),
+        ]),
+    )
+    .await;
     backend
-        .clone()
-        .using::<PlacementPolicy>("flotilla")
+        .using::<FulfilmentKind>("flotilla")
         .create(
-            &test_meta(policy_name),
-            &PlacementPolicySpec::builder()
+            &test_meta(kind_name),
+            &FulfilmentKindSpec::builder()
+                .host_ref(host_ref.to_string())
                 .pool("passthrough".to_string())
-                .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
-                    memory_policy: Default::default(),
-                    host_ref: host_ref.to_string(),
-                    image: Some("crew:latest".into()),
-                    pull_policy: Default::default(),
-                    agent_adapters: BTreeSet::from(["codex".to_string()]),
-                    default_cwd: None,
-                    env: BTreeMap::new(),
-                    checkout: flotilla_resources::DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+                .grants(BTreeSet::from([
+                    flotilla_resources::FulfilmentGrant::platform("linux".to_string()),
+                    flotilla_resources::FulfilmentGrant::network("scoped".to_string()),
+                ]))
+                .realisation(FulfilmentRealisation::DockerPerVessel {
+                    image: Some(flotilla_resources::DockerImageSource::Literal("crew:latest".into())),
                 })
                 .build(),
         )
         .await
-        .expect("placement create");
+        .expect("kind create");
 }
 
 use chrono::Duration as ChronoDuration;

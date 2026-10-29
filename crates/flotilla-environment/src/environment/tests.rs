@@ -63,6 +63,11 @@ struct RecordingRunner {
     dockerfiles: Mutex<Vec<String>>,
 }
 
+/// A Docker provider under the test slice, which [`RecordingRunner`] answers.
+fn bounded(runner: Arc<dyn CommandRunner>) -> DockerEnvironmentProvider {
+    DockerEnvironmentProvider::new(runner).with_vessel_slice(Some(super::docker_vessels::DockerVessels::for_tests()))
+}
+
 impl RecordingRunner {
     fn new_ok(output: &str) -> Self {
         Self {
@@ -70,7 +75,7 @@ impl RecordingRunner {
             result: Ok(output.to_string()),
             image_environment: Mutex::new(VecDeque::new()),
             memory_info: None,
-            slice_show: Err("systemctl not expected".into()),
+            slice_show: Ok(super::docker_vessels::TEST_SLICE_SHOW.into()),
             tags: Default::default(),
             dockerfiles: Mutex::new(vec![]),
         }
@@ -82,7 +87,7 @@ impl RecordingRunner {
             result: Err(msg.to_string()),
             image_environment: Mutex::new(VecDeque::new()),
             memory_info: None,
-            slice_show: Err("systemctl not expected".into()),
+            slice_show: Ok(super::docker_vessels::TEST_SLICE_SHOW.into()),
             tags: Default::default(),
             dockerfiles: Mutex::new(vec![]),
         }
@@ -120,15 +125,12 @@ impl CommandRunner for RecordingRunner {
         }
         // Host capacity probe fixture, independent of the command under test.
         if cmd == "docker" && args == ["info", "--format", "{{json .}}"] {
-            return self
-                .memory_info
-                .clone()
-                .unwrap_or_else(|| Ok(r#"{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":true}"#.into()));
+            return self.memory_info.clone().unwrap_or_else(|| Ok(super::docker_vessels::TEST_DOCKER_INFO.into()));
         }
-        self.calls.lock().expect("calls mutex").push((cmd.to_string(), args.iter().map(|a| a.to_string()).collect(), cwd.to_path_buf()));
         if cmd == "systemctl" {
             return self.slice_show.clone();
         }
+        self.calls.lock().expect("calls mutex").push((cmd.to_string(), args.iter().map(|a| a.to_string()).collect(), cwd.to_path_buf()));
         if let ("docker", ["tag", id, tag]) = (cmd, args) {
             return self.tags.tag(id, tag);
         }
@@ -272,7 +274,10 @@ impl CommandRunner for QueuedRunner {
         }
 
         if cmd == "docker" && args == ["info", "--format", "{{json .}}"] {
-            return Ok(r#"{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":true}"#.into());
+            return Ok(super::docker_vessels::TEST_DOCKER_INFO.into());
+        }
+        if cmd == "systemctl" {
+            return Ok(super::docker_vessels::TEST_SLICE_SHOW.into());
         }
         if cmd == "docker" && args.starts_with(&["image", "inspect", "--format", "{{.Os}}/{{.Architecture}}"]) {
             return Ok("linux/amd64".into());
@@ -430,7 +435,7 @@ async fn host_adoption_is_idempotent_and_preparation_is_instance_scoped() {
 async fn create_returns_handle() {
     use flotilla_protocol::ImageId;
     let runner = Arc::new(QueuedRunner::new([Ok("container-id-123".into()), Ok("sha256:8c7f4e5d6a1b\n".into())]));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![("GITHUB_TOKEN".into(), "ghp_secret".into())],
@@ -440,7 +445,6 @@ async fn create_returns_handle() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
-        memory_policy: Default::default(),
     };
 
     let id = EnvironmentId::new("test-env-1");
@@ -486,7 +490,7 @@ async fn create_runs_container_as_the_host_user() {
     use flotilla_protocol::ImageId;
 
     let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: Vec::new(),
@@ -496,7 +500,6 @@ async fn create_runs_container_as_the_host_user() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
-        memory_policy: Default::default(),
     };
 
     provider.create(EnvironmentId::new("host-user"), &image, opts).await.expect("create environment as host user");
@@ -516,7 +519,7 @@ async fn create_removes_container_when_local_image_id_cannot_be_resolved() {
     use flotilla_protocol::ImageId;
 
     let runner = Arc::new(QueuedRunner::new([Ok("container-id-123".into()), Ok("not-a-digest".into()), Err("docker rm failed".into())]));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
     let image = ImageId::new("registry.example/crew:latest");
     let opts = CreateOpts {
         tokens: Vec::new(),
@@ -526,7 +529,6 @@ async fn create_removes_container_when_local_image_id_cannot_be_resolved() {
         image_pull_policy: ImagePullPolicy::Always,
         prepared_auth: Default::default(),
         cpu_limit: None,
-        memory_policy: Default::default(),
     };
 
     let error = match provider.create(EnvironmentId::new("invalid-digest"), &image, opts).await {
@@ -550,7 +552,7 @@ async fn create_translates_image_pull_policy_and_crew_limits_to_docker_run() {
         [(ImagePullPolicy::Always, "always"), (ImagePullPolicy::IfNotPresent, "missing"), (ImagePullPolicy::Never, "never")]
     {
         let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
-        let provider = DockerEnvironmentProvider::new(runner.clone());
+        let provider = bounded(runner.clone());
         let image = ImageId::new("flotilla-dev-env:latest");
         let opts = CreateOpts {
             tokens: Vec::new(),
@@ -560,7 +562,6 @@ async fn create_translates_image_pull_policy_and_crew_limits_to_docker_run() {
             image_pull_policy: policy,
             prepared_auth: Default::default(),
             cpu_limit: None,
-            memory_policy: Default::default(),
         };
 
         provider.create(EnvironmentId::new(docker_value), &image, opts).await.expect("image policy should create an environment");
@@ -569,11 +570,9 @@ async fn create_translates_image_pull_policy_and_crew_limits_to_docker_run() {
         assert_eq!(calls.len(), 2);
         let (_, args, _) = &calls[0];
         assert!(args.windows(2).any(|pair| pair == ["--pull", docker_value]));
-        // Crew vessels share CPU by equal weight and retain memory bounds.
+        // Crew vessels share CPU by equal weight.
         assert!(args.windows(2).any(|pair| pair == ["--cpu-shares", "1024"]));
         assert!(!args.iter().any(|arg| arg == "--cpus"));
-        assert!(args.iter().any(|arg| arg == "--memory"));
-        assert!(args.iter().any(|arg| arg == "--memory-swap"));
         assert!(!calls.iter().any(|(_, args, _)| args.first().is_some_and(|arg| arg == "pull")));
     }
 }
@@ -584,7 +583,7 @@ async fn create_uses_the_credential_scoped_docker_config_for_pull_on_run() {
     use flotilla_protocol::ImageId;
 
     let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
     let image = ImageId::new("registry.example/crew:latest");
     let opts = CreateOpts {
         tokens: Vec::new(),
@@ -594,7 +593,6 @@ async fn create_uses_the_credential_scoped_docker_config_for_pull_on_run() {
         image_pull_policy: ImagePullPolicy::Always,
         prepared_auth: test_registry_auth("/run/flotilla/registry-auth"),
         cpu_limit: None,
-        memory_policy: Default::default(),
     };
 
     provider.create(EnvironmentId::new("private-registry"), &image, opts).await.expect("create authenticated environment");
@@ -611,7 +609,7 @@ async fn create_reports_infrastructure_and_requested_mount_metadata() {
     use flotilla_protocol::ImageId;
 
     let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
     let reference_repo = DaemonHostPath::new("/host/reference-repo");
     let opts = CreateOpts {
@@ -622,7 +620,6 @@ async fn create_reports_infrastructure_and_requested_mount_metadata() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
-        memory_policy: Default::default(),
     };
 
     let id = EnvironmentId::new("test-env-metadata");
@@ -649,7 +646,7 @@ async fn create_rejects_a_mount_targeting_the_reserved_daemon_socket_directory()
     use flotilla_protocol::ImageId;
 
     let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
@@ -663,7 +660,6 @@ async fn create_rejects_a_mount_targeting_the_reserved_daemon_socket_directory()
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
-        memory_policy: Default::default(),
     };
 
     let error = provider
@@ -681,7 +677,7 @@ async fn create_rejects_a_mount_targeting_a_reserved_tool_file() {
     use flotilla_protocol::ImageId;
 
     let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
     let tool = EnvironmentTool::new("flotilla", "/usr/local/bin/flotilla").with_asset(EnvironmentToolAsset::new(
         "/host/flotilla",
@@ -698,7 +694,6 @@ async fn create_rejects_a_mount_targeting_a_reserved_tool_file() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
-        memory_policy: Default::default(),
     };
 
     let error = provider
@@ -716,7 +711,7 @@ async fn create_delivers_tool_assets_and_applies_tool_environment() {
     use flotilla_protocol::ImageId;
 
     let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
     let tool = EnvironmentTool::new("terminal", "/usr/local/bin/terminal")
         .with_asset(EnvironmentToolAsset::new(
@@ -743,7 +738,6 @@ async fn create_delivers_tool_assets_and_applies_tool_environment() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
-        memory_policy: Default::default(),
     };
 
     provider.create(EnvironmentId::new("tool-delivery"), &image, opts).await.expect("Docker should lower provider-neutral tool assets");
@@ -769,7 +763,6 @@ fn path_prepending_opts(image_pull_policy: ImagePullPolicy) -> CreateOpts {
         image_pull_policy,
         prepared_auth: Default::default(),
         cpu_limit: None,
-        memory_policy: Default::default(),
     }
 }
 
@@ -790,7 +783,7 @@ async fn create_prepends_to_the_image_path_when_no_value_is_supplied() {
         RecordingRunner::new_ok("container-id-123")
             .with_image_environment(Ok(r#"["PATH=/usr/local/cargo/bin:/usr/bin:/bin","RUSTUP_HOME=/usr/local/rustup"]"#)),
     );
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
 
     provider
         .create(EnvironmentId::new("image-path"), &ImageId::new("crew:latest"), path_prepending_opts(ImagePullPolicy::IfNotPresent))
@@ -808,7 +801,7 @@ async fn create_prepends_to_the_docker_default_path_when_the_image_sets_none() {
     use flotilla_protocol::ImageId;
 
     let runner = Arc::new(RecordingRunner::new_ok("container-id-123").with_image_environment(Ok("null")));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
 
     provider
         .create(EnvironmentId::new("default-path"), &ImageId::new("scratch-ish"), path_prepending_opts(ImagePullPolicy::IfNotPresent))
@@ -827,7 +820,7 @@ async fn create_pulls_before_inspecting_when_the_policy_is_always() {
     use flotilla_protocol::ImageId;
 
     let runner = Arc::new(RecordingRunner::new_ok("container-id-123").with_image_environment(Ok(r#"["PATH=/usr/bin"]"#)));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
 
     provider
         .create(EnvironmentId::new("always-pull"), &ImageId::new("crew:latest"), path_prepending_opts(ImagePullPolicy::Always))
@@ -845,7 +838,7 @@ async fn create_refuses_when_the_image_environment_cannot_be_inspected() {
     use flotilla_protocol::ImageId;
 
     let runner = Arc::new(RecordingRunner::new_ok("container-id-123").with_image_environment(Err("No such image: crew:latest")));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
 
     let error = provider
         .create(EnvironmentId::new("missing-image"), &ImageId::new("crew:latest"), path_prepending_opts(ImagePullPolicy::Never))
@@ -866,7 +859,7 @@ async fn create_pulls_a_missing_image_before_reading_its_environment_when_the_po
             .with_image_environment(Err("No such image: crew:latest"))
             .with_image_environment(Ok(r#"["PATH=/usr/local/cargo/bin:/usr/bin"]"#)),
     );
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
 
     provider
         .create(
@@ -893,7 +886,7 @@ async fn create_reports_both_inspect_and_pull_failures_when_a_missing_image_cann
 
     let runner =
         Arc::new(RecordingRunner::new_err("pull access denied for crew").with_image_environment(Err("No such image: crew:latest")));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
 
     let error = provider
         .create(EnvironmentId::new("unpullable"), &ImageId::new("crew:latest"), path_prepending_opts(ImagePullPolicy::IfNotPresent))
@@ -911,7 +904,7 @@ async fn create_uses_the_bare_value_for_a_non_path_variable_the_image_does_not_s
     use flotilla_protocol::ImageId;
 
     let runner = Arc::new(RecordingRunner::new_ok("container-id-123").with_image_environment(Ok(r#"["PATH=/usr/bin"]"#)));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
     let mut opts = path_prepending_opts(ImagePullPolicy::IfNotPresent);
     opts.tools = vec![EnvironmentTool::new("terminal", "/usr/local/bin/terminal")
         .with_environment(EnvironmentVariableUpdate::prepend_path("LD_LIBRARY_PATH", "/usr/local/lib/terminal"))];
@@ -927,7 +920,7 @@ async fn create_mounts_the_flotilla_binary_directory_so_atomic_replacements_stay
     use flotilla_protocol::ImageId;
 
     let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
     let tool = EnvironmentTool::new("flotilla", "/usr/local/bin/flotilla")
         .with_asset(EnvironmentToolAsset::new(
@@ -952,7 +945,6 @@ async fn create_mounts_the_flotilla_binary_directory_so_atomic_replacements_stay
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
-        memory_policy: Default::default(),
     };
 
     provider.create(EnvironmentId::new("upgrade-visible"), &image, opts).await.expect("create environment");
@@ -976,7 +968,7 @@ fn create_uses_requested_mount_modes_in_docker_arguments(tc: hegel::TestCase) {
         use flotilla_protocol::ImageId;
 
         let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
-        let provider = DockerEnvironmentProvider::new(runner.clone());
+        let provider = bounded(runner.clone());
         let image = ImageId::new("ubuntu:22.04");
         let mut opts = CreateOpts {
             tokens: vec![],
@@ -993,7 +985,6 @@ fn create_uses_requested_mount_modes_in_docker_arguments(tc: hegel::TestCase) {
             image_pull_policy: ImagePullPolicy::IfNotPresent,
             prepared_auth: Default::default(),
             cpu_limit: None,
-            memory_policy: Default::default(),
         };
 
         for own in 0..own_count {
@@ -1033,7 +1024,7 @@ async fn protected_git_mount_rejects_a_comma_in_its_path() {
     use flotilla_protocol::ImageId;
 
     let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
     let opts = CreateOpts {
         tokens: vec![],
         tools: vec![],
@@ -1042,7 +1033,6 @@ async fn protected_git_mount_rejects_a_comma_in_its_path() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
-        memory_policy: Default::default(),
     };
     let error = provider.create(EnvironmentId::new("comma"), &ImageId::new("ubuntu:22.04"), opts).await.err().expect("unsafe mount syntax");
     assert!(error.contains("comma"), "{error}");
@@ -1065,7 +1055,7 @@ async fn list_preserves_provisioned_mount_metadata() {
             .expect("serialize mount metadata")
         )),
     ]));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
@@ -1075,7 +1065,6 @@ async fn list_preserves_provisioned_mount_metadata() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
-        memory_policy: Default::default(),
     };
 
     provider.create(EnvironmentId::new("test-env-list"), &image, opts).await.expect("create");
@@ -1097,7 +1086,7 @@ async fn list_defaults_mount_mode_from_pre_mode_metadata() {
     let runner = Arc::new(RecordingRunner::new_ok(
         "container-1\ttest-env-list\tubuntu:22.04\t[{\"host_path\":\"/host/reference-repo\",\"environment_path\":\"/ref/repo\"}]\n",
     ));
-    let provider = DockerEnvironmentProvider::new(runner);
+    let provider = bounded(runner);
 
     let handles = provider.list().await.expect("pre-mode mount metadata should remain readable");
 
@@ -1117,7 +1106,7 @@ async fn list_fails_on_malformed_reference_repo_mount_metadata() {
         Ok("sha256:test-image".into()),
         Ok("container-1\ttest-env-list\tubuntu:22.04\tnot-json\n".into()),
     ]));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
@@ -1127,7 +1116,6 @@ async fn list_fails_on_malformed_reference_repo_mount_metadata() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
-        memory_policy: Default::default(),
     };
 
     provider.create(EnvironmentId::new("test-env-list-malformed"), &image, opts).await.expect("create");
@@ -1145,7 +1133,7 @@ async fn list_rejects_missing_reference_repo_mount_metadata() {
         Ok("sha256:test-image".into()),
         Ok("container-1\ttest-env-list\tubuntu:22.04\t\n".into()),
     ]));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
@@ -1155,7 +1143,6 @@ async fn list_rejects_missing_reference_repo_mount_metadata() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
-        memory_policy: Default::default(),
     };
 
     provider.create(EnvironmentId::new("test-env-list-missing"), &image, opts).await.expect("create");
@@ -1169,7 +1156,7 @@ async fn provisioned_handle_returns_its_initialized_runner() {
     use flotilla_protocol::ImageId;
 
     let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
-    let provider = DockerEnvironmentProvider::new(runner);
+    let provider = bounded(runner);
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
@@ -1179,7 +1166,6 @@ async fn provisioned_handle_returns_its_initialized_runner() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
-        memory_policy: Default::default(),
     };
 
     let handle = provider.create(EnvironmentId::new("test-env-runner"), &image, opts).await.expect("create");
@@ -1197,7 +1183,7 @@ async fn status_returns_running() {
         Ok("sha256:test-image".into()),
         Ok(include_str!("fixtures/normal-stop.json").replace("exited", "running")), // full inspect
     ]));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
@@ -1207,7 +1193,6 @@ async fn status_returns_running() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
-        memory_policy: Default::default(),
     };
 
     let id = EnvironmentId::new("test-env-status");
@@ -1245,7 +1230,7 @@ async fn env_vars_reads_configured_container_environment() {
             responses.push(Ok("/home/crew".into()));
         }
         let runner = Arc::new(QueuedRunner::new(responses));
-        let provider = DockerEnvironmentProvider::new(runner.clone());
+        let provider = bounded(runner.clone());
         let image = ImageId::new("ubuntu:22.04");
         let opts = CreateOpts {
             tokens: vec![],
@@ -1255,7 +1240,6 @@ async fn env_vars_reads_configured_container_environment() {
             image_pull_policy: ImagePullPolicy::IfNotPresent,
             prepared_auth: Default::default(),
             cpu_limit: None,
-            memory_policy: Default::default(),
         };
 
         let id = EnvironmentId::new("test-env-vars");
@@ -1295,7 +1279,7 @@ async fn destroy_calls_docker_rm() {
         Ok("sha256:test-image".into()),
         Ok("".into()), // docker rm -f
     ]));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
@@ -1305,7 +1289,6 @@ async fn destroy_calls_docker_rm() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
-        memory_policy: Default::default(),
     };
 
     let id = EnvironmentId::new("test-env-destroy");
@@ -1431,34 +1414,6 @@ async fn environment_runner_transforms_commands_for_container() {
     assert_eq!(cwd, Path::new("/"));
 }
 
-// #2653: every contained environment must bound RAM and disable swap by default.
-#[tokio::test]
-async fn create_bounds_memory_and_swap() {
-    let runner = Arc::new(RecordingRunner::new_ok("container-id"));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
-    provider
-        .create(
-            EnvironmentId::new("memory-test"),
-            &flotilla_protocol::ImageId::new("test-image"),
-            CreateOpts {
-                tokens: Vec::new(),
-                working_directory: None,
-                provisioned_mounts: Vec::new(),
-                tools: Vec::new(),
-                image_pull_policy: ImagePullPolicy::Never,
-                prepared_auth: Default::default(),
-                cpu_limit: None,
-                memory_policy: Default::default(),
-            },
-        )
-        .await
-        .expect("create");
-    let calls = runner.calls();
-    let args = &calls.iter().find(|(cmd, args, _)| cmd == "docker" && args.first().is_some_and(|arg| arg == "run")).expect("docker run").1;
-    assert!(args.windows(2).any(|pair| pair == ["--memory", "13743895347"]));
-    assert!(args.windows(2).any(|pair| pair == ["--memory-swap", "13743895347"]));
-}
-
 // Subprocess boundary: replay the operator's real inspect/journal recordings.
 struct InspectionRunner {
     inspect: String,
@@ -1517,7 +1472,7 @@ async fn recorded_container_deaths_are_classified_through_the_provider() {
     ];
     for ((inspect, oomd, cause, code, signal, oom_killed), expected) in cases.into_iter().zip(expected) {
         let runner = Arc::new(InspectionRunner { inspect: inspect.into(), usage: None, oomd, calls: Mutex::new(Vec::new()) });
-        let provider = DockerEnvironmentProvider::new(runner.clone());
+        let provider = bounded(runner.clone());
         let handles = provider.list().await.expect("list");
         let observed = handles[0].observe().await;
         assert_eq!(observed.state, ObservationState::Gone { cause: expected });
@@ -1574,29 +1529,27 @@ fn oomd_requires_a_matching_kill_record(tc: hegel::TestCase) {
     });
 }
 
-// #2653: placement policy changes the hard RAM and combined RAM/swap flags.
+// A crew never runs unbounded: without [docker_vessels] Docker is not ready and creates nothing.
 #[tokio::test]
-async fn create_uses_configured_memory_policy() {
+async fn docker_without_docker_vessels_is_not_ready_and_creates_nothing() {
     let runner = Arc::new(RecordingRunner::new_ok("container-id"));
     let provider = DockerEnvironmentProvider::new(runner.clone());
+    let readiness = provider.detect_readiness().await;
+    assert!(matches!(&readiness, super::ProviderReadiness::MissingTool { reason } if reason.contains("[docker_vessels]")), "{readiness:?}");
     let mut opts = path_prepending_opts(ImagePullPolicy::Never);
     opts.tools.clear();
-    opts.memory_policy =
-        flotilla_resources::EnvironmentMemoryPolicy { host_memory_percent: 25, expected_concurrent_crews: 2, swap_bytes: 1073741824 };
-    provider.create(EnvironmentId::new("configured-memory"), &flotilla_protocol::ImageId::new("image"), opts).await.expect("create");
-    let args = docker_run_args(&runner);
-    assert!(args.windows(2).any(|pair| pair == ["--memory", "8589934592"]));
-    assert!(args.windows(2).any(|pair| pair == ["--memory-swap", "9663676416"]));
-    assert!(!args.iter().any(|arg| arg == "--cgroup-parent"));
-    assert!(!runner.calls().iter().any(|(cmd, _, _)| cmd == "systemctl"));
+    let error =
+        provider.create(EnvironmentId::new("unbounded"), &flotilla_protocol::ImageId::new("image"), opts).await.err().expect("refused");
+    assert!(error.contains("[docker_vessels]"), "{error}");
+    assert!(runner.calls().is_empty(), "{:?}", runner.calls());
 }
 
 // With [docker_vessels], a crew starts under the slice with memory = memory-swap
-// = the ceiling whatever the policy's share, and only once the slice is loaded
+// = the ceiling, and only once the slice is loaded
 // under Docker's systemd driver with a finite MemoryMax no lower than the
 // ceiling, on a host with at least the ceiling in RAM. Otherwise provisioning
 // refuses, naming the slice, before any container runs. Each case draws the
-// ceiling and the policy, then tries host RAM one GiB below, at and above the
+// ceiling, then tries host RAM one GiB below, at and above the
 // ceiling against every systemctl answer (MemoryMax one GiB below, at and above the ceiling, in either
 // property order; a missing slice; `infinity`, u64::MAX and absent MemoryMax;
 // an unreadable unit) under both cgroup drivers.
@@ -1604,11 +1557,6 @@ async fn create_uses_configured_memory_policy() {
 fn docker_vessels_set_parent_and_ceiling_or_refuse(tc: hegel::TestCase) {
     use hegel::generators as gs;
     let gib = tc.draw(gs::integers::<u64>().min_value(2).max_value(256));
-    let policy = flotilla_resources::EnvironmentMemoryPolicy {
-        host_memory_percent: tc.draw(gs::integers::<u8>().min_value(1).max_value(100)),
-        expected_concurrent_crews: tc.draw(gs::integers::<u32>().min_value(1).max_value(20)),
-        swap_bytes: tc.draw(gs::integers::<u64>().min_value(0).max_value(1 << 30)),
-    };
     let slice = "flotilla-crews.slice";
     let mut shows: Vec<(Result<String, String>, bool)> = Vec::new();
     for max_gib in [gib - 1, gib, gib + 1] {
@@ -1637,7 +1585,6 @@ fn docker_vessels_set_parent_and_ceiling_or_refuse(tc: hegel::TestCase) {
         let provider = DockerEnvironmentProvider::new(runner.clone()).with_vessel_slice(Some(vessels));
         let mut opts = path_prepending_opts(ImagePullPolicy::Never);
         opts.tools.clear();
-        opts.memory_policy = policy.clone();
         let created = runtime.block_on(provider.create(EnvironmentId::new("sliced"), &flotilla_protocol::ImageId::new("image"), opts));
         if show_ok && driver == "systemd" && ram_gib >= gib {
             created.unwrap_or_else(|error| panic!("{show:?} should provision: {error}"));
@@ -1654,8 +1601,8 @@ fn docker_vessels_set_parent_and_ceiling_or_refuse(tc: hegel::TestCase) {
     }
 }
 
-// #2653: unavailable capacity or unsupported enforcement must never run an
-// unbounded crew. Invalid/malformed/empty outputs and unsupported kernels refuse.
+// #2653: under a slice, unavailable capacity or unsupported enforcement must
+// never run an unbounded crew. Invalid/malformed/empty outputs and unsupported kernels refuse.
 #[tokio::test]
 async fn create_refuses_unenforceable_memory_limits() {
     for info in [
@@ -1668,7 +1615,9 @@ async fn create_refuses_unenforceable_memory_limits() {
         let mut runner = RecordingRunner::new_ok("container-id");
         runner.memory_info = Some(info);
         let runner = Arc::new(runner);
-        let provider = DockerEnvironmentProvider::new(runner.clone());
+        let vessels = toml::from_str("slice = \"flotilla-crews.slice\"\nmemory_ceiling_gib = 1\n").expect("table");
+        let vessels = super::docker_vessels::DockerVessels::parse(vessels).expect("valid [docker_vessels]");
+        let provider = DockerEnvironmentProvider::new(runner.clone()).with_vessel_slice(Some(vessels));
         let mut opts = path_prepending_opts(ImagePullPolicy::Never);
         opts.tools.clear();
         assert!(provider.create(EnvironmentId::new("unsupported-memory"), &flotilla_protocol::ImageId::new("image"), opts).await.is_err());
@@ -1709,7 +1658,7 @@ fn running_memory_samples_do_not_invent_usage(tc: hegel::TestCase) {
         let id = inspect[0]["Id"].as_str().expect("container id").to_string();
         let runner =
             Arc::new(InspectionRunner { inspect: inspect.to_string(), usage: usage.clone(), oomd: None, calls: Mutex::new(Vec::new()) });
-        let provider = DockerEnvironmentProvider::new(runner.clone());
+        let provider = bounded(runner.clone());
         let observation = runtime.block_on(async {
             let handles = provider.list().await.expect("list");
             handles[0].observe().await.runtime.expect("Docker observation")
@@ -1730,7 +1679,7 @@ fn running_memory_samples_do_not_invent_usage(tc: hegel::TestCase) {
 async fn list_backings_uses_immutable_identity_without_mount_metadata() {
     let id = "a".repeat(64);
     let runner = Arc::new(RecordingRunner::new_ok(&format!("{id}\tenv-orphan\n")));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let provider = bounded(runner.clone());
     let backings = provider.list_backings().await.expect("list backing identities");
     assert_eq!(backings, vec![super::EnvironmentBacking { environment_id: EnvironmentId::new("env-orphan"), backing_id: id }]);
     assert_eq!(
@@ -1758,10 +1707,10 @@ async fn list_backings_rejects_incomplete_identity() {
     for output in
         ["short\tenv\n".into(), format!("{}\t\n", "a".repeat(64)), "missing separator".into(), format!("{}\tenv\textra\n", "a".repeat(64))]
     {
-        let provider = DockerEnvironmentProvider::new(Arc::new(RecordingRunner::new_ok(&output)));
+        let provider = bounded(Arc::new(RecordingRunner::new_ok(&output)));
         assert!(provider.list_backings().await.is_err(), "invalid identity {output:?}");
     }
-    let provider = DockerEnvironmentProvider::new(Arc::new(RecordingRunner::new_ok("")));
+    let provider = bounded(Arc::new(RecordingRunner::new_ok("")));
     assert!(provider.list_backings().await.expect("empty listing").is_empty());
 }
 
@@ -1831,7 +1780,7 @@ async fn preparation_pulls_only_pinned_registry_content() {
 async fn preparation_refuses_mutable_or_malformed_image_identity() {
     for image in ["crew:latest", "registry.example/crew@sha256:invalid", "sha256:invalid", ""] {
         let runner = Arc::new(RecordingRunner::new_ok("held"));
-        let provider = DockerEnvironmentProvider::new(runner.clone());
+        let provider = bounded(runner.clone());
         let mut spec = pinned_spec();
         spec.docker.as_mut().expect("docker").image = image.into();
         assert!(provider.prepare(&spec, &Default::default()).await.is_err());
@@ -1856,7 +1805,7 @@ async fn inspection_reports_weight_and_legacy_quotas() {
             inspect[0]["HostConfig"][key] = value.clone();
         }
         let runner = Arc::new(InspectionRunner { inspect: inspect.to_string(), usage: None, oomd: None, calls: Mutex::new(Vec::new()) });
-        let provider = DockerEnvironmentProvider::new(runner);
+        let provider = bounded(runner);
         let handles = provider.list().await.expect("list");
         let observed = handles[0].observe().await.runtime.expect("Docker observation");
         let limits = observed.configured_limits.expect("inspected CPU settings");
@@ -1870,7 +1819,7 @@ async fn inspection_reports_weight_and_legacy_quotas() {
 async fn create_rejects_nested_tool_mounts_but_accepts_adjacent_paths() {
     for (target, rejected) in [("/reserved", true), ("/reserved/child", true), ("/", true), ("/reserved-other", false)] {
         let runner = Arc::new(RecordingRunner::new_ok("container"));
-        let provider = DockerEnvironmentProvider::new(runner);
+        let provider = bounded(runner);
         let opts = CreateOpts {
             tools: vec![EnvironmentTool::new("tool", "/bin/tool").with_asset(EnvironmentToolAsset::new(
                 "/host/tool",
@@ -1892,7 +1841,7 @@ async fn create_rejects_nested_tool_mounts_but_accepts_adjacent_paths() {
 #[cfg(not(unix))]
 #[tokio::test]
 async fn docker_agent_provisioning_reports_unsupported_host() {
-    let provider = DockerEnvironmentProvider::new(Arc::new(RecordingRunner::new_ok("")));
+    let provider = bounded(Arc::new(RecordingRunner::new_ok("")));
     let prepared = super::PreparedEnvironment::new(&Arc::new(()), ());
     let error = provider.provision(EnvironmentId::new("unsupported"), &prepared, Default::default()).await.err().unwrap();
     assert!(matches!(error, super::EnvironmentProvisionError::Failed(message) if message.contains("require a Unix host")));

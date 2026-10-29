@@ -19,9 +19,9 @@ use flotilla_discovery_api::UnmetRequirement;
 use flotilla_protocol::HostName;
 use flotilla_resources::{
     Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CredentialExpiry, CrewWorkPhase, CrewWorkState, Environment as ResourceEnvironment,
-    EnvironmentSpec as ResourceEnvironmentSpec, Host as ResourceHost, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceObject, Selector,
-    TerminalAttention, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    EnvironmentSpec as ResourceEnvironmentSpec, FulfilmentFacts, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec,
+    FulfilmentRealisation, HarnessFacts, Host as ResourceHost, HostDirectEnvironmentSpec, HostSpec, HostStatus, InputMeta, ResourceObject,
+    Selector, TerminalAttention, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
     TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus,
     VesselRequirement, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
     VESSEL_LABEL, VESSEL_REF_LABEL,
@@ -391,26 +391,33 @@ pub(in crate::in_process) fn test_meta(name: &str) -> InputMeta {
     InputMeta::builder().name(name.to_string()).build()
 }
 
-pub(super) async fn placement_policy(backend: &ResourceBackend, name: &str, host_ref: &str) -> ResourceObject<PlacementPolicy> {
+/// Capacity a placement host publishes so the admission free-space floor passes.
+const PLACEMENT_DISK_FREE_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+const PLACEMENT_FREE_SPACE_FLOOR_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+pub(super) async fn host_direct_kind(backend: &ResourceBackend, name: &str, host_ref: &str) -> ResourceObject<FulfilmentKind> {
     backend
-        .using::<PlacementPolicy>("flotilla")
+        .using::<FulfilmentKind>("flotilla")
         .create(
             &test_meta(name),
-            &PlacementPolicySpec::builder()
+            &FulfilmentKindSpec::builder()
+                .host_ref(host_ref.to_string())
                 .pool("passthrough".to_string())
-                .host_direct(HostDirectPlacementPolicySpec {
-                    host_ref: host_ref.to_string(),
-                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                })
+                .grants(BTreeSet::from([
+                    FulfilmentGrant::platform("linux".to_string()),
+                    FulfilmentGrant::host_account_reach(),
+                    FulfilmentGrant::network("host".to_string()),
+                ]))
+                .realisation(FulfilmentRealisation::HostDirect)
                 .build(),
         )
         .await
-        .expect("placement policy")
+        .expect("host-direct kind")
 }
 
 pub(super) async fn create_host_direct_placement(
     backend: &ResourceBackend,
-    policy_name: &str,
+    kind_name: &str,
     host_ref: &str,
     agent_adapters: BTreeSet<String>,
 ) {
@@ -438,12 +445,14 @@ pub(super) async fn create_host_direct_placement(
                 .collect(),
                 heartbeat_at: Some(Utc::now()),
                 ready: true,
+                disk_free_bytes: Some(PLACEMENT_DISK_FREE_BYTES),
+                admission_free_space_floor_bytes: Some(PLACEMENT_FREE_SPACE_FLOOR_BYTES),
                 ..HostStatus::default()
             },
         )
         .await
         .expect("host status update");
-    placement_policy(backend, policy_name, host_ref).await;
+    host_direct_kind(backend, kind_name, host_ref).await;
 }
 
 pub(super) fn trusted_codex_workflow() -> WorkflowTemplateSpec {
@@ -506,9 +515,11 @@ pub(in crate::in_process) async fn create_running_session(daemon: &InProcessDaem
         .expect("running session");
 }
 
+/// A ready Docker host and a literal-image Docker kind on it whose image the
+/// host probed for the Codex harness.
 pub(super) async fn create_docker_placement(
     backend: &ResourceBackend,
-    policy_name: &str,
+    kind_name: &str,
     host_ref: &str,
     held_credentials: BTreeSet<String>,
 ) {
@@ -539,6 +550,19 @@ pub(super) async fn create_docker_placement(
                 heartbeat_at: Some(Utc::now()),
                 ready: true,
                 resource_store: None,
+                disk_free_bytes: Some(PLACEMENT_DISK_FREE_BYTES),
+                admission_free_space_floor_bytes: Some(PLACEMENT_FREE_SPACE_FLOOR_BYTES),
+                fulfilment_facts: BTreeMap::from([(
+                    kind_name.to_string(),
+                    FulfilmentFacts {
+                        harnesses: BTreeMap::from([(
+                            "codex".to_string(),
+                            HarnessFacts { version: "0.160.0".to_string(), models: BTreeMap::new() },
+                        )]),
+                        observed_at: Utc::now(),
+                        ..Default::default()
+                    },
+                )]),
                 ..HostStatus::default()
             },
         )
@@ -546,25 +570,20 @@ pub(super) async fn create_docker_placement(
         .expect("host status update");
     backend
         .clone()
-        .using::<PlacementPolicy>("flotilla")
+        .using::<FulfilmentKind>("flotilla")
         .create(
-            &test_meta(policy_name),
-            &PlacementPolicySpec::builder()
+            &test_meta(kind_name),
+            &FulfilmentKindSpec::builder()
+                .host_ref(host_ref.to_string())
                 .pool("passthrough".to_string())
-                .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
-                    memory_policy: Default::default(),
-                    host_ref: host_ref.to_string(),
-                    image: Some("crew:latest".into()),
-                    pull_policy: Default::default(),
-                    agent_adapters: BTreeSet::from(["codex".to_string()]),
-                    default_cwd: None,
-                    env: BTreeMap::new(),
-                    checkout: flotilla_resources::DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+                .grants(BTreeSet::from([FulfilmentGrant::platform("linux".to_string()), FulfilmentGrant::network("scoped".to_string())]))
+                .realisation(FulfilmentRealisation::DockerPerVessel {
+                    image: Some(flotilla_resources::DockerImageSource::Literal("crew:latest".to_string())),
                 })
                 .build(),
         )
         .await
-        .expect("placement create");
+        .expect("Docker kind");
 }
 
 pub(super) async fn set_host_credential_expiry(backend: &ResourceBackend, host_ref: &str, expiry: BTreeMap<String, CredentialExpiry>) {

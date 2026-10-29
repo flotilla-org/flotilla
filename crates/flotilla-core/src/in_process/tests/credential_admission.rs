@@ -8,8 +8,8 @@ use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
     ConvoyRepositorySpec, CredentialConsumer, CredentialExpiry, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec,
     CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec,
-    Host as ResourceHost, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, Repository, RepositorySpec, RepositoryTrust,
-    Selector, VesselRequirement, WorkflowTemplateSpec,
+    FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host as ResourceHost, HostSpec, HostStatus, Repository, RepositorySpec,
+    RepositoryTrust, Selector, VesselRequirement, WorkflowTemplateSpec,
 };
 use flotilla_store::ResourceBackend;
 
@@ -54,7 +54,7 @@ async fn docker_placement_refuses_instance_readiness_before_selection() {
         for policy in [Some("docker-kiwi"), None] {
             let error = daemon
                 .admission
-                .resolve_convoy_placement("flotilla", None, &[], &workflow, policy, false)
+                .resolve_created_convoy_placement("flotilla", None, &[], &workflow, policy)
                 .await
                 .expect_err("ineligible host must refuse admission");
             assert!(error.contains("kiwi: fixture-1"), "{error}");
@@ -321,7 +321,7 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
     assert!(with_grant.vessels[0].credential_refs.is_empty(), "a subscription credential is never vessel-wide");
 
     create_docker_placement(&backend, "docker-claude", "host-a", BTreeSet::from(["claude-max".to_string()])).await;
-    let placement = backend.using::<PlacementPolicy>("flotilla").get("docker-claude").await.expect("get placement");
+    let placement = backend.using::<FulfilmentKind>("flotilla").get("docker-claude").await.expect("get placement");
     validate_workflow_credentials(&backend, "flotilla", &with_grant, Some(&placement))
         .await
         .expect("matching held OAuth grant admits contained Claude");
@@ -330,7 +330,7 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
         .expect("matching held OAuth grant admits contained Claude");
     assert_eq!(alternatives[0].usable().into_iter().map(|name| name.0.as_str()).collect::<Vec<_>>(), ["claude-max"]);
     create_docker_placement(&backend, "docker-bare", "host-b", BTreeSet::new()).await;
-    let bare = backend.using::<PlacementPolicy>("flotilla").get("docker-bare").await.expect("get placement");
+    let bare = backend.using::<FulfilmentKind>("flotilla").get("docker-bare").await.expect("get placement");
     assert_eq!(
         validate_account_access(&backend, "flotilla", Some("flotilla"), &[], &with_grant, Some(&bare)).await.expect_err("unheld"),
         "role `coder` has no usable credential for `claude:subscription`: `claude-max`: host `host-b` does not hold it"
@@ -389,7 +389,7 @@ async fn harness_bound_credential_reaches_only_vessels_running_that_harness() {
     assert!(workflow.vessels[1].credential_refs.is_empty());
     assert!(workflow.vessels[1].credential_scopes.is_empty());
     create_docker_placement(&backend, "docker-claude", "host-a", BTreeSet::from(["claude-max".to_string()])).await;
-    let placement = backend.using::<PlacementPolicy>("flotilla").get("docker-claude").await.expect("get placement");
+    let placement = backend.using::<FulfilmentKind>("flotilla").get("docker-claude").await.expect("get placement");
     validate_workflow_credentials(&backend, "flotilla", &workflow, Some(&placement))
         .await
         .expect("codex vessel admits without the Claude credential");
@@ -397,7 +397,7 @@ async fn harness_bound_credential_reaches_only_vessels_running_that_harness() {
     let mut codex_only = workflow.clone();
     codex_only.vessels.remove(0);
     create_docker_placement(&backend, "docker-codex", "host-b", BTreeSet::new()).await;
-    let bare = backend.using::<PlacementPolicy>("flotilla").get("docker-codex").await.expect("get placement");
+    let bare = backend.using::<FulfilmentKind>("flotilla").get("docker-codex").await.expect("get placement");
     validate_workflow_credentials(&backend, "flotilla", &codex_only, Some(&bare))
         .await
         .expect("codex vessel admits on a placement without the Claude credential");
@@ -434,7 +434,7 @@ async fn docker_placement_selects_credentials_for_the_effective_contained_stance
         .await
         .expect("create contained GitHub grant");
     create_docker_placement(&backend, "docker-crew", "host-a", BTreeSet::from(["github-crew-pr".to_string()])).await;
-    let placement = backend.using::<PlacementPolicy>("flotilla").get("docker-crew").await.expect("get Docker placement");
+    let placement = backend.using::<FulfilmentKind>("flotilla").get("docker-crew").await.expect("get Docker placement");
     let mut workflow = WorkflowTemplateSpec::builder()
         .vessels(vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()])
         .build();
@@ -537,20 +537,14 @@ async fn remote_placement_uses_replicated_host_capabilities() {
     assert_eq!(sources.items.len(), 1, "a Host should have only its home-authored source");
 
     let placement = backend
-        .using::<PlacementPolicy>("flotilla")
+        .using::<FulfilmentKind>("flotilla")
         .create(
             &test_meta("feta-docker"),
-            &PlacementPolicySpec::builder()
+            &FulfilmentKindSpec::builder()
+                .host_ref("feta-host".to_string())
                 .pool("passthrough".to_string())
-                .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
-                    memory_policy: Default::default(),
-                    host_ref: "feta-host".to_string(),
-                    image: Some("crew:latest".into()),
-                    pull_policy: Default::default(),
-                    agent_adapters: BTreeSet::new(),
-                    default_cwd: None,
-                    env: BTreeMap::new(),
-                    checkout: flotilla_resources::DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+                .realisation(FulfilmentRealisation::DockerPerVessel {
+                    image: Some(flotilla_resources::DockerImageSource::Literal("crew:latest".to_string())),
                 })
                 .build(),
         )
@@ -635,7 +629,7 @@ async fn trusted_claude_requires_and_accepts_a_project_selected_oauth_grant() {
     assert!(with_grant.vessels[0].credential_refs.is_empty(), "a subscription credential is never vessel-wide");
 
     create_docker_placement(&backend, "host-claude", "host-a", BTreeSet::from(["claude-max".to_string()])).await;
-    let placement = backend.using::<PlacementPolicy>("flotilla").get("host-claude").await.expect("get placement");
+    let placement = backend.using::<FulfilmentKind>("flotilla").get("host-claude").await.expect("get placement");
     let expired_ambient = CredentialExpiry::builder().refresh_expires_at("2026-07-30T00:00:00Z".parse().expect("timestamp")).build();
     set_host_credential_expiry(
         &backend,
@@ -684,7 +678,7 @@ async fn dispatch_against_an_expired_credential_is_refused_with_the_credential_a
         .build();
     workflow.vessels[0].credential_refs = BTreeSet::from(["claude-max".to_string()]);
     create_docker_placement(&backend, "docker-claude", "host-a", BTreeSet::from(["claude-max".to_string()])).await;
-    let placement = backend.using::<PlacementPolicy>("flotilla").get("docker-claude").await.expect("get placement");
+    let placement = backend.using::<FulfilmentKind>("flotilla").get("docker-claude").await.expect("get placement");
 
     let near_expiry = CredentialExpiry::builder().refresh_expires_at(Utc::now() + chrono::Duration::days(3)).build();
     set_host_credential_expiry(&backend, "host-a", BTreeMap::from([("claude-max".to_string(), near_expiry)])).await;

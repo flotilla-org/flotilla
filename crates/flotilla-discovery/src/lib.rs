@@ -14,7 +14,7 @@
 //! composition roots. The build-graph
 //! gate enforces the upward-dependency prohibition.
 
-use flotilla_agent::adapter::{AgentAdapterFactory, AgentAdapterRegistry};
+use flotilla_agent::adapter::{built_in_harnesses, AgentAdapterFactory, AgentAdapterRegistry, Harness};
 use flotilla_discovery_api::provider_config::ProviderConfigView;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
@@ -96,6 +96,17 @@ impl FactoryRegistry {
             .chain(self.agent_adapters.iter().filter_map(|factory| factory.account_state()))
             .collect::<Vec<_>>();
         AccountVariables::from_families(&declared)
+    }
+
+    /// The built-in harnesses `env` enables and those installed adapter factories contribute.
+    pub fn harnesses(&self, env: &dyn EnvVars) -> Vec<Harness> {
+        let mut harnesses = built_in_harnesses(env).collect::<Vec<_>>();
+        for harness in self.agent_adapters.iter().filter_map(|factory| factory.harness()) {
+            if !harnesses.iter().any(|known| known.adapter == harness.adapter) {
+                harnesses.push(harness);
+            }
+        }
+        harnesses
     }
 
     /// Probe all factory categories against an environment bag and return a
@@ -866,6 +877,38 @@ mod orchestrator_tests {
                 .count(),
             1,
             "raw env vars should not be duplicated by env-var detectors"
+        );
+    }
+}
+
+#[cfg(test)]
+mod harness_tests {
+    use super::*;
+
+    struct Contributing(&'static str);
+    impl AgentAdapterFactory for Contributing {
+        fn probe(&self, _env: &EnvironmentBag, _runner: Arc<dyn CommandRunner>) -> Option<Arc<dyn flotilla_agent::adapter::AgentAdapter>> {
+            None
+        }
+        fn harness(&self) -> Option<Harness> {
+            Some(Harness { adapter: self.0, binary: "contributed-crew" })
+        }
+    }
+
+    // Fulfilment probes look for the built-in harnesses and each one an installed
+    // adapter contributes; a built-in adapter's own harness is never replaced.
+    #[test]
+    fn harnesses_are_the_built_in_ones_and_those_adapters_contribute() {
+        let mut factories = FactoryRegistry::default_all();
+        factories.agent_adapters = vec![Arc::new(Contributing("contributed")), Arc::new(Contributing("codex"))];
+        let harnesses = factories.harnesses(&crate::testing::TestEnvVars::new([("FLOTILLA_FLEET_CANARY", "0")]));
+        assert_eq!(
+            harnesses,
+            [
+                Harness { adapter: "claude-code", binary: "claude" },
+                Harness { adapter: "codex", binary: "codex" },
+                Harness { adapter: "contributed", binary: "contributed-crew" },
+            ]
         );
     }
 }

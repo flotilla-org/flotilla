@@ -1,5 +1,6 @@
 use super::*;
 use crate::startup::busy_store::BusyStore;
+use flotilla_resources::{definition_provenance::SEEDING_MANAGER, DockerImageSource, FulfilmentGrant};
 use flotilla_store_sqlite::SqliteBackend;
 
 #[tokio::test]
@@ -36,7 +37,7 @@ async fn migrates_display_name_host_ref_to_canonical_host_id() {
         .pool("cleat".to_string())
         .host_direct(HostDirectPlacementPolicySpec { host_ref: "udder".to_string(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
         .build();
-    policies.create(&empty_meta("host-direct-udder"), &spec).await.expect("seed legacy policy");
+    policies.create(&empty_meta("direct-udder"), &spec).await.expect("seed legacy policy");
     let docker_spec = PlacementPolicySpec::builder()
         .pool("cleat".to_string())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
@@ -52,12 +53,7 @@ async fn migrates_display_name_host_ref_to_canonical_host_id() {
         .build();
     policies.create(&empty_meta("docker-udder"), &docker_spec).await.expect("seed legacy docker policy");
     let legacy_kind = FulfilmentKindSpec::from_policy(&spec, "linux").expect("valid legacy policy");
-    backend
-        .clone()
-        .using::<FulfilmentKind>(NAMESPACE)
-        .create(&empty_meta("host-direct-udder"), &legacy_kind)
-        .await
-        .expect("seed legacy kind");
+    backend.clone().using::<FulfilmentKind>(NAMESPACE).create(&empty_meta("direct-udder"), &legacy_kind).await.expect("seed legacy kind");
     backend
         .clone()
         .using::<FulfilmentKind>(NAMESPACE)
@@ -71,7 +67,7 @@ async fn migrates_display_name_host_ref_to_canonical_host_id() {
         .await
         .expect("seed ambiguous kind");
     let previous =
-        BTreeMap::from([("host-direct-udder".to_string(), FulfilmentFacts { observed_at: Utc::now(), ..FulfilmentFacts::default() })]);
+        BTreeMap::from([("direct-udder".to_string(), FulfilmentFacts { observed_at: Utc::now(), ..FulfilmentFacts::default() })]);
     let runner = Arc::new(DiscoveryMockRunner::builder().build());
     let facts = observe_fulfilment_facts(
         &backend,
@@ -85,19 +81,20 @@ async fn migrates_display_name_host_ref_to_canonical_host_id() {
             env: &TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]),
             scratch: Path::new("/tmp/flotilla-probe-test"),
             observation: &Default::default(),
+            harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
         },
         &mut ModelProbeState::default(),
     )
     .await
     .expect("observe legacy kind");
-    assert!(facts.contains_key("host-direct-udder"), "display-name kind must receive host facts");
+    assert!(facts.contains_key("direct-udder"), "display-name kind must receive host facts");
     assert!(!facts.contains_key("a-collision"), "ambiguous kind must not block healthy facts");
 
     migrate_live_placement_policies(&backend, NAMESPACE, host_id, "linux").await.expect("migrate policy");
 
-    let policy = policies.get("host-direct-udder").await.expect("policy remains");
+    let policy = policies.get("direct-udder").await.expect("policy remains");
     assert_eq!(policy.spec.host_direct.expect("direct policy").host_ref, host_id);
-    let kind = backend.clone().using::<FulfilmentKind>(NAMESPACE).get("host-direct-udder").await.expect("kind exists");
+    let kind = backend.clone().using::<FulfilmentKind>(NAMESPACE).get("direct-udder").await.expect("kind exists");
     assert_eq!(kind.spec.host_ref, host_id);
     let orphan = backend.clone().using::<FulfilmentKind>(NAMESPACE).get("orphan-udder").await.expect("orphan kind exists");
     assert_eq!(orphan.spec.host_ref, host_id);
@@ -202,10 +199,19 @@ async fn migrates_live_policy_names_to_fulfilment_kinds() {
         .await
         .expect("seed frozen placement snapshot");
     let kinds = backend.clone().using::<FulfilmentKind>(NAMESPACE);
-    kinds
-        .create(&empty_meta(snapshot_name), &FulfilmentKindSpec::from_policy(&snapshot_spec, "linux").expect("valid frozen policy"))
+    let frozen_kind = kinds
+        .create(
+            &InputMeta::builder()
+                .name(snapshot_name.to_string())
+                .labels(BTreeMap::from([(
+                    flotilla_resources::PREPARED_SNAPSHOT_LABEL.to_string(),
+                    flotilla_resources::PLACEMENT_SNAPSHOT_KIND.to_string(),
+                )]))
+                .build(),
+            &FulfilmentKindSpec::from_policy(&snapshot_spec, "linux").expect("valid frozen policy"),
+        )
         .await
-        .expect("seed previously migrated snapshot kind");
+        .expect("seed admission's snapshot kind");
     let legacy_snapshot = "old-convoy-remote-placement-012345abcdef";
     policies.create(&empty_meta(legacy_snapshot), &snapshot_spec).await.expect("seed legacy snapshot without label");
     let mut invalid = PlacementPolicySpec::builder().pool("cleat".to_string()).build();
@@ -225,10 +231,15 @@ async fn migrates_live_policy_names_to_fulfilment_kinds() {
     for host in ["feta", "kiwi", "udder"] {
         migrate_live_placement_policies(&backend, NAMESPACE, host, "linux").await.expect("migrate host policies");
     }
+    let snapshot_kind = kinds.get(snapshot_name).await.expect("admission's snapshot kind is left alone");
+    assert_eq!(snapshot_kind.metadata.resource_version, frozen_kind.metadata.resource_version);
     let kinds = kinds.list().await.expect("list kinds").items;
-    assert_eq!(kinds.len(), 5);
-    assert!(kinds.iter().all(|kind| kind.metadata.name != snapshot_name));
-    assert!(kinds.iter().all(|kind| kind.metadata.name != legacy_snapshot));
+    let names: BTreeSet<_> = kinds.iter().map(|kind| kind.metadata.name.as_str()).collect();
+    assert_eq!(
+        names,
+        BTreeSet::from(["docker-crew-image-feta", "docker-crew-image-kiwi", "docker-crew-image-udder", snapshot_name]),
+        "snapshots, seeded names and invalid policies do not migrate"
+    );
     for kind in kinds {
         assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::platform("linux".to_string())));
         if kind.metadata.name.starts_with("docker-") {
@@ -262,12 +273,14 @@ async fn startup_registration_is_idempotent_and_discovers_existing_clone() {
     let backend = daemon.resource_backend();
     let hosts = backend.clone().using::<Host>(NAMESPACE);
     let environments = backend.clone().using::<Environment>(NAMESPACE);
+    let kinds = backend.clone().using::<FulfilmentKind>(NAMESPACE);
     let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
     let clones = backend.using::<Clone>(NAMESPACE);
 
     assert!(hosts.get(&host_id).await.is_ok(), "host resource should exist");
     assert!(environments.get(&format!("host-direct-{host_id}")).await.is_ok(), "host-direct environment should exist");
-    assert!(policies.get(&format!("host-direct-{host_id}")).await.is_ok(), "host-direct policy should exist");
+    assert!(kinds.get(&format!("host-direct-{host_id}")).await.is_ok(), "host-direct kind should exist");
+    assert!(policies.list().await.expect("list policies").items.is_empty(), "startup seeds no placement policy");
 
     let clone_name = format!(
         "clone-{}",
@@ -281,120 +294,142 @@ async fn startup_registration_is_idempotent_and_discovers_existing_clone() {
     assert_eq!(clone.metadata.labels.get("flotilla.work/discovered").map(String::as_str), Some("true"));
 }
 
+fn host_direct_kind_spec(profile: &LocalProvisioningProfile, platform: &str) -> FulfilmentKindSpec {
+    FulfilmentKindSpec {
+        host_ref: profile.host_id.clone(),
+        pool: profile.host_direct_pool.clone(),
+        cost_class: Default::default(),
+        grants: BTreeSet::from([
+            FulfilmentGrant::platform(platform.to_string()),
+            FulfilmentGrant::host_account_reach(),
+            FulfilmentGrant::network("host".to_string()),
+        ]),
+        realisation: FulfilmentRealisation::HostDirect,
+    }
+}
+
+fn docker_kind_spec(profile: &LocalProvisioningProfile) -> FulfilmentKindSpec {
+    FulfilmentKindSpec {
+        host_ref: profile.host_id.clone(),
+        pool: profile.docker_pool.clone(),
+        cost_class: Default::default(),
+        grants: BTreeSet::from([FulfilmentGrant::platform("linux".to_string()), FulfilmentGrant::network("scoped".to_string())]),
+        realisation: FulfilmentRealisation::DockerPerVessel { image: Some(DockerImageSource::Literal("ubuntu:24.04".into())) },
+    }
+}
+
+fn seeded_labels() -> BTreeMap<String, String> {
+    BTreeMap::from([(MANAGED_BY_LABEL.to_string(), SEEDING_MANAGER.to_string())])
+}
+
+// Seeding writes this host's kinds directly, labelled as seeding's, and seeds no PlacementPolicy.
 #[tokio::test]
-async fn policy_registration_preserves_operator_fields_and_corrects_owned_drift() {
+async fn seeding_writes_host_direct_and_docker_kinds() {
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let profile = manual_profile("host-test", true);
+    ensure_default_kinds(&backend, NAMESPACE, &profile, "macos").await.expect("seed kinds");
+
+    let kinds = backend.clone().using::<FulfilmentKind>(NAMESPACE);
+    let direct = kinds.get(&profile.host_direct_policy_name()).await.expect("host-direct kind");
+    assert_eq!(profile.host_direct_policy_name(), "host-direct-host-test");
+    assert_eq!(direct.spec, host_direct_kind_spec(&profile, "macos"));
+    assert_eq!(direct.metadata.labels, seeded_labels());
+    let docker = kinds.get(&profile.docker_policy_name()).await.expect("docker kind");
+    assert_eq!(profile.docker_policy_name(), "docker-on-host-test");
+    assert_eq!(docker.spec, docker_kind_spec(&profile));
+    assert_eq!(docker.metadata.labels, seeded_labels());
+    assert!(backend.using::<PlacementPolicy>(NAMESPACE).list().await.expect("list policies").items.is_empty());
+}
+
+#[tokio::test]
+async fn kind_seeding_keeps_operator_grants_and_corrects_owned_drift() {
     let temp = TempDir::new().expect("tempdir");
     let database_path = temp.path().join("resources.sqlite");
     let profile = manual_profile("host-test", false);
+    let operator_grants = BTreeSet::from([
+        FulfilmentGrant::platform("windows".to_string()),
+        FulfilmentGrant::network("host".to_string()),
+        FulfilmentGrant::toolchain("rust".to_string()),
+    ]);
     {
         let backend = ResourceBackend::new(SqliteBackend::open(&database_path).expect("initial sqlite resource backend should open"));
-        ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("initial policy registration should succeed");
+        ensure_default_kinds(&backend, NAMESPACE, &profile, "linux").await.expect("initial seeding should succeed");
 
-        let policies = backend.using::<PlacementPolicy>(NAMESPACE);
-        let registered = policies.get(&profile.host_direct_policy_name()).await.expect("registered host-direct policy");
-        policies
+        let kinds = backend.using::<FulfilmentKind>(NAMESPACE);
+        let seeded = kinds.get(&profile.host_direct_policy_name()).await.expect("seeded host-direct kind");
+        kinds
             .update(
-                &InputMeta::from(&registered.metadata),
-                &registered.metadata.resource_version,
-                &PlacementPolicySpec::builder()
-                    .pool("operator-edited-pool".to_string())
-                    .priority(10)
-                    .host_direct(HostDirectPlacementPolicySpec {
-                        host_ref: "operator-edited-host".to_string(),
-                        checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                    })
-                    .build(),
+                &InputMeta::from(&seeded.metadata),
+                &seeded.metadata.resource_version,
+                &FulfilmentKindSpec {
+                    host_ref: "operator-edited-host".to_string(),
+                    pool: "operator-edited-pool".to_string(),
+                    cost_class: flotilla_resources::FulfilmentCostClass::Metered,
+                    grants: operator_grants,
+                    realisation: FulfilmentRealisation::DockerPerVessel { image: None },
+                },
             )
             .await
-            .expect("operator policy apply should succeed");
+            .expect("operator kind apply should succeed");
     }
 
     let backend = ResourceBackend::new(SqliteBackend::open(&database_path).expect("restarted sqlite resource backend should open"));
-    ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("policy re-registration should succeed");
+    ensure_default_kinds(&backend, NAMESPACE, &profile, "linux").await.expect("re-seeding should succeed");
 
-    let reconciled =
-        backend.using::<PlacementPolicy>(NAMESPACE).get(&profile.host_direct_policy_name()).await.expect("reconciled host-direct policy");
-    assert_eq!(reconciled.spec.priority, 10, "operator-owned priority must survive re-registration");
-    assert_eq!(reconciled.spec.pool, profile.host_direct_pool, "registration must assert the discovered terminal pool");
+    let kinds = backend.using::<FulfilmentKind>(NAMESPACE);
+    let reconciled = kinds.get(&profile.host_direct_policy_name()).await.expect("reconciled host-direct kind");
+    assert_eq!(reconciled.spec.host_ref, profile.host_id, "seeding asserts its host");
+    assert_eq!(reconciled.spec.pool, profile.host_direct_pool, "seeding asserts the discovered terminal pool");
+    assert_eq!(reconciled.spec.realisation, FulfilmentRealisation::HostDirect, "seeding asserts the realisation");
+    assert_eq!(reconciled.spec.cost_class, flotilla_resources::FulfilmentCostClass::Metered, "the operator's cost class survives");
     assert_eq!(
-        reconciled.spec.host_direct,
-        Some(HostDirectPlacementPolicySpec { host_ref: profile.host_id.clone(), checkout: HostDirectPlacementPolicyCheckout::Worktree }),
-        "registration must assert its host and checkout strategy"
+        reconciled.spec.grants,
+        BTreeSet::from([
+            FulfilmentGrant::platform("linux".to_string()),
+            FulfilmentGrant::network("host".to_string()),
+            FulfilmentGrant::toolchain("rust".to_string()),
+        ]),
+        "operator grants survive while the platform is the host's"
     );
-    assert!(reconciled.spec.docker_per_vessel.is_none());
+    assert_eq!(reconciled.metadata.labels, seeded_labels());
 
-    ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("steady-state policy registration should succeed");
-    let steady =
-        backend.using::<PlacementPolicy>(NAMESPACE).get(&profile.host_direct_policy_name()).await.expect("steady host-direct policy");
-    assert_eq!(steady.spec.priority, 10);
-    assert_eq!(steady.metadata.resource_version, reconciled.metadata.resource_version, "steady registration must not rewrite the policy");
+    ensure_default_kinds(&backend, NAMESPACE, &profile, "linux").await.expect("steady-state seeding should succeed");
+    let steady = kinds.get(&profile.host_direct_policy_name()).await.expect("steady host-direct kind");
+    assert_eq!(steady.metadata.resource_version, reconciled.metadata.resource_version, "steady seeding must not rewrite the kind");
 }
 
 #[tokio::test]
-async fn docker_policy_registration_preserves_runtime_configuration_and_corrects_owned_drift() {
+async fn kind_seeding_refreshes_platform_and_adopts_unlabelled_kinds() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let profile = manual_profile("host-test", true);
-    ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("initial policy registration should succeed");
+    let kinds = backend.clone().using::<FulfilmentKind>(NAMESPACE);
+    let mut stale_docker = docker_kind_spec(&profile);
+    stale_docker.realisation =
+        FulfilmentRealisation::DockerPerVessel { image: Some(DockerImageSource::Literal("operator/image:1".into())) };
+    stale_docker.grants.insert(FulfilmentGrant::gpu());
+    kinds.create(&empty_meta(&profile.docker_policy_name()), &stale_docker).await.expect("unlabelled docker kind");
 
-    let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
-    let registered = policies.get(&profile.docker_policy_name()).await.expect("registered docker policy");
-    policies
-        .update(
-            &InputMeta::from(&registered.metadata),
-            &registered.metadata.resource_version,
-            &PlacementPolicySpec::builder()
-                .pool("operator-edited-pool".to_string())
-                .priority(20)
-                .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                    memory_policy: Default::default(),
-                    host_ref: "operator-edited-host".to_string(),
-                    image: Some("operator/image:latest".into()),
-                    pull_policy: flotilla_resources::DockerImagePullPolicy::Never,
-                    agent_adapters: BTreeSet::from(["codex".to_string()]),
-                    default_cwd: Some("/operator-workspace".to_string()),
-                    env: BTreeMap::from([("OPERATOR_CONFIG".to_string(), "true".to_string())]),
-                    checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/operator-clone".to_string() },
-                })
-                .build(),
-        )
-        .await
-        .expect("operator policy apply should succeed");
+    ensure_default_kinds(&backend, NAMESPACE, &profile, "macos").await.expect("seed on macos");
+    ensure_default_kinds(&backend, NAMESPACE, &profile, "linux").await.expect("seed on linux");
 
-    ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("policy re-registration should succeed");
-
-    let reconciled = policies.get(&profile.docker_policy_name()).await.expect("reconciled docker policy");
-    assert_eq!(reconciled.spec.priority, 20);
-    assert_eq!(reconciled.spec.pool, profile.docker_pool);
-    assert!(reconciled.spec.host_direct.is_none());
-    assert_eq!(
-        reconciled.spec.docker_per_vessel,
-        Some(DockerPerVesselPlacementPolicySpec {
-            memory_policy: Default::default(),
-            host_ref: profile.host_id,
-            image: Some("operator/image:latest".into()),
-            pull_policy: flotilla_resources::DockerImagePullPolicy::Never,
-            agent_adapters: BTreeSet::from(["codex".to_string()]),
-            default_cwd: Some("/operator-workspace".to_string()),
-            env: BTreeMap::from([("OPERATOR_CONFIG".to_string(), "true".to_string())]),
-            checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
-        })
-    );
+    let direct = kinds.get(&profile.host_direct_policy_name()).await.expect("host-direct kind");
+    assert_eq!(direct.spec, host_direct_kind_spec(&profile, "linux"), "the platform grant follows the host's platform");
+    let docker = kinds.get(&profile.docker_policy_name()).await.expect("docker kind");
+    let mut expected = docker_kind_spec(&profile);
+    expected.grants.insert(FulfilmentGrant::gpu());
+    assert_eq!(docker.spec, expected, "seeding owns the Docker realisation and keeps the operator's grant");
+    assert_eq!(docker.metadata.labels, seeded_labels(), "seeding adopts the unlabelled kind");
 }
 
 #[tokio::test]
-async fn policy_registration_leaves_manifest_managed_collision_untouched() {
+async fn kind_seeding_leaves_kind_managed_elsewhere_untouched() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let profile = manual_profile("host-test", false);
-    let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
-    let manifest_spec = PlacementPolicySpec::builder()
-        .pool("manifest-pool".to_string())
-        .priority(25)
-        .host_direct(HostDirectPlacementPolicySpec {
-            host_ref: "manifest-host".to_string(),
-            checkout: HostDirectPlacementPolicyCheckout::Worktree,
-        })
-        .build();
-    let manifest = policies
+    let kinds = backend.clone().using::<FulfilmentKind>(NAMESPACE);
+    let mut manifest_spec = host_direct_kind_spec(&profile, "windows");
+    manifest_spec.host_ref = "manifest-host".to_string();
+    manifest_spec.pool = "manifest-pool".to_string();
+    let manifest = kinds
         .create(
             &empty_meta_with_labels(
                 &profile.host_direct_policy_name(),
@@ -403,17 +438,17 @@ async fn policy_registration_leaves_manifest_managed_collision_untouched() {
             &manifest_spec,
         )
         .await
-        .expect("manifest-managed policy should exist");
+        .expect("manifest-managed kind should exist");
 
-    ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("registration should tolerate managed collision");
+    ensure_default_kinds(&backend, NAMESPACE, &profile, "linux").await.expect("seeding should tolerate managed collision");
 
-    let unchanged = policies.get(&profile.host_direct_policy_name()).await.expect("manifest-managed policy should remain");
+    let unchanged = kinds.get(&profile.host_direct_policy_name()).await.expect("manifest-managed kind should remain");
     assert_eq!(unchanged.spec, manifest_spec);
-    assert_eq!(unchanged.metadata.resource_version, manifest.metadata.resource_version, "registration must not rewrite managed policy");
+    assert_eq!(unchanged.metadata.resource_version, manifest.metadata.resource_version, "seeding must not rewrite a managed kind");
 }
 
 #[tokio::test]
-async fn startup_registration_skips_repos_without_origin_and_gates_docker_policy() {
+async fn startup_registration_skips_repos_without_origin_and_gates_docker_kind() {
     let temp = TempDir::new().expect("tempdir");
     let git_repo = TestGitRepo::init(temp.path().join("repo-no-origin"));
     let repo = git_repo.path().to_path_buf();
@@ -430,9 +465,9 @@ async fn startup_registration_skips_repos_without_origin_and_gates_docker_policy
 
     let backend = daemon.resource_backend();
     let clones = backend.clone().using::<Clone>(NAMESPACE);
-    let policies = backend.using::<PlacementPolicy>(NAMESPACE);
+    let kinds = backend.using::<FulfilmentKind>(NAMESPACE);
     assert!(clones.list().await.expect("clone list").items.is_empty(), "repo without origin should not create a discovered clone");
-    assert!(policies.get(&format!("docker-on-{host_id}")).await.is_err(), "docker policy should be absent when docker capability is false");
+    assert!(kinds.get(&format!("docker-on-{host_id}")).await.is_err(), "docker kind should be absent when docker capability is false");
 
     let temp2 = TempDir::new().expect("tempdir");
     let config2_base = temp2.path().join("config");
@@ -444,75 +479,8 @@ async fn startup_registration_skips_repos_without_origin_and_gates_docker_policy
     register_startup_resources(&daemon2, NAMESPACE, &manual_profile(&host_id2, true))
         .await
         .expect("startup registration with docker capability should succeed");
-    let policies2 = daemon2.resource_backend().using::<PlacementPolicy>(NAMESPACE);
-    assert!(
-        policies2.get(&format!("docker-on-{host_id2}")).await.is_ok(),
-        "docker policy should be created when docker capability is true"
-    );
-}
-
-// #3163: host-local operator and manifest checkout changes survive seed passes,
-// while the reserved docker-on-* policies retain loop-owned checkout reseeding.
-#[tokio::test]
-async fn operator_docker_checkout_survives_seed_passes() {
-    for backend in [
-        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
-        ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite")),
-    ] {
-        let profile = manual_profile("host-test", true);
-        ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("seed policies");
-        let policies = backend.using::<PlacementPolicy>(NAMESPACE);
-        let seeded_name = profile.docker_policy_name();
-        let seeded = policies.get(&seeded_name).await.expect("seeded policy");
-        let original = seeded.spec.clone();
-        let crew_name = "docker-crew-image-host-test";
-        policies.create(&empty_meta(crew_name), &original).await.expect("operator policy");
-        let mut requested = original.clone();
-        requested.docker_per_vessel.as_mut().expect("docker").checkout =
-            DockerCheckoutStrategy::LocalCloneOnHostAndMount { mount_path: "/workspace".into() };
-        let document = |name: &str, spec: &PlacementPolicySpec| {
-            serde_json::json!({
-                "apiVersion": "flotilla.work/v1", "kind": "PlacementPolicy",
-                "metadata": { "name": name }, "spec": spec
-            })
-        };
-        flotilla_store::apply_resource_document(&backend, NAMESPACE, document(crew_name, &requested))
-            .await
-            .expect("operator must be able to switch checkout");
-        for _ in 0..2 {
-            ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("later seed pass");
-            assert_eq!(policies.get(crew_name).await.expect("crew policy").spec, requested);
-            assert_eq!(policies.get(&seeded_name).await.expect("untouched seed").spec, original);
-        }
-        let error = flotilla_store::apply_resource_document(&backend, NAMESPACE, document(&seeded_name, &requested))
-            .await
-            .expect_err("seeded checkout remains loop-owned");
-        assert!(error.to_string().contains("manifest"), "refusal must name the working authoring route: {error}");
-        policies
-            .update(&InputMeta::from(&seeded.metadata), &seeded.metadata.resource_version, &requested)
-            .await
-            .expect("simulate stored seed drift");
-        ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("reseed drift");
-        assert_eq!(policies.get(&seeded_name).await.expect("reseeded policy").spec, original);
-
-        // Host-direct seed identities also retain ownership of Docker presence
-        // so registration can repair an accidentally stored Docker strategy.
-        let direct = policies.get(&profile.host_direct_policy_name()).await.expect("direct seed");
-        policies
-            .update(&InputMeta::from(&direct.metadata), &direct.metadata.resource_version, &original)
-            .await
-            .expect("simulate host-direct strategy drift");
-        ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("repair direct seed");
-        assert_eq!(policies.get(&profile.host_direct_policy_name()).await.expect("reseeded direct policy").spec, direct.spec);
-
-        // The manifest route may author even reserved names; managed policies
-        // are excluded from registration so manifest and seed never fight.
-        let mut manifest = document(&seeded_name, &requested);
-        manifest["metadata"]["labels"] = serde_json::json!({ "flotilla.work/managed-by": "manifest" });
-        flotilla_store::apply_manifest_resource_document(&backend, NAMESPACE, manifest).await.expect("manifest checkout switch");
-        ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("seed after manifest");
-        assert_eq!(policies.get(&seeded_name).await.expect("manifest policy").spec, requested);
-    }
+    let kinds2 = daemon2.resource_backend().using::<FulfilmentKind>(NAMESPACE);
+    assert!(kinds2.get(&format!("docker-on-{host_id2}")).await.is_ok(), "docker kind should be created when docker capability is true");
 }
 
 // #3765 S6: a cloud policy migrates only on its uniquely advertised controller;

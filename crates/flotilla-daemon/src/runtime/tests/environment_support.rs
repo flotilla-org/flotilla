@@ -594,7 +594,6 @@ impl EnvironmentProvider for CapturingFailingEnvironmentProvider {
             provisioned_mounts: opts.provisioned_mounts,
             tools: opts.tools,
             cpu_limit: opts.cpu_limit,
-            memory_policy: opts.memory_policy,
             image_pull_policy: Default::default(),
             prepared_auth: self.prepared_auth.lock().await.take().expect("prepared auth captured"),
         });
@@ -787,7 +786,6 @@ pub(super) async fn create_ready_docker_environment(
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
                     image_build_ref: None,
-                    memory_policy: Default::default(),
                     host_ref,
                     image: "contained-image".to_string(),
                     declared_agent_adapters,

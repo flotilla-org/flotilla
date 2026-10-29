@@ -10,9 +10,9 @@ use flotilla_config::ConfigStore;
 use flotilla_protocol::{HostName, PlacementDecision};
 use flotilla_resources::{
     image_build_name, image_identity, CrewDefaults, CrewDefaultsSpec, CrewSource, CrewSpec, DockerImageSource, FleetDesignation,
-    FleetDesignationSpec, Host, ImageBuild, ImageBuildCapacity, ImageBuildReservation, ImageCacheBinding, ImageDelivery, ImageLayer,
-    ImageLayerSource, ImageLayerSpec, ImageLayerTier, ImageSelection, PlacementPolicy, Project, ProjectSpec, VesselRequirement,
-    WorkflowTemplateSpec, FLEET_DESIGNATION_NAME,
+    FleetDesignationSpec, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, ImageBuild, ImageBuildCapacity,
+    ImageBuildReservation, ImageCacheBinding, ImageDelivery, ImageLayer, ImageLayerSource, ImageLayerSpec, ImageLayerTier, ImageSelection,
+    Project, ProjectSpec, VesselRequirement, WorkflowTemplateSpec, FLEET_DESIGNATION_NAME,
 };
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
@@ -73,10 +73,10 @@ async fn fixture(layers: Vec<ImageLayerSpec>, image: Option<ImageSelection>) -> 
     )
     .await;
     create_docker_placement(&backend, "crew-policy", "host-a", BTreeSet::new()).await;
-    let policies = backend.using::<PlacementPolicy>(NS);
-    let mut policy = policies.get("crew-policy").await.expect("policy");
-    policy.spec.docker_per_vessel.as_mut().expect("docker").image = None;
-    policies.update(&test_meta("crew-policy"), &policy.metadata.resource_version, &policy.spec).await.expect("composed policy");
+    let kinds = backend.using::<FulfilmentKind>(NS);
+    let mut kind = kinds.get("crew-policy").await.expect("kind");
+    kind.spec.realisation = FulfilmentRealisation::DockerPerVessel { image: None };
+    kinds.update(&test_meta("crew-policy"), &kind.metadata.resource_version, &kind.spec).await.expect("composed kind");
     set_architecture(&backend, "host-a", "x86_64", None).await;
     for spec in layers {
         backend.definitions::<ImageLayer>(NS).apply(&test_meta(&spec.resource_name()), &spec.into()).await.expect("layer");
@@ -143,9 +143,8 @@ async fn admit(
     fixture: &Fixture,
     workflow: &WorkflowTemplateSpec,
 ) -> Result<(Option<DockerImageSource>, BTreeMap<String, Option<DockerImageSource>>), String> {
-    let policy = fixture.backend.using::<PlacementPolicy>(NS).get("crew-policy").await.expect("policy");
-    let mut placement =
-        PlacementResolution { selected: Some(policy), refused_candidates: Vec::new(), viable_not_selected: Vec::new(), allocation: None };
+    let kind = fixture.backend.using::<FulfilmentKind>(NS).get("crew-policy").await.expect("kind");
+    let mut placement = PlacementResolution::selected(kind);
     let (pins, builds) =
         fixture.daemon.admission.join_convoy_placement_builds(NS, Some("flotilla"), workflow, &mut placement, Some(&decision())).await?;
     assert!(fixture
@@ -159,8 +158,15 @@ async fn admit(
         .all(|build| builds.iter().all(|planned| planned.create.is_none() || planned.name != build.metadata.name)));
     // Admission commits its planned builds with the convoy.
     flotilla_admission::image_build::create_planned_builds(&fixture.backend, NS, &builds).await?;
-    let image = placement.selected.expect("selected").spec.docker_per_vessel.expect("docker").image;
-    Ok((image, pins.into_iter().map(|(vessel, (spec, _))| (vessel, spec.docker_per_vessel.expect("docker").image)).collect()))
+    let image = docker_image(&placement.selected.expect("selected").spec);
+    Ok((image, pins.into_iter().map(|(vessel, (spec, _))| (vessel, docker_image(&spec))).collect()))
+}
+
+fn docker_image(spec: &FulfilmentKindSpec) -> Option<DockerImageSource> {
+    match &spec.realisation {
+        FulfilmentRealisation::DockerPerVessel { image } => image.clone(),
+        other => panic!("Docker realisation expected: {other:?}"),
+    }
 }
 
 fn layer_names(build: &flotilla_resources::ResourceObject<ImageBuild>) -> Vec<String> {

@@ -73,7 +73,6 @@ async fn a_provisioning_failure_marks_the_environment_failed() {
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
                     image_build_ref: None,
-                    memory_policy: Default::default(),
                     host_ref: "host-a".to_string(),
                     image: "crew-image".to_string(),
                     declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
@@ -135,7 +134,6 @@ async fn failed_environment_without_a_container_still_runs_terminal_cleanup() {
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
                     image_build_ref: None,
-                    memory_policy: Default::default(),
                     host_ref: "host-a".to_string(),
                     image: "crew-image".to_string(),
                     declared_agent_adapters: BTreeSet::new(),
@@ -213,7 +211,6 @@ async fn foreign_environment_is_not_actuated_or_finalized() {
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
                     image_build_ref: None,
-                    memory_policy: Default::default(),
                     host_ref: "udder".to_string(),
                     image: "crew:latest".to_string(),
                     declared_agent_adapters: BTreeSet::new(),
@@ -261,7 +258,6 @@ async fn orphaned_environment_can_finalize_after_its_host_disappears() {
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
                     image_build_ref: None,
-                    memory_policy: Default::default(),
                     host_ref: "deleted-host".to_string(),
                     image: "crew:latest".to_string(),
                     declared_agent_adapters: BTreeSet::new(),
@@ -324,7 +320,6 @@ async fn lost_environment_is_not_reprovisioned() {
                     host_ref: "host-a".into(),
                     image: "crew-image".into(),
                     image_build_ref: None,
-                    memory_policy: Default::default(),
                     declared_agent_adapters: Default::default(),
                     required_agent_adapters: Default::default(),
                     pull_policy: Default::default(),
@@ -439,7 +434,6 @@ async fn composed_environment_waits_for_its_build_then_provisions_the_digest(#[c
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
                     image_build_ref: Some(name.clone()),
-                    memory_policy: Default::default(),
                     host_ref: "host-a".to_string(),
                     image: String::new(),
                     declared_agent_adapters: BTreeSet::new(),
@@ -527,7 +521,6 @@ async fn retired_build_reference_fails_the_environment() {
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
                     image_build_ref: Some("image-build-old-stage".into()),
-                    memory_policy: Default::default(),
                     host_ref: "host-a".to_string(),
                     image: String::new(),
                     declared_agent_adapters: BTreeSet::new(),

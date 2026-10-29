@@ -76,7 +76,6 @@ async fn docker_provisioning_mounts_interior_control_binaries_and_durable_cleat_
     let state = Arc::new(state);
     let spec = flotilla_resources::DockerEnvironmentSpec {
         image_build_ref: None,
-        memory_policy: Default::default(),
         host_ref: "host-test".to_string(),
         image: "contained-image".to_string(),
         declared_agent_adapters: BTreeSet::new(),
@@ -189,7 +188,6 @@ async fn docker_provisioning_fails_loudly_without_interior_cleat_assets() {
     );
     let spec = flotilla_resources::DockerEnvironmentSpec {
         image_build_ref: None,
-        memory_policy: Default::default(),
         host_ref: "host-test".to_string(),
         image: "contained-image".to_string(),
         declared_agent_adapters: BTreeSet::new(),
@@ -281,7 +279,6 @@ async fn registry_admission_delivers_opaque_auth_without_runtime_preflight_and_r
             Arc::new(if outcome == RegistryPreflightOutcome::MissingStore { state } else { state.with_credential_store(credential_store) });
         let spec = flotilla_resources::DockerEnvironmentSpec {
             image_build_ref: None,
-            memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: "registry.example/crew:latest".to_string(),
             declared_agent_adapters: BTreeSet::new(),
@@ -451,7 +448,6 @@ async fn composed_registry_images_pull_with_the_fleet_pull_credential() {
         );
         let spec = flotilla_resources::DockerEnvironmentSpec {
             image_build_ref: Some("image-build".to_string()),
-            memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: if case == "local" { format!("sha256:{}", "d".repeat(64)) } else { image.clone() },
             declared_agent_adapters: BTreeSet::new(),
@@ -649,7 +645,6 @@ async fn docker_orphan_cleanup_without_persisted_status_reaps_backing() {
                     host_ref: "host-test".into(),
                     image: "image".into(),
                     image_build_ref: None,
-                    memory_policy: Default::default(),
                     declared_agent_adapters: Default::default(),
                     required_agent_adapters: Default::default(),
                     pull_policy: Default::default(),
@@ -703,7 +698,6 @@ async fn docker_provisioning_reports_unavailable_flotilla_cli() {
     ));
     let spec = flotilla_resources::DockerEnvironmentSpec {
         image_build_ref: None,
-        memory_policy: Default::default(),
         host_ref: "host-test".to_string(),
         image: "contained-image".to_string(),
         declared_agent_adapters: BTreeSet::new(),
@@ -758,7 +752,6 @@ async fn docker_provisioning_rejects_mounts_targeting_reserved_tool_assets() {
     );
     let spec = flotilla_resources::DockerEnvironmentSpec {
         image_build_ref: None,
-        memory_policy: Default::default(),
         host_ref: "host-test".to_string(),
         image: "contained-image".to_string(),
         declared_agent_adapters: BTreeSet::new(),
@@ -782,7 +775,6 @@ async fn docker_provisioning_rejects_mounts_targeting_reserved_tool_assets() {
 
     let cli_collision_spec = flotilla_resources::DockerEnvironmentSpec {
         image_build_ref: None,
-        memory_policy: Default::default(),
         mounts: vec![flotilla_resources::EnvironmentMount {
             source_path: "/host/replacement-flotilla".to_string(),
             target_path: "/opt/flotilla/crew-bin/flotilla".to_string(),
@@ -863,7 +855,6 @@ async fn provisioned_environment_discovers_and_registers_interior_agent_adapters
 
     let spec = flotilla_resources::DockerEnvironmentSpec {
         image_build_ref: None,
-        memory_policy: Default::default(),
         host_ref: "host-test".to_string(),
         image: "contained-image".to_string(),
         declared_agent_adapters: BTreeSet::from(["codex".to_string(), "missing-adapter".to_string()]),
@@ -920,7 +911,6 @@ async fn provisioned_environment_is_destroyed_when_declared_adapter_is_missing()
     );
     let spec = flotilla_resources::DockerEnvironmentSpec {
         image_build_ref: None,
-        memory_policy: Default::default(),
         host_ref: "host-test".to_string(),
         image: "contained-image".to_string(),
         declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
@@ -1064,14 +1054,22 @@ async fn cloud_image_probe_refuses_missing_harness() {
         destroyed: Arc::new(AtomicBool::new(false)),
     });
     let bag = EnvironmentBag::new();
-    assert!(super::super::provider_path::verify_cloud_image_needs(&BTreeSet::new(), "cloud-image", &handle, &bag, &Default::default())
-        .await
-        .is_ok());
+    assert!(super::super::provider_path::verify_cloud_image_needs(
+        &BTreeSet::new(),
+        "cloud-image",
+        &handle,
+        &bag,
+        &Default::default(),
+        &[]
+    )
+    .await
+    .is_ok());
     let needs = [flotilla_resources::CapabilityNeed::Harness { adapter: "missing-harness".into(), minimum_version: "1.0.0".into() }]
         .into_iter()
         .collect();
-    let error =
-        super::super::provider_path::verify_cloud_image_needs(&needs, "cloud-image", &handle, &bag, &Default::default()).await.unwrap_err();
+    let error = super::super::provider_path::verify_cloud_image_needs(&needs, "cloud-image", &handle, &bag, &Default::default(), &[])
+        .await
+        .unwrap_err();
     assert!(error.contains("missing-harness"), "{error}");
 }
 

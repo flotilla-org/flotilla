@@ -36,6 +36,7 @@ pub mod definitions;
 pub mod environment;
 pub mod image_build;
 pub mod import;
+pub mod kinds;
 pub mod manifest_root;
 pub mod manifest_root_import;
 pub mod placement_import;

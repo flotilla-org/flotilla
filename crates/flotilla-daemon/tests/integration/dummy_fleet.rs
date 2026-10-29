@@ -12,18 +12,16 @@ use flotilla_daemon::{
     runtime::{DaemonRuntime, RuntimeOptions},
 };
 use flotilla_daemon_api::daemon::DaemonHandle;
-use flotilla_discovery_testkit::fake_discovery;
+use flotilla_discovery_testkit::fake_discovery_with_host_directories;
 use flotilla_dummy_fleet::{
-    catalog::{self, CrewMix, DUMMY_PLACEMENT_POLICY},
-    DummyFleet, DummyFleetSnapshot,
+    catalog::{self, CrewMix, DUMMY_FULFILMENT_KIND},
+    DummyFleet, DummyFleetSnapshot, DUMMY_AGENT_ADAPTER,
 };
 use flotilla_protocol::{
     commands::{CommandValue, CrewSupervisionAction},
     Command, CommandAction, DaemonEvent, HostName, PrincipalRef,
 };
-use flotilla_resources::{
-    Convoy, ConvoyPhase, CrewWorkPhase, Forge, Host, InputMeta, PlacementPolicy, Repository, ResourceObject, WorkflowTemplate,
-};
+use flotilla_resources::{Convoy, ConvoyPhase, CrewWorkPhase, Forge, Host, InputMeta, Repository, ResourceObject, WorkflowTemplate};
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
 
@@ -80,7 +78,7 @@ impl DummyDaemon {
         std::fs::write(config_dir.join("daemon.toml"), daemon_toml).expect("daemon.toml");
         let config = Arc::new(ConfigStore::with_base(config_dir));
         let daemon_config: DaemonConfig = config.load_daemon_config().expect("daemon config");
-        let mut discovery = fake_discovery(false);
+        let mut discovery = fake_discovery_with_host_directories(dir.path());
         let fleet = install_dummy_fleet(&daemon_config, &mut discovery).expect("dummy fleet configured");
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let daemon = InProcessDaemon::new_with_resource_backend(
@@ -168,21 +166,8 @@ impl DummyDaemon {
         repositories.create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository).await.expect("repository");
         backend
             .clone()
-            .using::<PlacementPolicy>(NAMESPACE)
-            .create(
-                &InputMeta::builder().name(DUMMY_PLACEMENT_POLICY.to_string()).labels(catalog::placement_policy_labels()).build(),
-                &catalog::placement_policy(&host.metadata.name),
-            )
-            .await
-            .expect("dummy placement policy");
-        backend
-            .clone()
             .using::<flotilla_resources::FulfilmentKind>(NAMESPACE)
-            .create(
-                &InputMeta::builder().name(DUMMY_PLACEMENT_POLICY.into()).build(),
-                &flotilla_resources::FulfilmentKindSpec::from_policy(&catalog::placement_policy(&host.metadata.name), "linux")
-                    .expect("dummy fulfilment"),
-            )
+            .create(&InputMeta::builder().name(DUMMY_FULFILMENT_KIND.to_string()).build(), &catalog::fulfilment_kind(&host.metadata.name))
             .await
             .expect("dummy fulfilment kind");
         for mix in CrewMix::ALL {
@@ -206,6 +191,17 @@ impl DummyDaemon {
         })
         .await
         .expect("the dummy forge resolves the default branch");
+        // Admission places a literal image only once its host has probed the image's harnesses.
+        let hosts = backend.clone().using::<Host>(NAMESPACE);
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !hosts.get(&host.metadata.name).await.ok().and_then(|host| host.status).is_some_and(|status| {
+                status.fulfilment_facts.get(DUMMY_FULFILMENT_KIND).is_some_and(|facts| facts.harnesses.contains_key(DUMMY_AGENT_ADAPTER))
+            }) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the dummy kind's harness is observed");
     }
 
     async fn execute(&self, action: CommandAction) -> CommandValue {
@@ -243,7 +239,7 @@ impl DummyDaemon {
                 repository_url: Some(catalog::repository_url(&forge)),
                 r#ref: Some("main".into()),
                 project_ref: None,
-                placement_policy: Some(DUMMY_PLACEMENT_POLICY.into()),
+                placement_policy: Some(DUMMY_FULFILMENT_KIND.into()),
                 adopted_checkout: None,
             })
             .await;
@@ -900,7 +896,7 @@ async fn on_the_engine_a_standing_ensure_readmits_after_abandon() {
                 .project_ref("fleet".into())
                 .role("governor".into())
                 .workflow_ref("engine-standing-workflow".into())
-                .placement_policy(DUMMY_PLACEMENT_POLICY.into())
+                .placement_policy(DUMMY_FULFILMENT_KIND.into())
                 .repositories(vec![repository.key()])
                 .build(),
         )
@@ -1015,7 +1011,7 @@ impl DummyDaemon {
                     .role(name.into())
                     .r#ref("main".into())
                     .project_ref("fleet".into())
-                    .placement_policy(DUMMY_PLACEMENT_POLICY.into())
+                    .placement_policy(DUMMY_FULFILMENT_KIND.into())
                     .repositories(vec![flotilla_resources::ConvoyRepositorySpec {
                         url: catalog::repository_url(&forge),
                         repo_ref: repository.key(),
@@ -1411,6 +1407,7 @@ impl DummyDaemon {
                 collect!(stored flotilla_provisioning::stored::project::ProjectDefinition);
                 collect!(stored flotilla_provisioning::stored::project::ProjectOpsRecord);
                 collect!(stored flotilla_provisioning::stored::artifact::ArtifactRecord);
+                collect!(stored flotilla_provisioning::stored::placement::FulfilmentKindDefinition);
                 assert_eq!(covered, registered, "every registered engine kind needs a transport fixture");
                 Ok(snapshots)
             })
@@ -1591,7 +1588,7 @@ impl DummyDaemon {
         drop(daemon);
         tokio::task::yield_now().await;
         let config = Arc::new(ConfigStore::with_base(_dir.path().join("config")));
-        let mut discovery = fake_discovery(false);
+        let mut discovery = fake_discovery_with_host_directories(_dir.path());
         fleet.install(&mut discovery);
         let daemon = InProcessDaemon::new_with_resource_backend(
             vec![],

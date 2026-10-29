@@ -1,9 +1,10 @@
-//! Checkouts inside a dummy environment. Materialising a clone or worktree
+//! Checkouts inside a dummy environment, and a host's clones and worktrees of
+//! repositories on the dummy forge. Materialising a clone or worktree
 //! succeeds at once with a revision derived from the target path; the work is
 //! always clean and pushed, and its head is in the history of any merged
 //! request. A checkout holds no commits beyond its base: a crew's work lives
 //! in the change request it opens on the dummy forge. Nothing is read from or
-//! written to disk.
+//! written to disk beyond the empty directory each clone or checkout is.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -19,17 +20,24 @@ use flotilla_discovery_api::{
 use flotilla_environment::environment::dummy::{dummy_draw, DUMMY_FLEET_ENV};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{Checkout, CheckoutIntent};
-use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
 use flotilla_resources::CheckoutBranchProvenance;
 use flotilla_vcs::vcs::{
     CheckoutMaterialisation, CheckoutMaterialisationError, CheckoutRemoval, EnumeratedCheckout, RepositoryRead, Vcs, VcsCheck,
+    WorktreeMetadata,
 };
 
 pub struct DummyVcs {
     fleet: Arc<DummyFleet>,
     environment: String,
     root: PathBuf,
+    runner: Arc<dyn CommandRunner>,
+    /// The dummy-forge repository a host checkout is of; none inside a dummy environment.
+    origin: Option<String>,
 }
+
+/// The environment a host's dummy-forge checkouts are recorded under.
+const HOST_CHECKOUTS: &str = "host";
 
 /// The branch each dummy checkout was materialised on, by environment and path.
 #[derive(Default)]
@@ -55,8 +63,15 @@ impl DummyCheckouts {
 }
 
 impl DummyVcs {
-    fn record(&self, branch: &str, target: &str) {
+    /// A checkout is an empty directory at its target: its host or environment sees it there.
+    async fn record(&self, branch: &str, target: &str) -> Result<(), String> {
+        self.run(&["mkdir", "-p", target]).await?;
         self.fleet.checkouts.lock().insert((self.environment.clone(), PathBuf::from(target)), branch.to_string());
+        Ok(())
+    }
+
+    async fn run(&self, command: &[&str]) -> Result<(), String> {
+        self.runner.run(command[0], &command[1..], Path::new("/"), &ChannelLabel::Default).await.map(|_| ())
     }
 
     fn branch(&self, path: &Path) -> String {
@@ -110,7 +125,7 @@ impl Vcs for DummyVcs {
         target: &str,
         _registration_reason: &str,
     ) -> Result<CheckoutMaterialisation, CheckoutMaterialisationError> {
-        self.record(branch, target);
+        self.record(branch, target).await?;
         Ok(Self::materialised(target, CheckoutBranchProvenance::CreatedForConvoy))
     }
 
@@ -120,12 +135,12 @@ impl Vcs for DummyVcs {
         target: &str,
         _reason: &str,
     ) -> Result<CheckoutMaterialisation, CheckoutMaterialisationError> {
-        self.record(branch, target);
+        self.record(branch, target).await?;
         Ok(Self::materialised(target, CheckoutBranchProvenance::PreExisting))
     }
 
     async fn continue_fresh_clone(&self, _url: &str, branch: &str, target: &str) -> Result<CheckoutMaterialisation, String> {
-        self.record(branch, target);
+        self.record(branch, target).await?;
         Ok(Self::materialised(target, CheckoutBranchProvenance::PreExisting))
     }
 
@@ -136,11 +151,12 @@ impl Vcs for DummyVcs {
         _base_ref: Option<&str>,
         target: &str,
     ) -> Result<CheckoutMaterialisation, String> {
-        self.record(branch, target);
+        self.record(branch, target).await?;
         Ok(Self::materialised(target, CheckoutBranchProvenance::CreatedForConvoy))
     }
 
     async fn remove_materialised_checkout(&self, _branch: &str, target: &str) -> Result<CheckoutRemoval, String> {
+        self.run(&["rm", "-rf", "--", target]).await?;
         self.fleet.checkouts.lock().remove(&(self.environment.clone(), PathBuf::from(target)));
         Ok(CheckoutRemoval::Removed)
     }
@@ -161,8 +177,20 @@ impl Vcs for DummyVcs {
         Ok(true)
     }
 
-    async fn clone_repository(&self, _url: &str, _target: &Path) -> Result<(), String> {
-        Ok(())
+    async fn clone_repository(&self, _url: &str, target: &Path) -> Result<(), String> {
+        self.run(&["mkdir", "-p", &target.to_string_lossy()]).await
+    }
+
+    /// A dummy checkout's administration lives beside it; nothing reads it but the mounts
+    /// a dummy environment ignores.
+    async fn worktree_metadata(&self, target: &Path) -> Result<WorktreeMetadata, String> {
+        let common_dir = target.join(".dummy-vcs");
+        let admin_dir = common_dir.join("worktrees").join(target.file_name().unwrap_or_default());
+        Ok(WorktreeMetadata { common_dir, admin_dir })
+    }
+
+    async fn clone_origin(&self, _target: &Path) -> Result<String, String> {
+        self.origin.clone().ok_or_else(|| "a dummy environment's checkouts have no origin".into())
     }
 
     async fn inspect_clone(&self, _target: &Path) -> Result<Option<String>, String> {
@@ -190,8 +218,8 @@ impl Vcs for DummyVcs {
     }
 }
 
-/// Claims every checkout inside a dummy environment, and nothing elsewhere.
-/// Install it ahead of the Git factory.
+/// Claims every checkout inside a dummy environment and, elsewhere, those of
+/// repositories on the dummy forge. Install it ahead of the Git factory.
 pub struct DummyVcsFactory {
     pub(crate) fleet: Arc<DummyFleet>,
 }
@@ -210,17 +238,29 @@ impl Factory for DummyVcsFactory {
         env: &EnvironmentBag,
         _config: &dyn ProviderConfigView,
         repo_root: &ExecutionEnvironmentPath,
-        _runner: Arc<dyn CommandRunner>,
+        runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn Vcs>, Vec<UnmetRequirement>> {
+        let root = repo_root.as_path().to_path_buf();
         if env.find_env_var(DUMMY_FLEET_ENV).is_none() {
-            return Err(vec![UnmetRequirement::MissingEnvVar(DUMMY_FLEET_ENV.into())]);
+            let forge = self.fleet.forge.host();
+            let (owner, name, _) = env.find_remote_host(forge).ok_or_else(|| {
+                vec![UnmetRequirement::MissingEnvVar(DUMMY_FLEET_ENV.into()), UnmetRequirement::MissingRemoteHost(forge.into())]
+            })?;
+            let origin = format!("{}/{owner}/{name}", self.fleet.config.forge_service_url.trim_end_matches('/'));
+            return Ok(Arc::new(DummyVcs {
+                fleet: Arc::clone(&self.fleet),
+                environment: HOST_CHECKOUTS.into(),
+                root,
+                runner,
+                origin: Some(origin),
+            }));
         }
         let environment = env
             .find_env_var("FLOTILLA_ENVIRONMENT_ID")
             .filter(|id| !id.is_empty())
             .ok_or_else(|| vec![UnmetRequirement::MissingEnvVar("FLOTILLA_ENVIRONMENT_ID".into())])?
             .to_string();
-        Ok(Arc::new(DummyVcs { fleet: Arc::clone(&self.fleet), environment, root: repo_root.as_path().to_path_buf() }))
+        Ok(Arc::new(DummyVcs { fleet: Arc::clone(&self.fleet), environment, root, runner, origin: None }))
     }
 }
 #[cfg(test)]
@@ -262,5 +302,35 @@ mod ownership_tests {
         assert_eq!(remaining.len(), 1, "{remaining:?}");
         assert!(remaining[0].ends_with(":/own"));
         assert_eq!(fleet.remaining_for(&other).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod host_tests {
+    use flotilla_config::{dummy_fleet::DummyFleetConfig, ConfigStore};
+    use flotilla_discovery_api::EnvironmentAssertion;
+    use flotilla_environment::environment::dummy::DummyCommandRunner;
+
+    use super::*;
+
+    // On a host, the dummy VCS claims a repository on the dummy forge, named by the
+    // remote its record gives, and nothing else; its checkouts are directories there.
+    #[tokio::test]
+    async fn on_a_host_the_dummy_vcs_claims_only_dummy_forge_repositories() {
+        let factory = DummyVcsFactory { fleet: DummyFleet::new(DummyFleetConfig::default()) };
+        let directory = tempfile::tempdir().expect("configuration");
+        let config = ConfigStore::with_base(directory.path().to_path_buf());
+        let root = ExecutionEnvironmentPath::new("/repos/fleet");
+        let runner = Arc::new(DummyCommandRunner::default());
+        let other = EnvironmentBag::new().with(EnvironmentAssertion::remote_host("github.com", "dummy", "fleet", "origin"));
+        assert!(factory.probe(&EnvironmentBag::new(), &config, &root, runner.clone()).await.is_err());
+        assert!(factory.probe(&other, &config, &root, runner.clone()).await.is_err());
+        let dummy = EnvironmentBag::new().with(EnvironmentAssertion::remote_host("forge.dummy.invalid", "dummy", "fleet", "origin"));
+        let Ok(vcs) = factory.probe(&dummy, &config, &root, runner.clone()).await else { panic!("claimed") };
+        assert_eq!(vcs.clone_origin(Path::new("/repos/fleet")).await, Ok("https://forge.dummy.invalid/dummy/fleet".into()));
+        vcs.materialise_checkout("dummy/convoy/work", Some("main"), "/repos/convoy/work", "test").await.expect("materialised");
+        assert!(runner.path_exists(Path::new("/repos/convoy/work")).await.expect("exists"));
+        vcs.remove_materialised_checkout("dummy/convoy/work", "/repos/convoy/work").await.expect("removed");
+        assert!(!runner.path_exists(Path::new("/repos/convoy/work")).await.expect("exists"));
     }
 }

@@ -131,7 +131,6 @@ fn docker_recipe(n: usize) -> flotilla_provisioning::stored::environment::Docker
         declared_adapters: BTreeSet::from(["claude-code".into(), "codex".into()]),
         required_adapters: BTreeSet::from(["claude-code".into()]),
         pull_policy: Default::default(),
-        memory_policy: Default::default(),
         mounts: vec![
             EnvironmentMount { source_path: format!("/work/{n}"), target_path: "/workspace".into(), mode: EnvironmentMountMode::Rw },
             EnvironmentMount { source_path: "/cache".into(), target_path: "/cache".into(), mode: EnvironmentMountMode::Ro },

@@ -391,7 +391,6 @@ impl DockerControllerRuntime {
             tools,
             prepared_auth,
             cpu_limit: None,
-            memory_policy: spec.memory_policy.clone(),
         };
         let prepared = match provider
             .prepare(

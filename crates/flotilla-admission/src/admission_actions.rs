@@ -330,13 +330,12 @@ impl AdmissionActions<'_> {
             }
             let mut placement = match self
                 .admission
-                .resolve_convoy_placement(
+                .resolve_created_convoy_placement(
                     &namespace,
                     project_ref.as_deref(),
                     &repositories,
                     &workflow.spec,
                     placement_policy.as_deref(),
-                    false,
                 )
                 .await
             {

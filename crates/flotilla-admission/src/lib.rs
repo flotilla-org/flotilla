@@ -6,7 +6,6 @@ pub mod convoy_admission;
 pub mod convoy_ensure;
 pub mod dispatch_missions;
 pub mod image_build;
-pub mod placement_policy;
 pub mod ports;
 pub mod project_image_layers;
 pub mod project_ops;

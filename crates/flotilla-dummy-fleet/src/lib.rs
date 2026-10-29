@@ -7,8 +7,8 @@
 //! the daemon it built. Nothing in the controllers knows about it:
 //!
 //! - the dummy environment provider instance (in `flotilla-environment`)
-//!   realises Docker-kind environments selected by a PlacementPolicy whose
-//!   provider-instance label is `dummy`, and marks them as dummy environments;
+//!   realises the Docker-kind environments of a host whose only per-vessel
+//!   provider it is, and marks them as dummy environments;
 //! - inside a dummy environment, discovery finds the dummy terminal pool, the
 //!   dummy agent adapter and the dummy VCS, and no real tools;
 //! - the dummy change-request tracker claims repositories on the dummy forge;

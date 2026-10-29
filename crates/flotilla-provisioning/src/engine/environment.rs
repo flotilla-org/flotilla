@@ -39,7 +39,6 @@ impl Binding for EnvironmentBinding {
                     declared_adapters: docker.declared_agent_adapters.clone(),
                     required_adapters: docker.required_agent_adapters.clone(),
                     pull_policy: docker.pull_policy,
-                    memory_policy: docker.memory_policy.clone(),
                     mounts: docker.mounts.clone(),
                     // Credential grants and skills are composed at launch, never stored.
                     env: docker

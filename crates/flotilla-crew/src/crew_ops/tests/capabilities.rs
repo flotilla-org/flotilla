@@ -547,7 +547,6 @@ async fn image_capabilities_follow_engine_without_a_copy() {
                     declared_agent_adapters: Default::default(),
                     required_agent_adapters: Default::default(),
                     pull_policy: Default::default(),
-                    memory_policy: Default::default(),
                     mounts: vec![],
                     env: Default::default(),
                 }),

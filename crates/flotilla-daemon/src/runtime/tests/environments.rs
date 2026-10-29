@@ -158,7 +158,6 @@ async fn standing_backing_inspection_trusts_live_docker_over_failed_resource_pha
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
                     image_build_ref: None,
-                    memory_policy: Default::default(),
                     host_ref: "host-test".to_string(),
                     image: "contained-image".to_string(),
                     declared_agent_adapters: BTreeSet::new(),
@@ -422,7 +421,6 @@ async fn failed_environment_readoption_does_not_block_a_live_sibling() {
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
                     image_build_ref: None,
-                    memory_policy: Default::default(),
                     host_ref: "deleted-host".to_string(),
                     image: "contained-image".to_string(),
                     declared_agent_adapters: BTreeSet::new(),

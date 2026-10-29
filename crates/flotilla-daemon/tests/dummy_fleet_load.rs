@@ -59,17 +59,17 @@ use flotilla_daemon::{
 };
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_daemon_testkit::server::{spawn_in_memory_request_mesh_with_replication_metrics, InMemoryRequestMesh};
-use flotilla_discovery_testkit::fake_discovery;
+use flotilla_discovery_testkit::fake_discovery_with_host_directories;
 use flotilla_dummy_fleet::{
-    catalog::{self, CrewMix, DUMMY_PLACEMENT_POLICY},
-    CrewCommandPort, DaemonCommandPort, DummyFleet,
+    catalog::{self, CrewMix, DUMMY_FULFILMENT_KIND},
+    CrewCommandPort, DaemonCommandPort, DummyFleet, DUMMY_AGENT_ADAPTER,
 };
 use flotilla_load_driver::{ConvoyObservation, ConvoyState, FleetTarget, HomeSample, LoadPlan, TargetSample};
 use flotilla_observation::forge_observation::NO_READY_FORGE_OBSERVER;
 use flotilla_protocol::{commands::CommandValue, CommandAction, HostName};
 use flotilla_resources::{
-    Checkout, Convoy, ConvoyPhase, FleetDesignation, FleetDesignationSpec, Forge, Host, InputMeta, Message, PlacementPolicy, Project,
-    ProjectSpec, ReadWatchEvent, Repository, ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
+    Checkout, Convoy, ConvoyPhase, FleetDesignation, FleetDesignationSpec, Forge, Host, InputMeta, Message, Project, ProjectSpec,
+    ReadWatchEvent, Repository, ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
     FLEET_DESIGNATION_NAME,
 };
 use flotilla_schema::{Cause, CodeEnum, KindCode, KindSpec};
@@ -135,9 +135,9 @@ async fn start_home(root: &std::path::Path, index: usize, dummy_fleet: &str, adm
     let switch = if load_primitives() { "[primitives]\n" } else { "" };
     std::fs::write(config_dir.join("daemon.toml"), format!("machine_id = \"load-{index}\"\n\n{switch}[dummy_fleet]\n{dummy_fleet}"))
         .expect("daemon.toml");
-    let config = Arc::new(ConfigStore::with_base(config_dir));
+    let config = Arc::new(ConfigStore::with_base(config_dir.clone()));
     let daemon_config: DaemonConfig = config.load_daemon_config().expect("daemon config");
-    let mut discovery = fake_discovery(false);
+    let mut discovery = fake_discovery_with_host_directories(&config_dir);
     let fleet = install_dummy_fleet(&daemon_config, &mut discovery).expect("dummy fleet configured");
     // The daemon's own store, opened where flotillad opens it.
     let database = config.state_dir().as_path().join("resources.sqlite");
@@ -207,13 +207,10 @@ async fn seed(backend: &ResourceBackend, forge_service_url: &str, primitives: bo
     repositories.create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository).await.expect("repository");
     backend
         .clone()
-        .using::<PlacementPolicy>(NAMESPACE)
-        .create(
-            &InputMeta::builder().name(DUMMY_PLACEMENT_POLICY.to_string()).labels(catalog::placement_policy_labels()).build(),
-            &catalog::placement_policy(&host.metadata.name),
-        )
+        .using::<flotilla_resources::FulfilmentKind>(NAMESPACE)
+        .create(&InputMeta::builder().name(DUMMY_FULFILMENT_KIND.to_string()).build(), &catalog::fulfilment_kind(&host.metadata.name))
         .await
-        .expect("dummy placement policy");
+        .expect("dummy fulfilment kind");
     for mix in CrewMix::ALL {
         backend
             .clone()
@@ -230,6 +227,17 @@ async fn seed(backend: &ResourceBackend, forge_service_url: &str, primitives: bo
     })
     .await
     .expect("the dummy forge resolves the default branch");
+    // Admission places a literal image only once its host has probed the image's harnesses.
+    let hosts = backend.clone().using::<Host>(NAMESPACE);
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !hosts.get(&host.metadata.name).await.ok().and_then(|host| host.status).is_some_and(|status| {
+            status.fulfilment_facts.get(DUMMY_FULFILMENT_KIND).is_some_and(|facts| facts.harnesses.contains_key(DUMMY_AGENT_ADAPTER))
+        }) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the dummy kind's harness is observed");
 }
 
 /// Track the driver's local convoys, and time replicas arriving from other homes.
@@ -447,9 +455,10 @@ impl FleetTarget for InProcessFleet {
             workflow_ref: mix.workflow_name().into(),
             inputs: Vec::new(),
             repository_url: Some(catalog::repository_url(&forge)),
-            r#ref: Some("main".into()),
+            // Each convoy's worktree on the host reserves its own branch.
+            r#ref: Some(format!("dummy/{name}")),
             project_ref: None,
-            placement_policy: Some(DUMMY_PLACEMENT_POLICY.into()),
+            placement_policy: Some(DUMMY_FULFILMENT_KIND.into()),
             adopted_checkout: None,
         };
         match home.port.execute(action).await? {

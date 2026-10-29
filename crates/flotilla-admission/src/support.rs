@@ -12,14 +12,15 @@ use flotilla_resources::CheckoutPhase as ResourceCheckoutPhase;
 use flotilla_resources::CheckoutSpec as ResourceCheckoutSpec;
 use flotilla_resources::CheckoutStatus as ResourceCheckoutStatus;
 use flotilla_resources::Convoy;
+use flotilla_resources::FulfilmentKind;
+use flotilla_resources::FulfilmentKindSpec;
+use flotilla_resources::FulfilmentRealisation;
 use flotilla_resources::Host as ResourceHost;
 use flotilla_resources::HostOccupancy;
 use flotilla_resources::HostStatus as ResourceHostStatus;
 use flotilla_resources::InputMeta;
 use flotilla_resources::LifecycleAuthority;
 use flotilla_resources::ObservedCheckoutSpec as ResourceObservedCheckoutSpec;
-use flotilla_resources::PlacementPolicy;
-use flotilla_resources::PlacementPolicySpec;
 use flotilla_resources::ProjectSpec;
 use flotilla_resources::ReadResourceObject;
 use flotilla_resources::Repository;
@@ -157,31 +158,22 @@ pub fn home_copy_wins_by_name<T: Resource>(sources: impl IntoIterator<Item = Rea
     resolved.into_values().map(|source| source.object).collect()
 }
 
-pub fn placement_host_ref(policy: &ResourceObject<PlacementPolicy>) -> Option<&str> {
-    policy
-        .spec
-        .host_direct
-        .as_ref()
-        .map(|spec| spec.host_ref.as_str())
-        .or_else(|| policy.spec.docker_per_vessel.as_ref().map(|spec| spec.host_ref.as_str()))
+/// The host a kind places on; a cloud sandbox's is its controller, found by its provider.
+pub fn placement_host_ref(kind: &ResourceObject<FulfilmentKind>) -> Option<&str> {
+    (!matches!(kind.spec.realisation, FulfilmentRealisation::CloudSandboxPerVessel { .. })).then_some(kind.spec.host_ref.as_str())
 }
 
-/// The provider instance admission froze on `policy`: its requirement's instance, else its instance label.
-pub fn provider_instance(policy: &ResourceObject<PlacementPolicy>) -> Option<&str> {
-    policy
-        .spec
-        .provider_requirements
-        .as_ref()
-        .and_then(|requirements| requirements.instance.as_deref())
-        .or_else(|| policy.metadata.labels.get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str))
+/// The provider instance admission froze on `kind`'s placement.
+pub fn provider_instance(kind: &ResourceObject<FulfilmentKind>) -> Option<&str> {
+    kind.metadata.labels.get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str)
 }
 
 pub async fn placement_target_host(
     backend: &ResourceBackend,
     namespace: &str,
-    policy: &ResourceObject<PlacementPolicy>,
+    policy: &ResourceObject<FulfilmentKind>,
 ) -> Result<PlacementTargetHost, String> {
-    if policy.spec.cloud_sandbox_per_vessel.is_some() {
+    if matches!(policy.spec.realisation, FulfilmentRealisation::CloudSandboxPerVessel { .. }) {
         let hosts = backend.including_replicas::<flotilla_resources::Host>(namespace).list().await.map_err(|e| e.to_string())?;
         let instance = provider_instance(policy);
         let observed_hosts = hosts.items.iter().map(|h| h.object.metadata.name.as_str()).collect::<Vec<_>>().join(", ");
@@ -352,18 +344,11 @@ pub async fn host_occupancy(backend: &ResourceBackend, namespace: &str, host: &s
     Ok(occupancies.remove(host).unwrap_or_default())
 }
 
-pub async fn policy_targets_ssh_host(backend: &ResourceBackend, namespace: &str, policy: &ResourceObject<PlacementPolicy>) -> bool {
-    let Ok(target) = placement_target_host(backend, namespace, policy).await else {
-        return false;
-    };
-    authoritative_placement_host(backend, namespace, &target, &policy.metadata.name).await.ok().is_some_and(|host| is_ssh_host(&host))
-}
-
-/// Validate and freeze one provider for this vessel's placement snapshot.
+/// Validate and freeze one provider for this vessel's placement.
 pub async fn resolve_placement_provider(
     backend: &ResourceBackend,
     namespace: &str,
-    policy: &mut ResourceObject<PlacementPolicy>,
+    policy: &mut ResourceObject<FulfilmentKind>,
 ) -> Result<Option<String>, String> {
     use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
     use flotilla_protocol::provider::ProviderAdvertisement;
@@ -378,15 +363,13 @@ pub async fn resolve_placement_provider(
         .map_err(|error| format!("{}: invalid provider advertisements: {error}", target.display_name))?;
     let selected = crate::provider_placement::match_provider(
         &target.display_name,
-        &policy.spec,
+        &policy.spec.realisation,
         policy.metadata.labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str),
         &providers,
     )?;
-    // Specs are frozen per vessel; metadata is also retained for existing image
-    // cache and provisioning consumers that already use the identity label.
-    policy.spec.provider_requirements.get_or_insert_with(Default::default).instance = Some(selected.instance.clone());
+    // Held in memory only: the decision carries the instance, never the kind.
     policy.metadata.labels.insert(ENVIRONMENT_PROVIDER_INSTANCE_LABEL.into(), selected.instance.clone());
-    if policy.spec.cloud_sandbox_per_vessel.is_some() {
+    if matches!(policy.spec.realisation, FulfilmentRealisation::CloudSandboxPerVessel { .. }) {
         // Cloud roots name the POSIX guest, independent of the admitting host OS.
         if !selected.capabilities.workspace_root.to_string_lossy().starts_with('/') {
             return Err("cloud provider workspace root must be absolute".into());
@@ -400,9 +383,9 @@ pub async fn resolve_placement_provider(
 pub async fn provider_workspace_root(
     backend: &ResourceBackend,
     namespace: &str,
-    policy: &ResourceObject<PlacementPolicy>,
+    policy: &ResourceObject<FulfilmentKind>,
 ) -> Result<Option<String>, String> {
-    if policy.spec.cloud_sandbox_per_vessel.is_none() {
+    if !matches!(policy.spec.realisation, FulfilmentRealisation::CloudSandboxPerVessel { .. }) {
         return Ok(None);
     }
     resolve_placement_provider(backend, namespace, &mut policy.clone()).await
@@ -455,26 +438,28 @@ pub async fn ensure_prepared_workflow_snapshot(
     }
 }
 
+/// Write `convoy`'s placement snapshot: a FulfilmentKind admission writes for that Convoy.
 pub async fn ensure_prepared_placement_snapshot(
     backend: &ResourceBackend,
     namespace: &str,
     name: &str,
-    spec: &PlacementPolicySpec,
+    convoy: &str,
+    spec: &FulfilmentKindSpec,
 ) -> Result<(), String> {
-    let policies = backend.including_replicas::<PlacementPolicy>(namespace);
-    match policies.get(name).await {
+    let kinds = backend.including_replicas::<FulfilmentKind>(namespace);
+    match kinds.get(name).await {
         Ok(existing) if existing.object.spec == *spec => Ok(()),
         Ok(_) => Err(format!("prepared placement snapshot {name} already exists with different contents")),
         Err(ResourceError::NotFound { .. }) => backend
             .clone()
-            .using::<PlacementPolicy>(namespace)
+            .using::<FulfilmentKind>(namespace)
             .create(
                 &InputMeta::builder()
                     .name(name.to_string())
-                    .labels(BTreeMap::from([(
-                        flotilla_resources::PREPARED_SNAPSHOT_LABEL.to_string(),
-                        flotilla_resources::PLACEMENT_SNAPSHOT_KIND.to_string(),
-                    )]))
+                    .labels(BTreeMap::from([
+                        (flotilla_resources::PREPARED_SNAPSHOT_LABEL.to_string(), flotilla_resources::PLACEMENT_SNAPSHOT_KIND.to_string()),
+                        (flotilla_resources::CONVOY_LABEL.to_string(), convoy.to_string()),
+                    ]))
                     .build(),
                 spec,
             )

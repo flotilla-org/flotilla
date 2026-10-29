@@ -5,13 +5,14 @@
 //! configured rate (drawn deterministically from the seed and environment ID),
 //! and otherwise returns a handle whose command runner is an in-memory world:
 //! files written by provisioning are kept, `test` and `cat` read them back, and
-//! every other program is absent. Its environment marks itself with
-//! [`DUMMY_FLEET_ENV`], so discovery inside it selects the other dummy
-//! providers (terminal pool, agent adapter, VCS) and nothing real.
+//! every other program is absent; detection finds only the dummy crew harness.
+//! Its environment marks itself with [`DUMMY_FLEET_ENV`], so discovery inside
+//! it selects the other dummy providers (terminal pool, agent adapter, VCS) and
+//! nothing real.
 //!
-//! The provider is selected like any other instance: a PlacementPolicy labels
-//! its environments with [`super::ENVIRONMENT_PROVIDER_INSTANCE_LABEL`] set to
-//! [`DUMMY_ENVIRONMENT_INSTANCE`].
+//! The provider is selected like any other instance: placement freezes
+//! [`DUMMY_ENVIRONMENT_INSTANCE`] for a Docker kind on a host where it is the
+//! only per-vessel provider.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -36,6 +37,9 @@ use super::{
 /// Environment variable that marks a dummy environment. Dummy providers inside
 /// an environment activate only when its discovery bag asserts this variable.
 pub const DUMMY_FLEET_ENV: &str = "FLOTILLA_DUMMY_FLEET";
+
+/// The dummy crew's harness, the one program a dummy environment's detection finds.
+pub const DUMMY_CREW_BINARY: &str = "flotilla-dummy-crew";
 
 /// `$0` of the agent exit-receipt batch script run by `flotilla_agent::process`.
 const EXIT_RECEIPT_BATCH: &str = "flotilla-agent-exits";
@@ -471,7 +475,10 @@ impl super::EnvironmentDetection for DummyEnvironmentProvider {
         _args: &[&str],
         _scratch: &Path,
     ) -> Result<CommandOutput, String> {
-        Ok(absent(binary))
+        Ok(match binary {
+            DUMMY_CREW_BINARY => succeeded(format!("{DUMMY_CREW_BINARY} 1.0.0")),
+            _ => absent(binary),
+        })
     }
 }
 
@@ -513,7 +520,6 @@ mod tests {
                 declared_agent_adapters: Default::default(),
                 required_agent_adapters: Default::default(),
                 pull_policy: Default::default(),
-                memory_policy: Default::default(),
                 mounts: Vec::new(),
                 env: Default::default(),
             }),

@@ -17,12 +17,12 @@ use flotilla_resources::{
     CheckoutWorktreeSpec as ResourceCheckoutWorktreeSpec, ConditionValue, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec,
     ConvoyStatusPatch, CredentialConsumer, CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec,
     FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, ImageAcquisitionCost, InputMeta,
-    ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Repository,
-    RepositorySpec, ResourceObject, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
+    ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository, RepositorySpec, ResourceObject,
+    VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
 };
 use flotilla_store::ResourceBackend;
 
-use super::support::{test_meta, ForgeAwareTestChangeRequestFactory};
+use super::support::{create_host_direct_placement, test_meta, ForgeAwareTestChangeRequestFactory};
 use crate::in_process::{CheckoutArchiveStatus, CheckoutIntegrationStatus, InProcessDaemon, IntegrationCondition};
 use crate::testkits::discovery::{fake_discovery, fake_discovery_with_runner, FakeChangeRequest};
 use crate::testkits::replay::testing::MockRunner;
@@ -277,6 +277,8 @@ async fn concurrent_duplicate_adopted_convoy_creates_leave_only_the_winning_chec
     .await;
     daemon.set_repository_inspector(Arc::new(ConcurrentCreateRepositoryInspector)).await;
     let backend = daemon.resource_backend();
+    let local_host = daemon.local_host_id().expect("local host id").to_string();
+    create_host_direct_placement(&backend, "host-direct-local", &local_host, BTreeSet::new()).await;
     backend
         .using::<WorkflowTemplate>("flotilla")
         .create(
@@ -352,24 +354,28 @@ async fn prepared_workflow_snapshot_reuses_an_identical_replica() {
     assert!(driver.using::<WorkflowTemplate>("flotilla").list().await.expect("driver local workflow log").items.is_empty());
 }
 
+fn snapshot_kind(pool: &str) -> FulfilmentKindSpec {
+    FulfilmentKindSpec::builder().host_ref("host".to_string()).pool(pool.to_string()).realisation(FulfilmentRealisation::HostDirect).build()
+}
+
 #[tokio::test]
 async fn prepared_placement_snapshot_reuses_an_identical_replica() {
     let home_root = NodeId::new("snapshot-home");
     let driver_root = NodeId::new("snapshot-driver");
     let home = ResourceBackend::new(InMemoryBackend::default()).with_local_root(home_root.clone());
     let driver = ResourceBackend::new(InMemoryBackend::default()).with_local_root(driver_root);
-    let spec = PlacementPolicySpec::builder().pool("passthrough".to_string()).build();
+    let spec = snapshot_kind("passthrough");
     let name = prepared_snapshot_name("placement", &serde_json::to_value(&spec).expect("serialize placement")).expect("snapshot name");
 
-    ensure_prepared_placement_snapshot(&home, "flotilla", &name, &spec).await.expect("author snapshot on home");
+    ensure_prepared_placement_snapshot(&home, "flotilla", &name, "convoy", &spec).await.expect("author snapshot on home");
     driver
-        .replica_writer::<PlacementPolicy>(home_root, "flotilla")
-        .replace(&home.using::<PlacementPolicy>("flotilla").list().await.expect("home placement log"), Utc::now())
+        .replica_writer::<FulfilmentKind>(home_root, "flotilla")
+        .replace(&home.using::<FulfilmentKind>("flotilla").list().await.expect("home placement log"), Utc::now())
         .await
         .expect("replicate snapshot to driver");
 
-    ensure_prepared_placement_snapshot(&driver, "flotilla", &name, &spec).await.expect("reuse identical replicated snapshot");
-    assert!(driver.using::<PlacementPolicy>("flotilla").list().await.expect("driver local placement log").items.is_empty());
+    ensure_prepared_placement_snapshot(&driver, "flotilla", &name, "convoy", &spec).await.expect("reuse identical replicated snapshot");
+    assert!(driver.using::<FulfilmentKind>("flotilla").list().await.expect("driver local placement log").items.is_empty());
 }
 
 #[tokio::test]
@@ -378,19 +384,20 @@ async fn prepared_placement_snapshot_rejects_a_different_replica_spec() {
     let home = ResourceBackend::new(InMemoryBackend::default()).with_local_root(home_root.clone());
     let driver = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("snapshot-driver"));
     let name = "placement-snapshot-collision";
-    let authored = PlacementPolicySpec::builder().pool("passthrough".to_string()).build();
-    let requested = PlacementPolicySpec::builder().pool("cleat".to_string()).build();
-    home.using::<PlacementPolicy>("flotilla").create(&test_meta(name), &authored).await.expect("author snapshot on home");
+    let authored = snapshot_kind("passthrough");
+    let requested = snapshot_kind("cleat");
+    home.using::<FulfilmentKind>("flotilla").create(&test_meta(name), &authored).await.expect("author snapshot on home");
     driver
-        .replica_writer::<PlacementPolicy>(home_root, "flotilla")
-        .replace(&home.using::<PlacementPolicy>("flotilla").list().await.expect("home placement log"), Utc::now())
+        .replica_writer::<FulfilmentKind>(home_root, "flotilla")
+        .replace(&home.using::<FulfilmentKind>("flotilla").list().await.expect("home placement log"), Utc::now())
         .await
         .expect("replicate snapshot to driver");
 
-    let error =
-        ensure_prepared_placement_snapshot(&driver, "flotilla", name, &requested).await.expect_err("mismatched replica must be refused");
+    let error = ensure_prepared_placement_snapshot(&driver, "flotilla", name, "convoy", &requested)
+        .await
+        .expect_err("mismatched replica must be refused");
     assert_eq!(error, format!("prepared placement snapshot {name} already exists with different contents"));
-    assert!(driver.using::<PlacementPolicy>("flotilla").list().await.expect("driver local placement log").items.is_empty());
+    assert!(driver.using::<FulfilmentKind>("flotilla").list().await.expect("driver local placement log").items.is_empty());
 }
 
 #[tokio::test]

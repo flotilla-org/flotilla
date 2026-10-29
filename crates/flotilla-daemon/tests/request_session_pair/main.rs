@@ -73,14 +73,12 @@ use flotilla_resources::{
     api_version, Artifact, ArtifactSubjectBinding, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Convoy,
     ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialGrantSelector,
     CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec,
-    CrewCompletionExpectation, CrewSessionStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, DockerCheckoutStrategy,
-    DockerPerVesselPlacementPolicySpec, FreshCloneCheckoutSpec, FulfilmentKind, FulfilmentKindSpec, Host,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, LifecycleAuthority, Message,
-    PlacementPolicy, PlacementPolicySpec, Regard, RepositoryKey, Resource, ResourceError, ResourceProvenance, Selector, SystemClock,
-    TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel,
-    VesselRequirement, VesselSpec, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
-    WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, GENERATION_LABEL,
-    HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    CrewCompletionExpectation, CrewSessionStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, FreshCloneCheckoutSpec,
+    FulfilmentKind, FulfilmentKindSpec, Host, HostSpec, HostStatus, InputMeta, LifecycleAuthority, Message, Regard, RepositoryKey,
+    Resource, ResourceError, ResourceProvenance, Selector, SystemClock, TerminalBrief, TerminalCrewContext, TerminalSession,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkCompletionAuthority,
+    WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::{controller::ControllerLoop, list_resource_kind, OwnerGarbageCollector, ResourceBackend, REGISTERED_RESOURCE_KINDS};
 use hegel::generators as gs;
@@ -366,25 +364,37 @@ async fn await_placement_workflow(topology: &InMemoryRequestTopology, name: &str
     .await;
 }
 
-async fn seed_target_placement_policy(topology: &InMemoryRequestTopology, namespace: &str, policy_name: &str) {
-    let host_ref = topology.follower.local_host_id().expect("placement host identity").to_string();
-    let policies = topology.follower.resource_backend().using::<PlacementPolicy>(namespace);
-    let policy = PlacementPolicySpec::builder()
+fn host_direct_kind(host_ref: &str) -> FulfilmentKindSpec {
+    FulfilmentKindSpec::builder()
+        .host_ref(host_ref.to_string())
         .pool("cleat".to_string())
-        .host_direct(HostDirectPlacementPolicySpec { host_ref: host_ref.clone(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
-        .build();
-    policies
-        .create(&InputMeta::builder().name(policy_name.to_string()).build(), &policy)
+        .grants(BTreeSet::from([
+            flotilla_resources::FulfilmentGrant::platform("linux".to_string()),
+            flotilla_resources::FulfilmentGrant::host_account_reach(),
+            flotilla_resources::FulfilmentGrant::network("host".to_string()),
+        ]))
+        .realisation(flotilla_resources::FulfilmentRealisation::HostDirect)
+        .build()
+}
+
+/// Register the daemon's own `host-direct-<host>` kind, whose facts `seed_host_capacity` publishes.
+async fn seed_local_host_direct_kind(daemon: &Arc<InProcessDaemon>) {
+    let host_id = daemon.local_host_id().expect("host identity").to_string();
+    daemon
+        .resource_backend()
+        .using::<FulfilmentKind>("flotilla")
+        .create(&InputMeta::builder().name(format!("host-direct-{host_id}")).build(), &host_direct_kind(&host_id))
         .await
-        .expect("placement host should register its local placement policy");
+        .expect("local host-direct kind");
+}
+
+async fn seed_target_fulfilment_kind(topology: &InMemoryRequestTopology, namespace: &str, policy_name: &str) {
+    let host_ref = topology.follower.local_host_id().expect("placement host identity").to_string();
     topology
         .follower
         .resource_backend()
         .using::<FulfilmentKind>(namespace)
-        .create(
-            &InputMeta::builder().name(policy_name.to_string()).build(),
-            &FulfilmentKindSpec::from_policy(&policy, "linux").expect("kind"),
-        )
+        .create(&InputMeta::builder().name(policy_name.to_string()).build(), &host_direct_kind(&host_ref))
         .await
         .expect("placement host should register its fulfilment kind");
     let hosts = topology.follower.resource_backend().using::<Host>(namespace);
@@ -392,9 +402,8 @@ async fn seed_target_placement_policy(topology: &InMemoryRequestTopology, namesp
     let mut status = host.status.expect("host status");
     status.fulfilment_facts.insert(policy_name.to_string(), compatible_codex_facts());
     hosts.update_status(&host_ref, &host.metadata.resource_version, &status).await.expect("compatible harness facts");
-    eventually(Duration::from_secs(5), Duration::from_millis(10), "home-authored placement policy should replicate to origin", || async {
-        topology.leader.resource_backend().including_replicas::<PlacementPolicy>(namespace).get(policy_name).await.is_ok()
-            && topology.leader.resource_backend().including_replicas::<FulfilmentKind>(namespace).get(policy_name).await.is_ok()
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "home-authored fulfilment kind should replicate to origin", || async {
+        topology.leader.resource_backend().including_replicas::<FulfilmentKind>(namespace).get(policy_name).await.is_ok()
     })
     .await;
 }
@@ -514,18 +523,9 @@ async fn paired_world_trace(home_index: usize, issuer_index: usize) -> Vec<Strin
     let mesh = spawn_in_memory_request_mesh(hosts).await.expect("paired world mesh");
     let host_id = home.local_host_id().expect("home id").to_string();
     let policy_name = format!("host-direct-{host_id}");
-    let policy = PlacementPolicySpec::builder()
-        .pool("cleat".to_string())
-        .host_direct(HostDirectPlacementPolicySpec { host_ref: host_id.clone(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
-        .build();
-    home.resource_backend()
-        .using::<PlacementPolicy>("flotilla")
-        .create(&InputMeta::builder().name(policy_name.clone()).build(), &policy)
-        .await
-        .expect("pair policy");
     home.resource_backend()
         .using::<FulfilmentKind>("flotilla")
-        .create(&InputMeta::builder().name(policy_name.clone()).build(), &FulfilmentKindSpec::from_policy(&policy, "linux").expect("kind"))
+        .create(&InputMeta::builder().name(policy_name.clone()).build(), &host_direct_kind(&host_id))
         .await
         .expect("pair kind");
     for host in &mesh.hosts {
@@ -534,7 +534,6 @@ async fn paired_world_trace(home_index: usize, issuer_index: usize) -> Vec<Strin
     eventually(Duration::from_secs(5), Duration::from_millis(10), "pair placement visible", || async {
         let issuer = mesh.hosts[issuer_index].resource_backend();
         issuer.including_replicas::<Host>("flotilla").get(&host_id).await.is_ok()
-            && issuer.including_replicas::<PlacementPolicy>("flotilla").get(&policy_name).await.is_ok()
             && issuer.including_replicas::<FulfilmentKind>("flotilla").get(&policy_name).await.is_ok()
     })
     .await;
@@ -978,23 +977,16 @@ fn generated_admission_covers_remote_placement_for_origin_first_fault_model() {
                 let mesh = spawn_in_memory_request_mesh(hosts).await.expect("request mesh");
                 let host_id = placement.local_host_id().expect("placement host id").to_string();
                 let policy_name = format!("host-direct-{host_id}");
-                let policy = PlacementPolicySpec::builder()
-                    .pool("cleat".to_string())
-                    .host_direct(HostDirectPlacementPolicySpec {
-                        host_ref: host_id.clone(),
-                        checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                    })
-                    .build();
                 placement
                     .resource_backend()
-                    .using::<PlacementPolicy>("flotilla")
-                    .create(&InputMeta::builder().name(policy_name.clone()).build(), &policy)
+                    .using::<FulfilmentKind>("flotilla")
+                    .create(&InputMeta::builder().name(policy_name.clone()).build(), &host_direct_kind(&host_id))
                     .await
-                    .expect("placement policy");
+                    .expect("placement kind");
                 eventually(Duration::from_secs(5), Duration::from_millis(10), "issuer sees placement", || async {
                     let issuer = mesh.hosts[issuer_index].resource_backend();
                     issuer.including_replicas::<Host>("flotilla").get(&host_id).await.is_ok()
-                        && issuer.including_replicas::<PlacementPolicy>("flotilla").get(&policy_name).await.is_ok()
+                        && issuer.including_replicas::<FulfilmentKind>("flotilla").get(&policy_name).await.is_ok()
                 })
                 .await;
                 let action = CommandAction::ConvoyStart {
@@ -1143,21 +1135,9 @@ async fn codex_version_admission_row(issuer_index: usize, minor: u32) {
     home.set_local_placement_capabilities(&BTreeSet::from(["codex".into()]), &["cleat".into()]).await;
     let host_id = home.local_host_id().expect("home").to_string();
     let backend = home.resource_backend();
-    let policy = PlacementPolicySpec::builder()
-        .pool("cleat".into())
-        .host_direct(HostDirectPlacementPolicySpec { host_ref: host_id.clone(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
-        .build();
-    backend
-        .using::<PlacementPolicy>("flotilla")
-        .create(&InputMeta::builder().name("codex-direct".into()).build(), &policy)
-        .await
-        .expect("policy");
     backend
         .using::<FulfilmentKind>("flotilla")
-        .create(
-            &InputMeta::builder().name("codex-direct".into()).build(),
-            &FulfilmentKindSpec::from_policy(&policy, "linux").expect("kind"),
-        )
+        .create(&InputMeta::builder().name("codex-direct".into()).build(), &host_direct_kind(&host_id))
         .await
         .expect("kind");
     let host = backend.using::<Host>("flotilla").get(&host_id).await.expect("host");
@@ -1195,7 +1175,6 @@ async fn codex_version_admission_row(issuer_index: usize, minor: u32) {
         let issuer = mesh.hosts[issuer_index].resource_backend();
         issuer.including_replicas::<Host>("flotilla").get(&host_id).await.is_ok()
             && issuer.including_replicas::<FulfilmentKind>("flotilla").get("codex-direct").await.is_ok()
-            && issuer.including_replicas::<PlacementPolicy>("flotilla").get("codex-direct").await.is_ok()
     })
     .await;
     let mut events = mesh.hosts[issuer_index].subscribe();
@@ -1267,23 +1246,10 @@ fn generated_convoy_admission_is_homed_on_placement(tc: hegel::TestCase) {
         let mesh = spawn_in_memory_request_mesh(hosts).await.expect("request mesh");
         let host_id = placement.local_host_id().expect("placement host identity").to_string();
         let policy_name = format!("host-direct-{host_id}");
-        let policy = PlacementPolicySpec::builder()
-            .pool("cleat".to_string())
-            .host_direct(HostDirectPlacementPolicySpec { host_ref: host_id.clone(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
-            .build();
-        placement
-            .resource_backend()
-            .using::<PlacementPolicy>("flotilla")
-            .create(&InputMeta::builder().name(policy_name.clone()).build(), &policy)
-            .await
-            .expect("placement policy");
         placement
             .resource_backend()
             .using::<FulfilmentKind>("flotilla")
-            .create(
-                &InputMeta::builder().name(policy_name.clone()).build(),
-                &FulfilmentKindSpec::from_policy(&policy, "linux").expect("kind"),
-            )
+            .create(&InputMeta::builder().name(policy_name.clone()).build(), &host_direct_kind(&host_id))
             .await
             .expect("fulfilment kind");
         for host in &mesh.hosts {
@@ -1292,7 +1258,6 @@ fn generated_convoy_admission_is_homed_on_placement(tc: hegel::TestCase) {
         eventually(Duration::from_secs(5), Duration::from_millis(10), "issuer sees placement", || async {
             let issuer = mesh.hosts[issuing_index].resource_backend();
             issuer.including_replicas::<Host>("flotilla").get(&host_id).await.is_ok()
-                && issuer.including_replicas::<PlacementPolicy>("flotilla").get(&policy_name).await.is_ok()
                 && issuer.including_replicas::<FulfilmentKind>("flotilla").get(&policy_name).await.is_ok()
         })
         .await;
@@ -1426,10 +1391,13 @@ async fn router_duplicate_create_scenarios_admit_one_generation_at_the_requested
             .create(&InputMeta::builder().name("empty".to_string()).build(), &WorkflowTemplateSpec::builder().vessels(Vec::new()).build())
             .await
             .expect("workflow at create host");
+        if !remote {
+            seed_local_host_direct_kind(home).await;
+        }
         let placement_policy = if remote {
             let host_id = home.local_host_id().expect("placement host identity").to_string();
             await_host_capacity(&topology.leader, &host_id).await;
-            seed_target_placement_policy(&topology, "flotilla", "duplicate-placement").await;
+            seed_target_fulfilment_kind(&topology, "flotilla", "duplicate-placement").await;
             eventually(Duration::from_secs(5), Duration::from_millis(10), "origin sees workflow", || async {
                 topology.leader.resource_backend().definitions::<WorkflowTemplate>("flotilla").get("empty").await.is_ok()
             })
@@ -1771,6 +1739,7 @@ fn convoy_creation_attributes_provenance_and_regard_to_the_surface_principal() {
 async fn convoy_creation_attribution_scenario() {
     let leader = empty_daemon_named("leader").await;
     seed_host_capacity(&leader, 2 * 1024 * 1024 * 1024, 1024 * 1024 * 1024).await;
+    seed_local_host_direct_kind(&leader).await;
     leader
         .resource_backend()
         .using::<WorkflowTemplate>("flotilla")
@@ -3087,7 +3056,7 @@ async fn assert_convoy_start_routes_through_peer_session(caller: Option<CommandC
     let namespace = "flotilla";
     let remote_host_id = topology.follower.local_host_id().expect("feta host identity").to_string();
     let placement_policy = format!("host-direct-{remote_host_id}");
-    seed_target_placement_policy(&topology, namespace, &placement_policy).await;
+    seed_target_fulfilment_kind(&topology, namespace, &placement_policy).await;
     await_host_capacity(&topology.leader, &remote_host_id).await;
     seed_trusted_remote_convoy_project(&topology.leader, namespace).await;
     await_placement_workflow(&topology, "remote-workflow", None).await;
@@ -3193,7 +3162,7 @@ async fn convoy_start_routes_to_placement_when_presentation_membership_is_stale(
     let remote_host_id = topology.follower.local_host_id().expect("follower host identity").to_string();
     let placement_policy = format!("host-direct-{remote_host_id}");
 
-    seed_target_placement_policy(&topology, namespace, &placement_policy).await;
+    seed_target_fulfilment_kind(&topology, namespace, &placement_policy).await;
     await_host_capacity(&topology.leader, &remote_host_id).await;
 
     seed_trusted_remote_convoy_project(&topology.leader, namespace).await;
@@ -3297,7 +3266,7 @@ async fn lagging_start_placement_scenario(explicit: bool, destination_holds_cred
     let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
     let namespace = "flotilla";
     let placement_policy = format!("host-direct-{remote_host_id}");
-    seed_target_placement_policy(&topology, namespace, &placement_policy).await;
+    seed_target_fulfilment_kind(&topology, namespace, &placement_policy).await;
     eventually(Duration::from_secs(5), Duration::from_millis(10), "kiwi should read feta's single home-authored Host replica", || async {
         let sources = topology
             .leader
@@ -3495,13 +3464,9 @@ async fn placement_host_capacity_scenario(hold_definitions: bool) {
     // Admission runs on the placement host. Holding definition replication
     // verifies that admission needs neither definition replicated to the origin.
     let topology = if hold_definitions {
-        spawn_in_memory_request_topology_with_replication_kinds(
-            leader,
-            follower,
-            &[Host::API_PATHS.kind, PlacementPolicy::API_PATHS.kind, FulfilmentKind::API_PATHS.kind],
-        )
-        .await
-        .expect("spawn topology holding Project and WorkflowTemplate replication")
+        spawn_in_memory_request_topology_with_replication_kinds(leader, follower, &[Host::API_PATHS.kind, FulfilmentKind::API_PATHS.kind])
+            .await
+            .expect("spawn topology holding Project and WorkflowTemplate replication")
     } else {
         spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology")
     };
@@ -3509,7 +3474,7 @@ async fn placement_host_capacity_scenario(hold_definitions: bool) {
     let remote_host_id = topology.follower.local_host_id().expect("follower host identity").to_string();
     let placement_policy = format!("host-direct-{remote_host_id}");
 
-    seed_target_placement_policy(&topology, namespace, &placement_policy).await;
+    seed_target_fulfilment_kind(&topology, namespace, &placement_policy).await;
     await_host_capacity(&topology.leader, &remote_host_id).await;
     // The follower performs admission; seed its prerequisites synchronously.
     seed_trusted_remote_convoy_project(&topology.follower, namespace).await;
@@ -3637,31 +3602,22 @@ async fn remote_docker_admission_refusal_scenario(provider_case: Option<usize>, 
         )
         .await
         .expect("mark remote Docker host ready without capacity");
-    let remote_policy = PlacementPolicySpec::builder()
-        .pool("cleat".to_string())
-        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-            memory_policy: Default::default(),
-            host_ref: "remote-docker-host".to_string(),
-            image: Some("crew:latest".into()),
-            pull_policy: Default::default(),
-            agent_adapters: BTreeSet::from(["codex".to_string()]),
-            default_cwd: None,
-            env: BTreeMap::new(),
-            checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
-        })
-        .build();
-    daemon
-        .resource_backend()
-        .using::<PlacementPolicy>(namespace)
-        .create(&InputMeta::builder().name("remote-docker".to_string()).build(), &remote_policy)
-        .await
-        .expect("create remote Docker placement");
     daemon
         .resource_backend()
         .using::<FulfilmentKind>(namespace)
         .create(
             &InputMeta::builder().name("remote-docker".to_string()).build(),
-            &FulfilmentKindSpec::from_policy(&remote_policy, "linux").expect("kind"),
+            &FulfilmentKindSpec::builder()
+                .host_ref("remote-docker-host".to_string())
+                .pool("cleat".to_string())
+                .grants(BTreeSet::from([
+                    flotilla_resources::FulfilmentGrant::platform("linux".to_string()),
+                    flotilla_resources::FulfilmentGrant::network("scoped".to_string()),
+                ]))
+                .realisation(flotilla_resources::FulfilmentRealisation::DockerPerVessel {
+                    image: Some(flotilla_resources::DockerImageSource::Literal("crew:latest".into())),
+                })
+                .build(),
         )
         .await
         .expect("remote Docker kind");
@@ -3682,16 +3638,8 @@ async fn remote_docker_admission_refusal_scenario(provider_case: Option<usize>, 
                 expected = "readiness unknown";
             }
             2 => {
+                // A Docker kind checks out a worktree on the host, which needs Shared material.
                 providers[1].capabilities.material_modes.retain(|mode| *mode != MaterialMode::Shared);
-                let policies = daemon.resource_backend().using::<PlacementPolicy>(namespace);
-                let policy = policies.get("remote-docker").await.unwrap();
-                let mut spec = policy.spec;
-                spec.provider_requirements = Some(flotilla_resources::ProviderRequirements {
-                    class: Some(flotilla_protocol::provider::EnvironmentClass::Container),
-                    material_modes: vec![MaterialMode::Shared],
-                    ..Default::default()
-                });
-                policies.update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &spec).await.unwrap();
                 expected = "ready but no Shared material";
             }
             _ => {

@@ -757,7 +757,6 @@ async fn environment_becomes_ready_with_the_built_digest(#[case] delivery: Image
                 host_direct: None,
                 docker: Some(DockerEnvironmentSpec {
                     image_build_ref: Some(name.clone()),
-                    memory_policy: Default::default(),
                     host_ref: HOST.into(),
                     image: String::new(),
                     declared_agent_adapters: BTreeSet::new(),
@@ -901,7 +900,6 @@ async fn environment_image_dependency_follows_engine_without_a_copy() {
                     declared_agent_adapters: Default::default(),
                     required_agent_adapters: Default::default(),
                     pull_policy: Default::default(),
-                    memory_policy: Default::default(),
                     mounts: vec![],
                     env: Default::default(),
                 }),

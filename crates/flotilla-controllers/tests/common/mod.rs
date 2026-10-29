@@ -5,11 +5,10 @@ use std::{collections::BTreeMap, future::Future, time::Duration};
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
     canonicalize_repo_url, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Clone, ClonePhase, CloneSpec, CloneStatus,
-    Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerEnvironmentSpec,
-    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, HostDirectEnvironmentSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, PlacementPolicy, PlacementPolicySpec, Repository,
-    RepositorySpec, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement,
-    VesselSpec, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerEnvironmentSpec, Environment, EnvironmentPhase,
+    EnvironmentSpec, EnvironmentStatus, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HostDirectEnvironmentSpec, InputMeta,
+    Repository, RepositorySpec, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, Vessel,
+    VesselRequirement, VesselSpec, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 use flotilla_store::{ensure_repository, ResourceBackend};
 use tokio::{
@@ -177,53 +176,41 @@ pub async fn create_workspace(
         .expect("workspace create should succeed")
 }
 
-pub async fn create_policy(backend: &ResourceBackend, namespace: &str, name: &str, spec: PlacementPolicySpec) {
-    backend.clone().using::<PlacementPolicy>(namespace).create(&meta(name), &spec).await.expect("policy create should succeed");
+pub async fn create_kind(backend: &ResourceBackend, namespace: &str, name: &str, spec: FulfilmentKindSpec) {
+    backend.clone().using::<FulfilmentKind>(namespace).create(&meta(name), &spec).await.expect("fulfilment kind create should succeed");
 }
 
-pub async fn create_host_direct_policy(backend: &ResourceBackend, namespace: &str, name: &str, host_ref: &str, pool: &str) {
-    create_policy(
+pub async fn create_host_direct_kind(backend: &ResourceBackend, namespace: &str, name: &str, host_ref: &str, pool: &str) {
+    create_kind(
         backend,
         namespace,
         name,
-        PlacementPolicySpec::builder()
+        FulfilmentKindSpec::builder()
+            .host_ref(host_ref.to_string())
             .pool(pool.to_string())
-            .host_direct(HostDirectPlacementPolicySpec {
-                host_ref: host_ref.to_string(),
-                checkout: HostDirectPlacementPolicyCheckout::Worktree,
-            })
+            .realisation(FulfilmentRealisation::HostDirect)
             .build(),
     )
     .await;
 }
 
 #[derive(bon::Builder)]
-pub struct DockerWorktreePolicyFixture {
+pub struct DockerKindFixture {
     pub name: String,
     pub host_ref: String,
     pub pool: String,
     pub image: String,
-    pub mount_path: String,
-    pub default_cwd: Option<String>,
 }
 
-pub async fn create_docker_worktree_policy(backend: &ResourceBackend, namespace: &str, fixture: DockerWorktreePolicyFixture) {
-    create_policy(
+pub async fn create_docker_kind(backend: &ResourceBackend, namespace: &str, fixture: DockerKindFixture) {
+    create_kind(
         backend,
         namespace,
         &fixture.name,
-        PlacementPolicySpec::builder()
+        FulfilmentKindSpec::builder()
+            .host_ref(fixture.host_ref)
             .pool(fixture.pool)
-            .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                memory_policy: Default::default(),
-                host_ref: fixture.host_ref,
-                image: Some(fixture.image.into()),
-                pull_policy: Default::default(),
-                agent_adapters: Default::default(),
-                default_cwd: fixture.default_cwd,
-                env: Default::default(),
-                checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: fixture.mount_path },
-            })
+            .realisation(FulfilmentRealisation::DockerPerVessel { image: Some(fixture.image.into()) })
             .build(),
     )
     .await;

@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 
 
 class CanaryFailure(RuntimeError):
@@ -200,6 +201,25 @@ def live_canary_image(log):
         raise CanaryFailure(f'canary image: invalid host environment declarations: {error}') from error
 
 
+def docker_vessels(host_home, probe_config):
+    """Give the probe daemon the host's [docker_vessels]: Docker crews refuse to run without it."""
+    probe = probe_config / 'daemon.toml'
+    existing = probe.read_text() if probe.exists() else ''
+    if 'docker_vessels' in tomllib.loads(existing):
+        return
+    host = host_home / '.config/flotilla/daemon.toml'
+    try:
+        table = tomllib.loads(host.read_text()).get('docker_vessels')
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise CanaryFailure(f'[docker_vessels]: cannot read {host}: {error}') from error
+    if not isinstance(table, dict) or not table:
+        raise CanaryFailure(f'[docker_vessels]: {host} sets none, so Docker crews cannot run')
+    if not all(isinstance(value, (str, int)) and not isinstance(value, bool) for value in table.values()):
+        raise CanaryFailure(f'[docker_vessels]: {host} has a value that is not a string or integer')
+    lines = ''.join(f'{key} = {json.dumps(value)}\n' for key, value in table.items())
+    probe.write_text(f'{existing.rstrip()}\n\n[docker_vessels]\n{lines}'.lstrip())
+
+
 class Canary:
     def __init__(self, release, root, commands, timeout=180, *, host_home=None, live_spec=None, image=None):
         self.release = Path(release)
@@ -249,6 +269,7 @@ class Canary:
         self.registry_spec = registry_credential(self.host_home, self.live_spec)
         for directory in ('config/run', 'state', 'home', 'cleat'):
             (self.root / directory).mkdir(parents=True)
+        docker_vessels(self.host_home, self.root / 'config')
         with (self.root / 'daemon.log').open('w') as log:
             self.daemon = self.commands.start([
                 str(self.release / 'bin/flotillad'), '--timeout', '0',
@@ -295,6 +316,10 @@ class Canary:
         self.apply('FulfilmentKind', 'fleet-canary', {
             'host_ref': host, 'pool': 'cleat', 'realisation': 'docker_per_vessel',
             'image': image})
+        # A literal image offers the adapters its host probed it for.
+        self.wait('host probes the canary image for its harness', lambda: any(
+            'fleet-canary' in (((item.get('status') or {}).get('fulfilment_facts') or {}).get('fleet-canary') or {}).get('harnesses', {})
+            for item in self.list('hosts')))
         self.wait('host observes registry credential', lambda: any(
             REGISTRY_CREDENTIAL in item.get('status', {}).get('capabilities', {}).get('held_credentials', [])
             for item in self.list('hosts')))

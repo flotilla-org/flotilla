@@ -268,9 +268,6 @@ pub struct DockerEnvironmentSpec {
     pub required_agent_adapters: BTreeSet<String>,
     #[serde(default)]
     pub pull_policy: DockerImagePullPolicy,
-    /// ADR 0047: default old records for one fleet roll.
-    #[serde(default)]
-    pub memory_policy: EnvironmentMemoryPolicy,
     #[serde(default)]
     pub mounts: Vec<EnvironmentMount>,
     #[serde(default)]

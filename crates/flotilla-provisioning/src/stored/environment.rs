@@ -89,9 +89,6 @@ pub struct DockerRecipe {
     /// Adapters this environment's workflow will launch.
     pub required_adapters: std::collections::BTreeSet<String>,
     pub pull_policy: flotilla_resources::DockerImagePullPolicy,
-    /// The placement policy's memory formula, resolved against host memory at
-    /// container creation (where it belongs is #3734).
-    pub memory_policy: flotilla_resources::EnvironmentMemoryPolicy,
     pub mounts: Vec<flotilla_resources::EnvironmentMount>,
     /// The values the placement policy and workflow declare, and nothing
     /// derived at launch: credential grants and skills are composed then and

@@ -9,13 +9,12 @@ use flotilla_config::ConfigStore;
 use flotilla_protocol::{HostName, PlacementDecision, PlacementTargetHost};
 use flotilla_resources::{
     CapabilityNeed, Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, FulfilmentFacts, FulfilmentGrant, FulfilmentKind,
-    FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, Host as ResourceHost, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, PlacementPolicy, PlacementPolicySpec, WorkflowTemplateSpec,
+    FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, Host as ResourceHost, HostSpec, HostStatus, InputMeta, WorkflowTemplateSpec,
     GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
 };
 use flotilla_store::ResourceBackend;
 
-use super::support::{create_docker_placement, create_identity_convoy, placement_policy, test_meta};
+use super::support::{create_docker_placement, create_identity_convoy, host_direct_kind, test_meta};
 use crate::in_process::{placement_target_host, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;
 use flotilla_admission::convoy_admission::allocate_convoy_generation;
@@ -177,7 +176,6 @@ async fn capability_admission_resolves_display_name_kind_and_policy_host_refs() 
             .await
             .expect("ambiguous host");
     }
-    placement_policy(&backend, "a-collision", "collision").await;
     backend
         .clone()
         .using::<FulfilmentKind>("flotilla")
@@ -192,7 +190,6 @@ async fn capability_admission_resolves_display_name_kind_and_policy_host_refs() 
         )
         .await
         .expect("ambiguous kind");
-    placement_policy(&backend, "udder-kind", "udder").await;
     backend
         .clone()
         .using::<FulfilmentKind>("flotilla")
@@ -362,20 +359,7 @@ async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_rep
         )
         .await
         .expect("publish live local capacity");
-    backend
-        .using::<PlacementPolicy>("flotilla")
-        .create(
-            &test_meta("self-targeted"),
-            &PlacementPolicySpec::builder()
-                .pool("passthrough".to_string())
-                .host_direct(HostDirectPlacementPolicySpec {
-                    host_ref: host_id.clone(),
-                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                })
-                .build(),
-        )
-        .await
-        .expect("self-targeted placement policy");
+    host_direct_kind(&backend, "self-targeted", &host_id).await;
 
     daemon
         .check_remote_placement_free_space_floor(
@@ -462,20 +446,7 @@ async fn self_targeted_admission_resolves_display_name_policy_to_live_local_host
         )
         .await
         .expect("publish live local capacity");
-    let policy = backend
-        .using::<PlacementPolicy>("flotilla")
-        .create(
-            &test_meta("self-targeted"),
-            &PlacementPolicySpec::builder()
-                .pool("passthrough".to_string())
-                .host_direct(HostDirectPlacementPolicySpec {
-                    host_ref: "local-host".to_string(),
-                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                })
-                .build(),
-        )
-        .await
-        .expect("self-targeted placement policy");
+    let policy = host_direct_kind(&backend, "self-targeted", "local-host").await;
 
     let target = placement_target_host(&backend, "flotilla", &policy).await.expect("resolve display-name host reference");
     assert_eq!(target.reference.as_str(), host_id);
@@ -550,7 +521,6 @@ async fn capability_admission_places_on_ssh_hosts_only_when_pinned() {
         )
         .await
         .expect("SSH host facts");
-    placement_policy(&backend, "host-direct-ssh-host", "ssh-host").await;
     backend
         .clone()
         .using::<FulfilmentKind>("flotilla")
@@ -812,7 +782,6 @@ async fn ssh_host(backend: &ResourceBackend, name: &str, max_vessels: Option<u32
         )
         .await
         .expect("SSH host facts");
-    placement_policy(backend, &kind, name).await;
     backend
         .clone()
         .using::<FulfilmentKind>("flotilla")
@@ -1139,13 +1108,6 @@ async fn docker_host(backend: &ResourceBackend, name: &str, max_vessels: Option<
     let mut status = host.status.expect("Docker host status");
     status.capabilities.insert(flotilla_resources::IMAGE_DIGESTS_CAPABILITY.into(), serde_json::json!({"fixture-1": ["crew:latest"]}));
     hosts.update_status(name, &host.metadata.resource_version, &status).await.expect("held crew image");
-    let policy = backend.clone().using::<PlacementPolicy>("flotilla").get(&kind).await.expect("Docker policy");
-    backend
-        .clone()
-        .using::<FulfilmentKind>("flotilla")
-        .create(&test_meta(&kind), &FulfilmentKindSpec::from_policy(&policy.spec, "linux").expect("Docker kind"))
-        .await
-        .expect("Docker kind");
 }
 
 /// A capped SSH host box whose host-direct kind is derived as b1's is,
@@ -1160,13 +1122,18 @@ async fn dedicated_box(backend: &ResourceBackend, name: &str, max_vessels: u32, 
         .expect("box tenancy");
     let kinds = backend.clone().using::<FulfilmentKind>("flotilla");
     let kind = kinds.get(&format!("host-direct-{name}")).await.expect("box kind");
-    let policy = backend.clone().using::<PlacementPolicy>("flotilla").get(&kind.metadata.name).await.expect("box policy");
-    let derived = FulfilmentKindSpec::from_policy(&policy.spec, "linux").expect("box grants");
     kinds
         .update(
             &InputMeta::from(&kind.metadata),
             &kind.metadata.resource_version,
-            &FulfilmentKindSpec { grants: derived.grants, ..kind.spec.clone() },
+            &FulfilmentKindSpec {
+                grants: BTreeSet::from([
+                    FulfilmentGrant::platform("linux".to_string()),
+                    FulfilmentGrant::host_account_reach(),
+                    FulfilmentGrant::network("host".to_string()),
+                ]),
+                ..kind.spec.clone()
+            },
         )
         .await
         .expect("box grants");

@@ -4,6 +4,9 @@ use super::*;
 
 pub(super) struct FleetCanaryAdapter;
 
+/// The probe is a checkout script run by `bash`, which the image must carry.
+pub(super) const HARNESS: Harness = Harness { adapter: "fleet-canary", binary: "bash" };
+
 #[async_trait]
 impl AgentAdapter for FleetCanaryAdapter {
     fn id(&self) -> &'static str {
@@ -21,7 +24,7 @@ impl AgentAdapter for FleetCanaryAdapter {
             return Err("fleet-canary adapter does not use a model".into());
         }
         Ok(AgentLaunchPlan {
-            command: "bash .flotilla/fleet-canary-agent.sh".into(),
+            command: format!("{} .flotilla/fleet-canary-agent.sh", HARNESS.binary),
             env: request.environment.clone(),
             stance: TRUSTED_IMPLICIT_STANCE.into(),
         })
@@ -60,5 +63,20 @@ mod tests {
         assert_eq!(plan.command, "bash .flotilla/fleet-canary-agent.sh");
         request.model = Some("unused-model".into());
         assert!(adapter.launch(&request).is_err());
+    }
+
+    // Fulfilment probes look for the canary's harness only where discovery would offer the canary.
+    #[test]
+    fn the_canary_harness_is_probed_only_where_the_canary_is_enabled() {
+        struct Env(Option<&'static str>);
+        impl flotilla_provider_runtime::EnvVars for Env {
+            fn get(&self, key: &str) -> Option<String> {
+                (key == "FLOTILLA_FLEET_CANARY").then_some(self.0).flatten().map(str::to_owned)
+            }
+        }
+        for (value, expected) in [(None, false), (Some("0"), false), (Some("1"), true)] {
+            assert_eq!(built_in_harnesses(&Env(value)).any(|harness| harness == HARNESS), expected, "{value:?}");
+        }
+        assert_eq!(HARNESS.binary, "bash");
     }
 }
