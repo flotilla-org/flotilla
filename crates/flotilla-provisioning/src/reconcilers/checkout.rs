@@ -482,7 +482,8 @@ where
             let mut live_checkouts = Vec::new();
             for other in self.checkouts.list().await?.items {
                 // A terminal or deleting convoy reserves no branch in any member repo; an
-                // unresolvable owner is also released when continuing.
+                // unresolvable owner is also released when continuing. A terminal owner's
+                // checkout still on disk is caught by `validate_new_branch` below.
                 if other.metadata.labels.contains_key(CONVOY_LABEL) {
                     let owner = self.owning_convoy(&other).await?;
                     let released = match &owner {
