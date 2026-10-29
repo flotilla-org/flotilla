@@ -168,6 +168,7 @@ python3 "$(dirname "$0")/generation_validation.py" codex-home "$codex_home_bundl
   # drydock-host is only a dev-dependency here, which cargo cannot build as a package.
   drydock_rev="$(sed -n 's/^drydock-host = .*rev = "\([0-9a-f]\{40\}\)".*/\1/p' Cargo.toml)"
   [[ -n "$drydock_rev" ]]
+  [[ "$(grep -c '^drydock[a-z-]* = { git = .*rev = "'"$drydock_rev"'"' Cargo.toml)" == "$(grep -c '^drydock[a-z-]* = { git' Cargo.toml)" ]]
   cargo install --locked --force --git https://github.com/flotilla-org/drydock --rev "$drydock_rev" \
     --root "$flotilla_root/target/drydock-host-install" --bin drydock-host drydock-host
   if [[ "$platform" == linux-* ]]; then
