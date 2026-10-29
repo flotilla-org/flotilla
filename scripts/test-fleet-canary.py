@@ -371,12 +371,11 @@ class Contract(unittest.TestCase):
         probe = processes.manifests['WorkflowTemplate']['spec']['vessels'][0]['crew'][0]
         self.assertEqual(probe['promises'], [{'kind': 'decision-ledger', 'owner': 'probe'}])
         self.assertFalse(probe.get('deliverer', False))
-        placement = processes.manifests['PlacementPolicy']['spec']['docker_per_vessel']
-        self.assertEqual(placement['image'], canary.canary_image('sha256:' + 'a' * 64))
+        self.assertEqual(processes.manifests['FulfilmentKind']['spec'], {
+            'host_ref': 'canary-host', 'pool': 'cleat', 'realisation': 'docker_per_vessel',
+            'image': canary.canary_image('sha256:' + 'a' * 64)})
+        self.assertNotIn('PlacementPolicy', processes.manifests, 'admission reads only FulfilmentKinds')
         self.assertNotIn('CrewImageBaseline', processes.manifests)
-        self.assertNotIn('memory_policy', placement, 'use the shared deserialization default')
-        self.assertEqual(placement['host_ref'], 'canary-host')
-        self.assertEqual(placement['env']['FLOTILLA_FLEET_CANARY'], '1')
         self.assertFalse(any('systemctl' in str(call) or 'fleet-container' in call for call in processes.calls))
         self.assertFalse(any(call[0] == 'docker' and 'rm' in call for call in processes.calls))
 

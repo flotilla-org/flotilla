@@ -362,10 +362,13 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
                     return Err(format!("failed to parse provisioned mount metadata for container {container_name}: {err}"));
                 }
             };
+            // Another daemon on this host (a canary, say) shares Docker; its containers'
+            // agent directories lie outside this provider's runtime root, and are never adopted.
             #[cfg(unix)]
-            if let Some(mount) =
-                provisioned_mounts.iter().find(|mount: &&ProvisionedMount| mount.environment_path.as_path() == Path::new("/run/drydock"))
-            {
+            if let Some(mount) = provisioned_mounts.iter().find(|mount: &&ProvisionedMount| {
+                mount.environment_path.as_path() == Path::new("/run/drydock")
+                    && mount.host_path.as_path().parent().and_then(Path::parent) == Some(self.inner.agent_settings.runtime_root.as_path())
+            }) {
                 let directory = mount.host_path.as_path().parent().map(Path::to_path_buf);
                 let inner = self.inner.clone();
                 let (backing, name, id, base, mounts, index) =
@@ -2047,15 +2050,27 @@ mod adoption_tests {
         }
         // Recorded and inspected mounts both omit the agent on this older backing.
         engine.rows.lock().unwrap().push(("pre-agent".into(), PathBuf::new()));
-        let provider = DockerEnvironmentProvider::new(engine.clone()).with_agent_connector(Arc::new(move |socket| {
-            if socket == bad {
-                Arc::new(Unreachable)
-            } else {
-                shared.clone()
-            }
-        }));
+        let foreign = tempfile::tempdir().unwrap();
+        let foreign_agent = foreign.path().join("other");
+        std::fs::create_dir_all(foreign_agent.join("guest")).unwrap();
+        std::fs::create_dir_all(foreign_agent.join("host")).unwrap();
+        engine.rows.lock().unwrap().push(("foreign".into(), foreign_agent.join("guest")));
+        let connected = Arc::new(Mutex::new(Vec::new()));
+        let record = connected.clone();
+        let provider = DockerEnvironmentProvider::new(engine.clone())
+            .with_agent_settings(DockerAgentSettings { runtime_root: root.path().into(), executable: root.path().join("agent") })
+            .with_agent_connector(Arc::new(move |socket| {
+                record.lock().unwrap().push(socket.to_path_buf());
+                if socket == bad {
+                    Arc::new(Unreachable)
+                } else {
+                    shared.clone()
+                }
+            }));
         let handles = provider.list().await.unwrap();
-        assert_eq!(handles.len(), 3);
+        assert_eq!(handles.len(), 4);
+        assert!(handles.iter().find(|h| h.id().as_str() == "foreign").unwrap().agent().ready().await.is_err());
+        assert!(connected.lock().unwrap().iter().all(|socket| socket.starts_with(root.path())), "{connected:?}");
         assert!(handles.iter().find(|h| h.id().as_str() == "bad").unwrap().agent().ready().await.is_err());
         let old = handles.iter().find(|h| h.id().as_str() == "pre-agent").unwrap();
         assert!(old.agent().ready().await.is_err());

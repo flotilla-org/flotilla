@@ -94,17 +94,13 @@ exit 1
                 gate.prepare()
                 convoys = gate.list('convoys')
                 assert len(convoys) == 1, convoys
-                # The daemon materializes the shared Rust default for a reference
-                # policy with no memory override. Compare all fields, without a Python literal.
-                gate.apply('PlacementPolicy', 'memory-default', {
-                    'pool': 'cleat', 'docker_per_vessel': {
-                        'host_ref': gate.list('hosts')[0]['metadata']['name'],
-                        'image': canary.canary_image(gate.image),
-                        'checkout': {'worktree_on_host_and_mount': {'mount_path': '/workspace'}}}})
-                policy = gate.list('placementpolicies')
-                authored = next(item for item in policy if item['metadata']['name'] == 'fleet-canary')
-                default = next(item for item in policy if item['metadata']['name'] == 'memory-default')
-                assert authored['spec']['docker_per_vessel']['memory_policy'] == default['spec']['docker_per_vessel']['memory_policy']
+                # The container's discovery offers the canary adapter only from its env; the
+                # requested Environment is the last evidence before the fake Docker refuses it.
+                docker = gate.wait('vessel environment requested', lambda: [
+                    item['spec']['docker'] for item in gate.list('environments') if (item.get('spec') or {}).get('docker')])
+                assert len(docker) == 1, docker
+                assert docker[0]['required_agent_adapters'] == ['fleet-canary'], docker
+                assert docker[0]['env'].get('FLOTILLA_FLEET_CANARY') == '1', docker
                 # A real clone proves the recorded transport is usable, not just syntactically accepted.
                 remote = commands.run(['git', '-C', str(probe / 'repository'),
                                        'remote', 'get-url', 'origin']).strip()

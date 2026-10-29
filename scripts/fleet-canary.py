@@ -305,14 +305,6 @@ class Canary:
         self.apply('CredentialSpec', REGISTRY_CREDENTIAL, self.registry_spec)
         self.apply('CredentialGrant', 'fleet-canary-registry', {
             'selector': {'projects': ['fleet-canary']}, 'credentials': [REGISTRY_CREDENTIAL]})
-        self.apply('PlacementPolicy', 'fleet-canary', {
-            'pool': 'cleat', 'docker_per_vessel': {
-                'host_ref': host, 'image': image,
-                'pull_policy': 'if_not_present',
-                'agent_adapters': ['fleet-canary'], 'default_cwd': '/workspace',
-                'env': {'FLOTILLA_FLEET_CANARY': '1', 'CLAUDE_CONFIG_DIR': '/tmp/flotilla-config/canary'},
-                'checkout': {'worktree_on_host_and_mount': {'mount_path': '/workspace'}}}})
-        # --fulfilment pins a kind; a PlacementPolicy alone is not its definition.
         self.apply('FulfilmentKind', 'fleet-canary', {
             'host_ref': host, 'pool': 'cleat', 'realisation': 'docker_per_vessel',
             'image': image})
