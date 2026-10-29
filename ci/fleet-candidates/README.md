@@ -698,4 +698,4 @@ Operator sequence after merge:
 
 ## drydock-host
 
-Every generation, on every platform, ships `bin/drydock-host` beside `bin/flotillad`, built from the pinned drydock. flotillad's embedded drydock daemon runs provider modules (such as Daytona) through it, so release validation refuses a bundle without it.
+Every generation, on every platform, ships `bin/drydock-host` beside `bin/flotillad`, built from the pinned drydock. flotillad's embedded drydock daemon runs provider modules (such as Daytona) through it, so `build-candidate.sh` fails when it cannot build and install it. Validation only tolerates a missing binary so a failed health check can roll back to an older generation that predates it; once no such generation remains, move `bin/drydock-host` from `PRODUCED_PAYLOAD` to `REQUIRED_PAYLOAD`.

@@ -1200,7 +1200,7 @@ def refresh_darwin_payload(source, destination):
     source, destination = Path(source), Path(destination)
     files = [Path("bin") / name for name in ("flotilla", "flotillad", "cleat")]
     # Absent from generations built before it shipped (rollback targets).
-    files += [Path("bin") / name for name in ("drydock-host",) if (source / "bin" / name).exists()]
+    files += [Path(p) for p in sorted(PRODUCED_PAYLOAD) if (source / p).exists()]
     files += [path.relative_to(source) for path in (source / "lib").rglob("*") if path.is_file()]
     expected = set(files)
     for stale in (destination / "lib").rglob("*"):
