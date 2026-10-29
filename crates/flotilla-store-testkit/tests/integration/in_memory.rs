@@ -14,9 +14,9 @@ use flotilla_store_testkit::fixtures::{
         assert_project_definition_metadata_edit_converges_with_backend,
         assert_project_definition_optional_field_can_be_cleared_with_backend,
         assert_repeated_delete_with_pending_finalizers_is_noop_with_backend,
-        assert_replica_events_ignore_stale_writes_and_deletes_with_backend, assert_replica_read_view_contract,
-        assert_stale_resource_version_conflicts, assert_store_diagnostics_report_retained_events_with_backend,
-        assert_watch_from_version_replays, assert_watch_now_semantics,
+        assert_replica_events_ignore_stale_writes_and_deletes_with_backend, assert_replica_keeps_newer_resource_version_with_backend,
+        assert_replica_read_view_contract, assert_stale_resource_version_conflicts,
+        assert_store_diagnostics_report_retained_events_with_backend, assert_watch_from_version_replays, assert_watch_now_semantics,
         assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend,
         assert_watch_retention_expires_only_versions_below_floor_with_backend, ConvoyFixture, DemandFixture, RegardFixture,
     },
@@ -134,6 +134,11 @@ async fn replica_read_view_contract() {
 #[tokio::test]
 async fn get_all_provenances_contract() {
     assert_get_all_provenances_contract(ResourceBackend::new(InMemoryBackend::default())).await;
+}
+
+#[tokio::test]
+async fn replica_keeps_newer_resource_version() {
+    assert_replica_keeps_newer_resource_version_with_backend(ResourceBackend::new(InMemoryBackend::default())).await;
 }
 
 #[tokio::test]

@@ -462,6 +462,8 @@ impl PlacementStrategy {
 #[derive(Debug, Clone)]
 enum PlannedPatch {
     None,
+    /// A dependency is not ready yet; change nothing and look again.
+    Waiting,
     Provisioning {
         observed_kind_ref: String,
         observed_kind_version: String,
@@ -595,6 +597,10 @@ impl VesselPrepared {
         Some(Self { phase: None, patch, actuations: Vec::new() })
     }
 
+    fn waiting() -> Self {
+        Self { phase: None, patch: PlannedPatch::Waiting, actuations: Vec::new() }
+    }
+
     fn failed(message: impl Into<String>) -> Self {
         Self { phase: None, patch: PlannedPatch::Failed { message: message.into() }, actuations: Vec::new() }
     }
@@ -670,11 +676,12 @@ impl VesselReconciler {
         }
         let mut declared_agent_adapters = BTreeSet::new();
 
-        let (vessel_index, requirement) = match convoy
-            .status
-            .as_ref()
-            .and_then(|status| status.workflow_snapshot.as_ref())
-            .and_then(|snapshot| snapshot.vessels.iter().enumerate().find(|(_, vessel)| vessel.name == obj.spec.vessel_name))
+        // A convoy read without its snapshot is not ready yet: admission has
+        // not frozen it, or a replica briefly holds an older body (#4137).
+        let Some(snapshot) = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()) else {
+            return Ok(VesselPrepared::waiting());
+        };
+        let (vessel_index, requirement) = match snapshot.vessels.iter().enumerate().find(|(_, vessel)| vessel.name == obj.spec.vessel_name)
         {
             Some((vessel_index, requirement)) => (vessel_index, requirement),
             None => return Ok(VesselPrepared::failed(format!("vessel {} missing from convoy snapshot", obj.spec.vessel_name))),
@@ -1547,7 +1554,7 @@ impl Reconciler for VesselReconciler {
     ) -> ReconcileOutcome<Self::Resource> {
         let patch =
             match &prepared.patch {
-                PlannedPatch::None => None,
+                PlannedPatch::None | PlannedPatch::Waiting => None,
                 PlannedPatch::Provisioning { observed_kind_ref, observed_kind_version, placement_decision, waiting_for, image } => {
                     Some(VesselStatusPatch::MarkProvisioning {
                         observed_kind_ref: observed_kind_ref.clone(),
@@ -1619,7 +1626,10 @@ impl Reconciler for VesselReconciler {
         let mut outcome = ReconcileOutcome::with_actuations(patch, prepared.actuations.clone());
         if matches!(&prepared.patch, PlannedPatch::CheckoutChurn { .. }) {
             outcome.requeue_after = Some(CHECKOUT_RECREATE_BACKOFF);
-        } else if matches!(&prepared.patch, PlannedPatch::Provisioning { .. } | PlannedPatch::EnvironmentRecreation { .. }) {
+        } else if matches!(
+            &prepared.patch,
+            PlannedPatch::Provisioning { .. } | PlannedPatch::EnvironmentRecreation { .. } | PlannedPatch::Waiting
+        ) {
             outcome.requeue_after = Some(VESSEL_PROVISIONING_REQUEUE_AFTER);
         } else if matches!(&prepared.patch, PlannedPatch::Interrupted { .. }) {
             outcome.requeue_after = Some(VESSEL_INTERRUPTED_REQUEUE_AFTER);
@@ -2122,6 +2132,78 @@ mod tests {
 
     // A vessel no admission froze an instance for takes the one provider its kind's host
     // advertises for the realisation, and none before any is observed; a frozen instance wins.
+    // #4137: a vessel reading its convoy from a replica that lacks the frozen snapshot
+    // waits for it, leaving the vessel untouched; a snapshot without the vessel fails it.
+    #[tokio::test]
+    async fn a_vessel_waits_for_a_replicated_convoy_snapshot() {
+        use flotilla_store::controller::Reconciler;
+        let author = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("author"));
+        let driver = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("driver"));
+        let kind =
+            FulfilmentKindSpec::builder().host_ref("h".into()).pool("cleat".into()).realisation(FulfilmentRealisation::HostDirect).build();
+        let kinds = author.using::<FulfilmentKind>("flotilla");
+        kinds.create(&InputMeta::builder().name("kind".into()).build(), &kind).await.expect("kind");
+        driver
+            .replica_writer::<FulfilmentKind>(NodeId::new("author"), "flotilla")
+            .replace(&kinds.list().await.expect("author kinds"), chrono::Utc::now())
+            .await
+            .expect("replicate kinds");
+        let convoys = author.using::<Convoy>("flotilla");
+        let convoy = convoys
+            .create(&InputMeta::builder().name("convoy".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+            .await
+            .expect("convoy");
+        let replicate = || async {
+            driver
+                .replica_writer::<Convoy>(NodeId::new("author"), "flotilla")
+                .replace(&convoys.list().await.expect("author convoys"), chrono::Utc::now())
+                .await
+                .expect("replicate convoys")
+        };
+        replicate().await;
+        let reconciler = VesselReconciler::new(driver.clone(), "flotilla")
+            .with_federated_dependencies(&driver, flotilla_protocol::CanonicalHostId::resolved("driver-host"));
+        let mut meta = InputMeta::builder().name("vessel".into()).build();
+        meta.annotations.insert(ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), "author".to_string());
+        let vessel = driver
+            .using::<Vessel>("flotilla")
+            .create(
+                &meta,
+                &VesselSpec {
+                    convoy_ref: "convoy".into(),
+                    vessel_name: "work".into(),
+                    fulfilment_kind_ref: "kind".into(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+            )
+            .await
+            .expect("vessel");
+
+        let prepared = reconciler.prepare(&vessel).await.expect("prepare");
+        assert!(matches!(prepared.patch, super::PlannedPatch::Waiting), "{:?}", prepared.patch);
+        let outcome = reconciler.reconcile(&vessel, &prepared, chrono::Utc::now());
+        assert!(outcome.patch.is_none());
+        assert_eq!(outcome.requeue_after, Some(super::VESSEL_PROVISIONING_REQUEUE_AFTER));
+
+        let mut status = flotilla_store_testkit::fixtures::convoy_status(flotilla_resources::ConvoyPhase::Active);
+        status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
+            cascade: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            stall_nudges: Default::default(),
+            supervision: None,
+            vessels: Vec::new(),
+        });
+        convoys.update_status("convoy", &convoy.metadata.resource_version, &status).await.expect("freeze snapshot");
+        replicate().await;
+        let prepared = reconciler.prepare(&vessel).await.expect("prepare");
+        assert!(
+            matches!(&prepared.patch, super::PlannedPatch::Failed { message } if message == "vessel work missing from convoy snapshot"),
+            "{:?}",
+            prepared.patch
+        );
+    }
+
     #[tokio::test]
     async fn an_unfrozen_vessel_takes_the_one_provider_its_host_advertises() {
         use flotilla_protocol::provider::{

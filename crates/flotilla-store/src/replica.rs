@@ -30,3 +30,14 @@ pub struct ReplicaDeletion {
     pub name: String,
     pub last_synced_at: DateTime<Utc>,
 }
+
+/// Whether a held replica body is newer than an arriving one by its origin's
+/// resource version. An origin's versions only grow within a generation, so
+/// the newer body wins whatever the arrival order or the receiver's clock
+/// (#4137). Bodies without a numeric version fall back to sync-time ordering.
+pub fn replica_body_is_newer(held: &serde_json::Value, arriving: &serde_json::Value) -> bool {
+    fn version(body: &serde_json::Value) -> Option<u64> {
+        body.get("metadata")?.get("resourceVersion")?.as_str()?.parse().ok()
+    }
+    version(held).zip(version(arriving)).is_some_and(|(held, arriving)| held > arriving)
+}

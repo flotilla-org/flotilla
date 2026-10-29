@@ -31,7 +31,7 @@ use tokio_rusqlite::Connection;
 
 use crate::{
     error::ResourceError,
-    replica::{StoredReplicaEvent, StoredReplicaEventKind},
+    replica::{replica_body_is_newer, StoredReplicaEvent, StoredReplicaEventKind},
     resource::{InputMeta, MergeMetadata, ObjectMeta, ResourceObject},
     retention::{
         EventRetention, ResourceDecodeQuarantine, ResourceEventDecodeQuarantine, ResourceStoreDiagnostics,
@@ -2208,6 +2208,16 @@ impl SqliteBackend {
                     if old.get(name).is_some_and(|(old_body, _)| old_body == body) {
                         return Ok(true);
                     }
+                    // A digest repair cut can predate an event the log already
+                    // applied; keep the newer body (#4137). A full snapshot is
+                    // authoritative and may start a new origin generation.
+                    if bucket.is_some()
+                        && old.get(name).is_some_and(|(old_body, _)| {
+                            serde_json::from_str::<Value>(old_body).is_ok_and(|old_body| replica_body_is_newer(&old_body, &mutation.value))
+                        })
+                    {
+                        return Ok(false);
+                    }
                     tx.execute_cached(
                         REPLICA_OBJECT_UPSERT_SQL,
                         params![origin, key.0, key.1, key.2, key.3, name, body, synced],
@@ -2385,18 +2395,22 @@ impl SqliteBackend {
             )
             .optional()
             .map_err(|err| Self::map_replica_sqlite(err, "read sqlite replica tombstone"))?;
-        let unchanged = match kind {
-            StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
-                tombstone_synced_at.as_ref().is_some_and(|existing_synced| existing_synced >= &synced)
-                    || existing.as_ref().is_some_and(|(existing_body, existing_synced)| {
-                        existing_synced > &synced || (existing_synced == &synced && existing_body >= &body)
-                    })
-            }
-            StoredReplicaEventKind::Deleted => {
-                tombstone_synced_at.as_ref().is_some_and(|existing_synced| existing_synced >= &synced)
-                    || existing.as_ref().is_some_and(|(_, existing_synced)| existing_synced > &synced)
-            }
-        };
+        let held_is_newer = existing.as_ref().is_some_and(|(existing_body, _)| {
+            serde_json::from_str::<Value>(existing_body).is_ok_and(|existing_body| replica_body_is_newer(&existing_body, value))
+        });
+        let unchanged = held_is_newer
+            || match kind {
+                StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
+                    tombstone_synced_at.as_ref().is_some_and(|existing_synced| existing_synced >= &synced)
+                        || existing.as_ref().is_some_and(|(existing_body, existing_synced)| {
+                            existing_synced > &synced || (existing_synced == &synced && existing_body >= &body)
+                        })
+                }
+                StoredReplicaEventKind::Deleted => {
+                    tombstone_synced_at.as_ref().is_some_and(|existing_synced| existing_synced >= &synced)
+                        || existing.as_ref().is_some_and(|(_, existing_synced)| existing_synced > &synced)
+                }
+            };
         if unchanged {
             return Ok(false);
         }
