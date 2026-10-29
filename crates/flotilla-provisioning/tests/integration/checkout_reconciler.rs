@@ -844,6 +844,65 @@ async fn forced_convoy_deletion_directs_checkout_authority_to_archive_before_rem
 }
 
 #[tokio::test]
+async fn abandoned_convoy_directs_checkout_authority_to_archive_before_removal() {
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+    let convoy = convoys
+        .create(
+            &InputMeta::builder().name("convoy-a".to_string()).build(),
+            &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build(),
+        )
+        .await
+        .expect("create convoy");
+    convoys
+        .update_status(
+            &convoy.metadata.name,
+            &convoy.metadata.resource_version,
+            &ConvoyStatus { phase: ConvoyPhase::Abandoned, ..Default::default() },
+        )
+        .await
+        .expect("mark convoy Abandoned");
+    create_ready_clone(&backend, NAMESPACE, "clone-a", REPO_URL, "host-direct-a", "/checkouts/repo").await;
+    let checkout = backend
+        .clone()
+        .using::<Checkout>(NAMESPACE)
+        .create(
+            &InputMeta::builder()
+                .name("checkout-a".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]))
+                .build(),
+            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                env_ref: "host-direct-a".to_string(),
+                r#ref: "feature/cleanup".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/checkouts/convoy-a/repo.feature-cleanup".to_string(),
+                clone_ref: "clone-a".to_string(),
+            }),
+        )
+        .await
+        .expect("create checkout");
+    let runtime = Arc::new(RecordingCheckoutRuntime { archive_path: Some("/archives/work-123".to_string()), ..Default::default() });
+    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE);
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            match reconciler.run_finalizer(&checkout).await {
+                Ok(()) => break,
+                Err(ResourceError::FinalizerPending) => tokio::task::yield_now().await,
+                Err(error) => panic!("abandoned finalizer: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("abandoned finalizer should finish");
+
+    assert!(matches!(runtime.removals.lock().expect("removals lock").as_slice(), [CheckoutRemoval::ForcedWorktree { .. }]));
+    let events = backend.using::<Event>(NAMESPACE).list().await.expect("events");
+    assert!(events.items.iter().any(|event| event.spec.reason == "CheckoutArchived" && event.spec.message.contains("/archives/work-123")));
+}
+
+#[tokio::test]
 async fn slow_forced_archive_does_not_stop_other_checkout_or_controller_heartbeat() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);

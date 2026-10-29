@@ -491,6 +491,56 @@ async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push
     );
 }
 
+#[tokio::test]
+async fn abandon_archive_names_replica_checkouts_left_to_their_own_host() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"archive-test\"\n").unwrap();
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("udder-root"));
+    let feta_root = NodeId::new("feta-root");
+    let feta = ResourceBackend::new(InMemoryBackend::default()).with_local_root(feta_root.clone());
+    let mut discovery = fake_discovery_with_runner(false, Arc::new(flotilla_provider_runtime::ProcessCommandRunner));
+    discovery.repo_detectors.clear();
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        discovery,
+        HostName::local(),
+        backend.clone(),
+        Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    let repository = RepositorySpec::remote("https://github.com/acme/archive").unwrap().key();
+    feta.using::<ResourceCheckout>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("remote-work".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "archive-convoy".to_string())]))
+                .build(),
+            &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+                r#ref: "remote-work".to_string(),
+                path: "/feta/work".to_string(),
+                repo_ref: repository,
+                host_ref: "feta".into(),
+                is_main: false,
+            }),
+        )
+        .await
+        .unwrap();
+    backend
+        .replica_writer::<ResourceCheckout>(feta_root, "flotilla")
+        .replace(&feta.using::<ResourceCheckout>("flotilla").list().await.unwrap(), Utc::now())
+        .await
+        .unwrap();
+
+    let outcomes = daemon.crew.archive_convoy_checkouts_best_effort("flotilla", "archive-convoy").await.unwrap();
+
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].checkout, "remote-work");
+    assert_eq!(outcomes[0].status, CheckoutArchiveStatus::ArchivingOnHost);
+    let detail = outcomes[0].detail.as_deref().unwrap();
+    assert!(detail.contains("/feta/work") && detail.contains("feta"), "{detail}");
+}
+
 // #3815: abandon archives unique commits, but must not publish an untouched
 // checkout's branch. Real Git push effects prove which checkout was archived.
 #[tokio::test]

@@ -256,13 +256,16 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         CommandValue::ConvoyAbandoned { name, archives } => {
             let failed = archives.iter().filter(|archive| archive.status == flotilla_protocol::CheckoutArchiveStatus::Failed).count();
             let archived = archives.iter().filter(|archive| archive.status == flotilla_protocol::CheckoutArchiveStatus::Archived).count();
-            info!(%name, %archived, %failed, "convoy abandoned");
+            let remote =
+                archives.iter().filter(|archive| archive.status == flotilla_protocol::CheckoutArchiveStatus::ArchivingOnHost).count();
+            info!(%name, %archived, %failed, %remote, "convoy abandoned");
             let warning = match failed {
                 0 => String::new(),
                 1 => " (1 archive warning)".to_string(),
                 count => format!(" ({count} archive warnings)"),
             };
-            app.set_status_message(Some(format!("Convoy abandoned: {name}{warning}")));
+            let remote = if remote == 0 { String::new() } else { format!(" ({remote} on other hosts)") };
+            app.set_status_message(Some(format!("Convoy abandoned: {name}{warning}{remote}")));
         }
         CommandValue::ConvoyStarted { name, .. } => {
             info!(%name, "convoy started");
