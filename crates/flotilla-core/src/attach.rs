@@ -320,7 +320,9 @@ impl<'a> AttachResolver<'a> {
         });
         let mut connectable = Vec::new();
         for source in candidates {
-            let sessions = sessions_by_convoy.get(&source.object.metadata.name).expect("candidate convoy has a session");
+            let sessions = sessions_by_convoy.get_mut(&source.object.metadata.name).expect("candidate convoy has a session");
+            // A crew normally runs on one host; sorting by name keeps the choice stable if it ever does not.
+            sessions.sort_by(|(left, _), (right, _)| left.metadata.name.cmp(&right.metadata.name));
             // The crew's TerminalSession, not the Convoy, decides where attach routes.
             let mut reachable = None;
             for (session, provenance) in sessions {
