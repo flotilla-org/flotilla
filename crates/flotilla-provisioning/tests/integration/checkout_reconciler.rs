@@ -1728,7 +1728,10 @@ async fn terminal_owner_reserves_no_branch_in_non_continued_member_repo() {
     let new = checkouts.create(&labelled("new-checkout", "new-owner"), &spec("/checkout/new")).await.expect("new");
     let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend.clone(), NAMESPACE);
     let live = reconciler.prepare(&new).await.expect("live");
-    assert!(matches!(live, CheckoutPrepared::Failed(_)), "live owner reserves the branch");
+    assert!(
+        matches!(&live, CheckoutPrepared::Failed(message) if message.contains("conflicts with Checkout old-checkout")),
+        "live owner reserves the branch"
+    );
     let old = convoys.get("old-owner").await.expect("owner");
     convoys
         .update_status("old-owner", &old.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() })
