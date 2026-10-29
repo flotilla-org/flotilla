@@ -602,7 +602,8 @@ pub fn rehearse_accounts(
 /// them into `target`, bindings first, so each provision's reference finds its binding (ADR 0047:
 /// the previous generation's records decode). A binding takes its engine name from its requester
 /// and opening; a provision is re-pointed at that name. Counted by kind and state; refusals are
-/// named. Records of a home `target` does not import are left to that home.
+/// named. Every home's bindings name the bindings provisions point at, but only the records of a
+/// home `target` imports are written: another home's are left to that home.
 pub fn import_accounts(
     bindings: &[(flotilla_resources::ResourceObject<flotilla_resources::AccountBinding>, String)],
     provisions: &[(flotilla_resources::ResourceObject<flotilla_resources::AccountProvision>, String)],
@@ -617,21 +618,30 @@ pub fn import_accounts(
     let mut renamed = BTreeMap::new();
     let mut taken = BTreeSet::new();
     for (old, home) in bindings {
-        if !target.imports(home) {
-            continue;
-        }
         let refuse = |reason: String| ImportRefusal { kind: "AccountBinding", record: old.metadata.name.clone(), reason };
         // An r879 binding's home-key label (#3953) is dropped (ADR 0047).
         let spec = binding_spec(&old.spec);
-        let Some(requester) = requester_name(&spec) else {
-            report.refused.push(refuse(format!("requester `{}` names no convoy and role", spec.requester)));
-            continue;
+        let named = requester_name(&spec)
+            .ok_or_else(|| format!("requester `{}` names no convoy and role", spec.requester))
+            .map(|requester| engine_binding_name(&requester, spec.opened_at))
+            .and_then(|name| match taken.insert((home.clone(), name.clone())) {
+                true => Ok(name),
+                false => Err(format!("another binding of its requester opened at the same time already imports as `{name}`")),
+            });
+        let imported = target.imports(home);
+        let name = match named {
+            Ok(name) if !imported => {
+                renamed.insert((home.clone(), old.metadata.name.clone()), (home.clone(), name));
+                continue;
+            }
+            Ok(name) => name,
+            Err(reason) => {
+                if imported {
+                    report.refused.push(refuse(reason));
+                }
+                continue;
+            }
         };
-        let name = engine_binding_name(&requester, spec.opened_at);
-        if !taken.insert((home.clone(), name.clone())) {
-            report.refused.push(refuse(format!("another binding of its requester opened at the same time already imports as `{name}`")));
-            continue;
-        }
         let state = binding_state(&old.spec.state.value);
         let label = match state {
             BindingState::Open => "open",
@@ -661,7 +671,10 @@ pub fn import_accounts(
         // A daemon's own records list without an origin root; a provision names its binding's
         // home by node id, so a binding listed as this daemon's is found by name alone.
         let named = renamed.get(&(old.spec.binding.home.clone(), old.spec.binding.name.clone())).or_else(|| {
-            let mut local = renamed.iter().filter(|((_, held), _)| *held == old.spec.binding.name).map(|(_, renamed)| renamed);
+            let mut local = renamed
+                .iter()
+                .filter(|((held_home, held), _)| *held == old.spec.binding.name && target.imports(held_home))
+                .map(|(_, renamed)| renamed);
             local.next().filter(|_| local.next().is_none())
         });
         let Some((binding_home, binding)) = named else {
@@ -673,7 +686,13 @@ pub fn import_accounts(
         let mut spec = provision_spec(&old.spec);
         spec.binding = Ref::new(binding.clone(), binding_home.clone());
         let label = if spec.delivered.is_some() { "delivered" } else { "recorded" };
-        match target.holds::<Resource<AccountBinding>>(&spec.binding.name, &spec.binding.home) {
+        // Another home's binding arrives by replication; the reference creates its identity.
+        let restored = if target.imports(&spec.binding.home) {
+            target.holds::<Resource<AccountBinding>>(&spec.binding.name, &spec.binding.home)
+        } else {
+            Ok(true)
+        };
+        match restored {
             Ok(true) => {}
             Ok(false) => {
                 report.refused.push(refuse(format!("its binding `{}` at `{}` is not restored", spec.binding.name, spec.binding.home)));
