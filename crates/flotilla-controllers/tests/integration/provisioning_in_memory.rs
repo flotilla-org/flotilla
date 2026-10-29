@@ -22,11 +22,12 @@ use flotilla_provisioning::reconcilers::{
     CloneRuntime, EnvironmentProvisioning, EnvironmentReconciler, EnvironmentRuntime, PreparedCheckout,
 };
 use flotilla_resources::{
-    canonicalize_repo_url, clone_key, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone,
-    ClonePhase, CloneSpec, CloneStatus, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec,
+    canonicalize_repo_url, clone_key, Actuation, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec,
+    Clone, ClonePhase, CloneSpec, CloneStatus, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec,
     DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, Host,
-    HostDirectEnvironmentSpec, HostSpec, HostStatus, Repository, RepositorySpec, ResourceError, ResourceObject, TerminalSession,
-    TerminalSessionPhase, TerminalSessionTarget, Vessel, VesselPhase, VesselRequirement, VESSEL_REF_LABEL,
+    HostDirectEnvironmentSpec, HostSpec, HostStatus, InputMeta, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec,
+    Repository, RepositorySpec, ResourceError, ResourceObject, TerminalSession, TerminalSessionPhase, TerminalSessionTarget, Vessel,
+    VesselPhase, VesselRequirement, VESSEL_REF_LABEL,
 };
 use flotilla_store::{
     controller::{ControllerLoop, ReconcileOutcome, Reconciler},
@@ -289,6 +290,71 @@ async fn controller_loops_drive_host_direct_workspace_to_ready() {
         "steady-state reconciliation must not create new resource versions"
     );
     assert_eq!(steady.status.expect("steady workspace status").ready_at, status.ready_at);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_project_gaining_a_member_leaves_a_running_convoys_checkouts_unchanged() {
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    create_ready_host(&backend, "01HXYZ").await;
+    create_ready_host_direct_environment(&backend, NAMESPACE, "01HXYZ", "/Users/alice/dev/flotilla-repos").await;
+    create_host_direct_kind(&backend, NAMESPACE, "kind-a", "01HXYZ", "cleat").await;
+    let repository_url = "https://github.com/flotilla-org/flotilla";
+    let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-a", "implement", repository_url, "fix/members").await;
+    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+    let mut spec = convoy.spec.clone();
+    spec.project_ref = Some("suite".to_string());
+    convoys.update(&InputMeta::from(&convoy.metadata), &convoy.metadata.resource_version, &spec).await.expect("bind project");
+    let admitted = convoy.spec.repositories.clone();
+    let projects = backend.clone().using::<Project>(NAMESPACE);
+    let member = |repo| {
+        ProjectRepositorySpec::builder().repo(repo).roles([ProjectRepositoryRole::Code].into()).default_branch("main".into()).build()
+    };
+    projects
+        .create(
+            &controller_meta().name("suite").call(),
+            &ProjectSpec::builder().display_name("Suite".into()).repositories(vec![member(admitted[0].repo_ref.clone())]).build(),
+        )
+        .await
+        .expect("project create");
+    create_workspace(&backend, NAMESPACE, "workspace-a", "convoy-a", "implement", "kind-a", repository_url).await;
+
+    let harness = full_controller_harness(backend.clone());
+    let vessels = backend.clone().using::<Vessel>(NAMESPACE);
+    harness
+        .wait_until(Duration::from_secs(3), || {
+            let vessels = vessels.clone();
+            async move {
+                matches!(
+                    vessels.get("workspace-a").await.ok().and_then(|vessel| vessel.status).map(|status| status.phase),
+                    Some(VesselPhase::Ready)
+                )
+            }
+        })
+        .await;
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    let checkout_names =
+        |items: Vec<ResourceObject<Checkout>>| items.into_iter().map(|checkout| checkout.metadata.name).collect::<Vec<_>>();
+    let before = checkout_names(checkouts.list().await.expect("checkouts").items);
+    assert_eq!(before, ["checkout-convoy-a"]);
+
+    let added = RepositorySpec::remote("https://github.com/flotilla-org/binnacle").expect("added repository");
+    flotilla_store::ensure_repository(&backend.clone().using::<Repository>(NAMESPACE), &added.key(), &added)
+        .await
+        .expect("added repository");
+    let project = projects.get("suite").await.expect("project");
+    let mut grown = project.spec.clone();
+    grown.repositories.push(member(added.key()));
+    projects.update(&InputMeta::from(&project.metadata), &project.metadata.resource_version, &grown).await.expect("project gains a member");
+
+    let vessel = vessels.get("workspace-a").await.expect("vessel");
+    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let outcome = reconciler.reconcile(&vessel, &reconciler.prepare(&vessel).await.expect("vessel dependencies"), Utc::now());
+    assert!(outcome.actuations.iter().all(|actuation| !matches!(actuation, Actuation::CreateCheckout { .. })), "{:?}", outcome.actuations);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(checkout_names(checkouts.list().await.expect("checkouts").items), before);
+    assert_eq!(convoys.get("convoy-a").await.expect("convoy").spec.repositories, admitted);
 
     harness.shutdown().await;
 }

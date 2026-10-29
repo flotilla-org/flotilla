@@ -6290,8 +6290,42 @@ impl flotilla_crew::ports::CheckoutIntegrationInspector for CheckoutInspector {
         checkout: &ResourceObject<ResourceCheckout>,
     ) -> Result<flotilla_resources::CheckoutIntegrationStatus, String> {
         let daemon = self.0.upgrade().ok_or("checkout inspector daemon unavailable")?;
+        if let Some(env_ref) = checkout.spec.env_ref().filter(|env_ref| daemon.resolve_environment_ref(env_ref).is_none()) {
+            return Err(daemon.unreachable_checkout_environment(&checkout.metadata.namespace, env_ref).await);
+        }
         let forges = daemon.checkout_integration_forges(&convoy.metadata.namespace).await?;
         daemon.inspect_resource_checkout_integration(checkout, Some(convoy), &forges).await
+    }
+}
+
+impl InProcessDaemon {
+    /// Delete runs at the convoy's home, so name the host that owns an environment it cannot reach.
+    async fn unreachable_checkout_environment(&self, namespace: &str, env_ref: &str) -> String {
+        // The owner's Environment and Host usually reach the convoy's home only as replicas.
+        let by_name = |name: &str| flotilla_store::StoreQuery {
+            fields: BTreeMap::from([("metadata.name".into(), name.into())]),
+            include_replicas: true,
+            ..Default::default()
+        };
+        let host_ref = match self.resource_backend.query_declared::<flotilla_resources::Environment>(namespace, &by_name(env_ref)).await {
+            Ok(found) => found.items.into_iter().find_map(|source| source.object.spec.host_ref().map(str::to_string)),
+            Err(error) => {
+                tracing::warn!(%env_ref, %error, "could not read checkout environment owner");
+                None
+            }
+        };
+        let Some(host_ref) = host_ref else {
+            return format!("checkout environment {env_ref} is unavailable on this host and its owning host is unknown");
+        };
+        let display = match self.resource_backend.query_declared::<flotilla_resources::Host>(namespace, &by_name(&host_ref)).await {
+            Ok(found) => found.items.into_iter().map(|source| source.object.spec.display_name).find(|name| !name.is_empty()),
+            Err(error) => {
+                tracing::warn!(%host_ref, %error, "could not read checkout environment owner's host");
+                None
+            }
+        };
+        let host = display.map_or_else(|| host_ref.clone(), |display| format!("{display} ({host_ref})"));
+        format!("checkout environment {env_ref} belongs to host {host}, not this host; it can only be inspected there")
     }
 }
 
