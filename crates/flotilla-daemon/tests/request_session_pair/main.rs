@@ -2850,6 +2850,98 @@ async fn mistargeted_convoy_delete_routes_to_remote_home() {
 }
 
 #[tokio::test]
+async fn active_convoy_delete_names_the_host_owning_an_unreachable_checkout_environment() {
+    let leader = empty_daemon_named("leader").await;
+    let follower = empty_daemon_named("follower").await;
+    let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
+    let namespace = "flotilla";
+    let convoy_name = "remote-checkout";
+    let home = topology.follower.resource_backend();
+
+    let convoys = home.clone().using::<Convoy>(namespace);
+    let convoy = convoys.create(&convoy_meta(convoy_name, convoy_name), &convoy_spec("scratch", convoy_name)).await.expect("convoy");
+    convoys
+        .update_status(
+            convoy_name,
+            &convoy.metadata.resource_version,
+            &ConvoyStatus { phase: ResourceConvoyPhase::Active, ..Default::default() },
+        )
+        .await
+        .expect("active convoy");
+    let owner = "01HFETA";
+    let env_ref = flotilla_resources::host_direct_environment_name(owner);
+    home.clone()
+        .using::<Host>(namespace)
+        .create(&InputMeta::builder().name(owner.to_string()).build(), &HostSpec { display_name: "feta".into(), ..HostSpec::default() })
+        .await
+        .expect("owning host");
+    home.clone()
+        .using::<flotilla_resources::Environment>(namespace)
+        .create(
+            &InputMeta::builder().name(env_ref.clone()).build(),
+            &flotilla_resources::EnvironmentSpec {
+                host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec {
+                    host_ref: owner.into(),
+                    repo_default_dir: "/srv/repos".into(),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("owning host's environment");
+    let checkouts = home.clone().using::<Checkout>(namespace);
+    let checkout = checkouts
+        .create(
+            &InputMeta::builder()
+                .name("checkout-remote".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy_name.to_string())]))
+                .build(),
+            &CheckoutSpec::Worktree(
+                flotilla_resources::CheckoutWorktreeSpec::builder()
+                    .repo_ref(RepositoryKey("repo".into()))
+                    .env_ref(env_ref.clone())
+                    .r#ref("topic".into())
+                    .target_path("/srv/repos/topic".into())
+                    .clone_ref("clone".into())
+                    .build(),
+            ),
+        )
+        .await
+        .expect("checkout");
+    checkouts
+        .update_status(
+            "checkout-remote",
+            &checkout.metadata.resource_version,
+            &CheckoutStatus { phase: CheckoutPhase::Ready, path: Some("/srv/repos/topic".into()), ..Default::default() },
+        )
+        .await
+        .expect("ready checkout");
+    apply_convoy_replica_feed(&topology.leader, namespace, convoy_name, topology.follower_host.clone()).await;
+
+    let mut rx = topology.leader.subscribe();
+    let command_id = topology
+        .client
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: Some(namespace.to_string()), name: convoy_name.to_string(), force: false })
+                .build(),
+        )
+        .await
+        .expect("dispatch convoy delete");
+
+    let CommandValue::Error { message } = await_command_result(&mut rx, command_id).await else {
+        panic!("delete of an uninspectable checkout must be refused");
+    };
+    assert!(
+        message.contains(&format!(
+            "fresh inspection failed for checkout checkout-remote: checkout environment {env_ref} belongs to host feta ({owner})"
+        )),
+        "{message}"
+    );
+    convoys.get(convoy_name).await.expect("refused delete keeps the convoy at its home");
+}
+
+#[tokio::test]
 async fn hostless_convoy_abandon_routes_to_remote_home() {
     let leader = empty_daemon_named("leader").await;
     let follower = empty_daemon_named("follower").await;
