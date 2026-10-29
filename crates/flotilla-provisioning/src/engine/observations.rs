@@ -8,7 +8,7 @@
 //! which case they were last confirmed when they started to fail.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::Duration,
 };
@@ -128,7 +128,7 @@ struct Resident {
     follower: Follower,
     records: Records,
     /// Records already reported as not encoding, by kind, name, home and version: each is reported once.
-    warned: std::collections::BTreeSet<(&'static str, String, String, u64)>,
+    warned: BTreeSet<(&'static str, String, String, u64)>,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
