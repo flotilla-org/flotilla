@@ -1299,6 +1299,45 @@ impl DummyDaemon {
             .build();
         let record = flotilla_provisioning::stored::artifact::ArtifactRecord::from_spec(&artifact).expect("artifact");
         log.create("transport-artifact", &record, &change).expect("artifact record");
+        // #3824 layer 5a: one record of each forge observation.
+        use flotilla_provisioning::stored::forge_observation::{ChangeRequestRecord, ForgeReadRecord, IssueRecord, IssueState, ReadValue};
+        let change_request = ChangeRequestRecord {
+            service: "github.com".into(),
+            scope: "transport/app".into(),
+            number: 1,
+            title: Some("transport".into()),
+            author: None,
+            state: Some(flotilla_provisioning::stored::forge_observation::ChangeRequestState::Open),
+            review_decision: None,
+            review_requested_from_owner: None,
+            head_sha: Some("abc".into()),
+            checks: None,
+            actionable_at_head: None,
+            mergeable: None,
+            failing_since: None,
+        };
+        log.create("transport-cr", &change_request, &change).expect("change request record");
+        let issue = IssueRecord {
+            service: "github.com".into(),
+            scope: "transport/app".into(),
+            number: 2,
+            title: Some("transport".into()),
+            assignees: Some(Vec::new()),
+            state: Some(IssueState::Open),
+            labels: None,
+            updated_at: Some(at),
+            failing_since: None,
+        };
+        log.create("transport-issue", &issue, &change).expect("issue record");
+        let read = ForgeReadRecord {
+            service: "https://github.com".into(),
+            scope: "transport/app".into(),
+            request: flotilla_resources::ForgeReadRequest::Board,
+            value: Some(ReadValue { value: serde_json::Value::Null }),
+            error: None,
+            retry_at: None,
+        };
+        log.create("transport-forge-read", &read, &change).expect("forge read record");
     }
 
     fn transport_binding(&self, at: flotilla_schema::Timestamp) -> flotilla_provisioning::stored::account::BindingSpec {
@@ -1407,6 +1446,9 @@ impl DummyDaemon {
                 collect!(stored flotilla_provisioning::stored::project::ProjectDefinition);
                 collect!(stored flotilla_provisioning::stored::project::ProjectOpsRecord);
                 collect!(stored flotilla_provisioning::stored::artifact::ArtifactRecord);
+                collect!(stored flotilla_provisioning::stored::forge_observation::ChangeRequestRecord);
+                collect!(stored flotilla_provisioning::stored::forge_observation::IssueRecord);
+                collect!(stored flotilla_provisioning::stored::forge_observation::ForgeReadRecord);
                 collect!(stored flotilla_provisioning::stored::placement::FulfilmentKindDefinition);
                 assert_eq!(covered, registered, "every registered engine kind needs a transport fixture");
                 Ok(snapshots)
