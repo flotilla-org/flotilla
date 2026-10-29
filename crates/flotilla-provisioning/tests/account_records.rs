@@ -241,3 +241,52 @@ async fn an_engine_rebind_that_cannot_open_leaves_the_binding_open() {
     assert!(bound.spec.state.value.is_open());
     assert_eq!(bound.spec.credential.0, "cred-1");
 }
+
+fn engine_home(home: &str) -> flotilla_engine_store::Import {
+    let mut kinds = flotilla_schema::KindRegistry::new();
+    flotilla_provisioning::stored::account::register(&mut kinds).expect("register");
+    flotilla_engine_store::Import::in_memory(home, kinds).expect("store")
+}
+
+#[test]
+fn a_provision_naming_another_homes_binding_imports_at_both_homes() {
+    use flotilla_engine_store::ImportTarget;
+    use flotilla_provisioning::{
+        engine::{account::import_accounts, import::ImportReport},
+        stored::account::{AccountBinding, ProvisionSpec},
+    };
+    use flotilla_schema::Kind;
+    use flotilla_state_machines::Resource;
+    type Binding = Resource<AccountBinding>;
+    let open = pending("convoy-a", "coder", "cred-1", 10);
+    let bindings = vec![old_binding(&open.name, open.clone(), BindingState::Open, "udder")];
+    let provisions = vec![
+        (object("prov-1", provision(&open.name, "udder", Some("g1"))), "feta".to_owned()),
+        (object("prov-2", provision("unlisted", "udder", None)), "feta".to_owned()),
+    ];
+    let mut udder = engine_home("udder");
+    let mut feta = engine_home("feta");
+    let mut udder_report = ImportReport::default();
+    let mut feta_report = ImportReport::default();
+    import_accounts(&bindings, &provisions, &mut udder, &mut udder_report);
+    import_accounts(&bindings, &provisions, &mut feta, &mut feta_report);
+
+    assert_eq!(udder_report.imported, BTreeMap::from([(("AccountBinding", "open"), 1)]));
+    assert!(udder_report.refused.is_empty(), "{:?}", udder_report.refused);
+    assert_eq!(feta_report.imported, BTreeMap::from([(("AccountProvision", "delivered"), 1)]));
+    let refused: Vec<_> = feta_report.refused.iter().map(|refusal| (refusal.kind, refusal.record.as_str())).collect();
+    assert_eq!(refused, [("AccountProvision", "prov-2")]);
+
+    let mut feta_read = feta.store().read().expect("read");
+    let id = feta_read.resolve(ProvisionSpec::CODE, "prov-1", "feta").expect("resolve").expect("provision imported");
+    let reference = feta_read.load::<ProvisionSpec>(id).expect("load").expect("provision").value.binding;
+    let identity = feta_read.resolve(Binding::CODE, &reference.name, &reference.home).expect("resolve");
+    assert!(identity.is_some(), "the reference holds the binding's identity");
+    drop(feta_read);
+    assert!(!feta.holds::<Binding>(&reference.name, &reference.home).expect("holds"), "the binding arrives by replication");
+
+    let mut udder_read = udder.store().read().expect("read");
+    let id = udder_read.resolve(Binding::CODE, &reference.name, &reference.home).expect("resolve").expect("binding at the reference");
+    assert!(udder_read.load::<Binding>(id).expect("load").is_some());
+    assert_eq!(udder_read.resolve(ProvisionSpec::CODE, "prov-1", "feta").expect("resolve"), None);
+}
