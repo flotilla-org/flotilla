@@ -10,6 +10,7 @@
 //! [`STEPS`] lists the importers in the order they write, each with the old kinds it imports;
 //! every kind [`plan::PLAN`] marks imported has exactly one.
 
+mod attentions;
 mod convoys;
 mod definitions;
 mod lifecycle;
@@ -157,6 +158,8 @@ impl Source {
 struct Carried {
     /// Each imported message's engine reference and inbox, by namespace and old record name.
     messages: BTreeMap<(String, String), (flotilla_state_machines::machines::message::MessageRef, flotilla_address::Address)>,
+    /// The last admission sequence the imported messages took, by home.
+    admitted: BTreeMap<String, u64>,
 }
 
 /// One importer: the old kinds it imports, by plural, and its writes.
@@ -176,6 +179,7 @@ pub const STEPS: &[Step] = &[
     Step { name: "forge observations", kinds: &observations::KINDS, run: observations::observations },
     Step { name: "accounts", kinds: &records::ACCOUNT_KINDS, run: records::accounts },
     Step { name: "messages", kinds: &["messages"], run: messages::messages },
+    Step { name: "attentions", kinds: &["demands"], run: attentions::attentions },
     Step { name: "convoys", kinds: &["convoys"], run: convoys::convoys },
     Step { name: "lifecycles", kinds: &lifecycle::KINDS, run: lifecycle::lifecycles },
 ];

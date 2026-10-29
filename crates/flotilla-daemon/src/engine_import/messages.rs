@@ -12,7 +12,7 @@ use flotilla_core::primitives::{
 };
 use flotilla_engine_store::{Import, ImportTarget};
 use flotilla_provisioning::engine::import::{ImportRefusal, ImportReport};
-use flotilla_resources::{Artifact, Convoy, FleetDesignation, Forge, Message, Project, Repository, TerminalSession};
+use flotilla_resources::{Artifact, Convoy, FleetDesignation, Forge, Message, Project, Repository, ResourceObject, TerminalSession};
 use flotilla_state_machines::machines::message::MessageRef;
 
 use super::{Carried, Source};
@@ -35,13 +35,7 @@ fn namespace_messages(source: &Source, namespace: &str, target: &mut Import, car
         return;
     }
     // Conversion needs the fleet's roles: without them no message is imported, rather than a partial set.
-    let designation = source.context::<FleetDesignation>("fleetdesignations", Some(namespace)).into_iter().next();
-    let roles = match designation {
-        Some(designation) => FleetRoles::from_designation(&designation.object.spec),
-        None if source.of("fleetdesignations", Some(namespace)).next().is_some() => Err("its FleetDesignation does not decode".to_owned()),
-        None => Err("no FleetDesignation names the fleet".to_owned()),
-    };
-    let roles = match roles {
+    let roles = match fleet_roles(source, namespace) {
         Ok(roles) => roles,
         Err(reason) => {
             if messages.iter().any(|(_, home)| target.imports(home)) {
@@ -61,15 +55,7 @@ fn namespace_messages(source: &Source, namespace: &str, target: &mut Import, car
             ))
         })
         .collect();
-    let records = OldStoreRecords::from_records(
-        namespace,
-        source.context::<Forge>("forges", Some(namespace)).into_iter().map(|forge| forge.object.spec).collect(),
-        source.context::<Convoy>("convoys", Some(namespace)).into_iter().map(|convoy| convoy.object).collect(),
-        terminals.into_iter().map(|terminal| terminal.object).collect(),
-        source.context::<Artifact>("artifacts", Some(namespace)).into_iter().map(|artifact| artifact.object).collect(),
-        source.context::<Repository>("repositories", Some(namespace)).into_iter().map(|repository| repository.object).collect(),
-        source.context::<Project>("projects", Some(namespace)).into_iter().map(|project| project.object).collect(),
-    );
+    let records = old_store_records(source, namespace, terminals.into_iter().map(|terminal| terminal.object).collect());
     let conversion = Conversion { roles: &roles, forges: &records.forges, records: &records };
     let world = ReadRecords {
         messages: messages.iter().map(|(record, home)| (record.metadata.name.clone(), (record, home.clone()))).collect(),
@@ -87,6 +73,8 @@ fn namespace_messages(source: &Source, namespace: &str, target: &mut Import, car
         })
         .collect();
     for message in &imported {
+        let admitted = carried.admitted.entry(message.home.clone()).or_default();
+        *admitted = (*admitted).max(message.resource.version().0);
         carried.messages.insert(
             (namespace.to_owned(), message.record.clone()),
             (MessageRef::new(message.resource.name(), &message.home), message.resource.spec().inbox.clone()),
@@ -115,4 +103,26 @@ fn namespace_messages(source: &Source, namespace: &str, target: &mut Import, car
         record: refusal.record,
         reason: refusal.reason,
     }));
+}
+
+/// The fleet's roles, from the namespace's FleetDesignation.
+pub(super) fn fleet_roles(source: &Source, namespace: &str) -> Result<FleetRoles, String> {
+    match source.context::<FleetDesignation>("fleetdesignations", Some(namespace)).into_iter().next() {
+        Some(designation) => FleetRoles::from_designation(&designation.object.spec),
+        None if source.of("fleetdesignations", Some(namespace)).next().is_some() => Err("its FleetDesignation does not decode".to_owned()),
+        None => Err("no FleetDesignation names the fleet".to_owned()),
+    }
+}
+
+/// The records of `namespace` a message's addresses are read from.
+pub(super) fn old_store_records(source: &Source, namespace: &str, terminals: Vec<ResourceObject<TerminalSession>>) -> OldStoreRecords {
+    OldStoreRecords::from_records(
+        namespace,
+        source.context::<Forge>("forges", Some(namespace)).into_iter().map(|forge| forge.object.spec).collect(),
+        source.context::<Convoy>("convoys", Some(namespace)).into_iter().map(|convoy| convoy.object).collect(),
+        terminals,
+        source.context::<Artifact>("artifacts", Some(namespace)).into_iter().map(|artifact| artifact.object).collect(),
+        source.context::<Repository>("repositories", Some(namespace)).into_iter().map(|repository| repository.object).collect(),
+        source.context::<Project>("projects", Some(namespace)).into_iter().map(|project| project.object).collect(),
+    )
 }

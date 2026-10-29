@@ -571,9 +571,7 @@ pub(super) fn spawn_codex_central_refresh_task(env: Arc<dyn EnvVars>, interval: 
     })
 }
 
-pub(super) const CREDENTIAL_REFRESH_REASON_ANNOTATION: &str = "flotilla.work/credential-refresh-reason";
-
-pub(super) const CREDENTIAL_REFRESH_VESSEL_ANNOTATION: &str = "flotilla.work/credential-refresh-vessel";
+pub(super) use flotilla_resources::{CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION};
 
 pub(super) async fn reconcile_credential_refresh_attention(
     daemon: &InProcessDaemon,

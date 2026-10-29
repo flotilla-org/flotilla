@@ -580,7 +580,7 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
 
 pub(super) const RECLAIM_REFUSAL_ATTENTION_AFTER: u64 = 3;
 
-pub(super) const RECLAIM_REFUSAL_REASON_ANNOTATION: &str = "flotilla.work/reclaim-refusal-reason";
+pub(super) use flotilla_resources::RECLAIM_REFUSAL_REASON_ANNOTATION;
 
 pub(super) const RECONCILE_NOW_ANNOTATION: &str = "flotilla.work/reconcile-now-at";
 

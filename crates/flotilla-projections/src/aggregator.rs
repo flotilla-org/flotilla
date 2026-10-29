@@ -35,8 +35,8 @@ use flotilla_resources::{
     Demand, DemandAddressee, DemandState, Environment, FulfilmentKind, FulfilmentRealisation, PlacementPolicy, Project, ReadResourceObject,
     ReadWatchEvent, Regard, RegardExpiryPolicy, Repository, Resource, ResourceError, ResourceObject, ResourceProvenance, StallRung,
     StalledCondition, TerminalAttention, TerminalAttentionState, TerminalSession, TerminalSessionPhase, Vessel, VesselPhase,
-    VesselRequirement, WatchEvent, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL,
-    ROLE_LABEL, VESSEL_LABEL,
+    VesselRequirement, WatchEvent, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, RECLAIM_REFUSAL_REASON_ANNOTATION,
+    REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{ReadResourceList, ResourceList, WatchStart};
@@ -127,7 +127,6 @@ enum LocalSource {
 }
 
 const LOCAL_SOURCE_PRECEDENCE: [LocalSource; 2] = [LocalSource::Durable, LocalSource::Observed];
-const RECLAIM_REFUSAL_REASON_ANNOTATION: &str = "flotilla.work/reclaim-refusal-reason";
 
 #[async_trait]
 pub trait AttachCapabilityResolver: Send + Sync {
@@ -2768,7 +2767,7 @@ impl Aggregator {
                     && target.name == resource.name
                     && (demand.metadata.annotations.contains_key(RECLAIM_REFUSAL_REASON_ANNOTATION)
                         || demand.metadata.annotations.contains_key(ENSURE_CONFIG_DRIFT_REASON_ANNOTATION)
-                        || demand.metadata.annotations.contains_key("flotilla.work/credential-refresh-reason"))
+                        || demand.metadata.annotations.contains_key(flotilla_resources::CREDENTIAL_REFRESH_REASON_ANNOTATION))
             })
             .min_by_key(|demand| {
                 (if demand.metadata.annotations.contains_key(RECLAIM_REFUSAL_REASON_ANNOTATION) { 0 } else { 1 }, &demand.metadata.name)
@@ -2845,7 +2844,7 @@ impl Aggregator {
                                 .annotations
                                 .get(RECLAIM_REFUSAL_REASON_ANNOTATION)
                                 .or_else(|| demand.metadata.annotations.get(ENSURE_CONFIG_DRIFT_REASON_ANNOTATION))
-                                .or_else(|| demand.metadata.annotations.get("flotilla.work/credential-refresh-reason"))
+                                .or_else(|| demand.metadata.annotations.get(flotilla_resources::CREDENTIAL_REFRESH_REASON_ANNOTATION))
                                 .cloned()
                         })
                     })
@@ -3149,7 +3148,7 @@ impl Aggregator {
             .maybe_finished_at(state.and_then(|state| state.finished_at))
             .maybe_message(loss_reason.or_else(|| {
                 credential_attention
-                    .and_then(|demand| demand.metadata.annotations.get("flotilla.work/credential-refresh-reason").cloned())
+                    .and_then(|demand| demand.metadata.annotations.get(flotilla_resources::CREDENTIAL_REFRESH_REASON_ANNOTATION).cloned())
                     .or_else(|| {
                         state
                             .filter(|state| state.phase == ResourceWorkPhase::Interrupted)
@@ -3600,7 +3599,10 @@ mod tests {
             status: None,
         };
         demand.metadata.annotations = BTreeMap::from([
-            ("flotilla.work/credential-refresh-reason".to_string(), "credential `github-app` failed; expires in 120 seconds".to_string()),
+            (
+                flotilla_resources::CREDENTIAL_REFRESH_REASON_ANNOTATION.to_string(),
+                "credential `github-app` failed; expires in 120 seconds".to_string(),
+            ),
             ("flotilla.work/credential-refresh-vessel".to_string(), "implement".to_string()),
         ]);
         aggregator.apply_demand_event(WatchEvent::Added(demand.clone())).await;
@@ -3612,10 +3614,10 @@ mod tests {
 
         let mut second_credential = demand.clone();
         second_credential.metadata.name = "credential-refresh-vessel-zed".to_string();
-        second_credential
-            .metadata
-            .annotations
-            .insert("flotilla.work/credential-refresh-reason".to_string(), "credential `zed` failed; expires in 1 minute".to_string());
+        second_credential.metadata.annotations.insert(
+            flotilla_resources::CREDENTIAL_REFRESH_REASON_ANNOTATION.to_string(),
+            "credential `zed` failed; expires in 1 minute".to_string(),
+        );
         aggregator.apply_demand_event(WatchEvent::Added(second_credential.clone())).await;
         let result_set = state.result_set().await;
         assert!(result_set.rows.as_convoys().expect("convoy rows")[0].vessels[0]
