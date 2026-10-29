@@ -98,15 +98,22 @@ async fn connect(feta_on: bool, kiwi_on: bool) -> Pair {
 
     let dialer_node = kiwi.node_id().clone();
     let mut listener_admitted = false;
-    for _ in 0..50 {
-        listener_admitted = peer_manager.lock().await.current_generation(&dialer_node).is_some();
-        if listener_admitted {
-            break;
+    if dialer.is_err() {
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("listener finishes the refused connection")
+            .expect("listener task");
+    } else {
+        for _ in 0..50 {
+            listener_admitted = peer_manager.lock().await.current_generation(&dialer_node).is_some();
+            if listener_admitted {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        server.abort();
     }
     drop(transport);
-    server.abort();
     Pair { dialer, listener_admitted }
 }
 

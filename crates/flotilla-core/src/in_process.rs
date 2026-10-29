@@ -2285,6 +2285,7 @@ impl InProcessDaemon {
         Arc::clone(&self.convoy_engine_path)
     }
 
+    /// Set once at init, before peers are built; not a runtime toggle.
     pub fn set_primitives_switch(&self, on: bool) {
         self.primitives_switch.store(on, std::sync::atomic::Ordering::Relaxed);
     }

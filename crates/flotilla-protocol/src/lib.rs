@@ -634,6 +634,21 @@ pub fn primitives_mismatch(peer: &str, peer_on: bool, local_on: bool) -> Option<
     (peer_on != local_on).then(|| format!("peer {peer} has [primitives] {}, this host has it {}", word(peer_on), word(local_on)))
 }
 
+#[cfg(test)]
+mod primitives_mismatch_tests {
+    use super::*;
+
+    #[test]
+    fn a_mismatch_reason_is_recognised_and_a_match_is_not() {
+        for (peer_on, local_on) in [(true, false), (false, true)] {
+            let reason = primitives_mismatch("feta", peer_on, local_on).expect("differs");
+            assert!(is_primitives_mismatch(&reason));
+        }
+        assert_eq!(primitives_mismatch("feta", true, true), None);
+        assert!(!is_primitives_mismatch("peer node id mismatch: expected a, got b"));
+    }
+}
+
 /// Whether a dial error is a [`primitives_mismatch`] refusal.
 pub fn is_primitives_mismatch(error: &str) -> bool {
     error.starts_with("peer ") && error.contains(" has [primitives] ")

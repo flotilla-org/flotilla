@@ -80,9 +80,11 @@ impl PeerConnection {
 
         if let Some(reason) = mismatch {
             warn!(peer = %node_id, %reason, "refusing peer");
-            self.daemon
-                .publish_peer_connection_status(&NodeInfo::new(node_id, display_name), PeerConnectionState::Rejected { reason })
-                .await;
+            if self.peer_manager.lock().await.current_generation(&node_id).is_none() {
+                self.daemon
+                    .publish_peer_connection_status(&NodeInfo::new(node_id, display_name), PeerConnectionState::Rejected { reason })
+                    .await;
+            }
             return;
         }
 
