@@ -356,7 +356,8 @@ impl Query {
                 (Value::String(value), ColumnType::Timestamp) => chrono::DateTime::parse_from_rfc3339(value).is_ok(),
                 (Value::String(value), ColumnType::Code(codes)) => codes.iter().any(|code| code.as_str() == value),
                 (Value::String(_), ColumnType::Text | ColumnType::Ref | ColumnType::Interned(_)) => true,
-                (Value::Number(value), ColumnType::Integer) => value.as_i64().is_some(),
+                (Value::Number(value), ColumnType::Integer) => value.is_i64() || value.is_u64(),
+                (Value::Number(_), ColumnType::Number) => true,
                 (Value::Bool(_), ColumnType::Bool) => true,
                 _ => false,
             };
@@ -367,15 +368,44 @@ impl Query {
         Ok(Some(cursor.values))
     }
 }
+fn rank(value: &Value) -> u8 {
+    match value {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Number(_) => 2,
+        Value::String(_) => 3,
+        Value::Array(_) => 4,
+        Value::Object(_) => 5,
+    }
+}
+fn compare_numbers(a: &serde_json::Number, b: &serde_json::Number) -> Ordering {
+    let integer = |n: &serde_json::Number| n.as_i64().map(i128::from).or_else(|| n.as_u64().map(i128::from));
+    match (integer(a), integer(b)) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        (Some(a), None) => compare_integer_float(a, b.as_f64().unwrap_or(f64::NAN)),
+        (None, Some(b)) => compare_integer_float(b, a.as_f64().unwrap_or(f64::NAN)).reverse(),
+        (None, None) => a.as_f64().partial_cmp(&b.as_f64()).unwrap_or(Ordering::Equal),
+    }
+}
+/// JSON carries no NaN, so the `unwrap_or` fallbacks above are unreachable.
+fn compare_integer_float(integer: i128, float: f64) -> Ordering {
+    const LIMIT: f64 = 1.7014118346046923e38;
+    if float >= LIMIT {
+        return Ordering::Less;
+    }
+    if float <= -LIMIT {
+        return Ordering::Greater;
+    }
+    let floor = float.floor();
+    integer.cmp(&(floor as i128)).then(if float > floor { Ordering::Less } else { Ordering::Equal })
+}
 fn compare(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
-        (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Null, _) => Ordering::Less,
-        (_, Value::Null) => Ordering::Greater,
         (Value::String(a), Value::String(b)) => a.cmp(b),
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
-        (Value::Number(a), Value::Number(b)) => a.as_i64().cmp(&b.as_i64()),
-        _ => a.to_string().cmp(&b.to_string()),
+        (Value::Number(a), Value::Number(b)) => compare_numbers(a, b),
+        // Same-rank arrays and objects tie-break on their text; other mismatched pairs order by rank.
+        _ => rank(a).cmp(&rank(b)).then_with(|| if rank(a) >= 4 { a.to_string().cmp(&b.to_string()) } else { Ordering::Equal }),
     }
 }
 fn row(value: &Value, table: &Table) -> Row {
@@ -978,6 +1008,77 @@ mod properties {
         assert_eq!(query.compare(&values, &query.values(&row)), Ordering::Equal);
         assert!(query.project(&row).contains_key(KEY));
         assert!(resumed.after("other-table").is_err());
+    }
+
+    #[test]
+    fn numbers_compare_exactly_at_integer_float_boundaries() {
+        assert_eq!(compare(&json!(u64::MAX), &json!(1.8446744073709552e19)), Ordering::Less);
+        assert_eq!(compare(&json!(i64::MAX), &json!(9.223372036854776e18)), Ordering::Less);
+        assert_eq!(compare(&json!(-0.0), &json!(0)), Ordering::Equal);
+        assert_eq!(compare(&json!(-0.0), &json!(0.0)), Ordering::Equal);
+    }
+
+    fn numeric_value(tc: &hegel::TestCase) -> Value {
+        use hegel::generators as gs;
+        match tc.draw(gs::integers::<u8>().min_value(0).max_value(5)) {
+            0 => Value::Null,
+            1 => json!(tc.draw(gs::integers::<i64>())),
+            2 => json!(tc.draw(gs::integers::<u64>().min_value(i64::MAX as u64))),
+            3 => json!(tc.draw(gs::integers::<i16>()) as f64 / 4.0),
+            4 => json!(tc.draw(gs::floats::<f64>().allow_nan(false).allow_infinity(false))),
+            _ => json!(tc.draw(gs::integers::<i64>().min_value(-(1 << 53)).max_value(1 << 53)) as f64),
+        }
+    }
+
+    #[hegel::test]
+    fn numeric_sort_orders_rows_and_cursors_page_every_row_once(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let mut table = descriptor("convoys");
+        let column = table.columns.iter_mut().find(|column| column.name == "status.phase").expect("phase column");
+        column.ty = ColumnType::Number;
+        column.nullable = true;
+        let descending = tc.draw(gs::booleans());
+        let limit = tc.draw(gs::integers::<usize>().min_value(1).max_value(5));
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(20));
+        let rows: Vec<Row> =
+            (0..count).map(|i| Row::from([(KEY.into(), json!(format!("r{i:02}"))), ("status.phase".into(), numeric_value(&tc))])).collect();
+        let sort = format!("{}status.phase", if descending { "-" } else { "" });
+        let mut query = Query::parse(&[("sort".into(), sort)], &table).unwrap_or_else(|_| panic!("valid query"));
+        query.limit = limit;
+
+        let mut sorted = rows.clone();
+        sorted.sort_by(|a, b| query.compare(&query.values(a), &query.values(b)));
+        let oracle = |row: &Row| {
+            let n = row["status.phase"].as_f64().unwrap_or(f64::NEG_INFINITY);
+            if descending {
+                -n
+            } else {
+                n
+            }
+        };
+        for pair in sorted.windows(2) {
+            assert!(oracle(&pair[0]) <= oracle(&pair[1]), "{:?} before {:?}", pair[0], pair[1]);
+        }
+
+        let mut seen = Vec::new();
+        let mut page_query = query.clone();
+        loop {
+            let snapshot = Snapshot { rows: rows.clone(), sequence: 1, incarnation: "same".into(), start: WatchStart::Now };
+            let messages = page("convoys", json!({"fields": []}), &page_query, &snapshot).unwrap();
+            let mut cursor = None;
+            for message in messages {
+                if let Message::Rows { rows, cursor: next, .. } = message {
+                    seen.extend(rows.iter().map(|row| row[KEY].clone()));
+                    cursor = next;
+                }
+            }
+            match cursor {
+                Some(cursor) => page_query.cursor = Some(cursor),
+                None => break,
+            }
+        }
+        let expected: Vec<_> = sorted.iter().map(|row| row[KEY].clone()).collect();
+        assert_eq!(seen, expected);
     }
 }
 fn resource_rows(document: &Value, table: &Table) -> Result<Vec<Row>, String> {
