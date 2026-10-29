@@ -5,17 +5,14 @@ use crate::FulfilmentRealisation;
 use flotilla_protocol::provider::{CheckoutStrategy, EnvironmentClass, MaterialMode, ProviderAdvertisement, ProviderReadiness};
 
 /// The provider classes that can realise `realisation`, and the checkout it takes.
-fn realised_by(realisation: &FulfilmentRealisation) -> (&'static str, fn(EnvironmentClass) -> bool, CheckoutStrategy) {
+fn realised_by(realisation: &FulfilmentRealisation) -> (&'static str, &'static [EnvironmentClass], CheckoutStrategy) {
+    const HOST_DIRECT: &[EnvironmentClass] = &[EnvironmentClass::HostDirect];
+    const PER_VESSEL: &[EnvironmentClass] = &[EnvironmentClass::Container, EnvironmentClass::MicroVm, EnvironmentClass::Dummy];
+    const CLOUD_SANDBOX: &[EnvironmentClass] = &[EnvironmentClass::CloudSandbox];
     match realisation {
-        FulfilmentRealisation::HostDirect => ("host-direct", |class| class == EnvironmentClass::HostDirect, CheckoutStrategy::HostWorktree),
-        FulfilmentRealisation::DockerPerVessel { .. } => (
-            "per-vessel",
-            |class| !matches!(class, EnvironmentClass::HostDirect | EnvironmentClass::CloudSandbox),
-            CheckoutStrategy::HostWorktree,
-        ),
-        FulfilmentRealisation::CloudSandboxPerVessel { .. } => {
-            ("cloud sandbox", |class| class == EnvironmentClass::CloudSandbox, CheckoutStrategy::CloneInVessel)
-        }
+        FulfilmentRealisation::HostDirect => ("host-direct", HOST_DIRECT, CheckoutStrategy::HostWorktree),
+        FulfilmentRealisation::DockerPerVessel { .. } => ("per-vessel", PER_VESSEL, CheckoutStrategy::HostWorktree),
+        FulfilmentRealisation::CloudSandboxPerVessel { .. } => ("cloud sandbox", CLOUD_SANDBOX, CheckoutStrategy::CloneInVessel),
     }
 }
 
@@ -38,7 +35,7 @@ pub fn match_provider<'a>(
         .iter()
         .filter(|provider| match instance {
             Some(instance) => provider.instance == instance,
-            None => class_of(provider).is_some_and(admits),
+            None => class_of(provider).is_some_and(|class| admits.contains(&class)),
         })
         .collect::<Vec<_>>();
     if identity_matches.is_empty() {
@@ -56,7 +53,7 @@ pub fn match_provider<'a>(
     let mut matching = Vec::new();
     let mut reasons = Vec::new();
     for provider in identity_matches {
-        let missing = match class_of(provider).filter(|class| !admits(*class)) {
+        let missing = match class_of(provider).filter(|class| !admits.contains(class)) {
             Some(class) => Some(format!("class {class:?} cannot realise a {strategy} kind")),
             None => missing_requirement(provider, checkout),
         };
