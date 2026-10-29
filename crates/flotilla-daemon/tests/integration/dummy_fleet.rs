@@ -67,6 +67,8 @@ impl DummyDaemon {
         #[builder(default = true)] primitives: bool,
         host: &str,
         #[builder(default)] restartable: bool,
+        #[builder(default = true)] designated: bool,
+        #[builder(default)] supervision: flotilla_daemon::supervisor::ControllerSupervision,
     ) -> Self {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let config_dir = dir.path().join("config");
@@ -107,19 +109,31 @@ impl DummyDaemon {
             namespace: NAMESPACE.into(),
             heartbeat_interval: Duration::from_secs(5),
             controller_resync_interval: resync,
+            controller_supervision: supervision,
             ..RuntimeOptions::default()
         };
         let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options).await.expect("runtime");
         let started = Self { daemon, fleet, _runtime: runtime, relay, _dir: dir };
-        started.seed().await;
+        started.seed(designated).await;
         started
+    }
+
+    async fn designate(&self) {
+        self.backend()
+            .definitions::<flotilla_resources::FleetDesignation>(NAMESPACE)
+            .create(
+                &InputMeta::builder().name(flotilla_resources::FLEET_DESIGNATION_NAME.to_string()).build(),
+                &flotilla_resources::FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
+            )
+            .await
+            .expect("fleet designation");
     }
 
     fn backend(&self) -> ResourceBackend {
         self.daemon.resource_backend()
     }
 
-    async fn seed(&self) {
+    async fn seed(&self, designated: bool) {
         let backend = self.backend();
         if self.daemon.message_primitives().is_some() {
             // Fleet identity and charter Project are declared independently.
@@ -136,15 +150,9 @@ impl DummyDaemon {
                 )
                 .await
                 .expect("fleet project");
-            backend
-                .clone()
-                .definitions::<flotilla_resources::FleetDesignation>(NAMESPACE)
-                .create(
-                    &InputMeta::builder().name(flotilla_resources::FLEET_DESIGNATION_NAME.to_string()).build(),
-                    &flotilla_resources::FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
-                )
-                .await
-                .expect("fleet designation");
+            if designated {
+                self.designate().await;
+            }
         }
         let host = backend.clone().using::<Host>(NAMESPACE).list().await.expect("hosts").items.into_iter().next().expect("local host");
         let forge = catalog::forge(&self.fleet.config().forge_service_url);
@@ -562,7 +570,54 @@ async fn on_the_engine_a_long_runner_exchanges_its_turns_before_landing() {
     fleet.assert_on_the_engine().await;
 }
 
+// Behaviour: with no FleetDesignation the controllers keep running and health names the missing
+// record; once it is recorded the waiting convoy delivers without a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_missing_fleet_designation_waits_and_delivery_resumes_when_it_arrives() {
+    let supervision = flotilla_daemon::supervisor::ControllerSupervision {
+        max_consecutive_failures: 2,
+        recovery_backoff: Duration::from_secs(3600),
+        initial_backoff: Duration::from_millis(10),
+        max_backoff: Duration::from_millis(10),
+        ..Default::default()
+    };
+    let fleet = DummyDaemon::start_with_relay().host("dummy-load").designated(false).supervision(supervision).call().await;
+    fleet.dispatch("undesignated", CrewMix::Coder).await;
+    let named = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let conditions = fleet.host_conditions().await;
+            if let Some(condition) = conditions.iter().find(|c| c.condition_type == "Message/FleetDesignation") {
+                return condition.message.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("health names the missing FleetDesignation");
+    assert!(named.contains("FleetDesignation `fleet` is missing"), "{named}");
+    let convoy = fleet.convoy("undesignated").await.expect("convoy");
+    let explained = fleet.daemon.explain_convoy_internal(Some(NAMESPACE), &convoy.metadata.name).await.expect("explain");
+    assert!(explained.warnings.iter().any(|warning| warning.contains("FleetDesignation `fleet` is missing")), "{:?}", explained.warnings);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let conditions = fleet.host_conditions().await;
+    assert!(conditions.iter().all(|c| !c.condition_type.starts_with("Controller/")), "no controller exhausted its budget: {conditions:?}");
+    fleet.designate().await;
+    fleet.wait_for_phase("undesignated", ConvoyPhase::Landed).await;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while fleet.host_conditions().await.iter().any(|c| c.condition_type == "Message/FleetDesignation") {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("health clears the wait");
+}
+
 impl DummyDaemon {
+    async fn host_conditions(&self) -> Vec<flotilla_resources::HostCondition> {
+        let hosts = self.backend().using::<Host>(NAMESPACE).list().await.expect("hosts");
+        hosts.items.into_iter().flat_map(|h| h.status.map(|s| s.conditions).unwrap_or_default()).collect()
+    }
+
     /// Every Message is on the engine, delivered with a receipt on a real
     /// AgentSession; the old store holds none.
     async fn assert_on_the_engine(&self) {

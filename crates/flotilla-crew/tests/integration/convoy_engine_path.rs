@@ -292,6 +292,9 @@ impl flotilla_crew::ports::EngineMessages for Turns {
         assert_eq!((namespace, receiver), (NAMESPACE, "flotilla/c/work/coder"));
         Ok(self.awaiting)
     }
+    async fn delivery_wait(&self, _: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
     fn charter_notices(self: Arc<Self>, namespace: &str) -> Box<dyn flotilla_messaging::CharterNotices> {
         Box::new(flotilla_messaging::MessageInbox::new(self.backend.clone(), namespace))
     }
