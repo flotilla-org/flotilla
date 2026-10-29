@@ -202,7 +202,6 @@ fn the_corpus_imports_at_each_hosts_own_home() {
     assert!(report.refused.is_empty(), "{report:?}");
     assert_eq!(report.imported, [(("Host", "spec"), corpus.len()), (("HostObservation", "observed"), corpus.len())].into());
     for reason in [
-        "expected_concurrent_rust_crews, which nothing reads",
         "terminal pools, read only for display",
         "heartbeat time and readiness, a judgement",
         "metrics",
@@ -282,18 +281,26 @@ fn the_observation_keeps_the_facts_admission_and_health_read() {
 }
 
 // Behaviour (#3824 layer 4c, owner's answer 1): a Host imports only at its home, a daemon's own at
-// that daemon and an SSH host's at its owning daemon. A copy elsewhere is a stray, dropped; a home
-// whose own host is not known is refused.
+// that daemon and an SSH host's at its owning daemon. A copy elsewhere is a stray and a deleted copy
+// is gone: both are dropped before the namespace check, so neither is refused for its namespaces, and
+// a deleted copy needs no known home. Any other copy at a home whose own host is not known is refused.
+// The crew sizing is counted only where it was set.
 #[test]
 fn a_host_imports_only_at_its_home() {
     let status = HostStatus { capabilities: BTreeMap::from([("owning_daemon".to_owned(), json!("udder"))]), ..HostStatus::default() };
+    let mut deleted = object("kiwi", HostSpec::default(), None);
+    deleted.metadata.deletion_timestamp = Some(Utc::now());
+    let sized = HostSpec { expected_concurrent_rust_crews: 8, ..HostSpec::default() };
     let copies = HostCopies {
         copies: vec![
-            copy(object("udder", HostSpec::default(), None), "flotilla", "udder-node"),
+            copy(object("udder", sized, None), "flotilla", "udder-node"),
             copy(object("b1", ssh("udder"), Some(status)), "flotilla", "udder-node"),
             copy(object("b1", ssh("udder"), None), "flotilla", "feta-node"),
+            copy(object("b1", ssh("udder"), None), "other", "feta-node"),
             copy(object("udder", HostSpec::default(), None), "flotilla", "feta-node"),
+            copy(object("udder", HostSpec::default(), None), "other", "feta-node"),
             copy(object("feta", HostSpec::default(), None), "flotilla", "feta-node"),
+            copy(deleted, "flotilla", "kiwi-node"),
             copy(object("kiwi", HostSpec::default(), None), "flotilla", "kiwi-node"),
         ],
         homes: [("udder-node".into(), "udder".into()), ("feta-node".into(), "feta".into())].into(),
@@ -304,13 +311,35 @@ fn a_host_imports_only_at_its_home() {
     assert_eq!(
         report.dropped.iter().filter(|((kind, _), _)| *kind == "Host").map(|((_, reason), count)| (*reason, *count)).collect::<Vec<_>>(),
         [
-            ("a copy of an SSH host another daemon owns", 1),
-            ("a copy of another daemon's Host", 1),
-            ("expected_concurrent_rust_crews, which nothing reads", 3)
+            ("a copy of an SSH host another daemon owns", 2),
+            ("a copy of another daemon's Host", 2),
+            ("deleted", 1),
+            ("expected_concurrent_rust_crews, which nothing reads", 1)
         ]
     );
     let refused: Vec<_> = report.refused.iter().map(|refusal| refusal.record.as_str()).collect();
     assert_eq!(refused, ["kiwi"], "{report:?}");
+}
+
+// Behaviour (ADR 0047): an SSH host published under the pre-#4001 `agentless` key imports, its
+// markers dropped as the connection carries them; a previous generation's Host with no adapter
+// baseline takes its adapters as the baseline, as the health check compares against them.
+#[test]
+fn a_previous_generations_ssh_host_and_missing_baseline_import() {
+    let status = HostStatus {
+        capabilities: serde_json::from_value(json!({
+            "agentless": true, "transport": "ssh", "placement": "host_direct_only", "owning_daemon": "udder",
+            "agent_adapters": ["claude-code"]
+        }))
+        .expect("capabilities"),
+        agent_adapter_baseline: None,
+        ..HostStatus::default()
+    };
+    let (host, observation, dropped) = records(import_host(&object("b1", ssh("udder"), Some(status)), "udder").expect("imports"));
+    assert!(matches!(host.connection, host_kinds::Connection::SshHost { ref owning_daemon, .. } if owning_daemon == "udder"));
+    assert!(dropped.contains(&("HostObservation", "the SSH capability markers, which the connection carries")), "{dropped:?}");
+    let observation = observation.expect("observed");
+    assert_eq!(observation.agent_adapter_baseline, BTreeSet::from(["claude-code".to_owned()]));
 }
 
 // Behaviour (#3824 layer 4c): nothing is dropped silently. An unknown capability key, a capability

@@ -6,7 +6,7 @@
 //! | Old copy | Imported |
 //! |---|---|
 //! | Deleted | dropped |
-//! | `spec` | a Host record; `expected_concurrent_rust_crews` dropped, as nothing reads it |
+//! | `spec` | a Host record; `expected_concurrent_rust_crews` dropped, as nothing reads it, and counted when not the default |
 //! | `status` | a HostObservation record: generation, protocol fingerprint, architecture, the free-space floor as a flag, conditions (`observed_at` as `since`), providers, adapters and their baseline, held credentials and their expiry, image digests, the Codex central login |
 //! | `status.fulfilment_facts` | facts by FulfilmentKind name: GUI login, image and its presence, harness and toolchain versions; each fact's observation time, free vessel slots and model facts dropped, as judgements or kept by nothing |
 //! | Heartbeat time, readiness, `sleeping_until`, model probes | dropped: readiness is a judgement, and nothing sets the others |
@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_engine_store::ImportTarget;
 use flotilla_protocol::provider::ProviderAdvertisement;
 use flotilla_resources::{
-    image_architecture::canonical_image_architecture, CredentialExpiry, Host, HostConnection, HostStatus, LocalImageInventories,
+    image_architecture::canonical_image_architecture, CredentialExpiry, Host, HostConnection, HostSpec, HostStatus, LocalImageInventories,
     ModelProbeState, ResourceObject, AGENT_ADAPTERS_CAPABILITY, CODEX_CENTRAL_LOGIN_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY,
     ENVIRONMENT_PROVIDERS_CAPABILITY, HELD_CREDENTIALS_CAPABILITY, IMAGE_DIGESTS_CAPABILITY, OWNING_DAEMON_CAPABILITY,
     PLACEMENT_CAPABILITY, SSH_HOST_CAPABILITY, TERMINAL_POOLS_CAPABILITY, TRANSPORT_CAPABILITY,
@@ -106,7 +106,10 @@ pub fn import_host(old: &ResourceObject<Host>, own_host: &str) -> Result<Importe
         }
         _ => {}
     }
-    let mut dropped = vec![(HOST, "expected_concurrent_rust_crews, which nothing reads")];
+    let mut dropped = Vec::new();
+    if old.spec.expected_concurrent_rust_crews != HostSpec::default().expected_concurrent_rust_crews {
+        dropped.push((HOST, "expected_concurrent_rust_crews, which nothing reads"));
+    }
     let observation = old.status.as_ref().map(|status| observation(&old.spec.connection, status, &mut dropped)).transpose()?;
     Ok(Imported::Records { host: Box::new(HostRecord::new(&old.spec)), observation: observation.map(Box::new), dropped })
 }
@@ -235,18 +238,12 @@ pub fn rehearse_hosts(copies: &HostCopies, report: &mut ImportReport) {
 /// HostObservation, each at the copy's creation time; drops are counted and refusals named in
 /// `report`.
 pub fn import_hosts(copies: &HostCopies, target: &mut impl ImportTarget, report: &mut ImportReport) {
-    let own: Vec<_> = copies.copies.iter().filter(|copy| target.imports(&copy.home)).collect();
-    let mut namespaces = BTreeMap::<(&str, &str), BTreeSet<&str>>::new();
-    for copy in own.iter().filter(|copy| copy.object.metadata.deletion_timestamp.is_none()) {
-        namespaces.entry((copy.object.metadata.name.as_str(), copy.home.as_str())).or_default().insert(copy.namespace.as_str());
-    }
-    for copy in own {
-        let name = &copy.object.metadata.name;
-        let refuse = |reason: String| ImportRefusal { kind: HOST, record: name.clone(), reason: format!("at `{}`: {reason}", copy.home) };
-        let held = namespaces.get(&(name.as_str(), copy.home.as_str())).cloned().unwrap_or_default();
-        if held.len() > 1 {
-            let held: Vec<_> = held.into_iter().collect();
-            report.refused.push(refuse(format!("held in namespaces `{}`, and the engine has no namespaces", held.join("`, `"))));
+    // Deleted copies and strays are dropped before the namespace check, which sees only what imports.
+    let mut importing = Vec::new();
+    for copy in copies.copies.iter().filter(|copy| target.imports(&copy.home)) {
+        let refuse = refusal(copy);
+        if copy.object.metadata.deletion_timestamp.is_some() {
+            *report.dropped.entry((HOST, "deleted")).or_default() += 1;
             continue;
         }
         let Some(own_host) = copies.homes.get(&copy.home) else {
@@ -254,12 +251,31 @@ pub fn import_hosts(copies: &HostCopies, target: &mut impl ImportTarget, report:
             continue;
         };
         match import_host(&copy.object, own_host) {
-            Ok(Imported::Records { host, observation, dropped }) => {
+            Ok(Imported::Dropped(reason)) => *report.dropped.entry((HOST, reason)).or_default() += 1,
+            Ok(Imported::Records { host, observation, dropped }) => importing.push((copy, Ok((host, observation, dropped)))),
+            Err(reason) => importing.push((copy, Err(reason))),
+        }
+    }
+    let mut namespaces = BTreeMap::<(&str, &str), BTreeSet<&str>>::new();
+    for (copy, _) in &importing {
+        namespaces.entry((copy.object.metadata.name.as_str(), copy.home.as_str())).or_default().insert(copy.namespace.as_str());
+    }
+    for (copy, imported) in importing {
+        let name = &copy.object.metadata.name;
+        let refuse = refusal(copy);
+        let held = &namespaces[&(name.as_str(), copy.home.as_str())];
+        if held.len() > 1 {
+            let held: Vec<_> = held.iter().copied().collect();
+            report.refused.push(refuse(format!("held in namespaces `{}`, and the engine has no namespaces", held.join("`, `"))));
+            continue;
+        }
+        match imported {
+            Ok((host, observation, dropped)) => {
                 // Each record starts at its home as a fresh write; its old versions are not carried.
-                // A copy counts only once both are written: a refusal fails the whole import, so a
-                // Host written without its observation is never put in place.
+                // A copy counts only once both are written. The cut-over import puts no store in
+                // place after any refusal, so a Host written without its observation never serves.
                 let change = created(&copy.object);
-                let written = target.write(&copy.home, name, &change, &*host).map_err(refuse).and_then(|()| match &observation {
+                let written = target.write(&copy.home, name, &change, &*host).map_err(&refuse).and_then(|()| match &observation {
                     Some(observation) => target
                         .write(&copy.home, name, &change, &**observation)
                         .map_err(|reason| ImportRefusal { kind: OBSERVATION, ..refuse(reason) }),
@@ -277,8 +293,11 @@ pub fn import_hosts(copies: &HostCopies, target: &mut impl ImportTarget, report:
                     *report.dropped.entry(key).or_default() += 1;
                 }
             }
-            Ok(Imported::Dropped(reason)) => *report.dropped.entry((HOST, reason)).or_default() += 1,
             Err(reason) => report.refused.push(refuse(reason)),
         }
     }
+}
+
+fn refusal(copy: &HostCopy) -> impl Fn(String) -> ImportRefusal + '_ {
+    move |reason| ImportRefusal { kind: HOST, record: copy.object.metadata.name.clone(), reason: format!("at `{}`: {reason}", copy.home) }
 }
