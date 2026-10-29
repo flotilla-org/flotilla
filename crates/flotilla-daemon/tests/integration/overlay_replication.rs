@@ -1683,3 +1683,114 @@ fn generated_digest_session_repair(tc: hegel::TestCase) {
 async fn digest_repairs_a_relay_advanced_prefix() {
     digest_session_scenario(false, false, true).await;
 }
+
+// #4127: attach routes by the host of the crew's TerminalSession, never by the
+// Convoy's home. The Convoy is homed on kiwi while its crew runs on feta.
+#[tokio::test]
+async fn attach_routes_by_session_host_when_convoy_is_homed_elsewhere() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let kiwi = daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
+    let feta = daemon(temp.path().join("feta"), "feta-root", "feta").await;
+    let feta_host_id = feta.local_host_id().expect("feta host id").to_string();
+    let feta_hosts = feta.resource_backend().using::<Host>("flotilla");
+    let host = feta_hosts.create(&InputMeta::builder().name(feta_host_id.clone()).build(), &HostSpec::default()).await.expect("feta host");
+    feta_hosts
+        .update_status(
+            &feta_host_id,
+            &host.metadata.resource_version,
+            &HostStatus { heartbeat_at: Some(chrono::Utc::now()), ready: true, ..HostStatus::default() },
+        )
+        .await
+        .expect("feta heartbeat");
+    feta.resource_backend()
+        .using::<flotilla_resources::Environment>("flotilla")
+        .create(
+            &InputMeta::builder().name("feta-environment".to_string()).build(),
+            &flotilla_resources::EnvironmentSpec {
+                cloud_sandbox: None,
+                provider_address: None,
+                host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec {
+                    host_ref: feta_host_id.clone(),
+                    repo_default_dir: "/tmp".to_string(),
+                }),
+                docker: None,
+            },
+        )
+        .await
+        .expect("feta environment");
+    let mut spec = ConvoySpec::builder().workflow_ref("workflow".to_string()).role("coder".to_string()).build();
+    spec.project_ref = Some("flotilla".to_string());
+    kiwi.resource_backend()
+        .using::<Convoy>("flotilla")
+        .create(&InputMeta::builder().name("convoy-homed-on-kiwi".to_string()).build(), &spec)
+        .await
+        .expect("create convoy on kiwi");
+    feta.resource_backend()
+        .using::<TerminalSession>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("crew-session".to_string())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.to_string(), "convoy-homed-on-kiwi".to_string()),
+                    (VESSEL_LABEL.to_string(), "work".to_string()),
+                    (ROLE_LABEL.to_string(), "coder".to_string()),
+                ]))
+                .build(),
+            &TerminalSessionSpec::builder()
+                .env_ref("feta-environment".to_string())
+                .role("coder".to_string())
+                .source(TerminalSessionSource::Tool { command: "true".to_string() })
+                .cwd("/tmp".to_string())
+                .pool("passthrough".to_string())
+                .build(),
+        )
+        .await
+        .expect("create feta session");
+    let session = feta.resource_backend().using::<TerminalSession>("flotilla").get("crew-session").await.expect("session");
+    feta.resource_backend()
+        .using::<TerminalSession>("flotilla")
+        .update_status(
+            "crew-session",
+            &session.metadata.resource_version,
+            &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running,
+                session_id: Some("session-id".to_string()),
+                ..TerminalSessionStatus::default()
+            },
+        )
+        .await
+        .expect("running session");
+
+    let topology = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect daemons");
+    std::fs::write(kiwi.config_store().base_path().join("hosts.toml"), "[hosts.feta]\nhostname = 'feta.example'\n").expect("hop config");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let sessions = kiwi.resource_backend().including_replicas::<TerminalSession>("flotilla").list().await.expect("sessions");
+            let convoys = feta.resource_backend().including_replicas::<Convoy>("flotilla").list().await.expect("convoys");
+            if !sessions.items.is_empty() && !convoys.items.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replication");
+
+    let feta_name = HostName::new("feta");
+    for reference in ["coder@flotilla", "convoy-homed-on-kiwi"] {
+        // From the Convoy's home, with and without an explicit session host.
+        for host in [None, Some(&feta_name)] {
+            let resolved =
+                kiwi.resolve_attach_command_on_host_internal(reference, host).await.unwrap_or_else(|e| panic!("{reference}: {e}"));
+            let binding = resolved.binding.expect("binding");
+            assert_eq!(binding.host, feta_name, "{reference}");
+            assert_eq!(binding.convoy.as_deref(), Some("convoy-homed-on-kiwi"));
+        }
+        // From the session's own host the session is local.
+        let resolved = feta.resolve_attach_command_internal(reference).await.unwrap_or_else(|e| panic!("{reference}: {e}"));
+        assert_eq!(resolved.binding.expect("binding").session.as_deref(), Some("crew-session"));
+    }
+    // The Convoy's home is not an attach host.
+    assert!(kiwi.resolve_attach_command_on_host_internal("coder@flotilla", Some(&HostName::new("kiwi"))).await.is_err());
+    drop(topology);
+}
