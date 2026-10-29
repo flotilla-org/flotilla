@@ -38,6 +38,7 @@ async fn message_session_pair_transfers_protocol_messages() {
             connection_role: None,
             surface: None,
             crew_claims: Default::default(),
+            primitives: false,
         })
         .await
         .expect("write hello");

@@ -127,6 +127,7 @@ impl Fixture {
                 connection_role: Some(flotilla_protocol::ConnectionRole::Client),
                 surface: None,
                 crew_claims: claims.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect::<BTreeMap<_, _>>(),
+                primitives: false,
             })
             .await
             .expect("hello");

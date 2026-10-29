@@ -206,3 +206,27 @@ fn node_info_for_advertisement_preserves_display_name() {
     let info: NodeInfo = mgr.node_info_for(&NodeId::new("remote"));
     assert_eq!(info.display_name, "Remote host");
 }
+
+#[tokio::test]
+async fn host_list_shows_a_primitives_refusal_as_rejected() {
+    let label = ConfigLabel("feta".into());
+    let (sender, _) = MockPeerSender::new();
+    let mut manager = PeerManager::new(NodeId::new("local"));
+    manager.add_configured_target(
+        label.clone(),
+        HostName::new("feta"),
+        None,
+        Box::new(HangingOnceTransport {
+            attempts: Arc::new(AtomicUsize::new(0)),
+            sender: Arc::new(sender),
+            remote: NodeInfo::new(NodeId::new("feta-node"), "feta"),
+            status: PeerConnectionStatus::Disconnected,
+        }),
+    );
+    let reason = "peer feta has [primitives] on, this host has it off";
+    manager.note_dial_result(&label, Err(reason));
+
+    let mut hosts = flotilla_protocol::HostListResponse { hosts: Vec::new() };
+    manager.project_host_list(&mut hosts);
+    assert_eq!(hosts.hosts[0].connection_status, flotilla_protocol::PeerConnectionState::Rejected { reason: reason.into() });
+}

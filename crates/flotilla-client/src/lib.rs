@@ -95,6 +95,7 @@ async fn do_client_hello_with_surface(
             // Over a forwarded environment socket the daemon cannot read this
             // process's environment, so a crew client states its identity.
             crew_claims: flotilla_protocol::crew_claims_from(|key| std::env::var(key).ok()),
+            primitives: false,
         })
         .await
         .map_err(|e| format!("failed to send Hello: {e}"))?;
@@ -1332,6 +1333,7 @@ mod spawn_lock_tests {
                         connection_role: Some(ConnectionRole::Client),
                         surface: None,
                         crew_claims: Default::default(),
+                        primitives: false,
                     })
                     .await
                     .expect("daemon hello");

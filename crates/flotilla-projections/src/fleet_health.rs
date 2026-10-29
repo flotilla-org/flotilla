@@ -1,13 +1,21 @@
 //! Installer readiness and fingerprint diagnostics from the daemon's typed query.
 use std::{collections::BTreeMap, fmt::Write};
 
-use flotilla_protocol::CommandValue;
+use flotilla_protocol::{CommandValue, PeerConnectionState};
 
 /// The matching CLI/daemon handshake has already succeeded. Readiness additionally
 /// requires the control plane to return a fleet response containing this host.
-pub fn check(result: Result<CommandValue, String>) -> Result<(), String> {
+/// The `Ok` lines name peers the daemon refused.
+pub fn check(result: Result<CommandValue, String>) -> Result<Vec<String>, String> {
     match result? {
-        CommandValue::FleetHealth(response) if response.hosts.iter().any(|host| host.is_local) => Ok(()),
+        CommandValue::FleetHealth(response) if response.hosts.iter().any(|host| host.is_local) => Ok(response
+            .hosts
+            .iter()
+            .filter_map(|host| match &host.link {
+                PeerConnectionState::Rejected { reason } => Some(format!("{}: rejected: {reason}", host.host)),
+                _ => None,
+            })
+            .collect()),
         CommandValue::Error { message } => Err(message),
         _ => Err("daemon did not return fleet health containing the local host".into()),
     }
@@ -107,6 +115,14 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn check_names_rejected_peers() {
+        let mut feta = host("feta", false, None);
+        feta.link = PeerConnectionState::Rejected { reason: "peer feta has [primitives] on, this host has it off".into() };
+        let refused = check(Ok(response(vec![host("kiwi", true, None), feta]))).expect("local row present");
+        assert_eq!(refused, vec!["feta: rejected: peer feta has [primitives] on, this host has it off".to_string()]);
     }
 
     // Generation diagnostics are invariant under host ordering, preserve all
