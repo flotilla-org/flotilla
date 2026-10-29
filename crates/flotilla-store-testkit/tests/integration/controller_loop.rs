@@ -1671,6 +1671,41 @@ async fn secondary_watch_restart_is_backed_off() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn secondary_watch_that_keeps_exiting_backs_off_with_a_cap() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: vec![Box::new(RestartingSecondaryWatch { spawns: Arc::clone(&spawns) })],
+            reconciler: RecordingReconciler::new(Arc::new(Mutex::new(Vec::new()))),
+            resync_interval: Duration::from_secs(3600),
+            backend,
+        }
+        .run(),
+    );
+
+    let advance = |total: Duration| async move {
+        for _ in 0..(total.as_millis() / 50) {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+        }
+    };
+    advance(Duration::from_secs(10)).await;
+    let early = spawns.load(Ordering::SeqCst);
+    assert!((3..=9).contains(&early), "10s at 10 starts a second would be 100; got {early}");
+
+    advance(Duration::from_secs(300)).await;
+    let later = spawns.load(Ordering::SeqCst);
+    assert!(later - early <= 15, "the delay is capped at 30s, so 300s allows about 10 starts; got {}", later - early);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn expired_secondary_watch_resyncs_primaries_without_restarting_controller_loop() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let primaries = backend.clone().using::<PrimaryResource>("flotilla");
