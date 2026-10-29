@@ -575,6 +575,17 @@ pub struct ControllerLoop<R: Reconciler> {
 
 impl<R: Reconciler> ControllerLoop<R> {
     const WATCH_RESTART_BACKOFF: Duration = Duration::from_millis(100);
+    const SECONDARY_BACKOFF_CAP: Duration = Duration::from_secs(30);
+    const SECONDARY_STABLE_RUN: Duration = Duration::from_secs(60);
+
+    /// Doubles per early exit up to a cap; a watch that ran for a while starts over.
+    fn next_secondary_backoff(previous: Duration, ran_for: Duration) -> Duration {
+        if ran_for >= Self::SECONDARY_STABLE_RUN {
+            Self::WATCH_RESTART_BACKOFF
+        } else {
+            (previous * 2).min(Self::SECONDARY_BACKOFF_CAP)
+        }
+    }
 
     async fn write_tolerating_not_found<T>(write: impl Future<Output = Result<T, ResourceError>>) -> Result<(), ResourceError> {
         match write.await {
@@ -848,6 +859,8 @@ impl<R: Reconciler> ControllerLoop<R> {
             })
             .collect();
         let mut watches = ControllerWatches { primary: primary_watch, secondaries: secondary_watches };
+        let mut secondary_started = vec![Instant::now(); secondary_templates.len()];
+        let mut secondary_backoff = vec![Self::WATCH_RESTART_BACKOFF / 2; secondary_templates.len()];
         let mut resync = tokio::time::interval(resync_interval);
         resync.tick().await;
         let mut pending: VecDeque<String> = VecDeque::new();
@@ -1170,6 +1183,9 @@ impl<R: Reconciler> ControllerLoop<R> {
                             // cannot reveal a deletion missed while its watch was expired.
                             let live_names = Self::resync_all(&primary, &sender).await?;
                             finalizer_failures.retain(|name, _| live_names.contains(name));
+                            let backoff = Self::next_secondary_backoff(secondary_backoff[index], secondary_started[index].elapsed());
+                            secondary_backoff[index] = backoff;
+                            secondary_started[index] = Instant::now() + backoff;
                             watches.secondaries[index] = Self::spawn_secondary_watch(
                                 index,
                                 secondary_templates[index].clone(),
@@ -1177,7 +1193,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                                 primary.namespace.clone(),
                                 sender.clone(),
                                 watch_exited_tx.clone(),
-                                Some(Self::WATCH_RESTART_BACKOFF),
+                                Some(backoff),
                             );
                         }
                     }

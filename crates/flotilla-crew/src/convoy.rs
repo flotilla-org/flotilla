@@ -323,7 +323,7 @@ impl SecondaryWatch for EngineConvoyWake {
             let Some(engine) = self.engine.get() else {
                 // Logged, so a startup reordering that empties the path with the switch on is visible.
                 tracing::debug!("no engine convoy path: the engine convoy wake is off");
-                return Ok(());
+                return std::future::pending().await;
             };
             let mut changes = engine.changes();
             loop {
