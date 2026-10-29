@@ -81,7 +81,7 @@ async fn migrates_display_name_host_ref_to_canonical_host_id() {
             env: &TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]),
             scratch: Path::new("/tmp/flotilla-probe-test"),
             observation: &Default::default(),
-            harnesses: &flotilla_agent::adapter::built_in_harnesses().collect::<Vec<_>>(),
+            harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
         },
         &mut ModelProbeState::default(),
     )

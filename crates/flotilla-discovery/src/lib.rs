@@ -98,9 +98,9 @@ impl FactoryRegistry {
         AccountVariables::from_families(&declared)
     }
 
-    /// The built-in harnesses and those installed adapter factories contribute.
-    pub fn harnesses(&self) -> Vec<Harness> {
-        let mut harnesses = built_in_harnesses().collect::<Vec<_>>();
+    /// The built-in harnesses `env` enables and those installed adapter factories contribute.
+    pub fn harnesses(&self, env: &dyn EnvVars) -> Vec<Harness> {
+        let mut harnesses = built_in_harnesses(env).collect::<Vec<_>>();
         for harness in self.agent_adapters.iter().filter_map(|factory| factory.harness()) {
             if !harnesses.iter().any(|known| known.adapter == harness.adapter) {
                 harnesses.push(harness);
@@ -901,7 +901,7 @@ mod harness_tests {
     fn harnesses_are_the_built_in_ones_and_those_adapters_contribute() {
         let mut factories = FactoryRegistry::default_all();
         factories.agent_adapters = vec![Arc::new(Contributing("contributed")), Arc::new(Contributing("codex"))];
-        let harnesses = factories.harnesses();
+        let harnesses = factories.harnesses(&crate::testing::TestEnvVars::new([("FLOTILLA_FLEET_CANARY", "0")]));
         assert_eq!(
             harnesses,
             [

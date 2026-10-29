@@ -1261,10 +1261,15 @@ pub struct Harness {
     pub binary: &'static str,
 }
 
-/// The built-in harnesses, each running its [`harness_binary`].
-pub fn built_in_harnesses() -> impl Iterator<Item = Harness> {
-    ["claude-code", "codex"].into_iter().filter_map(|adapter| Some(Harness { adapter, binary: harness_binary(adapter)? }))
+/// The built-in harnesses, each running its [`harness_binary`], and the canary's where
+/// `env` enables it, as discovery does.
+pub fn built_in_harnesses(env: &dyn flotilla_provider_runtime::EnvVars) -> impl Iterator<Item = Harness> {
+    let canary = (env.get(FLEET_CANARY_ENV).as_deref() == Some("1")).then_some(fleet_canary::HARNESS);
+    ["claude-code", "codex"].into_iter().filter_map(|adapter| Some(Harness { adapter, binary: harness_binary(adapter)? })).chain(canary)
 }
+
+/// Enables the credential-free canary adapter.
+const FLEET_CANARY_ENV: &str = "FLOTILLA_FLEET_CANARY";
 
 /// Claude Code's login and configuration home, and the variables that
 /// authenticate it directly.
@@ -1319,7 +1324,7 @@ impl AgentAdapterRegistry {
 
     pub fn discover(env: &EnvironmentBag, runner: Arc<dyn CommandRunner>) -> Self {
         let mut registry = Self::default();
-        if env.find_env_var("FLOTILLA_FLEET_CANARY") == Some("1") {
+        if env.find_env_var(FLEET_CANARY_ENV) == Some("1") {
             registry.insert(Arc::new(fleet_canary::FleetCanaryAdapter));
         }
         if let Some(binary) = harness_binary("claude-code").and_then(|name| env.find_binary(name)) {

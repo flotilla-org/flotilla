@@ -119,6 +119,7 @@ async fn spawned_fulfilment_probe_task_publishes_facts_after_heartbeat() {
     .await;
     task.abort();
     let _ = task.await;
+    assert!(temp.path().join("probe-cwd").is_dir(), "image probes run in the probe directory, which the task creates");
 }
 
 #[tokio::test]
@@ -191,7 +192,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
                 env: &TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]),
                 scratch: Path::new("/tmp/flotilla-probe-test"),
                 observation: &Default::default(),
-                harnesses: &flotilla_agent::adapter::built_in_harnesses().collect::<Vec<_>>(),
+                harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
             },
             &mut ModelProbeState::default(),
         )
@@ -277,7 +278,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
             env: &TestEnvVars::default(),
             scratch: Path::new("/tmp/flotilla-probe-test"),
             observation: &Default::default(),
-            harnesses: &flotilla_agent::adapter::built_in_harnesses().collect::<Vec<_>>(),
+            harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
         },
         &mut model_probes,
     )
@@ -305,7 +306,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
             env: &TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]),
             scratch: Path::new("/tmp/flotilla-probe-test"),
             observation: &Default::default(),
-            harnesses: &flotilla_agent::adapter::built_in_harnesses().collect::<Vec<_>>(),
+            harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
         },
         &mut model_probes,
     )
@@ -597,7 +598,7 @@ fn unresolved_fulfilment_provider_publishes_unknown(tc: hegel::TestCase) {
                 env: &TestEnvVars::default(),
                 scratch: Path::new("/tmp/probe"),
                 observation: &Default::default(),
-                harnesses: &flotilla_agent::adapter::built_in_harnesses().collect::<Vec<_>>(),
+                harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
             },
             &mut model_probes,
         )
@@ -801,7 +802,7 @@ async fn headless_host_is_not_granted_a_gui_session() {
                 env: &env,
                 scratch: Path::new("/tmp/flotilla-probe-test"),
                 observation: &Default::default(),
-                harnesses: &flotilla_agent::adapter::built_in_harnesses().collect::<Vec<_>>(),
+                harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
             },
             &mut ModelProbeState::default(),
         )
@@ -857,7 +858,7 @@ async fn capped_docker_kind_publishes_free_slots_from_the_hosts_vessels() {
                     env: &TestEnvVars::default(),
                     scratch: Path::new("/tmp/flotilla-probe-test"),
                     observation: &Default::default(),
-                    harnesses: &flotilla_agent::adapter::built_in_harnesses().collect::<Vec<_>>(),
+                    harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
                 },
                 &mut ModelProbeState::default(),
             )
@@ -934,7 +935,7 @@ async fn unknown_observation_keeps_a_gui_grant() {
             env: &TestEnvVars::default(),
             scratch: Path::new("/tmp/flotilla-probe-test"),
             observation: &Default::default(),
-            harnesses: &flotilla_agent::adapter::built_in_harnesses().collect::<Vec<_>>(),
+            harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
         },
         &mut ModelProbeState::default(),
     )

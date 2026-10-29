@@ -57,7 +57,15 @@ pub(super) async fn provision(
             if let Some(cloud) = &spec.cloud_sandbox {
                 let factories = &state.daemon.discovery_runtime().factories;
                 let accounts = factories.account_variables();
-                verify_cloud_image_needs(&cloud.probe_needs, &cloud.image, &handle, &bag, &accounts, &factories.harnesses()).await?;
+                verify_cloud_image_needs(
+                    &cloud.probe_needs,
+                    &cloud.image,
+                    &handle,
+                    &bag,
+                    &accounts,
+                    &factories.harnesses(&GuestProbeEnvironment(&bag)),
+                )
+                .await?;
             }
             state
                 .daemon

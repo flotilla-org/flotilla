@@ -93,7 +93,9 @@ class Processes:
                 raise AssertionError('probe must inspect only its own store')
             resources = {
                 'hosts': [{'metadata': {'name': 'canary-host'}, 'status': {'capabilities': {
-                    'held_credentials': [] if self.failure == 'credential-observation' else [canary.REGISTRY_CREDENTIAL]}}}],
+                    'held_credentials': [] if self.failure == 'credential-observation' else [canary.REGISTRY_CREDENTIAL]},
+                    'fulfilment_facts': {'fleet-canary': {'harnesses': {} if self.failure == 'harness-observation' else {
+                        'fleet-canary': {'version': '5.2.21'}}}}}}],
                 'vessels': [] if self.completed else [{'status': {'phase': 'Ready'}}],
                 'terminalsessions': [] if self.completed else [{'status': {'phase': 'Running'}}],
                 'environments': [] if self.completed else [{'spec': {'docker': {'image': 'pinned-image'}},
@@ -148,6 +150,7 @@ class Contract(unittest.TestCase):
             token = root / '.config/flotilla/credentials/lab-forgejo-registry-pull.token'
             token.parent.mkdir(parents=True)
             token.write_text('test-registry-token\n')
+            (root / '.config/flotilla/daemon.toml').write_text('[docker_vessels]\nslice = "crews.slice"\nmemory_ceiling_gib = 8\n')
             processes = Processes(root / 'probe', failure)
             gate = canary.Canary(release, root / 'probe', processes, timeout=0.02, host_home=root, image="sha256:" + "a" * 64)
             if failure:
@@ -293,6 +296,25 @@ class Contract(unittest.TestCase):
             self.assertIn(str(root / '.config/flotilla/credentials/lab-forgejo-registry-pull.token'), str(error.exception))
             self.assertEqual(processes.calls, [])
 
+    # The probe daemon takes the host's [docker_vessels], keeping its own settings;
+    # a host without the table fails before starting a daemon.
+    def test_probe_daemon_takes_the_host_docker_vessels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'probe/config').mkdir(parents=True)
+            (root / 'probe/config/daemon.toml').write_text('machine_id = "probe"\n')
+            (root / '.config/flotilla').mkdir(parents=True)
+            with self.assertRaisesRegex(canary.CanaryFailure, r'\[docker_vessels\]: cannot read'):
+                canary.docker_vessels(root, root / 'probe/config')
+            (root / '.config/flotilla/daemon.toml').write_text('machine_id = "host"\n')
+            with self.assertRaisesRegex(canary.CanaryFailure, r'sets none, so Docker crews cannot run'):
+                canary.docker_vessels(root, root / 'probe/config')
+            (root / '.config/flotilla/daemon.toml').write_text('[docker_vessels]\nslice = "crews.slice"\nmemory_ceiling_gib = 8\n')
+            canary.docker_vessels(root, root / 'probe/config')
+            canary.docker_vessels(root, root / 'probe/config')
+            probe = canary.tomllib.loads((root / 'probe/config/daemon.toml').read_text())
+            self.assertEqual(probe, {'machine_id': 'probe', 'docker_vessels': {'slice': 'crews.slice', 'memory_ceiling_gib': 8}})
+
     # The canary environment must ignore ambient Docker login configuration.
     def test_no_ambient_docker_config(self):
         with patch.dict(os.environ, {'DOCKER_CONFIG': '/ambient/docker'}):
@@ -363,6 +385,7 @@ class Contract(unittest.TestCase):
     def test_lifecycle_failures_name_the_failed_assertion(self):
         for failure, diagnostic in [('federated', 'unfederated'), ('admission', 'admission'),
                                     ('credential-observation', 'host observes registry credential'),
+                                    ('harness-observation', 'host probes the canary image for its harness'),
                                     ('terminal', 'Running'), ('skills', 'crew skills'),
                                     ('settlement', 'convoy settles'), ('resources', 'resources are reaped'),
                                     ('container', 'containers were not reaped')]:
@@ -380,6 +403,7 @@ class Contract(unittest.TestCase):
                 token = release / '.config/flotilla/credentials/lab-forgejo-registry-pull.token'
                 token.parent.mkdir(parents=True)
                 token.write_text('test-registry-token\n')
+                (release / '.config/flotilla/daemon.toml').write_text('[docker_vessels]\nslice = "crews.slice"\nmemory_ceiling_gib = 8\n')
                 processes = []
 
                 def factory(environment, log):

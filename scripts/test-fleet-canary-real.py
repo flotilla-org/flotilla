@@ -35,6 +35,28 @@ if [ "$#" -eq 3 ] && [ "$1" = info ] && [ "$2" = --format ] && [ "$3" = '{{json 
     echo '{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":true}'
     exit 0
 fi
+# The fact probe inspects the canary image and asks it, without a network, for
+# each harness; it carries bash. These are answered here, never run.
+image="sha256:''' + 'a' * 64 + '''"
+if [ "$#" -eq 3 ] && [ "$1" = image ] && [ "$2" = inspect ] && [ "$3" = "$image" ]; then
+    printf '[{"Id":"%s"}]\\n' "$image"
+    exit 0
+fi
+if [ "$#" -eq 5 ] && [ "$1 $2 $3 $4" = 'image inspect --format {{json .Config.Env}}' ] && [ "$5" = "$image" ]; then
+    echo '["PATH=/usr/bin:/bin"]'
+    exit 0
+fi
+if [ "$1" = run ] && [ "$2" = --rm ]; then
+    for argument in "$@"; do binary=$previous; previous=$argument; done
+    if [ "$binary" = bash ] && [ "$previous" = --version ]; then
+        echo 'GNU bash, version 5.2.21(1)-release'
+        exit 0
+    fi
+    exit 127
+fi
+if [ "$1" = rm ] && [ "$2" = --force ]; then
+    exit 0
+fi
 echo "pre-Docker admission test" >&2
 exit 1
 ''')
@@ -59,7 +81,9 @@ exit 1
         probe = root / 'probe'
         # Containers/CI runners need not expose a stable host machine identity.
         (probe / 'config').mkdir(parents=True)
-        (probe / 'config/daemon.toml').write_text('machine_id = "canary-admission-test"\n')
+        # Docker crews need a bounding slice; admission reads only the table, never the slice itself.
+        (probe / 'config/daemon.toml').write_text('machine_id = "canary-admission-test"\n\n'
+                                                  '[docker_vessels]\nslice = "flotilla-crews.slice"\nmemory_ceiling_gib = 4\n')
         environment = canary.isolated_environment(release, probe)
         with (root / 'commands.log').open('w') as log:
             commands = canary.Commands(environment, log)

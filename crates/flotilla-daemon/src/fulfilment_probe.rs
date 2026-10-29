@@ -250,7 +250,7 @@ mod tests {
                 image: None,
                 provider: provider.as_ref(),
                 context: &Default::default(),
-                harnesses: &built_in_harnesses().collect::<Vec<_>>(),
+                harnesses: &built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
             },
             false,
             runner.as_ref(),
@@ -266,7 +266,7 @@ mod tests {
         assert_eq!(facts.toolchains["node"], "v24.0.0");
         assert_eq!(facts.free_vessel_slots, Some(0));
         assert_eq!(state, ModelProbeState::default());
-        assert_eq!(runner.calls.lock().expect("calls").len(), TOOLCHAINS.len() + built_in_harnesses().count());
+        assert_eq!(runner.calls.lock().expect("calls").len(), TOOLCHAINS.len() + built_in_harnesses(&TestEnvVars::default()).count());
         assert_eq!(runner.inference_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
@@ -282,7 +282,10 @@ mod tests {
             .realisation(FulfilmentRealisation::HostDirect)
             .build();
         let contributed = Harness { adapter: "contributed", binary: "contributed-crew" };
-        for harnesses in [built_in_harnesses().collect::<Vec<_>>(), built_in_harnesses().chain([contributed]).collect()] {
+        for harnesses in [
+            built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
+            built_in_harnesses(&TestEnvVars::default()).chain([contributed]).collect(),
+        ] {
             let facts = probe_kind(
                 &spec,
                 DetectionTarget { image: None, provider: provider.as_ref(), context: &Default::default(), harnesses: &harnesses },
@@ -320,7 +323,7 @@ mod tests {
                     image: Some("crew:test"),
                     provider: provider.as_ref(),
                     context: &Default::default(),
-                    harnesses: &built_in_harnesses().collect::<Vec<_>>(),
+                    harnesses: &built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
                 },
                 true,
                 runner.as_ref(),
@@ -399,7 +402,7 @@ mod tests {
                 image: None,
                 provider: &provider,
                 context: &Default::default(),
-                harnesses: &built_in_harnesses().collect::<Vec<_>>(),
+                harnesses: &built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
             },
             true,
             runner.as_ref(),
