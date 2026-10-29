@@ -1926,6 +1926,34 @@ impl CrewService {
             .map_err(|err| err.to_string())?
             .items;
         let mut outcomes = Vec::new();
+        // Checkouts recorded on other hosts cannot be inspected here; each
+        // host's teardown archives its own uncommitted work. Name them.
+        let sources = self
+            .resource_backend
+            .query_declared::<ResourceCheckout>(
+                namespace,
+                &StoreQuery::labels(&BTreeMap::from([(CONVOY_LABEL.into(), name.to_string())]), true, true),
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+        for source in sources.items {
+            let flotilla_resources::ResourceProvenance::Replica { origin_root, .. } = &source.provenance else {
+                continue;
+            };
+            let checkout = &source.object;
+            let host = origin_root.to_string();
+            let detail = match checkout_path(checkout) {
+                Some(path) => format!("{}; archived there on teardown", checkout_work_location(&checkout.spec, path)),
+                None => format!("on host {host}; archived there on teardown"),
+            };
+            outcomes.push(
+                CheckoutArchiveOutcome::builder()
+                    .checkout(checkout.metadata.name.clone())
+                    .status(CheckoutArchiveStatus::ArchivingOnHost)
+                    .detail(detail)
+                    .build(),
+            );
+        }
         for checkout in checkout_list {
             let Some(path) = checkout_path(&checkout) else {
                 continue;

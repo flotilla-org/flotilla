@@ -214,6 +214,8 @@ pub enum EvidenceFreshness {
 pub enum CheckoutArchiveStatus {
     Archived,
     NothingToArchive,
+    /// The checkout lives on another host, whose teardown archives it there.
+    ArchivingOnHost,
     Failed,
 }
 

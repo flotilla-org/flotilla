@@ -802,9 +802,12 @@ where
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
         self.validation_backoff.lock().expect("validation backoff lock").remove(&obj.metadata.name);
         let convoy = self.owning_convoy(obj).await?;
-        let forced = convoy
-            .as_ref()
-            .is_some_and(|convoy| convoy.metadata.annotations.get(FORCE_TEARDOWN_ANNOTATION).map(String::as_str) == Some("true"));
+        // Abandonment is an explicit terminal override: archive this host's
+        // uncommitted work, then remove, rather than keeping a dirty worktree.
+        let forced = convoy.as_ref().is_some_and(|convoy| {
+            convoy.metadata.annotations.get(FORCE_TEARDOWN_ANNOTATION).map(String::as_str) == Some("true")
+                || convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Abandoned)
+        });
         let landed = convoy.as_ref().is_some_and(|convoy| convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landed));
         let removal = match &obj.spec {
             CheckoutSpec::Worktree(spec) => match self.clones.get(&spec.clone_ref).await {
