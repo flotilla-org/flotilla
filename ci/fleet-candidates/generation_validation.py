@@ -49,7 +49,7 @@ CODEX_CREDENTIAL_FILE = "auth.json"
 # carrying generation failed health confirmation could not roll back off it.
 # Enforce at production, tolerate at consumption.
 REQUIRED_PAYLOAD = {
-    "bin/flotilla", "bin/flotillad", "bin/cleat", "install.sh", "generation_validation.py",
+    "bin/flotilla", "bin/flotillad", "bin/drydock-host", "bin/cleat", "install.sh", "generation_validation.py",
     "share/flotilla/skills/.flotilla-sources.json",
 }
 # Produced together by build-candidate.sh, optional when decoding a previous
@@ -847,7 +847,7 @@ def validate_release(root, outer, platform):
     codex_home = root.joinpath(*CODEX_HOME_PREFIX)
     if codex_home.exists():
         validate_codex_home_template(codex_home)
-    binaries = {"bin/flotilla", "bin/flotillad", "bin/cleat"} | (expected & {"bin/flotilla-vessel", "bin/drydock-agent"})
+    binaries = {"bin/flotilla", "bin/flotillad", "bin/drydock-host", "bin/cleat"} | (expected & {"bin/flotilla-vessel", "bin/drydock-agent"})
     for rel in binaries:
         if not os.access(root / rel, os.X_OK):
             raise ValidationError(f"release binary is not executable: {rel}")
@@ -1183,7 +1183,7 @@ def refresh_darwin_payload(source, destination):
     # file atomically. This is not a tree-wide transaction: a later copy failure
     # can leave earlier replacements/pruning applied. Empty lib directories stay.
     source, destination = Path(source), Path(destination)
-    files = [Path("bin") / name for name in ("flotilla", "flotillad", "cleat")]
+    files = [Path("bin") / name for name in ("flotilla", "flotillad", "drydock-host", "cleat")]
     files += [path.relative_to(source) for path in (source / "lib").rglob("*") if path.is_file()]
     expected = set(files)
     for stale in (destination / "lib").rglob("*"):

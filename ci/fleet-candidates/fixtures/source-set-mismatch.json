@@ -15,6 +15,7 @@
   "payload": [
     "bin/flotilla",
     "bin/flotillad",
+    "bin/drydock-host",
     "bin/cleat",
     "install.sh",
     "generation_validation.py",

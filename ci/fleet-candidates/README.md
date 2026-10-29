@@ -695,3 +695,7 @@ Operator sequence after merge:
    library, and compiled terminfo aliases as a unit. Also exercise old-generation
    rollback and missing-build refusal. These checks follow merge; crew acceptance
    uses isolated fixtures without fleet or signing credentials.
+
+## drydock-host
+
+Every generation, on every platform, ships `bin/drydock-host` beside `bin/flotillad`, built from the pinned drydock. flotillad's embedded drydock daemon runs provider modules (such as Daytona) through it, so release validation refuses a bundle without it.

@@ -71,7 +71,7 @@ class RecoveryHelperTests(unittest.TestCase):
     def payload(self, root):
         source, destination = root / "source", root / "destination"
         (source / "bin").mkdir(parents=True)
-        for name in ("flotilla", "flotillad", "cleat"):
+        for name in ("flotilla", "flotillad", "drydock-host", "cleat"):
             path = source / "bin" / name
             path.write_text(name)
             path.chmod(0o755)
@@ -95,7 +95,7 @@ class RecoveryHelperTests(unittest.TestCase):
                 (destination / "bin" / "flotilla").symlink_to(source / "bin" / "flotilla")
                 for _ in range(2):
                     validation.refresh_darwin_payload(source, destination)
-                    for name in ("flotilla", "flotillad", "cleat"):
+                    for name in ("flotilla", "flotillad", "drydock-host", "cleat"):
                         path = destination / "bin" / name
                         self.assertFalse(path.is_symlink())
                         self.assertEqual(path.read_text(), name)

@@ -44,6 +44,11 @@ class BootstrapValidationTests(unittest.TestCase):
                 self.assertNotIn(path, validation.REQUIRED_PAYLOAD)
         self.assertFalse(validation.allowed_payload("bin/../drydock-agent", "linux-x86_64"))
 
+    def test_drydock_host_is_required_on_every_platform(self):
+        self.assertIn("bin/drydock-host", validation.REQUIRED_PAYLOAD)
+        for platform in validation.PLATFORMS:
+            self.assertTrue(validation.allowed_payload("bin/drydock-host", platform))
+
     # cleat's database and license are release data. Earlier generations may
     # omit them so health rollback remains valid.
     def test_terminfo_payload_accepts_release_data_without_requiring_old_generations(self):
