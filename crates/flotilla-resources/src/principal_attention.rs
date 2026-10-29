@@ -15,6 +15,15 @@ define_resource!(
     queryable = &["metadata.name", "spec.originating_work_ref.name", "status.state", "spec.originating_work_ref.kind"]
 );
 
+/// Why a held standing convoy, or a convoy whose reclaim is refused, needs a person.
+pub const RECLAIM_REFUSAL_REASON_ANNOTATION: &str = "flotilla.work/reclaim-refusal-reason";
+/// Why a standing convoy is held; stored under the same key as a refused reclaim.
+pub const ENSURE_HOLD_REASON_ANNOTATION: &str = RECLAIM_REFUSAL_REASON_ANNOTATION;
+/// Why a credential stopped refreshing for a vessel.
+pub const CREDENTIAL_REFRESH_REASON_ANNOTATION: &str = "flotilla.work/credential-refresh-reason";
+/// The convoy's name for the vessel whose credential stopped refreshing.
+pub const CREDENTIAL_REFRESH_VESSEL_ANNOTATION: &str = "flotilla.work/credential-refresh-vessel";
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct DemandPoolRef(pub String);

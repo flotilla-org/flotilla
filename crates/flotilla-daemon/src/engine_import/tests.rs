@@ -134,6 +134,16 @@ async fn populated(dir: &Path) -> SqliteBackend {
     )
     .await;
     own::<Convoy>(&backend, document("Convoy", "governor-1", json!({"workflow_ref": "w", "inputs": {}}), Value::Null)).await;
+    own::<flotilla_resources::Demand>(
+        &backend,
+        demand(
+            "reclaim-refusal-governor-1",
+            ("Convoy", "governor-1"),
+            &[(flotilla_resources::RECLAIM_REFUSAL_REASON_ANNOTATION, "checkout is dirty")],
+            "raised",
+        ),
+    )
+    .await;
     let repository = json!({"forge": {"repository": "org/repo", "service_url": "https://github.com"},
         "identity": {"canonical_remote": "https://github.com/org/repo", "kind": "remote"}, "remotes": ["https://github.com/org/repo"]});
     let key = serde_json::from_value::<RepositorySpec>(repository.clone()).expect("repository").key().0;
@@ -253,6 +263,7 @@ async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
         "Project",
         "CredentialSpec",
         "TerminalSession",
+        "Demand",
     ] {
         assert_eq!(kinds[kind]["imported"], 1, "{kind}: {report:#}");
     }
@@ -381,10 +392,10 @@ fn rows_of_kinds_no_importer_reads_are_dropped_kept_or_refused_here_only() {
     let source = Source::new(vec![
         row("usages", HERE, "usage"),
         row("events", HERE, "event"),
-        row("demands", HERE, "demand"),
+        row("regards", HERE, "regard"),
         row("widgets", HERE, "widget"),
         row("widgets", THERE, "their-widget"),
-        row("demands", THERE, "their-demand"),
+        row("regards", THERE, "their-regard"),
     ]);
     let target = Import::in_memory(HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
     assert!(target.imports(HERE) && !target.imports(THERE));
@@ -392,7 +403,7 @@ fn rows_of_kinds_no_importer_reads_are_dropped_kept_or_refused_here_only() {
     plan_rows(&source, &target, &mut summary);
     assert_eq!(summary.kinds["Usage"].dropped, 1);
     assert_eq!(summary.kinds["Event"].dropped, 1);
-    assert_eq!(summary.staying.get("Demand"), Some(&("#3824 layer 8", 1)), "a kind still moving stays on the old store");
+    assert_eq!(summary.staying.get("Regard"), Some(&("#3938", 1)), "a kind still moving stays on the old store");
     assert_eq!(
         summary.refusals,
         vec![Refusal { kind: "widgets".into(), name: "widget".into(), reason: "no import plan for its kind".into() }]
@@ -770,4 +781,180 @@ fn hosts_importing_together_write_each_observation_once_at_its_observer() {
         ("Issue".to_owned(), vec![ELSEWHERE.to_owned()]),
     ]);
     assert_eq!(written, expected);
+}
+
+type MessageResource = flotilla_state_machines::Resource<flotilla_state_machines::machines::message::Message>;
+
+fn demand(name: &str, target: (&str, &str), annotations: &[(&str, &str)], state: &str) -> Value {
+    let target = flotilla_protocol::ResourceRef::new("flotilla.work/v1", target.0, NS, target.1);
+    let spec = flotilla_resources::DemandSpec::for_dispatching_principal(
+        target,
+        flotilla_resources::DemandKind::HumanGate,
+        flotilla_protocol::PrincipalRef::implicit_for_namespace(NS),
+    );
+    let mut record = document(
+        "Demand",
+        name,
+        serde_json::to_value(spec).expect("spec"),
+        json!({"state": state, "raised": {"as_of": "2026-10-20T00:00:00Z", "authority": "writer"}}),
+    );
+    record["metadata"]["annotations"] = annotations.iter().map(|(key, value)| ((*key).to_owned(), json!(value))).collect();
+    record
+}
+
+fn attention_records() -> Vec<Value> {
+    let convoy = |name: &str, project: Option<&str>, phase: &str| {
+        let spec = flotilla_resources::ConvoySpec::builder().workflow_ref("w".into()).maybe_project_ref(project.map(str::to_owned)).build();
+        document("Convoy", name, serde_json::to_value(spec).expect("spec"), json!({"phase": phase}))
+    };
+    let mut terminal = document(
+        "TerminalSession",
+        "coder-session",
+        json!({"env_ref": "env", "role": "coder", "source": {"kind": "tool", "command": "true"}, "cwd": "/repo", "pool": "cleat"}),
+        json!({"phase": "Running", "session_id": "s1"}),
+    );
+    terminal["metadata"]["labels"] = json!({"flotilla.work/convoy": "demo", "flotilla.work/role": "coder"});
+    let reclaim = flotilla_resources::RECLAIM_REFUSAL_REASON_ANNOTATION;
+    let credential = flotilla_resources::CREDENTIAL_REFRESH_REASON_ANNOTATION;
+    let vessel = flotilla_resources::CREDENTIAL_REFRESH_VESSEL_ANNOTATION;
+    let drift = flotilla_charter::ops_entry::ENSURE_CONFIG_DRIFT_REASON_ANNOTATION;
+    let delivery = flotilla_resources::delivery_hold::DELIVERY_HOLD_REASON_ANNOTATION;
+    let mut pooled = demand("ensure-attention-pooled", ("Convoy", "standing-gui-1"), &[], "raised");
+    pooled["spec"]["addressee"] = json!({"kind": "pool", "pool_ref": "reviewers"});
+    vec![
+        designation(),
+        convoy("standing-gui-1", Some("flotilla"), "Active"),
+        convoy("finished", None, "Landed"),
+        convoy("demo", Some("flotilla"), "Active"),
+        document(
+            "ConvoyEnsure",
+            "standing-gui",
+            json!({"project_ref": "flotilla", "role": "gui", "repositories": []}),
+            json!({"convoy_ref": "standing-gui-1"}),
+        ),
+        document(
+            "Vessel",
+            "demo-work",
+            json!({"convoy_ref": "demo", "vessel_name": "work", "fulfilment_kind_ref": "p"}),
+            json!({"phase": "Ready", "environment_ref": "env-b",
+                "placement_decision": {"policy_name": "p", "target_host": {"ref": "feta", "display_name": "feta"}}}),
+        ),
+        terminal,
+        demand("ensure-attention-standing-gui", ("Convoy", "standing-gui-1"), &[(reclaim, "held after 3 failures")], "escalated"),
+        demand("ensure-config-drift-standing-gui", ("Convoy", "standing-gui-1"), &[(drift, "ConfigDrift: workflow: a -> b")], "raised"),
+        demand("reclaim-refusal-finished", ("Convoy", "finished"), &[(reclaim, "checkout is dirty")], "raised"),
+        demand(
+            "credential-refresh-demo-work-github-app",
+            ("Convoy", "demo"),
+            &[(credential, "expires in 2 minutes"), (vessel, "work")],
+            "raised",
+        ),
+        demand("credential-refresh-demo-work-forgejo", ("Convoy", "demo"), &[(credential, "refused"), (vessel, "work")], "raised"),
+        demand("terminal-delivery-coder-session", ("TerminalSession", "coder-session"), &[(delivery, "batch held")], "raised"),
+        demand("terminal-attention-coder-session", ("TerminalSession", "coder-session"), &[], "raised"),
+        demand("declaration-refused-flotilla", ("Project", "flotilla"), &[], "raised"),
+        demand("ensure-attention-seen", ("Convoy", "standing-gui-1"), &[(reclaim, "held")], "acknowledged"),
+        demand("reclaim-refusal-gone", ("Convoy", "gone"), &[(reclaim, "refused")], "raised"),
+        demand("surprise", ("Convoy", "demo"), &[], "raised"),
+        demand("terminal-delivery-misaimed", ("Convoy", "demo"), &[], "raised"),
+        pooled,
+    ]
+}
+
+#[test]
+fn open_demands_import_as_the_attentions_their_writers_send() {
+    let source = rows(attention_records());
+    let summary = rehearse(&source, HERE);
+    assert_eq!(summary.kinds["Demand"], Counts { imported: 5, dropped: 5, refused: 3 }, "{summary:?}");
+    assert_eq!(
+        refused(&summary),
+        [("Demand", "ensure-attention-pooled"), ("Demand", "surprise"), ("Demand", "terminal-delivery-misaimed")],
+        "{summary:?}"
+    );
+
+    let mut target = Import::in_memory(HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
+    let imported = import(&source, &mut target);
+    assert_eq!(imported.kinds["Demand"], summary.kinds["Demand"]);
+    let mut read = target.store().read().expect("read");
+    let mut load = |name: &str| {
+        let id = read.resolve(<MessageResource as Kind>::CODE, name, HERE).expect("resolve").expect(name);
+        read.load::<MessageResource>(id).expect("load").expect(name).value
+    };
+    let cases = [
+        ("project:flotilla/role:operator/message:ensure-attention-standing-gui", "standing", "project:flotilla/convoy:standing-gui-1"),
+        ("project:flotilla/role:operator/message:ensure-config-drift-standing-gui", "standing", "project:flotilla/role:gui"),
+        ("fleet:lab/role:operator/message:reclaim-refusal-finished", "teardown", "convoy:finished"),
+        ("project:flotilla/role:operator/message:credential-refresh-demo-work", "capabilities", "project:flotilla/convoy:demo/vessel:work"),
+        ("project:flotilla/role:operator/message:terminal-delivery-coder-session", "turn-rules", "project:flotilla/convoy:demo/role:coder"),
+    ];
+    for (name, sender, subject) in cases {
+        let message = load(name);
+        assert_eq!(message.spec().sender.as_str(), format!("fleet:lab/role:{sender}"), "{name}");
+        assert_eq!(message.spec().subject().map(|reference| reference.address.as_str()), Some(subject), "{name}");
+        assert_eq!(*message.state(), flotilla_state_machines::machines::message::MessageState::Pending, "{name}");
+        assert_eq!(message.since(), Timestamp::from_datetime(&"2026-10-20T00:00:00Z".parse().expect("time")), "{name}");
+    }
+    let credential = load("project:flotilla/role:operator/message:credential-refresh-demo-work");
+    assert_eq!(
+        credential.spec().body.value(),
+        &flotilla_state_machines::machines::message::MessageBody::Text("forgejo: refused\ngithub-app: expires in 2 minutes".into())
+    );
+}
+
+#[test]
+fn attentions_of_two_namespaces_at_one_home_take_distinct_admission_sequences() {
+    let records = |namespace: &str| {
+        let spec = flotilla_resources::ConvoySpec::builder().workflow_ref("w".into()).project_ref(namespace.into()).build();
+        let reclaim = flotilla_resources::RECLAIM_REFUSAL_REASON_ANNOTATION;
+        [
+            designation(),
+            document("Convoy", "finished", serde_json::to_value(spec).expect("spec"), json!({"phase": "Landed"})),
+            demand("reclaim-refusal-finished", ("Convoy", "finished"), &[(reclaim, "checkout is dirty")], "raised"),
+        ]
+        .into_iter()
+        .map(|mut document| {
+            document["metadata"]["namespace"] = json!(namespace);
+            let kind = document["kind"].as_str().expect("kind").to_owned();
+            let plural = REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.kind == kind).expect("registered").plural;
+            Row { namespace: namespace.into(), plural: plural.into(), home: HERE.into(), document }
+        })
+        .collect::<Vec<_>>()
+    };
+    let source = Source::new([records("alpha"), records("beta")].concat());
+    let summary = rehearse(&source, HERE);
+    assert_eq!(summary.kinds["Demand"], Counts { imported: 2, dropped: 0, refused: 0 }, "{summary:?}");
+}
+
+#[test]
+fn a_credential_group_with_no_vessel_drops_every_demand_for_that_reason() {
+    let credential = flotilla_resources::CREDENTIAL_REFRESH_REASON_ANNOTATION;
+    let vessel = flotilla_resources::CREDENTIAL_REFRESH_VESSEL_ANNOTATION;
+    let mut records: Vec<Value> = attention_records().into_iter().filter(|record| record["kind"] != "Demand").collect();
+    records.extend([
+        demand("credential-refresh-demo-gone-a", ("Convoy", "demo"), &[(credential, "refused"), (vessel, "gone")], "raised"),
+        demand("credential-refresh-demo-gone-b", ("Convoy", "demo"), &[(credential, "refused"), (vessel, "gone")], "raised"),
+    ]);
+    let source = rows(records);
+    let mut target = Import::in_memory(HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
+    let mut report = ImportReport::default();
+    attentions::attentions(&source, &mut target, &mut Carried::default(), &mut report);
+    assert_eq!(report.dropped.get(&("Demand", "its vessel is gone")), Some(&2), "{report:?}");
+    assert!(report.imported.is_empty() && report.refused.is_empty(), "{report:?}");
+}
+
+#[test]
+fn a_credential_group_addressed_to_different_people_is_refused_whole() {
+    let credential = flotilla_resources::CREDENTIAL_REFRESH_REASON_ANNOTATION;
+    let vessel = flotilla_resources::CREDENTIAL_REFRESH_VESSEL_ANNOTATION;
+    let mut records: Vec<Value> = attention_records().into_iter().filter(|record| record["kind"] != "Demand").collect();
+    let mut other = demand("credential-refresh-demo-work-b", ("Convoy", "demo"), &[(credential, "refused"), (vessel, "work")], "raised");
+    other["status"]["raised"]["as_of"] = json!("2026-10-21T00:00:00Z");
+    other["spec"]["addressee"]["principal_ref"]["name"] = json!("alice");
+    records.extend([
+        demand("credential-refresh-demo-work-a", ("Convoy", "demo"), &[(credential, "refused"), (vessel, "work")], "raised"),
+        other,
+    ]);
+    let summary = rehearse(&rows(records), HERE);
+    assert_eq!(summary.kinds["Demand"], Counts { imported: 0, dropped: 0, refused: 2 }, "{summary:?}");
+    assert!(summary.refusals.iter().all(|refusal| refusal.reason.contains("different people")), "{summary:?}");
 }

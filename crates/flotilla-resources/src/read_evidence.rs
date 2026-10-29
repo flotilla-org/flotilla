@@ -138,7 +138,7 @@ pub fn credential_refresh_alert_for_vessel(demand: &ResourceObject<ResourceDeman
     {
         return None;
     }
-    demand.metadata.annotations.get("flotilla.work/credential-refresh-reason").cloned()
+    demand.metadata.annotations.get(crate::CREDENTIAL_REFRESH_REASON_ANNOTATION).cloned()
 }
 
 use crate::{TerminalAttentionState, TerminalSessionStatus};

@@ -26,7 +26,7 @@ use flotilla_resources::{
     ConvoyEnsureConfigDrift, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyEnsureStatusPatch, ConvoyPhase,
     Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, FulfilmentKind,
     Host as ResourceHost, InputMeta, ObjectEvent, Project, ReadResourceObject, Repository, Resource, ResourceError, ResourceObject,
-    ResourceProvenance, WorkflowTemplate, DRIVER_ADMISSION_CONDITION_TYPE,
+    ResourceProvenance, WorkflowTemplate, DRIVER_ADMISSION_CONDITION_TYPE, ENSURE_HOLD_REASON_ANNOTATION,
 };
 use flotilla_store::{apply_status_patch as apply_resource_status_patch, EventRecorder, ResourceBackend, StoreQuery};
 use sha2::{Digest, Sha256};
@@ -36,7 +36,6 @@ const ENSURE_BACKOFF_RESET_AFTER: ChronoDuration = ChronoDuration::minutes(10);
 const ENSURE_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const ENSURE_ESCALATION_AFTER: ChronoDuration = ChronoDuration::minutes(15);
 const ENSURE_HOLD_ATTENTION_PREFIX: &str = "ensure-attention-";
-const RECLAIM_REFUSAL_REASON_ANNOTATION: &str = "flotilla.work/reclaim-refusal-reason";
 #[derive(Debug, Clone)]
 struct EnsureAdmissionRetry {
     config_hash: String,
@@ -1122,7 +1121,7 @@ impl EnsurePass<'_> {
         );
         let meta = InputMeta::builder()
             .name(name)
-            .annotations(BTreeMap::from([(RECLAIM_REFUSAL_REASON_ANNOTATION.to_string(), reason.to_string())]))
+            .annotations(BTreeMap::from([(ENSURE_HOLD_REASON_ANNOTATION.to_string(), reason.to_string())]))
             .build();
         let mut spec = DemandSpec::for_dispatching_principal(target, DemandKind::HumanGate, convoy.spec.dispatching_principal_ref.clone());
         spec.expiry = escalation_deadline.map(|deadline| DemandExpiry { deadline, disposition: DemandExpiryDisposition::Escalate });

@@ -10,12 +10,14 @@
 //! ports here ([`OldStoreRecords`]), so each kind that moves later swaps
 //! one implementation.
 
+pub mod attention;
 pub mod awaiting;
 pub mod convert;
 pub mod convoy_engine;
 pub mod convoy_import;
 pub mod convoy_map;
 pub mod convoys;
+pub mod demand_import;
 pub mod ensures;
 pub mod import;
 pub mod ports;

@@ -71,7 +71,7 @@ fn engine_message(primitives: &MessagePrimitives, record: &str) -> flotilla_stat
 async fn system_producers_send_as_their_fleet_roles() {
     let dir = tempfile::tempdir().expect("tempdir");
     let primitives = primitives(&dir).await;
-    for role in ["turn-rules", "nudge", "stall-judge", "capabilities", "fleet-store"] {
+    for role in ["turn-rules", "nudge", "stall-judge", "capabilities", "fleet-store", "standing", "teardown"] {
         let sender = format!("system:{role}");
         let record = flotilla_resources::message_record_name(CREW, &sender, role);
         primitives.admit(NAMESPACE, &record, &intent(&sender, CREW)).await.expect("admitted");

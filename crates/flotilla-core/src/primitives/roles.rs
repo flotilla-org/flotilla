@@ -21,13 +21,22 @@ pub const TURN_RULES: FleetRole = FleetRole {
 pub const NUDGE: FleetRole = FleetRole { name: "nudge", purpose: "Nudges a quiet crew toward the obligation it has not yet met." };
 pub const STALL_JUDGE: FleetRole =
     FleetRole { name: "stall-judge", purpose: "Judges a quiet crew stalled and escalates it to its supervisor." };
-pub const CAPABILITIES: FleetRole =
-    FleetRole { name: "capabilities", purpose: "Tells a crew when the credentials and tools it may use change." };
+pub const CAPABILITIES: FleetRole = FleetRole {
+    name: "capabilities",
+    purpose: "Tells a crew when the credentials and tools it may use change, and tells a person when a credential stops refreshing.",
+};
 pub const FLEET_STORE: FleetRole =
     FleetRole { name: "fleet-store", purpose: "Tells a crew when the charter of the project it works under changes." };
 
+pub const STANDING: FleetRole = FleetRole {
+    name: "standing",
+    purpose: "Keeps each standing role's convoy running, and tells a person when one is held or its configuration has drifted from what was admitted.",
+};
+pub const TEARDOWN: FleetRole =
+    FleetRole { name: "teardown", purpose: "Reclaims a finished convoy's resources, and tells a person when reclaim is refused." };
+
 /// The defaults the system sends as, in declaration order.
-pub const FLEET_ROLES: [FleetRole; 5] = [TURN_RULES, NUDGE, STALL_JUDGE, CAPABILITIES, FLEET_STORE];
+pub const FLEET_ROLES: [FleetRole; 7] = [TURN_RULES, NUDGE, STALL_JUDGE, CAPABILITIES, FLEET_STORE, STANDING, TEARDOWN];
 
 /// A person's role for the matters of its context (#3938): crew stalls
 /// escalated past every supervisor, held turns waiting on a ruling, and the
@@ -53,7 +62,7 @@ pub struct FleetRoles {
 }
 
 impl FleetRoles {
-    /// The five default roles under the fleet's own name, preserving its exact
+    /// The default roles under the fleet's own name, preserving its exact
     /// spelling. Changing that identity changes the inbox addresses and strands
     /// messages pending under the previous name; changing the charter Project does not.
     pub fn declared(fleet: &str) -> Result<Self, String> {
@@ -138,13 +147,13 @@ pub async fn designated_fleet_roles(backend: &ResourceBackend, namespace: &str) 
 mod tests {
     use super::*;
 
-    // Behaviour: five code-declared roles live under the fleet,
+    // Behaviour: the code-declared roles live under the fleet,
     // each with a purpose; overrides keep the same address form.
     #[test]
     fn fleet_roles_are_roles_of_the_fleet() {
         let roles = FleetRoles::declared("fleet").expect("roles");
         let names: Vec<_> = roles.roles().map(|(name, _)| name).collect();
-        assert_eq!(names, ["capabilities", "fleet-store", "nudge", "stall-judge", "turn-rules"]);
+        assert_eq!(names, ["capabilities", "fleet-store", "nudge", "stall-judge", "standing", "teardown", "turn-rules"]);
         assert!(roles.roles().all(|(_, purpose)| !purpose.is_empty() && !purpose.contains('\n')));
         let turn_rules = roles.address("turn-rules").expect("declared");
         assert_eq!(turn_rules.as_str(), "fleet:fleet/role:turn-rules");
