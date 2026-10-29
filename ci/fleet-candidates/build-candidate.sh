@@ -164,6 +164,8 @@ python3 "$(dirname "$0")/generation_validation.py" codex-home "$codex_home_bundl
   cd "$flotilla_root"
   export FLOTILLA_BUILD_ID="${flotilla_sha:0:12}"
   cargo build --locked --release --bin flotilla --bin flotillad
+  # flotillad embeds the drydock daemon, which finds provider hosts beside itself.
+  cargo build --locked --release -p drydock-host --bin drydock-host
   if [[ "$platform" == linux-* ]]; then
     cargo build --locked --release -p flotilla-cli --bin flotilla-vessel
     cargo build --locked --release -p drydock-agent --bin drydock-agent
@@ -182,6 +184,7 @@ python3 "$(dirname "$0")/generation_validation.py" codex-home "$codex_home_bundl
 
 install -m 0755 "$flotilla_root/target/release/flotilla" "$bundle/bin/flotilla"
 install -m 0755 "$flotilla_root/target/release/flotillad" "$bundle/bin/flotillad"
+install -m 0755 "$flotilla_root/target/release/drydock-host" "$bundle/bin/drydock-host"
 if [[ "$platform" == linux-* ]]; then
   install -m 0755 "$flotilla_root/target/release/flotilla-vessel" "$bundle/bin/flotilla-vessel"
   install -m 0755 "$flotilla_root/target/release/drydock-agent" "$bundle/bin/drydock-agent"
@@ -228,6 +231,8 @@ cp "$flotilla_root/scripts/fleet-canary.py" "$bundle/fleet-canary.py"
 cp "$flotilla_root/scripts/fleet-canary-agent.sh" "$bundle/fleet-canary-agent.sh"
 cp "$flotilla_root/ci/fleet-candidates/generation_validation.py" "$bundle/generation_validation.py"
 chmod 0755 "$bundle/install.sh" "$bundle/generation_validation.py"
+
+python3 "$(dirname "$0")/generation_validation.py" produced-payload "$bundle"
 
 wire_generation="${flotilla_sha:0:12}"
 "$bundle/bin/flotilla" --version | grep -F "wire=$wire_generation"

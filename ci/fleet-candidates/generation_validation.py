@@ -60,6 +60,13 @@ CANARY_PAYLOAD = {
     # roll; new candidates do not package it. Remove in generation 3.
     "crew-image-baseline.yaml",
 }
+# Shipped beside flotillad on every platform: its embedded drydock daemon finds
+# provider hosts there. Like the CODEX_HOME template it is required at
+# production (`produced-payload`, run by build-candidate.sh) and tolerated at
+# consumption, so health rollback to a generation built before it still
+# validates. Remove from the tolerance (move to REQUIRED_PAYLOAD) one roll
+# after every installed generation carries it.
+PRODUCED_PAYLOAD = {"bin/drydock-host"}
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 GENERATION_PATTERN = re.compile(r"^(\d{8}T\d{6}Z-r\d+-f([0-9a-f]{12})-c([0-9a-f]{12}))$")
@@ -393,7 +400,7 @@ def allowed_payload(path, platform=None):
     # Optional for prior-generation rollback; the producer always ships these.
     if path in {"bin/flotilla-vessel", "bin/drydock-agent"}:
         return platform.startswith("linux-")
-    if path in REQUIRED_PAYLOAD or path in CANARY_PAYLOAD:
+    if path in REQUIRED_PAYLOAD or path in CANARY_PAYLOAD or path in PRODUCED_PAYLOAD:
         return True
     pure = PurePosixPath(path)
     library = (len(pure.parts) == 2 and pure.parts[0] == "lib"
@@ -549,6 +556,14 @@ def validate_skill_source_paths(document, catalog_output=None):
     if catalog_output is not None:
         Path(catalog_output).write_text(json.dumps(catalog, indent=2, sort_keys=True) + "\n")
 
+
+
+def validate_produced_payload(bundle):
+    """Refuse a freshly assembled bundle missing a payload every new generation ships."""
+    for rel in sorted(PRODUCED_PAYLOAD):
+        path = Path(bundle) / rel
+        if not path.is_file() or not os.access(path, os.X_OK):
+            raise ValidationError(f"bundle is missing executable {rel}")
 
 
 def validate_codex_home_template(root):
@@ -847,7 +862,7 @@ def validate_release(root, outer, platform):
     codex_home = root.joinpath(*CODEX_HOME_PREFIX)
     if codex_home.exists():
         validate_codex_home_template(codex_home)
-    binaries = {"bin/flotilla", "bin/flotillad", "bin/cleat"} | (expected & {"bin/flotilla-vessel", "bin/drydock-agent"})
+    binaries = {"bin/flotilla", "bin/flotillad", "bin/cleat"} | (expected & ({"bin/flotilla-vessel", "bin/drydock-agent"} | PRODUCED_PAYLOAD))
     for rel in binaries:
         if not os.access(root / rel, os.X_OK):
             raise ValidationError(f"release binary is not executable: {rel}")
@@ -1184,6 +1199,8 @@ def refresh_darwin_payload(source, destination):
     # can leave earlier replacements/pruning applied. Empty lib directories stay.
     source, destination = Path(source), Path(destination)
     files = [Path("bin") / name for name in ("flotilla", "flotillad", "cleat")]
+    # Absent from generations built before it shipped (rollback targets).
+    files += [Path(p) for p in sorted(PRODUCED_PAYLOAD) if (source / p).exists()]
     files += [path.relative_to(source) for path in (source / "lib").rglob("*") if path.is_file()]
     expected = set(files)
     for stale in (destination / "lib").rglob("*"):
@@ -1314,6 +1331,8 @@ def main():
     skill_sources.add_argument("--catalog-output")
     codex_home = sub.add_parser("codex-home")
     codex_home.add_argument("root")
+    produced = sub.add_parser("produced-payload")
+    produced.add_argument("root")
     helper = sub.add_parser("package-page")
     helper.add_argument("response")
     helper.add_argument("package_name")
@@ -1436,6 +1455,8 @@ def main():
             validate_fixture(args.path)
         elif args.command == "skill-sources":
             validate_skill_source_paths(json.loads(Path(args.manifest).read_text()), args.catalog_output)
+        elif args.command == "produced-payload":
+            validate_produced_payload(args.root)
         elif args.command == "codex-home":
             validate_codex_home_template(args.root)
         elif args.command == "generation":

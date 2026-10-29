@@ -462,7 +462,7 @@ def validate_derivative(
     }
     if attestation.get("output") != expected_output:
         raise FinalizationError("signing attestation does not bind the signed output")
-    signing_targets = REQUIRED_BINARIES | {path for path in unsigned_files if path.startswith("lib/")}
+    signing_targets = REQUIRED_BINARIES | (validation.PRODUCED_PAYLOAD & set(unsigned_files)) | {path for path in unsigned_files if path.startswith("lib/")}
     payloads = attestation.get("payloads")
     if not isinstance(payloads, list) or any(not isinstance(record, dict) for record in payloads):
         raise FinalizationError("signing attestation has invalid payload records")
