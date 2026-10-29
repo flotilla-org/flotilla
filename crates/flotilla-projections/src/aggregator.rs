@@ -2341,7 +2341,7 @@ impl Aggregator {
                     .collect()
             })
             .collect();
-        SalienceFacts { demands, regards, attention, pane_exits: Vec::new() }
+        SalienceFacts { demands, regards, attention }
     }
 
     fn next_regard_expiry_delay(&self) -> Option<std::time::Duration> {

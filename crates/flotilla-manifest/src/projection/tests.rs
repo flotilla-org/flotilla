@@ -2,7 +2,7 @@ use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeMap;
 
 use flotilla_protocol::{
-    result_set::{AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessLink, AwarenessNode, AwarenessState, CrewMemberSummary},
+    result_set::{AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessState, CrewMemberSummary},
     HostName, IssueRef, IssueSource, RepoKey, RepositoryKey, ResourceRef,
 };
 use flotilla_resources::{
@@ -14,11 +14,10 @@ use super::*;
 use crate::{
     entity,
     keys::{
-        KEY_CHANGE_REQUEST_NUMBER, KEY_CHECKOUT_BRANCH, KEY_CHECKOUT_PATH, KEY_CONVOY, KEY_CONVOY_NAME, KEY_COUNT_CHECKOUTS,
-        KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_DISPLAY_LABEL, KEY_DISPLAY_LABEL_MEDIUM, KEY_DISPLAY_LABEL_SHORT, KEY_ENTITY_ID,
-        KEY_ENTITY_KIND, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET, KEY_ROLE, KEY_ROLE_HOLD, KEY_ROLE_NAME, KEY_SOURCE,
-        KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL, KEY_WORKSPACE_PRIMARY_STATE, KEY_WORKSPACE_PRIMARY_TARGET,
-        SEGMENT_PROJECT, SEGMENT_REPO,
+        KEY_CHANGE_REQUEST_NUMBER, KEY_CONVOY, KEY_CONVOY_NAME, KEY_COUNT_CHECKOUTS, KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_DISPLAY_LABEL,
+        KEY_DISPLAY_LABEL_MEDIUM, KEY_DISPLAY_LABEL_SHORT, KEY_ENTITY_ID, KEY_ENTITY_KIND, KEY_PRIMARY_ACTION_RECIPE,
+        KEY_PRIMARY_ACTION_TARGET, KEY_ROLE, KEY_ROLE_HOLD, KEY_ROLE_NAME, KEY_SOURCE, KEY_STATUS_ATTENTION, KEY_STATUS_STATE,
+        KEY_SUMMARY_TEXT, KEY_VESSEL, KEY_WORKSPACE_PRIMARY_STATE, KEY_WORKSPACE_PRIMARY_TARGET, SEGMENT_PROJECT, SEGMENT_REPO,
     },
     recipe::FlotillaRecipes,
 };
@@ -589,17 +588,6 @@ fn awareness_convoy_labels_ignore_legacy_subject_annotations() {
             (KEY_CHANGE_REQUEST_NUMBER.to_owned(), "1044".to_owned()),
         ]))
         .build();
-    let checkout = AwarenessEntry::builder()
-        .id("checkout/kiwi//work/flotilla".to_owned())
-        .kind(AwarenessKind::Checkout)
-        .label("main · /work/flotilla".to_owned())
-        .state(AwarenessState::Active)
-        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
-        .annotations(std::collections::HashMap::from([
-            (KEY_CHECKOUT_BRANCH.to_owned(), "main".to_owned()),
-            (KEY_CHECKOUT_PATH.to_owned(), "/work/flotilla".to_owned()),
-        ]))
-        .build();
     let node = AwarenessNode::builder()
         .id("project/dev/platform".to_owned())
         .kind(AwarenessKind::Project)
@@ -607,8 +595,8 @@ fn awareness_convoy_labels_ignore_legacy_subject_annotations() {
         .scope(flotilla_protocol::QueryScope::new("dev", "platform"))
         .state(AwarenessState::Active)
         .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
-        .counts(AwarenessCounts::builder().total(2).convoys(1).checkouts(1).build())
-        .entries(vec![convoy, checkout])
+        .counts(AwarenessCounts::builder().total(1).convoys(1).build())
+        .entries(vec![convoy])
         .build();
 
     let patches = project_catalog(
@@ -631,16 +619,10 @@ fn awareness_convoy_labels_ignore_legacy_subject_annotations() {
     assert_eq!(text(convoy, KEY_CONVOY_NAME), "landing");
     assert!(!convoy.set.contains_key(KEY_CHANGE_REQUEST_NUMBER));
 
-    let checkout = find_entity(&patches, &entity::checkout("checkout/kiwi//work/flotilla"));
-    assert_eq!(text(checkout, KEY_DISPLAY_LABEL), "main · /work/flotilla");
-    assert_eq!(text(checkout, KEY_SUMMARY_TEXT), "main · /work/flotilla");
-    assert_eq!(text(checkout, KEY_CHECKOUT_BRANCH), "main");
-    assert_eq!(text(checkout, KEY_CHECKOUT_PATH), "/work/flotilla");
-
     let project = find_entity(&patches, &entity::project("dev", "platform", "fleet"));
-    assert_eq!(text(project, KEY_SUMMARY_TEXT), "2 entries · 0 issues · 0 vessels · 1 checkouts");
-    assert_eq!(project.set[KEY_COUNT_TOTAL].value, MetadataValue::Integer(2));
-    assert_eq!(project.set[KEY_COUNT_CHECKOUTS].value, MetadataValue::Integer(1));
+    assert_eq!(text(project, KEY_SUMMARY_TEXT), "1 entries · 0 issues · 0 vessels · 0 checkouts");
+    assert_eq!(project.set[KEY_COUNT_TOTAL].value, MetadataValue::Integer(1));
+    assert_eq!(project.set[KEY_COUNT_CHECKOUTS].value, MetadataValue::Integer(0));
 }
 
 #[test]
@@ -738,58 +720,6 @@ fn same_role_remote_governors_project_as_distinct_catalog_entities() {
         assert_eq!(text(governor, KEY_CONVOY), format!("flotilla/{resource_name}@udder"));
         assert_eq!(text(governor, KEY_CONVOY_NAME), "governor");
     }
-}
-
-#[test]
-fn standing_checkout_mints_a_transient_terminal_action_but_convoy_checkout_does_not() {
-    let checkout = |id: &str, path: &str, links: Vec<AwarenessLink>| {
-        AwarenessEntry::builder()
-            .id(id.to_owned())
-            .kind(AwarenessKind::Checkout)
-            .label(format!("main · {path}"))
-            .state(AwarenessState::Active)
-            .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
-            .refs(vec![ResourceRef::new("flotilla.work/v1", "Checkout", "dev", id).on_host(HostName::new("kiwi"))])
-            .links(links)
-            .annotations(std::collections::HashMap::from([
-                (KEY_CHECKOUT_BRANCH.to_owned(), "main".to_owned()),
-                (KEY_CHECKOUT_PATH.to_owned(), path.to_owned()),
-            ]))
-            .build()
-    };
-    let standing = checkout("standing", "/work/standing", vec![]);
-    let convoy_owned =
-        checkout("convoy-owned", "/work/convoy", vec![AwarenessLink { rel: "for-convoy".to_owned(), target: "dev/ship-it".to_owned() }]);
-    let node = AwarenessNode::builder()
-        .id("project/dev/platform".to_owned())
-        .kind(AwarenessKind::Project)
-        .label("platform".to_owned())
-        .scope(flotilla_protocol::QueryScope::new("dev", "platform"))
-        .state(AwarenessState::Active)
-        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
-        .counts(AwarenessCounts::builder().total(2).checkouts(2).build())
-        .entries(vec![standing, convoy_owned])
-        .build();
-
-    let patches = project_catalog(
-        &CatalogInput {
-            subjects: None,
-            awareness: Some(&[node]),
-            convoys: &[],
-            independents: &[],
-            standing_roles: &[],
-            project_repositories: &[],
-        },
-        &mint(),
-    )
-    .reassert_patches();
-    let standing = find_entity(&patches, &entity::checkout("standing"));
-    assert_eq!(text(standing, KEY_PRIMARY_ACTION_RECIPE), "'flotilla' attach --transient --host 'kiwi' '/work/standing'");
-    assert_eq!(text(standing, KEY_PRIMARY_ACTION_TARGET), "checkout:kiwi//work/standing");
-
-    let convoy_owned = find_entity(&patches, &entity::checkout("convoy-owned"));
-    assert!(!convoy_owned.set.contains_key(KEY_PRIMARY_ACTION_RECIPE));
-    assert!(!convoy_owned.set.contains_key(KEY_PRIMARY_ACTION_TARGET));
 }
 
 #[test]
@@ -3001,19 +2931,6 @@ fn structured_action_facts_preserve_addresses_and_raw_arguments(tc: hegel::TestC
     let cases = [
         (mint.attach(reference, &host).expect("attach"), "attach", format!("session:feta/{reference}"), None),
         (mint.scoped_view(&view).expect("view"), "view", "view:project/dev/platform".to_owned(), None),
-        (
-            mint.checkout_terminal(reference, &host).expect("checkout"),
-            "command",
-            format!("checkout:feta/{reference}"),
-            Some(vec![
-                executable.to_owned(),
-                "attach".to_owned(),
-                "--transient".to_owned(),
-                "--host".to_owned(),
-                "feta".to_owned(),
-                reference.to_owned(),
-            ]),
-        ),
         (Recipe::command("command:test", argv.clone()), "command", "command:test".to_owned(), Some(argv)),
     ];
     for (recipe, kind, target, expected_argv) in cases {
@@ -3047,10 +2964,6 @@ fn structured_actions_keep_legacy_recipe_spelling() {
         (
             mint.scoped_view(&ViewAddress::Project { namespace: "dev".to_owned(), name: "p".to_owned() }).expect("view"),
             "'/opt/$current;flotilla'\\''s build' view 'project/dev/p'",
-        ),
-        (
-            mint.checkout_terminal("/work/repo's path", &host).expect("command"),
-            "'/opt/$current;flotilla'\\''s build' attach --transient --host 'feta' '/work/repo'\\''s path'",
         ),
     ];
     for (recipe, expected) in cases {
@@ -3090,7 +3003,6 @@ fn structured_action_diff_retracts_obsolete_arguments() {
 fn structured_recipe_mint_refuses_ambiguous_hosts() {
     let host = HostName::new("host/ambiguous");
     assert!(mint().attach("refs/heads/topic", &host).is_none());
-    assert!(mint().checkout_terminal("/work/repo", &host).is_none());
 }
 
 // #2758: the catalog exposes raw holds, latest ledger and pending/stuck messages;

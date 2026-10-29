@@ -1,7 +1,6 @@
 use flotilla_cloud_agent::detectors::{self as cloud_agent, claude, codex, cursor};
 use flotilla_discovery_api::host_environment_keys;
 use flotilla_discovery_api::{HostDetector, RepoDetector};
-pub mod cmux;
 
 use flotilla_discovery_api::detectors::{parse_first_dotted_version, CommandDetector, EnvVarDetector};
 
@@ -22,10 +21,6 @@ pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
         Box::new(EnvVarDetector::new("ANTHROPIC_API_KEY")),
         Box::new(cursor::api_key_detector()),
         Box::new(cursor::binary_detector()),
-        Box::new(cmux::CmuxDetector),
-        Box::new(EnvVarDetector::new("ZELLIJ")),
-        Box::new(EnvVarDetector::new("ZELLIJ_SESSION_NAME")),
-        Box::new(CommandDetector::new("zellij", &["--version"], parse_first_dotted_version)),
         Box::new(CommandDetector::new("cleat", &["--version"], parse_first_dotted_version)),
         Box::new(cloud_agent::binary_presence_detector("gemini")),
         Box::new(EnvVarDetector::new("TERM")),
@@ -61,7 +56,7 @@ mod tests {
     #[tokio::test]
     async fn default_env_var_detectors_are_table_driven() {
         let runner = DiscoveryMockRunner::builder().build();
-        let cases = [("CURSOR_API_KEY", "cursor-secret"), ("ZELLIJ", "0"), ("ZELLIJ_SESSION_NAME", "my-session")];
+        let cases = [("CURSOR_API_KEY", "cursor-secret"), ("CLEAT_DAEMON", "main")];
 
         for (key, value) in cases {
             let bag = run_host_detectors(&default_host_detectors(), &runner, &TestEnvVars::new([(key, value)])).await;
@@ -81,7 +76,6 @@ mod tests {
             ("curl", &["--version"], "curl 8.7.1 (arm64-apple-darwin)\n", None, "curl", "8.7.1"),
             ("gh", &["--version"], "gh version 2.49.0\n", None, "gh", "2.49.0"),
             ("agent", &["--version"], "0.1.0\n", Some(resolve("agent")), "/tools/agent", "0.1.0"),
-            ("zellij", &["--version"], "zellij 0.40.1\n", None, "zellij", "0.40.1"),
             ("cleat", &["--version"], "cleat 0.1.0\n", None, "cleat", "0.1.0"),
             ("gemini", &["--version"], "gemini 1.0.0\n", Some(resolve("gemini")), "/tools/gemini", "1.0.0"),
             ("codex", &["--version"], "codex-cli 0.5.0\n", Some(resolve("codex")), "/tools/codex", "0.5.0"),

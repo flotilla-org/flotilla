@@ -555,13 +555,11 @@ impl AwarenessLimit {
 #[serde(rename_all = "snake_case")]
 #[derive(flotilla_schema::Describe)]
 pub enum AwarenessKind {
-    Fleet,
     Project,
     Convoy,
     Issue,
     Vessel,
     Independent,
-    Checkout,
 }
 
 /// Named-query family represented by one panel of a project awareness view.
@@ -571,7 +569,6 @@ pub enum AwarenessKind {
 pub enum AwarenessFamily {
     Convoys,
     Issues,
-    Checkouts,
     Independents,
 }
 
@@ -663,8 +660,6 @@ pub struct AwarenessLink {
     pub rel: String,
     pub target: String,
 }
-
-pub const AWARENESS_REL_FOR_CONVOY: &str = "for-convoy";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder, flotilla_schema::Describe)]
 pub struct AwarenessEntry {
@@ -1739,8 +1734,8 @@ mod serde_category_tests {
     #[test]
     fn every_query_row_enum_matches_its_serde_output() {
         categories!(AwarenessGrouping, None, Project => AwarenessGrouping::Project, Convoy => AwarenessGrouping::Convoy);
-        categories!(AwarenessKind, None, Fleet => AwarenessKind::Fleet, Project => AwarenessKind::Project, Convoy => AwarenessKind::Convoy, Issue => AwarenessKind::Issue, Vessel => AwarenessKind::Vessel, Independent => AwarenessKind::Independent, Checkout => AwarenessKind::Checkout);
-        categories!(AwarenessFamily, None, Convoys => AwarenessFamily::Convoys, Issues => AwarenessFamily::Issues, Checkouts => AwarenessFamily::Checkouts, Independents => AwarenessFamily::Independents);
+        categories!(AwarenessKind, None, Project => AwarenessKind::Project, Convoy => AwarenessKind::Convoy, Issue => AwarenessKind::Issue, Vessel => AwarenessKind::Vessel, Independent => AwarenessKind::Independent);
+        categories!(AwarenessFamily, None, Convoys => AwarenessFamily::Convoys, Issues => AwarenessFamily::Issues, Independents => AwarenessFamily::Independents);
         categories!(AwarenessState, None, Unknown => AwarenessState::Unknown, Idle => AwarenessState::Idle, Pending => AwarenessState::Pending, Waiting => AwarenessState::Waiting, Active => AwarenessState::Active, Done => AwarenessState::Done, Failed => AwarenessState::Failed, Cancelled => AwarenessState::Cancelled);
         categories!(Salience, None, None => Salience::None, Info => Salience::Info, Attention => Salience::Attention, Urgent => Salience::Urgent);
         categories!(AwarenessPhase, Some("kind"), Convoy => AwarenessPhase::Convoy(ConvoyPhase::Pending), Work => AwarenessPhase::Work(WorkPhase::Pending), Session => AwarenessPhase::Session(SessionPhase::Starting), Issue => AwarenessPhase::Issue(IssueState::Open));

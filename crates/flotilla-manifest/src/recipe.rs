@@ -31,7 +31,6 @@ pub(crate) enum LegacyRecipe {
     Attach(Vec<String>),
     View(Vec<String>),
     Command(Vec<String>),
-    Checkout(Vec<String>),
 }
 
 impl Recipe {
@@ -59,10 +58,6 @@ impl Recipe {
         Self { legacy: LegacyRecipe::Command(argv.clone()), shape: RecipeShape::Command { target: target.into(), argv } }
     }
 
-    fn checkout_command(target: String, argv: Vec<String>) -> Self {
-        Self { legacy: LegacyRecipe::Checkout(argv.clone()), shape: RecipeShape::Command { target, argv } }
-    }
-
     fn address(kind: &str, target: String, legacy: LegacyRecipe) -> Self {
         Self { shape: RecipeShape::Address { kind: kind.to_owned(), target }, legacy }
     }
@@ -80,8 +75,6 @@ pub trait RecipeMint: Send + Sync {
     /// running session into a workspace; `attach_ref` is any reference the
     /// daemon accepts (rows expose it as a capability fact).
     fn attach(&self, attach_ref: &str, host: &HostName) -> Option<Recipe>;
-    /// Recipe opening a transient shell rooted at a standing checkout.
-    fn checkout_terminal(&self, path: &str, host: &HostName) -> Option<Recipe>;
     /// Recipe materialising a scoped view of an entity with no live session.
     fn scoped_view(&self, target: &flotilla_protocol::ViewAddress) -> Option<Recipe>;
 }
@@ -131,20 +124,6 @@ impl RecipeMint for FlotillaRecipes {
                 attach_ref.to_owned(),
             ]),
         ))
-    }
-
-    fn checkout_terminal(&self, path: &str, host: &HostName) -> Option<Recipe> {
-        let target = host_target("checkout", host, path)?;
-        // Transient checkout terminals are genuine CLI commands, not live sessions.
-        let argv = vec![
-            self.flotilla_bin.clone(),
-            "attach".to_owned(),
-            "--transient".to_owned(),
-            "--host".to_owned(),
-            host.to_string(),
-            path.to_owned(),
-        ];
-        Some(Recipe::checkout_command(target, argv))
     }
 
     fn scoped_view(&self, target: &ViewAddress) -> Option<Recipe> {

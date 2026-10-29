@@ -11,11 +11,9 @@ use super::resource::run_control_command;
 
 pub(crate) async fn run_pm_command(cli: &Cli, command: PmSubCommand) -> Result<()> {
     match command {
-        PmSubCommand::Connect { zellij_bin, plugin_url, wheelhouse_socket, flotilla_bin } => {
+        PmSubCommand::Connect { wheelhouse_socket, flotilla_bin } => {
             let flotilla_bin = resolve_pm_flotilla_bin(flotilla_bin, std::env::current_exe)?;
             let options = flotilla_cli::pm_connect::PmConnectOptions::builder()
-                .maybe_zellij_bin(zellij_bin)
-                .maybe_plugin_url(plugin_url)
                 .maybe_wheelhouse_socket(wheelhouse_socket)
                 .flotilla_bin(flotilla_bin)
                 .build();

@@ -3,14 +3,12 @@
 #![allow(clippy::double_must_use)]
 
 //! The manifest wire layer: flotilla's producer-side binding to Presentation
-//! Manager metadata planes (zellij + andamento today, wheelhouse next).
+//! Manager metadata planes (wheelhouse).
 //!
-//! Three flotilla producers import this crate, with disjoint patch targets
-//! (design on flotilla-org/flotilla#667, build ticket #708):
+//! Two flotilla producers import this crate, with disjoint patch targets:
 //!
 //! - `flotilla attach` stamps `Pane(id)` with the session identity at the
 //!   binding moment (no TTL),
-//! - the workspace actuator stamps `Tab(id)` on tabs it creates (no TTL),
 //! - `flotilla pm connect` publishes the catalog against `Group`/`Identity`
 //!   targets (TTL'd, re-asserted).
 //!

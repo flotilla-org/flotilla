@@ -23,8 +23,7 @@ cargo run -- ..
 git diff ..
 ```
 
-The generator uses Wheelhouse's UUID workspace IDs for tab targets and includes
-provider-qualified entity references. Flotilla preserves incoming providers;
+The generator includes provider-qualified entity references. Flotilla preserves incoming providers;
 its own entity constructors leave the provider empty for Wheelhouse to scope
 at the connection. Text uses `String` in the mirror and `Arc<str>` upstream;
 both have the same JSON string representation.

@@ -12,7 +12,7 @@ use flotilla_protocol::{
         ConvoyRow, IndependentRow, ProjectRepositoriesRow, Readiness, ReadinessState, SessionPhase, StandingRoleHold, StandingRoleRow,
         SurfaceState, Timestamp, VesselRow, WorkPhase,
     },
-    EnvironmentKind, HostName, ReferenceContext, ViewAddress, AWARENESS_REL_FOR_CONVOY,
+    EnvironmentKind, HostName, ReferenceContext, ViewAddress,
 };
 use flotilla_resources::{
     ChangeRequest, ChangeRequestStatus, Forge, Issue, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability,
@@ -22,22 +22,21 @@ use flotilla_resources::{
 use crate::{
     entity::{self, EntityRef},
     keys::{
-        ARCHIPELAGO_ORDINAL, CATALOG_TTL_MS, KEY_CHECKOUT_BRANCH, KEY_CHECKOUT_PATH, KEY_CONVOY, KEY_CONVOY_ALTERNATIVES,
-        KEY_CONVOY_COST_CLASS, KEY_CONVOY_HOST_NAME, KEY_CONVOY_HOST_REF, KEY_CONVOY_KIND, KEY_CONVOY_MESSAGE, KEY_CONVOY_MINIMAL,
-        KEY_CONVOY_MINIMAL_ALTERNATIVES, KEY_CONVOY_NAME, KEY_CONVOY_PHASE, KEY_CONVOY_POLICY, KEY_CONVOY_STANDING, KEY_CONVOY_SUPERSEDED,
-        KEY_CONVOY_WORKFLOW, KEY_COUNT_CHECKOUTS, KEY_COUNT_CONVOYS, KEY_COUNT_INDEPENDENTS, KEY_COUNT_ISSUES, KEY_COUNT_TOTAL,
-        KEY_COUNT_VESSELS, KEY_CREW_ADAPTER, KEY_CREW_MODEL, KEY_CREW_ROLES, KEY_DISPLAY_LABEL, KEY_DISPLAY_LABEL_MEDIUM,
-        KEY_DISPLAY_LABEL_SHORT, KEY_ENTITY_ID, KEY_ENTITY_KIND, KEY_INDEPENDENT_HOST, KEY_MEMBERSHIP_PROJECT,
-        KEY_MEMBERSHIP_REPOSITORY_KEY, KEY_MEMBERSHIP_REPOSITORY_SLUG, KEY_MEMBERSHIP_SUBPATH, KEY_PRIMARY_ACTION_KEY,
-        KEY_PRIMARY_ACTION_KIND, KEY_PRIMARY_ACTION_LABEL, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET,
-        KEY_PRIMARY_ACTION_VEHICLE, KEY_PRIMARY_DIRECT_DAEMON, KEY_PRIMARY_DIRECT_HOST, KEY_PRIMARY_DIRECT_REASON,
-        KEY_PRIMARY_DIRECT_RUNTIME_ROOT, KEY_PRIMARY_DIRECT_SESSION, KEY_PRIMARY_DIRECT_TRANSPORT, KEY_PROJECT_NAME,
-        KEY_PROJECT_REPOSITORY_COUNT, KEY_REPO_NAME, KEY_ROLE, KEY_ROLE_HOLD, KEY_ROLE_NAME, KEY_ROLE_PRESENTS_AS, KEY_SESSION, KEY_SOURCE,
-        KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_SURFACE_RUNG, KEY_SURFACE_STATE, KEY_VESSEL, KEY_VESSEL_ALTERNATIVES,
-        KEY_VESSEL_BUILD_JOBS, KEY_VESSEL_CARRIED_BY, KEY_VESSEL_COST_CLASS, KEY_VESSEL_CPUS, KEY_VESSEL_ENV, KEY_VESSEL_HOST,
-        KEY_VESSEL_HOST_NAME, KEY_VESSEL_HOST_REF, KEY_VESSEL_IMAGE_DIGEST, KEY_VESSEL_IMAGE_REF, KEY_VESSEL_IMAGE_SHORT_DIGEST,
-        KEY_VESSEL_KIND, KEY_VESSEL_LINKER_THREADS, KEY_VESSEL_MINIMAL, KEY_VESSEL_MINIMAL_ALTERNATIVES, KEY_VESSEL_NAME,
-        KEY_VESSEL_POLICY, KEY_VESSEL_STANCE, KEY_WORKSPACE_PRIMARY_STATE, KEY_WORKSPACE_PRIMARY_TARGET, KEY_WORK_PHASE, SEGMENT_CHECKOUT,
+        ARCHIPELAGO_ORDINAL, CATALOG_TTL_MS, KEY_CONVOY, KEY_CONVOY_ALTERNATIVES, KEY_CONVOY_COST_CLASS, KEY_CONVOY_HOST_NAME,
+        KEY_CONVOY_HOST_REF, KEY_CONVOY_KIND, KEY_CONVOY_MESSAGE, KEY_CONVOY_MINIMAL, KEY_CONVOY_MINIMAL_ALTERNATIVES, KEY_CONVOY_NAME,
+        KEY_CONVOY_PHASE, KEY_CONVOY_POLICY, KEY_CONVOY_STANDING, KEY_CONVOY_SUPERSEDED, KEY_CONVOY_WORKFLOW, KEY_COUNT_CHECKOUTS,
+        KEY_COUNT_CONVOYS, KEY_COUNT_INDEPENDENTS, KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_COUNT_VESSELS, KEY_CREW_ADAPTER, KEY_CREW_MODEL,
+        KEY_CREW_ROLES, KEY_DISPLAY_LABEL, KEY_DISPLAY_LABEL_MEDIUM, KEY_DISPLAY_LABEL_SHORT, KEY_ENTITY_ID, KEY_ENTITY_KIND,
+        KEY_INDEPENDENT_HOST, KEY_MEMBERSHIP_PROJECT, KEY_MEMBERSHIP_REPOSITORY_KEY, KEY_MEMBERSHIP_REPOSITORY_SLUG,
+        KEY_MEMBERSHIP_SUBPATH, KEY_PRIMARY_ACTION_KEY, KEY_PRIMARY_ACTION_KIND, KEY_PRIMARY_ACTION_LABEL, KEY_PRIMARY_ACTION_RECIPE,
+        KEY_PRIMARY_ACTION_TARGET, KEY_PRIMARY_ACTION_VEHICLE, KEY_PRIMARY_DIRECT_DAEMON, KEY_PRIMARY_DIRECT_HOST,
+        KEY_PRIMARY_DIRECT_REASON, KEY_PRIMARY_DIRECT_RUNTIME_ROOT, KEY_PRIMARY_DIRECT_SESSION, KEY_PRIMARY_DIRECT_TRANSPORT,
+        KEY_PROJECT_NAME, KEY_PROJECT_REPOSITORY_COUNT, KEY_REPO_NAME, KEY_ROLE, KEY_ROLE_HOLD, KEY_ROLE_NAME, KEY_ROLE_PRESENTS_AS,
+        KEY_SESSION, KEY_SOURCE, KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_SURFACE_RUNG, KEY_SURFACE_STATE, KEY_VESSEL,
+        KEY_VESSEL_ALTERNATIVES, KEY_VESSEL_BUILD_JOBS, KEY_VESSEL_CARRIED_BY, KEY_VESSEL_COST_CLASS, KEY_VESSEL_CPUS, KEY_VESSEL_ENV,
+        KEY_VESSEL_HOST, KEY_VESSEL_HOST_NAME, KEY_VESSEL_HOST_REF, KEY_VESSEL_IMAGE_DIGEST, KEY_VESSEL_IMAGE_REF,
+        KEY_VESSEL_IMAGE_SHORT_DIGEST, KEY_VESSEL_KIND, KEY_VESSEL_LINKER_THREADS, KEY_VESSEL_MINIMAL, KEY_VESSEL_MINIMAL_ALTERNATIVES,
+        KEY_VESSEL_NAME, KEY_VESSEL_POLICY, KEY_VESSEL_STANCE, KEY_WORKSPACE_PRIMARY_STATE, KEY_WORKSPACE_PRIMARY_TARGET, KEY_WORK_PHASE,
         SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
     },
     legacy_recipe,
@@ -677,9 +676,7 @@ fn awareness_parent_facts(node: &AwarenessNode, convoys: &[ConvoyRow]) -> Vec<(&
             let convoy = entity::convoy(namespace, name, &origin);
             vec![(KEY_CONVOY, MetadataValue::text(convoy.id)), (KEY_CONVOY_NAME, MetadataValue::text(node.label.clone()))]
         }
-        AwarenessKind::Fleet | AwarenessKind::Vessel | AwarenessKind::Issue | AwarenessKind::Independent | AwarenessKind::Checkout => {
-            vec![]
-        }
+        AwarenessKind::Vessel | AwarenessKind::Issue | AwarenessKind::Independent => vec![],
     }
 }
 
@@ -847,18 +844,7 @@ fn awareness_entry_entity(entry: &AwarenessEntry, convoys: &[ConvoyRow]) -> Opti
             facts.extend(label_tier_facts(value));
             (entity, facts)
         }
-        AwarenessKind::Checkout => {
-            let entity = entity::checkout(&entry.id);
-            let mut facts = vec![(SEGMENT_CHECKOUT, MetadataValue::text(entity.id.clone()))];
-            if let Some(branch) = entry.annotations.get(KEY_CHECKOUT_BRANCH) {
-                facts.push((KEY_CHECKOUT_BRANCH, MetadataValue::text(branch.clone())));
-            }
-            if let Some(path) = entry.annotations.get(KEY_CHECKOUT_PATH) {
-                facts.push((KEY_CHECKOUT_PATH, MetadataValue::text(path.clone())));
-            }
-            (entity, facts)
-        }
-        AwarenessKind::Fleet | AwarenessKind::Project => return None,
+        AwarenessKind::Project => return None,
     };
     let mut facts = facts;
     facts.push((KEY_DISPLAY_LABEL, MetadataValue::text(label)));
@@ -879,14 +865,6 @@ fn awareness_project_recipe(node: &AwarenessNode, mint: &dyn RecipeMint) -> Opti
 fn awareness_entry_recipe(entry: &AwarenessEntry, convoys: &[ConvoyRow], mint: &dyn RecipeMint) -> Option<Recipe> {
     if matches!(entry.kind, AwarenessKind::Issue) {
         return None;
-    }
-    if matches!(entry.kind, AwarenessKind::Checkout) {
-        if entry.links.iter().any(|link| link.rel == AWARENESS_REL_FOR_CONVOY) {
-            return None;
-        }
-        let path = entry.annotations.get(KEY_CHECKOUT_PATH)?;
-        let host = entry.refs.iter().find_map(|reference| reference.host.as_ref())?;
-        return mint.checkout_terminal(path, host);
     }
     match entry.id.parse().ok()? {
         address @ ViewAddress::Project { .. } => mint.scoped_view(&address),

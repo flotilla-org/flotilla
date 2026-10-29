@@ -4,9 +4,6 @@
 //! Key map: design §5 on flotilla-org/flotilla#667. `flotilla.leg.*` is
 //! reserved and deliberately absent — legs are unmaterialised (#680).
 
-/// Pipe name patches are written to (v0: andamento's current spelling;
-/// Leg 1 renames it `manifest-apply-patch`).
-pub const APPLY_METADATA_PATCH_PIPE: &str = "andamento-apply-metadata-patch";
 /// Pipe name that returns the identities the PM has observed on its panes
 /// (v0 spelling; Leg 1: `manifest-observed-identities`).
 pub const OBSERVED_IDENTITIES_PIPE: &str = "andamento-observed-identities";
@@ -15,12 +12,10 @@ pub const OBSERVED_IDENTITIES_PIPE: &str = "andamento-observed-identities";
 pub const SOURCE_CONNECTOR: &str = "flotilla-connector";
 /// Source id for the pane stamp published by `flotilla attach`.
 pub const SOURCE_ATTACH: &str = "flotilla-attach";
-/// Source id for tab stamps published by the workspace actuator.
-pub const SOURCE_ACTUATOR: &str = "flotilla-actuator";
 /// Producer provenance exposed as a fact for presentation surfaces.
 pub const SOURCE_FLOTILLA: &str = "flotilla";
 
-/// TTL for catalog facts. Pane/tab stamps carry no TTL: they are facts about
+/// TTL for catalog facts. Pane stamps carry no TTL: they are facts about
 /// the binding, not about the daemon being alive.
 pub const CATALOG_TTL_MS: u64 = 30_000;
 /// Re-assertion cadence for TTL'd catalog facts.

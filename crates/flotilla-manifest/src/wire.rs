@@ -97,9 +97,6 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::entity::EntityRef;
 
-mod workspace_id;
-pub use workspace_id::WorkspaceId;
-
 /// A metadata fact value.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "kebab-case")]
@@ -267,11 +264,8 @@ pub enum PaneTarget {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
 pub enum MetadataTarget {
-    Root,
     Pane(PaneTarget),
-    Tab(WorkspaceId),
     Entity(EntityRef),
-    Identity(MetadataIdentity),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

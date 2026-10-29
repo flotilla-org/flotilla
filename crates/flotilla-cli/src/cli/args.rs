@@ -493,13 +493,7 @@ pub enum CompletionShell {
 pub enum PmSubCommand {
     /// Run the manifest metadata-patch connector for the enclosing PM
     Connect {
-        /// Zellij binary for pipe delivery (default: $ZELLIJ_BIN, then `zellij`)
-        #[arg(long)]
-        zellij_bin: Option<String>,
-        /// Restrict pipe delivery to one plugin instance
-        #[arg(long)]
-        plugin_url: Option<String>,
-        /// Publish to a Wheelhouse Unix socket (Windows: named pipe) instead of zellij pipes
+        /// Publish to a Wheelhouse Unix socket (Windows: named pipe); default: $WHEELHOUSE_SOCKET
         #[arg(long)]
         wheelhouse_socket: Option<PathBuf>,
         /// Executable path or name the PM runs (default: this connector executable)

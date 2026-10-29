@@ -757,7 +757,6 @@ pub fn project_panels(address: &ViewAddress, data: &TableRows<'_>) -> Result<Vec
     }
 
     if let Some(awareness) = awareness {
-        apply_family_summary(&mut checkouts, awareness, AwarenessFamily::Checkouts);
         apply_family_summary(&mut issues, awareness, AwarenessFamily::Issues);
         apply_family_summary(&mut independents, awareness, AwarenessFamily::Independents);
     }
@@ -2173,11 +2172,6 @@ mod tests {
                     .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
                     .build(),
                 AwarenessFamilySummary::builder()
-                    .family(AwarenessFamily::Checkouts)
-                    .salience(Salience::None)
-                    .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
-                    .build(),
-                AwarenessFamilySummary::builder()
                     .family(AwarenessFamily::Issues)
                     .salience(Salience::Attention)
                     .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
@@ -2228,7 +2222,10 @@ mod tests {
             panels.iter().map(|panel| panel.table.meta.salience).collect::<Vec<_>>(),
             vec![Salience::Urgent, Salience::None, Salience::Attention, Salience::Info,]
         );
-        assert!(panels.iter().all(|panel| panel.table.meta.as_of == Some(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)));
+        assert!(panels
+            .iter()
+            .filter(|panel| panel.kind != ProjectPanelKind::Checkouts)
+            .all(|panel| panel.table.meta.as_of == Some(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)));
         assert_eq!(panels[0].table.rows[0].cells[0].text, "tables");
         assert_eq!(panels[1].table.rows[0].cells[1].text, "/work/flotilla");
         assert_eq!(

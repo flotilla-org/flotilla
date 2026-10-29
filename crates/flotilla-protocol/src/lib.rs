@@ -317,7 +317,7 @@ pub use result_set::{
     AwarenessLink, AwarenessNode, AwarenessPhase, AwarenessState, CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow,
     CrewMemberSummary, DemandBackedMetadata, IndependentRow, IssueRow, ProjectRepositoriesRow, ProjectRepositoryMembership, QueryChanges,
     QueryId, QueryScope, ResultDelta, ResultSet, ResultSetCondition, ResultSetState, Rows, Salience, SessionPhase, StandingRoleHold,
-    StandingRoleRow, VesselRow, WorkPhase, AWARENESS_REL_FOR_CONVOY,
+    StandingRoleRow, VesselRow, WorkPhase,
 };
 use serde::{Deserialize, Serialize};
 

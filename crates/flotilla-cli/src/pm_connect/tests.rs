@@ -535,9 +535,10 @@ fn resolve_pm_prefers_explicit_socket_then_environment_detection() {
     let options = PmConnectOptions::builder().wheelhouse_socket(PathBuf::from("/tmp/wheelhouse.sock")).flotilla_bin("flotilla").build();
     assert!(matches!(resolve_pm(&options, &|_| None), Ok(PmInstance::Wheelhouse { .. })), "explicit socket needs no PM environment");
 
-    let detect = PmConnectOptions::builder().zellij_bin("/opt/zellij").flotilla_bin("flotilla").build();
-    let pm = resolve_pm(&detect, &|key| (key == "ZELLIJ").then(|| "1".to_owned())).expect("zellij detected");
-    assert!(matches!(pm, PmInstance::Zellij { ref bin, .. } if bin == "/opt/zellij"), "options override the detected default");
+    let detect = PmConnectOptions::builder().flotilla_bin("flotilla").build();
+    let pm =
+        resolve_pm(&detect, &|key| (key == "WHEELHOUSE_SOCKET").then(|| "/tmp/wheelhouse.sock".to_owned())).expect("wheelhouse detected");
+    assert!(matches!(pm, PmInstance::Wheelhouse { .. }));
     let error = resolve_pm(&detect, &|_| None).map(|_| ()).expect_err("no PM detected");
     assert!(error.contains("no presentation manager detected"));
 }
@@ -1989,10 +1990,6 @@ impl RecipeMint for CountingMint {
     fn attach(&self, attach_ref: &str, host: &HostName) -> Option<flotilla_manifest::recipe::Recipe> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.inner.attach(attach_ref, host)
-    }
-    fn checkout_terminal(&self, path: &str, host: &HostName) -> Option<flotilla_manifest::recipe::Recipe> {
-        self.calls.fetch_add(1, Ordering::Relaxed);
-        self.inner.checkout_terminal(path, host)
     }
     fn scoped_view(&self, target: &flotilla_protocol::ViewAddress) -> Option<flotilla_manifest::recipe::Recipe> {
         self.calls.fetch_add(1, Ordering::Relaxed);
