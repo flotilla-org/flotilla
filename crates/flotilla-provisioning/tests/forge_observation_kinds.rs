@@ -339,6 +339,7 @@ fn the_observer_imports_the_copy_readers_pick_and_counts_the_rest() {
     assert_eq!(record.state, Some(stored::ChangeRequestState::Merged));
     let dropped: Vec<_> = report.dropped.iter().map(|((_, reason), count)| (*reason, *count)).collect();
     assert_eq!(dropped, [("convoy history", 1), ("deleted", 1), ("never observed", 1), ("no declared observer", 1)]);
+    assert_eq!(report.notes, ["ChangeRequest of github.com/someone/else not imported: no Project declares its source"]);
 
     let mut beta = import_at("beta");
     let mut report = ImportReport::default();
@@ -448,4 +449,38 @@ fn an_issue_imports_its_freshest_copy_at_its_observer() {
         let record: Option<IssueRecord> = load(&mut target, "issue-7", home);
         assert_eq!(record.map(|record| record.state), (home == "alpha").then_some(Some(stored::IssueState::Closed)), "{home}");
     }
+}
+
+// Behaviour (ADR 0047): a read that succeeded and found nothing keeps its null result, distinct from
+// a read that never succeeded.
+#[test]
+fn a_forge_read_that_found_nothing_keeps_its_null_result() {
+    let now = epoch(1_800_000_000);
+    let found_nothing = read(
+        "forge-read-null",
+        ForgeReadRequest::Branch { branch: "gone".into() },
+        now,
+        Some(read_status(Some(serde_json::Value::Null), None, now, "alpha")),
+    );
+    let failed = read(
+        "forge-read-none",
+        ForgeReadRequest::Branch { branch: "x".into() },
+        now,
+        Some(read_status(None, Some("forbidden"), now, "alpha")),
+    );
+    let mut target = import_at("alpha");
+    let mut report = ImportReport::default();
+    import_forge_reads(
+        &[copy(found_nothing, "alpha"), copy(failed, "alpha")],
+        &Demands::new(),
+        &observed_at_alpha,
+        now,
+        &mut target,
+        &mut report,
+    );
+    assert!(report.refused.is_empty(), "{report:?}");
+    let found_nothing: ForgeReadRecord = load(&mut target, "forge-read-null", "alpha").expect("imported");
+    let failed: ForgeReadRecord = load(&mut target, "forge-read-none", "alpha").expect("imported");
+    assert_eq!(found_nothing.value, Some(ReadValue { value: serde_json::Value::Null }));
+    assert_eq!(failed.value, None);
 }

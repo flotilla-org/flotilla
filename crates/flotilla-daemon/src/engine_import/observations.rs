@@ -32,10 +32,17 @@ fn declarations(source: &Source) -> Declarations<String> {
             }
         }
     }
+    // Every host holds a copy of a repository per observing home; each picks the same one.
     let mut repositories = BTreeMap::new();
     for repository in source.context::<Repository>("repositories", None) {
-        repositories.entry(repository.object.metadata.name.clone()).or_insert(Ok(repository.object));
+        match repositories.get(&repository.object.metadata.name) {
+            Some((home, _)) if *home <= repository.home => {}
+            _ => {
+                repositories.insert(repository.object.metadata.name.clone(), (repository.home, repository.object));
+            }
+        }
     }
+    let repositories = repositories.into_iter().map(|(name, (_, object))| (name, Ok(object))).collect();
     Declarations { forges, projects: projects.into_values().collect(), repositories }
 }
 

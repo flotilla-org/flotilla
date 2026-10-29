@@ -20,7 +20,8 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Duration, Utc};
 use flotilla_engine_store::ImportTarget;
 use flotilla_protocol::IssueSource;
-use flotilla_resources::{select_change_request_sources, ChangeRequest, ForgeRead, ForgeReadRequest, Issue, ResourceObject};
+use flotilla_resources::{select_change_request_sources, ChangeRequest, ForgeRead, ForgeReadRequest, Issue, Resource, ResourceObject};
+use flotilla_schema::Kind;
 
 use super::import::{created, ImportRefusal, ImportReport};
 use crate::stored::forge_observation::{ChangeRequestRecord, ForgeReadRecord, IssueRecord};
@@ -29,7 +30,7 @@ use crate::stored::forge_observation::{ChangeRequestRecord, ForgeReadRecord, Iss
 pub const READ_RETENTION: Duration = Duration::seconds(3600);
 
 /// One home's old copy of an observation: the object, and the home that wrote it.
-pub struct ObservationCopy<R: flotilla_resources::Resource> {
+pub struct ObservationCopy<R: Resource> {
     pub object: ResourceObject<R>,
     pub home: String,
 }
@@ -37,39 +38,68 @@ pub struct ObservationCopy<R: flotilla_resources::Resource> {
 /// The home that observes a source, when a declaration names one.
 pub type ObserverOf<'a> = dyn Fn(&IssueSource) -> Option<String> + 'a;
 
-/// The home `copy` is a candidate to import at: its source's observer, when `target` imports there.
+/// Why a copy is not written at its own home.
+enum Skip {
+    Deleted,
+    /// It holds nothing to import, for the reason named.
+    Unusable(&'static str),
+    NoObserver,
+    /// Its source's observer is another home, which imports it.
+    Elsewhere,
+}
+
+impl Skip {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Deleted => "deleted",
+            Self::Unusable(reason) => reason,
+            Self::NoObserver => "no declared observer",
+            Self::Elsewhere => "imported at its observer",
+        }
+    }
+}
+
+/// The home `copy` is a candidate to import at: `source`'s observer, when `target` imports there.
 /// A copy that cannot be imported (`unusable`) or is imported elsewhere is counted as dropped when
-/// `target` imports its own home.
-fn candidate<R: flotilla_resources::Resource>(
+/// `target` imports its own home; a source with no observer is also named in a note.
+fn candidate<R: Resource>(
     kind: &'static str,
     copy: &ObservationCopy<R>,
+    source: &IssueSource,
     unusable: Option<&'static str>,
-    observer: Option<String>,
+    observer_of: &ObserverOf<'_>,
     target: &impl ImportTarget,
     report: &mut ImportReport,
 ) -> Option<String> {
-    let reason = if copy.object.metadata.deletion_timestamp.is_some() {
-        Some("deleted")
-    } else if unusable.is_some() {
-        unusable
+    let observer = observer_of(source);
+    let skip = if copy.object.metadata.deletion_timestamp.is_some() {
+        Some(Skip::Deleted)
+    } else if let Some(reason) = unusable {
+        Some(Skip::Unusable(reason))
     } else if observer.is_none() {
-        Some("no declared observer")
+        Some(Skip::NoObserver)
     } else if observer.as_deref() != Some(copy.home.as_str()) {
-        Some("imported at its observer")
+        Some(Skip::Elsewhere)
     } else {
         None
     };
-    if let Some(reason) = reason.filter(|_| target.imports(&copy.home)) {
-        *report.dropped.entry((kind, reason)).or_default() += 1;
+    if let Some(skip) = skip.as_ref().filter(|_| target.imports(&copy.home)) {
+        *report.dropped.entry((kind, skip.label())).or_default() += 1;
+        if matches!(skip, Skip::NoObserver) {
+            let note = format!("{kind} of {}/{} not imported: no Project declares its source", source.service, source.scope);
+            if !report.notes.contains(&note) {
+                report.notes.push(note);
+            }
+        }
     }
-    match reason {
-        None | Some("imported at its observer") => observer.filter(|home| target.imports(home)),
+    match skip {
+        None | Some(Skip::Elsewhere) => observer.filter(|home| target.imports(home)),
         Some(_) => None,
     }
 }
 
 /// Writes `record` as `name` at `home` and counts it, or names the refusal.
-fn write<K: flotilla_schema::Kind + PartialEq + Clone, R: flotilla_resources::Resource>(
+fn write<K: Kind + PartialEq + Clone, R: Resource>(
     kind: &'static str,
     target: &mut impl ImportTarget,
     home: &str,
@@ -104,7 +134,7 @@ pub fn import_change_requests(
     for copy in copies {
         let source = IssueSource { service: copy.object.spec.service.clone(), scope: copy.object.spec.scope.clone() };
         let unusable = copy.object.status.is_none().then_some("never observed");
-        if let Some(home) = candidate(KIND, copy, unusable, observer_of(&source), target, report) {
+        if let Some(home) = candidate(KIND, copy, &source, unusable, observer_of, target, report) {
             live.push((&copy.object, home));
         }
     }
@@ -139,7 +169,7 @@ pub fn import_issues(
     for copy in copies {
         let source = IssueSource { service: copy.object.spec.service.clone(), scope: copy.object.spec.scope.clone() };
         let unusable = copy.object.status.is_none().then_some("never observed");
-        let Some(home) = candidate(KIND, copy, unusable, observer_of(&source), target, report) else { continue };
+        let Some(home) = candidate(KIND, copy, &source, unusable, observer_of, target, report) else { continue };
         let key = (copy.object.spec.service.clone(), copy.object.spec.scope.clone(), copy.object.spec.number);
         match selected.get(&key) {
             Some((prior, _)) if rank(prior) >= rank(&copy.object) => {}
@@ -189,7 +219,7 @@ pub fn import_forge_reads(
         } else {
             None
         };
-        let Some(home) = candidate(KIND, copy, unusable, observer_of(&copy.object.spec.source), target, report) else { continue };
+        let Some(home) = candidate(KIND, copy, &copy.object.spec.source, unusable, observer_of, target, report) else { continue };
         match selected.get(name) {
             Some((prior, _)) if rank(prior) >= rank(&copy.object) => {}
             _ => {

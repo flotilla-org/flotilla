@@ -2,11 +2,13 @@ use std::path::Path;
 
 use chrono::Utc;
 use flotilla_engine_store::ImportTarget;
-use flotilla_protocol::NodeId;
+use flotilla_protocol::{IssueSource, NodeId};
 use flotilla_provisioning::stored::forge_observation::{ChangeRequestRecord, ForgeReadRecord, IssueRecord};
 use flotilla_resources::{
-    Artifact, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure, CredentialSpec, FleetDesignation, Forge, FulfilmentKind, InputMeta,
-    Message, Project, Repository, RepositorySpec, Resource, TerminalSession, Vessel,
+    forge_read_name, Artifact, ChangeRequestReviewObservation, ChangeRequestStatus, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure,
+    CredentialSpec, FleetDesignation, Forge, ForgeReadRequest, FulfilmentKind, InputMeta, IssueStatus, Message, Observation,
+    ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision, Project, Repository,
+    RepositorySpec, Resource, TerminalSession, Vessel,
 };
 use flotilla_schema::{Kind, Timestamp};
 use flotilla_store::{replica::StoredReplicaEventKind, ResourceKind};
@@ -638,21 +640,21 @@ fn a_stored_body_that_is_not_json_is_refused_by_name() {
     assert!(refusal.reason.contains("not JSON"), "{refusal:?}");
 }
 
-fn observed<T>(value: T) -> flotilla_resources::Observation<T> {
-    flotilla_resources::Observation { value: Some(value), observed_at: Utc::now() }
+fn observed<T>(value: T) -> Observation<T> {
+    Observation { value: Some(value), observed_at: Utc::now() }
 }
 
-fn change_request(number: u64, authority: &str, state: flotilla_resources::ObservedChangeRequestState) -> Value {
-    let status = flotilla_resources::ChangeRequestStatus {
+fn change_request(number: u64, authority: &str, state: ObservedChangeRequestState) -> Value {
+    let status = ChangeRequestStatus {
         title: observed("Layer 5".to_owned()),
         author: observed("coder".to_owned()),
-        review_decision: observed(flotilla_resources::ObservedReviewDecision::Required),
+        review_decision: observed(ObservedReviewDecision::Required),
         review_requested_from_owner: observed(false),
         state: observed(state),
         head_sha: observed("abc".to_owned()),
-        checks: observed(flotilla_resources::ObservedChecks::Pass),
-        review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: observed(false) },
-        mergeable: observed(flotilla_resources::ObservedMergeability::Mergeable),
+        checks: observed(ObservedChecks::Pass),
+        review: ChangeRequestReviewObservation { actionable_at_head: observed(false) },
+        mergeable: observed(ObservedMergeability::Mergeable),
     };
     document(
         "ChangeRequest",
@@ -663,10 +665,10 @@ fn change_request(number: u64, authority: &str, state: flotilla_resources::Obser
 }
 
 fn issue(number: u64) -> Value {
-    let status = flotilla_resources::IssueStatus {
+    let status = IssueStatus {
         title: observed("Remaining kinds".to_owned()),
         assignees: observed(vec![]),
-        state: observed(flotilla_resources::ObservedIssueState::Open),
+        state: observed(ObservedIssueState::Open),
         labels: observed(vec!["enhancement".to_owned()]),
         updated_at: observed(Utc::now()),
     };
@@ -679,11 +681,11 @@ fn issue(number: u64) -> Value {
 }
 
 fn forge_read() -> Value {
-    let source = flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
-    let request = flotilla_resources::ForgeReadRequest::Board;
+    let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
+    let request = ForgeReadRequest::Board;
     document(
         "ForgeRead",
-        &flotilla_resources::forge_read_name(&source, &request),
+        &forge_read_name(&source, &request),
         json!({"source": source, "request": request, "demanded_at": Utc::now()}),
         json!({"authority": HERE, "attempted_at": Utc::now(), "observed_at": Utc::now(), "value": {"repositories": []}, "error": null, "retry_at": null}),
     )
@@ -724,19 +726,25 @@ fn hosts_importing_together_write_each_observation_once_at_its_observer() {
             homed(home, forge()),
         ]
     };
-    use flotilla_resources::ObservedChangeRequestState::{Merged, Open};
     let stores = [
         (
             HERE,
             vec![
-                homed(HERE, change_request(1, HERE, Merged)),
+                homed(HERE, change_request(1, HERE, ObservedChangeRequestState::Merged)),
                 homed(HERE, issue(2)),
                 homed(HERE, forge_read()),
-                homed(THERE, change_request(1, THERE, Open)),
+                homed(THERE, change_request(1, THERE, ObservedChangeRequestState::Open)),
             ],
         ),
-        (THERE, vec![homed(THERE, change_request(1, THERE, Open)), homed(HERE, issue(2)), homed(HERE, forge_read())]),
-        (ELSEWHERE, vec![homed(HERE, change_request(1, HERE, Merged)), homed(HERE, issue(2))]),
+        (
+            THERE,
+            vec![
+                homed(THERE, change_request(1, THERE, ObservedChangeRequestState::Open)),
+                homed(HERE, issue(2)),
+                homed(HERE, forge_read()),
+            ],
+        ),
+        (ELSEWHERE, vec![homed(HERE, change_request(1, HERE, ObservedChangeRequestState::Merged)), homed(HERE, issue(2))]),
     ];
     let mut written: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (home, observations) in stores {

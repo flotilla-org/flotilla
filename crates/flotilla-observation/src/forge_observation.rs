@@ -1,5 +1,10 @@
 //! Source-scoped forge ownership and replicated reads (ADR 0057).
-use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration as StdDuration};
+use std::{
+    collections::{btree_map::Entry, BTreeMap},
+    future::Future,
+    sync::Arc,
+    time::Duration as StdDuration,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -11,9 +16,10 @@ use flotilla_protocol::{
 };
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
-    forge_read_name, normalize_issue_source, Clock, ForgeRead, ForgeReadHeartbeat, ForgeReadHeartbeatSpec, ForgeReadHeartbeatStatus,
-    ForgeReadRequest, ForgeReadSpec, ForgeReadStatus, Host, HostStatus, InputMeta, IssueSourceResolution, Project, ReadWatchEvent,
-    Repository, ResourceError, ResourceProvenance, SystemClock,
+    forge_read_name, normalize_issue_source, resolve_project_issue_sources_from_inventory, Clock, Forge, ForgeRead, ForgeReadHeartbeat,
+    ForgeReadHeartbeatSpec, ForgeReadHeartbeatStatus, ForgeReadRequest, ForgeReadSpec, ForgeReadStatus, ForgeSpec, Host, HostStatus,
+    InputMeta, IssueSourceResolution, Project, ProjectSpec, ReadWatchEvent, Repository, ResourceError, ResourceObject, ResourceProvenance,
+    SystemClock,
 };
 use flotilla_store::ResourceBackend;
 use futures::StreamExt;
@@ -163,9 +169,9 @@ fn observer_ready(status: &HostStatus) -> bool {
 /// What declares a source's observer: the forges, each Project with its declaration (its earliest
 /// creation and the home that made it), and the repositories the Projects name, by key.
 pub struct Declarations<H> {
-    pub forges: Vec<flotilla_resources::ForgeSpec>,
-    pub projects: Vec<(flotilla_resources::ProjectSpec, (DateTime<Utc>, H))>,
-    pub repositories: BTreeMap<String, Result<flotilla_resources::ResourceObject<Repository>, ResourceError>>,
+    pub forges: Vec<ForgeSpec>,
+    pub projects: Vec<(ProjectSpec, (DateTime<Utc>, H))>,
+    pub repositories: BTreeMap<String, Result<ResourceObject<Repository>, ResourceError>>,
 }
 
 impl<H: Ord + Clone> Declarations<H> {
@@ -182,8 +188,7 @@ impl<H: Ord + Clone> Declarations<H> {
             if project.issue_source_bindings.iter().any(|binding| !binding.exclude && canonical_source(&binding.source) == source) {
                 homes.push(declaration.clone());
             }
-            if let IssueSourceResolution::Available { bindings } =
-                flotilla_resources::resolve_project_issue_sources_from_inventory(&self.repositories, project)
+            if let IssueSourceResolution::Available { bindings } = resolve_project_issue_sources_from_inventory(&self.repositories, project)
             {
                 if bindings.iter().any(|binding| canonical_source(&binding.source) == source) {
                     homes.push(declaration.clone());
@@ -207,14 +212,8 @@ impl<H: Ord + Clone> Declarations<H> {
 }
 
 async fn declarations(backend: &ResourceBackend, namespace: &str) -> Result<Declarations<NodeId>, String> {
-    let forges = backend
-        .definitions::<flotilla_resources::Forge>(namespace)
-        .list()
-        .await
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .map(|forge| forge.spec)
-        .collect();
+    let forges =
+        backend.definitions::<Forge>(namespace).list().await.map_err(|e| e.to_string())?.into_iter().map(|forge| forge.spec).collect();
     // Recover every declaration home in one store listing, rather than listing
     // every Project's replica sources again for each binding and repository.
     let mut project_homes = BTreeMap::new();
@@ -229,7 +228,7 @@ async fn declarations(backend: &ResourceBackend, namespace: &str) -> Result<Decl
     for project in backend.definitions::<Project>(namespace).list().await.map_err(|e| e.to_string())? {
         for member in &project.spec.repositories {
             let key = member.repo.to_string();
-            if let std::collections::btree_map::Entry::Vacant(entry) = repositories.entry(key) {
+            if let Entry::Vacant(entry) = repositories.entry(key) {
                 let repository = resolver.get(entry.key()).await.map(|record| record.object);
                 entry.insert(repository);
             }
