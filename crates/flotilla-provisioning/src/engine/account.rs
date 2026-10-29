@@ -577,6 +577,16 @@ pub fn requester_name(binding: &BindingSpec) -> Option<String> {
     requester_parts(&binding.requester).map(|(convoy, role)| binding_name(&convoy, &role, &binding.requirement))
 }
 
+/// The engine name an old binding at `home` imports as, unless another of `taken` holds it.
+fn imported_binding_name(spec: &BindingSpec, home: &str, taken: &mut BTreeSet<(String, String)>) -> Result<String, String> {
+    let requester = requester_name(spec).ok_or_else(|| format!("requester `{}` names no convoy and role", spec.requester))?;
+    let name = engine_binding_name(&requester, spec.opened_at);
+    if !taken.insert((home.to_owned(), name.clone())) {
+        return Err(format!("another binding of its requester opened at the same time already imports as `{name}`"));
+    }
+    Ok(name)
+}
+
 /// [`import_accounts`] into a temporary store of their own.
 pub fn rehearse_accounts(
     bindings: &[(flotilla_resources::ResourceObject<flotilla_resources::AccountBinding>, String)],
@@ -621,13 +631,7 @@ pub fn import_accounts(
         let refuse = |reason: String| ImportRefusal { kind: "AccountBinding", record: old.metadata.name.clone(), reason };
         // An r879 binding's home-key label (#3953) is dropped (ADR 0047).
         let spec = binding_spec(&old.spec);
-        let named = requester_name(&spec)
-            .ok_or_else(|| format!("requester `{}` names no convoy and role", spec.requester))
-            .map(|requester| engine_binding_name(&requester, spec.opened_at))
-            .and_then(|name| match taken.insert((home.clone(), name.clone())) {
-                true => Ok(name),
-                false => Err(format!("another binding of its requester opened at the same time already imports as `{name}`")),
-            });
+        let named = imported_binding_name(&spec, home, &mut taken);
         let imported = target.imports(home);
         let name = match named {
             Ok(name) if !imported => {
