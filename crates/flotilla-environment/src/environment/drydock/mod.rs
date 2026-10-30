@@ -583,7 +583,9 @@ impl CommandRunner for InventoryRunner {
 fn api_error(cause: ::drydock::client::Error) -> String {
     use ::drydock::client::Error;
     match cause {
-        Error::Protocol(_) => "drydock provider protocol error".into(),
+        // Drydock masks credentials in the provider's explanation before it
+        // leaves the host; without it an operator cannot tell a quota from a fault.
+        Error::Protocol(error) => format!("drydock provider {error}"),
         Error::NotReady(_) => "drydock provider not ready".into(),
         Error::ReadinessTimeout(_) => "drydock provider readiness timed out".into(),
         other => other.to_string(),
