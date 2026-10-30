@@ -9,14 +9,15 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
 use async_trait::async_trait;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_environment::environment::{
-    EnvironmentHandle, EnvironmentProvisionError, EnvironmentToolAssetKind, EnvironmentVariableUpdate, VesselAgent, DAEMON_SOCKET_ENV,
+    EnvironmentHandle, EnvironmentProvisionError, EnvironmentToolAssetKind, EnvironmentVariableUpdate, VesselAgent,
+    CONTAINED_DAEMON_REQUIRED_ENV, DAEMON_SOCKET_ENV,
 };
 use flotilla_protocol::EnvironmentId;
 use flotilla_provider_runtime::{
@@ -30,13 +31,16 @@ use sha2::Digest;
 use super::docker::{discard_failed_environment, probe_provisioned_environment};
 use super::environments::ActiveProvisionedEnvironment;
 use super::state::ControllerRuntimeState;
-use crate::environment_tools::{EnvironmentToolContext, EnvironmentToolProviderKind, DOCKER_PROVIDER_KIND};
+use crate::environment_tools::{EnvironmentToolContext, EnvironmentToolProviderKind, DOCKER_PROVIDER_KIND, SSH_HOST_PROVIDER_KIND};
 
 /// The crew socket's file name in the vessel.
 const CREW_SOCKET: &str = "flotilla.sock";
 /// The contained tool layout, under `/opt/flotilla`: a layout the tool
 /// provisioner keys by its Docker kind, not the vessel's provider.
 const CONTAINED_TOOL_LAYOUT: EnvironmentToolProviderKind = DOCKER_PROVIDER_KIND;
+/// A layout published under a vessel's own prefix: what an SSH host's vessel
+/// takes, keyed by that kind (#3792).
+const SHARED_TOOL_LAYOUT: EnvironmentToolProviderKind = SSH_HOST_PROVIDER_KIND;
 /// The `PATH` a vessel's tools prepend to when the vessel has none of its own.
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -144,8 +148,35 @@ async fn deliver_vessel_layer(
     agent.create_dir(&directory, 0o700).await?;
     let guest = directory.join(CREW_SOCKET);
     let cpus = spec.cloud_sandbox.as_ref().map(|cloud| cloud.size.cpus as usize);
-    let mut tools = state.environment_tools.prepare(CONTAINED_TOOL_LAYOUT, id.as_str(), &DeclaredSize { state, cpus }).await?;
+    let base = agent.writable_base().await?;
     let mut environment = BTreeMap::new();
+    let host_filesystem = handle.provider_descriptor().is_some_and(|descriptor| descriptor.capabilities.host_filesystem);
+    let mut tools = if host_filesystem {
+        // A vessel on this machine's own filesystem (drydock's `local` module)
+        // cannot take a container's fixed `/opt/flotilla`: its layer, and its
+        // cleat state, go under its own writable prefix, as an SSH host's do.
+        let prefix = base.join("vessel-layers").join(&digest[..16]);
+        agent.create_dir(&prefix, 0o700).await?;
+        let composition = flotilla_environment::composition::flotilla_tools();
+        let mut updates = composition
+            .path_entries(&prefix)
+            .into_iter()
+            .rev()
+            .map(|entry| EnvironmentVariableUpdate::prepend_path("PATH", entry.to_string_lossy()))
+            .collect::<Vec<_>>();
+        updates.extend(
+            composition.variables(&prefix).into_iter().map(|(name, value)| EnvironmentVariableUpdate::set(name, value, "generation tools")),
+        );
+        updates.push(EnvironmentVariableUpdate::set("CLEAT_RUNTIME_DIR", prefix.join("cleat").to_string_lossy(), "durable cleat state"));
+        updates.push(EnvironmentVariableUpdate::set(DAEMON_SOCKET_ENV, guest.to_string_lossy(), "the daemon socket"));
+        updates.push(EnvironmentVariableUpdate::set(CONTAINED_DAEMON_REQUIRED_ENV, "1", "the contained host-daemon requirement"));
+        for update in &updates {
+            apply(&mut environment, update, &guest.to_string_lossy(), agent.as_ref()).await?;
+        }
+        state.environment_tools.prepare(SHARED_TOOL_LAYOUT, id.as_str(), &SharedFilesystem { prefix }).await?
+    } else {
+        state.environment_tools.prepare(CONTAINED_TOOL_LAYOUT, id.as_str(), &DeclaredSize { state, cpus }).await?
+    };
     for tool in &mut tools {
         // The crew socket is the layer's own forward, not a pushed file.
         tool.assets.retain(|asset| asset.kind != EnvironmentToolAssetKind::UnixSocket);
@@ -203,6 +234,21 @@ async fn vessel_variable(agent: &dyn VesselAgent, name: &str) -> Result<String, 
         .await
         .map_err(|error| format!("read vessel {name}: {error}"))?;
     Ok(value.trim_end_matches('\n').to_string())
+}
+
+/// The layer of a vessel sharing this machine's filesystem, under its own prefix.
+struct SharedFilesystem {
+    prefix: PathBuf,
+}
+
+#[async_trait]
+impl EnvironmentToolContext for SharedFilesystem {
+    async fn rust_build_jobs(&self) -> Result<usize, String> {
+        Err("a vessel on the host's own filesystem carries no build limits".into())
+    }
+    fn tools_prefix(&self) -> Option<&Path> {
+        Some(&self.prefix)
+    }
 }
 
 /// Build limits from the backing's declared size, or this host's where it declares none.

@@ -19,7 +19,9 @@ use flotilla_environment::environment::{
 use sha2::Digest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::environment_tools::{EnvironmentToolContext, EnvironmentToolFactory, EnvironmentToolProviderKind, DOCKER_PROVIDER_KIND};
+use crate::environment_tools::{
+    EnvironmentToolContext, EnvironmentToolFactory, EnvironmentToolProviderKind, DOCKER_PROVIDER_KIND, SSH_HOST_PROVIDER_KIND,
+};
 use crate::server::environment_sockets::{directory_name, EnvironmentSocketRegistry, EnvironmentSocketService, SocketReach};
 
 const BUILD: &[u8] = b"drydock launch scenario agent";
@@ -170,6 +172,35 @@ async fn launch_through_the_provider_path(declared_path: Option<&str>, harness_i
     stand_in.clean_up();
 }
 
+// #4165: a provider whose vessels run on the host's own filesystem (drydock's
+// `local` module) cannot take a container's fixed `/opt/flotilla`: the vessel
+// layer lands below the vessel's own writable prefix, with its cleat state, and
+// the vessel's environment names them and the crew socket.
+#[tokio::test]
+async fn a_vessel_on_the_host_filesystem_takes_its_layer_below_its_own_prefix() {
+    let stand_in = stand_in_with(None, true, true).await;
+    let runtime = DockerControllerRuntime { state: Arc::clone(&stand_in.state) };
+    runtime.provision_environment(stand_in.env_id.as_str(), &stand_in.spec).await.expect("provision");
+    let handle = stand_in.handle().await.expect("provisioned handle");
+    let agent = handle.agent();
+    let digest = format!("{:x}", sha2::Sha256::digest(stand_in.env_id.as_str().as_bytes()));
+    let prefix = agent.writable_base().await.expect("writable base").join("vessel-layers").join(&digest[..16]);
+    let commands = agent.commands();
+    let shell = |script: &str| {
+        let (commands, script) = (Arc::clone(&commands), script.to_string());
+        async move { commands.run("sh", &["-c", &script], Path::new("/"), &ChannelLabel::Default).await.expect("vessel command") }
+    };
+    let own_path = std::env::var("PATH").expect("host PATH");
+    assert_eq!(shell("printf %s \"$PATH\"").await, format!("{}:{own_path}", prefix.join("bin").display()));
+    assert_eq!(shell("command -v flotilla").await.trim(), prefix.join("bin/flotilla").display().to_string());
+    assert_eq!(shell("printf %s \"$CLEAT_RUNTIME_DIR\"").await, prefix.join("cleat").display().to_string());
+    assert!(!stand_in.root().join("vessel/opt/flotilla").exists(), "nothing at the container layout");
+    let guest_socket = PathBuf::from(shell(&format!("printf %s \"${DAEMON_SOCKET_ENV}\"")).await);
+    tokio::net::UnixStream::connect(&guest_socket).await.expect("guest crew socket");
+    handle.destroy().await.expect("destroy");
+    stand_in.clean_up();
+}
+
 // #3981: a vessel layer that fails discards a vessel this provision created,
 // with its crew socket, and retains a vessel it adopted, with its socket, for
 // the retry.
@@ -234,6 +265,7 @@ impl StandIn {
         let _ = fs::remove_dir_all(base.join("agent-material/requesters").join(&self.convoy));
         let digest = format!("{:x}", sha2::Sha256::digest(self.env_id.as_str().as_bytes()));
         let _ = fs::remove_dir_all(base.join("crew-sockets").join(&digest[..16]));
+        let _ = fs::remove_dir_all(base.join("vessel-layers").join(&digest[..16]));
     }
 }
 
@@ -256,6 +288,11 @@ impl ::drydock::launch::ImageResolver for Digests {
 }
 
 async fn stand_in(declared_path: Option<&str>, harness_in_image: bool) -> StandIn {
+    stand_in_with(declared_path, harness_in_image, false).await
+}
+
+/// With the provider declaring, or not, that its vessels run on the host's own filesystem.
+async fn stand_in_with(declared_path: Option<&str>, harness_in_image: bool, host_filesystem: bool) -> StandIn {
     let temp = tempfile::Builder::new().prefix("dl-").tempdir_in("/tmp").expect("tempdir");
     let root = temp.path();
     {
@@ -281,8 +318,8 @@ async fn stand_in(declared_path: Option<&str>, harness_in_image: bool) -> StandI
     fs::write(root.join("hosts"), "127.0.0.1 localhost\n").expect("hosts file");
     let text = format!(
         "[providers.stand-in]\nmodule='reference'\ncredential={{file='{}'}}\n\
-         settings={{agent=true, poll_interval_ms=10, workspace_root='{}', reach={{kind='ssh', endpoint='gateway.test:22', \
-         user='minted', host_key='ssh-ed25519 AAAA'}}}}\n",
+         settings={{agent=true, poll_interval_ms=10, workspace_root='{}', host_filesystem={host_filesystem}, \
+         reach={{kind='ssh', endpoint='gateway.test:22', user='minted', host_key='ssh-ed25519 AAAA'}}}}\n",
         root.join("credential").display(),
         root.join("workspace").display()
     );
@@ -458,9 +495,9 @@ struct GenerationCli {
 #[async_trait]
 impl EnvironmentToolFactory for GenerationCli {
     fn provider_kinds(&self) -> &[EnvironmentToolProviderKind] {
-        &[DOCKER_PROVIDER_KIND]
+        &[DOCKER_PROVIDER_KIND, SSH_HOST_PROVIDER_KIND]
     }
-    async fn prepare(&self, _: &str, _: &dyn EnvironmentToolContext) -> Result<EnvironmentTool, String> {
+    async fn prepare(&self, _: &str, context: &dyn EnvironmentToolContext) -> Result<EnvironmentTool, String> {
         use std::os::unix::fs::PermissionsExt;
         if self.refused.load(Ordering::SeqCst) {
             return Err("the generation's tools are refused".into());
@@ -469,6 +506,17 @@ impl EnvironmentToolFactory for GenerationCli {
         fs::create_dir_all(cli.parent().expect("CLI directory")).map_err(|error| error.to_string())?;
         fs::write(&cli, "#!/bin/sh\n").map_err(|error| error.to_string())?;
         fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).map_err(|error| error.to_string())?;
+        // A layer under the vessel's own prefix declares no environment: the
+        // provider path names the prefix's entries itself.
+        if let Some(prefix) = context.tools_prefix() {
+            return Ok(EnvironmentTool::new("flotilla", prefix.join("bin/flotilla")).with_asset(EnvironmentToolAsset::new(
+                &cli,
+                prefix.join("bin/flotilla"),
+                EnvironmentToolAssetKind::File,
+                EnvironmentToolAssetAccess::ReadOnly,
+                "the flotilla CLI",
+            )));
+        }
         let guest = self.root.join("vessel/opt/flotilla/bin");
         Ok(EnvironmentTool::new("flotilla", guest.join("flotilla"))
             .with_environment(EnvironmentVariableUpdate::prepend_path("PATH", guest.to_string_lossy()))

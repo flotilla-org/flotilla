@@ -95,6 +95,11 @@ pub struct ProviderCapabilities {
     pub fallback_runner: bool,
     pub receives_host_tools: bool,
     pub per_vessel: bool,
+    /// Vessels run on the controller host's own filesystem: a guest path is a
+    /// host path, so each vessel's layer goes below paths it can write, never
+    /// at a container's fixed locations.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub host_filesystem: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

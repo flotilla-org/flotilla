@@ -4,7 +4,8 @@
 //!
 //! Drydock owns each vessel's connections (ADR 0070, drydock#132): the adapter
 //! asks it for standing exposures and connects to the local sockets they give.
-//! It never interprets a reach, holds a vessel key, opens SSH or names a provider.
+//! It never holds a vessel key, opens SSH or names a provider; of a reach it
+//! reads only whether drydock relays the agent connection itself.
 mod connector;
 mod exposures;
 mod observations;
@@ -131,6 +132,7 @@ impl DrydockEnvironmentProvider {
                 platform: platform.clone(),
                 executable: self.executable.clone(),
                 report: report.clone(),
+                relayed: Default::default(),
             };
             // Attach sockets are drydock's exposures, never this runner's forwards.
             Arc::new(AgentRunner::without_attach_forwards(Arc::new(connector)))
@@ -416,6 +418,7 @@ fn capabilities(c: &wire::Capabilities) -> ProviderCapabilities {
         fallback_runner: c.fallback_runner,
         receives_host_tools: true,
         per_vessel: true,
+        host_filesystem: c.host_filesystem,
     }
 }
 struct DrydockEnvironment {
