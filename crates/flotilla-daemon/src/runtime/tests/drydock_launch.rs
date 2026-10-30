@@ -37,12 +37,20 @@ const BUILD: &[u8] = b"drydock launch scenario agent";
 async fn cloud_vessel_reaches_launch_through_the_generic_provider_path() {
     // The provider declares the vessel's PATH, or the image keeps its own (here, this host's).
     for declared_path in [Some("/opt/image/bin:/usr/bin:/bin"), None] {
-        launch_through_the_provider_path(declared_path).await;
+        launch_through_the_provider_path(declared_path, true).await;
     }
 }
 
-async fn launch_through_the_provider_path(declared_path: Option<&str>) {
-    let mut stand_in = stand_in(declared_path).await;
+// #3909: an operator's cloud image need not carry a harness. Where the vessel's
+// interior discovery finds none, the access layer delivers the pinned harness
+// through the vessel's agent, and the crew launches that one.
+#[tokio::test]
+async fn a_cloud_image_without_a_harness_launches_the_pinned_one() {
+    launch_through_the_provider_path(None, false).await;
+}
+
+async fn launch_through_the_provider_path(declared_path: Option<&str>, harness_in_image: bool) {
+    let mut stand_in = stand_in(declared_path, harness_in_image).await;
     let env_id = stand_in.env_id.clone();
     let root = stand_in.root().to_path_buf();
     // #4163: provisioned through the Environment reconciler, which records it Ready.
@@ -108,6 +116,9 @@ async fn launch_through_the_provider_path(declared_path: Option<&str>) {
         env: BTreeMap::new(),
         pool: "fake-terminals".to_string(),
     };
+    if !harness_in_image {
+        seed_pinned_harness(&root.join("vessel"), "claude-code");
+    }
     TerminalControllerRuntime { state: Arc::clone(&stand_in.state) }
         .ensure_session("terminal-demo-work-coder", (&session).into(), &[])
         .await
@@ -136,6 +147,15 @@ async fn launch_through_the_provider_path(declared_path: Option<&str>) {
     let mechanisms = delivery.needs.iter().map(|need| (need.need.as_str(), need.mechanism.as_str())).collect::<BTreeMap<_, _>>();
     assert_eq!(mechanisms.get("home"), Some(&"agent-push"));
     assert_eq!(mechanisms.get("skills"), Some(&"agent-push"));
+    let command = stand_in.pool.ensured.lock().await.iter().map(|launch| launch.command.clone()).collect::<Vec<_>>().join("\n");
+    let delivered = home.join(".flotilla/harness/bin/claude");
+    if harness_in_image {
+        assert_eq!(mechanisms.get("harness"), None, "an image's own harness is used");
+        assert!(!command.contains(&delivered.display().to_string()), "{command}");
+    } else {
+        assert_eq!(mechanisms.get("harness"), Some(&"agent-fetch(digest)"));
+        assert!(command.contains(&delivered.display().to_string()), "the delivered harness is launched: {command}");
+    }
     let connection = delivery.agent_connection.as_ref().expect("explain shows drydock's report");
     assert_eq!((connection.provider.as_str(), connection.mode.as_str()), ("stand-in", "inward_exposure"));
     assert_eq!(connection.vessel, handle.backing_id());
@@ -149,7 +169,7 @@ async fn launch_through_the_provider_path(declared_path: Option<&str>) {
 // the retry.
 #[tokio::test]
 async fn a_failed_vessel_layer_discards_only_a_vessel_it_created() {
-    let stand_in = stand_in(None).await;
+    let stand_in = stand_in(None, true).await;
     let runtime = DockerControllerRuntime { state: Arc::clone(&stand_in.state) };
     let name = stand_in.env_id.as_str();
     let provider = stand_in.state.provider_for_environment(name).await.expect("provider");
@@ -229,7 +249,7 @@ impl ::drydock::launch::ImageResolver for Digests {
     }
 }
 
-async fn stand_in(declared_path: Option<&str>) -> StandIn {
+async fn stand_in(declared_path: Option<&str>, harness_in_image: bool) -> StandIn {
     let temp = tempfile::Builder::new().prefix("dl-").tempdir_in("/tmp").expect("tempdir");
     let root = temp.path();
     {
@@ -297,7 +317,7 @@ async fn stand_in(declared_path: Option<&str>) -> StandIn {
     let config = Arc::new(ConfigStore::with_base(config_base));
     let pool = Arc::new(FakeTerminalPool::new());
     let mut discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_terminal_pool(pool.clone()));
-    discovery.host_detectors = Arc::new(vec![Box::new(GuestHarness) as Box<dyn HostDetector>]);
+    discovery.host_detectors = Arc::new(vec![Box::new(GuestHarness(harness_in_image)) as Box<dyn HostDetector>]);
     let git = git_process_discovery(false);
     discovery.factories.vcs = git.factories.vcs;
     discovery.repo_detectors = git.repo_detectors;
@@ -392,14 +412,34 @@ async fn stand_in(declared_path: Option<&str>) -> StandIn {
     StandIn { temp, convoy, env_id, spec, state, backend, pool, _gateway: gateway, host, crew_connections, refuse_tools }
 }
 
-/// The vessel's harness, as interior discovery finds it.
-struct GuestHarness;
+/// The vessel's image, as interior discovery finds it: with its harness, or without one.
+struct GuestHarness(bool);
 
 #[async_trait]
 impl HostDetector for GuestHarness {
     async fn detect(&self, _: &dyn CommandRunner, _: &dyn EnvVars) -> Vec<EnvironmentAssertion> {
-        vec![EnvironmentAssertion::binary("claude", "/usr/local/bin/claude"), EnvironmentAssertion::binary("git", "/usr/bin/git")]
+        let mut found = vec![EnvironmentAssertion::binary("git", "/usr/bin/git")];
+        if self.0 {
+            found.push(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude"));
+        }
+        found
     }
+}
+
+/// The pinned harness's bytes already in the stand-in vessel agent's store, as a
+/// fetch by digest leaves them, so delivering it reads no network.
+fn seed_pinned_harness(vessel: &Path, adapter: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let sha256 = super::ssh_host_harness::pinned_harness_sha256(adapter);
+    let store = vessel.join("drydock-agent.store");
+    let entry = store.join("artifacts").join(&sha256);
+    fs::create_dir_all(entry.parent().expect("artifacts")).expect("artifacts directory");
+    fs::write(&entry, "#!/bin/sh\n").expect("harness entry");
+    fs::set_permissions(&entry, fs::Permissions::from_mode(0o555)).expect("harness mode");
+    fs::create_dir_all(store.join("index")).expect("index directory");
+    let record = serde_json::json!({"sha256": sha256, "size": 10, "unpack": {"kind": "file", "mode": 0o555}});
+    fs::write(store.join("index").join(&sha256), record.to_string()).expect("index record");
+    sha256
 }
 
 /// The generation's CLI in the contained layout, rooted in the stand-in vessel,

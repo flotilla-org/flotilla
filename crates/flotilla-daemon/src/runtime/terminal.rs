@@ -440,6 +440,8 @@ impl TerminalRuntime for TerminalControllerRuntime {
                         vessel_ref: &context.vessel_ref,
                         adapter: &requirement.adapter,
                         access: requirement.account_access(),
+                        // #3909: a place whose discovery found no harness takes the pinned one.
+                        carries_harness: vessel.is_none() && registry.agent_adapters.get(&requirement.adapter).is_some(),
                     };
                     deliver_access(&self.state, &launch, agent, &credential_env).await?
                 };
@@ -942,18 +944,23 @@ impl TerminalControllerRuntime {
         self.session_adapter(spec, &requirement.adapter).await.map(Some)
     }
 
-    /// The adapter a session's harness runs under: the place's discovered one, or, on an
-    /// SSH host vessel, whose access layer delivers the pinned harness (#3909), the
-    /// built-in adapter for it even when the host has none installed. Observation and
+    /// The adapter a session's harness runs under: the place's discovered one, or, where the
+    /// access layer delivers the pinned harness (#3909: an SSH host vessel, or a provisioned
+    /// place whose discovery found none), the built-in adapter for it. Observation and
     /// cleanup never run its binary; launch uses the executable delivery returns.
     async fn session_adapter(&self, spec: TerminalSessionTarget<'_>, adapter: &str) -> Result<Arc<dyn AgentAdapter>, String> {
         let unavailable = || format!("agent adapter {adapter} unavailable for environment {}", spec.env_ref);
         if let Some(found) = self.registry_for_spec(spec).await?.agent_adapters.get(adapter) {
             return Ok(Arc::clone(found));
         }
-        let Some(vessel) = self.vessel_for_spec(spec).await? else { return Err(unavailable()) };
+        // A provisioned place without one ran the harness the access layer delivered too.
+        let runner = match self.vessel_for_spec(spec).await? {
+            Some(vessel) => vessel.runner(),
+            None if spec.env_ref != self.state.host_direct_environment_name => self.runner_for_env(&spec.env_ref)?,
+            None => return Err(unavailable()),
+        };
         let name = flotilla_agent::adapter::harness_binary(adapter).ok_or_else(unavailable)?;
-        AgentAdapterRegistry::delivered(adapter, Path::new(name), &[], vessel.runner()).ok_or_else(unavailable)
+        AgentAdapterRegistry::delivered(adapter, Path::new(name), &[], runner).ok_or_else(unavailable)
     }
 
     pub(super) async fn pool_for_spec(&self, spec: TerminalSessionTarget<'_>) -> Result<Arc<dyn TerminalPool>, String> {

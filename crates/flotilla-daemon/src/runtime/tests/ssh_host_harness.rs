@@ -668,7 +668,7 @@ impl CommandRunner for LoopbackSshHost {
 }
 
 /// The amd64 digest the stdlib pins for `adapter`'s harness.
-fn pinned_harness_sha256(adapter: &str) -> String {
+pub(super) fn pinned_harness_sha256(adapter: &str) -> String {
     let layers = flotilla_resources::stdlib::stdlib_image_layers().expect("stdlib layers");
     let layer = layers.iter().find(|layer| layer.provides.contains(&format!("harness:{adapter}"))).expect("harness layer");
     layer.pins.values().next().and_then(|pin| pin.artifact("amd64")).expect("amd64 artifact").sha256.clone()
