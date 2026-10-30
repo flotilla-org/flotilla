@@ -1623,6 +1623,9 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl ProvisionedEnvironment for Access {
+            fn provider_descriptor(&self) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
+                None
+            }
             fn backing_id(&self) -> &str {
                 self.inner.backing_id()
             }
@@ -1670,6 +1673,9 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl ProvisionedEnvironment for Independent {
+            fn provider_descriptor(&self) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
+                None
+            }
             fn id(&self) -> &EnvironmentId {
                 &self.id
             }

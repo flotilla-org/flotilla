@@ -45,19 +45,23 @@ async fn launch_through_the_provider_path(declared_path: Option<&str>) {
     let mut stand_in = stand_in(declared_path).await;
     let env_id = stand_in.env_id.clone();
     let root = stand_in.root().to_path_buf();
-    let provisioned = DockerControllerRuntime { state: Arc::clone(&stand_in.state) }
-        .provision_environment(env_id.as_str(), &stand_in.spec)
-        .await
-        .expect("provision");
-    // Recorded as the Environment reconciler records it.
+    // #4163: provisioned through the Environment reconciler, which records it Ready.
     let environments = stand_in.backend.using::<Environment>(NAMESPACE);
     let record = environments.get(env_id.as_str()).await.expect("environment record");
-    let status = flotilla_resources::EnvironmentStatus {
-        provider_descriptor: provisioned.provider_descriptor.map(|descriptor| *descriptor),
-        ..Default::default()
-    };
-    environments.update_status(env_id.as_str(), &record.metadata.resource_version, &status).await.expect("environment status");
+    let reconciler = EnvironmentReconciler::new(
+        Arc::new(DockerControllerRuntime { state: Arc::clone(&stand_in.state) }),
+        stand_in.backend.clone(),
+        NAMESPACE,
+    );
+    let prepared = reconciler.prepare(&record).await.expect("prepare");
+    let mut status = record.status.clone().unwrap_or_default();
+    reconciler.reconcile(&record, &prepared, chrono::Utc::now()).patch.expect("provision patch").apply(&mut status);
+    assert_eq!((status.phase, status.message.as_deref()), (EnvironmentPhase::Ready, None), "a drydock vessel reaches Ready");
     let handle = stand_in.handle().await.expect("provisioned handle");
+    assert_eq!(status.backing_id.as_deref(), Some(handle.backing_id()));
+    assert_eq!(status.image_ref.as_deref(), stand_in.spec.cloud_sandbox.as_ref().map(|cloud| cloud.image.as_str()));
+    assert_eq!(status.provider_descriptor.as_ref().map(|descriptor| descriptor.instance.as_str()), Some("stand-in"));
+    environments.update_status(env_id.as_str(), &record.metadata.resource_version, &status).await.expect("environment status");
 
     // The vessel layer: the generation's CLI is on the vessel's own PATH beside
     // the provider's environment, and the socket the vessel's environment names

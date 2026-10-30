@@ -525,12 +525,10 @@ pub trait ProvisionedEnvironment: Send + Sync {
         None
     }
 
-    fn survivors(&self) -> Option<flotilla_resources::EnvironmentSurvivors> {
-        None
-    }
-    fn provider_descriptor(&self) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
-        None
-    }
+    /// The facts a cloud backing records when it is provisioned. Every cloud
+    /// sandbox handle must return one, and keep returning one, or its provision
+    /// fails; other kinds record none. Deliberately without a default (#4163).
+    fn provider_descriptor(&self) -> Option<flotilla_resources::EnvironmentProviderDescriptor>;
     fn id(&self) -> &EnvironmentId;
     fn image(&self) -> &ImageId;
     /// Immutable content digest of the image actually backing this environment.

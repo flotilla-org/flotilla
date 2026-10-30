@@ -246,7 +246,6 @@ pub async fn create_ready_host_direct_environment(
             &EnvironmentStatus {
                 backing_id: None,
                 provider_descriptor: None,
-                survivors: None,
                 configured_limits: None,
                 runtime_observation: None,
                 phase: EnvironmentPhase::Ready,
@@ -284,7 +283,6 @@ pub async fn create_ready_docker_environment(
             &EnvironmentStatus {
                 backing_id: None,
                 provider_descriptor: None,
-                survivors: None,
                 configured_limits: None,
                 runtime_observation: None,
                 phase: EnvironmentPhase::Ready,

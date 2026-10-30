@@ -160,8 +160,8 @@ pub use credential::{
 pub use environment::{
     host_direct_environment_name, validate_environment_provider_address, CloudSandboxEnvironmentSpec, CloudSandboxSize,
     DockerEnvironmentSpec, Environment, EnvironmentMemoryPolicy, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase,
-    EnvironmentProviderDescriptor, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, EnvironmentSurvivors,
-    HostDirectEnvironmentSpec, HOST_DIRECT_NAME_PREFIX,
+    EnvironmentProviderDescriptor, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, HostDirectEnvironmentSpec,
+    HOST_DIRECT_NAME_PREFIX,
 };
 pub use error::{FinalizerWaitReason, ResourceError};
 pub use event::{Event, EventRegarding, EventSpec, ObjectEvent, DEFAULT_EVENT_TTL_SECONDS};

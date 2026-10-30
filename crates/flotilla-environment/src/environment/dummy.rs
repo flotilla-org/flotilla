@@ -233,6 +233,9 @@ struct DummyEnvironment {
 
 #[async_trait]
 impl ProvisionedEnvironment for DummyEnvironment {
+    fn provider_descriptor(&self) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
+        None
+    }
     fn capabilities(&self) -> super::ProviderCapabilities {
         DummyEnvironmentProvider::capability_declaration()
     }

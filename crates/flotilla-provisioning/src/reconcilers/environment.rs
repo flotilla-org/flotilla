@@ -103,16 +103,41 @@ impl<R> EnvironmentReconciler<R> {
     }
 }
 
-/// Provider facts mapped to the preceding-generation stored status shape.
+/// What a provision reports, by the kind of backing it made. The variant, not
+/// the Environment's spec, decides which Ready patch the reconciler writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvironmentProvisioning {
+    /// A Docker or host backing, recorded in the preceding-generation status shape.
+    Local(LocalProvisioning),
+    /// A cloud sandbox backing, which records every fact below or fails provision.
+    Cloud(CloudProvisioning),
+}
+
+/// What a Docker or host backing reports; each fact is recorded as reported.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EnvironmentProvisioning {
+pub struct LocalProvisioning {
+    /// Docker's per-crew limits; host backings set none.
     pub configured_limits: Option<ConfiguredResourceLimits>,
-    pub provider_descriptor: Option<Box<flotilla_resources::EnvironmentProviderDescriptor>>,
-    pub survivors: Option<flotilla_resources::EnvironmentSurvivors>,
+    /// The backing's opaque identity, recorded as `docker_container_id`.
     pub backing_id: Option<String>,
+    /// The image the backing runs, when it reports the image's digest.
     pub image_ref: Option<String>,
+    /// The content digest of that image.
     pub local_image_id: Option<String>,
+    /// The registry manifest identity, when the image was pulled by digest.
     pub registry_digest: Option<String>,
+}
+
+/// Every fact a cloud backing's Ready status records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudProvisioning {
+    /// The backing's opaque provider identity, used again for teardown.
+    pub backing_id: String,
+    /// The image the backing runs, pinned by digest: a cloud provider refuses
+    /// an unpinned image at prepare, and Ready derives the digest from it.
+    pub image_ref: String,
+    /// The provider's immutable facts about this backing.
+    pub provider_descriptor: Box<flotilla_resources::EnvironmentProviderDescriptor>,
 }
 
 pub enum EnvironmentPrepared {
@@ -248,27 +273,19 @@ where
         };
         let patch = if Self::provisioning(obj, reading.as_ref()) {
             match prepared {
-                EnvironmentPrepared::Ready(provisioning) if obj.spec.cloud_sandbox.is_some() => {
-                    match (&provisioning.backing_id, &provisioning.image_ref, &provisioning.provider_descriptor, &provisioning.survivors) {
-                        (Some(backing_id), Some(image_ref), Some(provider_descriptor), Some(survivors)) => {
-                            Some(EnvironmentStatusPatch::MarkCloudReady {
-                                backing_id: backing_id.clone(),
-                                image_ref: image_ref.clone(),
-                                provider_descriptor: provider_descriptor.clone(),
-                                survivors: survivors.clone(),
-                            })
-                        }
-                        _ => Some(EnvironmentStatusPatch::MarkFailed {
-                            message: "cloud provider omitted backing, image, descriptor or survivors".into(),
-                        }),
-                    }
-                }
-                EnvironmentPrepared::Ready(provisioning) => Some(EnvironmentStatusPatch::MarkReady {
-                    configured_limits: provisioning.configured_limits.clone(),
-                    docker_container_id: provisioning.backing_id.clone(),
-                    image_ref: provisioning.image_ref.clone(),
-                    local_image_id: provisioning.local_image_id.clone(),
-                    registry_digest: provisioning.registry_digest.clone(),
+                EnvironmentPrepared::Ready(provisioning) => Some(match &**provisioning {
+                    EnvironmentProvisioning::Cloud(cloud) => EnvironmentStatusPatch::MarkCloudReady {
+                        backing_id: cloud.backing_id.clone(),
+                        image_ref: cloud.image_ref.clone(),
+                        provider_descriptor: cloud.provider_descriptor.clone(),
+                    },
+                    EnvironmentProvisioning::Local(local) => EnvironmentStatusPatch::MarkReady {
+                        configured_limits: local.configured_limits.clone(),
+                        docker_container_id: local.backing_id.clone(),
+                        image_ref: local.image_ref.clone(),
+                        local_image_id: local.local_image_id.clone(),
+                        registry_digest: local.registry_digest.clone(),
+                    },
                 }),
                 EnvironmentPrepared::Failed(message) => Some(EnvironmentStatusPatch::MarkFailed { message: message.clone() }),
                 // This legacy patch writes only generic Provisioning/ready=false
