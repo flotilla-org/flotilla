@@ -703,6 +703,10 @@ pub struct DockerProvisionedEnvironment {
 
 #[async_trait]
 impl ProvisionedEnvironment for DockerProvisionedEnvironment {
+    /// A Docker backing records its identity in Docker-specific status.
+    fn provider_descriptor(&self) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
+        None
+    }
     fn capabilities(&self) -> super::ProviderCapabilities {
         DockerEnvironmentProvider::capability_declaration()
     }

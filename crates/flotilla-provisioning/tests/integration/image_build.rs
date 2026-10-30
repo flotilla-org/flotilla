@@ -22,7 +22,7 @@ use flotilla_environment::environment::{
 use flotilla_protocol::{EnvironmentId, HostSummary, LifecycleReading, NodeId, NodeInfo, SystemInfo};
 use flotilla_provisioning::reconcilers::{
     image_build::{attribute_recipe_failure, image_build_retry_backoff, registry_build_cache},
-    EnvironmentProvisioning, EnvironmentReconciler, EnvironmentRuntime, ImageBuildMaterials, ImageBuildReconciler,
+    EnvironmentProvisioning, EnvironmentReconciler, EnvironmentRuntime, ImageBuildMaterials, ImageBuildReconciler, LocalProvisioning,
 };
 use flotilla_resources::lifecycle_reads::{LifecycleReads, ProvisioningKind};
 use flotilla_resources::{
@@ -719,15 +719,13 @@ impl EnvironmentRuntime for Docker {
         let spec = spec.docker.as_ref().expect("Docker scenario input");
 
         self.provisioned.lock().expect("provisioned").push((spec.image.clone(), spec.pull_policy));
-        Ok(EnvironmentProvisioning {
-            provider_descriptor: None,
-            survivors: None,
+        Ok(EnvironmentProvisioning::Local(LocalProvisioning {
             configured_limits: None,
             backing_id: Some("container".into()),
             image_ref: Some(spec.image.clone()),
             local_image_id: Some(digest('d')),
             registry_digest: spec.image.split_once('@').map(|(_, digest)| digest.to_string()),
-        })
+        }))
     }
     async fn destroy(&self, _: &str, _: &str) -> Result<(), String> {
         Ok(())

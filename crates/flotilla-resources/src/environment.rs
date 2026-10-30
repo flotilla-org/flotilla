@@ -227,18 +227,6 @@ pub struct EnvironmentProviderDescriptor {
     pub agent_connection: Option<flotilla_protocol::provider::AgentConnectionReport>,
 }
 
-/// Durable references only; recovery owns their retention and deletion.
-// The retired `host_checkpoint` field (#4056) is accepted and dropped by this
-// type's lenient decoding (no `deny_unknown_fields`); keep it lenient until one
-// roll after #4056 lands, then this note can go.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EnvironmentSurvivors {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub persistent_storage: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pushed_branch: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostDirectEnvironmentSpec {
     /// ADR 0047: decode legacy host placement for one roll after #3521.
@@ -304,14 +292,14 @@ pub enum EnvironmentPhase {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 // The retired ADR 0053 `image_build_refs` list is accepted and dropped by
 // this type's lenient decoding (ADR 0047); `DockerEnvironmentSpec.image_build_ref`
-// names the single per-identity build.
+// names the single per-identity build. Likewise the retired `survivors` record
+// (#4163), which no provider populated and nothing read; keep this type lenient
+// until one roll after #4163 lands, then this note can go.
 pub struct EnvironmentStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backing_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_descriptor: Option<EnvironmentProviderDescriptor>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub survivors: Option<EnvironmentSurvivors>,
     /// Configured limits, not usage. Remove the decoder default one fleet roll
     /// after this field lands (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -346,7 +334,6 @@ pub enum EnvironmentStatusPatch {
         backing_id: String,
         image_ref: String,
         provider_descriptor: Box<EnvironmentProviderDescriptor>,
-        survivors: EnvironmentSurvivors,
     },
     ObserveRuntime {
         observation: flotilla_protocol::EnvironmentRuntimeObservation,
@@ -378,7 +365,7 @@ pub enum EnvironmentStatusPatch {
 impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
     fn apply(&self, status: &mut EnvironmentStatus) {
         match self {
-            Self::MarkCloudReady { backing_id, image_ref, provider_descriptor, survivors } => {
+            Self::MarkCloudReady { backing_id, image_ref, provider_descriptor } => {
                 status.phase = EnvironmentPhase::Ready;
                 status.ready = true;
                 status.backing_id = Some(backing_id.clone());
@@ -386,7 +373,6 @@ impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
                 status.local_image_id = image_ref.rsplit_once('@').map(|(_, digest)| digest.to_owned());
                 status.registry_digest = Some(image_ref.clone());
                 status.provider_descriptor = Some((**provider_descriptor).clone());
-                status.survivors = Some(survivors.clone());
                 status.message = None;
             }
             Self::ObserveRuntime { observation } => {
@@ -485,13 +471,12 @@ mod retired_image_field_tests {
             serde_json::from_value(serde_json::json!({"phase": "Provisioning", "image_build_refs": ["a", "b"]})).expect("old status");
         assert_eq!(status.phase, EnvironmentPhase::Provisioning);
         assert!(serde_json::to_value(&status).expect("encode").get("image_build_refs").is_none());
-        // #4056: the retired host checkpoint survivor decodes and is dropped.
+        // #4163: the retired survivors record decodes and is dropped.
         let status: EnvironmentStatus = serde_json::from_value(
             serde_json::json!({"phase": "Ready", "survivors": {"host_checkpoint": "/state/checkpoint.tar", "pushed_branch": "b"}}),
         )
         .expect("old survivors");
-        let survivors = serde_json::to_value(&status).expect("encode")["survivors"].clone();
-        assert_eq!(survivors, serde_json::json!({"pushed_branch": "b"}));
+        assert!(serde_json::to_value(&status).expect("encode").get("survivors").is_none());
     }
 }
 
@@ -725,6 +710,6 @@ mod cloud_schema_tests {
         let old_status: EnvironmentStatus =
             serde_json::from_value(serde_json::json!({"phase":"Ready","docker_container_id":"previous-backing"})).unwrap();
         assert_eq!(old_status.docker_container_id.as_deref(), Some("previous-backing"));
-        assert!(old_status.backing_id.is_none() && old_status.provider_descriptor.is_none() && old_status.survivors.is_none());
+        assert!(old_status.backing_id.is_none() && old_status.provider_descriptor.is_none());
     }
 }

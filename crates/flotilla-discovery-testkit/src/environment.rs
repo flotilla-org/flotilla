@@ -70,6 +70,9 @@ macro_rules! injected_environment_handle {
         fn backing_id(&self) -> &str {
             self.container_name().unwrap_or_else(|| self.id().as_str())
         }
+        fn provider_descriptor(&self) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
+            None
+        }
     };
 }
 

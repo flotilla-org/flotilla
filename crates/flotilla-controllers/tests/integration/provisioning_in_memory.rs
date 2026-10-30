@@ -19,7 +19,7 @@ use flotilla_environment::environment::EnvironmentProvisionError;
 use flotilla_protocol::ConfiguredResourceLimits;
 use flotilla_provisioning::reconcilers::{
     checkout::CheckoutPrepared, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler,
-    CloneRuntime, EnvironmentProvisioning, EnvironmentReconciler, EnvironmentRuntime, PreparedCheckout,
+    CloneRuntime, EnvironmentProvisioning, EnvironmentReconciler, EnvironmentRuntime, LocalProvisioning, PreparedCheckout,
 };
 use flotilla_resources::{
     canonicalize_repo_url, clone_key, Actuation, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec,
@@ -52,9 +52,7 @@ impl EnvironmentRuntime for FakeDockerRuntime {
     ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, EnvironmentProvisionError> {
         let spec = spec.docker.as_ref().expect("Docker scenario input");
 
-        Ok(EnvironmentProvisioning {
-            provider_descriptor: None,
-            survivors: None,
+        Ok(EnvironmentProvisioning::Local(LocalProvisioning {
             configured_limits: Some(ConfiguredResourceLimits {
                 cpus: Some(4),
                 cpu_shares: None,
@@ -65,7 +63,7 @@ impl EnvironmentRuntime for FakeDockerRuntime {
             image_ref: Some(spec.image.clone()),
             local_image_id: Some("sha256:test-image".to_string()),
             registry_digest: None,
-        })
+        }))
     }
 
     async fn destroy(&self, _environment_ref: &str, container_id: &str) -> Result<(), String> {

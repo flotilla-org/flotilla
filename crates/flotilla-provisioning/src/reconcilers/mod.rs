@@ -8,7 +8,7 @@ pub use checkout::{
     BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
 };
 pub use clone::{CloneReconciler, CloneRuntime};
-pub use environment::{EnvironmentProvisioning, EnvironmentReconciler, EnvironmentRuntime};
+pub use environment::{CloudProvisioning, EnvironmentProvisioning, EnvironmentReconciler, EnvironmentRuntime, LocalProvisioning};
 pub use image_build::{ImageBuildMaterials, ImageBuildReconciler};
 
 pub use repository::{ForgeDefaultBranchResolver, RepositoryReconciler};

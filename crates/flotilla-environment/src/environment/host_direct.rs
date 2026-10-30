@@ -115,6 +115,10 @@ struct HostHandle {
 
 #[async_trait]
 impl ProvisionedEnvironment for HostHandle {
+    /// A host backing is the host itself.
+    fn provider_descriptor(&self) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
+        None
+    }
     fn capabilities(&self) -> super::ProviderCapabilities {
         HostDirectEnvironmentProvider::capability_declaration()
     }

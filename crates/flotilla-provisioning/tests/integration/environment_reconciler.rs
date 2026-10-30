@@ -5,7 +5,9 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_environment::environment::EnvironmentProvisionError;
-use flotilla_provisioning::reconcilers::{EnvironmentProvisioning, EnvironmentReconciler, EnvironmentRuntime};
+use flotilla_provisioning::reconcilers::{
+    CloudProvisioning, EnvironmentProvisioning, EnvironmentReconciler, EnvironmentRuntime, LocalProvisioning,
+};
 use flotilla_resources::{
     DockerEnvironmentSpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, Host,
     HostDirectEnvironmentSpec, HostSpec, InputMeta, ResourceError, StatusPatch,
@@ -370,15 +372,13 @@ impl EnvironmentRuntime for ProvisioningDockerRuntime {
         let spec = spec.docker.as_ref().expect("Docker scenario input");
 
         self.provisioned.lock().expect("provision log").push((spec.image.clone(), spec.pull_policy));
-        Ok(EnvironmentProvisioning {
-            provider_descriptor: None,
-            survivors: None,
+        Ok(EnvironmentProvisioning::Local(LocalProvisioning {
             configured_limits: None,
             backing_id: Some("container".into()),
             image_ref: Some(spec.image.clone()),
             local_image_id: Some(format!("sha256:{}", "9".repeat(64))),
             registry_digest: None,
-        })
+        }))
     }
 
     async fn destroy(&self, _environment_ref: &str, _container_id: &str) -> Result<(), String> {
@@ -617,10 +617,7 @@ impl EnvironmentRuntime for NeutralRuntime {
     ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, EnvironmentProvisionError> {
         assert!(spec.docker.is_none() && spec.host_direct.is_none());
         assert!(spec.provider_address.is_some());
-        Ok(flotilla_provisioning::reconcilers::EnvironmentProvisioning {
-            backing_id: Some("opaque-provider-backing".into()),
-            ..Default::default()
-        })
+        Ok(EnvironmentProvisioning::Local(LocalProvisioning { backing_id: Some("opaque-provider-backing".into()), ..Default::default() }))
     }
     async fn destroy(&self, _: &str, backing: &str) -> Result<(), String> {
         self.destroyed.lock().unwrap().push(backing.into());
@@ -667,10 +664,10 @@ struct CloudRuntime {
 impl EnvironmentRuntime for CloudRuntime {
     async fn provision_environment(&self, _: &str, spec: &EnvironmentSpec) -> Result<EnvironmentProvisioning, EnvironmentProvisionError> {
         assert!(spec.cloud_sandbox.is_some() && spec.docker.is_none() && spec.host_direct.is_none());
-        Ok(EnvironmentProvisioning {
-            backing_id: Some("opaque-cloud-backing".into()),
-            image_ref: Some(spec.cloud_sandbox.as_ref().unwrap().image.clone()),
-            provider_descriptor: Some(Box::new(flotilla_resources::EnvironmentProviderDescriptor {
+        Ok(EnvironmentProvisioning::Cloud(CloudProvisioning {
+            backing_id: "opaque-cloud-backing".into(),
+            image_ref: spec.cloud_sandbox.as_ref().unwrap().image.clone(),
+            provider_descriptor: Box::new(flotilla_resources::EnvironmentProviderDescriptor {
                 instance: "daytona".into(),
                 kind: flotilla_protocol::provider::ProviderKind::new(
                     flotilla_protocol::provider::EnvironmentClass::CloudSandbox,
@@ -681,21 +678,15 @@ impl EnvironmentRuntime for CloudRuntime {
                 module_version: "1".into(),
                 capabilities: Default::default(),
                 agent_connection: None,
-            })),
-            survivors: Some(flotilla_resources::EnvironmentSurvivors {
-                persistent_storage: Some("controller-storage".into()),
-                ..Default::default()
             }),
-            ..Default::default()
-        })
+        }))
     }
     async fn destroy(&self, _: &str, backing: &str) -> Result<(), String> {
         self.destroyed.lock().unwrap().push(backing.into());
         Ok(())
     }
 }
-// #3620: cloud provisioning stores the opaque backing, descriptor and survivor
-// references without populating legacy Docker identity. Finalization uses that
+// #3620: cloud provisioning stores the opaque backing and descriptor without populating legacy Docker identity. Finalization uses that
 // same opaque identity through the reconciler's kind-neutral runtime port.
 #[tokio::test]
 async fn cloud_ready_and_finalization_use_generic_backing() {
@@ -728,7 +719,6 @@ async fn cloud_ready_and_finalization_use_generic_backing() {
     assert_eq!(status.backing_id.as_deref(), Some("opaque-cloud-backing"));
     assert!(status.docker_container_id.is_none());
     assert_eq!(status.provider_descriptor.as_ref().unwrap().instance, "daytona");
-    assert_eq!(status.survivors.as_ref().unwrap().persistent_storage.as_deref(), Some("controller-storage"));
     environments.update_status(&environment.metadata.name, &environment.metadata.resource_version, &status).await.unwrap();
     let ready = environments.get(&environment.metadata.name).await.unwrap();
     reconciler.run_finalizer(&ready).await.unwrap();

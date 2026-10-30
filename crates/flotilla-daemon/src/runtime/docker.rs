@@ -19,7 +19,7 @@ use flotilla_environment::environment::{
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ConfiguredResourceLimits, EnvironmentId};
 use flotilla_provider_runtime::ChannelLabel;
-use flotilla_provisioning::reconcilers::{EnvironmentProvisioning, EnvironmentRuntime};
+use flotilla_provisioning::reconcilers::{EnvironmentProvisioning, EnvironmentRuntime, LocalProvisioning};
 use flotilla_resources::{
     Environment, EnvironmentSpec, ResourceError, Vessel, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ENV,
 };
@@ -541,13 +541,9 @@ impl DockerControllerRuntime {
             .await);
         }
         let handle_registry_digest = handle.registry_digest().map(str::to_owned);
-        let provider_descriptor = handle.provider_descriptor().map(Box::new);
-        let survivors = handle.survivors();
         self.state.provisioned_environments.lock().await.insert(container_id.clone(), ActiveProvisionedEnvironment { handle });
-        Ok(EnvironmentProvisioning {
+        Ok(EnvironmentProvisioning::Local(LocalProvisioning {
             backing_id: Some(container_id),
-            provider_descriptor,
-            survivors,
             image_ref: Some(image_ref),
             local_image_id: Some(local_image_id),
             registry_digest: handle_registry_digest,
@@ -557,7 +553,7 @@ impl DockerControllerRuntime {
                 build_jobs: Some(jobs),
                 linker_threads: Some(jobs),
             }),
-        })
+        }))
     }
 }
 

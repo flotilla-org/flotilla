@@ -23,7 +23,7 @@ use flotilla_provider_runtime::{
     execution_context::{AccountVariables, BaseLayer, ObservationContext, LOCALE_VARIABLES},
     ChannelLabel,
 };
-use flotilla_provisioning::reconcilers::EnvironmentProvisioning;
+use flotilla_provisioning::reconcilers::{CloudProvisioning, EnvironmentProvisioning, LocalProvisioning};
 use flotilla_resources::EnvironmentSpec;
 use sha2::Digest;
 
@@ -50,6 +50,25 @@ pub(super) async fn provision(
     let prepared = provider.prepare(spec, &Default::default()).await?;
     let id = EnvironmentId::new(name);
     let handle = provider.provision(id.clone(), &prepared, Default::default()).await?;
+    // A cloud backing's Ready status records its provider's facts: a provider
+    // that gives none fails here, before the vessel layer, not at Ready.
+    let described = match &spec.cloud_sandbox {
+        None => None,
+        Some(_) => match handle.provider_descriptor() {
+            Some(descriptor) => Some(descriptor),
+            None => {
+                let error = format!("cloud provider for {name} reported no provider descriptor");
+                return Err(discard_failed_environment(
+                    &handle,
+                    state.credential_store.as_deref(),
+                    state.agent_material.as_deref(),
+                    name,
+                    error,
+                )
+                .await);
+            }
+        },
+    };
     if provider.receives_host_tools() {
         let delivered = async {
             deliver_vessel_layer(state, &id, spec, &handle).await?;
@@ -83,15 +102,21 @@ pub(super) async fn provision(
             return Err(error);
         }
     }
-    let facts = EnvironmentProvisioning {
-        backing_id: Some(handle.backing_id().to_string()),
-        provider_descriptor: handle.provider_descriptor().map(Box::new),
-        survivors: handle.survivors(),
-        // A backing that reports its image's digest names the image it runs.
-        image_ref: handle.local_image_id().map(|_| handle.image().as_str().to_string()),
-        local_image_id: handle.local_image_id().map(str::to_owned),
-        registry_digest: handle.registry_digest().map(str::to_owned),
-        configured_limits: None,
+    let facts = match described {
+        Some(described) => EnvironmentProvisioning::Cloud(CloudProvisioning {
+            backing_id: handle.backing_id().to_string(),
+            image_ref: handle.image().as_str().to_string(),
+            // Read again, so the descriptor carries the agent's latest connection.
+            provider_descriptor: Box::new(handle.provider_descriptor().unwrap_or(described)),
+        }),
+        None => EnvironmentProvisioning::Local(LocalProvisioning {
+            backing_id: Some(handle.backing_id().to_string()),
+            // A backing that reports its image's digest names the image it runs.
+            image_ref: handle.local_image_id().map(|_| handle.image().as_str().to_string()),
+            local_image_id: handle.local_image_id().map(str::to_owned),
+            registry_digest: handle.registry_digest().map(str::to_owned),
+            configured_limits: None,
+        }),
     };
     state.provisioned_environments.lock().await.insert(handle.backing_id().to_string(), ActiveProvisionedEnvironment { handle });
     Ok(facts)

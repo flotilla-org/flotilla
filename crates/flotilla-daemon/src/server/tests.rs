@@ -2315,7 +2315,6 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
             &flotilla_resources::EnvironmentStatus {
                 backing_id: None,
                 provider_descriptor: None,
-                survivors: None,
                 configured_limits: None,
                 runtime_observation: None,
                 phase: flotilla_resources::EnvironmentPhase::Ready,
@@ -5870,7 +5869,6 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
             &flotilla_resources::EnvironmentStatus {
                 backing_id: None,
                 provider_descriptor: None,
-                survivors: None,
                 docker_container_id: Some("actuation-container-name".into()),
                 runtime_observation: Some(flotilla_protocol::EnvironmentRuntimeObservation {
                     container_id: Some("kernel-container".into()),
@@ -6419,7 +6417,6 @@ async fn host_direct_caller_keeps_crew_completion_and_stall() {
             &flotilla_resources::EnvironmentStatus {
                 backing_id: None,
                 provider_descriptor: None,
-                survivors: None,
                 runtime_observation: Some(flotilla_protocol::EnvironmentRuntimeObservation {
                     container_id: Some("stale-container".into()),
                     ..Default::default()
@@ -6468,7 +6465,6 @@ async fn legacy_mount_caller_keeps_working_until_vessel_ends() {
             &flotilla_resources::EnvironmentStatus {
                 backing_id: None,
                 provider_descriptor: None,
-                survivors: None,
                 docker_container_id: Some("actuation-container-name".into()),
                 ..Default::default()
             },
