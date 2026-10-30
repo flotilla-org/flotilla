@@ -1577,7 +1577,12 @@ impl Vcs for FlotillaVcs {
         // A clone that never landed in a provider-made workspace root leaves
         // it empty: there is no work to preserve.
         let list = ["-A", "--", target];
-        if self.runner.run("ls", &list, Path::new("/"), &command_channel_label("ls", &list)).await.is_ok_and(|entries| entries.trim().is_empty()) {
+        if self
+            .runner
+            .run("ls", &list, Path::new("/"), &command_channel_label("ls", &list))
+            .await
+            .is_ok_and(|entries| entries.trim().is_empty())
+        {
             return Ok(());
         }
         match self.local_clone_is_clean(target).await {
