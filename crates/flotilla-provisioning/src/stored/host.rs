@@ -243,6 +243,8 @@ pub struct ProviderImages {
 /// What the probe found for one FulfilmentKind here. Its age and free slots are judgements.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 pub struct Facts {
+    /// The kind's crew terminal pool is missing here, which keeps the kind full.
+    pub crew_pool_missing: bool,
     pub gui_session_logged_in: bool,
     pub image_ref: Option<String>,
     pub local_image_id: Option<String>,
@@ -260,6 +262,8 @@ impl Facts {
     pub fn new(facts: &FulfilmentFacts) -> Self {
         let image = facts.image.as_ref();
         Self {
+            // The probe publishes no free slots at all as the sign of a missing pool.
+            crew_pool_missing: facts.free_vessel_slots == Some(0),
             gui_session_logged_in: facts.gui_session_logged_in,
             image_ref: image.map(|image| image.image_ref.clone()),
             local_image_id: image.and_then(|image| image.local_image_id.clone()),

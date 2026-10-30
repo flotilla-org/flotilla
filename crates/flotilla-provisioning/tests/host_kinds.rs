@@ -277,7 +277,28 @@ fn the_observation_keeps_the_facts_admission_and_health_read() {
         );
         assert_eq!(facts.harnesses, BTreeMap::from([("claude-code".to_owned(), "2.1".to_owned())]));
         assert_eq!(facts.toolchains, BTreeMap::from([("rust".to_owned(), "1.99.0".to_owned())]));
+        assert!(!facts.crew_pool_missing);
     }
+}
+
+// Behaviour (#3824 layer 4c): a kind the probe found with no free slots, its crew pool missing,
+// keeps that fact; any other slot count is a judgement and is dropped.
+#[test]
+fn a_kind_without_its_crew_pool_stays_full() {
+    let facts = |slots: Option<u32>| {
+        let status = HostStatus {
+            fulfilment_facts: serde_json::from_value(json!({"host-direct": {
+                "gui_session_logged_in": false, "observed_at": "2026-10-29T00:00:00Z", "free_vessel_slots": slots}}))
+            .expect("facts"),
+            ..HostStatus::default()
+        };
+        let (_, observation, dropped) = records(import_host(&object("kiwi", HostSpec::default(), Some(status)), "kiwi").expect("imports"));
+        let counted = dropped.contains(&("HostObservation", "free vessel slots, a judgement"));
+        (observation.expect("observed").facts["host-direct"].crew_pool_missing, counted)
+    };
+    assert_eq!(facts(Some(0)), (true, false));
+    assert_eq!(facts(Some(3)), (false, true));
+    assert_eq!(facts(None), (false, false));
 }
 
 // Behaviour (#3824 layer 4c, owner's answer 1): a Host imports only at its home, a daemon's own at

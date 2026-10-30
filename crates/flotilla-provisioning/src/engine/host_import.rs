@@ -8,7 +8,7 @@
 //! | Deleted | dropped |
 //! | `spec` | a Host record; `expected_concurrent_rust_crews` dropped, as nothing reads it, and counted when not the default |
 //! | `status` | a HostObservation record: generation, protocol fingerprint, architecture, the free-space floor as a flag, conditions (`observed_at` as `since`), providers, adapters and their baseline, held credentials and their expiry, image digests, the Codex central login |
-//! | `status.fulfilment_facts` | facts by FulfilmentKind name: GUI login, image and its presence, harness and toolchain versions; each fact's observation time, free vessel slots and model facts dropped, as judgements or kept by nothing |
+//! | `status.fulfilment_facts` | facts by FulfilmentKind name: a missing crew pool (no free slots), GUI login, image and its presence, harness and toolchain versions; each fact's observation time, any other free slot count and model facts dropped, as judgements or kept by nothing |
 //! | Heartbeat time, readiness, `sleeping_until`, model probes | dropped: readiness is a judgement, and nothing sets the others |
 //! | The host summary (but its architecture), daemon version and start time, sleep inhibition state | dropped: display only; the sleep condition carries what readiness needs |
 //! | Free disk and the free-space floor | only whether free disk is below the floor |
@@ -190,7 +190,7 @@ fn observation(
     }
     for facts in status.fulfilment_facts.values() {
         uncarried("each fact's observation time, a judgement");
-        if facts.free_vessel_slots.is_some() {
+        if facts.free_vessel_slots.is_some_and(|slots| slots > 0) {
             uncarried("free vessel slots, a judgement");
         }
         if facts.harnesses.values().any(|harness| !harness.models.is_empty()) {

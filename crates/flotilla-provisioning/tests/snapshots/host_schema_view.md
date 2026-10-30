@@ -14,7 +14,7 @@ Kind tables only; the shared tables are in `host.sql`.
 | `host_observation_credential_expiry` | child | 4 | – | – | – |
 | `host_observation_image_digests` | child | 2 | – | `host_observation_image_digests_images` (child) | – |
 | `host_observation_image_digests_images` | child | 3 | – | – | – |
-| `host_observation_facts` | child | 7 | – | `host_observation_facts_harnesses` (child), `host_observation_facts_toolchains` (child) | – |
+| `host_observation_facts` | child | 8 | – | `host_observation_facts_harnesses` (child), `host_observation_facts_toolchains` (child) | – |
 | `host_observation_facts_harnesses` | child | 4 | – | – | – |
 | `host_observation_facts_toolchains` | child | 4 | – | – | – |
 

@@ -200,6 +200,7 @@ CREATE TABLE "host_observation_image_digests_images" (
 CREATE TABLE "host_observation_facts" (
   "host_observation" INTEGER NOT NULL,
   "key" TEXT NOT NULL,
+  "crew_pool_missing" INTEGER NOT NULL CHECK ("crew_pool_missing" IN (0, 1)),
   "gui_session_logged_in" INTEGER NOT NULL CHECK ("gui_session_logged_in" IN (0, 1)),
   "image_ref" TEXT,
   "local_image_id" TEXT,
@@ -297,6 +298,7 @@ FROM "host_observation_image_digests_images";
 CREATE VIEW "host_observation_facts_view" AS SELECT
   "host_observation_facts"."host_observation",
   "host_observation_facts"."key",
+  "host_observation_facts"."crew_pool_missing",
   "host_observation_facts"."gui_session_logged_in",
   "host_observation_facts"."image_ref",
   "host_observation_facts"."local_image_id",
