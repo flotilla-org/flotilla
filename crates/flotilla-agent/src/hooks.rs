@@ -4,6 +4,7 @@
 //! hook format. This module provides a trait for normalizing native events
 //! into a common `AgentHookEvent`, with parsers for Claude Code and Codex.
 
+use flotilla_protocol::arg::{flatten, Arg};
 use flotilla_protocol::{AgentEventType, AgentHarness};
 // Re-export protocol types used by callers of this module.
 pub use flotilla_protocol::{AgentHookEvent, AgentStatus};
@@ -263,6 +264,11 @@ pub const CLAUDE_CODE_HOOK_TOKEN_ENV: &str = "FLOTILLA_HOOK_TOKEN";
 /// The environment variable naming the base URL of flotillad's Claude Code hook routes on
 /// its loopback listener; each event posts to `<base>/<event>`.
 pub const CLAUDE_CODE_HOOK_URL_ENV: &str = "FLOTILLA_HOOK_URL";
+/// The environment variable naming the absolute path of the flotilla CLI in a session's
+/// place. Command hooks run it by that path: Claude Code runs them under the shell cleat
+/// launched with `sh -lc`, and a login profile such as Debian's `/etc/profile` resets
+/// `PATH` and drops the directory that holds the CLI.
+pub const FLOTILLA_CLI_ENV: &str = "FLOTILLA_CLI";
 
 /// Claude Code hook events that accept only `command` and `mcp_tool` hooks.
 const CLAUDE_CODE_COMMAND_ONLY_HOOKS: &[&str] = &["SessionStart", "Setup"];
@@ -288,7 +294,7 @@ impl<'a> ClaudeCodeHookTransport<'a> {
         }
     }
 
-    fn handler(self, subscription: &ClaudeCodeHookSubscription) -> serde_json::Value {
+    fn handler(self, subscription: &ClaudeCodeHookSubscription, cli: &str) -> serde_json::Value {
         match self {
             Self::Http { base_url } if !CLAUDE_CODE_COMMAND_ONLY_HOOKS.contains(&subscription.hook) => serde_json::json!({
                 "type": "http",
@@ -296,8 +302,17 @@ impl<'a> ClaudeCodeHookTransport<'a> {
                 "headers": { "Authorization": format!("Bearer ${CLAUDE_CODE_HOOK_TOKEN_ENV}") },
                 "allowedEnvVars": [CLAUDE_CODE_HOOK_TOKEN_ENV],
             }),
-            _ => serde_json::json!({ "type": "command", "command": format!("{CLAUDE_CODE_HOOK_COMMAND_PREFIX} {}", subscription.event) }),
+            _ => serde_json::json!({ "type": "command", "command": hook_command(cli, subscription.event) }),
         }
+    }
+}
+
+/// `flotilla` from `PATH` keeps the form installers recognise by
+/// [`CLAUDE_CODE_HOOK_COMMAND_PREFIX`]; a path is quoted for the hook's shell.
+fn hook_command(cli: &str, event: &str) -> String {
+    match cli {
+        "flotilla" => format!("{CLAUDE_CODE_HOOK_COMMAND_PREFIX} {event}"),
+        path => format!("{} hook claude-code {event}", flatten(&[Arg::Quoted(path.to_string())], 0)),
     }
 }
 
@@ -308,6 +323,10 @@ pub fn claude_code_hook_entries() -> serde_json::Value {
 
 /// The `hooks` object for a transport.
 pub fn claude_code_hook_entries_over(transport: ClaudeCodeHookTransport<'_>) -> serde_json::Value {
+    hook_entries(transport, "flotilla")
+}
+
+fn hook_entries(transport: ClaudeCodeHookTransport<'_>, cli: &str) -> serde_json::Value {
     let mut entries = serde_json::Map::new();
     for subscription in CLAUDE_CODE_HOOK_SUBSCRIPTIONS {
         entries
@@ -315,7 +334,7 @@ pub fn claude_code_hook_entries_over(transport: ClaudeCodeHookTransport<'_>) -> 
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut()
             .expect("hook entries are arrays")
-            .push(serde_json::json!({ "matcher": subscription.matcher, "hooks": [transport.handler(subscription)] }));
+            .push(serde_json::json!({ "matcher": subscription.matcher, "hooks": [transport.handler(subscription, cli)] }));
     }
     serde_json::Value::Object(entries)
 }
@@ -332,6 +351,13 @@ pub fn claude_code_hook_settings() -> serde_json::Value {
 /// [`claude_code_hook_settings`] for a transport.
 pub fn claude_code_hook_settings_over(transport: ClaudeCodeHookTransport<'_>) -> serde_json::Value {
     serde_json::json!({ "hooks": claude_code_hook_entries_over(transport) })
+}
+
+/// The settings a managed crew's launch environment calls for: its hook transport, and
+/// command hooks that run the CLI [`FLOTILLA_CLI_ENV`] names, or `flotilla` from `PATH`.
+pub fn claude_code_hook_settings_for(environment: &[(String, String)]) -> serde_json::Value {
+    let cli = environment.iter().find(|(key, value)| key == FLOTILLA_CLI_ENV && !value.is_empty()).map_or("flotilla", |(_, cli)| cli);
+    serde_json::json!({ "hooks": hook_entries(ClaudeCodeHookTransport::from_environment(environment), cli) })
 }
 
 /// Look up the parser for a given harness name.

@@ -156,6 +156,12 @@ async fn launch_through_the_provider_path(declared_path: Option<&str>, harness_i
         assert_eq!(mechanisms.get("harness"), Some(&"agent-fetch(digest)"));
         assert!(command.contains(&delivered.display().to_string()), "the delivered harness is launched: {command}");
     }
+    // The crew's command hooks run the vessel's CLI by path, since the login
+    // shell cleat starts may reset PATH (Debian's /etc/profile does).
+    let settings = fs::read_to_string(root.join("skill-source/.flotilla/claude-settings.json")).expect("settings overlay");
+    let settings: serde_json::Value = serde_json::from_str(&settings).expect("parse settings");
+    let stop = format!("'{}' hook claude-code stop", tools.join("flotilla").display());
+    assert_eq!(settings["hooks"]["Stop"][0]["hooks"][0]["command"], stop.as_str());
     let connection = delivery.agent_connection.as_ref().expect("explain shows drydock's report");
     assert_eq!((connection.provider.as_str(), connection.mode.as_str()), ("stand-in", "inward_exposure"));
     assert_eq!(connection.vessel, handle.backing_id());
