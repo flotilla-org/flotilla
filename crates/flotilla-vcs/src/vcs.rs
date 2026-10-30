@@ -1574,6 +1574,12 @@ impl Vcs for FlotillaVcs {
         if !self.runner.path_exists(Path::new(target)).await? {
             return Ok(());
         }
+        // A clone that never landed in a provider-made workspace root leaves
+        // it empty: there is no work to preserve.
+        let list = ["-A", "--", target];
+        if self.runner.run("ls", &list, Path::new("/"), &command_channel_label("ls", &list)).await.is_ok_and(|entries| entries.trim().is_empty()) {
+            return Ok(());
+        }
         match self.local_clone_is_clean(target).await {
             VcsCheck::True(_) => {}
             VcsCheck::False(details) | VcsCheck::Unknown(details) => {
@@ -3657,6 +3663,21 @@ mod tests {
                 assert_eq!(GitCliBackend::checkout_root(&target, &*runner).current_branch().await.unwrap().trim(), "convoy");
             }
         }
+    }
+
+    // A clone that never landed leaves a provider-made workspace root empty;
+    // its teardown has nothing to preserve, while other files still hold it.
+    #[tokio::test]
+    async fn an_empty_clone_target_is_reclaimable() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
+        let vcs = test_fl(dir.path(), runner, true);
+        let target = dir.path().join("workspace");
+        std::fs::create_dir(&target).unwrap();
+        vcs.verify_local_clone_reclaimable(target.to_str().unwrap()).await.expect("an empty root is reclaimable");
+        std::fs::write(target.join("notes"), "kept").unwrap();
+        let error = vcs.verify_local_clone_reclaimable(target.to_str().unwrap()).await.unwrap_err();
+        assert!(error.contains("preserving local clone"), "{error}");
     }
 
     // #3340: adoption compares with the fetched base, not a stale local main.
