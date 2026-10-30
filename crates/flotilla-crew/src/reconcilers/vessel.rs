@@ -1088,7 +1088,14 @@ impl VesselReconciler {
         }
         let has_repositories = !repository_refs.is_empty();
         let workspace_root = if multi_repository {
-            workspace_root
+            match (&strategy, checkout_paths.values().next()) {
+                // A vessel's clones stay where they were made, whatever the layout
+                // says now (a vessel cloned at its provider's root before #4165).
+                (PlacementStrategy::CloneInVessel { .. }, Some(path)) => {
+                    std::path::Path::new(path).parent().map_or(workspace_root, |parent| parent.to_string_lossy().into_owned())
+                }
+                _ => workspace_root,
+            }
         } else if let Some(path) = checkout_paths.values().next() {
             path.clone()
         } else {
@@ -1915,7 +1922,8 @@ impl PlacementStrategy {
         match self {
             Self::HostDirect { .. } => workspace_root.to_string(),
             Self::DockerHostCheckoutAndMount { .. } => realisation_settings::DOCKER_WORKSPACE.to_string(),
-            Self::CloneInVessel { clone_path, .. } if has_repositories => clone_path.clone(),
+            // Where the vessel's checkouts are recorded: one checkout's path, or several's parent.
+            Self::CloneInVessel { .. } if has_repositories => workspace_root.to_string(),
             Self::CloneInVessel { .. } => "/".to_string(),
         }
     }

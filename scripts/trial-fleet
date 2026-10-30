@@ -285,6 +285,9 @@ class Trial:
         self.daemon = None
         self.forge_process = None
         self.local_root = None
+        self.host_filesystem = False
+        self.convoys = set()
+        self.environments = set()
         self.convoy = None
 
     # -- processes -------------------------------------------------------
@@ -408,6 +411,7 @@ class Trial:
                     if provider.get('instance') == self.instance:
                         readiness = provider.get('readiness') or {}
                         if readiness.get('state') == 'ready':
+                            self.host_filesystem = bool((provider.get('capabilities') or {}).get('host_filesystem'))
                             return provider
                         raise TrialFailure(f'provider {self.instance} is {readiness.get("state")}: {readiness.get("reason")}')
             raise TrialFailure(f'no host advertises provider {self.instance}')
@@ -463,6 +467,7 @@ class Trial:
         if len(convoys) != 1:
             raise TrialFailure(f'expected one convoy, found {len(convoys)}')
         self.convoy = convoys[0]['metadata']['name']
+        self.convoys.add(self.convoy)
 
     # -- observation -----------------------------------------------------
 
@@ -494,6 +499,7 @@ class Trial:
     def provisioned(self):
         ready = self.until('environment Ready', lambda: [name for name, phase in self.phase('environments') if phase == 'Ready'
                                                          and name != f'host-direct-{self.host}'])
+        self.environments.update(ready)
         self.until('vessel Ready', lambda: [name for name, phase in self.phase('vessels') if phase == 'Ready'])
         return ready
 
@@ -525,6 +531,8 @@ class Trial:
         problems = []
         if self.daemon is not None and self.daemon.poll() is None:
             try:
+                self.convoys.update(name for name, _ in self.phase('convoys'))
+                self.environments.update(name for name, _ in self.phase('environments') if not name.startswith('host-direct-'))
                 for name, phase in self.phase('convoys'):
                     if phase not in ('Landed', 'Abandoned'):
                         self.cli('convoy', 'abandon', '--reason', 'trial fleet teardown', name, check=False, timeout=60)
@@ -540,8 +548,14 @@ class Trial:
         shutil.rmtree(f'/tmp/flotilla-drydock-{digest}', ignore_errors=True)
         if Path(f'/tmp/flotilla-drydock-{digest}').exists():
             problems.append(f'drydock run directory /tmp/flotilla-drydock-{digest} left behind')
+        left = [path for path in vessel_state(self.convoys, self.environments) if path.exists()] if self.host_filesystem else []
+        if left:
+            for path in left:
+                remove_tree(path)
+            if any(path.exists() for path in left):
+                problems.append(f'vessel state left in {CONTAINED_BASE}: {", ".join(str(path) for path in left if path.exists())}')
         if self.local_root is not None and self.local_root.is_dir():
-            left = [path for path in self.local_root.iterdir()]
+            left = local_leftovers(self.local_root, self.environments, own=self.local_root.is_relative_to(self.root))
             if left:
                 problems.append(f'provider environments left in {self.local_root}: {", ".join(path.name for path in left)}; removed')
                 for path in left:
@@ -684,6 +698,43 @@ def run(args):
         return 1
     clock.say(f'PASSED: reached {reached} with provider {trial.instance}')
     return 0
+
+
+# A vessel's own writable base (flotilla's CONTAINED_WRITABLE_CONFIG_BASE). On a
+# provider whose vessels share the host's filesystem it is this machine's own
+# directory, shared by every such vessel, and nothing destroys it with them.
+CONTAINED_BASE = Path('/tmp/flotilla-config')
+
+
+def vessel_state(convoys, environments):
+    """What flotilla's vessel layer writes per convoy and environment below the
+    contained base: crew sockets, the published layer, agent homes and material."""
+    paths = []
+    for environment in sorted(environments):
+        digest = hashlib.sha256(environment.encode()).hexdigest()[:16]
+        paths += [CONTAINED_BASE / 'crew-sockets' / digest, CONTAINED_BASE / 'vessel-layers' / digest]
+    for convoy in sorted(convoys):
+        paths += [CONTAINED_BASE / 'agent-homes/requesters' / convoy, CONTAINED_BASE / 'agent-material/requesters' / convoy]
+    return paths
+
+
+def local_leftovers(root, environments, own):
+    """What this trial left below a local provider's root. The trial's own root
+    holds nothing else; a root given by --provider-config may hold other vessels,
+    so only the environments this trial made (by the label their record keeps)
+    and the clones of its vessels (env-<vessel> → <vessel>) count there."""
+    if own:
+        return sorted(root.iterdir())
+    vessels = {name.removeprefix('env-') for name in environments}
+    left = []
+    for path in sorted(root.iterdir()):
+        try:
+            label = json.loads((path / 'environment.json').read_text()).get('label')
+        except (OSError, ValueError, AttributeError):
+            label = None
+        if label in environments or path.name in vessels:
+            left.append(path)
+    return left
 
 
 def remove_tree(path):

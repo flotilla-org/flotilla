@@ -74,6 +74,26 @@ class EndPointTest(unittest.TestCase):
 
 
 class TeardownTest(unittest.TestCase):
+    def test_vessel_state_is_named_by_the_trials_own_convoys_and_environments(self):
+        import hashlib
+        digest = hashlib.sha256(b'env-convoy-x-work').hexdigest()[:16]
+        base = trial.CONTAINED_BASE
+        self.assertEqual(trial.vessel_state({'convoy-x'}, {'env-convoy-x-work'}), [
+            base / 'crew-sockets' / digest, base / 'vessel-layers' / digest,
+            base / 'agent-homes/requesters/convoy-x', base / 'agent-material/requesters/convoy-x'])
+        self.assertEqual(trial.vessel_state(set(), set()), [])
+
+    def test_a_shared_local_root_gives_up_only_what_this_trial_made(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(trial.remove_tree, root)
+        for name, label in [('local-ours', 'env-convoy-a-work'), ('local-theirs', 'env-convoy-b-work')]:
+            (root / name).mkdir()
+            (root / name / 'environment.json').write_text(f'{{"label": "{label}"}}')
+        (root / 'convoy-a-work').mkdir()
+        (root / 'unrelated').mkdir()
+        self.assertEqual(trial.local_leftovers(root, {'env-convoy-a-work'}, own=False), [root / 'convoy-a-work', root / 'local-ours'])
+        self.assertEqual(len(trial.local_leftovers(root, set(), own=True)), 4)
+
     def test_a_tree_with_read_only_directories_is_removed(self):
         root = Path(tempfile.mkdtemp())
         (root / 'store/tree').mkdir(parents=True)

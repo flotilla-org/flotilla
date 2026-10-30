@@ -1415,6 +1415,110 @@ async fn docker_kind_environment_uses_constant_pull_policy_and_decided_instance(
     assert_eq!(environment, ("rootless".to_string(), "flotilla-dev-env:latest".to_string(), DockerImagePullPolicy::Always));
 }
 
+// #4165: a cloud vessel clones into a directory of its own below its provider's
+// workspace root, since vessels on the host's filesystem (drydock's `local`)
+// share that root. One already cloned at the root itself keeps its checkout
+// there, and its crew runs where the checkout is recorded.
+#[tokio::test]
+async fn a_cloud_vessel_clones_below_the_workspace_root_and_crews_run_at_the_recorded_checkout() {
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-cloud", "implement", REPO_URL, GIT_REF).await;
+    let mut status = convoy.status.expect("convoy status");
+    status.placement_decision = Some(PlacementDecision {
+        provider_instance: Some("local".to_string()),
+        provider_workspace_root: Some("/vessels".to_string()),
+        minimal_alternatives: Vec::new(),
+        escalation_reason: None,
+        kind: "kind-cloud".to_string(),
+        target_host: PlacementTargetHost { reference: CanonicalHostId::resolved(HOST_REF), display_name: HOST_REF.to_string() },
+        refused_candidates: Vec::new(),
+        viable_not_selected: Vec::new(),
+        allocation: None,
+    });
+    backend.using::<Convoy>(NAMESPACE).update_status("convoy-cloud", &convoy.metadata.resource_version, &status).await.expect("decision");
+    let image = format!("crew@sha256:{}", "a".repeat(64));
+    create_kind(
+        &backend,
+        NAMESPACE,
+        "kind-cloud",
+        FulfilmentKindSpec::builder()
+            .host_ref(HOST_REF.to_string())
+            .pool("cleat".to_string())
+            .realisation(FulfilmentRealisation::CloudSandboxPerVessel { image: image.clone() })
+            .build(),
+    )
+    .await;
+    let vessel = create_workspace(&backend, NAMESPACE, "workspace-cloud", "convoy-cloud", "implement", "kind-cloud", REPO_URL).await;
+    let environments = backend.clone().using::<Environment>(NAMESPACE);
+    let environment = environments
+        .create(
+            &meta("env-workspace-cloud"),
+            &EnvironmentSpec {
+                cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+                    image: image.clone(),
+                    size: flotilla_resources::realisation_settings::CLOUD_SANDBOX_SIZE,
+                    lifetime_cap_seconds: None,
+                    probe_needs: Default::default(),
+                    env: Default::default(),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("environment");
+    let ready = flotilla_resources::EnvironmentStatus {
+        phase: flotilla_resources::EnvironmentPhase::Ready,
+        ready: true,
+        image_ref: Some(image),
+        local_image_id: Some(format!("sha256:{}", "a".repeat(64))),
+        ..Default::default()
+    };
+    environments.update_status("env-workspace-cloud", &environment.metadata.resource_version, &ready).await.expect("ready");
+
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let reconcile = |vessel| {
+        let reconciler = &reconciler;
+        async move {
+            let deps = reconciler.prepare(vessel).await.expect("deps should load");
+            reconciler.reconcile(vessel, &deps, Utc::now())
+        }
+    };
+    let outcome = reconcile(&vessel).await;
+    let (name, checkout) = outcome
+        .actuations
+        .iter()
+        .find_map(|actuation| match actuation {
+            Actuation::CreateCheckout { meta, spec: CheckoutSpec::FreshClone(spec) } => Some((meta.name.clone(), spec.clone())),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a fresh clone should be created: {:?}", outcome.patch));
+    assert_eq!(checkout.target_path, "/vessels/workspace-cloud");
+
+    // The checkout was recorded at the root itself, by an earlier layout.
+    create_ready_checkout(
+        &backend,
+        NAMESPACE,
+        ReadyCheckoutFixture::builder()
+            .name(name)
+            .env_ref("env-workspace-cloud".to_string())
+            .git_ref(GIT_REF.to_string())
+            .path("/vessels".to_string())
+            .fresh_clone(flotilla_resources::FreshCloneCheckoutSpec { target_path: "/vessels".to_string(), ..checkout })
+            .build(),
+    )
+    .await;
+    let outcome = reconcile(&vessel).await;
+    let cwd = outcome
+        .actuations
+        .iter()
+        .find_map(|actuation| match actuation {
+            Actuation::CreateTerminalSession { spec, .. } => Some(spec.cwd.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a terminal session should be created: {:?}", outcome.patch));
+    assert_eq!(cwd, "/vessels");
+}
+
 // Discovery offers the canary adapter only where a vessel's environment enables it.
 #[rstest]
 #[case::canary("fleet-canary", Some("1"))]
