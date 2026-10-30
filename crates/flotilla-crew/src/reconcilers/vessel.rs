@@ -671,7 +671,7 @@ impl VesselReconciler {
             let Some(root) = placement_decision.as_ref().and_then(|decision| decision.provider_workspace_root.as_ref()) else {
                 return Ok(VesselPrepared::failed("cloud provider workspace root missing from frozen placement"));
             };
-            root.clone_into(clone_path);
+            *clone_path = vessel_clone_path(root, &obj.metadata.name);
         }
         if let Some(decision) = placement_decision.as_ref() {
             strategy.canonicalize_host_ref(decision.target_host.reference.as_str());
@@ -1832,6 +1832,13 @@ fn cloud_environment_spec(
     })
 }
 
+/// Where a vessel clones below its provider's workspace root: a directory of
+/// its own, since where vessels share one filesystem (drydock's `local`) the
+/// root is theirs together.
+fn vessel_clone_path(workspace_root: &str, vessel: &str) -> String {
+    format!("{}/{vessel}", workspace_root.trim_end_matches('/'))
+}
+
 fn environment_provider_labels(placement: &Placement) -> BTreeMap<String, String> {
     placement.instance.iter().map(|instance| (ENVIRONMENT_PROVIDER_INSTANCE_LABEL.into(), instance.clone())).collect()
 }
@@ -2348,6 +2355,21 @@ mod tests {
         let sized = Placement { kind: sized_kind, instance: Some("daytona".into()) };
         let spec = cloud_environment_spec(&sized, "image@sha256:digest", needs).expect("a typed spec");
         assert_eq!(spec.cloud_sandbox.unwrap().size, policy_size);
+    }
+
+    // #4165: vessels whose provider declares one workspace root for all of them
+    // each clone into a directory of their own below it.
+    #[test]
+    fn each_vessel_clones_below_the_workspace_root_in_its_own_directory() {
+        use super::vessel_clone_path;
+        for root in ["/workspace", "/workspace/", "/tmp/trial/vessels"] {
+            let (first, second) = (vessel_clone_path(root, "convoy-a-work"), vessel_clone_path(root, "convoy-b-work"));
+            assert_ne!(first, second);
+            for path in [&first, &second] {
+                let parent = std::path::Path::new(path).parent().expect("below the root");
+                assert_eq!(parent, std::path::Path::new(root));
+            }
+        }
     }
 
     #[test]

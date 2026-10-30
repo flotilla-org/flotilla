@@ -1,0 +1,721 @@
+#!/usr/bin/env python3
+"""Run one convoy through a throwaway flotilla built from this checkout (#4165).
+
+    scripts/trial-fleet run [--provider-config FILE] [--crew scripted|<agent>]
+                            [--until provisioned|attached|landed]
+
+Builds flotillad, flotilla, the vessel CLI, drydock-agent and drydock-host
+(debug, in this checkout's target directory), starts one flotillad with its
+own config dir, state dir and socket, serves issues and pull requests from the
+fake forge (#3374), starts one convoy on a fixed trial issue and waits for the
+chosen end point. Every phase is printed; the first failure is printed with
+its message. Everything is torn down afterwards, the provider's environments
+included, and checked to be gone, also when interrupted.
+
+The provider is the one `[providers.NAME]` table in --provider-config, as in
+any drydock.toml. Without one, drydock's `local` module runs the vessel as a
+child process on this machine. This script names no other module.
+
+Exit status 0 means the end point was reached.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+
+REPO = Path(__file__).resolve().parent.parent
+END_POINTS = ('provisioned', 'attached', 'landed')
+# The trial repository's forge identity. Its issues and pull requests are
+# served by the fake forge; git traffic goes to a local bare repository.
+FORGE_SERVICE = 'https://github.com'
+TRIAL_REPOSITORY = 'flotilla-trial/trial'
+TRIAL_PROJECT = 'trial'
+TRIAL_ISSUE_TITLE = 'Trial: make one change end to end'
+# The scripted crew is the credential-free managed agent stand-in: the
+# `fleet-canary` adapter runs `.flotilla/fleet-canary-agent.sh` from the checkout.
+SCRIPTED_ADAPTER = 'fleet-canary'
+# Recorded by the local module, never pulled.
+LOCAL_IMAGE = 'trial-fleet/local@sha256:' + '0' * 64
+# Every process the trial starts inherits this marker; teardown sweeps by it.
+MARKER = 'FLOTILLA_TRIAL_FLEET'
+GUEST_SOURCES = ('flotilla', 'cleat', 'mattpocock-skills', 'rjw-skills')
+
+
+class TrialFailure(RuntimeError):
+    pass
+
+
+class Interrupted(BaseException):
+    pass
+
+
+def interrupt(signum, _frame):
+    raise Interrupted(signal.Signals(signum).name)
+
+
+class Clock:
+    def __init__(self):
+        self.start = time.monotonic()
+
+    def say(self, message, *, stream=sys.stdout):
+        print(f'[{time.monotonic() - self.start:6.1f}s] {message}', file=stream, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Build
+
+
+def cargo_target_dir():
+    metadata = json.loads(subprocess.run(['cargo', 'metadata', '--format-version', '1', '--no-deps', '--offline'],
+                                         cwd=REPO, check=True, text=True, stdout=subprocess.PIPE).stdout)
+    return Path(metadata['target_directory'])
+
+
+def drydock_pin():
+    text = (REPO / 'Cargo.toml').read_text()
+    pins = set(re.findall(r'^drydock[a-z-]* = \{ git = "([^"]+)", rev = "([0-9a-f]{40})" \}', text, re.M))
+    if len(pins) != 1:
+        raise TrialFailure(f'Cargo.toml must pin every drydock crate to one git rev; found {sorted(pins)}')
+    return pins.pop()
+
+
+def build(target, log):
+    """Debug builds in the checkout's own target directory, so reruns are incremental."""
+    git, rev = drydock_pin()
+    steps = [
+        ['cargo', 'build', '--locked', '--bin', 'flotilla', '--bin', 'flotillad'],
+        # Cargo resolves features per invocation; combining these packages trips it.
+        ['cargo', 'build', '--locked', '-p', 'flotilla-cli', '--bin', 'flotilla-vessel'],
+        ['cargo', 'build', '--locked', '-p', 'drydock-agent', '--bin', 'drydock-agent'],
+        ['cargo', 'build', '--locked', '-p', 'flotilla-fake-forge', '--bin', 'flotilla-fake-forge'],
+        # drydock-host is only a dev-dependency here, which cargo cannot build as a
+        # package; install it from the pinned rev. Each rev builds apart: cargo
+        # takes a git package built at another rev as fresh.
+        ['cargo', 'install', '--locked', '--debug', '--git', git, '--rev', rev, '--root', str(target / f'trial-fleet/drydock-host/{rev}'),
+         '--target-dir', str(target / f'trial-fleet/drydock-host/{rev}/build'), '--bin', 'drydock-host', 'drydock-host'],
+    ]
+    for step in steps:
+        log.write(f'$ {" ".join(step)}\n')
+        log.flush()
+        if subprocess.run(step, cwd=REPO, stdout=log, stderr=log).returncode:
+            raise TrialFailure(f'build failed: {" ".join(step)} (see {log.name})')
+    return {
+        'flotilla': target / 'debug/flotilla', 'flotillad': target / 'debug/flotillad',
+        'flotilla-vessel': target / 'debug/flotilla-vessel', 'drydock-agent': target / 'debug/drydock-agent',
+        'flotilla-fake-forge': target / 'debug/flotilla-fake-forge',
+        'drydock-host': target / f'trial-fleet/drydock-host/{rev}/bin/drydock-host',
+    }
+
+
+def link_or_copy(source, destination):
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
+
+
+def stripped_copy(source, destination):
+    # Guest members are pushed into every vessel and capped at 128 MiB each.
+    shutil.copy2(source, destination)
+    subprocess.run(['strip', '--strip-debug', str(destination)], check=True)
+
+
+def tools_layer(explicit):
+    """The installed tools layer that provides cleat, its library and terminfo."""
+    if explicit is not None:
+        root = Path(explicit).resolve()
+    else:
+        cleat = shutil.which('cleat')
+        if cleat is None:
+            raise TrialFailure('no cleat on PATH; pass --tools DIR (an installed generation or vessel tools layer)')
+        root = Path(cleat).resolve().parent.parent
+    needed = ['bin/cleat', 'lib/libghostty-vt.so.0', 'share/terminfo/x/xterm-ghostty', 'share/terminfo/LICENSE']
+    missing = [name for name in needed if not (root / name).is_file()]
+    if missing:
+        raise TrialFailure(f'tools layer {root} lacks {", ".join(missing)}')
+    return root
+
+
+def stage_generation(root, binaries, tools):
+    """Lay the build out as an installed generation: flotillad pushes its guest
+    tools from <exe>/../../share/flotilla/guest-tools, indexed by a catalog."""
+    generation = root / 'generation'
+    (generation / 'bin').mkdir(parents=True)
+    (generation / 'lib').mkdir()
+    for name in ('flotilla', 'flotillad', 'drydock-host', 'flotilla-fake-forge'):
+        link_or_copy(binaries[name], generation / 'bin' / name)
+    for name in ('flotilla-vessel', 'drydock-agent'):
+        stripped_copy(binaries[name], generation / 'bin' / name)
+    shutil.copy2(tools / 'bin/cleat', generation / 'bin/cleat')
+    shutil.copy2(tools / 'lib/libghostty-vt.so.0', generation / 'lib/libghostty-vt.so.0')
+    shutil.copytree(tools / 'share/terminfo', generation / 'share/terminfo')
+    sys.path.insert(0, str(REPO / 'ci/fleet-candidates'))
+    sys.dont_write_bytecode = True
+    import generation_validation
+    head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=REPO, check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
+    sources = {name: head if name == 'flotilla' else '0' * 40 for name in GUEST_SOURCES}
+    cohort = '1'
+    generation_validation.produce_guest_tools(generation, sources, cohort,
+                                              generation_validation.load_guest_layers(REPO / 'stdlib/guest-layers'))
+    (generation / 'manifest.json').write_text(json.dumps({'sources': sources, 'guest_tools_cohort': cohort}))
+    (generation / '.generation.json').write_text(json.dumps({'sources': sources, 'source_run': {'api_run_id': int(cohort)}}))
+    return generation
+
+
+# ---------------------------------------------------------------------------
+# Provider
+
+
+def provider_config(path, root):
+    """The drydock.toml the trial daemon reads, and its one provider instance."""
+    if path is None:
+        text = (f'[providers.local]\nmodule = "local"\nimage = "{LOCAL_IMAGE}"\n'
+                f'settings = {{ root = "{root / "vessels"}", agent = "{root / "generation/bin/drydock-agent"}" }}\n')
+        return text, 'local', LOCAL_IMAGE, root / 'vessels'
+    text = Path(path).read_text()
+    try:
+        parsed = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise TrialFailure(f'{path}: {error}') from error
+    providers = parsed.get('providers')
+    if not isinstance(providers, dict) or len(providers) != 1:
+        raise TrialFailure(f'{path}: name exactly one [providers.NAME] table')
+    (name, table), = providers.items()
+    image = table.get('image') if isinstance(table, dict) else None
+    if not isinstance(image, str) or '@sha256:' not in image:
+        raise TrialFailure(f'{path}: [providers.{name}] needs an image pinned by digest (image = "...@sha256:...")')
+    local_root = None
+    if table.get('module') == 'local':
+        local_root = Path(((table.get('settings') or {}).get('root')) or '')
+        if not local_root.is_absolute():
+            raise TrialFailure(f'{path}: a local provider needs an absolute settings.root to be checked at teardown')
+    return text, name, image, local_root
+
+
+# ---------------------------------------------------------------------------
+# Fake forge
+
+
+def free_port():
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        return sock.getsockname()[1]
+
+
+def stage_forge(root, log):
+    forge = root / 'forge'
+    port, admin_port = free_port(), free_port()
+    result = subprocess.run([str(REPO / 'scripts/rehearsal/install-fake-forge.sh'), '--stage', str(forge),
+                             '--host', 'localhost', '--ip', '127.0.0.1', '--bind', '127.0.0.1',
+                             '--port', str(port), '--admin-port', str(admin_port),
+                             '--forge', f'github=github={FORGE_SERVICE}', '--login', 'trial-crew',
+                             '--auto-merge-after', '5', '--client-token-dir', str(forge / 'tokens')],
+                            stdout=log, stderr=log)
+    if result.returncode:
+        raise TrialFailure(f'staging the fake forge failed (see {log.name})')
+    bundle = root / 'ca-bundle.pem'
+    system = next((Path(p) for p in ('/etc/ssl/certs/ca-certificates.crt', '/etc/pki/tls/certs/ca-bundle.crt') if Path(p).is_file()), None)
+    bundle.write_text((system.read_text() if system else '') + (forge / 'rehearsal-ca.pem').read_text())
+    return {'dir': forge, 'url': f'https://localhost:{port}', 'admin': f'https://localhost:{admin_port}/admin/v1',
+            'token': forge / 'tokens/github', 'admin_token': forge / 'admin-token', 'ca': forge / 'rehearsal-ca.pem'}
+
+
+# ---------------------------------------------------------------------------
+# The trial
+
+
+CREW_SCRIPT = r'''#!/usr/bin/env bash
+# The trial fleet's scripted crew (scripts/trial-fleet). It runs through the
+# ordinary managed agent path; reaching `landed` it pushes a commit, opens a
+# pull request on the fake forge and submits it against its promise.
+set -euo pipefail
+# A failed step stays on screen, and the crew stays up, so the trial reports it.
+trap 'echo "flotilla trial crew · failed at line $LINENO: $BASH_COMMAND"; while true; do sleep 1; done' ERR
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/trial.env"
+echo "flotilla trial crew · ${TRIAL_UNTIL} · started"
+if [[ $TRIAL_UNTIL == landed ]]; then
+  branch="$(git rev-parse --abbrev-ref HEAD)"
+  date -u +%FT%TZ >trial-change.txt
+  git add trial-change.txt
+  git -c user.name='Trial Crew' -c user.email=trial@localhost commit -q -m 'Trial change'
+  git push -q origin "HEAD:refs/heads/$branch"
+  body="$(printf '{"head":"%s","base":"main","title":"Trial change","body":"Closes #%s"}' "$branch" "$TRIAL_ISSUE")"
+  number="$(curl -fsS --cacert "$TRIAL_FORGE_CA" -H "Authorization: token $(cat "$TRIAL_FORGE_TOKEN")" \
+    -H 'Accept: application/json' -H 'Content-Type: application/json' -d "$body" "$TRIAL_FORGE_API/repos/$TRIAL_REPOSITORY/pulls" |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["number"])')"
+  # The fake forge stands in for the trial repository's forge, whose URLs claims keep.
+  url="$TRIAL_FORGE_SERVICE/$TRIAL_REPOSITORY/pull/$number"
+  echo "opened $url"
+  flotilla crew submit --kind pr --reference "$url"
+  ledger="$(mktemp)"
+  cat >"$ledger" <<'LEDGER'
+## Decision ledger
+
+1. **Brief silence:** What the scripted trial crew changes.
+- **Choice:** Commit one timestamp file and open a pull request for it.
+- **Alternative:** Submit without a change.
+- **If asking were free:** None; the trial only proves the delivery path.
+LEDGER
+  flotilla artifact put --kind decision-ledger "$ledger"
+  rm -f "$ledger"
+  echo "flotilla trial crew · submitted"
+fi
+while true; do sleep 1; done
+'''
+
+
+class Trial:
+    def __init__(self, args, root, clock, log):
+        self.args = args
+        self.root = root
+        self.clock = clock
+        self.log = log
+        self.socket = root / 'config/run/flotilla.sock'
+        self.daemon = None
+        self.forge_process = None
+        self.local_root = None
+        self.convoy = None
+
+    # -- processes -------------------------------------------------------
+
+    def environment(self):
+        generation = self.root / 'generation'
+        env = {
+            'HOME': str(self.root / 'home'), 'PATH': f'{generation}/bin:/usr/local/bin:/usr/bin:/bin',
+            'CLEAT_RUNTIME_DIR': str(self.root / 'cleat'), 'FLOTILLA_FLEET_CANARY': '1',
+            'SSL_CERT_FILE': str(self.root / 'ca-bundle.pem'), 'GIT_CONFIG_GLOBAL': str(self.root / 'gitconfig'),
+            'GIT_CONFIG_NOSYSTEM': '1', MARKER: str(self.root), 'RUST_LOG': os.environ.get('RUST_LOG', 'info'),
+            'LANG': 'C.UTF-8',
+        }
+        for name in ('USER', 'LOGNAME', 'TERM'):
+            if name in os.environ:
+                env[name] = os.environ[name]
+        return env
+
+    def run(self, args, *, timeout=60, check=True, cwd=None):
+        self.log.write(json.dumps([str(arg) for arg in args]) + '\n')
+        self.log.flush()
+        try:
+            result = subprocess.run([str(arg) for arg in args], env=self.environment(), cwd=cwd, text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            raise TrialFailure(f'command timed out: {" ".join(map(str, args))}') from error
+        self.log.write(result.stdout[-4000:] + result.stderr[-4000:] + '\n')
+        if check and result.returncode:
+            raise TrialFailure(f'{" ".join(map(str, args[:6]))} failed: {(result.stderr or result.stdout).strip()[-2000:]}')
+        return result
+
+    def cli(self, *args, **kwargs):
+        return self.run([self.root / 'generation/bin/flotilla', '--socket', self.socket, '--json', *args], **kwargs).stdout
+
+    def objects(self, kind):
+        response = json.loads(self.cli('resource', 'list', kind, '--local-only'))
+        return [record['object'] for record in response['records'] if record.get('object') is not None]
+
+    def apply(self, kind, name, spec, labels=None):
+        document = self.root / 'resources' / f'{kind}-{name}.json'
+        document.parent.mkdir(exist_ok=True)
+        metadata = {'name': name, 'namespace': 'flotilla', **({'labels': labels} if labels else {})}
+        document.write_text(json.dumps({'apiVersion': 'flotilla.work/v1', 'kind': kind, 'metadata': metadata, 'spec': spec}))
+        self.cli('resource', 'apply', '--file', document)
+
+    def admin(self, method, path, body=None):
+        forge = self.forge
+        args = ['curl', '-fsS', '--cacert', forge['ca'], '-X', method, '-H', f'@{self.root / "forge/admin-header"}',
+                '-H', 'Content-Type: application/json', f'{forge["admin"]}{path}']
+        if body is not None:
+            args[1:1] = ['-d', json.dumps(body)]
+        return json.loads(self.run(args).stdout or 'null')
+
+    # -- phases ----------------------------------------------------------
+
+    def step(self, name, action):
+        self.clock.say(f'{name} ...')
+        result = action()
+        self.clock.say(f'{name}: ok')
+        return result
+
+    def wait(self, what, probe, timeout=None):
+        deadline = time.monotonic() + (timeout or self.args.timeout)
+        last = 'no evidence yet'
+        while time.monotonic() < deadline:
+            for process, name in ((self.daemon, 'flotillad'), (self.forge_process, 'fake forge')):
+                if process is not None and process.poll() is not None:
+                    raise TrialFailure(f'{what}: {name} exited with status {process.returncode}')
+            try:
+                result = probe()
+                if result:
+                    return result
+            except (TrialFailure, json.JSONDecodeError, KeyError) as error:
+                last = str(error)
+            time.sleep(1)
+        raise TrialFailure(f'{what}: timed out after {timeout or self.args.timeout}s; {last}')
+
+    def start_forge(self, log):
+        forge = stage_forge(self.root, log)
+        self.forge = forge
+        header = self.root / 'forge/admin-header'
+        header.write_text(f'Authorization: Bearer {forge["admin_token"].read_text().strip()}\n')
+        header.chmod(0o600)
+        self.forge_process = subprocess.Popen(
+            [str(self.root / 'generation/bin/flotilla-fake-forge'), 'serve', '--config', str(forge['dir'] / 'config.toml')],
+            env=self.environment(), stdout=log, stderr=log, start_new_session=True)
+        self.wait('fake forge answers', lambda: self.admin('GET', '/state') is not None, timeout=30)
+
+    def configure(self):
+        config = self.root / 'config'
+        (config / 'run').mkdir(parents=True)
+        for directory in ('state', 'home', 'cleat'):
+            (self.root / directory).mkdir()
+        text, self.instance, self.image, self.local_root = provider_config(self.args.provider_config, self.root)
+        (config / 'drydock.toml').write_text(text)
+        forge = self.forge
+        (config / 'daemon.toml').write_text(
+            f'[forge_overrides."{FORGE_SERVICE}"]\nprovider = "forgejo"\n'
+            f'endpoint_url = "{forge["url"]}/github"\ntoken_path = "{forge["token"]}"\n')
+        upstream = self.root / 'upstream.git'
+        # Clones of the trial repository's forge URL read the local bare repository.
+        (self.root / 'gitconfig').write_text(
+            f'[url "{upstream.as_uri()}"]\n\tinsteadOf = {FORGE_SERVICE}/{TRIAL_REPOSITORY}\n'
+            '[user]\n\tname = Trial\n\temail = trial@localhost\n[push]\n\tdefault = current\n')
+
+    def start_daemon(self, log):
+        self.daemon = subprocess.Popen(
+            [str(self.root / 'generation/bin/flotillad'), '--timeout', '0', '--config-dir', str(self.root / 'config'),
+             '--state-dir', str(self.root / 'state'), '--socket', str(self.socket)],
+            env=self.environment(), cwd='/', stdout=log, stderr=log, start_new_session=True)
+        hosts = self.wait('flotillad answers', lambda: self.objects('hosts'), timeout=120)
+        if len(hosts) != 1:
+            raise TrialFailure(f'expected one unfederated host, found {len(hosts)}')
+        self.host = hosts[0]['metadata']['name']
+
+    def provider_ready(self):
+        def ready():
+            for host in self.objects('hosts'):
+                advertised = ((host.get('status') or {}).get('capabilities') or {}).get('environment_providers') or []
+                for provider in advertised:
+                    if provider.get('instance') == self.instance:
+                        readiness = provider.get('readiness') or {}
+                        if readiness.get('state') == 'ready':
+                            return provider
+                        raise TrialFailure(f'provider {self.instance} is {readiness.get("state")}: {readiness.get("reason")}')
+            raise TrialFailure(f'no host advertises provider {self.instance}')
+        return self.wait(f'provider {self.instance} ready', ready, timeout=120)
+
+    def seed_project(self):
+        repo = self.root / 'repository'
+        (repo / '.flotilla').mkdir(parents=True)
+        (repo / 'README.md').write_text('Trial fleet repository (scripts/trial-fleet).\n')
+        script = repo / '.flotilla/fleet-canary-agent.sh'
+        script.write_text(CREW_SCRIPT)
+        script.chmod(0o755)
+        forge = self.forge
+        owner, name = TRIAL_REPOSITORY.split('/')
+        self.issue = self.admin('POST', f'/forges/github/repos/{owner}/{name}/issues',
+                                {'title': TRIAL_ISSUE_TITLE, 'body': 'Created by scripts/trial-fleet.'})['number']
+        (repo / '.flotilla/trial.env').write_text(''.join(f'{key}={value}\n' for key, value in {
+            'TRIAL_UNTIL': self.args.until, 'TRIAL_ISSUE': self.issue, 'TRIAL_REPOSITORY': TRIAL_REPOSITORY,
+            'TRIAL_FORGE_SERVICE': FORGE_SERVICE, 'TRIAL_FORGE_API': f'{forge["url"]}/github/api/v1', 'TRIAL_FORGE_TOKEN': forge['token'],
+            'TRIAL_FORGE_CA': forge['ca']}.items()))
+        git = ['git', '-C', repo]
+        self.run([*git, 'init', '-q', '--initial-branch=main'])
+        self.run([*git, 'add', '.'])
+        self.run([*git, 'commit', '-q', '-m', 'Trial repository'])
+        self.run(['git', 'clone', '-q', '--bare', repo, self.root / 'upstream.git'])
+        self.run([*git, 'remote', 'add', 'origin', f'{FORGE_SERVICE}/{TRIAL_REPOSITORY}'])
+        self.run([*git, 'fetch', '-q', 'origin'])
+        self.run([*git, 'branch', '-q', '--set-upstream-to=origin/main', 'main'])
+        self.cli('project', 'add', repo, '--name', TRIAL_PROJECT)
+        # The checkout's origin resolves through the clone rewrite to the bare
+        # repository; the Repository's forge identity is the trial's forge URL.
+        url = f'{FORGE_SERVICE}/{TRIAL_REPOSITORY}'
+        repositories = [item for item in self.objects('repositories')
+                        if (item['spec'].get('identity') or {}).get('canonical_remote') == url]
+        if len(repositories) != 1:
+            raise TrialFailure(f'project add registered {len(repositories)} repositories for {url}')
+        self.apply('Repository', repositories[0]['metadata']['name'], {
+            'identity': {'kind': 'remote', 'canonical_remote': url}, 'remotes': [url],
+            'forge': {'service_url': FORGE_SERVICE, 'repository': TRIAL_REPOSITORY}})
+        self.apply('FulfilmentKind', 'trial', {'host_ref': self.host, 'pool': 'cleat', 'realisation': 'cloud_sandbox_per_vessel',
+                                               'image': self.image},
+                   labels={'flotilla.work/environment-provider-instance': self.instance})
+        crew = {'role': 'coder', 'selector': {'capability': 'code'}, 'promises': [{'kind': 'decision-ledger', 'owner': 'coder'}]}
+        if self.args.until == 'landed':
+            crew['deliverer'] = True
+        self.apply('WorkflowTemplate', 'trial', {'vessels': [{'name': 'work', 'crew': [crew]}]})
+
+    def start_convoy(self):
+        agent = SCRIPTED_ADAPTER if self.args.crew == 'scripted' else self.args.crew
+        self.cli('convoy', 'start', '--project', TRIAL_PROJECT, '--issue', str(self.issue), '--name', 'trial',
+                 '--workflow', 'trial', '--fulfilment', 'trial', '--agent', agent, '--no-attach', timeout=120)
+        convoys = self.objects('convoys')
+        if len(convoys) != 1:
+            raise TrialFailure(f'expected one convoy, found {len(convoys)}')
+        self.convoy = convoys[0]['metadata']['name']
+
+    # -- observation -----------------------------------------------------
+
+    def failure(self):
+        """The first failed or stalled resource in this trial, with its message."""
+        for kind in ('environments', 'vessels', 'terminalsessions', 'convoys'):
+            for item in self.objects(kind):
+                status = item.get('status') or {}
+                if status.get('phase') in ('Failed', 'Lost') or status.get('stalled'):
+                    message = status.get('message') or status.get('reason') or json.dumps(status)[:600]
+                    return f'{kind[:-1]} {item["metadata"]["name"]} {status.get("phase")}: {message}'
+        return None
+
+    def until(self, what, predicate):
+        def probe():
+            failed = self.failure()
+            if failed:
+                raise Failed(failed)
+            return predicate()
+        try:
+            return self.wait(what, probe)
+        except Failed as error:
+            raise TrialFailure(f'{what}: {error}') from None
+
+    def phase(self, kind, name_prefix=''):
+        return [(item['metadata']['name'], (item.get('status') or {}).get('phase')) for item in self.objects(kind)
+                if item['metadata']['name'].startswith(name_prefix)]
+
+    def provisioned(self):
+        ready = self.until('environment Ready', lambda: [name for name, phase in self.phase('environments') if phase == 'Ready'
+                                                         and name != f'host-direct-{self.host}'])
+        self.until('vessel Ready', lambda: [name for name, phase in self.phase('vessels') if phase == 'Ready'])
+        return ready
+
+    def attached(self):
+        self.until('crew session Running', lambda: [name for name, phase in self.phase('terminalsessions') if phase == 'Running'])
+        # `--json attach` resolves the plan `flotilla attach` would exec; run it
+        # under a pseudo-terminal and read the crew's screen through it.
+        plan = self.until('attach resolves', lambda: json.loads(self.cli('attach', self.convoy, timeout=30)))
+        argv = plan_argv(plan)
+        if not argv:
+            raise TrialFailure(f'attach resolved no command: {json.dumps(plan)[:400]}')
+        transcript = self.root / 'attach.out'
+        command = f'stty rows 40 cols 120; exec {" ".join(map(shell_quote, argv))}'
+        self.run(['timeout', '-s', 'INT', '8', 'script', '-qfec', command, transcript], check=False, timeout=30)
+        screen = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', transcript.read_text(errors='replace'))
+        lines = [line for line in screen.splitlines() if 'flotilla trial crew' in line]
+        if not lines:
+            raise TrialFailure(f'attach reached no crew screen: {screen.strip()[-400:]!r}')
+        failed = [line.strip() for line in lines if '· failed' in line]
+        if failed:
+            raise TrialFailure(f'the crew reports: {failed[-1][-300:]}')
+
+    def landed(self):
+        self.until('convoy Landing', lambda: [name for name, phase in self.phase('convoys') if phase in ('Landing', 'Landed')])
+
+    # -- teardown --------------------------------------------------------
+
+    def teardown(self):
+        problems = []
+        if self.daemon is not None and self.daemon.poll() is None:
+            try:
+                for name, phase in self.phase('convoys'):
+                    if phase not in ('Landed', 'Abandoned'):
+                        self.cli('convoy', 'abandon', '--reason', 'trial fleet teardown', name, check=False, timeout=60)
+                self.wait('environments destroyed', lambda: not [name for name, _ in self.phase('environments')
+                                                                 if not name.startswith('host-direct-')], timeout=180)
+            except (TrialFailure, OSError) as error:
+                problems.append(f'convoy teardown: {error}')
+        for process in (self.daemon, self.forge_process):
+            stop(process)
+        problems.extend(sweep(self.root))
+        # Drydock's sockets live beside, not below, the state directory (sun_path).
+        digest = hashlib.sha256(str(self.root / 'state').encode()).hexdigest()[:16]
+        shutil.rmtree(f'/tmp/flotilla-drydock-{digest}', ignore_errors=True)
+        if Path(f'/tmp/flotilla-drydock-{digest}').exists():
+            problems.append(f'drydock run directory /tmp/flotilla-drydock-{digest} left behind')
+        if self.local_root is not None and self.local_root.is_dir():
+            left = [path for path in self.local_root.iterdir()]
+            if left:
+                problems.append(f'provider environments left in {self.local_root}: {", ".join(path.name for path in left)}; removed')
+                for path in left:
+                    remove_tree(path)
+        return problems
+
+
+class Failed(Exception):
+    pass
+
+
+def plan_argv(plan):
+    """The argv of the last command a resolved attach plan execs."""
+    commands = [step['value'] for step in plan.get('plan') or [] if isinstance(step, dict) and step.get('type') == 'command']
+    if not commands:
+        return None
+    return [part['value'] for part in commands[-1]]
+
+
+def shell_quote(value):
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
+def stop(process):
+    if process is None or process.poll() is not None:
+        return
+    try:
+        # The leader first, so it can stop its own children; then the group.
+        process.send_signal(signal.SIGTERM)
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=10)
+        os.killpg(process.pid, signal.SIGTERM)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+    except ProcessLookupError:
+        pass
+
+
+def marked_processes(root):
+    marker = f'{MARKER}={root}'.encode()
+    found = []
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdecimal() or int(entry.name) == os.getpid():
+            continue
+        try:
+            if marker in (entry / 'environ').read_bytes().split(b'\0'):
+                found.append(int(entry.name))
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+    return found
+
+
+def sweep(root):
+    """Stop every process that inherited this trial's marker (vessel agents start
+    sessions of their own, so a process group signal misses them)."""
+    for sig, grace in ((signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+        pids = marked_processes(root)
+        if not pids:
+            return []
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline and marked_processes(root):
+            time.sleep(0.2)
+    left = marked_processes(root)
+    return [f'processes left running: {left}'] if left else []
+
+
+def run(args):
+    clock = Clock()
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, interrupt)
+    target = cargo_target_dir()
+    logs = target / 'trial-fleet/logs'
+    logs.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime('%Y%m%dT%H%M%S')
+    # Socket paths must stay SUN_LEN-safe whatever TMPDIR is.
+    root = Path(tempfile.mkdtemp(prefix='trial-fleet.', dir='/tmp'))
+    root.chmod(0o700)
+    log_dir = logs / stamp
+    log_dir.mkdir()
+    reached, failure = None, None
+    with (log_dir / 'build.log').open('w') as build_log, (log_dir / 'commands.log').open('w') as commands_log, \
+            (log_dir / 'flotillad.log').open('w') as daemon_log, (log_dir / 'forge.log').open('w') as forge_log:
+        trial = Trial(args, root, clock, commands_log)
+        try:
+            binaries = trial.step('build', lambda: build(target, build_log))
+            trial.step('stage generation', lambda: stage_generation(root, binaries, tools_layer(args.tools)))
+            trial.step('fake forge', lambda: trial.start_forge(forge_log))
+            trial.configure()
+            trial.step('flotillad', lambda: trial.start_daemon(daemon_log))
+            trial.step(f'provider {trial.instance}', trial.provider_ready)
+            trial.step('trial project', trial.seed_project)
+            trial.step('convoy', trial.start_convoy)
+            trial.step('provisioned', trial.provisioned)
+            reached = 'provisioned'
+            if args.until in ('attached', 'landed'):
+                trial.step('attached', trial.attached)
+                reached = 'attached'
+            if args.until == 'landed':
+                trial.step('landed', trial.landed)
+                reached = 'landed'
+        except TrialFailure as error:
+            failure = str(error)
+        except Interrupted as error:
+            failure = f'interrupted by {error}'
+        finally:
+            # Teardown itself must not be interrupted half way.
+            for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                signal.signal(signum, signal.SIG_IGN)
+            if args.keep:
+                clock.say(f'--keep: left running under {root}; socket {trial.socket}; stop with: kill -- -{trial.daemon.pid if trial.daemon else 0}')
+                problems = []
+            else:
+                clock.say('teardown ...')
+                problems = trial.teardown()
+            for problem in problems:
+                clock.say(f'teardown: {problem}', stream=sys.stderr)
+            if not args.keep:
+                for name in ('state/log/flotillad.jsonl', 'attach.out'):
+                    if (root / name).is_file():
+                        shutil.copy2(root / name, log_dir / Path(name).name)
+                if not remove_tree(root):
+                    problems.append(f'{root} could not be removed')
+                if not problems:
+                    clock.say('teardown: ok (no process, socket, directory or environment left)')
+    if failure:
+        clock.say(f'FAILED at {next_end_point(reached)}: {failure}', stream=sys.stderr)
+        clock.say(f'logs: {log_dir}', stream=sys.stderr)
+        return 1
+    if problems:
+        clock.say(f'reached {reached}, but teardown was not clean; logs: {log_dir}', stream=sys.stderr)
+        return 1
+    clock.say(f'PASSED: reached {reached} with provider {trial.instance}')
+    return 0
+
+
+def remove_tree(path):
+    """Remove `path`, read-only directories included; whether it is gone."""
+    def writable(function, failed, _error):
+        parent = Path(failed).parent
+        parent.chmod(parent.stat().st_mode | 0o700)
+        function(failed)
+    try:
+        shutil.rmtree(path, onexc=writable) if sys.version_info >= (3, 12) else shutil.rmtree(path, onerror=writable)
+    except OSError:
+        pass
+    return not Path(path).exists()
+
+
+def next_end_point(reached):
+    return END_POINTS[END_POINTS.index(reached) + 1] if reached in END_POINTS[:-1] else (reached or 'provisioned')
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog='trial-fleet', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = parser.add_subparsers(dest='command', required=True)
+    trial = commands.add_parser('run', help='run one convoy through a throwaway flotilla')
+    trial.add_argument('--provider-config', type=Path, help='a drydock.toml with one [providers.NAME] table (default: local)')
+    trial.add_argument('--crew', default='scripted', help='scripted (no model account) or an agent adapter')
+    trial.add_argument('--until', choices=END_POINTS, default='landed')
+    trial.add_argument('--timeout', type=int, default=300, help='seconds allowed for each phase (default 300)')
+    trial.add_argument('--tools', type=Path, help='installed tools layer providing cleat (default: from cleat on PATH)')
+    trial.add_argument('--keep', action='store_true', help='leave everything running for inspection instead of tearing down')
+    args = parser.parse_args(argv)
+    return run(args)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
