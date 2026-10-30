@@ -39,7 +39,9 @@ const CREW_SOCKET: &str = "flotilla.sock";
 /// provisioner keys by its Docker kind, not the vessel's provider.
 const CONTAINED_TOOL_LAYOUT: EnvironmentToolProviderKind = DOCKER_PROVIDER_KIND;
 /// A layout published under a vessel's own prefix: what an SSH host's vessel
-/// takes, keyed by that kind (#3792).
+/// takes, keyed by that kind (#3792). It relies on that kind's factories laying
+/// the generation out below `tools_prefix()`, as `FleetToolsTool` does; a change
+/// there changes drydock `local` vessels too.
 const SHARED_TOOL_LAYOUT: EnvironmentToolProviderKind = SSH_HOST_PROVIDER_KIND;
 /// The `PATH` a vessel's tools prepend to when the vessel has none of its own.
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
