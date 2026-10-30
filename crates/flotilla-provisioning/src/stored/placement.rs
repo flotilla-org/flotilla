@@ -3,7 +3,9 @@
 
 use std::collections::BTreeSet;
 
-use flotilla_resources::{DockerImageSource, FulfilmentCostClass, FulfilmentGrant, FulfilmentKindSpec, FulfilmentRealisation};
+use flotilla_resources::{
+    CloudSandboxSize, DockerImageSource, FulfilmentCostClass, FulfilmentGrant, FulfilmentKindSpec, FulfilmentRealisation,
+};
 use flotilla_schema::{KindRegistry, RegistryError, Stored};
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +15,9 @@ use serde::{Deserialize, Serialize};
 pub enum KindRealisation {
     CloudSandboxPerVessel {
         sandbox_image: String,
+        /// Absent in rows written before the policy's size was carried.
+        #[serde(default)]
+        size: Option<CloudSandboxSize>,
     },
     /// The vessel's composed image, frozen per vessel at admission.
     DockerComposed,
@@ -43,8 +48,8 @@ pub struct FulfilmentKindDefinition {
 impl FulfilmentKindDefinition {
     pub fn new(spec: &FulfilmentKindSpec) -> Result<Self, String> {
         let realisation = match &spec.realisation {
-            FulfilmentRealisation::CloudSandboxPerVessel { image } => {
-                KindRealisation::CloudSandboxPerVessel { sandbox_image: image.clone() }
+            FulfilmentRealisation::CloudSandboxPerVessel { image, size } => {
+                KindRealisation::CloudSandboxPerVessel { sandbox_image: image.clone(), size: size.clone() }
             }
             FulfilmentRealisation::HostDirect => KindRealisation::HostDirect,
             FulfilmentRealisation::DockerPerVessel { image } => match image {
@@ -66,8 +71,8 @@ impl FulfilmentKindDefinition {
 
     pub fn spec(&self) -> FulfilmentKindSpec {
         let realisation = match &self.realisation {
-            KindRealisation::CloudSandboxPerVessel { sandbox_image } => {
-                FulfilmentRealisation::CloudSandboxPerVessel { image: sandbox_image.clone() }
+            KindRealisation::CloudSandboxPerVessel { sandbox_image, size } => {
+                FulfilmentRealisation::CloudSandboxPerVessel { image: sandbox_image.clone(), size: size.clone() }
             }
             KindRealisation::HostDirect => FulfilmentRealisation::HostDirect,
             KindRealisation::DockerComposed => FulfilmentRealisation::DockerPerVessel { image: None },

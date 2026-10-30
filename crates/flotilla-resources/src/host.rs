@@ -433,7 +433,7 @@ mod vessel_cap_tests {
         let ssh_host = HostConnection::SshHost { owning_daemon: "owner".into(), destination: "crew@b1".into() };
         let docker = FulfilmentRealisation::DockerPerVessel { image: None };
         let direct = FulfilmentRealisation::HostDirect;
-        let cloud = FulfilmentRealisation::CloudSandboxPerVessel { image: "sandbox".into() };
+        let cloud = FulfilmentRealisation::CloudSandboxPerVessel { image: "sandbox".into(), size: None };
         for (connection, realisation, capped) in [
             (ssh_host.clone(), &direct, true),
             (ssh_host, &docker, true),

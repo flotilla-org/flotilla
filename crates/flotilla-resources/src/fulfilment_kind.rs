@@ -327,6 +327,9 @@ impl fmt::Display for FulfilmentCostClass {
 pub enum FulfilmentRealisation {
     CloudSandboxPerVessel {
         image: String,
+        /// The policy's size; `None` provisions at `realisation_settings::CLOUD_SANDBOX_SIZE`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<crate::CloudSandboxSize>,
     },
     DockerPerVessel {
         /// `None` is the vessel's composed image.
@@ -364,7 +367,7 @@ impl FulfilmentKindSpec {
             }
             (None, None, Some(cloud)) => (
                 String::new(),
-                FulfilmentRealisation::CloudSandboxPerVessel { image: cloud.image.clone() },
+                FulfilmentRealisation::CloudSandboxPerVessel { image: cloud.image.clone(), size: Some(cloud.size.clone()) },
                 BTreeSet::from([FulfilmentGrant::platform(Platform::Linux.to_string()), FulfilmentGrant::network("open".into())]),
             ),
             _ => return Err("placement policy must define exactly one realisation".to_string()),

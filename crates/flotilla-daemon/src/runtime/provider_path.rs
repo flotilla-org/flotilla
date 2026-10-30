@@ -260,7 +260,7 @@ pub(super) async fn verify_cloud_image_needs(
         pool: "cleat".into(),
         cost_class: Default::default(),
         grants: Default::default(),
-        realisation: flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { image: image.to_owned() },
+        realisation: flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { image: image.to_owned(), size: None },
     };
     let facts = crate::fulfilment_probe::probe_kind(
         &kind,

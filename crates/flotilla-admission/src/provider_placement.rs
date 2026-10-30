@@ -21,7 +21,9 @@ mod tests {
     fn realisation(class: EnvironmentClass) -> FulfilmentRealisation {
         match class {
             EnvironmentClass::HostDirect => FulfilmentRealisation::HostDirect,
-            EnvironmentClass::CloudSandbox => FulfilmentRealisation::CloudSandboxPerVessel { image: "image@sha256:digest".into() },
+            EnvironmentClass::CloudSandbox => {
+                FulfilmentRealisation::CloudSandboxPerVessel { image: "image@sha256:digest".into(), size: None }
+            }
             _ => FulfilmentRealisation::DockerPerVessel { image: None },
         }
     }

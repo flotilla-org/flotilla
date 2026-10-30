@@ -7,7 +7,7 @@ pub const DOCKER_WORKSPACE: &str = "/workspace";
 
 pub const DOCKER_PULL_POLICY: DockerImagePullPolicy = DockerImagePullPolicy::Always;
 
-/// The size every cloud sandbox is provisioned at.
+/// The size a cloud sandbox is provisioned at when its policy names none.
 pub const CLOUD_SANDBOX_SIZE: CloudSandboxSize = CloudSandboxSize { cpus: 2, memory_bytes: 4 << 30, disk_bytes: 10 << 30 };
 
 pub fn docker_checkout() -> DockerCheckoutStrategy {
