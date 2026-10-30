@@ -103,28 +103,40 @@ impl<R> EnvironmentReconciler<R> {
     }
 }
 
-/// What a provision reports, by the kind of backing it made.
+/// What a provision reports, by the kind of backing it made. The variant, not
+/// the Environment's spec, decides which Ready patch the reconciler writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentProvisioning {
+    /// A Docker or host backing, recorded in the preceding-generation status shape.
     Local(LocalProvisioning),
+    /// A cloud sandbox backing, which records every fact below or fails provision.
     Cloud(CloudProvisioning),
 }
 
-/// Provider facts mapped to the preceding-generation stored status shape.
+/// What a Docker or host backing reports; each fact is recorded as reported.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LocalProvisioning {
+    /// Docker's per-crew limits; host backings set none.
     pub configured_limits: Option<ConfiguredResourceLimits>,
+    /// The backing's opaque identity, recorded as `docker_container_id`.
     pub backing_id: Option<String>,
+    /// The image the backing runs, when it reports the image's digest.
     pub image_ref: Option<String>,
+    /// The content digest of that image.
     pub local_image_id: Option<String>,
+    /// The registry manifest identity, when the image was pulled by digest.
     pub registry_digest: Option<String>,
 }
 
 /// Every fact a cloud backing's Ready status records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloudProvisioning {
+    /// The backing's opaque provider identity, used again for teardown.
     pub backing_id: String,
+    /// The image the backing runs, pinned by digest: a cloud provider refuses
+    /// an unpinned image at prepare, and Ready derives the digest from it.
     pub image_ref: String,
+    /// The provider's immutable facts about this backing.
     pub provider_descriptor: Box<flotilla_resources::EnvironmentProviderDescriptor>,
 }
 

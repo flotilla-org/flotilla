@@ -106,7 +106,9 @@ pub(super) async fn provision(
         Some(described) => EnvironmentProvisioning::Cloud(CloudProvisioning {
             backing_id: handle.backing_id().to_string(),
             image_ref: handle.image().as_str().to_string(),
-            // Read again, so the descriptor carries the agent's latest connection.
+            // Read again, so the descriptor carries the agent's latest connection
+            // (the vessel layer may have reconnected). A handle's descriptor does
+            // not vanish once given; the first read stands if it ever did.
             provider_descriptor: Box::new(handle.provider_descriptor().unwrap_or(described)),
         }),
         None => EnvironmentProvisioning::Local(LocalProvisioning {
