@@ -526,8 +526,8 @@ pub trait ProvisionedEnvironment: Send + Sync {
     }
 
     /// The facts a cloud backing records when it is provisioned. Every cloud
-    /// sandbox handle must return one, or its provision fails; other kinds
-    /// record none. Deliberately without a default (#4163).
+    /// sandbox handle must return one, and keep returning one, or its provision
+    /// fails; other kinds record none. Deliberately without a default (#4163).
     fn provider_descriptor(&self) -> Option<flotilla_resources::EnvironmentProviderDescriptor>;
     fn id(&self) -> &EnvironmentId;
     fn image(&self) -> &ImageId;

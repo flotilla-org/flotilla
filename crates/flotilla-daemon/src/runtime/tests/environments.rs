@@ -717,8 +717,39 @@ async fn docker_readoption_restores_the_daemon_forward() {
 
 // #4163: a cloud backing whose provider gives no descriptor fails its provision
 // before the vessel layer, and the backing this provision created is destroyed.
+// A cloud sandbox takes its provider's path even beside a Docker input, never
+// the Docker path, which would record it Ready as a local backing.
 #[tokio::test]
 async fn cloud_backing_without_a_descriptor_is_discarded() {
+    let image = format!("example.test/crew@sha256:{}", "a".repeat(64));
+    let docker = flotilla_resources::DockerEnvironmentSpec {
+        host_ref: String::new(),
+        image: image.clone(),
+        image_build_ref: None,
+        declared_agent_adapters: Default::default(),
+        required_agent_adapters: Default::default(),
+        pull_policy: Default::default(),
+        mounts: Vec::new(),
+        env: Default::default(),
+    };
+    for docker in [None, Some(docker)] {
+        let spec = flotilla_resources::EnvironmentSpec {
+            provider_address: Some("account:cloud/provider:cloud".parse().unwrap()),
+            cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+                probe_needs: Default::default(),
+                image: image.clone(),
+                size: flotilla_resources::CloudSandboxSize { cpus: 1, memory_bytes: 1024, disk_bytes: 1024 },
+                lifetime_cap_seconds: None,
+                env: Default::default(),
+            }),
+            docker,
+            ..Default::default()
+        };
+        undescribed_cloud_backing_is_discarded(spec).await;
+    }
+}
+
+async fn undescribed_cloud_backing_is_discarded(spec: flotilla_resources::EnvironmentSpec) {
     let temp = TempDir::new().unwrap();
     fs::create_dir_all(temp.path().join("config")).unwrap();
     fs::write(temp.path().join("config/daemon.toml"), r#"machine_id = "cloud-descriptor-test""#).unwrap();
@@ -739,7 +770,7 @@ async fn cloud_backing_without_a_descriptor_is_discarded() {
         env_vars: HashMap::new(),
         destroyed: Arc::clone(&destroyed),
     });
-    let address: flotilla_address::Address = "account:cloud/provider:cloud".parse().unwrap();
+    let address = spec.provider_address.clone().unwrap();
     let mut state = ControllerRuntimeState::new(
         daemon.clone(),
         config,
@@ -752,12 +783,6 @@ async fn cloud_backing_without_a_descriptor_is_discarded() {
         .environment_providers
         .insert(address.clone(), Arc::new(TestInteriorEnvironmentProvider { handle: tokio::sync::Mutex::new(Some(handle)) }))
         .unwrap();
-    let spec: flotilla_resources::EnvironmentSpec = serde_json::from_value(serde_json::json!({
-        "provider_address": address.to_string(), "cloud_sandbox": {
-            "image": format!("example.test/crew@sha256:{}", "a".repeat(64)),
-            "size": {"cpus":1,"memory_bytes":1024,"disk_bytes":1024}, "env": {} }
-    }))
-    .unwrap();
     daemon.resource_backend().using::<Environment>(NAMESPACE).create(&empty_meta("undescribed"), &spec).await.unwrap();
     let error =
         DockerControllerRuntime { state: Arc::new(state) }.provision_environment("undescribed", &spec).await.expect_err("no descriptor");

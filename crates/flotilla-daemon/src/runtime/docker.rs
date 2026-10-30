@@ -564,10 +564,12 @@ impl EnvironmentRuntime for DockerControllerRuntime {
         name: &str,
         spec: &EnvironmentSpec,
     ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, EnvironmentProvisionError> {
-        if let Some(docker) = &spec.docker {
-            return self.provision_docker(name, docker).await;
+        // A cloud sandbox always takes its own provider's path, which records it
+        // as a cloud backing and refuses any other environment input beside it.
+        match &spec.docker {
+            Some(docker) if spec.cloud_sandbox.is_none() => self.provision_docker(name, docker).await,
+            _ => super::provider_path::provision(&self.state, name, spec).await,
         }
-        super::provider_path::provision(&self.state, name, spec).await
     }
 
     async fn destroy(&self, environment_ref: &str, container_id: &str) -> Result<(), String> {
