@@ -328,6 +328,7 @@ pub enum FulfilmentRealisation {
     CloudSandboxPerVessel {
         image: String,
         /// The policy's size; `None` provisions at `realisation_settings::CLOUD_SANDBOX_SIZE`.
+        /// Kinds stored before the size was carried decode with `None`; remove this default one roll later.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         size: Option<crate::CloudSandboxSize>,
     },
@@ -388,5 +389,17 @@ impl FulfilmentKindSpec {
         } else {
             self.grants.remove(&FulfilmentGrant::gui_session())
         }
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::FulfilmentRealisation;
+
+    #[test]
+    fn cloud_realisation_without_a_size_decodes_to_none() {
+        let legacy: FulfilmentRealisation =
+            serde_json::from_value(serde_json::json!({"realisation": "cloud_sandbox_per_vessel", "image": "i@sha256:d"})).unwrap();
+        assert_eq!(legacy, FulfilmentRealisation::CloudSandboxPerVessel { image: "i@sha256:d".into(), size: None });
     }
 }

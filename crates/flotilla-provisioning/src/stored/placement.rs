@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 pub enum KindRealisation {
     CloudSandboxPerVessel {
         sandbox_image: String,
-        /// Absent in rows written before the policy's size was carried.
+        /// Absent in rows written before the policy's size was carried; remove this default one roll later.
         #[serde(default)]
         size: Option<CloudSandboxSize>,
     },

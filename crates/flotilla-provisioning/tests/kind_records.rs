@@ -54,6 +54,11 @@ async fn contract(backend: &ResourceBackend) {
         .expect("snapshot");
     kinds.create(&labelled("host-direct-kiwi", &[]), &kind("passthrough", FulfilmentRealisation::HostDirect)).await.expect("operator's");
 
+    let size = flotilla_resources::CloudSandboxSize { cpus: 4, memory_bytes: 8 << 30, disk_bytes: 10 << 30 };
+    let cloud = kind("cleat", FulfilmentRealisation::CloudSandboxPerVessel { image: "image@sha256:digest".into(), size: Some(size) });
+    kinds.create(&labelled("cloud-sized", &[]), &cloud).await.expect("cloud");
+    assert_eq!(kinds.get("cloud-sized").await.expect("get cloud").spec, cloud, "the policy's size survives storage");
+
     let read = kinds.get("placement-snapshot-012345abcdef").await.expect("get snapshot");
     assert_eq!(read.spec, frozen);
     assert_eq!(read.metadata.labels.get(PREPARED_SNAPSHOT_LABEL).map(String::as_str), Some(PLACEMENT_SNAPSHOT_KIND));
@@ -63,8 +68,8 @@ async fn contract(backend: &ResourceBackend) {
 
     let mut names: Vec<_> = kinds.list().await.expect("list").items.into_iter().map(|kind| kind.metadata.name).collect();
     names.sort();
-    assert_eq!(names, ["docker-on-kiwi", "host-direct-kiwi", "placement-snapshot-012345abcdef"]);
-    assert_eq!(backend.including_replicas::<FulfilmentKind>(NS).list().await.expect("replicas").items.len(), 3);
+    assert_eq!(names, ["cloud-sized", "docker-on-kiwi", "host-direct-kiwi", "placement-snapshot-012345abcdef"]);
+    assert_eq!(backend.including_replicas::<FulfilmentKind>(NS).list().await.expect("replicas").items.len(), 4);
 
     let mut observed = read.spec.clone();
     observed.grants.insert(FulfilmentGrant::gui_session());
@@ -75,7 +80,7 @@ async fn contract(backend: &ResourceBackend) {
 
     kinds.delete("placement-snapshot-012345abcdef").await.expect("delete");
     assert!(kinds.get("placement-snapshot-012345abcdef").await.is_err());
-    assert_eq!(kinds.list().await.expect("list").items.len(), 2);
+    assert_eq!(kinds.list().await.expect("list").items.len(), 3);
 }
 
 #[tokio::test]
