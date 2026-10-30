@@ -27,7 +27,8 @@ pub(super) struct DrydockAgentConnector {
     pub executable: Arc<tokio::sync::OnceCell<Vec<u8>>>,
     /// Where the latest connection went.
     pub report: Arc<std::sync::Mutex<Option<AgentConnectionReport>>>,
-    /// Whether the vessel's reach is a relay, asked of drydock once.
+    /// Whether the vessel's reach is a relay, asked of drydock once: a provider
+    /// declares one kind of reach per backing, which does not change after it is provisioned.
     pub relayed: tokio::sync::OnceCell<bool>,
 }
 

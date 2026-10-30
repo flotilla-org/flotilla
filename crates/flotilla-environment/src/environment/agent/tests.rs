@@ -34,7 +34,9 @@ impl AgentProcess {
             let _ = stop.send(());
         }
         if let Some(thread) = self.thread.lock().unwrap().take() {
-            let _ = thread.join();
+            if let Err(panic) = thread.join() {
+                eprintln!("fixture agent thread panicked: {panic:?}");
+            }
         }
     }
 }
