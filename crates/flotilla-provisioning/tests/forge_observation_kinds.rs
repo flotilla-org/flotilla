@@ -121,7 +121,8 @@ fn column_count(conn: &rusqlite::Connection, table: &str) -> usize {
     conn.query_row("SELECT count(*) FROM pragma_table_info(?1)", [table], |row| row.get(0)).expect("columns")
 }
 
-/// Takes the forge observation tables back to the shape the previous generation created.
+/// Takes the forge observation tables back to the shape the previous generation created. Goes with
+/// the `added_since_previous_generation` marks after the next fleet roll.
 fn previous_generation_tables(conn: &rusqlite::Connection) {
     conn.execute_batch(
         "DROP VIEW change_request_view; DROP VIEW issue_view; DROP VIEW change_request_closes_view; DROP VIEW issue_blocked_by_view;
