@@ -5,6 +5,8 @@ use flotilla_forgejo_providers::factories::change_request::ForgejoChangeRequestF
 use flotilla_forgejo_providers::factories::issue_tracker::ForgejoIssueProviderFactory;
 use flotilla_github_providers::factories::change_request::GitHubChangeRequestFactory;
 use flotilla_github_providers::factories::issue_tracker::GitHubIssueProviderFactory;
+use flotilla_provider_runtime::{HttpClient, ReqwestHttpClient};
+use std::sync::Arc;
 
 use super::FactoryRegistry;
 use flotilla_terminal::factories::{cleat::CleatTerminalPoolFactory, passthrough::PassthroughTerminalPoolFactory};
@@ -19,10 +21,16 @@ fn vcs_factories() -> Vec<Box<super::VcsFactory>> {
 
 impl FactoryRegistry {
     pub fn default_all() -> Self {
+        Self::with_http_client(Arc::new(ReqwestHttpClient::new()))
+    }
+
+    /// The default factories, with the Forgejo factories sharing `http` rather than each building
+    /// its own client: a client loads the TLS root store when it is built.
+    pub fn with_http_client(http: Arc<dyn HttpClient>) -> Self {
         Self {
             vcs: vcs_factories(),
-            change_requests: vec![Box::new(GitHubChangeRequestFactory), Box::new(ForgejoChangeRequestFactory::default())],
-            issue_trackers: vec![Box::new(GitHubIssueProviderFactory), Box::new(ForgejoIssueProviderFactory::default())],
+            change_requests: vec![Box::new(GitHubChangeRequestFactory), Box::new(ForgejoChangeRequestFactory::new(Arc::clone(&http)))],
+            issue_trackers: vec![Box::new(GitHubIssueProviderFactory), Box::new(ForgejoIssueProviderFactory::new(http))],
             cloud_agents: vec![Box::new(ClaudeCodingAgentFactory), Box::new(CursorCodingAgentFactory), Box::new(CodexCodingAgentFactory)],
             ai_utilities: vec![Box::new(ClaudeApiAiUtilityFactory), Box::new(ClaudeCliAiUtilityFactory)],
             terminal_pools: terminal_pool_factories(),
