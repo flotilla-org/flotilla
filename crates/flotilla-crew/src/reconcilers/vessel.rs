@@ -1091,6 +1091,8 @@ impl VesselReconciler {
             match (&strategy, checkout_paths.values().next()) {
                 // A vessel's clones stay where they were made, whatever the layout
                 // says now (a vessel cloned at its provider's root before #4165).
+                // Every layout clones a vessel's repositories side by side under one
+                // parent, so the first checkout's parent is the workspace root.
                 (PlacementStrategy::CloneInVessel { .. }, Some(path)) => {
                     std::path::Path::new(path).parent().map_or(workspace_root, |parent| parent.to_string_lossy().into_owned())
                 }

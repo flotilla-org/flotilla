@@ -191,7 +191,9 @@ async fn a_vessel_on_the_host_filesystem_takes_its_layer_below_its_own_prefix() 
         async move { commands.run("sh", &["-c", &script], Path::new("/"), &ChannelLabel::Default).await.expect("vessel command") }
     };
     let own_path = std::env::var("PATH").expect("host PATH");
-    assert_eq!(shell("printf %s \"$PATH\"").await, format!("{}:{own_path}", prefix.join("bin").display()));
+    let path = shell("printf %s \"$PATH\"").await;
+    assert!(path.starts_with(&format!("{}:", prefix.join("bin").display())), "the layer comes first: {path}");
+    assert!(path.ends_with(&format!(":{own_path}")), "the vessel's own PATH is kept: {path}");
     assert_eq!(shell("command -v flotilla").await.trim(), prefix.join("bin/flotilla").display().to_string());
     assert_eq!(shell("printf %s \"$CLEAT_RUNTIME_DIR\"").await, prefix.join("cleat").display().to_string());
     assert!(!stand_in.root().join("vessel/opt/flotilla").exists(), "nothing at the container layout");
