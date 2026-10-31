@@ -337,7 +337,7 @@ Every PR that changes a resource kind's serialized shape must name the out-of-re
 
 ### Activity records are telemetry
 
-A record of what happened (an invocation, the intent behind it, an audit trail) is a tracing span or structured log event, exported through each host's collector to the fleet's VictoriaTraces and VictoriaLogs (see [OpenTelemetry traces](docs/configuration.md#opentelemetry-traces)). It is not a stored or replicated kind. Make a repeat safe by making the effect idempotent on a caller-supplied id, not by storing outcomes to replay.
+A record of what happened (an invocation, the intent behind it, an audit trail) is a tracing span or structured log event, carried by the daemon's logging and OpenTelemetry export to whatever backend the operator configures (see [OpenTelemetry traces](docs/configuration.md#opentelemetry-traces)). It is not a stored or replicated kind. Make a repeat safe by making the effect idempotent on a caller-supplied id, not by storing outcomes to replay.
 
 See [CODING_STANDARDS.md](CODING_STANDARDS.md) for coding conventions and judgement-call standards.
 
