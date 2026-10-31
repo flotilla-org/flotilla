@@ -52,11 +52,7 @@ jobs:
         uses: ./ci/toolchain/action
       - uses: Swatinem/rust-cache@v2
         with:
-          # Key on the repository's pin alone: rust-cache's environment hash also
-          # lists every toolchain the runner image preinstalls, so two image
-          # versions in rollout split one cache into two and PRs miss main's.
           prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
-          add-rust-environment-hash-key: false
           shared-key: "compose-integration"
           # PR caches are branch-scoped and only churn the shared pool; main
           # pushes keep the dependency cache warm for every PR.

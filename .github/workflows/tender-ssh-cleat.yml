@@ -48,11 +48,7 @@ jobs:
         uses: ./ci/toolchain/action
       - uses: Swatinem/rust-cache@v2
         with:
-          # Key on the repository's pin alone: rust-cache's environment hash also
-          # lists every toolchain the runner image preinstalls, so two image
-          # versions in rollout split one cache into two and PRs miss main's.
           prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
-          add-rust-environment-hash-key: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: tender-ssh-cleat
       - name: Provision OpenSSH and functional pinned cleat

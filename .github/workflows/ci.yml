@@ -179,11 +179,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: steps.filter.outputs.run == 'true'
         with:
-          # Key on the repository's pin alone: rust-cache's environment hash also
-          # lists every toolchain the runner image preinstalls, so two image
-          # versions in rollout split one cache into two and PRs miss main's.
           prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
-          add-rust-environment-hash-key: false
           shared-key: cleat-environment
           cache-workspace-crates: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -263,11 +259,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: steps.packages.outputs.selection != 'none'
         with:
-          # Key on the repository's pin alone: rust-cache's environment hash also
-          # lists every toolchain the runner image preinstalls, so two image
-          # versions in rollout split one cache into two and PRs miss main's.
           prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
-          add-rust-environment-hash-key: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: "clippy"
       - if: steps.packages.outputs.selection != 'none'
@@ -293,11 +285,7 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
-          # Key on the repository's pin alone: rust-cache's environment hash also
-          # lists every toolchain the runner image preinstalls, so two image
-          # versions in rollout split one cache into two and PRs miss main's.
           prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
-          add-rust-environment-hash-key: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: "relay-wasm"
       - run: cargo --config 'profile.dev.package."*".debug=0' build -p flotilla-relay --target wasm32-unknown-unknown --locked
@@ -342,11 +330,7 @@ jobs:
       - if: steps.packages.outputs.selection != 'none'
         uses: Swatinem/rust-cache@v2
         with:
-          # Key on the repository's pin alone: rust-cache's environment hash also
-          # lists every toolchain the runner image preinstalls, so two image
-          # versions in rollout split one cache into two and PRs miss main's.
           prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
-          add-rust-environment-hash-key: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
           # Bumped when the build profile changes: an exact key hit never saves.
           shared-key: "test-v2"
@@ -519,10 +503,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: v1-rust-${{ steps.rust-pin.outputs.version }}
-          add-rust-environment-hash-key: false
-          # Disabling the environment hash also disables rust-cache's lockfile
-          # hash. Include input content in shared-key (which overrides key)
-          # so main can save a fresh immutable cache when inputs change.
+          # rust-cache's key hashes only the lockfile and manifests. Include
+          # the other inputs' content in shared-key (which overrides key) so
+          # main can save a fresh immutable cache when any of them change.
           shared-key: quint-engine-${{ hashFiles('.github/workflows/ci.yml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/config.toml', 'ci/quint/**', 'specs/primitives/*conformance.sh', 'specs/primitives/check.sh') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/download-artifact@v4
@@ -550,10 +533,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: v1-rust-${{ steps.rust-pin.outputs.version }}
-          add-rust-environment-hash-key: false
-          # Disabling the environment hash also disables rust-cache's lockfile
-          # hash. Include input content in shared-key (which overrides key)
-          # so main can save a fresh immutable cache when inputs change.
+          # rust-cache's key hashes only the lockfile and manifests. Include
+          # the other inputs' content in shared-key (which overrides key) so
+          # main can save a fresh immutable cache when any of them change.
           shared-key: quint-store-${{ hashFiles('.github/workflows/ci.yml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/config.toml', 'ci/quint/**', 'specs/primitives/*conformance.sh', 'specs/primitives/check.sh') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/download-artifact@v4
@@ -599,11 +581,7 @@ jobs:
         uses: ./ci/toolchain/action
       - uses: Swatinem/rust-cache@v2
         with:
-          # Key on the repository's pin alone: rust-cache's environment hash also
-          # lists every toolchain the runner image preinstalls, so two image
-          # versions in rollout split one cache into two and PRs miss main's.
           prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
-          add-rust-environment-hash-key: false
           shared-key: "windows-client"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo --config 'profile.dev.package."*".debug=0' clippy -p flotilla-client -p flotilla-manifest -p flotilla-transport --locked -- -D warnings
@@ -638,11 +616,7 @@ jobs:
         uses: ./ci/toolchain/action
       - uses: Swatinem/rust-cache@v2
         with:
-          # Key on the repository's pin alone: rust-cache's environment hash also
-          # lists every toolchain the runner image preinstalls, so two image
-          # versions in rollout split one cache into two and PRs miss main's.
           prefix-key: v0-rust-${{ steps.rust-pin.outputs.version }}
-          add-rust-environment-hash-key: false
           shared-key: "macos-peer-identity"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run selected macOS tests
