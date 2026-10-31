@@ -1,11 +1,12 @@
 //! Carrier-neutral table reads. Sources lower conditions; paging and live reconciliation
 //! have one implementation shared by every carrier and both storage adapters.
 mod decided;
+use crate::server::verbs::when;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use flotilla_address::{Operator, Template};
 use flotilla_protocol::table::{Message, Row};
 use flotilla_resources::WatchStart;
-use flotilla_schema::{ColumnType, Layout, Table};
+use flotilla_schema::{ColumnType, Layout, Table, TableSet};
 use flotilla_store::{query_resource_kind, watch_resource_kind_from, ResourceBackend, StoreQuery, REGISTERED_RESOURCE_KINDS};
 use futures::{stream::BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -77,7 +78,7 @@ pub(crate) fn batches(rows: Vec<Row>, sequence: u64, partial: bool, cursor: Opti
     Ok(messages)
 }
 
-fn descriptor(kind: &str) -> Table {
+pub(crate) fn descriptor(kind: &str) -> Table {
     let condition_items = json!({
         "type":"object",
         "properties":{
@@ -436,10 +437,24 @@ pub(crate) struct Snapshot {
     pub incarnation: String,
     start: WatchStart,
 }
+/// Tables computed from code rather than stored, such as `verbs` (#4197): a description and
+/// every row of each table, in the set's table order, fixed for the daemon's life.
+pub(crate) struct DerivedSet {
+    pub set: TableSet,
+    pub rows: Vec<Vec<Row>>,
+}
+
+impl DerivedSet {
+    fn table(&self, name: &str) -> Option<usize> {
+        self.set.tables.iter().position(|table| table.name == name)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum TableSource {
     Resource { backend: ResourceBackend, name: String },
     Decided { service: Arc<flotilla_schema_sqlite::stream::Service>, name: String },
+    Derived { derived: Arc<DerivedSet>, name: String },
 }
 pub(crate) struct Description {
     pub table: Table,
@@ -447,9 +462,16 @@ pub(crate) struct Description {
     pub markdown: String,
 }
 impl TableSource {
-    pub(crate) async fn list(service: Option<Arc<flotilla_schema_sqlite::stream::Service>>) -> Result<Value, Failure> {
+    pub(crate) async fn list(
+        service: Option<Arc<flotilla_schema_sqlite::stream::Service>>,
+        derived: &[Arc<DerivedSet>],
+    ) -> Result<Value, Failure> {
         let mut kinds: Vec<_> =
             REGISTERED_RESOURCE_KINDS.iter().map(|kind| json!({"kind":kind.kind,"root":kind.plural,"tables":[kind.plural]})).collect();
+        kinds.extend(derived.iter().map(|derived| {
+            let names: Vec<_> = derived.set.tables.iter().map(|table| table.name.clone()).collect();
+            json!({"kind":derived.set.kind,"root":names[0],"tables":names})
+        }));
         if let Some(service) = service {
             kinds.extend(decided::list(&service).await?);
         }
@@ -459,15 +481,19 @@ impl TableSource {
         name: String,
         backend: ResourceBackend,
         service: Option<Arc<flotilla_schema_sqlite::stream::Service>>,
+        derived: &[Arc<DerivedSet>],
     ) -> Result<Self, Failure> {
         if REGISTERED_RESOURCE_KINDS.iter().any(|kind| kind.plural == name) {
             return Ok(Self::Resource { backend, name });
+        }
+        if let Some(derived) = derived.iter().find(|derived| derived.table(&name).is_some()) {
+            return Ok(Self::Derived { derived: Arc::clone(derived), name });
         }
         service.map(|service| Self::Decided { service, name }).ok_or_else(|| bad("not_found", "unknown table"))
     }
     pub(crate) fn name(&self) -> &str {
         match self {
-            Self::Resource { name, .. } | Self::Decided { name, .. } => name,
+            Self::Resource { name, .. } | Self::Decided { name, .. } | Self::Derived { name, .. } => name,
         }
     }
     pub(crate) async fn describe(&self) -> Result<Description, Failure> {
@@ -510,6 +536,17 @@ impl TableSource {
                         .insert("whereOperators".into(), json!(if scalar { vec!["==", "!=", "<", "<=", ">", ">="] } else { vec![] }));
                 }
                 Ok(Description { schema: set.frictionless(&table), table, markdown })
+            }
+            Self::Derived { derived, name } => {
+                let mut table = derived.set.tables[derived.table(name).expect("opened table")].clone();
+                for column in table.key.iter_mut().chain(&mut table.columns) {
+                    let scalar = !matches!(column.ty, ColumnType::Blob | ColumnType::Cbor | ColumnType::Frozen);
+                    column.properties.insert("sortable".into(), json!(scalar));
+                    column
+                        .properties
+                        .insert("whereOperators".into(), json!(if scalar { vec!["==", "!=", "<", "<=", ">", ">="] } else { vec![] }));
+                }
+                Ok(Description { schema: derived.set.frictionless(&table), markdown: flotilla_schema::render_view([&derived.set]), table })
             }
         }
     }
@@ -564,6 +601,19 @@ impl TableSource {
                 let (sequence, _, rows) = decided::read(service, name, table, query).await?;
                 Ok(Snapshot { rows, sequence, incarnation: "durable".into(), start: WatchStart::Now })
             }
+            Self::Derived { derived, name } => {
+                let rows = derived.rows[derived.table(name).expect("opened table")]
+                    .iter()
+                    .filter(|row| {
+                        query.filter.iter().all(|condition| {
+                            when::holds(row.get(&condition.field).unwrap_or(&Value::Null), condition.operator, &condition.literal)
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                // Derived rows change only with the daemon, so one snapshot serves its life.
+                Ok(Snapshot { rows, sequence: 1, incarnation: "derived".into(), start: WatchStart::Now })
+            }
         }
     }
     fn events(&self, query: &Query, snapshot: &Snapshot) -> BoxStream<'static, Result<(), String>> {
@@ -599,6 +649,7 @@ impl TableSource {
                 })
                 .boxed()
             }
+            Self::Derived { .. } => futures::stream::pending().boxed(),
         }
     }
     pub(crate) async fn messages(self, description: Description, query: Query) -> Result<BoxStream<'static, Message>, Failure> {
@@ -1081,7 +1132,7 @@ mod properties {
         assert_eq!(seen, expected);
     }
 }
-fn resource_rows(document: &Value, table: &Table) -> Result<Vec<Row>, String> {
+pub(crate) fn resource_rows(document: &Value, table: &Table) -> Result<Vec<Row>, String> {
     document["items"]
         .as_array()
         .ok_or("missing resource items")?

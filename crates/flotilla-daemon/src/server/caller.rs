@@ -22,6 +22,10 @@ impl PeerCredential {
     pub(super) fn from_kernel(uid: u32, pid: Option<i32>) -> Self {
         Self { pid: pid.and_then(|pid| u32::try_from(pid).ok()), uid }
     }
+
+    pub(super) fn uid(&self) -> u32 {
+        self.uid
+    }
 }
 
 pub(super) fn socket_peer_credential(stream: &tokio::net::UnixStream) -> Option<PeerCredential> {

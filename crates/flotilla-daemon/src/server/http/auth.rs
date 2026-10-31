@@ -45,6 +45,21 @@ impl CallerAuth {
             .map(|(status, message)| if status == StatusCode::UNAUTHORIZED { unauthenticated() } else { refusal(status, message) })
     }
 
+    /// Who the caller is, as the `verb.invocation` span names it (#4182 ruling 6): the main socket's
+    /// user by uid, the bearer-token holder, a browser session, an environment or a hook's
+    /// terminal.
+    pub(super) fn principal(&self) -> String {
+        match self {
+            Self::Socket(Some(peer)) => format!("socket:uid={}", peer.uid()),
+            Self::Socket(None) => "socket".into(),
+            Self::Environment { environment, .. } => format!("environment:{environment}"),
+            Self::Bearer => "bearer".into(),
+            Self::Session(session) => format!("session:{}", session.number()),
+            Self::Hook { .. } => "hook".into(),
+            Self::Anonymous => "anonymous".into(),
+        }
+    }
+
     /// The refusal for an anonymous caller, or a hook token outside the hook routes.
     pub(super) fn refusal_unless_authenticated(&self) -> Option<Response> {
         match self {

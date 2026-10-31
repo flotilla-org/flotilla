@@ -21,6 +21,9 @@ mod tcp;
 #[cfg(test)]
 mod tests;
 mod unix;
+mod verb_api;
+#[cfg(test)]
+mod verb_tests;
 mod wire;
 
 use std::sync::{Arc, OnceLock};
@@ -43,6 +46,11 @@ pub use hooks::{HookEndpoint, HookLaunch};
 pub(in crate::server) use login::LoginStore;
 use resource_api::Reply;
 use rigging_http_serve::Caller;
+
+use crate::server::{
+    tables::DerivedSet,
+    verbs::{self, Verbs},
+};
 
 pub(in crate::server) use tcp::{ListenAddress, TcpListener};
 pub(in crate::server) use unix::{is_http_preface, serve_sniffed};
@@ -76,6 +84,11 @@ pub(in crate::server) struct HttpRouter {
     hooks: HookEndpoint,
     /// Where `GET /` sends a browser (`[web] link_prefix`); unset means the fleet default.
     link_prefix: Option<String>,
+    /// The verb route; the built-in verbs over `backend` and `daemon` unless a test supplies its own.
+    verbs: Option<Arc<Verbs>>,
+    /// Tables derived from code (`verbs`), filled in when the router is built.
+    #[builder(skip)]
+    derived: Vec<Arc<DerivedSet>>,
 }
 
 /// The TCP listener's origin, known only once it binds (its port may be chosen then). The
@@ -118,6 +131,8 @@ impl HttpRouter {
             tcp_origin,
             hooks: HookEndpoint::default(),
             link_prefix: None,
+            verbs: None,
+            derived: Vec::new(),
         }
     }
 
@@ -147,7 +162,9 @@ impl HttpRouter {
         self
     }
 
-    pub(in crate::server) fn into_router(self) -> Router {
+    pub(in crate::server) fn into_router(mut self) -> Router {
+        let verbs = self.verbs.get_or_insert_with(|| Arc::new(verbs::builtin(self.backend.clone(), self.daemon.clone())));
+        self.derived = vec![Arc::new(verbs.tables())];
         Router::new()
             .route("/", get(root::handle))
             .route("/metrics", get(metrics::handle))
@@ -155,6 +172,7 @@ impl HttpRouter {
             .route("/tables", get(table_api::list))
             .route("/tables/{table}", get(table_api::describe))
             .route("/tables/{table}/rows", get(table_api::rows))
+            .route("/verbs/{name}", post(verb_api::invoke))
             .route(LOGIN_CODES_PATH, post(mint_login_code))
             .route(LOGIN_PATH, get(login))
             .route(LOGOUT_PATH, post(logout))

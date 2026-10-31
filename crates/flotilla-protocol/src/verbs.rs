@@ -7,7 +7,8 @@ use serde_json::{Map, Value};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Invocation {
-    /// The client's invocation id, unique per caller: a repeat returns the original outcome.
+    /// The client's invocation id. It flows into the verb's effect: a repeat runs again, and
+    /// the effect does nothing new. The route keeps no record of past invocations.
     pub invocation: String,
     /// The subjects' ADR 0066 addresses.
     pub subjects: Vec<String>,

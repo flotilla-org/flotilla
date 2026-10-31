@@ -21,6 +21,7 @@ mod index;
 mod serde_names;
 mod shape;
 mod structs;
+mod verb;
 
 use proc_macro::TokenStream;
 use syn::{Data, DeriveInput, Fields, GenericParam};
@@ -61,6 +62,13 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
 pub fn derive_describe(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as DeriveInput);
     describe::expand(&input).unwrap_or_else(syn::Error::into_compile_error).into()
+}
+
+/// A native verb's declaration from its parameter struct (#4197); see `flotilla_schema::Verb`.
+#[proc_macro_derive(Verb, attributes(verb, param))]
+pub fn derive_verb(input: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(input as DeriveInput);
+    verb::expand(&input).unwrap_or_else(syn::Error::into_compile_error).into()
 }
 
 #[cfg(test)]

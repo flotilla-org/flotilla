@@ -1318,18 +1318,6 @@ impl DummyDaemon {
             .build();
         let record = flotilla_provisioning::stored::artifact::ArtifactRecord::from_spec(&artifact).expect("artifact");
         log.create("transport-artifact", &record, &change).expect("artifact record");
-        // #4197: one record of intent, as the verb route writes it.
-        use flotilla_daemon::server::verbs::intent::{record_name, OutcomeRecord, OutcomeStatus, ParamValue, VerbInvocation};
-        let invocation = VerbInvocation {
-            caller: "bearer".into(),
-            invocation: "transport".into(),
-            verb: "convoy.explain".into(),
-            subjects: vec!["convoy:transport-convoy".into()],
-            params: std::collections::BTreeMap::from([("note".into(), ParamValue::Text("transport".into()))]),
-            at: flotilla_schema::Timestamp(1),
-            outcomes: vec![OutcomeRecord { subject: "convoy:transport-convoy".into(), status: OutcomeStatus::Done, detail: None }],
-        };
-        log.create(&record_name("bearer", "transport"), &invocation, &change).expect("verb invocation record");
         // One record of each forge observation.
         use flotilla_provisioning::stored::forge_observation::{ChangeRequestRecord, ForgeReadRecord, IssueRecord, IssueState, ReadValue};
         let change_request = ChangeRequestRecord {
@@ -1481,7 +1469,6 @@ impl DummyDaemon {
                 collect!(stored flotilla_provisioning::stored::forge_observation::IssueRecord);
                 collect!(stored flotilla_provisioning::stored::forge_observation::ForgeReadRecord);
                 collect!(stored flotilla_provisioning::stored::placement::FulfilmentKindDefinition);
-                collect!(stored flotilla_daemon::server::verbs::intent::VerbInvocation);
                 assert_eq!(covered, registered, "every registered engine kind needs a transport fixture");
                 Ok(snapshots)
             })

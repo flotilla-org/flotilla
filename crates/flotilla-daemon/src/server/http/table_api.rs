@@ -80,7 +80,7 @@ pub(super) async fn list(
     if let Some((status, message)) = caller.user_refusal() {
         return encoding.error_code(status, "unauthorized", message);
     }
-    match TableSource::list(store(&state)).await {
+    match TableSource::list(store(&state), &state.derived).await {
         Ok(value) => encoding.render(StatusCode::OK, value),
         Err(error) => failure(error, encoding),
     }
@@ -119,7 +119,7 @@ async fn respond(
     if let Some((status, message)) = caller.user_refusal() {
         return encoding.error_code(status, "unauthorized", message);
     }
-    let source = match TableSource::open(name, state.backend.clone(), store(&state)) {
+    let source = match TableSource::open(name, state.backend.clone(), store(&state), &state.derived) {
         Ok(source) => source,
         Err(error) => return failure(error, encoding),
     };
