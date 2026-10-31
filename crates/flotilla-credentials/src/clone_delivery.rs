@@ -18,8 +18,10 @@ use sha2::{Digest, Sha256};
 
 use crate::credential::{shell_single_quote, CredentialStore};
 
-/// Sources the delivered environment, then runs Git with the remaining arguments.
-const GIT_WITH_ENVIRONMENT: &str = "set -a; . \"$0\" || exit; set +a; exec git \"$@\"";
+/// Sources the delivered environment, then runs Git with the remaining
+/// arguments. Git speaks the C locale, so its sign-in refusals read as the
+/// daemon matches them.
+const GIT_WITH_ENVIRONMENT: &str = "set -a; . \"$0\" || exit; set +a; LC_ALL=C exec git \"$@\"";
 
 impl CredentialStore {
     /// Deliver a clone's granted credentials into `environment_ref` and return a
