@@ -96,4 +96,14 @@ impl flotilla::ProviderApi for DrydockApi {
     async fn outward(&self, provider: &str, id: &str, name: &str) -> ApiResult<flotilla::Outward> {
         convert(&self.0.outward(provider, id, name).await.map_err(api_error)?)
     }
+    async fn reach_kind(&self, provider: &str, id: &str) -> ApiResult<flotilla::ReachKind> {
+        Ok(match self.0.reach(provider, id).await.map_err(api_error)? {
+            drydock_protocol::Reach::Ssh { .. } => flotilla::ReachKind::Ssh,
+            drydock_protocol::Reach::Dial { .. } => flotilla::ReachKind::Dial,
+            drydock_protocol::Reach::Relay { .. } => flotilla::ReachKind::Relay,
+        })
+    }
+    async fn relay(&self, provider: &str, id: &str) -> ApiResult<flotilla::ByteStream> {
+        self.0.relay(provider, id).await.map_err(api_error)
+    }
 }

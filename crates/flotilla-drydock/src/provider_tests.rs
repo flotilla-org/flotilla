@@ -71,6 +71,9 @@ struct HostFixture {
     daemon: Option<(Arc<Daemon>, tokio::task::JoinHandle<()>)>,
     /// The daemon's API socket, as a socket-backed caller sees it.
     client: Client,
+    /// Whether the host carries the agent connection itself (a relay reach),
+    /// instead of declaring SSH.
+    relayed: bool,
 }
 impl Drop for HostFixture {
     fn drop(&mut self) {
@@ -84,8 +87,15 @@ impl HostFixture {
     async fn start() -> Self {
         Self::start_through(|gateway| gateway).await
     }
+    /// With the host relaying to the stand-in vessel's agent, as drydock's `local` module does.
+    async fn start_relayed() -> Self {
+        Self::start_with(|gateway| gateway, true).await
+    }
     /// With drydock's SSH link to the vessel made by `dialer`, given the gateway.
     async fn start_through(dialer: impl FnOnce(Arc<Gateway>) -> Arc<dyn SshDialer>) -> Self {
+        Self::start_with(dialer, false).await
+    }
+    async fn start_with(dialer: impl FnOnce(Arc<Gateway>) -> Arc<dyn SshDialer>, relayed: bool) -> Self {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -106,8 +116,16 @@ impl HostFixture {
         std::fs::write(bin.join("tar"), "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(bin.join("tar"), std::fs::Permissions::from_mode(0o755)).unwrap();
         let dialer = dialer(gateway.clone());
-        let mut fixture =
-            Self { _directory: directory, root, gateway, dialer, host, daemon: None, client: Client::unix("/nonexistent").unwrap() };
+        let mut fixture = Self {
+            _directory: directory,
+            root,
+            gateway,
+            dialer,
+            host,
+            daemon: None,
+            client: Client::unix("/nonexistent").unwrap(),
+            relayed,
+        };
         tokio::time::timeout(Duration::from_secs(5), async {
             while Client::unix(&socket).unwrap().hello().await.is_err() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -122,10 +140,14 @@ impl HostFixture {
         self.daemon.as_ref().expect("drydock runs").0.clone()
     }
     async fn start_daemon(&mut self) {
+        let reach = if self.relayed {
+            format!("relay_socket='{}'", self.root.join("vessel/agent.sock").display())
+        } else {
+            "reach={kind='ssh', endpoint='gateway.test:22', user='minted-gateway-user', host_key='ssh-ed25519 AAAA'}".into()
+        };
         let text = format!(
             "[providers.reference]\nmodule='reference'\ncredential={{file='{}'}}\n\
-             settings={{fixture=true, agent=true, poll_interval_ms=10, workspace_root='{}', \
-             reach={{kind='ssh', endpoint='gateway.test:22', user='minted-gateway-user', host_key='ssh-ed25519 AAAA'}}}}\n",
+             settings={{fixture=true, agent=true, poll_interval_ms=10, workspace_root='{}', {reach}}}\n",
             self.root.join("credential").display(),
             self.root.join("workspace").display()
         );
@@ -538,6 +560,30 @@ async fn the_agent_is_driven_through_an_inward_exposure() {
     use std::os::unix::fs::PermissionsExt;
     let pushed = std::fs::metadata(host.root.join("vessel/opt/flotilla/tool")).unwrap();
     assert_eq!(pushed.permissions().mode() & 0o777, 0o755);
+    handle.destroy().await.unwrap();
+}
+
+// A host that carries the connection to its vessel's agent itself (a relay
+// reach, as drydock's `local` module's) has no agent socket at the guest path:
+// the agent is reached through drydock's relay route, and no exposure is made.
+#[tokio::test]
+async fn a_relayed_agent_is_reached_through_the_relay() {
+    let host = HostFixture::start_relayed().await;
+    host.ready().await;
+    let provider = host.provider().with_guest_agent_socket(host.root.join("no-guest-agent.sock"));
+    let prepared = fixture_prepared(&host, &provider).await;
+    let handle = provider.provision(EnvironmentId::new("relayed"), &prepared, host.opts()).await.unwrap();
+    let expected = AgentConnectionReport {
+        provider: "reference".into(),
+        module: "reference".into(),
+        vessel: handle.backing_id().into(),
+        endpoint: "relay".into(),
+        mode: "relay".into(),
+    };
+    assert_eq!(handle.provider_descriptor().unwrap().agent_connection, Some(expected));
+    assert!(host.daemon().inward("reference", handle.backing_id(), "agent").await.is_err());
+    handle.agent().create_dir(&host.root.join("vessel/made-through-the-relay"), 0o700).await.unwrap();
+    assert!(host.root.join("vessel/made-through-the-relay").is_dir());
     handle.destroy().await.unwrap();
 }
 

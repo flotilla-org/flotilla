@@ -11,6 +11,7 @@ pub use crate::platform::Platform;
 
 pub type ApiResult<T> = Result<T, ApiError>;
 pub type ObservationStream = BoxStream<'static, ApiResult<ObserveRecord>>;
+pub use rigging_stream::ByteStream;
 
 #[async_trait]
 pub trait ProviderApi: Send + Sync {
@@ -27,6 +28,10 @@ pub trait ProviderApi: Send + Sync {
     async fn inward(&self, provider: &str, id: &str, name: &str) -> ApiResult<Inward>;
     async fn put_outward(&self, provider: &str, id: &str, name: &str, request: &OutwardRequest) -> ApiResult<Outward>;
     async fn outward(&self, provider: &str, id: &str, name: &str) -> ApiResult<Outward>;
+    /// How drydock reaches the vessel, by kind alone.
+    async fn reach_kind(&self, provider: &str, id: &str) -> ApiResult<ReachKind>;
+    /// A connection to the vessel's agent that drydock's host carries (a relay reach).
+    async fn relay(&self, provider: &str, id: &str) -> ApiResult<ByteStream>;
 }
 
 /// A failed call. The text is drydock's own: a provider's explanation is
@@ -100,6 +105,9 @@ pub struct Capabilities {
     pub checkout_strategies: Vec<CheckoutStrategy>,
     pub workspace_root: String,
     pub fallback_runner: bool,
+    /// The vessels share the host's filesystem (drydock's `local` module).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_filesystem: bool,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -256,6 +264,14 @@ pub enum EventKind {
     Resumed,
     Gone { cause: GoneCause },
     Exposure { name: String },
+}
+
+/// The kind of a vessel's reach. Its endpoint and secret stay with drydock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReachKind {
+    Ssh,
+    Dial,
+    Relay,
 }
 
 /// What an inward exposure reaches in the vessel.

@@ -86,6 +86,51 @@ startup failures or panics; it is not the structured daemon log and may be
 stale. The current built-in launcher sends that same pre-tracing and panic tail
 to `~/.config/flotilla/daemon-panic.log` instead.
 
+## Trial fleet
+
+`scripts/trial-fleet run` runs one convoy through a throwaway flotilla built
+from the checkout (#4165), so a change to how flotilla deals with vessels is
+tried end to end before it ships:
+
+```sh
+scripts/trial-fleet run [--provider-config FILE] [--crew scripted|<agent>] [--until provisioned|attached|landed]
+```
+
+It builds `flotillad`, `flotilla`, the vessel CLI, `drydock-agent` and
+`drydock-host` (debug, in this checkout's target directory) and lays them out as
+an installed generation under a fresh `/tmp/trial-fleet.*` root. Cleat comes from
+the installed tools layer that provides `cleat` on `PATH` (or `--tools DIR`).
+It then starts one `flotillad` with its own config dir, state dir and socket.
+Issues and pull requests come from the fake forge (#3374), standing in for the
+trial repository's forge; git goes to a local bare repository. The script starts
+a convoy on a fixed trial issue and waits for the end point:
+
+- `provisioned`: the environment and vessel are Ready (the agent answered hello);
+- `attached`: the crew session runs, and the plan `flotilla attach` resolves
+  reaches the crew's screen;
+- `landed` (default): the crew pushed, opened a pull request on the fake forge
+  and submitted it, and the convoy reached Landing.
+
+The provider is the one `[providers.NAME]` table in `--provider-config`, as in
+any `drydock.toml`, with an image pinned by digest. Without one, drydock's
+`local` module runs the vessel as a child process on this machine. The default
+crew is scripted: the credential-free `fleet-canary` adapter runs the trial
+repository's `.flotilla/fleet-canary-agent.sh`, which needs no model account.
+
+Every phase is printed with the first failure and its message, and exit status
+0 means the end point was reached. Teardown always runs, also on Ctrl-C: it
+abandons the convoy, waits for the provider's environments to be destroyed, stops
+every process carrying the trial's marker variable and removes the root and
+drydock's run directory. It then checks that none are left. Logs (commands, the
+daemon's own log, the fake forge's, and the attach transcript) stay under
+`target/trial-fleet/logs/`. `--keep` leaves everything running for inspection.
+
+Required for changes to provisioning, admission and placement, environment
+providers, the vessel agent, crew start and attach, and drydock integration:
+operator acceptance runs it at `--until attached` or further, and provider-module
+work runs it against the real provider. The script's own tests are
+`python3 -m unittest scripts.tests.test_trial_fleet`.
+
 ## Docker environment recovery
 
 Run one authoritative Flotilla daemon per Docker endpoint. Environment container

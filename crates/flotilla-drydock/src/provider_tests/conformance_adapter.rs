@@ -74,6 +74,12 @@ impl flotilla_api::ProviderApi for Recording {
     async fn outward(&self, provider: &str, id: &str, name: &str) -> flotilla_api::ApiResult<flotilla_api::Outward> {
         self.inner.outward(provider, id, name).await
     }
+    async fn reach_kind(&self, provider: &str, id: &str) -> flotilla_api::ApiResult<flotilla_api::ReachKind> {
+        self.inner.reach_kind(provider, id).await
+    }
+    async fn relay(&self, provider: &str, id: &str) -> flotilla_api::ApiResult<flotilla_api::ByteStream> {
+        self.inner.relay(provider, id).await
+    }
 }
 
 pub(super) struct AdapterHttp {

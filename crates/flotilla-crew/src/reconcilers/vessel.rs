@@ -671,7 +671,7 @@ impl VesselReconciler {
             let Some(root) = placement_decision.as_ref().and_then(|decision| decision.provider_workspace_root.as_ref()) else {
                 return Ok(VesselPrepared::failed("cloud provider workspace root missing from frozen placement"));
             };
-            root.clone_into(clone_path);
+            *clone_path = vessel_clone_path(root, &obj.metadata.name);
         }
         if let Some(decision) = placement_decision.as_ref() {
             strategy.canonicalize_host_ref(decision.target_host.reference.as_str());
@@ -1088,7 +1088,12 @@ impl VesselReconciler {
         }
         let has_repositories = !repository_refs.is_empty();
         let workspace_root = if multi_repository {
-            workspace_root
+            match &strategy {
+                // A vessel's clones stay where they were made, whatever the layout
+                // says now (a vessel cloned at its provider's root before #4165).
+                PlacementStrategy::CloneInVessel { .. } => recorded_workspace_root(checkout_paths.values()).unwrap_or(workspace_root),
+                _ => workspace_root,
+            }
         } else if let Some(path) = checkout_paths.values().next() {
             path.clone()
         } else {
@@ -1832,6 +1837,21 @@ fn cloud_environment_spec(
     })
 }
 
+/// The directory a vessel's recorded checkouts sit side by side in, when they
+/// all share one; otherwise the layout's own root stands.
+fn recorded_workspace_root<'a>(paths: impl IntoIterator<Item = &'a String>) -> Option<String> {
+    let mut parents = paths.into_iter().map(|path| std::path::Path::new(path).parent());
+    let first = parents.next()??;
+    parents.all(|parent| parent == Some(first)).then(|| first.to_string_lossy().into_owned())
+}
+
+/// Where a vessel clones below its provider's workspace root: a directory of
+/// its own, since where vessels share one filesystem (drydock's `local`) the
+/// root is theirs together.
+fn vessel_clone_path(workspace_root: &str, vessel: &str) -> String {
+    format!("{}/{vessel}", workspace_root.trim_end_matches('/'))
+}
+
 fn environment_provider_labels(placement: &Placement) -> BTreeMap<String, String> {
     placement.instance.iter().map(|instance| (ENVIRONMENT_PROVIDER_INSTANCE_LABEL.into(), instance.clone())).collect()
 }
@@ -1908,7 +1928,8 @@ impl PlacementStrategy {
         match self {
             Self::HostDirect { .. } => workspace_root.to_string(),
             Self::DockerHostCheckoutAndMount { .. } => realisation_settings::DOCKER_WORKSPACE.to_string(),
-            Self::CloneInVessel { clone_path, .. } if has_repositories => clone_path.clone(),
+            // Where the vessel's checkouts are recorded: one checkout's path, or several's parent.
+            Self::CloneInVessel { .. } if has_repositories => workspace_root.to_string(),
             Self::CloneInVessel { .. } => "/".to_string(),
         }
     }
@@ -2348,6 +2369,38 @@ mod tests {
         let sized = Placement { kind: sized_kind, instance: Some("daytona".into()) };
         let spec = cloud_environment_spec(&sized, "image@sha256:digest", needs).expect("a typed spec");
         assert_eq!(spec.cloud_sandbox.unwrap().size, policy_size);
+    }
+
+    // #4165: vessels whose provider declares one workspace root for all of them
+    // each clone into a directory of their own below it.
+    // #4165: a multi-repository cloud vessel's crew runs where its checkouts were
+    // recorded side by side, in either layout, and nowhere they disagree.
+    #[test]
+    fn a_multi_repository_vessel_runs_where_its_checkouts_sit_together() {
+        use super::recorded_workspace_root;
+        let paths = |paths: &[&str]| paths.iter().map(|path| path.to_string()).collect::<Vec<_>>();
+        for (recorded, root) in [
+            (paths(&["/vessels/convoy-a-work/cleat", "/vessels/convoy-a-work/flotilla"]), Some("/vessels/convoy-a-work")),
+            (paths(&["/workspace/cleat", "/workspace/flotilla"]), Some("/workspace")),
+            (paths(&["/vessels/convoy-a-work/cleat", "/workspace/flotilla"]), None),
+            (paths(&["/"]), None),
+            (paths(&[]), None),
+        ] {
+            assert_eq!(recorded_workspace_root(&recorded).as_deref(), root, "{recorded:?}");
+        }
+    }
+
+    #[test]
+    fn each_vessel_clones_below_the_workspace_root_in_its_own_directory() {
+        use super::vessel_clone_path;
+        for root in ["/workspace", "/workspace/", "/tmp/trial/vessels"] {
+            let (first, second) = (vessel_clone_path(root, "convoy-a-work"), vessel_clone_path(root, "convoy-b-work"));
+            assert_ne!(first, second);
+            for path in [&first, &second] {
+                let parent = std::path::Path::new(path).parent().expect("below the root");
+                assert_eq!(parent, std::path::Path::new(root));
+            }
+        }
     }
 
     #[test]

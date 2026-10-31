@@ -34,6 +34,7 @@ impl MemoryApi {
                     checkout_strategies: vec![CheckoutStrategy::HostWorktree, CheckoutStrategy::CloneInVessel],
                     workspace_root: "/workspace".into(),
                     fallback_runner: false,
+                    host_filesystem: false,
                 },
                 readiness: Readiness::Ready,
             }),
@@ -144,5 +145,13 @@ impl ProviderApi for MemoryApi {
     async fn outward(&self, provider: &str, id: &str, name: &str) -> ApiResult<Outward> {
         self.environment(provider, id)?;
         self.outwards.lock().expect("outwards").get(&(id.into(), name.into())).cloned().ok_or_else(|| ApiError::not_found(name.to_owned()))
+    }
+    async fn reach_kind(&self, provider: &str, id: &str) -> ApiResult<ReachKind> {
+        self.environment(provider, id)?;
+        Ok(ReachKind::Ssh)
+    }
+    async fn relay(&self, provider: &str, id: &str) -> ApiResult<ByteStream> {
+        self.environment(provider, id)?;
+        Err(ApiError::protocol(ProtocolErrorKind::Refused, "refused", "this vessel's reach is not a relay"))
     }
 }
