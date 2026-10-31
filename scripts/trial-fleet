@@ -445,6 +445,8 @@ class Trial:
         # macOS has no /etc/machine-id; each trial is its own machine anyway.
         (config / 'daemon.toml').write_text(
             f'machine_id = "trial-fleet-{self.root.name}"\n'
+            # The fleet's 20 GiB floor guards a host's own vessels; a trial vessel is throwaway.
+            '[admission]\nfree_space_floor_gib = 2\n'
             f'[forge_overrides."{FORGE_SERVICE}"]\nprovider = "forgejo"\n'
             f'endpoint_url = "{forge["url"]}/github"\ntoken_path = "{forge["token"]}"\nca_path = "{forge["ca"]}"\n')
         upstream = self.root / 'upstream.git'
