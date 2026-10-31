@@ -163,6 +163,8 @@ mod tests {
             }
         }
         async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+            let args = args.iter().map(|arg| scaled_deadlines(arg)).collect::<Vec<_>>();
+            let args = &args.iter().map(String::as_str).collect::<Vec<_>>()[..];
             let mut command = cmd.to_string();
             let mut argv = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
             if cmd == "ssh" {
@@ -209,6 +211,21 @@ mod tests {
         }
     }
 
+    // The endpoint runs the real isolation script with its 10s harness deadline and 11s
+    // watchdog scaled to 2s and 3s, keeping their order, so a cancelled live harness is
+    // still cleaned up by the script's own deadline without ten seconds of waiting.
+    fn scaled_deadlines(arg: &str) -> String {
+        const SCALES: [(&str, &str); 2] =
+            [("deadline=$((SECONDS + 10))", "deadline=$((SECONDS + 2))"), ("(sleep 11; kill", "(sleep 3; kill")];
+        if !arg.contains("deadline=$((SECONDS") {
+            return arg.to_string();
+        }
+        SCALES.iter().fold(arg.to_string(), |arg, (from, to)| {
+            assert!(arg.contains(from), "isolation script no longer contains {from}");
+            arg.replace(from, to)
+        })
+    }
+
     const CLAUDE: AccountState =
         AccountState::new("claude").homes(&["CLAUDE_CONFIG_DIR"]).secrets(&["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]);
     const CODEX: AccountState = AccountState::new("codex").homes(&["CODEX_HOME"]);
@@ -251,7 +268,7 @@ case "$1" in success|failure)
     [ "$1" = success ] && echo '2.1.300' && exit 0
     exit 7
     ;; cancel)
-    (sleep 11; mkdir -p "$HOME"; printf leaked > "$HOME/late-writer"; printf leaked > "${2}.leak") &
+    (sleep 3; mkdir -p "$HOME"; printf leaked > "$HOME/late-writer"; printf leaked > "${2}.leak") &
     wait
     ;; esac
 "#,
@@ -329,9 +346,8 @@ case "$1" in success|failure)
     // targets, including nonzero exits and cancellation during a live process.
     #[tokio::test]
     async fn detection_isolates_and_cleans_every_provider_target() {
-        for mode in ["success", "failure", "cancel"] {
-            let ((), (), ()) = tokio::join!(sentinel_case(0, mode), sentinel_case(1, mode), sentinel_case(2, mode));
-        }
+        let cases = ["success", "failure", "cancel"].into_iter().flat_map(|mode| (0..3).map(move |target| sentinel_case(target, mode)));
+        futures::future::join_all(cases).await;
     }
 
     /// A host with a declared rust supply whose toolchain, like rustup's

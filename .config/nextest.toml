@@ -4,3 +4,18 @@
 # Surface every failure in one run, including failures in other binaries.
 fail-fast = false
 test-threads = "num-cpus"
+
+# Start the known-slow tests first so they overlap the bulk of the run rather
+# than extending its tail (#4191). Each stays slow for a reason given beside it
+# in its test: a nested Cargo build, wall-clock windows or fixed cadences.
+[[profile.default.overrides]]
+filter = """
+(binary_id(flotilla-schema::integration) & test(=compile_fail::refused_shapes_fail_to_compile))
+| (binary_id(flotilla-daemon::dummy_fleet_load) & test(=load_driver_smoke))
+| (binary_id(flotilla-build-features::integration) & test(/^workspace_graph::/))
+| (binary_id(flotilla-daemon::integration) & test(/^engine_import::hosts_importing_/))
+| (binary_id(flotilla-daemon::integration) & test(/long_runner_exchanges_its_turns_before_landing$/))
+| (binary_id(flotilla-tui::pm_connector_e2e) & test(=connector_real_daemon_subject_lifecycle))
+| (binary_id(flotilla-schema-sqlite::integration) & test(=queries::limits_are_required_and_capped))
+"""
+priority = 100

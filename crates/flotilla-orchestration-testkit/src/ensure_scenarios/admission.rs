@@ -1011,129 +1011,132 @@ pub async fn driverless_ensure_has_one_acting_home(factory: &dyn EnsureScenarioC
 }
 
 async fn driverless_ensure_home_scenario(factory: &dyn EnsureScenarioController, declared: bool, legacy: bool, passes: &[usize]) {
+    for refused in [false, true] {
+        driverless_ensure_home_case(factory, declared, legacy, refused, passes).await;
+    }
+}
+
+/// One variant of [`driverless_ensure_has_one_acting_home`]: `legacy` names the declaring root by
+/// its host (only meaningful when `declared`), and `refused` points the ensure at a missing workflow.
+pub async fn driverless_ensure_home_case(
+    factory: &dyn EnsureScenarioController,
+    declared: bool,
+    legacy: bool,
+    refused: bool,
+    passes: &[usize],
+) {
     use flotilla_resources::{ManifestRoot, ManifestRootSpec};
 
-    for refused in [false, true] {
-        let home = standing_ensure_fixture_for(factory, "kiwi", true).await;
-        let peer_a = standing_ensure_fixture_for(factory, "feta", false).await;
-        let peer_b = standing_ensure_fixture_for(factory, "udder", false).await;
-        let hosts = [&home, &peer_a, &peer_b];
-        // A declaration moves authority away from the original creating host.
-        let acting_home = usize::from(declared);
-        let home_backend = &home.1;
-        let acting_backend = &hosts[acting_home].1;
-        let ensures = home_backend.definitions::<ConvoyEnsure>("flotilla");
-        let mut ensure = ensures.get("quartermaster").await.expect("home ensure");
-        if declared {
-            acting_backend
-                .using::<ManifestRoot>("flotilla")
-                .create(
-                    &test_meta("declaring-root"),
-                    &ManifestRootSpec::builder().host("feta".into()).path("/ops".into()).source("project-map".into()).build(),
-                )
-                .await
-                .expect("declaring root");
-            let mut meta = InputMeta::from(&ensure.metadata);
-            meta.annotations.insert("flotilla.work/manifest-reconciler-root".into(), if legacy { "feta" } else { "declaring-root" }.into());
-            meta.annotations.insert("flotilla.work/manifest-source".into(), "project-map".into());
-            ensure = ensures.apply(&meta, &ensure.spec).await.expect("declared ensure");
-        }
-        if refused {
-            let mut spec = ensure.spec.clone();
-            spec.workflow_ref = "missing-workflow".into();
-            ensures.apply(&InputMeta::from(&ensure.metadata), &spec).await.expect("refused ensure config");
-        }
-        let project = home_backend.definitions::<Project>("flotilla").get("standing-project").await.expect("home project");
-        for peer in [&peer_a, &peer_b] {
-            let backend = &peer.1;
-            backend
-                .definitions::<Project>("flotilla")
-                .create(&InputMeta::from(&project.metadata), &project.spec)
-                .await
-                .expect("each host registers its own Project copy");
-            backend
-                .replica_writer::<ConvoyEnsure>(home.0.node_id().clone(), "flotilla")
-                .replace(&home_backend.using::<ConvoyEnsure>("flotilla").list().await.expect("ensure snapshot"), Utc::now())
-                .await
-                .expect("replicate ensure");
-            let copy = backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("replicated ensure");
-            let mut meta = InputMeta::from(&copy.metadata);
-            meta.labels.insert("local-copy".into(), peer.0.node_id().to_string());
-            backend
-                .definitions::<ConvoyEnsure>("flotilla")
-                .apply(&meta, &copy.spec)
-                .await
-                .expect("local definition copy does not confer home");
-        }
-        if declared {
-            let roots = acting_backend.using::<ManifestRoot>("flotilla").list().await.expect("root snapshot");
-            for (index, host) in hosts.iter().enumerate() {
-                if index != acting_home {
-                    host.1
-                        .replica_writer::<ManifestRoot>(hosts[acting_home].0.node_id().clone(), "flotilla")
-                        .replace(&roots, Utc::now())
-                        .await
-                        .expect("replicate declaring root");
-                }
-            }
-        }
-        let mut before = Vec::new();
-        for host in hosts {
-            before.push(
-                serde_json::to_value(host.1.using::<ConvoyEnsure>("flotilla").list().await.expect("local ensures"))
-                    .expect("encode ensures"),
-            );
-        }
-        // Interleave repeated passes with the peers both before and after home.
-        // Refusal exercises Events/retry/stall; success exercises actual admission.
-        for &index in passes {
-            let (daemon, backend, _, _) = hosts[index];
-            let result = daemon.reconcile_convoy_ensures_once("flotilla").await;
-            if index == acting_home {
-                if refused {
-                    // The first pass refuses; subsequent passes may wait for backoff.
-                    assert!(result.as_ref().map_or(true, |changes| changes.is_empty()), "home refusal/backoff: {result:?}");
-                } else {
-                    result.expect("home admission or steady state");
-                }
-                continue;
-            }
-            assert!(result.expect("non-home has no stall").is_empty());
-            assert_eq!(
-                serde_json::to_value(backend.using::<ConvoyEnsure>("flotilla").list().await.expect("local ensures"))
-                    .expect("encode ensures"),
-                before[index],
-                "non-home writes no status or retry state"
-            );
-            assert!(backend.using::<Event>("flotilla").list().await.expect("events").items.is_empty(), "non-home writes no Event");
-            assert!(
-                backend.using::<ResourceDemand>("flotilla").list().await.expect("demands").items.is_empty(),
-                "non-home raises no stall"
-            );
-            assert!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("convoys").items.is_empty(), "non-home never admits");
-        }
-        if refused {
-            assert!(
-                acting_backend
-                    .using::<Event>("flotilla")
-                    .list()
+    let home = standing_ensure_fixture_for(factory, "kiwi", true).await;
+    let peer_a = standing_ensure_fixture_for(factory, "feta", false).await;
+    let peer_b = standing_ensure_fixture_for(factory, "udder", false).await;
+    let hosts = [&home, &peer_a, &peer_b];
+    // A declaration moves authority away from the original creating host.
+    let acting_home = usize::from(declared);
+    let home_backend = &home.1;
+    let acting_backend = &hosts[acting_home].1;
+    let ensures = home_backend.definitions::<ConvoyEnsure>("flotilla");
+    let mut ensure = ensures.get("quartermaster").await.expect("home ensure");
+    if declared {
+        acting_backend
+            .using::<ManifestRoot>("flotilla")
+            .create(
+                &test_meta("declaring-root"),
+                &ManifestRootSpec::builder().host("feta".into()).path("/ops".into()).source("project-map".into()).build(),
+            )
+            .await
+            .expect("declaring root");
+        let mut meta = InputMeta::from(&ensure.metadata);
+        meta.annotations.insert("flotilla.work/manifest-reconciler-root".into(), if legacy { "feta" } else { "declaring-root" }.into());
+        meta.annotations.insert("flotilla.work/manifest-source".into(), "project-map".into());
+        ensure = ensures.apply(&meta, &ensure.spec).await.expect("declared ensure");
+    }
+    if refused {
+        let mut spec = ensure.spec.clone();
+        spec.workflow_ref = "missing-workflow".into();
+        ensures.apply(&InputMeta::from(&ensure.metadata), &spec).await.expect("refused ensure config");
+    }
+    let project = home_backend.definitions::<Project>("flotilla").get("standing-project").await.expect("home project");
+    for peer in [&peer_a, &peer_b] {
+        let backend = &peer.1;
+        backend
+            .definitions::<Project>("flotilla")
+            .create(&InputMeta::from(&project.metadata), &project.spec)
+            .await
+            .expect("each host registers its own Project copy");
+        backend
+            .replica_writer::<ConvoyEnsure>(home.0.node_id().clone(), "flotilla")
+            .replace(&home_backend.using::<ConvoyEnsure>("flotilla").list().await.expect("ensure snapshot"), Utc::now())
+            .await
+            .expect("replicate ensure");
+        let copy = backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("replicated ensure");
+        let mut meta = InputMeta::from(&copy.metadata);
+        meta.labels.insert("local-copy".into(), peer.0.node_id().to_string());
+        backend.definitions::<ConvoyEnsure>("flotilla").apply(&meta, &copy.spec).await.expect("local definition copy does not confer home");
+    }
+    if declared {
+        let roots = acting_backend.using::<ManifestRoot>("flotilla").list().await.expect("root snapshot");
+        for (index, host) in hosts.iter().enumerate() {
+            if index != acting_home {
+                host.1
+                    .replica_writer::<ManifestRoot>(hosts[acting_home].0.node_id().clone(), "flotilla")
+                    .replace(&roots, Utc::now())
                     .await
-                    .expect("home events")
-                    .items
-                    .iter()
-                    .any(|event| event.spec.reason == "EnsureAdmissionRefused"),
-                "only home attempts refused admission"
-            );
-            let status = acting_backend
-                .using::<ConvoyEnsure>("flotilla")
-                .get("quartermaster")
-                .await
-                .expect("acting ensure")
-                .status
-                .expect("retry status");
-            assert!(status.retry.is_some(), "home persists refusal retry state");
-        } else {
-            assert_eq!(acting_backend.using::<ResourceConvoy>("flotilla").list().await.expect("home convoys").items.len(), 1);
+                    .expect("replicate declaring root");
+            }
         }
+    }
+    let mut before = Vec::new();
+    for host in hosts {
+        before.push(
+            serde_json::to_value(host.1.using::<ConvoyEnsure>("flotilla").list().await.expect("local ensures")).expect("encode ensures"),
+        );
+    }
+    // Interleave repeated passes with the peers both before and after home.
+    // Refusal exercises Events/retry/stall; success exercises actual admission.
+    for &index in passes {
+        let (daemon, backend, _, _) = hosts[index];
+        let result = daemon.reconcile_convoy_ensures_once("flotilla").await;
+        if index == acting_home {
+            if refused {
+                // The first pass refuses; subsequent passes may wait for backoff.
+                assert!(result.as_ref().map_or(true, |changes| changes.is_empty()), "home refusal/backoff: {result:?}");
+            } else {
+                result.expect("home admission or steady state");
+            }
+            continue;
+        }
+        assert!(result.expect("non-home has no stall").is_empty());
+        assert_eq!(
+            serde_json::to_value(backend.using::<ConvoyEnsure>("flotilla").list().await.expect("local ensures")).expect("encode ensures"),
+            before[index],
+            "non-home writes no status or retry state"
+        );
+        assert!(backend.using::<Event>("flotilla").list().await.expect("events").items.is_empty(), "non-home writes no Event");
+        assert!(backend.using::<ResourceDemand>("flotilla").list().await.expect("demands").items.is_empty(), "non-home raises no stall");
+        assert!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("convoys").items.is_empty(), "non-home never admits");
+    }
+    if refused {
+        assert!(
+            acting_backend
+                .using::<Event>("flotilla")
+                .list()
+                .await
+                .expect("home events")
+                .items
+                .iter()
+                .any(|event| event.spec.reason == "EnsureAdmissionRefused"),
+            "only home attempts refused admission"
+        );
+        let status = acting_backend
+            .using::<ConvoyEnsure>("flotilla")
+            .get("quartermaster")
+            .await
+            .expect("acting ensure")
+            .status
+            .expect("retry status");
+        assert!(status.retry.is_some(), "home persists refusal retry state");
+    } else {
+        assert_eq!(acting_backend.using::<ResourceConvoy>("flotilla").list().await.expect("home convoys").items.len(), 1);
     }
 }

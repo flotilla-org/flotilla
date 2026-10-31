@@ -457,18 +457,59 @@ fn snapshot_plus_tail<K: Fixture>(tc: &TestCase) {
 // Behaviour (#3208 snapshot plus tail, #3392): a replica holding only a resource's snapshot at
 // version v (its rows and the objects they name), plus that resource's logged events after v (read
 // by `changes`, paged two at a time), holds the newest snapshot: each tail event carries its objects.
+// One test per kind, so they run in parallel.
 #[hegel::test]
-fn a_snapshot_plus_its_tail_is_the_newest_snapshot(tc: TestCase) {
+fn a_snapshot_plus_its_tail_is_the_newest_snapshot_message(tc: TestCase) {
     snapshot_plus_tail::<Resource<Message>>(&tc);
+}
+
+#[hegel::test]
+fn a_snapshot_plus_its_tail_is_the_newest_snapshot_agent_session(tc: TestCase) {
     snapshot_plus_tail::<Resource<AgentSession>>(&tc);
+}
+
+#[hegel::test]
+fn a_snapshot_plus_its_tail_is_the_newest_snapshot_person(tc: TestCase) {
     snapshot_plus_tail::<Resource<Person>>(&tc);
+}
+
+#[hegel::test]
+fn a_snapshot_plus_its_tail_is_the_newest_snapshot_awaiting_reply(tc: TestCase) {
     snapshot_plus_tail::<Resource<AwaitingReply>>(&tc);
+}
+
+#[hegel::test]
+fn a_snapshot_plus_its_tail_is_the_newest_snapshot_convoy(tc: TestCase) {
     snapshot_plus_tail::<Resource<Convoy>>(&tc);
+}
+
+#[hegel::test]
+fn a_snapshot_plus_its_tail_is_the_newest_snapshot_ensure(tc: TestCase) {
     snapshot_plus_tail::<Resource<Ensure>>(&tc);
+}
+
+#[hegel::test]
+fn a_snapshot_plus_its_tail_is_the_newest_snapshot_terminal_session(tc: TestCase) {
     snapshot_plus_tail::<TerminalSession>(&tc);
+}
+
+#[hegel::test]
+fn a_snapshot_plus_its_tail_is_the_newest_snapshot_vessel(tc: TestCase) {
     snapshot_plus_tail::<Resource<Vessel>>(&tc);
+}
+
+#[hegel::test]
+fn a_snapshot_plus_its_tail_is_the_newest_snapshot_ticket(tc: TestCase) {
     snapshot_plus_tail::<Ticket>(&tc);
+}
+
+#[hegel::test]
+fn a_snapshot_plus_its_tail_is_the_newest_snapshot_referral(tc: TestCase) {
     snapshot_plus_tail::<Referral>(&tc);
+}
+
+#[hegel::test]
+fn a_snapshot_plus_its_tail_is_the_newest_snapshot_dossier(tc: TestCase) {
     snapshot_plus_tail::<Dossier>(&tc);
 }
 

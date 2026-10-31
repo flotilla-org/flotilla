@@ -131,19 +131,60 @@ fn ticket_evolves_by_transitions_and_spec_edits(tc: TestCase) {
 
 // Behaviour (#3320 round trip): the same law holds for every variant of every enum, nested,
 // flattened and in child tables, for every edge, and for empty and non-empty collections at every
-// depth: the covering indexes reach each of them (see each fixture's `COVERING`).
+// depth: the covering indexes reach each of them (see each fixture's `COVERING`). One test per
+// kind, so they run in parallel.
 #[hegel::test]
-fn every_variant_round_trips_and_switches_through_writes(tc: TestCase) {
+fn every_variant_round_trips_and_switches_through_writes_message(tc: TestCase) {
     covering::<Resource<Message>>(&tc);
+}
+
+#[hegel::test]
+fn every_variant_round_trips_and_switches_through_writes_agent_session(tc: TestCase) {
     covering::<Resource<AgentSession>>(&tc);
+}
+
+#[hegel::test]
+fn every_variant_round_trips_and_switches_through_writes_person(tc: TestCase) {
     covering::<Resource<Person>>(&tc);
+}
+
+#[hegel::test]
+fn every_variant_round_trips_and_switches_through_writes_awaiting_reply(tc: TestCase) {
     covering::<Resource<AwaitingReply>>(&tc);
+}
+
+#[hegel::test]
+fn every_variant_round_trips_and_switches_through_writes_convoy(tc: TestCase) {
     covering::<Resource<Convoy>>(&tc);
+}
+
+#[hegel::test]
+fn every_variant_round_trips_and_switches_through_writes_ensure(tc: TestCase) {
     covering::<Resource<Ensure>>(&tc);
+}
+
+#[hegel::test]
+fn every_variant_round_trips_and_switches_through_writes_terminal_session(tc: TestCase) {
     covering::<TerminalSession>(&tc);
+}
+
+#[hegel::test]
+fn every_variant_round_trips_and_switches_through_writes_vessel(tc: TestCase) {
     covering::<Resource<Vessel>>(&tc);
+}
+
+#[hegel::test]
+fn every_variant_round_trips_and_switches_through_writes_ticket(tc: TestCase) {
     covering::<Ticket>(&tc);
+}
+
+#[hegel::test]
+fn every_variant_round_trips_and_switches_through_writes_referral(tc: TestCase) {
     covering::<Referral>(&tc);
+}
+
+#[hegel::test]
+fn every_variant_round_trips_and_switches_through_writes_dossier(tc: TestCase) {
     covering::<Dossier>(&tc);
 }
 
@@ -173,14 +214,39 @@ fn all_edges<M: Machine>() -> BTreeSet<&'static str> {
 
 // Behaviour (#3319 engine kinds): the engine kinds' fixtures reach every edge their machine
 // declares: from the covering values, the engine applies each edge kind at least once, so every
-// test drawing edges runs over every real transition.
+// test drawing edges runs over every real transition. One test per machine, so they run in
+// parallel.
 #[hegel::test(test_cases = 5)]
-fn engine_fixtures_reach_every_declared_edge(tc: TestCase) {
+fn engine_fixtures_reach_every_declared_edge_message(tc: TestCase) {
     assert_eq!(edges_reached::<Message>(&tc), all_edges::<Message>());
+}
+
+#[hegel::test(test_cases = 5)]
+fn engine_fixtures_reach_every_declared_edge_agent_session(tc: TestCase) {
     assert_eq!(edges_reached::<AgentSession>(&tc), all_edges::<AgentSession>());
+}
+
+#[hegel::test(test_cases = 5)]
+fn engine_fixtures_reach_every_declared_edge_awaiting_reply(tc: TestCase) {
     assert_eq!(edges_reached::<AwaitingReply>(&tc), all_edges::<AwaitingReply>());
+}
+
+#[hegel::test(test_cases = 5)]
+fn engine_fixtures_reach_every_declared_edge_convoy(tc: TestCase) {
     assert_eq!(edges_reached::<Convoy>(&tc), all_edges::<Convoy>());
+}
+
+#[hegel::test(test_cases = 5)]
+fn engine_fixtures_reach_every_declared_edge_ensure(tc: TestCase) {
     assert_eq!(edges_reached::<Ensure>(&tc), all_edges::<Ensure>());
+}
+
+#[hegel::test(test_cases = 5)]
+fn engine_fixtures_reach_every_declared_edge_terminal(tc: TestCase) {
     assert_eq!(edges_reached::<Lifecycle<Terminal>>(&tc), all_edges::<Lifecycle<Terminal>>());
+}
+
+#[hegel::test(test_cases = 5)]
+fn engine_fixtures_reach_every_declared_edge_vessel(tc: TestCase) {
     assert_eq!(edges_reached::<Vessel>(&tc), all_edges::<Vessel>());
 }

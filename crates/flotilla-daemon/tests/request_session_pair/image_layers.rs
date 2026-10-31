@@ -137,7 +137,7 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
     }
     let mesh = spawn_in_memory_request_mesh(hosts).await.expect("mesh");
     // Run the production demand service on either possible source owner; the
-    // paused-clock generated scenarios must not wait on an absent refresher.
+    // paused-clock scenarios must not wait on an absent refresher.
     let mut forge_services = Vec::new();
     for host in &mesh.hosts {
         let (service, ready) = flotilla_daemon::runtime::spawn_forge_read_demand_task(host.clone(), "flotilla".into());
@@ -265,22 +265,25 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
     assert!(mesh.hosts[1].resource_backend().using::<Convoy>("flotilla").list().await.expect("issuer authored convoys").items.is_empty());
 }
 
+const COMPOSED_IMAGE_ROWS: [(usize, bool); 4] = [(1, true), (0, true), (1, false), (0, false)];
+
 #[tokio::test]
 async fn composed_image_routing_pinned_rows() {
-    for (issuer, satisfiable) in [(1, true), (0, true), (1, false), (0, false)] {
+    for (issuer, satisfiable) in COMPOSED_IMAGE_ROWS {
         composed_image_routing_row(issuer, satisfiable).await;
     }
 }
 
-#[hegel::test]
-fn generated_composed_image_routing(tc: hegel::TestCase) {
-    // Both issuer locations and resolvable/unresolvable dispatched needs.
-    let issuer = tc.draw(gs::integers::<usize>().min_value(0).max_value(1));
-    let satisfiable = tc.draw(gs::booleans());
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .start_paused(true)
-        .build()
-        .expect("runtime")
-        .block_on(composed_image_routing_row(issuer, satisfiable));
+// Both issuer locations and resolvable/unresolvable dispatched needs, again on
+// a paused clock. The four rows are the whole domain, so enumerate them.
+#[test]
+fn composed_image_routing_rows_on_a_paused_clock() {
+    for (issuer, satisfiable) in COMPOSED_IMAGE_ROWS {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("runtime")
+            .block_on(composed_image_routing_row(issuer, satisfiable));
+    }
 }

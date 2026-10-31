@@ -2047,8 +2047,9 @@ mod adoption_tests {
 
     // One failed agent cannot erase healthy inventory. Healthy monitoring uses
     // the existing client; out-of-band removal retires the watcher/cache even
-    // while a caller retains the old handle.
-    #[tokio::test]
+    // while a caller retains the old handle. Paused time runs the supervisor's
+    // two-second liveness cadence virtually.
+    #[tokio::test(start_paused = true)]
     async fn unavailable_agent_keeps_inventory_and_removed_container_retires_supervision() {
         let root = tempfile::tempdir().unwrap();
         let engine = Arc::new(Inventory::default());

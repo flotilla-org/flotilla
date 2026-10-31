@@ -32,9 +32,8 @@ fn interned(conn: &Connection) -> u64 {
 
 /// Applies `edge` in its own transaction; returns the event it logged and the rows SQLite counted
 /// as written, excluding new `strings` and `resource_identity` rows.
-fn apply_counted(store: Store, current: Stamp, edge: Edge<Ticket>) -> (Store, Stamp, Event, u64) {
+fn apply_counted(store: &mut Store, current: Stamp, edge: Edge<Ticket>) -> (Stamp, Event, u64) {
     let at = edge.at();
-    let mut store = store;
     // The edge's change is opened first, so the counted statements are the edge's own.
     let change = {
         let mut write = store.write().expect("write");
@@ -42,17 +41,15 @@ fn apply_counted(store: Store, current: Stamp, edge: Edge<Ticket>) -> (Store, St
         write.commit().expect("commit");
         change
     };
-    let conn = store.into_connection();
-    let before = (conn.total_changes(), interned(&conn));
-    let mut store = Store::open(conn, LOCAL, registry()).expect("reopen");
+    let before = (store.connection().total_changes(), interned(store.connection()));
     let mut write = store.write().expect("write");
     let stamp = write.apply_edge(current, edge, change).expect("edge");
     let mut changes = write.changes(current.id, current.version, 10).expect("changes");
     write.commit().expect("commit");
-    let conn = store.into_connection();
-    let written = conn.total_changes() - before.0 - (interned(&conn) - before.1);
+    let conn = store.connection();
+    let written = conn.total_changes() - before.0 - (interned(conn) - before.1);
     assert_eq!(changes.len(), 1, "one entry per edge");
-    (Store::open(conn, LOCAL, registry()).expect("reopen"), stamp, changes.remove(0), written)
+    (stamp, changes.remove(0), written)
 }
 
 fn ticket(state: TicketState) -> Ticket {
@@ -111,8 +108,7 @@ fn a_transition_logs_its_state_and_exactly_the_rows_that_differ(tc: TestCase) {
         let current = store.read().expect("read").load::<Ticket>(stamp.id).expect("load").expect("present");
         let before = snapshot(&mut store, stamp.id);
         let (edge, _) = current.value.edge(&tc, Pick::Draw).expect("a ticket always has an edge");
-        let (next_store, next, change, written) = apply_counted(store, stamp, edge);
-        store = next_store;
+        let (next, change, written) = apply_counted(&mut store, stamp, edge);
         let after = snapshot(&mut store, stamp.id);
         let root = &set.tables[0];
         let (old_root, new_root) = (&before.rows.tables[0][0].values, &after.rows.tables[0][0].values);

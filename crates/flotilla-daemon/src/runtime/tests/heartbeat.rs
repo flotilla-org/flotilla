@@ -103,6 +103,7 @@ async fn spawned_fulfilment_probe_task_publishes_facts_after_heartbeat() {
         detection_registry(daemon.discovery_runtime().runner.clone()),
         temp.path().join("probe-cwd"),
         runtime_health.host_observations.clone(),
+        FULFILMENT_CHANGE_CHECK_INTERVAL,
     );
     wait_until_with_timeout(Duration::from_secs(5), || {
         let hosts = hosts.clone();
@@ -713,6 +714,7 @@ async fn host_status_commits_at_most_once_per_heartbeat_interval_on_sqlite() {
             Arc::new(ProviderRegistry::new()),
             temp.path().join("probe-cwd"),
             observations.clone(),
+            FULFILMENT_CHANGE_CHECK_INTERVAL,
         ),
     ];
     let probe_time = || {

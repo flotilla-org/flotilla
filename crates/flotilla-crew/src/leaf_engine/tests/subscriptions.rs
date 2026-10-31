@@ -81,10 +81,17 @@ async fn leaf_sustained_overload_bounds_snapshot_work_and_recovers() {
     table.inner.rows.lock().await.insert(id, row.clone());
     let mut watching = Box::pin(table.watch_row(row));
     assert!(watching.as_mut().now_or_never().is_none());
-    // 30,000 writes in two simulated seconds, with the leaf allowed
-    // to run between bursts. Count addressed snapshots, not RSS.
+    // Two simulated seconds in 20ms ticks, overrunning every watch the router
+    // opens with a 300-write burst at the next tick, and letting the leaf run
+    // between bursts. A router sleeping in backoff holds no watch, so writes then
+    // could not reach it. Count addressed snapshots, not RSS.
     for _ in 0..100 {
-        overload_convoy(&backend).await;
+        let routing = table.inner.routing.lock().await;
+        let watching_live = routing.watch_losses == routing.resyncs;
+        drop(routing);
+        if watching_live {
+            overload_convoy(&backend).await;
+        }
         for _ in 0..2 {
             assert!(watching.as_mut().now_or_never().is_none());
         }
@@ -92,6 +99,8 @@ async fn leaf_sustained_overload_bounds_snapshot_work_and_recovers() {
     }
     let snapshots = table.inner.snapshot_loads.load(Ordering::SeqCst);
     let resyncs = table.inner.routing.lock().await.resyncs;
+    // Backoff from 25ms reaches its one-second cap after seven resyncs, within the two seconds.
+    assert!(resyncs >= 6, "sustained overload keeps expiring reopened watches: {resyncs}");
     assert!(resyncs <= 10, "repeated expiry must throttle shared resyncs: {resyncs}");
     assert_eq!(table.inner.store_reads.load(Ordering::SeqCst), snapshots, "recovery reads only the addressed convoy");
     assert!(table.rows().await.iter().any(|row| row.id == id));
