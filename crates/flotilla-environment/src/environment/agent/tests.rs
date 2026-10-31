@@ -7,6 +7,45 @@ use tokio::{
     sync::mpsc,
 };
 
+/// An agent incarnation run as a process runs: on a runtime of its own, so that
+/// killing it drops every task the agent spawned, the connections it serves
+/// with them, as a killed process closes its sockets.
+pub(crate) struct AgentProcess {
+    stop: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+impl AgentProcess {
+    pub(crate) fn spawn(serve: impl std::future::Future<Output = ()> + Send + 'static) -> Self {
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async move {
+                tokio::select! {
+                    _ = stopped => {}
+                    () = serve => {}
+                }
+            });
+            runtime.shutdown_background();
+        });
+        Self { stop: std::sync::Mutex::new(Some(stop)), thread: std::sync::Mutex::new(Some(thread)) }
+    }
+    pub(crate) fn kill(&self) {
+        if let Some(stop) = self.stop.lock().unwrap().take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.lock().unwrap().take() {
+            if let Err(panic) = thread.join() {
+                eprintln!("fixture agent thread panicked: {panic:?}");
+            }
+        }
+    }
+}
+impl Drop for AgentProcess {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
 /// Real drydock agent and client, with only their byte transport in memory.
 /// The composition-root fake reloads Agent after run returns an upgrade path;
 /// drydock's actual files/upgrade/hello handlers decide that path and its bytes.
@@ -15,7 +54,7 @@ pub(crate) struct MemoryAgent {
     current: Vec<u8>,
     pub(crate) starts: Arc<AtomicUsize>,
     pub(crate) upgrades: Arc<AtomicUsize>,
-    task: tokio::task::JoinHandle<()>,
+    process: AgentProcess,
     _directory: tempfile::TempDir,
 }
 impl MemoryAgent {
@@ -31,7 +70,7 @@ impl MemoryAgent {
         let (started, upgraded) = (starts.clone(), upgrades.clone());
         let published = dialer.clone();
         let mut fingerprint = if mismatched { "previous-build".to_string() } else { format!("{:x}", Sha256::digest(&current)) };
-        let task = tokio::spawn(async move {
+        let process = AgentProcess::spawn(async move {
             loop {
                 started.fetch_add(1, Ordering::SeqCst);
                 if let Ok(path) = Agent::new(listener, fingerprint.clone(), installed.clone()).run().await {
@@ -47,19 +86,14 @@ impl MemoryAgent {
                 listener = next;
             }
         });
-        Arc::new(Self { dialer, current, starts, upgrades, task, _directory: directory })
+        Arc::new(Self { dialer, current, starts, upgrades, process, _directory: directory })
     }
     pub(crate) fn stop(&self) {
-        self.task.abort();
+        self.process.kill();
     }
     async fn open(&self) -> io::Result<ByteStream> {
         let dialer = self.dialer.lock().unwrap().clone();
         dialer.connect().await
-    }
-}
-impl Drop for MemoryAgent {
-    fn drop(&mut self) {
-        self.task.abort();
     }
 }
 #[async_trait]
@@ -90,7 +124,7 @@ pub(crate) struct SocketAgent {
     pub(crate) socket: PathBuf,
     starts: Arc<AtomicUsize>,
     upgrades: Arc<AtomicUsize>,
-    task: tokio::task::JoinHandle<()>,
+    process: AgentProcess,
     _directory: tempfile::TempDir,
 }
 impl SocketAgent {
@@ -103,7 +137,7 @@ impl SocketAgent {
         let upgrades = Arc::new(AtomicUsize::new(0));
         let (started, upgraded, path) = (starts.clone(), upgrades.clone(), socket.clone());
         let mut fingerprint = if mismatched { "previous-build".to_string() } else { format!("{:x}", Sha256::digest(current)) };
-        let task = tokio::spawn(async move {
+        let process = AgentProcess::spawn(async move {
             loop {
                 let _ = std::fs::remove_file(&path);
                 let listener = UnixListener::bind(&path).unwrap();
@@ -119,19 +153,14 @@ impl SocketAgent {
                 }
             }
         });
-        Arc::new(Self { socket, starts, upgrades, task, _directory: directory })
+        Arc::new(Self { socket, starts, upgrades, process, _directory: directory })
     }
     /// The agent dies: its socket stays behind, refusing connections.
     pub(crate) fn kill(&self) {
-        self.task.abort();
+        self.process.kill();
     }
     pub(crate) fn starts(&self) -> usize {
         self.starts.load(Ordering::SeqCst)
-    }
-}
-impl Drop for SocketAgent {
-    fn drop(&mut self) {
-        self.task.abort();
     }
 }
 
