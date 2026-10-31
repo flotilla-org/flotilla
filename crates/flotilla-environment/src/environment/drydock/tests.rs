@@ -330,7 +330,6 @@ async fn reference_passes_drydock_conformance() {
             conformance::Scenario::Destroy,
         ],
         fixture_configuration: None,
-        null_environment_id: None,
         auth_audit: None,
         billing_sample_millis: 25,
         billing_settle_millis: 0,
