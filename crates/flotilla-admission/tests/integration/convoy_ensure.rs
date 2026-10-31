@@ -336,10 +336,13 @@ async fn undeclared_driverless_ensure_has_one_acting_home() {
 
 // ADR 0064: arbitrary repeated host passes preserve one acting home, both
 // after declaration and while undeclared, for successful and refused admissions.
+// Each case draws one variant; the pinned tests above run every variant.
 #[hegel::test]
 fn generated_driverless_ensure_has_one_acting_home(tc: hegel::TestCase) {
     use hegel::generators as gs;
     let declared = tc.draw(gs::booleans());
+    let legacy = declared && tc.draw(gs::booleans());
+    let refused = tc.draw(gs::booleans());
     // Generate repeated/interleaved host passes; the suffix visits every host
     // and exercises home steady state even when the random prefix omits it.
     let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(8));
@@ -349,5 +352,5 @@ fn generated_driverless_ensure_has_one_acting_home(tc: hegel::TestCase) {
         .enable_all()
         .build()
         .expect("runtime")
-        .block_on(ensure_scenarios::driverless_ensure_has_one_acting_home(&Controller, declared, &passes));
+        .block_on(ensure_scenarios::driverless_ensure_home_case(&Controller, declared, legacy, refused, &passes));
 }
