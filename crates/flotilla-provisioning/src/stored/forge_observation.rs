@@ -169,8 +169,9 @@ impl From<IssueState> for ObservedIssueState {
     }
 }
 
-/// An issue another record refers to, in the stored spelling of its source.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// An issue another record refers to, in the stored spelling of its source: one row of a list
+/// of links.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Stored)]
 pub struct IssueSubject {
     pub service: String,
     pub scope: String,
@@ -182,7 +183,8 @@ fn at<T>(value: Option<T>, observed_at: DateTime<Utc>) -> Observation<T> {
 }
 
 /// The observing home's view of one change request: kind code `cq`, named by the subject's record
-/// name. A null value is one the forge has not reported.
+/// name. A null value is one the forge has not reported; a list is unreported until its
+/// `_observed` flag is set.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 // clippy::duplicated_attributes reads the key columns the two `index(...)` declarations share as
 // repeated attributes.
@@ -191,7 +193,8 @@ fn at<T>(value: Option<T>, observed_at: DateTime<Utc>) -> Observation<T> {
     kind = "ChangeRequest",
     code = "cq",
     index(name = "by_subject", eq(service, scope, number)),
-    index(name = "by_branch", eq(service, scope, head_branch))
+    index(name = "by_branch", eq(service, scope, head_branch)),
+    index(name = "by_closed_issue", eq(closes))
 )]
 pub struct ChangeRequestRecord {
     pub service: String,
@@ -211,8 +214,9 @@ pub struct ChangeRequestRecord {
     pub head_branch: Option<String>,
     pub base_branch: Option<String>,
     /// The issues the forge says this change request closes.
-    #[store(cbor)]
-    pub closes: Option<Vec<IssueSubject>>,
+    #[store(child)]
+    pub closes: Vec<IssueSubject>,
+    pub closes_observed: bool,
 }
 
 impl ChangeRequestRecord {
@@ -234,7 +238,8 @@ impl ChangeRequestRecord {
             failing_since: None,
             head_branch: None,
             base_branch: None,
-            closes: None,
+            closes: Vec::new(),
+            closes_observed: false,
         }
     }
 
@@ -256,7 +261,8 @@ impl ChangeRequestRecord {
             failing_since: None,
             head_branch: None,
             base_branch: None,
-            closes: None,
+            closes: Vec::new(),
+            closes_observed: false,
         }
     }
 
@@ -287,9 +293,16 @@ impl ChangeRequestRecord {
     }
 }
 
-/// The observing home's view of one issue: kind code `iu`, named by the subject's record name.
+/// The observing home's view of one issue: kind code `iu`, named by the subject's record name. A
+/// list is unreported until its `_observed` flag is set.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
-#[store(kind = "Issue", code = "iu", index(name = "by_subject", eq(service, scope, number)))]
+#[store(
+    kind = "Issue",
+    code = "iu",
+    index(name = "by_subject", eq(service, scope, number)),
+    index(name = "by_parent", eq(parent_service, parent_scope, parent_number)),
+    index(name = "by_blocker", eq(blocked_by))
+)]
 pub struct IssueRecord {
     pub service: String,
     pub scope: String,
@@ -306,10 +319,13 @@ pub struct IssueRecord {
     pub body: Option<String>,
     /// The forge's issue type name, uninterpreted.
     pub issue_type: Option<String>,
-    #[store(cbor)]
-    pub parent: Option<IssueSubject>,
-    #[store(cbor)]
-    pub blocked_by: Option<Vec<IssueSubject>>,
+    /// The parent issue: all three set, or none.
+    pub parent_service: Option<String>,
+    pub parent_scope: Option<String>,
+    pub parent_number: Option<u64>,
+    #[store(child)]
+    pub blocked_by: Vec<IssueSubject>,
+    pub blocked_by_observed: bool,
     /// Each issue field's value by field name, as the forge spells it: a single-select field's
     /// option name, a number's decimal digits.
     #[store(cbor)]
@@ -331,8 +347,11 @@ impl IssueRecord {
             failing_since: None,
             body: None,
             issue_type: None,
-            parent: None,
-            blocked_by: None,
+            parent_service: None,
+            parent_scope: None,
+            parent_number: None,
+            blocked_by: Vec::new(),
+            blocked_by_observed: false,
             fields: None,
         }
     }
@@ -351,8 +370,11 @@ impl IssueRecord {
             failing_since: None,
             body: None,
             issue_type: None,
-            parent: None,
-            blocked_by: None,
+            parent_service: None,
+            parent_scope: None,
+            parent_number: None,
+            blocked_by: Vec::new(),
+            blocked_by_observed: false,
             fields: None,
         }
     }
@@ -421,25 +443,30 @@ impl ForgeReadRecord {
 
 /// Registers the three kinds into `registry` under their codes, `cq`, `iu` and `fr`: plain kinds.
 pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
-    registry.register_table_set(added_since_previous_generation::<ChangeRequestRecord>(&["head_branch", "base_branch", "closes"]))?;
-    registry.register_table_set(added_since_previous_generation::<IssueRecord>(&[
-        "body",
-        "issue_type",
-        "parent",
-        "blocked_by",
-        "fields",
-    ]))?;
+    registry.register_table_set(added_since_previous_generation::<ChangeRequestRecord>(
+        &["head_branch", "base_branch"],
+        &["closes_observed"],
+    ))?;
+    registry.register_table_set(added_since_previous_generation::<IssueRecord>(
+        &["body", "issue_type", "parent_service", "parent_scope", "parent_number", "fields"],
+        &["blocked_by_observed"],
+    ))?;
     registry.register::<ForgeReadRecord>()
 }
 
-/// `K`'s tables, `columns` of its root marked absent from the previous generation's table, so
-/// opening its store adds them. ADR 0047 N→N+1: remove the marks after the next fleet roll.
-fn added_since_previous_generation<K: Kind>(columns: &[&str]) -> TableSet {
+/// `K`'s tables with root columns the previous generation's table lacks marked, so opening its
+/// store adds them: `absent` as unobserved, `unset` flags as false. ADR 0047 N→N+1: remove the
+/// marks after the next fleet roll.
+fn added_since_previous_generation<K: Kind>(absent: &[&str], unset: &[&str]) -> TableSet {
     let mut set = K::table_set();
-    for name in columns {
+    for (name, flag) in absent.iter().map(|name| (name, false)).chain(unset.iter().map(|name| (name, true))) {
         let column = set.tables[0].columns.iter_mut().find(|column| column.name == *name);
         let column = column.unwrap_or_else(|| panic!("{} has no root column {name}", K::KIND));
-        column.mark_previous_generation_absent();
+        if flag {
+            column.properties.insert("previous_generation_default".into(), 0.into());
+        } else {
+            column.mark_previous_generation_absent();
+        }
         assert!(column.previous_generation_value().is_some(), "{} column {name} cannot be added to an older table", K::KIND);
     }
     set

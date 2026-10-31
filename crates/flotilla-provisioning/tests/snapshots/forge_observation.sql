@@ -68,10 +68,20 @@ CREATE TABLE "change_request" (
   "failing_since" INTEGER,
   "head_branch" TEXT,
   "base_branch" TEXT,
-  "closes" BLOB NOT NULL DEFAULT x'f6'
+  "closes_observed" INTEGER NOT NULL CHECK ("closes_observed" IN (0, 1)) DEFAULT 0
 ) STRICT;
+CREATE TABLE "change_request_closes" (
+  "change_request" INTEGER NOT NULL,
+  "pos" INTEGER NOT NULL,
+  "service" TEXT NOT NULL,
+  "scope" TEXT NOT NULL,
+  "number" INTEGER NOT NULL,
+  PRIMARY KEY ("change_request", "pos"),
+  FOREIGN KEY ("change_request") REFERENCES "change_request" ("id") ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
 CREATE INDEX "change_request_by_branch" ON "change_request" ("service", "scope", "head_branch");
 CREATE INDEX "change_request_by_subject" ON "change_request" ("service", "scope", "number");
+CREATE INDEX "change_request_closes_by_closed_issue" ON "change_request_closes" ("service", "scope", "number");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cq', 'state', 'cl', 'Closed'),
   ('cq', 'state', 'dr', 'Draft'),
@@ -104,8 +114,15 @@ CREATE VIEW "change_request_view" AS SELECT
   "change_request"."failing_since",
   "change_request"."head_branch",
   "change_request"."base_branch",
-  "change_request"."closes"
+  "change_request"."closes_observed"
 FROM "change_request";
+CREATE VIEW "change_request_closes_view" AS SELECT
+  "change_request_closes"."change_request",
+  "change_request_closes"."pos",
+  "change_request_closes"."service",
+  "change_request_closes"."scope",
+  "change_request_closes"."number"
+FROM "change_request_closes";
 CREATE TABLE "forge_read" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -140,10 +157,23 @@ CREATE TABLE "issue" (
   "failing_since" INTEGER,
   "body" TEXT,
   "issue_type" TEXT,
-  "parent" BLOB NOT NULL DEFAULT x'f6',
-  "blocked_by" BLOB NOT NULL DEFAULT x'f6',
+  "parent_service" TEXT,
+  "parent_scope" TEXT,
+  "parent_number" INTEGER,
+  "blocked_by_observed" INTEGER NOT NULL CHECK ("blocked_by_observed" IN (0, 1)) DEFAULT 0,
   "fields" BLOB NOT NULL DEFAULT x'f6'
 ) STRICT;
+CREATE TABLE "issue_blocked_by" (
+  "issue" INTEGER NOT NULL,
+  "pos" INTEGER NOT NULL,
+  "service" TEXT NOT NULL,
+  "scope" TEXT NOT NULL,
+  "number" INTEGER NOT NULL,
+  PRIMARY KEY ("issue", "pos"),
+  FOREIGN KEY ("issue") REFERENCES "issue" ("id") ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE INDEX "issue_blocked_by_by_blocker" ON "issue_blocked_by" ("service", "scope", "number");
+CREATE INDEX "issue_by_parent" ON "issue" ("parent_service", "parent_scope", "parent_number");
 CREATE INDEX "issue_by_subject" ON "issue" ("service", "scope", "number");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('iu', 'state', 'cl', 'Closed'),
@@ -162,10 +192,19 @@ CREATE VIEW "issue_view" AS SELECT
   "issue"."failing_since",
   "issue"."body",
   "issue"."issue_type",
-  "issue"."parent",
-  "issue"."blocked_by",
+  "issue"."parent_service",
+  "issue"."parent_scope",
+  "issue"."parent_number",
+  "issue"."blocked_by_observed",
   "issue"."fields"
 FROM "issue";
+CREATE VIEW "issue_blocked_by_view" AS SELECT
+  "issue_blocked_by"."issue",
+  "issue_blocked_by"."pos",
+  "issue_blocked_by"."service",
+  "issue_blocked_by"."scope",
+  "issue_blocked_by"."number"
+FROM "issue_blocked_by";
 CREATE VIEW "log_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "l"."home") AS "home",
   "l"."home_seq",

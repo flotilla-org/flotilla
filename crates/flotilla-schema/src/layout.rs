@@ -425,6 +425,27 @@ impl Layout {
         self.set.indexes.push(index);
     }
 
+    /// Declares index `name` on the table of the current table's `child` list `field`, keyed by
+    /// every column of its element.
+    pub fn element_index(&mut self, name: &str, field: &str) {
+        let parent = self.frames.last().expect("layout has a current table").table;
+        let table = self
+            .set
+            .tables
+            .iter()
+            .find(|table| table.parent == Some(parent) && table.field == field && table.role == TableRole::Child)
+            .unwrap_or_else(|| panic!("`{field}` is no child list of table {}", self.set.tables[parent].name));
+        let index = Index {
+            name: name.to_owned(),
+            table: table.name.clone(),
+            eq: table.columns.iter().map(|column| column.name.clone()).collect(),
+            order: Vec::new(),
+            predicate: Vec::new(),
+            unique: false,
+        };
+        self.set.indexes.push(index);
+    }
+
     pub fn finish(self) -> TableSet {
         assert_eq!(self.frames.len(), 1, "every nested table closes before the layout finishes");
         self.set

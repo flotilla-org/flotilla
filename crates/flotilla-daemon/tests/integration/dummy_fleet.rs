@@ -1319,7 +1319,8 @@ impl DummyDaemon {
             failing_since: None,
             head_branch: Some("transport".into()),
             base_branch: Some("main".into()),
-            closes: Some(vec![IssueSubject { service: "github.com".into(), scope: "transport/app".into(), number: 2 }]),
+            closes: vec![IssueSubject { service: "github.com".into(), scope: "transport/app".into(), number: 2 }],
+            closes_observed: true,
         };
         log.create("transport-cr", &change_request, &change).expect("change request record");
         let issue = IssueRecord {
@@ -1334,8 +1335,11 @@ impl DummyDaemon {
             failing_since: None,
             body: Some("transport".into()),
             issue_type: Some("Task".into()),
-            parent: None,
-            blocked_by: Some(Vec::new()),
+            parent_service: None,
+            parent_scope: None,
+            parent_number: None,
+            blocked_by: Vec::new(),
+            blocked_by_observed: true,
             fields: Some(std::collections::BTreeMap::from([("Weight".into(), "2".into())])),
         };
         log.create("transport-issue", &issue, &change).expect("issue record");

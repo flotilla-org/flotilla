@@ -67,12 +67,25 @@ fn subject(tc: &hegel::TestCase) -> stored::IssueSubject {
     }
 }
 
+/// An observed list of subjects, or an unobserved one: no rows and the flag unset.
+fn observed_list(tc: &hegel::TestCase) -> (Vec<stored::IssueSubject>, bool) {
+    match maybe(tc, ()) {
+        Some(()) => ((0..tc.draw(gs::integers::<usize>().max_value(3))).map(|_| subject(tc)).collect(), true),
+        None => (Vec::new(), false),
+    }
+}
+
 fn issue_record(tc: &hegel::TestCase, number: u64) -> IssueRecord {
+    let parent = maybe(tc, subject(tc));
+    let (blocked_by, blocked_by_observed) = observed_list(tc);
     IssueRecord {
         body: maybe(tc, tc.draw(gs::text().max_size(40))),
         issue_type: maybe(tc, tc.draw(gs::text().max_size(8))),
-        parent: maybe(tc, subject(tc)),
-        blocked_by: maybe(tc, (0..tc.draw(gs::integers::<usize>().max_value(3))).map(|_| subject(tc)).collect()),
+        parent_service: parent.as_ref().map(|parent| parent.service.clone()),
+        parent_scope: parent.as_ref().map(|parent| parent.scope.clone()),
+        parent_number: parent.map(|parent| parent.number),
+        blocked_by,
+        blocked_by_observed,
         fields: maybe(
             tc,
             (0..tc.draw(gs::integers::<usize>().max_value(3)))
@@ -84,10 +97,12 @@ fn issue_record(tc: &hegel::TestCase, number: u64) -> IssueRecord {
 }
 
 fn change_request_record(tc: &hegel::TestCase, number: u64) -> ChangeRequestRecord {
+    let (closes, closes_observed) = observed_list(tc);
     ChangeRequestRecord {
         head_branch: maybe(tc, tc.draw(gs::text().max_size(12))),
         base_branch: maybe(tc, tc.draw(gs::text().max_size(12))),
-        closes: maybe(tc, (0..tc.draw(gs::integers::<usize>().max_value(3))).map(|_| subject(tc)).collect()),
+        closes,
+        closes_observed,
         ..ChangeRequestRecord::unobserved(&cr_spec(SCOPE, number, "alpha"))
     }
 }
@@ -109,11 +124,14 @@ fn column_count(conn: &rusqlite::Connection, table: &str) -> usize {
 /// Takes the forge observation tables back to the shape the previous generation created.
 fn previous_generation_tables(conn: &rusqlite::Connection) {
     conn.execute_batch(
-        "DROP VIEW change_request_view; DROP VIEW issue_view; DROP INDEX change_request_by_branch;
+        "DROP VIEW change_request_view; DROP VIEW issue_view; DROP VIEW change_request_closes_view; DROP VIEW issue_blocked_by_view;
+         DROP TABLE change_request_closes; DROP TABLE issue_blocked_by;
+         DROP INDEX change_request_by_branch; DROP INDEX issue_by_parent;
          ALTER TABLE change_request DROP COLUMN head_branch; ALTER TABLE change_request DROP COLUMN base_branch;
-         ALTER TABLE change_request DROP COLUMN closes;
-         ALTER TABLE issue DROP COLUMN body; ALTER TABLE issue DROP COLUMN issue_type; ALTER TABLE issue DROP COLUMN parent;
-         ALTER TABLE issue DROP COLUMN blocked_by; ALTER TABLE issue DROP COLUMN fields;",
+         ALTER TABLE change_request DROP COLUMN closes_observed;
+         ALTER TABLE issue DROP COLUMN body; ALTER TABLE issue DROP COLUMN issue_type; ALTER TABLE issue DROP COLUMN parent_service;
+         ALTER TABLE issue DROP COLUMN parent_scope; ALTER TABLE issue DROP COLUMN parent_number;
+         ALTER TABLE issue DROP COLUMN blocked_by_observed; ALTER TABLE issue DROP COLUMN fields;",
     )
     .expect("previous generation shape");
     assert_eq!((column_count(conn, "change_request"), column_count(conn, "issue")), (15, 11));
@@ -168,11 +186,25 @@ fn previous_generation_observations_open_and_read_as_unobserved(tc: hegel::TestC
     assert_eq!(stored_record::<IssueRecord>(&mut store, "issue-7"), observed_issue);
     assert_eq!(stored_record::<ChangeRequestRecord>(&mut store, "cr-8"), observed_change_request);
     let conn = store.into_connection();
+    let index = |name: &str| {
+        conn.query_row("SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?1", [name], |row| row.get::<_, String>(0))
+            .expect("index")
+    };
     assert_eq!(
-        conn.query_row("SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = 'change_request_by_branch'", [], |row| row
-            .get::<_, String>(0))
-            .expect("index"),
+        index("change_request_by_branch"),
         r#"CREATE INDEX "change_request_by_branch" ON "change_request" ("service", "scope", "head_branch")"#
+    );
+    assert_eq!(
+        index("issue_by_parent"),
+        r#"CREATE INDEX "issue_by_parent" ON "issue" ("parent_service", "parent_scope", "parent_number")"#
+    );
+    assert_eq!(
+        index("change_request_closes_by_closed_issue"),
+        r#"CREATE INDEX "change_request_closes_by_closed_issue" ON "change_request_closes" ("service", "scope", "number")"#
+    );
+    assert_eq!(
+        index("issue_blocked_by_by_blocker"),
+        r#"CREATE INDEX "issue_blocked_by_by_blocker" ON "issue_blocked_by" ("service", "scope", "number")"#
     );
 }
 
@@ -195,7 +227,18 @@ fn previous_generation_entries_apply_with_the_new_fields_unobserved() {
         let headers = read.changes_of(&events).expect("headers");
         (events, headers)
     };
-    let added = ["head_branch", "base_branch", "closes", "body", "issue_type", "parent", "blocked_by", "fields"];
+    let added = [
+        "head_branch",
+        "base_branch",
+        "closes_observed",
+        "body",
+        "issue_type",
+        "parent_service",
+        "parent_scope",
+        "parent_number",
+        "blocked_by_observed",
+        "fields",
+    ];
     for event in &mut events {
         event.effect.changes.retain(|change| !matches!(change, Change::Set { field, .. } if added.contains(&field.as_str())));
     }

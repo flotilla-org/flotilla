@@ -5,7 +5,9 @@
 //! and index and carries its `eq` arguments as logical values (strings and identities, not local
 //! ids), so any backend can run it; the sqlite runtime pages it by keyset. A kind's spec declares
 //! the indexes of the kind its holder stores (`MessageSpec::open_by_inbox`), so the query's type is
-//! the declaring type and the kind is named by its code.
+//! the declaring type and the kind is named by its code. An index on a `child` list
+//! (`index(name = "by_closed", eq(closes))`) takes one element and reads the resources holding an
+//! equal row.
 
 use std::{fmt, marker::PhantomData};
 
@@ -16,7 +18,8 @@ use crate::{
 };
 
 /// A query of one index that `K` declares (a kind, or a kind's spec): rows of the kind matching
-/// its predicate whose `eq` columns equal the arguments, in `order..., id` order.
+/// its predicate whose `eq` columns equal the arguments, in `order..., id` order; for an index on
+/// a `child` list, the kind's resources holding a row equal to the argument, in id order.
 pub struct IndexQuery<K> {
     kind: KindCode,
     index: &'static str,
@@ -69,6 +72,14 @@ pub fn key_value<T: KeyColumn + Element>(value: &T) -> Result<Value, EncodeError
     let mut values = rows.tables.swap_remove(0).pop().map(|row| row.values).unwrap_or_default();
     debug_assert_eq!(values.len(), 1, "a key column is one value");
     Ok(values.pop().unwrap_or(Value::Null))
+}
+
+/// Encodes the argument of an index on a `child` list: one element's row values, which are the
+/// `eq` values in column order.
+#[doc(hidden)]
+pub fn element_values<T: Element>(value: &T) -> Result<Vec<Value>, EncodeError> {
+    let mut rows = Encoder::encode(value)?;
+    Ok(rows.tables.swap_remove(0).pop().map(|row| row.values).unwrap_or_default())
 }
 
 /// Encodes one `eq` argument of an `#[store(intern = "tx")]` field.
