@@ -206,7 +206,7 @@ CEL is the base because only it has all of the following:
 | Ternary, arithmetic, macros, strings, regex, bytes, uint, maps and lists as values | Not needed. Each one adds SQL translation and cross-language risk. | Excluded (§4.4). |
 | Gradual typing; heterogeneous `==` is false at run time | A client and the server could disagree on an ill-typed condition | Fully checked against declared field types before evaluation. A condition that does not check is refused at write time. |
 | Enums are protobuf ints | flotilla's enums are closed string sets | A `string` field with a declared value set. The checker requires each literal to be in the set. |
-| Error and unknown are separate | The subset has only one source of U | Every runtime error in the subset comes from an absent value, so a stock CEL evaluator's "error" is exactly U. |
+| Error and unknown are separate | The subset needs one U | For rows whose fields are present or absent (every table row), every runtime error in the subset comes from an absent value, so a stock CEL evaluator's "error" is exactly U. Unknown fields (§4.5, leaf subjects only) are the exception; see below. |
 | Comments, single quotes, raw and triple-quoted strings, many escapes | A stored condition needs exactly one spelling (ADR 0066 §4) | Strict parsing accepts canonical text only. Lenient input accepts any CEL spelling of the same AST. |
 
 **The compatibility promise.** Take any expression the subset accepts, with its fields declared as in §4.3. Bind them in a conforming CEL evaluator, under these conventions:
@@ -495,7 +495,7 @@ The conversion needs the field's type from the schema (§4.3):
 
 `labels` is a `list(string)` field that is unknown when the set is unobserved, so `!U = U` gives today's Unknown in the last column.
 
-**A legacy condition that does not type-check.** The old admission never checked some literals, such as an enum value outside the set (`leaf.rs:117-128`), so such a condition can be stored today, and it is never true. It decodes to a **decode-only AST node, `Legacy(text)`**. The node keeps the legacy canonical text exactly as stored, evaluates to U for every row, and prints as that same legacy text. Its spelling starts with the subject and then `.`, so the next decode recognises it again (above). Its interned key, gate key and frozen bytes stay byte-identical, and nothing is re-keyed for it. The checker refuses `Legacy` in new input, so no new condition can take this form. The re-encode step leaves these records alone and reports how many there are. The legacy parser can retire only when that count is zero on every host: these conditions sit on messages, so they go when the messages are archived (#3939). It is never a decode failure, because ADR 0047 forbids one.
+**A legacy condition that does not type-check.** The old admission never checked some literals, such as an enum value outside the set (`leaf.rs:117-128`), so such a condition can be stored today, and it is never true. It decodes to a **decode-only AST node, `Legacy(text)`**. The node keeps the legacy canonical text exactly as stored, evaluates to U for every row, and prints as that same legacy text. Its spelling starts with the subject and then `.`, so the next decode recognises it again (above). Its interned key, gate key and frozen bytes stay byte-identical, and nothing is re-keyed for it. The checker refuses `Legacy` in new input, so no new condition can take this form. The re-encode step leaves these records alone and reports how many there are. The legacy parser can retire only when that count is zero on every host. This check fails closed: a host whose store has not reported a count since the step ran, because it was offline or unreachable, counts as non-zero. This mirrors ADR 0066 §6, where the pre-roll live-store gate (#2167) refuses a shim removal while any host's store lacks the step's marker. The count is checked the same way, so a shim removal waits for that host. These conditions sit on messages, so they go when the messages are archived (#3939). It is never a decode failure, because ADR 0047 forbids one.
 
 ### Per stored form
 
@@ -555,6 +555,8 @@ The subset was chosen as the intersection, so a later graph layer can use it as 
 | `address` | IRI, through the link form `https://flotilla.work/<fleet>/<address>` (#4182 ruling 5) |
 | `enum` | string literal (or an IRI per value, if a vocabulary is published) |
 | `f.under(P)` | `?f = <P> \|\| STRSTARTS(STR(?f), CONCAT(STR(<P>), "/"))`, or an IRI-named extension function |
+
+**The one partial mapping.** SPARQL has no unknown separate from unbound, and `BOUND` is never an error. So `has(f)` on an *unknown* field, which gives U here, has no exact SPARQL form. Everything else in the subset is the intersection of the three languages. The gap is confined to leaf subjects (`wait`, messages, promise rules), whose rows SQL and a graph layer never see: those rows are always present or absent.
 
 Two SPARQL differences cannot arise in the subset:
 - SPARQL's `=` on incompatible literals is an error rather than false (SQ §17.4.1.7). Here the checker refuses an ill-typed comparison before evaluation.
