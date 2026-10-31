@@ -76,7 +76,9 @@ fn observed_list(tc: &hegel::TestCase) -> (Vec<stored::IssueSubject>, bool) {
 }
 
 fn issue_record(tc: &hegel::TestCase, number: u64) -> IssueRecord {
-    let parent = maybe(tc, subject(tc));
+    // An unobserved parent is null; an observed one is a subject or none.
+    let parent_observed = tc.draw(gs::booleans());
+    let parent = if parent_observed { maybe(tc, subject(tc)) } else { None };
     let (blocked_by, blocked_by_observed) = observed_list(tc);
     IssueRecord {
         body: maybe(tc, tc.draw(gs::text().max_size(40))),
@@ -84,6 +86,7 @@ fn issue_record(tc: &hegel::TestCase, number: u64) -> IssueRecord {
         parent_service: parent.as_ref().map(|parent| parent.service.clone()),
         parent_scope: parent.as_ref().map(|parent| parent.scope.clone()),
         parent_number: parent.map(|parent| parent.number),
+        parent_observed,
         blocked_by,
         blocked_by_observed,
         fields: maybe(
@@ -131,7 +134,7 @@ fn previous_generation_tables(conn: &rusqlite::Connection) {
          ALTER TABLE change_request DROP COLUMN head_branch; ALTER TABLE change_request DROP COLUMN base_branch;
          ALTER TABLE change_request DROP COLUMN closes_observed;
          ALTER TABLE issue DROP COLUMN body; ALTER TABLE issue DROP COLUMN issue_type; ALTER TABLE issue DROP COLUMN parent_service;
-         ALTER TABLE issue DROP COLUMN parent_scope; ALTER TABLE issue DROP COLUMN parent_number;
+         ALTER TABLE issue DROP COLUMN parent_scope; ALTER TABLE issue DROP COLUMN parent_number; ALTER TABLE issue DROP COLUMN parent_observed;
          ALTER TABLE issue DROP COLUMN blocked_by_observed; ALTER TABLE issue DROP COLUMN fields;",
     )
     .expect("previous generation shape");
@@ -237,6 +240,7 @@ fn previous_generation_entries_apply_with_the_new_fields_unobserved() {
         "parent_service",
         "parent_scope",
         "parent_number",
+        "parent_observed",
         "blocked_by_observed",
         "fields",
     ];

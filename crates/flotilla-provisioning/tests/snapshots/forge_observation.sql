@@ -160,6 +160,7 @@ CREATE TABLE "issue" (
   "parent_service" TEXT,
   "parent_scope" TEXT,
   "parent_number" INTEGER,
+  "parent_observed" INTEGER NOT NULL CHECK ("parent_observed" IN (0, 1)) DEFAULT 0,
   "blocked_by_observed" INTEGER NOT NULL CHECK ("blocked_by_observed" IN (0, 1)) DEFAULT 0,
   "fields" BLOB NOT NULL DEFAULT x'f6'
 ) STRICT;
@@ -195,6 +196,7 @@ CREATE VIEW "issue_view" AS SELECT
   "issue"."parent_service",
   "issue"."parent_scope",
   "issue"."parent_number",
+  "issue"."parent_observed",
   "issue"."blocked_by_observed",
   "issue"."fields"
 FROM "issue";

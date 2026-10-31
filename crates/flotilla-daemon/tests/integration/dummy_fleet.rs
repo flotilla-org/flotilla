@@ -1338,6 +1338,7 @@ impl DummyDaemon {
             parent_service: None,
             parent_scope: None,
             parent_number: None,
+            parent_observed: true,
             blocked_by: Vec::new(),
             blocked_by_observed: true,
             fields: Some(std::collections::BTreeMap::from([("Weight".into(), "2".into())])),

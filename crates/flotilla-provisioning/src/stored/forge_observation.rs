@@ -293,8 +293,8 @@ impl ChangeRequestRecord {
     }
 }
 
-/// The observing home's view of one issue: kind code `iu`, named by the subject's record name. A
-/// list is unreported until its `_observed` flag is set.
+/// The observing home's view of one issue: kind code `iu`, named by the subject's record name. The
+/// parent and a list are unreported until their `_observed` flag is set.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 #[store(
     kind = "Issue",
@@ -319,10 +319,11 @@ pub struct IssueRecord {
     pub body: Option<String>,
     /// The forge's issue type name, uninterpreted.
     pub issue_type: Option<String>,
-    /// The parent issue: all three set, or none.
+    /// The parent issue: all three set, or none; unreported until `parent_observed` is set.
     pub parent_service: Option<String>,
     pub parent_scope: Option<String>,
     pub parent_number: Option<u64>,
+    pub parent_observed: bool,
     #[store(child)]
     pub blocked_by: Vec<IssueSubject>,
     pub blocked_by_observed: bool,
@@ -350,6 +351,7 @@ impl IssueRecord {
             parent_service: None,
             parent_scope: None,
             parent_number: None,
+            parent_observed: false,
             blocked_by: Vec::new(),
             blocked_by_observed: false,
             fields: None,
@@ -373,6 +375,7 @@ impl IssueRecord {
             parent_service: None,
             parent_scope: None,
             parent_number: None,
+            parent_observed: false,
             blocked_by: Vec::new(),
             blocked_by_observed: false,
             fields: None,
@@ -449,7 +452,7 @@ pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     ))?;
     registry.register_table_set(added_since_previous_generation::<IssueRecord>(
         &["body", "issue_type", "parent_service", "parent_scope", "parent_number", "fields"],
-        &["blocked_by_observed"],
+        &["parent_observed", "blocked_by_observed"],
     ))?;
     registry.register::<ForgeReadRecord>()
 }
