@@ -55,8 +55,8 @@ impl Verbs {
     /// out; every field taken from the request is bounded to [`FIELD_LIMIT`], since a request
     /// refused for its size is still traced.
     pub(crate) async fn invoke(&self, caller: &str, name: &str, request: Invocation) -> Result<Invoked, Refusal> {
-        let subjects = bounded(Value::from(request.subjects.clone()).to_string());
-        let params = bounded(Value::Object(request.params.clone()).to_string());
+        let subjects = bounded(serde_json::to_string(&request.subjects).unwrap_or_default());
+        let params = bounded(serde_json::to_string(&request.params).unwrap_or_default());
         let (name_field, id_field) = (bounded(name.to_owned()), bounded(request.invocation.clone()));
         let span = tracing::info_span!(
             "verb.invocation",
