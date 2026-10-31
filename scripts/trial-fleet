@@ -446,7 +446,7 @@ class Trial:
         (config / 'daemon.toml').write_text(
             f'machine_id = "trial-fleet-{self.root.name}"\n'
             f'[forge_overrides."{FORGE_SERVICE}"]\nprovider = "forgejo"\n'
-            f'endpoint_url = "{forge["url"]}/github"\ntoken_path = "{forge["token"]}"\n')
+            f'endpoint_url = "{forge["url"]}/github"\ntoken_path = "{forge["token"]}"\nca_path = "{forge["ca"]}"\n')
         upstream = self.root / 'upstream.git'
         # Clones of the trial repository's forge URL read the local bare repository.
         (self.root / 'gitconfig').write_text(
