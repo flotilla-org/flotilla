@@ -1062,7 +1062,18 @@ impl VesselReconciler {
                     {
                         labels.insert(CHANGE_REQUEST_ID_LABEL.to_string(), change_request.id.clone());
                     }
-                    let meta = convoy_owned_child_meta(&checkout_name, &convoy, obj, labels);
+                    let mut meta = convoy_owned_child_meta(&checkout_name, &convoy, obj, labels);
+                    if matches!(spec, CheckoutSpec::FreshClone(_)) {
+                        // #4218: a cloud vessel clones before any crew session exists,
+                        // so its checkout carries the grants that cover this repository.
+                        flotilla_resources::CloneCredentials::for_repository(
+                            &repository_key,
+                            &requirement.credential_refs,
+                            &requirement.credential_scopes,
+                            &requirement.credential_permissions,
+                        )
+                        .annotate(&mut meta.annotations);
+                    }
                     actuations.push(Actuation::CreateCheckout { meta, spec });
                     waiting_for_checkouts.push(checkout_name);
                 }

@@ -8,6 +8,7 @@
 #![allow(clippy::double_must_use)]
 
 mod agent_material;
+mod clone_delivery;
 mod codex_central;
 mod credential;
 mod skill_archive;

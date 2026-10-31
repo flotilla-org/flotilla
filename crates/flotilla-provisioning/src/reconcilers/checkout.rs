@@ -12,8 +12,8 @@ use flotilla_resources::checkout_integration::{checkout_observation_lacks_convoy
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::{
     convoy_sanctions_checkout_reclaim, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
-    CheckoutStatus, CheckoutStatusPatch, Clock, Clone, CloneFailurePolicy, ClonePhase, Convoy, ConvoyPhase, Forge, IntegrationCondition,
-    LifecycleAuthority, ObjectEvent, Resource, ResourceError, ResourceObject, ResourceProvenance, SystemClock,
+    CheckoutStatus, CheckoutStatusPatch, Clock, Clone, CloneCredentials, CloneFailurePolicy, ClonePhase, Convoy, ConvoyPhase, Forge,
+    IntegrationCondition, LifecycleAuthority, ObjectEvent, Resource, ResourceError, ResourceObject, ResourceProvenance, SystemClock,
     ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, FORCE_TEARDOWN_ANNOTATION,
 };
 use flotilla_store::{
@@ -139,6 +139,8 @@ pub trait CheckoutRuntime: Send + Sync {
     ) -> Result<PreparedCheckout, CheckoutMaterialisationError> {
         self.create_worktree(clone_path, branch, base_ref, target_path).await.map_err(Into::into)
     }
+    /// `credentials` are the grants covering the repository, delivered into
+    /// the environment before Git runs (#4218).
     async fn create_fresh_clone_in(
         &self,
         _env_ref: &str,
@@ -146,6 +148,7 @@ pub trait CheckoutRuntime: Send + Sync {
         branch: &str,
         base_ref: Option<&str>,
         target_path: &str,
+        _credentials: &CloneCredentials,
     ) -> Result<PreparedCheckout, String> {
         self.create_fresh_clone(repo_url, branch, base_ref, target_path).await
     }
@@ -658,16 +661,29 @@ where
                     Err(CheckoutMaterialisationError::Creation(error)) => CheckoutPrepared::Failed(error),
                 })
             }
-            CheckoutSpec::FreshClone(spec) => Ok(
-                match self
-                    .runtime
-                    .create_fresh_clone_in(&spec.env_ref, &spec.url, &spec.r#ref, spec.base_ref.as_deref(), &spec.target_path)
-                    .await
-                {
-                    Ok(prepared) => CheckoutPrepared::Ready { prepared },
-                    Err(err) => CheckoutPrepared::Failed(err),
-                },
-            ),
+            CheckoutSpec::FreshClone(spec) => {
+                let credentials = match CloneCredentials::from_annotations(&obj.metadata.annotations) {
+                    Ok(credentials) => credentials,
+                    Err(message) => return Ok(CheckoutPrepared::Failed(message)),
+                };
+                Ok(
+                    match self
+                        .runtime
+                        .create_fresh_clone_in(
+                            &spec.env_ref,
+                            &spec.url,
+                            &spec.r#ref,
+                            spec.base_ref.as_deref(),
+                            &spec.target_path,
+                            &credentials,
+                        )
+                        .await
+                    {
+                        Ok(prepared) => CheckoutPrepared::Ready { prepared },
+                        Err(err) => CheckoutPrepared::Failed(err),
+                    },
+                )
+            }
             // Observed checkouts are facts from the observed-resource backend.
             // The managed checkout reconciler must not actuate or patch them.
             CheckoutSpec::Observed(_) => Ok(CheckoutPrepared::None),

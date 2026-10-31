@@ -129,6 +129,7 @@ use recovery_scenario::*;
 use terminal_support::*;
 
 mod adopted_checkouts;
+mod clone_credentials;
 mod clone_reads;
 mod convoy_lifecycle;
 mod credential_delivery;
