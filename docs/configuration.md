@@ -606,8 +606,8 @@ span; valid unsampled context still supplies IDs for logs.
 
 The `otel_trace` daemon test runs the two-home router scenario with an in-memory
 exporter and checks connected spans and their JSON log IDs. **Operator, after
-the roll:** send one message across hosts, find its trace in VictoriaTraces,
-and confirm its linked log lines in VictoriaLogs through Alloy.
+the roll:** send one message across hosts, find its trace in the tracing
+backend, and confirm its linked log lines in the log backend.
 
 ## Daemon logging
 
