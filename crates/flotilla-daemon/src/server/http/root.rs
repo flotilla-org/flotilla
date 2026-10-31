@@ -8,7 +8,7 @@ use axum::{
     Extension,
 };
 use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE;
-use flotilla_resources::{FleetDesignation, FLEET_DESIGNATION_NAME};
+use flotilla_resources::{FleetDesignation, ResourceError, FLEET_DESIGNATION_NAME};
 use serde::Serialize;
 
 use super::{wire, CallerAuth, HttpRouter, RouterState};
@@ -47,14 +47,27 @@ struct Root {
 
 /// The fleet's name, from the replicated designation; unnamed until that record exists.
 async fn fleet(state: &HttpRouter) -> Option<String> {
-    let designation =
-        state.backend.definitions::<FleetDesignation>(DEFAULT_PROVISIONING_NAMESPACE).get(FLEET_DESIGNATION_NAME).await.ok()?;
-    designation.spec.fleet.filter(|fleet| !fleet.trim().is_empty())
+    match state.backend.definitions::<FleetDesignation>(DEFAULT_PROVISIONING_NAMESPACE).get(FLEET_DESIGNATION_NAME).await {
+        Ok(designation) => designation.spec.fleet.filter(|fleet| !fleet.trim().is_empty()),
+        Err(ResourceError::NotFound { .. }) => None,
+        Err(error) => {
+            tracing::warn!(%error, "reading the FleetDesignation for the root document failed; serving it unnamed");
+            None
+        }
+    }
 }
 
-/// The configured prefix, else the default under the fleet's name; none while the fleet is unnamed.
+/// The configured prefix, else the default under the fleet's name (percent-encoded as one path
+/// segment); none while the fleet is unnamed or the configured prefix is empty.
 fn link_prefix(configured: Option<&str>, fleet: Option<&str>) -> Option<String> {
-    let prefix = configured.map(str::to_owned).or_else(|| fleet.map(|fleet| format!("{DEFAULT_LINK_PREFIX_HOST}/{fleet}")))?;
+    let prefix = match configured.map(|prefix| prefix.trim_end_matches('/')).filter(|prefix| !prefix.is_empty()) {
+        Some(prefix) => prefix.to_owned(),
+        None => {
+            let mut url = url::Url::parse(DEFAULT_LINK_PREFIX_HOST).expect("the default host is a URL");
+            url.path_segments_mut().expect("an https URL has path segments").push(fleet?);
+            url.into()
+        }
+    };
     Some(prefix.trim_end_matches('/').to_owned())
 }
 
@@ -99,7 +112,7 @@ pub(super) async fn handle(
     if chosen == "text/html" {
         // flotillad does not render pages: send a browser where they are rendered, else the JSON.
         if let Some(prefix) = &link_prefix {
-            return Redirect::temporary(prefix).into_response();
+            return with_vary(Redirect::temporary(prefix).into_response());
         }
     }
     let encoding = if matches!(chosen, ROOT_CBOR | "application/cbor") { wire::Encoding::Cbor } else { wire::Encoding::Json };
@@ -111,15 +124,29 @@ pub(super) async fn handle(
         links: links(&state),
     };
     let mut response = encoding.render(StatusCode::OK, root);
-    let content_type = match chosen {
-        ROOT_JSON | ROOT_CBOR => chosen,
-        _ => return with_vary(response),
-    };
-    response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    if matches!(chosen, ROOT_JSON | ROOT_CBOR) {
+        response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(chosen));
+    }
     with_vary(response)
 }
 
 fn with_vary(mut response: Response) -> Response {
     response.headers_mut().insert(header::VARY, HeaderValue::from_static("Accept"));
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_prefix_defaults_under_the_encoded_fleet_and_ignores_an_empty_configuration() {
+        assert_eq!(link_prefix(None, Some("flotilla")).as_deref(), Some("https://flotilla.work/flotilla"));
+        assert_eq!(link_prefix(None, Some("a b/c?d#e")).as_deref(), Some("https://flotilla.work/a%20b%2Fc%3Fd%23e"));
+        assert_eq!(link_prefix(None, None), None);
+        for empty in ["", "/", "//"] {
+            assert_eq!(link_prefix(Some(empty), Some("f")).as_deref(), Some("https://flotilla.work/f"));
+        }
+        assert_eq!(link_prefix(Some("https://x.example/p/"), None).as_deref(), Some("https://x.example/p"));
+    }
 }

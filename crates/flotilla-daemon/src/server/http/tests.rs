@@ -840,5 +840,14 @@ async fn root_document_has_a_cbor_twin() {
     let reply = daemon.call(CallerAuth::Bearer, get_accepting("/", "application/vnd.flotilla.root+cbor")).await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.headers[header::CONTENT_TYPE], "application/vnd.flotilla.root+cbor");
-    assert!(!reply.body.is_empty());
+    let root: serde_json::Value = flotilla_cbor::from_slice(&reply.body, &super::wire::LIMITS).expect("CBOR root document");
+    assert_eq!(rels(&root), ["tables"]);
+    assert_eq!(root["build_id"], flotilla_daemon_api::build_info::build_id());
+}
+
+#[tokio::test]
+async fn root_document_refuses_an_unacceptable_accept() {
+    let daemon = Incarnation::new();
+    let reply = daemon.call(CallerAuth::Bearer, get_accepting("/", "image/png")).await;
+    assert_eq!(reply.status, StatusCode::NOT_ACCEPTABLE);
 }
