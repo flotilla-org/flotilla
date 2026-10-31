@@ -65,7 +65,8 @@ pub enum ParamType {
     Bool,
     /// One of the declared options.
     Enum,
-    /// The address of a subject of this ADR 0066 kind.
+    /// The address of a subject of this ADR 0066 kind. The route checks only that the address
+    /// parses and names this kind; the verb resolves it and answers when no such subject exists.
     Subject(&'static str),
 }
 

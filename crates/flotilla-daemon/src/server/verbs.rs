@@ -39,7 +39,7 @@ fn presentations() -> Vec<Presentation> {
 /// The verb route over the daemon's resources, or over a bare backend in resource-handler tests.
 pub(crate) fn builtin(backend: ResourceBackend, daemon: Option<Arc<InProcessDaemon>>) -> Verbs {
     let subjects = Arc::new(convoy::ResourceSubjects::new(backend, daemon.clone()));
-    Verbs { catalog: Catalog::new(natives(daemon), presentations(), subjects.as_ref()), subjects }
+    Verbs { catalog: Catalog::new(natives(daemon), presentations(), subjects.as_ref()), subjects, policy: invoke::allow_all }
 }
 
 impl Verbs {

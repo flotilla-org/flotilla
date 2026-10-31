@@ -1,20 +1,16 @@
 //! `POST /verbs/{name}` (#4182 ruling 6): one invocation of a native verb, answered with an
 //! outcome per subject. The caller is the router's caller identity, named on the invocation's
 //! span.
-use axum::{
-    body::Bytes,
-    extract::{Path, State},
-    http::StatusCode,
-    response::Response,
-    Extension,
-};
+use std::sync::Arc;
+
+use axum::{body::Bytes, extract::Path, http::StatusCode, response::Response, Extension};
 use flotilla_protocol::verbs::Invocation;
 
-use super::{wire::Encoding, CallerAuth, RouterState};
-use crate::server::verbs::Refusal;
+use super::{wire::Encoding, CallerAuth};
+use crate::server::verbs::{Refusal, Verbs};
 
 pub(super) async fn invoke(
-    State(RouterState(state)): State<RouterState>,
+    Extension(verbs): Extension<Arc<Verbs>>,
     Extension(caller): Extension<CallerAuth>,
     Path(name): Path<String>,
     body: Bytes,
@@ -27,7 +23,6 @@ pub(super) async fn invoke(
         Ok(request) => request,
         Err(error) => return Encoding::Json.error_code(StatusCode::BAD_REQUEST, "invalid_request", error.to_string()),
     };
-    let verbs = state.verbs.as_ref().expect("the router fills in its verbs");
     match verbs.invoke(&caller.principal(), &name, request).await {
         Ok(invoked) => Encoding::Json.render(StatusCode::OK, invoked),
         Err(Refusal::UnknownVerb(name)) => Encoding::Json.error_code(StatusCode::NOT_FOUND, "not_found", format!("no verb `{name}`")),

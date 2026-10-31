@@ -84,7 +84,8 @@ pub(in crate::server) struct HttpRouter {
     hooks: HookEndpoint,
     /// Where `GET /` sends a browser (`[web] link_prefix`); unset means the fleet default.
     link_prefix: Option<String>,
-    /// The verb route; the built-in verbs over `backend` and `daemon` unless a test supplies its own.
+    /// The verb route's verbs; the built-in verbs over `backend` and `daemon` unless a test
+    /// supplies its own. Building the router hands them to the route.
     verbs: Option<Arc<Verbs>>,
     /// Tables derived from code (`verbs`), filled in when the router is built.
     #[builder(skip)]
@@ -163,7 +164,7 @@ impl HttpRouter {
     }
 
     pub(in crate::server) fn into_router(mut self) -> Router {
-        let verbs = self.verbs.get_or_insert_with(|| Arc::new(verbs::builtin(self.backend.clone(), self.daemon.clone())));
+        let verbs = self.verbs.take().unwrap_or_else(|| Arc::new(verbs::builtin(self.backend.clone(), self.daemon.clone())));
         self.derived = vec![Arc::new(verbs.tables())];
         Router::new()
             .route("/", get(root::handle))
@@ -172,7 +173,7 @@ impl HttpRouter {
             .route("/tables", get(table_api::list))
             .route("/tables/{table}", get(table_api::describe))
             .route("/tables/{table}/rows", get(table_api::rows))
-            .route("/verbs/{name}", post(verb_api::invoke))
+            .route("/verbs/{name}", post(verb_api::invoke).layer(Extension(verbs)))
             .route(LOGIN_CODES_PATH, post(mint_login_code))
             .route(LOGIN_PATH, get(login))
             .route(LOGOUT_PATH, post(logout))

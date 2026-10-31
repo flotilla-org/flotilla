@@ -31,6 +31,7 @@ use crate::server::{
     tables,
     verbs::{
         catalog::{Catalog, NativeVerb, Picks, Presentation, Subject, Subjects},
+        invoke::{allow_all, FIELD_LIMIT},
         Verbs,
     },
 };
@@ -43,7 +44,7 @@ use span_exporter::InMemorySpanExporter;
 /// subject once per invocation id, so a repeat runs again and changes nothing.
 #[derive(Verb)]
 #[verb(name = "convoy.touch", subject = "convoy", effect = "write", invocation)]
-#[allow(dead_code)]
+#[expect(dead_code, reason = "only its derived declaration is used")]
 struct Touch {
     #[param(text)]
     note: Option<String>,
@@ -111,7 +112,7 @@ fn fixture() -> Fixture {
         vec![presentation],
         subjects.as_ref(),
     );
-    let verbs = Verbs { catalog, subjects };
+    let verbs = Verbs { catalog, subjects, policy: allow_all };
     let router = HttpRouter::builder()
         .backend(ResourceBackend::new(InMemoryBackend::default()))
         .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
@@ -243,8 +244,9 @@ fn attribute(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Option<Str
 }
 
 // Behaviour (#4197): the intent record is the `verb.invocation` span. It carries the caller,
-// verb, subjects, params, invocation id and each subject's outcome, and the verb's own spans nest
-// under it. A request refused whole carries its refusal instead.
+// verb, subjects, params, invocation id and each subject's outcome (without the verb's `result`),
+// and the verb's own spans nest under it. A request refused whole carries its refusal instead,
+// and a long parameter is cut to the field limit.
 #[tokio::test]
 async fn the_invocation_span_records_the_intent_and_the_outcomes() {
     let exporter = InMemorySpanExporter::default();
@@ -265,6 +267,9 @@ async fn the_invocation_span_records_the_intent_and_the_outcomes() {
     assert_eq!(body["outcomes"][1], json!({"subject": missing, "status": "failed", "error": format!("no convoy at `{missing}`")}));
     let (status, _) = invoke(&router, CallerAuth::Socket(None), "convoy.touch", json!({"invocation": "bad", "subjects": []})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    let long = json!({"invocation": "long", "subjects": [RUNNING], "params": {"note": "é".repeat(FIELD_LIMIT)}});
+    let (status, _) = invoke(&router, CallerAuth::Bearer, "convoy.touch", long).await;
+    assert_eq!(status, StatusCode::OK);
     provider.force_flush().unwrap();
     let spans = exporter.get_finished_spans().unwrap();
     let invocation = |id: &str| {
@@ -279,13 +284,17 @@ async fn the_invocation_span_records_the_intent_and_the_outcomes() {
     assert_eq!(attribute(span, "verb.subjects").map(|text| serde_json::from_str::<Value>(&text).unwrap()), Some(json!([RUNNING, missing])));
     assert_eq!(attribute(span, "verb.params").map(|text| serde_json::from_str::<Value>(&text).unwrap()), Some(json!({"note": "why"})));
     let outcomes: Value = serde_json::from_str(&attribute(span, "verb.outcomes").expect("outcomes")).unwrap();
-    assert_eq!(outcomes, body["outcomes"]);
+    let mut expected = body["outcomes"].clone();
+    assert!(expected[0].as_object_mut().unwrap().remove("result").is_some());
+    assert_eq!(outcomes, expected);
     let effect = spans.iter().find(|span| span.name == "convoy.touch.effect").expect("the verb's span");
     assert_eq!(effect.parent_span_id, span.span_context.span_id(), "the verb's spans nest under the invocation");
     let refused = invocation("bad");
     assert_eq!(attribute(refused, "verb.caller").as_deref(), Some("socket"));
     assert!(attribute(refused, "verb.refusal").expect("refusal").contains("at least one subject"));
     assert_eq!(attribute(refused, "verb.outcomes"), None);
+    let params = attribute(invocation("long"), "verb.params").expect("params");
+    assert!(params.len() <= FIELD_LIMIT && params.ends_with('…'), "{} bytes", params.len());
     provider.shutdown().unwrap();
 }
 

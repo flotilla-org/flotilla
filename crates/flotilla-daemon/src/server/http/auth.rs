@@ -47,7 +47,7 @@ impl CallerAuth {
 
     /// Who the caller is, as the `verb.invocation` span names it (#4182 ruling 6): the main socket's
     /// user by uid, the bearer-token holder, a browser session, an environment or a hook's
-    /// terminal.
+    /// terminal. Every holder of the daemon's one bearer token is the same `bearer`.
     pub(super) fn principal(&self) -> String {
         match self {
             Self::Socket(Some(peer)) => format!("socket:uid={}", peer.uid()),

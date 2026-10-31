@@ -1,11 +1,11 @@
 //! A verb's `when` (#4182 ruling 3): conditions over a row's columns that must all hold, in the
 //! grammar of a table read's `where` (`.status.phase != Landed`). The client evaluates them from
 //! the row's cells; the route re-checks them against the subject's current row.
-use std::cmp::Ordering;
-
 use flotilla_address::{Operator, Template};
 use flotilla_protocol::table::Row;
 use serde_json::Value;
+
+use crate::server::tables::holds;
 
 /// One parsed condition: the column it reads, compared with a literal.
 #[derive(Debug, Clone, PartialEq)]
@@ -36,31 +36,6 @@ impl Condition {
     /// holds of it.
     pub(crate) fn holds(&self, row: &Row) -> bool {
         holds(row.get(&self.column).unwrap_or(&Value::Null), self.operator, &self.literal)
-    }
-}
-
-/// Whether `cell` compares as `operator` with `literal`: numerically when both are numbers, by
-/// text otherwise.
-pub(crate) fn holds(cell: &Value, operator: Operator, literal: &str) -> bool {
-    let order = match cell {
-        Value::Null => return operator == Operator::NotEqual,
-        Value::Number(number) => match (number.as_f64(), literal.parse::<f64>()) {
-            (Some(number), Ok(literal)) => number.partial_cmp(&literal),
-            _ => Some(number.to_string().as_str().cmp(literal)),
-        },
-        // Booleans have no order.
-        Value::Bool(flag) => matches!(operator, Operator::Equal | Operator::NotEqual).then(|| flag.to_string().as_str().cmp(literal)),
-        Value::String(text) => Some(text.as_str().cmp(literal)),
-        Value::Array(_) | Value::Object(_) => None,
-    };
-    let Some(order) = order else { return operator == Operator::NotEqual };
-    match operator {
-        Operator::Equal => order == Ordering::Equal,
-        Operator::NotEqual => order != Ordering::Equal,
-        Operator::LessThan => order == Ordering::Less,
-        Operator::LessThanOrEqual => order != Ordering::Greater,
-        Operator::GreaterThan => order == Ordering::Greater,
-        Operator::GreaterThanOrEqual => order != Ordering::Less,
     }
 }
 

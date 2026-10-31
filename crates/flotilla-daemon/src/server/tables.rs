@@ -1,7 +1,6 @@
 //! Carrier-neutral table reads. Sources lower conditions; paging and live reconciliation
 //! have one implementation shared by every carrier and both storage adapters.
 mod decided;
-use crate::server::verbs::when;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use flotilla_address::{Operator, Template};
 use flotilla_protocol::table::{Message, Row};
@@ -606,12 +605,13 @@ impl TableSource {
                     .iter()
                     .filter(|row| {
                         query.filter.iter().all(|condition| {
-                            when::holds(row.get(&condition.field).unwrap_or(&Value::Null), condition.operator, &condition.literal)
+                            holds(row.get(&condition.field).unwrap_or(&Value::Null), condition.operator, &condition.literal)
                         })
                     })
                     .cloned()
                     .collect();
-                // Derived rows change only with the daemon, so one snapshot serves its life.
+                // Derived rows change only with the daemon, so one snapshot serves its life. A catalog
+                // that reloads (verbs from `verbs/*.yaml`, #4198) needs events here.
                 Ok(Snapshot { rows, sequence: 1, incarnation: "derived".into(), start: WatchStart::Now })
             }
         }
@@ -1132,6 +1132,32 @@ mod properties {
         assert_eq!(seen, expected);
     }
 }
+/// Whether `cell` compares as `operator` with `literal`, as a `where` condition and a verb's
+/// `when` both compare: numerically when both are numbers, by text otherwise. A null cell, or one
+/// with no order for the operator, satisfies only `!=`.
+pub(crate) fn holds(cell: &Value, operator: Operator, literal: &str) -> bool {
+    let order = match cell {
+        Value::Null => return operator == Operator::NotEqual,
+        Value::Number(number) => match (number.as_f64(), literal.parse::<f64>()) {
+            (Some(number), Ok(literal)) => number.partial_cmp(&literal),
+            _ => Some(number.to_string().as_str().cmp(literal)),
+        },
+        // Booleans have no order.
+        Value::Bool(flag) => matches!(operator, Operator::Equal | Operator::NotEqual).then(|| flag.to_string().as_str().cmp(literal)),
+        Value::String(text) => Some(text.as_str().cmp(literal)),
+        Value::Array(_) | Value::Object(_) => None,
+    };
+    let Some(order) = order else { return operator == Operator::NotEqual };
+    match operator {
+        Operator::Equal => order == Ordering::Equal,
+        Operator::NotEqual => order != Ordering::Equal,
+        Operator::LessThan => order == Ordering::Less,
+        Operator::LessThanOrEqual => order != Ordering::Greater,
+        Operator::GreaterThan => order == Ordering::Greater,
+        Operator::GreaterThanOrEqual => order != Ordering::Less,
+    }
+}
+
 pub(crate) fn resource_rows(document: &Value, table: &Table) -> Result<Vec<Row>, String> {
     document["items"]
         .as_array()

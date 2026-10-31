@@ -24,24 +24,35 @@ pub(crate) enum Refusal {
     Conflict(String),
 }
 
-/// Whether a caller may run a verb on a subject (#4182 ruling 6). It allows everything for now.
-pub(crate) fn policy(_caller: &str, _entry: &Entry, _subject: &Address) -> Result<(), String> {
+/// Whether a caller may run a verb on a subject (#4182 ruling 6): `Err` carries the reason a
+/// `refused` outcome gives.
+pub(crate) type Policy = fn(caller: &str, entry: &Entry, subject: &Address) -> Result<(), String>;
+
+/// The policy until ruling 6 decides per caller: everything is allowed.
+pub(crate) fn allow_all(_caller: &str, _entry: &Entry, _subject: &Address) -> Result<(), String> {
     Ok(())
 }
 
-/// The verb route over a catalog and the subjects' rows.
+/// The most text a span field carries. Longer params or outcomes are cut and end in `…`, so a
+/// long text parameter cannot flood the trace and log pipeline.
+pub(crate) const FIELD_LIMIT: usize = 4096;
+
+/// The verb route over a catalog, the subjects' rows and the policy.
 pub(crate) struct Verbs {
     pub catalog: Catalog,
     pub subjects: Arc<dyn Subjects>,
+    pub policy: Policy,
 }
 
 impl Verbs {
     /// Runs one invocation inside its `verb.invocation` span, which is the intent record
     /// (#4197): the caller, verb, subjects, params and invocation id, then each subject's
-    /// outcome or the request's refusal. The verb's own spans nest under it.
+    /// outcome or the request's refusal. The verb's own spans nest under it. A `done` outcome's
+    /// `result` is the verb's answer to the caller, not part of the record, so the span leaves it
+    /// out; params and outcomes are bounded to [`FIELD_LIMIT`].
     pub(crate) async fn invoke(&self, caller: &str, name: &str, request: Invocation) -> Result<Invoked, Refusal> {
         let subjects = Value::from(request.subjects.clone()).to_string();
-        let params = Value::Object(request.params.clone()).to_string();
+        let params = bounded(Value::Object(request.params.clone()).to_string());
         let span = tracing::info_span!(
             "verb.invocation",
             verb.caller = caller,
@@ -55,7 +66,8 @@ impl Verbs {
         let invoked = self.invoke_inner(caller, name, request).instrument(span.clone()).await;
         span.in_scope(|| match &invoked {
             Ok(invoked) => {
-                let outcomes = serde_json::to_string(&invoked.outcomes).unwrap_or_default();
+                let outcomes: Vec<_> = invoked.outcomes.iter().map(|outcome| Outcome { result: None, ..outcome.clone() }).collect();
+                let outcomes = bounded(serde_json::to_string(&outcomes).unwrap_or_default());
                 span.record("verb.outcomes", outcomes.as_str());
                 tracing::info!(outcomes = %outcomes, "verb invoked");
             }
@@ -144,12 +156,25 @@ impl Verbs {
             Ok(None) => return Err(Box::new(Outcome::failed(subject, format!("no {} at `{address}`", entry.declaration.subject)))),
             Err(error) => return Err(Box::new(Outcome::failed(subject, error))),
         };
-        policy(caller, entry, address).map_err(|reason| Box::new(Outcome::refused(subject.clone(), reason)))?;
+        (self.policy)(caller, entry, address).map_err(|reason| Box::new(Outcome::refused(subject.clone(), reason)))?;
         if let Some(failing) = entry.when.iter().find(|condition| !condition.holds(&row)) {
             return Err(Box::new(Outcome::not_applicable(subject, failing.text.clone())));
         }
         Ok(Subject { address: address.clone(), row })
     }
+}
+
+/// `text` cut to at most [`FIELD_LIMIT`] bytes on a character boundary, ending in `…` when cut.
+fn bounded(mut text: String) -> String {
+    if text.len() > FIELD_LIMIT {
+        let mut end = FIELD_LIMIT - '…'.len_utf8();
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push('…');
+    }
+    text
 }
 
 fn outcome(subject: &Subject, ran: Result<Option<Value>, String>) -> Outcome {
