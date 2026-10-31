@@ -43,9 +43,12 @@ def main(repo):
         check=True, capture_output=True, text=True,
     ).stdout
     caches = [json.loads(line) for line in listed.splitlines() if line.strip()]
-    for key in superseded(caches):
+    doomed = superseded(caches)
+    # A zero here with many caches listed means the key shape no longer matches.
+    print(f"{len(caches)} caches listed, {len(doomed)} superseded")
+    for key in doomed:
         print(f"deleting {key}")
-        subprocess.run(["gh", "cache", "delete", key, "--repo", repo], check=True)
+        subprocess.run(["gh", "cache", "delete", key, "--ref", "refs/heads/main", "--repo", repo], check=True)
 
 
 if __name__ == "__main__":

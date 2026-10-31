@@ -503,9 +503,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: v1-rust-${{ steps.rust-pin.outputs.version }}
-          # Disabling the environment hash also disables rust-cache's lockfile
-          # hash. Include input content in shared-key (which overrides key)
-          # so main can save a fresh immutable cache when inputs change.
+          # rust-cache's key hashes only the lockfile and manifests. Include
+          # the other inputs' content in shared-key (which overrides key) so
+          # main can save a fresh immutable cache when any of them change.
           shared-key: quint-engine-${{ hashFiles('.github/workflows/ci.yml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/config.toml', 'ci/quint/**', 'specs/primitives/*conformance.sh', 'specs/primitives/check.sh') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/download-artifact@v4
@@ -533,9 +533,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: v1-rust-${{ steps.rust-pin.outputs.version }}
-          # Disabling the environment hash also disables rust-cache's lockfile
-          # hash. Include input content in shared-key (which overrides key)
-          # so main can save a fresh immutable cache when inputs change.
+          # rust-cache's key hashes only the lockfile and manifests. Include
+          # the other inputs' content in shared-key (which overrides key) so
+          # main can save a fresh immutable cache when any of them change.
           shared-key: quint-store-${{ hashFiles('.github/workflows/ci.yml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/config.toml', 'ci/quint/**', 'specs/primitives/*conformance.sh', 'specs/primitives/check.sh') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/download-artifact@v4
