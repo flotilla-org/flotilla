@@ -1736,7 +1736,7 @@ fn placement_strategy(spec: &FulfilmentKindSpec) -> PlacementStrategy {
             PlacementStrategy::DockerHostCheckoutAndMount { host_ref, pool, image: image.clone() }
         }
         // The guest's root comes from the frozen decision.
-        FulfilmentRealisation::CloudSandboxPerVessel { image } => {
+        FulfilmentRealisation::CloudSandboxPerVessel { image, .. } => {
             PlacementStrategy::CloneInVessel { host_ref: String::new(), pool, image: image.clone(), clone_path: String::new() }
         }
     }
@@ -1815,11 +1815,15 @@ fn cloud_environment_spec(
     let address = flotilla_address::Address::root(flotilla_address::Kind::Account, instance)
         .and_then(|account| account.child(flotilla_address::Kind::Provider, instance))
         .map_err(|error| error.to_string())?;
+    let size = match &placement.kind.spec.realisation {
+        FulfilmentRealisation::CloudSandboxPerVessel { size: Some(size), .. } => size.clone(),
+        _ => realisation_settings::CLOUD_SANDBOX_SIZE,
+    };
     Ok(EnvironmentSpec {
         provider_address: Some(address),
         cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
             image: image.to_owned(),
-            size: realisation_settings::CLOUD_SANDBOX_SIZE,
+            size,
             lifetime_cap_seconds: None,
             probe_needs,
             env: BTreeMap::new(),
@@ -2304,14 +2308,14 @@ mod tests {
     }
 
     // #3981: a cloud vessel's Environment names its frozen provider instance and carries
-    // typed inputs only: no Docker spec, nothing in its env, and the constant size.
+    // typed inputs only: no Docker spec, nothing in its env, and the policy's size.
     #[test]
     fn cloud_environment_is_typed_provider_input() {
         use super::{cloud_environment_spec, Placement};
         let spec = FulfilmentKindSpec::builder()
             .host_ref(String::new())
             .pool("cleat".into())
-            .realisation(FulfilmentRealisation::CloudSandboxPerVessel { image: "image@sha256:digest".into() })
+            .realisation(FulfilmentRealisation::CloudSandboxPerVessel { image: "image@sha256:digest".into(), size: None })
             .build();
         let kind: flotilla_resources::ResourceObject<FulfilmentKind> = serde_json::from_value(serde_json::json!({
             "metadata": { "name": "cloud", "namespace": "flotilla", "resource_version": "1", "annotations": {}, "labels": {},
@@ -2334,8 +2338,16 @@ mod tests {
         );
         let cloud = spec.cloud_sandbox.unwrap();
         assert_eq!(cloud.probe_needs, needs);
-        assert_eq!(cloud.size, flotilla_resources::realisation_settings::CLOUD_SANDBOX_SIZE);
+        assert_eq!(cloud.size, flotilla_resources::realisation_settings::CLOUD_SANDBOX_SIZE, "no policy size falls back to the default");
         assert!(cloud.env.is_empty());
+
+        let policy_size = flotilla_resources::CloudSandboxSize { cpus: 4, memory_bytes: 8 << 30, disk_bytes: 10 << 30 };
+        let mut sized_kind = placement.kind;
+        sized_kind.spec.realisation =
+            FulfilmentRealisation::CloudSandboxPerVessel { image: "image@sha256:digest".into(), size: Some(policy_size.clone()) };
+        let sized = Placement { kind: sized_kind, instance: Some("daytona".into()) };
+        let spec = cloud_environment_spec(&sized, "image@sha256:digest", needs).expect("a typed spec");
+        assert_eq!(spec.cloud_sandbox.unwrap().size, policy_size);
     }
 
     #[test]
