@@ -6,6 +6,12 @@ use tokio::{
     time::timeout,
 };
 
+#[cfg(unix)]
+#[path = "common/links.rs"]
+mod links;
+#[cfg(unix)]
+use links::Links;
+
 // Scenarios use only Tender and host controls. A transport adapter can run
 // the same suite by providing a new rig without duplicating expectations.
 trait HostControls {
@@ -51,7 +57,7 @@ struct Rig {
     host: Box<dyn HostControls>,
     host_id: Fingerprint,
     #[cfg(unix)]
-    _server: Option<(tender::ssh::Server, tempfile::TempDir)>,
+    _server: Option<(Vec<tender::ssh::Server>, tempfile::TempDir)>,
 }
 
 fn memory() -> Rig {
@@ -91,22 +97,57 @@ async fn local_adapter() -> Rig {
     let host = MemoryTender::new(host_id.clone());
     let endpoint = directory.path().join("tender");
     let server = tender::ssh::Server::bind(endpoint.clone(), host_identity, host.clone()).expect("Tender listener");
-    let names = [
-        "host-user",
-        "laptop",
-        "container-key",
-        "parent",
-        "outsider",
-        "owner",
-        "consumer",
-        "contender",
-        "first-helper",
-        "second-helper",
-        "kept",
-        "removed",
-    ];
-    let adapter = tender::ssh::SshTender::new(endpoint, host_id.clone(), names.into_iter().map(identity).collect()).expect("adapter");
-    Rig { tender: Box::new(adapter), host: Box::new(host), host_id, _server: Some((server, directory)) }
+    let adapter = tender::ssh::SshTender::new(endpoint, host_id.clone(), CALLERS.into_iter().map(identity).collect()).expect("adapter");
+    Rig { tender: Box::new(adapter), host: Box::new(host), host_id, _server: Some((vec![server], directory)) }
+}
+
+#[cfg(unix)]
+const CALLERS: [&str; 15] = [
+    "host-user",
+    "laptop",
+    "container-key",
+    "parent",
+    "outsider",
+    "owner",
+    "consumer",
+    "contender",
+    "first-helper",
+    "second-helper",
+    "kept",
+    "removed",
+    "roaming-key",
+    "home-client",
+    "relay-key",
+];
+
+// Every caller reaches the host through the same dialer: directly, or through
+// a relay its session names. The host trusts `relay-key` but not `impostor`;
+// both relays admit every caller and forward to the host.
+#[cfg(unix)]
+async fn relayed_adapter() -> Rig {
+    use std::{os::unix::fs::PermissionsExt, sync::Arc};
+    let directory = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("private directory");
+    let host_identity = identity("host-key");
+    let host_id = host_identity.fingerprint();
+    let host = MemoryTender::new(host_id.clone());
+    let relays = ["relay-key", "impostor"];
+    let mut paths = std::collections::BTreeMap::from([(host_id.clone(), directory.path().join("host"))]);
+    for relay in relays {
+        paths.insert(fp(relay), directory.path().join(relay));
+    }
+    let links = Arc::new(Links { paths: Arc::new(paths), next: std::collections::BTreeMap::from([(host_id.clone(), host_id.clone())]) });
+    let mut servers = vec![tender::ssh::Server::bind(links.paths[&host_id].clone(), host_identity, host.clone()).expect("host listener")];
+    for relay in relays {
+        let policy = MemoryTender::new(fp(relay));
+        for caller in CALLERS {
+            policy.allow_connect(fp(caller)).expect("relay policy");
+        }
+        let server = tender::ssh::Server::bind(links.paths[&fp(relay)].clone(), identity(relay), policy).expect("relay listener");
+        server.route_relays(links.clone());
+        servers.push(server);
+    }
+    let adapter = tender::ssh::SshTender::with_dial(links, host_id.clone(), CALLERS.into_iter().map(identity).collect()).expect("adapter");
+    Rig { tender: Box::new(adapter), host: Box::new(host), host_id, _server: Some((servers, directory)) }
 }
 
 fn ns(value: &str) -> Namespace {
@@ -417,7 +458,7 @@ macro_rules! contract {
 
 contract!(existing_service_on_ssh_host);
 contract!(scoped_container_publisher);
-// Authenticated intermediary routing belongs to slice 3; this adapter refuses it.
+// The direct socket rig has no relay to name, so it runs only where one exists.
 mod roaming_via_pinned_intermediary {
     #[tokio::test]
     async fn run() {
@@ -425,11 +466,8 @@ mod roaming_via_pinned_intermediary {
     }
     #[cfg(unix)]
     #[tokio::test]
-    async fn local_socket_refuses_intermediary() {
-        let rig = super::local_adapter().await;
-        let mut client = super::session("consumer", &rig.host_id);
-        client.via = Some(super::fp("relay-key"));
-        assert_eq!(rig.tender.browse(&client).await, Err(super::Error::UntrustedIntermediary));
+    async fn relayed() {
+        super::roaming_via_pinned_intermediary(super::relayed_adapter().await).await;
     }
 }
 contract!(lifecycle_and_stale_teardown);
