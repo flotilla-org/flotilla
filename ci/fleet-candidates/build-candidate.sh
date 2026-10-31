@@ -65,6 +65,7 @@ build_typescript_host() {
     export COREPACK_HOME="$scratch/corepack"
     cd "$drydock_root/hosts/typescript"
     corepack pnpm install --frozen-lockfile
+    rm -f flotilla-drydock-host-typescript-*.tgz
     corepack pnpm pack:companion
     archives=(flotilla-drydock-host-typescript-*.tgz)
     [[ "${#archives[@]}" == 1 && -f "${archives[0]}" ]] \
