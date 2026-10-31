@@ -67,6 +67,14 @@ CANARY_PAYLOAD = {
 # validates. Remove from the tolerance (move to REQUIRED_PAYLOAD) one roll
 # after every installed generation carries it.
 PRODUCED_PAYLOAD = {"bin/drydock-host"}
+# drydock's TypeScript host: an executable wrapper beside flotillad (where the
+# embedded drydock finds `drydock-host-typescript`) and the tree it runs, with
+# production dependencies installed and no symlinks. Required at production,
+# tolerated at consumption for health rollback, like `bin/drydock-host`; the
+# wrapper is a script, so it is not a Darwin signing target.
+TYPESCRIPT_HOST_WRAPPER = "bin/drydock-host-typescript"
+TYPESCRIPT_HOST_TREE = "share/flotilla/drydock-host-typescript"
+TYPESCRIPT_HOST_ENTRIES = {f"{TYPESCRIPT_HOST_TREE}/dist/main.js", f"{TYPESCRIPT_HOST_TREE}/package.json"}
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 GENERATION_PATTERN = re.compile(r"^(\d{8}T\d{6}Z-r\d+-f([0-9a-f]{12})-c([0-9a-f]{12}))$")
@@ -400,9 +408,11 @@ def allowed_payload(path, platform=None):
     # Optional for prior-generation rollback; the producer always ships these.
     if path in {"bin/flotilla-vessel", "bin/drydock-agent"}:
         return platform.startswith("linux-")
-    if path in REQUIRED_PAYLOAD or path in CANARY_PAYLOAD or path in PRODUCED_PAYLOAD:
+    if path in REQUIRED_PAYLOAD or path in CANARY_PAYLOAD or path in PRODUCED_PAYLOAD or path == TYPESCRIPT_HOST_WRAPPER:
         return True
     pure = PurePosixPath(path)
+    if path.startswith(TYPESCRIPT_HOST_TREE + "/"):
+        return all(part not in ("", ".", "..") for part in path.split("/"))
     library = (len(pure.parts) == 2 and pure.parts[0] == "lib"
                and (pure.suffix == ".dylib" or pure.name.endswith(".so") or ".so." in pure.name))
     if platform == "darwin-aarch64" and library:
@@ -564,6 +574,35 @@ def validate_produced_payload(bundle):
         path = Path(bundle) / rel
         if not path.is_file() or not os.access(path, os.X_OK):
             raise ValidationError(f"bundle is missing executable {rel}")
+    validate_typescript_host(bundle)
+
+
+def validate_typescript_host_paths(paths):
+    """A generation carrying any of the TypeScript host carries all of it."""
+    paths = set(paths)
+    present = TYPESCRIPT_HOST_WRAPPER in paths or any(path.startswith(TYPESCRIPT_HOST_TREE + "/") for path in paths)
+    if present and not ({TYPESCRIPT_HOST_WRAPPER} | TYPESCRIPT_HOST_ENTRIES).issubset(paths):
+        raise ValidationError("incomplete drydock TypeScript host payload")
+
+
+def validate_typescript_host(bundle):
+    """Refuse a freshly assembled bundle whose TypeScript host cannot run."""
+    bundle = Path(bundle)
+    wrapper = bundle / TYPESCRIPT_HOST_WRAPPER
+    if not wrapper.is_file() or not os.access(wrapper, os.X_OK):
+        raise ValidationError(f"bundle is missing executable {TYPESCRIPT_HOST_WRAPPER}")
+    tree = bundle / TYPESCRIPT_HOST_TREE
+    for rel in sorted(TYPESCRIPT_HOST_ENTRIES):
+        if not (bundle / rel).is_file():
+            raise ValidationError(f"bundle is missing {rel}")
+    if not (tree / "node_modules").is_dir():
+        raise ValidationError("drydock TypeScript host has no installed production dependencies")
+    for path in tree.rglob("*"):
+        if path.is_symlink():
+            raise ValidationError(f"drydock TypeScript host entry is a symlink: {path.relative_to(bundle)}")
+        # The tree is pure JS: Darwin signing covers no native code inside it.
+        if path.suffix == ".node":
+            raise ValidationError(f"drydock TypeScript host carries native code: {path.relative_to(bundle)}")
 
 
 def validate_codex_home_template(root):
@@ -863,6 +902,9 @@ def validate_release(root, outer, platform):
     if codex_home.exists():
         validate_codex_home_template(codex_home)
     binaries = {"bin/flotilla", "bin/flotillad", "bin/cleat"} | (expected & ({"bin/flotilla-vessel", "bin/drydock-agent"} | PRODUCED_PAYLOAD))
+    validate_typescript_host_paths(expected)
+    if TYPESCRIPT_HOST_WRAPPER in expected:
+        binaries = binaries | {TYPESCRIPT_HOST_WRAPPER}
     for rel in binaries:
         if not os.access(root / rel, os.X_OK):
             raise ValidationError(f"release binary is not executable: {rel}")
@@ -880,6 +922,7 @@ def validate_fixture(path):
     payload = fixture.get("payload", sorted(REQUIRED_PAYLOAD))
     if not REQUIRED_PAYLOAD.issubset(payload) or any(not allowed_payload(item) for item in payload):
         raise ValidationError("unexpected or missing payload")
+    validate_typescript_host_paths(payload)
     validate_skill_bundle(fixture["skill_bundle"], sources)
 
 
@@ -1203,6 +1246,20 @@ def refresh_darwin_payload(source, destination):
     files += [Path(p) for p in sorted(PRODUCED_PAYLOAD) if (source / p).exists()]
     files += [path.relative_to(source) for path in (source / "lib").rglob("*") if path.is_file()]
     expected = set(files)
+    typescript = Path(TYPESCRIPT_HOST_TREE)
+    # Absent from generations built before it shipped. The wrapper finds its tree
+    # relative to itself, so the stable root carries both. Rolling back to a
+    # generation without it deliberately leaves the previous copy in place:
+    # drydock only needs the files to exist, and the next generation that
+    # carries the host refreshes and prunes them.
+    if (source / TYPESCRIPT_HOST_WRAPPER).exists():
+        files.append(Path(TYPESCRIPT_HOST_WRAPPER))
+        files += [path.relative_to(source) for path in sorted((source / typescript).rglob("*")) if path.is_file()]
+        # The `lib/` prune below only looks under lib/, so these paths are safe from it.
+        expected = set(files)
+        for stale in (destination / typescript).rglob("*") if (destination / typescript).exists() else ():
+            if (stale.is_file() or stale.is_symlink()) and stale.relative_to(destination) not in expected:
+                stale.unlink()
     for stale in (destination / "lib").rglob("*"):
         if (stale.is_file() or stale.is_symlink()) and stale.relative_to(destination) not in expected:
             stale.unlink()

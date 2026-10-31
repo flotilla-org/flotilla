@@ -699,3 +699,11 @@ Operator sequence after merge:
 ## drydock-host
 
 Every generation, on every platform, ships `bin/drydock-host` beside `bin/flotillad`, built from the pinned drydock. flotillad's embedded drydock daemon runs provider modules (such as Daytona) through it, so `build-candidate.sh` fails when it cannot build and install it. Validation only tolerates a missing binary so a failed health check can roll back to an older generation that predates it; once no such generation remains, move `bin/drydock-host` from `PRODUCED_PAYLOAD` to `REQUIRED_PAYLOAD`.
+
+## drydock-host-typescript
+
+Every generation also ships drydock's TypeScript host, built from the same pinned drydock revision as `bin/drydock-host`. drydock's embedded daemon looks for `drydock-host-typescript` beside `flotillad` and enables it when `node` is on `PATH`, so the generation carries a small executable wrapper at `bin/drydock-host-typescript` and the host's tree at `share/flotilla/drydock-host-typescript/` (`dist/`, `package.json`, and production `node_modules` installed with `--frozen-lockfile` and the hoisted linker, so the tree holds no symlinks). The wrapper runs `node` on `dist/main.js` relative to itself, which keeps working in the Darwin stable root, where `refresh_darwin_payload` copies both. The wrapper is a script and is not signed, and the tree must be pure JavaScript (production validation refuses `.node` add-ons), since Darwin signing covers nothing inside it.
+
+The builder needs node >= 24.18 and corepack (corepack downloads the pnpm version drydock's `packageManager` field names, into a scratch `COREPACK_HOME`, so the build needs network access); `build-candidate.sh` fails up front with a message if either is missing. The Linux workflow installs a pinned node in `setup-linux-toolchain.sh`; the Darwin worker must provide one. Validation tolerates absence (health rollback to older generations) but refuses a partial host; once no older generation remains, require it in `REQUIRED_PAYLOAD`.
+
+The host loads whatever modules the pinned drydock revision bundles; a Namespace entry in `drydock.toml` is ready only once the pin includes drydock's Namespace module (drydock #148).

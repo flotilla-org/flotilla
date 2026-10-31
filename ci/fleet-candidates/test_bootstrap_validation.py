@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import plistlib
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -57,7 +58,117 @@ class BootstrapValidationTests(unittest.TestCase):
         with self.assertRaises(validation.ValidationError):
             validation.validate_produced_payload(self.root)
         host.chmod(0o755)
+        with self.assertRaisesRegex(validation.ValidationError, "missing executable bin/drydock-host-typescript"):
+            validation.validate_produced_payload(self.root)
+        self.write_typescript_host()
         validation.validate_produced_payload(self.root)
+
+    def write_typescript_host(self, root=None):
+        root = root or self.root
+        wrapper = root / validation.TYPESCRIPT_HOST_WRAPPER
+        wrapper.parent.mkdir(parents=True, exist_ok=True)
+        wrapper.write_text("#!/bin/sh\n")
+        wrapper.chmod(0o755)
+        tree = root / validation.TYPESCRIPT_HOST_TREE
+        (tree / "dist").mkdir(parents=True)
+        (tree / "node_modules" / "dep").mkdir(parents=True)
+        (tree / "dist" / "main.js").write_text("")
+        (tree / "package.json").write_text("{}")
+        (tree / "node_modules" / "dep" / "index.js").write_text("")
+
+    def test_typescript_host_is_checked_at_production(self):
+        self.write_typescript_host()
+        tree = self.root / validation.TYPESCRIPT_HOST_TREE
+        validation.validate_typescript_host(self.root)
+        (self.root / validation.TYPESCRIPT_HOST_WRAPPER).chmod(0o644)
+        with self.assertRaisesRegex(validation.ValidationError, "missing executable"):
+            validation.validate_typescript_host(self.root)
+        (self.root / validation.TYPESCRIPT_HOST_WRAPPER).chmod(0o755)
+        (tree / "dist" / "main.js").unlink()
+        with self.assertRaisesRegex(validation.ValidationError, "missing share/flotilla/drydock-host-typescript/dist/main.js"):
+            validation.validate_typescript_host(self.root)
+        (tree / "dist" / "main.js").write_text("")
+        (tree / "node_modules" / "dep" / "link").symlink_to("index.js")
+        with self.assertRaisesRegex(validation.ValidationError, "symlink"):
+            validation.validate_typescript_host(self.root)
+        (tree / "node_modules" / "dep" / "link").unlink()
+        (tree / "node_modules" / "dep" / "addon.node").write_bytes(b"")
+        with self.assertRaisesRegex(validation.ValidationError, "native code"):
+            validation.validate_typescript_host(self.root)
+        (tree / "node_modules" / "dep" / "addon.node").unlink()
+        shutil.rmtree(tree / "node_modules")
+        with self.assertRaisesRegex(validation.ValidationError, "production dependencies"):
+            validation.validate_typescript_host(self.root)
+
+    def test_typescript_host_payload_is_all_or_nothing_and_stays_inside_its_tree(self):
+        tree = validation.TYPESCRIPT_HOST_TREE
+        complete = {validation.TYPESCRIPT_HOST_WRAPPER, f"{tree}/dist/main.js", f"{tree}/package.json", f"{tree}/node_modules/a/index.js"}
+        validation.validate_typescript_host_paths(set())
+        validation.validate_typescript_host_paths(complete)
+        for missing in (validation.TYPESCRIPT_HOST_WRAPPER, f"{tree}/dist/main.js", f"{tree}/package.json"):
+            with self.assertRaises(validation.ValidationError):
+                validation.validate_typescript_host_paths(complete - {missing})
+        for platform in validation.PLATFORMS:
+            for path in complete:
+                self.assertTrue(validation.allowed_payload(path, platform))
+                self.assertNotIn(path, validation.REQUIRED_PAYLOAD)
+            for path in (f"{tree}/../x", f"{tree}//x", f"{tree}/./x", "bin/drydock-host-typescript2", "share/flotilla/drydock-host-typescript-x/a"):
+                self.assertFalse(validation.allowed_payload(path, platform))
+
+    def test_typescript_host_wrapper_finds_its_tree_relative_to_itself_and_builder_leaves_no_trap(self):
+        script = Path(__file__).with_name("build-candidate.sh")
+        stub = self.root / "stub"
+        stub.mkdir()
+        (stub / "node").write_text('#!/bin/sh\necho "node $*"\n')
+        (stub / "node").chmod(0o755)
+        (stub / "corepack").write_text(
+            '#!/bin/sh\n'
+            'case "$*" in\n'
+            '  *pack:companion*) mkdir -p package/dist && echo "{}" >package/package.json && touch package/dist/main.js && tar -czf flotilla-drydock-host-typescript-0.1.0.tgz package;;\n'
+            '  *"install --prod"*) mkdir -p node_modules/dep node_modules/.bin;;\n'
+            'esac\n')
+        (stub / "corepack").chmod(0o755)
+        (self.root / "drydock" / "hosts" / "typescript").mkdir(parents=True)
+        script_body = (
+            f'set -euo pipefail; source {script}; '
+            f'build_typescript_host {self.root}/drydock {self.root}/gen/share/flotilla/drydock-host-typescript; '
+            f'mkdir -p {self.root}/gen/bin; write_typescript_host_wrapper {self.root}/gen/bin/drydock-host-typescript; '
+            f'chmod 755 {self.root}/gen/bin/drydock-host-typescript; '
+            f'cd /; {self.root}/gen/bin/drydock-host-typescript --unix sock'
+        )
+        result = subprocess.run(["bash", "-c", script_body], capture_output=True, text=True,
+                                env={"PATH": f"{stub}:/usr/bin:/bin", "HOME": str(self.root)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), f"node {self.root}/gen/bin/../share/flotilla/drydock-host-typescript/dist/main.js --unix sock")
+        tree = self.root / "gen" / validation.TYPESCRIPT_HOST_TREE
+        self.assertTrue((tree / "node_modules" / "dep").is_dir())
+        self.assertFalse((tree / "node_modules" / ".bin").exists())
+
+    def test_darwin_refresh_without_a_typescript_host_leaves_the_previous_copy(self):
+        source, destination = self.root / "source", self.root / "destination"
+        for name in ("flotilla", "flotillad", "cleat"):
+            (source / "bin").mkdir(parents=True, exist_ok=True)
+            (source / "bin" / name).write_text(name)
+        kept = destination / validation.TYPESCRIPT_HOST_TREE / "dist" / "main.js"
+        kept.parent.mkdir(parents=True)
+        kept.write_text("previous")
+        validation.refresh_darwin_payload(source, destination)
+        self.assertEqual(kept.read_text(), "previous")
+
+    def test_darwin_refresh_copies_the_typescript_host_and_prunes_its_stale_files(self):
+        source, destination = self.root / "source", self.root / "destination"
+        for name in ("flotilla", "flotillad", "cleat"):
+            (source / "bin").mkdir(parents=True, exist_ok=True)
+            (source / "bin" / name).write_text(name)
+        self.write_typescript_host(source)
+        stale = destination / validation.TYPESCRIPT_HOST_TREE / "node_modules" / "gone.js"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("")
+        validation.refresh_darwin_payload(source, destination)
+        copied = destination / validation.TYPESCRIPT_HOST_TREE / "node_modules" / "dep" / "index.js"
+        self.assertTrue(copied.is_file())
+        self.assertFalse(stale.exists())
+        self.assertTrue((destination / validation.TYPESCRIPT_HOST_WRAPPER).stat().st_mode & 0o100)
 
     # cleat's database and license are release data. Earlier generations may
     # omit them so health rollback remains valid.
