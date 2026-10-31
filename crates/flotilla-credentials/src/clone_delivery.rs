@@ -19,9 +19,9 @@ use sha2::{Digest, Sha256};
 use crate::credential::{shell_single_quote, CredentialStore};
 
 /// Sources the delivered environment, then runs Git with the remaining
-/// arguments. Git speaks the C locale, so its sign-in refusals read as the
-/// daemon matches them.
-const GIT_WITH_ENVIRONMENT: &str = "set -a; . \"$0\" || exit; set +a; LC_ALL=C exec git \"$@\"";
+/// arguments. Only Git's messages take the C locale, so its sign-in refusals
+/// read as the daemon matches them; paths and names keep the vessel's locale.
+const GIT_WITH_ENVIRONMENT: &str = "set -a; . \"$0\" || exit; set +a; LC_ALL= LC_MESSAGES=C exec git \"$@\"";
 
 impl CredentialStore {
     /// Deliver a clone's granted credentials into `environment_ref` and return a
@@ -70,11 +70,20 @@ impl CredentialStore {
 /// The delivered environment as `sh` sources it: each value single-quoted, so
 /// none of its characters are interpreted.
 fn environment_file(env: &[(String, String)]) -> String {
+    debug_assert!(
+        env.iter().all(|(name, _)| name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')),
+        "delivered variable names are shell identifiers"
+    );
     env.iter().map(|(name, value)| format!("{name}={}\n", shell_single_quote(value))).collect()
 }
 
 /// A clone's delivered credentials: the runner its Git runs through, and the
-/// private environment file to remove once that Git is done.
+/// private environment file to remove once that Git is done. A clone whose
+/// future is dropped mid-Git leaves the file until the next attempt for that
+/// target removes it, or the vessel is torn down: it lives in the vessel's
+/// own delivery directory, beside the token files a session's delivery keeps
+/// for the vessel's life.
 pub struct CloneDelivery {
     pub runner: Arc<dyn CommandRunner>,
     env_file: Option<String>,

@@ -425,6 +425,8 @@ impl RoutingCheckoutRuntime {
             .prepare_clone(env_ref, target, credentials, environment.runner)
             .await
             .map_err(|error| refused_clone_grant(url, credentials, &error))?;
+        // The same Git clone over the same environment runner as the discovered
+        // VCS: a fresh clone uses only its runner, never its checkout strategy.
         Ok((Arc::new(flotilla_vcs::vcs::FlotillaVcs::fresh_clone(Arc::clone(&delivery.runner))), Some(delivery)))
     }
 
