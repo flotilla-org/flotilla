@@ -887,3 +887,12 @@ fn tracing_config_is_opt_in_with_defaults() {
     let config = custom.tracing.expect("enabled");
     assert_eq!((config.service_name.as_str(), config.sampling), ("test-daemon", 0.25));
 }
+
+// Existing daemon.toml files predate [web]; they load with the default link prefix.
+#[test]
+fn web_link_prefix_is_optional() {
+    let config: DaemonConfig = toml::from_str("host_name = \"my-host\"").expect("pre-[web] daemon config");
+    assert_eq!(config.web, WebConfig::default());
+    let config: DaemonConfig = toml::from_str("[web]\nlink_prefix = \"https://flotilla.work/flotilla\"").expect("[web] daemon config");
+    assert_eq!(config.web.link_prefix.as_deref(), Some("https://flotilla.work/flotilla"));
+}

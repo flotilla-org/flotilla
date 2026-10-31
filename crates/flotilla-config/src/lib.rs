@@ -410,6 +410,9 @@ pub struct DaemonConfig {
     /// The optional loopback HTTP listener (ADR 0065); absent means none.
     #[serde(default)]
     pub http: HttpListenerConfig,
+    /// `[web]`: where the root document sends browsers.
+    #[serde(default)]
+    pub web: WebConfig,
     /// How many Docker per-vessel vessels this daemon's host holds at once,
     /// the field an SSH host declares in `hosts.toml` (#4002). Absent
     /// means unbounded, as before.
@@ -467,6 +470,17 @@ pub struct HttpListenerConfig {
     pub listen: Option<String>,
 }
 
+/// `[web]` in `daemon.toml` (#4208). The section is new; daemon configs that predate it load
+/// with the default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebConfig {
+    /// Where a browser request for `GET /` is sent. Absent means
+    /// `https://flotilla.work/<fleet>` once the fleet is named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_prefix: Option<String>,
+}
+
 pub const DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(2).expect("default removal limit is positive");
 
 impl Default for DaemonConfig {
@@ -490,6 +504,7 @@ impl Default for DaemonConfig {
             dummy_fleet: None,
             primitives: None,
             http: HttpListenerConfig::default(),
+            web: WebConfig::default(),
             max_vessels: None,
             docker_vessels: None,
         }
