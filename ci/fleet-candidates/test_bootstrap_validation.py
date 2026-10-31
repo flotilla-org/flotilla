@@ -63,12 +63,13 @@ class BootstrapValidationTests(unittest.TestCase):
         self.write_typescript_host()
         validation.validate_produced_payload(self.root)
 
-    def write_typescript_host(self):
-        wrapper = self.root / validation.TYPESCRIPT_HOST_WRAPPER
+    def write_typescript_host(self, root=None):
+        root = root or self.root
+        wrapper = root / validation.TYPESCRIPT_HOST_WRAPPER
         wrapper.parent.mkdir(parents=True, exist_ok=True)
         wrapper.write_text("#!/bin/sh\n")
         wrapper.chmod(0o755)
-        tree = self.root / validation.TYPESCRIPT_HOST_TREE
+        tree = root / validation.TYPESCRIPT_HOST_TREE
         (tree / "dist").mkdir(parents=True)
         (tree / "node_modules" / "dep").mkdir(parents=True)
         (tree / "dist" / "main.js").write_text("")
@@ -155,9 +156,7 @@ class BootstrapValidationTests(unittest.TestCase):
         for name in ("flotilla", "flotillad", "cleat"):
             (source / "bin").mkdir(parents=True, exist_ok=True)
             (source / "bin" / name).write_text(name)
-        self.root, original = source, self.root
-        self.write_typescript_host()
-        self.root = original
+        self.write_typescript_host(source)
         stale = destination / validation.TYPESCRIPT_HOST_TREE / "node_modules" / "gone.js"
         stale.parent.mkdir(parents=True)
         stale.write_text("")
