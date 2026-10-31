@@ -7,3 +7,4 @@ pub mod observed_resources;
 pub mod sources;
 
 pub mod convoy_branch_refresh;
+pub mod engine_observers;

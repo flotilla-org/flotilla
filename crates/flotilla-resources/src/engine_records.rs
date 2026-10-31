@@ -57,3 +57,12 @@ pub trait EngineRecords: Send + Sync + std::fmt::Debug {
     /// before, from the moment it is called; watchers read the records again on each.
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String>;
 }
+
+/// Forge observations served by the engine: each written only by its source's observer, at its
+/// own home, when a value changes. A failed read is recorded once, so readers age the values from
+/// the last time they were confirmed.
+#[async_trait::async_trait]
+pub trait ObservationFailures: Send + Sync + std::fmt::Debug {
+    /// Marks this home's record `name` of `kind` as failing, unless it already is; absent is done.
+    async fn failing(&self, kind: &str, name: &str) -> Result<(), String>;
+}

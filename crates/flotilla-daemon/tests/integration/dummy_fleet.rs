@@ -1299,7 +1299,7 @@ impl DummyDaemon {
             .build();
         let record = flotilla_provisioning::stored::artifact::ArtifactRecord::from_spec(&artifact).expect("artifact");
         log.create("transport-artifact", &record, &change).expect("artifact record");
-        // #3824 layer 5a: one record of each forge observation.
+        // One record of each forge observation.
         use flotilla_provisioning::stored::forge_observation::{ChangeRequestRecord, ForgeReadRecord, IssueRecord, IssueState, ReadValue};
         let change_request = ChangeRequestRecord {
             service: "github.com".into(),

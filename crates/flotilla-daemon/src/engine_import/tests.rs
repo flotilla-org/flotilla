@@ -720,7 +720,7 @@ fn homed(home: &str, mut document: Value) -> Value {
     document
 }
 
-// Behaviour (#3824 layer 5, operator correction 1): hosts whose old stores hold different copies of
+// Behaviour (one import per subject): hosts whose old stores hold different copies of
 // the same observations, each importing only what is homed at itself, write each subject once, at
 // the host whose Project declares its source first; the others write nothing for it.
 #[test]

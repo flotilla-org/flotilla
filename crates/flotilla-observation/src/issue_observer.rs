@@ -13,6 +13,10 @@ use tokio::{
     task::JoinHandle,
 };
 
+use crate::engine_observers::EngineObservers;
+
+const KIND: &str = "Issue";
+
 /// One issue observed in one namespace: the issue observer's key.
 ///
 /// Its identity is the issue's [`Address`], so every spelling of one issue
@@ -117,6 +121,7 @@ struct IssueRefresherInner {
     observation_errors: Mutex<HashMap<IssueKey, String>>,
     relay_healthy: std::sync::atomic::AtomicBool,
     relay_wake: Notify,
+    engine: EngineObservers,
 }
 
 impl IssueRefresher {
@@ -131,12 +136,41 @@ impl IssueRefresher {
                 observation_errors: Mutex::new(HashMap::new()),
                 relay_healthy: std::sync::atomic::AtomicBool::new(false),
                 relay_wake: Notify::new(),
+                engine: EngineObservers::default(),
             }),
         }
     }
 
     pub fn stale_after(&self) -> Duration {
         self.inner.cadence.stale_after
+    }
+
+    /// The engine's observation records, which composition installs behind `[primitives]`.
+    pub fn engine(&self) -> &EngineObservers {
+        &self.inner.engine
+    }
+
+    /// Deletes this home's records nothing demands: under the engine, records outlive a restart
+    /// and their demand returns within one lease, after which the rest are orphans.
+    pub async fn sweep_undemanded(&self) -> Result<(), String> {
+        let namespaces = self.inner.backend.local_namespaces::<Issue>().await.map_err(|error| error.to_string())?;
+        for namespace in namespaces {
+            let records = self.inner.backend.using::<Issue>(&namespace);
+            for record in records.list().await.map_err(|error| error.to_string())?.items {
+                // Demand is admitted under this lock before its record is written, so holding it
+                // across the delete keeps a newly demanded issue's record.
+                let active = self.inner.active.lock().await;
+                if active.keys().any(|subject| subject.namespace == namespace && subject.record_name() == record.metadata.name) {
+                    continue;
+                }
+                match records.delete(&record.metadata.name).await {
+                    Ok(()) | Err(flotilla_resources::ResourceError::NotFound { .. }) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+                drop(active);
+            }
+        }
+        Ok(())
     }
 
     pub async fn observation_error(&self, subject: &IssueKey) -> Option<String> {
@@ -154,7 +188,13 @@ impl IssueRefresher {
         if !self.owns_record(subject, false, create_missing).await? {
             return Ok(());
         }
-        let status = self.inner.source.observe(subject).await?;
+        let status = match self.inner.source.observe(subject).await {
+            Ok(status) => status,
+            Err(error) => {
+                self.inner.engine.failed(KIND, &name).await;
+                return Err(error);
+            }
+        };
         self.publish(subject, &name, status, true, false, create_missing).await
     }
 
@@ -162,10 +202,13 @@ impl IssueRefresher {
         let name = subject.record_name();
         match self.inner.backend.including_replicas::<Issue>(&subject.namespace).get(&name).await {
             Ok(_) => {}
+            Err(flotilla_resources::ResourceError::NotFound { .. }) if self.inner.engine.installed() => {}
             Err(flotilla_resources::ResourceError::NotFound { .. }) => self.ensure_record(&subject, &name).await?,
             Err(error) => return Err(error.to_string()),
         }
 
+        // Under the engine the record is first written by the refresh loop spawned below, after
+        // the subject is in `active`; `sweep_undemanded` relies on that order.
         let mut active = self.inner.active.lock().await;
         if let Some(refresh) = active.get_mut(&subject) {
             refresh.demands.insert(subscription_id, freshness);
@@ -324,6 +367,7 @@ impl IssueRefresher {
                 }
                 Err(error) => {
                     self.inner.observation_errors.lock().await.insert(subject.clone(), error.clone());
+                    self.inner.engine.failed(KIND, &record_name).await;
                     tracing::warn!(issue = %subject.address(), %error, "issue observation failed");
                     if !self.wait_for_next(&subject, self.inner.cadence.state).await {
                         break;
@@ -594,5 +638,78 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         refresher.release(demand).await;
         assert_eq!(records.get(&name).await.expect("foreign record preserved").spec.observing_authority, "owner");
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordedFailures(std::sync::Mutex<Vec<(String, String)>>);
+
+    #[async_trait]
+    impl flotilla_resources::engine_records::ObservationFailures for RecordedFailures {
+        async fn failing(&self, kind: &str, name: &str) -> Result<(), String> {
+            self.0.lock().expect("failures").push((kind.to_owned(), name.to_owned()));
+            Ok(())
+        }
+    }
+
+    struct FailingSource;
+
+    #[async_trait]
+    impl IssueObservationSource for FailingSource {
+        async fn observe(&self, _subject: &IssueKey) -> Result<IssueStatus, String> {
+            Err("unavailable".into())
+        }
+    }
+
+    // Behaviour (age as a judgement): under the engine, the observer records a failed read on its
+    // record, from its refresh loop and from a claim-time refresh alike.
+    #[tokio::test]
+    async fn under_the_engine_a_failed_read_is_recorded() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let refresher = IssueRefresher::new(backend, "authority".into(), Arc::new(FailingSource), IssueRefreshCadence::default());
+        let failures = Arc::new(RecordedFailures::default());
+        refresher.engine().install(failures.clone()).expect("engine");
+        let subject = subject();
+        assert!(refresher.refresh_once(&subject).await.is_err());
+        assert_eq!(failures.0.lock().expect("failures").as_slice(), [("Issue".to_owned(), subject.record_name())]);
+        let demand = uuid::Uuid::new_v4();
+        refresher.demand(demand, subject.clone(), Some(Utc::now())).await.expect("demand");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while failures.0.lock().expect("failures").len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the refresh loop's failed read is recorded");
+        refresher.release(demand).await;
+    }
+
+    // Behaviour: the sweep deletes this home's records nothing demands, and keeps a demanded one.
+    #[tokio::test]
+    async fn the_sweep_keeps_demanded_records_and_deletes_the_rest() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let refresher = IssueRefresher::new(backend.clone(), "authority".into(), Arc::new(FailingSource), IssueRefreshCadence::default());
+        refresher.engine().install(Arc::new(RecordedFailures::default())).expect("engine");
+        let records = backend.using::<Issue>("flotilla");
+        let demanded = subject();
+        let orphan = IssueKey::new(
+            "flotilla",
+            flotilla_resources::address::stored_issue_address("github.com", "flotilla-org/flotilla", 9, &[]).expect("address"),
+        )
+        .expect("issue key");
+        for key in [&demanded, &orphan] {
+            let spec = IssueSpec::builder()
+                .service(key.stored_service_scope().0)
+                .scope(key.stored_service_scope().1)
+                .number(key.number())
+                .observing_authority("authority".into())
+                .build();
+            records.create(&InputMeta::builder().name(key.record_name()).build(), &spec).await.expect("record");
+        }
+        let demand = uuid::Uuid::new_v4();
+        refresher.demand(demand, demanded.clone(), None).await.expect("demand");
+        refresher.sweep_undemanded().await.expect("sweep");
+        let left: Vec<_> = records.list().await.expect("list").items.into_iter().map(|record| record.metadata.name).collect();
+        assert_eq!(left, [demanded.record_name()]);
+        refresher.release(demand).await;
     }
 }

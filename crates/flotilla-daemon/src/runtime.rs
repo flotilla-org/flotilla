@@ -1335,6 +1335,15 @@ async fn open_provisioning_lifecycles(
         .await
         .map_err(|error| error.to_string())??;
     daemon.resource_backend().install_engine_records(Arc::new(artifacts));
+    // ChangeRequest and Issue: written by their source's observer, read at every home.
+    let service = daemon.decided_store()?;
+    let clock = daemon.clock_for_scenarios();
+    let observations =
+        tokio::task::spawn_blocking(move || flotilla_provisioning::engine::observations::EngineObservations::open(service, clock))
+            .await
+            .map_err(|error| error.to_string())??;
+    let observations = Arc::new(observations);
+    daemon.install_observation_records(observations.clone(), observations)?;
     // FulfilmentKind, which admission and the vessel reconciler read and admission's snapshots write.
     let service = daemon.decided_store()?;
     let clock = daemon.clock_for_scenarios();

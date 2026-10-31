@@ -7,10 +7,11 @@
 //! fail. So the old per-field `observed_at`, the observing authority and the demand times are not
 //! stored. ChangeRequest's convoy history is not stored either: the convoys hold those links.
 
+use chrono::{DateTime, Utc};
 use flotilla_protocol::IssueSource;
 use flotilla_resources::{
-    ChangeRequestSpec, ChangeRequestStatus, ForgeReadRequest, ForgeReadStatus, IssueSpec, IssueStatus, ObservedChangeRequestState,
-    ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision,
+    ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, ForgeReadRequest, ForgeReadStatus, IssueSpec, IssueStatus,
+    Observation, ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision,
 };
 use flotilla_schema::{KindRegistry, RegistryError, Stored, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -166,6 +167,10 @@ impl From<IssueState> for ObservedIssueState {
     }
 }
 
+fn at<T>(value: Option<T>, observed_at: DateTime<Utc>) -> Observation<T> {
+    Observation { value, observed_at }
+}
+
 /// The observing home's view of one change request: kind code `cq`, named by the subject's record
 /// name. A null value is one the forge has not reported.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
@@ -206,6 +211,51 @@ impl ChangeRequestRecord {
             failing_since: None,
         }
     }
+
+    /// A record of `spec`'s change request with nothing observed yet.
+    pub fn unobserved(spec: &ChangeRequestSpec) -> Self {
+        Self {
+            service: spec.service.clone(),
+            scope: spec.scope.clone(),
+            number: spec.number,
+            title: None,
+            author: None,
+            state: None,
+            review_decision: None,
+            review_requested_from_owner: None,
+            head_sha: None,
+            checks: None,
+            actionable_at_head: None,
+            mergeable: None,
+            failing_since: None,
+        }
+    }
+
+    /// The old spec, observed by `home`; convoy history is the convoys' to tell.
+    pub fn old_spec(&self, home: &str) -> ChangeRequestSpec {
+        ChangeRequestSpec {
+            service: self.service.clone(),
+            scope: self.scope.clone(),
+            number: self.number,
+            observing_authority: home.to_owned(),
+            subject_of: Vec::new(),
+        }
+    }
+
+    /// The old status, every value last confirmed at `observed_at`.
+    pub fn old_status(&self, observed_at: DateTime<Utc>) -> ChangeRequestStatus {
+        ChangeRequestStatus {
+            title: at(self.title.clone(), observed_at),
+            author: at(self.author.clone(), observed_at),
+            review_decision: at(self.review_decision.map(Into::into), observed_at),
+            review_requested_from_owner: at(self.review_requested_from_owner, observed_at),
+            state: at(self.state.map(Into::into), observed_at),
+            head_sha: at(self.head_sha.clone(), observed_at),
+            checks: at(self.checks.map(Into::into), observed_at),
+            review: ChangeRequestReviewObservation { actionable_at_head: at(self.actionable_at_head, observed_at) },
+            mergeable: at(self.mergeable.map(Into::into), observed_at),
+        }
+    }
 }
 
 /// The observing home's view of one issue: kind code `iu`, named by the subject's record name.
@@ -240,6 +290,40 @@ impl IssueRecord {
             updated_at: status.updated_at.value.as_ref().map(Timestamp::from_datetime),
             failing_since: None,
         }
+    }
+
+    /// A record of `spec`'s issue with nothing observed yet.
+    pub fn unobserved(spec: &IssueSpec) -> Self {
+        Self {
+            service: spec.service.clone(),
+            scope: spec.scope.clone(),
+            number: spec.number,
+            title: None,
+            assignees: None,
+            state: None,
+            labels: None,
+            updated_at: None,
+            failing_since: None,
+        }
+    }
+
+    /// The old spec, observed by `home`.
+    pub fn old_spec(&self, home: &str) -> IssueSpec {
+        IssueSpec { service: self.service.clone(), scope: self.scope.clone(), number: self.number, observing_authority: home.to_owned() }
+    }
+
+    /// The old status, every value last confirmed at `observed_at`; refused when `updated_at` lies
+    /// outside chrono's range.
+    pub fn old_status(&self, observed_at: DateTime<Utc>) -> Result<IssueStatus, String> {
+        let updated_at =
+            self.updated_at.map(|at| at.to_datetime().ok_or_else(|| format!("time {} is out of range", at.micros()))).transpose()?;
+        Ok(IssueStatus {
+            title: at(self.title.clone(), observed_at),
+            assignees: at(self.assignees.clone(), observed_at),
+            state: at(self.state.map(Into::into), observed_at),
+            labels: at(self.labels.clone(), observed_at),
+            updated_at: at(updated_at, observed_at),
+        })
     }
 }
 

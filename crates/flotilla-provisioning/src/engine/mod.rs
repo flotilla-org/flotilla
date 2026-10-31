@@ -40,6 +40,7 @@ pub mod import;
 pub mod kinds;
 pub mod manifest_root;
 pub mod manifest_root_import;
+pub mod observations;
 pub mod placement_import;
 pub mod project_import;
 pub mod projects;

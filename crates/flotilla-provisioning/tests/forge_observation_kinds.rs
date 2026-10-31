@@ -303,7 +303,7 @@ fn every_forge_read_result_imports_with_its_value(tc: hegel::TestCase) {
     assert_eq!(record.retry_at, error.map(|_| Timestamp::from_datetime(&(now + Duration::seconds(30)))));
 }
 
-// Behaviour (ADR 0047; #3824 layer 5, operator correction 1): among every home's copies of one
+// Behaviour (ADR 0047; one import per subject): among every home's copies of one
 // subject, the observer imports the one readers pick today; deleted, never-observed and
 // undeclared copies are dropped, counted where they are homed, and convoy history is dropped.
 #[test]
@@ -395,7 +395,7 @@ fn forge_reads_import_their_latest_result_while_demanded() {
     assert_eq!(dropped, [("idle", 1), ("incremental", 1), ("never read", 1)]);
 }
 
-// Behaviour (#3824 layer 5, operator correction 1): hosts holding different copies, each importing
+// Behaviour (one import per subject): hosts holding different copies, each importing
 // only at itself, together write every observed subject exactly once, at its observer.
 #[hegel::test]
 fn hosts_importing_alone_write_each_subject_once_at_its_observer(tc: hegel::TestCase) {
