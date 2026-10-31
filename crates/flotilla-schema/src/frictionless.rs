@@ -37,6 +37,21 @@ impl Table {
         table.columns = expand(&self.columns);
         table
     }
+    /// The table as the rows wire carries it: every enum column holds its readable names (the
+    /// Rust variant names, `Landed`), in code order, in place of its stored codes. Short codes
+    /// stay in storage and SQL; a stored kind's reads name them through this view (ADR 0047: the
+    /// change is wire only). A column without names keeps its values.
+    pub fn readable(&self) -> Table {
+        let mut table = self.clone();
+        for column in table.key.iter_mut().chain(&mut table.columns) {
+            if matches!(column.ty, ColumnType::Code(_)) && !column.categories.is_empty() {
+                let names: Vec<String> = column.categories.iter().map(|(_, name)| name.clone()).collect();
+                column.categories = names.iter().map(|name| (name.clone(), name.clone())).collect();
+                column.ty = ColumnType::Code(names);
+            }
+        }
+        table
+    }
     /// Frictionless Table Schema v2 without text parsing conventions. Native values cross
     /// the wire; interned text and references never expose backend-local identifiers.
     pub fn frictionless(&self) -> Value {
@@ -48,6 +63,7 @@ impl Table {
             .chain(&this.columns)
             .map(|column| {
                 let ty = match column.ty {
+                    _ if column.address => "address",
                     ColumnType::Integer => "integer",
                     ColumnType::Number => "number",
                     ColumnType::Bool => "boolean",
@@ -59,15 +75,8 @@ impl Table {
                 if column.ty == ColumnType::Blob {
                     field["format"] = json!("binary");
                 }
-                if let ColumnType::Code(codes) = &column.ty {
-                    field["categories"] = json!(codes
-                        .iter()
-                        .map(|code| {
-                            let label =
-                                column.categories.iter().find(|(value, _)| value == code).map(|(_, name)| name.as_str()).unwrap_or(code);
-                            json!({"value":code,"label":label})
-                        })
-                        .collect::<Vec<_>>());
+                if let ColumnType::Code(values) = &column.ty {
+                    field["constraints"]["enum"] = json!(values);
                 }
                 field.as_object_mut().expect("field object").extend(column.properties.clone());
                 field
@@ -115,27 +124,28 @@ impl crate::TableSet {
         }
         schema
     }
-    /// The kind's projection of the per-home event log; its key stays natural and portable.
+    /// The kind's projection of the per-home event log; its key stays natural and portable. Its
+    /// enum columns take their values from [`TableSet::log_table`]: `cause` holds the log's
+    /// codes, while `edge`, `from` and `to` hold the names the readable `log_view` already reads
+    /// through `codes`, so [`Table::readable`] names all four alike.
     pub fn log_projection(&self) -> Table {
+        let log = self.log_table();
+        let categories = |name: &str| log.columns.iter().find(|column| column.name == name).expect("log column").categories.clone();
+        let named = |name: &str| categories(name).into_iter().map(|(_, name)| (name.clone(), name)).collect();
         let mut layout = Layout::description(&format!("{}.log", self.tables[0].name));
         layout.key(|layout| {
             layout.column("home", ColumnType::Text, true);
             layout.column("sequence", ColumnType::Integer, true);
             layout.role("sequence");
         });
-        for (name, ty, required, role) in [
-            ("name", ColumnType::Text, false, None),
-            ("cause", ColumnType::Text, true, None),
-            ("edge", ColumnType::Text, false, None),
-            ("from", ColumnType::Text, false, Some("transition-from")),
-            ("to", ColumnType::Text, false, Some("transition-to")),
-            ("at", ColumnType::Timestamp, true, Some("time")),
-        ] {
-            layout.column(name, ty, required);
-            if let Some(role) = role {
-                layout.role(role);
-            }
-        }
+        layout.column("name", ColumnType::Text, false);
+        layout.categories("cause", categories("cause"), true);
+        layout.categories("edge", named("edge"), false);
+        layout.categories("from", named("from"), false);
+        layout.role("transition-from");
+        layout.categories("to", named("to"), false);
+        layout.role("transition-to");
+        layout.column("at", ColumnType::Timestamp, true);
         layout.finish().tables.remove(0)
     }
 }
@@ -154,7 +164,8 @@ mod tests {
         table.key[0].properties.insert("title".into(), json!("State"));
         let schema = table.frictionless();
         let field = schema["fields"].as_array().unwrap().iter().find(|field| field["name"] == "state").unwrap();
-        assert_eq!(field["categories"], json!([{"value":"r", "label":"Running"}]));
+        assert_eq!(field["constraints"], json!({"required": true, "enum": ["r"]}));
+        assert!(field.get("categories").is_none());
         assert!(field.get("reference").is_none());
         assert_eq!(schema["foreignKeys"][0]["reference"]["resource"], "Agent");
         assert_eq!(schema["foreignKeys"][0]["fields"], json!(["state.home", "state"]));
@@ -178,6 +189,7 @@ mod tests {
             (ColumnType::Interned(crate::HOME_DOMAIN), "string"),
             (ColumnType::Ref, "string"),
             (ColumnType::Code(vec!["a".into()]), "string"),
+            (ColumnType::Interned(crate::ADDRESS_DOMAIN), "address"),
         ];
         let index = tc.draw(gs::integers::<usize>().min_value(0).max_value(cases.len() - 1));
         let nullable = tc.draw(gs::booleans());
@@ -185,6 +197,9 @@ mod tests {
         let mut layout = Layout::description("sample");
         layout.key(|layout| layout.column("name", ColumnType::Text, true));
         layout.column("value", ty.clone(), !nullable);
+        if *expected == "address" {
+            layout.address();
+        }
         layout.property("unit", json!("By"));
         layout.property("title", json!("Size"));
         let table = layout.finish().tables.remove(0);
@@ -193,7 +208,46 @@ mod tests {
         let field = schema["fields"].as_array().unwrap().iter().find(|field| field["name"] == "value").unwrap();
         assert_eq!(field["type"], *expected);
         assert_eq!(field["constraints"]["required"], !nullable);
+        assert_eq!(field["constraints"].get("enum").is_some(), matches!(ty, ColumnType::Code(_)));
         assert_eq!(field["unit"], "By");
         assert_eq!(field["title"], "Size");
+    }
+
+    // #4214: the rows wire names enum values. Generate an enum column with distinct codes and
+    // names, in key or data position, beside a plain column: the readable table declares the
+    // names, in code order, as the column's values and its Frictionless `constraints.enum`,
+    // and changes nothing else.
+    #[hegel::test]
+    fn readable_tables_declare_names_in_place_of_codes(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(6));
+        let categories: Vec<(String, String)> = (0..count).map(|index| (format!("c{index}"), format!("Name{index}"))).collect();
+        let key = tc.draw(gs::booleans());
+        let mut layout = Layout::description("sample");
+        layout.key(|layout| {
+            layout.column("name", ColumnType::Text, true);
+            if key {
+                layout.categories("state", categories.clone(), true);
+            }
+        });
+        if !key {
+            layout.categories("state", categories.clone(), tc.draw(gs::booleans()));
+        }
+        layout.column("note", ColumnType::Text, false);
+        let table = layout.finish().tables.remove(0);
+        let readable = table.readable();
+        let names: Vec<String> = categories.iter().map(|(_, name)| name.clone()).collect();
+        let state = |table: &Table| table.key.iter().chain(&table.columns).find(|column| column.name == "state").unwrap().clone();
+        assert_eq!(state(&readable).ty, ColumnType::Code(names.clone()));
+        assert_eq!(state(&readable).categories, names.iter().map(|name| (name.clone(), name.clone())).collect::<Vec<_>>());
+        assert_eq!(readable.readable(), readable, "naming is idempotent");
+        let schema = readable.frictionless();
+        let field = schema["fields"].as_array().unwrap().iter().find(|field| field["name"] == "state").unwrap();
+        assert_eq!(field["constraints"]["enum"], json!(names));
+        let mut restored = readable.clone();
+        for column in restored.key.iter_mut().chain(&mut restored.columns).filter(|column| column.name == "state") {
+            *column = state(&table);
+        }
+        assert_eq!(restored, table, "only the enum column changes");
     }
 }

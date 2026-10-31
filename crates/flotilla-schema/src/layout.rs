@@ -210,6 +210,11 @@ impl Layout {
         self.last_column().reference = Some(table.into());
     }
 
+    /// Marks the column just declared as holding canonical ADR 0066 addresses (wire type `address`).
+    pub fn address(&mut self) {
+        self.last_column().address = true;
+    }
+
     /// Declares the current table's own key: columns declared inside `f` become key columns.
     pub fn key(&mut self, f: impl FnOnce(&mut Layout)) {
         let frame = self.frame();

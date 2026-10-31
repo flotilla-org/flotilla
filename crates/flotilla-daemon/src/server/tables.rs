@@ -501,7 +501,8 @@ impl TableSource {
                     owner.extend(table.key);
                     table.key = owner;
                 }
-                table = table.with_natural_references();
+                // The rows wire names enum values; codes stay in storage (ADR 0047: wire only).
+                table = table.with_natural_references().readable();
                 for column in table.key.iter_mut().chain(&mut table.columns) {
                     let scalar = !matches!(column.ty, ColumnType::Blob | ColumnType::Cbor | ColumnType::Frozen);
                     column.properties.insert("sortable".into(), json!(scalar));
