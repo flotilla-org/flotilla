@@ -73,7 +73,7 @@ pub struct ProvisionOpts {
 pub struct PrepareOpts {
     /// Requested OCI guest target; omitted selects the provider's admitted default.
     #[cfg(unix)]
-    pub platform: Option<drydock_protocol::Platform>,
+    pub platform: Option<crate::platform::Platform>,
     pub prepared_auth: PreparedEnvironmentAuth,
 }
 

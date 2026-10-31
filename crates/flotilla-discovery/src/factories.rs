@@ -34,9 +34,20 @@ impl FactoryRegistry {
             cloud_agents: vec![Box::new(ClaudeCodingAgentFactory), Box::new(CursorCodingAgentFactory), Box::new(CodexCodingAgentFactory)],
             ai_utilities: vec![Box::new(ClaudeApiAiUtilityFactory), Box::new(ClaudeCliAiUtilityFactory)],
             terminal_pools: terminal_pool_factories(),
-            environment_providers: vec![Box::new(docker::DockerEnvironmentFactory), Box::new(host_direct::HostDirectEnvironmentFactory)],
+            environment_providers: vec![
+                Box::new(docker::DockerEnvironmentFactory::default()),
+                Box::new(host_direct::HostDirectEnvironmentFactory),
+            ],
             agent_adapters: Vec::new(),
         }
+    }
+
+    /// The default factories, whose Docker vessels reach their agents through
+    /// `link`: the composition root's. Without it they cannot be provisioned.
+    #[cfg(unix)]
+    pub fn link_vessel_agents(&mut self, link: Arc<dyn flotilla_environment::environment::agent::client::AgentLink>) {
+        self.environment_providers =
+            vec![Box::new(docker::DockerEnvironmentFactory::with_agent_link(link)), Box::new(host_direct::HostDirectEnvironmentFactory)];
     }
 }
 

@@ -26,10 +26,8 @@ use async_trait::async_trait;
 use flotilla_config::ConfigStore;
 use flotilla_discovery::{registry::ProviderRegistry, DiscoveryRuntime};
 use flotilla_discovery_api::EnvironmentBag;
-use flotilla_environment::environment::agent::{
-    host::{platform_from_uname, retire_host_agent, HostAgentConnector, SshAgentTransport},
-    AgentRunner, WritableBases,
-};
+use flotilla_drydock::host::{platform_from_uname, retire_host_agent, HostAgentConnector, SshAgentTransport};
+use flotilla_environment::environment::agent::{AgentRunner, WritableBases};
 use flotilla_environment::environment::{VesselAgent, CONTAINED_DAEMON_REQUIRED_ENV, DAEMON_SOCKET_ENV};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::EnvironmentId;
@@ -108,7 +106,7 @@ impl VesselPaths {
         let paths = Self { agent: agent_root(bag)?.join(key.directory()), state: state_root(bag)?.join(key.directory()) };
         for (socket, room) in [
             (paths.daemon_socket(), 0),
-            (paths.agent.join(flotilla_environment::environment::agent::host::AGENT_SOCKET), 0),
+            (paths.agent.join(flotilla_drydock::host::AGENT_SOCKET), 0),
             (paths.cleat_runtime(), CLEAT_SOCKET_SUFFIX),
         ] {
             let length = socket.as_os_str().len() + room;
@@ -177,12 +175,12 @@ pub(super) fn state_root(bag: &EnvironmentBag) -> Result<PathBuf, String> {
 /// normalisation of `uname` output ([`platform_from_uname`]) serves both the
 /// comparison with the controller and the choice of agent build.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct HostPlatform(drydock_protocol::Platform);
+pub(super) struct HostPlatform(flotilla_environment::platform::Platform);
 
 impl HostPlatform {
     #[cfg(test)]
     pub(super) fn controller() -> Self {
-        Self(drydock_protocol::Platform::current())
+        Self(flotilla_environment::platform::Platform::current())
     }
 
     /// From `uname -s` and `uname -m`.
@@ -204,7 +202,7 @@ impl HostPlatform {
     }
 
     /// The platform that selects the agent build.
-    pub(super) fn drydock(&self) -> drydock_protocol::Platform {
+    pub(super) fn drydock(&self) -> flotilla_environment::platform::Platform {
         self.0.clone()
     }
 }
@@ -399,7 +397,7 @@ pub(super) trait VesselAgents: Send + Sync {
 }
 
 /// Finds the controller's agent build for a host platform.
-type AgentBuild = Box<dyn Fn(&drydock_protocol::Platform) -> Result<PathBuf, String> + Send + Sync>;
+type AgentBuild = Box<dyn Fn(&flotilla_environment::platform::Platform) -> Result<PathBuf, String> + Send + Sync>;
 
 /// Drydock's SSH transport to agents copied from this generation.
 pub(super) struct SshVesselAgents {
@@ -892,13 +890,13 @@ done"#;
 
 /// The layer is published under the vessel's state directory.
 struct LayerContext {
-    platform: drydock_protocol::Platform,
+    platform: flotilla_environment::platform::Platform,
     prefix: PathBuf,
 }
 
 #[async_trait]
 impl EnvironmentToolContext for LayerContext {
-    fn guest_platform(&self) -> drydock_protocol::Platform {
+    fn guest_platform(&self) -> flotilla_environment::platform::Platform {
         self.platform.clone()
     }
     async fn rust_build_jobs(&self) -> Result<usize, String> {

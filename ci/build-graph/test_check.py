@@ -6,7 +6,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from check import (AGENT_CONNECTOR, AGENT_CONNECTOR_FORBIDDEN, CAPABILITY_CRATES, C_FREE_BASE, DISCOVERY_FORBIDDEN, RESOURCE_EXEMPTIONS, SCHEMA_CRATES, STATE_MACHINES, c_free_violations,
+from check import (AGENT_CONNECTOR, AGENT_CONNECTOR_FORBIDDEN, CAPABILITY_CRATES, C_FREE_BASE, DISCOVERY_FORBIDDEN, DRYDOCK_COMPOSITION, DRYDOCK_IMPLEMENTATION, RESOURCE_EXEMPTIONS, SCHEMA_CRATES, STATE_MACHINES, c_free_violations,
                    vessel_graph_violations, feature_differences, is_testkit, layer, main, tree_features, violations)
 
 
@@ -51,6 +51,33 @@ class BuildGraphContract(unittest.TestCase):
                 metadata["workspace_members"] = ["consumer"]
                 expected = [f"consumer: production dependency on testkit {name}"] if source and "flotilla-org/rigging" in source else []
                 self.assertEqual(violations(metadata), expected)
+
+    def test_drydock_crates_stay_in_the_composition_root(self):
+        # A drydock repin rebuilds only the composition root. Finite generator: each consumer
+        # against each edge kind and each spelling of drydock's source, renamed crates included.
+        self.assertEqual(DRYDOCK_COMPOSITION, {"flotilla-daemon", DRYDOCK_IMPLEMENTATION})
+        for consumer in ("flotilla-daemon", DRYDOCK_IMPLEMENTATION, "flotilla-environment", "flotilla-core", "flotilla"):
+            for kind in ("normal", "build", "dev"):
+                for name, source in (("drydock", "git+https://github.com/flotilla-org/drydock?rev=abc#abc"),
+                                     ("renamed-agent", "git+https://github.com/flotilla-org/drydock.git?rev=abc#abc"),
+                                     ("drydock", "git+https://github.com/other/drydock?rev=abc#abc"), ("drydock", None)):
+                    with self.subTest(consumer=consumer, kind=kind, source=source):
+                        metadata = graph(package(consumer, **{kind: (name,)}), package(name, source=source))
+                        metadata["workspace_members"] = [consumer]
+                        refused = (kind != "dev" and consumer not in DRYDOCK_COMPOSITION
+                                   and source is not None and "flotilla-org/drydock" in source)
+                        expected = [f"{consumer}: production dependency on drydock crate {name}; only the composition root "
+                                    "(flotilla-daemon, flotilla-drydock) depends on drydock"] if refused else []
+                        self.assertEqual(violations(metadata), expected)
+
+    def test_only_the_daemon_composes_the_drydock_implementation(self):
+        for consumer in ("flotilla-daemon", "flotilla-environment", "flotilla-core", "flotilla-daemon-testkit"):
+            for kind in ("normal", "build", "dev"):
+                with self.subTest(consumer=consumer, kind=kind):
+                    metadata = graph(package(consumer, **{kind: (DRYDOCK_IMPLEMENTATION,)}), package(DRYDOCK_IMPLEMENTATION))
+                    refused = kind != "dev" and consumer != "flotilla-daemon"
+                    expected = [f"{consumer}: production dependency on {DRYDOCK_IMPLEMENTATION}; only flotilla-daemon composes drydock"]
+                    self.assertEqual(violations(metadata), expected if refused else [])
 
     def test_vessel_cli_excludes_dashboard_dependencies(self):
         # ADR 0069: finite generator covers every renderer entry point, even transitively.

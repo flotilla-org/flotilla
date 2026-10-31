@@ -12,11 +12,9 @@ use tokio::{
     net::{UnixListener, UnixStream},
 };
 
-use super::super::{
-    tests::{SocketAgent, Sshd},
-    AgentRunner, VesselAgent,
-};
 use super::*;
+use crate::agent::tests::{SocketAgent, Sshd};
+use flotilla_environment::environment::{agent::AgentRunner, VesselAgent};
 
 /// A host whose commands run for real in local temporary directories. Its
 /// supervisor is the one part played in process: the executable flotilla
@@ -253,8 +251,9 @@ async fn a_stopped_controller_leaves_nothing_forwarding() {
         struct Direct(Arc<dyn AgentTransport>, PathBuf, Platform);
         #[async_trait]
         impl AgentConnector for Direct {
-            async fn connect(&self) -> Result<Client, String> {
-                connect_current(|| self.0.open(&self.1), &self.2, b"current", Duration::from_secs(10)).await.map_err(|e| e.to_string())
+            async fn connect(&self) -> Result<Arc<dyn AgentClient>, String> {
+                let connected = connect_current(|| self.0.open(&self.1), &platform_of(&self.2), b"current", Duration::from_secs(10)).await;
+                connected.map(|client| Arc::new(DrydockClient(client)) as Arc<dyn AgentClient>).map_err(|e| e.to_string())
             }
         }
         Arc::new(Direct(transport, socket, platform))

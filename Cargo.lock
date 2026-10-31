@@ -2337,6 +2337,7 @@ dependencies = [
  "flotilla-discovery",
  "flotilla-discovery-api",
  "flotilla-discovery-testkit",
+ "flotilla-drydock",
  "flotilla-dummy-fleet",
  "flotilla-engine-store",
  "flotilla-environment",
@@ -2539,6 +2540,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-drydock"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "drydock",
+ "drydock-agent",
+ "drydock-host",
+ "drydock-protocol",
+ "drydock-transport",
+ "flotilla-environment",
+ "flotilla-protocol",
+ "flotilla-provider-runtime",
+ "flotilla-resources",
+ "futures",
+ "hegeltest",
+ "http",
+ "libc",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "flotilla-dummy-fleet"
 version = "0.1.0"
 dependencies = [
@@ -2610,11 +2641,6 @@ dependencies = [
  "chrono",
  "clap",
  "data-encoding",
- "drydock",
- "drydock-agent",
- "drydock-host",
- "drydock-protocol",
- "drydock-transport",
  "flotilla-build-features",
  "flotilla-build-features-async",
  "flotilla-build-features-base",

@@ -1,5 +1,6 @@
-//! Host-owned vessel control. Only this module knows drydock's client. A layer
-//! update writes files and publishes links; it never activates an agent upgrade.
+//! Host-owned vessel control. Only this module drives the vessel agent's
+//! client. A layer update writes files and publishes links; it never activates
+//! an agent upgrade.
 use std::{
     collections::BTreeMap,
     io,
@@ -10,14 +11,13 @@ use std::{
 };
 
 use async_trait::async_trait;
-use drydock_agent::{
-    ArtifactSource, Client, Configuration, Endpoint, Exec, ExecEvent, ExitStatus, Fetch, FileOptions, InwardForward, OutwardForward,
-    Rename, Unpack,
+use client::{
+    AgentClient, AgentLink, ArtifactSource, ByteStream, Configuration, Endpoint, Exec, ExecEvent, ExitStatus, Fetch, FileOptions,
+    InwardForward, OutwardForward, Platform, Rename, Unpack,
 };
-use drydock_protocol::Platform;
-use drydock_transport::ByteStream;
 use flotilla_provider_runtime::{ChannelLabel, CommandOutput, CommandRunner};
 use flotilla_resources::PinUnpack;
+use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -27,25 +27,26 @@ use tokio::{
 use super::{EntryKind, EnvironmentTool, VesselAgent};
 use crate::composition::role;
 
-pub mod host;
+pub mod client;
 
-/// The actual process/transport seam. Tests use drydock's real Agent over duplex
-/// streams; Docker uses the private socket in its per-environment mounted dir.
+/// The actual process/transport seam. Tests use an in-memory agent; Docker
+/// uses the private socket in its per-environment mounted dir.
 #[async_trait]
 pub trait AgentConnector: Send + Sync {
-    async fn connect(&self) -> Result<Client, String>;
+    async fn connect(&self) -> Result<Arc<dyn AgentClient>, String>;
 }
 
 pub struct UnixAgentConnector {
     pub socket: PathBuf,
     pub executable: PathBuf,
     pub timeout: Duration,
+    link: Arc<dyn AgentLink>,
     platform: Platform,
     executable_bytes: Arc<OnceCell<Vec<u8>>>,
 }
 impl UnixAgentConnector {
-    pub fn new(socket: PathBuf, executable: PathBuf, platform: Platform, timeout: Duration) -> Self {
-        Self { socket, executable, timeout, platform, executable_bytes: Arc::new(OnceCell::new()) }
+    pub fn new(link: Arc<dyn AgentLink>, socket: PathBuf, executable: PathBuf, platform: Platform, timeout: Duration) -> Self {
+        Self { socket, executable, timeout, link, platform, executable_bytes: Arc::new(OnceCell::new()) }
     }
     pub(crate) fn with_executable_cache(mut self, cache: Arc<OnceCell<Vec<u8>>>) -> Self {
         self.executable_bytes = cache;
@@ -54,7 +55,7 @@ impl UnixAgentConnector {
 }
 #[async_trait]
 impl AgentConnector for UnixAgentConnector {
-    async fn connect(&self) -> Result<Client, String> {
+    async fn connect(&self) -> Result<Arc<dyn AgentClient>, String> {
         let executable = self
             .executable_bytes
             .get_or_try_init(|| async {
@@ -65,115 +66,13 @@ impl AgentConnector for UnixAgentConnector {
                 Ok::<_, String>(bytes)
             })
             .await?;
-        connect_current(
-            || async {
-                let stream = UnixStream::connect(&self.socket).await?;
-                Ok(Box::new(stream) as ByteStream)
-            },
-            &self.platform,
-            executable,
-            self.timeout,
-        )
-        .await
-        .map_err(|e| e.to_string())
-    }
-}
-
-/// First pause between connect attempts, doubled up to [`MAX_BACKOFF`].
-const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
-const MAX_BACKOFF: Duration = Duration::from_secs(2);
-
-/// Whether trying again could succeed. A socket that is not listening yet or
-/// a hello that has not arrived are transient; a refusal from the agent that
-/// states the request itself cannot be accepted (an upload already in
-/// progress, too large, no space) is the same on every attempt.
-fn is_transient(error: &io::Error) -> bool {
-    use drydock_agent::{AgentError, ErrorKind};
-    if let Some(refusal) = AgentError::of(error) {
-        return !matches!(
-            refusal.kind,
-            ErrorKind::Conflict
-                | ErrorKind::AlreadyExists
-                | ErrorKind::FileTooLarge
-                | ErrorKind::PayloadTooLarge
-                | ErrorKind::StorageFull
-                | ErrorKind::QuotaExceeded
-                | ErrorKind::PermissionDenied
-                | ErrorKind::InvalidData
-                | ErrorKind::InvalidInput
-                | ErrorKind::Unsupported
-        );
-    }
-    // A plain PermissionDenied is not listed: an ssh-level denial can clear
-    // while the host is still being provisioned. The agent's own refusal is final.
-    !matches!(
-        error.kind(),
-        io::ErrorKind::InvalidData
-            | io::ErrorKind::InvalidInput
-            | io::ErrorKind::Unsupported
-            | io::ErrorKind::AlreadyExists
-            | io::ErrorKind::FileTooLarge
-            | io::ErrorKind::StorageFull
-            | io::ErrorKind::QuotaExceeded
-    )
-}
-
-/// Initial socket/hello failures are normal while a provider starts the
-/// detached supervisor. Drydock itself handles mismatches and post-upgrade
-/// reconnects. `platform` is the one the vessel's `executable` was built for.
-///
-/// Transient failures are retried with exponential backoff until `timeout`;
-/// a failure that cannot change (see [`is_transient`]) is returned at once.
-/// When the deadline passes, the error is the last one an attempt reported,
-/// not the timeout that cut the final attempt short. Each attempt opens the
-/// transports drydock needs: a transport is consumed by its hello and an
-/// upgrade restarts the agent, so none can be shared between attempts.
-pub async fn connect_current<F, Fut>(mut open: F, platform: &Platform, executable: &[u8], timeout: Duration) -> io::Result<Client>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = io::Result<ByteStream>>,
-{
-    if executable.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "current agent executable is empty"));
-    }
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut last: Option<io::Error> = None;
-    let mut backoff = INITIAL_BACKOFF;
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(deadline_error(last));
-        }
-        match Client::connect_current(&mut open, platform, executable, remaining).await {
-            Ok(client) => return Ok(client),
-            Err(error) if !is_transient(&error) => return Err(error),
-            Err(error) => {
-                // The client's own timeout, once the deadline has passed, is
-                // the deadline cutting the attempt short; it says less than
-                // what failed before. A transport timeout earlier is real.
-                let cut = error.kind() == io::ErrorKind::TimedOut
-                    && drydock_agent::AgentError::of(&error).is_none()
-                    && tokio::time::Instant::now() >= deadline;
-                if !cut || last.is_none() {
-                    last = Some(error);
-                }
-            }
-        }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        tokio::time::sleep(backoff.min(remaining)).await;
-        backoff = (backoff * 2).min(MAX_BACKOFF);
-    }
-}
-
-fn deadline_error(last: Option<io::Error>) -> io::Error {
-    match last {
-        Some(error) => io::Error::new(io::ErrorKind::TimedOut, format!("agent hello: {error}")),
-        None => io::Error::new(io::ErrorKind::TimedOut, "agent hello: no hello"),
+        let mut open = || Box::pin(async { Ok(Box::new(UnixStream::connect(&self.socket).await?) as ByteStream) }) as _;
+        self.link.connect(&mut open, &self.platform, executable, self.timeout).await.map_err(|e| e.to_string())
     }
 }
 
 struct Connection {
-    client: Option<Arc<Client>>,
+    client: Option<Arc<dyn AgentClient>>,
     configuration: Configuration,
     /// The tag the agent gave `configuration`. It changes when the agent
     /// restarts, even behind a link that survived the restart.
@@ -184,7 +83,7 @@ struct Connection {
     outward_forwards: BTreeMap<String, (OutwardForward, Endpoint)>,
 }
 impl Connection {
-    async fn push(&mut self, client: &Client) -> Result<(), String> {
+    async fn push(&mut self, client: &dyn AgentClient) -> Result<(), String> {
         self.etag = Some(client.configure(self.configuration.clone()).await.map_err(|e| e.to_string())?);
         for (forward, endpoint) in self.outward_forwards.values() {
             client
@@ -225,21 +124,6 @@ pub(crate) const OUTPUT_LIMIT: usize = 256 * 1024 * 1024;
 /// How long `healthy` waits to restore a restarted agent's configuration
 /// and forwards before dropping the client for a fresh connection.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Run `exec` with `input` on its stdin. Input is written while output is
-/// read, so neither side fills its pipe. A process may exit without reading
-/// all of its input, as it may with a redirect.
-pub(crate) async fn exec_with_input(client: &Client, exec: Exec, input: &[u8]) -> io::Result<(Vec<u8>, Vec<u8>, ExitStatus)> {
-    let process = client.spawn(Exec { stdin: true, ..exec }).await?;
-    let (written, collected) =
-        tokio::join!(process.write_stdin_bytes(input.to_vec()), async { process.output().await?.collect(OUTPUT_LIMIT).await });
-    // Forget the handle, so the agent holds no output for it.
-    let removed = process.remove().await;
-    match written {
-        Err(error) if error.kind() != io::ErrorKind::BrokenPipe => Err(error),
-        _ => collected.and_then(|collected| removed.map(|()| collected)),
-    }
-}
 
 /// Where a vessel's writable state lives. A contained vessel owns its whole
 /// filesystem; an agent on a shared host resolves the same base the host's
@@ -379,7 +263,7 @@ impl AgentRunner {
         self
     }
 
-    async fn client(&self) -> Result<Arc<Client>, String> {
+    async fn client(&self) -> Result<Arc<dyn AgentClient>, String> {
         let mut state = self.state.lock().await;
         if self.is_closed() {
             return Err("vessel agent handle is closed".into());
@@ -387,8 +271,8 @@ impl AgentRunner {
         if let Some(client) = &state.client {
             return Ok(client.clone());
         }
-        let client = Arc::new(self.connector.connect().await?);
-        state.push(&client).await?;
+        let client = self.connector.connect().await?;
+        state.push(client.as_ref()).await?;
         state.client = Some(client.clone());
         Ok(client)
     }
@@ -400,15 +284,15 @@ impl AgentRunner {
     pub async fn healthy(&self) -> bool {
         let client = self.state.lock().await.client.clone();
         let Some(client) = client else { return false };
-        if let Ok(Ok(current)) = tokio::time::timeout(Duration::from_secs(2), client.configuration()).await {
+        if let Ok(Ok(current)) = tokio::time::timeout(Duration::from_secs(2), client.configuration_tag()).await {
             let mut state = self.state.lock().await;
-            if !state.client.as_ref().is_some_and(|cached| Arc::ptr_eq(cached, &client)) || state.etag.as_ref() == Some(&current.etag) {
+            if !state.client.as_ref().is_some_and(|cached| Arc::ptr_eq(cached, &client)) || state.etag.as_ref() == Some(&current) {
                 return true;
             }
             tracing::info!("vessel agent lost its configuration; pushing it again");
             // The state lock is held across the push, so a hung link must
             // not hold every other caller with it.
-            if matches!(tokio::time::timeout(PUSH_TIMEOUT, state.push(&client)).await, Ok(Ok(()))) {
+            if matches!(tokio::time::timeout(PUSH_TIMEOUT, state.push(client.as_ref())).await, Ok(Ok(()))) {
                 return true;
             }
         }
@@ -494,6 +378,12 @@ impl AgentRunner {
         Ok(())
     }
 
+    /// Drop this handle's connection. The next use connects again and pushes
+    /// the configuration and forwards to the new client.
+    pub async fn disconnect(&self) {
+        self.state.lock().await.client = None;
+    }
+
     /// Drop this handle's connection and its attach listeners for good.
     /// Teardown calls this before stopping the agent: a closed handle never
     /// connects again, so a caller still holding it cannot restart a retired
@@ -533,7 +423,7 @@ impl AgentRunner {
 
     async fn publish(&self, path: &Path, bytes: Vec<u8>, mode: Option<u32>) -> Result<(), String> {
         let options = Self::file_options(path, mode)?;
-        self.client().await?.write_bytes(path, bytes, &options).await.map(drop).map_err(|e| e.to_string())
+        self.client().await?.write_bytes(path, bytes, &options).await.map_err(|e| e.to_string())
     }
 
     /// Push each regular asset through files/write, then replace generation
@@ -665,12 +555,7 @@ impl VesselAgent for Arc<AgentRunner> {
     }
     async fn stat(&self, path: &Path) -> Result<Option<EntryKind>, String> {
         match self.client().await?.stat(path).await {
-            Ok(entry) => Ok(Some(match entry.kind {
-                drydock_agent::EntryKind::File => EntryKind::File,
-                drydock_agent::EntryKind::Directory => EntryKind::Directory,
-                drydock_agent::EntryKind::Symlink => EntryKind::Symlink,
-                drydock_agent::EntryKind::Other => EntryKind::Other,
-            })),
+            Ok(kind) => Ok(Some(kind)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(format!("stat {}: {error}", path.display())),
         }
@@ -679,7 +564,7 @@ impl VesselAgent for Arc<AgentRunner> {
         // The agent applies exactly `mode`, keeps an existing directory's contents
         // and refuses anything else, a symbolic link included, at `path`.
         let options = FileOptions { mode: Some(mode), parents: true, ..FileOptions::default() };
-        self.client().await?.create_dir(path, &options).await.map(drop).map_err(|error| format!("create {}: {error}", path.display()))
+        self.client().await?.create_dir(path, &options).await.map_err(|error| format!("create {}: {error}", path.display()))
     }
     async fn read(&self, path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
         match self.client().await?.read_bytes(path, limit).await {
@@ -704,13 +589,13 @@ impl VesselAgent for Arc<AgentRunner> {
         self.client().await?.rename(&rename).await.map_err(|error| format!("rename {} to {}: {error}", from.display(), to.display()))
     }
     async fn architecture(&self) -> Result<String, String> {
-        let platform = self.client().await?.hello().platform.clone();
+        let platform = self.client().await?.platform();
         platform.map(|platform| platform.architecture).ok_or_else(|| "the vessel agent predates platform reporting".to_string())
     }
     async fn fetch_artifact(&self, sha256: &str, urls: &[String], unpack: PinUnpack) -> Result<(), String> {
         let sources = urls.iter().map(|url| ArtifactSource::Upstream { url: url.clone() }).collect();
         let fetch = Fetch { sources, unpack: store_unpack(unpack)? };
-        self.client().await?.fetch_artifact(sha256, &fetch).await.map(drop).map_err(|error| format!("fetch artifact {sha256}: {error}"))
+        self.client().await?.fetch_artifact(sha256, &fetch).await.map_err(|error| format!("fetch artifact {sha256}: {error}"))
     }
     async fn push_artifact(&self, sha256: &str, file: &Path, unpack: PinUnpack) -> Result<(), String> {
         let fetch = Fetch { sources: vec![ArtifactSource::Push], unpack: store_unpack(unpack)? };
@@ -720,7 +605,6 @@ impl VesselAgent for Arc<AgentRunner> {
             .await?
             .fetch_artifact_or_push(sha256, &fetch, length, content)
             .await
-            .map(drop)
             .map_err(|error| format!("push artifact {sha256}: {error}"))
     }
     async fn link_artifact(&self, path: &Path, sha256: &str, member: &Path) -> Result<(), String> {
@@ -771,7 +655,7 @@ impl VesselAgent for Arc<AgentRunner> {
         }
         let listener = UnixListener::bind(&path).map_err(|e| format!("bind attach forward {}: {e}", path.display()))?;
         let mut cleanup = SocketCleanup(Some(path.clone()));
-        drydock_agent::socket::protect(&path).map_err(|e| e.to_string())?;
+        client::protect_socket(&path).map_err(|e| e.to_string())?;
         let client = self.client().await?;
         client
             .put_inward_forward(InwardForward { id: id.clone(), endpoint: Endpoint::Unix(guest.into()) })
@@ -839,14 +723,14 @@ impl CommandRunner for AgentRunner {
         self.publish(path, content.as_bytes().to_vec(), Some(mode)).await
     }
     async fn read_file_to(&self, source: &Path, destination: &Path) -> Result<(), String> {
-        let download = self.client().await?.read(source).await.map_err(|e| e.to_string())?;
+        let client = self.client().await?;
         let mut file = tokio::fs::File::create(destination).await.map_err(|e| e.to_string())?;
-        download.copy_to(&mut file).await.map(drop).map_err(|e| e.to_string())
+        client.read_to(source, &mut file).await.map(drop).map_err(|e| e.to_string())
     }
     async fn write_file_from(&self, source: &Path, destination: &Path) -> Result<(), String> {
         let options = Self::file_options(destination, None)?;
         let file = tokio::fs::File::open(source).await.map_err(|e| e.to_string())?;
-        self.client().await?.write(destination, file, &options).await.map(drop).map_err(|e| e.to_string())
+        self.client().await?.write(destination, Box::new(file), &options).await.map_err(|e| e.to_string())
     }
     async fn run_to_file(&self, cmd: &str, args: &[&str], cwd: &Path, destination: &Path) -> Result<(), String> {
         use tokio::io::AsyncWriteExt;
@@ -854,7 +738,7 @@ impl CommandRunner for AgentRunner {
         let mut stream = self.client().await?.exec(exec).await.map_err(|e| e.to_string())?;
         let mut file = tokio::fs::File::create(destination).await.map_err(|e| e.to_string())?;
         let mut stderr = Vec::new();
-        while let Some(event) = stream.next().await.map_err(|e| e.to_string())? {
+        while let Some(event) = stream.next().await.transpose().map_err(|e| e.to_string())? {
             match event {
                 ExecEvent::Stdout(bytes) => file.write_all(&bytes).await.map_err(|e| e.to_string())?,
                 ExecEvent::Stderr(bytes) => stderr.extend(bytes.into_iter().take((64 * 1024_usize).saturating_sub(stderr.len()))),
@@ -871,7 +755,8 @@ impl CommandRunner for AgentRunner {
     }
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, _: &ChannelLabel, input: &[u8]) -> Result<String, String> {
         let exec = Exec { cwd: Some(absolute_cwd(cwd)?), ..Exec::new(cmd, args.iter().copied()) };
-        let (stdout, stderr, status) = exec_with_input(&*self.client().await?, exec, input).await.map_err(|e| e.to_string())?;
+        let (stdout, stderr, status) =
+            self.client().await?.run_with_input(exec, input.to_vec(), OUTPUT_LIMIT).await.map_err(|e| e.to_string())?;
         if status.success() {
             Ok(String::from_utf8_lossy(&stdout).into_owned())
         } else {
@@ -897,7 +782,7 @@ impl CommandRunner for AgentRunner {
         let options = FileOptions { exclusive: true, ..Self::file_options(path, None)? };
         let client = self.client().await?;
         match client.write_bytes(path, content.as_bytes().to_vec(), &options).await {
-            Ok(_) => Ok(content.into()),
+            Ok(()) => Ok(content.into()),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let bytes = client.read_bytes(path, ENSURED_FILE_LIMIT).await.map_err(|e| e.to_string())?;
                 String::from_utf8(bytes).map_err(|e| e.to_string())
@@ -908,4 +793,6 @@ impl CommandRunner for AgentRunner {
 }
 
 #[cfg(test)]
-pub(crate) mod tests;
+pub(crate) mod memory;
+#[cfg(test)]
+mod tests;

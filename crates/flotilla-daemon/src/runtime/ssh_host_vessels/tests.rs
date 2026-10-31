@@ -1,13 +1,14 @@
 //! The vessel manager against real drydock agents. The "host" is this
 //! machine: each vessel's agent is drydock's Agent serving the vessel's real
 //! socket in this process, reached directly rather than over SSH (the SSH
-//! transport has its own contract tests in flotilla-environment), and host
+//! transport has its own contract tests in flotilla-drydock), and host
 //! commands run through the local process runner.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use flotilla_discovery_api::EnvironmentAssertion;
-use flotilla_environment::environment::agent::{connect_current, AgentConnector};
+use flotilla_drydock::agent::{connect_current, DrydockClient};
+use flotilla_environment::environment::agent::{client::AgentClient, AgentConnector};
 use flotilla_provider_runtime::{
     host_environment::{HostEnvironment, HostSupply},
     ProcessCommandRunner,
@@ -188,7 +189,7 @@ struct LocalConnector {
 
 #[async_trait]
 impl AgentConnector for LocalConnector {
-    async fn connect(&self) -> Result<drydock_agent::Client, String> {
+    async fn connect(&self) -> Result<Arc<dyn AgentClient>, String> {
         connect_current(
             || async {
                 let stream = UnixStream::connect(&self.socket).await?;
@@ -203,6 +204,7 @@ impl AgentConnector for LocalConnector {
             Duration::from_secs(5),
         )
         .await
+        .map(|client| Arc::new(DrydockClient(client)) as Arc<dyn AgentClient>)
         .map_err(|error| error.to_string())
     }
 }

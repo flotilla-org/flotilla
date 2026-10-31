@@ -5,14 +5,21 @@
 //! Drydock owns each vessel's connections (ADR 0070, drydock#132): the adapter
 //! asks it for standing exposures and connects to the local sockets they give.
 //! It never interprets a reach, holds a vessel key, opens SSH or names a provider.
+pub mod api;
 mod connector;
 mod exposures;
+#[cfg(test)]
+mod memory;
 mod observations;
 mod vessel_agent;
-use super::{agent::AgentRunner, vessel_ops::UnavailableAgent, *};
-use ::drydock::api::ProviderApi;
+use super::{
+    agent::{client::AgentLink, AgentRunner},
+    vessel_ops::UnavailableAgent,
+    *,
+};
+pub use api::ProviderApi;
+use api::{self as wire, ApiError};
 pub use connector::installed_agent_build;
-use drydock_protocol as wire;
 use flotilla_protocol::provider::AgentConnectionReport;
 use std::{collections::BTreeMap, sync::RwLock, time::Duration};
 
@@ -36,6 +43,7 @@ const AGENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct DrydockEnvironmentProvider {
     api: Arc<dyn ProviderApi>,
+    link: Arc<dyn AgentLink>,
     instance: String,
     module: String,
     lab_reach: Option<(String, u16)>,
@@ -50,9 +58,11 @@ pub struct DrydockEnvironmentProvider {
     active: tokio::sync::Mutex<HashMap<EnvironmentId, std::sync::Weak<DrydockEnvironment>>>,
 }
 impl DrydockEnvironmentProvider {
-    pub fn new(api: Arc<dyn ProviderApi>, instance: String, module: String) -> Self {
+    /// An instance served by `api`, whose vessels' agents are reached through `link`.
+    pub fn new(api: Arc<dyn ProviderApi>, link: Arc<dyn AgentLink>, instance: String, module: String) -> Self {
         Self {
             api,
+            link,
             instance,
             module,
             lab_reach: None,
@@ -80,6 +90,17 @@ impl DrydockEnvironmentProvider {
         self.guest.agent = socket;
         self
     }
+    /// The port the lab service's name answers on in the guest, for a
+    /// stand-in vessel that is not a drydock guest.
+    pub fn with_guest_lab_port(mut self, port: u16) -> Self {
+        self.guest.lab_port = port;
+        self
+    }
+    /// How long one agent connection may take, the vessel's boot included.
+    pub fn with_agent_timeout(mut self, timeout: Duration) -> Self {
+        self.agent_timeout = timeout;
+        self
+    }
     pub fn with_lab_reach(mut self, reach: Option<(String, u16)>) -> Self {
         self.lab_reach = reach;
         self
@@ -88,14 +109,12 @@ impl DrydockEnvironmentProvider {
     /// host cannot serve with the reason, and conservative capabilities.
     async fn declaration(&self) -> Result<wire::ProviderDeclaration, String> {
         let hello = self.api.hello().await.map_err(api_error)?;
-        if !hello.is_compatible() {
+        if !hello.compatible {
             return Err("drydock protocol version mismatch".into());
         }
         let declaration = match self.api.provider(&self.instance).await {
             Ok(declaration) => declaration,
-            Err(::drydock::client::Error::Protocol(wire::ProtocolError::NotFound { .. })) => {
-                return Err("instance absent from drydock".into());
-            }
+            Err(error) if error.is_not_found() => return Err("instance absent from drydock".into()),
             Err(error) => return Err(api_error(error)),
         };
         let module_version = hello
@@ -124,6 +143,7 @@ impl DrydockEnvironmentProvider {
         let exposures = exposures::Exposures { api: self.api.clone(), instance: self.instance.clone(), backing: environment.id.clone() };
         let agent = provisioned.then(|| {
             let connector = connector::DrydockAgentConnector {
+                link: self.link.clone(),
                 exposures: exposures.clone(),
                 module: self.module.clone(),
                 socket: self.guest.agent.clone(),
@@ -184,10 +204,11 @@ impl DrydockEnvironmentProvider {
 /// The lab service, reached from drydock's machine, at its own name inside the
 /// guest. TLS stays end to end; the guest receives no reach credential.
 fn lab_request(hostname: &str, port: u16, guest_port: u16) -> Result<wire::OutwardRequest, String> {
-    let name = wire::HostAddress::try_from(LAB_HOSTNAME.to_owned()).map_err(|error| format!("lab service name: {error}"))?;
-    let guest_port = wire::Port::new(guest_port).ok_or("lab service guest port must be nonzero")?;
+    if guest_port == 0 {
+        return Err("lab service guest port must be nonzero".into());
+    }
     Ok(wire::OutwardRequest {
-        guest: wire::Guest::Name { name, port: guest_port },
+        guest: wire::Guest::Name { name: LAB_HOSTNAME.into(), port: guest_port },
         destination: wire::OutwardDestination::Tcp(format!("{hostname}:{port}")),
     })
 }
@@ -248,9 +269,8 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
                     // The provider's builder pulls the pinned image and tools itself, as
                     // before drydock protocol 8 named routes; no pull access is sent.
                     route: Some(wire::ImageRouteKind::RegistryPull),
-                    image_pull: None,
                     image_digest: spec.image.clone(),
-                    tools_digest: ::drydock::launch::build_tools_digest().map_err(|e| e.to_string())?.into(),
+                    tools_digest: self.link.tools_image()?,
                     size: size(&spec.size),
                 },
             )
@@ -301,7 +321,7 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
             Ok(provisioned) => provisioned,
             // A backing this label names, whose key drydock does not hold (one an
             // earlier generation provisioned with its own key), keeps its work.
-            Err(::drydock::client::Error::Protocol(wire::ProtocolError::Refused { reason }))
+            Err(ApiError::Protocol { kind: wire::ProtocolErrorKind::Refused, reason, .. })
                 if self.list_backings().await.is_ok_and(|backings| backings.iter().any(|b| b.environment_id == id)) =>
             {
                 return Err(EnvironmentProvisionError::RetryAdoption(format!("drydock refused to adopt the existing backing: {reason}")));
@@ -309,8 +329,8 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
             Err(error) => return Err(api_error(error).into()),
         };
         let (created, environment) = match provisioned {
-            ::drydock::api::Provisioned::Created(environment) => (true, environment),
-            ::drydock::api::Provisioned::Existing(environment) => (false, environment),
+            wire::Provisioned::Created(environment) => (true, environment),
+            wire::Provisioned::Existing(environment) => (false, environment),
         };
         let mut env = prepared.spec.env.clone();
         env.extend(opts.tokens);
@@ -478,9 +498,7 @@ impl ProvisionedEnvironment for DrydockEnvironment {
         } else {
             match self.api.inspect(&self.instance, &self.backing).await {
                 Ok(e) => observation(e.state),
-                Err(::drydock::client::Error::Protocol(wire::ProtocolError::NotFound { .. })) => {
-                    ObservationState::Gone { cause: GoneCause::MissingOnList }
-                }
+                Err(error) if error.is_not_found() => ObservationState::Gone { cause: GoneCause::MissingOnList },
                 Err(e) => ObservationState::Unknown { reason: UnknownReason::ProviderApiError { message: api_error(e) } },
             }
         };
@@ -580,17 +598,8 @@ impl CommandRunner for InventoryRunner {
     }
 }
 
-fn api_error(cause: ::drydock::client::Error) -> String {
-    use ::drydock::client::Error;
-    match cause {
-        // Drydock masks credentials in the provider's explanation before it
-        // leaves the host; without it an operator cannot tell a quota from a fault.
-        Error::Protocol(error) => format!("drydock provider {error}"),
-        Error::NotReady(_) => "drydock provider not ready".into(),
-        Error::ReadinessTimeout(_) => "drydock provider readiness timed out".into(),
-        other => other.to_string(),
-    }
+/// Drydock masks credentials in the provider's explanation before it leaves
+/// the host; without it an operator cannot tell a quota from a fault.
+fn api_error(cause: ApiError) -> String {
+    cause.to_string()
 }
-
-#[cfg(test)]
-mod conformance_test;

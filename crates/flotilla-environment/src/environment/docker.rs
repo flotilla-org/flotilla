@@ -6,7 +6,10 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 #[cfg(unix)]
-use super::agent::{AgentConnector, AgentRunner, UnixAgentConnector};
+use super::agent::{
+    client::{private_directory, AgentLink},
+    AgentConnector, AgentRunner, UnixAgentConnector,
+};
 #[cfg(unix)]
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
@@ -136,6 +139,12 @@ impl DockerEnvironmentProvider {
         Arc::get_mut(&mut self.inner).expect("configure before sharing provider").agent_settings = settings;
         self
     }
+    /// How vessel agents are reached and installed: the composition root's.
+    /// Configure before sharing; panics if another Arc owns the inner state.
+    pub fn with_agent_link(mut self, link: Arc<dyn AgentLink>) -> Self {
+        Arc::get_mut(&mut self.inner).expect("configure before sharing provider").link = Some(link);
+        self
+    }
     /// Injectable process/transport seam. Docker command tests still run the
     /// production preparation and supervisor commands, then dial a real Agent.
     /// Configure before sharing; panics if another Arc owns the inner state.
@@ -146,7 +155,7 @@ impl DockerEnvironmentProvider {
 }
 #[cfg(unix)]
 struct DockerPrepared {
-    platform: drydock_protocol::Platform,
+    platform: super::agent::client::Platform,
     original: ImageId,
     image: ImageId,
 }
@@ -496,6 +505,8 @@ pub(super) struct DockerEnvironmentProviderInner {
     #[cfg(unix)]
     connector: Option<Arc<ConnectorFactory>>,
     #[cfg(unix)]
+    link: Option<Arc<dyn AgentLink>>,
+    #[cfg(unix)]
     agent_bytes: Arc<tokio::sync::OnceCell<Vec<u8>>>,
     #[cfg(unix)]
     agents: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Arc<AgentLease>>>>>,
@@ -513,6 +524,8 @@ impl DockerEnvironmentProviderInner {
             },
             #[cfg(unix)]
             connector: None,
+            #[cfg(unix)]
+            link: None,
             #[cfg(unix)]
             agents: Default::default(),
             #[cfg(unix)]
@@ -1355,7 +1368,7 @@ impl DockerEnvironmentProvider {
                 crate::guest_tools::GuestTools::installed(&platform)?;
             }
             self.inner.verify_image_platform(original.as_str()).await?;
-            let tools = drydock::launch::build_tools_digest().map_err(|e| e.to_string())?;
+            let tools = self.inner.link()?.tools_image()?;
             let base = self.agent_image_base(&original).await?;
             let dockerfile = format!("FROM --platform=linux/amd64 {tools} AS tools\nFROM --platform=linux/amd64 {base}\nCOPY --from=tools /opt/drydock /opt/drydock\n");
             let output = self
@@ -1395,6 +1408,10 @@ impl DockerEnvironmentProvider {
 
 #[cfg(unix)]
 impl DockerEnvironmentProviderInner {
+    fn link(&self) -> Result<Arc<dyn AgentLink>, String> {
+        self.link.clone().ok_or_else(|| "Docker vessels need the vessel agent link the composition root supplies".into())
+    }
+
     async fn remove_agent_directory(&self, directory: &Path) {
         // Mounted labels can describe legacy/external paths. Remove only the
         // hashed child owned by this provider, never an arbitrary adopted path.
@@ -1416,11 +1433,11 @@ impl DockerEnvironmentProviderInner {
 
     fn runtime_directory(&self, id: &EnvironmentId) -> Result<PathBuf, String> {
         std::fs::create_dir_all(&self.agent_settings.runtime_root).map_err(|e| e.to_string())?;
-        drydock_agent::socket::private_directory(&self.agent_settings.runtime_root).map_err(|e| e.to_string())?;
+        private_directory(&self.agent_settings.runtime_root).map_err(|e| e.to_string())?;
         let directory = self.agent_settings.runtime_root.join(&format!("{:x}", Sha256::digest(id.as_str().as_bytes()))[..24]);
-        drydock_agent::socket::private_directory(&directory).map_err(|e| e.to_string())?;
+        private_directory(&directory).map_err(|e| e.to_string())?;
         for child in ["guest", "host"] {
-            drydock_agent::socket::private_directory(&directory.join(child)).map_err(|e| e.to_string())?;
+            private_directory(&directory.join(child)).map_err(|e| e.to_string())?;
         }
         Ok(directory)
     }
@@ -1510,8 +1527,14 @@ impl DockerEnvironmentProviderInner {
                 let connector = match &self.connector {
                     Some(factory) => factory(&socket),
                     None => Arc::new(
-                        UnixAgentConnector::new(socket, executable, crate::guest_tools::linux_amd64(), Duration::from_secs(30))
-                            .with_executable_cache(self.agent_bytes.clone()),
+                        UnixAgentConnector::new(
+                            self.link()?,
+                            socket,
+                            executable,
+                            crate::guest_tools::linux_amd64(),
+                            Duration::from_secs(30),
+                        )
+                        .with_executable_cache(self.agent_bytes.clone()),
                     ),
                 };
                 let agent = Arc::new(AgentRunner::new(connector, directory.join("host")));
@@ -1585,7 +1608,10 @@ impl DockerEnvironmentProviderInner {
 
 #[cfg(all(test, unix))]
 mod agent_contract_tests {
-    use super::super::{agent::tests::MemoryAgent, contract_tests::LocalImageTags};
+    use super::super::{
+        agent::memory::{MemoryAgent, MemoryLink},
+        contract_tests::LocalImageTags,
+    };
     use super::super::{EnvironmentTool, EnvironmentToolAsset};
     use super::*;
     use flotilla_provider_runtime::CommandOutput;
@@ -1782,11 +1808,12 @@ mod agent_contract_tests {
         let destination = assets.path().join("guest/flotilla");
         std::fs::write(&source, b"cut-down CLI").unwrap();
         let engine = Arc::new(Engine::default());
-        let memory = MemoryAgent::new(true);
+        let memory = MemoryAgent::new();
         let shared = memory.clone();
         let provider = DockerEnvironmentProvider::new(engine.clone())
             .with_vessel_slice(Some(super::super::docker_vessels::DockerVessels::for_tests()))
             .with_agent_settings(DockerAgentSettings { runtime_root: root.path().into(), executable: source.clone() })
+            .with_agent_link(Arc::new(MemoryLink(memory.clone())))
             .with_agent_connector(Arc::new(move |_| shared.clone()));
         let spec = super::super::legacy_environment_spec(&flotilla_protocol::EnvironmentSpec {
             image: flotilla_protocol::ImageSource::Registry(BASE.into()),
@@ -1811,7 +1838,6 @@ mod agent_contract_tests {
         let readopted = provider.list().await.unwrap().pop().unwrap();
         assert!(readopted.agent().ready().await.is_ok());
         assert_eq!(readopted.runner().run("printf", &["readopted"], Path::new("/"), &ChannelLabel::Default).await.unwrap(), "readopted");
-        assert_eq!(memory.upgrades.load(Ordering::SeqCst), 1);
         handle.destroy().await.unwrap();
         assert!(!engine.created.load(Ordering::SeqCst));
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0, "destroy must remove the per-vessel runtime directory");
@@ -1820,10 +1846,11 @@ mod agent_contract_tests {
     async fn provision_with(engine: &Arc<Engine>, root: &Path, tools: Vec<EnvironmentTool>) -> Result<EnvironmentHandle, String> {
         let executable = root.join("agent");
         std::fs::write(&executable, b"agent").unwrap();
-        let memory = MemoryAgent::new(true);
+        let memory = MemoryAgent::new();
         let provider = DockerEnvironmentProvider::new(engine.clone())
             .with_vessel_slice(Some(super::super::docker_vessels::DockerVessels::for_tests()))
             .with_agent_settings(DockerAgentSettings { runtime_root: root.join("runtime"), executable })
+            .with_agent_link(Arc::new(MemoryLink(memory.clone())))
             .with_agent_connector(Arc::new(move |_| memory.clone()));
         let spec = super::super::legacy_environment_spec(&flotilla_protocol::EnvironmentSpec {
             image: flotilla_protocol::ImageSource::Registry(BASE.into()),
@@ -1971,7 +1998,7 @@ mod runtime_path_tests {
 
 #[cfg(all(test, unix))]
 mod adoption_tests {
-    use super::super::agent::tests::MemoryAgent;
+    use super::super::agent::{client::AgentClient, memory::MemoryAgent};
     use super::*;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -2040,7 +2067,7 @@ mod adoption_tests {
     struct Unreachable;
     #[async_trait]
     impl AgentConnector for Unreachable {
-        async fn connect(&self) -> Result<drydock_agent::Client, String> {
+        async fn connect(&self) -> Result<Arc<dyn AgentClient>, String> {
             Err("agent unreachable".into())
         }
     }
@@ -2053,7 +2080,7 @@ mod adoption_tests {
     async fn unavailable_agent_keeps_inventory_and_removed_container_retires_supervision() {
         let root = tempfile::tempdir().unwrap();
         let engine = Arc::new(Inventory::default());
-        let memory = MemoryAgent::new(false);
+        let memory = MemoryAgent::new();
         let shared = memory.clone();
         let bad = root.path().join("bad/guest/agent.sock");
         for id in ["bad", "healthy"] {
@@ -2112,7 +2139,7 @@ mod adoption_tests {
     }
     #[async_trait]
     impl AgentConnector for GatedConnector {
-        async fn connect(&self) -> Result<drydock_agent::Client, String> {
+        async fn connect(&self) -> Result<Arc<dyn AgentClient>, String> {
             self.entered.notify_one();
             std::future::pending().await
         }
@@ -2126,7 +2153,7 @@ mod adoption_tests {
         }
         let entered = Arc::new(tokio::sync::Notify::new());
         let gate = entered.clone();
-        let memory = MemoryAgent::new(false);
+        let memory = MemoryAgent::new();
         let provider = DockerEnvironmentProvider::new(Arc::new(Inventory::default())).with_agent_connector(Arc::new(move |socket| {
             if socket.to_string_lossy().contains("slow") {
                 Arc::new(GatedConnector { entered: gate.clone() })
