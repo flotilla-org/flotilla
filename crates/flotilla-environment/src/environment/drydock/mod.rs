@@ -268,9 +268,10 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
                 &self.instance,
                 &wire::PrepareRequest {
                     platform: Some(platform.clone()),
-                    // The provider's builder pulls the pinned image and tools itself, as
-                    // before drydock protocol 8 named routes; no pull access is sent.
-                    route: Some(wire::ImageRouteKind::RegistryPull),
+                    // Temporary: the route should follow the image's disposition
+                    // (flotilla-org/drydock#175). Safe only because no pull credentials are
+                    // sent, so only public images can be fetched and pushed.
+                    route: None,
                     image_digest: spec.image.clone(),
                     tools_digest: self.link.tools_image()?,
                     size: size(&spec.size),
