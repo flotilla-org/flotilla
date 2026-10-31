@@ -54,8 +54,8 @@ impl Factory for ForgejoIssueProviderFactory {
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn IssueProvider>, Vec<UnmetRequirement>> {
         let settings = config.load_config_for_probe().await.map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?;
-        let provider_config = bounded_forgejo_provider_config(env, config, &settings).await?;
-        Ok(Arc::new(ForgejoIssueProvider::new(Arc::clone(&self.http), runner, provider_config)))
+        let (provider_config, http) = bounded_forgejo_provider_config(env, config, &settings, Arc::clone(&self.http)).await?;
+        Ok(Arc::new(ForgejoIssueProvider::new(http, runner, provider_config)))
     }
 }
 
