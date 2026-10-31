@@ -28,3 +28,5 @@ runs:
         targets: ${{ inputs.targets }}
     - shell: bash
       run: ci/toolchain/assert.sh
+    - shell: bash
+      run: ci/toolchain/remove-others.sh
