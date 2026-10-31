@@ -774,6 +774,13 @@ impl FlotillaVcs {
         Self::new(ExecutionEnvironmentPath::new("/"), runner, strategy)
     }
 
+    /// A provider that makes a fresh clone through `runner`, such as one whose
+    /// Git carries a clone's delivered credentials (#4218). A fresh clone
+    /// addresses its target by path and never consults a checkout.
+    pub fn fresh_clone(runner: Arc<dyn CommandRunner>) -> Self {
+        Self::object_cache(runner)
+    }
+
     async fn remove_reference_clone(&self, branch: &str, target: &str) -> Result<CheckoutRemoval, String> {
         if !self.runner.path_exists(Path::new(target)).await? {
             return Ok(CheckoutRemoval::Removed);

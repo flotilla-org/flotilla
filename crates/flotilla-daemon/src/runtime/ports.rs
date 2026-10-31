@@ -21,8 +21,8 @@ use flotilla_provisioning::reconcilers::{
 };
 use flotilla_resources::checkout_path::checkout_path_from_status_and_spec;
 use flotilla_resources::{
-    ChangeRequest, Checkout, CheckoutIntegrationStatus, CheckoutSpec, Clone, ClonePhase, Convoy, ConvoyTeardownRuntime, Demand, DemandKind,
-    DemandSpec, Forge, ForgeIdentity, InputMeta, Resource, ResourceError, ResourceObject,
+    canonicalize_repo_url, ChangeRequest, Checkout, CheckoutIntegrationStatus, CheckoutSpec, Clone, CloneCredentials, ClonePhase, Convoy,
+    ConvoyTeardownRuntime, Demand, DemandKind, DemandSpec, Forge, ForgeIdentity, InputMeta, Resource, ResourceError, ResourceObject,
 };
 use flotilla_store::{ReplicaReadResolver, ResourceBackend};
 use flotilla_vcs::vcs::CheckoutMaterialisationError;
@@ -401,6 +401,32 @@ impl WorktreeMetadataResolver for RoutingCheckoutRuntime {
 }
 
 impl RoutingCheckoutRuntime {
+    /// The VCS a fresh clone runs through. A clone whose repository has grants
+    /// gets them delivered into its environment first, as a crew session's are,
+    /// and its Git runs with the delivered environment (#4218).
+    async fn fresh_clone_vcs(
+        &self,
+        env_ref: &str,
+        url: &str,
+        target: &str,
+        credentials: &CloneCredentials,
+    ) -> Result<Arc<dyn flotilla_vcs::vcs::Vcs>, String> {
+        if credentials.is_empty() {
+            return self.runtime_for(env_ref, target).await?.vcs(target);
+        }
+        let environment = self
+            .state
+            .daemon
+            .resolve_environment_ref(env_ref)
+            .ok_or_else(|| format!("checkout environment {env_ref} is unavailable on this host"))?;
+        let store = self.state.credential_store.as_ref().ok_or("host-local credential store unavailable for clone delivery")?;
+        let runner = store
+            .prepare_clone(env_ref, target, credentials, environment.runner)
+            .await
+            .map_err(|error| refused_clone_grant(url, credentials, &error))?;
+        Ok(Arc::new(flotilla_vcs::vcs::FlotillaVcs::fresh_clone(runner)))
+    }
+
     pub(super) async fn runtime_for(&self, env_ref: &str, checkout: &str) -> Result<CheckoutControllerRuntime, String> {
         let environment = self
             .state
@@ -454,7 +480,11 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
         let result = match &checkout.spec {
             CheckoutSpec::Worktree(spec) => vcs.continue_checkout(&spec.r#ref, target, reason).await?,
             CheckoutSpec::FreshClone(spec) if spec.source_clone_ref.is_none() => {
-                vcs.continue_fresh_clone(&spec.url, &spec.r#ref, target).await?
+                let credentials = CloneCredentials::from_annotations(&checkout.metadata.annotations)?;
+                let vcs = self.fresh_clone_vcs(env_ref, &spec.url, target, &credentials).await?;
+                vcs.continue_fresh_clone(&spec.url, &spec.r#ref, target)
+                    .await
+                    .map_err(|error| unauthorised_clone(&spec.url, &credentials, error))?
             }
             CheckoutSpec::FreshClone(_) => {
                 return Err("local clones continue through host-local clone preparation with a managed source".to_string().into())
@@ -551,8 +581,14 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
         branch: &str,
         base_ref: Option<&str>,
         target_path: &str,
+        credentials: &CloneCredentials,
     ) -> Result<PreparedCheckout, String> {
-        self.runtime_for(env_ref, target_path).await?.create_fresh_clone(repo_url, branch, base_ref, target_path).await
+        let vcs = self.fresh_clone_vcs(env_ref, repo_url, target_path, credentials).await?;
+        let materialisation = vcs
+            .materialise_fresh_clone(repo_url, branch, base_ref, target_path)
+            .await
+            .map_err(|error| unauthorised_clone(repo_url, credentials, error))?;
+        Ok(PreparedCheckout { commit: materialisation.commit, branch_provenance: materialisation.provenance })
     }
 
     async fn inspect_integration_in(
@@ -575,6 +611,40 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
             warn!(%error, "could not record checkout archive root for retention sweep");
         }
         self.runtime_for(env_ref, removal_source_path(removal)).await?.remove_checkout(removal).await
+    }
+}
+
+/// Git's own words when a forge asks for a sign-in the clone cannot give.
+const GIT_SIGN_IN_REFUSALS: &[&str] =
+    &["could not read Username", "could not read Password", "terminal prompts disabled", "Authentication failed", "Repository not found"];
+
+fn clone_forge(url: &str) -> String {
+    canonicalize_repo_url(url)
+        .ok()
+        .and_then(|canonical| canonical.split_once("://").and_then(|(_, rest)| rest.split('/').next().map(str::to_string)))
+        .unwrap_or_else(|| url.to_string())
+}
+
+fn clone_grants(credentials: &CloneCredentials) -> String {
+    credentials.refs.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ")
+}
+
+/// A grant whose delivery failed: name the repository, its forge and the grant.
+fn refused_clone_grant(url: &str, credentials: &CloneCredentials, error: &str) -> String {
+    format!("cannot clone {url}: delivering its granted credentials {} for {} failed: {error}", clone_grants(credentials), clone_forge(url))
+}
+
+/// A clone the forge refused for want of a sign-in says which grant is missing
+/// or refused, instead of leaving only Git's prompt failure (#4218).
+fn unauthorised_clone(url: &str, credentials: &CloneCredentials, error: String) -> String {
+    if !GIT_SIGN_IN_REFUSALS.iter().any(|refusal| error.contains(refusal)) {
+        return error;
+    }
+    let forge = clone_forge(url);
+    if credentials.is_empty() {
+        format!("cannot clone {url}: {forge} requires a sign-in and no credential grant covers this repository; grant a credential for {forge} to it ({error})")
+    } else {
+        format!("cannot clone {url}: {forge} refused the granted credentials {} ({error})", clone_grants(credentials))
     }
 }
 
