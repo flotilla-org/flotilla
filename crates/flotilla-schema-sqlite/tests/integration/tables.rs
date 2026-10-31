@@ -304,11 +304,10 @@ fn delete_cascades<K: Fixture>(tc: &TestCase) {
     for index in 0..K::COVERING {
         loaded.push(insert(&mut store, &format!("r{index}"), &K::generate(tc, Pick::Cover(index))));
     }
-    let conn = store.into_connection();
-    let before: i64 = loaded.iter().flat_map(|current| owned_rows::<K>(&conn, current.id.0)).map(|(_, rows)| rows).sum();
-    let tables_with_rows = K::table_set().tables.iter().filter(|table| owned_rows_in(&conn, table) > 0).count();
+    let conn = store.connection();
+    let before: i64 = loaded.iter().flat_map(|current| owned_rows::<K>(conn, current.id.0)).map(|(_, rows)| rows).sum();
+    let tables_with_rows = K::table_set().tables.iter().filter(|table| owned_rows_in(conn, table) > 0).count();
     assert_eq!(tables_with_rows, K::table_set().tables.len(), "the covering values fill every table");
-    let mut store = Store::open(conn, LOCAL, registry()).expect("reopen");
     let mut write = store.write().expect("write");
     for current in &loaded {
         write.delete::<K>(current.stamp(), &origin()).expect("delete");
@@ -327,17 +326,54 @@ fn owned_rows_in(conn: &Connection, table: &Table) -> i64 {
 }
 
 // Behaviour (DESIGN keys): deleting a resource cascades through every table of its kind, at every
-// depth, for every fixture; the covering values fill every table first.
+// depth, for every fixture; the covering values fill every table first. One test per kind, so
+// they run in parallel.
 #[hegel::test]
-fn deleting_a_resource_empties_every_table(tc: TestCase) {
+fn deleting_a_resource_empties_every_table_message(tc: TestCase) {
     delete_cascades::<Resource<Message>>(&tc);
+}
+
+#[hegel::test]
+fn deleting_a_resource_empties_every_table_agent_session(tc: TestCase) {
     delete_cascades::<Resource<AgentSession>>(&tc);
+}
+
+#[hegel::test]
+fn deleting_a_resource_empties_every_table_person(tc: TestCase) {
     delete_cascades::<Resource<Person>>(&tc);
+}
+
+#[hegel::test]
+fn deleting_a_resource_empties_every_table_awaiting_reply(tc: TestCase) {
     delete_cascades::<Resource<AwaitingReply>>(&tc);
+}
+
+#[hegel::test]
+fn deleting_a_resource_empties_every_table_convoy(tc: TestCase) {
     delete_cascades::<Resource<Convoy>>(&tc);
+}
+
+#[hegel::test]
+fn deleting_a_resource_empties_every_table_ensure(tc: TestCase) {
     delete_cascades::<Resource<Ensure>>(&tc);
+}
+
+#[hegel::test]
+fn deleting_a_resource_empties_every_table_terminal_session(tc: TestCase) {
     delete_cascades::<TerminalSession>(&tc);
+}
+
+#[hegel::test]
+fn deleting_a_resource_empties_every_table_vessel(tc: TestCase) {
     delete_cascades::<Resource<Vessel>>(&tc);
+}
+
+#[hegel::test]
+fn deleting_a_resource_empties_every_table_referral(tc: TestCase) {
     delete_cascades::<Referral>(&tc);
+}
+
+#[hegel::test]
+fn deleting_a_resource_empties_every_table_dossier(tc: TestCase) {
     delete_cascades::<Dossier>(&tc);
 }

@@ -115,18 +115,16 @@ fn touch(set: &TableSet, change: &Change, sequence: i64) -> Touch {
 
 /// Applies `edge` and returns the event it logged and the rows SQLite counted as written,
 /// excluding new `strings` and `resource_identity` rows.
-fn apply_counted<K: Kind>(store: Store, current: Stamp, edge: Edge<K>) -> (Store, Stamp, Event, u64) {
-    let conn = store.into_connection();
-    let before = (conn.total_changes(), interned(&conn));
-    let mut store = Store::open(conn, LOCAL, registry()).expect("reopen");
+fn apply_counted<K: Kind>(store: &mut Store, current: Stamp, edge: Edge<K>) -> (Stamp, Event, u64) {
+    let before = (store.connection().total_changes(), interned(store.connection()));
     let mut write = store.write().expect("write");
     let stamp = write.apply_edge(current, edge.clone(), &flotilla_schema::NewChange::new("test", edge.at())).expect("edge");
     let mut changes = write.changes(current.id, current.version, 10).expect("changes");
     write.commit().expect("commit");
-    let conn = store.into_connection();
-    let written = conn.total_changes() - before.0 - (interned(&conn) - before.1);
+    let conn = store.connection();
+    let written = conn.total_changes() - before.0 - (interned(conn) - before.1);
     assert_eq!(changes.len(), 1, "one entry per edge");
-    (Store::open(conn, LOCAL, registry()).expect("reopen"), stamp, changes.remove(0), written)
+    (stamp, changes.remove(0), written)
 }
 
 fn touches_only_declared_rows<K: Fixture>(tc: &TestCase) {
@@ -139,8 +137,7 @@ fn touches_only_declared_rows<K: Fixture>(tc: &TestCase) {
         let current = store.read().expect("read").load::<K>(stamp.id).expect("load").expect("present");
         let before = snapshot(&mut store, stamp.id);
         let Some((edge, _)) = current.value.edge(tc, Pick::Draw) else { return };
-        let (next_store, next, change, written) = apply_counted(store, stamp, edge);
-        store = next_store;
+        let (next, change, written) = apply_counted(&mut store, stamp, edge);
         let after = snapshot(&mut store, stamp.id);
         assert_eq!((change.home_seq, after.version), (next.version, next.version));
         let stamped = Value::Int(i64::try_from(next.version).expect("stored"));
@@ -246,18 +243,55 @@ fn touches_only_declared_rows<K: Fixture>(tc: &TestCase) {
 // one a logged `Set` or `State` names, and only within those columns, which hold the logged values;
 // no other row appears or disappears. SQLite counts one row write per change (the root's state as
 // one statement), plus the home sequence, identity sequence and log rows. The engine kinds' edges
-// are the engine's, drawn over every edge their stored states allow.
+// are the engine's, drawn over every edge their stored states allow. One test per kind, so they
+// run in parallel.
 #[hegel::test(test_cases = 60)]
-fn an_edge_touches_exactly_its_declared_rows(tc: TestCase) {
+fn an_edge_touches_exactly_its_declared_rows_message(tc: TestCase) {
     touches_only_declared_rows::<Resource<Message>>(&tc);
+}
+
+#[hegel::test(test_cases = 60)]
+fn an_edge_touches_exactly_its_declared_rows_agent_session(tc: TestCase) {
     touches_only_declared_rows::<Resource<AgentSession>>(&tc);
+}
+
+#[hegel::test(test_cases = 60)]
+fn an_edge_touches_exactly_its_declared_rows_person(tc: TestCase) {
     touches_only_declared_rows::<Resource<Person>>(&tc);
+}
+
+#[hegel::test(test_cases = 60)]
+fn an_edge_touches_exactly_its_declared_rows_awaiting_reply(tc: TestCase) {
     touches_only_declared_rows::<Resource<AwaitingReply>>(&tc);
+}
+
+#[hegel::test(test_cases = 60)]
+fn an_edge_touches_exactly_its_declared_rows_convoy(tc: TestCase) {
     touches_only_declared_rows::<Resource<Convoy>>(&tc);
+}
+
+#[hegel::test(test_cases = 60)]
+fn an_edge_touches_exactly_its_declared_rows_ensure(tc: TestCase) {
     touches_only_declared_rows::<Resource<Ensure>>(&tc);
+}
+
+#[hegel::test(test_cases = 60)]
+fn an_edge_touches_exactly_its_declared_rows_terminal_session(tc: TestCase) {
     touches_only_declared_rows::<TerminalSession>(&tc);
+}
+
+#[hegel::test(test_cases = 60)]
+fn an_edge_touches_exactly_its_declared_rows_vessel(tc: TestCase) {
     touches_only_declared_rows::<Resource<Vessel>>(&tc);
+}
+
+#[hegel::test(test_cases = 60)]
+fn an_edge_touches_exactly_its_declared_rows_referral(tc: TestCase) {
     touches_only_declared_rows::<Referral>(&tc);
+}
+
+#[hegel::test(test_cases = 60)]
+fn an_edge_touches_exactly_its_declared_rows_dossier(tc: TestCase) {
     touches_only_declared_rows::<Dossier>(&tc);
 }
 

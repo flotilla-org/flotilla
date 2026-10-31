@@ -1,7 +1,7 @@
 //! The database refuses rows that break a tag's or an optional value's column rule, whoever writes
 //! them.
 
-use flotilla_schema::{ColumnDef, ColumnType, Guard, Table, TableRole, When, RECORD_VERSION};
+use flotilla_schema::{ColumnDef, ColumnType, Guard, Kind, Table, TableRole, When, RECORD_VERSION};
 use flotilla_schema_sqlite::quote_ident;
 use flotilla_schema_sqlite::Write;
 use hegel::TestCase;
@@ -100,20 +100,96 @@ fn insert_all(write: &mut Write<'_>, tc: &TestCase) {
 // an unknown code in any code column. Cases come from the descriptors, not a hand list, so a new
 // variant or table is covered automatically; the covering generators must reach a holding row for
 // every guard, and an absent one for every optional value, or the test fails naming the guard.
-#[hegel::test]
-fn raw_writes_breaking_a_variant_rule_are_refused(tc: TestCase) {
+// One test per kind, so they run in parallel; `every_registered_kind_is_checked` keeps the list
+// complete.
+fn raw_writes_are_refused<K: Fixture>(tc: &TestCase) {
     let mut store = store();
     let mut write = store.write().expect("write");
-    insert_all(&mut write, &tc);
+    insert_covering::<K>(&mut write, tc);
     write.commit().expect("commit");
     let conn = store.into_connection();
-    let mut guards = 0;
-    for set in registry().iter() {
-        for table in &set.tables {
-            guards += table.guards.len();
-            check_table(&conn, table);
-        }
+    for table in &K::table_set().tables {
+        check_table(&conn, table);
     }
+}
+
+#[hegel::test]
+fn raw_writes_breaking_a_variant_rule_are_refused_message(tc: TestCase) {
+    raw_writes_are_refused::<Resource<Message>>(&tc);
+}
+
+#[hegel::test]
+fn raw_writes_breaking_a_variant_rule_are_refused_agent_session(tc: TestCase) {
+    raw_writes_are_refused::<Resource<AgentSession>>(&tc);
+}
+
+#[hegel::test]
+fn raw_writes_breaking_a_variant_rule_are_refused_person(tc: TestCase) {
+    raw_writes_are_refused::<Resource<Person>>(&tc);
+}
+
+#[hegel::test]
+fn raw_writes_breaking_a_variant_rule_are_refused_awaiting_reply(tc: TestCase) {
+    raw_writes_are_refused::<Resource<AwaitingReply>>(&tc);
+}
+
+#[hegel::test]
+fn raw_writes_breaking_a_variant_rule_are_refused_convoy(tc: TestCase) {
+    raw_writes_are_refused::<Resource<Convoy>>(&tc);
+}
+
+#[hegel::test]
+fn raw_writes_breaking_a_variant_rule_are_refused_ensure(tc: TestCase) {
+    raw_writes_are_refused::<Resource<Ensure>>(&tc);
+}
+
+#[hegel::test]
+fn raw_writes_breaking_a_variant_rule_are_refused_terminal_session(tc: TestCase) {
+    raw_writes_are_refused::<TerminalSession>(&tc);
+}
+
+#[hegel::test]
+fn raw_writes_breaking_a_variant_rule_are_refused_vessel(tc: TestCase) {
+    raw_writes_are_refused::<Resource<Vessel>>(&tc);
+}
+
+#[hegel::test]
+fn raw_writes_breaking_a_variant_rule_are_refused_ticket(tc: TestCase) {
+    raw_writes_are_refused::<Ticket>(&tc);
+}
+
+#[hegel::test]
+fn raw_writes_breaking_a_variant_rule_are_refused_referral(tc: TestCase) {
+    raw_writes_are_refused::<Referral>(&tc);
+}
+
+#[hegel::test]
+fn raw_writes_breaking_a_variant_rule_are_refused_dossier(tc: TestCase) {
+    raw_writes_are_refused::<Dossier>(&tc);
+}
+
+// The per-kind tests above check every registered kind, which declare guards in many tables.
+#[test]
+fn every_registered_kind_is_checked() {
+    let checked = [
+        Resource::<Message>::CODE,
+        Resource::<AgentSession>::CODE,
+        Resource::<Person>::CODE,
+        Resource::<AwaitingReply>::CODE,
+        Resource::<Convoy>::CODE,
+        Resource::<Ensure>::CODE,
+        TerminalSession::CODE,
+        Resource::<Vessel>::CODE,
+        Ticket::CODE,
+        Referral::CODE,
+        Dossier::CODE,
+    ];
+    let registered: Vec<_> = registry().iter().map(|set| set.code).collect();
+    for code in &registered {
+        assert!(checked.contains(code), "{code:?} has no raw-write test");
+    }
+    assert_eq!(registered.len(), checked.len());
+    let guards: usize = registry().iter().flat_map(|set| &set.tables).map(|table| table.guards.len()).sum();
     assert!(guards > 40, "the fixtures declare guards in many tables: {guards}");
 }
 

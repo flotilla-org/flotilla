@@ -273,6 +273,13 @@ impl Store {
         out
     }
 
+    /// The connection, for tests that count SQLite's row writes or read tables between writes
+    /// without handing the connection back and reopening the store.
+    #[doc(hidden)]
+    pub fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
     /// Hands the connection back, dropping the caches.
     pub fn into_connection(self) -> Connection {
         self.conn
