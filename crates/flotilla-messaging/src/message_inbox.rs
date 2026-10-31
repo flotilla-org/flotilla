@@ -431,6 +431,19 @@ impl MessageReceiverSnapshot {
         &self.terminals.items
     }
 
+    /// The crew now running on the local session a message was delivered to, when it replaced the delivered crew.
+    pub fn replacement_crew(&self, delivered: &ResolvedMessageReceiver) -> Option<&str> {
+        self.terminals
+            .items
+            .iter()
+            .filter(|holder| matches!(holder.provenance, ResourceProvenance::Local))
+            .filter_map(|holder| holder.object.status.as_ref())
+            .find(|status| status.session_id.as_deref() == Some(delivered.session.as_str()))
+            .and_then(|status| status.crew.as_ref())
+            .map(|crew| crew.id.as_str())
+            .filter(|crew| *crew != delivered.crew_id)
+    }
+
     pub fn resolve(&self, address: &str) -> Result<Option<crate::ReadResourceObject<TerminalSession>>, ResourceError> {
         validate_message_address(address)?;
         self.resolve_validated(address)

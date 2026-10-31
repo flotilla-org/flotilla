@@ -970,6 +970,76 @@ async fn delivered_expectations_settle_from_reply_and_outcome_evidence() {
     assert_eq!(messages.get("reply-request").await.expect("reply").status.expect("status").phase, MessagePhase::Answered);
 }
 
+// A relaunch gives the session a new crew that never saw the old crew's turns.
+#[tokio::test]
+async fn replacing_the_crew_drops_messages_awaiting_the_old_crew() {
+    use flotilla_resources::{CrewSessionStatus, TerminalSession, TerminalSessionStatusPatch};
+    let (backend, inbox) = delivery_inbox_from(&[]).await;
+    let never = "convoy/convoy .status.phase == Completed".parse().expect("condition");
+    for (name, expectation) in [
+        ("old-reply", MessageExpectation::Reply),
+        ("old-outcome", MessageExpectation::Outcome { condition: never }),
+        ("notification", MessageExpectation::None),
+    ] {
+        inbox.accept(&InputMeta::builder().name(name.into()).build(), &spec(None, expectation), at(11)).await.expect("message");
+    }
+    let transport = Arc::new(FakeMessageTransport {
+        submissions: Default::default(),
+        observations: Default::default(),
+        outcome: TransportOutcome::Accepted { evidence: "accepted by holder".into() },
+        accepted: Default::default(),
+        working: Default::default(),
+    });
+    inbox.reconcile_delivery(&router(&transport), at(20)).await.expect("deliver to the old crew");
+    inbox.reconcile_delivery(&router(&transport), at(21)).await.expect("settle the notification");
+    let messages = backend.using::<Message>("flotilla");
+    let settled = messages.get("notification").await.expect("notification").status.expect("status");
+    assert_eq!(settled.phase, MessagePhase::Satisfied);
+
+    let terminals = backend.using::<TerminalSession>("flotilla");
+    flotilla_store::apply_status_patch(&terminals, "terminal", &TerminalSessionStatusPatch::MarkStarting).await.expect("relaunch");
+    inbox.reconcile_delivery(&router(&transport), at(30)).await.expect("no crew yet");
+    for name in ["old-reply", "old-outcome"] {
+        assert_eq!(messages.get(name).await.expect("message").status.expect("status").phase, MessagePhase::Delivered, "{name}");
+    }
+    flotilla_store::apply_status_patch(
+        &terminals,
+        "terminal",
+        &TerminalSessionStatusPatch::MarkRunning {
+            configured_limits: None,
+            session_id: "session".into(),
+            pid: None,
+            started_at: at(31),
+            crew: Some(CrewSessionStatus { id: "replacement".into(), adapter: "codex".into(), model: None, stance: "work".into() }),
+            launch_command: "agent".into(),
+            delivered_message_id: None,
+        },
+    )
+    .await
+    .expect("replacement crew");
+    inbox
+        .accept(&InputMeta::builder().name("new-reply".into()).build(), &spec(None, MessageExpectation::Reply), at(32))
+        .await
+        .expect("message to the replacement");
+    inbox.reconcile_delivery(&router(&transport), at(33)).await.expect("drop and deliver");
+    inbox.reconcile_delivery(&router(&transport), at(34)).await.expect("replacement awaits");
+
+    for name in ["old-reply", "old-outcome"] {
+        let status = messages.get(name).await.expect("message").status.expect("status");
+        assert_eq!(status.phase, MessagePhase::DeadLettered, "{name}");
+        assert_eq!(
+            status.reason.as_deref(),
+            Some("undeliverable: crew `crew` on session `session` was replaced by crew `replacement`"),
+            "{name}"
+        );
+        assert_eq!(status.resolved_receiver.expect("receipt kept").crew_id, "crew");
+    }
+    let new = messages.get("new-reply").await.expect("new").status.expect("status");
+    assert_eq!(new.phase, MessagePhase::Delivered);
+    assert_eq!(new.resolved_receiver.expect("receipt").crew_id, "replacement");
+    assert_eq!(messages.get("notification").await.expect("notification").status.expect("status"), settled);
+}
+
 // A single Working observation can be a redraw flicker. Only sustained
 // post-submission Working evidence confirms a pending batch.
 #[tokio::test]
