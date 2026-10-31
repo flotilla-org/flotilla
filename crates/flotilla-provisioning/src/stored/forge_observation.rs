@@ -7,13 +7,15 @@
 //! fail. So the old per-field `observed_at`, the observing authority and the demand times are not
 //! stored. ChangeRequest's convoy history is not stored either: the convoys hold those links.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use flotilla_protocol::IssueSource;
 use flotilla_resources::{
     ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, ForgeReadRequest, ForgeReadStatus, IssueSpec, IssueStatus,
     Observation, ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision,
 };
-use flotilla_schema::{KindRegistry, RegistryError, Stored, Timestamp};
+use flotilla_schema::{Kind, KindRegistry, RegistryError, Stored, TableSet, Timestamp};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Stored)]
@@ -167,6 +169,14 @@ impl From<IssueState> for ObservedIssueState {
     }
 }
 
+/// An issue another record refers to, in the stored spelling of its source.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct IssueSubject {
+    pub service: String,
+    pub scope: String,
+    pub number: u64,
+}
+
 fn at<T>(value: Option<T>, observed_at: DateTime<Utc>) -> Observation<T> {
     Observation { value, observed_at }
 }
@@ -174,7 +184,14 @@ fn at<T>(value: Option<T>, observed_at: DateTime<Utc>) -> Observation<T> {
 /// The observing home's view of one change request: kind code `cq`, named by the subject's record
 /// name. A null value is one the forge has not reported.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
-#[store(kind = "ChangeRequest", code = "cq", index(name = "by_subject", eq(service, scope, number)))]
+// Clippy reads the two indexes' shared key columns as repeated attributes.
+#[allow(clippy::duplicated_attributes)]
+#[store(
+    kind = "ChangeRequest",
+    code = "cq",
+    index(name = "by_subject", eq(service, scope, number)),
+    index(name = "by_branch", eq(service, scope, head_branch))
+)]
 pub struct ChangeRequestRecord {
     pub service: String,
     pub scope: String,
@@ -190,6 +207,11 @@ pub struct ChangeRequestRecord {
     pub mergeable: Option<Mergeability>,
     /// Since when the observer's reads of this subject have failed; the values were last confirmed then.
     pub failing_since: Option<Timestamp>,
+    pub head_branch: Option<String>,
+    pub base_branch: Option<String>,
+    /// The issues the forge says this change request closes.
+    #[store(cbor)]
+    pub closes: Option<Vec<IssueSubject>>,
 }
 
 impl ChangeRequestRecord {
@@ -209,6 +231,9 @@ impl ChangeRequestRecord {
             actionable_at_head: status.review.actionable_at_head.value,
             mergeable: status.mergeable.value.map(Into::into),
             failing_since: None,
+            head_branch: None,
+            base_branch: None,
+            closes: None,
         }
     }
 
@@ -228,6 +253,9 @@ impl ChangeRequestRecord {
             actionable_at_head: None,
             mergeable: None,
             failing_since: None,
+            head_branch: None,
+            base_branch: None,
+            closes: None,
         }
     }
 
@@ -274,6 +302,17 @@ pub struct IssueRecord {
     pub updated_at: Option<Timestamp>,
     /// Since when the observer's reads of this issue have failed; the values were last confirmed then.
     pub failing_since: Option<Timestamp>,
+    pub body: Option<String>,
+    /// The forge's issue type name, uninterpreted.
+    pub issue_type: Option<String>,
+    #[store(cbor)]
+    pub parent: Option<IssueSubject>,
+    #[store(cbor)]
+    pub blocked_by: Option<Vec<IssueSubject>>,
+    /// Each issue field's value by field name, as the forge spells it: a single-select field's
+    /// option name, a number's decimal digits.
+    #[store(cbor)]
+    pub fields: Option<BTreeMap<String, String>>,
 }
 
 impl IssueRecord {
@@ -289,6 +328,11 @@ impl IssueRecord {
             labels: status.labels.value.clone(),
             updated_at: status.updated_at.value.as_ref().map(Timestamp::from_datetime),
             failing_since: None,
+            body: None,
+            issue_type: None,
+            parent: None,
+            blocked_by: None,
+            fields: None,
         }
     }
 
@@ -304,6 +348,11 @@ impl IssueRecord {
             labels: None,
             updated_at: None,
             failing_since: None,
+            body: None,
+            issue_type: None,
+            parent: None,
+            blocked_by: None,
+            fields: None,
         }
     }
 
@@ -371,9 +420,26 @@ impl ForgeReadRecord {
 
 /// Registers the three kinds into `registry` under their codes, `cq`, `iu` and `fr`: plain kinds.
 pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
-    registry.register::<ChangeRequestRecord>()?;
-    registry.register::<IssueRecord>()?;
+    registry.register_table_set(added_since_previous_generation::<ChangeRequestRecord>(&["head_branch", "base_branch", "closes"]))?;
+    registry.register_table_set(added_since_previous_generation::<IssueRecord>(&[
+        "body",
+        "issue_type",
+        "parent",
+        "blocked_by",
+        "fields",
+    ]))?;
     registry.register::<ForgeReadRecord>()
+}
+
+/// `K`'s tables, `columns` of its root marked absent from the previous generation's table, so
+/// opening its store adds them. Drop each mark one roll after its column ships.
+fn added_since_previous_generation<K: Kind>(columns: &[&str]) -> TableSet {
+    let mut set = K::table_set();
+    for name in columns {
+        let column = set.tables[0].columns.iter_mut().find(|column| column.name == *name);
+        column.unwrap_or_else(|| panic!("{} has no root column {name}", K::KIND)).mark_previous_generation_absent();
+    }
+    set
 }
 
 /// The forge observation kinds alone, for their DDL snapshot.

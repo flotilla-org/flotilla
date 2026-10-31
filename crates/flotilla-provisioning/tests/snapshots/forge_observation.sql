@@ -65,8 +65,12 @@ CREATE TABLE "change_request" (
   "checks" TEXT CHECK ("checks" IN ('fa', 'pa', 'pe')),
   "actionable_at_head" INTEGER CHECK ("actionable_at_head" IN (0, 1)),
   "mergeable" TEXT CHECK ("mergeable" IN ('co', 'me')),
-  "failing_since" INTEGER
+  "failing_since" INTEGER,
+  "head_branch" TEXT,
+  "base_branch" TEXT,
+  "closes" BLOB NOT NULL DEFAULT x'f6'
 ) STRICT;
+CREATE INDEX "change_request_by_branch" ON "change_request" ("service", "scope", "head_branch");
 CREATE INDEX "change_request_by_subject" ON "change_request" ("service", "scope", "number");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cq', 'state', 'cl', 'Closed'),
@@ -97,7 +101,10 @@ CREATE VIEW "change_request_view" AS SELECT
   (SELECT "name" FROM "codes" WHERE "kind" = 'cq' AND "field" = 'checks' AND "code" = "change_request"."checks") AS "checks",
   "change_request"."actionable_at_head",
   (SELECT "name" FROM "codes" WHERE "kind" = 'cq' AND "field" = 'mergeable' AND "code" = "change_request"."mergeable") AS "mergeable",
-  "change_request"."failing_since"
+  "change_request"."failing_since",
+  "change_request"."head_branch",
+  "change_request"."base_branch",
+  "change_request"."closes"
 FROM "change_request";
 CREATE TABLE "forge_read" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
@@ -130,7 +137,12 @@ CREATE TABLE "issue" (
   "state" TEXT CHECK ("state" IN ('cl', 'op')),
   "labels" BLOB NOT NULL,
   "updated_at" INTEGER,
-  "failing_since" INTEGER
+  "failing_since" INTEGER,
+  "body" TEXT,
+  "issue_type" TEXT,
+  "parent" BLOB NOT NULL DEFAULT x'f6',
+  "blocked_by" BLOB NOT NULL DEFAULT x'f6',
+  "fields" BLOB NOT NULL DEFAULT x'f6'
 ) STRICT;
 CREATE INDEX "issue_by_subject" ON "issue" ("service", "scope", "number");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
@@ -147,7 +159,12 @@ CREATE VIEW "issue_view" AS SELECT
   (SELECT "name" FROM "codes" WHERE "kind" = 'iu' AND "field" = 'state' AND "code" = "issue"."state") AS "state",
   "issue"."labels",
   "issue"."updated_at",
-  "issue"."failing_since"
+  "issue"."failing_since",
+  "issue"."body",
+  "issue"."issue_type",
+  "issue"."parent",
+  "issue"."blocked_by",
+  "issue"."fields"
 FROM "issue";
 CREATE VIEW "log_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "l"."home") AS "home",
