@@ -10,10 +10,10 @@ use flotilla_core::{in_process::InProcessDaemon, primitives::MessagePrimitives};
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_inbox::InboxBackend;
 use flotilla_resources::{
-    Convoy, ConvoySpec, CrewSessionStatus, FleetDesignation, FleetDesignationSpec, InputMeta, MessageExpectation, MessageReference,
-    MessageRelation, MessageSpec, Project, ProjectSpec, ResourceProvenance, Selector, SystemClock, TerminalBrief, TerminalCrewContext,
-    TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, CONVOY_LABEL, FLEET_DESIGNATION_NAME, ROLE_LABEL,
-    VESSEL_LABEL,
+    Convoy, ConvoySpec, CrewSessionStatus, FleetDesignation, FleetDesignationSpec, Host, InputMeta, MessageExpectation, MessageReference,
+    MessageRelation, MessageSpec, Project, ProjectSpec, Resource, ResourceProvenance, Selector, SystemClock, TerminalBrief,
+    TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, CONVOY_LABEL,
+    FLEET_DESIGNATION_NAME, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::stream::{Follower, Service};
@@ -148,9 +148,12 @@ pub(super) struct DropStep {
 // reads it from its replica, or at its home on a miss, marked remote with its
 // age; a reply to a fleet role is routed by subject.
 pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subject(operations: &[DropStep]) {
-    let topology = flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful(
+    // Both homes' Convoy and session replicas are written by hand below, so the
+    // router replicates only Host identity.
+    let topology = flotilla_daemon_testkit::server::spawn_in_memory_request_topology_with_replication_kinds(
         super::empty_daemon_named("home-a").await,
         super::empty_daemon_named("home-b").await,
+        &[Host::API_PATHS.kind],
     )
     .await
     .expect("two-home router");
