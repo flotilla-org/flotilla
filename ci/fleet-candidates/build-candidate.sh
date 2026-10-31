@@ -59,6 +59,7 @@ require_node_toolchain() {
 build_typescript_host() {
   local drydock_root="$1" destination="$2" scratch
   scratch="$(mktemp -d)"
+  trap 'rm -rf "$scratch"' RETURN
   (
     export COREPACK_HOME="$scratch/corepack"
     cd "$drydock_root/hosts/typescript"
@@ -72,7 +73,7 @@ build_typescript_host() {
   rm -rf "$destination"
   mkdir -p "$(dirname "$destination")"
   cp -R "$scratch/unpacked/package" "$destination"
-  rm -rf "$destination/node_modules/.bin" "$scratch"
+  rm -rf "$destination/node_modules/.bin"
 }
 
 # drydock finds `drydock-host-typescript` beside flotillad and runs it directly;

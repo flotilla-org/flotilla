@@ -38,9 +38,7 @@
         "name": "rjw-skills",
         "repository": "https://github.com/rjwittams/rjw-skills.git",
         "revision": "dddddddddddddddddddddddddddddddddddddddd",
-        "paths": [
-          "plugins/rjw-sdlc/skills"
-        ]
+        "paths": ["plugins/rjw-sdlc/skills"]
       },
       {
         "name": "cleat",

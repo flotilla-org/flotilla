@@ -1245,7 +1245,10 @@ def refresh_darwin_payload(source, destination):
     expected = set(files)
     typescript = Path(TYPESCRIPT_HOST_TREE)
     # Absent from generations built before it shipped. The wrapper finds its tree
-    # relative to itself, so the stable root carries both.
+    # relative to itself, so the stable root carries both. Rolling back to a
+    # generation without it deliberately leaves the previous copy in place:
+    # drydock only needs the files to exist, and the next generation that
+    # carries the host refreshes and prunes them.
     if (source / TYPESCRIPT_HOST_WRAPPER).exists():
         files.append(Path(TYPESCRIPT_HOST_WRAPPER))
         expected |= {Path(TYPESCRIPT_HOST_WRAPPER)}
