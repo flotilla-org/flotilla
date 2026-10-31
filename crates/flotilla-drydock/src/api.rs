@@ -37,6 +37,8 @@ pub fn api_error(error: drydock::client::Error) -> ApiError {
             let (kind, reason) = match &error {
                 ProtocolError::NotFound { reason } => (ProtocolErrorKind::NotFound, reason.clone()),
                 ProtocolError::Refused { reason } => (ProtocolErrorKind::Refused, reason.clone()),
+                // Deliberately coarse: the adapter acts only on these two kinds. Any
+                // other error is reported by its description, never matched on.
                 _ => (ProtocolErrorKind::Other, String::new()),
             };
             ApiError::Protocol { kind, reason, description: error.to_string() }

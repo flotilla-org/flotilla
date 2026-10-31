@@ -660,3 +660,18 @@ fn a_protocol_error_keeps_the_providers_explanation() {
     let message = api_error(error).to_string();
     assert!(message.contains("provision") && message.contains("Total memory limit exceeded"), "{message}");
 }
+
+/// The adapter tells apart only the kinds it acts on; every other kind keeps
+/// drydock's description and nothing else.
+#[test]
+fn protocol_errors_keep_the_kinds_the_adapter_acts_on() {
+    use flotilla_api::{ApiError, ProtocolErrorKind};
+    let kind = |error: wire::ProtocolError| match api_error(::drydock::client::Error::Protocol(error)) {
+        ApiError::Protocol { kind, reason, .. } => (kind, reason),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(kind(wire::ProtocolError::NotFound { reason: "gone".into() }), (ProtocolErrorKind::NotFound, "gone".into()));
+    assert_eq!(kind(wire::ProtocolError::Refused { reason: "no".into() }), (ProtocolErrorKind::Refused, "no".into()));
+    assert_eq!(kind(wire::ProtocolError::QuotaExhausted { reason: "full".into() }), (ProtocolErrorKind::Other, String::new()));
+    assert_eq!(api_error(::drydock::client::Error::NotReady(wire::Readiness::Ready)), ApiError::NotReady);
+}

@@ -202,6 +202,8 @@ impl AgentClient for DrydockClient {
         let (written, collected) = tokio::join!(process.write_stdin_bytes(input), async { process.output().await?.collect(limit).await });
         // Forget the handle, so the agent holds no output for it.
         let removed = process.remove().await;
+        // A process may exit without reading all of its input, as with a
+        // redirect: the broken pipe that leaves is not a failure.
         match written {
             Err(error) if error.kind() != io::ErrorKind::BrokenPipe => Err(error),
             _ => collected.and_then(|collected| removed.map(|()| self::collected(collected))),
