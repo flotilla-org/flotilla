@@ -66,6 +66,23 @@ class ProviderConfigTest(unittest.TestCase):
         self.assertEqual(local_root, self.root / 'v')
 
 
+class ForgeConfigTest(unittest.TestCase):
+    def test_a_real_forge_names_its_repository_and_absolute_identity_tokens(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / 'forge.toml'
+        complete = ('service_url = "https://forge.example"\nforge_id = "lab"\nrepository = "lab/trial"\n'
+                    'push_url = "git@forge.example:lab/trial"\nissue_token = "/t/issue"\n'
+                    'daemon = { login = "d", token = "/t/daemon" }\ncrew = { login = "c", token = "/t/crew" }\n')
+        path.write_text(complete)
+        self.assertEqual(trial.forge_config(path)['crew'], {'login': 'c', 'token': '/t/crew'})
+        for broken in [complete.replace('/t/crew', 't/crew'), complete.replace('https://', 'http://'),
+                       complete.replace('lab/trial"\n', 'trial"\n'), complete.replace('issue_token = "/t/issue"\n', '')]:
+            path.write_text(broken)
+            with self.subTest(text=broken), self.assertRaises(trial.TrialFailure):
+                trial.forge_config(path)
+
+
 class AttachPlanTest(unittest.TestCase):
     def test_the_last_command_of_a_resolved_plan_is_what_attach_execs(self):
         plan = {'kind': 'attach_command_resolved', 'plan': [

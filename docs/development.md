@@ -93,8 +93,8 @@ from the checkout (#4165), so a change to how flotilla deals with vessels is
 tried end to end before it ships:
 
 ```sh
-scripts/trial-fleet run [--provider-config FILE [--provider NAME] [--image REF]] [--crew scripted|<agent>]
-                        [--until provisioned|attached|landed] [--guest-tools DIR]
+scripts/trial-fleet run [--provider-config FILE [--provider NAME] [--image REF]] [--forge FILE]
+                        [--crew scripted|<agent>] [--until provisioned|attached|landed] [--guest-tools DIR]
 ```
 
 It builds `flotillad`, `flotilla`, the vessel CLI, `drydock-agent` and
@@ -119,6 +119,14 @@ provider table's `image`). Placement is set up as an operator does it: a
 PlacementPolicy naming the instance and image, which the daemon turns into the
 trial's FulfilmentKind. Without a config, drydock's `local` module runs the
 vessel as a child process on this machine.
+
+Issues, pull requests and git come from the fake forge on this machine, which a
+cloud vessel cannot reach. `--forge FILE` runs the trial against a real Forgejo
+repository instead (the TOML shape is in the script's `forge_config`): the trial
+replaces that repository's `main`, opens an issue there, and declares the Forge,
+the daemon's and crew's CredentialSpecs and a CredentialGrant as the fleet does.
+The build also stages drydock's TypeScript host (its Namespace module), started
+when `node` is on `PATH`.
 
 Guest tools are linux-amd64. On another host (macOS), `--guest-tools` names an
 installed generation's `share/flotilla/guest-tools` to push instead of building

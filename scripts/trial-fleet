@@ -20,6 +20,11 @@ naming that instance and the image, which the daemon turns into the trial's
 FulfilmentKind. Without a config, drydock's `local` module runs the vessel as a
 child process on this machine. This script names no other module.
 
+Issues, pull requests and git come from the fake forge on this machine,
+which a cloud vessel cannot reach. --forge FILE runs the trial against a real
+Forgejo repository instead (see forge_config), with the crew's credential
+delivered through a CredentialSpec and CredentialGrant as on the fleet.
+
 The guest tools pushed into a vessel are linux-amd64. On another host
 --guest-tools names an installed generation's guest tools
 (`<generation>/share/flotilla/guest-tools`) to push instead of building them.
@@ -60,6 +65,8 @@ GUEST_SOURCES = ('flotilla', 'cleat', 'mattpocock-skills', 'rjw-skills')
 # The size the fleet gives a cloud vessel.
 CLOUD_SIZE = {'cpus': 4, 'memory_bytes': 8 << 30, 'disk_bytes': 10 << 30}
 GUEST_TOOLS = 'share/flotilla/guest-tools'
+TRIAL_DAEMON_CREDENTIAL = 'trial-forge-daemon'
+TRIAL_CREW_CREDENTIAL = 'trial-forge-crew'
 
 
 class TrialFailure(RuntimeError):
@@ -122,12 +129,65 @@ def build(target, log, guest):
         log.flush()
         if subprocess.run(step, cwd=REPO, stdout=log, stderr=log).returncode:
             raise TrialFailure(f'build failed: {" ".join(step)} (see {log.name})')
+    typescript = typescript_host(target / f'trial-fleet/drydock-host-typescript/{rev}', log)
     return {
+        'drydock-host-typescript': typescript,
         'flotilla': target / 'debug/flotilla', 'flotillad': target / 'debug/flotillad',
         'flotilla-vessel': target / 'debug/flotilla-vessel', 'drydock-agent': target / 'debug/drydock-agent',
         'flotilla-fake-forge': target / 'debug/flotilla-fake-forge',
         'drydock-host': target / f'trial-fleet/drydock-host/{rev}/bin/drydock-host',
     }
+
+
+def typescript_host(destination, log):
+    """drydock's TypeScript host (its Namespace module, among others) from the
+    pinned drydock checkout, built as ci/fleet-candidates/build-candidate.sh does."""
+    if (destination / 'dist/main.js').is_file():
+        return destination
+    metadata = json.loads(subprocess.run(['cargo', 'metadata', '--format-version', '1', '--offline'], cwd=REPO, check=True,
+                                         text=True, stdout=subprocess.PIPE).stdout)
+    manifest = next(Path(package['manifest_path']) for package in metadata['packages'] if package['name'] == 'drydock')
+    source = next(parent for parent in manifest.parents if (parent / 'hosts/typescript/package.json').is_file())
+    with tempfile.TemporaryDirectory(dir=destination.parent.parent) as scratch:
+        scratch = Path(scratch)
+        # Its build reads the repository's openapi.json two levels up.
+        host = scratch / 'hosts/typescript'
+        shutil.copytree(source / 'hosts/typescript', host, ignore=shutil.ignore_patterns('node_modules'))
+        shutil.copy2(source / 'openapi.json', scratch / 'openapi.json')
+        env = {**os.environ, 'COREPACK_HOME': str(scratch / 'corepack'), 'COREPACK_ENABLE_DOWNLOAD_PROMPT': '0'}
+
+        # pnpm 12 needs a newer corepack than some hosts ship (0.34 cannot start it); run a
+        # pinned one, which the host's own `corepack pnpm` scripts then find on PATH.
+        corepack = ['npm', 'exec', '--yes', f'--package=corepack@{COREPACK}', '--', 'corepack']
+
+        def step(args, cwd):
+            args = [*corepack, *args[1:]] if args[0] == 'corepack' else args
+            log.write(f'$ {" ".join(args)}\n')
+            log.flush()
+            if subprocess.run(args, cwd=cwd, env=env, stdout=log, stderr=log).returncode:
+                raise TrialFailure(f'build failed: {" ".join(args)} (see {log.name})')
+        step(['corepack', 'pnpm', 'install', '--frozen-lockfile'], host)
+        step(['corepack', 'pnpm', 'pack:companion'], host)
+        archives = list(host.glob('flotilla-drydock-host-typescript-*.tgz'))
+        if len(archives) != 1:
+            raise TrialFailure(f'expected one packed TypeScript host, found {archives}')
+        (scratch / 'unpacked').mkdir()
+        step(['tar', '-xzf', str(archives[0]), '-C', str(scratch / 'unpacked')], scratch)
+        step(['corepack', 'pnpm', 'install', '--prod', '--frozen-lockfile', '--node-linker=hoisted'], scratch / 'unpacked/package')
+        shutil.rmtree(scratch / 'unpacked/package/node_modules/.bin', ignore_errors=True)
+        shutil.rmtree(destination, ignore_errors=True)
+        shutil.copytree(scratch / 'unpacked/package', destination)
+    return destination
+
+
+COREPACK = '0.36.0'
+
+
+# drydock finds `drydock-host-typescript` beside flotillad; the wrapper finds its tree from there.
+TYPESCRIPT_WRAPPER = """#!/bin/sh
+here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+exec node "$here/../share/flotilla/drydock-host-typescript/dist/main.js" "$@"
+"""
 
 
 def link_or_copy(source, destination):
@@ -169,6 +229,10 @@ def stage_generation(root, binaries, tools, guest_tools=None):
     (generation / 'lib').mkdir()
     for name in ('flotilla', 'flotillad', 'drydock-host', 'flotilla-fake-forge'):
         link_or_copy(binaries[name], generation / 'bin' / name)
+    shutil.copytree(binaries['drydock-host-typescript'], generation / 'share/flotilla/drydock-host-typescript')
+    wrapper = generation / 'bin/drydock-host-typescript'
+    wrapper.write_text(TYPESCRIPT_WRAPPER)
+    wrapper.chmod(0o755)
     if guest_tools is not None:
         shutil.copy2(tools / 'bin/cleat', generation / 'bin/cleat')
         for library in (tools / 'lib').glob('libghostty-vt*'):
@@ -243,6 +307,34 @@ def provider_config(path, root, instance=None, image=None):
     return text, name, image, local_root
 
 
+def forge_config(path):
+    """A real Forgejo repository for the trial, as TOML:
+
+        service_url = "https://forgejo.example"   # the forge's HTTPS URL
+        forge_id = "lab"                          # the Forge record's id
+        git_ssh_host = "git.example"              # optional
+        repository = "owner/name"                 # the trial repository, emptied of nothing: main is replaced
+        push_url = "git@git.example:owner/name"   # how this user's own git writes it
+        issue_token = "/abs/token"                # opens the trial issue
+        daemon = { login = "bot", token = "/abs/token" }  # the daemon's read identity
+        crew = { login = "bot", token = "/abs/token" }    # delivered to the crew; needs push
+    """
+    try:
+        config = tomllib.loads(Path(path).read_text())
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise TrialFailure(f'--forge {path}: {error}') from None
+    for key in ('service_url', 'forge_id', 'repository', 'push_url', 'issue_token'):
+        if not isinstance(config.get(key), str) or not config[key]:
+            raise TrialFailure(f'--forge {path}: needs {key}')
+    for identity in ('daemon', 'crew'):
+        table = config.get(identity)
+        if not isinstance(table, dict) or not table.get('login') or not Path(table.get('token') or '').is_absolute():
+            raise TrialFailure(f'--forge {path}: needs {identity} = {{ login = ..., token = "/absolute/path" }}')
+    if not config['service_url'].startswith('https://') or config['repository'].count('/') != 1:
+        raise TrialFailure(f'--forge {path}: service_url must be HTTPS and repository owner/name')
+    return config
+
+
 # ---------------------------------------------------------------------------
 # Fake forge
 
@@ -292,11 +384,13 @@ if [[ $TRIAL_UNTIL == landed ]]; then
   git -c user.name='Trial Crew' -c user.email=trial@localhost commit -q -m 'Trial change'
   git push -q origin "HEAD:refs/heads/$branch"
   body="$(printf '{"head":"%s","base":"main","title":"Trial change","body":"Closes #%s"}' "$branch" "$TRIAL_ISSUE")"
-  number="$(curl -fsS --cacert "$TRIAL_FORGE_CA" -H "Authorization: token $(cat "$TRIAL_FORGE_TOKEN")" \
+  # A real forge's token is the crew's delivered Forgejo credential.
+  token="${TRIAL_FORGE_TOKEN:-${FORGEJO_TOKEN_FILE:-}}"
+  number="$(curl -fsS ${TRIAL_FORGE_CA:+--cacert "$TRIAL_FORGE_CA"} -H "Authorization: token $(cat "$token")" \
     -H 'Accept: application/json' -H 'Content-Type: application/json' -d "$body" "$TRIAL_FORGE_API/repos/$TRIAL_REPOSITORY/pulls" |
     python3 -c 'import json, sys; print(json.load(sys.stdin)["number"])')"
   # The fake forge stands in for the trial repository's forge, whose URLs claims keep.
-  url="$TRIAL_FORGE_SERVICE/$TRIAL_REPOSITORY/pull/$number"
+  url="$TRIAL_FORGE_SERVICE/$TRIAL_REPOSITORY/$TRIAL_PULL_SEGMENT/$number"
   echo "opened $url"
   flotilla crew submit --kind pr --reference "$url"
   ledger="$(mktemp)"
@@ -330,28 +424,35 @@ class Trial:
         self.convoys = set()
         self.environments = set()
         self.convoy = None
+        self.forge = None
+        self.real = forge_config(args.forge) if getattr(args, 'forge', None) else None
 
     # -- processes -------------------------------------------------------
 
     def environment(self):
         generation = self.root / 'generation'
+        # drydock starts its TypeScript host only when `node` is on PATH.
+        runtimes = ''.join(f'{Path(found).parent}:' for found in {shutil.which('node')} if found)
         env = {
-            'HOME': str(self.root / 'home'), 'PATH': f'{generation}/bin:/usr/local/bin:/usr/bin:/bin',
+            'HOME': str(self.root / 'home'), 'PATH': f'{generation}/bin:{runtimes}/usr/local/bin:/usr/bin:/bin',
             'CLEAT_RUNTIME_DIR': str(self.root / 'cleat'), 'FLOTILLA_FLEET_CANARY': '1',
-            'SSL_CERT_FILE': str(self.root / 'ca-bundle.pem'), 'GIT_CONFIG_GLOBAL': str(self.root / 'gitconfig'),
+            'GIT_CONFIG_GLOBAL': str(self.root / 'gitconfig'),
             'GIT_CONFIG_NOSYSTEM': '1', MARKER: str(self.root), 'RUST_LOG': os.environ.get('RUST_LOG', 'info'),
             'LANG': 'C.UTF-8',
         }
+        if (self.root / 'ca-bundle.pem').is_file():
+            env['SSL_CERT_FILE'] = str(self.root / 'ca-bundle.pem')
         for name in ('USER', 'LOGNAME', 'TERM'):
             if name in os.environ:
                 env[name] = os.environ[name]
         return env
 
-    def run(self, args, *, timeout=60, check=True, cwd=None):
+    def run(self, args, *, timeout=60, check=True, cwd=None, operator=False):
+        """`operator` runs with this user's own environment (their git access)."""
         self.log.write(json.dumps([str(arg) for arg in args]) + '\n')
         self.log.flush()
         try:
-            result = subprocess.run([str(arg) for arg in args], env=self.environment(), cwd=cwd, text=True,
+            result = subprocess.run([str(arg) for arg in args], env=None if operator else self.environment(), cwd=cwd, text=True,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
         except subprocess.TimeoutExpired as error:
             raise TrialFailure(f'command timed out: {" ".join(map(str, args))}') from error
@@ -441,19 +542,21 @@ class Trial:
         text, self.instance, self.image, self.local_root = provider_config(self.args.provider_config, self.root,
                                                                            self.args.provider, self.args.image)
         (config / 'drydock.toml').write_text(text)
-        forge = self.forge
         # macOS has no /etc/machine-id; each trial is its own machine anyway.
-        (config / 'daemon.toml').write_text(
-            f'machine_id = "trial-fleet-{self.root.name}"\n'
-            # The fleet's 20 GiB floor guards a host's own vessels; a trial vessel is throwaway.
-            '[admission]\nfree_space_floor_gib = 2\n'
-            f'[forge_overrides."{FORGE_SERVICE}"]\nprovider = "forgejo"\n'
-            f'endpoint_url = "{forge["url"]}/github"\ntoken_path = "{forge["token"]}"\nca_path = "{forge["ca"]}"\n')
-        upstream = self.root / 'upstream.git'
-        # Clones of the trial repository's forge URL read the local bare repository.
-        (self.root / 'gitconfig').write_text(
-            f'[url "{upstream.as_uri()}"]\n\tinsteadOf = {FORGE_SERVICE}/{TRIAL_REPOSITORY}\n'
-            '[user]\n\tname = Trial\n\temail = trial@localhost\n[push]\n\tdefault = current\n')
+        # The fleet's 20 GiB floor guards a host's own vessels; a trial vessel is throwaway.
+        daemon = f'machine_id = "trial-fleet-{self.root.name}"\n[admission]\nfree_space_floor_gib = 2\n'
+        gitconfig = '[user]\n\tname = Trial\n\temail = trial@localhost\n[push]\n\tdefault = current\n'
+        if self.real is not None:
+            # The daemon reads the forge as the fleet's daemons do, with its own credential.
+            daemon += f'[credentials.forgejo]\n{self.real["forge_id"]} = "{TRIAL_DAEMON_CREDENTIAL}"\n'
+        else:
+            forge = self.forge
+            daemon += (f'[forge_overrides."{FORGE_SERVICE}"]\nprovider = "forgejo"\n'
+                       f'endpoint_url = "{forge["url"]}/github"\ntoken_path = "{forge["token"]}"\nca_path = "{forge["ca"]}"\n')
+            # Clones of the trial repository's forge URL read the local bare repository.
+            gitconfig = f'[url "{(self.root / "upstream.git").as_uri()}"]\n\tinsteadOf = {FORGE_SERVICE}/{TRIAL_REPOSITORY}\n' + gitconfig
+        (config / 'daemon.toml').write_text(daemon)
+        (self.root / 'gitconfig').write_text(gitconfig)
 
     def start_daemon(self, log):
         self.daemon = subprocess.Popen(
@@ -486,14 +589,25 @@ class Trial:
         script = repo / '.flotilla/fleet-canary-agent.sh'
         script.write_text(CREW_SCRIPT)
         script.chmod(0o755)
+        if self.real is not None:
+            self.seed_real_forge(repo)
+        else:
+            self.seed_fake_forge(repo)
+        self.place()
+
+    def trial_env(self, repo, values):
+        (repo / '.flotilla/trial.env').write_text(''.join(f'{key}={value}\n' for key, value in {
+            'TRIAL_UNTIL': self.args.until, 'TRIAL_ISSUE': self.issue, **values}.items()))
+
+    def seed_fake_forge(self, repo):
         forge = self.forge
         owner, name = TRIAL_REPOSITORY.split('/')
         self.issue = self.admin('POST', f'/forges/github/repos/{owner}/{name}/issues',
                                 {'title': TRIAL_ISSUE_TITLE, 'body': 'Created by scripts/trial-fleet.'})['number']
-        (repo / '.flotilla/trial.env').write_text(''.join(f'{key}={value}\n' for key, value in {
-            'TRIAL_UNTIL': self.args.until, 'TRIAL_ISSUE': self.issue, 'TRIAL_REPOSITORY': TRIAL_REPOSITORY,
-            'TRIAL_FORGE_SERVICE': FORGE_SERVICE, 'TRIAL_FORGE_API': f'{forge["url"]}/github/api/v1', 'TRIAL_FORGE_TOKEN': forge['token'],
-            'TRIAL_FORGE_CA': forge['ca']}.items()))
+        # The fake forge serves the repository's GitHub identity, whose pull URLs say `pull`.
+        self.trial_env(repo, {
+            'TRIAL_REPOSITORY': TRIAL_REPOSITORY, 'TRIAL_FORGE_SERVICE': FORGE_SERVICE, 'TRIAL_PULL_SEGMENT': 'pull',
+            'TRIAL_FORGE_API': f'{forge["url"]}/github/api/v1', 'TRIAL_FORGE_TOKEN': forge['token'], 'TRIAL_FORGE_CA': forge['ca']})
         git = ['git', '-C', repo]
         self.run([*git, 'init', '-q', '--initial-branch=main'])
         self.run([*git, 'add', '.'])
@@ -513,6 +627,55 @@ class Trial:
         self.apply('Repository', repositories[0]['metadata']['name'], {
             'identity': {'kind': 'remote', 'canonical_remote': url}, 'remotes': [url],
             'forge': {'service_url': FORGE_SERVICE, 'repository': TRIAL_REPOSITORY}})
+
+    def seed_real_forge(self, repo):
+        """The real forge's Forge, credentials and grant as the fleet declares them;
+        one new issue; the repository's main replaced by a fresh trial commit."""
+        real = self.real
+        service, repository, forge_id = real['service_url'], real['repository'], real['forge_id']
+        host = service.split('://', 1)[1].split('/', 1)[0]
+        self.apply('Forge', forge_id, {'forge_id': forge_id, 'kind': 'forgejo', 'hosts': [host], 'https_url': service,
+                                       **({'git_ssh_host': real['git_ssh_host']} if real.get('git_ssh_host') else {})})
+        for name, identity in ((TRIAL_DAEMON_CREDENTIAL, real['daemon']), (TRIAL_CREW_CREDENTIAL, real['crew'])):
+            self.apply('CredentialSpec', name, {
+                'consumer': {'adapter': 'forgejo', 'forge_ref': forge_id, 'username': identity['login']},
+                'source': {'kind': 'file', 'path': identity['token']}, 'lifecycle': 'static',
+                'placement': {'binaries': ['curl', 'git']}})
+        self.apply('CredentialGrant', 'trial', {'selector': {'projects': [TRIAL_PROJECT]}, 'credentials': [TRIAL_CREW_CREDENTIAL]})
+        self.issue = self.forge_api('POST', f'/repos/{repository}/issues',
+                                    {'title': TRIAL_ISSUE_TITLE, 'body': 'Created by scripts/trial-fleet.'})['number']
+        self.trial_env(repo, {'TRIAL_REPOSITORY': repository, 'TRIAL_FORGE_SERVICE': service, 'TRIAL_PULL_SEGMENT': 'pulls',
+                              'TRIAL_FORGE_API': f'{service}/api/v1'})
+        git = ['git', '-C', repo]
+        self.run([*git, 'init', '-q', '--initial-branch=main'])
+        self.run([*git, 'add', '.'])
+        self.run([*git, 'commit', '-q', '-m', 'Trial repository'])
+        url = f'{service}/{repository}'
+        self.run([*git, 'remote', 'add', 'origin', url])
+        # The operator's own git access writes the repository; the trial's identities never do.
+        self.run([*git, 'push', '-q', '-f', real['push_url'], 'main:main'], operator=True)
+        self.run([*git, 'fetch', '-q', real['push_url'], 'main:refs/remotes/origin/main'], operator=True)
+        self.run([*git, 'branch', '-q', '--set-upstream-to=origin/main', 'main'])
+        self.cli('project', 'add', repo, '--name', TRIAL_PROJECT)
+        repositories = [item for item in self.objects('repositories') if url in (item['spec'].get('remotes') or [])]
+        if len(repositories) != 1:
+            raise TrialFailure(f'project add registered {len(repositories)} repositories for {url}')
+        owner, name = repository.split('/')
+        self.apply('Repository', repositories[0]['metadata']['name'], {
+            'identity': {'kind': 'forge', 'forge_ref': forge_id, 'owner': owner, 'repo_name': name}, 'remotes': [url],
+            'forge': {'service_url': service, 'repository': repository}})
+
+    def forge_api(self, method, path, body):
+        header = self.root / 'forge-issue-header'
+        header.write_text(f'Authorization: token {Path(self.real["issue_token"]).read_text().strip()}\n')
+        header.chmod(0o600)
+        try:
+            return json.loads(self.run(['curl', '-fsS', '-X', method, '-H', f'@{header}', '-H', 'Content-Type: application/json',
+                                        '-d', json.dumps(body), f'{self.real["service_url"]}/api/v1{path}']).stdout)
+        finally:
+            header.unlink()
+
+    def place(self):
         # Placement as an operator gives it: a policy naming the provider instance,
         # which the daemon turns into the FulfilmentKind of its name.
         self.apply('PlacementPolicy', 'trial', {
@@ -730,7 +893,8 @@ def run(args):
             guest = args.guest_tools is None
             binaries = trial.step('build', lambda: build(target, build_log, guest))
             trial.step('stage generation', lambda: stage_generation(root, binaries, tools_layer(args.tools, guest), args.guest_tools))
-            trial.step('fake forge', lambda: trial.start_forge(forge_log))
+            if trial.real is None:
+                trial.step('fake forge', lambda: trial.start_forge(forge_log))
             trial.configure()
             trial.step('flotillad', lambda: trial.start_daemon(daemon_log))
             trial.step(f'provider {trial.instance}', trial.provider_ready)
@@ -840,6 +1004,7 @@ def main(argv=None):
     trial.add_argument('--provider-config', type=Path, help='a drydock.toml with [providers.NAME] tables (default: local)')
     trial.add_argument('--provider', help="the trial's provider instance, when --provider-config names more than one")
     trial.add_argument('--image', help="the image the trial's placement names, pinned by digest (default: the provider table's)")
+    trial.add_argument('--forge', type=Path, help='a real Forgejo repository for the trial (TOML; default: the fake forge)')
     trial.add_argument('--guest-tools', type=Path,
                        help='an installed generation\'s share/flotilla/guest-tools to push instead of building them')
     trial.add_argument('--crew', default='scripted', help='scripted (no model account) or an agent adapter')
