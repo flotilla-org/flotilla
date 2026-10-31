@@ -307,10 +307,12 @@ pub(super) async fn migrate_listed_placement_policies(
 ) -> Result<(), String> {
     let kinds = backend.clone().using::<FulfilmentKind>(namespace);
     for policy in policies {
+        // Admission reads the operator's provider instance from the kind's label.
+        let instance = policy.spec.provider_requirements.as_ref().and_then(|requirements| requirements.instance.clone());
         let cloud_controller = if policy.spec.cloud_sandbox_per_vessel.is_some() {
             let Ok(spec) = FulfilmentKindSpec::from_policy(&policy.spec, platform) else { continue };
             let mut kind = ResourceObject::<FulfilmentKind> { metadata: policy.metadata.clone(), spec, status: None };
-            if let Some(instance) = policy.spec.provider_requirements.as_ref().and_then(|requirements| requirements.instance.clone()) {
+            if let Some(instance) = instance.clone() {
                 kind.metadata.labels.insert(ENVIRONMENT_PROVIDER_INSTANCE_LABEL.to_owned(), instance);
             }
             match flotilla_admission::support::placement_target_host(backend, namespace, &kind).await {
@@ -394,15 +396,23 @@ pub(super) async fn migrate_listed_placement_policies(
                 // registration when an SSH host reports its own OS.
                 updated.grants.retain(|grant| !grant.0.starts_with("platform:"));
                 updated.grants.extend(spec.grants.iter().filter(|grant| grant.0.starts_with("platform:")).cloned());
-                if updated != existing.spec {
+                let mut labels = existing.metadata.labels.clone();
+                if let Some(instance) = instance.clone() {
+                    labels.insert(ENVIRONMENT_PROVIDER_INSTANCE_LABEL.to_owned(), instance);
+                }
+                if updated != existing.spec || labels != existing.metadata.labels {
                     kinds
-                        .update(&InputMeta::from(&existing.metadata), &existing.metadata.resource_version, &updated)
+                        .update(&meta_from_existing(&existing, labels), &existing.metadata.resource_version, &updated)
                         .await
                         .map_err(|error| format!("update fulfilment kind {name}: {error}"))?;
                 }
             }
             Err(ResourceError::NotFound { .. }) => {
-                kinds.create(&empty_meta(name), &spec).await.map_err(|error| format!("create fulfilment kind {name}: {error}"))?;
+                let labels = instance.map(|instance| (ENVIRONMENT_PROVIDER_INSTANCE_LABEL.to_owned(), instance)).into_iter().collect();
+                kinds
+                    .create(&empty_meta_with_labels(name, labels), &spec)
+                    .await
+                    .map_err(|error| format!("create fulfilment kind {name}: {error}"))?;
             }
             Err(error) => return Err(format!("inspect fulfilment kind {name}: {error}")),
         }

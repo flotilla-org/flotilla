@@ -562,3 +562,64 @@ async fn runtime_starts_after_store_read_deadlines_clear() {
     assert!(!daemon.resource_backend().using::<Host>(NAMESPACE).list().await.unwrap().items.is_empty());
     runtime.shutdown();
 }
+
+// A cloud policy's provider instance selects between two cloud providers on one
+// controller, both for a kind it creates and for one migrated before it carried the instance.
+#[tokio::test]
+async fn cloud_policy_instance_selects_among_controller_providers() {
+    use flotilla_protocol::provider::{
+        CheckoutStrategy, EnvironmentClass, ProviderAdvertisement, ProviderCapabilities, ProviderKind, ProviderReadiness,
+    };
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let hosts = backend.using::<Host>(NAMESPACE);
+    let host = hosts
+        .create(&empty_meta("cloud-controller"), &flotilla_resources::HostSpec { display_name: "controller".into(), ..Default::default() })
+        .await
+        .unwrap();
+    let advertisement = |instance: &str| ProviderAdvertisement {
+        instance: instance.into(),
+        kind: Some(ProviderKind::new(EnvironmentClass::CloudSandbox, instance)),
+        capabilities: ProviderCapabilities {
+            checkout_strategies: vec![CheckoutStrategy::CloneInVessel],
+            workspace_root: "/workspace".into(),
+            per_vessel: true,
+            ..Default::default()
+        },
+        readiness: ProviderReadiness::Ready,
+    };
+    hosts
+        .update_status(
+            &host.metadata.name,
+            &host.metadata.resource_version,
+            &flotilla_resources::HostStatus {
+                capabilities: [(
+                    flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                    serde_json::to_value(vec![advertisement("daytona"), advertisement("namespace")]).unwrap(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let spec: flotilla_resources::PlacementPolicySpec = serde_json::from_value(serde_json::json!({
+        "pool": "cleat", "provider_requirements": {"instance":"namespace", "class":"cloud_sandbox"},
+        "cloud_sandbox_per_vessel": {"image":"image@sha256:digest", "size":{"cpus":1,"memory_bytes":1024,"disk_bytes":2048}, "checkout":"clone_in_vessel", "env":{}}
+    }))
+    .unwrap();
+    let policies = backend.using::<PlacementPolicy>(NAMESPACE);
+    policies.create(&empty_meta("created"), &spec).await.unwrap();
+    policies.create(&empty_meta("migrated"), &spec).await.unwrap();
+    let mut unlabelled = FulfilmentKindSpec::from_policy(&spec, "linux").unwrap();
+    unlabelled.host_ref = "cloud-controller".into();
+    backend.using::<FulfilmentKind>(NAMESPACE).create(&empty_meta("migrated"), &unlabelled).await.unwrap();
+
+    migrate_live_placement_policies(&backend, NAMESPACE, "cloud-controller", "linux").await.unwrap();
+
+    for name in ["created", "migrated"] {
+        let mut kind = backend.using::<FulfilmentKind>(NAMESPACE).get(name).await.unwrap();
+        flotilla_admission::support::resolve_placement_provider(&backend, NAMESPACE, &mut kind).await.unwrap();
+        assert_eq!(flotilla_admission::support::provider_instance(&kind), Some("namespace"), "{name}");
+    }
+}
