@@ -459,14 +459,14 @@ pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
 
 /// `K`'s tables with root columns the previous generation's table lacks marked, so opening its
 /// store adds them: `absent` as unobserved, `unset` flags as false. ADR 0047 N→N+1: remove the
-/// marks after the next fleet roll.
+/// marks, and the test helper `previous_generation_tables`, after the next fleet roll.
 fn added_since_previous_generation<K: Kind>(absent: &[&str], unset: &[&str]) -> TableSet {
     let mut set = K::table_set();
     for (name, flag) in absent.iter().map(|name| (name, false)).chain(unset.iter().map(|name| (name, true))) {
         let column = set.tables[0].columns.iter_mut().find(|column| column.name == *name);
         let column = column.unwrap_or_else(|| panic!("{} has no root column {name}", K::KIND));
         if flag {
-            column.properties.insert("previous_generation_default".into(), 0.into());
+            column.mark_previous_generation_default(0);
         } else {
             column.mark_previous_generation_absent();
         }

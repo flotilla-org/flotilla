@@ -210,6 +210,11 @@ impl ColumnDef {
         self.properties.get("previous_generation_default").and_then(serde_json::Value::as_i64)
     }
 
+    /// Sets the explicit integer/bool default of a column the previous generation's table lacked.
+    pub fn mark_previous_generation_default(&mut self, default: i64) {
+        self.properties.insert("previous_generation_default".into(), default.into());
+    }
+
     /// Marks a column the previous generation's table lacked, its rows reading as unobserved there:
     /// see [`ColumnDef::previous_generation_value`].
     pub fn mark_previous_generation_absent(&mut self) {
@@ -640,5 +645,8 @@ mod tests {
         assert_eq!(absent(ColumnType::Cbor, false), Some(Value::Blob(vec![0xf6])));
         assert_eq!(absent(ColumnType::Text, false), None);
         assert_eq!(ColumnDef::new("c", ColumnType::Text, true).previous_generation_value(), None);
+        let mut flag = ColumnDef::new("c", ColumnType::Bool, false);
+        flag.mark_previous_generation_default(0);
+        assert_eq!(flag.previous_generation_value(), Some(Value::Int(0)));
     }
 }

@@ -79,7 +79,9 @@ pub fn key_value<T: KeyColumn + Element>(value: &T) -> Result<Value, EncodeError
 #[doc(hidden)]
 pub fn element_values<T: Element>(value: &T) -> Result<Vec<Value>, EncodeError> {
     let mut rows = Encoder::encode(value)?;
-    Ok(rows.tables.swap_remove(0).pop().map(|row| row.values).unwrap_or_default())
+    let mut element = rows.tables.swap_remove(0);
+    debug_assert_eq!(element.len(), 1, "an element is one row");
+    Ok(element.pop().map(|row| row.values).unwrap_or_default())
 }
 
 /// Encodes one `eq` argument of an `#[store(intern = "tx")]` field.
