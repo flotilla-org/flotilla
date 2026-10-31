@@ -65,7 +65,7 @@ fn failure(error: Failure, encoding: wire::Encoding) -> Response {
 fn params(query: Option<String>) -> Vec<(String, String)> {
     url::form_urlencoded::parse(query.as_deref().unwrap_or("").as_bytes()).into_owned().collect()
 }
-fn store(state: &super::HttpRouter) -> Option<std::sync::Arc<flotilla_schema_sqlite::stream::Service>> {
+pub(super) fn store(state: &super::HttpRouter) -> Option<std::sync::Arc<flotilla_schema_sqlite::stream::Service>> {
     state.table_store.clone().or_else(|| state.daemon.as_ref().and_then(|daemon| daemon.decided_store().ok()))
 }
 pub(super) async fn list(

@@ -536,6 +536,7 @@ impl DaemonServer {
         let hook_endpoint = http::HookEndpoint::load(&state_dir)?;
         let http_router = http::HttpRouter::for_daemon(Arc::clone(&daemon), Arc::clone(&logins), tcp_origin.clone())
             .with_hooks(hook_endpoint.clone())
+            .with_link_prefix(daemon_config.web.link_prefix.clone())
             .with_load_metrics(Arc::clone(&load_metrics), daemon_config.http.metrics)
             .with_commands(remote_command_router.clone(), shutdown_request_tx.clone(), socket_path.clone())
             .into_router();

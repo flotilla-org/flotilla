@@ -747,3 +747,107 @@ async fn unknown_unix_listener_caller_is_anonymous() {
     assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
     assert_eq!(reply.json()["message"], "authentication required");
 }
+
+fn get_accepting(uri: &str, accept: &str) -> Request<Body> {
+    Request::get(uri).header(header::ACCEPT, accept).body(Body::empty()).expect("request")
+}
+
+fn rels(root: &serde_json::Value) -> Vec<&str> {
+    root["links"].as_array().expect("links").iter().map(|link| link["rel"].as_str().expect("rel")).collect()
+}
+
+async fn designate_fleet(daemon: &Incarnation, fleet: &str) {
+    use flotilla_resources::{FleetDesignation, FleetDesignationSpec, FLEET_DESIGNATION_NAME};
+    daemon
+        .backend
+        .definitions::<flotilla_resources::Project>("flotilla")
+        .apply(
+            &InputMeta::builder().name("project-map".into()).build(),
+            &flotilla_resources::ProjectSpec::builder()
+                .display_name("project-map".into())
+                .default_workflow_ref("w".into())
+                .repositories(Vec::new())
+                .build(),
+        )
+        .await
+        .expect("charter project");
+    daemon
+        .backend
+        .definitions::<FleetDesignation>("flotilla")
+        .apply(
+            &InputMeta::builder().name(FLEET_DESIGNATION_NAME.into()).build(),
+            &FleetDesignationSpec { fleet: Some(fleet.into()), project: "project-map".into(), image_cache: None },
+        )
+        .await
+        .expect("designation");
+}
+
+// The root document names the build and links only what the daemon serves: no verbs or
+// presentations tables, no commands without a command router.
+#[tokio::test]
+async fn root_document_links_only_what_is_served() {
+    let daemon = Incarnation::new();
+    for caller in [CallerAuth::Socket(None), environment(), CallerAuth::Bearer] {
+        let reply = daemon.call(caller, get("/")).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.headers[header::CONTENT_TYPE], "application/vnd.flotilla.root+json");
+        let root = reply.json();
+        assert_eq!(root["build_id"], flotilla_daemon_api::build_info::build_id());
+        assert_eq!(root["protocol_fingerprint"], flotilla_protocol::PROTOCOL_FINGERPRINT);
+        assert_eq!(rels(&root), ["tables"]);
+        assert_eq!(root["links"][0]["href"], "/tables");
+    }
+    assert_eq!(daemon.call(CallerAuth::Anonymous, get("/")).await.status, StatusCode::UNAUTHORIZED);
+}
+
+// A browser is sent to the fleet's link prefix; with no fleet named and no prefix, it gets JSON.
+#[tokio::test]
+async fn root_document_redirects_browsers_through_the_link_prefix() {
+    let daemon = Incarnation::new();
+    let browser = "text/html,application/xhtml+xml,*/*;q=0.8";
+    let reply = daemon.call(CallerAuth::Bearer, get_accepting("/", browser)).await;
+    assert_eq!(reply.status, StatusCode::OK, "no prefix: JSON");
+    assert!(reply.json()["link_prefix"].is_null());
+
+    designate_fleet(&daemon, "flotilla").await;
+    let reply = daemon.call(CallerAuth::Bearer, get_accepting("/", browser)).await;
+    assert_eq!(reply.status, StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(reply.headers[header::LOCATION], "https://flotilla.work/flotilla");
+    let json = daemon.call(CallerAuth::Bearer, get_accepting("/", "application/json")).await;
+    assert_eq!(json.status, StatusCode::OK);
+    assert_eq!(json.json()["fleet"], "flotilla");
+    assert_eq!(json.json()["link_prefix"], "https://flotilla.work/flotilla");
+
+    let configured = HttpRouter::builder()
+        .backend(daemon.backend.clone())
+        .logins(Arc::clone(&daemon.logins))
+        .link_prefix("https://pages.example/fleet/".into())
+        .build()
+        .into_router();
+    let reply = configured.oneshot(with_caller(get_accepting("/", "text/html"), CallerAuth::Bearer)).await.expect("router");
+    assert_eq!(reply.headers()[header::LOCATION], "https://pages.example/fleet");
+}
+
+fn with_caller(mut request: Request<Body>, caller: CallerAuth) -> Request<Body> {
+    request.extensions_mut().insert(caller);
+    request
+}
+
+// The CBOR twin is chosen by Accept.
+#[tokio::test]
+async fn root_document_has_a_cbor_twin() {
+    let daemon = Incarnation::new();
+    let reply = daemon.call(CallerAuth::Bearer, get_accepting("/", "application/vnd.flotilla.root+cbor")).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.headers[header::CONTENT_TYPE], "application/vnd.flotilla.root+cbor");
+    let root: serde_json::Value = flotilla_cbor::from_slice(&reply.body, &super::wire::LIMITS).expect("CBOR root document");
+    assert_eq!(rels(&root), ["tables"]);
+    assert_eq!(root["build_id"], flotilla_daemon_api::build_info::build_id());
+}
+
+#[tokio::test]
+async fn root_document_refuses_an_unacceptable_accept() {
+    let daemon = Incarnation::new();
+    let reply = daemon.call(CallerAuth::Bearer, get_accepting("/", "image/png")).await;
+    assert_eq!(reply.status, StatusCode::NOT_ACCEPTABLE);
+}

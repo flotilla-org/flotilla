@@ -13,6 +13,7 @@ mod hooks;
 mod login;
 pub(in crate::server) mod metrics;
 mod resource_api;
+mod root;
 mod table_api;
 #[cfg(test)]
 mod table_tests;
@@ -73,6 +74,8 @@ pub(in crate::server) struct HttpRouter {
     /// Verifies the hook tokens environment callers carry; without its key they are refused.
     #[builder(default)]
     hooks: HookEndpoint,
+    /// Where `GET /` sends a browser (`[web] link_prefix`); unset means the fleet default.
+    link_prefix: Option<String>,
 }
 
 /// The TCP listener's origin, known only once it binds (its port may be chosen then). The
@@ -114,11 +117,17 @@ impl HttpRouter {
             logins,
             tcp_origin,
             hooks: HookEndpoint::default(),
+            link_prefix: None,
         }
     }
 
     pub(in crate::server) fn with_hooks(mut self, hooks: HookEndpoint) -> Self {
         self.hooks = hooks;
+        self
+    }
+
+    pub(in crate::server) fn with_link_prefix(mut self, link_prefix: Option<String>) -> Self {
+        self.link_prefix = link_prefix;
         self
     }
 
@@ -140,6 +149,7 @@ impl HttpRouter {
 
     pub(in crate::server) fn into_router(self) -> Router {
         Router::new()
+            .route("/", get(root::handle))
             .route("/metrics", get(metrics::handle))
             .route(HELLO_PATH, get(hello))
             .route("/tables", get(table_api::list))
