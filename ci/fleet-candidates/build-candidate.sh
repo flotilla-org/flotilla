@@ -78,7 +78,8 @@ build_typescript_host() {
 
 # drydock finds `drydock-host-typescript` beside flotillad and runs it directly;
 # the wrapper locates the installed tree relative to itself, so a copy of the
-# bin/ and share/ pair (the Darwin stable root) keeps working.
+# bin/ and share/ pair (the Darwin stable root) keeps working. It must be invoked
+# in place, not through a symlink elsewhere: drydock finds it beside flotillad.
 write_typescript_host_wrapper() {
   cat >"$1" <<'WRAPPER'
 #!/bin/sh

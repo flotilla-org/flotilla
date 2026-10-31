@@ -110,6 +110,17 @@ class BootstrapValidationTests(unittest.TestCase):
             for path in (f"{tree}/../x", f"{tree}//x", f"{tree}/./x", "bin/drydock-host-typescript2", "share/flotilla/drydock-host-typescript-x/a"):
                 self.assertFalse(validation.allowed_payload(path, platform))
 
+    def test_darwin_refresh_without_a_typescript_host_leaves_the_previous_copy(self):
+        source, destination = self.root / "source", self.root / "destination"
+        for name in ("flotilla", "flotillad", "cleat"):
+            (source / "bin").mkdir(parents=True, exist_ok=True)
+            (source / "bin" / name).write_text(name)
+        kept = destination / validation.TYPESCRIPT_HOST_TREE / "dist" / "main.js"
+        kept.parent.mkdir(parents=True)
+        kept.write_text("previous")
+        validation.refresh_darwin_payload(source, destination)
+        self.assertEqual(kept.read_text(), "previous")
+
     def test_darwin_refresh_copies_the_typescript_host_and_prunes_its_stale_files(self):
         source, destination = self.root / "source", self.root / "destination"
         for name in ("flotilla", "flotillad", "cleat"):
