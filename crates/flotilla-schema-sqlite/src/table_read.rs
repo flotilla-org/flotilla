@@ -8,6 +8,9 @@ use rusqlite::{params_from_iter, types::Value as SqlValue, Connection};
 use std::collections::BTreeMap;
 
 /// `expression` named: each stored value of `column`'s categories read as its readable name.
+/// There is no `ELSE`: a value outside the categories reads as null, never as a code on the wire.
+/// None can be stored, as the column's CHECK lists exactly these codes; for the log's `edge`,
+/// `from` and `to`, `log_view` already names the codes and its categories map each name to itself.
 fn named(expression: String, column: &ColumnDef) -> String {
     if !matches!(column.ty, ColumnType::Code(_)) || column.categories.is_empty() {
         return expression;
@@ -194,6 +197,7 @@ pub(crate) fn read_log(
     let stored = set.log_projection();
     let descriptor = stored.readable();
     let mut clauses = vec!["1".to_owned()];
+    // Bound in placeholder order: the inner query's `kind` and `home`, then the filters, then the limit.
     let mut values = vec![SqlValue::Text(set.code.to_string()), SqlValue::Text(home.into())];
     for filter in filters {
         let TableFilter::Compare { field, operator, value } = filter else {
