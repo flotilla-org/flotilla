@@ -37,6 +37,9 @@ pub(crate) fn allow_all(_caller: &str, _entry: &Entry, _subject: &Address) -> Re
 /// long text parameter cannot flood the trace and log pipeline.
 pub(crate) const FIELD_LIMIT: usize = 4096;
 
+/// The longest invocation id the route takes; a client id (a UUID is 36 bytes) needs no more.
+pub(crate) const INVOCATION_LIMIT: usize = 256;
+
 /// The verb route over a catalog, the subjects' rows and the policy.
 pub(crate) struct Verbs {
     pub catalog: Catalog,
@@ -49,15 +52,17 @@ impl Verbs {
     /// (#4197): the caller, verb, subjects, params and invocation id, then each subject's
     /// outcome or the request's refusal. The verb's own spans nest under it. A `done` outcome's
     /// `result` is the verb's answer to the caller, not part of the record, so the span leaves it
-    /// out; params and outcomes are bounded to [`FIELD_LIMIT`].
+    /// out; every field taken from the request is bounded to [`FIELD_LIMIT`], since a request
+    /// refused for its size is still traced.
     pub(crate) async fn invoke(&self, caller: &str, name: &str, request: Invocation) -> Result<Invoked, Refusal> {
-        let subjects = Value::from(request.subjects.clone()).to_string();
+        let subjects = bounded(Value::from(request.subjects.clone()).to_string());
         let params = bounded(Value::Object(request.params.clone()).to_string());
+        let (name_field, id_field) = (bounded(name.to_owned()), bounded(request.invocation.clone()));
         let span = tracing::info_span!(
             "verb.invocation",
             verb.caller = caller,
-            verb.name = name,
-            verb.invocation = %request.invocation,
+            verb.name = name_field,
+            verb.invocation = id_field,
             verb.subjects = subjects,
             verb.params = params,
             verb.outcomes = tracing::field::Empty,
@@ -96,6 +101,9 @@ impl Verbs {
         if request.invocation.is_empty() {
             return Err(Refusal::Invalid("an invocation id is required".into()));
         }
+        if request.invocation.len() > INVOCATION_LIMIT {
+            return Err(Refusal::Invalid(format!("an invocation id is at most {INVOCATION_LIMIT} bytes")));
+        }
         if request.subjects.is_empty() {
             return Err(Refusal::Invalid("at least one subject is required".into()));
         }
@@ -129,6 +137,7 @@ impl Verbs {
         }
         if entry.picks() == Picks::Set {
             if outcomes.is_empty() {
+                // `ready` is not empty: the request names at least one subject, and none failed.
                 let ran = entry.handler.run(&ready, &bound(params, entry, &ready[0]), invocation).await;
                 for subject in &ready {
                     outcomes.insert(subject.address.to_string(), outcome(subject, ran.clone()));

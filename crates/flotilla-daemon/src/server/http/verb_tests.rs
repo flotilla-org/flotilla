@@ -31,7 +31,7 @@ use crate::server::{
     tables,
     verbs::{
         catalog::{Catalog, NativeVerb, Picks, Presentation, Subject, Subjects},
-        invoke::{allow_all, FIELD_LIMIT},
+        invoke::{allow_all, FIELD_LIMIT, INVOCATION_LIMIT},
         Verbs,
     },
 };
@@ -246,7 +246,7 @@ fn attribute(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Option<Str
 // Behaviour (#4197): the intent record is the `verb.invocation` span. It carries the caller,
 // verb, subjects, params, invocation id and each subject's outcome (without the verb's `result`),
 // and the verb's own spans nest under it. A request refused whole carries its refusal instead,
-// and a long parameter is cut to the field limit.
+// and long parameters or subject lists are cut to the field limit.
 #[tokio::test]
 async fn the_invocation_span_records_the_intent_and_the_outcomes() {
     let exporter = InMemorySpanExporter::default();
@@ -270,6 +270,10 @@ async fn the_invocation_span_records_the_intent_and_the_outcomes() {
     let long = json!({"invocation": "long", "subjects": [RUNNING], "params": {"note": "é".repeat(FIELD_LIMIT)}});
     let (status, _) = invoke(&router, CallerAuth::Bearer, "convoy.touch", long).await;
     assert_eq!(status, StatusCode::OK);
+    // A request refused for its size is still traced, within the limit.
+    let many = vec![RUNNING; FIELD_LIMIT / RUNNING.len() + 1];
+    let (status, _) = invoke(&router, CallerAuth::Bearer, "convoy.touch", json!({"invocation": "many", "subjects": many})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     provider.force_flush().unwrap();
     let spans = exporter.get_finished_spans().unwrap();
     let invocation = |id: &str| {
@@ -295,6 +299,8 @@ async fn the_invocation_span_records_the_intent_and_the_outcomes() {
     assert_eq!(attribute(refused, "verb.outcomes"), None);
     let params = attribute(invocation("long"), "verb.params").expect("params");
     assert!(params.len() <= FIELD_LIMIT && params.ends_with('…'), "{} bytes", params.len());
+    let subjects = attribute(invocation("many"), "verb.subjects").expect("subjects");
+    assert!(subjects.len() <= FIELD_LIMIT && subjects.ends_with('…'), "{} bytes", subjects.len());
     provider.shutdown().unwrap();
 }
 
@@ -307,6 +313,7 @@ async fn requests_that_do_not_fit_the_verb_are_refused_whole() {
         ("convoy.nothing", json!({"invocation": "x", "subjects": [RUNNING]}), StatusCode::NOT_FOUND),
         ("convoy.touch", json!({"invocation": "x", "subjects": []}), StatusCode::BAD_REQUEST),
         ("convoy.touch", json!({"invocation": "", "subjects": [RUNNING]}), StatusCode::BAD_REQUEST),
+        ("convoy.touch", json!({"invocation": "x".repeat(INVOCATION_LIMIT + 1), "subjects": [RUNNING]}), StatusCode::BAD_REQUEST),
         ("convoy.touch", json!({"invocation": "x", "subjects": ["project:flotilla"]}), StatusCode::BAD_REQUEST),
         ("convoy.touch", json!({"invocation": "x", "subjects": [RUNNING, RUNNING]}), StatusCode::BAD_REQUEST),
         ("convoy.touch", json!({"invocation": "x", "subjects": [RUNNING], "params": {"other": 1}}), StatusCode::BAD_REQUEST),
