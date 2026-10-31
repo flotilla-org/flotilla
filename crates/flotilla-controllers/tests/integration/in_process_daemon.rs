@@ -6178,7 +6178,9 @@ hostname = "buildbox.example"
     );
 }
 
-#[tokio::test]
+// Paused time: the registration deadline and the hung host's longer six-second
+// reply elapse virtually.
+#[tokio::test(start_paused = true)]
 async fn static_ssh_registration_times_out_hung_hosts_and_keeps_startup_moving() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");

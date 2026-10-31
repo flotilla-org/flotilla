@@ -4974,7 +4974,8 @@ mod tests {
             }
         }
 
-        for blocked_command in ["find", "rm"] {
+        // The two blocked commands use separate roots and run concurrently.
+        let case = |blocked_command: &'static str| async move {
             let dir = tempfile::tempdir().expect("tempdir");
             let bin = dir.path().join("bin");
             std::fs::create_dir(&bin).expect("bin");
@@ -5011,7 +5012,8 @@ mod tests {
             std::fs::remove_file(shim).expect("unblock commands");
             prune_remote_checkout_archives(&runner, &root, 14, std::time::Duration::from_secs(5)).await.expect("next sweep succeeds");
             assert!(!old.exists());
-        }
+        };
+        tokio::join!(case("find"), case("rm"));
     }
 
     #[tokio::test]

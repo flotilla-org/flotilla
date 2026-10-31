@@ -7020,7 +7020,24 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
         wait.recv().unwrap();
     });
     ready.await.unwrap();
-    let error = super::change_stream::follow_round(Arc::clone(&target), "home", None, &router).await.unwrap_err();
+    // Paused time stands in for the 15s frame deadline. The blocked producer inhibits
+    // auto-advance, so step the clock while the round settles on its frame wait; the
+    // follower's 20s pull deadline would report "routed stream timed out" instead.
+    tokio::time::pause();
+    let round = tokio::spawn({
+        let (target, router) = (Arc::clone(&target), router.clone());
+        async move { super::change_stream::follow_round(target, "home", None, &router).await }
+    });
+    let error = loop {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        if round.is_finished() {
+            break round.await.unwrap().unwrap_err();
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+    };
+    tokio::time::resume();
     release.send(()).unwrap();
     writer.await.unwrap();
     assert_eq!(error, "routed frame timed out");
@@ -7040,17 +7057,20 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
             Ok(stamp.id)
         })
         .unwrap();
+    let mut current = source.with_store(|store| store.read()?.load::<RoutedStreamSample>(resource)).unwrap().unwrap();
     for _ in 0..65 {
-        source
+        let mut next = RoutedStreamSample { value: "large".into(), tags: current.value.tags.clone() };
+        next.tags.push("x".repeat(1024 * 1024));
+        let stamp = source
             .with_store(|store| {
                 let mut write = store.write()?;
-                let current = write.load::<RoutedStreamSample>(resource)?.unwrap();
-                let mut tags = current.value.tags.clone();
-                tags.push("x".repeat(1024 * 1024));
-                write.update(&current, &RoutedStreamSample { value: "large".into(), tags }, &NewChange::new("writer", Timestamp(2)))?;
-                write.commit()
+                let stamp = write.update(&current, &next, &NewChange::new("writer", Timestamp(2)))?;
+                write.commit()?;
+                Ok(stamp)
             })
             .unwrap();
+        current.version = stamp.version;
+        current.value = next;
     }
     let fresh = Arc::new(Service::open(&dir.path().join("fresh.db"), "local", kinds).unwrap());
     local.install_decided_store(Arc::clone(&fresh)).unwrap();

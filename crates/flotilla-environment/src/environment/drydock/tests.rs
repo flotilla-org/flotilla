@@ -464,7 +464,9 @@ async fn restart_failed_adoption_preserves_backing() {
     drop(first);
     drop(provider);
     host.gateway.stop();
-    let restarted = host.provider();
+    // No agent can answer, so the attempt only ever ends at its connect deadline.
+    let mut restarted = host.provider();
+    restarted.agent_timeout = Duration::from_secs(1);
     let prepared = fixture_prepared(&host, &restarted).await;
     let failure = restarted.provision(EnvironmentId::new("survivor"), &prepared, host.opts()).await.err().expect("no agent answers");
     assert!(

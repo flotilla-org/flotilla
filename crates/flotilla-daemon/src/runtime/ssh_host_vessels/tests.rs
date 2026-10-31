@@ -362,19 +362,19 @@ async fn shell(access: &VesselAccess, script: &str) -> String {
 /// A crew's request through its vessel's daemon forward, and the reply. A
 /// forward that nothing serves refuses, breaks or closes: no reply.
 async fn crew_request(access: &VesselAccess, byte: u8) -> Vec<u8> {
-    crew_request_within(access, byte).await.expect("reply")
+    crew_request_within(access, byte, Duration::from_secs(5)).await.expect("reply")
 }
 
 /// As [`crew_request`], but a connection held open past the deadline is an
 /// `Err`: a vessel agent that outlives its controller keeps an unclaimed
 /// connection until its claim deadline.
-async fn crew_request_within(access: &VesselAccess, byte: u8) -> Result<Vec<u8>, tokio::time::error::Elapsed> {
+async fn crew_request_within(access: &VesselAccess, byte: u8, wait: Duration) -> Result<Vec<u8>, tokio::time::error::Elapsed> {
     let Ok(mut crew) = UnixStream::connect(access.paths.daemon_socket()).await else { return Ok(Vec::new()) };
     if crew.write_all(&[byte]).await.is_err() {
         return Ok(Vec::new());
     }
     let mut reply = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), crew.read_to_end(&mut reply)).await.map(|_| reply)
+    tokio::time::timeout(wait, crew.read_to_end(&mut reply)).await.map(|_| reply)
 }
 
 // #3792 acceptance: two vessels on one host each get their own agent and
@@ -588,8 +588,9 @@ async fn an_unreachable_host_does_not_block_teardown() {
     host.profile.runner = Arc::new(Unreachable);
     vessels.retire(&host.profile, "convoy-1-work").await;
     // The host stayed unreachable, so its agent lives on holding the connection unclaimed.
+    // A served forward answers within milliseconds; one second of silence shows it is gone.
     assert!(
-        crew_request_within(&vessel, b'x').await.map_or(true, |reply| reply.is_empty()),
+        crew_request_within(&vessel, b'x', Duration::from_secs(1)).await.map_or(true, |reply| reply.is_empty()),
         "the controller no longer serves the vessel's forward"
     );
     assert!(access(&vessels, &host, "convoy-1-work").await.is_err());
