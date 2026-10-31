@@ -184,7 +184,8 @@ fn at<T>(value: Option<T>, observed_at: DateTime<Utc>) -> Observation<T> {
 /// The observing home's view of one change request: kind code `cq`, named by the subject's record
 /// name. A null value is one the forge has not reported.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
-// Clippy reads the two indexes' shared key columns as repeated attributes.
+// clippy::duplicated_attributes reads the key columns the two `index(...)` declarations share as
+// repeated attributes.
 #[allow(clippy::duplicated_attributes)]
 #[store(
     kind = "ChangeRequest",
@@ -432,12 +433,14 @@ pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
 }
 
 /// `K`'s tables, `columns` of its root marked absent from the previous generation's table, so
-/// opening its store adds them. Drop each mark one roll after its column ships.
+/// opening its store adds them. ADR 0047 N→N+1: remove the marks after the next fleet roll.
 fn added_since_previous_generation<K: Kind>(columns: &[&str]) -> TableSet {
     let mut set = K::table_set();
     for name in columns {
         let column = set.tables[0].columns.iter_mut().find(|column| column.name == *name);
-        column.unwrap_or_else(|| panic!("{} has no root column {name}", K::KIND)).mark_previous_generation_absent();
+        let column = column.unwrap_or_else(|| panic!("{} has no root column {name}", K::KIND));
+        column.mark_previous_generation_absent();
+        assert!(column.previous_generation_value().is_some(), "{} column {name} cannot be added to an older table", K::KIND);
     }
     set
 }
