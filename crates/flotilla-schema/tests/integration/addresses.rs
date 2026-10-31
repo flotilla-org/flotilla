@@ -15,6 +15,15 @@ struct Placard {
     watchers: BTreeSet<Address>,
 }
 
+/// A described row beside the stored one.
+#[derive(flotilla_schema::Describe)]
+#[allow(dead_code)]
+struct PlacardRow {
+    project: Address,
+    subject: Option<Address>,
+    note: String,
+}
+
 /// Segment values spanning bytes the canonical encoding escapes (`/ : % @`, space, quotes,
 /// multi-byte UTF-8) as well as bare ones.
 fn value(tc: &TestCase) -> String {
@@ -43,6 +52,27 @@ fn address_fields_are_interned_columns() {
         watchers.key.iter().map(|column| column.ty.clone()).collect::<Vec<_>>(),
         [ColumnType::Interned(flotilla_schema::Code::new("ad"))]
     );
+}
+
+// Behaviour (#4214): an address field, required, optional or a set's key, is described as an
+// address by both derives, and renders as Frictionless type `address`; plain text stays a string.
+// (A condition shares the address domain but is no address: the daemon's table test covers
+// Message's conditions.)
+#[test]
+fn address_fields_are_described_as_addresses() {
+    let stored = Placard::table_set();
+    let described = <PlacardRow as flotilla_schema::Describe>::table_set();
+    let addresses = |set: &flotilla_schema::TableSet| -> Vec<(String, bool)> {
+        set.tables
+            .iter()
+            .flat_map(|table| table.key.iter().chain(&table.columns).map(|column| (column.name.clone(), column.address)))
+            .collect()
+    };
+    assert!(addresses(&stored).iter().filter(|(name, _)| ["project", "subject", "value"].contains(&name.as_str())).all(|(_, a)| *a));
+    assert_eq!(addresses(&described), [("project".into(), true), ("subject".into(), true), ("note".into(), false)]);
+    let schema = described.tables[0].frictionless();
+    let types: Vec<_> = schema["fields"].as_array().unwrap().iter().map(|field| field["type"].as_str().unwrap().to_owned()).collect();
+    assert_eq!(types, ["address", "address", "string"]);
 }
 
 // Property: every address round-trips through its logical row as its canonical text, so two

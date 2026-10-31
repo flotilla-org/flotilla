@@ -51,7 +51,7 @@ Errors found while a stream is already open arrive as a `resync` message instead
 
 Parameters apply to the rows route. Each is validated against the table's description before any row is read.
 
-- `where=<field> <op> <literal>`, repeatable, all conditions must hold. The expression is the condition grammar of `flotilla-address` (`crates/flotilla-address/src/condition.rs`) with the field path and literal; it is not copied here. A column accepts an operator only if it appears in the column's `whereOperators`. Literals must fit the column type: integers parse as `i64`, booleans are `true`/`false`, timestamps are RFC 3339, `code` columns take one of their values. `cbor`, `frozen` and `blob` columns cannot be filtered. On resource kinds, `metadata.labels.<key>` filters by label with `==`.
+- `where=<field> <op> <literal>`, repeatable, all conditions must hold. The expression is the condition grammar of `flotilla-address` (`crates/flotilla-address/src/condition.rs`) with the field path and literal; it is not copied here. A column accepts an operator only if it appears in the column's `whereOperators`. Literals must fit the column type: integers parse as `i64`, booleans are `true`/`false`, timestamps are RFC 3339, enum columns take one of their `constraints.enum` names. `cbor`, `frozen` and `blob` columns cannot be filtered. On resource kinds, `metadata.labels.<key>` filters by label with `==`.
 - `sort=a,-b`: comma-separated column names, `-` for descending. Columns must be `sortable`. The table's key columns are appended in ascending order, so the order is total. Null sorts before every value ascending, and after every value descending.
 - `columns=a,b`: the columns to return. Key columns are always included, and a `reference` column brings its `.kind` and `.home` companions.
 - `limit`: rows per page; 200 when absent, otherwise 1 to 10000.
@@ -109,10 +109,33 @@ Each field has:
 
 - `name`: dotted for nested values, for example `metadata.name`.
 - `type`: the wire type, from the column type (below).
-- `constraints.required`: false when the column is nullable.
+- `constraints`: the Frictionless constraints below.
 - `format`: `binary` for `blob` columns (base64 strings in rows).
-- `categories`: for `code` columns, `[{"value","label"}]`, in code order.
 - every `properties` entry of the column, merged into the field.
+
+### Field types
+
+```list field-types
+integer
+number
+boolean
+string
+datetime
+object
+address
+```
+
+All but `address` are Frictionless types. `address` is a flotilla extension: the column holds canonical ADR 0066 addresses (`crates/flotilla-address`), as text. Address columns are the `interned` columns whose values are addresses; a condition shares their storage but is a `string`.
+
+### Constraints
+
+```list constraints
+required
+enum
+```
+
+- `required`: false when the column is nullable.
+- `enum`: on an enum (`code`) column, the closed set of values a cell may hold: the readable names (`Pending`, `Landed`), in code order. A null cell is allowed only when `required` is false. Rows never carry the short codes that storage and SQL use (ADR 0047: the spelling is wire only).
 
 ### Column types
 
@@ -138,8 +161,8 @@ cbor
 | `text` | `string` | string |
 | `blob` | `string`, `format: binary` | base64 string |
 | `timestamp` | `datetime` | RFC 3339 string |
-| `code` | `string` plus `categories` | one of the category values |
-| `interned` | `string` | string |
+| `code` | `string` plus `constraints.enum` | one of the enum's names |
+| `interned` | `string`, or `address` for an address | string |
 | `ref` | `string` | string, a resource name |
 | `frozen` | `object` | decoded value |
 | `cbor` | `object` | decoded value |
@@ -169,7 +192,7 @@ whereOperators
 `GET /tables` is the authority. The tables are:
 
 - Resource kinds: one table each, named by the kind's plural, with the shared columns `metadata.*`, `status.phase`, `status.conditions`, `spec` and `status`.
-- Engine kinds: a root table per kind, a table per nested collection, and `<root>.log`, the kind's event log projection with the columns `home`, `sequence`, `name`, `cause`, `edge`, `from`, `to`, `at`.
+- Engine kinds: a root table per kind, a table per nested collection, and `<root>.log`, the kind's event log projection with the columns `home`, `sequence`, `name`, `cause`, `edge`, `from`, `to`, `at`. `cause` (`Create`, `Edit`, `Edge`, `Delete`, `Expunge`), `edge` (the kind's edge names) and `from` and `to` (its state's labels) are enum columns.
 
 The columns are not listed here; `?format=markdown` on a table describes its own.
 

@@ -1,9 +1,21 @@
 //! Natural-value reads for self-describing tables. The SQL boundary validates every
 //! identifier and comparison before preparing a statement, and applies all predicates.
-use crate::{quote_ident, StoreError};
+//! Enum columns read as their readable names ([`Table::readable`]): short codes stay in
+//! storage and in the SQL below, and filters compare names.
+use crate::{ddl::text_literal, quote_ident, StoreError};
 use flotilla_schema::{ColumnDef, ColumnType, KindRegistry, Table, Value};
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection};
 use std::collections::BTreeMap;
+
+/// `expression` named: each stored value of `column`'s categories read as its readable name.
+fn named(expression: String, column: &ColumnDef) -> String {
+    if !matches!(column.ty, ColumnType::Code(_)) || column.categories.is_empty() {
+        return expression;
+    }
+    let arms: String =
+        column.categories.iter().map(|(value, name)| format!(" WHEN {} THEN {}", text_literal(value), text_literal(name))).collect();
+    format!("CASE {expression}{arms} END")
+}
 
 pub struct TableRead {
     pub descriptor: Table,
@@ -68,7 +80,7 @@ pub(crate) fn read(
                 ColumnType::Interned(_) => format!("(SELECT s FROM strings WHERE id={value})"),
                 ColumnType::Ref => format!("(SELECT s FROM strings WHERE id=(SELECT name FROM resource_identity WHERE id={value}))"),
                 ColumnType::Frozen => format!("(SELECT bytes FROM objects WHERE hash={value})"),
-                _ => value,
+                _ => named(value, original),
             }
         } else {
             if let Some(reference) = column.name.strip_suffix(".home") {
@@ -87,6 +99,7 @@ pub(crate) fn read(
         quote_ident(name),
         quote_ident(owner)
     );
+    let table = table.readable();
     let columns: Vec<_> = table.key.iter().chain(&table.columns).collect();
     let mut arguments = vec![SqlValue::Text(flotilla_schema::HOME_DOMAIN.to_string()), SqlValue::Text(home.into())];
     let mut clauses = vec![];
@@ -178,8 +191,9 @@ pub(crate) fn read_log(
     }
     let root = name.strip_suffix(".log").ok_or_else(|| StoreError::Stream("unknown log table".into()))?;
     let set = kinds.iter().find(|set| set.tables[0].name == root).ok_or_else(|| StoreError::Stream("unknown log kind".into()))?;
-    let descriptor = set.log_projection();
-    let mut clauses = vec!["kind=?".to_owned(), "home=?".to_owned()];
+    let stored = set.log_projection();
+    let descriptor = stored.readable();
+    let mut clauses = vec!["1".to_owned()];
     let mut values = vec![SqlValue::Text(set.code.to_string()), SqlValue::Text(home.into())];
     for filter in filters {
         let TableFilter::Compare { field, operator, value } = filter else {
@@ -221,8 +235,18 @@ pub(crate) fn read_log(
         |row| row.get(0),
     )?;
     let rows = {
+        let projected: Vec<String> = stored
+            .key
+            .iter()
+            .chain(&stored.columns)
+            .map(|column| {
+                let source = if column.name == "sequence" { "home_seq" } else { &column.name };
+                format!("{} AS {}", named(quote_ident(source), column), quote_ident(source))
+            })
+            .collect();
         let sql = format!(
-            "SELECT home,home_seq,name,cause,edge,\"from\",\"to\",at FROM log_view WHERE {} ORDER BY home_seq LIMIT ?",
+            "SELECT * FROM (SELECT {} FROM log_view WHERE kind=? AND home=?) WHERE {} ORDER BY home_seq LIMIT ?",
+            projected.join(","),
             clauses.join(" AND ")
         );
         values.push(SqlValue::Integer(limit as i64));

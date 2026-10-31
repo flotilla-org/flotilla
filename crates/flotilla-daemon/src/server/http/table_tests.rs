@@ -11,7 +11,10 @@ use flotilla_store::{ReadObserver, ReadOperation, ResourceBackend};
 use flotilla_store_memory::InMemoryBackend;
 use futures::StreamExt;
 use serde_json::json;
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
+};
 use tower::ServiceExt;
 
 #[derive(Debug, Default)]
@@ -307,7 +310,7 @@ async fn derived_table_router_uses_native_values_and_sql_predicates() {
         assert!(child.iter().any(|message| matches!(message,Message::Rows{rows,..} if rows.len()==2&&rows[0]["value"]=="tag")));
         let log = messages(&router, "/tables/table_sample.log/rows?limit=1", cbor).await;
         assert!(log.iter().any(|message| matches!(message, Message::Rows { rows, partial: true, cursor: None, .. } if rows.len() == 1)));
-        assert!(log.iter().any(|message| matches!(message,Message::Rows{rows,..} if rows[0]["cause"]=="create")));
+        assert!(log.iter().any(|message| matches!(message,Message::Rows{rows,..} if rows[0]["cause"]=="Create")));
     }
     for cbor in [false, true] {
         for (path, code) in [
@@ -390,6 +393,107 @@ async fn primitive_diagrams_describe_declared_and_observed_transitions() {
     assert!(json
         .iter()
         .any(|message| matches!(message,Message::Rows{rows,..}if rows.len()==3&&rows.iter().any(|row|row["resource.name"]=="session"))));
+}
+
+async fn json(router: &Router, path: &str) -> serde_json::Value {
+    let response = call(router, path, false).await;
+    assert_eq!(response.status(), StatusCode::OK, "{path}");
+    serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap()
+}
+
+// #4214: every table the daemon serves types its address columns `address` and declares each
+// enum column's value set as `constraints.enum`, the column's readable names in code order; a
+// rows read of each table carries only names from that set, and `where` compares names. Message's
+// conditions share the address domain but are no addresses.
+#[tokio::test]
+async fn served_tables_type_addresses_and_carry_enum_names() {
+    use flotilla_schema::{ColumnType, ADDRESS_DOMAIN};
+    use flotilla_state_machines::{
+        machines::agent_session::{AgentSession, End, EndReason, MemoryAgentSessionWorld},
+        Home,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let registry = crate::runtime::decided_registry().unwrap();
+    let service =
+        Arc::new(flotilla_schema_sqlite::stream::Service::open(&directory.path().join("served.db"), "home", registry.clone()).unwrap());
+    let mut sessions =
+        Home::<AgentSession, flotilla_engine_store::StoreLog>::with_log("home", flotilla_engine_store::StoreLog::new(service.store()))
+            .unwrap();
+    let mut world = MemoryAgentSessionWorld::default();
+    let observed = flotilla_state_machines::Ref::new("end");
+    world.ends.put(&observed, EndReason::Completed);
+    sessions.create("ended", (), &world, flotilla_schema::Timestamp(1)).unwrap();
+    sessions.apply("ended", End { reason: EndReason::Completed, observed }, &world, flotilla_schema::Timestamp(2)).unwrap();
+    sessions.create("live", (), &world, flotilla_schema::Timestamp(3)).unwrap();
+    let router = HttpRouter::builder()
+        .backend(ResourceBackend::new(InMemoryBackend::default()))
+        .table_store(service)
+        .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
+        .build()
+        .into_router();
+    let listed = json(&router, "/tables").await;
+    let tables: Vec<String> = listed["kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|kind| kind["tables"].as_array().unwrap().iter().map(|table| table.as_str().unwrap().to_owned()))
+        .collect();
+    let mut addresses = Vec::new();
+    for table in &tables {
+        let stored = registry.iter().find_map(|set| {
+            set.tables
+                .iter()
+                .find(|stored| stored.name == *table)
+                .cloned()
+                .or_else(|| (set.log_projection().name == *table).then(|| set.log_projection()))
+        });
+        let schema = json(&router, &format!("/tables/{table}")).await;
+        let mut enums = BTreeMap::new();
+        for field in schema["fields"].as_array().unwrap() {
+            let name = field["name"].as_str().unwrap();
+            let column = stored.as_ref().and_then(|stored| stored.key.iter().chain(&stored.columns).find(|column| column.name == name));
+            if field["type"] == "address" {
+                assert_eq!(column.map(|column| &column.ty), Some(&ColumnType::Interned(ADDRESS_DOMAIN)), "{table}.{name}");
+                addresses.push(format!("{table}.{name}"));
+            }
+            match column.map(|column| (&column.ty, &column.categories)) {
+                Some((ColumnType::Code(_), categories)) => {
+                    let names: Vec<_> = categories.iter().map(|(_, name)| json!(name)).collect();
+                    assert_eq!(field["constraints"]["enum"], json!(names), "{table}.{name}");
+                    enums.insert(name.to_owned(), names);
+                }
+                _ => assert!(field["constraints"].get("enum").is_none(), "{table}.{name} is no enum"),
+            }
+        }
+        for message in messages(&router, &format!("/tables/{table}/rows"), false).await {
+            let Message::Rows { rows, .. } = message else { continue };
+            for row in rows {
+                for (name, names) in &enums {
+                    assert!(row[name].is_null() || names.contains(&row[name]), "{table}.{name}: {} is not one of {names:?}", row[name]);
+                }
+            }
+        }
+    }
+    for column in ["inbox", "sender", "reason_by", "reason_authority"] {
+        assert!(addresses.contains(&format!("message.{column}")), "message.{column} in {addresses:?}");
+    }
+    assert!(!addresses.iter().any(|address| address.ends_with("_condition")), "{addresses:?}");
+    let rows = |messages: Vec<Message>| -> Vec<flotilla_protocol::table::Row> {
+        messages.into_iter().flat_map(|message| if let Message::Rows { rows, .. } = message { rows } else { vec![] }).collect()
+    };
+    let ended = rows(messages(&router, "/tables/agent_session/rows?where=.state%20%3D%3D%20Ended", false).await);
+    assert_eq!(
+        ended.iter().map(|row| (row["resource.name"].clone(), row["state"].clone(), row["reason"].clone())).collect::<Vec<_>>(),
+        [(json!("ended"), json!("Ended"), json!("Completed"))]
+    );
+    let response = call(&router, "/tables/agent_session/rows?where=.state%20%3D%3D%20en", false).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(error_body(response).await["code"], "type_mismatch", "a stored code is no wire value");
+    let log = rows(messages(&router, "/tables/agent_session.log/rows", false).await);
+    let entries: Vec<_> =
+        log.iter().map(|row| (row["cause"].clone(), row["edge"].clone(), row["from"].clone(), row["to"].clone())).collect();
+    assert!(entries.contains(&(json!("Create"), json!(null), json!(null), json!(null))), "{entries:?}");
+    assert!(entries.contains(&(json!("Edge"), json!("End"), json!("Live"), json!("Ended"))), "{entries:?}");
 }
 
 // A quiet watch proves liveness without requiring any resource mutation.
@@ -618,6 +722,44 @@ fn tables_doc_lists_the_column_types_of_the_code() {
         ColumnType::Cbor,
     ];
     assert_eq!(sorted(all.iter().map(name).collect()), sorted(documented("column-types")));
+}
+
+// #4214: the field types and constraints the description renders, over every column type and an
+// address column, are the ones `docs/tables.md` lists.
+#[test]
+fn tables_doc_lists_the_field_types_and_constraints_of_the_code() {
+    use flotilla_schema::{ColumnType, Layout};
+    let mut layout = Layout::description("sample");
+    for (index, ty) in [
+        ColumnType::Integer,
+        ColumnType::Number,
+        ColumnType::Bool,
+        ColumnType::Text,
+        ColumnType::Blob,
+        ColumnType::Timestamp,
+        ColumnType::Code(vec!["a".into()]),
+        ColumnType::Interned(flotilla_schema::HOME_DOMAIN),
+        ColumnType::Ref,
+        ColumnType::Frozen,
+        ColumnType::Cbor,
+        ColumnType::Interned(flotilla_schema::ADDRESS_DOMAIN),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let address = ty == ColumnType::Interned(flotilla_schema::ADDRESS_DOMAIN);
+        layout.column(&format!("c{index}"), ty, false);
+        if address {
+            layout.address();
+        }
+    }
+    let schema = layout.finish().tables.remove(0).frictionless();
+    let fields = schema["fields"].as_array().unwrap();
+    let types: BTreeSet<&str> = fields.iter().map(|field| field["type"].as_str().unwrap()).collect();
+    let constraints: BTreeSet<&str> =
+        fields.iter().flat_map(|field| field["constraints"].as_object().unwrap().keys().map(String::as_str)).collect();
+    assert_eq!(types, documented("field-types").into_iter().collect());
+    assert_eq!(constraints, documented("constraints").into_iter().collect());
 }
 
 #[test]

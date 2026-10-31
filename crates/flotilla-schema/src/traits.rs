@@ -189,14 +189,15 @@ impl Intern for String {
 
 /// Implements `Columns`, `Column` and `Element` for a single-column primitive.
 /// `$encode` maps `&Self` to `Result<Value, EncodeError>`; `$decode` maps a non-null `Value` to
-/// `Result<Self, DecodeError>`.
+/// `Result<Self, DecodeError>`. A trailing `then $mark` calls `layout.$mark()` on the declared column.
 macro_rules! scalar {
-    ($ty:ty, $column:expr, |$this:ident| $encode:expr, |$value:ident| $decode:expr) => {
+    ($ty:ty, $column:expr, |$this:ident| $encode:expr, |$value:ident| $decode:expr $(, then $mark:ident)?) => {
         impl Columns for $ty {
             const TABLES: usize = 0;
 
             fn layout(layout: &mut Layout, name: &str, required: bool) {
                 layout.column(name, $column, required);
+                $(layout.$mark();)?
             }
 
             fn encode(&self, e: &mut Encoder) -> Result<(), EncodeError> {
@@ -305,11 +306,19 @@ scalar!(DateTime<Utc>, ColumnType::Timestamp, |this| Ok(Value::Int(Timestamp::fr
 // the new store, which may not exist. Stored as its canonical text, interned, so equality is id
 // equality; decoding refuses text that is not canonical. Existence is a recorded gate read at
 // admission, never a foreign key.
-scalar!(Address, ColumnType::Interned(crate::ADDRESS_DOMAIN), |this| Ok(Value::Str(this.as_str().to_owned())), |value| match value {
-    Value::Str(text) =>
-        text.parse::<Address>().map_err(|error| DecodeError::Address { column: String::new(), text, reason: error.to_string() }),
-    other => Err(DecodeError::unexpected("interned address", &other)),
-});
+// The column is described as an address (wire type `address`), which a condition's address shares
+// the domain with but is not.
+scalar!(
+    Address,
+    ColumnType::Interned(crate::ADDRESS_DOMAIN),
+    |this| Ok(Value::Str(this.as_str().to_owned())),
+    |value| match value {
+        Value::Str(text) =>
+            text.parse::<Address>().map_err(|error| DecodeError::Address { column: String::new(), text, reason: error.to_string() }),
+        other => Err(DecodeError::unexpected("interned address", &other)),
+    },
+    then address
+);
 
 // A condition (ADR 0066 §4): an address, a field path, an operator and a literal, stored as its
 // canonical print in the address domain, as condition addresses always were. Equality is id

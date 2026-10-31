@@ -532,6 +532,7 @@ mod tests {
             nullable: true,
             categories: Vec::new(),
             reference: None,
+            address: false,
             properties: Default::default(),
         };
         let sql =

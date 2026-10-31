@@ -191,6 +191,9 @@ pub struct ColumnDef {
     /// Logical target table of a reference; identities without a static kind target
     /// the shared resource identity table.
     pub reference: Option<String>,
+    /// The values are canonical ADR 0066 addresses, described on the wire as type `address`.
+    /// Storage is unchanged: the column type still says how the text is held.
+    pub address: bool,
     /// Open semantic properties. Structural roles live in `roles` as an array of strings.
     pub properties: std::collections::BTreeMap<String, serde_json::Value>,
 }
@@ -205,7 +208,7 @@ impl ColumnDef {
     }
 
     pub fn new(name: impl Into<String>, ty: ColumnType, nullable: bool) -> Self {
-        Self { name: name.into(), ty, nullable, categories: Vec::new(), reference: None, properties: Default::default() }
+        Self { name: name.into(), ty, nullable, categories: Vec::new(), reference: None, address: false, properties: Default::default() }
     }
 
     pub fn add_role(&mut self, role: &str) {

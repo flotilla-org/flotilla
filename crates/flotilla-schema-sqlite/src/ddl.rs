@@ -94,7 +94,7 @@ pub fn code_field(set: &TableSet, table: &Table, column: &str) -> String {
 }
 
 /// A text value as an SQL string literal.
-fn text_literal(text: &str) -> String {
+pub(crate) fn text_literal(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 
