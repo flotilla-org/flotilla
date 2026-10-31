@@ -41,6 +41,51 @@ read_protocol_version() {
   return 1
 }
 
+require_node_toolchain() {
+  local minimum='24.18.0' version
+  command -v node >/dev/null 2>&1 || { echo "drydock's TypeScript host needs node >= $minimum on the builder; node is not on PATH" >&2; return 1; }
+  command -v corepack >/dev/null 2>&1 || { echo "drydock's TypeScript host needs corepack on the builder; corepack is not on PATH" >&2; return 1; }
+  version="$(node --version)"
+  version="${version#v}"
+  if [[ "$(printf '%s\n%s\n' "$minimum" "$version" | sort -V | head -n1)" != "$minimum" ]]; then
+    printf "drydock's TypeScript host needs node >= %s on the builder; found %s\n" "$minimum" "$version" >&2
+    return 1
+  fi
+}
+
+# Builds the TypeScript host from a drydock checkout into $2 (a directory holding
+# dist/, package.json and its production node_modules). The hoisted linker leaves
+# a plain tree with no symlinks, which the manifest and Darwin copy both need.
+build_typescript_host() {
+  local drydock_root="$1" destination="$2" scratch
+  scratch="$(mktemp -d)"
+  (
+    export COREPACK_HOME="$scratch/corepack"
+    cd "$drydock_root/hosts/typescript"
+    corepack pnpm install --frozen-lockfile
+    corepack pnpm pack:companion
+    mkdir -p "$scratch/unpacked"
+    tar -xzf flotilla-drydock-host-typescript-*.tgz -C "$scratch/unpacked"
+    cd "$scratch/unpacked/package"
+    corepack pnpm install --prod --frozen-lockfile --node-linker=hoisted
+  )
+  rm -rf "$destination"
+  mkdir -p "$(dirname "$destination")"
+  cp -R "$scratch/unpacked/package" "$destination"
+  rm -rf "$destination/node_modules/.bin" "$scratch"
+}
+
+# drydock finds `drydock-host-typescript` beside flotillad and runs it directly;
+# the wrapper locates the installed tree relative to itself, so a copy of the
+# bin/ and share/ pair (the Darwin stable root) keeps working.
+write_typescript_host_wrapper() {
+  cat >"$1" <<'WRAPPER'
+#!/bin/sh
+here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+exec node "$here/../share/flotilla/drydock-host-typescript/dist/main.js" "$@"
+WRAPPER
+}
+
 package_cleat_terminfo() {
   local cleat_root="$1" bundle="$2"
   # cleat #337 owns the emitter; preserve its in-bundle terminfo aliases.
@@ -70,6 +115,8 @@ case "$(uname -s)-$(uname -m)" in
     exit 1
     ;;
 esac
+
+require_node_toolchain
 
 if [[ "$platform" == darwin-aarch64 ]]; then
   xcodebuild -version | grep -Fx 'Xcode 26.6'
@@ -171,6 +218,9 @@ python3 "$(dirname "$0")/generation_validation.py" codex-home "$codex_home_bundl
   [[ "$(grep -c '^drydock[a-z-]* = { git = .*rev = "'"$drydock_rev"'"' Cargo.toml)" == "$(grep -c '^drydock[a-z-]* = { git' Cargo.toml)" ]]
   cargo install --locked --force --git https://github.com/flotilla-org/drydock --rev "$drydock_rev" \
     --root "$flotilla_root/target/drydock-host-install" --bin drydock-host drydock-host
+  # The TypeScript host comes from the same drydock revision.
+  fetch_exact https://github.com/flotilla-org/drydock.git "$drydock_rev" "$source_root/drydock"
+  build_typescript_host "$source_root/drydock" "$flotilla_root/target/drydock-host-typescript"
   if [[ "$platform" == linux-* ]]; then
     cargo build --locked --release -p flotilla-cli --bin flotilla-vessel
     cargo build --locked --release -p drydock-agent --bin drydock-agent
@@ -190,6 +240,10 @@ python3 "$(dirname "$0")/generation_validation.py" codex-home "$codex_home_bundl
 install -m 0755 "$flotilla_root/target/release/flotilla" "$bundle/bin/flotilla"
 install -m 0755 "$flotilla_root/target/release/flotillad" "$bundle/bin/flotillad"
 install -m 0755 "$flotilla_root/target/drydock-host-install/bin/drydock-host" "$bundle/bin/drydock-host"
+mkdir -p "$bundle/share/flotilla"
+cp -R "$flotilla_root/target/drydock-host-typescript" "$bundle/share/flotilla/drydock-host-typescript"
+write_typescript_host_wrapper "$bundle/bin/drydock-host-typescript"
+chmod 0755 "$bundle/bin/drydock-host-typescript"
 if [[ "$platform" == linux-* ]]; then
   install -m 0755 "$flotilla_root/target/release/flotilla-vessel" "$bundle/bin/flotilla-vessel"
   install -m 0755 "$flotilla_root/target/release/drydock-agent" "$bundle/bin/drydock-agent"

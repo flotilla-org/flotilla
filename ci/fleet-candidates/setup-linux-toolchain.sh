@@ -42,7 +42,12 @@ if [[ ! -x "$CARGO_HOME/bin/rustup" ]]; then
     --default-toolchain "$rust_toolchain"
 fi
 
-export PATH="$CARGO_HOME/bin:$zig_root:$PATH"
+# drydock's TypeScript host needs node >= 24.18 and corepack; the distro nodejs is older.
+node_version="24.18.0"
+node_sha256="55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742"
+node_root="$toolchain_root/node-v$node_version-linux-x64"
+
+export PATH="$CARGO_HOME/bin:$zig_root:$node_root/bin:$PATH"
 if ! rustup toolchain list | grep -Eq "^${rust_toolchain}(-x86_64-unknown-linux-gnu)?[[:space:]]"; then
   rustup toolchain install "$rust_toolchain" --profile minimal
 fi
@@ -59,5 +64,17 @@ if [[ ! -x "$zig_root/zig" ]]; then
   tar -xJf "$zig_archive" --strip-components=1 -C "$zig_root"
 fi
 
+if [[ ! -x "$node_root/bin/node" ]]; then
+  node_archive="$toolchain_root/node-v$node_version.tar.xz"
+  curl --proto '=https' --tlsv1.2 --fail --show-error --silent \
+    "https://nodejs.org/dist/v$node_version/node-v$node_version-linux-x64.tar.xz" \
+    -o "$node_archive"
+  printf '%s  %s\n' "$node_sha256" "$node_archive" | sha256sum --check --status
+  rm -rf "$node_root"
+  mkdir -p "$node_root"
+  tar -xJf "$node_archive" --strip-components=1 -C "$node_root"
+fi
+
 assert_rust_pin "$(dirname "${BASH_SOURCE[0]}")/../../rust-toolchain.toml"
+test "$(node --version)" = "v$node_version"
 test "$(zig version)" = "$zig_version"

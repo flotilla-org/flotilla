@@ -57,7 +57,74 @@ class BootstrapValidationTests(unittest.TestCase):
         with self.assertRaises(validation.ValidationError):
             validation.validate_produced_payload(self.root)
         host.chmod(0o755)
+        with self.assertRaisesRegex(validation.ValidationError, "missing executable bin/drydock-host-typescript"):
+            validation.validate_produced_payload(self.root)
+        self.write_typescript_host()
         validation.validate_produced_payload(self.root)
+
+    def write_typescript_host(self):
+        wrapper = self.root / validation.TYPESCRIPT_HOST_WRAPPER
+        wrapper.parent.mkdir(parents=True, exist_ok=True)
+        wrapper.write_text("#!/bin/sh\n")
+        wrapper.chmod(0o755)
+        tree = self.root / validation.TYPESCRIPT_HOST_TREE
+        (tree / "dist").mkdir(parents=True)
+        (tree / "node_modules" / "dep").mkdir(parents=True)
+        (tree / "dist" / "main.js").write_text("")
+        (tree / "package.json").write_text("{}")
+        (tree / "node_modules" / "dep" / "index.js").write_text("")
+
+    def test_typescript_host_is_checked_at_production(self):
+        self.write_typescript_host()
+        tree = self.root / validation.TYPESCRIPT_HOST_TREE
+        validation.validate_typescript_host(self.root)
+        (self.root / validation.TYPESCRIPT_HOST_WRAPPER).chmod(0o644)
+        with self.assertRaisesRegex(validation.ValidationError, "missing executable"):
+            validation.validate_typescript_host(self.root)
+        (self.root / validation.TYPESCRIPT_HOST_WRAPPER).chmod(0o755)
+        (tree / "dist" / "main.js").unlink()
+        with self.assertRaisesRegex(validation.ValidationError, "missing share/flotilla/drydock-host-typescript/dist/main.js"):
+            validation.validate_typescript_host(self.root)
+        (tree / "dist" / "main.js").write_text("")
+        (tree / "node_modules" / "dep" / "link").symlink_to("index.js")
+        with self.assertRaisesRegex(validation.ValidationError, "symlink"):
+            validation.validate_typescript_host(self.root)
+        (tree / "node_modules" / "dep" / "link").unlink()
+        __import__("shutil").rmtree(tree / "node_modules")
+        with self.assertRaisesRegex(validation.ValidationError, "production dependencies"):
+            validation.validate_typescript_host(self.root)
+
+    def test_typescript_host_payload_is_all_or_nothing_and_stays_inside_its_tree(self):
+        tree = validation.TYPESCRIPT_HOST_TREE
+        complete = {validation.TYPESCRIPT_HOST_WRAPPER, f"{tree}/dist/main.js", f"{tree}/package.json", f"{tree}/node_modules/a/index.js"}
+        validation.validate_typescript_host_paths(set())
+        validation.validate_typescript_host_paths(complete)
+        for missing in (validation.TYPESCRIPT_HOST_WRAPPER, f"{tree}/dist/main.js", f"{tree}/package.json"):
+            with self.assertRaises(validation.ValidationError):
+                validation.validate_typescript_host_paths(complete - {missing})
+        for platform in validation.PLATFORMS:
+            for path in complete:
+                self.assertTrue(validation.allowed_payload(path, platform))
+                self.assertNotIn(path, validation.REQUIRED_PAYLOAD)
+            for path in (f"{tree}/../x", f"{tree}//x", f"{tree}/./x", "bin/drydock-host-typescript2", "share/flotilla/drydock-host-typescript-x/a"):
+                self.assertFalse(validation.allowed_payload(path, platform))
+
+    def test_darwin_refresh_copies_the_typescript_host_and_prunes_its_stale_files(self):
+        source, destination = self.root / "source", self.root / "destination"
+        for name in ("flotilla", "flotillad", "cleat"):
+            (source / "bin").mkdir(parents=True, exist_ok=True)
+            (source / "bin" / name).write_text(name)
+        self.root, original = source, self.root
+        self.write_typescript_host()
+        self.root = original
+        stale = destination / validation.TYPESCRIPT_HOST_TREE / "node_modules" / "gone.js"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("")
+        validation.refresh_darwin_payload(source, destination)
+        copied = destination / validation.TYPESCRIPT_HOST_TREE / "node_modules" / "dep" / "index.js"
+        self.assertTrue(copied.is_file())
+        self.assertFalse(stale.exists())
+        self.assertTrue((destination / validation.TYPESCRIPT_HOST_WRAPPER).stat().st_mode & 0o100)
 
     # cleat's database and license are release data. Earlier generations may
     # omit them so health rollback remains valid.

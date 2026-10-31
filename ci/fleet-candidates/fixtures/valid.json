@@ -17,11 +17,14 @@
     "bin/flotilla",
     "bin/flotillad",
     "bin/drydock-host",
+    "bin/drydock-host-typescript",
     "bin/cleat",
     "install.sh",
     "generation_validation.py",
     "share/flotilla/skills/.flotilla-sources.json",
-    "share/flotilla/codex-home/config.toml"
+    "share/flotilla/codex-home/config.toml",
+    "share/flotilla/drydock-host-typescript/dist/main.js",
+    "share/flotilla/drydock-host-typescript/package.json"
   ],
   "skill_bundle": {
     "schema_version": 5,
@@ -36,7 +39,9 @@
         "name": "rjw-skills",
         "repository": "https://github.com/rjwittams/rjw-skills.git",
         "revision": "dddddddddddddddddddddddddddddddddddddddd",
-        "paths": ["plugins/rjw-sdlc/skills"]
+        "paths": [
+          "plugins/rjw-sdlc/skills"
+        ]
       },
       {
         "name": "cleat",
