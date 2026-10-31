@@ -2,6 +2,7 @@
 pub mod environment;
 pub mod factories;
 pub mod hop_chain;
+pub mod platform;
 #[cfg(test)]
 mod test_config;
 

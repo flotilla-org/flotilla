@@ -129,7 +129,10 @@ impl CommandRunner for DockerEngine {
 }
 #[cfg(unix)]
 pub(super) fn docker_provider(runner: Arc<dyn CommandRunner>) -> docker::DockerEnvironmentProvider {
-    use super::agent::{tests::MemoryAgent, AgentConnector};
+    use super::agent::{
+        memory::{MemoryAgent, MemoryLink},
+        AgentConnector,
+    };
     let directory = Arc::new(tempfile::tempdir().unwrap());
     let keep = directory.clone();
     let agents = Mutex::new(BTreeMap::<std::path::PathBuf, Arc<MemoryAgent>>::new());
@@ -139,9 +142,10 @@ pub(super) fn docker_provider(runner: Arc<dyn CommandRunner>) -> docker::DockerE
             runtime_root: directory.path().into(),
             executable: directory.path().join("current-agent"),
         })
+        .with_agent_link(Arc::new(MemoryLink(MemoryAgent::new())))
         .with_agent_connector(Arc::new(move |socket| {
             let _keep = &keep;
-            agents.lock().unwrap().entry(socket.into()).or_insert_with(|| MemoryAgent::new(false)).clone() as Arc<dyn AgentConnector>
+            agents.lock().unwrap().entry(socket.into()).or_default().clone() as Arc<dyn AgentConnector>
         }))
 }
 

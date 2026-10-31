@@ -140,7 +140,8 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-discovery-api` | Environment facts, narrow provider config view, detector traits and factory contracts; wraps Rigging version/binary probes into Flotilla environment assertions |
 | `flotilla-provider-runtime` | Flotilla Git guard, scratch namespace, helper scripts, SSH runner and neutral observation errors; re-exports Rigging process, probe and HTTP interfaces |
 | `flotilla-forge-github` | GitHub client, invocation macros, rate-limit classification, polling, telemetry, host budget accounting and discovery-time repository resolution |
-| `flotilla-environment` | Environment and image capability traits, Docker and host-direct adapters, factories and transport hop resolution |
+| `flotilla-environment` | Environment and image capability traits, Docker and host-direct adapters, factories and transport hop resolution; the drydock adapter, written against flotilla's own provider-API and vessel-agent client traits, with no drydock dependency |
+| `flotilla-drydock` | Drydock behind those traits: its provider API, vessel agent client and link, and SSH host vessel agents. Only `flotilla-daemon` depends on it, so a drydock repin rebuilds nothing below the composition root (`ci/build-graph/check.py`) |
 | `flotilla-vcs` | Checkout-scoped VCS traits, Git strategies, factory and Git discovery probes |
 | `flotilla-ai-utility` | AI utility trait, Claude API/CLI implementations and factories |
 | `flotilla-cloud-agent` | Cloud session provider trait, Claude/Codex/Cursor implementations, factories and detectors |

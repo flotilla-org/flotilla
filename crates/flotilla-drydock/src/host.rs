@@ -14,13 +14,16 @@ use std::{
 
 use async_trait::async_trait;
 use drydock_agent::Client;
-use drydock_protocol::Platform;
 use drydock_transport::{ssh::SshConfig, ByteStream};
+use flotilla_environment::environment::agent::{
+    client::{AgentClient, Platform},
+    AgentConnector,
+};
 use flotilla_provider_runtime::{execution_context::BaseLayer, ChannelLabel, CommandRunner};
 use sha2::{Digest, Sha256};
 use tokio::sync::OnceCell;
 
-use super::{connect_current, AgentConnector};
+use crate::agent::{connect_current, platform_of, DrydockClient};
 
 /// The agent's control socket inside its vessel directory.
 pub const AGENT_SOCKET: &str = "agent.sock";
@@ -233,12 +236,12 @@ impl HostAgentConnector {
 
 #[async_trait]
 impl AgentConnector for HostAgentConnector {
-    async fn connect(&self) -> Result<Client, String> {
+    async fn connect(&self) -> Result<Arc<dyn AgentClient>, String> {
         let executable = self.executable().await?;
         let watch = UpgradeWatch { connector: self, reached: AtomicBool::new(false), armed: true };
         let connected = self.connect_with(executable, &watch.reached).await;
         watch.settle(connected.as_ref().err());
-        connected
+        connected.map(|client| Arc::new(DrydockClient(client)) as Arc<dyn AgentClient>)
     }
 }
 
@@ -323,15 +326,16 @@ impl HostAgentConnector {
             }
             transport
         };
+        let platform = platform_of(&self.platform);
         // An agent from an earlier connect normally still runs under its
         // supervisor: try it once before touching the host.
-        match Client::connect_current(open, &self.platform, executable, self.timeout).await {
+        match Client::connect_current(open, &platform, executable, self.timeout).await {
             Ok(client) => return Ok(client),
             Err(error) if error.kind() == io::ErrorKind::Unsupported => return Err(error.to_string()),
             Err(error) => tracing::debug!(socket = %socket.display(), %error, "vessel agent did not answer; bootstrapping"),
         }
         self.bootstrap().await?;
-        connect_current(open, &self.platform, executable, self.timeout)
+        connect_current(open, &platform, executable, self.timeout)
             .await
             .map_err(|error| format!("vessel agent at {}: {error}", socket.display()))
     }

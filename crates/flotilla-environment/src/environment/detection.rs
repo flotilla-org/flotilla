@@ -133,7 +133,11 @@ pub(super) async fn run_with_cleanup(
 mod tests {
     use super::*;
     use crate::environment::{
-        agent::{tests::MemoryAgent, AgentConnector, AgentRunner},
+        agent::{
+            client::{AgentClient, Configuration},
+            memory::MemoryAgent,
+            AgentRunner,
+        },
         command_provider, EnvironmentInput,
     };
     use flotilla_provider_runtime::{
@@ -420,7 +424,7 @@ case "$1" in success|failure)
         /// The command starts from nothing but the rendered environment.
         Clean,
         /// The vessel agent is configured with it, as a vessel's push is.
-        Agent(Arc<drydock_agent::Client>),
+        Agent(Arc<dyn AgentClient>),
     }
 
     // The shared scenario every runner passes: a probe and a crew launch on
@@ -476,7 +480,7 @@ case "$1" in success|failure)
             }
             CrewLaunch::Agent(client) => {
                 let environment = env.iter().cloned().collect();
-                client.configure(drydock_agent::Configuration { environment, ..Default::default() }).await.expect("configure");
+                client.configure(Configuration { environment }).await.expect("configure");
                 runner.run("sh", &["-c", script, &dump], Path::new("/"), &ChannelLabel::Default).await
             }
         };
@@ -505,8 +509,8 @@ case "$1" in success|failure)
 
     #[tokio::test]
     async fn vessel_agent_renders_the_prepared_context() {
-        let agent = MemoryAgent::new(false);
-        let client = Arc::new(agent.connect().await.expect("client"));
+        let agent = MemoryAgent::new();
+        let client = agent.client();
         let directory = tempfile::tempdir().expect("tempdir");
         let runner = Arc::new(AgentRunner::new(agent.clone(), directory.path().into()));
         prepared_context_case(runner, CrewLaunch::Agent(client)).await;

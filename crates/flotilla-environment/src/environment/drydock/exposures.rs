@@ -20,7 +20,8 @@ impl Exposures {
     pub async fn inward(&self, name: &str, target: InwardTarget) -> Result<(PathBuf, Option<wire::ExposureError>), String> {
         let standing = match self.api.inward(&self.instance, &self.backing, name).await {
             Ok(inward) if inward.target == target => Some(inward),
-            Ok(_) | Err(::drydock::client::Error::Protocol(wire::ProtocolError::NotFound { .. })) => None,
+            Ok(_) => None,
+            Err(error) if error.is_not_found() => None,
             Err(error) => return Err(exposure_error("inward", name, error)),
         };
         let inward = match standing {
@@ -29,8 +30,7 @@ impl Exposures {
                 .api
                 .put_inward(&self.instance, &self.backing, name, &InwardRequest { target })
                 .await
-                .map_err(|error| exposure_error("inward", name, error))?
-                .into_inner(),
+                .map_err(|error| exposure_error("inward", name, error))?,
         };
         let Inward { local: Local::Unix(local), error, .. } = inward;
         Ok((local.into(), error))
@@ -51,15 +51,15 @@ impl Exposures {
             Ok(outward) if outward.ready && outward.guest == request.guest && outward.destination == request.destination => {
                 return Ok(outward);
             }
-            Ok(_) | Err(::drydock::client::Error::Protocol(wire::ProtocolError::NotFound { .. })) => {}
+            Ok(_) => {}
+            Err(error) if error.is_not_found() => {}
             Err(error) => return Err(exposure_error("outward", name, error)),
         }
         let outward = self
             .api
             .put_outward(&self.instance, &self.backing, name, &request)
             .await
-            .map_err(|error| exposure_error("outward", name, error))?
-            .into_inner();
+            .map_err(|error| exposure_error("outward", name, error))?;
         match &outward.error {
             None => Ok(outward),
             Some(error) => Err(format!("outward exposure {name} at {}: {:?}: {}", guest(&outward.guest), error.code, error.reason)),
@@ -83,15 +83,14 @@ pub(super) fn outward_unix(guest: &Path, destination: &Path) -> OutwardRequest {
 fn guest(guest: &Guest) -> String {
     match guest {
         Guest::Unix { unix } => unix.clone(),
-        Guest::Name { name, port } => format!("{}:{}", name.as_str(), port.get()),
+        Guest::Name { name, port } => format!("{name}:{port}"),
     }
 }
 
 /// A refusal's reason is drydock's own text about the request, never a credential.
-fn exposure_error(direction: &str, name: &str, error: ::drydock::client::Error) -> String {
-    use ::drydock::client::Error;
+fn exposure_error(direction: &str, name: &str, error: ApiError) -> String {
     match error {
-        Error::Protocol(wire::ProtocolError::Refused { reason }) | Error::Protocol(wire::ProtocolError::NotFound { reason }) => {
+        ApiError::Protocol { kind: wire::ProtocolErrorKind::Refused | wire::ProtocolErrorKind::NotFound, reason, .. } => {
             format!("{direction} exposure {name}: {reason}")
         }
         other => format!("{direction} exposure {name}: {}", api_error(other)),

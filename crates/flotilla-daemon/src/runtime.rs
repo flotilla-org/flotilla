@@ -1497,8 +1497,13 @@ async fn compose_drydock(config: &ConfigStore, registry: &mut ProviderRegistry) 
             return Err(format!("duplicate environment provider instance {name}"));
         }
         let adapter: Arc<dyn EnvironmentProvider> = Arc::new(
-            DrydockEnvironmentProvider::new(daemon.clone(), name.clone(), module)
-                .with_lab_reach(lab_reach.get(&name).map(|reach| (reach.hostname.clone(), reach.port))),
+            DrydockEnvironmentProvider::new(
+                flotilla_drydock::api::provider_api(daemon.clone()),
+                flotilla_drydock::agent::link(),
+                name.clone(),
+                module,
+            )
+            .with_lab_reach(lab_reach.get(&name).map(|reach| (reach.hostname.clone(), reach.port))),
         );
         adapter.detect_readiness().await;
         registry.environment_providers.insert(
@@ -1528,6 +1533,7 @@ struct InstalledAgentBuilds;
 #[async_trait::async_trait]
 impl drydock::daemon::AgentBuilds for InstalledAgentBuilds {
     async fn build(&self, platform: &drydock_protocol::Platform) -> Result<Vec<u8>, String> {
-        flotilla_environment::environment::drydock::installed_agent_build(platform).await
+        let platform = flotilla_environment::platform::Platform::new(&platform.os, &platform.architecture);
+        flotilla_environment::environment::drydock::installed_agent_build(&platform).await
     }
 }

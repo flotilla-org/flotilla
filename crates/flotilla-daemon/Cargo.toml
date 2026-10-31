@@ -89,6 +89,7 @@ subtle = "2"
 [target.'cfg(unix)'.dependencies]
 drydock.workspace = true
 drydock-protocol.workspace = true
+flotilla-drydock = { path = "../flotilla-drydock" }
 
 libc = { workspace = true }
 

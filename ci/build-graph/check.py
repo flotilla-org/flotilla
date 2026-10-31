@@ -88,6 +88,13 @@ C_BUILD_PACKAGES = frozenset({
 })
 
 
+# Drydock stays in the composition root: only these crates depend on drydock's crates in
+# production, and only the daemon on the crate implementing flotilla's drydock traits, so a
+# drydock repin rebuilds nothing below them.
+DRYDOCK_IMPLEMENTATION = "flotilla-drydock"
+DRYDOCK_COMPOSITION = frozenset({"flotilla-daemon", DRYDOCK_IMPLEMENTATION})
+
+
 # ADR 0069: the vessel CLI must not select dashboard/renderer packages.
 VESSEL_UI_PACKAGES = frozenset({"flotilla-tui", "ratatui", "ratatui-core", "ratatui-widgets", "tui-input", "catppuccin", "crokey"})
 
@@ -113,14 +120,22 @@ def is_testkit(name):
     return name.endswith("-testkit") or name == "flotilla-test-support"
 
 
-def rigging_source(package):
+def repository(package):
     # Cargo Git source IDs include the pinned query and resolved commit. Match the repository, not crate names.
-    source = (package.get("source") or "").partition("?")[0].partition("#")[0].removesuffix(".git")
-    return source == "git+https://github.com/flotilla-org/rigging"
+    return (package.get("source") or "").partition("?")[0].partition("#")[0].removesuffix(".git")
+
+
+def rigging_source(package):
+    return repository(package) == "git+https://github.com/flotilla-org/rigging"
+
+
+def drydock_source(package):
+    return repository(package) == "git+https://github.com/flotilla-org/drydock"
 
 
 def violations(metadata):
     packages = {package["name"]: package for package in metadata["packages"]}
+    drydock = {name for name, package in packages.items() if drydock_source(package)}
     members = set(metadata["workspace_members"])
     packages = {name: package for name, package in packages.items() if package["id"] in members or rigging_source(package)}
     production = {
@@ -141,6 +156,14 @@ def violations(metadata):
         return False
 
     errors = []
+    for name, package in sorted(packages.items()):
+        direct = {dependency["name"] for dependency in package["dependencies"] if dependency["kind"] in (None, "build")}
+        if package["id"] in members and name not in DRYDOCK_COMPOSITION:
+            for target in sorted(direct & drydock):
+                errors.append(f"{name}: production dependency on drydock crate {target}; only the composition root "
+                              f"({', '.join(sorted(DRYDOCK_COMPOSITION))}) depends on drydock")
+        if name != "flotilla-daemon" and DRYDOCK_IMPLEMENTATION in direct:
+            errors.append(f"{name}: production dependency on {DRYDOCK_IMPLEMENTATION}; only flotilla-daemon composes drydock")
     if "flotilla-client" in packages and "flotilla-core" in packages and reaches("flotilla-client", "flotilla-core"):
         errors.append("flotilla-client: must not depend on flotilla-core, directly or transitively")
     for component in ("flotilla-config", "flotilla-provider-runtime", "flotilla-discovery-api", "flotilla-vcs", "flotilla-environment", "flotilla-terminal", "flotilla-cloud-agent", "flotilla-ai-utility", "flotilla-forge-github", "flotilla-forge-forgejo", "flotilla-change-request", "flotilla-issue-tracker", "flotilla-agent", "flotilla-dummy-fleet", "flotilla-charter"):

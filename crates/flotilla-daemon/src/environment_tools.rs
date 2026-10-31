@@ -59,7 +59,7 @@ pub(crate) trait EnvironmentToolFactory: Send + Sync {
 pub(crate) trait EnvironmentToolContext: Send + Sync {
     async fn rust_build_jobs(&self) -> Result<usize, String>;
     #[cfg(unix)]
-    fn guest_platform(&self) -> drydock_protocol::Platform {
+    fn guest_platform(&self) -> flotilla_environment::platform::Platform {
         flotilla_environment::guest_tools::linux_amd64()
     }
     /// Where the generation layer is published in the environment, when it is

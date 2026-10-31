@@ -10,16 +10,28 @@ use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
 
-#[cfg(unix)]
-use crate::environment::docker::DockerAgentSettings;
 use crate::environment::docker::DockerEnvironmentProvider;
 use crate::environment::docker_vessels::DockerVessels;
 use crate::environment::EnvironmentProvider;
+#[cfg(unix)]
+use crate::environment::{agent::client::AgentLink, docker::DockerAgentSettings};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 
-pub struct DockerEnvironmentFactory;
+#[derive(Default)]
+pub struct DockerEnvironmentFactory {
+    #[cfg(unix)]
+    link: Option<Arc<dyn AgentLink>>,
+}
+
+#[cfg(unix)]
+impl DockerEnvironmentFactory {
+    /// Providers whose vessels' agents are reached through `link`.
+    pub fn with_agent_link(link: Arc<dyn AgentLink>) -> Self {
+        Self { link: Some(link) }
+    }
+}
 
 #[async_trait]
 impl Factory for DockerEnvironmentFactory {
@@ -58,6 +70,11 @@ impl Factory for DockerEnvironmentFactory {
                     })
                     .unwrap_or_else(|| Path::new("/usr/local/bin/drydock-agent").to_path_buf()),
             });
+            #[cfg(unix)]
+            let provider = match &self.link {
+                Some(link) => provider.with_agent_link(link.clone()),
+                None => provider,
+            };
             Arc::new(provider) as Arc<dyn EnvironmentProvider>
         };
         if env.find_binary("docker").is_some() {
@@ -89,7 +106,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = TestConfig::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = DockerEnvironmentFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
+        let result = DockerEnvironmentFactory::default().probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok());
     }
 
@@ -100,7 +117,7 @@ mod tests {
         let config = TestConfig::with_base(dir.path());
         // Runner returns success for `docker --version`
         let runner = Arc::new(DiscoveryMockRunner::builder().on_run("docker", &["--version"], Ok("Docker version 24.0.0".into())).build());
-        let result = DockerEnvironmentFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
+        let result = DockerEnvironmentFactory::default().probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok());
     }
 
@@ -112,7 +129,7 @@ mod tests {
         // Runner returns error for `docker --version` — docker not available
         let runner =
             Arc::new(DiscoveryMockRunner::builder().on_run("docker", &["--version"], Err("docker: command not found".into())).build());
-        let result = DockerEnvironmentFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
+        let result = DockerEnvironmentFactory::default().probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without docker");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("docker".into())));
     }
@@ -130,7 +147,7 @@ mod tests {
         ] {
             let config = TestConfig::with_base(dir.path()).with_docker_vessels(toml::from_str(table).expect("table"));
             let runner = Arc::new(DiscoveryMockRunner::builder().build());
-            let result = DockerEnvironmentFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
+            let result = DockerEnvironmentFactory::default().probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
             match result {
                 Ok(_) => assert!(valid, "{table} should be refused"),
                 Err(unmet) => {
@@ -143,7 +160,7 @@ mod tests {
 
     #[tokio::test]
     async fn docker_factory_descriptor() {
-        let desc = DockerEnvironmentFactory.descriptor();
+        let desc = DockerEnvironmentFactory::default().descriptor();
         assert_eq!(desc.backend, "docker");
         assert_eq!(desc.implementation, "docker");
         assert_eq!(desc.display_name, "docker");

@@ -42,7 +42,7 @@ use crate::stdlib_image_layers::harness_session_environment;
 use super::seed::{empty_meta, ensure_default_kinds, ensure_host_direct_environment_exists, kind_belongs_to_host};
 use super::ssh_host_vessels::SshHostVessels;
 use super::tasks::FULFILMENT_CHANGE_CHECK_INTERVAL;
-use flotilla_environment::environment::agent::host::SshAgentReach;
+use flotilla_drydock::host::SshAgentReach;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LocalProvisioningProfile {

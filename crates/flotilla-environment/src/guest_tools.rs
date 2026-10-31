@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use drydock_protocol::Platform;
+use crate::platform::Platform;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 

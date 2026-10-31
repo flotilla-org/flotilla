@@ -289,7 +289,7 @@ async fn stand_in(declared_path: Option<&str>, harness_in_image: bool) -> StandI
     fs::create_dir(root.join("vessel")).expect("vessel directory");
     // The provider prepares linux/amd64 guests, so the stand-in vessel reports
     // that platform on any test host.
-    let gateway = Gateway::start_as(&root.join("vessel"), BUILD, flotilla_environment::guest_tools::linux_amd64()).expect("gateway");
+    let gateway = Gateway::start_as(&root.join("vessel"), BUILD, drydock_protocol::Platform::new("linux", "amd64")).expect("gateway");
     let seams = Seams {
         dialer: gateway.clone(),
         builds: Arc::new(Build),
@@ -312,9 +312,14 @@ async fn stand_in(declared_path: Option<&str>, harness_in_image: bool) -> StandI
     })
     .await
     .expect("stand-in ready");
-    let provider = DrydockEnvironmentProvider::new(drydock, "stand-in".into(), "reference".into())
-        .with_agent_build(BUILD.to_vec())
-        .with_guest_agent_socket(root.join("vessel/agent.sock"));
+    let provider = DrydockEnvironmentProvider::new(
+        flotilla_drydock::api::provider_api(drydock),
+        flotilla_drydock::agent::link(),
+        "stand-in".into(),
+        "reference".into(),
+    )
+    .with_agent_build(BUILD.to_vec())
+    .with_guest_agent_socket(root.join("vessel/agent.sock"));
 
     // The daemon: interior discovery finds the harness and the terminal pool.
     let config_base = root.join("config");

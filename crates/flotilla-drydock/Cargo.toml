@@ -1,0 +1,38 @@
+# Composition-root only: the drydock crates stop here (ci/build-graph/check.py).
+[package]
+name = "flotilla-drydock"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+flotilla-environment = { path = "../flotilla-environment" }
+flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
+drydock.workspace = true
+drydock-protocol.workspace = true
+drydock-agent.workspace = true
+drydock-transport.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+drydock-host.workspace = true
+flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-resources = { path = "../flotilla-resources" }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+http.workspace = true
+reqwest = { workspace = true }
+hegeltest = "=0.48.1"
+libc.workspace = true
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

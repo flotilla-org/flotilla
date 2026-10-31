@@ -75,6 +75,8 @@ pub async fn run(
         info!(repo_count = repo_roots.len(), "starting daemon");
 
         let mut discovery = DiscoveryRuntime::for_process();
+        #[cfg(unix)]
+        discovery.factories.link_vessel_agents(flotilla_drydock::agent::link());
         let dummy_fleet = crate::dummy_fleet::install_dummy_fleet(&daemon_config, &mut discovery);
         let repo_root_paths = repo_roots.into_iter().map(|p| p.into_path_buf()).collect();
         let server = DaemonServer::new_with_socket_discovery_path(

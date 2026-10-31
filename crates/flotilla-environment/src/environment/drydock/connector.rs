@@ -2,15 +2,17 @@
 //! agent's socket (drydock#132 case 4). Drydock holds the vessel's link and
 //! key; this end only opens the local socket drydock hands back.
 use super::*;
-use crate::environment::agent::{connect_current, AgentConnector};
-use drydock_agent::Client;
-use drydock_transport::ByteStream;
+use crate::environment::agent::{
+    client::{AgentClient, ByteStream},
+    AgentConnector,
+};
 use flotilla_protocol::provider::AgentConnectionReport;
 
 /// What the adapter reports for the agent's latest connection.
 pub(super) const EXPOSURE_MODE: &str = "inward_exposure";
 
 pub(super) struct DrydockAgentConnector {
+    pub link: Arc<dyn AgentLink>,
     pub exposures: exposures::Exposures,
     pub module: String,
     /// The agent's socket in the vessel.
@@ -25,21 +27,15 @@ pub(super) struct DrydockAgentConnector {
 
 #[async_trait]
 impl AgentConnector for DrydockAgentConnector {
-    async fn connect(&self) -> Result<Client, String> {
+    async fn connect(&self) -> Result<Arc<dyn AgentClient>, String> {
         let build = agent_build(&self.executable, &self.platform).await?;
         let (local, error) = self.exposures.inward("agent", wire::InwardTarget::Unix(exposures::unix(&self.socket))).await?;
         // Each attempt is its own connection to the agent's socket.
-        let connected = connect_current(
-            || {
-                let local = local.clone();
-                async move { Ok(Box::new(tokio::net::UnixStream::connect(&local).await?) as ByteStream) }
-            },
-            &self.platform,
-            build,
-            self.timeout,
-        )
-        .await
-        .map_err(|cause| match &error {
+        let mut open = || {
+            let local = local.clone();
+            Box::pin(async move { Ok(Box::new(tokio::net::UnixStream::connect(&local).await?) as ByteStream) }) as _
+        };
+        let connected = self.link.connect(&mut open, &self.platform, build, self.timeout).await.map_err(|cause| match &error {
             Some(error) => format!("agent through drydock: {cause}; exposure {:?}: {}", error.code, error.reason),
             None => format!("agent through drydock: {cause}"),
         })?;

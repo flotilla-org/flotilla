@@ -1851,7 +1851,7 @@ async fn docker_agent_provisioning_reports_unsupported_host() {
 #[cfg(unix)]
 #[tokio::test]
 async fn docker_refuses_unsupported_requested_guest_before_execution() {
-    for platform in [drydock_protocol::Platform::new("linux", "arm64"), drydock_protocol::Platform::new("darwin", "arm64")] {
+    for platform in [crate::platform::Platform::new("linux", "arm64"), crate::platform::Platform::new("darwin", "arm64")] {
         let runner = Arc::new(RecordingRunner::new_ok("held"));
         let provider = super::contract_tests::docker_provider(runner.clone());
         let result = provider.prepare(&pinned_spec(), &super::PrepareOpts { platform: Some(platform.clone()), ..Default::default() }).await;

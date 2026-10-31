@@ -401,7 +401,7 @@ async fn ssh_host_without_vessel_agents_is_refused_at_placement() {
         vessel_support::held_socket_service(state.path()),
         state.path().join("vessels"),
     );
-    let reach = flotilla_environment::environment::agent::host::SshAgentReach {
+    let reach = flotilla_drydock::host::SshAgentReach {
         address: "b1.example".into(),
         port: 22,
         user: "crew".into(),

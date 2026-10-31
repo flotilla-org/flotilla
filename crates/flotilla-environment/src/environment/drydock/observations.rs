@@ -77,7 +77,7 @@ fn snapshot_state(
     provider: &str,
     backing: &str,
     environments: &[wire::Environment],
-    unavailable: &BTreeMap<String, wire::ProtocolError>,
+    unavailable: &BTreeMap<String, serde_json::Value>,
 ) -> Option<ObservationState> {
     if unavailable.contains_key(provider) {
         return None;
@@ -106,76 +106,6 @@ fn event_observation(event: wire::EventKind) -> Option<ObservationState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ::drydock::client::Error;
-    struct Api {
-        cursors: std::sync::Mutex<Vec<Option<String>>>,
-        streams: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<::drydock::api::ObservationStream>>,
-    }
-    #[async_trait]
-    impl ProviderApi for Api {
-        async fn hello(&self) -> Result<wire::Hello, Error> {
-            Err(unused())
-        }
-        async fn configure(&self, _: ::drydock::api::ConfigUpdate) -> Result<(), Error> {
-            Err(unused())
-        }
-        async fn providers(&self) -> Result<Vec<wire::ProviderDeclaration>, Error> {
-            Err(unused())
-        }
-        async fn provider(&self, _: &str) -> Result<wire::ProviderDeclaration, Error> {
-            Err(unused())
-        }
-        fn with_credential(&self, _: wire::Secret) -> Arc<dyn ProviderApi> {
-            unreachable!("only observation is served")
-        }
-        async fn observe(&self, since: Option<&str>) -> Result<::drydock::api::ObservationStream, Error> {
-            self.cursors.lock().unwrap().push(since.map(str::to_owned));
-            self.streams.lock().await.recv().await.ok_or_else(|| Error::Transport("observation stream closed".into()))
-        }
-        async fn prepare(&self, _: &str, _: &wire::PrepareRequest) -> Result<wire::Prepared, Error> {
-            Err(unused())
-        }
-        async fn provision(&self, _: &str, _: &wire::ProvisionRequest) -> Result<::drydock::api::Provisioned<wire::Environment>, Error> {
-            Err(unused())
-        }
-        async fn list(&self, _: &str) -> Result<Vec<wire::Environment>, Error> {
-            Err(unused())
-        }
-        async fn inspect(&self, _: &str, _: &str) -> Result<wire::Environment, Error> {
-            Err(unused())
-        }
-        async fn destroy(&self, _: &str, _: &str) -> Result<(), Error> {
-            Err(unused())
-        }
-        async fn reach(&self, _: &str, _: &str) -> Result<wire::Reach, Error> {
-            Err(unused())
-        }
-        async fn suspend(&self, _: &str, _: &str) -> Result<wire::ResumeToken, Error> {
-            Err(unused())
-        }
-        async fn resume(&self, _: &str, _: &str, _: &wire::ResumeToken) -> Result<(), Error> {
-            Err(unused())
-        }
-        async fn export(&self, _: &str, _: &str) -> Result<wire::Export, Error> {
-            Err(unused())
-        }
-        async fn quota(&self, _: &str) -> Result<wire::Quota, Error> {
-            Err(unused())
-        }
-        async fn usage(&self, _: &str, _: &wire::Period) -> Result<wire::Usage, Error> {
-            Err(unused())
-        }
-        async fn relay(&self, _: &str, _: &str) -> Result<rigging_stream::ByteStream, Error> {
-            Err(unused())
-        }
-        async fn exec(&self, _: &str, _: &str, _: &wire::ExecRequest) -> Result<rigging_stream::ByteStream, Error> {
-            Err(unused())
-        }
-    }
-    /// Only observation is exercised here.
-    fn unused() -> Error {
-        Error::Transport("only observation is served".into())
-    }
     async fn until(predicate: impl Fn() -> bool) {
         tokio::time::timeout(Duration::from_secs(4), async {
             while !predicate() {
@@ -185,30 +115,21 @@ mod tests {
         .await
         .unwrap();
     }
+    fn event(cursor: &str, id: &str, event: wire::EventKind) -> wire::ObserveRecord {
+        wire::ObserveRecord::Event { event: wire::Event { cursor: cursor.into(), id: id.into(), provider: "p".into(), event } }
+    }
     // A provider owns one stream across inventory handles, resumes its opaque
     // cursor after disconnect, and never turns unavailable inventory into Gone.
     #[tokio::test]
     async fn shared_stream_resumes_and_preserves_terminal_evidence() {
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
-        let api = Arc::new(Api { cursors: Default::default(), streams: tokio::sync::Mutex::new(rx) });
+        let (api, tx) = super::super::memory::MemoryApi::new("p", PathBuf::new());
         let hub = Hub::start(api.clone(), "p".into());
         let first = hub.watch("one".into());
         let second = hub.watch("two".into());
         let again = hub.watch("one".into());
         assert!(Arc::ptr_eq(&first.state, &again.state));
-        let record = wire::ObserveRecord::Event {
-            event: wire::Event {
-                cursor: "terminal-cursor".into(),
-                id: "one".into(),
-                provider: "p".into(),
-                label: None,
-                timestamp: serde_json::from_value(serde_json::json!("2026-10-22T00:00:00Z")).unwrap(),
-                timestamp_source: wire::TimestampSource::Provider,
-                event: wire::EventKind::Gone { cause: wire::GoneCause::LifetimeCapReached },
-            },
-        };
-        tx.send(Box::pin(futures::stream::iter([Ok(record), Err(Error::Transport("disconnected".into()))]))
-            as ::drydock::api::ObservationStream)
+        let record = event("terminal-cursor", "one", wire::EventKind::Gone { cause: wire::GoneCause::LifetimeCapReached });
+        tx.send(Box::pin(futures::stream::iter([Ok(record), Err(ApiError::Other("disconnected".into()))])) as wire::ObservationStream)
             .await
             .unwrap();
         until(|| matches!(*first.state.read().unwrap(), Some(ObservationState::Gone { cause: GoneCause::LifetimeCapReached }))).await;
@@ -216,22 +137,11 @@ mod tests {
         assert_eq!(*api.cursors.lock().unwrap(), vec![None, Some("terminal-cursor".into())]);
         assert!(second.state.read().unwrap().is_none());
         assert!(snapshot_state("p", "one", &[], &BTreeMap::new()).is_some());
-        let unavailable = BTreeMap::from([("p".into(), wire::ProtocolError::NotFound { reason: "offline".into() })]);
+        let unavailable = BTreeMap::from([("p".into(), serde_json::json!({"kind": "not_found", "reason": "offline"}))]);
         assert!(snapshot_state("p", "one", &[], &unavailable).is_none());
         let snapshot = wire::ObserveRecord::Snapshot { cursor: "gap".into(), environments: vec![], unavailable_providers: unavailable };
-        let resumed = wire::ObserveRecord::Event {
-            event: wire::Event {
-                cursor: "running".into(),
-                id: "two".into(),
-                provider: "p".into(),
-                label: None,
-                timestamp: serde_json::from_value(serde_json::json!("2026-10-22T00:00:00Z")).unwrap(),
-                timestamp_source: wire::TimestampSource::Provider,
-                event: wire::EventKind::Resumed,
-            },
-        };
-        tx.send(Box::pin(futures::stream::iter([Ok(snapshot), Ok(resumed)]).chain(futures::stream::pending()))
-            as ::drydock::api::ObservationStream)
+        let resumed = event("running", "two", wire::EventKind::Resumed);
+        tx.send(Box::pin(futures::stream::iter([Ok(snapshot), Ok(resumed)]).chain(futures::stream::pending())) as wire::ObservationStream)
             .await
             .unwrap();
         until(|| matches!(*second.state.read().unwrap(), Some(ObservationState::Running))).await;
