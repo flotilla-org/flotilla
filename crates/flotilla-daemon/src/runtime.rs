@@ -84,6 +84,7 @@ use self::tasks::{
 };
 use self::terminal::TerminalControllerRuntime;
 use crate::server::environment_sockets::EnvironmentSocketService;
+use crate::server::verbs;
 use crate::{
     blob_store::TieredBlobStore,
     resource_manifest::manifest_root_name,
@@ -1184,12 +1185,13 @@ fn spawn_controller_loops(
 
 /// The decided store's kinds behind `[primitives]`: Message and AgentSession
 /// (#3317), the provisioning lifecycle kinds and TerminalSession, the account
-/// kinds (#3824 layer 1), and the engine's Vessel and Ensure (#3629), each
-/// under its production code.
+/// kinds (#3824 layer 1), the engine's Vessel and Ensure (#3629), and the verb route's record of
+/// intent (#4197), each under its production code.
 pub(crate) fn decided_registry() -> Result<flotilla_schema::KindRegistry, flotilla_schema::RegistryError> {
     let mut registry = flotilla_engine_store::registry()?;
     flotilla_provisioning::stored::register(&mut registry)?;
     flotilla_engine_store::register_crew(&mut registry)?;
+    verbs::intent::register(&mut registry)?;
     Ok(registry)
 }
 

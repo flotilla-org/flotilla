@@ -809,3 +809,6 @@ pub use query::ForgeBudgetRow;
 
 /// Self-describing tables, shared by the HTTP and surface carriers.
 pub mod table;
+
+/// The verb route's request and per-subject outcomes (#4197).
+pub mod verbs;
