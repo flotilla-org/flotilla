@@ -48,7 +48,7 @@ impl CredentialStore {
             if env.is_empty() {
                 return Ok(CloneDelivery { runner, env_file: None });
             }
-            let contents = env.iter().map(|(name, value)| format!("{name}={}\n", shell_single_quote(value))).collect::<String>();
+            let contents = environment_file(&env);
             let digest = Sha256::digest(target.as_bytes()).iter().take(12).map(|byte| format!("{byte:02x}")).collect::<String>();
             let env_file = self.delivery_paths(&*runner).await?.base.join("credentials").join(format!("clone-{digest}.env"));
             let env_file =
@@ -63,6 +63,12 @@ impl CredentialStore {
             })
         })
     }
+}
+
+/// The delivered environment as `sh` sources it: each value single-quoted, so
+/// none of its characters are interpreted.
+fn environment_file(env: &[(String, String)]) -> String {
+    env.iter().map(|(name, value)| format!("{name}={}\n", shell_single_quote(value))).collect()
 }
 
 /// A clone's delivered credentials: the runner its Git runs through, and the
@@ -179,6 +185,24 @@ mod tests {
     use flotilla_provider_runtime::ProcessCommandRunner;
     use flotilla_store::ResourceBackend;
     use flotilla_store_memory::InMemoryBackend;
+
+    #[tokio::test]
+    async fn the_environment_file_gives_git_each_value_exactly() {
+        let dir = tempfile::tempdir().expect("dir");
+        let file = dir.path().join("clone.env");
+        let values = [("QUOTED", "it's"), ("MULTILINE", "first\nsecond"), ("EXPANDED", "$HOME `id` $(id) \\ \"")];
+        let env = values.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect::<Vec<_>>();
+        std::fs::write(&file, environment_file(&env)).expect("write");
+
+        // The clone's own script, with Git replaced by a print of what it would see.
+        let script = GIT_WITH_ENVIRONMENT.replace("exec git \"$@\"", "printf '%s\\0' \"$QUOTED\" \"$MULTILINE\" \"$EXPANDED\"");
+        assert_ne!(script, GIT_WITH_ENVIRONMENT);
+        let output = std::process::Command::new("sh").args(["-c", &script]).arg(&file).output().expect("sh");
+
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let read = String::from_utf8(output.stdout).expect("utf8");
+        assert_eq!(read.split_terminator('\0').collect::<Vec<_>>(), values.iter().map(|(_, value)| *value).collect::<Vec<_>>());
+    }
 
     #[tokio::test]
     async fn a_clone_without_grants_runs_on_the_vessel_runner_and_leaves_nothing_to_remove() {
