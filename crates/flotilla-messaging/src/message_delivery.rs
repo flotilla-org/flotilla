@@ -378,6 +378,7 @@ impl MessageInbox {
                             },
                         )
                         .await?;
+                        continue;
                     }
                 }
                 let mut answered = false;
@@ -401,6 +402,27 @@ impl MessageInbox {
                         &MessageStatusPatch::Finish {
                             phase: MessagePhase::Answered,
                             reason: "receiver published a correlated reply".into(),
+                            at: now,
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
+                if let Some((delivered, replacement)) = message
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.resolved_receiver.as_ref())
+                    .and_then(|delivered| Some((delivered, receivers.replacement_crew(delivered)?)))
+                {
+                    apply_status_patch(
+                        &self.messages,
+                        &message.metadata.name,
+                        &MessageStatusPatch::Finish {
+                            phase: MessagePhase::DeadLettered,
+                            reason: format!(
+                                "undeliverable: crew `{}` on session `{}` was replaced by crew `{replacement}`",
+                                delivered.crew_id, delivered.session
+                            ),
                             at: now,
                         },
                     )
