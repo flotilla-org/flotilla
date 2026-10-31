@@ -1663,18 +1663,24 @@ async fn failed_digest_snapshot_preserves_replicas() {
     digest_session_scenario(false, true, false).await;
 }
 
-// Generated scenarios span the two real backends and transient refusal versus
-// successful repair, checking convergence and the transfer boundary each time.
-#[hegel::test]
-fn generated_digest_session_repair(tc: hegel::TestCase) {
-    let sqlite = tc.draw(hegel::generators::booleans());
-    let failure = tc.draw(hegel::generators::booleans());
-    let advanced_prefix = tc.draw(hegel::generators::booleans());
-    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(digest_session_scenario(
-        sqlite,
-        failure,
-        advanced_prefix,
-    ));
+// The scenario's whole domain is eight combinations of backend, transient
+// refusal and relay-advanced prefix; the tests around these name the other four.
+// Each is its own test so they run side by side.
+#[tokio::test]
+async fn sqlite_failed_digest_snapshot_preserves_replicas() {
+    digest_session_scenario(true, true, false).await;
+}
+#[tokio::test]
+async fn sqlite_digest_repairs_a_relay_advanced_prefix() {
+    digest_session_scenario(true, false, true).await;
+}
+#[tokio::test]
+async fn failed_digest_snapshot_preserves_replicas_behind_a_relay_advanced_prefix() {
+    digest_session_scenario(false, true, true).await;
+}
+#[tokio::test]
+async fn sqlite_failed_digest_snapshot_preserves_replicas_behind_a_relay_advanced_prefix() {
+    digest_session_scenario(true, true, true).await;
 }
 
 // A falsely advanced legacy prefix cannot hide a missing final tombstone from
