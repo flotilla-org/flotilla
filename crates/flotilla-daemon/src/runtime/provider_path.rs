@@ -146,11 +146,11 @@ async fn deliver_vessel_layer(
     let agent = handle.agent();
     // The crew socket lives with the vessel's other writable state, wherever its agent keeps that.
     let digest = format!("{:x}", sha2::Sha256::digest(id.as_str().as_bytes()));
-    let directory = agent.writable_base().await?.join("crew-sockets").join(&digest[..16]);
+    let base = agent.writable_base().await?;
+    let directory = base.join("crew-sockets").join(&digest[..16]);
     agent.create_dir(&directory, 0o700).await?;
     let guest = directory.join(CREW_SOCKET);
     let cpus = spec.cloud_sandbox.as_ref().map(|cloud| cloud.size.cpus as usize);
-    let base = agent.writable_base().await?;
     let mut environment = BTreeMap::new();
     let host_filesystem = handle.provider_descriptor().is_some_and(|descriptor| descriptor.capabilities.host_filesystem);
     let mut tools = if host_filesystem {

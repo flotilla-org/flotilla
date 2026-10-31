@@ -1088,14 +1088,10 @@ impl VesselReconciler {
         }
         let has_repositories = !repository_refs.is_empty();
         let workspace_root = if multi_repository {
-            match (&strategy, checkout_paths.values().next()) {
+            match &strategy {
                 // A vessel's clones stay where they were made, whatever the layout
                 // says now (a vessel cloned at its provider's root before #4165).
-                // Every layout clones a vessel's repositories side by side under one
-                // parent, so the first checkout's parent is the workspace root.
-                (PlacementStrategy::CloneInVessel { .. }, Some(path)) => {
-                    std::path::Path::new(path).parent().map_or(workspace_root, |parent| parent.to_string_lossy().into_owned())
-                }
+                PlacementStrategy::CloneInVessel { .. } => recorded_workspace_root(checkout_paths.values()).unwrap_or(workspace_root),
                 _ => workspace_root,
             }
         } else if let Some(path) = checkout_paths.values().next() {
@@ -1841,6 +1837,14 @@ fn cloud_environment_spec(
     })
 }
 
+/// The directory a vessel's recorded checkouts sit side by side in, when they
+/// all share one; otherwise the layout's own root stands.
+fn recorded_workspace_root<'a>(paths: impl IntoIterator<Item = &'a String>) -> Option<String> {
+    let mut parents = paths.into_iter().map(|path| std::path::Path::new(path).parent());
+    let first = parents.next()??;
+    parents.all(|parent| parent == Some(first)).then(|| first.to_string_lossy().into_owned())
+}
+
 /// Where a vessel clones below its provider's workspace root: a directory of
 /// its own, since where vessels share one filesystem (drydock's `local`) the
 /// root is theirs together.
@@ -2369,6 +2373,23 @@ mod tests {
 
     // #4165: vessels whose provider declares one workspace root for all of them
     // each clone into a directory of their own below it.
+    // #4165: a multi-repository cloud vessel's crew runs where its checkouts were
+    // recorded side by side, in either layout, and nowhere they disagree.
+    #[test]
+    fn a_multi_repository_vessel_runs_where_its_checkouts_sit_together() {
+        use super::recorded_workspace_root;
+        let paths = |paths: &[&str]| paths.iter().map(|path| path.to_string()).collect::<Vec<_>>();
+        for (recorded, root) in [
+            (paths(&["/vessels/convoy-a-work/cleat", "/vessels/convoy-a-work/flotilla"]), Some("/vessels/convoy-a-work")),
+            (paths(&["/workspace/cleat", "/workspace/flotilla"]), Some("/workspace")),
+            (paths(&["/vessels/convoy-a-work/cleat", "/workspace/flotilla"]), None),
+            (paths(&["/"]), None),
+            (paths(&[]), None),
+        ] {
+            assert_eq!(recorded_workspace_root(&recorded).as_deref(), root, "{recorded:?}");
+        }
+    }
+
     #[test]
     fn each_vessel_clones_below_the_workspace_root_in_its_own_directory() {
         use super::vessel_clone_path;
