@@ -3,7 +3,9 @@
 //! The remote server publishes ordinary endpoints, without owning their
 //! processes. SSH authenticates the account; the signed handshake independently
 //! authenticates both Tender instances. ProxyJump and account selection remain
-//! in the operator's SSH configuration.
+//! in the operator's SSH configuration. The client reaches its first instance
+//! through a [`Dial`], so an OpenSSH forward is one route among others, and
+//! authenticated relays carry a caller onward to hosts it cannot dial.
 
 use std::{
     collections::BTreeMap,
@@ -20,7 +22,7 @@ use rand_core::{OsRng, RngCore};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{UnixListener, UnixStream},
     process::{Child, Command},
     sync::{mpsc, Mutex as AsyncMutex, Semaphore},
@@ -31,12 +33,15 @@ use tokio::{
 use crate::{
     memory::MemoryTender,
     runtime::{Clock, FileStore},
-    ByteStream, Error, Exposure, Fingerprint, Lease, Publication, PublicationId, PublishRequest, Published, Session, Tender, Watch,
+    ByteStream, Dial, Error, Exposure, Fingerprint, Lease, Publication, PublicationId, PublishRequest, Published, Router, Session, Tender,
+    Watch,
 };
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONTROL: usize = 64 * 1024;
 const MAX_CHANNELS: usize = 256;
+/// Bounds a relay chain, so a routing loop between relays fails promptly.
+const MAX_RELAY_HOPS: u8 = 8;
 
 /// Persist this key independently of SSH keys, account names, and routes.
 #[derive(Clone)]
@@ -89,7 +94,7 @@ fn fingerprint(key: &[u8; 32]) -> Fingerprint {
     Fingerprint(Sha256::digest(key).iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-async fn write_control<T: Serialize>(stream: &mut UnixStream, value: &T) -> io::Result<()> {
+async fn write_control<T: Serialize>(stream: &mut (impl AsyncWrite + Unpin), value: &T) -> io::Result<()> {
     let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
     if bytes.len() > MAX_CONTROL {
         return Err(io::Error::other("control frame too large"));
@@ -98,7 +103,7 @@ async fn write_control<T: Serialize>(stream: &mut UnixStream, value: &T) -> io::
     stream.write_all(&bytes).await
 }
 
-async fn read_control<T: DeserializeOwned>(stream: &mut UnixStream) -> io::Result<T> {
+async fn read_control<T: DeserializeOwned>(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<T> {
     let length = stream.read_u32().await? as usize;
     if length > MAX_CONTROL {
         return Err(io::Error::other("control frame too large"));
@@ -119,7 +124,7 @@ fn transcript(client_nonce: &[u8; 32], server_nonce: &[u8; 32], server_key: &[u8
     [b"tender-ssh-v1".as_slice(), client_nonce, server_nonce, server_key].concat()
 }
 
-async fn client_handshake(stream: &mut UnixStream, identity: &Identity, pin: &Fingerprint) -> Result<(), Error> {
+async fn client_handshake(stream: &mut (impl AsyncRead + AsyncWrite + Unpin), identity: &Identity, pin: &Fingerprint) -> Result<(), Error> {
     let mut nonce = [0; 32];
     OsRng.fill_bytes(&mut nonce);
     write_control(stream, &nonce).await.map_err(|_| Error::Unavailable)?;
@@ -139,7 +144,7 @@ async fn client_handshake(stream: &mut UnixStream, identity: &Identity, pin: &Fi
     write_control(stream, &reply).await.map_err(|_| Error::Unavailable)
 }
 
-async fn server_handshake(stream: &mut UnixStream, identity: &Identity) -> io::Result<Session> {
+async fn server_handshake(stream: &mut (impl AsyncRead + AsyncWrite + Unpin), identity: &Identity) -> io::Result<Session> {
     let client_nonce = read_control(stream).await?;
     let mut nonce = [0; 32];
     OsRng.fill_bytes(&mut nonce);
@@ -164,6 +169,12 @@ enum Request {
     Probe(PublicationId),
     Disconnect(Lease),
     Withdraw(Lease),
+    /// Carry the stream to `host`. The requester authenticated as itself; once
+    /// the stream opens, the original caller authenticates end to end.
+    Relay {
+        host: Fingerprint,
+        hops: u8,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -189,7 +200,10 @@ pub struct Server {
     pub policy: MemoryTender,
     task: JoinHandle<()>,
     path: PathBuf,
+    router: Relays,
 }
+
+type Relays = Arc<Mutex<Option<Arc<dyn Router>>>>;
 
 impl Server {
     /// Host a durable Tender authority. The private state directory owns both
@@ -230,6 +244,8 @@ impl Server {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         let registrations = Arc::new(Mutex::new(BTreeMap::new()));
         let authority = policy.clone();
+        let router: Relays = Arc::new(Mutex::new(None));
+        let relays = router.clone();
         let task = tokio::spawn(async move {
             let permits = Arc::new(Semaphore::new(MAX_CHANNELS));
             let mut cleanup = tokio::time::interval(Duration::from_secs(1));
@@ -245,9 +261,10 @@ impl Server {
                         let policy = authority.clone();
                         let identity = identity.clone();
                         let registrations = registrations.clone();
+                        let router = relays.lock().expect("router lock").clone();
                         connections.spawn(async move {
                             let _permit = permit;
-                            let _ = serve(stream, identity, policy, registrations).await;
+                            let _ = serve(stream, identity, policy, registrations, router).await;
                         });
                     }
                     _ = connections.join_next(), if !connections.is_empty() => {}
@@ -257,7 +274,14 @@ impl Server {
                 }
             }
         });
-        Ok(Self { policy, task, path })
+        Ok(Self { policy, task, path, router })
+    }
+
+    /// Forward relay requests for other hosts along the hosting application's
+    /// routes. Without a router this instance only terminates relays addressed
+    /// to it. Established relayed streams keep the route they opened on.
+    pub fn route_relays(&self, router: Arc<dyn Router>) {
+        *self.router.lock().expect("router lock") = Some(router);
     }
 
     /// Publish an already-running ordinary Unix endpoint. Neither publication
@@ -296,7 +320,13 @@ impl Drop for Server {
     }
 }
 
-async fn serve(mut stream: UnixStream, identity: Identity, policy: MemoryTender, registrations: Registrations) -> io::Result<()> {
+async fn serve(
+    mut stream: impl AsyncRead + AsyncWrite + Unpin + Send,
+    identity: Identity,
+    policy: MemoryTender,
+    registrations: Registrations,
+    router: Option<Arc<dyn Router>>,
+) -> io::Result<()> {
     let (session, request) = timeout(OPEN_TIMEOUT, async {
         let session = server_handshake(&mut stream, &identity).await?;
         let request = read_control(&mut stream).await?;
@@ -304,6 +334,29 @@ async fn serve(mut stream: UnixStream, identity: Identity, policy: MemoryTender,
     })
     .await
     .map_err(io::Error::other)??;
+    let (session, request) = match request {
+        Request::Relay { host, .. } if host == identity.fingerprint() => {
+            if let Err(error) = policy.check_intermediary(&session) {
+                return write_control(&mut stream, &Response::Error(error)).await;
+            }
+            write_control(&mut stream, &Response::Open).await?;
+            // The relay is recorded from its own handshake; the caller cannot
+            // assert it, and cannot nest another relay inside this one.
+            let (caller, request) = timeout(OPEN_TIMEOUT, async {
+                let caller = server_handshake(&mut stream, &identity).await?;
+                let request = read_control(&mut stream).await?;
+                Ok::<_, io::Error>((caller, request))
+            })
+            .await
+            .map_err(io::Error::other)??;
+            if matches!(request, Request::Relay { .. }) {
+                return write_control(&mut stream, &Response::Error(Error::UntrustedIntermediary)).await;
+            }
+            (Session { via: Some(session.caller), ..caller }, request)
+        }
+        Request::Relay { host, hops } => return forward(stream, &identity, &policy, router, &session, host, hops).await,
+        request => (session, request),
+    };
     let response = match request {
         Request::Publish(request) => match policy.publish(&session, request).await {
             Ok(published) => {
@@ -417,8 +470,60 @@ async fn serve(mut stream: UnixStream, identity: Identity, policy: MemoryTender,
             }
             Err(error) => Response::Error(error),
         },
+        Request::Relay { .. } => Response::Error(Error::UntrustedIntermediary),
     };
     write_control(&mut stream, &response).await
+}
+
+/// Relay one stream toward `host`, authenticating to the next instance as this
+/// one. After `Open` the stream is a byte splice: the caller's handshake and
+/// every later byte pass through unread. Like a direct connect, an open splice
+/// has no idle bound and holds one channel permit until either side closes;
+/// idle policy belongs to the hosting application. Refusals reach the caller
+/// unchanged, but a hop that stalls surfaces as the caller's own `Deadline`.
+async fn forward(
+    mut upstream: impl AsyncRead + AsyncWrite + Unpin,
+    identity: &Identity,
+    policy: &MemoryTender,
+    router: Option<Arc<dyn Router>>,
+    session: &Session,
+    host: Fingerprint,
+    hops: u8,
+) -> io::Result<()> {
+    let opened = async {
+        policy.check_forward(session)?;
+        let remaining = hops.checked_sub(1).ok_or(Error::Unavailable)?;
+        let router = router.ok_or(Error::Unavailable)?;
+        let hop = router.next_hop(&host).ok_or(Error::Unavailable)?;
+        if hop == identity.fingerprint() {
+            return Err(Error::Unavailable);
+        }
+        timeout(OPEN_TIMEOUT, async {
+            let mut downstream = router.dial(&hop).await.map_err(|_| Error::Unavailable)?;
+            client_handshake(&mut downstream, identity, &hop).await?;
+            write_control(&mut downstream, &Request::Relay { host, hops: remaining }).await.map_err(|_| Error::Unavailable)?;
+            match read_control(&mut downstream).await.map_err(|_| Error::Unavailable)? {
+                Response::Open => Ok(downstream),
+                Response::Error(error) => Err(error),
+                _ => Err(Error::Unavailable),
+            }
+        })
+        .await
+        .map_err(|_| Error::Deadline)?
+    }
+    .await;
+    // A failed open drops the downstream stream, with any partial handshake,
+    // and reports only the classified error upstream. Once spliced, a transport
+    // error ends this connection's task and closes both sides; there is no
+    // channel left on which to report it.
+    match opened {
+        Ok(mut downstream) => {
+            write_control(&mut upstream, &Response::Open).await?;
+            tokio::io::copy_bidirectional(&mut upstream, &mut downstream).await?;
+            Ok(())
+        }
+        Err(error) => write_control(&mut upstream, &Response::Error(error)).await,
+    }
 }
 
 /// Generic stream-local forward specification extracted from the peer
@@ -575,9 +680,22 @@ impl Drop for Forward {
 type ExposureMap = BTreeMap<(Fingerprint, PublicationId), Arc<LocalExposure>>;
 type Exposures = Arc<Mutex<ExposureMap>>;
 
+/// Dials one Unix socket path whichever instance is named, such as an OpenSSH
+/// stream-local forward or a host's own Tender listener. A single path cannot
+/// reach a distinct relay: a session naming one in `via` fails as
+/// `IdentityMismatch` when the host answers instead.
+pub struct UnixDial(pub PathBuf);
+
+#[async_trait]
+impl Dial for UnixDial {
+    async fn dial(&self, _: &Fingerprint) -> io::Result<ByteStream> {
+        Ok(Box::new(UnixStream::connect(&self.0).await?))
+    }
+}
+
 #[derive(Clone)]
 pub struct SshTender {
-    route: Arc<Mutex<PathBuf>>,
+    route: Arc<Mutex<Arc<dyn Dial>>>,
     credentials: Arc<BTreeMap<Fingerprint, Identity>>,
     pin: Fingerprint,
     exposures: Exposures,
@@ -615,10 +733,18 @@ impl Drop for LocalExposure {
 }
 
 impl SshTender {
+    /// Dial one socket path. It reaches only the pinned host, never a relay a
+    /// session names in `via`; use [`Self::with_dial`] for relayed sessions.
     pub fn new(route: PathBuf, pin: Fingerprint, identities: Vec<Identity>) -> io::Result<Self> {
+        Self::with_dial(Arc::new(UnixDial(route)), pin, identities)
+    }
+
+    /// Each operation dials a fresh stream to its first instance: the pinned
+    /// host, or the relay a session names in `via`.
+    pub fn with_dial(dial: Arc<dyn Dial>, pin: Fingerprint, identities: Vec<Identity>) -> io::Result<Self> {
         Ok(Self {
             snapshots: Arc::new(Mutex::new(BTreeMap::new())),
-            route: Arc::new(Mutex::new(route)),
+            route: Arc::new(Mutex::new(dial)),
             credentials: Arc::new(identities.into_iter().map(|identity| (identity.fingerprint(), identity)).collect()),
             pin,
             exposures: Arc::new(Mutex::new(BTreeMap::new())),
@@ -631,20 +757,35 @@ impl SshTender {
     /// Recovery affects only fresh connections. Existing sockets are never
     /// transferred to this route and no buffered application bytes are replayed.
     pub fn replace_route(&self, route: PathBuf) {
-        *self.route.lock().expect("route lock") = route;
+        self.replace_dial(Arc::new(UnixDial(route)));
     }
 
-    async fn request(&self, session: &Session, request: Request) -> Result<UnixStream, Error> {
+    /// As [`Self::replace_route`], for any dialer.
+    pub fn replace_dial(&self, dial: Arc<dyn Dial>) {
+        *self.route.lock().expect("route lock") = dial;
+    }
+
+    async fn request(&self, session: &Session, request: Request) -> Result<ByteStream, Error> {
         if session.pinned_host != self.pin {
             return Err(Error::IdentityMismatch);
         }
-        if session.via.is_some() {
-            return Err(Error::UntrustedIntermediary);
-        }
         let identity = self.credentials.get(&session.caller).ok_or(Error::Denied)?;
-        let route = self.route.lock().expect("route lock").clone();
+        let dial = self.route.lock().expect("route lock").clone();
         timeout(OPEN_TIMEOUT, async {
-            let mut stream = UnixStream::connect(route).await.map_err(|_| Error::Unavailable)?;
+            let mut stream = dial.dial(session.via.as_ref().unwrap_or(&self.pin)).await.map_err(|_| Error::Unavailable)?;
+            if let Some(relay) = &session.via {
+                // The caller pins its chosen relay before trusting it with the
+                // stream; the host independently decides whether to accept it.
+                client_handshake(&mut stream, identity, relay).await?;
+                write_control(&mut stream, &Request::Relay { host: self.pin.clone(), hops: MAX_RELAY_HOPS })
+                    .await
+                    .map_err(|_| Error::Unavailable)?;
+                match read_control(&mut stream).await.map_err(|_| Error::Unavailable)? {
+                    Response::Open => {}
+                    Response::Error(error) => return Err(error),
+                    _ => return Err(Error::Unavailable),
+                }
+            }
             client_handshake(&mut stream, identity, &self.pin).await?;
             write_control(&mut stream, &request).await.map_err(|_| Error::Unavailable)?;
             Ok(stream)
@@ -670,7 +811,11 @@ enum RetryPause {
     Cancelled,
 }
 
-async fn pause_publisher_retry(sender: &mpsc::UnboundedSender<ByteStream>, registration: &mut UnixStream, delay: Duration) -> RetryPause {
+async fn pause_publisher_retry(
+    sender: &mpsc::UnboundedSender<ByteStream>,
+    registration: &mut (impl AsyncRead + Unpin),
+    delay: Duration,
+) -> RetryPause {
     let mut byte = [0];
     tokio::select! {
         _ = sender.closed() => RetryPause::Cancelled,
@@ -715,7 +860,7 @@ impl Tender for SshTender {
                         match stream {
                             Ok(stream) => {
                                 retry_delay = Duration::from_millis(100);
-                                if sender.send(Box::new(stream) as ByteStream).is_err() { break }
+                                if sender.send(stream).is_err() { break }
                             }
                             Err(Error::Unavailable | Error::Deadline) => {
                                 // Backoff cannot delay lease loss or owner cancellation.
@@ -812,7 +957,7 @@ impl Tender for SshTender {
     async fn connect(&self, session: &Session, id: PublicationId) -> Result<ByteStream, Error> {
         let mut stream = self.request(session, Request::Connect(id)).await?;
         match timeout(OPEN_TIMEOUT, read_control(&mut stream)).await.map_err(|_| Error::Deadline)?.map_err(|_| Error::Unavailable)? {
-            Response::Open => Ok(Box::new(stream)),
+            Response::Open => Ok(stream),
             Response::Error(error) => Err(error),
             _ => Err(Error::Unavailable),
         }
@@ -970,7 +1115,7 @@ mod tests {
         let (mut client, server) = UnixStream::pair().expect("transport pair");
         let authority = policy.clone();
         let server_identity = host.clone();
-        let pending = tokio::spawn(async move { serve(server, server_identity, authority, registrations).await });
+        let pending = tokio::spawn(async move { serve(server, server_identity, authority, registrations, None).await });
         client_handshake(&mut client, &publisher, &host.fingerprint()).await.expect("authenticate publisher");
         write_control(&mut client, &Request::Accept(lease)).await.expect("duplicate accept request");
         drop(client);
@@ -981,6 +1126,30 @@ mod tests {
             .expect("cancellation");
         assert_eq!(policy.browse(&session).await.expect("host metadata")[0].availability, crate::Availability::Available);
         drop(incumbent);
+    }
+
+    // The host refuses an untrusted relay at its own handshake, before any
+    // relayed caller can authenticate or send a request through it; a trusted
+    // relay is answered with Open.
+    #[tokio::test]
+    async fn host_admits_only_trusted_relays_before_the_caller() {
+        let host = Identity::generate();
+        let policy = MemoryTender::new(host.fingerprint());
+        let trusted = Identity::generate();
+        policy.trust_intermediary(trusted.fingerprint()).expect("host policy");
+        for (relay, admitted) in [(trusted, true), (Identity::generate(), false)] {
+            let (mut client, server) = UnixStream::pair().expect("transport pair");
+            let pending = tokio::spawn(serve(server, host.clone(), policy.clone(), Arc::new(Mutex::new(BTreeMap::new())), None));
+            client_handshake(&mut client, &relay, &host.fingerprint()).await.expect("authenticate relay");
+            write_control(&mut client, &Request::Relay { host: host.fingerprint(), hops: 1 }).await.expect("relay request");
+            match read_control(&mut client).await.expect("admission") {
+                Response::Open => assert!(admitted, "untrusted relay opened"),
+                Response::Error(error) => assert!(!admitted && error == Error::UntrustedIntermediary, "{error:?}"),
+                _ => panic!("unexpected admission response"),
+            }
+            drop(client);
+            let _ = timeout(Duration::from_secs(1), pending).await.expect("host closes");
+        }
     }
 
     // A stale file cannot hide a dead forward, and process-probe errors are

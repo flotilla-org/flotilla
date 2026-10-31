@@ -181,6 +181,30 @@ impl MemoryTender {
         self.state()?.record_for_connect(session, id).map(|_| ())
     }
 
+    /// Admission to be forwarded through this instance: the authenticated
+    /// caller needs connect authority, as for any stream it opens here.
+    #[cfg(unix)]
+    pub(crate) fn check_forward(&self, session: &Session) -> Result<(), Error> {
+        let state = self.state()?;
+        state.authenticate(session)?;
+        if !state.connect.contains(&session.caller) {
+            return Err(Error::Denied);
+        }
+        Ok(())
+    }
+
+    /// Admission for an instance that delivers a relayed caller here. Only a
+    /// directly authenticated, trusted intermediary may stand in the path.
+    #[cfg(unix)]
+    pub(crate) fn check_intermediary(&self, session: &Session) -> Result<(), Error> {
+        let state = self.state()?;
+        state.authenticate(session)?;
+        if session.via.is_some() || !state.intermediaries.contains(&session.caller) {
+            return Err(Error::UntrustedIntermediary);
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     pub(crate) fn lease_active(&self, lease: &Lease) -> bool {
         self.state().ok().is_some_and(|state| {
