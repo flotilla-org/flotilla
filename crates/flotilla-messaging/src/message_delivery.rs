@@ -408,26 +408,25 @@ impl MessageInbox {
                     .await?;
                     continue;
                 }
-                if let Some((delivered, replacement)) = message
-                    .status
-                    .as_ref()
-                    .and_then(|status| status.resolved_receiver.as_ref())
-                    .and_then(|delivered| Some((delivered, receivers.replacement_crew(delivered)?)))
-                {
-                    apply_status_patch(
-                        &self.messages,
-                        &message.metadata.name,
-                        &MessageStatusPatch::Finish {
-                            phase: MessagePhase::DeadLettered,
-                            reason: format!(
-                                "undeliverable: crew `{}` on session `{}` was replaced by crew `{replacement}`",
-                                delivered.crew_id, delivered.session
-                            ),
-                            at: now,
-                        },
-                    )
-                    .await?;
-                }
+                let Some(delivered) = message.status.as_ref().and_then(|status| status.resolved_receiver.as_ref()) else {
+                    continue;
+                };
+                let Some(replacement) = receivers.replacement_crew(delivered) else {
+                    continue;
+                };
+                apply_status_patch(
+                    &self.messages,
+                    &message.metadata.name,
+                    &MessageStatusPatch::Finish {
+                        phase: MessagePhase::DeadLettered,
+                        reason: format!(
+                            "undeliverable: crew `{}` on session `{}` was replaced by crew `{replacement}`",
+                            delivered.crew_id, delivered.session
+                        ),
+                        at: now,
+                    },
+                )
+                .await?;
                 continue;
             }
             if message.status.as_ref().is_none_or(|status| status.submission.is_none())
