@@ -495,7 +495,8 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 // and cloud vessels keep command hooks. The token binds the hooks to this terminal.
                 if requirement.adapter == "claude-code" {
                     // A vessel's command hooks run the CLI by the path its session's `PATH` finds now,
-                    // before the login shell cleat starts can reset `PATH`.
+                    // before the login shell cleat starts can reset `PATH`. Temporary: remove once
+                    // sessions run with a declared environment and no login shell (#4173).
                     if spec.env_ref != self.state.host_direct_environment_name {
                         if let Some(cli) = place_cli(&*launch_runner()?, &credential_env).await {
                             credential_env.retain(|(key, _)| key != FLOTILLA_CLI_ENV);

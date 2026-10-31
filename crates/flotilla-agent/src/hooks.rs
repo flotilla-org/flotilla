@@ -267,7 +267,8 @@ pub const CLAUDE_CODE_HOOK_URL_ENV: &str = "FLOTILLA_HOOK_URL";
 /// The environment variable naming the absolute path of the flotilla CLI in a session's
 /// place. Command hooks run it by that path: Claude Code runs them under the shell cleat
 /// launched with `sh -lc`, and a login profile such as Debian's `/etc/profile` resets
-/// `PATH` and drops the directory that holds the CLI.
+/// `PATH` and drops the directory that holds the CLI. Temporary: remove once sessions run
+/// with a declared environment and no login shell (#4173).
 pub const FLOTILLA_CLI_ENV: &str = "FLOTILLA_CLI";
 
 /// Claude Code hook events that accept only `command` and `mcp_tool` hooks.
