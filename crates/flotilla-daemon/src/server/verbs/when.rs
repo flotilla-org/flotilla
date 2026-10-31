@@ -54,7 +54,8 @@ mod tests {
     }
 
     // Behaviour (#4182 ruling 3): `when` uses the `where` grammar over the row's columns; text
-    // compares as text, numbers numerically, and a missing cell satisfies only `!=`.
+    // compares as text, numbers numerically (as text against a literal that is not a number),
+    // and a missing cell satisfies only `!=`.
     #[test]
     fn conditions_compare_cells_with_literals() {
         let not_landed = Condition::parse(".status.phase != Landed").unwrap();
@@ -66,6 +67,11 @@ mod tests {
         assert!(!landed.holds(&Row::new()));
         assert!(holds(&json!(9), Operator::LessThan, "10"));
         assert!(!holds(&json!("9"), Operator::LessThan, "10"), "text compares as text");
+        // A number against a literal that is not one compares as text.
+        assert!(!holds(&json!(9), Operator::Equal, "nine"));
+        assert!(holds(&json!(9), Operator::NotEqual, "nine"));
+        assert!(holds(&json!(10), Operator::LessThan, "9x"), "`10` sorts before `9x` as text");
+        assert!(holds(&json!(1.5), Operator::Equal, "1.50"), "numbers compare by value, not text");
         assert!(holds(&json!(true), Operator::Equal, "true"));
         assert!(!holds(&json!(true), Operator::LessThan, "true"));
         assert!(Condition::parse("status.phase != Landed").is_err(), "a column path starts with `.`");
