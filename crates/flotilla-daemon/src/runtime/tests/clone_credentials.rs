@@ -173,12 +173,28 @@ async fn a_cloud_clone_runs_git_with_its_repository_grant_delivered() {
     assert!(!signed_in.is_empty(), "the clone's Git ran with a delivered environment");
     assert!(signed_in.iter().all(|answer| answer.contains("username=crew") && answer.contains(&format!("password={FORGE_TOKEN}"))));
     assert!(vessel.temp.path().join("vessel/widgets/.git").is_dir());
+    let left =
+        walk_files(vessel.temp.path()).into_iter().filter(|path| path.extension().is_some_and(|ext| ext == "env")).collect::<Vec<_>>();
+    assert!(left.is_empty(), "the clone's credential environment is removed after its Git: {left:?}");
+}
+
+fn walk_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(root).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(walk_files(&path))
+        } else {
+            files.push(path)
+        }
+    }
+    files
 }
 
 #[tokio::test]
 async fn a_cloud_clone_without_a_usable_grant_names_the_repository_forge_and_grant() {
     for (refs, reason) in [
-        (&[][..], "requires a sign-in and no credential grant covers this repository"),
+        (&[][..], "requires a sign-in, and no credential grant covers this repository"),
         (&["absent-forge"][..], "delivering its granted credentials `absent-forge` for forge.test failed"),
     ] {
         let vessel = cloud_vessel().await;

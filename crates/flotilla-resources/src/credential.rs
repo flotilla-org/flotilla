@@ -605,6 +605,43 @@ impl CloneCredentials {
 }
 
 #[cfg(test)]
+mod clone_credentials_tests {
+    use super::*;
+
+    #[test]
+    fn a_clone_keeps_only_grants_covering_its_repository_and_round_trips_through_annotations() {
+        let (widgets, other) = (RepositoryKey("widgets".into()), RepositoryKey("other".into()));
+        let refs = BTreeSet::from(["app".to_string(), "lab".to_string(), "elsewhere".to_string()]);
+        let scopes = BTreeMap::from([
+            ("app".to_string(), BTreeSet::from([widgets.clone(), other.clone()])),
+            ("lab".to_string(), BTreeSet::from([widgets.clone()])),
+            ("elsewhere".to_string(), BTreeSet::from([other.clone()])),
+        ]);
+        let permissions = BTreeMap::from([
+            ("app".to_string(), BTreeMap::from([("contents".to_string(), "write".to_string())])),
+            ("elsewhere".to_string(), BTreeMap::from([("issues".to_string(), "write".to_string())])),
+        ]);
+
+        let clone = CloneCredentials::for_repository(&widgets, &refs, &scopes, &permissions);
+        assert_eq!(clone.refs, BTreeSet::from(["app".to_string(), "lab".to_string()]));
+        assert_eq!(clone.scopes["app"], BTreeSet::from([widgets.clone(), other]), "a credential keeps its whole scope");
+        assert_eq!(clone.permissions.keys().collect::<Vec<_>>(), ["app"]);
+
+        let mut annotations = BTreeMap::new();
+        clone.annotate(&mut annotations);
+        assert_eq!(CloneCredentials::from_annotations(&annotations), Ok(clone));
+        assert_eq!(CloneCredentials::from_annotations(&BTreeMap::new()), Ok(CloneCredentials::default()));
+    }
+
+    #[test]
+    fn malformed_clone_annotations_are_refused() {
+        let annotations = BTreeMap::from([(CREDENTIAL_SCOPES_ANNOTATION.to_string(), "{not json".to_string())]);
+        let error = CloneCredentials::from_annotations(&annotations).expect_err("malformed scopes");
+        assert!(error.starts_with("invalid credential scopes annotation"), "{error}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use flotilla_provider_runtime::{ChannelLabel, CommandOutput, CommandRunner};
 use flotilla_resources::CloneCredentials;
 use futures::future::BoxFuture;
+use sha2::{Digest, Sha256};
 
 use crate::credential::{shell_single_quote, CredentialStore};
 
@@ -24,15 +25,16 @@ impl CredentialStore {
     /// Deliver a clone's granted credentials into `environment_ref` and return a
     /// runner whose Git commands see the delivered environment. The environment
     /// reaches Git through a private file in the delivery directory, never argv,
-    /// since an adapter such as `gh` delivers its token as a variable. `clone`
-    /// names the file, so concurrent clones in one vessel keep their own.
+    /// since an adapter such as `gh` delivers its token as a variable. A digest
+    /// of `target` names the file, so concurrent clones in one vessel keep their
+    /// own; [`CloneDelivery::finish`] removes it once the clone's Git is done.
     pub fn prepare_clone<'a>(
         &'a self,
         environment_ref: &'a str,
-        clone: &'a str,
+        target: &'a str,
         credentials: &'a CloneCredentials,
         runner: Arc<dyn CommandRunner>,
-    ) -> BoxFuture<'a, Result<Arc<dyn CommandRunner>, String>> {
+    ) -> BoxFuture<'a, Result<CloneDelivery, String>> {
         Box::pin(async move {
             let env = self
                 .prepare_scoped_with_permissions(
@@ -44,17 +46,39 @@ impl CredentialStore {
                 )
                 .await?;
             if env.is_empty() {
-                return Ok(runner);
+                return Ok(CloneDelivery { runner, env_file: None });
             }
             let contents = env.iter().map(|(name, value)| format!("{name}={}\n", shell_single_quote(value))).collect::<String>();
-            let name = clone.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect::<String>();
-            let env_file = self.delivery_paths(&*runner).await?.base.join("credentials").join(format!("clone-{name}.env"));
+            let digest = Sha256::digest(target.as_bytes()).iter().take(12).map(|byte| format!("{byte:02x}")).collect::<String>();
+            let env_file = self.delivery_paths(&*runner).await?.base.join("credentials").join(format!("clone-{digest}.env"));
+            let env_file =
+                env_file.into_os_string().into_string().map_err(|path| format!("clone credential path {path:?} is not UTF-8"))?;
             runner
-                .write_file_with_mode(&env_file, &contents, 0o600)
+                .write_file_with_mode(Path::new(&env_file), &contents, 0o600)
                 .await
                 .map_err(|error| format!("write clone credential environment: {error}"))?;
-            Ok(Arc::new(CloneCredentialRunner { inner: runner, env_file }) as Arc<dyn CommandRunner>)
+            Ok(CloneDelivery {
+                runner: Arc::new(CloneCredentialRunner { inner: runner, env_file: env_file.clone() }),
+                env_file: Some(env_file),
+            })
         })
+    }
+}
+
+/// A clone's delivered credentials: the runner its Git runs through, and the
+/// private environment file to remove once that Git is done.
+pub struct CloneDelivery {
+    pub runner: Arc<dyn CommandRunner>,
+    env_file: Option<String>,
+}
+
+impl CloneDelivery {
+    /// Remove the clone's environment file. The session's own delivery is
+    /// unaffected: it keeps the material the clone shared with it.
+    pub async fn finish(self) -> Result<(), String> {
+        let Some(env_file) = self.env_file else { return Ok(()) };
+        let args = ["-f", "--", env_file.as_str()];
+        self.runner.run("rm", &args, Path::new("/"), &ChannelLabel::Default).await.map(drop)
     }
 }
 
@@ -62,7 +86,7 @@ impl CredentialStore {
 /// and operation goes to the vessel's runner unchanged.
 struct CloneCredentialRunner {
     inner: Arc<dyn CommandRunner>,
-    env_file: PathBuf,
+    env_file: String,
 }
 
 impl CloneCredentialRunner {
@@ -70,11 +94,13 @@ impl CloneCredentialRunner {
         if cmd != "git" {
             return (cmd, args.to_vec());
         }
-        let env_file = self.env_file.to_str().expect("delivery paths are UTF-8");
-        ("sh", ["-c", GIT_WITH_ENVIRONMENT, env_file].into_iter().chain(args.iter().copied()).collect())
+        ("sh", ["-c", GIT_WITH_ENVIRONMENT, self.env_file.as_str()].into_iter().chain(args.iter().copied()).collect())
     }
 }
 
+// Every method that can run a command goes through `command`, so Git always
+// sees the delivered environment. Forward each method explicitly: a trait
+// method left to its default would run on this wrapper without that rewrite.
 #[async_trait]
 impl CommandRunner for CloneCredentialRunner {
     fn scratch_namespace(&self) -> &str {
@@ -143,5 +169,34 @@ impl CommandRunner for CloneCredentialRunner {
     }
     async fn write_file_from(&self, source: &Path, destination: &Path) -> Result<(), String> {
         self.inner.write_file_from(source, destination).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flotilla_discovery_api::EnvironmentBag;
+    use flotilla_provider_runtime::ProcessCommandRunner;
+    use flotilla_store::ResourceBackend;
+    use flotilla_store_memory::InMemoryBackend;
+
+    #[tokio::test]
+    async fn a_clone_without_grants_runs_on_the_vessel_runner_and_leaves_nothing_to_remove() {
+        let state = tempfile::tempdir().expect("state");
+        let store = CredentialStore::new(
+            ResourceBackend::new(InMemoryBackend::default()),
+            "test",
+            Arc::new(flotilla_provider_runtime::ProcessEnvVars),
+            EnvironmentBag::new(),
+            Arc::new(ProcessCommandRunner),
+            state.path().to_path_buf(),
+        );
+        let runner: Arc<dyn CommandRunner> = Arc::new(ProcessCommandRunner);
+
+        let delivery =
+            store.prepare_clone("vessel", "/work/widgets", &CloneCredentials::default(), Arc::clone(&runner)).await.expect("deliver");
+
+        assert!(Arc::ptr_eq(&delivery.runner, &runner));
+        delivery.finish().await.expect("nothing to remove");
     }
 }
