@@ -10,7 +10,7 @@
 //! application resource schemas (ADR 0047). Each connection gets a separate
 //! ordered byte stream. Control and diagnostics never enter that stream.
 
-use std::{collections::BTreeSet, fmt, time::Duration};
+use std::{collections::BTreeSet, fmt, io, time::Duration};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -93,6 +93,21 @@ pub struct Lease {
 pub trait RawStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> RawStream for T {}
 pub type ByteStream = Box<dyn RawStream>;
+
+/// Opens one fresh ordered byte stream toward the named Tender instance. The
+/// dialer only carries bytes: the handshake still authenticates whatever
+/// answers, so a wrong route fails as an identity mismatch.
+#[async_trait]
+pub trait Dial: Send + Sync {
+    async fn dial(&self, instance: &Fingerprint) -> io::Result<ByteStream>;
+}
+
+/// Routes supplied by the hosting application, which owns its links. The next
+/// hop toward `host` is either `host` itself or a relay that forwards onward
+/// under its own identity. Tender never stores or learns routes.
+pub trait Router: Dial {
+    fn next_hop(&self, host: &Fingerprint) -> Option<Fingerprint>;
+}
 
 pub struct Published {
     pub lease: Lease,

@@ -26,8 +26,11 @@ forward argument construction, path specifications, and socket/process waiter;
 Flotilla discovery, hello messages, reverse-path naming, and domain recovery
 stay with their current caller.
 
-`ssh::SshTender` implements `Tender` over that forward. Supply only the caller
-identities this client may use, and the pinned host fingerprint. Control records
+`ssh::SshTender` implements `Tender` over that forward, or over any `Dial`
+(`SshTender::with_dial`). A dialer opens one fresh byte stream toward a named
+instance; it only carries bytes, so the handshake still authenticates whatever
+answers. `UnixDial` dials one socket path, such as a forward. Supply only the
+caller identities this client may use, and the pinned host fingerprint. Control records
 are capped at 64 KiB and the server admits at most 256 live channels; after an authorized Open response each connection becomes
 a raw bidirectional stream. Each accepted exposure connection authenticates and
 checks host authority anew. Stream-local SSH channels provide multiplexing and
@@ -57,8 +60,18 @@ streams; it does not manage the application process. The host's
 publication authority and the route are separate, so a consumer SSH outage does
 not withdraw a healthy host-side publication.
 
-Container outward publication and authenticated Tender intermediary relays are
-slice 3; an asserted `Session::via` is refused by this direct adapter. Windows
+A session naming a relay in `Session::via` dials that relay, pins it with the
+caller's own handshake, and asks it to carry the stream to the pinned host.
+The relay admits callers holding connect authority in its own policy, then
+authenticates to the next instance as itself; `Server::route_relays` supplies
+the hosting application's `Router`, which names each next hop and dials it.
+Tender never stores or learns routes. The host accepts only a relay it trusts
+(`trust_intermediary`), records it as the session's `via` from the relay's own
+handshake, and then authenticates the caller end to end over the splice. In a
+chain the host sees only the relay that delivered the caller, and trusting an
+earlier relay is not enough. A chain is bounded at eight hops, so a routing
+loop fails as Unavailable. Relays see plaintext: each link's transport, such as
+SSH, provides confidentiality. Container outward publication is slice 3. Windows
 local adapters and Flotilla resource consumption are later slices. See the
 [cleat client-path research and pending proof](../../docs/research/tender-ssh-cleat-client-paths.md)
 for real-SSH checks and the installed CLI's connect-only limitations.
