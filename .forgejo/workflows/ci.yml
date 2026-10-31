@@ -41,4 +41,8 @@ jobs:
         run: cargo build --locked --bins
 
       - name: Test workspace
-        run: cargo test --workspace --locked
+        # macOS defaults to 256 open files per process; the daemon
+        # integration binary runs many in-process daemons in parallel.
+        run: |
+          ulimit -n 10240
+          cargo test --workspace --locked
