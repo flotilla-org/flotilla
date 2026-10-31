@@ -6,6 +6,12 @@ use tokio::{
     time::timeout,
 };
 
+#[cfg(unix)]
+#[path = "common/links.rs"]
+mod links;
+#[cfg(unix)]
+use links::Links;
+
 // Scenarios use only Tender and host controls. A transport adapter can run
 // the same suite by providing a new rig without duplicating expectations.
 trait HostControls {
@@ -114,30 +120,6 @@ const CALLERS: [&str; 15] = [
     "relay-key",
 ];
 
-/// Stands in for the hosting application's links: each instance's listener
-/// path, and routes that reach the host directly.
-#[cfg(unix)]
-struct Links {
-    paths: std::collections::BTreeMap<Fingerprint, std::path::PathBuf>,
-    host: Fingerprint,
-}
-
-#[cfg(unix)]
-#[async_trait::async_trait]
-impl tender::Dial for Links {
-    async fn dial(&self, instance: &Fingerprint) -> std::io::Result<tender::ByteStream> {
-        let path = self.paths.get(instance).ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
-        Ok(Box::new(tokio::net::UnixStream::connect(path).await?))
-    }
-}
-
-#[cfg(unix)]
-impl tender::Router for Links {
-    fn next_hop(&self, host: &Fingerprint) -> Option<Fingerprint> {
-        (host == &self.host).then(|| host.clone())
-    }
-}
-
 // Every caller reaches the host through the same dialer: directly, or through
 // a relay its session names. The host trusts `relay-key` but not `impostor`;
 // both relays admit every caller and forward to the host.
@@ -153,7 +135,7 @@ async fn relayed_adapter() -> Rig {
     for relay in relays {
         paths.insert(fp(relay), directory.path().join(relay));
     }
-    let links = Arc::new(Links { paths, host: host_id.clone() });
+    let links = Arc::new(Links { paths: Arc::new(paths), next: std::collections::BTreeMap::from([(host_id.clone(), host_id.clone())]) });
     let mut servers = vec![tender::ssh::Server::bind(links.paths[&host_id].clone(), host_identity, host.clone()).expect("host listener")];
     for relay in relays {
         let policy = MemoryTender::new(fp(relay));

@@ -12,37 +12,19 @@ use sha2::{Digest, Sha256};
 use tender::{
     memory::MemoryTender,
     ssh::{Identity, Server, SshTender},
-    ByteStream, Dial, Error, Fingerprint, Grant, Namespace, PublishRequest, Router, Session, Tender,
+    Error, Fingerprint, Grant, Namespace, PublishRequest, Session, Tender,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::UnixStream,
     time::timeout,
 };
 
+#[path = "common/links.rs"]
+mod links;
+use links::Links;
+
 fn identity(label: &str) -> Identity {
     Identity::from_secret(Sha256::digest(label.as_bytes()).into())
-}
-
-/// Stands in for one instance's links to the others: every listener path,
-/// and this instance's choice of next hop toward each host.
-struct Links {
-    paths: Arc<BTreeMap<Fingerprint, PathBuf>>,
-    next: BTreeMap<Fingerprint, Fingerprint>,
-}
-
-#[async_trait::async_trait]
-impl Dial for Links {
-    async fn dial(&self, instance: &Fingerprint) -> std::io::Result<ByteStream> {
-        let path = self.paths.get(instance).ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
-        Ok(Box::new(UnixStream::connect(path).await?))
-    }
-}
-
-impl Router for Links {
-    fn next_hop(&self, host: &Fingerprint) -> Option<Fingerprint> {
-        self.next.get(host).cloned()
-    }
 }
 
 /// One relay in a generated chain: whether it admits the instance before it,

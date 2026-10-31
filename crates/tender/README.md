@@ -63,16 +63,24 @@ not withdraw a healthy host-side publication.
 A session naming a relay in `Session::via` dials that relay, pins it with the
 caller's own handshake, and asks it to carry the stream to the pinned host.
 The relay admits callers holding connect authority in its own policy, then
-authenticates to the next instance as itself; `Server::route_relays` supplies
-the hosting application's `Router`, which names each next hop and dials it.
-Tender never stores or learns routes. The host accepts only a relay it trusts
-(`trust_intermediary`), records it as the session's `via` from the relay's own
-handshake, and then authenticates the caller end to end over the splice. In a
-chain the host sees only the relay that delivered the caller, and trusting an
-earlier relay is not enough. A chain is bounded at eight hops, so a routing
-loop fails as Unavailable. Relays see plaintext: each link's transport, such as
-SSH, provides confidentiality. Container outward publication is slice 3. Windows
-local adapters and Flotilla resource consumption are later slices. See the
+authenticates to the next instance as itself. `Server::route_relays` supplies
+the hosting application's `Router`, which names each next hop and dials it;
+Tender never stores or learns routes. A single-path `UnixDial` cannot reach a
+distinct relay, so relayed sessions need a dialer that resolves instances.
+
+The host accepts only a relay it trusts (`trust_intermediary`), records it as
+the session's `via` from the relay's own handshake, and then authenticates the
+caller end to end over the splice. In a chain the host sees only the relay that
+delivered the caller; trusting an earlier relay is not enough. A chain is
+bounded at eight hops, so a routing loop fails as Unavailable. Refusals reach
+the caller unchanged, while a hop that stalls surfaces as the caller's own
+Deadline. Like a direct connect, an open relayed stream has no idle bound and
+holds a channel permit until either side closes; idle policy belongs to the
+hosting application. Relays see plaintext: each link's transport, such as SSH,
+provides confidentiality.
+
+Container outward publication is slice 3. Windows local adapters and Flotilla
+resource consumption are later slices. See the
 [cleat client-path research and pending proof](../../docs/research/tender-ssh-cleat-client-paths.md)
 for real-SSH checks and the installed CLI's connect-only limitations.
 

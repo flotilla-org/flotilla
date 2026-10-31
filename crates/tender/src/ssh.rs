@@ -477,7 +477,10 @@ async fn serve(
 
 /// Relay one stream toward `host`, authenticating to the next instance as this
 /// one. After `Open` the stream is a byte splice: the caller's handshake and
-/// every later byte pass through unread.
+/// every later byte pass through unread. Like a direct connect, an open splice
+/// has no idle bound and holds one channel permit until either side closes;
+/// idle policy belongs to the hosting application. Refusals reach the caller
+/// unchanged, but a hop that stalls surfaces as the caller's own `Deadline`.
 async fn forward(
     mut upstream: impl AsyncRead + AsyncWrite + Unpin,
     identity: &Identity,
@@ -674,7 +677,9 @@ type ExposureMap = BTreeMap<(Fingerprint, PublicationId), Arc<LocalExposure>>;
 type Exposures = Arc<Mutex<ExposureMap>>;
 
 /// Dials one Unix socket path whichever instance is named, such as an OpenSSH
-/// stream-local forward or a host's own Tender listener.
+/// stream-local forward or a host's own Tender listener. A single path cannot
+/// reach a distinct relay: a session naming one in `via` fails as
+/// `IdentityMismatch` when the host answers instead.
 pub struct UnixDial(pub PathBuf);
 
 #[async_trait]
@@ -724,6 +729,8 @@ impl Drop for LocalExposure {
 }
 
 impl SshTender {
+    /// Dial one socket path. It reaches only the pinned host, never a relay a
+    /// session names in `via`; use [`Self::with_dial`] for relayed sessions.
     pub fn new(route: PathBuf, pin: Fingerprint, identities: Vec<Identity>) -> io::Result<Self> {
         Self::with_dial(Arc::new(UnixDial(route)), pin, identities)
     }
