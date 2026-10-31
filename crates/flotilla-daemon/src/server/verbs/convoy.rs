@@ -46,6 +46,7 @@ impl Subjects for ResourceSubjects {
             query_resource_kind(&self.backend, &self.namespace().await, "convoys", &query).await.map_err(|error| error.to_string())?;
         let row = tables::resource_rows(&document, &table)?.into_iter().next();
         // A convoy under a project is that project's: `project:other/convoy:c` names no convoy of `flotilla`.
+        // The `convoys` table keeps `spec` as one whole-object column, so `project_ref` is read inside it.
         Ok(row.filter(|row| {
             address
                 .get(Kind::Project)

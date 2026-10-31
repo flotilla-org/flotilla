@@ -39,6 +39,16 @@ struct Move {
     to: Address,
 }
 
+#[derive(Verb)]
+#[verb(name = "convoy.retry", subject = "convoy", effect = "write")]
+#[expect(dead_code, reason = "only its derived declaration is used")]
+struct Retry {
+    #[param(default = "lots")]
+    times: Option<i64>,
+    #[param(options("a", "b"), default = "c")]
+    style: Option<String>,
+}
+
 struct Handler(fn() -> VerbDeclaration);
 
 #[async_trait]
@@ -78,6 +88,7 @@ fn the_load_check_lists_broken_verbs_with_their_reasons() {
         Arc::new(Handler(Peek::declaration)),
         Arc::new(Handler(PeekVessel::declaration)),
         Arc::new(Handler(Move::declaration)),
+        Arc::new(Handler(Retry::declaration)),
     ];
     let presentations = vec![
         Presentation { verb: "convoy.wipe", when: vec![".status.nothing == x", "status.phase"], ..Presentation::default() },
@@ -100,8 +111,12 @@ fn the_load_check_lists_broken_verbs_with_their_reasons() {
     assert_eq!(peek, "the verb takes one subject at a time, so it cannot pick a set; another `convoy` verb is already the default");
     assert_eq!(broken(&catalog, "convoy.move").expect("broken"), "parameter `to` needs #[param(subject = \"<address kind>\")]");
     assert_eq!(broken(&catalog, "vessel.peek").expect("broken"), "no table serves `vessel` subjects");
+    assert_eq!(
+        broken(&catalog, "convoy.retry").expect("broken"),
+        "parameter `times`: default `lots` does not parse as integer; parameter `style`: default `c`: expected enum"
+    );
     let (verbs, params) = catalog.rows();
-    assert_eq!(verbs.len(), 4);
+    assert_eq!(verbs.len(), 5);
     let peek = verbs.iter().find(|row| row["name"] == "convoy.peek").expect("row");
     assert_eq!(peek["reads"], serde_json::json!(["metadata.name"]));
     assert_eq!(peek["label"], "Peek");

@@ -12,7 +12,10 @@ use flotilla_protocol::table::Row;
 use flotilla_schema::{ColumnType, Layout, ParamType, Table, TableRole, TableSet, VerbDeclaration, VerbEffect};
 use serde_json::{json, Map, Value};
 
-use super::when::{confirm_columns, Condition};
+use super::{
+    invoke::literal,
+    when::{confirm_columns, Condition},
+};
 
 /// How a verb takes the rows it is offered (#4182 ruling 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -288,6 +291,11 @@ fn check(entry: &Entry, subjects: &dyn Subjects) -> Vec<String> {
             }
             ParamType::Enum if param.options.is_empty() => problems.push(format!("enum parameter `{}` lists no options", param.name)),
             _ => {}
+        }
+        if let Some(default) = param.default.filter(|default| !default.starts_with("$row.")) {
+            if let Err(error) = literal(param, default) {
+                problems.push(format!("parameter `{}`: {error}", param.name));
+            }
         }
     }
     if let Some(table) = &table {

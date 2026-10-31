@@ -70,6 +70,24 @@ impl NativeVerb for Counted {
     }
 }
 
+/// A read verb that answers nothing.
+#[derive(Verb)]
+#[verb(name = "convoy.look", subject = "convoy", effect = "read")]
+struct Look {}
+
+struct Looked;
+
+#[async_trait]
+impl NativeVerb for Looked {
+    fn declaration(&self) -> VerbDeclaration {
+        Look::declaration()
+    }
+
+    async fn run(&self, _subjects: &[Subject], _params: &Map<String, Value>, _invocation: &str) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
+}
+
 /// Convoy rows by address, with the `convoys` table's columns.
 struct Rows(BTreeMap<String, Row>);
 
@@ -108,7 +126,7 @@ fn fixture() -> Fixture {
         ..Presentation::default()
     };
     let catalog = Catalog::new(
-        vec![Arc::new(Counted { runs: Arc::clone(&runs), touched: Arc::clone(&touched) })],
+        vec![Arc::new(Counted { runs: Arc::clone(&runs), touched: Arc::clone(&touched) }), Arc::new(Looked)],
         vec![presentation],
         subjects.as_ref(),
     );
@@ -156,13 +174,15 @@ async fn rows(router: &Router, path: &str) -> Vec<Row> {
 }
 
 // Behaviour (#4197): a native verb appears in `verbs` with its declaration and presentation, and
-// its parameters in `verbs_params`, keyed by verb and name; `where` filters the derived rows.
+// its parameters in `verbs_params`, keyed by verb and name; `where`, `sort` and `limit` apply to
+// the derived rows as to any table's.
 #[tokio::test]
 async fn the_verbs_table_lists_native_verbs_and_their_parameters() {
     let Fixture { router, .. } = fixture();
     let verbs = rows(&router, "/tables/verbs/rows").await;
-    assert_eq!(verbs.len(), 1);
-    let verb = &verbs[0];
+    let names = |rows: &[Row]| rows.iter().map(|row| row["name"].clone()).collect::<Vec<_>>();
+    assert_eq!(names(&verbs), [json!("convoy.look"), json!("convoy.touch")], "sorted by name by default");
+    let verb = &verbs[1];
     assert_eq!(verb["name"], "convoy.touch");
     assert_eq!(verb["subject"], "convoy");
     assert_eq!(verb["label"], "Touch convoy");
@@ -176,7 +196,10 @@ async fn the_verbs_table_lists_native_verbs_and_their_parameters() {
     assert_eq!(params.len(), 1);
     assert_eq!((&params[0]["verb"], &params[0]["name"], &params[0]["type"]), (&json!("convoy.touch"), &json!("note"), &json!("text")));
     assert_eq!(params[0]["required"], false);
-    assert!(rows(&router, "/tables/verbs/rows?where=.effect%20%3D%3D%20read").await.is_empty());
+    assert_eq!(names(&rows(&router, "/tables/verbs/rows?where=.effect%20%3D%3D%20read").await), [json!("convoy.look")]);
+    assert_eq!(names(&rows(&router, "/tables/verbs/rows?sort=-name").await), [json!("convoy.touch"), json!("convoy.look")]);
+    let paged = rows(&router, "/tables/verbs/rows?sort=-effect&limit=1").await;
+    assert_eq!(names(&paged), [json!("convoy.touch")], "write sorts after read, so first descending");
     let (status, listed) = send(&router, CallerAuth::Bearer, "GET", "/tables", None).await;
     assert_eq!(status, StatusCode::OK);
     let listed: Value = serde_json::from_slice(&listed).unwrap();
@@ -328,11 +351,15 @@ async fn requests_that_do_not_fit_the_verb_are_refused_whole() {
         let (answered, _) = invoke(&router, caller, "convoy.touch", json!({"invocation": "x", "subjects": [RUNNING]})).await;
         assert_eq!(answered, status);
     }
+    // The router's default body limit applies to the route.
+    let huge = json!({"invocation": "x", "subjects": [RUNNING], "params": {"note": "x".repeat(3 * 1024 * 1024)}});
+    let (status, _) = send(&router, CallerAuth::Bearer, "POST", "/verbs/convoy.touch", Some(huge)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(runs.load(Ordering::SeqCst), 0);
 }
 
 // Behaviour (#4197, operator check): the built-in catalog lists `convoy.explain`, unbroken, and it
-// runs through the route over the daemon's own convoy.
+// runs through the route over the daemon's own convoy, by a bare or project-qualified address.
 #[tokio::test]
 async fn convoy_explain_is_listed_and_runs_through_the_route() {
     let (_dir, daemon) = super::super::tests::empty_daemon().await;
@@ -340,7 +367,10 @@ async fn convoy_explain_is_listed_and_runs_through_the_route() {
     daemon
         .resource_backend()
         .using::<Convoy>(&namespace)
-        .create(&InputMeta::builder().name("explained".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+        .create(
+            &InputMeta::builder().name("explained".into()).build(),
+            &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).build(),
+        )
         .await
         .unwrap();
     let router =
@@ -354,4 +384,18 @@ async fn convoy_explain_is_listed_and_runs_through_the_route() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["outcomes"][0]["status"], "done", "{body}");
     assert!(body["outcomes"][0]["result"].is_object(), "{body}");
+    // A project-qualified address names the convoy only under its own project.
+    let (status, body) = invoke(
+        &router,
+        CallerAuth::Bearer,
+        "convoy.explain",
+        json!({"invocation": "p", "subjects": ["project:flotilla/convoy:explained", "project:other/convoy:explained"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcomes"][0]["status"], "done", "{body}");
+    assert_eq!(
+        body["outcomes"][1],
+        json!({"subject": "project:other/convoy:explained", "status": "failed", "error": "no convoy at `project:other/convoy:explained`"})
+    );
 }

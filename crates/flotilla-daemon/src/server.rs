@@ -13,7 +13,7 @@ mod replication;
 mod request_dispatch;
 mod shared;
 mod tables;
-pub mod verbs;
+mod verbs;
 
 pub use http::{HookEndpoint, HookLaunch};
 

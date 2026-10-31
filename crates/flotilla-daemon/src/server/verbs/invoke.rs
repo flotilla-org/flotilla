@@ -210,7 +210,10 @@ fn checked_params(declared: &[ParamDeclaration], given: &Map<String, Value>) -> 
             None => match param.default {
                 Some(default) if default.starts_with("$row.") => {}
                 Some(default) => {
-                    params.insert(param.name.into(), literal(param, default));
+                    // The load check refused a verb whose literal default does not fit.
+                    let value =
+                        literal(param, default).map_err(|error| Refusal::Conflict(format!("parameter `{}`: {error}", param.name)))?;
+                    params.insert(param.name.into(), value);
                 }
                 None if param.required => return Err(Refusal::Invalid(format!("parameter `{}` is required", param.name))),
                 None => {}
@@ -239,12 +242,17 @@ fn check_type(param: &ParamDeclaration, value: &Value) -> Result<(), String> {
     }
 }
 
-/// A literal default as its parameter's JSON value.
-fn literal(param: &ParamDeclaration, default: &str) -> Value {
-    match param.ty {
-        ParamType::Integer | ParamType::Number | ParamType::Bool => serde_json::from_str(default).unwrap_or_else(|_| Value::from(default)),
+/// A literal default as its parameter's JSON value, once it fits the parameter's type. The load
+/// check runs this for every literal default, so a verb with one that does not fit is broken.
+pub(super) fn literal(param: &ParamDeclaration, default: &str) -> Result<Value, String> {
+    let value = match param.ty {
+        ParamType::Integer | ParamType::Number | ParamType::Bool => {
+            serde_json::from_str(default).map_err(|_| format!("default `{default}` does not parse as {}", param.ty.as_str()))?
+        }
         _ => Value::from(default),
-    }
+    };
+    check_type(param, &value).map_err(|error| format!("default `{default}`: {error}"))?;
+    Ok(value)
 }
 
 /// `params` with each unset `$row.<column>` default bound from `subject`'s row.
