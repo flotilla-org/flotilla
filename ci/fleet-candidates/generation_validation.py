@@ -600,6 +600,9 @@ def validate_typescript_host(bundle):
     for path in tree.rglob("*"):
         if path.is_symlink():
             raise ValidationError(f"drydock TypeScript host entry is a symlink: {path.relative_to(bundle)}")
+        # The tree is pure JS: Darwin signing covers no native code inside it.
+        if path.suffix == ".node":
+            raise ValidationError(f"drydock TypeScript host carries native code: {path.relative_to(bundle)}")
 
 
 def validate_codex_home_template(root):

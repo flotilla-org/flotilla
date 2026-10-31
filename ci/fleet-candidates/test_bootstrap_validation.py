@@ -92,6 +92,10 @@ class BootstrapValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(validation.ValidationError, "symlink"):
             validation.validate_typescript_host(self.root)
         (tree / "node_modules" / "dep" / "link").unlink()
+        (tree / "node_modules" / "dep" / "addon.node").write_bytes(b"")
+        with self.assertRaisesRegex(validation.ValidationError, "native code"):
+            validation.validate_typescript_host(self.root)
+        (tree / "node_modules" / "dep" / "addon.node").unlink()
         shutil.rmtree(tree / "node_modules")
         with self.assertRaisesRegex(validation.ValidationError, "production dependencies"):
             validation.validate_typescript_host(self.root)
