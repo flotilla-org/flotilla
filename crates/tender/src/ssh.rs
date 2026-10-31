@@ -512,6 +512,10 @@ async fn forward(
         .map_err(|_| Error::Deadline)?
     }
     .await;
+    // A failed open drops the downstream stream, with any partial handshake,
+    // and reports only the classified error upstream. Once spliced, a transport
+    // error ends this connection's task and closes both sides; there is no
+    // channel left on which to report it.
     match opened {
         Ok(mut downstream) => {
             write_control(&mut upstream, &Response::Open).await?;
