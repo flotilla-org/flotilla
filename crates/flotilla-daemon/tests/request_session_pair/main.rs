@@ -515,12 +515,16 @@ async fn finalizer_oracle_detects_a_stuck_registered_resource() {
     assert!(detected.is_err_and(|error| error.is_panic()), "orphaned finalizer escaped registry scan");
 }
 
+// Placement scenarios author Host capacity, a FulfilmentKind, and the admitted Convoy.
+// Replicating only those keeps each rebuilt generated mesh off unrelated watch fanout.
+const PLACEMENT_KINDS: &[&str] = &[Host::API_PATHS.kind, FulfilmentKind::API_PATHS.kind, Convoy::API_PATHS.kind];
+
 async fn paired_world_trace(home_index: usize, issuer_index: usize) -> Vec<String> {
     let hosts = vec![empty_daemon_named("pair-a").await, empty_daemon_named("pair-b").await, empty_daemon_named("pair-c").await];
     let home = Arc::clone(&hosts[home_index]);
     seed_host_capacity(&home, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
     home.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
-    let mesh = spawn_in_memory_request_mesh(hosts).await.expect("paired world mesh");
+    let mesh = spawn_in_memory_request_mesh_with_replication_kinds(hosts, Some(PLACEMENT_KINDS)).await.expect("paired world mesh");
     let host_id = home.local_host_id().expect("home id").to_string();
     let policy_name = format!("host-direct-{host_id}");
     home.resource_backend()
@@ -682,17 +686,20 @@ fn cross_host_request_fits_one_megabyte_stack() {
         .expect("cross-host request exceeded the 1 MB worker stack");
 }
 
-#[hegel::test]
-fn generated_paired_world_host_independence(tc: hegel::TestCase) {
-    let home = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
-    let offset = tc.draw(gs::integers::<usize>().min_value(1).max_value(2));
-    let remote = (home + offset) % 3;
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
-    runtime.block_on(async {
-        let at_home = paired_world_trace(home, home).await;
-        let remote_desk = paired_world_trace(home, remote).await;
-        assert_eq!(remote_desk, at_home, "home={home}, remote={remote}");
-    });
+// The home x remote-issuer domain has six pairs, so enumerate all of them and
+// trace each home's at-home baseline once.
+#[test]
+fn paired_world_host_independence_over_every_home_and_issuer() {
+    for home in 0..3 {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
+        runtime.block_on(async {
+            let at_home = paired_world_trace(home, home).await;
+            for remote in (0..3).filter(|remote| *remote != home) {
+                let remote_desk = paired_world_trace(home, remote).await;
+                assert_eq!(remote_desk, at_home, "home={home}, remote={remote}");
+            }
+        });
+    }
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -926,7 +933,9 @@ fn generated_session_lookup_covers_remote_home_for_local_only_fault_model() {
                     empty_daemon_named("session-b").await,
                     empty_daemon_named("session-c").await,
                 ];
-                let mesh = spawn_in_memory_request_mesh(hosts).await.expect("request mesh");
+                let mesh = spawn_in_memory_request_mesh_with_replication_kinds(hosts, Some(&[TerminalSession::API_PATHS.kind]))
+                    .await
+                    .expect("request mesh");
                 let name = "remote-session";
                 mesh.hosts[home]
                     .resource_backend()
@@ -974,7 +983,7 @@ fn generated_admission_covers_remote_placement_for_origin_first_fault_model() {
                 ];
                 let placement = Arc::clone(&hosts[placement_index]);
                 seed_host_capacity(&placement, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
-                let mesh = spawn_in_memory_request_mesh(hosts).await.expect("request mesh");
+                let mesh = spawn_in_memory_request_mesh_with_replication_kinds(hosts, Some(PLACEMENT_KINDS)).await.expect("request mesh");
                 let host_id = placement.local_host_id().expect("placement host id").to_string();
                 let policy_name = format!("host-direct-{host_id}");
                 placement
@@ -1170,7 +1179,7 @@ async fn codex_version_admission_row(issuer_index: usize, minor: u32) {
             .await
             .expect("agent workflow");
     }
-    let mesh = spawn_in_memory_request_mesh(hosts).await.expect("mesh");
+    let mesh = spawn_in_memory_request_mesh_with_replication_kinds(hosts, Some(PLACEMENT_KINDS)).await.expect("mesh");
     eventually(Duration::from_secs(5), Duration::from_millis(10), "Codex placement replicated", || async {
         let issuer = mesh.hosts[issuer_index].resource_backend();
         issuer.including_replicas::<Host>("flotilla").get(&host_id).await.is_ok()
@@ -1243,7 +1252,7 @@ fn generated_convoy_admission_is_homed_on_placement(tc: hegel::TestCase) {
         let placement = Arc::clone(&hosts[placement_index]);
         seed_host_capacity(&placement, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
         placement.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
-        let mesh = spawn_in_memory_request_mesh(hosts).await.expect("request mesh");
+        let mesh = spawn_in_memory_request_mesh_with_replication_kinds(hosts, Some(PLACEMENT_KINDS)).await.expect("request mesh");
         let host_id = placement.local_host_id().expect("placement host identity").to_string();
         let policy_name = format!("host-direct-{host_id}");
         placement
@@ -2597,8 +2606,14 @@ impl IssueProvider for MockIssueProvider {
 async fn fleet_post_install_target_scenario(remote: bool, background_events: usize) {
     const BACKGROUND_COMMAND_ID: u64 = u64::MAX;
 
-    let topology =
-        spawn_in_memory_request_topology(empty_daemon_named("leader").await, empty_daemon_named("follower").await).await.expect("topology");
+    // Post-install reads no replicated records; Host alone keeps peer identity live.
+    let topology = spawn_in_memory_request_topology_with_replication_kinds(
+        empty_daemon_named("leader").await,
+        empty_daemon_named("follower").await,
+        &[Host::API_PATHS.kind],
+    )
+    .await
+    .expect("topology");
     let directory = tempfile::tempdir().expect("diagnostics directory");
     let command = Command::builder()
         .node_id(if remote { topology.follower.node_id().clone() } else { topology.leader.node_id().clone() })
@@ -3355,7 +3370,21 @@ async fn lagging_start_placement_scenario(explicit: bool, destination_holds_cred
         .await
         .expect("publish feta credential self-report");
 
-    let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
+    // Replicate the records admission reads at either end; the rest of the fleet is unrelated.
+    let topology = spawn_in_memory_request_topology_with_replication_kinds(
+        leader,
+        follower,
+        &[
+            Host::API_PATHS.kind,
+            FulfilmentKind::API_PATHS.kind,
+            flotilla_resources::Project::API_PATHS.kind,
+            WorkflowTemplate::API_PATHS.kind,
+            CredentialSpec::API_PATHS.kind,
+            CredentialGrant::API_PATHS.kind,
+        ],
+    )
+    .await
+    .expect("spawn stateful topology");
     let namespace = "flotilla";
     let placement_policy = format!("host-direct-{remote_host_id}");
     seed_target_fulfilment_kind(&topology, namespace, &placement_policy).await;
@@ -3525,15 +3554,20 @@ async fn automatic_start_destination_refuses_capacity_with_lagging_replica() {
     lagging_start_placement_scenario(false, true, false).await;
 }
 
-// Generator spans both routing choices and destination credential/capacity boundaries.
+// Enumerate both routing choices and destination credential/capacity boundaries:
+// the eight rows are fewer than a generated budget would draw.
 // Every scenario checks the router, request dispatch, result, and authored stores.
-#[hegel::test]
-fn generated_start_placement_with_lagging_replicas(tc: hegel::TestCase) {
-    let explicit = tc.draw(gs::booleans());
-    let destination_holds_credential = tc.draw(gs::booleans());
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
-    let destination_has_capacity = tc.draw(gs::booleans());
-    runtime.block_on(lagging_start_placement_scenario(explicit, destination_holds_credential, destination_has_capacity));
+#[test]
+fn start_placement_with_lagging_replicas_every_row() {
+    for explicit in [false, true] {
+        for destination_holds_credential in [false, true] {
+            for destination_has_capacity in [false, true] {
+                let runtime =
+                    tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
+                runtime.block_on(lagging_start_placement_scenario(explicit, destination_holds_credential, destination_has_capacity));
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -3887,9 +3921,15 @@ struct SupervisionScenario {
 
 async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
     let SupervisionScenario { subscriptions, legacy_cursor, unavailable, passes, source_remote, stale_home } = scenario;
-    let topology = spawn_in_memory_request_topology_stateful(empty_daemon_named("host-a").await, empty_daemon_named("host-b").await)
-        .await
-        .expect("router topology");
+    // The scenario writes its Convoy, session, and presence replicas by hand to
+    // model visibility lag, so the router replicates only Host identity.
+    let topology = spawn_in_memory_request_topology_with_replication_kinds(
+        empty_daemon_named("host-a").await,
+        empty_daemon_named("host-b").await,
+        &[Host::API_PATHS.kind],
+    )
+    .await
+    .expect("router topology");
     let (a, b) = if source_remote { (&topology.follower, &topology.leader) } else { (&topology.leader, &topology.follower) };
     for (daemon, name, vessel, role, crew_id) in
         [(a, "stalled-work", "work", "coder", "coder-id"), (b, "governor", "govern", "governor", "governor-id")]

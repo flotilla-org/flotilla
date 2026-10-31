@@ -2,10 +2,14 @@
 """Keep production free of testkits and package-local test feature selections reusable."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
+import os
+import queue
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
 
 # ADR 0060 step 2: these isolated production graphs must remain C-free.
@@ -274,6 +278,45 @@ def feature_differences(workspace, selected):
     return errors
 
 
+def isolated_cargo_home(source, destination):
+    # Cargo holds an exclusive package-cache lock in CARGO_HOME for every resolution, which
+    # serialises concurrent `cargo tree` runs. A private home that links the shared registry,
+    # Git checkouts and config, but not the lock files or the global-cache tracker, lets each
+    # worker resolve alone. Offline mode keeps workers from writing to the shared registry.
+    for entry in source.iterdir():
+        if entry.name not in {".package-cache", ".package-cache-mutate", ".global-cache"}:
+            (destination / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+    return {**os.environ, "CARGO_HOME": str(destination), "CARGO_NET_OFFLINE": "true"}
+
+
+def concurrent_trees(cargo, requests):
+    """Run independent `cargo tree` requests concurrently, returning parsed trees in request order."""
+    workers = min(len(requests), os.cpu_count() or 4) or 1
+    source = Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo")
+    with tempfile.TemporaryDirectory(prefix="build-graph-") as scratch:
+        homes = queue.SimpleQueue()
+        for index in range(workers):
+            home = Path(scratch, str(index))
+            home.mkdir()
+            try:
+                homes.put(isolated_cargo_home(source, home) if source.is_dir() else None)
+            except OSError as error:
+                # Without symlinks (unprivileged Windows) workers share the home and its lock.
+                if index == 0:
+                    print(f"build-graph: shared cargo home, resolutions run serially ({error})", file=sys.stderr)
+                homes.put(None)
+
+        def run(arguments):
+            env = homes.get()
+            try:
+                return tree_features(cargo(*arguments, env=env))
+            finally:
+                homes.put(env)
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(run, requests))
+
+
 def main(arguments=()):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", help="Cargo target triple for both layer and package feature trees (default: host)")
@@ -281,36 +324,44 @@ def main(arguments=()):
     target_arguments = ("--target", options.target) if options.target else ()
     root = Path(__file__).resolve().parents[2]
 
-    def cargo(*arguments):
-        return subprocess.run(["cargo", "--color", "never", *arguments], cwd=root, check=True, capture_output=True, text=True).stdout
+    def cargo(*arguments, env=None):
+        return subprocess.run([os.environ.get("CARGO", "cargo"), "--color", "never", *arguments], cwd=root, check=True, capture_output=True,
+                              text=True, env=env).stdout
 
+    # Unfiltered metadata resolves and downloads every package for every platform. It must run
+    # first: the concurrent trees below resolve offline from the cache it fills.
     metadata = json.loads(cargo("metadata", "--locked", "--format-version", "1"))
     errors = violations(metadata)
     tree_arguments = ("tree", "--locked", "--prefix", "none", "--format", "{p}|{f}")
-    vessel = tree_features(cargo(*tree_arguments, "-p", "flotilla-cli", "--edges", "normal,build", *target_arguments))
-    errors.extend(vessel_graph_violations(vessel))
     members = [package for package in metadata["packages"] if package["id"] in metadata["workspace_members"]]
-    # Resolver 2 unifies dependency features within a command. Compare to
-    # the union of consumers in the same layer, not the unrelated native stack.
-    workspace = {}
+    requests = [("vessel", (*tree_arguments, "-p", "flotilla-cli", "--edges", "normal,build", *target_arguments))]
     for group in ("base", "native"):
         selection = [argument for package in members if layer(package["name"]) == group
                      for argument in ("-p", package["name"])]
         if selection:
             for edges in ("normal,build", "normal,build,dev"):
-                workspace[group, edges] = tree_features(cargo(*tree_arguments, *selection, "--edges", edges, *target_arguments))
-    for package in metadata["packages"]:
-        if package["id"] not in metadata["workspace_members"]:
-            continue
+                requests.append((("layer", group, edges), (*tree_arguments, *selection, "--edges", edges, *target_arguments)))
+    for package in members:
         if package["name"] in C_FREE_BASE:
             # cargo tree resolves metadata only: Windows std need not be installed.
-            windows = tree_features(cargo(*tree_arguments, "-p", package["name"], "--edges", "normal,build",
-                                          "--target", "x86_64-pc-windows-gnu"))
-            errors.extend(c_free_violations(package["name"], windows))
+            requests.append((("windows", package["name"]), (*tree_arguments, "-p", package["name"], "--edges", "normal,build",
+                                                           "--target", "x86_64-pc-windows-gnu")))
         for edges in ("normal,build", "normal,build,dev"):
             if edges == "normal,build" and is_testkit(package["name"]):
                 continue
-            selected = tree_features(cargo(*tree_arguments, "-p", package["name"], "--edges", edges, *target_arguments))
+            requests.append((("package", package["name"], edges), (*tree_arguments, "-p", package["name"], "--edges", edges, *target_arguments)))
+    trees = dict(zip((key for key, _ in requests), concurrent_trees(cargo, [arguments for _, arguments in requests])))
+    errors.extend(vessel_graph_violations(trees["vessel"]))
+    # Resolver 2 unifies dependency features within a command. Compare to
+    # the union of consumers in the same layer, not the unrelated native stack.
+    workspace = {key[1:]: tree for key, tree in trees.items() if key[0] == "layer"}
+    for package in members:
+        if package["name"] in C_FREE_BASE:
+            errors.extend(c_free_violations(package["name"], trees["windows", package["name"]]))
+        for edges in ("normal,build", "normal,build,dev"):
+            if edges == "normal,build" and is_testkit(package["name"]):
+                continue
+            selected = trees["package", package["name"], edges]
             if edges == "normal,build":
                 for dependency, contexts in selected.items():
                     if dependency.startswith("tokio v") and any("test-util" in features for features in contexts):

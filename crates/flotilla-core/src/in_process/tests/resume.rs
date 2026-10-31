@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::HostName;
 use flotilla_resources::{
-    external_patches as convoy_external_patches, Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState,
+    external_patches as convoy_external_patches, Clock, Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState,
     InputMeta, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus as ResourceTerminalSessionStatus,
     CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
@@ -95,6 +95,20 @@ async fn resume_retries_a_racing_session_write_after_staging() {
         .items
         .iter()
         .any(|message| message.spec.body.contains("continue")));
+}
+
+/// System time plus an offset the test only ever moves forward.
+#[derive(Default)]
+struct SkippingClock(std::sync::Mutex<chrono::Duration>);
+impl SkippingClock {
+    fn skip(&self, by: chrono::Duration) {
+        *self.0.lock().expect("clock offset") += by;
+    }
+}
+impl Clock for SkippingClock {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() + *self.0.lock().expect("clock offset")
+    }
 }
 
 #[tokio::test]
@@ -313,12 +327,16 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     let sessions = backend.using::<ResourceTerminalSession>("flotilla");
     let restart_config = tempfile::tempdir().expect("restart config");
     std::fs::write(restart_config.path().join("daemon.toml"), "machine_id = \"resume-staging-test\"\n").expect("daemon config");
-    daemon = InProcessDaemon::new_with_resource_backend(
+    // The restarted daemon's wall clock runs ahead on demand, so attention
+    // debounces elapse without real waiting; the test stamps from the same clock.
+    let clock = Arc::new(SkippingClock::default());
+    daemon = InProcessDaemon::new_with_resource_backend_and_clock(
         Vec::new(),
         Arc::new(ConfigStore::with_base(restart_config.path())),
         fake_discovery(false),
         HostName::new("test-host"),
         backend.clone(),
+        clock.clone(),
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
@@ -379,7 +397,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
                 phase: ResourceTerminalSessionPhase::Running,
                 attention: Some(TerminalAttention {
                     state: TerminalAttentionState::Idle,
-                    as_of: chrono::Utc::now(),
+                    as_of: clock.now(),
                     source: TerminalAttentionSource::Hook,
                 }),
                 ..Default::default()
@@ -391,7 +409,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         "resume-staging".to_string(),
         "work".to_string(),
         "coder".to_string(),
-        chrono::Utc::now(),
+        clock.now(),
         flotilla_resources::StallReason::Access,
         None,
         "repository permission still missing".to_string(),
@@ -399,6 +417,8 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     apply_resource_status_patch(&convoys, "resume-staging", &patch).await.expect("stall again");
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
+            // Skip through the idle governor's attention debounce at ten times real speed.
+            clock.skip(chrono::Duration::milliseconds(500));
             let status = convoys.get("resume-staging").await.expect("source").status.expect("status");
             if status
                 .stalled
@@ -418,7 +438,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         &convoy_external_patches::resume_crew_work(
             "work".to_string(),
             "coder".to_string(),
-            chrono::Utc::now(),
+            clock.now(),
             "implicit stall test".to_string(),
             None,
             ResumeIntent::Reopen,
@@ -435,7 +455,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
                 phase: ResourceTerminalSessionPhase::Running,
                 attention: Some(TerminalAttention {
                     state: TerminalAttentionState::Working,
-                    as_of: chrono::Utc::now(),
+                    as_of: clock.now(),
                     source: TerminalAttentionSource::Hook,
                 }),
                 ..Default::default()
@@ -452,7 +472,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
                 phase: ResourceTerminalSessionPhase::Running,
                 attention: Some(TerminalAttention {
                     state: TerminalAttentionState::NeedsInput,
-                    as_of: chrono::Utc::now(),
+                    as_of: clock.now(),
                     source: TerminalAttentionSource::Hook,
                 }),
                 ..Default::default()
@@ -484,7 +504,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
                 phase: ResourceTerminalSessionPhase::Running,
                 attention: Some(TerminalAttention {
                     state: TerminalAttentionState::Working,
-                    as_of: chrono::Utc::now(),
+                    as_of: clock.now(),
                     source: TerminalAttentionSource::Hook,
                 }),
                 ..Default::default()

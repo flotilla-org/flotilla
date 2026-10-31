@@ -170,7 +170,10 @@ async fn converged(hosts: &[Host]) {
     .expect("every host holds every home's records");
 }
 
-#[tokio::test(start_paused = true)]
+// Real time: these daemons run on SQLite, whose store calls carry deadlines
+// that a paused clock fires while the store's own thread works. A start then
+// retries its busy reads for as long as the host is loaded.
+#[tokio::test]
 async fn hosts_importing_together_end_with_every_homes_records_written_by_their_home() {
     let hosts = fleet(&["import-a", "import-b", "import-c"]).await;
     let runtimes = futures::future::join_all(hosts.iter().map(Host::start)).await;
@@ -184,13 +187,13 @@ async fn hosts_importing_together_end_with_every_homes_records_written_by_their_
     converged(&hosts).await;
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn hosts_importing_one_after_another_end_with_every_homes_records_written_by_their_home() {
     let hosts = fleet(&["staggered-a", "staggered-b", "staggered-c"]).await;
     let mut runtimes = Vec::new();
     for host in hosts.iter().rev() {
         runtimes.push(host.start().await.expect("runtime"));
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
     let _mesh = flotilla_daemon_testkit::server::spawn_in_memory_request_mesh(hosts.iter().map(|host| Arc::clone(&host.daemon)).collect())
         .await

@@ -3,6 +3,8 @@
 .idea/
 __pycache__/
 .hypothesis/
+# Hegel example databases from local property-test runs.
+.hegel/
 *.egg-info/
 .playwright-mcp/
 .claude/worktrees/

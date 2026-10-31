@@ -57,7 +57,9 @@ impl ChangeRequestTracker for CountingForgeRequests {
     }
 }
 
-#[tokio::test]
+// Paused time: nonowner reads made before the manual replication rounds wait out
+// REMOTE_READ_TIMEOUT, which auto-advance skips.
+#[tokio::test(start_paused = true)]
 async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
     use flotilla_resources::{ForgeRead, ForgeReadHeartbeat, Resource};
     let mut temps = Vec::new();

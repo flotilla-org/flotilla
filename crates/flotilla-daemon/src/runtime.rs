@@ -101,6 +101,10 @@ pub struct RuntimeOptions {
     pub namespace: String,
     pub heartbeat_interval: Duration,
     pub controller_resync_interval: Duration,
+    /// How often the local host's fulfilment facts are re-probed. Harnesses
+    /// shorten it so a kind seeded after startup is observed promptly.
+    #[builder(default = tasks::FULFILMENT_CHANGE_CHECK_INTERVAL)]
+    pub fulfilment_probe_interval: Duration,
     pub controller_supervision: ControllerSupervision,
     pub start_controllers: bool,
     pub codex_central_refresh_interval: Duration,
@@ -119,6 +123,7 @@ impl Default for RuntimeOptions {
             namespace: flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE.to_string(),
             heartbeat_interval: Duration::from_secs(30),
             controller_resync_interval: Duration::from_secs(60),
+            fulfilment_probe_interval: tasks::FULFILMENT_CHANGE_CHECK_INTERVAL,
             controller_supervision: ControllerSupervision::default(),
             start_controllers: true,
             startup_ready: None,
@@ -330,6 +335,7 @@ impl DaemonRuntime {
                 Arc::clone(&local_registry),
                 config.state_dir().as_path().join("probe-cwd"),
                 runtime_health.host_observations.clone(),
+                options.fulfilment_probe_interval,
             ),
             tokio::spawn(Arc::clone(&blob_store).run_sync()),
             tokio::spawn(run_artifact_gc(daemon.resource_backend(), options.namespace.clone(), Arc::clone(&blob_store))),

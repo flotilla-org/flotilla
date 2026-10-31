@@ -328,8 +328,9 @@ pub(super) fn spawn_local_fulfilment_probe_task(
     providers: Arc<ProviderRegistry>,
     scratch: PathBuf,
     observations: HostObservations,
+    interval: Duration,
 ) -> JoinHandle<()> {
-    spawn_periodic_task(FULFILMENT_CHANGE_CHECK_INTERVAL, PeriodicTaskStart::Immediate, move || {
+    spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
         let daemon = Arc::clone(&daemon);
         let namespace = namespace.clone();
         let profile = profile.clone();

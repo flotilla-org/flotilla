@@ -21,16 +21,13 @@ use crate::testkits::discovery::fake_discovery;
 
 // #2559: an idle reconciliation pass must neither write resources nor emit
 // events, because its runtime caller is triggered by those same watches.
-#[hegel::test]
-fn supervisor_turn_reconciliation_noop_contract(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-
-    // Generate repeated idle passes and pending/terminal Message states.
-    // Every case uses both real storage backends with new-only terminal shapes.
-    let passes = tc.draw(gs::integers::<usize>().min_value(2).max_value(4));
-    let terminal_message = tc.draw(gs::booleans());
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-    runtime.block_on(async {
+#[tokio::test]
+async fn supervisor_turn_reconciliation_noop_contract() {
+    // The whole finite domain: pending and terminal Message states, each on both real
+    // storage backends with new-only terminal shapes. Every pass is asserted idle, so
+    // the longest run of repeated passes covers the shorter ones as its prefixes.
+    let passes = 4;
+    for terminal_message in [false, true] {
         for sqlite in [false, true] {
             let temp = tempfile::tempdir().expect("contract directory");
             std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"noop-contract\"\n").expect("daemon identity");
@@ -125,9 +122,10 @@ fn supervisor_turn_reconciliation_noop_contract(tc: hegel::TestCase) {
                 status.since = Utc::now();
                 messages.update_status("input", &record.metadata.resource_version, &status).await.unwrap();
             }
-            assert_supervisor_turn_passes_are_idle(&daemon, &backend, namespace, "new-only Message", passes).await;
+            let state = if terminal_message { "new-only expired Message" } else { "new-only Message" };
+            assert_supervisor_turn_passes_are_idle(&daemon, &backend, namespace, state, passes).await;
         }
-    });
+    }
 }
 
 async fn assert_supervisor_turn_passes_are_idle(

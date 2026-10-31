@@ -26,7 +26,9 @@ use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
 
 const NAMESPACE: &str = "flotilla";
-const LONG_RUNNER_TURNS: u32 = 3;
+// Two tasks cover both a middle turn and the last one.
+const LONG_RUNNER_TURNS: u32 = 2;
+const FULFILMENT_PROBE_INTERVAL: Duration = Duration::from_millis(200);
 
 struct DummyDaemon {
     daemon: Arc<InProcessDaemon>,
@@ -62,6 +64,7 @@ impl DummyDaemon {
         #[builder(default)] agent: &str,
         #[builder(default)] environment: &str,
         #[builder(default = Duration::from_millis(200))] resync: Duration,
+        #[builder(default = Duration::from_secs(5))] heartbeat: Duration,
         #[builder(default = true)] primitives: bool,
         host: &str,
         #[builder(default)] restartable: bool,
@@ -105,8 +108,10 @@ impl DummyDaemon {
         };
         let options = RuntimeOptions {
             namespace: NAMESPACE.into(),
-            heartbeat_interval: Duration::from_secs(5),
+            heartbeat_interval: heartbeat,
             controller_resync_interval: resync,
+            // The dummy kind is seeded after startup; observe it on the next pass.
+            fulfilment_probe_interval: FULFILMENT_PROBE_INTERVAL,
             controller_supervision: supervision,
             ..RuntimeOptions::default()
         };
@@ -577,7 +582,14 @@ async fn a_missing_fleet_designation_waits_and_delivery_resumes_when_it_arrives(
         max_backoff: Duration::from_millis(10),
         ..Default::default()
     };
-    let fleet = DummyDaemon::start_with_relay().host("dummy-load").designated(false).supervision(supervision).call().await;
+    // Host health is published on the heartbeat.
+    let fleet = DummyDaemon::start_with_relay()
+        .host("dummy-load")
+        .designated(false)
+        .supervision(supervision)
+        .heartbeat(Duration::from_millis(250))
+        .call()
+        .await;
     fleet.dispatch("undesignated", CrewMix::Coder).await;
     let named = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
@@ -647,50 +659,57 @@ impl DummyDaemon {
 // Behaviour (#3938): an operator sends as the operator role of the convoy's
 // project. On the engine path a CLI message to a stalled crew and the
 // operator's ruling are each admitted and delivered to the crew's session as
-// an engine Message from that role, and the resumed engine Convoys deliver.
-// Each goes to its own stalled crew: whichever turn reaches a stalled crew
-// first resumes it, and a later one may find its session already ended.
+// an engine Message from that role, and the resumed engine Convoy delivers.
+// Each goes to its own stalled crew in its own fleet: whichever turn reaches a
+// stalled crew first resumes it, and a later one may find its session already ended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn on_the_engine_an_operators_message_and_ruling_reach_the_crew_from_the_projects_operator() {
+async fn on_the_engine_an_operators_message_reaches_the_crew_from_the_projects_operator() {
+    operator_turn_scenario("engine-noted", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn on_the_engine_an_operators_ruling_reaches_the_crew_from_the_projects_operator() {
+    operator_turn_scenario("engine-ruled", false).await;
+}
+
+async fn operator_turn_scenario(role: &str, noted: bool) {
     use flotilla_state_machines::machines::convoy::ConvoyState;
 
     let fleet = DummyDaemon::start_on_primitives(&format!("{SCENARIO_AGENT}stall_rate = 1.0\n"), "").await;
     let primitives = fleet.daemon.message_primitives().expect("engine path");
-    for (role, noted) in [("engine-noted", true), ("engine-ruled", false)] {
-        fleet.dispatch(role, CrewMix::Coder).await;
-        let convoy = fleet.wait_for_stall(role).await;
-        let engine = primitives.convoys().get(&convoy.metadata.name).expect("admitted engine Convoy");
-        assert!(matches!(engine.state(), ConvoyState::Open { .. }), "the stalled convoy remains open: {engine:?}");
-        let sent = if noted {
-            fleet
-                .execute_as_operator(CommandAction::ConvoyResume {
-                    namespace: Some(NAMESPACE.into()),
-                    name: convoy.metadata.name.clone(),
-                    prompt: "Operator note: the API is stable now.".into(),
-                    vessel: None,
-                    role: None,
-                    reopen: false,
-                })
-                .await
-        } else {
-            fleet.execute_as_operator(supervise(&convoy, CrewSupervisionAction::Resume)).await
-        };
-        assert!(!matches!(sent, CommandValue::Error { .. }), "{role}: {sent:?}");
-        fleet.wait_for_phase(role, ConvoyPhase::Landed).await;
-        fleet.assert_engine_delivered(&convoy.metadata.name);
-        let operator = format!("project:{NAMESPACE}/role:operator");
-        let coder = format!("project:{NAMESPACE}/convoy:{}/role:coder", convoy.metadata.name);
-        let from_operator: Vec<_> = primitives
-            .messages()
-            .expect("engine messages")
-            .into_iter()
-            .filter(|(_, message)| message.spec().sender.as_str() == operator && message.spec().inbox.as_str() == coder)
-            .collect();
-        assert_eq!(from_operator.len(), 1, "{role}: {from_operator:?}");
-        let (_, message) = &from_operator[0];
-        let receiver = message.state().receiver().unwrap_or_else(|| panic!("{role} delivered: {message:?}"));
-        assert!(primitives.sessions().get(&receiver.id).is_some(), "{role} received by the crew's session: {message:?}");
-    }
+    fleet.dispatch(role, CrewMix::Coder).await;
+    let convoy = fleet.wait_for_stall(role).await;
+    let engine = primitives.convoys().get(&convoy.metadata.name).expect("admitted engine Convoy");
+    assert!(matches!(engine.state(), ConvoyState::Open { .. }), "the stalled convoy remains open: {engine:?}");
+    let sent = if noted {
+        fleet
+            .execute_as_operator(CommandAction::ConvoyResume {
+                namespace: Some(NAMESPACE.into()),
+                name: convoy.metadata.name.clone(),
+                prompt: "Operator note: the API is stable now.".into(),
+                vessel: None,
+                role: None,
+                reopen: false,
+            })
+            .await
+    } else {
+        fleet.execute_as_operator(supervise(&convoy, CrewSupervisionAction::Resume)).await
+    };
+    assert!(!matches!(sent, CommandValue::Error { .. }), "{role}: {sent:?}");
+    fleet.wait_for_phase(role, ConvoyPhase::Landed).await;
+    fleet.assert_engine_delivered(&convoy.metadata.name);
+    let operator = format!("project:{NAMESPACE}/role:operator");
+    let coder = format!("project:{NAMESPACE}/convoy:{}/role:coder", convoy.metadata.name);
+    let from_operator: Vec<_> = primitives
+        .messages()
+        .expect("engine messages")
+        .into_iter()
+        .filter(|(_, message)| message.spec().sender.as_str() == operator && message.spec().inbox.as_str() == coder)
+        .collect();
+    assert_eq!(from_operator.len(), 1, "{role}: {from_operator:?}");
+    let (_, message) = &from_operator[0];
+    let receiver = message.state().receiver().unwrap_or_else(|| panic!("{role} delivered: {message:?}"));
+    assert!(primitives.sessions().get(&receiver.id).is_some(), "{role} received by the crew's session: {message:?}");
 }
 
 // Behaviour (#3938): a crew stall escalated past every supervisor reaches the
@@ -1463,10 +1482,11 @@ impl DummyDaemon {
 #[tokio::test(start_paused = true)]
 async fn on_the_engine_two_daemons_replicate_every_kind_alongside_the_old_replicator() {
     use OldInventory::{HomeLocal, Replicated};
-    let a = DummyDaemon::start_with_relay().host("engine-a").call().await;
-    let b = DummyDaemon::start_with_relay().host("engine-b").call().await;
-    a.deliver("replicated-a", CrewMix::CoderReviewer).await;
-    b.deliver("replicated-b", CrewMix::CoderReviewer).await;
+    // Replication is under test, not missed events: the production resync
+    // keeps the paused clock's controller passes, which cost real time, few.
+    let start = |host| DummyDaemon::start_with_relay().host(host).resync(RuntimeOptions::default().controller_resync_interval).call();
+    let (a, b) = tokio::join!(start("engine-a"), start("engine-b"));
+    tokio::join!(a.deliver("replicated-a", CrewMix::CoderReviewer), b.deliver("replicated-b", CrewMix::CoderReviewer));
     let _peers = flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful(Arc::clone(&a.daemon), Arc::clone(&b.daemon))
         .await
         .expect("peer runtimes");
