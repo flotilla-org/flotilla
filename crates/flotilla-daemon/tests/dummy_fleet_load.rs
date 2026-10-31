@@ -590,16 +590,18 @@ fn dummy_fleet_settings(long_runner_turns: u32) -> String {
 fn smoke_plan() -> LoadPlan {
     LoadPlan {
         running: 10,
-        warmup_ended: 0,
+        // Open the window once a convoy has landed, so turns are flowing in it
+        // however long admission takes on a loaded runner.
+        warmup_ended: 1,
         drain: Duration::from_secs(180),
         ramp_per_second: 20.0,
         dispatch_concurrency: 6,
         // The first `running` dispatches cover every mix, and the window's
         // replacements are coders. A turn takes its 1.5s delay plus the 1s
-        // delivery confirmation, so the window holds receipted turns even on a
-        // loaded runner (3s did not on four contended cores).
+        // delivery confirmation, so a window opened after warm-up holds
+        // receipted turns.
         window: Duration::from_secs(6),
-        max_ramp: Duration::from_secs(30),
+        max_ramp: Duration::from_secs(60),
         convoy_deadline: Duration::from_secs(120),
         tick: Duration::from_millis(200),
         series_every: Duration::from_secs(5),
