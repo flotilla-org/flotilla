@@ -1574,6 +1574,17 @@ impl Vcs for FlotillaVcs {
         if !self.runner.path_exists(Path::new(target)).await? {
             return Ok(());
         }
+        // A clone that never landed in a provider-made workspace root leaves
+        // it empty: there is no work to preserve.
+        let list = ["-A", "--", target];
+        if self
+            .runner
+            .run("ls", &list, Path::new("/"), &command_channel_label("ls", &list))
+            .await
+            .is_ok_and(|entries| entries.trim().is_empty())
+        {
+            return Ok(());
+        }
         match self.local_clone_is_clean(target).await {
             VcsCheck::True(_) => {}
             VcsCheck::False(details) | VcsCheck::Unknown(details) => {
@@ -1728,7 +1739,13 @@ impl Vcs for FlotillaVcs {
         base_ref: Option<&str>,
         target: &str,
     ) -> Result<CheckoutMaterialisation, String> {
-        if self.runner.path_exists(Path::new(target)).await? {
+        // A cloud vessel's provider makes its workspace root, the single
+        // repository's clone target, before the clone: an empty directory is
+        // no clone, so it is replaced.
+        let rmdir = ["--", target];
+        if self.runner.path_exists(Path::new(target)).await?
+            && !self.runner.run_output("rmdir", &rmdir, Path::new("/"), &command_channel_label("rmdir", &rmdir)).await?.success()
+        {
             let origin = self
                 .clone_origin(Path::new(target))
                 .await
@@ -3619,6 +3636,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    // A cloud provider makes the workspace root that a single repository is
+    // cloned into: an empty target directory takes the clone, any other
+    // existing non-clone still refuses.
+    #[tokio::test]
+    async fn fresh_clone_takes_an_empty_target_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = dir.path().join("remote.git");
+        let source = dir.path().join("source");
+        git(dir.path(), &["init", "--bare", "-b", "main", remote.to_str().unwrap()]);
+        git(dir.path(), &["clone", remote.to_str().unwrap(), source.to_str().unwrap()]);
+        git(&source, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
+        git(&source, &["push", "origin", "main"]);
+        let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
+        let vcs = test_fl(&source, runner.clone(), true);
+        for occupied in [false, true] {
+            let target = dir.path().join(format!("workspace-{occupied}"));
+            std::fs::create_dir(&target).unwrap();
+            if occupied {
+                std::fs::write(target.join("notes"), "kept").unwrap();
+            }
+            let result = vcs.materialise_fresh_clone(remote.to_str().unwrap(), "convoy", Some("main"), target.to_str().unwrap()).await;
+            if occupied {
+                let error = result.err().expect("an occupied non-clone refuses");
+                assert!(error.contains("not a reusable clone"), "{error}");
+                assert!(target.join("notes").exists(), "refusal keeps the directory's contents");
+            } else {
+                result.expect("an empty directory takes the clone");
+                assert_eq!(GitCliBackend::checkout_root(&target, &*runner).current_branch().await.unwrap().trim(), "convoy");
+            }
+        }
+    }
+
+    // A clone that never landed leaves a provider-made workspace root empty;
+    // its teardown has nothing to preserve, while other files still hold it.
+    #[tokio::test]
+    async fn an_empty_clone_target_is_reclaimable() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
+        let vcs = test_fl(dir.path(), runner, true);
+        let target = dir.path().join("workspace");
+        std::fs::create_dir(&target).unwrap();
+        vcs.verify_local_clone_reclaimable(target.to_str().unwrap()).await.expect("an empty root is reclaimable");
+        std::fs::write(target.join("notes"), "kept").unwrap();
+        let error = vcs.verify_local_clone_reclaimable(target.to_str().unwrap()).await.unwrap_err();
+        assert!(error.contains("preserving local clone"), "{error}");
     }
 
     // #3340: adoption compares with the fetched base, not a stale local main.

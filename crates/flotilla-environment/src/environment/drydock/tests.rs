@@ -657,3 +657,15 @@ async fn exposures_outlast_a_drydock_restart() {
     assert!(adopted.env_vars().await.unwrap().contains_key("PATH"));
     adopted.destroy().await.unwrap();
 }
+
+/// A provider's refusal reaches the operator: the Environment's message
+/// carries drydock's reason and the provider's (masked) explanation.
+#[test]
+fn a_protocol_error_keeps_the_providers_explanation() {
+    let error = ::drydock::client::Error::Protocol(wire::ProtocolError::Internal {
+        reason: "provider daytona operation provision".into(),
+        provider_error: "Total memory limit exceeded".into(),
+    });
+    let message = api_error(error);
+    assert!(message.contains("provision") && message.contains("Total memory limit exceeded"), "{message}");
+}

@@ -936,7 +936,7 @@ impl CliAgentAdapter {
                 }
                 // The runtime supplies a hook URL and token only to host-direct sessions
                 // while flotillad has a loopback listener; vessel sessions keep commands.
-                let mut settings = crate::claude_code_hook_settings_over(crate::ClaudeCodeHookTransport::from_environment(environment));
+                let mut settings = crate::claude_code_hook_settings_for(environment);
                 settings["skipDangerousModePermissionPrompt"] = serde_json::Value::Bool(true);
                 settings["promptSuggestionEnabled"] = serde_json::Value::Bool(false);
                 if contained {

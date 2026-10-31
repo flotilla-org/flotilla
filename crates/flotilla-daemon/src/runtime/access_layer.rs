@@ -62,6 +62,10 @@ pub(super) struct AccessLaunch<'a> {
     pub adapter: &'a str,
     /// The account access its harness item declares, if any.
     pub access: Option<&'a AccessName>,
+    /// Whether the place already carries the adapter's harness: a composed crew image's
+    /// layers, or a cloud image whose interior discovery found one. An SSH host never
+    /// does, whatever it has installed.
+    pub carries_harness: bool,
 }
 
 /// What the access layer delivered for a launch.
@@ -219,7 +223,7 @@ async fn deliver_crew(
     }
     // #3909: where the place does not already carry the pinned harness, it lands in the
     // home by digest, through whichever mechanism the planner chooses.
-    let pinned = if place_carries_harnesses(launch.account.ssh_host) {
+    let pinned = if launch.carries_harness {
         None
     } else {
         let architecture = agent.architecture().await.map_err(failed_at(HARNESS))?;
@@ -261,13 +265,6 @@ async fn deliver_crew(
 }
 
 /// What a place offers vessel delivery beyond the mandatory agent fetch and push. An SSH
-/// Whether the place already carries the pinned harnesses. A composed crew image includes
-/// the harness layers, whose pins its identity hashes; an SSH host has no image. Step 4 of
-/// #3956 moves this declaration onto each provider instance.
-fn place_carries_harnesses(ssh_host: bool) -> bool {
-    !ssh_host
-}
-
 /// What a place offers vessel delivery beyond the mandatory agent fetch and push. An SSH
 /// host's bases are the host's own storage; a container's are not, so its homes are
 /// created through the agent. Both kinds in use reach public sources: neither declares an

@@ -13,7 +13,7 @@ use flotilla_agent::adapter::AgentAdapter;
 use flotilla_agent::adapter::AgentAdapterRegistry;
 use flotilla_agent::adapter::AgentLaunchRequest;
 use flotilla_agent::adapter::CapabilityTable;
-use flotilla_agent::{CLAUDE_CODE_HOOK_TOKEN_ENV, CLAUDE_CODE_HOOK_URL_ENV};
+use flotilla_agent::{CLAUDE_CODE_HOOK_TOKEN_ENV, CLAUDE_CODE_HOOK_URL_ENV, FLOTILLA_CLI_ENV};
 use flotilla_capability_contract::SessionCapabilitySource;
 use flotilla_credentials::crew_git_identity_environment;
 use flotilla_crew::reconcilers::terminal_session::{
@@ -25,7 +25,7 @@ use flotilla_environment::environment::VesselAgent;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ConfiguredResourceLimits, TerminalStatus};
 use flotilla_provider_runtime::execution_context::BoundLayer;
-use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
 use flotilla_resources::{
     Checkout, Convoy, FulfilmentKind, ResourceObject, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession,
     TerminalSessionPhase, TerminalSessionSource, TerminalSessionTarget, Vessel, CREDENTIAL_PERMISSIONS_SESSION_TAG,
@@ -440,6 +440,8 @@ impl TerminalRuntime for TerminalControllerRuntime {
                         vessel_ref: &context.vessel_ref,
                         adapter: &requirement.adapter,
                         access: requirement.account_access(),
+                        // #3909: a place whose discovery found no harness takes the pinned one.
+                        carries_harness: vessel.is_none() && registry.agent_adapters.get(&requirement.adapter).is_some(),
                     };
                     deliver_access(&self.state, &launch, agent, &credential_env).await?
                 };
@@ -492,6 +494,15 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 // loopback TCP, and in a Docker vessel through its agent's forward. SSH host
                 // and cloud vessels keep command hooks. The token binds the hooks to this terminal.
                 if requirement.adapter == "claude-code" {
+                    // A vessel's command hooks run the CLI by the path its session's `PATH` finds now,
+                    // before the login shell cleat starts can reset `PATH`. Temporary: remove once
+                    // sessions run with a declared environment and no login shell (#4173).
+                    if spec.env_ref != self.state.host_direct_environment_name {
+                        if let Some(cli) = place_cli(&*launch_runner()?, &credential_env).await {
+                            credential_env.retain(|(key, _)| key != FLOTILLA_CLI_ENV);
+                            credential_env.push((FLOTILLA_CLI_ENV.to_string(), cli));
+                        }
+                    }
                     let hooks = if spec.env_ref == self.state.host_direct_environment_name {
                         self.host_direct_hooks(&context.namespace, name).await
                     } else if vessel.is_none() {
@@ -942,18 +953,23 @@ impl TerminalControllerRuntime {
         self.session_adapter(spec, &requirement.adapter).await.map(Some)
     }
 
-    /// The adapter a session's harness runs under: the place's discovered one, or, on an
-    /// SSH host vessel, whose access layer delivers the pinned harness (#3909), the
-    /// built-in adapter for it even when the host has none installed. Observation and
+    /// The adapter a session's harness runs under: the place's discovered one, or, where the
+    /// access layer delivers the pinned harness (#3909: an SSH host vessel, or a provisioned
+    /// place whose discovery found none), the built-in adapter for it. Observation and
     /// cleanup never run its binary; launch uses the executable delivery returns.
     async fn session_adapter(&self, spec: TerminalSessionTarget<'_>, adapter: &str) -> Result<Arc<dyn AgentAdapter>, String> {
         let unavailable = || format!("agent adapter {adapter} unavailable for environment {}", spec.env_ref);
         if let Some(found) = self.registry_for_spec(spec).await?.agent_adapters.get(adapter) {
             return Ok(Arc::clone(found));
         }
-        let Some(vessel) = self.vessel_for_spec(spec).await? else { return Err(unavailable()) };
+        // A provisioned place without one ran the harness the access layer delivered too.
+        let runner = match self.vessel_for_spec(spec).await? {
+            Some(vessel) => vessel.runner(),
+            None if spec.env_ref != self.state.host_direct_environment_name => self.runner_for_env(&spec.env_ref)?,
+            None => return Err(unavailable()),
+        };
         let name = flotilla_agent::adapter::harness_binary(adapter).ok_or_else(unavailable)?;
-        AgentAdapterRegistry::delivered(adapter, Path::new(name), &[], vessel.runner()).ok_or_else(unavailable)
+        AgentAdapterRegistry::delivered(adapter, Path::new(name), &[], runner).ok_or_else(unavailable)
     }
 
     pub(super) async fn pool_for_spec(&self, spec: TerminalSessionTarget<'_>) -> Result<Arc<dyn TerminalPool>, String> {
@@ -967,3 +983,13 @@ impl TerminalControllerRuntime {
 }
 
 pub(super) const CREW_SESSION_SIZE: TerminalSize = TerminalSize::new(200, 50);
+
+/// The absolute path the session's `PATH`, or the place's own where the session
+/// declares none, resolves `flotilla` to; none where it finds no CLI.
+async fn place_cli(runner: &dyn CommandRunner, environment: &[(String, String)]) -> Option<String> {
+    let path = environment.iter().find(|(key, _)| key == "PATH").map_or("", |(_, path)| path.as_str());
+    let script = r#"if [ -n "$1" ]; then PATH=$1; fi; command -v flotilla"#;
+    let found = runner.run("sh", &["-c", script, "sh", path], Path::new("/"), &ChannelLabel::Default).await.ok()?;
+    let found = found.trim();
+    found.starts_with('/').then(|| found.to_string())
+}
