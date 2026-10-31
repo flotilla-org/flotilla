@@ -442,7 +442,9 @@ class Trial:
                                                                            self.args.provider, self.args.image)
         (config / 'drydock.toml').write_text(text)
         forge = self.forge
+        # macOS has no /etc/machine-id; each trial is its own machine anyway.
         (config / 'daemon.toml').write_text(
+            f'machine_id = "trial-fleet-{self.root.name}"\n'
             f'[forge_overrides."{FORGE_SERVICE}"]\nprovider = "forgejo"\n'
             f'endpoint_url = "{forge["url"]}/github"\ntoken_path = "{forge["token"]}"\n')
         upstream = self.root / 'upstream.git'
