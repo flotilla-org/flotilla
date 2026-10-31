@@ -7022,7 +7022,8 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     ready.await.unwrap();
     // Paused time stands in for the 15s frame deadline. The blocked producer inhibits
     // auto-advance, so step the clock while the round settles on its frame wait; the
-    // follower's 20s pull deadline would report "routed stream timed out" instead.
+    // follower's 20s pull deadline would report "routed stream timed out" instead. Only this
+    // round runs on paused time; `pause` needs the current-thread runtime `#[tokio::test]` gives.
     tokio::time::pause();
     let round = tokio::spawn({
         let (target, router) = (Arc::clone(&target), router.clone());

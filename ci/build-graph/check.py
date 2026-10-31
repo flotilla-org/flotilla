@@ -300,8 +300,10 @@ def concurrent_trees(cargo, requests):
             home.mkdir()
             try:
                 homes.put(isolated_cargo_home(source, home) if source.is_dir() else None)
-            except OSError:
+            except OSError as error:
                 # Without symlinks (unprivileged Windows) workers share the home and its lock.
+                if index == 0:
+                    print(f"build-graph: shared cargo home, resolutions run serially ({error})", file=sys.stderr)
                 homes.put(None)
 
         def run(arguments):
@@ -326,7 +328,8 @@ def main(arguments=()):
         return subprocess.run([os.environ.get("CARGO", "cargo"), "--color", "never", *arguments], cwd=root, check=True, capture_output=True,
                               text=True, env=env).stdout
 
-    # Unfiltered metadata resolves and downloads every package for every platform.
+    # Unfiltered metadata resolves and downloads every package for every platform. It must run
+    # first: the concurrent trees below resolve offline from the cache it fills.
     metadata = json.loads(cargo("metadata", "--locked", "--format-version", "1"))
     errors = violations(metadata)
     tree_arguments = ("tree", "--locked", "--prefix", "none", "--format", "{p}|{f}")
@@ -337,28 +340,28 @@ def main(arguments=()):
                      for argument in ("-p", package["name"])]
         if selection:
             for edges in ("normal,build", "normal,build,dev"):
-                requests.append(((group, edges), (*tree_arguments, *selection, "--edges", edges, *target_arguments)))
+                requests.append((("layer", group, edges), (*tree_arguments, *selection, "--edges", edges, *target_arguments)))
     for package in members:
         if package["name"] in C_FREE_BASE:
             # cargo tree resolves metadata only: Windows std need not be installed.
-            requests.append(((package["name"], "windows"), (*tree_arguments, "-p", package["name"], "--edges", "normal,build",
+            requests.append((("windows", package["name"]), (*tree_arguments, "-p", package["name"], "--edges", "normal,build",
                                                            "--target", "x86_64-pc-windows-gnu")))
         for edges in ("normal,build", "normal,build,dev"):
             if edges == "normal,build" and is_testkit(package["name"]):
                 continue
-            requests.append(((package["name"], edges), (*tree_arguments, "-p", package["name"], "--edges", edges, *target_arguments)))
+            requests.append((("package", package["name"], edges), (*tree_arguments, "-p", package["name"], "--edges", edges, *target_arguments)))
     trees = dict(zip((key for key, _ in requests), concurrent_trees(cargo, [arguments for _, arguments in requests])))
     errors.extend(vessel_graph_violations(trees["vessel"]))
     # Resolver 2 unifies dependency features within a command. Compare to
     # the union of consumers in the same layer, not the unrelated native stack.
-    workspace = {key: tree for key, tree in trees.items() if key[0] in ("base", "native")}
+    workspace = {key[1:]: tree for key, tree in trees.items() if key[0] == "layer"}
     for package in members:
         if package["name"] in C_FREE_BASE:
-            errors.extend(c_free_violations(package["name"], trees[package["name"], "windows"]))
+            errors.extend(c_free_violations(package["name"], trees["windows", package["name"]]))
         for edges in ("normal,build", "normal,build,dev"):
             if edges == "normal,build" and is_testkit(package["name"]):
                 continue
-            selected = trees[package["name"], edges]
+            selected = trees["package", package["name"], edges]
             if edges == "normal,build":
                 for dependency, contexts in selected.items():
                     if dependency.startswith("tokio v") and any("test-util" in features for features in contexts):
