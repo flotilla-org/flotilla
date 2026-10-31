@@ -13,7 +13,7 @@
 use std::fmt::Write as _;
 
 use flotilla_schema::Code;
-use flotilla_schema::{ColumnDef, ColumnType, Condition, Guard, Index, Table, TableRole, TableSet, When};
+use flotilla_schema::{ColumnDef, ColumnType, Condition, Guard, Index, Table, TableRole, TableSet, Value, When};
 
 /// The shared table naming every code: one row per (kind, field, code), `name` the Rust name of
 /// the variant carrying it. `kind` is the kind code and `field` the code column: its name on the
@@ -257,8 +257,15 @@ pub(crate) fn column(column: &ColumnDef) -> String {
         }
         ColumnType::Integer | ColumnType::Number | ColumnType::Text | ColumnType::Blob | ColumnType::Cbor | ColumnType::Timestamp => {}
     }
-    if let Some(default) = column.previous_generation_default() {
-        let _ = write!(out, " DEFAULT {default}");
+    match column.previous_generation_value() {
+        Some(Value::Int(default)) => {
+            let _ = write!(out, " DEFAULT {default}");
+        }
+        Some(Value::Blob(bytes)) => {
+            let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+            let _ = write!(out, " DEFAULT x'{hex}'");
+        }
+        _ => {}
     }
     out
 }

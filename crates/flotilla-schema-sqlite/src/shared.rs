@@ -315,9 +315,10 @@ pub(crate) fn has_string_domain(conn: &Connection) -> rusqlite::Result<bool> {
     conn.query_row("SELECT EXISTS (SELECT 1 FROM pragma_table_info('strings') WHERE name = 'domain')", [], |row| row.get(0))
 }
 
-/// Refuses a kind table whose columns differ from its kind's: the backend's own columns (`id` and
-/// `version` on the root, the parent key below it), and the key and data columns. Order is not
-/// compared: statements name their columns, and an additive upgrade (`ADD COLUMN`) appends.
+/// Refuses an existing kind table whose columns differ from its kind's: the backend's own columns
+/// (`id` and `version` on the root, the parent key below it), and the key and data columns. Order
+/// is not compared: statements name their columns, and an additive upgrade (`ADD COLUMN`) appends.
+/// A table not yet created is skipped; the schema DDL creates it whole.
 pub(crate) fn check_kind_columns(conn: &Connection, kinds: &KindRegistry) -> Result<(), StoreError> {
     let mut statement = conn.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?;
     for set in kinds.iter() {
@@ -328,12 +329,15 @@ pub(crate) fn check_kind_columns(conn: &Connection, kinds: &KindRegistry) -> Res
             };
             expected.extend(table.key.iter().chain(&table.columns).map(|column| column.name.clone()));
             let mut found = statement.query_map([&table.name], |row| row.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+            if found.is_empty() {
+                continue;
+            }
             // Explicit ADR 0047 N→N+1 defaults only: no broad migration policy.
             // Remove each column's default/upgrade eligibility one roll after its
             // field lands; once no eligible columns remain this check only reads.
             // The open transaction rolls this back if any other drift remains.
             for column in &table.columns {
-                if !found.contains(&column.name) && column.previous_generation_default().is_some() {
+                if !found.contains(&column.name) && column.previous_generation_value().is_some() {
                     conn.execute_batch(&format!("ALTER TABLE {} ADD COLUMN {};", quote_ident(&table.name), crate::ddl::column(column)))?;
                     found.push(column.name.clone());
                 }
@@ -350,8 +354,8 @@ pub(crate) fn check_kind_columns(conn: &Connection, kinds: &KindRegistry) -> Res
 /// a CHECK in place, so a table whose stored code lists are each a subset of its kind's, at least
 /// one strictly, and which is otherwise exactly the table this build renders, is rebuilt with the
 /// current definition by [`widen_table`]. "Otherwise exactly" is an exact match of the stored
-/// `CREATE TABLE` text, less only the columns [`check_kind_columns`] may add (those declaring a
-/// previous-generation default), which the rebuild adds with their default; it runs first, so a
+/// `CREATE TABLE` text, less only the columns [`check_kind_columns`] may add (those with a
+/// previous-generation value), which the rebuild adds with that value; it runs first, so a
 /// table needing both is widened rather than refused. A table whose text an earlier `ALTER TABLE`
 /// changed is not widened: it refuses with [`StoreError::KindCodeDrift`].
 ///
@@ -375,7 +379,7 @@ pub(crate) fn check_kind_codes(conn: &Connection, kinds: &KindRegistry) -> Resul
             // The table as this build renders it with the stored code lists and without the
             // columns opening may add, and the first column missing codes.
             let mut stored_table = table.clone();
-            stored_table.columns.retain(|column| present.contains(&column.name) || column.previous_generation_default().is_none());
+            stored_table.columns.retain(|column| present.contains(&column.name) || column.previous_generation_value().is_none());
             let mut missing = None;
             for column in stored_table.key.iter_mut().chain(stored_table.columns.iter_mut()) {
                 let ColumnType::Code(codes) = &mut column.ty else { continue };

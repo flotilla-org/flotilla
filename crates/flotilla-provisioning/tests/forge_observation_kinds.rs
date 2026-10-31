@@ -21,7 +21,7 @@ use flotilla_resources::{
     ForgeReadRequest, ForgeReadSpec, ForgeReadStatus, Issue, IssueSpec, IssueStatus, ObjectMeta, Observation, ObservedChangeRequestState,
     ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision, Resource, ResourceObject,
 };
-use flotilla_schema::{render_view, Kind, Timestamp};
+use flotilla_schema::{render_view, Change, Kind, NewChange, Timestamp};
 use flotilla_schema_sqlite::{schema_ddl, DdlMode, Store};
 use hegel::{generators as gs, generators::Generator};
 use schema_support::{check, plan};
@@ -57,6 +57,161 @@ fn forge_observation_statements_search_by_key() {
         .filter(|(label, rows)| schema_support::unkeyed(label, rows))
         .collect();
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+fn subject(tc: &hegel::TestCase) -> stored::IssueSubject {
+    stored::IssueSubject {
+        service: SERVICE.into(),
+        scope: tc.draw(gs::sampled_from(vec![SCOPE.to_owned(), "flotilla-org/rigging".to_owned()])),
+        number: tc.draw(gs::integers::<u64>().min_value(1).max_value(i64::MAX as u64)),
+    }
+}
+
+fn issue_record(tc: &hegel::TestCase, number: u64) -> IssueRecord {
+    IssueRecord {
+        body: maybe(tc, tc.draw(gs::text().max_size(40))),
+        issue_type: maybe(tc, tc.draw(gs::text().max_size(8))),
+        parent: maybe(tc, subject(tc)),
+        blocked_by: maybe(tc, (0..tc.draw(gs::integers::<usize>().max_value(3))).map(|_| subject(tc)).collect()),
+        fields: maybe(
+            tc,
+            (0..tc.draw(gs::integers::<usize>().max_value(3)))
+                .map(|_| (tc.draw(gs::text().max_size(8)), tc.draw(gs::text().max_size(8))))
+                .collect(),
+        ),
+        ..IssueRecord::unobserved(&issue_spec(number))
+    }
+}
+
+fn change_request_record(tc: &hegel::TestCase, number: u64) -> ChangeRequestRecord {
+    ChangeRequestRecord {
+        head_branch: maybe(tc, tc.draw(gs::text().max_size(12))),
+        base_branch: maybe(tc, tc.draw(gs::text().max_size(12))),
+        closes: maybe(tc, (0..tc.draw(gs::integers::<usize>().max_value(3))).map(|_| subject(tc)).collect()),
+        ..ChangeRequestRecord::unobserved(&cr_spec(SCOPE, number, "alpha"))
+    }
+}
+
+fn change() -> NewChange {
+    NewChange::new("test", Timestamp(0))
+}
+
+fn stored_record<K: Kind>(store: &mut Store, name: &str) -> K {
+    let mut read = store.read().expect("read");
+    let id = read.resolve(K::CODE, name, "home").expect("resolve").expect("stored");
+    read.load::<K>(id).expect("load").expect("present").value
+}
+
+fn column_count(conn: &rusqlite::Connection, table: &str) -> usize {
+    conn.query_row("SELECT count(*) FROM pragma_table_info(?1)", [table], |row| row.get(0)).expect("columns")
+}
+
+/// Takes the forge observation tables back to the shape the previous generation created.
+fn previous_generation_tables(conn: &rusqlite::Connection) {
+    conn.execute_batch(
+        "DROP VIEW change_request_view; DROP VIEW issue_view; DROP INDEX change_request_by_branch;
+         ALTER TABLE change_request DROP COLUMN head_branch; ALTER TABLE change_request DROP COLUMN base_branch;
+         ALTER TABLE change_request DROP COLUMN closes;
+         ALTER TABLE issue DROP COLUMN body; ALTER TABLE issue DROP COLUMN issue_type; ALTER TABLE issue DROP COLUMN parent;
+         ALTER TABLE issue DROP COLUMN blocked_by; ALTER TABLE issue DROP COLUMN fields;",
+    )
+    .expect("previous generation shape");
+    assert_eq!((column_count(conn, "change_request"), column_count(conn, "issue")), (15, 11));
+}
+
+// Behaviour: every observed value of an issue or change request, the subjects it refers to and its
+// issue fields included, reads back as written, an unknown list staying distinct from an empty one.
+#[hegel::test]
+fn forge_observations_read_back_as_written(tc: hegel::TestCase) {
+    let issue = issue_record(&tc, 7);
+    let change_request = change_request_record(&tc, 8);
+    let mut store =
+        Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", stored::registry().expect("registry")).expect("open");
+    let mut write = store.write().expect("write");
+    write.insert("issue-7", &issue, &change()).expect("issue");
+    write.insert("cr-8", &change_request, &change()).expect("change request");
+    write.commit().expect("commit");
+    assert_eq!(stored_record::<IssueRecord>(&mut store, "issue-7"), issue);
+    assert_eq!(stored_record::<ChangeRequestRecord>(&mut store, "cr-8"), change_request);
+}
+
+// Behaviour (ADR 0047 N→N+1): a store whose forge observation tables the previous generation
+// created opens with the new columns added and indexed, its rows reading them as unobserved, and
+// takes writes of the new values.
+#[hegel::test]
+fn previous_generation_observations_open_and_read_as_unobserved(tc: hegel::TestCase) {
+    let issue = IssueRecord::from_old(&issue_spec(7), &issue_status(ObservedIssueState::Open, epoch(100)));
+    let change_request =
+        ChangeRequestRecord::from_old(&cr_spec(SCOPE, 8, "alpha"), &cr_status(ObservedChangeRequestState::Open, epoch(100)));
+    let mut store =
+        Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", stored::registry().expect("registry")).expect("open");
+    let mut write = store.write().expect("write");
+    write.insert("issue-7", &issue, &change()).expect("issue");
+    write.insert("cr-8", &change_request, &change()).expect("change request");
+    write.commit().expect("commit");
+    let conn = store.into_connection();
+    previous_generation_tables(&conn);
+
+    let mut store = Store::open(conn, "home", stored::registry().expect("registry")).expect("reopen");
+    assert_eq!(stored_record::<IssueRecord>(&mut store, "issue-7"), issue);
+    assert_eq!(stored_record::<ChangeRequestRecord>(&mut store, "cr-8"), change_request);
+    let observed_issue = IssueRecord { title: issue.title.clone(), ..issue_record(&tc, 7) };
+    let observed_change_request = ChangeRequestRecord { title: change_request.title.clone(), ..change_request_record(&tc, 8) };
+    let mut write = store.write().expect("write");
+    let id = write.resolve(IssueRecord::CODE, "issue-7", "home").expect("resolve").expect("issue");
+    let current = write.load::<IssueRecord>(id).expect("load").expect("issue");
+    write.update(&current, &observed_issue, &change()).expect("issue");
+    let id = write.resolve(ChangeRequestRecord::CODE, "cr-8", "home").expect("resolve").expect("change request");
+    let current = write.load::<ChangeRequestRecord>(id).expect("load").expect("change request");
+    write.update(&current, &observed_change_request, &change()).expect("change request");
+    write.commit().expect("commit");
+    assert_eq!(stored_record::<IssueRecord>(&mut store, "issue-7"), observed_issue);
+    assert_eq!(stored_record::<ChangeRequestRecord>(&mut store, "cr-8"), observed_change_request);
+    let conn = store.into_connection();
+    assert_eq!(
+        conn.query_row("SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = 'change_request_by_branch'", [], |row| row
+            .get::<_, String>(0))
+            .expect("index"),
+        r#"CREATE INDEX "change_request_by_branch" ON "change_request" ("service", "scope", "head_branch")"#
+    );
+}
+
+// Behaviour (ADR 0047 N→N+1): an entry the previous generation wrote, which names none of the new
+// fields, applies at a store of this generation as a record with them unobserved.
+#[test]
+fn previous_generation_entries_apply_with_the_new_fields_unobserved() {
+    let issue = IssueRecord::from_old(&issue_spec(7), &issue_status(ObservedIssueState::Closed, epoch(100)));
+    let change_request =
+        ChangeRequestRecord::from_old(&cr_spec(SCOPE, 8, "alpha"), &cr_status(ObservedChangeRequestState::Merged, epoch(100)));
+    let mut writer =
+        Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", stored::registry().expect("registry")).expect("open");
+    let mut write = writer.write().expect("write");
+    write.insert("issue-7", &issue, &change()).expect("issue");
+    write.insert("cr-8", &change_request, &change()).expect("change request");
+    write.commit().expect("commit");
+    let (mut events, headers) = {
+        let mut read = writer.read().expect("read");
+        let events = read.changes_since("home", 0, 8).expect("events");
+        let headers = read.changes_of(&events).expect("headers");
+        (events, headers)
+    };
+    let added = ["head_branch", "base_branch", "closes", "body", "issue_type", "parent", "blocked_by", "fields"];
+    for event in &mut events {
+        event.effect.changes.retain(|change| !matches!(change, Change::Set { field, .. } if added.contains(&field.as_str())));
+    }
+    assert_eq!(events.iter().map(|event| event.effect.changes.len()).collect::<Vec<_>>(), [9, 13]);
+
+    let mut follower =
+        Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "follower", stored::registry().expect("registry"))
+            .expect("open");
+    let mut write = follower.write().expect("write");
+    for (header, event) in headers.iter().zip(&events) {
+        write.record_change(header).expect("change");
+        write.apply(event).expect("apply");
+    }
+    write.commit().expect("commit");
+    assert_eq!(stored_record::<IssueRecord>(&mut follower, "issue-7"), issue);
+    assert_eq!(stored_record::<ChangeRequestRecord>(&mut follower, "cr-8"), change_request);
 }
 
 const SERVICE: &str = "github.com";
