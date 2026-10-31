@@ -2,6 +2,7 @@
 //! the change-request and issue-tracker factories.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use flotilla_config::provider_config::ForgejoIssueTrackerConfig;
 use flotilla_discovery_api::provider_config::ProviderConfig;
@@ -9,22 +10,24 @@ use flotilla_discovery_api::provider_config::ProviderConfigView;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_discovery_api::UnmetRequirement;
 use flotilla_paths::path_context::DaemonHostPath;
+use flotilla_provider_runtime::{HttpClient, ReqwestHttpClient};
 use flotilla_resources::ForgeKind;
 
 use crate::{ForgejoAuth, ForgejoIssueProviderConfig, FORGEJO_AUTH_PROVIDER};
 
-/// Resolve the Forgejo connection off the async runtime, bounding the
-/// credential file reads by the shared probe timeout.
+/// Resolve the Forgejo connection and its transport off the async runtime,
+/// bounding the credential and CA file reads by the shared probe timeout.
 pub async fn bounded_forgejo_provider_config(
     env: &EnvironmentBag,
     config: &dyn ProviderConfigView,
     settings: &ProviderConfig,
-) -> Result<ForgejoIssueProviderConfig, Vec<UnmetRequirement>> {
+    http: Arc<dyn HttpClient>,
+) -> Result<(ForgejoIssueProviderConfig, Arc<dyn HttpClient>), Vec<UnmetRequirement>> {
     let env = env.clone();
     let settings = settings.clone();
     let config = config.base_path().clone();
     flotilla_provider_runtime::probe::blocking("Forgejo credential", flotilla_provider_runtime::probe::PROBE_TIMEOUT, move || {
-        Ok(forgejo_provider_config(&env, &config, &settings))
+        Ok(forgejo_provider_config(&env, &config, &settings).and_then(|resolved| Ok((resolved, forgejo_transport(&env, http)?))))
     })
     .await
     .map_err(|error| vec![UnmetRequirement::MissingAuth(error)])?
@@ -38,7 +41,7 @@ fn forgejo_provider_config(
     if let Some(binding) = env.forge_override() {
         binding.validate().map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?;
         let identity = env.repo_identity().ok_or_else(|| vec![UnmetRequirement::MissingRemoteHost("origin".into())])?;
-        let flotilla_config::forge_override::ForgeOverride::Forgejo { endpoint_url, token_path } = binding;
+        let flotilla_config::forge_override::ForgeOverride::Forgejo { endpoint_url, token_path, .. } = binding;
         let auth_bag =
             EnvironmentBag::new().with(flotilla_discovery_api::EnvironmentAssertion::auth_file(FORGEJO_AUTH_PROVIDER, token_path));
         let auth = resolve_forgejo_auth(&auth_bag, config, &ForgejoIssueTrackerConfig::default())
@@ -65,6 +68,18 @@ fn forgejo_provider_config(
         vec![UnmetRequirement::MissingAuth(FORGEJO_AUTH_PROVIDER.into())]
     })?;
     Ok(ForgejoIssueProviderConfig::new(service_url.into(), forgejo.api_base_url, auth))
+}
+
+/// The given transport, or for a forge override with `ca_path` one that also
+/// trusts that file's roots; a CA that cannot build a client refuses the provider.
+fn forgejo_transport(env: &EnvironmentBag, http: Arc<dyn HttpClient>) -> Result<Arc<dyn HttpClient>, Vec<UnmetRequirement>> {
+    let Some(flotilla_config::forge_override::ForgeOverride::Forgejo { ca_path: Some(path), .. }) = env.forge_override() else {
+        return Ok(http);
+    };
+    let refuse = |error: String| vec![UnmetRequirement::MissingConfig(format!("forge override ca_path {path}: {error}"))];
+    let pem = std::fs::read(path).map_err(|error| refuse(error.to_string()))?;
+    let transport = ReqwestHttpClient::restricted(None, Some(&pem)).map_err(refuse)?;
+    Ok(Arc::new(transport))
 }
 
 fn resolve_forgejo_auth(env: &EnvironmentBag, config: &DaemonHostPath, forgejo: &ForgejoIssueTrackerConfig) -> Result<ForgejoAuth, String> {
@@ -239,6 +254,7 @@ mod rehearsal_tests {
                 binding: ForgeOverride::Forgejo {
                     endpoint_url: "https://fake:3443/github/".into(),
                     token_path: token.to_string_lossy().into_owned(),
+                    ca_path: None,
                 },
             });
         let resolved =
@@ -253,5 +269,31 @@ mod rehearsal_tests {
             forgejo_provider_config(&bag, &DaemonHostPath::new(temp.path()), &ProviderConfig::default()).is_err(),
             "missing fake credentials cannot fall back to real ones"
         );
+    }
+
+    // Without `ca_path` the injected transport serves the override; with one, a
+    // transport trusting that file's roots does. A file that is not a certificate
+    // refuses the provider rather than falling back to platform roots.
+    #[test]
+    fn rehearsal_ca_selects_the_transport_and_a_bad_one_refuses_it() {
+        let temp = tempfile::tempdir().expect("scratch dir");
+        let not_a_certificate = temp.path().join("not-a-certificate");
+        std::fs::write(&not_a_certificate, "fake-token\n").expect("scratch file");
+        let ca = concat!(env!("CARGO_MANIFEST_DIR"), "/../flotilla-fake-forge/tests/fixtures/ca.pem");
+        let bag = |ca_path: Option<&str>| {
+            EnvironmentBag::new().with(EnvironmentAssertion::ForgeOverride {
+                binding: ForgeOverride::Forgejo {
+                    endpoint_url: "https://fake:3443/github".into(),
+                    token_path: "/tokens/fake".into(),
+                    ca_path: ca_path.map(Into::into),
+                },
+            })
+        };
+        let injected: Arc<dyn HttpClient> = Arc::new(ReqwestHttpClient::new());
+        let transport = |ca_path| forgejo_transport(&bag(ca_path), Arc::clone(&injected));
+        assert!(Arc::ptr_eq(&transport(None).expect("no CA"), &injected));
+        assert!(!Arc::ptr_eq(&transport(Some(ca)).expect("override CA"), &injected));
+        let Err(unmet) = transport(Some(&not_a_certificate.to_string_lossy())) else { panic!("a bad CA must refuse the provider") };
+        assert!(matches!(unmet.as_slice(), [UnmetRequirement::MissingConfig(message)] if message.contains("ca_path")), "{unmet:?}");
     }
 }
