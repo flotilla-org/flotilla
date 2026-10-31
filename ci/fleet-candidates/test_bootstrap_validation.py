@@ -110,6 +110,35 @@ class BootstrapValidationTests(unittest.TestCase):
             for path in (f"{tree}/../x", f"{tree}//x", f"{tree}/./x", "bin/drydock-host-typescript2", "share/flotilla/drydock-host-typescript-x/a"):
                 self.assertFalse(validation.allowed_payload(path, platform))
 
+    def test_typescript_host_wrapper_finds_its_tree_relative_to_itself_and_builder_leaves_no_trap(self):
+        script = Path(__file__).with_name("build-candidate.sh")
+        stub = self.root / "stub"
+        stub.mkdir()
+        (stub / "node").write_text('#!/bin/sh\necho "node $*"\n')
+        (stub / "node").chmod(0o755)
+        (stub / "corepack").write_text(
+            '#!/bin/sh\n'
+            'case "$*" in\n'
+            '  *pack:companion*) mkdir -p package/dist && echo "{}" >package/package.json && touch package/dist/main.js && tar -czf flotilla-drydock-host-typescript-0.1.0.tgz package;;\n'
+            '  *"install --prod"*) mkdir -p node_modules/dep node_modules/.bin;;\n'
+            'esac\n')
+        (stub / "corepack").chmod(0o755)
+        (self.root / "drydock" / "hosts" / "typescript").mkdir(parents=True)
+        script_body = (
+            f'set -euo pipefail; source {script}; '
+            f'build_typescript_host {self.root}/drydock {self.root}/gen/share/flotilla/drydock-host-typescript; '
+            f'mkdir -p {self.root}/gen/bin; write_typescript_host_wrapper {self.root}/gen/bin/drydock-host-typescript; '
+            f'chmod 755 {self.root}/gen/bin/drydock-host-typescript; '
+            f'cd /; {self.root}/gen/bin/drydock-host-typescript --unix sock'
+        )
+        result = subprocess.run(["bash", "-c", script_body], capture_output=True, text=True,
+                                env={"PATH": f"{stub}:/usr/bin:/bin", "HOME": str(self.root)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), f"node {self.root}/gen/bin/../share/flotilla/drydock-host-typescript/dist/main.js --unix sock")
+        tree = self.root / "gen" / validation.TYPESCRIPT_HOST_TREE
+        self.assertTrue((tree / "node_modules" / "dep").is_dir())
+        self.assertFalse((tree / "node_modules" / ".bin").exists())
+
     def test_darwin_refresh_without_a_typescript_host_leaves_the_previous_copy(self):
         source, destination = self.root / "source", self.root / "destination"
         for name in ("flotilla", "flotillad", "cleat"):

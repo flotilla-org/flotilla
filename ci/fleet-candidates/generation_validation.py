@@ -1251,9 +1251,9 @@ def refresh_darwin_payload(source, destination):
     # carries the host refreshes and prunes them.
     if (source / TYPESCRIPT_HOST_WRAPPER).exists():
         files.append(Path(TYPESCRIPT_HOST_WRAPPER))
-        expected |= {Path(TYPESCRIPT_HOST_WRAPPER)}
         files += [path.relative_to(source) for path in sorted((source / typescript).rglob("*")) if path.is_file()]
-        expected |= set(files)
+        # The `lib/` prune below only looks under lib/, so these paths are safe from it.
+        expected = set(files)
         for stale in (destination / typescript).rglob("*") if (destination / typescript).exists() else ():
             if (stale.is_file() or stale.is_symlink()) and stale.relative_to(destination) not in expected:
                 stale.unlink()

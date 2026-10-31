@@ -43,6 +43,7 @@ if [[ ! -x "$CARGO_HOME/bin/rustup" ]]; then
 fi
 
 # drydock's TypeScript host needs node >= 24.18 and corepack; the distro nodejs is older.
+[[ "$(uname -m)" == x86_64 ]] || { echo "the node toolchain below is linux-x64 only" >&2; exit 1; }
 node_version="24.18.0"
 node_sha256="55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742"
 node_root="$toolchain_root/node-v$node_version-linux-x64"

@@ -57,23 +57,27 @@ require_node_toolchain() {
 # dist/, package.json and its production node_modules). The hoisted linker leaves
 # a plain tree with no symlinks, which the manifest and Darwin copy both need.
 build_typescript_host() {
-  local drydock_root="$1" destination="$2" scratch
-  scratch="$(mktemp -d)"
-  trap 'rm -rf "$scratch"' RETURN
+  local drydock_root="$1" destination="$2"
+  # A subshell keeps the cleanup trap from outliving this function.
   (
+    scratch="$(mktemp -d)"
+    trap 'rm -rf "$scratch"' EXIT
     export COREPACK_HOME="$scratch/corepack"
     cd "$drydock_root/hosts/typescript"
     corepack pnpm install --frozen-lockfile
     corepack pnpm pack:companion
+    archives=(flotilla-drydock-host-typescript-*.tgz)
+    [[ "${#archives[@]}" == 1 && -f "${archives[0]}" ]] \
+      || { echo "expected exactly one packed companion archive, found: ${archives[*]}" >&2; exit 1; }
     mkdir -p "$scratch/unpacked"
-    tar -xzf flotilla-drydock-host-typescript-*.tgz -C "$scratch/unpacked"
+    tar -xzf "${archives[0]}" -C "$scratch/unpacked"
     cd "$scratch/unpacked/package"
     corepack pnpm install --prod --frozen-lockfile --node-linker=hoisted
+    rm -rf "$destination"
+    mkdir -p "$(dirname "$destination")"
+    cp -R "$scratch/unpacked/package" "$destination"
+    rm -rf "$destination/node_modules/.bin"
   )
-  rm -rf "$destination"
-  mkdir -p "$(dirname "$destination")"
-  cp -R "$scratch/unpacked/package" "$destination"
-  rm -rf "$destination/node_modules/.bin"
 }
 
 # drydock finds `drydock-host-typescript` beside flotillad and runs it directly;
