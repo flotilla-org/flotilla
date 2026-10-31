@@ -211,12 +211,12 @@ CEL is the base because only it has all of the following:
 
 **The compatibility promise.** Take any expression the subset accepts, with its fields declared as in §4.3. Bind them in a conforming CEL evaluator, under these conventions:
 - the row is a map with absent fields left out;
-- every intermediate map of a dotted path is present;
+- every intermediate map of a dotted path is present, even when the sub-structure behind it is missing (a stock CEL evaluator errors on `has(a.b)` when `a` is missing). The oracle adapter builds these maps; rigging's own `Row` trait never needs them (§4.5);
 - addresses and enums are strings;
 - timestamps are `google.protobuf.Timestamp`;
 - `under` is registered as in §4.6.
 
-The evaluator then returns `true` where this spec says T, `false` where it says F, and an error where it says U. This lets the stock `cel` crate act as a **differential oracle** in rigging's tests, without being a runtime dependency.
+The evaluator then returns `true` where this spec says T, `false` where it says F, and an error where it says U. The promise covers rows whose fields are present or absent. It does not cover *unknown* fields (§4.5), which stock CEL can only model through cel-go's partial evaluation, so corpus cases with unknown fields are checked against this spec's tables alone. This lets the stock `cel` crate act as a **differential oracle** in rigging's tests, without being a runtime dependency.
 
 ## 4. The subset: grammar and semantics
 
@@ -236,7 +236,7 @@ The evaluator then returns `true` where this spec says T, `false` where it says 
  ├──────────────────────────────────────────────────────────────────────┤
  │ field resolution (flotilla, binnacle sources)                        │
  │   schema: field → type, from descriptors or the leaf vocabulary      │
- │   row:    field → value or absent (absent includes stale)            │
+ │   row:    field → value | absent | unknown (unobserved or stale)     │
  └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -293,6 +293,8 @@ Restrictions beyond CEL:
 
   These are CEL's *minimum* supported limits (langdef, Syntax), so any conforming CEL implementation accepts every condition.
 
+  **The parser enforces the limits,** before any schema is read, so an over-limit `where` is always `invalid_filter`, whatever the table. Errors that need the schema (unknown field, wrong literal type, ordering an enum) come from the checker as `unknown_column` or `type_mismatch`, the codes `docs/tables.md` already lists.
+
 ### 4.3 Types and the schema
 
 The checker reads a **schema**: each field path maps to a type and a nullable flag. It may also declare bound variables. The types:
@@ -336,25 +338,26 @@ Checker rules:
 
 ### 4.5 Evaluation
 
-The evaluator returns `eval(e, row) ∈ {T, F, U}`. Rows provide `get(path) → value | absent`.
+The evaluator returns `eval(e, row) ∈ {T, F, U}`. Rows provide `get(path) → present(value) | absent | unknown`, looked up by the field's **full declared path**. A dotted path names one field; it is not a walk through nested maps, so a missing sub-structure (no latest claim, for `` `latest-claim`.disposition ``) is simply that field being absent or unknown.
 
-- **When a value is absent:**
+- **A field is absent** when the row knows it has no value:
   - the field's cell is NULL;
-  - the field is missing from the row;
   - a `number` is NaN;
-  - a map has no such key;
-  - the resolver says the observation is unknown or stale (leaf subjects, `leaf.rs:318`).
+  - a map has no such key.
+- **A field is unknown** when the row cannot say whether it has a value:
+  - the subject has no record, or has not been observed (`message_conditions.rs:77-83`);
+  - the observation is stale (`leaf.rs:318`, `:363-371`).
 
-  Intermediate maps are never absent.
-- **`Field op v`:** U if the field is absent. Otherwise the comparison of two values of one type:
+  Only leaf subjects produce unknown. Table rows are stored values, so for them every field is present or absent.
+- **`Field op v`:** U if the field is absent or unknown. Otherwise the comparison of two values of one type:
   - `int` and `number` compare on the number line;
   - `string` compares by **Unicode code point**, which is CEL's ordering, and SQLite `BINARY` on UTF-8, and Rust `str` ordering. JavaScript's `<` compares UTF-16 code units, so a TS evaluator must compare by code point (it differs for characters outside the BMP);
   - `timestamp` and `duration` compare by microsecond count;
   - `enum` and `address` compare as strings, for equality only.
-- **`Field in [v…]`:** U if the field is absent, otherwise T if it equals any element, else F. The list holds only literals, so its elements are never U.
-- **`"k" in Field`:** U if the field (the map or list) is absent, otherwise membership.
-- **`has(Path)`:** T if present, F if absent. It is never U.
-- **Bare bool field:** its value, or U if absent. `BoolLit` is its value.
+- **`Field in [v…]`:** U if the field is absent or unknown, otherwise T if it equals any element, else F. The list holds only literals, so its elements are never U.
+- **`"k" in Field`:** U if the field (the map or list) is absent or unknown, otherwise membership.
+- **`has(Path)`:** T if present, F if absent, **U if unknown**. So `!has(f)` on a stale observation is U, not T, and rewrites such as §6's `!has(f) || …` keep "unobserved is not failed" for `wait` and messages.
+- **Bare bool field:** its value, or U if absent or unknown. `BoolLit` is its value.
 - **`!`, `&&`, `||`:** the Kleene tables in §2. They are commutative: evaluation order is free and a short-circuit never changes the result (CEL langdef, Logical Operators).
 - **Determinism.** The result depends only on the expression and the row.
 - **Termination.** Evaluation is linear in the expression's size: no loops, no recursion, at most 32 list elements per `in`.
@@ -371,7 +374,7 @@ What a consumer does with U:
 | Verb `when` (client) | enabled | greyed, with reason | greyed, with reason "unknown: `<field>`" |
 | Verb `when` (server re-check) | run | `not_applicable` | `not_applicable` |
 
-The engine sweep currently writes an Unknown outcome into the gate as `false` (`crates/flotilla-core/src/primitives/sweep.rs:253-257`). The gate keeps two values, but the language returns three; the build should check that this collapse is intended.
+The engine sweep currently writes an Unknown outcome into the gate as `false` (`crates/flotilla-core/src/primitives/sweep.rs:253-257`). The gate keeps two values, but the language returns three. This is filed as #4204.
 
 **Reasons.** For `when`, the evaluator should report the first top-level conjunct that is not T, in canonical text, so the "failing condition as its reason" of #4182 ruling 3 comes for free. `when: [a, b]` means `a && b`.
 
@@ -380,7 +383,7 @@ The engine sweep currently writes an Unknown outcome into the gate as `false` (`
 `f.under("P")` is defined in the language itself, not supplied by flotilla, because every client evaluator has to agree on it:
 
 - `f` must have type `address`. `P` is a string literal holding a canonical address, or a bound variable of type `address` (a pick's `vessel.under(row.convoy)`), which is checked when it is bound.
-- The result is U if `f` is absent. Otherwise it is T if and only if `f == P`, or `f` starts with `P + "/"`.
+- The result is U if `f` is absent or unknown. Otherwise it is T if and only if `f == P`, or `f` starts with `P + "/"`.
 
 This is ADR 0066 §4's segment-boundary rule: `…/convoy:demo2` is not under `…/convoy:demo`. It needs no address parsing at evaluation time, because a canonical value never contains a bare `/` (ADR 0066 §4). The definition depends on the canonical encoding alone, which is why the checker requires canonical literals. Lenient input such as a PR URL or mixed case is resolved to canonical text before checking, through `flotilla_address::resolve`, as today.
 
@@ -399,7 +402,7 @@ Print-then-parse returns exactly the AST, and parse-then-print returns exactly t
 - **Spacing.** One space on each side of `==` `!=` `<` `<=` `>` `>=` `in` `&&` `||`. None after `!`, inside brackets or parentheses, or around `.`. Lists print as `[a, b]`.
 - **Strings** are double-quoted with JSON escaping exactly as `serde_json` prints it. That output is valid CEL: `\"`, `\\`, `\b`, `\f`, `\n`, `\r`, `\t` and `\u00XX` are all CEL escapes (langdef, String literals). It also matches today's quoted literals.
 - **Integers** are decimal with no leading zeros and no `+`.
-- **Floats** print as Rust's `{:?}` does: shortest round-trip, and `1.0` for integral values.
+- **Floats** print as Rust's `{:?}` does: shortest round-trip, `1.0` for integral values, and an exponent without `+` outside Rust's plain range (`1e21`, `1.5e-7`, where JavaScript writes `1e+21`). `-0.0` is written `0.0`: the two are equal under every comparison here. The corpus pins `1e21`, `1e-7`, `-0.0` and `0.1` so a non-Rust printer can't drift.
 - **Timestamps** print as `timestamp("YYYY-MM-DDTHH:MM:SS[.ffffff]Z")`, in UTC, with the fraction trimmed of trailing zeros and omitted when zero.
 - **Durations** print as `duration("<seconds>[.ffffff]s")`, the protobuf JSON form, trimmed the same way.
 - **Field segments** are bare when they are a `SELECTOR` and not a reserved word, and backticked otherwise (`` `latest-claim` ``). A map key goes in `["…"]` as a string.
@@ -445,6 +448,10 @@ The translation is a direct mapping over the subset. Literals and bound variable
 
 The `under` range is sound under `BINARY` collation, because `0` is the byte after `/` and canonical values never contain a bare `/` (ADR 0066 §4, `descendant_bounds`). The interned form scans the `UNIQUE(domain, s)` index of `strings` (`crates/flotilla-schema-sqlite/src/shared.rs:46-51`), rather than comparing text from correlated subqueries as `table_read.rs:63-83` does today.
 
+**Identifiers come only from the schema.** The translator never writes a field's path text into SQL. Each field resolves through the store's `ColumnMap` to a column expression the store wrote, and literals are always bound parameters. A backticked segment may hold `.`, `-`, `/` and spaces, and `where` is client input, so this is an invariant of `rigging-condition::sql`, with corpus cases for hostile names (`` `a" OR 1=1 --` `` and similar) that must give `unknown_column` or a parameter, never SQL. Flattened and child-table columns are reachable only where the `ColumnMap` gives an expression for them.
+
+**Query plans are pinned.** The SQL corpus runs `EXPLAIN QUERY PLAN` on the `under` forms and on `in`. The interned form must use the `strings` `UNIQUE(domain, s)` index, not scan the table per row.
+
 Which fields a table may filter on is now declared by the schema. A field the store cannot push down (a `cbor` column, or a map with no index) is simply not declared in the `where` schema, so `whereOperators` becomes redundant. Resource-kind tables, which today push down only `==`, can evaluate the expression in memory over the decoded rows before paging, until the ADR 0064 cut-over retires them.
 
 ## 5. Migrating today's spelling
@@ -472,12 +479,23 @@ The conversion needs the field's type from the schema (§4.3):
 |---|---|
 | `forge:github/repo:flotilla-org%2Fflotilla/cr:1363 .state == merged` | `forge:github/repo:flotilla-org%2Fflotilla/cr:1363 state == "merged"` |
 | `convoy:demo .latest-claim.disposition == "changes pushed"` | ``convoy:demo `latest-claim`.disposition == "changes pushed"`` |
-| `$issue .labels."kind:bug" == true` | `$issue "kind:bug" in labels` |
+| `$issue .labels."kind:bug" == true` | `$issue "kind:bug" in labels` (see labels below) |
 | `$issue .updated-at > 2026-10-01T00:00:00Z` | ``$issue `updated-at` > timestamp("2026-10-01T00:00:00Z")`` |
 | `$cr.state == merged` (old-store workflow template) | `$cr state == "merged"` |
 | `$cr .head-sha == revision` (promise kind) | ``$cr `head-sha` == revision`` (a declared bound variable) |
 
-A legacy literal that does not fit the field's type, such as an enum value not in the set (`leaf.rs:117-128` never checked these), converts to a condition that is **always U**. That matches today's behaviour: such a condition is admitted and never true. The conversion logs it. It is never a decode failure, because ADR 0047 forbids one.
+**Issue labels.** Today `issue .labels.<k>` reads `"true"` when the observed label set holds `k` and `"false"` when it does not. It reads Unknown when the label set is unobserved or stale (`leaf.rs:331-334`). Admission allows only `true` and `false` as literals (`leaf.rs:123-125`). So there are four cases, and each keeps its U behaviour:
+
+| Legacy | New | Label set observed, `k` held | observed, `k` not held | unobserved or stale |
+|---|---|---|---|---|
+| `.labels.k == true` | `"k" in labels` | T | F | U |
+| `.labels.k != false` | `"k" in labels` | T | F | U |
+| `.labels.k == false` | `!("k" in labels)` | F | T | U |
+| `.labels.k != true` | `!("k" in labels)` | F | T | U |
+
+`labels` is a `list(string)` field that is unknown when the set is unobserved, so `!U = U` gives today's Unknown in the last column.
+
+**A legacy condition that does not type-check.** The old admission never checked some literals, such as an enum value outside the set (`leaf.rs:117-128`), so such a condition can be stored today, and it is never true. It decodes to a **decode-only AST node, `Legacy(text)`**. The node keeps the legacy canonical text exactly as stored, evaluates to U for every row, and prints as that same legacy text. Its spelling starts with the subject and then `.`, so the next decode recognises it again (above). Its interned key, gate key and frozen bytes stay byte-identical, and nothing is re-keyed for it. The checker refuses `Legacy` in new input, so no new condition can take this form. The re-encode step leaves these records alone and reports how many there are. The legacy parser can retire only when that count is zero on every host: these conditions sit on messages, so they go when the messages are archived (#3939). It is never a decode failure, because ADR 0047 forbids one.
 
 ### Per stored form
 
@@ -526,7 +544,7 @@ The subset was chosen as the intersection, so a later graph layer can use it as 
 | Here | SPARQL / RDF |
 |---|---|
 | field | variable `?f` |
-| absent, U | unbound, error |
+| absent or unknown, U | unbound, error (SPARQL has no separate unknown; `BOUND` is never an error, so `has` on an unknown field has no exact SPARQL form) |
 | `has(f)` | `BOUND(?f)` |
 | `&&` `\|\|` `!` | `&&` `\|\|` `!` (the same table, SQ §17.2) |
 | top-level U drops the row | FILTER drops the solution (SQ §17) |
@@ -570,7 +588,7 @@ Serde for `Condition` is the canonical text, matching `text_serde!` in `conditio
 - rows, each with its expected T, F or U.
 
 Cases marked for SQL run against an in-memory SQLite, and must keep exactly the rows that evaluate to T. Two sources feed it:
-- **hand-written cases** for every rule in §4: absent values under each operator, Kleene tables, code-point ordering outside the BMP, `under` on segment boundaries (`demo` against `demo2`, percent-encoded `/`), timestamp precision, empty `in`, limits and canonical spelling;
+- **hand-written cases** for every rule in §4: absent values under each operator, Kleene tables, code-point ordering outside the BMP, `under` on segment boundaries (`demo` against `demo2`, percent-encoded `/`), timestamp precision, empty `in`, limits and canonical spelling, unknown versus absent under `has` and `!has`, fields behind a missing sub-structure, hostile identifiers, float printing, and query plans;
 - **a generated slice of cel-spec** `tests/simple/testdata` (`logic`, `comparisons`, `fields`, `lists`, `timestamps`), restricted to expressions inside the subset.
 
 A dev-only differential test also runs every corpus expression through the `cel` crate (0.15.0, which runs cel-spec v0.25.3), mapping its error to U. That checks the compatibility promise of §3.
@@ -588,7 +606,7 @@ A dev-only differential test also runs every corpus expression through the `cel`
 - **Field resolution:**
   - schemas from table descriptors (`descriptor.rs:220-241`), including the `address` type that #4108 adds as a role;
   - the leaf vocabulary (`leaf.rs:8-24`) and the promise vocabulary (`kinds.rs:59-115`) become schemas;
-  - `Row` implementations over table rows and leaf subjects, where stale means absent.
+  - `Row` implementations over table rows and leaf subjects, keyed by full declared path. An optional sub-structure that is missing (no latest claim) makes its fields absent, or unknown for an unobserved subject, and never a missing intermediate. Stale and unobserved mean unknown.
 - **Address literals:** validation as canonical text, and lenient resolution through `ForgeLookup`.
 - **The subject layer:**
   - `<address> <expression>`;
@@ -603,7 +621,7 @@ A dev-only differential test also runs every corpus expression through the `cel`
 2. **Enum spelling on the wire** (§5): readable names, with codes only in storage, is this note's recommendation, but it belongs to the descriptor work.
 3. **`under` moves to rigging** (§4.6), against the brief's placement.
 4. **Text search** (`contains`, case folding, regex) stays out of the subset for now.
-5. **The engine gate's Unknown-as-false collapse** (§4.5) predates this note, but the migration touches the same gate keys.
+5. **The engine gate's Unknown-as-false collapse** (§4.5, #4204) predates this note, but the migration touches the same gate keys.
 
 ## Sources
 
