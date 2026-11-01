@@ -8,9 +8,9 @@ installed Cleat lacks (#4051).
 import argparse
 from pathlib import Path
 import re
-import subprocess
 import sys
-import tempfile
+
+from generation_validation import AncestryError, fetched_history, git_run, is_ancestor
 
 CLEAT_REPOSITORY = "https://github.com/flotilla-org/cleat.git"
 REVISIONS = "ci/cleat-environment/revisions.sh"
@@ -34,34 +34,19 @@ def normalize_pin(value):
     return value.lower()
 
 
-def git_run(args, **kwargs):
-    return subprocess.run(["git", *args], capture_output=True, text=True, **kwargs)
-
-
 def require_pairing(declared, pinned, run=git_run):
-    """Refuse a Cleat that does not contain the declared revision.
-
-    `run` is the git process boundary: it takes an argument vector and
-    optional `cwd` and `check` keywords (as subprocess.run does) and returns a completed process.
-    """
+    """Refuse a Cleat that does not contain the declared revision."""
     if pinned == declared:
         return
-    with tempfile.TemporaryDirectory() as scratch:
-        for args in (["init", "--quiet"], ["remote", "add", "origin", CLEAT_REPOSITORY]):
-            run(args, cwd=scratch, check=True)
-        # History without blobs is enough to answer ancestry.
-        for commit in (pinned, declared):
-            fetched = run(["fetch", "--quiet", "--filter=blob:none", "origin", commit], cwd=scratch)
-            if fetched.returncode != 0:
-                raise PairingError(f"cannot fetch cleat {commit}: {fetched.stderr.strip()}")
-        verdict = run(["merge-base", "--is-ancestor", declared, pinned], cwd=scratch)
-    if verdict.returncode == 0:
-        return
-    if verdict.returncode != 1:
-        raise PairingError(f"cannot compare cleat {pinned} with {declared}: {verdict.stderr.strip()}")
-    raise PairingError(
-        f"cleat {pinned} does not contain the cleat {declared} that flotilla declares "
-        f"as CLEAT_NEW_REVISION in {REVISIONS}; pin that revision or a descendant")
+    try:
+        with fetched_history(CLEAT_REPOSITORY, (pinned, declared), "cleat", run) as scratch:
+            contains = is_ancestor(scratch, declared, pinned, "cleat", run)
+    except AncestryError as error:
+        raise PairingError(str(error)) from error
+    if not contains:
+        raise PairingError(
+            f"cleat {pinned} does not contain the cleat {declared} that flotilla declares "
+            f"as CLEAT_NEW_REVISION in {REVISIONS}; pin that revision or a descendant")
 
 
 def resolve_cleat_sha(flotilla_root, requested, run=git_run):

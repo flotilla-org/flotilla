@@ -15,6 +15,7 @@ readonly DAEMON_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/flotilla"
 readonly DAEMON_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/flotilla"
 readonly DAEMON_INSTALL_MARKER="$DAEMON_CONFIG_DIR/run/install-in-progress"
 readonly DAEMON_INSTALL_WINDOW_LOCK="$DAEMON_CONFIG_DIR/run/install-window.lock"
+readonly ROLL_LOG="$DAEMON_CONFIG_DIR/fleet-rolls.log"
 readonly DAEMON_SOCKET="$DAEMON_CONFIG_DIR/run/flotilla.sock"
 readonly LAUNCH_LOG_DIR="$HOME/Library/Logs/flotilla"
 readonly RELEASES_DIR="$FLEET_ROOT/releases"
@@ -53,6 +54,8 @@ CONFIRMATION_LOG=""
 CONFIRMATION_DONE=""
 # Set by --from: a pushed package directory replaces the Forgejo package store.
 SOURCE_DIR=""
+# Set by --rollback --reason: the operator accepts installing an older flotilla.
+ROLLBACK_REASON=""
 readonly GENERATION_INCOMPLETE_EXIT=20
 
 die() {
@@ -912,6 +915,8 @@ activate_staged_generation() {
   ensure_launchers_and_path
   prepare_linux_daemon_service
   prepare_darwin_daemon_service
+  local replaced
+  replaced="$(current_generation)"
   switch_to "$generation" "$rollback_generation" "$confirmation_token"
   restart_linux_daemon_service
   restart_darwin_daemon_service
@@ -922,6 +927,9 @@ activate_staged_generation() {
   else
     await_confirmation_watchdog "$generation" "$rollback_generation"
     prune_after_confirmation
+  fi
+  if [[ "$replaced" != "$generation" ]] && ! record_roll "$generation" "$replaced" "${FLEET_INSTALL_ROLLBACK_REASON:-}"; then
+    printf 'fleet-install: could not record the roll in %s\n' "$ROLL_LOG" >&2
   fi
   # Always use the incoming generation: the previous CLI may not have this
   # post-install step. Cleat alias turnover is outside the health rollback.
@@ -1005,6 +1013,57 @@ finish_staging() {
   fi
 }
 
+roll_label() {
+  local label="${1#*-}"
+  printf '%s\n' "${label%%-*}"
+}
+
+# Leads the install with the flotilla commit comparison and refuses a generation
+# that does not descend from the live one unless the operator asked for it.
+guard_roll_direction() {
+  local generation="$1" manifest="$2" live="$3"
+  unset FLEET_INSTALL_ROLLBACK_REASON
+  ((CANARY_ONLY)) && return 0
+  [[ -n "$live" && "$live" != "$generation" ]] || return 0
+  local live_commit incoming_commit verdict direction count="" summary
+  if incoming_commit="$(manifest_value "$manifest" sources.flotilla)" \
+    && live_commit="$(manifest_value "$RELEASES_DIR/$live/.generation.json" sources.flotilla)" \
+    && verdict="$(python3 "$GENERATION_VALIDATOR" roll-direction -- "$live_commit" "$incoming_commit")"; then
+    read -r direction count <<<"$verdict"
+  else
+    direction=unknown
+  fi
+  case "$direction" in
+    same) summary="unchanged" ;;
+    forward) summary="$count commits ahead" ;;
+    rollback) summary="ROLLBACK: $count commits behind live $(roll_label "$live")" ;;
+    diverged) summary="ROLLBACK: diverged from live $(roll_label "$live")" ;;
+    *) summary="ROLLBACK: cannot compare with live $(roll_label "$live")" ;;
+  esac
+  printf 'flotilla %s -> %s (%s)\n' "${live_commit:0:8}" "${incoming_commit:0:8}" "$summary"
+  case "$direction" in
+    same|forward) return 0 ;;
+  esac
+  if [[ -z "$ROLLBACK_REASON" ]]; then
+    printf 'refused: pass --rollback --reason "<why>" to install an older generation\n' >&2
+    die "$generation (flotilla ${incoming_commit:-unknown}) does not descend from live $live (flotilla ${live_commit:-unknown})"
+  fi
+  export FLEET_INSTALL_ROLLBACK_REASON="$ROLLBACK_REASON"
+}
+
+# One tab-separated line per roll: time, generation, replaced generation,
+# flotilla commit, cleat commit, installer, rollback reason (empty for none).
+record_roll() {
+  local generation="$1" replaced="$2" reason="${3:-}"
+  local manifest="$RELEASES_DIR/$generation/.generation.json" flotilla cleat
+  flotilla="$(manifest_value "$manifest" sources.flotilla)" || return 1
+  cleat="$(manifest_value "$manifest" sources.cleat)" || return 1
+  reason="${reason//[$'\t\r\n']/ }"
+  mkdir -p "$DAEMON_CONFIG_DIR" || return 1
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$generation" "$replaced" \
+    "$flotilla" "$cleat" "$(id -un)" "$reason" >>"$ROLL_LOG"
+}
+
 install_generation() {
   local generation="$1"
   require_generation "$generation"
@@ -1024,21 +1083,19 @@ install_generation() {
   fi
   [[ "$rollback_generation" != "$generation" ]] || rollback_generation=""
   confirmation_token="$$-$(python3 "$GENERATION_VALIDATOR" nonce)"
+  make_work_dir
+  local outer="$WORK_DIR/generation.json"
+  require_generation_manifest "$generation" "$outer"
+  guard_roll_direction "$generation" "$outer" "$old"
   printf 'fleet-install: %s -> %s\n' "${old:-<none>}" "$generation"
   if [[ -d "$RELEASES_DIR/$generation" ]]; then
-    make_work_dir
-    local installed_outer="$WORK_DIR/installed-generation.json"
-    require_generation_manifest "$generation" "$installed_outer"
-    verify_installed_release "$RELEASES_DIR/$generation" "$installed_outer"
+    verify_installed_release "$RELEASES_DIR/$generation" "$outer"
     finish_staging "$generation" "$rollback_generation" "$confirmation_token"
     ((CANARY_ONLY)) || printf 'fleet-install: generation %s is installed\n' "$generation"
     return
   fi
-  make_work_dir
-  local outer="$WORK_DIR/generation.json"
   local archive="$WORK_DIR/artifact.tar.gz"
   local unpack="$WORK_DIR/unpack"
-  require_generation_manifest "$generation" "$outer"
   local artifact expected expected_size actual actual_size
   artifact="$(platform_value "$outer" artifact)"
   expected="$(platform_value "$outer" sha256)"
@@ -1105,6 +1162,8 @@ rollback() {
   restart_linux_daemon_service
   restart_darwin_daemon_service
   end_darwin_install_window
+  record_roll "$previous" "$current" 'fleet-install rollback' \
+    || printf 'fleet-install: could not record the roll in %s\n' "$ROLL_LOG" >&2
 }
 
 # Selection and deletion share the install lock. Always delegate to the active
@@ -1135,22 +1194,34 @@ host_preflight() {
 }
 
 usage() {
-  echo 'usage: fleet-install [--min-free-bytes N] [--max-wait-seconds N] [--from DIR] [--skip-canary] <latest|generation> | --canary <generation> | status | rollback | --prune-dry-run | --prune' >&2
+  echo 'usage: fleet-install [--min-free-bytes N] [--max-wait-seconds N] [--from DIR] [--rollback --reason WHY] [--skip-canary] <latest|generation> | --canary <generation> | status | rollback | --prune-dry-run | --prune' >&2
   echo 'defaults: --min-free-bytes 5368709120 (5 GiB); --max-wait-seconds 600; ordinary confirmation 90 seconds' >&2
   echo '--from DIR installs a named generation from a pushed package directory (DIR/<generation>/generation.json and archive) instead of Forgejo; no package token is read' >&2
   exit 2
 }
 
 main() {
-  while [[ "${1:-}" == --min-free-bytes || "${1:-}" == --max-wait-seconds || "${1:-}" == --from ]]; do
+  local rollback_requested=0
+  while [[ "${1:-}" == --min-free-bytes || "${1:-}" == --max-wait-seconds || "${1:-}" == --from || "${1:-}" == --reason || "${1:-}" == --rollback ]]; do
+    if [[ "$1" == --rollback ]]; then
+      rollback_requested=1
+      shift
+      continue
+    fi
     [[ $# -ge 2 ]] || usage
     case "$1" in
       --min-free-bytes) MIN_FREE_BYTES="$2" ;;
       --max-wait-seconds) MAX_WAIT_SECONDS="$2" ;;
       --from) SOURCE_DIR="$2" ;;
+      --reason) ROLLBACK_REASON="$2" ;;
     esac
     shift 2
   done
+  if ((rollback_requested)); then
+    [[ -n "$ROLLBACK_REASON" ]] || die '--rollback needs --reason "<why>"'
+  else
+    [[ -z "$ROLLBACK_REASON" ]] || die '--reason only goes with --rollback'
+  fi
   if [[ -n "$SOURCE_DIR" ]]; then
     [[ -d "$SOURCE_DIR" && ! -L "$SOURCE_DIR" ]] || die "pushed package directory is missing or not a directory: $SOURCE_DIR"
     # Only a named generation can come from a pushed directory: there is no

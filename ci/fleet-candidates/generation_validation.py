@@ -2,6 +2,7 @@
 """Canonical validation for fleet candidates and promoted generations."""
 
 import argparse
+import contextlib
 import copy
 import datetime
 import hashlib
@@ -78,6 +79,58 @@ TYPESCRIPT_HOST_ENTRIES = {f"{TYPESCRIPT_HOST_TREE}/dist/main.js", f"{TYPESCRIPT
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 GENERATION_PATTERN = re.compile(r"^(\d{8}T\d{6}Z-r\d+-f([0-9a-f]{12})-c([0-9a-f]{12}))$")
+FLOTILLA_REPOSITORY = "https://github.com/flotilla-org/flotilla.git"
+
+
+class AncestryError(ValueError):
+    pass
+
+
+def git_run(args, **kwargs):
+    return subprocess.run(["git", *args], capture_output=True, text=True, **kwargs)
+
+
+@contextlib.contextmanager
+def fetched_history(repository, commits, label, run=git_run):
+    """A scratch clone holding the history of `commits`, without blobs.
+
+    `run` is the git process boundary: it takes an argument vector and optional
+    `cwd` and `check` keywords (as subprocess.run does) and returns a completed process.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        for args in (["init", "--quiet"], ["remote", "add", "origin", repository]):
+            run(args, cwd=scratch, check=True)
+        for commit in commits:
+            fetched = run(["fetch", "--quiet", "--filter=blob:none", "origin", commit], cwd=scratch)
+            if fetched.returncode != 0:
+                raise AncestryError(f"cannot fetch {label} {commit}: {fetched.stderr.strip()}")
+        yield scratch
+
+
+def is_ancestor(scratch, ancestor, descendant, label, run=git_run):
+    verdict = run(["merge-base", "--is-ancestor", ancestor, descendant], cwd=scratch)
+    if verdict.returncode not in (0, 1):
+        raise AncestryError(f"cannot compare {label} {descendant} with {ancestor}: {verdict.stderr.strip()}")
+    return verdict.returncode == 0
+
+
+def commits_between(scratch, ancestor, descendant, label, run=git_run):
+    counted = run(["rev-list", "--count", f"{ancestor}..{descendant}"], cwd=scratch)
+    if counted.returncode != 0:
+        raise AncestryError(f"cannot count {label} commits {ancestor}..{descendant}: {counted.stderr.strip()}")
+    return int(counted.stdout.strip())
+
+
+def compare_revisions(repository, live, incoming, label, run=git_run):
+    """How `incoming` moves from `live`: ("same"|"forward"|"rollback"|"diverged", commit count)."""
+    if live == incoming:
+        return "same", 0
+    with fetched_history(repository, (live, incoming), label, run) as scratch:
+        if is_ancestor(scratch, live, incoming, label, run):
+            return "forward", commits_between(scratch, live, incoming, label, run)
+        if is_ancestor(scratch, incoming, live, label, run):
+            return "rollback", commits_between(scratch, incoming, live, label, run)
+    return "diverged", 0
 # Component metadata is embedded in the signed v2 pin list, so compatibility
 # claims are authenticated together with the identity and archive digest.
 COMPONENT_PATTERN = re.compile(r"^[a-z][a-z0-9-]*$")
@@ -1436,6 +1489,9 @@ def main():
     helper.add_argument("relative")
     helper = sub.add_parser("protocol")
     helper.add_argument("path")
+    helper = sub.add_parser("roll-direction")
+    helper.add_argument("live")
+    helper.add_argument("incoming")
     helper = sub.add_parser("release-lock")
     helper.add_argument("path")
     helper.add_argument("owner")
@@ -1571,7 +1627,10 @@ def main():
             validate_entitlements(args.path, args.relative)
         elif args.command == "protocol":
             protocol_version(args.path)
-    except (OSError, json.JSONDecodeError, tarfile.TarError, KeyError, ValidationError) as error:
+        elif args.command == "roll-direction":
+            repository = os.environ.get("FLEET_INSTALL_FLOTILLA_REPOSITORY", FLOTILLA_REPOSITORY)
+            print(*compare_revisions(repository, args.live, args.incoming, "flotilla"))
+    except (AncestryError, OSError, json.JSONDecodeError, tarfile.TarError, KeyError, ValidationError) as error:
         parser.exit(1, f"generation validation: {error}\n")
 
 
