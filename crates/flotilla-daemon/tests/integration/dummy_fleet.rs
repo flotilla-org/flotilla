@@ -581,18 +581,17 @@ async fn a_missing_fleet_designation_waits_and_delivery_resumes_when_it_arrives(
     let fleet = DummyDaemon::start_with_relay().host("dummy-load").designated(false).supervision(supervision).call().await;
     fleet.dispatch("undesignated", CrewMix::Coder).await;
     let convoy = fleet.convoy("undesignated").await.expect("convoy");
-    let explained = tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let explained = fleet.daemon.explain_convoy_internal(Some(NAMESPACE), &convoy.metadata.name).await.expect("explain");
             if explained.warnings.iter().any(|warning| warning.contains("FleetDesignation `fleet` is missing")) {
-                return explained;
+                return;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
     .expect("explain names the missing FleetDesignation");
-    assert!(!explained.warnings.is_empty());
     let conditions = fleet.host_conditions().await;
     assert!(conditions.iter().all(|c| c.condition_type != "Message/FleetDesignation"), "a diagnostic is not recorded: {conditions:?}");
     tokio::time::sleep(Duration::from_secs(1)).await;

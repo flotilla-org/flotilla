@@ -43,7 +43,7 @@ use futures::stream::BoxStream;
 use serde_json::{json, Value};
 
 use super::host_import;
-use crate::stored::host::{Condition, HostObservation, HostRecord, Readiness};
+use crate::stored::host::{Class, Condition, HostObservation, HostRecord, Readiness};
 
 const KIND: &str = <HostRecord as Kind>::KIND;
 const HOST: KindCode = <HostRecord as Kind>::CODE;
@@ -235,7 +235,7 @@ fn capabilities(connection: &HostConnection, observation: &HostObservation) -> B
         .iter()
         .map(|(instance, provider)| ProviderAdvertisement {
             instance: instance.clone(),
-            kind: provider.class.map(|class| ProviderKind::new(class.environment_class(), String::new())),
+            kind: provider.class.and_then(Class::environment_class).map(|class| ProviderKind::new(class, String::new())),
             capabilities: ProviderCapabilities {
                 material_modes: provider.material_modes.clone(),
                 checkout_strategies: provider.checkout_strategies.clone(),
@@ -388,6 +388,9 @@ impl EngineHosts {
         Some(encoded.map(|(spec, status)| EngineObject {
             name: name.to_owned(),
             home: home.to_owned(),
+            // A change token for the writers' version checks, which read it back from this home: it
+            // moves with each write of either record. Delete ends both, and a Host made again
+            // starts as a new object.
             version: host_version + held.observation.as_ref().map_or(0, |(_, version)| *version),
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
