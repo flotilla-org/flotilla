@@ -1,5 +1,6 @@
 pub mod cleat;
 pub mod environment;
+pub mod generation;
 pub mod passthrough;
 
 use async_trait::async_trait;

@@ -9,10 +9,26 @@ use flotilla_provider_runtime::{HttpClient, ReqwestHttpClient};
 use std::sync::Arc;
 
 use super::FactoryRegistry;
+use crate::generation_turnover::PoolTurnover;
 use flotilla_terminal::factories::{cleat::CleatTerminalPoolFactory, passthrough::PassthroughTerminalPoolFactory};
 
 fn terminal_pool_factories() -> Vec<Box<super::TerminalPoolFactory>> {
     vec![Box::new(CleatTerminalPoolFactory), Box::new(PassthroughTerminalPoolFactory)]
+}
+
+/// Each terminal pool by the name its sessions record, with the generation turnover it offers.
+pub fn generation_turnovers() -> Vec<PoolTurnover> {
+    use flotilla_discovery_api::Factory;
+    vec![
+        PoolTurnover {
+            pool: CleatTerminalPoolFactory.descriptor().implementation,
+            facility: CleatTerminalPoolFactory.generation_turnover(),
+        },
+        PoolTurnover {
+            pool: PassthroughTerminalPoolFactory.descriptor().implementation,
+            facility: PassthroughTerminalPoolFactory.generation_turnover(),
+        },
+    ]
 }
 
 fn vcs_factories() -> Vec<Box<super::VcsFactory>> {

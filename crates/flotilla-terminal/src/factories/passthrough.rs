@@ -10,12 +10,20 @@ use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
 
+use crate::generation::GenerationTurnover;
 use crate::passthrough::PassthroughTerminalPool;
 use crate::TerminalPool;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 
 pub struct PassthroughTerminalPoolFactory;
+
+impl PassthroughTerminalPoolFactory {
+    /// Passthrough sessions are plain processes with no backend generation to advance.
+    pub fn generation_turnover(&self) -> Option<Arc<dyn GenerationTurnover>> {
+        None
+    }
+}
 
 #[async_trait]
 impl Factory for PassthroughTerminalPoolFactory {

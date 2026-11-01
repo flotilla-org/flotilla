@@ -28,6 +28,7 @@ pub mod detectors;
 pub mod environment_manager;
 pub mod environments;
 pub mod factories;
+pub mod generation_turnover;
 pub mod observation_credentials;
 pub mod registry;
 

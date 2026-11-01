@@ -10,40 +10,110 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use flotilla_discovery_api::EnvironmentBag;
-use flotilla_protocol::{result_set::CleatEndpoint, EnvironmentId};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::AsyncWriteExt;
 
+use crate::environment::ControlledTerminalEnvironment;
+use crate::generation::{
+    BuildAssessment, DrainAttempt, DrainReport, GenerationTurnover, IncomingBuild, RollReport, Turnover, TurnoverEnvironment,
+};
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
-use flotilla_terminal::environment::ControlledTerminalEnvironment;
 
-#[derive(bon::Builder)]
-pub struct CleatEnvironment {
-    pub id: EnvironmentId,
-    pub bag: EnvironmentBag,
-    pub runner: Arc<dyn CommandRunner>,
-    pub contained: bool,
+/// Release composition roles of the Cleat executable and its loader-relative library.
+const CLEAT_ROLE: &str = "cleat";
+const LIBRARY_ROLE: &str = "cleat-library";
+
+/// Cleat's generation turnover: descriptor handover to the installed daemon generation.
+pub struct CleatGenerationTurnover;
+
+#[async_trait]
+impl GenerationTurnover for CleatGenerationTurnover {
+    fn condition_type(&self) -> &'static str {
+        "CleatBuildSkew"
+    }
+
+    fn declared(&self, bag: &EnvironmentBag) -> bool {
+        bag.find_binary("cleat").is_some()
+    }
+
+    async fn advance(&self, environments: &[TurnoverEnvironment], incoming: &IncomingBuild) -> Turnover {
+        let (targets, errors) = inventory(environments);
+        drain(incoming, &targets, errors).await
+    }
+
+    async fn assess(
+        &self,
+        host: &TurnoverEnvironment,
+        environments: &[TurnoverEnvironment],
+        previous: Option<&RollReport>,
+        errors: Vec<String>,
+    ) -> Option<BuildAssessment> {
+        let binary = host.bag.find_binary("cleat")?;
+        let output = host
+            .runner
+            .run_with_timeout(
+                &binary.as_path().display().to_string(),
+                &["version", "--json"],
+                Path::new("/"),
+                &ChannelLabel::Default,
+                Duration::from_secs(5),
+            )
+            .await;
+        let installed = output
+            .ok()
+            .and_then(|output| serde_json::from_str::<Value>(&output).ok())
+            .and_then(|value| value["client"]["git_sha"].as_str().map(str::to_string));
+        let (targets, target_errors) = inventory(environments);
+        let mut report = previous.cloned();
+        if let Some(report) = &mut report {
+            // A relaunched/destroyed environment no longer carries the failed
+            // handover. Keep failures only for still-registered runtime targets.
+            report.attempts.retain(|attempt| {
+                targets.iter().any(|target| {
+                    target.environment == attempt.environment && target.runtime_root == attempt.runtime_root && target.name == attempt.name
+                })
+            });
+        }
+        let mut assessment = build_skew(installed.as_deref(), &targets, report.as_ref()).await;
+        assessment.actionable.extend(errors);
+        assessment.actionable.extend(target_errors);
+        if let Some(report) = report.as_ref() {
+            assessment.actionable.extend(assess_drain(report).actionable);
+        }
+        Some(assessment)
+    }
+}
+
+fn inventory(environments: &[TurnoverEnvironment]) -> (Vec<CleatTarget>, Vec<String>) {
+    let mut targets = Vec::new();
+    let mut errors = Vec::new();
+    for environment in environments {
+        match crew_targets(environment) {
+            Ok(environment_targets) => targets.extend(environment_targets),
+            Err(error) => errors.push(format!("{}: {error}", environment.id)),
+        }
+    }
+    (targets, errors)
 }
 
 #[derive(Clone, bon::Builder)]
-pub struct CleatTarget {
-    pub environment: String,
-    pub runtime_root: PathBuf,
-    pub name: String,
-    pub binary: String,
-    pub runner: Arc<dyn CommandRunner>,
-    pub contained: bool,
+struct CleatTarget {
+    environment: String,
+    runtime_root: PathBuf,
+    name: String,
+    binary: String,
+    runner: Arc<dyn CommandRunner>,
+    contained: bool,
     #[builder(default)]
-    pub vessels: Vec<String>,
+    vessels: Vec<String>,
 }
 
 /// Add default and ambient names, then recorded session endpoints in this
 /// environment. A root/name pair is addressed once, independent of generation.
-pub fn crew_targets(environment: &CleatEnvironment, endpoints: &[CleatEndpoint]) -> Result<Vec<CleatTarget>, String> {
+fn crew_targets(environment: &TurnoverEnvironment) -> Result<Vec<CleatTarget>, String> {
     let root = if let Some(root) = environment.bag.find_env_var("CLEAT_RUNTIME_DIR") {
         PathBuf::from(root)
     } else if let Some(state) = environment.bag.find_env_var("XDG_STATE_HOME").filter(|state| Path::new(state).is_absolute()) {
@@ -58,7 +128,7 @@ pub fn crew_targets(environment: &CleatEnvironment, endpoints: &[CleatEndpoint])
     if let Some(name) = environment.bag.find_env_var("CLEAT_DAEMON") {
         names.insert((root, logical_name(name)?.to_string()), ());
     }
-    for endpoint in endpoints {
+    for endpoint in &environment.endpoints {
         names.insert((PathBuf::from(&endpoint.runtime_root), logical_name(&endpoint.daemon)?.to_string()), ());
     }
     names
@@ -74,6 +144,7 @@ pub fn crew_targets(environment: &CleatEnvironment, endpoints: &[CleatEndpoint])
                 .binary(binary.clone())
                 .runner(ControlledTerminalEnvironment::from_bag(&environment.bag).runner(Arc::clone(&environment.runner)))
                 .contained(environment.contained)
+                .vessels(environment.vessels.clone())
                 .build())
         })
         .collect()
@@ -88,46 +159,6 @@ fn logical_name(name: &str) -> Result<&str, String> {
         return Err(format!("invalid cleat logical daemon: {name}"));
     }
     Ok(logical)
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DrainReport {
-    pub changed: bool,
-    pub installed: Value,
-    pub old: Value,
-    pub current: Value,
-    pub warning: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
-pub struct DrainAttempt {
-    pub environment: String,
-    pub runtime_root: PathBuf,
-    pub name: String,
-    pub stdout: String,
-    pub stderr: String,
-    pub success: bool,
-    pub report: Option<DrainReport>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
-pub struct RollReport {
-    pub host: String,
-    pub generation: String,
-    pub attempts: Vec<DrainAttempt>,
-    pub errors: Vec<String>,
-    /// ADR 0047: absent in previous roll reports; remove default after one roll.
-    #[serde(default)]
-    #[builder(default)]
-    pub information: Vec<String>,
-    pub diagnostics_path: Option<PathBuf>,
-}
-
-impl RollReport {
-    pub fn failed(&self) -> bool {
-        !self.errors.is_empty() || self.attempts.iter().any(|attempt| attempt.error.is_some())
-    }
 }
 
 async fn command(target: &CleatTarget, binary: &str, verb: &[&str], timeout: Duration) -> Result<CommandOutput, String> {
@@ -150,31 +181,24 @@ struct IncomingTools {
     library: PathBuf,
 }
 
-#[cfg(unix)]
-fn contained_incoming(incoming: &Path) -> Result<IncomingTools, String> {
-    let release = incoming.parent().and_then(Path::parent).ok_or("incoming cleat has no release root")?;
-    flotilla_environment::guest_tools::GuestTools::resolve(release, &flotilla_environment::guest_tools::linux_amd64()).map(|tools| {
-        use flotilla_environment::composition::role;
-        IncomingTools { cleat: tools.file(role::CLEAT), library: tools.file(role::CLEAT_LIBRARY) }
-    })
-}
-
-#[cfg(not(unix))]
-fn contained_incoming(_incoming: &Path) -> Result<IncomingTools, String> {
-    Err("contained Cleat delivery requires a supported guest-tool controller".into())
+fn contained_incoming(guest: &Result<BTreeMap<String, PathBuf>, String>) -> Result<IncomingTools, String> {
+    let files = guest.as_ref().map_err(String::clone)?;
+    let file = |role: &str| files.get(role).cloned().ok_or_else(|| format!("incoming guest build has no {role} file"));
+    Ok(IncomingTools { cleat: file(CLEAT_ROLE)?, library: file(LIBRARY_ROLE)? })
 }
 
 // Host-local tools already reside in the verified installed release, including
 // its loader-relative library. Contained environments need a private payload
 // reachable through their runner, independent of their original tool mounts.
-async fn incoming_for_target(target: &CleatTarget, generation: &str, incoming: &Path) -> Result<PathBuf, String> {
+async fn incoming_for_target(target: &CleatTarget, incoming: &IncomingBuild) -> Result<PathBuf, String> {
     if !target.contained {
-        return Ok(incoming.to_path_buf());
+        return Ok(incoming.installed.clone());
     }
     if !target.runtime_root.is_absolute() {
         return Err("cleat runtime root must be absolute".into());
     }
-    let tools = contained_incoming(incoming)?;
+    let generation = incoming.generation.as_str();
+    let tools = contained_incoming(&incoming.guest)?;
     let mut files = Vec::new();
     for (name, source) in [("bin/cleat", tools.cleat.as_path()), ("lib/libghostty-vt.so.0", tools.library.as_path())] {
         let bytes = tokio::fs::read(source).await.map_err(|error| format!("read incoming {}: {error}", source.display()))?;
@@ -232,14 +256,14 @@ async fn incoming_for_target(target: &CleatTarget, generation: &str, incoming: &
 
 /// Transfer live descriptors to the installed generation. Failure leaves old
 /// sessions alive and becomes actionable CleatBuildSkew; never request drops.
-pub async fn drain(host: String, generation: String, incoming: &Path, targets: &[CleatTarget], errors: Vec<String>) -> RollReport {
-    let mut report = RollReport::builder().host(host).generation(generation).attempts(vec![]).errors(errors).build();
-    if logical_name(&report.generation).is_err() || report.generation.contains('@') {
+async fn drain(incoming: &IncomingBuild, targets: &[CleatTarget], errors: Vec<String>) -> Turnover {
+    let mut report = Turnover { errors, ..Turnover::default() };
+    if logical_name(&incoming.generation).is_err() || incoming.generation.contains('@') {
         report.errors.push("invalid fleet generation".to_string());
         return report;
     }
     for target in targets {
-        let selected_incoming = incoming_for_target(target, &report.generation, incoming).await;
+        let selected_incoming = incoming_for_target(target, incoming).await;
         let output = match &selected_incoming {
             Ok(incoming) => match incoming.to_str() {
                 Some(binary) => command(target, binary, &["server", "handover", "--json"], Duration::from_secs(30)).await,
@@ -364,61 +388,6 @@ pub async fn drain(host: String, generation: String, incoming: &Path, targets: &
     report
 }
 
-/// Retain successful and failed attempts alike. A storage failure is added to
-/// the same report so the caller can still surface all captured CLI evidence.
-pub async fn persist(report: &mut RollReport, directory: &Path) {
-    let path = directory.join(format!("cleat-drain-{}.json", uuid::Uuid::new_v4()));
-    report.diagnostics_path = Some(path.clone());
-    let result: Result<(), String> = async {
-        tokio::fs::create_dir_all(directory).await.map_err(|error| error.to_string())?;
-        let mut options = tokio::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options.open(&path).await.map_err(|error| error.to_string())?;
-        let bytes = serde_json::to_vec_pretty(report).map_err(|error| error.to_string())?;
-        file.write_all(&bytes).await.map_err(|error| error.to_string())?;
-        // Tokio file writes may still be buffered; the returned path must be
-        // readable immediately by a caller using synchronous filesystem I/O.
-        file.flush().await.map_err(|error| error.to_string())
-    }
-    .await;
-    if let Err(error) = result {
-        report.diagnostics_path = None;
-        report.errors.push(format!("write roll diagnostics {}: {error}", path.display()));
-    }
-}
-
-/// Health separates actionable host skew from expected old generations.
-#[derive(Debug, Default)]
-pub struct BuildAssessment {
-    pub actionable: Vec<String>,
-    pub information: Vec<String>,
-}
-
-impl BuildAssessment {
-    pub fn into_condition(self, observed_at: chrono::DateTime<chrono::Utc>) -> Option<flotilla_resources::HostCondition> {
-        let degraded = !self.actionable.is_empty();
-        let mut messages = self.actionable;
-        messages.extend(self.information);
-        if messages.is_empty() {
-            return None;
-        }
-        Some(
-            flotilla_resources::HostCondition::builder()
-                .condition_type("CleatBuildSkew")
-                .value(if degraded { flotilla_resources::ConditionValue::False } else { flotilla_resources::ConditionValue::True })
-                .reason(if degraded { "InstalledServingMismatch" } else { "ExpectedGenerationSkew" })
-                .message(messages.join("; "))
-                .observed_at(observed_at)
-                .blocks_readiness(false)
-                // Cleat terminal build skew does not disable forge reads.
-                .blocks_forge_observation(false)
-                .build(),
-        )
-    }
-}
-
 impl CleatTarget {
     fn label(&self) -> String {
         if self.vessels.is_empty() {
@@ -435,7 +404,7 @@ fn sha(build: &Value) -> Option<&str> {
 
 /// Derive health from the current alias observation, never the oldest listed
 /// daemon or the `old` generation in a successful drain report.
-pub fn assess_current(installed: Option<&str>, target: &CleatTarget, current: &Value) -> BuildAssessment {
+fn assess_current(installed: Option<&str>, target: &CleatTarget, current: &Value) -> BuildAssessment {
     let mut assessment = BuildAssessment::default();
     let serving = sha(&current["daemon"]);
     let installed = installed.filter(|sha| !sha.is_empty() && *sha != "unknown");
@@ -465,7 +434,7 @@ pub fn assess_current(installed: Option<&str>, target: &CleatTarget, current: &V
 
 /// Failed host drain attempts remain actionable even when no build can be
 /// observed. Expected inventory/skip observations remain informational.
-pub fn assess_drain(report: &RollReport) -> BuildAssessment {
+fn assess_drain(report: &RollReport) -> BuildAssessment {
     let mut assessment = BuildAssessment { actionable: report.errors.clone(), information: report.information.clone() };
     for attempt in &report.attempts {
         if let Some(error) = &attempt.error {
@@ -606,7 +575,7 @@ async fn observe(installed: Option<&str>, target: &CleatTarget, report: Option<&
     assessment
 }
 
-pub async fn build_skew(installed: Option<&str>, targets: &[CleatTarget], report: Option<&RollReport>) -> BuildAssessment {
+async fn build_skew(installed: Option<&str>, targets: &[CleatTarget], report: Option<&RollReport>) -> BuildAssessment {
     let mut assessment = BuildAssessment::default();
     // Observe runtimes concurrently so unavailable vessels do not multiply the
     // heartbeat's timeout by the number of environments.

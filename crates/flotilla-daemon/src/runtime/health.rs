@@ -553,9 +553,7 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
     );
 
     conditions.extend(file_descriptor_pressure_condition());
-    if let Some(condition) = daemon.cleat_build_skew_condition().await {
-        conditions.push(condition);
-    }
+    conditions.extend(daemon.generation_conditions().await);
     if let Some(condition) = resource_decode_quarantine_condition(resource_store.as_ref()) {
         conditions.push(condition);
     }

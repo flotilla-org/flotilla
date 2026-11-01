@@ -191,6 +191,17 @@ impl GuestTools {
             _ => unreachable!("the composition declares file role `{role}`"),
         }
     }
+    /// Every verified file member, by role.
+    pub fn files(&self) -> std::collections::BTreeMap<String, PathBuf> {
+        self.composition
+            .members
+            .iter()
+            .filter_map(|member| match &member.source {
+                Source::File(file) => Some((member.role.clone(), self.root.join(file))),
+                Source::Tree(_) => None,
+            })
+            .collect()
+    }
     pub fn composition(&self) -> &'static Composition {
         self.composition
     }

@@ -44,7 +44,7 @@ use flotilla_executor::executor_actions;
 use flotilla_projections::projections_actions;
 
 mod change_stream;
-mod cleat_roll;
+mod generation_turnover;
 use flotilla_crew::crew_actions;
 use flotilla_crew::crew_ops::{ConvoyResumeOutcome, CrewRoutingContext, CrewService, CrewTurnDeliveryActuator, MessageAttribution};
 use flotilla_crew::ports::WorkCredentialReconciler;
@@ -757,7 +757,8 @@ pub struct InProcessDaemon {
     host_registry: flotilla_projections::host_registry::HostRegistry,
     local_environment_id: EnvironmentId,
     environment_manager: Arc<EnvironmentManager>,
-    cleat_roll_report: Mutex<Option<crate::cleat_roll::RollReport>>,
+    turnover_report: Mutex<Option<flotilla_terminal::generation::RollReport>>,
+    pool_turnovers: Vec<flotilla_discovery::generation_turnover::PoolTurnover>,
     environment_adoption: tokio::sync::watch::Sender<bool>,
     /// Discovery dependencies and configuration used for all daemon-side
     /// provider detection, both at startup and for later repo additions.
@@ -1358,7 +1359,8 @@ impl InProcessDaemon {
             ),
             local_environment_id: local_environment_id.clone(),
             environment_manager: Arc::clone(&environment_manager),
-            cleat_roll_report: Mutex::new(None),
+            turnover_report: Mutex::new(None),
+            pool_turnovers: flotilla_discovery::factories::generation_turnovers(),
             environment_adoption: tokio::sync::watch::channel(true).0,
             discovery: Arc::clone(&discovery),
             change_request_query_port: Arc::clone(&query_port),

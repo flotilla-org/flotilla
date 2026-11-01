@@ -10,12 +10,20 @@ use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
 
+use crate::cleat::turnover::CleatGenerationTurnover;
 use crate::cleat::CleatTerminalPool;
+use crate::generation::GenerationTurnover;
 use crate::TerminalPool;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 
 pub struct CleatTerminalPoolFactory;
+
+impl CleatTerminalPoolFactory {
+    pub fn generation_turnover(&self) -> Option<Arc<dyn GenerationTurnover>> {
+        Some(Arc::new(CleatGenerationTurnover))
+    }
+}
 
 #[async_trait]
 impl Factory for CleatTerminalPoolFactory {

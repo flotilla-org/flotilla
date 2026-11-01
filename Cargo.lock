@@ -2455,6 +2455,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bon",
+ "chrono",
  "flotilla-address",
  "flotilla-agent",
  "flotilla-ai-utility",
@@ -3762,17 +3763,21 @@ dependencies = [
  "flotilla-build-features-types",
  "flotilla-discovery-api",
  "flotilla-discovery-testkit",
+ "flotilla-environment",
  "flotilla-paths",
  "flotilla-protocol",
  "flotilla-provider-runtime",
  "flotilla-replay-testkit",
+ "futures",
  "hegeltest",
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
