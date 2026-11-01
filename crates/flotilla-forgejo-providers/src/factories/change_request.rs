@@ -60,9 +60,9 @@ impl Factory for ForgejoChangeRequestFactory {
             return Err(vec![UnmetRequirement::MissingRemoteHost("Forgejo origin".into())]);
         }
         let settings = config.load_config_for_probe().await.map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?;
-        let provider_config = bounded_forgejo_provider_config(env, config, &settings).await?;
+        let (provider_config, http) = bounded_forgejo_provider_config(env, config, &settings, Arc::clone(&self.http)).await?;
         let slug = env.repo_slug().ok_or_else(|| vec![UnmetRequirement::MissingRemoteHost("origin".into())])?;
-        let mut provider = ForgejoChangeRequestProvider::new(Arc::clone(&self.http), runner, provider_config, slug);
+        let mut provider = ForgejoChangeRequestProvider::new(http, runner, provider_config, slug);
         if let Some(login) = settings.change_request.operator_login {
             provider = provider.with_operator_login(login);
         }

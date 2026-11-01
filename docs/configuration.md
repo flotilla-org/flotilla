@@ -466,6 +466,8 @@ substituting the provider that serves them. Install the same host-local
 provider = "forgejo"
 endpoint_url = "https://fake-forge.rehearsal:3443/github"
 token_path = "/etc/flotilla-rehearsal/tokens/github"
+# Optional: extra root CAs (absolute PEM file) for this endpoint only
+ca_path = "/etc/flotilla-rehearsal/rehearsal-ca.pem"
 ```
 
 The key is the original canonical service URL, including an installation prefix
@@ -474,7 +476,10 @@ HTTPS endpoint and absolute token file before ordinary provider/credential
 selection. Builtin GitHub needs no replacement Forge record. Repository keys,
 Forge definitions, Git remotes and issue sources retain their original values.
 Missing override credentials refuse provider construction rather than falling
-back to production credentials. Removing a binding restores ordinary discovery
+back to production credentials. `ca_path` adds the PEM certificates in that file
+to the platform's trust roots for the endpoint, which a private rehearsal CA
+needs where the platform verifier ignores `SSL_CERT_FILE` (macOS); an unreadable
+or invalid file refuses provider construction. Removing a binding restores ordinary discovery
 on subsequent provider resolution.
 
 See the [fake forge rehearsal guide](../crates/flotilla-fake-forge/README.md)

@@ -5,13 +5,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ForgeOverride {
-    Forgejo { endpoint_url: String, token_path: String },
+    Forgejo {
+        endpoint_url: String,
+        token_path: String,
+        /// An absolute PEM file of extra root CAs the endpoint's certificate chains to,
+        /// trusted beside the platform's roots for this endpoint only. Platforms whose
+        /// verifier ignores `SSL_CERT_FILE` (macOS) need it for a private rehearsal CA.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ca_path: Option<String>,
+    },
 }
 
 impl ForgeOverride {
     pub fn validate(&self) -> Result<(), String> {
         match self {
-            Self::Forgejo { endpoint_url, token_path } => {
+            Self::Forgejo { endpoint_url, token_path, ca_path } => {
                 let url = url::Url::parse(endpoint_url).map_err(|_| "forge override endpoint_url must be an HTTPS URL")?;
                 if url.scheme() != "https"
                     || url.host_str().is_none()
@@ -26,6 +34,9 @@ impl ForgeOverride {
                 }
                 if !std::path::Path::new(token_path).is_absolute() {
                     return Err("forge override token_path must be absolute".into());
+                }
+                if ca_path.as_deref().is_some_and(|path| !std::path::Path::new(path).is_absolute()) {
+                    return Err("forge override ca_path must be absolute".into());
                 }
                 Ok(())
             }
@@ -58,6 +69,7 @@ mod tests {
         let binding = ForgeOverride::Forgejo {
             endpoint_url: endpoints[endpoint].into(),
             token_path: if absolute { "/tokens/fake" } else { "tokens/fake" }.into(),
+            ca_path: None,
         };
         assert_eq!(binding.validate().is_ok(), endpoint < 3 && absolute);
         let old: crate::DaemonConfig = toml::from_str("machine_id = 'copied'").expect("old daemon config");
