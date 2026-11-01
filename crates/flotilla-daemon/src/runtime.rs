@@ -1228,7 +1228,8 @@ async fn open_message_primitives(daemon: &Arc<InProcessDaemon>, config: &ConfigS
     let home = daemon.node_id().as_str().to_owned();
     // Before this daemon serves or connects to a peer, so an importing host neither sends nor receives records.
     let importing = home.clone();
-    tokio::task::spawn_blocking(move || crate::engine_import::first_start(&state_dir, &importing))
+    let own_host = daemon.local_host_id().map(|host| host.to_string());
+    tokio::task::spawn_blocking(move || crate::engine_import::first_start(&state_dir, &importing, own_host.as_deref()))
         .await
         .map_err(|error| error.to_string())??;
     let registry = decided_registry().map_err(|error| format!("decided store registry: {error:?}"))?;
@@ -1342,6 +1343,14 @@ async fn open_provisioning_lifecycles(
         .await
         .map_err(|error| error.to_string())??;
     daemon.resource_backend().install_engine_records(Arc::new(kinds));
+    // Host, which every placement reads and this daemon's observers write only on change.
+    let service = daemon.decided_store()?;
+    let clock = daemon.clock_for_scenarios();
+    let own_host = daemon.local_host_id().ok_or("the engine's Hosts need this daemon's host id")?.to_string();
+    let hosts = tokio::task::spawn_blocking(move || flotilla_provisioning::engine::hosts::EngineHosts::open(service, own_host, clock))
+        .await
+        .map_err(|error| error.to_string())??;
+    daemon.resource_backend().install_engine_records(Arc::new(hosts));
     let backend = daemon.resource_backend();
     tokio::task::spawn_blocking(move || {
         let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
