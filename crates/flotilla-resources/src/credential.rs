@@ -530,6 +530,117 @@ impl CredentialGrantSelector {
     }
 }
 
+/// The grants a cloud vessel's fresh clone carries (#4218): the vessel's
+/// credentials whose scope covers the cloned repository. The vessel reconciler
+/// writes them on the Checkout under the annotations a crew session uses, and the
+/// clone delivers them into the vessel before Git runs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CloneCredentials {
+    pub refs: BTreeSet<String>,
+    pub scopes: BTreeMap<String, BTreeSet<RepositoryKey>>,
+    pub permissions: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl CloneCredentials {
+    /// Admission scopes every granted credential to the repositories its grant
+    /// covers, so a credential absent from this repository's scope is not for it.
+    pub fn for_repository(
+        repository: &RepositoryKey,
+        refs: &BTreeSet<String>,
+        scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
+        permissions: &BTreeMap<String, BTreeMap<String, String>>,
+    ) -> Self {
+        let refs =
+            refs.iter().filter(|name| scopes.get(*name).is_some_and(|scope| scope.contains(repository))).cloned().collect::<BTreeSet<_>>();
+        Self {
+            scopes: scopes.iter().filter(|(name, _)| refs.contains(*name)).map(|(name, scope)| (name.clone(), scope.clone())).collect(),
+            permissions: permissions
+                .iter()
+                .filter(|(name, _)| refs.contains(*name))
+                .map(|(name, permissions)| (name.clone(), permissions.clone()))
+                .collect(),
+            refs,
+        }
+    }
+
+    pub fn annotate(&self, annotations: &mut BTreeMap<String, String>) {
+        if !self.refs.is_empty() {
+            annotations.insert(CREDENTIAL_REFS_ANNOTATION.into(), serde_json::to_string(&self.refs).expect("credential names serialize"));
+        }
+        if !self.scopes.is_empty() {
+            annotations
+                .insert(CREDENTIAL_SCOPES_ANNOTATION.into(), serde_json::to_string(&self.scopes).expect("credential scopes serialize"));
+        }
+        if !self.permissions.is_empty() {
+            annotations.insert(
+                CREDENTIAL_PERMISSIONS_ANNOTATION.into(),
+                serde_json::to_string(&self.permissions).expect("credential permissions serialize"),
+            );
+        }
+    }
+
+    /// A Checkout written before #4218 carries no annotations and clones without credentials.
+    pub fn from_annotations(annotations: &BTreeMap<String, String>) -> Result<Self, String> {
+        fn decode<T: serde::de::DeserializeOwned + Default>(
+            annotations: &BTreeMap<String, String>,
+            key: &str,
+            what: &str,
+        ) -> Result<T, String> {
+            annotations
+                .get(key)
+                .map(|encoded| serde_json::from_str(encoded).map_err(|error| format!("invalid {what} annotation: {error}")))
+                .transpose()
+                .map(Option::unwrap_or_default)
+        }
+        Ok(Self {
+            refs: decode(annotations, CREDENTIAL_REFS_ANNOTATION, "credential references")?,
+            scopes: decode(annotations, CREDENTIAL_SCOPES_ANNOTATION, "credential scopes")?,
+            permissions: decode(annotations, CREDENTIAL_PERMISSIONS_ANNOTATION, "credential permissions")?,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.refs.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod clone_credentials_tests {
+    use super::*;
+
+    #[test]
+    fn a_clone_keeps_only_grants_covering_its_repository_and_round_trips_through_annotations() {
+        let (widgets, other) = (RepositoryKey("widgets".into()), RepositoryKey("other".into()));
+        let refs = BTreeSet::from(["app".to_string(), "lab".to_string(), "elsewhere".to_string()]);
+        let scopes = BTreeMap::from([
+            ("app".to_string(), BTreeSet::from([widgets.clone(), other.clone()])),
+            ("lab".to_string(), BTreeSet::from([widgets.clone()])),
+            ("elsewhere".to_string(), BTreeSet::from([other.clone()])),
+        ]);
+        let permissions = BTreeMap::from([
+            ("app".to_string(), BTreeMap::from([("contents".to_string(), "write".to_string())])),
+            ("elsewhere".to_string(), BTreeMap::from([("issues".to_string(), "write".to_string())])),
+        ]);
+
+        let clone = CloneCredentials::for_repository(&widgets, &refs, &scopes, &permissions);
+        assert_eq!(clone.refs, BTreeSet::from(["app".to_string(), "lab".to_string()]));
+        assert_eq!(clone.scopes["app"], BTreeSet::from([widgets.clone(), other]), "a credential keeps its whole scope");
+        assert_eq!(clone.permissions.keys().collect::<Vec<_>>(), ["app"]);
+
+        let mut annotations = BTreeMap::new();
+        clone.annotate(&mut annotations);
+        assert_eq!(CloneCredentials::from_annotations(&annotations), Ok(clone));
+        assert_eq!(CloneCredentials::from_annotations(&BTreeMap::new()), Ok(CloneCredentials::default()));
+    }
+
+    #[test]
+    fn malformed_clone_annotations_are_refused() {
+        let annotations = BTreeMap::from([(CREDENTIAL_SCOPES_ANNOTATION.to_string(), "{not json".to_string())]);
+        let error = CloneCredentials::from_annotations(&annotations).expect_err("malformed scopes");
+        assert!(error.starts_with("invalid credential scopes annotation"), "{error}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

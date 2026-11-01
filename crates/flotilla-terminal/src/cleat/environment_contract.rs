@@ -64,6 +64,8 @@ impl Harness {
                 assert_eq!(version["client"]["git_sha"].as_str(), Some(revision), "wrong binary source revision");
                 let help = harness.raw(&["launch", "--help"]).await.expect("real help");
                 assert_eq!(help.split_whitespace().any(|word| word == "--env-clear"), supports_clear, "wrong cleat revision");
+                // #4173: the argv probe reads clap's usage line; the new pin must render it.
+                assert_eq!(super::super::LaunchCapability::from_help(&help).argv, supports_clear, "argv launch probe");
                 if matches!(scenario, Scenario::PollutedDaemon) {
                     // Inventory does not start an idle daemon in real Cleat. Seed a
                     // live daemon with an additive launch before the controlled client.
@@ -337,6 +339,48 @@ mod fake_launch_environment_contract {
 mod real_launch_environment_contract {
     use super::*;
     launch_cases!(true);
+
+    #[tokio::test]
+    async fn new_declared_session_runs_without_a_login_profile() {
+        declared_session_contract().await;
+    }
+}
+
+// #4173: a declared session runs its script with exactly the declared
+// environment. A login profile that resets PATH, as Debian's /etc/profile does,
+// never runs: the program found only on the declared PATH starts and sees it.
+#[cfg(feature = "cleat-environment-contract")]
+async fn declared_session_contract() {
+    let harness = Harness::new(true, Scenario::HostBaseline, true).await;
+    let root = harness.root.path();
+    let home = root.join("home");
+    let bin = root.join("opt-bin");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(&bin).expect("declared bin");
+    std::fs::write(home.join(".profile"), "PATH=/usr/bin:/bin\nexport PATH\n").expect("resetting profile");
+    std::fs::copy(root.join("probe"), bin.join("declared-probe")).expect("probe on the declared PATH only");
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let runtime = root.display().to_string();
+    let bag = EnvironmentBag::new()
+        .with(EnvironmentAssertion::env_var("CLEAT_RUNTIME_DIR", &runtime))
+        .with(EnvironmentAssertion::env_var("CLEAT_DAEMON", "contract"));
+    let pool = CleatTerminalPool::new(harness.runner.clone(), &harness.binary, &bag);
+    let declared = vec![
+        ("HOME".to_string(), home.display().to_string()),
+        ("PATH".to_string(), path.clone()),
+        ("SHELL".to_string(), "/bin/sh".to_string()),
+        ("ENV".to_string(), home.join(".profile").display().to_string()),
+    ];
+    pool.ensure_declared_session("crew", "exec declared-probe", &ExecutionEnvironmentPath::new("/"), &declared, &[], None)
+        .await
+        .expect("declared launch");
+    let child = harness.child().await;
+    assert_eq!(child.get("PATH"), Some(&path), "a login profile rebuilt the declared PATH");
+    assert_eq!(child.get("LANG").map(String::as_str), Some("C.UTF-8"));
+    pool.kill_session("crew").await.expect("stop child");
+    let pids = harness.daemon_pids.lock().expect("daemon PIDs").clone();
+    drop(harness);
+    assert_daemons_stopped(&pids).await;
 }
 
 // A retained PID can outlive its daemon. Cleanup must leave another process alone.

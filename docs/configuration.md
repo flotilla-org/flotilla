@@ -262,11 +262,13 @@ state in (such as `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GH_CONFIG_DIR` or
 `GH_TOKEN`). Each of these is a configuration error reported for the host, and
 the host is not registered or the crew is not launched.
 
-cleat still starts each session command through `$SHELL -lc`, so the profile
-runs once inside a crew session before its command. The command sets the
-base layer and `PATH` again as its first step, so the harness
-sees the composed environment. Removing that profile run needs a cleat launch
-without a login shell (#3761).
+A crew session runs with exactly this environment: cleat starts its command
+in `sh -c` with a cleared environment (`cleat launch --env-clear --env … --
+/bin/sh -c …`), so no login profile runs (#4173). The harnesses' tool shells
+keep it too: Codex runs with `allow_login_shell=false` and
+`features.shell_snapshot=false`, and Claude Code's Bash tool runs in the bash
+the session's `PATH` finds (`CLAUDE_CODE_SHELL`). A shell a person opens on the
+host is still an ordinary login shell.
 
 #### Vessel cap
 

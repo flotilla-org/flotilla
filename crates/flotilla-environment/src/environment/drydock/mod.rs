@@ -441,6 +441,11 @@ fn capabilities(c: &wire::Capabilities) -> ProviderCapabilities {
         host_filesystem: c.host_filesystem,
     }
 }
+/// The pipeline defaults drydock-agent sets on every process it starts, over
+/// its configured environment (drydock `crates/drydock-agent/src/process.rs`,
+/// `Processes::spawn`).
+const AGENT_PROCESS_DEFAULTS: &[&str] = &["CI", "GIT_TERMINAL_PROMPT", "NO_COLOR", "TERM", "PAGER", "GIT_PAGER", "DEBIAN_FRONTEND"];
+
 struct DrydockEnvironment {
     api: Arc<dyn ProviderApi>,
     instance: String,
@@ -516,7 +521,21 @@ impl ProvisionedEnvironment for DrydockEnvironment {
     }
     async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
         let output = self.runner().run("env", &["-0"], Path::new("/"), &flotilla_provider_runtime::ChannelLabel::Default).await?;
-        Ok(output.split('\0').filter_map(|entry| entry.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned()))).collect())
+        let mut environment: HashMap<String, String> =
+            output.split('\0').filter_map(|entry| entry.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned()))).collect();
+        // #4173: the vessel's environment is the image's and provider's. The agent
+        // sets its pipeline defaults on every process it starts, `env` included, and
+        // they override its configuration; only the configuration states them. An
+        // image's own value for one of these names is overridden the same way, so
+        // this read cannot recover it: such a value is lost on a cloud vessel.
+        let declared = self.env.read().expect("environment lock");
+        for name in AGENT_PROCESS_DEFAULTS {
+            match declared.get(*name) {
+                Some(value) => environment.insert(name.to_string(), value.clone()),
+                None => environment.remove(*name),
+            };
+        }
+        Ok(environment)
     }
     fn runner(&self) -> Arc<dyn CommandRunner> {
         match &self.agent {

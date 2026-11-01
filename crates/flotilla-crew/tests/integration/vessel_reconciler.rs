@@ -1418,12 +1418,22 @@ async fn docker_kind_environment_uses_constant_pull_policy_and_decided_instance(
 // #4165: a cloud vessel clones into a directory of its own below its provider's
 // workspace root, since vessels on the host's filesystem (drydock's `local`)
 // share that root. One already cloned at the root itself keeps its checkout
-// there, and its crew runs where the checkout is recorded.
+// there, and its crew runs where the checkout is recorded. Its checkout carries
+// the grants covering its repository (#4218).
 #[tokio::test]
 async fn a_cloud_vessel_clones_below_the_workspace_root_and_crews_run_at_the_recorded_checkout() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-cloud", "implement", REPO_URL, GIT_REF).await;
     let mut status = convoy.status.expect("convoy status");
+    // #4218: the vessel holds a grant for this repository and one for another.
+    let repository = convoy.spec.repositories[0].repo_ref.clone();
+    let other = flotilla_resources::RepositoryKey("other".to_string());
+    let requirement = &mut status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels[0];
+    requirement.credential_refs = BTreeSet::from(["lab-forge".to_string(), "other-forge".to_string()]);
+    requirement.credential_scopes = BTreeMap::from([
+        ("lab-forge".to_string(), BTreeSet::from([repository.clone(), other.clone()])),
+        ("other-forge".to_string(), BTreeSet::from([other.clone()])),
+    ]);
     status.placement_decision = Some(PlacementDecision {
         provider_instance: Some("local".to_string()),
         provider_workspace_root: Some("/vessels".to_string()),
@@ -1484,15 +1494,25 @@ async fn a_cloud_vessel_clones_below_the_workspace_root_and_crews_run_at_the_rec
         }
     };
     let outcome = reconcile(&vessel).await;
-    let (name, checkout) = outcome
+    let (checkout_meta, checkout) = outcome
         .actuations
         .iter()
         .find_map(|actuation| match actuation {
-            Actuation::CreateCheckout { meta, spec: CheckoutSpec::FreshClone(spec) } => Some((meta.name.clone(), spec.clone())),
+            Actuation::CreateCheckout { meta, spec: CheckoutSpec::FreshClone(spec) } => Some((meta.clone(), spec.clone())),
             _ => None,
         })
         .unwrap_or_else(|| panic!("a fresh clone should be created: {:?}", outcome.patch));
     assert_eq!(checkout.target_path, "/vessels/workspace-cloud");
+    // The clone carries only the grant covering its repository, before any session starts.
+    assert_eq!(
+        flotilla_resources::CloneCredentials::from_annotations(&checkout_meta.annotations).expect("clone grants"),
+        flotilla_resources::CloneCredentials {
+            refs: BTreeSet::from(["lab-forge".to_string()]),
+            scopes: BTreeMap::from([("lab-forge".to_string(), BTreeSet::from([repository, other]))]),
+            permissions: BTreeMap::new(),
+        }
+    );
+    let name = checkout_meta.name;
 
     // The checkout was recorded at the root itself, by an earlier layout.
     create_ready_checkout(
