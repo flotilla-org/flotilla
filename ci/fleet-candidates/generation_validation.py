@@ -1141,7 +1141,10 @@ def lock_install_window(fd):
 
 
 def install_window_owner(marker):
-    """Return the fleet root recorded in a marker, or "" for a marker that predates it."""
+    """Return the fleet root recorded in a marker, or "" for a marker that predates it.
+
+    The marker is single-line key=value text, so a fleet root cannot contain a newline.
+    """
     for line in Path(marker).read_text().splitlines():
         if line.startswith("fleet_root="):
             return line[len("fleet_root="):]

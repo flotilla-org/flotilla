@@ -515,6 +515,7 @@ write_launchd_agent() {
 # Fd 9 holds this config's install-window flock for the whole replacement window.
 # Children inherit it, so a detached health watchdog keeps the window owned after
 # this process dies; the kernel releases it only when its last holder exits.
+# Flotilla CLI children run with 9>&- so a daemon they might start cannot hold it.
 lock_install_window() {
   if ((!DAEMON_INSTALL_WINDOW_OPEN)); then
     mkdir -p "$(dirname "$DAEMON_INSTALL_WINDOW_LOCK")"
@@ -633,7 +634,7 @@ restart_darwin_daemon_service() {
 probe_daemon_health() {
   # This candidate CLI requires an exact wire-generation handshake and a local fleet
   # row. The check neither starts a daemon nor re-execs another generation.
-  FLOTILLA_CONTAINED_HOST_DAEMON=1 python3 "$GENERATION_VALIDATOR" daemon-health -- "$CURRENT_LINK/bin/flotilla" "$DAEMON_SOCKET" "$1" 2>"$WORK_DIR/daemon-health.stderr"
+  FLOTILLA_CONTAINED_HOST_DAEMON=1 python3 "$GENERATION_VALIDATOR" daemon-health -- "$CURRENT_LINK/bin/flotilla" "$DAEMON_SOCKET" "$1" 2>"$WORK_DIR/daemon-health.stderr" 9>&-
 }
 
 startup_timestamp() {
@@ -800,7 +801,7 @@ daemon_preflight() {
   fi
   [[ -n "$cli" ]] || die 'flotillad is running; install a usable flotilla command and run `flotilla daemon stop`'
   if [[ "$PLATFORM" == darwin-* ]]; then
-    if python3 "$GENERATION_VALIDATOR" stop-daemon -- "$cli" "$DAEMON_SOCKET" "$DAEMON_CONFIG_DIR" "$DAEMON_STATE_DIR"; then
+    if python3 "$GENERATION_VALIDATOR" stop-daemon -- "$cli" "$DAEMON_SOCKET" "$DAEMON_CONFIG_DIR" "$DAEMON_STATE_DIR" 9>&-; then
       return 0
     fi
     printf -v invocation '%q daemon stop' "$cli"

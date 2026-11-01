@@ -80,6 +80,7 @@ if [[ "\${1:-}" == --socket && "\${3:-}" == fleet && "\${4:-}" == check ]]; then
   if [[ -n "\${FLEET_CHECK_LOG:-}" ]]; then printf '%s|%s|%s\\n' "\$0" "\$*" "\${FLOTILLA_CONTAINED_HOST_DAEMON:-}" >>"\$FLEET_CHECK_LOG"; fi
   if [[ "\${FLEET_HEALTH_FAIL_FOR:-}" == "$2" ]]; then printf 'fixture readiness failure\\n' >&2; exit 1; fi
   if [[ -n "\${FLEET_HEALTH_GATE:-}" && ! -e "\${FLEET_HEALTH_GATE:-}" ]]; then exit 1; fi
+  if [[ -n "\${WINDOW_FD_LOG:-}" ]] && { : >&9; } 2>/dev/null; then echo check >>"\$WINDOW_FD_LOG"; fi
   exit 0
 fi
 if [[ "\${1:-}" == --socket && "\${3:-}" == fleet && "\${4:-}" == spread ]]; then
@@ -168,6 +169,7 @@ if [[ "${1:-}" == --socket && "${3:-}" == --config-dir ]]; then
   shift 6
 fi
 if [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then
+  if [[ -n "${WINDOW_FD_LOG:-}" ]] && { : >&9; } 2>/dev/null; then echo stop >>"$WINDOW_FD_LOG"; fi
   if [[ "${STOP_DISAPPEARS:-0}" == 1 ]]; then rm -f "$LAUNCHCTL_STATE.running"; exit 1; fi
   [[ "${STOP_FAIL:-0}" == 0 ]] || exit 1
   if [[ -f "$LAUNCHCTL_STATE.starting" ]]; then
@@ -801,8 +803,9 @@ test ! -e "$darwin_home/.local/opt/flotilla-fleet/previous" || fail 'pressure re
 test -f "$darwin_home/launchctl-state.running" || fail 'pressure refusal stopped daemon'
 # A client arriving between bootout and preflight must not resurrect the old
 # daemon. A spawn already admitted must survive a transient startup stop error.
-CLIENT_AFTER_BOOTOUT=1 LATE_SPAWN_AFTER_BOOTOUT=1 run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-install-window.out" 2>&1 \
+WINDOW_FD_LOG="$test_root/window-fd.log" CLIENT_AFTER_BOOTOUT=1 LATE_SPAWN_AFTER_BOOTOUT=1 run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-install-window.out" 2>&1 \
   || fail 'daemon arriving after bootout required a second install attempt'
+test ! -e "$test_root/window-fd.log" || fail "CLI children inherited the install-window lock: $(cat "$test_root/window-fd.log")"
 grep -Fxq refused "$darwin_home/launchctl-state.client" || fail 'install window permitted a client spawn'
 test ! -e "$darwin_home/.config/flotilla/run/install-in-progress" || fail 'successful install leaked marker'
 test "$(cat "$darwin_home/launchctl-state.running")" = "releases/$generation_two" || fail 'install window ran old generation'
@@ -909,7 +912,19 @@ grep -Fq 'holds the daemon install window' "$test_root/darwin-watchdog-window.ou
 test -f "$darwin_marker" || fail 'watchdog-held window lost its marker'
 if grep -Ev '^print-disabled ' "$test_root/launchctl.log" | grep -q .; then fail 'retry touched launchd while the watchdog held the window'; fi
 touch "$health_gate"
-python3 -c 'import fcntl, sys; fcntl.flock(open(sys.argv[1], "a"), fcntl.LOCK_EX)' "$darwin_window_lock"
+python3 - "$darwin_window_lock" <<'PY' || fail 'orphaned watchdog did not release the install window'
+import fcntl, sys, time
+deadline = time.monotonic() + 60
+with open(sys.argv[1], "a") as lock:
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                sys.exit(1)
+            time.sleep(0.1)
+PY
 grep -Fq "generation $generation_one confirmed healthy" "$darwin_root"/.confirmation.*.log || fail 'orphaned watchdog did not confirm'
 run_darwin_installer "$darwin_home" "$generation_one" >"$test_root/darwin-after-watchdog.out" 2>&1 \
   || fail 'window released by the watchdog was not reclaimed'
