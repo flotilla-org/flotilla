@@ -31,10 +31,26 @@ pub(super) enum ArtifactArrival {
     Pushed(Vec<String>),
 }
 
-/// Where the fake agent of the vessel at `agent` keeps an entry, as drydock keeps its
-/// store beside the agent.
-pub(super) fn store_entry(agent: &Path, sha256: &str) -> PathBuf {
-    agent.join("store/artifacts").join(sha256)
+/// Where the host's shared content store at `store` keeps an entry, as drydock lays it out.
+pub(super) fn store_entry(store: &Path, sha256: &str) -> PathBuf {
+    store.join("artifacts").join(sha256)
+}
+
+/// The content store the host's vessel agents share (#4087), as drydock keeps it: its
+/// entries, and each link placed into one with the agent that placed it (its holder).
+#[derive(Clone, Debug, Default)]
+pub(super) struct SharedStore {
+    pub(super) entries: BTreeSet<String>,
+    /// Each link, by path, with its entry's digest and its holder's agent directory.
+    pub(super) uses: BTreeMap<PathBuf, (String, PathBuf)>,
+}
+
+impl SharedStore {
+    /// The holder of the link at `path` into the entry for `sha256`, while the store holds it.
+    pub(super) fn holder(&self, path: &Path, sha256: &str) -> Option<&Path> {
+        let (linked, holder) = self.uses.get(path)?;
+        (linked == sha256 && self.entries.contains(sha256)).then_some(holder.as_path())
+    }
 }
 
 /// Opens every vessel onto `runner`, keyed by its agent directory, and gives
@@ -44,25 +60,70 @@ pub(super) struct RunnerVesselAgents {
     registry: Arc<ProviderRegistry>,
     pub(super) vessels: Arc<StdMutex<BTreeMap<PathBuf, RecordedVessel>>>,
     pub(super) refusals: StdMutex<Vec<HostRefusal>>,
+    pub(super) store: Arc<StdMutex<SharedStore>>,
+    /// Refuse every fetch and push into the store, as an unreachable source and controller would.
+    pub(super) refuse_artifacts: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RunnerVesselAgents {
     pub(super) fn new(runner: Arc<dyn CommandRunner>, registry: Arc<ProviderRegistry>) -> Arc<Self> {
-        Arc::new(Self { runner, registry, vessels: Arc::default(), refusals: StdMutex::default() })
+        Arc::new(Self {
+            runner,
+            registry,
+            vessels: Arc::default(),
+            refusals: StdMutex::default(),
+            store: Arc::default(),
+            refuse_artifacts: Arc::default(),
+        })
     }
 
     pub(super) fn recorded(&self, paths: &VesselPaths) -> RecordedVessel {
         self.vessels.lock().expect("vessels").get(&paths.agent).cloned().unwrap_or_default()
     }
+
+    /// The shared store as it stands.
+    pub(super) fn store(&self) -> SharedStore {
+        self.store.lock().expect("store").clone()
+    }
+
+    /// Collect the store after the vessel agent at `released` retires, as drydock's
+    /// `--collect --release` does once its idle time has passed: the agent's uses go,
+    /// then every entry no remaining use links.
+    pub(super) fn collect(&self, released: &Path) {
+        let mut store = self.store.lock().expect("store");
+        store.uses.retain(|_, (_, holder)| holder != released);
+        let used = store.uses.values().map(|(sha256, _)| sha256.clone()).collect::<BTreeSet<_>>();
+        store.entries.retain(|sha256| used.contains(sha256));
+    }
+
+    /// Clear the store by hand: every entry and use goes, and the links into it dangle.
+    pub(super) fn clear_store(&self) {
+        *self.store.lock().expect("store") = SharedStore::default();
+    }
 }
 
+#[derive(Clone)]
 struct RunnerVessel {
     agent: PathBuf,
     runner: Arc<dyn CommandRunner>,
     vessels: Arc<StdMutex<BTreeMap<PathBuf, RecordedVessel>>>,
+    /// The shared store's root, where its entries' links point.
+    root: PathBuf,
+    store: Arc<StdMutex<SharedStore>>,
+    refuse_artifacts: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RunnerVessel {
+    /// Store `sha256`, recording how its bytes arrived, unless artifacts are refused.
+    fn arrive(&self, sha256: &str, arrival: ArtifactArrival) -> Result<(), String> {
+        if self.refuse_artifacts.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(format!("artifact {sha256} is unreachable"));
+        }
+        self.record(|vessel| vessel.artifacts.push((sha256.into(), arrival)));
+        self.store.lock().expect("store").entries.insert(sha256.into());
+        Ok(())
+    }
+
     fn record(&self, change: impl FnOnce(&mut RecordedVessel)) {
         change(self.vessels.lock().expect("vessels").entry(self.agent.clone()).or_default());
     }
@@ -98,22 +159,28 @@ impl VesselAgent for RunnerVessel {
         Ok("amd64".into())
     }
     async fn fetch_artifact(&self, sha256: &str, urls: &[String], _: flotilla_resources::PinUnpack) -> Result<(), String> {
-        self.record(|vessel| vessel.artifacts.push((sha256.into(), ArtifactArrival::Fetched(urls.to_vec()))));
-        Ok(())
+        self.arrive(sha256, ArtifactArrival::Fetched(urls.to_vec()))
     }
     async fn push_artifact(&self, sha256: &str, file: &Path, unpack: flotilla_resources::PinUnpack) -> Result<(), String> {
         let files = match unpack {
             flotilla_resources::PinUnpack::TarGz => archive_files(&fs::read(file).map_err(|error| error.to_string())?),
             _ => Vec::new(),
         };
-        self.record(|vessel| vessel.artifacts.push((sha256.into(), ArtifactArrival::Pushed(files))));
-        Ok(())
+        self.arrive(sha256, ArtifactArrival::Pushed(files))
     }
     async fn link_artifact(&self, path: &Path, sha256: &str, member: &Path) -> Result<(), String> {
         let host = RunnerVesselAgent(self.runner.clone());
         host.create_dir(path.parent().ok_or("a link needs a directory")?, 0o755).await?;
-        let entry = store_entry(&self.agent, sha256);
-        host.symlink(path, &if member.as_os_str().is_empty() { entry } else { entry.join(member) }).await
+        if !self.store.lock().expect("store").entries.contains(sha256) {
+            return Err(format!("no stored artifact {sha256}; fetch it first"));
+        }
+        let entry = store_entry(&self.root, sha256);
+        host.symlink(path, &if member.as_os_str().is_empty() { entry } else { entry.join(member) }).await?;
+        self.store.lock().expect("store").uses.insert(path.into(), (sha256.into(), self.agent.clone()));
+        Ok(())
+    }
+    async fn has_artifact(&self, sha256: &str) -> Result<bool, String> {
+        Ok(self.store.lock().expect("store").entries.contains(sha256))
     }
     async fn ready(&self) -> Result<(), String> {
         Ok(())
@@ -134,7 +201,7 @@ impl VesselHandle for RunnerVessel {
         Arc::clone(&self.runner)
     }
     fn agent(&self) -> Arc<dyn VesselAgent> {
-        Arc::new(RunnerVessel { agent: self.agent.clone(), runner: Arc::clone(&self.runner), vessels: Arc::clone(&self.vessels) })
+        Arc::new(self.clone())
     }
     async fn configure_environment(&self, environment: BTreeMap<String, String>) -> Result<(), String> {
         self.record(|vessel| vessel.environment = environment);
@@ -166,7 +233,14 @@ impl VesselAgents for RunnerVesselAgents {
         paths: &VesselPaths,
         _local: &Path,
     ) -> Result<Arc<dyn VesselHandle>, String> {
-        Ok(Arc::new(RunnerVessel { agent: paths.agent.clone(), runner: Arc::clone(&self.runner), vessels: Arc::clone(&self.vessels) }))
+        Ok(Arc::new(RunnerVessel {
+            agent: paths.agent.clone(),
+            runner: Arc::clone(&self.runner),
+            vessels: Arc::clone(&self.vessels),
+            root: paths.store.clone(),
+            store: Arc::clone(&self.store),
+            refuse_artifacts: Arc::clone(&self.refuse_artifacts),
+        }))
     }
     async fn probe(
         &self,

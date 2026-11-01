@@ -357,6 +357,12 @@ pub trait VesselAgent: Send + Sync {
         let _ = member;
         Err(format!("this vessel agent has no artifact store to link {} to {sha256}", path.display()))
     }
+    /// Whether the store holds the entry for `sha256`. A store shared by several
+    /// vessels collects an entry once no live vessel links it, and a store can be
+    /// cleared by hand, so an entry linked once may be gone (#4088).
+    async fn has_artifact(&self, sha256: &str) -> Result<bool, String> {
+        Err(format!("this vessel agent has no artifact store to find {sha256} in"))
+    }
 }
 
 /// A live handle to a provisioned sandbox environment.

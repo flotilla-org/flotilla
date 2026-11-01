@@ -236,6 +236,9 @@ impl flotilla_environment::environment::VesselAgent for CachedAgent {
     async fn link_artifact(&self, path: &Path, sha256: &str, member: &Path) -> Result<(), String> {
         self.cache.link(path, sha256, member)
     }
+    async fn has_artifact(&self, sha256: &str) -> Result<bool, String> {
+        Ok(self.cache.entries.lock().expect("entries").contains_key(sha256))
+    }
 }
 
 /// A contained vessel whose agent answers, with a content cache: the handle launch finds

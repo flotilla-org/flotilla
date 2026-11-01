@@ -27,8 +27,9 @@ use flotilla_resources::{
 };
 use flotilla_schema::Timestamp;
 use flotilla_vessel_delivery::{
-    deliver, Access, AccessKey, ContentDigest, CostTable, DeliveryError, HomeBase, HostPathOffer, HostReach, Item, Liveness, Mechanism,
-    Need, NeedName, Plan, ProviderMechanisms, Reachability, RelativePath, StepFailure, TreeDelivery, TreeSources,
+    deliver, Access, AccessKey, ContentDigest, CostTable, Delivery, DeliveryError, HomeBase, HostPathOffer, HostReach, Item, Liveness,
+    Mechanism, Need, NeedName, Plan, ProviderMechanisms, Reachability, RelativePath, StepFailure, StoreDelivery, StoreEntry, TreeDelivery,
+    TreeSources,
 };
 
 use self::{
@@ -153,20 +154,16 @@ async fn deliver_crew(
         })
     };
     let mut needs = vec![home(HOME, requester_home(Path::new(""), convoy, role, harness.name), HomeBase::Durable)?];
-    let mut trees: BTreeMap<NeedName, Arc<dyn TreeDelivery>> = BTreeMap::new();
-    let mut tree = |needs: &mut Vec<Need>,
-                    name: &str,
-                    digest: String,
-                    (home, path): (&str, &str),
-                    sources: TreeSources,
-                    delivery: Arc<dyn TreeDelivery>| {
-        needs.push(Need {
-            name: NeedName::new(name),
-            digest: ContentDigest::new(digest),
-            item: Item::Tree { home: NeedName::new(home), path: RelativePath::new(path).expect("a constant relative path"), sources },
-        });
-        trees.insert(NeedName::new(name), delivery);
-    };
+    let mut trees: BTreeMap<NeedName, Delivery> = BTreeMap::new();
+    let mut tree =
+        |needs: &mut Vec<Need>, name: &str, digest: String, (home, path): (&str, &str), sources: TreeSources, delivery: Delivery| {
+            needs.push(Need {
+                name: NeedName::new(name),
+                digest: ContentDigest::new(digest),
+                item: Item::Tree { home: NeedName::new(home), path: RelativePath::new(path).expect("a constant relative path"), sources },
+            });
+            trees.insert(NeedName::new(name), delivery);
+        };
     let skills = material.skill_tree(&crew.skills).await.map_err(|SkillTreeError { message, permanent }| Failed {
         need: SKILLS.to_string(),
         error: message,
@@ -178,11 +175,11 @@ async fn deliver_crew(
         skills.digest(),
         (HOME, "skills"),
         TreeSources { controller: true, ..TreeSources::default() },
-        Arc::new(SkillsDelivery {
+        Delivery::Stored(Arc::new(SkillsDelivery {
             trees: state.skill_trees.clone(),
             tokens: state.credential_store.clone().map(|store| store as Arc<dyn SkillSourceTokens>),
             tree: skills,
-        }),
+        })),
     );
     let bound = match launch.access {
         Some(access) => Some(Arc::new(BoundAccount::resolve(state, &launch.account, access).await.map_err(failed_at(ACCOUNT))?)),
@@ -198,7 +195,11 @@ async fn deliver_crew(
             bound.digest(state, &launch.account).await.map_err(failed_at(ACCOUNT))?,
             (SECRETS, flotilla_agent::account_access::CLAUDE_OAUTH_TOKEN_FILE),
             TreeSources { controller: true, ..TreeSources::default() },
-            Arc::new(AccountDelivery { state: state.clone(), launch: OwnedAccountLaunch::of(&launch.account), bound: bound.clone() }),
+            Delivery::Placed(Arc::new(AccountDelivery {
+                state: state.clone(),
+                launch: OwnedAccountLaunch::of(&launch.account),
+                bound: bound.clone(),
+            })),
         );
     }
     let base = agent.writable_base().await.map_err(failed_at(HOME))?;
@@ -218,7 +219,7 @@ async fn deliver_crew(
             login.digest(),
             (HOME, "auth.json"),
             TreeSources { controller: true, ..TreeSources::default() },
-            Arc::new(LoginDelivery(login)),
+            Delivery::Placed(Arc::new(LoginDelivery(login))),
         );
     }
     // #3909: where the place does not already carry the pinned harness, it lands in the
@@ -230,7 +231,8 @@ async fn deliver_crew(
         PinnedHarness::resolve(launch.adapter, &architecture).map_err(failed_at(HARNESS))?
     };
     if let Some(pinned) = &pinned {
-        tree(&mut needs, HARNESS, pinned.sha256.clone(), (HOME, HARNESS_PATH), PinnedHarness::sources(), Arc::new(pinned.clone()));
+        let delivery = Delivery::Stored(Arc::new(pinned.clone()));
+        tree(&mut needs, HARNESS, pinned.sha256.clone(), (HOME, HARNESS_PATH), PinnedHarness::sources(), delivery);
     }
     let place = launch.account.env_ref;
     let delivered = deliver(&needs, &trees, &place_mechanisms(launch.account.ssh_host), &CostTable::default(), agent.as_ref())
@@ -333,8 +335,8 @@ struct SkillsDelivery {
 }
 
 #[async_trait]
-impl TreeDelivery for SkillsDelivery {
-    async fn deliver(&self, mechanism: Mechanism, _: Option<&Path>, target: &Path, agent: &dyn VesselAgent) -> Result<(), StepFailure> {
+impl StoreDelivery for SkillsDelivery {
+    async fn store(&self, mechanism: Mechanism, target: &Path, agent: &dyn VesselAgent) -> Result<StoreEntry, StepFailure> {
         if mechanism != Mechanism::AgentPush {
             return Err(StepFailure::permanent(format!("skills cannot be delivered by {mechanism}")));
         }
@@ -343,12 +345,14 @@ impl TreeDelivery for SkillsDelivery {
             StepFailure { error: error.message, permanent: error.permanent }
         })?;
         push_tree(&archive, target, agent).await?;
-        tracing::info!(target = %target.display(), sha256 = %archive.sha256, "delivered frozen crew skills");
-        Ok(())
+        tracing::info!(target = %target.display(), sha256 = %archive.sha256, "stored frozen crew skills");
+        // #4253: the record names the archive's own digest, so a later launch looks for
+        // exactly this entry.
+        Ok(StoreEntry { sha256: ContentDigest::new(&archive.sha256), link: None })
     }
 }
 
-/// Put `archive` into the agent's content cache and point `target` at it. A real
+/// Put `archive` into the agent's content cache, ready to link at `target`. A real
 /// directory at `target`, left by a delivery that predates the cache, is moved aside
 /// first: a link cannot replace it.
 async fn push_tree(archive: &SkillArchive, target: &Path, agent: &dyn VesselAgent) -> Result<(), String> {
@@ -359,7 +363,7 @@ async fn push_tree(archive: &SkillArchive, target: &Path, agent: &dyn VesselAgen
         let aside = target.with_file_name(format!("{name}.legacy-{}", uuid::Uuid::new_v4().simple()));
         agent.rename(target, &aside).await?;
     }
-    agent.link_artifact(target, &archive.sha256, Path::new("")).await
+    Ok(())
 }
 
 /// An owned copy of the launch's identity, for deliveries the executor holds.
@@ -522,7 +526,10 @@ mod tests {
     struct Recording {
         files: Mutex<BTreeMap<PathBuf, Vec<u8>>>,
         directories: Mutex<BTreeSet<PathBuf>>,
-        links: Mutex<BTreeSet<PathBuf>>,
+        /// Each link into the content cache, with the entry it points into.
+        links: Mutex<BTreeMap<PathBuf, String>>,
+        /// The content cache's entries, by digest.
+        stored: Mutex<BTreeSet<String>>,
         calls: Mutex<Vec<String>>,
         /// Refuse the next link, as an agent connection lost mid-delivery would.
         refuse_link: std::sync::atomic::AtomicBool,
@@ -555,7 +562,7 @@ mod tests {
             Ok("/home/crew/flotilla".into())
         }
         async fn stat(&self, path: &Path) -> Result<Option<EntryKind>, String> {
-            Ok(if self.links.lock().expect("links").contains(path) {
+            Ok(if self.links.lock().expect("links").contains_key(path) {
                 Some(EntryKind::Symlink)
             } else if self.directories.lock().expect("directories").contains(path) {
                 Some(EntryKind::Directory)
@@ -587,6 +594,7 @@ mod tests {
         }
         async fn push_artifact(&self, sha256: &str, _: &Path, unpack: PinUnpack) -> Result<(), String> {
             self.calls.lock().expect("calls").push(format!("push {sha256} {}", unpack.as_str()));
+            self.stored.lock().expect("stored").insert(sha256.into());
             Ok(())
         }
         async fn link_artifact(&self, path: &Path, sha256: &str, member: &Path) -> Result<(), String> {
@@ -597,9 +605,12 @@ mod tests {
             if self.directories.lock().expect("directories").contains(path) {
                 return Err(format!("{} is a directory", path.display()));
             }
-            self.links.lock().expect("links").insert(path.into());
+            self.links.lock().expect("links").insert(path.into(), sha256.into());
             self.calls.lock().expect("calls").push(format!("link {} {sha256}/{}", path.display(), member.display()));
             Ok(())
+        }
+        async fn has_artifact(&self, sha256: &str) -> Result<bool, String> {
+            Ok(self.stored.lock().expect("stored").contains(sha256))
         }
     }
 
@@ -629,6 +640,8 @@ mod tests {
     // a real `skills` directory left by an older delivery is moved aside once, before the
     // first link, and never again. A link that fails after the move leaves the access
     // undelivered (no harness starts), and the retry links without moving anything.
+    // #4088: a kept tree is linked again, so this vessel's agent holds the use, and a
+    // cache that no longer holds the recorded entry is pushed into and linked again.
     #[tokio::test]
     async fn skills_are_pushed_by_digest_and_linked_and_a_legacy_directory_is_moved_aside_once() {
         let cache = tempfile::tempdir().expect("cache");
@@ -638,7 +651,7 @@ mod tests {
         ));
         let tree = SkillTree::resolve(None, &[]).await.expect("an empty selection needs no supply");
         let archive = trees.crew_archive(&tree, None).await.expect("archive");
-        let delivery: Arc<dyn TreeDelivery> = Arc::new(SkillsDelivery { trees, tokens: None, tree: tree.clone() });
+        let delivery = Delivery::Stored(Arc::new(SkillsDelivery { trees, tokens: None, tree: tree.clone() }));
         let trees = BTreeMap::from([(NeedName::new(SKILLS), delivery)]);
         let agent = Recording::default();
         let skills = Path::new("/home/crew/flotilla/agent-homes/coder/skills");
@@ -656,7 +669,10 @@ mod tests {
         run(tree.digest()).await.expect("retried");
         assert_eq!(agent.calls(), [push.clone(), link.clone()], "the retry links; nothing is left to move aside");
         run(tree.digest()).await.expect("kept");
-        assert_eq!(agent.calls(), Vec::<String>::new(), "the record already names this digest");
+        assert_eq!(agent.calls(), std::slice::from_ref(&link), "the record already names this entry: it is only linked again");
+        agent.stored.lock().expect("stored").clear();
+        run(tree.digest()).await.expect("delivered again");
+        assert_eq!(agent.calls(), [push.clone(), link.clone()], "a cleared cache is pushed into again");
         run(format!("{}-reselected", tree.digest())).await.expect("redelivered");
         assert_eq!(agent.calls(), [push, link], "a later delivery finds a link, not a directory");
     }
@@ -689,7 +705,7 @@ mod tests {
             root.path().join("cache"),
         ));
         let digest = tree.digest();
-        let delivery: Arc<dyn TreeDelivery> = Arc::new(SkillsDelivery { trees, tokens: None, tree });
+        let delivery = Delivery::Stored(Arc::new(SkillsDelivery { trees, tokens: None, tree }));
         let agent = Recording::default();
         let error = deliver(
             &skill_needs(&digest),

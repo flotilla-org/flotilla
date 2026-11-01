@@ -455,6 +455,47 @@ async fn artifacts_cross_the_agent_by_digest(agent: Arc<dyn TestAgent>) {
     assert!(vessel.push_artifact(&sha256, &local, PinUnpack::TarXz).await.unwrap_err().contains("tar.xz"));
 }
 
+// #4088: the store answers for one entry by its exact digest: held once stored, and a
+// digest never stored is not. A store cleared since, as collection or a hand clears
+// it, holds nothing, and the link placed into it dangles.
+over_each_transport!(the_store_answers_for_one_entry_by_digest);
+async fn the_store_answers_for_one_entry_by_digest(agent: Arc<dyn TestAgent>) {
+    let directory = tempfile::tempdir().unwrap();
+    let vessel: Arc<dyn VesselAgent> = Arc::new(runner_for(&agent, directory.path()));
+    let local = directory.path().join("harness");
+    std::fs::write(&local, b"pinned harness").unwrap();
+    let sha256 = format!("{:x}", Sha256::digest(b"pinned harness"));
+    let link = directory.path().join("home/.flotilla/harness/bin/claude");
+    assert!(!vessel.has_artifact(&sha256).await.unwrap(), "nothing is stored yet");
+    vessel.push_artifact(&sha256, &local, PinUnpack::File).await.unwrap();
+    vessel.link_artifact(&link, &sha256, Path::new("")).await.unwrap();
+
+    assert!(vessel.has_artifact(&sha256).await.unwrap());
+    assert!(!vessel.has_artifact(&format!("{:x}", Sha256::digest(b"other bytes"))).await.unwrap());
+
+    let entry = std::fs::read_link(&link).unwrap();
+    let store = entry.ancestors().find(|path| path.extension().is_some_and(|extension| extension == "store")).expect("the store");
+    clear(store);
+    assert!(std::fs::metadata(&link).is_err(), "the link dangles");
+    assert!(!vessel.has_artifact(&sha256).await.unwrap());
+}
+
+/// Remove `root` and everything in it, write-protected as a store's entries are.
+fn clear(root: &Path) {
+    fn open_up(directory: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for child in std::fs::read_dir(directory).unwrap() {
+            let child = child.unwrap().path();
+            if std::fs::symlink_metadata(&child).unwrap().is_dir() {
+                open_up(&child);
+            }
+        }
+    }
+    open_up(root);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 // Issue 3486: flotilla's CLI cycle is separate from drydock's. Updating files
 // changes what exec sees while the same agent incarnation continues running.
 over_each_transport!(pushing_new_cli_layer_does_not_reexec_agent);

@@ -122,7 +122,9 @@ impl std::error::Error for PlanError {}
 ///   controller holds it (#3956 ruling: a private or unreachable artifact is fetched
 ///   where its authority allows and pushed).
 /// - A need whose digest already landed through the chosen mechanism, at the same
-///   guest path, is kept, unless its home is delivered again.
+///   guest path, is kept, unless its home is delivered again. `delivered` holds only
+///   what is still there: the executor drops a stored tree's record once the
+///   vessel agent's store no longer holds its entry (#4088).
 ///
 /// Every tree's home is validated before any mechanism is chosen.
 pub fn plan(

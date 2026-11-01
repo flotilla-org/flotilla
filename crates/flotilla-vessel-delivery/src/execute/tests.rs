@@ -18,6 +18,12 @@ use crate::vocabulary::{HomeBase, RelativePath, TreeSources};
 struct LocalVessel {
     base: tempfile::TempDir,
     runtime: tempfile::TempDir,
+    /// The agent's content store: one file per entry, named by its digest.
+    store: tempfile::TempDir,
+    /// Every link placed into the store, in order.
+    links: Mutex<Vec<PathBuf>>,
+    /// Fail every store lookup, as an agent that cannot answer does.
+    lookup_fails: AtomicBool,
 }
 
 #[async_trait]
@@ -55,11 +61,36 @@ impl VesselAgent for LocalVessel {
     async fn symlink(&self, path: &Path, target: &Path) -> Result<(), String> {
         self.local().symlink(path, target).await
     }
+    async fn push_artifact(&self, sha256: &str, file: &Path, _: flotilla_resources::PinUnpack) -> Result<(), String> {
+        std::fs::copy(file, self.store.path().join(sha256)).map(drop).map_err(|error| error.to_string())
+    }
+    async fn has_artifact(&self, sha256: &str) -> Result<bool, String> {
+        if self.lookup_fails.load(Ordering::SeqCst) {
+            return Err("the agent cannot be reached".into());
+        }
+        Ok(self.store.path().join(sha256).is_file())
+    }
+    async fn link_artifact(&self, path: &Path, sha256: &str, _: &Path) -> Result<(), String> {
+        let entry = self.store.path().join(sha256);
+        if !entry.is_file() {
+            return Err(format!("no stored artifact {sha256}"));
+        }
+        self.local().create_dir(path.parent().ok_or("a link needs a directory")?, 0o755).await?;
+        self.local().symlink(path, &entry).await?;
+        self.links.lock().expect("links").push(path.into());
+        Ok(())
+    }
 }
 
 impl LocalVessel {
     fn new() -> Self {
-        Self { base: tempfile::tempdir().expect("base"), runtime: tempfile::tempdir().expect("runtime base") }
+        Self {
+            base: tempfile::tempdir().expect("base"),
+            runtime: tempfile::tempdir().expect("runtime base"),
+            store: tempfile::tempdir().expect("store"),
+            links: Mutex::default(),
+            lookup_fails: AtomicBool::new(false),
+        }
     }
 
     fn local(&self) -> RunnerVesselAgent {
@@ -98,6 +129,37 @@ impl TreeDelivery for Tree {
     }
 }
 
+/// Stores its content as one entry of the agent's store, recording each time it does.
+struct StoredTree {
+    content: String,
+    stored: Mutex<Vec<Mechanism>>,
+}
+
+impl StoredTree {
+    fn new(content: &str) -> Arc<Self> {
+        Arc::new(Self { content: content.into(), stored: Mutex::default() })
+    }
+
+    fn sha256(&self) -> String {
+        format!("sha-{}", self.content.replace(' ', "-"))
+    }
+
+    fn stored(&self) -> Vec<Mechanism> {
+        self.stored.lock().expect("stored").clone()
+    }
+}
+
+#[async_trait]
+impl StoreDelivery for StoredTree {
+    async fn store(&self, mechanism: Mechanism, _: &Path, agent: &dyn VesselAgent) -> Result<StoreEntry, StepFailure> {
+        let file = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
+        std::fs::write(file.path(), &self.content).map_err(|error| error.to_string())?;
+        agent.push_artifact(&self.sha256(), file.path(), flotilla_resources::PinUnpack::File).await?;
+        self.stored.lock().expect("stored").push(mechanism);
+        Ok(StoreEntry { sha256: ContentDigest::new(self.sha256()), link: Some(RelativePath::new("SKILL.md").expect("link")) })
+    }
+}
+
 fn needs(skills: &str, notes: &str) -> Vec<Need> {
     let tree = |name: &str, digest: &str| Need {
         name: NeedName::new(name),
@@ -129,8 +191,8 @@ async fn re_runs_deliver_only_what_changed_or_failed() {
     let vessel = LocalVessel::new();
     let (skills, notes) = (Tree::new("skills v1"), Tree::new("notes v1"));
     let trees = BTreeMap::from([
-        (NeedName::new("skills"), skills.clone() as Arc<dyn TreeDelivery>),
-        (NeedName::new("notes"), notes.clone() as Arc<dyn TreeDelivery>),
+        (NeedName::new("skills"), Delivery::Placed(skills.clone())),
+        (NeedName::new("notes"), Delivery::Placed(notes.clone())),
     ]);
     let run = |needs: Vec<Need>| {
         let trees = trees.clone();
@@ -182,6 +244,59 @@ async fn re_runs_deliver_only_what_changed_or_failed() {
     assert_eq!((skills.deliveries(), notes.deliveries()), (3, 4));
 }
 
+// Behaviour (#4088): the executor links a stored tree to the entry its delivery names,
+// and the home's record names that entry. A re-run keeps the tree while the store holds
+// that exact entry, storing nothing but linking it again, so this vessel's agent holds
+// the use. Once the store no longer holds it (collected after the vessel that linked it
+// retired, or cleared by hand), the tree is stored again by the mechanism it landed by,
+// before anything that needs it runs. A record line from before stored trees named their
+// entry is stored again once. A placed tree beside it is kept throughout. A lookup the
+// agent cannot answer fails the delivery at that tree, not permanently.
+#[tokio::test]
+async fn a_stored_tree_is_kept_only_while_the_store_holds_its_entry() {
+    let vessel = LocalVessel::new();
+    let (skills, notes) = (StoredTree::new("skills v1"), Tree::new("notes"));
+    let trees = BTreeMap::from([
+        (NeedName::new("skills"), Delivery::Stored(skills.clone())),
+        (NeedName::new("notes"), Delivery::Placed(notes.clone())),
+    ]);
+    let (needs, mechanisms, costs) = (needs("s1", "n1"), ProviderMechanisms::default(), CostTable::default());
+    let run = || deliver(&needs, &trees, &mechanisms, &costs, &vessel);
+    let links = || vessel.links.lock().expect("links").len();
+    let first = run().await.expect("first delivery");
+    let home = first.homes[&NeedName::new("home")].clone();
+    let skill = home.join("skills/skills/SKILL.md");
+    assert_eq!(std::fs::read_to_string(&skill).expect("linked entry"), "skills v1");
+    let record = std::fs::read_to_string(home.join(DELIVERY_RECORD)).expect("record");
+    assert!(record.lines().any(|line| line.ends_with("\tsha-skills-v1\tSKILL.md")), "the record names the entry: {record}");
+    assert_eq!((skills.stored().len(), links(), notes.deliveries()), (1, 1, 1));
+
+    let again = run().await.expect("kept");
+    assert!(again.plan.steps.iter().all(|step| step.action == Action::Keep), "{:?}", again.plan);
+    assert_eq!((skills.stored().len(), links(), notes.deliveries()), (1, 2, 1), "a kept stored tree is only linked again");
+
+    std::fs::remove_file(vessel.store.path().join(skills.sha256())).expect("collect the entry");
+    let collected = run().await.expect("stored again");
+    let actions = collected.plan.steps.iter().map(|step| (step.need.as_str(), step.action)).collect::<BTreeMap<_, _>>();
+    assert_eq!(actions, BTreeMap::from([("home", Action::Keep), ("notes", Action::Keep), ("skills", Action::Deliver)]));
+    assert_eq!(skills.stored(), vec![Mechanism::AgentFetch { by: crate::FetchBy::Url }; 2], "stored again the same way");
+    assert_eq!((links(), notes.deliveries()), (3, 1));
+    assert_eq!(std::fs::read_to_string(&skill).expect("linked entry"), "skills v1");
+
+    let record = std::fs::read_to_string(home.join(DELIVERY_RECORD)).expect("record");
+    std::fs::write(home.join(DELIVERY_RECORD), record.replace("\tsha-skills-v1\tSKILL.md", "")).expect("an older record");
+    run().await.expect("an older record's stored tree");
+    assert_eq!((skills.stored().len(), links(), notes.deliveries()), (3, 4, 1), "a record naming no entry is stored again once");
+    run().await.expect("kept");
+    assert_eq!((skills.stored().len(), links()), (3, 5));
+
+    // A lookup that fails keeps nothing it cannot see: the delivery fails at that tree, to be retried.
+    vessel.lookup_fails.store(true, Ordering::SeqCst);
+    let error = run().await.expect_err("the lookup failed");
+    assert_eq!(error, DeliveryError::Step { need: NeedName::new("skills"), error: "the agent cannot be reached".into(), permanent: false });
+    assert_eq!((skills.stored().len(), links()), (3, 5), "nothing was stored or linked");
+}
+
 // Behaviour (#4012): a runtime home lands under the writable base, apart from the
 // durable home base, with its trees and its own record, so clearing the runtime
 // base clears what it holds together with the record that it landed.
@@ -191,8 +306,8 @@ async fn a_runtime_home_lands_under_the_writable_base() {
     let mut needs = needs("s1", "n1");
     needs[0].item = Item::Home { key: RelativePath::new("agent-material/c").expect("key"), base: HomeBase::Runtime };
     let trees = BTreeMap::from([
-        (NeedName::new("skills"), Tree::new("skills") as Arc<dyn TreeDelivery>),
-        (NeedName::new("notes"), Tree::new("notes") as Arc<dyn TreeDelivery>),
+        (NeedName::new("skills"), Delivery::Placed(Tree::new("skills"))),
+        (NeedName::new("notes"), Delivery::Placed(Tree::new("notes"))),
     ]);
     let delivered = deliver(&needs, &trees, &ProviderMechanisms::default(), &CostTable::default(), &vessel).await.expect("delivery");
     let home = vessel.runtime.path().join("agent-material/c");
@@ -202,11 +317,12 @@ async fn a_runtime_home_lands_under_the_writable_base() {
 }
 
 // Behaviour: a tree with no delivery for its content, or a name its record cannot
-// hold, is refused before anything is written.
+// hold, is refused before anything is written, and a tree placed outside a home is
+// refused whatever its record says.
 #[tokio::test]
 async fn undeliverable_needs_are_refused() {
     let vessel = LocalVessel::new();
-    let trees = BTreeMap::from([(NeedName::new("skills"), Tree::new("skills") as Arc<dyn TreeDelivery>)]);
+    let trees = BTreeMap::from([(NeedName::new("skills"), Delivery::Placed(Tree::new("skills")))]);
     let error = deliver(&needs("s1", "n1"), &trees, &ProviderMechanisms::default(), &CostTable::default(), &vessel)
         .await
         .expect_err("notes has no delivery");
@@ -216,6 +332,18 @@ async fn undeliverable_needs_are_refused() {
     unrecordable[1].digest = ContentDigest::new("two\tfields");
     let error = deliver(&unrecordable, &trees, &ProviderMechanisms::default(), &CostTable::default(), &vessel).await.expect_err("tab");
     assert_eq!(error, DeliveryError::Unrecordable(NeedName::new("skills")));
+    // A recorded tree now placed in a need that is not a home is still refused by the
+    // planner: looking for what its record names never stands in for that check.
+    let trees = BTreeMap::from([
+        (NeedName::new("skills"), Delivery::Placed(Tree::new("skills"))),
+        (NeedName::new("notes"), Delivery::Placed(Tree::new("notes"))),
+    ]);
+    deliver(&needs("s1", "n1"), &trees, &ProviderMechanisms::default(), &CostTable::default(), &vessel).await.expect("recorded");
+    let mut misplaced = needs("s1", "n1");
+    let Item::Tree { home, .. } = &mut misplaced[1].item else { panic!("skills is a tree") };
+    *home = NeedName::new("notes");
+    let error = deliver(&misplaced, &trees, &ProviderMechanisms::default(), &CostTable::default(), &vessel).await.expect_err("no home");
+    assert_eq!(error, DeliveryError::Plan(PlanError::NoHome { tree: NeedName::new("skills"), home: NeedName::new("notes") }));
 }
 
 // Behaviour: every mechanism a record holds reads back as itself, so a recorded

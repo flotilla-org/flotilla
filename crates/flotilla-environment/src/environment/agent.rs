@@ -615,6 +615,9 @@ impl VesselAgent for Arc<AgentRunner> {
             .await
             .map_err(|error| format!("link {} to artifact {sha256}: {error}", path.display()))
     }
+    async fn has_artifact(&self, sha256: &str) -> Result<bool, String> {
+        self.client().await?.has_artifact(sha256).await.map_err(|error| format!("look up artifact {sha256}: {error}"))
+    }
     async fn ready(&self) -> Result<(), String> {
         self.healthy().await;
         self.client().await.map(|_| ())
