@@ -9,9 +9,9 @@
 //! live under the user's state directory. The agents keep content (harnesses,
 //! skills) in one store under that state directory, shared by all of the
 //! user's vessels (#4087): the runtime directory, a small tmpfs, holds only
-//! sockets, locks, executables and short-lived secrets. The agent's pushed environment, its
-//! forwards and its claimed endpoints belong to that vessel alone, however many
-//! vessels share the host and its one Environment.
+//! sockets, locks, executables and short-lived secrets. The agent's pushed
+//! environment, its forwards and its claimed endpoints belong to that vessel
+//! alone, however many vessels share the host and its one Environment.
 //!
 //! Crews reach the daemon through a guest forward the agent serves at the
 //! vessel's `flotilla.sock`, carried over the controller's own link to a
@@ -681,6 +681,9 @@ impl SshHostVessels {
         agent.ready().await.map_err(|error| format!("vessel agent for {}: {error}", key.vessel))?;
         let runner = handle.runner();
         let marker = serde_json::to_string(key).map_err(|error| error.to_string())?;
+        // Writing the marker creates the state directory, the vessel's holder
+        // in the shared store, before any tool or artifact reaches the agent:
+        // a link placed without a holder is refused.
         for directory in [&paths.agent, &paths.state] {
             runner.write_file(&directory.join(MARKER), &marker).await.map_err(|error| format!("mark vessel directory: {error}"))?;
         }

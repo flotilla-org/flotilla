@@ -333,6 +333,41 @@ async fn vessels_on_one_host_share_the_durable_store_and_retirement_collects_it(
     assert!(std::fs::symlink_metadata(link).is_ok(), "the crew's home outlives its vessel");
     assert_eq!(std::fs::read(link).map_err(|error| error.kind()), Err(io::ErrorKind::NotFound), "no live vessel uses the entry");
     assert_eq!(std::fs::read_dir(store.path.join("artifacts")).unwrap().count(), 0);
+
+    // The vessel returns to its home: delivering again replaces the dangling link.
+    std::fs::create_dir_all(holder).unwrap();
+    let connector = HostAgentConnector::new(
+        host.clone(),
+        Arc::new(LocalTransport),
+        directory.clone(),
+        Platform::current(),
+        executable.clone(),
+        Duration::from_secs(10),
+        &system_base(),
+    )
+    .with_store(store.path.clone(), holder.clone());
+    let controller = root.path().join("controller-again");
+    std::fs::create_dir(&controller).unwrap();
+    let runner = Arc::new(AgentRunner::new(Arc::new(connector), controller));
+    VesselAgent::push_artifact(&runner, &digest, &pinned, flotilla_resources::PinUnpack::File).await.unwrap();
+    VesselAgent::link_artifact(&runner, link, &digest, Path::new("")).await.unwrap();
+    assert_eq!(std::fs::read(link).unwrap(), harness);
+    assert_eq!(VesselAgent::artifact_links(&runner).await.unwrap(), vec![link.clone()]);
+}
+
+// A retirement whose collection cannot run, as after a reboot cleared the
+// vessel's executable, still stops the vessel and removes its directories:
+// the collection is left to the next retirement on the host.
+#[tokio::test]
+async fn a_collection_that_cannot_run_does_not_fail_retirement() {
+    let root = tempfile::Builder::new().prefix("fvc-").tempdir_in("/tmp").unwrap();
+    let (directory, holder) = (root.path().join("run/flotilla/v/vessel"), root.path().join("state/flotilla/vessels/vessel"));
+    for path in [&directory, &holder] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let store = SharedStore::new(root.path().join("state/flotilla/content-store"));
+    retire_host_agent(FakeHost::new().as_ref(), &directory, std::slice::from_ref(&holder), Some(&store)).await.unwrap();
+    assert!(!directory.exists() && !holder.exists());
 }
 
 // An executable an earlier generation installed refuses this generation's

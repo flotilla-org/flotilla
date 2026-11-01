@@ -536,6 +536,9 @@ fn collect(source: &Path, destination: &Path, files: &mut Vec<FileEntry>, links:
     Ok(())
 }
 
+/// How a refusal for a content store without room for an artifact begins.
+pub const STORE_FULL: &str = "content store full";
+
 /// Why the agent's store refused an artifact. A store whose filesystem cannot
 /// hold it is named as such: the agent's refusal gives the store's path and
 /// its free space (#4087).
@@ -545,9 +548,6 @@ fn store_refusal(operation: String, error: io::Error) -> String {
     }
     format!("{operation}: {error}")
 }
-
-/// How a refusal for a content store without room for an artifact begins.
-pub const STORE_FULL: &str = "content store full";
 
 /// The store's unpack kind for a pin's. The store unpacks `tar` and `tar.gz` archives.
 fn store_unpack(unpack: PinUnpack) -> Result<Unpack, String> {

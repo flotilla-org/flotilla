@@ -38,6 +38,15 @@ pub const AGENT_EXECUTABLE: &str = "drydock-agent";
 /// The bootstrap script's exit status when the vessel has no executable yet.
 const MISSING_EXECUTABLE: i32 = 64;
 
+/// How one run of the bootstrap script went on the host.
+enum Started {
+    Running,
+    /// The vessel has no executable yet.
+    Missing,
+    /// The executable (or the script) refused, saying why.
+    Refused(String),
+}
+
 /// How long a store entry no vessel links outlives its last fetch: longer
 /// than any vessel waits between fetching an artifact and linking it.
 pub const STORE_GRACE: Duration = Duration::from_secs(3600);
@@ -47,7 +56,8 @@ pub const STORE_GRACE: Duration = Duration::from_secs(3600);
 /// the login's identity and the prepared base layer, passed as `NAME=value`
 /// words after the directory, the store and the holder: never the SSH
 /// session's own environment. Without a store the agent keeps its own beside
-/// its executable.
+/// its executable. `${store:+...}` is deliberately unquoted: it expands to
+/// the four quoted words, or to none.
 const BOOTSTRAP: &str = r#"dir=$1
 store=$2
 holder=$3
@@ -239,19 +249,24 @@ impl HostAgentConnector {
     /// An executable from an earlier generation may refuse this one's store
     /// options; it is replaced with this generation's build and started again.
     pub async fn bootstrap(&self) -> Result<(), String> {
-        match self.start().await {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
-            Err(error) => tracing::info!(vessel = %self.vessel, %error, "vessel agent did not start; installing this generation's build"),
+        match self.start().await? {
+            Started::Running => return Ok(()),
+            Started::Missing => {}
+            // Only the executable's own refusal: a host the runner cannot
+            // reach is no reason to copy the build again.
+            Started::Refused(error) => {
+                tracing::info!(vessel = %self.vessel, %error, "vessel agent refused to start; installing this generation's build")
+            }
         }
         self.install().await?;
-        if self.start().await? {
-            return Ok(());
+        match self.start().await? {
+            Started::Running => Ok(()),
+            Started::Missing => Err(format!("drydock agent in {} is still missing after install", self.directory.display())),
+            Started::Refused(error) => Err(error),
         }
-        Err(format!("drydock agent in {} is still missing after install", self.directory.display()))
     }
 
-    async fn start(&self) -> Result<bool, String> {
+    async fn start(&self) -> Result<Started, String> {
         let directory = self.directory.to_string_lossy();
         let (store, holder) = match &self.store {
             Some((store, holder)) => (store.to_string_lossy(), holder.to_string_lossy()),
@@ -264,11 +279,11 @@ impl HostAgentConnector {
             .run_output("sh", &args, Path::new("/"), &ChannelLabel::Default)
             .await
             .map_err(|error| format!("start vessel agent in {directory}: {error}"))?;
-        match output.exit_code {
-            Some(0) => Ok(true),
-            Some(MISSING_EXECUTABLE) => Ok(false),
-            code => Err(format!("start vessel agent in {directory} exited {code:?}: {}", output.stderr.trim())),
-        }
+        Ok(match output.exit_code {
+            Some(0) => Started::Running,
+            Some(MISSING_EXECUTABLE) => Started::Missing,
+            code => Started::Refused(format!("start vessel agent in {directory} exited {code:?}: {}", output.stderr.trim())),
+        })
     }
 
     async fn install(&self) -> Result<(), String> {

@@ -230,7 +230,11 @@ pub async fn deliver(
 }
 
 /// Drop from `landed` each tree linked from the content store that no live
-/// link of the store reaches any more, so it is delivered again.
+/// link of the store reaches any more, so it is delivered again. Links are
+/// matched by path components against the home the plan resolved, as the
+/// agent records them: the same absolute spelling. A link spelled through a
+/// symlinked directory would not match, and its tree would be delivered
+/// again each run: wasteful, never wrong.
 async fn forget_collected(
     needs: &[Need],
     trees: &BTreeMap<NeedName, Arc<dyn TreeDelivery>>,
