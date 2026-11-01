@@ -804,7 +804,7 @@ impl VesselReconciler {
                             .filter(|need| need.requires_guest_probe())
                             .cloned()
                             .collect();
-                        let spec = match cloud_environment_spec(&placement, image, probe_needs) {
+                        let spec = match cloud_environment_spec(&placement, image, probe_needs, &required_adapters) {
                             Ok(spec) => spec,
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         };
@@ -1198,11 +1198,7 @@ impl VesselReconciler {
                         // Preserve absolute host paths in both mount domains so
                         // .git pointers and host registration backlinks remain valid.
                         mounts.extend(git_mounts);
-                        let mut env = required_adapters
-                            .iter()
-                            .filter_map(|adapter| adapter_enabling_env(adapter))
-                            .map(|(name, value)| (name.to_string(), value.to_string()))
-                            .collect::<BTreeMap<_, _>>();
+                        let mut env = enabling_env(&required_adapters);
                         if let Err(message) = configure_contained_tracking(&mut env, &contained_branches) {
                             return Ok(VesselPrepared::failed(message));
                         }
@@ -1819,10 +1815,20 @@ fn checkout_target_path(repo_default_dir: &str, convoy_slug: &str, repo_slug: &s
 
 /// A cloud sandbox is provisioned by its own provider instance from typed
 /// inputs alone: no Docker spec, and nothing smuggled through its env (#3981).
+/// The variables that enable the crew's adapters in its vessel, as each place's discovery reads them.
+fn enabling_env(required_adapters: &BTreeSet<String>) -> BTreeMap<String, String> {
+    required_adapters
+        .iter()
+        .filter_map(|adapter| adapter_enabling_env(adapter))
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+}
+
 fn cloud_environment_spec(
     placement: &Placement,
     image: &str,
     probe_needs: BTreeSet<flotilla_resources::CapabilityNeed>,
+    required_adapters: &BTreeSet<String>,
 ) -> Result<EnvironmentSpec, String> {
     let instance = placement
         .instance
@@ -1842,7 +1848,7 @@ fn cloud_environment_spec(
             size,
             lifetime_cap_seconds: None,
             probe_needs,
-            env: BTreeMap::new(),
+            env: enabling_env(required_adapters),
         }),
         ..EnvironmentSpec::default()
     })
@@ -2357,11 +2363,11 @@ mod tests {
         .unwrap();
         let needs: BTreeSet<flotilla_resources::CapabilityNeed> = ["toolchain:rust".parse().unwrap()].into_iter().collect();
         let unfrozen = Placement { kind: kind.clone(), instance: None };
-        assert!(cloud_environment_spec(&unfrozen, "image@sha256:digest", needs.clone())
+        assert!(cloud_environment_spec(&unfrozen, "image@sha256:digest", needs.clone(), &BTreeSet::new())
             .unwrap_err()
             .contains("names no provider instance"));
         let placement = Placement { kind, instance: Some("daytona".into()) };
-        let spec = cloud_environment_spec(&placement, "image@sha256:digest", needs.clone()).expect("a typed spec");
+        let spec = cloud_environment_spec(&placement, "image@sha256:digest", needs.clone(), &BTreeSet::new()).expect("a typed spec");
         assert!(spec.docker.is_none() && spec.host_direct.is_none());
         assert_eq!(spec.provider_address.unwrap().to_string(), "account:daytona/provider:daytona");
         assert_eq!(
@@ -2378,8 +2384,34 @@ mod tests {
         sized_kind.spec.realisation =
             FulfilmentRealisation::CloudSandboxPerVessel { image: "image@sha256:digest".into(), size: Some(policy_size.clone()) };
         let sized = Placement { kind: sized_kind, instance: Some("daytona".into()) };
-        let spec = cloud_environment_spec(&sized, "image@sha256:digest", needs).expect("a typed spec");
+        let spec = cloud_environment_spec(&sized, "image@sha256:digest", needs, &BTreeSet::new()).expect("a typed spec");
         assert_eq!(spec.cloud_sandbox.unwrap().size, policy_size);
+    }
+
+    // A cloud vessel's discovery reads its adapters' enabling variables from the
+    // Environment's declared env, as a Docker vessel's does: a crew that needs
+    // fleet-canary enables it, and one that does not declares nothing.
+    #[test]
+    fn cloud_environment_declares_the_crews_adapter_enabling_env() {
+        use super::{cloud_environment_spec, Placement};
+        let spec = FulfilmentKindSpec::builder()
+            .host_ref(String::new())
+            .pool("cleat".into())
+            .realisation(FulfilmentRealisation::CloudSandboxPerVessel { image: "image@sha256:digest".into(), size: None })
+            .build();
+        let kind: flotilla_resources::ResourceObject<FulfilmentKind> = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "cloud", "namespace": "flotilla", "resource_version": "1", "annotations": {}, "labels": {},
+                "creation_timestamp": "2026-10-23T00:00:00Z" },
+            "spec": spec
+        }))
+        .unwrap();
+        let placement = Placement { kind, instance: Some("daytona".into()) };
+        let env = |adapters: &[&str]| {
+            let adapters = adapters.iter().map(|adapter| adapter.to_string()).collect();
+            cloud_environment_spec(&placement, "image@sha256:digest", BTreeSet::new(), &adapters).unwrap().cloud_sandbox.unwrap().env
+        };
+        assert_eq!(env(&["fleet-canary"]), BTreeMap::from([("FLOTILLA_FLEET_CANARY".to_string(), "1".to_string())]));
+        assert!(env(&["claude"]).is_empty());
     }
 
     // #4165: vessels whose provider declares one workspace root for all of them
