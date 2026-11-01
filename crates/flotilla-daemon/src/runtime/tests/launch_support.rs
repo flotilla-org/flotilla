@@ -305,6 +305,8 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
     let [launch] = ensured.as_slice() else {
         panic!("expected exactly one contained Claude launch");
     };
+    // #4173: a Docker vessel's crew runs with its declared environment, no login shell.
+    assert!(launch.declared);
     // #2706: session declarations survive, and granted credentials override conflicts.
     assert!(launch.env_vars.iter().any(|(name, value)| name == "DECLARED_VALUE" && value == "hello declared crew"));
     assert!(!launch.env_vars.iter().any(|(_, value)| value == "superseded-spec-token"));

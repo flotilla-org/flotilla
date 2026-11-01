@@ -33,7 +33,6 @@ use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::EnvironmentId;
 use flotilla_provider_runtime::{
     execution_context::{BaseLayer, BoundLayer},
-    host_environment::export_lines,
     ChannelLabel, CommandOutput, CommandProcess, CommandRunner,
 };
 use flotilla_resources::{TerminalSession, TerminalSessionTarget, Vessel};
@@ -956,25 +955,18 @@ pub(super) fn apply_reach_environment(env: &mut Vec<(String, String)>, environme
 
 /// The last step before an SSH host session starts: the vessel's prepared
 /// context rendered onto the launch, with `bound` the crew's account
-/// material. Nothing after it adds to `PATH` or sets a base variable.
-///
-/// cleat runs a session command through `$SHELL -lc`, so the host's login
-/// profile still runs before the command; the returned command sets the
-/// base layer and `PATH` again before anything else, until cleat can launch
-/// without a login shell.
+/// material. Nothing after it adds to `PATH` or sets a base variable, and the
+/// session runs with exactly this environment: no login profile (#4173).
 pub(super) fn compose_session_environment(
     env: &mut Vec<(String, String)>,
-    command: &str,
     paths: &VesselPaths,
     profile: &SshHostProfile,
     bound: BoundLayer,
-) -> Result<String, String> {
+) -> Result<(), String> {
     let environment = &profile.environment_id;
     let prepared =
         profile.preparer(paths.generation_path()).prepare(Some(bound)).map_err(|error| error.for_environment(environment.as_str()))?;
-    prepared.render_crew(env, &profile.accounts).map_err(|error| error.for_environment(environment.as_str()))?;
-    let composed = env.iter().filter(|(name, _)| prepared.base().sets(name)).cloned().collect::<Vec<_>>();
-    Ok(format!("{}{command}", export_lines(&composed)))
+    prepared.render_crew(env, &profile.accounts).map_err(|error| error.for_environment(environment.as_str()))
 }
 
 #[cfg(test)]

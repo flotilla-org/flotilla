@@ -2081,3 +2081,37 @@ async fn checkout_reserves_branches_from_sibling_engine_phases() {
         .expect("stale ready");
     assert!(matches!(reconciler.prepare(&checkout).await.expect("released reservation"), CheckoutPrepared::Ready { .. }));
 }
+
+// #4218: a cloud clone's grants ride on its annotations; undecodable ones fail
+// the checkout with the reason rather than cloning without them.
+#[tokio::test]
+async fn fresh_clone_with_undecodable_grant_annotations_fails_with_the_reason() {
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("local-root"));
+    let checkout = backend
+        .clone()
+        .using::<Checkout>(NAMESPACE)
+        .create(
+            &InputMeta::builder()
+                .name("cloud-checkout".to_string())
+                .annotations(BTreeMap::from([(flotilla_resources::CREDENTIAL_REFS_ANNOTATION.to_string(), "[not json".to_string())]))
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Managed),
+            &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                source_clone_ref: None,
+                repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                env_ref: "env-cloud".to_string(),
+                r#ref: "feature/cloud".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/vessels/cloud".to_string(),
+                url: REPO_URL.to_string(),
+            }),
+        )
+        .await
+        .expect("create cloud checkout");
+    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend, NAMESPACE);
+
+    let deps = reconciler.prepare(&checkout).await.expect("prepare");
+
+    let CheckoutPrepared::Failed(message) = deps else { panic!("undecodable grants should fail the checkout") };
+    assert!(message.starts_with("invalid credential references annotation"), "{message}");
+}
