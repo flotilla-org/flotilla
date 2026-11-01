@@ -194,6 +194,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
                 scratch: Path::new("/tmp/flotilla-probe-test"),
                 observation: &Default::default(),
                 harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
+                pinned_harnesses: &Default::default(),
             },
             &mut ModelProbeState::default(),
         )
@@ -280,6 +281,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
             scratch: Path::new("/tmp/flotilla-probe-test"),
             observation: &Default::default(),
             harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
+            pinned_harnesses: &Default::default(),
         },
         &mut model_probes,
     )
@@ -308,6 +310,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
             scratch: Path::new("/tmp/flotilla-probe-test"),
             observation: &Default::default(),
             harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
+            pinned_harnesses: &Default::default(),
         },
         &mut model_probes,
     )
@@ -600,6 +603,7 @@ fn unresolved_fulfilment_provider_publishes_unknown(tc: hegel::TestCase) {
                 scratch: Path::new("/tmp/probe"),
                 observation: &Default::default(),
                 harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
+                pinned_harnesses: &Default::default(),
             },
             &mut model_probes,
         )
@@ -805,6 +809,7 @@ async fn headless_host_is_not_granted_a_gui_session() {
                 scratch: Path::new("/tmp/flotilla-probe-test"),
                 observation: &Default::default(),
                 harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
+                pinned_harnesses: &Default::default(),
             },
             &mut ModelProbeState::default(),
         )
@@ -813,6 +818,49 @@ async fn headless_host_is_not_granted_a_gui_session() {
         let kind = kinds.get("host-direct-b1").await.expect("kind");
         assert_eq!(kind.spec.grants.contains(&FulfilmentGrant::gui_session()), granted, "display {display:?}: {:?}", kind.spec.grants);
         assert!(kind.spec.grants.contains(&FulfilmentGrant::host_account_reach()));
+    }
+}
+
+// #4093: a host whose crews are given the pinned harnesses (an SSH host) reports each at
+// its pin, though it has no `claude` or `codex` of its own on PATH.
+#[tokio::test]
+async fn a_host_given_pinned_harnesses_reports_their_pins_without_installing_them() {
+    let temp = TempDir::new().expect("tempdir");
+    fs::write(temp.path().join("daemon.toml"), "machine_id = \"pinned-test\"\n").expect("daemon config");
+    let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+    let host_id = daemon.local_host_id().expect("local host id").to_string();
+    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "b1", None).await.expect("host registration");
+    let kinds = daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE);
+    kinds.create(&empty_meta("host-direct-b1"), &host_direct_kind_spec(&host_id, "linux")).await.expect("stored kind");
+    let runner = Arc::new(DiscoveryMockRunner::builder().build());
+    let pins = flotilla_resources::stdlib::stdlib_harness_pins().clone();
+    assert!(pins.contains_key("claude-code") && pins.contains_key("codex"), "{pins:?}");
+    for (pinned, expected) in [(BTreeMap::new(), BTreeMap::new()), (pins.clone(), pins.clone())] {
+        let facts = observe_fulfilment_facts(
+            &daemon.resource_backend(),
+            NAMESPACE,
+            &host_id,
+            &["passthrough".to_string()],
+            &BTreeMap::new(),
+            FulfilmentProbeContext {
+                providers: &detection_registry(runner.clone()),
+                runner: runner.as_ref(),
+                env: &TestEnvVars::default(),
+                scratch: Path::new("/tmp/flotilla-probe-test"),
+                observation: &Default::default(),
+                harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
+                pinned_harnesses: &pinned,
+            },
+            &mut ModelProbeState::default(),
+        )
+        .await
+        .expect("observe the host");
+        let reported = facts["host-direct-b1"]
+            .harnesses
+            .iter()
+            .map(|(adapter, harness)| (adapter.clone(), harness.version.clone()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(reported, expected);
     }
 }
 
@@ -861,6 +909,7 @@ async fn capped_docker_kind_publishes_free_slots_from_the_hosts_vessels() {
                     scratch: Path::new("/tmp/flotilla-probe-test"),
                     observation: &Default::default(),
                     harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
+                    pinned_harnesses: &Default::default(),
                 },
                 &mut ModelProbeState::default(),
             )
@@ -938,6 +987,7 @@ async fn unknown_observation_keeps_a_gui_grant() {
             scratch: Path::new("/tmp/flotilla-probe-test"),
             observation: &Default::default(),
             harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
+            pinned_harnesses: &Default::default(),
         },
         &mut ModelProbeState::default(),
     )

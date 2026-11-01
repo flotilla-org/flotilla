@@ -312,7 +312,13 @@ pub(super) async fn verify_cloud_image_needs(
     };
     let facts = crate::fulfilment_probe::probe_kind(
         &kind,
-        crate::fulfilment_probe::DetectionTarget { image: None, provider: detector.as_ref(), context: &observation, harnesses },
+        crate::fulfilment_probe::DetectionTarget {
+            image: None,
+            provider: detector.as_ref(),
+            context: &observation,
+            harnesses,
+            pinned_harnesses: &BTreeMap::new(),
+        },
         true,
         &*handle.runner(),
         &GuestProbeEnvironment(bag),

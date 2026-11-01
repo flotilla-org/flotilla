@@ -544,6 +544,8 @@ pub(super) async fn observe_provider_advertisements(
         .collect()
 }
 
+static NO_PINNED_HARNESSES: BTreeMap<String, String> = BTreeMap::new();
+
 pub(super) struct FulfilmentProbeContext<'a> {
     pub(super) providers: &'a ProviderRegistry,
     pub(super) runner: &'a dyn CommandRunner,
@@ -552,6 +554,9 @@ pub(super) struct FulfilmentProbeContext<'a> {
     /// The host's prepared base layer and isolation.
     pub(super) observation: &'a ObservationContext,
     pub(super) harnesses: &'a [flotilla_agent::adapter::Harness],
+    /// Adapter → version of the pinned harnesses the host's crews are given (#4093);
+    /// empty for a host whose crews run what it has installed.
+    pub(super) pinned_harnesses: &'a BTreeMap<String, String>,
 }
 
 /// The daemon's own host declares its environment through the daemon
@@ -676,6 +681,12 @@ pub(super) async fn observe_fulfilment_facts(
                         provider: provider.as_ref(),
                         context: probe.observation,
                         harnesses: probe.harnesses,
+                        // A host-direct crew runs the pin; an image's crews run what it carries.
+                        pinned_harnesses: if kind.spec.realisation == FulfilmentRealisation::HostDirect {
+                            probe.pinned_harnesses
+                        } else {
+                            &NO_PINNED_HARNESSES
+                        },
                     },
                     pool_available,
                     probe.runner,

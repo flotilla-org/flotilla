@@ -356,7 +356,7 @@ async fn ssh_host_takes_only_pinned_work_and_routes_to_its_owner() {
     let agent_workflow = flotilla_resources::single_agent_workflow_spec();
     let refused = validate_workflow_agent_adapters(&backend, "flotilla", &agent_workflow, Some(&policy), false)
         .await
-        .expect_err("SSH host cannot run a local agent adapter");
+        .expect_err("SSH host has no central Codex login to copy");
     assert!(refused.contains("agent adapter `codex`"), "{refused}");
 
     let observed = hosts.get("ssh-host").await.expect("SSH Host");
@@ -369,6 +369,8 @@ async fn ssh_host_takes_only_pinned_work_and_routes_to_its_owner() {
 
 // #4037 contract 4: a Codex crew is placeable on an SSH host while its owning daemon
 // publishes a central Codex login, and refused with that reason while it publishes none.
+// #4093: the host has neither harness on its PATH; its crews run the delivered pins, so
+// Claude crews place there too.
 #[tokio::test]
 async fn codex_crews_place_on_an_ssh_host_only_while_its_owner_has_a_central_login() {
     for central_login in [None, Some(false), Some(true)] {
@@ -384,7 +386,7 @@ async fn codex_crews_place_on_an_ssh_host_only_while_its_owner_has_a_central_log
                 flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
                 serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
             ),
-            (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"])),
+            (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!([])),
             (flotilla_resources::SSH_HOST_CAPABILITY.to_string(), serde_json::json!(true)),
         ]);
         capabilities
@@ -396,6 +398,23 @@ async fn codex_crews_place_on_an_ssh_host_only_while_its_owner_has_a_central_log
         let placed =
             validate_workflow_agent_adapters(&backend, "flotilla", &flotilla_resources::single_agent_workflow_spec(), Some(&policy), false)
                 .await;
+
+        let claude = WorkflowTemplateSpec::builder()
+            .vessels(vec![VesselRequirement::builder()
+                .name("work".to_string())
+                .crew(vec![CrewSpec::builder()
+                    .role("coder".to_string())
+                    .source(CrewSource::Agent {
+                        selector: Selector { capability: "code".to_string(), adapter: Some("claude-code".to_string()), model: None },
+                        prompt: None,
+                        brief_template: None,
+                    })
+                    .build()])
+                .build()])
+            .build();
+        validate_workflow_agent_adapters(&backend, "flotilla", &claude, Some(&policy), false)
+            .await
+            .expect("the pinned Claude harness is offered without a host install");
 
         match central_login {
             Some(true) => placed.expect("the owner's central login serves the host's Codex crews"),

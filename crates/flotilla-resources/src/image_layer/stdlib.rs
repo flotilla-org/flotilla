@@ -47,6 +47,40 @@ pub fn stdlib_image_layers() -> Result<&'static [ImageLayerSpec], &'static str> 
     }
 }
 
+/// The pinned version of each harness the layers deliver (#4093): adapter → version, for
+/// every adapter exactly one layer provides as `harness:<adapter>` with exactly one pin.
+/// That is the harness a place given pinned harnesses (an SSH host) runs, whatever it has
+/// installed; an ambiguous or malformed layer pins nothing, as delivery refuses it.
+pub fn harness_pins(layers: &[ImageLayerSpec]) -> BTreeMap<String, String> {
+    let mut pins = BTreeMap::<String, Option<String>>::new();
+    for layer in layers {
+        let mut layer_pins = layer.pins.values();
+        let version = match (layer_pins.next(), layer_pins.next()) {
+            (Some(pin), None) => Some(pin.version.clone()),
+            _ => None,
+        };
+        for adapter in
+            layer.provides.iter().filter_map(|provided| provided.strip_prefix("harness:")).filter(|adapter| !adapter.contains('@'))
+        {
+            pins.entry(adapter.to_string()).and_modify(|pinned| *pinned = None).or_insert_with(|| version.clone());
+        }
+    }
+    pins.into_iter().filter_map(|(adapter, version)| Some((adapter, version?))).collect()
+}
+
+/// [`harness_pins`] of this release's stdlib, computed once; empty, with one warning, when
+/// the stdlib does not parse, so SSH hosts fall back to offering what their PATH holds.
+pub fn stdlib_harness_pins() -> &'static BTreeMap<String, String> {
+    static PINS: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+    PINS.get_or_init(|| match stdlib_image_layers() {
+        Ok(layers) => harness_pins(layers),
+        Err(error) => {
+            tracing::warn!(%error, "stdlib image layers do not parse; no harness is pinned");
+            BTreeMap::new()
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -186,5 +220,33 @@ mod tests {
         assert_eq!(layers[1].context_files.len(), 1);
         let broken = [EmbeddedLayerDirectory { directory: "broken", files: &[("layer.yaml", b"name: broken\n", false)] }];
         assert!(parse_stdlib_layers(&broken).expect_err("invalid layer").contains("stdlib image layer `broken`"));
+    }
+
+    // #4093: the shipped harness layers name the versions an SSH host's crews run; a
+    // harness two layers provide pins nothing, as delivery refuses it.
+    #[test]
+    fn harness_pins_name_each_shipped_harness_version() {
+        let layers = stdlib_image_layers().expect("stdlib");
+        let version = |name: &str| {
+            layers
+                .iter()
+                .find(|layer| layer.name == name)
+                .expect("shipped harness layer")
+                .pins
+                .values()
+                .next()
+                .expect("pin")
+                .version
+                .clone()
+        };
+        assert_eq!(
+            *stdlib_harness_pins(),
+            BTreeMap::from([("claude-code".to_string(), version("harness-claude-code")), ("codex".to_string(), version("harness-codex"))])
+        );
+        let mut doubled = layers.to_vec();
+        let mut second = layers.iter().find(|layer| layer.name == "harness-codex").expect("codex layer").clone();
+        second.name = "harness-codex-fork".into();
+        doubled.push(second);
+        assert_eq!(harness_pins(&doubled).keys().collect::<Vec<_>>(), ["claude-code"]);
     }
 }
