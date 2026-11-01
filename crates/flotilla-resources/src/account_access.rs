@@ -460,3 +460,26 @@ pub trait AccountRecords: Send + Sync {
     /// Every later change of a binding or provision, from now on, for the controllers' wake-ups.
     async fn changes(&self, namespace: &str) -> Result<futures::stream::BoxStream<'static, Result<AccountChange, String>>, String>;
 }
+
+#[cfg(test)]
+mod requester_path_tests {
+    use std::path::Path;
+
+    use super::*;
+
+    // The convoy directory is the grandparent of a requester's home and material, also for names
+    // that need encoding, so removing it takes exactly what the convoy's crews were given.
+    #[test]
+    fn the_convoy_dir_is_the_grandparent_of_each_requester_path() {
+        let base = Path::new("/base");
+        for convoy in ["demo", "a.b", "a b/c"] {
+            let home = requester_home(base, convoy, "coder", "claude");
+            assert_eq!(home.parent().and_then(Path::parent), Some(requester_convoy_dir(base, REQUESTER_HOME_DIR, convoy).as_path()));
+            let material = requester_material(base, convoy, "coder", "claude");
+            assert_eq!(
+                material.parent().and_then(Path::parent),
+                Some(requester_convoy_dir(base, REQUESTER_MATERIAL_DIR, convoy).as_path())
+            );
+        }
+    }
+}

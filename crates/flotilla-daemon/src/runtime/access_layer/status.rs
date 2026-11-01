@@ -232,8 +232,10 @@ impl AccessStatusReconciler {
         // dirs nothing else removes. A failure keeps the record, so the next pass retries. With the
         // place gone too the host is no longer ours to drive, so the record goes without cleanup.
         if convoy_gone && !place_gone {
-            if let (Some(convoy), Some(profile)) = (record.metadata.labels.get(CONVOY_LABEL), self.state.ssh_host.get(place)) {
-                remove_requester_state(profile.runner.as_ref(), convoy).await?;
+            match (record.metadata.labels.get(CONVOY_LABEL), self.state.ssh_host.get(place)) {
+                (Some(convoy), Some(profile)) => remove_requester_state(profile.runner.as_ref(), convoy).await?,
+                (convoy, None) => tracing::debug!(%place, ?convoy, "no SSH host profile for the place; requester state not removed"),
+                (None, Some(_)) => {}
             }
         }
         match backend.using::<AccessDelivery>(&self.namespace).delete(&record.metadata.name).await {
