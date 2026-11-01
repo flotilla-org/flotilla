@@ -142,6 +142,21 @@ pub trait TerminalPool: Send + Sync {
         self.ensure_session(session_name, command, cwd, env_vars, tags).await
     }
 
+    /// Ensure a session that runs `script` in `sh -c` with exactly the given
+    /// environment: no login shell, so no profile rebuilds it (#4173). Pools
+    /// that cannot launch without a shell run it as an ordinary command.
+    async fn ensure_declared_session(
+        &self,
+        session_name: &str,
+        script: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &TerminalEnvVars,
+        tags: &[TerminalSessionTag],
+        initial_size: Option<TerminalSize>,
+    ) -> Result<(), String> {
+        self.ensure_session_with_size(session_name, script, cwd, env_vars, tags, initial_size).await
+    }
+
     /// Returns a structured `Arg` tree representing the attach command.
     /// Callers that need a flat string can use `flatten(&args, 0)`.
     fn attach_args(

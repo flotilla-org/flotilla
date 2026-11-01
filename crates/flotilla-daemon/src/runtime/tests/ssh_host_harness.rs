@@ -446,6 +446,7 @@ impl SshHostRuntime {
             return Err(error);
         }
         let Some(launch) = ensured.last() else { panic!("expected a launch") };
+        assert!(launch.declared, "an SSH host crew runs with its declared environment and no login shell");
         // The vessel was prepared before its crew started: its layer pushed, its
         // environment configured, and its daemon forward up at the socket the
         // session names.
@@ -774,12 +775,13 @@ async fn ssh_host_harness_path_is_composed_and_never_the_login_profile() {
     .await
     .expect("launch SSH host crew");
 
-    // cleat starts the command through `$SHELL -lc` with the launch's
-    // environment over the login basics.
+    // #4173: cleat runs a declared session's script in `sh -c` with exactly the
+    // launch's environment over the pool's host baseline (the login basics);
+    // no login shell reads the profile.
     let mut cleat = vec!["-i".to_string(), format!("HOME={}", home.display()), "USER=crew".into(), "SHELL=/bin/sh".into()];
     cleat.push(format!("FLOTILLA_PRELUDE_DIR={}", remote.path().join("no-preludes").display()));
     cleat.extend(session.env_vars.iter().map(|(name, value)| format!("{name}={value}")));
-    cleat.extend(["/bin/sh".to_string(), "-lc".to_string(), session.command.clone()]);
+    cleat.extend(["/bin/sh".to_string(), "-c".to_string(), session.command.clone()]);
     let status = std::process::Command::new("env").args(&cleat).current_dir(&checkout).status().expect("run the session command");
     assert!(status.success(), "session command failed: {status}");
 
