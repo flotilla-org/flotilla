@@ -46,7 +46,7 @@ use flotilla_provisioning::reconcilers::{
 use flotilla_resources::LANDING_EVIDENCE_TTL;
 use flotilla_resources::{
     host_direct_environment_name, ChangeRequest, Checkout, Clone, Convoy, Environment, Forge, Host, Repository, Resource, ResourceError,
-    SystemClock, TerminalSession, Vessel, WorkflowTemplate,
+    TerminalSession, Vessel, WorkflowTemplate,
 };
 use flotilla_store::{controller::ControllerLoop, ResourceBackend};
 use tokio::{sync::watch, task::JoinHandle};
@@ -478,11 +478,10 @@ impl DaemonRuntime {
         let ensure_engine = match provisioning_lifecycles {
             Some(_) => {
                 let store = daemon.decided_store()?.store();
-                let path = tokio::task::spawn_blocking(move || {
-                    flotilla_core::primitives::ensures::EngineEnsurePath::open(store, Arc::new(SystemClock))
-                })
-                .await
-                .map_err(|error| error.to_string())??;
+                let clock = daemon.clock_for_scenarios();
+                let path = tokio::task::spawn_blocking(move || flotilla_core::primitives::ensures::EngineEnsurePath::open(store, clock))
+                    .await
+                    .map_err(|error| error.to_string())??;
                 Some(Arc::new(path) as Arc<dyn flotilla_admission::convoy_ensure::EngineEnsures>)
             }
             None => None,
@@ -492,7 +491,7 @@ impl DaemonRuntime {
                 EnsureReconciler::builder()
                     .teardown(daemon.convoy_teardown())
                     .resource_backend(daemon.resource_backend())
-                    .clock(Arc::new(SystemClock))
+                    .clock(daemon.clock_for_scenarios())
                     .maybe_engine(ensure_engine)
                     .manifest_roots(daemon.manifest_roots())
                     .build(),

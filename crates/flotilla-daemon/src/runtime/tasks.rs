@@ -848,6 +848,19 @@ pub(super) async fn convoy_ensure_dependency_watches(
             Err(error) => warn!(%kind, %error, "could not watch standing convoy admission dependency"),
         }
     }
+    // A person acknowledging a hold releases it on the next pass.
+    if let Some(changes) = backend.attentions().changes() {
+        let acknowledged = futures::stream::unfold(changes, |mut changes| async move {
+            loop {
+                match changes.recv().await {
+                    Ok(()) => return Some((Ok(Value::Null), changes)),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        });
+        watches.push(Box::pin(acknowledged) as BoxStream<'static, Result<Value, ResourceError>>);
+    }
     futures::stream::select_all(watches)
 }
 

@@ -70,6 +70,7 @@ impl DummyDaemon {
         #[builder(default)] restartable: bool,
         #[builder(default = true)] designated: bool,
         #[builder(default)] supervision: flotilla_daemon::supervisor::ControllerSupervision,
+        #[builder(default = Arc::new(flotilla_resources::SystemClock))] clock: Arc<dyn flotilla_resources::Clock>,
     ) -> Self {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let config_dir = dir.path().join("config");
@@ -84,12 +85,13 @@ impl DummyDaemon {
         let mut discovery = fake_discovery_with_host_directories(dir.path());
         let fleet = install_dummy_fleet(&daemon_config, &mut discovery).expect("dummy fleet configured");
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let daemon = InProcessDaemon::new_with_resource_backend(
+        let daemon = InProcessDaemon::new_with_resource_backend_and_clock(
             vec![],
             Arc::clone(&config),
             discovery,
             HostName::new(host),
             backend,
+            clock,
             std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
@@ -1740,4 +1742,181 @@ async fn assert_old_inventory<T: flotilla_resources::Resource>(source: &DummyDae
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }).await.unwrap_or_else(|error| panic!("old {} inventory does not replicate: {error}", T::API_PATHS.kind));
+}
+
+/// Wall time moved forward by however much a test skips, so retry backoff passes at once.
+#[derive(Default)]
+struct SkippingClock(std::sync::Mutex<chrono::Duration>);
+
+impl SkippingClock {
+    fn skip(&self, by: chrono::Duration) {
+        *self.0.lock().expect("clock") += by;
+    }
+}
+
+impl flotilla_resources::Clock for SkippingClock {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() + *self.0.lock().expect("clock")
+    }
+}
+
+// Behaviour (#3824 layer 8b): with `[primitives]` on, a standing convoy whose
+// generation ends three times is held, and the hold is an attention from the standing
+// role in its project's operator inbox. The person sees it in `message inbox`;
+// acknowledging it releases the hold, and the next generation is admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn on_the_engine_acknowledging_a_standing_convoys_hold_admits_its_next_generation() {
+    use flotilla_resources::{
+        ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyEnsureSpec, Project, ProjectRepositoryRole, ProjectRepositorySpec,
+    };
+
+    let clock = Arc::new(SkippingClock::default());
+    let fleet = DummyDaemon::start_with_relay()
+        .host("dummy-load")
+        // The host heartbeats on the skipping clock, so it stays fresh across each skip.
+        .heartbeat(Duration::from_millis(100))
+        .clock(clock.clone() as Arc<dyn flotilla_resources::Clock>)
+        .call()
+        .await;
+    let backend = fleet.backend();
+    let forge = catalog::forge(&fleet.fleet.config().forge_service_url);
+    let repository = catalog::repository(&forge).expect("repository").key();
+    // A standing role runs until it is stopped: its workflow declares no exit.
+    let mut workflow = CrewMix::Coder.workflow(LONG_RUNNER_TURNS);
+    workflow.exit = None;
+    backend
+        .using::<WorkflowTemplate>(NAMESPACE)
+        .create(&InputMeta::builder().name("standing-coder".into()).build(), &workflow)
+        .await
+        .expect("standing workflow");
+    backend
+        .definitions::<Project>(NAMESPACE)
+        .create(
+            &InputMeta::builder().name("standing".into()).build(),
+            &flotilla_resources::ProjectSpec::builder()
+                .display_name("Standing".to_string())
+                .default_workflow_ref(CrewMix::Coder.workflow_name().to_string())
+                .repositories(vec![ProjectRepositorySpec {
+                    charter_store: None,
+                    repo: repository.clone(),
+                    alias: Some("app".into()),
+                    roles: std::collections::BTreeSet::from([ProjectRepositoryRole::Code]),
+                    subpath: None,
+                    default_branch: Some("main".into()),
+                }])
+                .build(),
+        )
+        .await
+        .expect("standing project");
+    backend
+        .definitions::<ConvoyEnsure>(NAMESPACE)
+        .create(
+            &InputMeta::builder()
+                .name("quartermaster".into())
+                .annotations(std::collections::BTreeMap::from([
+                    (flotilla_charter::ops_entry::MATERIALIZED_PROJECT_ANNOTATION.to_string(), "standing".to_string()),
+                    (flotilla_charter::ops_entry::SOURCE_REPOSITORY_ANNOTATION.to_string(), repository.to_string()),
+                    (flotilla_charter::ops_entry::SOURCE_COMMIT_ANNOTATION.to_string(), "abc123".to_string()),
+                    (flotilla_charter::ops_entry::SOURCE_ENTRY_PATH_ANNOTATION.to_string(), "ops/quartermaster.md".to_string()),
+                ]))
+                .build(),
+            &ConvoyEnsureSpec {
+                project_ref: "standing".into(),
+                role: "quartermaster".into(),
+                driver_ref: None,
+                workflow_ref: "standing-coder".into(),
+                placement_policy: Some(DUMMY_FULFILMENT_KIND.into()),
+                escalation_reason: None,
+                repositories: vec![repository.clone()],
+                presents_as: None,
+                agent_overrides: Vec::new(),
+            },
+        )
+        .await
+        .expect("standing role");
+
+    let generations = || async {
+        backend
+            .using::<Convoy>(NAMESPACE)
+            .list()
+            .await
+            .expect("convoys")
+            .items
+            .into_iter()
+            .filter(|convoy| {
+                convoy.metadata.annotations.get(flotilla_charter::ops_entry::ENSURED_FROM_ANNOTATION).map(String::as_str)
+                    == Some("quartermaster")
+            })
+            .collect::<Vec<_>>()
+    };
+    let held = || async {
+        backend
+            .definitions::<ConvoyEnsure>(NAMESPACE)
+            .get("quartermaster")
+            .await
+            .ok()
+            .and_then(|ensure| ensure.status)
+            .is_some_and(|status| status.hold_reason == Some(ConvoyEnsureHoldReason::RestartLimit))
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !held().await {
+        let latest = generations().await.into_iter().max_by_key(|convoy| convoy.spec.generation);
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never held: {:?}, ensure {:?}",
+            latest.as_ref().map(|convoy| (convoy.metadata.name.clone(), convoy.status.as_ref().map(|status| status.phase))),
+            backend.definitions::<ConvoyEnsure>(NAMESPACE).get("quartermaster").await.ok().and_then(|ensure| ensure.status)
+        );
+        match latest.as_ref().and_then(|convoy| Some((convoy, convoy.status.as_ref()?))) {
+            // An operator abandons each generation; the standing role counts it a failure.
+            Some((convoy, status)) if !status.phase.is_terminal() => {
+                let abandon = CommandAction::ConvoyAbandon {
+                    namespace: Some(NAMESPACE.into()),
+                    name: convoy.metadata.name.clone(),
+                    reason: "the generation failed".into(),
+                };
+                fleet.execute_as_operator(abandon).await;
+            }
+            _ => {}
+        }
+        // Each ended generation waits out its backoff; skip just that.
+        let retry_at =
+            backend.definitions::<ConvoyEnsure>(NAMESPACE).get("quartermaster").await.ok().and_then(|ensure| ensure.status?.retry_at);
+        let now = flotilla_resources::Clock::now(&*clock);
+        if let Some(retry_at) = retry_at.filter(|retry_at| *retry_at > now) {
+            clock.skip(retry_at - now + chrono::Duration::seconds(1));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert_eq!(generations().await.len(), 3, "three ended generations, then the hold");
+
+    let inbox = CommandAction::PersonInbox { namespace: Some(NAMESPACE.into()) };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let item = loop {
+        let CommandValue::PersonInbox(listing) = fleet.execute_as_operator(inbox.clone()).await else { panic!("a person inbox") };
+        if let Some(item) = listing.items.into_iter().find(|item| item.sender == "fleet:lab/role:standing") {
+            break item;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the hold never reached a person");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(item.inbox, "project:standing/role:operator");
+    assert_eq!(item.expects, "nothing");
+    clock.skip(chrono::Duration::hours(1));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(generations().await.len(), 3, "the hold holds until a person acknowledges it");
+
+    let acknowledged = fleet
+        .execute_as_operator(CommandAction::PersonAcknowledge { namespace: Some(NAMESPACE.into()), message: item.message.clone() })
+        .await;
+    assert_eq!(acknowledged, CommandValue::Ok);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while generations().await.len() < 4 {
+        assert!(tokio::time::Instant::now() < deadline, "the next generation was never admitted");
+        // Released, the role restarts after its ordinary backoff.
+        clock.skip(chrono::Duration::minutes(1));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let CommandValue::PersonInbox(listing) = fleet.execute_as_operator(inbox).await else { panic!("a person inbox") };
+    assert!(listing.items.iter().all(|left| left.message != item.message), "an acknowledged hold waits no more");
 }
