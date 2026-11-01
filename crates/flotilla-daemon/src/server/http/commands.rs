@@ -18,8 +18,7 @@ use axum::{
 };
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
-    CommandCaller, CommandValue, DaemonEvent, DispatcherErrorClass, Message, PrincipalRef, Request as RpcRequest, Response as RpcResponse,
-    ResponseResult,
+    CommandCaller, CommandValue, DaemonEvent, DispatcherErrorClass, Message, Request as RpcRequest, Response as RpcResponse, ResponseResult,
 };
 use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
@@ -30,12 +29,9 @@ use tokio::sync::{
 use tokio::{task::JoinHandle, time::Instant};
 use uuid::Uuid;
 
-use super::{
-    auth::{injected_evidence, main_socket_caller},
-    CallerAuth, RouterState,
-};
+use super::{auth::command_caller, CallerAuth, RouterState};
 use crate::server::{
-    caller, client_connection::QuerySubscriptions, environment_connection, environment_supervision, remote_commands::RemoteCommandRouter,
+    client_connection::QuerySubscriptions, environment_supervision, remote_commands::RemoteCommandRouter,
     request_dispatch::RequestDispatcher,
 };
 
@@ -243,7 +239,7 @@ pub(super) async fn handle(
     State(RouterState(state)): State<RouterState>,
     Extension(authenticated): Extension<CallerAuth>,
     encoding: Encoding,
-    request: Request,
+    mut request: Request,
 ) -> Response {
     if matches!(authenticated, CallerAuth::Anonymous) {
         return refuse(encoding, StatusCode::UNAUTHORIZED, "authentication required");
@@ -271,46 +267,15 @@ pub(super) async fn handle(
             None => return refuse(encoding, StatusCode::METHOD_NOT_ALLOWED, "method is not available on this route"),
         }
     };
-    let evidence = injected_evidence(request.extensions());
+    // The caller is resolved once the body is read; its extensions move out first, uncloned.
+    let extensions = std::mem::take(request.extensions_mut());
     let body = match Body::read(request, limit).await {
         Ok(body) => body,
         Err(refused) => return refuse(encoding, refused.status(), refused.message()),
     };
-    let namespace = daemon.provisioning_namespace().await;
-    let mut transport_bound = false;
-    let caller = match &authenticated {
-        CallerAuth::Socket(Some(peer)) => match main_socket_caller(daemon, *peer, Some(commands.socket_path.clone()), evidence).await {
-            Ok(resolved) => {
-                transport_bound = resolved.transport_bound;
-                resolved.caller
-            }
-            Err((status, error)) => return refuse(encoding, status, error),
-        },
-        CallerAuth::Environment { environment, peer } => {
-            let crews = match environment_connection::environment_crews(daemon, environment).await {
-                Ok(c) => c,
-                Err(e) => return refuse(encoding, StatusCode::FORBIDDEN, e),
-            };
-            let peer = *peer;
-            let claims = match tokio::task::spawn_blocking(move || caller::claims_from_peer(peer)).await {
-                Ok(c) => c,
-                Err(e) => return refuse(encoding, StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-            };
-            let crew = match caller::check_claims(crews, &claims) {
-                Ok(c) => c,
-                Err(e) => return refuse(encoding, StatusCode::FORBIDDEN, e),
-            };
-            transport_bound = true;
-            CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace(&crew.namespace), process: None, crew: Some(crew) }
-        }
-        CallerAuth::Bearer | CallerAuth::Session(_) => {
-            CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace(&namespace), process: None, crew: None }
-        }
-        CallerAuth::Socket(None) => {
-            return refuse(encoding, StatusCode::FORBIDDEN, "CallerIdentityUnavailable: socket peer credentials unavailable")
-        }
-        CallerAuth::Hook { .. } => return refuse(encoding, StatusCode::FORBIDDEN, "a hook token reaches only the hook routes"),
-        CallerAuth::Anonymous => return refuse(encoding, StatusCode::UNAUTHORIZED, "authentication required"),
+    let (caller, transport_bound) = match command_caller(daemon, Some(commands.socket_path()), &authenticated, &extensions).await {
+        Ok(resolved) => (resolved.caller, resolved.transport_bound),
+        Err((status, error)) => return refuse(encoding, status, error),
     };
     if transport_bound && method == Method::DELETE && command_resource.is_some() {
         return refuse(encoding, StatusCode::FORBIDDEN, "EnvironmentCommandDenied: cancellation is outside supervisor authority");
@@ -664,9 +629,10 @@ mod tests {
 
     use super::*;
     use crate::blob_store::{BlobStore, TieredBlobStore};
-    use crate::server::http::auth::PeerEvidence;
     use crate::server::http::{HttpRouter, ListenerOrigin, LoginStore};
     use crate::server::tests::{caller_mountinfo, placed_crew_daemon, supervisor_daemon};
+    use crate::server::{caller, http::auth::PeerEvidence};
+    use flotilla_protocol::PrincipalRef;
 
     struct Harness {
         _temp: tempfile::TempDir,

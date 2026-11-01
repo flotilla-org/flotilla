@@ -1,7 +1,7 @@
 //! Carrier-neutral table reads. Sources lower conditions; paging and live reconciliation
 //! have one implementation shared by every carrier and both storage adapters.
 mod decided;
-mod filter;
+pub(crate) mod filter;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use flotilla_protocol::table::{Message, Row};
 use flotilla_resources::WatchStart;

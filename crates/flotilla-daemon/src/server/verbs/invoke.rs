@@ -56,8 +56,8 @@ impl Verbs {
     /// outcome or the request's refusal. The verb's own spans nest under it. A `done` outcome's
     /// `result` is the verb's answer to the caller, not part of the record, so the span leaves it
     /// out; every field taken from the request is bounded to [`FIELD_LIMIT`], since a request
-    /// refused for its size is still traced.
-    pub(crate) async fn invoke(&self, caller: &str, name: &str, request: Invocation) -> Result<Invoked, Refusal> {
+    /// refused for its size is still traced. Subjects are read in `namespace`.
+    pub(crate) async fn invoke(&self, caller: &str, namespace: &str, name: &str, request: Invocation) -> Result<Invoked, Refusal> {
         let subjects = bounded(serde_json::to_string(&request.subjects).unwrap_or_default());
         let params = bounded(serde_json::to_string(&request.params).unwrap_or_default());
         let (name_field, id_field) = (bounded(name.to_owned()), bounded(request.invocation.clone()));
@@ -71,7 +71,7 @@ impl Verbs {
             verb.outcomes = tracing::field::Empty,
             verb.refusal = tracing::field::Empty,
         );
-        let invoked = self.invoke_inner(caller, name, request).instrument(span.clone()).await;
+        let invoked = self.invoke_inner(caller, namespace, name, request).instrument(span.clone()).await;
         span.in_scope(|| match &invoked {
             Ok(invoked) => {
                 let outcomes: Vec<_> = invoked.outcomes.iter().map(|outcome| Outcome { result: None, ..outcome.clone() }).collect();
@@ -87,14 +87,14 @@ impl Verbs {
         invoked
     }
 
-    async fn invoke_inner(&self, caller: &str, name: &str, request: Invocation) -> Result<Invoked, Refusal> {
+    async fn invoke_inner(&self, caller: &str, namespace: &str, name: &str, request: Invocation) -> Result<Invoked, Refusal> {
         let entry = self.catalog.get(name).ok_or_else(|| Refusal::UnknownVerb(name.to_owned()))?;
         if let Some(broken) = &entry.broken {
             return Err(Refusal::Conflict(format!("verb `{name}` is broken: {broken}")));
         }
         let addresses = self.addresses(entry, &request)?;
         let params = params(entry, request.params)?;
-        let outcomes = self.run(caller, entry, &addresses, &params, &request.invocation).await;
+        let outcomes = self.run(caller, namespace, entry, &addresses, &params, &request.invocation).await;
         Ok(Invoked { invocation: request.invocation, outcomes })
     }
 
@@ -130,11 +130,19 @@ impl Verbs {
         Ok(addresses)
     }
 
-    async fn run(&self, caller: &str, entry: &Entry, addresses: &[Address], params: &Params, invocation: &str) -> Vec<Outcome> {
+    async fn run(
+        &self,
+        caller: &str,
+        namespace: &str,
+        entry: &Entry,
+        addresses: &[Address],
+        params: &Params,
+        invocation: &str,
+    ) -> Vec<Outcome> {
         let mut ready = Vec::new();
         let mut outcomes = BTreeMap::new();
         for address in addresses {
-            match self.check(caller, entry, address).await {
+            match self.check(caller, namespace, entry, address).await {
                 Ok(subject) => ready.push(subject),
                 Err(outcome) => {
                     outcomes.insert(address.to_string(), *outcome);
@@ -164,16 +172,16 @@ impl Verbs {
     }
 
     /// The subject's current row, once it exists, policy allows the caller and `when` holds.
-    async fn check(&self, caller: &str, entry: &Entry, address: &Address) -> Result<Subject, Box<Outcome>> {
+    async fn check(&self, caller: &str, namespace: &str, entry: &Entry, address: &Address) -> Result<Subject, Box<Outcome>> {
         let subject = address.to_string();
-        let row = match self.subjects.row(address).await {
+        let row = match self.subjects.row(namespace, address).await {
             Ok(Some(row)) => row,
             Ok(None) => return Err(Box::new(Outcome::failed(subject, format!("no {} at `{address}`", entry.declaration.subject)))),
             Err(error) => return Err(Box::new(Outcome::failed(subject, error))),
         };
         (self.policy)(caller, entry, address).map_err(|reason| Box::new(Outcome::refused(subject.clone(), reason)))?;
-        if let Some(failing) = entry.when.iter().find(|condition| !condition.holds(&row)) {
-            return Err(Box::new(Outcome::not_applicable(subject, failing.text.clone())));
+        if let Some(failing) = entry.failing(&row) {
+            return Err(Box::new(Outcome::not_applicable(subject, failing.text.to_owned())));
         }
         Ok(Subject { address: address.clone(), row })
     }

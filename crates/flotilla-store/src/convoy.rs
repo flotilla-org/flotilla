@@ -19,13 +19,59 @@ pub fn live_convoys_query() -> crate::StoreQuery {
     }
 }
 
-/// Resolves a convoy address to its local record name.
-pub async fn resolve_local_convoy_name(backend: &crate::ResourceBackend, namespace: &str, address: &str) -> Result<String, String> {
-    find_local_convoy_name(backend, namespace, address).await?.ok_or_else(|| format!("no convoy matches `{address}`"))
+/// The convoys holding `role`, by the role label and, when `project` names one, the project
+/// label: an indexed read of the local store. A projectless convoy may carry an empty project label or none, so an
+/// empty `project` is not a label match; [`flotilla_resources::resolve_convoy_role_indices`]
+/// narrows to it.
+pub fn convoy_role_query(role: &str, project: Option<&str>) -> crate::StoreQuery {
+    let mut labels = BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_owned(), role.to_owned())]);
+    if let Some(project) = project.filter(|project| !project.is_empty()) {
+        labels.insert(flotilla_resources::PROJECT_LABEL.to_owned(), project.to_owned());
+    }
+    crate::StoreQuery::labels(&labels, false, false)
 }
 
-/// Resolves a convoy address to its local record name, or none when no convoy matches it.
-pub async fn find_local_convoy_name(backend: &crate::ResourceBackend, namespace: &str, address: &str) -> Result<Option<String>, String> {
+/// The local convoy holding `role` in `project` (empty for a projectless convoy), as an item of
+/// the `convoys` list document: one indexed query, then the role rules of
+/// [`flotilla_resources::resolve_convoy_role_indices`]. None when no convoy holds the role.
+pub async fn query_convoy_by_role(
+    backend: &crate::ResourceBackend,
+    namespace: &str,
+    role: &str,
+    project: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let query = convoy_role_query(role, Some(project));
+    let mut document = crate::query_resource_kind(backend, namespace, "convoys", &query).await.map_err(|error| error.to_string())?;
+    let items = match document["items"].take() {
+        serde_json::Value::Array(items) => items,
+        _ => return Err("missing convoy items".into()),
+    };
+    let identities = items
+        .iter()
+        .map(|item| {
+            let phase = item
+                .pointer("/status/phase")
+                .cloned()
+                .and_then(|phase| serde_json::from_value::<flotilla_resources::ConvoyPhase>(phase).ok());
+            flotilla_resources::ConvoyAddressIdentity {
+                record_name: item.pointer("/metadata/name").and_then(serde_json::Value::as_str).unwrap_or_default(),
+                role: label(item, flotilla_resources::ROLE_LABEL),
+                project: label(item, flotilla_resources::PROJECT_LABEL),
+                terminal: phase.is_some_and(|phase| phase.is_terminal()),
+            }
+        })
+        .collect::<Vec<_>>();
+    let selected = flotilla_resources::resolve_convoy_role_indices(&identities, role, Some(project))?;
+    Ok(selected.first().map(|index| items[*index].clone()))
+}
+
+/// A label of a resource item in a list document.
+fn label<'a>(item: &'a serde_json::Value, label: &str) -> Option<&'a str> {
+    item.pointer("/metadata/labels").and_then(|labels| labels.get(label)).and_then(serde_json::Value::as_str)
+}
+
+/// Resolves a convoy address to its local record name.
+pub async fn resolve_local_convoy_name(backend: &crate::ResourceBackend, namespace: &str, address: &str) -> Result<String, String> {
     let convoys = backend.clone().using::<flotilla_resources::Convoy>(namespace);
     let candidates = convoys.list().await.map_err(|error| error.to_string())?.items;
     let identities = candidates
@@ -39,8 +85,8 @@ pub async fn find_local_convoy_name(backend: &crate::ResourceBackend, namespace:
         .collect::<Vec<_>>();
     let selected = flotilla_resources::resolve_convoy_candidate_indices(&identities, address)?;
     match selected.as_slice() {
-        [index] => Ok(Some(candidates[*index].metadata.name.clone())),
-        [] => Ok(None),
+        [index] => Ok(candidates[*index].metadata.name.clone()),
+        [] => Err(format!("no convoy matches `{address}`")),
         _ => Err(format!("convoy record `{address}` is present from multiple sources")),
     }
 }

@@ -62,7 +62,7 @@ impl Subjects for Convoys {
         (kind == Kind::Convoy).then(|| tables::descriptor("convoys"))
     }
 
-    async fn row(&self, _address: &Address) -> Result<Option<Row>, String> {
+    async fn row(&self, _namespace: &str, _address: &Address) -> Result<Option<Row>, String> {
         Ok(None)
     }
 }
@@ -78,12 +78,15 @@ fn broken(catalog: &Catalog, name: &str) -> Option<String> {
 #[test]
 fn the_load_check_lists_broken_verbs_with_their_reasons() {
     let natives = vec![inert::<Wipe>(), inert::<PeekVessel>(), inert::<Retry>()];
-    let presentations =
-        vec![Presentation { verb: "convoy.wipe", when: vec![".status.nothing == x", "status.phase"], ..Presentation::default() }];
+    let presentations = vec![Presentation {
+        verb: "convoy.wipe",
+        when: vec![r#"status.nothing == "x""#, ".status.phase", r#"status.phase != "Landed""#],
+        ..Presentation::default()
+    }];
     let catalog = Catalog::new(natives, presentations, &Convoys);
     let wipe = broken(&catalog, "convoy.wipe").expect("broken");
-    assert!(wipe.contains("`status.nothing` is not a column of `convoys`"), "{wipe}");
-    assert!(wipe.contains("condition `status.phase`"), "{wipe}");
+    assert!(wipe.contains(r#"condition `status.nothing == "x"`: unknown field"#), "{wipe}");
+    assert!(wipe.contains("condition `.status.phase`"), "{wipe}");
     assert_eq!(broken(&catalog, "vessel.peek").expect("broken"), "no table serves `vessel` subjects");
     assert_eq!(
         broken(&catalog, "convoy.retry").expect("broken"),
@@ -93,7 +96,7 @@ fn the_load_check_lists_broken_verbs_with_their_reasons() {
     let (verbs, params) = catalog.rows();
     assert_eq!(verbs.len(), 3);
     let wipe = verbs.iter().find(|row| row["name"] == "convoy.wipe").expect("row");
-    assert_eq!(wipe["reads"], json!(["status.nothing"]));
+    assert_eq!(wipe["reads"], json!(["status.phase"]), "the conditions that check");
     assert_eq!(wipe["label"], "Wipe");
     let style = params.iter().find(|row| row["name"] == "_style").expect("param");
     assert_eq!((&style["type"], &style["default"], &style["options"]), (&"enum".into(), &"c".into(), &json!(["a", "b"])));
@@ -166,7 +169,7 @@ impl Subjects for Rows {
         Convoys.table(kind)
     }
 
-    async fn row(&self, address: &Address) -> Result<Option<Row>, String> {
+    async fn row(&self, _namespace: &str, address: &Address) -> Result<Option<Row>, String> {
         let phase = match address.as_str() {
             RUNNING | OTHER => "Running",
             LANDED => "Landed",
@@ -188,7 +191,7 @@ fn not_other(_caller: &str, _entry: &Entry, subject: &Address) -> Result<(), Str
 fn verbs(policy: Policy) -> Verbs {
     let natives = vec![echo::<Group>(), echo::<Tag>()];
     let presentations = vec![
-        Presentation { verb: "convoy.group", picks: Picks::Set, when: vec![".status.phase != Landed"], ..Presentation::default() },
+        Presentation { verb: "convoy.group", picks: Picks::Set, when: vec![r#"status.phase != "Landed""#], ..Presentation::default() },
         Presentation { verb: "convoy.tag", picks: Picks::Each, ..Presentation::default() },
     ];
     let catalog = Catalog::new(natives, presentations, &Rows);
@@ -203,6 +206,7 @@ async fn call(verbs: &Verbs, verb: &str, subjects: &[&str], params: Value) -> Re
     verbs
         .invoke(
             "bearer",
+            "default",
             verb,
             Invocation { invocation: "id".into(), subjects: subjects.iter().map(|s| (*s).to_owned()).collect(), params },
         )
@@ -292,28 +296,46 @@ async fn parameter_values_must_fit_their_declared_types() {
     assert_eq!(refused.unwrap_err(), Refusal::Invalid("parameters: invalid type: string \"1\", expected i64".into()));
 }
 
-// Behaviour (#4234): a convoy address resolves as the CLI resolves one, with or without a
-// project: an exact record name wins over another convoy's role, and a role finds its record.
+// Behaviour (#4234, owner ruling): under an ADR 0066 address a convoy is named by its role,
+// found by the role and project labels the resolver matches. A convoy labelled with its project
+// answers for it whether or not its spec names the project; a record named like a role does not
+// answer for that role; the root address names projectless convoys only.
 #[tokio::test]
-async fn a_record_name_wins_over_another_convoys_role() {
+async fn a_convoy_address_names_a_role_by_its_labels() {
     let backend = flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let convoys = backend.clone().using::<Convoy>("default");
-    for (record, role) in [("reviewer", None), ("convoy-0123", Some("reviewer")), ("convoy-0456", Some("coder"))] {
-        let mut labels = BTreeMap::from([(PROJECT_LABEL.to_owned(), "flotilla".to_owned())]);
+    let convoys = backend.clone().using::<Convoy>("ns");
+    let convoy = |record: &str, role: Option<&str>, project: Option<&str>, project_ref: Option<&str>| {
+        let mut labels = BTreeMap::new();
         labels.extend(role.map(|role| (ROLE_LABEL.to_owned(), role.to_owned())));
-        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).maybe_role(role.map(str::to_owned));
-        convoys.create(&InputMeta::builder().name(record.into()).labels(labels).build(), &spec.build()).await.unwrap();
-    }
-    let subjects = ResourceSubjects::new(backend, None);
-    for (address, record) in [
-        ("project:flotilla/convoy:reviewer", Some("reviewer")),
-        ("convoy:reviewer", Some("reviewer")),
-        ("project:flotilla/convoy:coder", Some("convoy-0456")),
-        ("convoy:coder", Some("convoy-0456")),
-        ("project:other/convoy:reviewer", None),
-        ("project:other/convoy:coder", None),
+        labels.extend(project.map(|project| (PROJECT_LABEL.to_owned(), project.to_owned())));
+        let spec = ConvoySpec::builder()
+            .workflow_ref("workflow".into())
+            .maybe_project_ref(project_ref.map(str::to_owned))
+            .maybe_role(role.map(str::to_owned))
+            .build();
+        (InputMeta::builder().name(record.into()).labels(labels).build(), spec)
+    };
+    for (meta, spec) in [
+        // A record named like a role, holding another role.
+        convoy("reviewer", Some("coder"), Some("flotilla"), Some("flotilla")),
+        convoy("convoy-0123", Some("reviewer"), Some("flotilla"), Some("flotilla")),
+        // Labelled with its project, with no `project_ref` in its spec.
+        convoy("convoy-0456", Some("lander"), Some("flotilla"), None),
+        convoy("convoy-0789", Some("reviewer"), None, None),
     ] {
-        let row = subjects.row(&address.parse().unwrap()).await.unwrap();
+        convoys.create(&meta, &spec).await.unwrap();
+    }
+    let subjects = ResourceSubjects::new(backend);
+    for (address, record) in [
+        ("project:flotilla/convoy:reviewer", Some("convoy-0123")),
+        ("project:flotilla/convoy:coder", Some("reviewer")),
+        ("project:flotilla/convoy:lander", Some("convoy-0456")),
+        ("convoy:reviewer", Some("convoy-0789")),
+        ("convoy:lander", None),
+        ("project:other/convoy:reviewer", None),
+        ("project:flotilla/convoy:convoy-0123", None),
+    ] {
+        let row = subjects.row("ns", &address.parse::<Address>().unwrap()).await.unwrap();
         assert_eq!(row.as_ref().and_then(|row| row["metadata.name"].as_str()), record, "{address}");
     }
 }

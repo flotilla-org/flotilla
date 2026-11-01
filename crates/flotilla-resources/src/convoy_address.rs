@@ -30,6 +30,18 @@ pub fn resolve_convoy_candidate_indices(identities: &[ConvoyAddressIdentity<'_>]
     }
 
     let (role, project) = parse_role_address(address)?;
+    resolve_convoy_role_indices(identities, role, project)
+}
+
+/// The convoys among `identities` that hold `role`, within `project` when one is given (an
+/// empty project is the projectless convoys): the live ones, else the terminal ones, refused when
+/// they span more than one record.
+pub fn resolve_convoy_role_indices(
+    identities: &[ConvoyAddressIdentity<'_>],
+    role: &str,
+    project: Option<&str>,
+) -> Result<Vec<usize>, String> {
+    let address = convoy_address(role, project);
     let matching = identities
         .iter()
         .enumerate()
