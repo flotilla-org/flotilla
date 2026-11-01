@@ -87,32 +87,6 @@ pub struct EnsureReconciler {
     engine: Option<Arc<dyn EngineEnsures>>,
     /// The daemon's ManifestRoots (#3824 layer 2c); the old store's when absent.
     manifest_roots: Option<Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>>,
-    #[builder(skip)]
-    released_holds: ReleasedHolds,
-}
-
-/// The held convoy whose acknowledgement last released an admission, by namespace and ensure.
-/// One acknowledgement releases once, until the ensure's hold is raised again. Kept in memory: after
-/// a restart it may release once more, which only retries the same held convoy's admission.
-#[derive(Default)]
-struct ReleasedHolds(std::sync::Mutex<HashMap<(String, String), String>>);
-
-impl ReleasedHolds {
-    /// Whether this acknowledged hold on `convoy` releases an admission now.
-    fn release(&self, namespace: &str, ensure: &str, convoy: &str) -> bool {
-        let mut released = self.0.lock().expect("released holds");
-        let key = (namespace.to_owned(), ensure.to_owned());
-        if released.get(&key).is_some_and(|held| held == convoy) {
-            return false;
-        }
-        released.insert(key, convoy.to_owned());
-        true
-    }
-
-    /// The ensure is held again: its next acknowledgement releases again.
-    fn rehold(&self, namespace: &str, ensure: &str) {
-        self.0.lock().expect("released holds").remove(&(namespace.to_owned(), ensure.to_owned()));
-    }
 }
 
 impl EnsureReconciler {
@@ -123,7 +97,6 @@ impl EnsureReconciler {
             .unwrap_or_else(|| Arc::new(flotilla_store::OldStoreManifestRoots::new(self.resource_backend.clone())));
         EnsurePass::builder()
             .attentions(self.resource_backend.attentions())
-            .released_holds(&self.released_holds)
             .teardown(&self.teardown)
             .resource_backend(&self.resource_backend)
             .manifest_roots(manifest_roots)
@@ -160,7 +133,6 @@ impl EnsureReconciler {
 #[derive(bon::Builder)]
 struct EnsurePass<'a> {
     attentions: Arc<dyn Attentions>,
-    released_holds: &'a ReleasedHolds,
     teardown: &'a Arc<dyn ConvoyTeardown>,
     resource_backend: &'a ResourceBackend,
     manifest_roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
@@ -647,7 +619,14 @@ impl EnsurePass<'_> {
                 self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
                 consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES
             }
-            Some(latest) => self.release_acknowledged_hold(namespace, &ensure.metadata.name, &latest.metadata.name).await?,
+            // A person's acknowledgement releases the hold once: its end is cleared with it.
+            Some(latest)
+                if self.attentions.acknowledged(namespace, Sender::Standing, &Subject::convoy(latest.metadata.name.clone())).await? =>
+            {
+                self.clear_hold(namespace, &latest.metadata.name).await?;
+                true
+            }
+            Some(_) => false,
             None => false,
         };
 
@@ -882,7 +861,7 @@ impl EnsurePass<'_> {
             if !force_now && self.hold_is_open(namespace, &convoy.metadata.name).await? {
                 return Ok(None);
             }
-            self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
+            self.clear_hold(namespace, &convoy.metadata.name).await?;
             if !force_now {
                 self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
                 return Ok(Some(format!("ConvoyEnsure/{} restart hold cleared", ensure.metadata.name)));
@@ -917,6 +896,7 @@ impl EnsurePass<'_> {
             }
         }
         self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
+        self.clear_hold(namespace, &convoy.metadata.name).await?;
 
         if status.retry_at.is_none() && !force_now {
             let failure = "ensured convoy entered a terminal failure phase";
@@ -1112,28 +1092,25 @@ impl EnsurePass<'_> {
         convoy: &ResourceObject<ResourceConvoy>,
         reason: &str,
     ) -> Result<(), String> {
-        self.released_holds.rehold(&convoy.metadata.namespace, &ensure.metadata.name);
         let fact = Fact::Hold { ensure: ensure.metadata.name.clone(), convoy: convoy.metadata.name.clone() };
         self.attentions.raise(&convoy.metadata.namespace, &Attention::new(fact, reason)).await
     }
 
     async fn hold_is_open(&self, namespace: &str, convoy: &str) -> Result<bool, String> {
         let subject = Subject::convoy(convoy);
-        let open = self.attentions.open(namespace, Some(&subject)).await?;
+        let open = self.attentions.open(namespace, Some(Sender::Standing), Some(&subject)).await?;
         Ok(open.iter().any(|attention| attention.is_hold() && attention.subject == subject))
     }
 
-    /// Whether a person acknowledged the hold on `convoy` since it last released an admission.
-    async fn release_acknowledged_hold(&self, namespace: &str, ensure: &str, convoy: &str) -> Result<bool, String> {
-        if !self.attentions.acknowledged(namespace, Sender::Standing, &Subject::convoy(convoy)).await? {
-            return Ok(false);
-        }
-        Ok(self.released_holds.release(namespace, ensure, convoy))
+    /// Ends the hold on `convoy`, open or acknowledged.
+    async fn clear_hold(&self, namespace: &str, convoy: &str) -> Result<(), String> {
+        self.attentions.clear(namespace, Sender::Standing, &Subject::convoy(convoy)).await
     }
 
     /// Clears the hold on any of the ensure's generations.
     async fn clear_ensure_attention(&self, namespace: &str, ensure_name: &str) -> Result<(), String> {
-        let holds: Vec<_> = self.attentions.open(namespace, None).await?.into_iter().filter(OpenAttention::is_hold).collect();
+        let holds: Vec<_> =
+            self.attentions.open(namespace, Some(Sender::Standing), None).await?.into_iter().filter(OpenAttention::is_hold).collect();
         if holds.is_empty() {
             return Ok(());
         }
@@ -1248,17 +1225,6 @@ mod tests {
 
     use super::*;
     use flotilla_resources::{Demand as ResourceDemand, InputMeta};
-
-    #[test]
-    fn an_acknowledged_hold_releases_once_until_it_is_held_again() {
-        let released = ReleasedHolds::default();
-        assert!(released.release("ns", "standing", "generation-3"));
-        assert!(!released.release("ns", "standing", "generation-3"), "a refused admission does not release again");
-        assert!(released.release("ns", "other", "generation-3"), "each ensure releases on its own");
-        released.rehold("ns", "standing");
-        assert!(released.release("ns", "standing", "generation-3"), "held again, the next acknowledgement releases");
-        assert!(released.release("ns", "standing", "generation-4"));
-    }
 
     // Stands in for provider-backed admission and lifecycle operations. Resource
     // storage, status patches, the clock and the reconcile loop are real.

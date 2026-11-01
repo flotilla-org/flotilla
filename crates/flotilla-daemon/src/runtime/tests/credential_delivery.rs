@@ -110,10 +110,9 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
         message: "credential `github-app`: outage; expires in 180 seconds".to_string(),
         should_surface: false,
     };
-    let raised = RaisedCredentials::default();
     let attentions = daemon.attentions();
-    let open = || async { attentions.open(NAMESPACE, None).await.expect("open attentions") };
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[transient], &raised).await.expect("ignore transient failure");
+    let open = || async { attentions.open(NAMESPACE, None, None).await.expect("open attentions") };
+    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[transient]).await.expect("ignore transient failure");
     assert!(open().await.is_empty());
 
     let failure = |message: &str, should_surface| CredentialRefreshError {
@@ -122,7 +121,7 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
         message: message.to_string(),
         should_surface,
     };
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage; expires in 120 seconds", true)], &raised)
+    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage; expires in 120 seconds", true)])
         .await
         .expect("raise attention");
     let told = open().await;
@@ -138,20 +137,20 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     )
     .await
     .expect("acknowledge demand");
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage; expires in 60 seconds", true)], &raised)
+    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage; expires in 60 seconds", true)])
         .await
         .expect("the same credential keeps failing");
     assert!(open().await.is_empty(), "an acknowledged attention is not raised again while the same credentials fail");
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[], &raised).await.expect("recovery");
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage; expires in 90 seconds", true)], &raised)
+    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[]).await.expect("recovery");
+    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage; expires in 90 seconds", true)])
         .await
         .expect("a new failure");
     assert_eq!(open().await.len(), 1, "a failure after recovery is told again");
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage; expired 5 seconds ago", false)], &raised)
+    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage; expired 5 seconds ago", false)])
         .await
         .expect("retain alert during retry");
     assert_eq!(open().await.len(), 1);
-    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[], &raised).await.expect("clear on recovery");
+    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[]).await.expect("clear on recovery");
     assert!(open().await.is_empty());
 
     // Each change of the failing set is told: {github-app}, then {github-app, forgejo}, then {github-app}.
@@ -159,7 +158,7 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     for (failing, told) in
         [(vec![failure("outage", true)], 1), (vec![failure("outage", true), forgejo], 2), (vec![failure("outage", true)], 1)]
     {
-        reconcile_credential_refresh_attention(&daemon, NAMESPACE, &failing, &raised).await.expect("raise attention");
+        reconcile_credential_refresh_attention(&daemon, NAMESPACE, &failing).await.expect("raise attention");
         let open = open().await;
         assert_eq!(open.len(), 1, "one attention per vessel");
         assert_eq!(open[0].reason.lines().count(), told, "{}", open[0].reason);
@@ -1090,7 +1089,6 @@ async fn credential_attention_reads_only_live_convoys() {
         &backend,
         "flotilla",
         &[failure],
-        &Default::default(),
     ))
     .await;
     result.expect("attention");

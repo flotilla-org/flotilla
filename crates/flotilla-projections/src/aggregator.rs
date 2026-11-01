@@ -1127,7 +1127,7 @@ impl Aggregator {
     /// Reads the open attentions; whether they changed.
     async fn read_attentions(&mut self) -> bool {
         let Some(port) = &self.attention_port else { return false };
-        let mut open = match port.open(&self.attention_namespace, None).await {
+        let mut open = match port.open(&self.attention_namespace, None, None).await {
             Ok(open) => open,
             Err(error) => {
                 tracing::warn!(%error, "the open attentions did not read; rows keep the last read");
@@ -4586,13 +4586,13 @@ mod tests {
         async fn clear(&self, _: &str, _: Sender, _: &AttentionSubject) -> Result<(), String> {
             Err("the test sets attentions".into())
         }
-        async fn open(&self, _: &str, scope: Option<&AttentionSubject>) -> Result<Vec<OpenAttention>, String> {
+        async fn open(&self, _: &str, from: Option<Sender>, scope: Option<&AttentionSubject>) -> Result<Vec<OpenAttention>, String> {
             Ok(self
                 .0
                 .lock()
                 .expect("attentions")
                 .iter()
-                .filter(|open| scope.is_none_or(|scope| open.subject.within(scope)))
+                .filter(|open| from.is_none_or(|from| from == open.sender) && scope.is_none_or(|scope| open.subject.within(scope)))
                 .cloned()
                 .collect())
         }

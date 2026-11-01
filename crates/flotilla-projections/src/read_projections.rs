@@ -888,7 +888,7 @@ impl ReadProjections<'_> {
                 message,
             });
         }
-        for open in self.attentions.open(namespace, None).await? {
+        for open in self.attentions.open(namespace, Some(Sender::Standing), None).await? {
             let (Sender::Standing, attentions::Subject::StandingRole { project, role }) = (open.sender, &open.subject) else { continue };
             declaration_attention.push(DeclarationAttentionRow {
                 resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Project", namespace, project)

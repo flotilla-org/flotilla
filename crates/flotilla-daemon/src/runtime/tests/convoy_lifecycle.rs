@@ -172,7 +172,7 @@ async fn repeated_reclaim_refusal_with_changing_reason_raises_demand() {
 
     runtime.verify_reclaim(&changed_reason_convoy, &[]).await.expect_err("persistent missing checkout must refuse reclaim");
 
-    let open = daemon.attentions().open(NAMESPACE, None).await.expect("open attentions");
+    let open = daemon.attentions().open(NAMESPACE, None, None).await.expect("open attentions");
     assert_eq!(open.len(), 1);
     assert!(
         open[0].reason.contains("checkout-still-orphaned") && open[0].reason.contains("missing checkout integration evidence"),

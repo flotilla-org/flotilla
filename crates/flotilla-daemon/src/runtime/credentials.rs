@@ -522,12 +522,10 @@ pub(super) fn spawn_credential_refresh_task(
     namespace: String,
     store: Arc<CredentialStore>,
 ) -> JoinHandle<()> {
-    let raised = Arc::new(RaisedCredentials::default());
     spawn_periodic_task(Duration::from_secs(30), PeriodicTaskStart::Immediate, move || {
         let daemon = Arc::clone(&daemon);
         let namespace = namespace.clone();
         let store = Arc::clone(&store);
-        let raised = Arc::clone(&raised);
         async move {
             let errors = store.refresh_due_github_app_tokens().await;
             // Cards read committed delivery observations, never the preparation index.
@@ -538,7 +536,7 @@ pub(super) fn spawn_credential_refresh_task(
             for error in &errors {
                 warn!(error = %error.message, environment = %error.environment_ref, "failed to refresh GitHub App credential delivery");
             }
-            if let Err(status_error) = reconcile_credential_refresh_attention(&daemon, &namespace, &errors, &raised).await {
+            if let Err(status_error) = reconcile_credential_refresh_attention(&daemon, &namespace, &errors).await {
                 warn!(%status_error, "failed to reconcile credential refresh attention");
             }
         }
@@ -573,89 +571,75 @@ pub(super) fn spawn_codex_central_refresh_task(env: Arc<dyn EnvVars>, interval: 
     })
 }
 
-/// The failing credentials last raised for each vessel, by namespace, convoy and vessel name. A
-/// vessel's attention is raised again only when that set changes, so an acknowledged one stays
-/// acknowledged while the same credentials keep failing.
-pub(super) type RaisedCredentials = tokio::sync::Mutex<BTreeMap<(String, String, String), BTreeSet<String>>>;
-
 pub(super) async fn reconcile_credential_refresh_attention(
     daemon: &InProcessDaemon,
     namespace: &str,
     errors: &[CredentialRefreshError],
-    raised: &RaisedCredentials,
 ) -> Result<(), String> {
-    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &daemon.resource_backend(), namespace, errors, raised).await
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &daemon.resource_backend(), namespace, errors).await
 }
 
+/// The credentials an open attention names, one per line of its reason.
+fn told(reason: &str) -> BTreeSet<String> {
+    reason.lines().filter_map(|line| line.split_once(": ")).map(|(credential, _)| credential.to_owned()).collect()
+}
+
+/// Each vessel's attention names the credentials that keep failing. It is raised when that set
+/// changes, cleared when none fails, and a person's acknowledgement stands until it is cleared.
 pub(super) async fn reconcile_credential_refresh_attention_in(
     attentions: &dyn Attentions,
     backend: &ResourceBackend,
     namespace: &str,
     errors: &[CredentialRefreshError],
-    raised: &RaisedCredentials,
 ) -> Result<(), String> {
     record_credential_refresh_dispositions(backend, namespace, errors).await?;
-    let mut raised = raised.lock().await;
-    let open: Vec<Subject> = attentions
-        .open(namespace, None)
+    let open: BTreeMap<Subject, BTreeSet<String>> = attentions
+        .open(namespace, Some(Sender::Capabilities), None)
         .await?
         .into_iter()
-        .filter(|open| open.sender == Sender::Capabilities)
-        .map(|open| open.subject)
+        .map(|open| (open.subject, told(&open.reason)))
         .collect();
-    if errors.is_empty() && open.is_empty() && !raised.keys().any(|(raised_in, _, _)| raised_in == namespace) {
-        return Ok(());
-    }
     let vessels = backend.using::<Vessel>(namespace).list().await.map_err(|error| error.to_string())?;
     let convoys =
         backend.query_declared::<Convoy>(namespace, &flotilla_store::live_convoys_query()).await.map_err(|error| error.to_string())?;
     let convoys = convoys.items.into_iter().map(|source| (source.object.metadata.name.clone(), source.object)).collect::<BTreeMap<_, _>>();
-    // Each vessel's failing credentials, with why and whether the failure is persistent enough to tell a person.
-    let mut failing: BTreeMap<(String, String), BTreeMap<String, (String, bool)>> = BTreeMap::new();
-    for error in errors {
-        let Some(credential) = error.credential_name.as_ref() else { continue };
-        for vessel in &vessels.items {
-            if vessel.status.as_ref().and_then(|status| status.environment_ref.as_ref()) != Some(&error.environment_ref) {
-                continue;
-            }
-            let Some(convoy) = convoys.get(&vessel.spec.convoy_ref) else { continue };
-            let holds_credential = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).is_some_and(|snapshot| {
-                snapshot
-                    .vessels
-                    .iter()
-                    .any(|requirement| requirement.name == vessel.spec.vessel_name && requirement.credential_refs.contains(credential))
-            });
-            if holds_credential {
-                failing
-                    .entry((convoy.metadata.name.clone(), vessel.spec.vessel_name.clone()))
-                    .or_default()
-                    .insert(credential.clone(), (error.message.clone(), error.should_surface));
-            }
-        }
-    }
-    for subject in &open {
-        if let Subject::Vessel { convoy, vessel } = subject {
-            if !failing.contains_key(&(convoy.clone(), vessel.clone())) {
-                attentions.clear(namespace, Sender::Capabilities, subject).await?;
+    // Every vessel that holds a credential, with its failing ones: why, and whether persistent enough to tell a person.
+    let mut held: BTreeMap<(String, String), BTreeMap<String, (String, bool)>> = BTreeMap::new();
+    for vessel in &vessels.items {
+        let Some(convoy) = convoys.get(&vessel.spec.convoy_ref) else { continue };
+        let Some(requirement) = convoy
+            .status
+            .as_ref()
+            .and_then(|status| status.workflow_snapshot.as_ref())
+            .and_then(|snapshot| snapshot.vessels.iter().find(|requirement| requirement.name == vessel.spec.vessel_name))
+            .filter(|requirement| !requirement.credential_refs.is_empty())
+        else {
+            continue;
+        };
+        let failing = held.entry((convoy.metadata.name.clone(), vessel.spec.vessel_name.clone())).or_default();
+        for error in errors {
+            let Some(credential) = error.credential_name.as_ref() else { continue };
+            if vessel.status.as_ref().and_then(|status| status.environment_ref.as_ref()) == Some(&error.environment_ref)
+                && requirement.credential_refs.contains(credential)
+            {
+                failing.insert(credential.clone(), (error.message.clone(), error.should_surface));
             }
         }
     }
-    raised.retain(|(raised_in, convoy, vessel), _| raised_in != namespace || failing.contains_key(&(convoy.clone(), vessel.clone())));
-    for ((convoy, vessel), credentials) in failing {
-        let key = (namespace.to_owned(), convoy.clone(), vessel.clone());
-        let before = raised.get(&key).cloned().unwrap_or_default();
+    for ((convoy, vessel), credentials) in held {
+        let subject = Subject::Vessel { convoy: convoy.clone(), vessel: vessel.clone() };
+        let before = open.get(&subject);
         // A credential already told stays told while it keeps failing, persistent or not.
         let told: BTreeMap<String, String> = credentials
             .into_iter()
-            .filter(|(credential, (_, surface))| *surface || before.contains(credential))
+            .filter(|(credential, (_, surface))| *surface || before.is_some_and(|before| before.contains(credential)))
             .map(|(credential, (why, _))| (credential, why))
             .collect();
-        let names: BTreeSet<String> = told.keys().cloned().collect();
-        if names.is_empty() || names == before {
-            continue;
+        if told.is_empty() {
+            attentions.clear(namespace, Sender::Capabilities, &subject).await?;
+        } else if before.is_none_or(|before| told.keys().ne(before.iter())) {
+            attentions.raise(namespace, &Attention::credential_refresh(&convoy, &vessel, told)).await?;
         }
-        attentions.raise(namespace, &Attention::credential_refresh(&convoy, &vessel, told)).await?;
-        raised.insert(key, names);
     }
     Ok(())
 }

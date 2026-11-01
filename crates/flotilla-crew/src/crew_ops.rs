@@ -1009,10 +1009,9 @@ impl CrewService {
         let credential_alerts = self
             .resource_backend
             .attentions()
-            .open(&context.namespace, Some(&vessel))
+            .open(&context.namespace, Some(Sender::Capabilities), Some(&vessel))
             .await?
             .into_iter()
-            .filter(|open| open.sender == Sender::Capabilities)
             .flat_map(|open| open.reason.lines().map(str::to_owned).collect::<Vec<_>>())
             .collect::<Vec<_>>();
         let crew_work = convoy.status.as_ref().and_then(|status| status.crew_work.get(&context.vessel));
@@ -1719,7 +1718,7 @@ impl CrewService {
             .await
             .map_err(|error| error.to_string())?;
         let attentions = self.resource_backend.attentions();
-        for open in attentions.open(namespace, Some(&Subject::convoy(name))).await? {
+        for open in attentions.open(namespace, None, Some(&Subject::convoy(name))).await? {
             attentions.clear(namespace, open.sender, &open.subject).await?;
         }
         Ok(())
