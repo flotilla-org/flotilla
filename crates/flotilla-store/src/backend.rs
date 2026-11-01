@@ -101,7 +101,7 @@ impl ResourceBackend {
 
     /// Whether the engine's attentions are installed, so Demand is written by no one.
     pub fn attentions_on_engine(&self) -> bool {
-        self.attentions.0.get().is_some()
+        self.attentions.0.read().unwrap_or_else(std::sync::PoisonError::into_inner).is_some()
     }
 
     /// The attentions: the engine's once installed, the old store's before.

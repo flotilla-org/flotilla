@@ -1492,14 +1492,16 @@ mod tests {
                 assert_eq!(response.rows.len(), 1);
                 assert_eq!(response.rows[0].convoy_ref.as_deref(), Some("target"));
                 let reads = memory.read_snapshot().since(&before);
-                // At most one indexed read per kind. The only whole-kind list
-                // is the Project definition catalog, which scoping consults.
-                let budget = ["Checkout", "Demand", "Environment", "FleetDesignation", "Host"]
+                // At most one indexed read per kind. The whole-kind lists are the
+                // Project definition catalog, which scoping consults, and this
+                // host's attentions, which never replicate.
+                let budget = ["Checkout", "Environment", "FleetDesignation", "Host"]
                     .into_iter()
                     .fold(ReadBudget::new(), |budget, kind| budget.calls(kind, ReadOperation::Query, 1))
                     .objects("Convoy", ReadOperation::Query, 1, 1)
                     .objects("TerminalSession", ReadOperation::Query, 1, 1)
-                    .calls("Project", ReadOperation::List, 1);
+                    .calls("Project", ReadOperation::List, 1)
+                    .calls("Demand", ReadOperation::List, 1);
                 reads.assert_within(&budget, "scoped fleet listing");
                 assert_eq!(reads.objects_by_kind().get("TerminalSession"), Some(&1));
                 assert_eq!(reads.objects_by_kind().get("Message").copied().unwrap_or_default(), 0);
