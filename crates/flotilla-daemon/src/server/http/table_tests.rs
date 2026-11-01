@@ -638,6 +638,8 @@ async fn table_request_errors_and_content_negotiation_are_explicit() {
         assert_eq!(response.status(), status);
         assert_eq!(response.headers()["content-type"], media);
         assert_eq!(response.headers()["cache-control"], "no-store");
+        // Streamed rows and refusals alike vary by Accept.
+        assert_eq!(response.headers()["vary"], "Accept");
     }
     let response = call(&router, "/tables/convoys/rows?format=arrow", false).await;
     assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);

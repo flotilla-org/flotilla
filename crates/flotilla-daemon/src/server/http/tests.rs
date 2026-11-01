@@ -842,6 +842,7 @@ async fn root_document_has_a_cbor_twin() {
     let reply = daemon.call(CallerAuth::Bearer, get_accepting("/", "application/vnd.flotilla.root+cbor")).await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.headers[header::CONTENT_TYPE], "application/vnd.flotilla.root+cbor");
+    assert_eq!(reply.headers[header::VARY], "Accept");
     let root: serde_json::Value = flotilla_cbor::from_slice(&reply.body, &rigging_http_wire::LIMITS).expect("CBOR root document");
     assert_eq!(rels(&root), ["tables", "verbs", "verb"]);
     assert_eq!(root["build_id"], flotilla_daemon_api::build_info::build_id());

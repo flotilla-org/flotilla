@@ -10,8 +10,6 @@ use std::{
     time::Duration,
 };
 
-#[cfg(test)]
-use axum::body::to_bytes;
 use axum::{
     extract::{Request, State},
     http::{header, Method, StatusCode},
@@ -215,8 +213,6 @@ impl Commands {
     }
 }
 
-#[cfg(test)]
-use rigging_http_wire::json_safe_integers as large_integers;
 use rigging_http_wire::{Body, Encoding};
 
 /// Command routes answer every refusal with the `command_error` code.
@@ -685,7 +681,11 @@ fn error_status(class: DispatcherErrorClass) -> StatusCode {
 mod tests {
     use std::sync::Arc;
 
-    use axum::{body::Body, http::Request as HttpRequest, Router};
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request as HttpRequest,
+        Router,
+    };
     use flotilla_config::ConfigStore;
     use flotilla_core::in_process::InProcessDaemon;
     use flotilla_protocol::{Command, CommandAction, HostName};
@@ -693,6 +693,8 @@ mod tests {
     use flotilla_store::ResourceBackend;
     use flotilla_store_memory::InMemoryBackend;
     use tower::ServiceExt;
+
+    use rigging_http_wire::json_safe_integers as large_integers;
 
     use super::*;
     use crate::blob_store::{BlobStore, TieredBlobStore};
