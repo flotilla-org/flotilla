@@ -756,6 +756,8 @@ pub struct InProcessDaemon {
     local_environment_id: EnvironmentId,
     environment_manager: Arc<EnvironmentManager>,
     cleat_roll_report: Mutex<Option<crate::cleat_roll::RollReport>>,
+    environment_adoption: tokio::sync::watch::Sender<bool>,
+    environment_adoption_deadline_ms: AtomicU64,
     /// Discovery dependencies and configuration used for all daemon-side
     /// provider detection, both at startup and for later repo additions.
     discovery: Arc<DiscoveryRuntime>,
@@ -1356,6 +1358,8 @@ impl InProcessDaemon {
             local_environment_id: local_environment_id.clone(),
             environment_manager: Arc::clone(&environment_manager),
             cleat_roll_report: Mutex::new(None),
+            environment_adoption: tokio::sync::watch::channel(true).0,
+            environment_adoption_deadline_ms: AtomicU64::new(120_000),
             discovery: Arc::clone(&discovery),
             change_request_query_port: Arc::clone(&query_port),
             issue_query_port: Arc::clone(&issue_query_port),
@@ -2099,6 +2103,22 @@ impl InProcessDaemon {
     }
 
     /// Resolve once when a caller needs both the runner and its registered identity.
+    /// Marks start-up environment adoption as pending; call before clients can reach the daemon.
+    pub fn begin_environment_adoption(&self) {
+        self.environment_adoption.send_replace(false);
+    }
+
+    /// Records that start-up adoption has run to the end, whether or not every environment came back.
+    pub fn finish_environment_adoption(&self) {
+        self.environment_adoption.send_replace(true);
+    }
+
+    async fn wait_for_environment_adoption(&self) {
+        let deadline = std::time::Duration::from_millis(self.environment_adoption_deadline_ms.load(Ordering::Relaxed));
+        let mut adopted = self.environment_adoption.subscribe();
+        let _ = tokio::time::timeout(deadline, adopted.wait_for(|adopted| *adopted)).await;
+    }
+
     pub fn resolve_environment_ref(&self, env_ref: &str) -> Option<ResolvedEnvironment> {
         self.environment_manager.resolve_environment_ref(env_ref)
     }

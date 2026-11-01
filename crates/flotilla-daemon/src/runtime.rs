@@ -576,6 +576,7 @@ impl DaemonRuntime {
             controller_state = Some(state);
         }
 
+        daemon.begin_environment_adoption();
         tasks.push(spawn_startup_restoration(
             StartupRestoration::builder()
                 .daemon(daemon)
@@ -662,6 +663,7 @@ impl StartupRestoration {
         // partial adoption could violate ownership and credential-staging order.
         // Ordinary failures still let periodic reconciliation retry.
         self.restore().await;
+        self.daemon.finish_environment_adoption();
         let daemon = &self.daemon;
         let options = &self.options;
         let runtime_health = &self.runtime_health;
