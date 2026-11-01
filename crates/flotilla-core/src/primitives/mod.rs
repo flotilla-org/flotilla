@@ -357,6 +357,12 @@ impl MessagePrimitives {
         let convoys = Arc::new(convoys::Convoys::open(home, &service)?);
         let convoy_engine = Arc::new(convoy_engine::ConvoyEngine::new(Arc::clone(&convoys), backend.clone(), Arc::clone(&clock)));
         let awaiting = Arc::new(awaiting::AwaitingReplies::open(home, &service)?);
+        // Attentions homed elsewhere arrive with their homes' entries; their readers read again then.
+        let attention_changes = tokio::sync::broadcast::channel(16).0;
+        let replicated = attention_changes.clone();
+        service.on_applied(Arc::new(move || {
+            let _ = replicated.send(());
+        }));
         Ok(Self {
             home: home.to_owned(),
             service,
@@ -377,7 +383,7 @@ impl MessagePrimitives {
             home_reads: std::sync::OnceLock::new(),
             located: Mutex::new(BTreeMap::new()),
             records: tokio::sync::Mutex::new(BTreeMap::new()),
-            attention_changes: tokio::sync::broadcast::channel(16).0,
+            attention_changes,
             backend,
         })
     }

@@ -325,3 +325,67 @@ async fn the_old_store_keeps_an_acknowledgement_until_cleared() {
 async fn the_engine_keeps_an_acknowledgement_until_cleared() {
     acknowledged_until_cleared(Implementation::engine().await).await;
 }
+
+/// A home's engine over its own decided store.
+fn engine_at(home: &str, backend: ResourceBackend, dir: &tempfile::TempDir) -> (Arc<Service>, Arc<MessagePrimitives>) {
+    let service = Arc::new(
+        Service::open(&dir.path().join(format!("{home}.sqlite")), home, flotilla_engine_store::registry().expect("registry"))
+            .expect("store"),
+    );
+    let primitives = MessagePrimitives::open(home, Arc::clone(&service), backend, Arc::new(SystemClock)).expect("primitives");
+    (service, Arc::new(primitives))
+}
+
+/// One round of `from`'s stream applied at `to`, as a follower does.
+fn follow(from: &Service, from_home: &str, to: &Service, cursor: &mut Option<u64>) {
+    let mut frames = Vec::new();
+    let next = from
+        .serve(*cursor, flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now()), |frame| {
+            frames.push(frame.to_vec());
+            Ok(())
+        })
+        .expect("serve");
+    to.with_store(|store| {
+        flotilla_schema_sqlite::stream::Follower::new(store).receive(from_home, |sink| {
+            for frame in &frames {
+                sink(frame)?;
+            }
+            Ok(())
+        })
+    })
+    .expect("follow");
+    *cursor = Some(next);
+}
+
+// Behaviour: an attention raised at one home, and its acknowledgement there, reach another home's
+// readers with the replicated entries: the signal fires when they are applied, with no local write.
+#[tokio::test]
+async fn another_homes_attentions_signal_their_readers_when_they_arrive() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (a_store, a) = engine_at("home-a", records().await, &dir);
+    let (b_store, b) = engine_at("home-b", records().await, &dir);
+    let mut cursor = None;
+    follow(&a_store, "home-a", &b_store, &mut cursor);
+    let mut signal = b.changes().expect("the engine signals its readers");
+    let hold = attention(0, "held");
+    let (sender, subject) = (hold.fact.sender(), hold.fact.subject());
+    a.raise(NAMESPACE, &hold).await.expect("raise at home a");
+    assert!(signal.try_recv().is_err(), "nothing has reached home b yet");
+    follow(&a_store, "home-a", &b_store, &mut cursor);
+    signal.try_recv().expect("applying home a's entries signals home b's readers");
+    let seen = b.open(NAMESPACE, Some(sender), Some(&subject)).await.expect("open at home b");
+    assert_eq!(seen.len(), 1, "home b reads home a's hold");
+
+    let message = a
+        .messages()
+        .expect("messages")
+        .into_iter()
+        .map(|(_, message)| message)
+        .find(|message| *message.state() == MessageState::Pending)
+        .expect("the hold");
+    a.acknowledge(NAMESPACE, &record_name(message.name()).expect("record")).await.expect("acknowledge at home a");
+    follow(&a_store, "home-a", &b_store, &mut cursor);
+    signal.try_recv().expect("the acknowledgement's entries signal home b's readers");
+    assert!(b.open(NAMESPACE, Some(sender), Some(&subject)).await.expect("open at home b").is_empty());
+    assert!(b.acknowledged(NAMESPACE, sender, &subject).await.expect("acknowledged at home b"));
+}
