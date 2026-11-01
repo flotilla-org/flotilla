@@ -272,6 +272,10 @@ pub(super) fn actor_is_working(
     working && !silent
 }
 
+/// Evidence for a Landing convoy whose workflow declares no exit (#4278).
+pub const NO_EXIT_STALL_EVIDENCE: &str =
+    "no exit: the workflow declares no exit, so nothing can settle this Landing convoy; an operator reaps it";
+
 /// Evidence for a holding convoy with no actionable row. A Landing convoy whose
 /// workflow omits `exit` is a Standing Convoy: nothing can settle it, so name
 /// that dead end rather than an absent maker (#4278). A Done claim's observed
@@ -281,7 +285,7 @@ fn empty_row_evidence(status: &ConvoyStatus) -> String {
     let digest_anchored =
         status.crew_work.values().flat_map(BTreeMap::values).any(|work| work.phase == CrewWorkPhase::Done && work.claim_evidence.is_some());
     if status.phase == ConvoyPhase::Landing && standing && !digest_anchored {
-        "no exit: the workflow declares no exit, so nothing can settle this Landing convoy; an operator reaps it".into()
+        NO_EXIT_STALL_EVIDENCE.into()
     } else {
         "no armed row with an able maker".into()
     }

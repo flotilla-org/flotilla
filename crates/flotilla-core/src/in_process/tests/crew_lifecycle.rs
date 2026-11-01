@@ -378,7 +378,7 @@ async fn landing_without_armed_exit_rows_stalls() {
         .expect("landing status");
     let stalled = wait_for_stall(&backend, "unarmed-landing", true).await.stalled.expect("stalled");
     assert_eq!(stalled.maker, None);
-    assert!(stalled.evidence.starts_with("no exit"), "{}", stalled.evidence);
+    assert_eq!(stalled.evidence, flotilla_crew::leaf_engine::NO_EXIT_STALL_EVIDENCE);
     watch.abort();
 }
 

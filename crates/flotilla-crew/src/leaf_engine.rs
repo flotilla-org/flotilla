@@ -342,6 +342,7 @@ impl LeafSubscriptionTable {
 mod routing;
 mod sources;
 mod stalls;
+pub use stalls::NO_EXIT_STALL_EVIDENCE;
 mod subscriptions;
 mod supervision;
 pub(crate) use supervision::EscalationAdmission;

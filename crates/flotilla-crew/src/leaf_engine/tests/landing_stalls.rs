@@ -398,7 +398,7 @@ async fn landing_with_nothing_owed_stalls_with_evidence() {
     wake.judge_stalls_at("flotilla", &objects, Utc::now()).await.unwrap();
     let stall = convoys.get("dead-end").await.unwrap().status.unwrap().stalled.expect("genuine dead end stalls");
     assert_eq!(stall.source, flotilla_resources::StallEvidenceSource::LeafEngine);
-    assert!(stall.evidence.starts_with("no exit"), "{}", stall.evidence);
+    assert_eq!(stall.evidence, NO_EXIT_STALL_EVIDENCE);
 }
 
 // #4278: a deliverer submits its PR, the forge merges it, and its promises
@@ -561,7 +561,7 @@ fn merged_submission_entering_landing_owes_settlement_or_names_no_exit(tc: hegel
             assert!(rows.is_empty());
             let stalled = stalled.expect("a standing convoy in Landing is a dead end");
             assert_eq!((stalled.maker, stalled.leaves), (None, Vec::new()));
-            assert!(stalled.evidence.contains("no exit"), "the stall must name the missing exit: {}", stalled.evidence);
+            assert_eq!(stalled.evidence, NO_EXIT_STALL_EVIDENCE, "the stall must name the missing exit");
         }
     });
 }
@@ -649,7 +649,7 @@ fn landing_digest_evidence_obligations_follow_observations(tc: hegel::TestCase) 
             let stalled = convoys.get("digest").await.unwrap().status.unwrap().stalled;
             assert_eq!(stalled.is_some(), step == 3);
             // The claim's digest anchors settlement without an exit: not a standing dead end.
-            assert!(stalled.is_none_or(|stalled| !stalled.evidence.starts_with("no exit")));
+            assert!(stalled.is_none_or(|stalled| stalled.evidence != NO_EXIT_STALL_EVIDENCE));
             let rows = wake.subscriptions.rows().await;
             if step < 2 {
                 assert!(rows
