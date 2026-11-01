@@ -234,7 +234,8 @@ async fn a_runtime_home_lands_under_the_writable_base() {
 }
 
 // Behaviour: a tree with no delivery for its content, or a name its record cannot
-// hold, is refused before anything is written.
+// hold, is refused before anything is written, and a tree placed outside a home is
+// refused whatever its record says.
 #[tokio::test]
 async fn undeliverable_needs_are_refused() {
     let vessel = LocalVessel::new();
@@ -248,6 +249,18 @@ async fn undeliverable_needs_are_refused() {
     unrecordable[1].digest = ContentDigest::new("two\tfields");
     let error = deliver(&unrecordable, &trees, &ProviderMechanisms::default(), &CostTable::default(), &vessel).await.expect_err("tab");
     assert_eq!(error, DeliveryError::Unrecordable(NeedName::new("skills")));
+    // A recorded tree now placed in a need that is not a home is still refused by the
+    // planner: looking for what its record names never stands in for that check.
+    let trees = BTreeMap::from([
+        (NeedName::new("skills"), Tree::new("skills") as Arc<dyn TreeDelivery>),
+        (NeedName::new("notes"), Tree::new("notes") as Arc<dyn TreeDelivery>),
+    ]);
+    deliver(&needs("s1", "n1"), &trees, &ProviderMechanisms::default(), &CostTable::default(), &vessel).await.expect("recorded");
+    let mut misplaced = needs("s1", "n1");
+    let Item::Tree { home, .. } = &mut misplaced[1].item else { panic!("skills is a tree") };
+    *home = NeedName::new("notes");
+    let error = deliver(&misplaced, &trees, &ProviderMechanisms::default(), &CostTable::default(), &vessel).await.expect_err("no home");
+    assert_eq!(error, DeliveryError::Plan(PlanError::NoHome { tree: NeedName::new("skills"), home: NeedName::new("notes") }));
 }
 
 // Behaviour: every mechanism a record holds reads back as itself, so a recorded
