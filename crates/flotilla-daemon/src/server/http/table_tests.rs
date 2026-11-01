@@ -616,6 +616,7 @@ async fn table_request_errors_and_content_negotiation_are_explicit() {
         assert_eq!(body["code"], code, "{query}");
     }
     let response = call(&router, "/tables/convoys?format=markdown", false).await;
+    assert_eq!(response.headers()["vary"], "Accept");
     let markdown = String::from_utf8(to_bytes(response.into_body(), 1024 * 1024).await.unwrap().to_vec()).unwrap();
     assert!(markdown.contains("`metadata.name`"));
     assert!(!markdown.contains("`id`"));

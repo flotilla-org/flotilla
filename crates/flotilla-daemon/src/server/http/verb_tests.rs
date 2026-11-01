@@ -260,6 +260,11 @@ async fn the_route_negotiates_and_refuses_callers_before_reading_the_body() {
     assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
     let response = post("text/plain", "application/json", Body::from(invocation.to_string())).await.unwrap();
     assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    // A body that is not an invocation is the wire's 400, under the status-named code.
+    let response = post("application/json", "application/json", Body::from("{")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let refused: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(refused["code"], "bad_request");
     assert_eq!(runs.load(Ordering::SeqCst), 2);
 
     // An oversized declared length that would be 413 for the user: an anonymous caller is 401,

@@ -214,5 +214,7 @@ flotilla-daemon = { path = "crates/flotilla-daemon" }
 
 # rigging-http-wire speaks the stack CBOR profile through rigging's copy of
 # flotilla-cbor; resolve it to this workspace's copy so the daemon links one profile.
+# Remove it, and crates/flotilla-cbor, once the crate is renamed in rigging and flotilla
+# takes rigging's (flotilla-org/rigging#35).
 [patch."https://github.com/flotilla-org/rigging"]
 flotilla-cbor = { path = "crates/flotilla-cbor" }
