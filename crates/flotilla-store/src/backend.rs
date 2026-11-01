@@ -43,7 +43,7 @@ impl std::fmt::Debug for TerminalReadSlot {
 }
 
 #[derive(Default)]
-struct AttentionSlot(std::sync::OnceLock<std::sync::Arc<dyn flotilla_resources::attentions::Attentions>>);
+struct AttentionSlot(std::sync::RwLock<Option<std::sync::Arc<dyn flotilla_resources::attentions::Attentions>>>);
 impl std::fmt::Debug for AttentionSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("AttentionSlot")
@@ -93,14 +93,15 @@ impl ResourceBackend {
         self.terminal_reads.0.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
-    /// Installs the engine's attentions behind `[primitives]`; refused if some are installed already.
-    pub fn install_attentions(&self, attentions: std::sync::Arc<dyn flotilla_resources::attentions::Attentions>) -> Result<(), String> {
-        self.attentions.0.set(attentions).map_err(|_| "attentions are already installed".to_owned())
+    /// Installs the engine's attentions behind `[primitives]`. A daemon runtime restarted over the
+    /// same backend installs its reopened engine in place of the last.
+    pub fn install_attentions(&self, attentions: std::sync::Arc<dyn flotilla_resources::attentions::Attentions>) {
+        *self.attentions.0.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(attentions);
     }
 
     /// The attentions: the engine's once installed, the old store's before.
     pub fn attentions(&self) -> std::sync::Arc<dyn flotilla_resources::attentions::Attentions> {
-        match self.attentions.0.get() {
+        match self.attentions.0.read().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
             Some(engine) => std::sync::Arc::clone(engine),
             None => std::sync::Arc::new(crate::OldStoreAttentions::new(self.clone())),
         }

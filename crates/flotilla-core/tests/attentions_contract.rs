@@ -204,6 +204,11 @@ async fn check(implementation: &Implementation, model: &mut Model, after: &[Step
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     assert_eq!(under, expected, "open about the convoy after {after:?}");
+    let vessel = Subject::Vessel { convoy: "demo".into(), vessel: "work".into() };
+    let about_vessel = seen(attentions.open(NAMESPACE, Some(&vessel)).await.expect("open"));
+    let expected: BTreeMap<_, _> =
+        model.open.iter().filter(|((_, subject), _)| *subject == vessel).map(|(k, v)| (k.clone(), v.clone())).collect();
+    assert_eq!(about_vessel, expected, "open about the vessel after {after:?}");
     for fact in 0..FACTS {
         let key = {
             let fact = attention(fact, "").fact;

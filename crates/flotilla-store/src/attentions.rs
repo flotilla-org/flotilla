@@ -103,10 +103,26 @@ impl OldStoreAttentions {
             .ok_or_else(|| format!("convoy `{convoy}` has no vessel `{vessel}`"))
     }
 
-    /// Every Demand that is an attention, with its sender and subject.
-    async fn attentions(&self, namespace: &str) -> Result<Vec<(Sender, Subject, ResourceObject<Demand>)>, String> {
+    /// Every Demand that is an attention, with its sender and subject; with `about`, only those
+    /// that target that convoy, read through the target's index.
+    async fn attentions(&self, namespace: &str, about: Option<&str>) -> Result<Vec<(Sender, Subject, ResourceObject<Demand>)>, String> {
+        let demands = match about {
+            Some(convoy) => self
+                .demands(namespace)
+                .query_declared(&crate::StoreQuery {
+                    fields: BTreeMap::from([("spec.originating_work_ref.name".into(), convoy.into())]),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .items
+                .into_iter()
+                .map(|demand| demand.object)
+                .collect(),
+            None => self.demands(namespace).list().await.map_err(|error| error.to_string())?.items,
+        };
         let mut found = Vec::new();
-        for demand in self.demands(namespace).list().await.map_err(|error| error.to_string())?.items {
+        for demand in demands {
             if let Some((sender, subject)) = self.classify(namespace, &demand).await? {
                 found.push((sender, subject, demand));
             }
@@ -181,7 +197,7 @@ impl Attentions for OldStoreAttentions {
         let demands = self.demands(namespace);
         let desired = self.desired(namespace, attention).await?;
         let (sender, subject) = (attention.fact.sender(), attention.fact.subject());
-        for (held_by, about, current) in self.attentions(namespace).await? {
+        for (held_by, about, current) in self.attentions(namespace, None).await? {
             if held_by == sender && about == subject && !desired.contains_key(&current.metadata.name) {
                 self.delete(namespace, &current.metadata.name).await?;
             }
@@ -204,7 +220,7 @@ impl Attentions for OldStoreAttentions {
     }
 
     async fn clear(&self, namespace: &str, sender: Sender, subject: &Subject) -> Result<(), String> {
-        for (held_by, about, demand) in self.attentions(namespace).await? {
+        for (held_by, about, demand) in self.attentions(namespace, None).await? {
             if held_by == sender && &about == subject && is_open(&demand) {
                 self.delete(namespace, &demand.metadata.name).await?;
             }
@@ -214,7 +230,12 @@ impl Attentions for OldStoreAttentions {
 
     async fn open(&self, namespace: &str, scope: Option<&Subject>) -> Result<Vec<OpenAttention>, String> {
         let mut open: BTreeMap<(Sender, Subject), OpenAttention> = BTreeMap::new();
-        for (sender, subject, demand) in self.attentions(namespace).await? {
+        // A vessel's attentions target its convoy; the other subjects are found by name.
+        let about = match scope {
+            Some(Subject::Vessel { convoy, .. }) => Some(convoy.as_str()),
+            _ => None,
+        };
+        for (sender, subject, demand) in self.attentions(namespace, about).await? {
             if !is_open(&demand) || scope.is_some_and(|scope| !subject.within(scope)) {
                 continue;
             }
@@ -244,7 +265,7 @@ impl Attentions for OldStoreAttentions {
     }
 
     async fn acknowledged(&self, namespace: &str, sender: Sender, subject: &Subject) -> Result<bool, String> {
-        let found = self.attentions(namespace).await?;
+        let found = self.attentions(namespace, None).await?;
         let about: Vec<_> = found.iter().filter(|(held_by, about, _)| *held_by == sender && about == subject).collect();
         Ok(!about.is_empty()
             && about.iter().all(|(_, _, demand)| demand.status.as_ref().is_some_and(|status| status.state == DemandState::Acknowledged)))
