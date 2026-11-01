@@ -465,7 +465,7 @@ pub(super) fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, name
                     scratch: &scratch,
                     observation: &observation,
                     harnesses: &harnesses,
-                    pinned_harnesses: &pinned_harnesses,
+                    pinned_harnesses,
                 },
                 &mut model_probes,
             )

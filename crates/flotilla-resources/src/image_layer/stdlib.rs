@@ -68,16 +68,17 @@ pub fn harness_pins(layers: &[ImageLayerSpec]) -> BTreeMap<String, String> {
     pins.into_iter().filter_map(|(adapter, version)| Some((adapter, version?))).collect()
 }
 
-/// [`harness_pins`] of this release's stdlib; empty, with a warning, when the stdlib does
-/// not parse, so SSH hosts fall back to offering what their PATH holds.
-pub fn stdlib_harness_pins() -> BTreeMap<String, String> {
-    match stdlib_image_layers() {
+/// [`harness_pins`] of this release's stdlib, computed once; empty, with one warning, when
+/// the stdlib does not parse, so SSH hosts fall back to offering what their PATH holds.
+pub fn stdlib_harness_pins() -> &'static BTreeMap<String, String> {
+    static PINS: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+    PINS.get_or_init(|| match stdlib_image_layers() {
         Ok(layers) => harness_pins(layers),
         Err(error) => {
             tracing::warn!(%error, "stdlib image layers do not parse; no harness is pinned");
             BTreeMap::new()
         }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -239,7 +240,7 @@ mod tests {
                 .clone()
         };
         assert_eq!(
-            stdlib_harness_pins(),
+            *stdlib_harness_pins(),
             BTreeMap::from([("claude-code".to_string(), version("harness-claude-code")), ("codex".to_string(), version("harness-codex"))])
         );
         let mut doubled = layers.to_vec();

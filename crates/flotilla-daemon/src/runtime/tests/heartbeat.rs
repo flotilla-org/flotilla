@@ -833,7 +833,7 @@ async fn a_host_given_pinned_harnesses_reports_their_pins_without_installing_the
     let kinds = daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE);
     kinds.create(&empty_meta("host-direct-b1"), &host_direct_kind_spec(&host_id, "linux")).await.expect("stored kind");
     let runner = Arc::new(DiscoveryMockRunner::builder().build());
-    let pins = flotilla_resources::stdlib::stdlib_harness_pins();
+    let pins = flotilla_resources::stdlib::stdlib_harness_pins().clone();
     assert!(pins.contains_key("claude-code") && pins.contains_key("codex"), "{pins:?}");
     for (pinned, expected) in [(BTreeMap::new(), BTreeMap::new()), (pins.clone(), pins.clone())] {
         let facts = observe_fulfilment_facts(
