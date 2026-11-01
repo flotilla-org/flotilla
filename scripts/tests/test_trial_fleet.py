@@ -42,12 +42,20 @@ class ProviderConfigTest(unittest.TestCase):
         written, instance, image, local_root = trial.provider_config(self.config(text), self.root)
         self.assertEqual((written, instance, image, local_root), (text, 'anything', 'base@sha256:' + 'a' * 64, None))
 
-    def test_a_configuration_must_name_exactly_one_provider_with_a_pinned_image(self):
+    def test_a_configuration_must_name_one_provider_or_select_one_with_a_pinned_image(self):
         pinned = 'image = "base@sha256:' + 'a' * 64 + '"\n'
         for text in ['', '[providers.a]\nmodule = "m"\n' + pinned + '[providers.b]\nmodule = "m"\n' + pinned,
                      '[providers.a]\nmodule = "m"\nimage = "base:latest"\n', '[providers.a\n']:
             with self.subTest(text=text), self.assertRaises(trial.TrialFailure):
                 trial.provider_config(self.config(text), self.root)
+        with self.assertRaises(trial.TrialFailure):
+            trial.provider_config(self.config('[providers.a]\nmodule = "m"\n' + pinned), self.root, 'b')
+
+    def test_an_operators_config_with_several_providers_runs_the_selected_one_with_the_given_image(self):
+        image = 'rust@sha256:' + 'b' * 64
+        text = '[providers.daytona]\nmodule = "daytona"\n[providers.namespace]\nmodule = "namespace"\n'
+        written, instance, chosen, local_root = trial.provider_config(self.config(text), self.root, 'daytona', image)
+        self.assertEqual((written, instance, chosen, local_root), (text, 'daytona', image, None))
 
     def test_a_local_provider_needs_an_absolute_root_to_be_checked_at_teardown(self):
         pinned = 'image = "base@sha256:' + 'a' * 64 + '"\n'
@@ -56,6 +64,23 @@ class ProviderConfigTest(unittest.TestCase):
         _, _, _, local_root = trial.provider_config(
             self.config(f'[providers.l]\nmodule = "local"\n{pinned}settings = {{ root = "{self.root}/v" }}\n'), self.root)
         self.assertEqual(local_root, self.root / 'v')
+
+
+class ForgeConfigTest(unittest.TestCase):
+    def test_a_real_forge_names_its_repository_and_absolute_identity_tokens(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / 'forge.toml'
+        complete = ('service_url = "https://forge.example"\nforge_id = "lab"\nrepository = "lab/trial"\n'
+                    'push_url = "git@forge.example:lab/trial"\nissue_token = "/t/issue"\n'
+                    'daemon = { login = "d", token = "/t/daemon" }\ncrew = { login = "c", token = "/t/crew" }\n')
+        path.write_text(complete)
+        self.assertEqual(trial.forge_config(path)['crew'], {'login': 'c', 'token': '/t/crew'})
+        for broken in [complete.replace('/t/crew', 't/crew'), complete.replace('https://', 'http://'),
+                       complete.replace('lab/trial"\n', 'trial"\n'), complete.replace('issue_token = "/t/issue"\n', '')]:
+            path.write_text(broken)
+            with self.subTest(text=broken), self.assertRaises(trial.TrialFailure):
+                trial.forge_config(path)
 
 
 class AttachPlanTest(unittest.TestCase):
@@ -106,8 +131,10 @@ class TeardownTest(unittest.TestCase):
     def test_every_process_carrying_the_trial_marker_is_stopped_and_no_other(self):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(trial.remove_tree, root)
-        marked = subprocess.Popen(['sleep', '60'], env={**os.environ, trial.MARKER: str(root)}, start_new_session=True)
-        other = subprocess.Popen(['sleep', '60'], env={**os.environ, trial.MARKER: str(root) + '-other'})
+        # Not a system binary: macOS hides a platform binary's environment from ps.
+        sleeper = [sys.executable, '-c', 'import time; time.sleep(60)']
+        marked = subprocess.Popen(sleeper, env={**os.environ, trial.MARKER: str(root)}, start_new_session=True)
+        other = subprocess.Popen(sleeper, env={**os.environ, trial.MARKER: str(root) + '-other'})
         self.addCleanup(other.kill)
         deadline = time.monotonic() + 5
         while marked.pid not in trial.marked_processes(root) and time.monotonic() < deadline:

@@ -93,7 +93,8 @@ from the checkout (#4165), so a change to how flotilla deals with vessels is
 tried end to end before it ships:
 
 ```sh
-scripts/trial-fleet run [--provider-config FILE] [--crew scripted|<agent>] [--until provisioned|attached|landed]
+scripts/trial-fleet run [--provider-config FILE [--provider NAME] [--image REF]] [--forge FILE]
+                        [--crew scripted|<agent>] [--until provisioned|attached|landed] [--guest-tools DIR]
 ```
 
 It builds `flotillad`, `flotilla`, the vessel CLI, `drydock-agent` and
@@ -111,9 +112,25 @@ a convoy on a fixed trial issue and waits for the end point:
 - `landed` (default): the crew pushed, opened a pull request on the fake forge
   and submitted it, and the convoy reached Landing.
 
-The provider is the one `[providers.NAME]` table in `--provider-config`, as in
-any `drydock.toml`, with an image pinned by digest. Without one, drydock's
-`local` module runs the vessel as a child process on this machine. The default
+`--provider-config` is a `drydock.toml` as an operator writes it, with any
+number of `[providers.NAME]` tables; `--provider` names the trial's instance when
+there is more than one, and `--image` the image pinned by digest (else the
+provider table's `image`). Placement is set up as an operator does it: a
+PlacementPolicy naming the instance and image, which the daemon turns into the
+trial's FulfilmentKind. Without a config, drydock's `local` module runs the
+vessel as a child process on this machine.
+
+Issues, pull requests and git come from the fake forge on this machine, which a
+cloud vessel cannot reach. `--forge FILE` runs the trial against a real Forgejo
+repository instead (the TOML shape is in the script's `forge_config`): the trial
+replaces that repository's `main`, opens an issue there, and declares the Forge,
+the daemon's and crew's CredentialSpecs and a CredentialGrant as the fleet does.
+The build also stages drydock's TypeScript host (its Namespace module), started
+when `node` is on `PATH`.
+
+Guest tools are linux-amd64. On another host (macOS), `--guest-tools` names an
+installed generation's `share/flotilla/guest-tools` to push instead of building
+them; the vessel CLI and agent then come from that generation, not this checkout. The default
 crew is scripted: the credential-free `fleet-canary` adapter runs the trial
 repository's `.flotilla/fleet-canary-agent.sh`, which needs no model account.
 
