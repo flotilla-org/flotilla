@@ -117,6 +117,7 @@ impl InProcessDaemon {
     }
 
     pub async fn post_install_cleat(&self, incoming: &Path, generation: &str, diagnostics_dir: &Path) -> Result<RollReport, String> {
+        self.wait_for_environment_adoption().await;
         let inventory = self.crew_cleat_targets(true).await?;
         #[cfg(unix)]
         let mut inventory = inventory;
@@ -414,6 +415,103 @@ mod tests {
         assert!(malformed.errors.iter().any(|error| error.contains("incoming cleat has no release root")));
         assert_eq!(malformed.attempts.len(), 4);
         assert!(malformed.diagnostics_path.expect("durable report").exists());
+    }
+
+    async fn daemon_with_unadopted_vessel() -> (Arc<InProcessDaemon>, tempfile::TempDir) {
+        let directory = tempfile::tempdir().expect("config");
+        std::fs::write(directory.path().join("daemon.toml"), "machine_id = \"cleat-roll-test\"\n").expect("daemon identity");
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let daemon = InProcessDaemon::new_with_resource_backend(
+            vec![],
+            Arc::new(ConfigStore::with_base(directory.path())),
+            fake_discovery(false),
+            HostName::new("host"),
+            backend.clone(),
+            std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+        )
+        .await;
+        let spec = serde_json::from_value(serde_json::json!({"docker": {
+            "host_ref": daemon.environment_manager.local_host_id().as_str(), "image": "pinned-image"
+        }}))
+        .expect("stored Docker spec");
+        backend.using::<Environment>("flotilla").create(&InputMeta::builder().name("vessel-env".into()).build(), &spec).await.expect("env");
+        let sessions = backend.using::<TerminalSession>("flotilla");
+        let session = sessions
+            .create(
+                &InputMeta::builder()
+                    .name("coder".into())
+                    .labels(std::collections::BTreeMap::from([(flotilla_resources::VESSEL_REF_LABEL.into(), "work-vessel".into())]))
+                    .build(),
+                &TerminalSessionSpec::builder()
+                    .env_ref("vessel-env".into())
+                    .role("coder".into())
+                    .source(TerminalSessionSource::Tool { command: "sh".into() })
+                    .cwd("/".into())
+                    .pool("cleat".into())
+                    .build(),
+            )
+            .await
+            .expect("session");
+        sessions
+            .update_status(
+                "coder",
+                &session.metadata.resource_version,
+                &TerminalSessionStatus {
+                    phase: TerminalSessionPhase::Running,
+                    cleat_endpoint: Some(CleatEndpoint {
+                        runtime_root: "/var/lib/flotilla/cleat".into(),
+                        daemon: "default@1".into(),
+                        session: "coder".into(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("endpoint");
+        (daemon, directory)
+    }
+
+    fn adopt_vessel_env(daemon: &InProcessDaemon) {
+        let id = EnvironmentId::new("vessel-env");
+        let handle =
+            Arc::new(Contained { id: id.clone(), image: ImageId::new("crew-image"), runner: Arc::new(MockRunner::with_outputs(vec![])) });
+        let bag = EnvironmentBag::new()
+            .with(EnvironmentAssertion::binary("cleat", "/usr/local/bin/cleat"))
+            .with(EnvironmentAssertion::env_var("CLEAT_RUNTIME_DIR", "/var/lib/flotilla/cleat"));
+        daemon.register_provisioned_environment(id, handle, bag, None).expect("adopt");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn post_install_waits_for_pending_adoption_then_turns_over_the_vessel() {
+        let (daemon, directory) = daemon_with_unadopted_vessel().await;
+        daemon.begin_environment_adoption();
+        let adopter = Arc::clone(&daemon);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            adopt_vessel_env(&adopter);
+            adopter.finish_environment_adoption();
+        });
+        let report = daemon
+            .post_install_cleat(Path::new("/missing/release/bin/cleat"), "gen", &directory.path().join("diagnostics"))
+            .await
+            .expect("report");
+        assert!(!report.errors.iter().any(|error| error.contains("runner unavailable")), "{:?}", report.errors);
+        assert!(report.attempts.iter().any(|attempt| attempt.environment == "vessel-env"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn post_install_reports_environment_that_never_comes_back_after_the_deadline() {
+        let (daemon, directory) = daemon_with_unadopted_vessel().await;
+        daemon.begin_environment_adoption();
+        let report = daemon
+            .post_install_cleat(Path::new("/missing/release/bin/cleat"), "gen", &directory.path().join("diagnostics"))
+            .await
+            .expect("report");
+        assert!(
+            report.errors.iter().any(|error| error == "work-vessel: cleat environment runner unavailable: vessel-env"),
+            "{:?}",
+            report.errors
+        );
     }
 
     // Unavailable registered targets retain their last failed evidence. A real
