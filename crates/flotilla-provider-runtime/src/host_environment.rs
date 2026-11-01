@@ -103,15 +103,6 @@ impl HostEnvironment {
     }
 }
 
-/// Shell lines that set `variables` again, for a command whose shell may have
-/// read a login profile after its environment was handed over (cleat runs a
-/// session command through `$SHELL -lc`). They are POSIX `export` lines, as the
-/// session command they prefix already is (`flotilla_agent::process`); a csh
-/// login shell cannot run either.
-pub fn export_lines(variables: &[(String, String)]) -> String {
-    variables.iter().map(|(name, value)| format!("export {name}={}\n", shell_quote(value))).collect()
-}
-
 fn supply_collision(supply: &str, variable: &str) -> String {
     format!("supply `{supply}` sets {variable}, which flotilla sets")
 }

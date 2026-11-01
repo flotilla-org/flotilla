@@ -368,6 +368,8 @@ async fn starting_agent_replaces_a_pool_session_left_by_a_previous_daemon_runtim
     // #2706: restored crews get the current daemon's declared socket and
     // session values, regardless of a stale inherited or supplied socket.
     let ensured = pool.ensured.lock().await;
+    // #4173: a host-direct crew runs with its declared environment, no login shell.
+    assert!(ensured[0].declared);
     assert!(ensured[0]
         .env_vars
         .iter()
