@@ -135,6 +135,9 @@ fn show_live(socket: &Path, table: &str, namespace: &str, flags: &Flags, interac
     if namespace.is_empty() {
         return Err(eyre!("--namespace can't be empty"));
     }
+    if cfg!(not(unix)) {
+        return Err(eyre!(NO_UNIX_SOCKET));
+    }
     // A print gives up after a few failed attempts on a daemon that is down; a terminal retries,
     // saying so, until it has rows. Both stop at [`FIRST_READ`] if no rows come.
     let options = Options::new(Endpoint::Unix(socket.to_path_buf()));
@@ -290,9 +293,20 @@ fn now() -> Timestamp {
     Timestamp::from_unix_nanos(now.map_or(0, |since| since.as_nanos() as i128))
 }
 
+#[cfg(unix)]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// What `flotilla table` says on a platform that hosts no local daemon socket.
+const NO_UNIX_SOCKET: &str = "`table` reads this host's daemon over its Unix socket, which this platform does not host";
+
 /// `GET /tables` over the daemon's socket.
+#[cfg(not(unix))]
+async fn listing(_socket: &Path) -> Result<Json> {
+    Err(eyre!(NO_UNIX_SOCKET))
+}
+
+/// `GET /tables` over the daemon's socket.
+#[cfg(unix)]
 async fn listing(socket: &Path) -> Result<Json> {
     let client = rigging_tls::client_builder()
         .unix_socket(socket)
