@@ -1,5 +1,5 @@
 //! HTTP adapter for the carrier-neutral table source.
-use super::{wire, CallerAuth, RouterState};
+use super::{CallerAuth, RouterState};
 #[cfg(test)]
 use crate::server::tables;
 use crate::server::tables::{Failure, Query, TableSource};
@@ -11,6 +11,7 @@ use axum::{
     Extension,
 };
 use futures::StreamExt;
+use rigging_http_wire::{self as wire, Encoding};
 
 #[derive(Clone, Copy)]
 enum Format {
@@ -31,11 +32,7 @@ fn format(headers: &HeaderMap, params: &[(String, String)], rows: bool) -> Resul
             _ => Err(Failure::new("unsupported_format", value)),
         };
     }
-    let accept = headers
-        .get(header::ACCEPT)
-        .map(|header| header.to_str().map_err(|_| Failure::new("unsupported_format", "invalid Accept header")))
-        .transpose()?
-        .unwrap_or("");
+    let accept = wire::accept(headers).map_err(|error| Failure::new("unsupported_format", error))?;
     let allowed = if rows {
         vec!["application/x-ndjson", "application/json", "application/jsonl", "application/cbor-seq"]
     } else {
@@ -52,7 +49,7 @@ fn format(headers: &HeaderMap, params: &[(String, String)], rows: bool) -> Resul
         [Format::Json("application/json"), Format::Cbor, Format::Markdown, Format::Mermaid][index]
     })
 }
-fn failure(error: Failure, encoding: wire::Encoding) -> Response {
+fn failure(error: Failure, encoding: Encoding) -> Response {
     let status = match error.code.as_str() {
         "not_found" | "no_machine" => StatusCode::NOT_FOUND,
         "unauthorized" => StatusCode::FORBIDDEN,
@@ -73,9 +70,9 @@ pub(super) async fn list(
     Extension(caller): Extension<CallerAuth>,
     headers: HeaderMap,
 ) -> Response {
-    let encoding = match wire::Encoding::response(&headers) {
+    let encoding = match Encoding::negotiate(&headers) {
         Ok(encoding) => encoding,
-        Err(error) => return wire::Encoding::error_encoding(&headers).error_code(StatusCode::NOT_ACCEPTABLE, "unsupported_format", error),
+        Err(error) => return error.respond(&headers),
     };
     if let Some((status, message)) = caller.user_refusal() {
         return encoding.error_code(status, "unauthorized", message);
@@ -113,9 +110,9 @@ async fn respond(
 ) -> Response {
     let format = match format(&headers, &params, rows) {
         Ok(format) => format,
-        Err(error) => return failure(error, wire::Encoding::error_encoding(&headers)),
+        Err(error) => return failure(error, Encoding::for_errors(&headers)),
     };
-    let encoding = if matches!(format, Format::Cbor) { wire::Encoding::Cbor } else { wire::Encoding::Json };
+    let encoding = if matches!(format, Format::Cbor) { Encoding::Cbor } else { Encoding::Json };
     if let Some((status, message)) = caller.user_refusal() {
         return encoding.error_code(status, "unauthorized", message);
     }
@@ -129,15 +126,19 @@ async fn respond(
     };
     if !rows {
         if matches!(format, Format::Markdown) {
-            return ([(header::CONTENT_TYPE, "text/markdown; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], description.markdown)
-                .into_response();
+            return wire::vary_accept(
+                ([(header::CONTENT_TYPE, "text/markdown; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], description.markdown)
+                    .into_response(),
+            );
         }
         if matches!(format, Format::Mermaid | Format::Observed) {
             let get = |name: &str| params.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone());
             return match source.diagram(matches!(format, Format::Observed), get("namespace").unwrap_or("default".into()), get("name")).await
             {
-                Ok(diagram) => ([(header::CONTENT_TYPE, "text/vnd.mermaid; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], diagram)
-                    .into_response(),
+                Ok(diagram) => wire::vary_accept(
+                    ([(header::CONTENT_TYPE, "text/vnd.mermaid; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], diagram)
+                        .into_response(),
+                ),
                 Err(error) => failure(error, encoding),
             };
         }
@@ -151,34 +152,45 @@ async fn respond(
         Ok(messages) => messages,
         Err(error) => return failure(error, encoding),
     };
-    let cbor = matches!(format, Format::Cbor);
-    let stream = messages.map(move |message| {
-        if cbor {
-            flotilla_cbor::to_vec(&message, &wire::LIMITS).map_err(std::io::Error::other)
-        } else {
-            let mut value = serde_json::to_value(message).map_err(std::io::Error::other)?;
-            wire::large_integers(&mut value);
-            let mut bytes = serde_json::to_vec(&value)?;
-            bytes.push(b'\n');
-            Ok(bytes)
-        }
-    });
-    (
-        [
-            (
-                header::CONTENT_TYPE,
-                match format {
-                    Format::Json(media) => media,
-                    _ => "application/cbor-seq",
-                },
-            ),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        Body::from_stream(stream),
+    let stream = messages.map(move |message| encoding.encode_item(&message).map_err(std::io::Error::other));
+    wire::vary_accept(
+        (
+            [
+                (
+                    header::CONTENT_TYPE,
+                    match format {
+                        Format::Json(media) => media,
+                        _ => "application/cbor-seq",
+                    },
+                ),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            Body::from_stream(stream),
+        )
+            .into_response(),
     )
-        .into_response()
 }
 #[cfg(test)]
 pub(super) fn test_ordering() {
     tables::test_ordering()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The JSON tagged-integer profile and its CBOR counterpart both round-trip a table
+    // message's full u64 range through flotilla-protocol's decoder.
+    #[tokio::test]
+    async fn table_integer_profiles_preserve_full_u64() {
+        let message = flotilla_protocol::table::Message::Count { count: u64::MAX, estimate: false, sequence: u64::MAX };
+        for encoding in [Encoding::Json, Encoding::Cbor] {
+            let bytes = encoding.encode(&message).unwrap();
+            let decoded: flotilla_protocol::table::Message = match encoding {
+                Encoding::Json => serde_json::from_slice(&bytes).unwrap(),
+                Encoding::Cbor => flotilla_cbor::from_slice(&bytes, &wire::LIMITS).unwrap(),
+            };
+            assert_eq!(decoded, message);
+        }
+    }
 }

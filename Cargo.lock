@@ -907,7 +907,7 @@ dependencies = [
 [[package]]
 name = "drydock"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=eb214c72e0d4753d34c76436c6b2216471ca098d#eb214c72e0d4753d34c76436c6b2216471ca098d"
+source = "git+https://github.com/flotilla-org/drydock?rev=f7c0ab9df825b8c21f54751c70061e53cd28e436#f7c0ab9df825b8c21f54751c70061e53cd28e436"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -946,7 +946,7 @@ dependencies = [
 [[package]]
 name = "drydock-agent"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=eb214c72e0d4753d34c76436c6b2216471ca098d#eb214c72e0d4753d34c76436c6b2216471ca098d"
+source = "git+https://github.com/flotilla-org/drydock?rev=f7c0ab9df825b8c21f54751c70061e53cd28e436#f7c0ab9df825b8c21f54751c70061e53cd28e436"
 dependencies = [
  "axum",
  "bytes",
@@ -989,7 +989,7 @@ dependencies = [
 [[package]]
 name = "drydock-client"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=eb214c72e0d4753d34c76436c6b2216471ca098d#eb214c72e0d4753d34c76436c6b2216471ca098d"
+source = "git+https://github.com/flotilla-org/drydock?rev=f7c0ab9df825b8c21f54751c70061e53cd28e436#f7c0ab9df825b8c21f54751c70061e53cd28e436"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1018,7 +1018,7 @@ dependencies = [
 [[package]]
 name = "drydock-host"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=eb214c72e0d4753d34c76436c6b2216471ca098d#eb214c72e0d4753d34c76436c6b2216471ca098d"
+source = "git+https://github.com/flotilla-org/drydock?rev=f7c0ab9df825b8c21f54751c70061e53cd28e436#f7c0ab9df825b8c21f54751c70061e53cd28e436"
 dependencies = [
  "async-trait",
  "axum",
@@ -1049,7 +1049,7 @@ dependencies = [
 [[package]]
 name = "drydock-protocol"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=eb214c72e0d4753d34c76436c6b2216471ca098d#eb214c72e0d4753d34c76436c6b2216471ca098d"
+source = "git+https://github.com/flotilla-org/drydock?rev=f7c0ab9df825b8c21f54751c70061e53cd28e436#f7c0ab9df825b8c21f54751c70061e53cd28e436"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -1063,7 +1063,7 @@ dependencies = [
 [[package]]
 name = "drydock-provider"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=eb214c72e0d4753d34c76436c6b2216471ca098d#eb214c72e0d4753d34c76436c6b2216471ca098d"
+source = "git+https://github.com/flotilla-org/drydock?rev=f7c0ab9df825b8c21f54751c70061e53cd28e436#f7c0ab9df825b8c21f54751c70061e53cd28e436"
 dependencies = [
  "async-trait",
  "axum",
@@ -1082,7 +1082,7 @@ dependencies = [
 [[package]]
 name = "drydock-transport"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=eb214c72e0d4753d34c76436c6b2216471ca098d#eb214c72e0d4753d34c76436c6b2216471ca098d"
+source = "git+https://github.com/flotilla-org/drydock?rev=f7c0ab9df825b8c21f54751c70061e53cd28e436#f7c0ab9df825b8c21f54751c70061e53cd28e436"
 dependencies = [
  "async-trait",
  "axum",
@@ -2390,6 +2390,7 @@ dependencies = [
  "reqwest 0.13.2",
  "rigging-condition",
  "rigging-http-serve",
+ "rigging-http-wire",
  "rigging-process",
  "rigging-replay-testkit",
  "rigging-tls",
@@ -6069,7 +6070,7 @@ dependencies = [
 [[package]]
 name = "rigging-http-client"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=8c5fef84c6ce9c01ea56fb680a83986c1f14941d#8c5fef84c6ce9c01ea56fb680a83986c1f14941d"
+source = "git+https://github.com/flotilla-org/rigging?rev=4450a0c836fa8f731c954860d3196d0851ea3796#4450a0c836fa8f731c954860d3196d0851ea3796"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6083,7 +6084,7 @@ dependencies = [
 [[package]]
 name = "rigging-http-serve"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=8c5fef84c6ce9c01ea56fb680a83986c1f14941d#8c5fef84c6ce9c01ea56fb680a83986c1f14941d"
+source = "git+https://github.com/flotilla-org/rigging?rev=4450a0c836fa8f731c954860d3196d0851ea3796#4450a0c836fa8f731c954860d3196d0851ea3796"
 dependencies = [
  "axum",
  "getrandom 0.3.4",
@@ -6097,9 +6098,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rigging-http-wire"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/rigging?rev=4450a0c836fa8f731c954860d3196d0851ea3796#4450a0c836fa8f731c954860d3196d0851ea3796"
+dependencies = [
+ "axum",
+ "flotilla-cbor",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rigging-paths"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=8c5fef84c6ce9c01ea56fb680a83986c1f14941d#8c5fef84c6ce9c01ea56fb680a83986c1f14941d"
+source = "git+https://github.com/flotilla-org/rigging?rev=4450a0c836fa8f731c954860d3196d0851ea3796#4450a0c836fa8f731c954860d3196d0851ea3796"
 dependencies = [
  "rigging-process",
 ]
@@ -6107,7 +6119,7 @@ dependencies = [
 [[package]]
 name = "rigging-process"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=8c5fef84c6ce9c01ea56fb680a83986c1f14941d#8c5fef84c6ce9c01ea56fb680a83986c1f14941d"
+source = "git+https://github.com/flotilla-org/rigging?rev=4450a0c836fa8f731c954860d3196d0851ea3796#4450a0c836fa8f731c954860d3196d0851ea3796"
 dependencies = [
  "async-trait",
  "libc",
@@ -6120,7 +6132,7 @@ dependencies = [
 [[package]]
 name = "rigging-replay-testkit"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=8c5fef84c6ce9c01ea56fb680a83986c1f14941d#8c5fef84c6ce9c01ea56fb680a83986c1f14941d"
+source = "git+https://github.com/flotilla-org/rigging?rev=4450a0c836fa8f731c954860d3196d0851ea3796#4450a0c836fa8f731c954860d3196d0851ea3796"
 dependencies = [
  "async-trait",
  "axum",
@@ -6141,7 +6153,7 @@ dependencies = [
 [[package]]
 name = "rigging-stream"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=8c5fef84c6ce9c01ea56fb680a83986c1f14941d#8c5fef84c6ce9c01ea56fb680a83986c1f14941d"
+source = "git+https://github.com/flotilla-org/rigging?rev=4450a0c836fa8f731c954860d3196d0851ea3796#4450a0c836fa8f731c954860d3196d0851ea3796"
 dependencies = [
  "tokio",
 ]
@@ -6149,7 +6161,7 @@ dependencies = [
 [[package]]
 name = "rigging-tls"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=8c5fef84c6ce9c01ea56fb680a83986c1f14941d#8c5fef84c6ce9c01ea56fb680a83986c1f14941d"
+source = "git+https://github.com/flotilla-org/rigging?rev=4450a0c836fa8f731c954860d3196d0851ea3796#4450a0c836fa8f731c954860d3196d0851ea3796"
 dependencies = [
  "reqwest 0.13.2",
  "rustls",

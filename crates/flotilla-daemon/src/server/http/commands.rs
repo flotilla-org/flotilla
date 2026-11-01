@@ -10,8 +10,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use axum::body::to_bytes;
 use axum::{
-    body::to_bytes,
     extract::{Request, State},
     http::{header, Method, StatusCode},
     response::Response,
@@ -215,8 +216,13 @@ impl Commands {
 }
 
 #[cfg(test)]
-use super::wire::large_integers;
-use super::wire::Encoding;
+use rigging_http_wire::json_safe_integers as large_integers;
+use rigging_http_wire::{Body, Encoding};
+
+/// Command routes answer every refusal with the `command_error` code.
+fn refuse(encoding: Encoding, status: StatusCode, message: impl AsRef<str>) -> Response {
+    encoding.error_code(status, "command_error", message)
+}
 
 // The route determines the request kind; callers cannot select a different operation
 // through a body tag. GET/DELETE control requests have a zero-byte body limit.
@@ -240,23 +246,18 @@ fn route(method: &Method, path: &str) -> Option<(&'static str, usize)> {
 pub(super) async fn handle(
     State(RouterState(state)): State<RouterState>,
     Extension(authenticated): Extension<CallerAuth>,
+    encoding: Encoding,
     request: Request,
 ) -> Response {
-    let encoding = match Encoding::response(request.headers()) {
-        Ok(encoding) => encoding,
-        Err(error) => {
-            return Encoding::error_encoding(request.headers()).error_code(StatusCode::NOT_ACCEPTABLE, "unsupported_format", error)
-        }
-    };
     if matches!(authenticated, CallerAuth::Anonymous) {
-        return encoding.error(StatusCode::UNAUTHORIZED, "authentication required");
+        return refuse(encoding, StatusCode::UNAUTHORIZED, "authentication required");
     }
 
     let Some(daemon) = state.daemon.as_ref() else {
-        return encoding.error(StatusCode::SERVICE_UNAVAILABLE, "daemon is unavailable");
+        return refuse(encoding, StatusCode::SERVICE_UNAVAILABLE, "daemon is unavailable");
     };
     let Some(commands) = state.commands.as_ref() else {
-        return encoding.error(StatusCode::SERVICE_UNAVAILABLE, "command service is unavailable");
+        return refuse(encoding, StatusCode::SERVICE_UNAVAILABLE, "command service is unavailable");
     };
     let path = request.uri().path().to_owned();
     let method = request.method().clone();
@@ -265,43 +266,20 @@ pub(super) async fn handle(
     let command_resource = path.strip_prefix("/v1/commands/");
     let (kind, limit) = if command_resource.is_some() {
         if method != Method::GET && method != Method::DELETE {
-            return encoding.error(StatusCode::METHOD_NOT_ALLOWED, "use GET or DELETE");
+            return refuse(encoding, StatusCode::METHOD_NOT_ALLOWED, "use GET or DELETE");
         }
         ("command_record", 0)
     } else {
         match route(&method, &path) {
             Some(route) => route,
-            None => return encoding.error(StatusCode::METHOD_NOT_ALLOWED, "method is not available on this route"),
+            None => return refuse(encoding, StatusCode::METHOD_NOT_ALLOWED, "method is not available on this route"),
         }
     };
-    if let Some(length) = request.headers().get(header::CONTENT_LENGTH) {
-        let Some(size) = length.to_str().ok().and_then(|v| v.parse::<u64>().ok()) else {
-            return encoding.error(StatusCode::BAD_REQUEST, "invalid Content-Length");
-        };
-        if size > limit as u64 {
-            return encoding.error(StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds route limit");
-        }
-    }
     #[cfg(test)]
     let injected_evidence = request.extensions().get::<Arc<PeerEvidence>>().cloned();
-    let content_type = request
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    if limit > 0 && !matches!(content_type.as_str(), "application/json" | "application/cbor") {
-        return encoding.error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "use application/json or application/cbor");
-    }
-    // to_bytes applies http-body-util's limiting body: unknown-length/chunked streams
-    // stop at the limit too, rather than collecting first and checking afterwards.
-    let bytes = match to_bytes(request.into_body(), limit).await {
-        Ok(bytes) => bytes,
-        Err(_) => return encoding.error(StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds route limit"),
+    let body = match Body::read(request, limit).await {
+        Ok(body) => body,
+        Err(refused) => return refuse(encoding, refused.status(), refused.message()),
     };
     let namespace = daemon.provisioning_namespace().await;
     let mut transport_bound = false;
@@ -338,25 +316,25 @@ pub(super) async fn handle(
                         transport_bound = resolved.transport_bound;
                         resolved.caller
                     }
-                    Err(error) => return encoding.error(StatusCode::FORBIDDEN, error),
+                    Err(error) => return refuse(encoding, StatusCode::FORBIDDEN, error),
                 },
-                Ok(Err(error)) => return encoding.error(StatusCode::FORBIDDEN, error),
-                Err(error) => return encoding.error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+                Ok(Err(error)) => return refuse(encoding, StatusCode::FORBIDDEN, error),
+                Err(error) => return refuse(encoding, StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
             }
         }
         CallerAuth::Environment { environment, peer } => {
             let crews = match environment_connection::environment_crews(daemon, environment).await {
                 Ok(c) => c,
-                Err(e) => return encoding.error(StatusCode::FORBIDDEN, e),
+                Err(e) => return refuse(encoding, StatusCode::FORBIDDEN, e),
             };
             let peer = *peer;
             let claims = match tokio::task::spawn_blocking(move || caller::claims_from_peer(peer)).await {
                 Ok(c) => c,
-                Err(e) => return encoding.error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                Err(e) => return refuse(encoding, StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             };
             let crew = match caller::check_claims(crews, &claims) {
                 Ok(c) => c,
-                Err(e) => return encoding.error(StatusCode::FORBIDDEN, e),
+                Err(e) => return refuse(encoding, StatusCode::FORBIDDEN, e),
             };
             transport_bound = true;
             CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace(&crew.namespace), process: None, crew: Some(crew) }
@@ -365,44 +343,44 @@ pub(super) async fn handle(
             CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace(&namespace), process: None, crew: None }
         }
         CallerAuth::Socket(None) => {
-            return encoding.error(StatusCode::FORBIDDEN, "CallerIdentityUnavailable: socket peer credentials unavailable")
+            return refuse(encoding, StatusCode::FORBIDDEN, "CallerIdentityUnavailable: socket peer credentials unavailable")
         }
-        CallerAuth::Hook { .. } => return encoding.error(StatusCode::FORBIDDEN, "a hook token reaches only the hook routes"),
-        CallerAuth::Anonymous => return encoding.error(StatusCode::UNAUTHORIZED, "authentication required"),
+        CallerAuth::Hook { .. } => return refuse(encoding, StatusCode::FORBIDDEN, "a hook token reaches only the hook routes"),
+        CallerAuth::Anonymous => return refuse(encoding, StatusCode::UNAUTHORIZED, "authentication required"),
     };
     if transport_bound && method == Method::DELETE && command_resource.is_some() {
-        return encoding.error(StatusCode::FORBIDDEN, "EnvironmentCommandDenied: cancellation is outside supervisor authority");
+        return refuse(encoding, StatusCode::FORBIDDEN, "EnvironmentCommandDenied: cancellation is outside supervisor authority");
     }
     if let Some(id) = command_resource {
         let id = match Uuid::parse_str(id) {
             Ok(id) => id,
-            Err(_) => return encoding.error(StatusCode::BAD_REQUEST, "invalid command id"),
+            Err(_) => return refuse(encoding, StatusCode::BAD_REQUEST, "invalid command id"),
         };
         let records = commands.records.lock().await;
         let Some(record) = records.get(&id) else {
-            return encoding.error(StatusCode::NOT_FOUND, "command not found");
+            return refuse(encoding, StatusCode::NOT_FOUND, "command not found");
         };
         if record.owner.crew != caller.crew || (transport_bound && caller.crew.is_none()) {
-            return encoding.error(StatusCode::FORBIDDEN, "command belongs to another caller");
+            return refuse(encoding, StatusCode::FORBIDDEN, "command belongs to another caller");
         }
         let mut receiver = record.state.clone();
         let command_id = record.command_id;
         drop(records);
         if method == Method::DELETE {
             if receiver.borrow().outcome.is_some() {
-                return encoding.error(StatusCode::CONFLICT, "command has finished");
+                return refuse(encoding, StatusCode::CONFLICT, "command has finished");
             }
             let Some(command_id) = command_id else {
-                return encoding.error(StatusCode::CONFLICT, "command cannot be cancelled");
+                return refuse(encoding, StatusCode::CONFLICT, "command cannot be cancelled");
             };
             return match commands.router.dispatch_cancel_typed(command_id).await {
                 Ok(()) => encoding.render(StatusCode::ACCEPTED, json!({"id": id})),
-                Err(e) => encoding.error(cancel_status(e.class, &receiver.borrow()), e.message),
+                Err(e) => refuse(encoding, cancel_status(e.class, &receiver.borrow()), e.message),
             };
         }
         let wait = match query.get("wait").map(|v| v.parse::<f64>()).transpose() {
             Ok(wait) if wait.is_none_or(|w| w.is_finite() && (0.0..=MAX_WAIT).contains(&w)) => wait.unwrap_or(0.0),
-            _ => return encoding.error(StatusCode::BAD_REQUEST, "wait must be between 0 and 300 seconds"),
+            _ => return refuse(encoding, StatusCode::BAD_REQUEST, "wait must be between 0 and 300 seconds"),
         };
         if wait > 0.0 {
             let _ =
@@ -410,17 +388,12 @@ pub(super) async fn handle(
         }
         return encoding.render(StatusCode::OK, receiver.borrow().clone());
     }
-    let params = if limit == 0 || (kind == "remove_repo" && bytes.is_empty()) {
+    let params = if limit == 0 || (kind == "remove_repo" && body.is_empty()) {
         serde_json::to_value(&query).expect("string map")
-    } else if content_type == "application/cbor" {
-        match flotilla_cbor::from_slice::<Value>(&bytes, &flotilla_cbor::Limits { max_message: limit, ..Default::default() }) {
-            Ok(v) => v,
-            Err(e) => return encoding.error(StatusCode::BAD_REQUEST, e.to_string()),
-        }
     } else {
-        match serde_json::from_slice::<Value>(&bytes) {
+        match body.decode::<Value>() {
             Ok(v) => v,
-            Err(e) => return encoding.error(StatusCode::BAD_REQUEST, e.to_string()),
+            Err(refused) => return refuse(encoding, refused.status(), refused.message()),
         }
     };
     let params = if kind == "execute" { json!({"command": params}) } else { params };
@@ -431,20 +404,20 @@ pub(super) async fn handle(
     };
     let mut rpc: RpcRequest = match serde_json::from_value(envelope) {
         Ok(r) => r,
-        Err(e) => return encoding.error(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(e) => return refuse(encoding, StatusCode::BAD_REQUEST, e.to_string()),
     };
     if matches!(rpc, RpcRequest::ArtifactPut { .. } | RpcRequest::ArtifactGet { .. })
         && !matches!(authenticated, CallerAuth::Socket(_) | CallerAuth::Environment { .. })
     {
-        return encoding.error(StatusCode::FORBIDDEN, "artifact path operations require a Unix socket");
+        return refuse(encoding, StatusCode::FORBIDDEN, "artifact path operations require a Unix socket");
     }
     let scope = if transport_bound {
         let Some(crew) = caller.crew.as_ref() else {
-            return encoding.error(StatusCode::FORBIDDEN, "calling crew is unavailable");
+            return refuse(encoding, StatusCode::FORBIDDEN, "calling crew is unavailable");
         };
         match environment_supervision::authorize(daemon, &mut rpc, crew).await {
             Ok(scope) => scope,
-            Err(e) => return encoding.error(StatusCode::FORBIDDEN, e),
+            Err(e) => return refuse(encoding, StatusCode::FORBIDDEN, e),
         }
     } else {
         None
@@ -454,7 +427,7 @@ pub(super) async fn handle(
     let _admission = if kind == "execute" {
         let guard = commands.admission.lock().await;
         if !commands.has_capacity(&caller).await {
-            return encoding.error(StatusCode::CONFLICT, RECORD_CAPACITY_ERROR);
+            return refuse(encoding, StatusCode::CONFLICT, RECORD_CAPACITY_ERROR);
         }
         Some(guard)
     } else {
@@ -489,16 +462,16 @@ pub(super) async fn handle(
     let response = match response {
         Message::Response { response, .. } => match *response {
             ResponseResult::Ok { response } => *response,
-            ResponseResult::Err { class, message } => return encoding.error(error_status(class), message),
+            ResponseResult::Err { class, message } => return refuse(encoding, error_status(class), message),
         },
-        _ => return encoding.error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected dispatcher response"),
+        _ => return refuse(encoding, StatusCode::INTERNAL_SERVER_ERROR, "unexpected dispatcher response"),
     };
     if kind == "execute" {
         let id = Uuid::new_v4();
         let (command_id, outcome) = match response {
             RpcResponse::Execute { command_id } => (Some(command_id), None),
             RpcResponse::QueryResult { value, .. } => (None, Some(value)),
-            _ => return encoding.error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected execute response"),
+            _ => return refuse(encoding, StatusCode::INTERNAL_SERVER_ERROR, "unexpected execute response"),
         };
         let permit = commands.reserve_for(&caller).await.expect("serialized admission retains an eligible slot");
         let completion_scope = CompletionScope {
@@ -536,7 +509,7 @@ pub(super) async fn handle(
         return response;
     }
     if matches!(response, RpcResponse::Shutdown) && commands.shutdown.send(()).is_err() {
-        return encoding.error(StatusCode::SERVICE_UNAVAILABLE, "shutdown service unavailable");
+        return refuse(encoding, StatusCode::SERVICE_UNAVAILABLE, "shutdown service unavailable");
     }
     let value = serde_json::to_value(response).expect("protocol response serializes");
     encoding.render(
