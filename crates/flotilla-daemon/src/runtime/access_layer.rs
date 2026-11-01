@@ -604,6 +604,9 @@ mod tests {
             self.calls.lock().expect("calls").push(format!("link {} {sha256}/{}", path.display(), member.display()));
             Ok(())
         }
+        async fn artifact_links(&self) -> Result<Vec<PathBuf>, String> {
+            Ok(self.links.lock().expect("links").iter().cloned().collect())
+        }
     }
 
     /// A crew's home, and its skills tree in it, as the access layer declares them.
