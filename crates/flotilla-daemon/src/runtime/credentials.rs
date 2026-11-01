@@ -19,9 +19,9 @@ use flotilla_credentials::{
 use flotilla_crew::ports::WorkCredentialReconciler;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
-use flotilla_resources::Resource;
+use flotilla_resources::attentions::{Attention, Attentions, Sender, Subject};
 use flotilla_resources::{
-    ControllerRetry, ControllerRetryDisposition, Convoy, Demand, DemandKind, DemandSpec, Environment, EnvironmentStatusPatch, InputMeta,
+    ControllerRetry, ControllerRetryDisposition, Convoy, Environment, EnvironmentStatusPatch,
     Repository, RepositoryTrust, ResourceError, RetryBackoff, TerminalSession, TerminalSessionSource, Vessel, VesselStatusPatch,
 };
 use flotilla_store::ResourceBackend;
@@ -522,10 +522,12 @@ pub(super) fn spawn_credential_refresh_task(
     namespace: String,
     store: Arc<CredentialStore>,
 ) -> JoinHandle<()> {
+    let raised = Arc::new(RaisedCredentials::default());
     spawn_periodic_task(Duration::from_secs(30), PeriodicTaskStart::Immediate, move || {
         let daemon = Arc::clone(&daemon);
         let namespace = namespace.clone();
         let store = Arc::clone(&store);
+        let raised = Arc::clone(&raised);
         async move {
             let errors = store.refresh_due_github_app_tokens().await;
             // Cards read committed delivery observations, never the preparation index.
@@ -536,7 +538,7 @@ pub(super) fn spawn_credential_refresh_task(
             for error in &errors {
                 warn!(error = %error.message, environment = %error.environment_ref, "failed to refresh GitHub App credential delivery");
             }
-            if let Err(status_error) = reconcile_credential_refresh_attention(&daemon, &namespace, &errors).await {
+            if let Err(status_error) = reconcile_credential_refresh_attention(&daemon, &namespace, &errors, &raised).await {
                 warn!(%status_error, "failed to reconcile credential refresh attention");
             }
         }
@@ -571,35 +573,46 @@ pub(super) fn spawn_codex_central_refresh_task(env: Arc<dyn EnvVars>, interval: 
     })
 }
 
-pub(super) use flotilla_resources::{CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION};
+
+/// The failing credentials last raised for each vessel, by namespace, convoy and vessel name. A
+/// vessel's attention is raised again only when that set changes, so an acknowledged one stays
+/// acknowledged while the same credentials keep failing.
+pub(super) type RaisedCredentials = tokio::sync::Mutex<BTreeMap<(String, String, String), BTreeSet<String>>>;
 
 pub(super) async fn reconcile_credential_refresh_attention(
     daemon: &InProcessDaemon,
     namespace: &str,
     errors: &[CredentialRefreshError],
+    raised: &RaisedCredentials,
 ) -> Result<(), String> {
-    reconcile_credential_refresh_attention_in(&daemon.resource_backend(), namespace, errors).await
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &daemon.resource_backend(), namespace, errors, raised).await
 }
 
 pub(super) async fn reconcile_credential_refresh_attention_in(
+    attentions: &dyn Attentions,
     backend: &ResourceBackend,
     namespace: &str,
     errors: &[CredentialRefreshError],
+    raised: &RaisedCredentials,
 ) -> Result<(), String> {
     record_credential_refresh_dispositions(backend, namespace, errors).await?;
-    let demands = backend.using::<Demand>(namespace);
-    let existing = demands.list().await.map_err(|error| error.to_string())?;
-    if errors.is_empty()
-        && existing.items.iter().all(|demand| !demand.metadata.annotations.contains_key(CREDENTIAL_REFRESH_REASON_ANNOTATION))
-    {
+    let mut raised = raised.lock().await;
+    let open: Vec<Subject> = attentions
+        .open(namespace, None)
+        .await?
+        .into_iter()
+        .filter(|open| open.sender == Sender::Capabilities)
+        .map(|open| open.subject)
+        .collect();
+    if errors.is_empty() && open.is_empty() && !raised.keys().any(|(raised_in, _, _)| raised_in == namespace) {
         return Ok(());
     }
     let vessels = backend.using::<Vessel>(namespace).list().await.map_err(|error| error.to_string())?;
     let convoys =
         backend.query_declared::<Convoy>(namespace, &flotilla_store::live_convoys_query()).await.map_err(|error| error.to_string())?;
     let convoys = convoys.items.into_iter().map(|source| (source.object.metadata.name.clone(), source.object)).collect::<BTreeMap<_, _>>();
-    let mut desired = BTreeMap::new();
-    let mut still_failing = BTreeSet::new();
+    // Each vessel's failing credentials, with why and whether the failure is persistent enough to tell a person.
+    let mut failing: BTreeMap<(String, String), BTreeMap<String, (String, bool)>> = BTreeMap::new();
     for error in errors {
         let Some(credential) = error.credential_name.as_ref() else { continue };
         for vessel in &vessels.items {
@@ -613,51 +626,37 @@ pub(super) async fn reconcile_credential_refresh_attention_in(
                     .iter()
                     .any(|requirement| requirement.name == vessel.spec.vessel_name && requirement.credential_refs.contains(credential))
             });
-            if !holds_credential {
-                continue;
+            if holds_credential {
+                failing
+                    .entry((convoy.metadata.name.clone(), vessel.spec.vessel_name.clone()))
+                    .or_default()
+                    .insert(credential.clone(), (error.message.clone(), error.should_surface));
             }
-            let name = format!("credential-refresh-{}-{credential}", vessel.metadata.name);
-            still_failing.insert(name.clone());
-            if !error.should_surface {
-                continue;
-            }
-            let target = flotilla_protocol::ResourceRef::new(
-                flotilla_resources::api_version(Convoy::API_PATHS),
-                Convoy::API_PATHS.kind,
-                namespace,
-                &convoy.metadata.name,
-            );
-            let spec = DemandSpec::for_dispatching_principal(target, DemandKind::HumanGate, convoy.spec.dispatching_principal_ref.clone());
-            let meta = InputMeta::builder()
-                .name(name.clone())
-                .annotations(BTreeMap::from([
-                    (CREDENTIAL_REFRESH_REASON_ANNOTATION.to_string(), error.message.clone()),
-                    (CREDENTIAL_REFRESH_VESSEL_ANNOTATION.to_string(), vessel.spec.vessel_name.clone()),
-                ]))
-                .build();
-            desired.insert(name, (meta, spec));
         }
     }
-    for demand in existing.items {
-        if !demand.metadata.annotations.contains_key(CREDENTIAL_REFRESH_REASON_ANNOTATION) {
+    for subject in &open {
+        if let Subject::Vessel { convoy, vessel } = subject {
+            if !failing.contains_key(&(convoy.clone(), vessel.clone())) {
+                attentions.clear(namespace, Sender::Capabilities, subject).await?;
+            }
+        }
+    }
+    raised.retain(|(raised_in, convoy, vessel), _| raised_in != namespace || failing.contains_key(&(convoy.clone(), vessel.clone())));
+    for ((convoy, vessel), credentials) in failing {
+        let key = (namespace.to_owned(), convoy.clone(), vessel.clone());
+        let before = raised.get(&key).cloned().unwrap_or_default();
+        // A credential already told stays told while it keeps failing, persistent or not.
+        let told: BTreeMap<String, String> = credentials
+            .into_iter()
+            .filter(|(credential, (_, surface))| *surface || before.contains(credential))
+            .map(|(credential, (why, _))| (credential, why))
+            .collect();
+        let names: BTreeSet<String> = told.keys().cloned().collect();
+        if names.is_empty() || names == before {
             continue;
         }
-        if let Some((meta, spec)) = desired.remove(&demand.metadata.name) {
-            if !matches!(
-                demand.status.as_ref().map_or(flotilla_resources::DemandState::Raised, |status| status.state),
-                flotilla_resources::DemandState::Raised | flotilla_resources::DemandState::Escalated
-            ) {
-                demands.delete(&demand.metadata.name).await.map_err(|error| error.to_string())?;
-                demands.create(&meta, &spec).await.map_err(|error| error.to_string())?;
-            } else if demand.metadata.annotations != meta.annotations || demand.spec != spec {
-                demands.update(&meta, &demand.metadata.resource_version, &spec).await.map_err(|error| error.to_string())?;
-            }
-        } else if !still_failing.contains(&demand.metadata.name) {
-            demands.delete(&demand.metadata.name).await.map_err(|error| error.to_string())?;
-        }
-    }
-    for (_, (meta, spec)) in desired {
-        demands.create(&meta, &spec).await.map_err(|error| error.to_string())?;
+        attentions.raise(namespace, &Attention::credential_refresh(&convoy, &vessel, told)).await?;
+        raised.insert(key, names);
     }
     Ok(())
 }

@@ -2277,6 +2277,11 @@ impl InProcessDaemon {
         self.accounts.install(records)
     }
 
+    /// The attentions: the engine's once its Message path is installed, the old store's before.
+    pub fn attentions(&self) -> Arc<dyn flotilla_resources::attentions::Attentions> {
+        self.resource_backend.attentions()
+    }
+
     /// The account kinds' records: the engine's once installed, the old store's before.
     pub fn account_records(&self) -> Arc<dyn flotilla_resources::account_access::AccountRecords> {
         self.accounts.clone()
