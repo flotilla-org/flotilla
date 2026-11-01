@@ -1,7 +1,7 @@
 //! `flotilla web`: browser access to the daemon's loopback HTTP listener (ADR 0065).
 
 #[cfg(unix)]
-use std::{path::Path, time::Duration};
+use std::path::Path;
 
 use color_eyre::{eyre::eyre, Result};
 use flotilla_cli::cli::args::{Cli, WebSubCommand};
@@ -9,8 +9,6 @@ use flotilla_cli::cli::args::{Cli, WebSubCommand};
 /// The router path that mints one-time login codes; only the main Unix socket may call it.
 #[cfg(unix)]
 const LOGIN_CODES_PATH: &str = "/v1/web/login-codes";
-#[cfg(unix)]
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) async fn run_web_command(cli: &Cli, command: WebSubCommand) -> Result<()> {
     match command {
@@ -32,29 +30,8 @@ pub(crate) async fn run_web_command(cli: &Cli, command: WebSubCommand) -> Result
 /// Ask the daemon over its Unix socket for a one-time login URL on its HTTP listener.
 #[cfg(unix)]
 async fn mint_login_url(socket: &Path) -> Result<String> {
-    let client = rigging_tls::client_builder()
-        .unix_socket(socket)
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .map_err(|error| eyre!("build daemon HTTP client: {error}"))?;
-    let response = client
-        .post(format!("http://flotilla.local{LOGIN_CODES_PATH}"))
-        .send()
-        .await
-        .map_err(|error| eyre!("could not reach the daemon at {}: {error}", socket.display()))?;
-    let status = response.status();
-    let text = response.text().await.map_err(|error| eyre!("read daemon response ({status}): {error}"))?;
-    let body = serde_json::from_str::<serde_json::Value>(&text).ok();
-    if !status.is_success() {
-        // Prefer the router's JSON message; otherwise show whatever the daemon sent.
-        let message = body.as_ref().and_then(|body| body["message"].as_str()).unwrap_or(text.trim());
-        let message = if message.is_empty() { "no reason given" } else { message };
-        return Err(eyre!("daemon refused a login code ({status}): {message}"));
-    }
-    body.as_ref()
-        .and_then(|body| body["url"].as_str())
-        .map(str::to_owned)
-        .ok_or_else(|| eyre!("daemon login code response has no url: {}", text.trim()))
+    let body = super::daemon_http::request_json(socket, reqwest::Method::POST, LOGIN_CODES_PATH, "a login code").await?;
+    body["url"].as_str().map(str::to_owned).ok_or_else(|| eyre!("daemon login code response has no url: {body}"))
 }
 
 #[cfg(all(test, unix))]

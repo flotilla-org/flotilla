@@ -1,4 +1,5 @@
 mod daemon;
+mod daemon_http;
 mod fleet;
 mod image;
 mod resource;
@@ -13,5 +14,5 @@ pub(crate) use flotilla_cli::frontend::logs::{run_logs, run_status, run_topology
 pub(crate) use flotilla_cli::frontend::manifest::{run_ensure_command, run_manifest_command};
 pub(crate) use image::run_image_command;
 pub(crate) use resource::{dispatch, run_artifact_command, run_control_command, run_resource_command};
-pub(crate) use table::run_table_command;
+pub(crate) use table::{run_table_command, table_exit_status};
 pub(crate) use web::run_web_command;
