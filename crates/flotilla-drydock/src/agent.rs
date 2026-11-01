@@ -76,6 +76,20 @@ fn is_transient(error: &io::Error) -> bool {
     )
 }
 
+/// The reason a vessel's artifact cannot land because its content store is
+/// full (#4087). Drydock's refusal names the store's path and free bytes.
+pub const CONTENT_STORE_FULL: &str = "ContentStoreFull";
+
+/// Name a full content store's refusal, which no retry can change.
+fn store_full(error: io::Error) -> io::Error {
+    match drydock_agent::AgentError::of(&error) {
+        Some(refusal) if matches!(refusal.kind, drydock_agent::ErrorKind::StorageFull | drydock_agent::ErrorKind::QuotaExceeded) => {
+            io::Error::new(error.kind(), format!("{CONTENT_STORE_FULL}: {refusal}"))
+        }
+        _ => error,
+    }
+}
+
 /// Initial socket/hello failures are normal while a provider starts the
 /// detached supervisor. Drydock itself handles mismatches and post-upgrade
 /// reconnects. `platform` is the one the vessel's `executable` was built for.
@@ -264,7 +278,7 @@ impl AgentClient for DrydockClient {
         self.0.rename(&rename).await
     }
     async fn fetch_artifact(&self, sha256: &str, request: &flotilla::Fetch) -> io::Result<()> {
-        self.0.fetch_artifact(sha256, &fetch(request)).await.map(drop)
+        self.0.fetch_artifact(sha256, &fetch(request)).await.map(drop).map_err(store_full)
     }
     async fn fetch_artifact_or_push(
         &self,
@@ -273,7 +287,7 @@ impl AgentClient for DrydockClient {
         length: u64,
         content: tokio::fs::File,
     ) -> io::Result<()> {
-        self.0.fetch_artifact_or_push(sha256, &fetch(request), length, content).await.map(drop)
+        self.0.fetch_artifact_or_push(sha256, &fetch(request), length, content).await.map(drop).map_err(store_full)
     }
     async fn link_artifact(&self, path: &Path, sha256: &str, member: &Path, file: &flotilla::FileOptions) -> io::Result<()> {
         self.0.link_artifact(path, sha256, member, &options(file)).await

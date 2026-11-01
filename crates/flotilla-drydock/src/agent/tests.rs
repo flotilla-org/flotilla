@@ -126,6 +126,11 @@ pub(crate) struct SocketAgent {
 impl SocketAgent {
     /// Serve `socket`, reporting the digest of `current` unless `mismatched`.
     pub(crate) fn start(socket: PathBuf, current: &[u8], mismatched: bool) -> Arc<Self> {
+        Self::start_in(socket, current, mismatched, None)
+    }
+    /// As [`SocketAgent::start`], keeping its content store in `store` and
+    /// naming itself by its socket, as `drydock-agent --store` does.
+    pub(crate) fn start_in(socket: PathBuf, current: &[u8], mismatched: bool, store: Option<PathBuf>) -> Arc<Self> {
         let directory = tempfile::Builder::new().prefix("fa-").tempdir_in("/tmp").unwrap();
         let installed = directory.path().join("agent");
         std::fs::write(&installed, b"previous drydock executable").unwrap();
@@ -138,7 +143,11 @@ impl SocketAgent {
                 let _ = std::fs::remove_file(&path);
                 let listener = UnixListener::bind(&path).unwrap();
                 started.fetch_add(1, Ordering::SeqCst);
-                match Agent::new(listener, fingerprint.clone(), installed.clone()).run().await {
+                let mut agent = Agent::new(listener, fingerprint.clone(), installed.clone());
+                if let Some(store) = &store {
+                    agent = agent.with_store(store.clone()).with_holder(path.to_string_lossy().into_owned());
+                }
+                match agent.run().await {
                     Ok(upgrade) => {
                         let bytes = tokio::fs::read(&upgrade).await.unwrap();
                         fingerprint = format!("{:x}", Sha256::digest(&bytes));
