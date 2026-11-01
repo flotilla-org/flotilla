@@ -1131,7 +1131,27 @@ def release_install_lock(path, owner):
         pass
 
 
-def begin_daemon_install(socket, marker):
+def lock_install_window(fd):
+    """Take the config's install-window flock on an fd the installer keeps open."""
+    import fcntl  # macOS bootstrap only; keep Windows validator imports usable.
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise ValidationError("another fleet-install or its health watchdog holds the daemon install window")
+
+
+def install_window_owner(marker):
+    """Return the fleet root recorded in a marker, or "" for a marker that predates it.
+
+    The marker is single-line key=value text, so a fleet root cannot contain a newline.
+    """
+    for line in Path(marker).read_text().splitlines():
+        if line.startswith("fleet_root="):
+            return line[len("fleet_root="):]
+    return ""
+
+
+def begin_daemon_install(socket, marker, fleet_root):
     """Serialize marker publication with clients admitted to the spawn path."""
     import fcntl  # macOS bootstrap only; keep Windows validator imports usable.
     Path(marker).parent.mkdir(parents=True, exist_ok=True)
@@ -1145,7 +1165,7 @@ def begin_daemon_install(socket, marker):
                 if time.monotonic() >= deadline:
                     raise ValidationError("daemon spawn lock did not settle within 15s")
                 time.sleep(0.05)
-        Path(marker).write_text("fleet-install\n")
+        Path(marker).write_text(f"fleet_root={fleet_root}\n")
 
 
 def stop_daemon_for_install(cli, socket, config_dir, state_dir, timeout=30):
@@ -1419,9 +1439,14 @@ def main():
     helper = sub.add_parser("release-lock")
     helper.add_argument("path")
     helper.add_argument("owner")
+    helper = sub.add_parser("lock-window")
+    helper.add_argument("fd", type=int)
+    helper = sub.add_parser("window-owner")
+    helper.add_argument("marker")
     helper = sub.add_parser("begin-install")
     helper.add_argument("socket")
     helper.add_argument("marker")
+    helper.add_argument("fleet_root")
     helper = sub.add_parser("stop-daemon")
     helper.add_argument("cli")
     helper.add_argument("socket")
@@ -1476,8 +1501,12 @@ def main():
             return 0 if startup_pending(args.path, args.since) else 1
         elif args.command == "release-lock":
             release_install_lock(args.path, args.owner)
+        elif args.command == "lock-window":
+            lock_install_window(args.fd)
+        elif args.command == "window-owner":
+            print(install_window_owner(args.marker))
         elif args.command == "begin-install":
-            begin_daemon_install(args.socket, args.marker)
+            begin_daemon_install(args.socket, args.marker, args.fleet_root)
         elif args.command == "stop-daemon":
             stop_daemon_for_install(args.cli, args.socket, args.config_dir, args.state_dir)
         elif args.command == "nonce":

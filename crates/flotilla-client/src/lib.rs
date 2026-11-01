@@ -805,7 +805,7 @@ fn ensure_no_install_in_progress(config_dir: &Path) -> Result<(), String> {
     match marker.try_exists() {
         Ok(false) => Ok(()),
         Ok(true) => Err(format!(
-            "daemon install in progress ({}); retry after fleet-install finishes; if an installer was killed, remove this marker only after verifying no fleet-install is running",
+            "daemon install in progress ({}); retry after fleet-install finishes; if an installer was killed, rerun fleet-install to recover its install window",
             marker.display()
         )),
         Err(error) => Err(format!("cannot inspect daemon install marker {}: {error}", marker.display())),
@@ -1566,7 +1566,7 @@ mod spawn_lock_tests {
         let result = connect_or_spawn_with_optional_surface_using(&socket, &config, &state, None, &supervisor, &spawner).await;
         let Err(error) = result else { panic!("install must refuse startup") };
         assert!(error.contains("install in progress"), "{error}");
-        assert!(error.contains("remove this marker only after verifying no fleet-install is running"), "{error}");
+        assert!(error.contains("rerun fleet-install to recover its install window"), "{error}");
         assert!(error.contains(&config.join("run/install-in-progress").display().to_string()), "{error}");
     }
 
