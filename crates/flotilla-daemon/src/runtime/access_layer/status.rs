@@ -229,7 +229,8 @@ impl AccessStatusReconciler {
             return Ok(());
         }
         // The access ended with its convoy: its requester state goes from an SSH host, whose
-        // dirs nothing else removes. A failure keeps the record, so the next pass retries.
+        // dirs nothing else removes. A failure keeps the record, so the next pass retries. With the
+        // place gone too the host is no longer ours to drive, so the record goes without cleanup.
         if convoy_gone && !place_gone {
             if let (Some(convoy), Some(profile)) = (record.metadata.labels.get(CONVOY_LABEL), self.state.ssh_host.get(place)) {
                 remove_requester_state(profile.runner.as_ref(), convoy).await?;
@@ -268,7 +269,7 @@ async fn remove_requester_state(runner: &dyn CommandRunner, convoy: &str) -> Res
 const REMOVE_TREES: &str = r#"for path in "$@"; do
   case "$path" in /?*) ;; *) echo "refusing $path" >&2; exit 1;; esac
   [ -e "$path" ] || [ -L "$path" ] || continue
-  chmod -R u+rwX -- "$path" 2>/dev/null
+  chmod -R u+rwX -- "$path" 2>/dev/null || true
   rm -rf -- "$path" || exit 1
 done"#;
 
