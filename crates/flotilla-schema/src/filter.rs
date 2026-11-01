@@ -98,6 +98,11 @@ impl Table {
         let mut filterable = Filterable::default();
         for (column, ty) in columns {
             let name = column.name.as_str();
+            // A child table's owner key can share its name with a reference's companion
+            // (`resource.home`); the first column of a name, the owner key, is the field.
+            if filterable.path(name).is_some() {
+                continue;
+            }
             let extends = names.iter().any(|other| name.strip_prefix(other).is_some_and(|rest| rest.starts_with('.')));
             let path = if extends { Path::new([name]) } else { Path::new(name.split('.')) };
             // A name no path can spell (a character outside CEL's escaped identifiers) stays
@@ -136,5 +141,16 @@ mod tests {
         assert_eq!(filterable.field_type("inbox"), Some(&Type::Address));
         assert_eq!(where_operators(filterable.field_type("inbox")), ["==", "!=", "in", "under", "has"]);
         assert_eq!(where_operators(filterable.field_type("spec")), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn the_first_column_of_a_repeated_name_is_the_field() {
+        let mut layout = Layout::description("sample");
+        layout.key(|layout| layout.column("resource.home", ColumnType::Text, true));
+        layout.column("resource", ColumnType::Ref, false);
+        layout.column("resource.home", ColumnType::Integer, false);
+        let filterable = layout.finish().tables.remove(0).filterable();
+        assert_eq!(filterable.path("resource.home").map(ToString::to_string).as_deref(), Some("`resource.home`"));
+        assert_eq!(filterable.field_type("resource.home"), Some(&Type::String));
     }
 }
