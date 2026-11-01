@@ -196,7 +196,7 @@ async fn the_verbs_table_lists_native_verbs_and_their_parameters() {
     assert_eq!(params.len(), 1);
     assert_eq!((&params[0]["verb"], &params[0]["name"], &params[0]["type"]), (&json!("convoy.touch"), &json!("note"), &json!("text")));
     assert_eq!(params[0]["required"], false);
-    assert_eq!(names(&rows(&router, "/tables/verbs/rows?where=.effect%20%3D%3D%20read").await), [json!("convoy.look")]);
+    assert_eq!(names(&rows(&router, "/tables/verbs/rows?where=effect%20%3D%3D%20%22read%22").await), [json!("convoy.look")]);
     assert_eq!(names(&rows(&router, "/tables/verbs/rows?sort=-name").await), [json!("convoy.touch"), json!("convoy.look")]);
     let paged = rows(&router, "/tables/verbs/rows?sort=-effect&limit=1").await;
     assert_eq!(names(&paged), [json!("convoy.touch")], "write sorts after read, so first descending");

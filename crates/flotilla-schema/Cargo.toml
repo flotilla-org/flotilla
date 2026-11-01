@@ -10,6 +10,7 @@ serde_json = { workspace = true }
 flotilla-address = { path = "../flotilla-address" }
 flotilla-cbor = { path = "../flotilla-cbor" }
 flotilla-schema-derive = { path = "../flotilla-schema-derive" }
+rigging-condition = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 serde = { workspace = true }
 sha2 = { workspace = true }

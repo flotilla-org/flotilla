@@ -158,20 +158,33 @@ struct Runtime {
 }
 
 impl Store {
-    /// Read one described table with predicates applied in SQLite. Natural identities
+    /// Read one described table with `filter` applied in SQLite. The filter is checked against the
+    /// table's readable description ([`flotilla_schema::Table::filterable`]). Natural identities
     /// replace owner ids; interned strings and object bytes are resolved in the query.
     pub fn table_read(
         &self,
         home: &str,
         name: &str,
-        filters: &[crate::TableFilter],
+        filter: Option<&rigging_condition::Checked<rigging_condition::Condition>>,
         log_limit: usize,
     ) -> Result<crate::TableRead, StoreError> {
         if name.ends_with(".log") {
-            crate::table_read::read_log(&self.conn, &self.runtime.kinds, home, name, filters, log_limit)
+            crate::table_read::read_log(&self.conn, &self.runtime.kinds, home, name, filter, log_limit)
         } else {
-            crate::table_read::read(&self.conn, &self.runtime.kinds, home, name, filters)
+            crate::table_read::read(&self.conn, &self.runtime.kinds, home, name, filter)
         }
+    }
+
+    /// The statement and arguments [`Store::table_read`] prepares for a table other than a log,
+    /// for tests that pin its query plan.
+    #[doc(hidden)]
+    pub fn table_read_statement(
+        &self,
+        home: &str,
+        name: &str,
+        filter: Option<&rigging_condition::Checked<rigging_condition::Condition>>,
+    ) -> Result<(String, Vec<rusqlite::types::Value>), StoreError> {
+        crate::table_read::statement(&self.runtime.kinds, home, name, filter).map(|(sql, arguments, _)| (sql, arguments))
     }
     /// Counts of observed state transitions, scoped to one registered kind and home.
     pub fn observed_edges(&self, kind: &str, home: &str, name: Option<&str>) -> Result<Vec<(String, String, u64)>, StoreError> {

@@ -2,7 +2,7 @@
 
 flotillad serves its resource kinds and engine kinds as self-describing tables. A client reads a table's description, then a stream of row messages.
 
-Fenced blocks tagged `list <name>` below (routes, messages, column types) are checked against the code by a test.
+Fenced blocks tagged `list <name>` below (routes, messages, column types, `where` operators) are checked against the code by a test.
 
 ## Routes
 
@@ -51,17 +51,50 @@ Errors found while a stream is already open arrive as a `resync` message instead
 
 Parameters apply to the rows route. Each is validated against the table's description before any row is read.
 
-- `where=<field> <op> <literal>`, repeatable, all conditions must hold. The expression is the condition grammar of `flotilla-address` (`crates/flotilla-address/src/condition.rs`) with the field path and literal; it is not copied here. A column accepts an operator only if it appears in the column's `whereOperators`. Literals must fit the column type: integers parse as `i64`, booleans are `true`/`false`, timestamps are RFC 3339, enum columns take one of their `constraints.enum` names. `cbor`, `frozen` and `blob` columns cannot be filtered. On resource kinds, `metadata.labels.<key>` filters by label with `==`.
+- `where=<condition>`, repeatable; every condition must hold. A condition is an expression in the condition language ([Conditions](#conditions)), URL-encoded, such as `where=inbox.under("project:flotilla/convoy:fix-3774")`.
 - `sort=a,-b`: comma-separated column names, `-` for descending. Columns must be `sortable`. The table's key columns are appended in ascending order, so the order is total. Null sorts before every value ascending, and after every value descending.
 - `columns=a,b`: the columns to return. Key columns are always included, and a `reference` column brings its `.kind` and `.home` companions.
 - `limit`: rows per page; 200 when absent, otherwise 1 to 10000.
 - `offset`: rows to skip (default 0).
-- `cursor`: the `cursor` of the previous `rows` message when it was not null. It is opaque, and bound to the table, `namespace`, `sort` and `where` of the query that produced it; a cursor used with a different query yields a `resync` message instead of rows. Paging is keyset: rows strictly after the cursor's sort values are returned, so inserts and deletes between pages do not shift it.
+- `cursor`: the `cursor` of the previous `rows` message when it was not null. It is opaque, and bound to the table, `namespace`, `sort` and the canonical text of `where` of the query that produced it, so another spelling of the same conditions continues it; a cursor used with a different query, or one issued before conditions took this language, yields a `resync` message instead of rows. Paging is keyset: rows strictly after the cursor's sort values are returned, so inserts and deletes between pages do not shift it.
 - `count=exact|estimate`: adds a `count` message.
 - `namespace` (default `default`): the scope read. Flotilla's own records live in the `flotilla` namespace, so a client that omits `namespace` gets empty tables and no error; pass `namespace=flotilla`. For engine kinds, a namespace other than `default` names the home.
 - `watch` (bare, or `true`): keep the stream open and send changes.
 
 `.log` tables accept no `watch`, `cursor`, `offset`, `count` or custom `sort`; they return a bounded snapshot in `home, sequence` order.
+
+## Conditions
+
+`where` speaks one condition language, a strict subset of [CEL](https://github.com/google/cel-spec) implemented by `rigging-condition`. Its grammar, canonical text, three-valued evaluation and SQL translation are defined there: see the crate's [README](https://github.com/flotilla-org/rigging/blob/main/crates/rigging-condition/README.md) and its conformance corpus, [`corpus/corpus.json`](https://github.com/flotilla-org/rigging/blob/main/crates/rigging-condition/corpus/corpus.json), which every implementation runs. The design is [the condition language note](research/2026-10-31-condition-expression-language.md).
+
+```text
+inbox.under("project:flotilla/convoy:fix-3774")
+phase in ["Running", "Landing"] && !has(`closed-at`)
+`admitted_seq` > 10 || state == "Settled"
+"kind:bug" in metadata.labels
+```
+
+- **Fields** are the table's columns. A column's field path is its name: `metadata.name`, with a segment that is not an identifier backticked (`` `closed-at` ``). Where another filterable column's name is a dotted prefix of it, the whole name is one backticked segment: a reference's `` `reference.home` `` beside `reference`.
+- **Literals** are typed by the column: strings are double-quoted (`"Landed"`, never a bare word), integers and floats are plain, booleans are `true`/`false`, and timestamps are `timestamp("2026-10-01T00:00:00Z")` with at most six fractional digits. An enum column takes one of its `constraints.enum` names; an address column takes canonical ADR 0066 address text.
+- **A missing value** (a null cell) makes every comparison that reads it unknown, so `!=` does not keep it; test presence with `has(field)`. `&&`, `||` and `!` are three-valued, and a row is kept only when its condition is true.
+- **`under`** holds when the address equals the literal or lies below it at a segment boundary: `…/convoy:demo2` is not under `…/convoy:demo`, and an encoded `/` (`repo:org%2Frepo`) is no boundary. On a stored address the store searches its interned strings by range.
+- Any CEL spelling of a condition is accepted (whitespace, single quotes, comments); the canonical print is what a cursor binds. The former spelling, `.field op literal`, is refused.
+
+Each field's `whereOperators` lists what its type allows; an empty array means the column cannot be filtered (`cbor`, `frozen` and `blob` columns).
+
+```list where-operators
+integer, number, string, datetime: == != < <= > >= in has
+boolean: == != has
+enum: == != in has
+address: == != in under has
+map: in
+```
+
+- `in` takes a non-empty list of up to 32 literals: `state in ["Pending", "Awaiting"]`. On a map it is `"key" in field`.
+- A bare boolean field is a condition: `done`, `!done`.
+- On resource kinds, `metadata.labels` is a map: `"k" in metadata.labels` tests a label's presence and `metadata.labels["k"] == "v"` its value; its `additionalProperties` carry the string operators. Label and indexed field equalities are read through the store's indexes, and the rest of the condition is evaluated over the rows the store returns.
+
+Errors: a condition that does not parse, exceeds a limit (32 terms in one `&&` or `||` run, 32 list elements, 12 nested parentheses or `!`, 4,096 bytes), or names a bare word where a literal belongs, is `invalid_filter`; a field the table does not have is `unknown_column`, and one it cannot filter is `unsupported_filter`; a literal of the wrong type, an enum name outside the set, a non-canonical address, or ordering (`<`, `>`, …) on a boolean, enum or address is `type_mismatch`.
 
 ## Messages
 
@@ -185,7 +218,7 @@ whereOperators
 - `roles`: an array of strings. In use: `key` (part of the primary key), `ref` (identifies a resource), `state` (a state label), `since` (when a state was entered), `sequence` (log position), `time` (an event time), `transition-from` and `transition-to` (the states an event moved between).
 - `title`: a display name.
 - `sortable`: whether `sort` accepts the column.
-- `whereOperators`: the operators `where` accepts on the column; an empty array means it cannot be filtered. Scalar columns of engine kinds take `==`, `!=`, `<`, `<=`, `>`, `>=`. Resource kinds take `==` on the columns their kind declares queryable.
+- `whereOperators`: the operators `where` accepts on the column, by its type ([Conditions](#conditions)); an empty array means it cannot be filtered.
 
 ## Which tables exist
 

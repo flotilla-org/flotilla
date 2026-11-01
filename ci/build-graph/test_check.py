@@ -98,7 +98,7 @@ class BuildGraphContract(unittest.TestCase):
 
     def state_machines_error(self, target):
         return (f"{STATE_MACHINES}: must not depend on {target}, directly or transitively; the engine depends only "
-                "on flotilla-schema and what it may reach (flotilla-schema-derive, flotilla-address, flotilla-cbor and "
+                "on flotilla-schema and what it may reach (flotilla-schema-derive, flotilla-address, flotilla-cbor, rigging-condition and "
                 "flotilla-build-features anchors)")
 
     def test_state_machines_may_reach_the_schema_crate(self):
@@ -231,7 +231,7 @@ class BuildGraphContract(unittest.TestCase):
 
     def schema_error(self, schema, target):
         return (f"{schema}: must not depend on {target}, directly or transitively; schema crates depend only "
-                "on flotilla-address, flotilla-cbor, lower schema crates and flotilla-build-features anchors")
+                "on flotilla-address, flotilla-cbor, rigging-condition, lower schema crates and flotilla-build-features anchors")
 
     def test_schema_crates_refuse_other_workspace_crates(self):
         # Explicit finite generator: every schema crate, each forbidden family named by #3320,

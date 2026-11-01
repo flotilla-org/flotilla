@@ -25,6 +25,7 @@ mod states;
 mod stream;
 mod stream_schema;
 mod table_reads;
+mod table_where;
 mod tables;
 #[path = "../../../../tests/support/integration_modules.rs"]
 mod test_module_registration;

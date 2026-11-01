@@ -60,4 +60,4 @@ pub use store::{
 };
 
 mod table_read;
-pub use table_read::{TableFilter, TableRead};
+pub use table_read::TableRead;
