@@ -95,12 +95,13 @@ fn flags_patch_the_view() {
     let text = printed(&mut convoys("convoys"), "convoys", &["--format", "tsv", "--view", "default"]);
     assert_eq!(names(&text), NEWEST_FIRST, "{text}");
     let flags = flags(&table_args(&["--view", "nosuch"])).unwrap();
-    assert!(layout(&mut convoys("convoys"), "convoys", &flags).is_err());
-    assert!(flags_error(&["--format", "csv"]).contains("unknown format"));
-}
-
-fn flags_error(args: &[&str]) -> String {
-    flags(&table_args(args)).expect_err("refused").to_string()
+    let unknown = layout(&mut convoys("convoys"), "convoys", &flags).unwrap_err().to_string();
+    assert!(unknown.contains("nosuch"), "{unknown}");
+    // An unknown format is refused while parsing, naming the formats.
+    use clap::Parser;
+    let refused = Cli::try_parse_from(["flotilla", "table", "convoys", "--format", "csv"]).err().expect("csv refused").to_string();
+    assert!(refused.contains("text") && refused.contains("jsonl"), "{refused}");
+    assert!(show_live(Path::new("/nonexistent"), "convoys", "", &flags, false).unwrap_err().to_string().contains("--namespace"));
 }
 
 #[test]
@@ -152,6 +153,33 @@ fn the_listing_prints_each_table_with_its_kind_and_views() {
     tables.dedup();
     assert_eq!(tables.len(), lines.len() - 1, "each table once");
     assert!(tables.windows(2).all(|pair| pair[0] < pair[1]), "by name: {tables:?}");
+}
+
+#[test]
+fn drain_feeds_messages_reports_retries_and_stops_at_a_refusal() {
+    let mut source = DescribedSource::new("convoys", Scope::new("flotilla"));
+    let _ = source.poll_request();
+    let mut decoder = Decoder::new(binnacle_described::Encoding::Ndjson);
+    decoder.feed(&fixture("convoys.ndjson"));
+    let mut reconnecting = None;
+    let mut events = vec![Event::Retrying { attempt: 1, wait: Duration::from_millis(250), status: Some(503), body: b"busy".to_vec() }];
+    drain(&mut source, || events.pop(), |_| {}, &mut reconnecting).unwrap();
+    assert_eq!(reconnecting.as_deref(), Some("reconnecting (503 busy), retry 1 in 250 ms"));
+    // The next message clears it.
+    let mut messages = std::iter::from_fn(|| decoder.next()).map(|message| Event::Message(message.unwrap()));
+    drain(&mut source, || messages.next(), |_| {}, &mut reconnecting).unwrap();
+    assert!(source.status().synced && reconnecting.is_none());
+    assert_eq!(source.row_count(), 6);
+
+    let mut events = vec![Event::Failed { status: 404, body: br#"{"message":"unknown table"}"#.to_vec() }];
+    let refused = drain(&mut source, || events.pop(), |_| {}, &mut reconnecting).unwrap_err();
+    assert_eq!(refused, "404 unknown table");
+
+    // A stream that ends asks for the watch again.
+    let mut opened = Vec::new();
+    let mut events = vec![Event::Ended];
+    drain(&mut source, || events.pop(), |request| opened.push(request), &mut reconnecting).unwrap();
+    assert_eq!(opened.len(), 1);
 }
 
 #[test]

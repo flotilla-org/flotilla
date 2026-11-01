@@ -223,6 +223,19 @@ pub struct LsArgs {
     pub all: bool,
 }
 
+/// How `flotilla table` prints a table.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableFormat {
+    /// Columns under their titles, aligned (binnacle's `aligned`)
+    Text,
+    /// A header of field names, then raw values separated by tabs
+    Tsv,
+    /// One JSON array of objects keyed by field name
+    Json,
+    /// One JSON object per line
+    Jsonl,
+}
+
 /// `flotilla table`'s arguments. The view flags mirror binnacle's CLI host flags; this crate
 /// stays free of binnacle and ratatui (the vessel CLI excludes renderers), so the root package
 /// hands them to binnacle.
@@ -248,9 +261,9 @@ pub struct TableArgs {
     /// Show the hidden columns too
     #[arg(long)]
     pub wide: bool,
-    /// text (aligned), tsv, json or jsonl
-    #[arg(long)]
-    pub format: Option<String>,
+    /// How a printed table is written (piped, or with --no-interactive)
+    #[arg(long, value_enum)]
+    pub format: Option<TableFormat>,
     /// Open the table inline even when not in a terminal
     #[arg(long, conflicts_with = "no_interactive")]
     pub interactive: bool,
