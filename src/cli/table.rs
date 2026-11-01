@@ -328,7 +328,8 @@ fn listing_source(listing: &Json) -> Result<DescribedSource> {
         .collect();
     rows.sort_by(|a, b| a["table"].as_str().cmp(&b["table"].as_str()));
     // A table name routes to one source (`/tables/{table}`), so the daemon lists each once; the
-    // dedup only keeps the key unique should two kinds ever list the same name.
+    // dedup only keeps the key unique should two kinds ever list the same name. `dedup_by` drops
+    // adjacent rows only, so it must follow the sort.
     rows.dedup_by(|a, b| a["table"] == b["table"]);
     let field = |name: &str, title: &str, roles: &[&str], required: bool| json!({"name": name, "title": title, "type": "string", "roles": roles, "constraints": {"required": required}});
     let messages = [
