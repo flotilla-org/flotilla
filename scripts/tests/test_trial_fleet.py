@@ -98,6 +98,17 @@ class EndPointTest(unittest.TestCase):
                          ['provisioned', 'attached', 'landed', 'landed'])
 
 
+class WorkflowTest(unittest.TestCase):
+    # #4278: a workflow without `exit` is a standing convoy, which nothing
+    # settles, so the trial convoy stalled as it entered Landing. The trial's
+    # workflow lands on its pull request's world terminal, as the stock one does.
+    def test_the_trial_workflow_lands_on_its_pull_requests_world_terminal(self):
+        for until in trial.END_POINTS:
+            spec = trial.workflow_spec(until)
+            self.assertEqual(spec.get('exit'), {'merged': '$cr.state == merged', 'closed-unmerged': '$cr.state == closed'}, until)
+            self.assertEqual(spec['vessels'][0]['crew'][0].get('deliverer', False), until == 'landed', until)
+
+
 class TeardownTest(unittest.TestCase):
     def test_vessel_state_is_named_by_the_trials_own_convoys_and_environments(self):
         import hashlib
