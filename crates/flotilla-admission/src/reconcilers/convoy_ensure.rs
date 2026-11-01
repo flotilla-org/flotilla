@@ -92,7 +92,8 @@ pub struct EnsureReconciler {
 }
 
 /// The held convoy whose acknowledgement last released an admission, by namespace and ensure.
-/// One acknowledgement releases once, until the ensure's hold is raised again.
+/// One acknowledgement releases once, until the ensure's hold is raised again. Kept in memory: after
+/// a restart it may release once more, which only retries the same held convoy's admission.
 #[derive(Default)]
 struct ReleasedHolds(std::sync::Mutex<HashMap<(String, String), String>>);
 
