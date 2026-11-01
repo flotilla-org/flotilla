@@ -84,8 +84,8 @@ impl<'a> GenerationTurnovers<'a> {
                 endpoints.entry(session.environment.clone()).or_default().push(endpoint.clone());
             }
         }
-        let mut errors = sessions.errors.clone();
-        errors.extend(sessions.unavailable.iter().filter(|(unavailable, _)| unavailable == pool).map(|(_, message)| message.clone()));
+        let mut errors: Vec<_> =
+            sessions.unavailable.iter().filter(|(unavailable, _)| unavailable == pool).map(|(_, message)| message.clone()).collect();
         let mut environments = Vec::new();
         for (id, state) in self.environments.managed_environments() {
             let local = self.local(&state);
@@ -139,7 +139,7 @@ impl<'a> GenerationTurnovers<'a> {
 
     /// Hand every local environment's live sessions to the installed generation.
     pub async fn advance(&self, request: AdvanceRequest<'_>) -> RollReport {
-        let mut errors = Vec::new();
+        let mut errors = request.sessions.errors.clone();
         let mut plans = Vec::new();
         for pool in self.pools {
             let Some(facility) = &pool.facility else { continue };
@@ -149,11 +149,7 @@ impl<'a> GenerationTurnovers<'a> {
         }
         let contained = plans.iter().any(|(_, environments)| environments.iter().any(|environment| environment.contained));
         let guest = guest_build(request.incoming, request.tools_root, contained, &mut errors);
-        let incoming = IncomingBuild {
-            generation: request.generation.to_string(),
-            host: BTreeMap::from([(flotilla_environment::composition::role::CLEAT.to_string(), request.incoming.to_path_buf())]),
-            guest,
-        };
+        let incoming = IncomingBuild { generation: request.generation.to_string(), installed: request.incoming.to_path_buf(), guest };
         let mut report =
             RollReport::builder().host(request.host).generation(request.generation.to_string()).attempts(vec![]).errors(errors).build();
         for (facility, environments) in plans {
@@ -187,13 +183,15 @@ impl<'a> GenerationTurnovers<'a> {
     ) -> Vec<HostCondition> {
         let local = self.environments.local_environment_id();
         let (Some(bag), Some(runner)) = (self.environments.environment_bag(local), self.environments.environment_runner(local)) else {
+            tracing::debug!(environment = %local, "local environment unregistered; no generation conditions");
             return Vec::new();
         };
         let host = TurnoverEnvironment::builder().id(local.to_string()).bag(bag).runner(runner).contained(false).build();
         let mut conditions = Vec::new();
         for pool in self.pools {
             let Some(facility) = &pool.facility else { continue };
-            let (environments, errors) = self.environments(&pool.pool, facility.as_ref(), sessions, false);
+            let (environments, pool_errors) = self.environments(&pool.pool, facility.as_ref(), sessions, false);
+            let errors = sessions.errors.iter().cloned().chain(pool_errors).collect();
             if let Some(assessment) = facility.assess(&host, &environments, previous, errors).await {
                 conditions.extend(condition(assessment, facility.condition_type(), observed_at));
             }

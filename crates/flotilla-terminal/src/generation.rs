@@ -31,11 +31,12 @@ pub struct TurnoverEnvironment {
     pub vessels: Vec<String>,
 }
 
-/// The installed build a turnover advances to: release files by composition role.
+/// The installed build a turnover advances to.
 #[derive(Clone, Debug)]
 pub struct IncomingBuild {
     pub generation: String,
-    pub host: BTreeMap<String, PathBuf>,
+    /// The installed host executable, inside its release.
+    pub installed: PathBuf,
     /// The verified guest build, or why contained environments cannot receive one.
     pub guest: Result<BTreeMap<String, PathBuf>, String>,
 }

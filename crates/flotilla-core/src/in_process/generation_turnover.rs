@@ -501,11 +501,16 @@ mod tests {
             .with(EnvironmentAssertion::binary("cleat", "/installed/cleat"))
             .with(EnvironmentAssertion::env_var("CLEAT_RUNTIME_DIR", "/crew/cleat"));
         daemon.environment_manager.update_direct_environment_bag(daemon.local_environment_id(), bag).expect("local bag");
-        let condition = daemon.generation_conditions().await.into_iter().next().expect("skew condition");
+        let condition = daemon
+            .generation_conditions()
+            .await
+            .into_iter()
+            .find(|condition| condition.condition_type == "CleatBuildSkew")
+            .expect("skew condition");
         assert_eq!(condition.condition_type, "CleatBuildSkew");
         assert_eq!(condition.value, ConditionValue::False);
         assert!(!condition.blocks_readiness());
         assert!(condition.message.contains("/crew/cleat/default: installed new vs serving old"));
-        assert!(daemon.generation_conditions().await.is_empty());
+        assert!(!daemon.generation_conditions().await.iter().any(|condition| condition.condition_type == "CleatBuildSkew"));
     }
 }

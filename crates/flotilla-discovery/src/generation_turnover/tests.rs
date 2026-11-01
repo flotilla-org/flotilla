@@ -33,16 +33,28 @@ struct Relay {
     incoming: Mutex<Option<IncomingBuild>>,
     assessed: Mutex<Vec<Assessed>>,
     fail: Option<String>,
+    binary: &'static str,
+    condition: &'static str,
+}
+
+impl Relay {
+    fn new() -> Self {
+        Self::named("relayd", "RelayGenerationSkew")
+    }
+
+    fn named(binary: &'static str, condition: &'static str) -> Self {
+        Self { binary, condition, ..Default::default() }
+    }
 }
 
 #[async_trait]
 impl GenerationTurnover for Relay {
     fn condition_type(&self) -> &'static str {
-        "RelayGenerationSkew"
+        self.condition
     }
 
     fn declared(&self, bag: &EnvironmentBag) -> bool {
-        bag.find_binary("relayd").is_some()
+        bag.find_binary(self.binary).is_some()
     }
 
     async fn advance(&self, environments: &[TurnoverEnvironment], incoming: &IncomingBuild) -> Turnover {
@@ -134,7 +146,7 @@ fn request<'a>(sessions: &'a RecordedSessions, tools_root: &'a Path) -> AdvanceR
 #[tokio::test]
 async fn each_pool_is_asked_for_its_own_local_environments_and_endpoints() {
     let manager = manager();
-    let relay = Arc::new(Relay::default());
+    let relay = Arc::new(Relay::new());
     let pools =
         [PoolTurnover { pool: "relay".into(), facility: Some(relay.clone()) }, PoolTurnover { pool: "plain".into(), facility: None }];
     let sessions = RecordedSessions {
@@ -158,7 +170,7 @@ async fn each_pool_is_asked_for_its_own_local_environments_and_endpoints() {
     );
     let incoming = relay.incoming.lock().unwrap().clone().expect("incoming build");
     assert_eq!(incoming.generation, "gen-2");
-    assert_eq!(incoming.host.values().collect::<Vec<_>>(), [Path::new("/release/bin/cleat")]);
+    assert_eq!(incoming.installed, Path::new("/release/bin/cleat"));
     assert!(!report.failed(), "{report:?}");
     assert_eq!(report.attempts.len(), 3);
     assert_eq!(
@@ -195,7 +207,7 @@ async fn a_pool_without_turnover_is_skipped_informationally() {
 #[tokio::test]
 async fn failed_turnover_is_reported_and_unavailable_runners_stay_with_their_pool() {
     let manager = manager();
-    let relay = Arc::new(Relay { fail: Some("sessions stayed on the old generation".into()), ..Default::default() });
+    let relay = Arc::new(Relay { fail: Some("sessions stayed on the old generation".into()), ..Relay::new() });
     let pools = [PoolTurnover { pool: "relay".into(), facility: Some(relay.clone()) }];
     let sessions = RecordedSessions {
         unavailable: vec![
@@ -224,6 +236,45 @@ async fn failed_turnover_is_reported_and_unavailable_runners_stay_with_their_poo
             errors: vec!["session inventory unavailable".into(), "work: relay environment runner unavailable: gone".into()],
         }]
     );
+}
+
+#[tokio::test]
+async fn independent_pools_receive_only_their_own_endpoints_and_inventory_errors_appear_once() {
+    let manager = manager();
+    let relay = Arc::new(Relay::new());
+    let mux = Arc::new(Relay::named("muxd", "MuxGenerationSkew"));
+    let pools = [
+        PoolTurnover { pool: "relay".into(), facility: Some(relay.clone()) },
+        PoolTurnover { pool: "mux".into(), facility: Some(mux.clone()) },
+    ];
+    let sessions = RecordedSessions {
+        running: vec![session("relay", "recorded", "work", Some("coder")), session("mux", "bare", "other", Some("pane"))],
+        unavailable: vec![("mux".into(), "gone: mux environment runner unavailable: gone".into())],
+        errors: vec!["session inventory unavailable".into()],
+    };
+    let tools = tempfile::tempdir().expect("tools root");
+    let report = GenerationTurnovers::new(&manager, &pools).advance(request(&sessions, tools.path())).await;
+    let endpoints = |facility: &Relay| {
+        facility
+            .advanced
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|advanced| !advanced.endpoints.is_empty())
+            .map(|advanced| advanced.environment.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(endpoints(&relay), ["recorded"]);
+    assert_eq!(endpoints(&mux), ["bare"]);
+    assert_eq!(report.errors, ["session inventory unavailable", "gone: mux environment runner unavailable: gone"]);
+
+    let conditions = GenerationTurnovers::new(&manager, &pools).conditions(&sessions, None, chrono::Utc::now()).await;
+    assert_eq!(
+        conditions.iter().map(|condition| condition.condition_type.as_str()).collect::<Vec<_>>(),
+        ["RelayGenerationSkew", "MuxGenerationSkew"]
+    );
+    assert_eq!(relay.assessed.lock().unwrap()[0].errors, ["session inventory unavailable"]);
+    assert_eq!(mux.assessed.lock().unwrap()[0].errors, ["session inventory unavailable", "gone: mux environment runner unavailable: gone"]);
 }
 
 #[hegel::test]

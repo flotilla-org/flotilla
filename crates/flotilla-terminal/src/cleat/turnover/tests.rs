@@ -38,11 +38,7 @@ fn guest_files(_incoming: &Path) -> Result<BTreeMap<String, PathBuf>, String> {
 }
 
 fn build(generation: &str, incoming: &Path) -> IncomingBuild {
-    IncomingBuild {
-        generation: generation.into(),
-        host: BTreeMap::from([(CLEAT_ROLE.to_string(), incoming.to_path_buf())]),
-        guest: guest_files(incoming),
-    }
+    IncomingBuild { generation: generation.into(), installed: incoming.to_path_buf(), guest: guest_files(incoming) }
 }
 
 async fn drain(host: String, generation: String, incoming: &Path, targets: &[CleatTarget], errors: Vec<String>) -> RollReport {

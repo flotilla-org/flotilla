@@ -192,7 +192,7 @@ fn contained_incoming(guest: &Result<BTreeMap<String, PathBuf>, String>) -> Resu
 // reachable through their runner, independent of their original tool mounts.
 async fn incoming_for_target(target: &CleatTarget, incoming: &IncomingBuild) -> Result<PathBuf, String> {
     if !target.contained {
-        return incoming.host.get(CLEAT_ROLE).cloned().ok_or_else(|| "incoming build has no host cleat".into());
+        return Ok(incoming.installed.clone());
     }
     if !target.runtime_root.is_absolute() {
         return Err("cleat runtime root must be absolute".into());
