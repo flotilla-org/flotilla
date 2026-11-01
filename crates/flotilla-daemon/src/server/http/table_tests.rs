@@ -163,6 +163,47 @@ async fn table_carriers_share_paging_filter_count_and_resync_contract() {
         .any(|message| matches!(message, Message::Rows { rows, .. } if rows.iter().all(|row| row["metadata.name"] != "a"))));
 }
 
+// #4108: a resource kind evaluates what its store does not index over every row it reads, before
+// paging, so a selective in-memory filter still fills each page and its cursor walks the rest. A
+// null cell is absent: `!=` does not keep it (the condition is unknown), and `!has` selects it.
+#[tokio::test]
+async fn in_memory_filters_page_fully_and_read_null_cells_as_absent() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    for name in ["a", "b", "c", "d", "e"] {
+        seed(&backend, name, "yes").await;
+    }
+    let router = router(backend);
+    let names = |messages: &[Message]| -> Vec<serde_json::Value> {
+        messages
+            .iter()
+            .flat_map(|message| if let Message::Rows { rows, .. } = message { rows.clone() } else { vec![] })
+            .map(|row| row["metadata.name"].clone())
+            .collect()
+    };
+    let selective = condition(r#"metadata.name in ["b", "d", "e"]"#);
+    let mut seen = Vec::new();
+    let mut path = format!("/tables/convoys/rows?namespace=test&where={selective}&limit=2");
+    loop {
+        let page = messages(&router, &path, false).await;
+        let rows = names(&page);
+        let cursor = page.iter().find_map(|message| if let Message::Rows { cursor, .. } = message { cursor.clone() } else { None });
+        if cursor.is_some() {
+            assert_eq!(rows.len(), 2, "a page with more to come is full");
+        }
+        seen.extend(rows);
+        match cursor {
+            Some(cursor) => path = format!("/tables/convoys/rows?namespace=test&where={selective}&limit=2&cursor={cursor}"),
+            None => break,
+        }
+    }
+    assert_eq!(seen, [json!("b"), json!("d"), json!("e")]);
+    let unequal =
+        messages(&router, &format!("/tables/convoys/rows?namespace=test&where={}", condition(r#"status.phase != "Running""#)), false).await;
+    assert!(names(&unequal).is_empty(), "a null phase is unknown under !=");
+    let missing = messages(&router, &format!("/tables/convoys/rows?namespace=test&where={}", condition("!has(status.phase)")), false).await;
+    assert_eq!(names(&missing).len(), 5);
+}
+
 // Table reads inherit the exact user-caller gate of the resource routes.
 #[tokio::test]
 async fn tables_do_not_bypass_resource_caller_access() {
@@ -481,6 +522,15 @@ async fn served_tables_type_addresses_and_carry_enum_names() {
         for field in schema["fields"].as_array().unwrap() {
             let name = field["name"].as_str().unwrap();
             let column = stored.as_ref().and_then(|stored| stored.key.iter().chain(&stored.columns).find(|column| column.name == name));
+            // #4108: every scalar column is filterable; none is dropped for a path it cannot spell.
+            // A resource kind's labels are the one object filtered, as a map.
+            let filterable = (field["type"].as_str().is_some_and(|ty| !["object", "array"].contains(&ty)) && field["format"] != "binary")
+                || name == "metadata.labels";
+            assert_eq!(
+                field["whereOperators"].as_array().is_some_and(|ops| !ops.is_empty()),
+                filterable,
+                "{table}.{name} whereOperators: {field}"
+            );
             if field["type"] == "address" {
                 assert_eq!(column.map(|column| &column.ty), Some(&ColumnType::Interned(ADDRESS_DOMAIN)), "{table}.{name}");
                 addresses.push(format!("{table}.{name}"));

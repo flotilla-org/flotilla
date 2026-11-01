@@ -13,6 +13,7 @@ use crate::{ColumnDef, ColumnType, Table};
 pub struct Filterable {
     schema: Schema,
     columns: BTreeMap<Path, String>,
+    paths: BTreeMap<String, Path>,
 }
 
 impl Default for Filterable {
@@ -21,7 +22,7 @@ impl Default for Filterable {
         // `under` is defined on canonical text alone (§4.6 of the design note), so an address
         // literal must be canonical ADR 0066 text.
         schema.validate_addresses(|text| text.parse::<flotilla_address::Address>().map(drop).map_err(|error| error.to_string()));
-        Self { schema, columns: BTreeMap::new() }
+        Self { schema, columns: BTreeMap::new(), paths: BTreeMap::new() }
     }
 }
 
@@ -29,7 +30,8 @@ impl Filterable {
     /// Declares `column` as the field at `path`. A path that conflicts with another field is refused.
     pub fn declare(&mut self, column: &str, path: Path, ty: Type, nullable: bool) -> Result<(), rigging_condition::SchemaError> {
         self.schema.insert_field(path.clone(), ty, nullable)?;
-        self.columns.insert(path, column.to_owned());
+        self.columns.insert(path.clone(), column.to_owned());
+        self.paths.insert(column.to_owned(), path);
         Ok(())
     }
 
@@ -44,7 +46,7 @@ impl Filterable {
 
     /// The field path of a column, when the column can be filtered.
     pub fn path(&self, column: &str) -> Option<&Path> {
-        self.columns.iter().find(|(_, name)| *name == column).map(|(path, _)| path)
+        self.paths.get(column)
     }
 
     /// The field type of a column, when the column can be filtered.
@@ -98,9 +100,11 @@ impl Table {
             let name = column.name.as_str();
             let extends = names.iter().any(|other| name.strip_prefix(other).is_some_and(|rest| rest.starts_with('.')));
             let path = if extends { Path::new([name]) } else { Path::new(name.split('.')) };
-            // A name no path can spell (a character outside CEL's escaped identifiers) stays unfilterable.
+            // A name no path can spell (a character outside CEL's escaped identifiers) stays
+            // unfilterable; the daemon's served-tables test checks that no real column is one.
             if let Ok(path) = path {
-                let _ = filterable.declare(name, path, ty, column.nullable);
+                let declared = filterable.declare(name, path, ty, column.nullable);
+                debug_assert!(declared.is_ok(), "{}.{name}: {declared:?}", self.name);
             }
         }
         filterable

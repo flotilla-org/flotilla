@@ -57,6 +57,8 @@ fn refusal(error: CheckError, table: &Table) -> Failure {
             bad("type_mismatch", error)
         }
         CheckError::UnknownVariable(_) => bad("invalid_filter", format!("{error}; a string literal is quoted")),
+        // `CheckError` is `#[non_exhaustive]`: a variant rigging adds lands here until it is
+        // mapped above. Limits and shape errors, and an empty `in` list, are malformed filters.
         _ => bad("invalid_filter", error),
     }
 }
