@@ -119,6 +119,23 @@ async fn the_agent_is_driven_through_an_inward_exposure() {
     assert_eq!(adopted.env_vars().await.unwrap().get("TOKEN").map(String::as_str), Some("rotated"));
 }
 
+// #4173: the vessel environment flotilla reads is the provider's and its own
+// declarations, never the agent's pipeline defaults for the processes it starts.
+#[tokio::test]
+async fn the_vessel_environment_omits_the_agent_process_defaults() {
+    let fixture = Fixture::new();
+    let provider = fixture.provider();
+    let mut spec = spec();
+    spec.cloud_sandbox.as_mut().unwrap().env = BTreeMap::from([("TERM".to_string(), "xterm-ghostty".to_string())]);
+    let prepared = provider.prepare(&spec, &Default::default()).await.unwrap();
+    let handle = provider.provision(EnvironmentId::new("baseline"), &prepared, ProvisionOpts::default()).await.unwrap();
+    let environment = handle.env_vars().await.unwrap();
+    assert_eq!(environment.get("TERM").map(String::as_str), Some("xterm-ghostty"), "a declared value is kept");
+    for name in ["CI", "GIT_TERMINAL_PROMPT", "NO_COLOR", "PAGER", "GIT_PAGER", "DEBIAN_FRONTEND"] {
+        assert!(!environment.contains_key(name), "{name} is the agent's process default, not the vessel's");
+    }
+}
+
 // An agent that stops answering makes a running vessel Unknown, never Gone,
 // until it answers again.
 #[tokio::test]

@@ -13,7 +13,7 @@ use flotilla_agent::adapter::AgentAdapter;
 use flotilla_agent::adapter::AgentAdapterRegistry;
 use flotilla_agent::adapter::AgentLaunchRequest;
 use flotilla_agent::adapter::CapabilityTable;
-use flotilla_agent::{CLAUDE_CODE_HOOK_TOKEN_ENV, CLAUDE_CODE_HOOK_URL_ENV, FLOTILLA_CLI_ENV};
+use flotilla_agent::{CLAUDE_CODE_HOOK_TOKEN_ENV, CLAUDE_CODE_HOOK_URL_ENV};
 use flotilla_capability_contract::SessionCapabilitySource;
 use flotilla_credentials::crew_git_identity_environment;
 use flotilla_crew::reconcilers::terminal_session::{
@@ -45,7 +45,7 @@ use super::state::ControllerRuntimeState;
 use crate::blob_store::BlobDigest;
 use crate::blob_store::BlobStore;
 use crate::server::HookLaunch;
-use flotilla_agent::adapter::FLOTILLA_ENVIRONMENT_ID_ENV;
+use flotilla_agent::adapter::{CLAUDE_CODE_SHELL_ENV, FLOTILLA_ENVIRONMENT_ID_ENV};
 
 pub(super) struct PendingTerminalDelivery {
     pub(super) message_batch: Option<String>,
@@ -403,7 +403,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
             // declared or delivered environment claims.
             credential_env.retain(|(key, _)| key != FLOTILLA_ENVIRONMENT_ID_ENV);
         }
-        let (mut command, mut env, crew) = match &spec.source {
+        let (command, mut env, crew) = match &spec.source {
             TerminalSessionSource::Tool { command } => (command.clone(), credential_env.clone(), None),
             TerminalSessionSource::Agent { selector, brief, context, .. } => {
                 let mut materialized_brief = brief.clone();
@@ -494,15 +494,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 // loopback TCP, and in a Docker vessel through its agent's forward. SSH host
                 // and cloud vessels keep command hooks. The token binds the hooks to this terminal.
                 if requirement.adapter == "claude-code" {
-                    // A vessel's command hooks run the CLI by the path its session's `PATH` finds now,
-                    // before the login shell cleat starts can reset `PATH`. Temporary: remove once
-                    // sessions run with a declared environment and no login shell (#4173).
-                    if spec.env_ref != self.state.host_direct_environment_name {
-                        if let Some(cli) = place_cli(&*launch_runner()?, &credential_env).await {
-                            credential_env.retain(|(key, _)| key != FLOTILLA_CLI_ENV);
-                            credential_env.push((FLOTILLA_CLI_ENV.to_string(), cli));
-                        }
-                    }
+                    declare_claude_shell(&*launch_runner()?, &mut credential_env, name).await;
                     let hooks = if spec.env_ref == self.state.host_direct_environment_name {
                         self.host_direct_hooks(&context.namespace, name).await
                     } else if vessel.is_none() {
@@ -590,7 +582,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
             // variable. Every SSH host launch reaches here with its vessel:
             // without one it returned above.
             let bound = BoundLayer::delivered(&bound_material, &vessel_base(profile, &access.paths)?)?;
-            command = compose_session_environment(&mut env, &command, &access.paths, profile, bound)?;
+            compose_session_environment(&mut env, &access.paths, profile, bound)?;
         }
         // A dead generation may retain a recording with the old ID. Launch
         // under a fresh ID so cleat cannot resolve the name ambiguously, then
@@ -606,7 +598,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 pool_tags.push(flotilla_terminal::TerminalSessionTag::new("recognizer", &crew.adapter));
             }
         }
-        pool.ensure_session_with_size(&session_id, &command, &cwd, &env, &pool_tags, initial_size).await?;
+        // #4173: flotilla's own launches run with exactly their declared
+        // environment; no login shell rebuilds it from a profile.
+        pool.ensure_declared_session(&session_id, &command, &cwd, &env, &pool_tags, initial_size).await?;
         if recovered_from_lost {
             if let Err(error) = pool.retain_recovered_recording(name).await {
                 tracing::warn!(%error, session = name, "retain old cleat recording after recovery failed");
@@ -984,11 +978,28 @@ impl TerminalControllerRuntime {
 
 pub(super) const CREW_SESSION_SIZE: TerminalSize = TerminalSize::new(200, 50);
 
-/// The absolute path the session's `PATH`, or the place's own where the session
-/// declares none, resolves `flotilla` to; none where it finds no CLI.
-async fn place_cli(runner: &dyn CommandRunner, environment: &[(String, String)]) -> Option<String> {
+/// #4173: Claude Code's Bash tool runs in a declared shell, never one it picks from a
+/// `SHELL` the place may not declare or from passwd. A shell the session already
+/// declares is kept; otherwise it is the bash the session's `PATH` finds. Every kind
+/// takes it, host-direct included. Without one, Claude Code detects a shell itself.
+pub(super) async fn declare_claude_shell(runner: &dyn CommandRunner, environment: &mut Vec<(String, String)>, session: &str) {
+    if environment.iter().any(|(key, value)| key == CLAUDE_CODE_SHELL_ENV && !value.is_empty()) {
+        return;
+    }
+    match place_bash(runner, environment).await {
+        Some(bash) => {
+            environment.retain(|(key, _)| key != CLAUDE_CODE_SHELL_ENV);
+            environment.push((CLAUDE_CODE_SHELL_ENV.to_string(), bash));
+        }
+        None => warn!(%session, "no bash on the session's PATH; Claude Code chooses its own shell"),
+    }
+}
+
+/// The absolute path of the bash the session's `PATH`, or the place's own where the
+/// session declares none, finds; none where it finds no bash.
+async fn place_bash(runner: &dyn CommandRunner, environment: &[(String, String)]) -> Option<String> {
     let path = environment.iter().find(|(key, _)| key == "PATH").map_or("", |(_, path)| path.as_str());
-    let script = r#"if [ -n "$1" ]; then PATH=$1; fi; command -v flotilla"#;
+    let script = r#"if [ -n "$1" ]; then PATH=$1; fi; command -v bash"#;
     let found = runner.run("sh", &["-c", script, "sh", path], Path::new("/"), &ChannelLabel::Default).await.ok()?;
     let found = found.trim();
     found.starts_with('/').then(|| found.to_string())

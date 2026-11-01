@@ -895,6 +895,9 @@ pub struct EnsuredTerminalSession {
     pub cwd: ExecutionEnvironmentPath,
     pub env_vars: flotilla_terminal::TerminalEnvVars,
     pub initial_size: Option<flotilla_terminal::TerminalSize>,
+    /// Asked for with [`TerminalPool::ensure_declared_session`]: the command runs in
+    /// `sh -c` with exactly `env_vars`, and no login profile (#4173).
+    pub declared: bool,
 }
 
 impl Default for FakeTerminalPool {
@@ -934,6 +937,37 @@ impl FakeTerminalPool {
 
     pub async fn set_attach_preflight_error(&self, error: impl Into<String>) {
         *self.attach_preflight_error.lock().await = Some(error.into());
+    }
+
+    async fn record_session(
+        &self,
+        session_name: &str,
+        command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &flotilla_terminal::TerminalEnvVars,
+        initial_size: Option<flotilla_terminal::TerminalSize>,
+        declared: bool,
+    ) -> Result<(), String> {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.iter().any(|s| s.session_name == session_name) {
+            return Ok(());
+        }
+        self.ensured.lock().await.push(EnsuredTerminalSession {
+            session_name: session_name.to_string(),
+            command: command.to_string(),
+            cwd: cwd.clone(),
+            env_vars: env_vars.clone(),
+            initial_size,
+            declared,
+        });
+        sessions.push(flotilla_terminal::TerminalSession {
+            session_name: session_name.to_string(),
+            status: TerminalStatus::Running,
+            command: Some(command.to_string()),
+            working_directory: Some(cwd.clone()),
+            screen_activity: None,
+        });
+        Ok(())
     }
 }
 
@@ -978,25 +1012,19 @@ impl TerminalPool for FakeTerminalPool {
         _tags: &[flotilla_terminal::TerminalSessionTag],
         initial_size: Option<flotilla_terminal::TerminalSize>,
     ) -> Result<(), String> {
-        let mut sessions = self.sessions.lock().await;
-        if sessions.iter().any(|s| s.session_name == session_name) {
-            return Ok(());
-        }
-        self.ensured.lock().await.push(EnsuredTerminalSession {
-            session_name: session_name.to_string(),
-            command: command.to_string(),
-            cwd: cwd.clone(),
-            env_vars: env_vars.clone(),
-            initial_size,
-        });
-        sessions.push(flotilla_terminal::TerminalSession {
-            session_name: session_name.to_string(),
-            status: TerminalStatus::Running,
-            command: Some(command.to_string()),
-            working_directory: Some(cwd.clone()),
-            screen_activity: None,
-        });
-        Ok(())
+        self.record_session(session_name, command, cwd, env_vars, initial_size, false).await
+    }
+
+    async fn ensure_declared_session(
+        &self,
+        session_name: &str,
+        script: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &flotilla_terminal::TerminalEnvVars,
+        _tags: &[flotilla_terminal::TerminalSessionTag],
+        initial_size: Option<flotilla_terminal::TerminalSize>,
+    ) -> Result<(), String> {
+        self.record_session(session_name, script, cwd, env_vars, initial_size, true).await
     }
 
     fn attach_args(
