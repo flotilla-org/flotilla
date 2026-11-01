@@ -209,6 +209,11 @@ reboot clears and the next launch fills again (#4012):
 - Codex uses `<base>/agent-homes/<environment>/codex`, or a delivered Codex key's
   home. Workspace trust is seeded in that home's `config.toml`, and the host's
   existing Codex login (`auth.json`) is linked into it.
+- The harness itself is the stdlib layer's pin, delivered into the home
+  (`.flotilla/harness`), never a `claude` or `codex` the host has installed.
+  Admission and observation read the same pin (#4093): the host offers each
+  pinned harness whatever its `PATH` holds, version floors are checked against
+  the pin, and `fulfilment list` and `convoy explain` show the pinned version.
 - The session gets the crew image's harness environment (`DISABLE_AUTOUPDATER`,
   `DISABLE_INSTALLATION_CHECKS`, `GH_NO_UPDATE_NOTIFIER`, `LANG`), read from the
   stdlib image layers.

@@ -4710,6 +4710,11 @@ pub async fn placement_agent_adapters(
                 placement.metadata.name, host_label
             )
         })?;
+        // #4093: an SSH host's crews run the pinned harness delivered to them, so the host
+        // offers each pinned adapter whatever its PATH holds.
+        if ssh_host {
+            available_adapters.extend(flotilla_resources::stdlib::stdlib_harness_pins().into_keys());
+        }
         // #4037: an SSH host's Codex crews take a copy of its owning daemon's central
         // login, so the host offers Codex only while the owner publishes one.
         let central_login = status.capabilities.get(CODEX_CENTRAL_LOGIN_CAPABILITY).and_then(serde_json::Value::as_bool) == Some(true);

@@ -371,6 +371,7 @@ pub(super) fn spawn_local_fulfilment_probe_task(
                     scratch: &scratch,
                     observation: &observation,
                     harnesses: &harnesses,
+                    pinned_harnesses: &Default::default(),
                 },
                 &mut model_probes,
             )
@@ -440,6 +441,9 @@ pub(super) fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, name
                 warn!(%error, scratch = %scratch.display(), "cannot create the SSH fulfilment probe directory");
             }
             let harnesses = daemon.discovery_runtime().factories.harnesses(&BagEnvVars(&ssh.env_bag));
+            // #4093: the host's crews run the pinned harness delivered to them, so its
+            // facts report the pin, whatever the host has installed.
+            let pinned_harnesses = flotilla_resources::stdlib::stdlib_harness_pins();
             let observation = match ssh.preparer(Vec::new()).observation() {
                 Ok(observation) => observation,
                 Err(error) => {
@@ -461,6 +465,7 @@ pub(super) fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, name
                     scratch: &scratch,
                     observation: &observation,
                     harnesses: &harnesses,
+                    pinned_harnesses: &pinned_harnesses,
                 },
                 &mut model_probes,
             )

@@ -20,6 +20,9 @@ pub(crate) struct DetectionTarget<'a> {
     pub(crate) context: &'a ObservationContext,
     /// The harnesses to look for: the built-in ones and those registered adapters contribute.
     pub(crate) harnesses: &'a [Harness],
+    /// Adapter → version of the pinned harnesses this target's crews are given (#4093): an
+    /// SSH host's crews run the delivered pin, never what the host has installed.
+    pub(crate) pinned_harnesses: &'a BTreeMap<String, String>,
 }
 
 async fn run_in_realisation(
@@ -51,15 +54,19 @@ fn harness_version(stdout: &str) -> String {
         .to_string()
 }
 
-/// Source: the target provider's isolated harness --version output. No login or
-/// model request participates; an absent version leaves this harness unknown.
+/// Source: the pin of a harness the target's crews are given, else the target
+/// provider's isolated harness --version output. No login or model request
+/// participates; an absent version leaves this harness unknown.
 async fn harness_facts(target: &DetectionTarget<'_>, scratch: &Path) -> BTreeMap<String, HarnessFacts> {
-    let mut facts = BTreeMap::new();
-    let outputs = futures::future::join_all(
-        target.harnesses.iter().map(|harness| run_in_realisation(target, harness.binary, &["--version"], scratch)),
-    )
-    .await;
-    for (Harness { adapter: harness, .. }, output) in target.harnesses.iter().zip(outputs) {
+    let mut facts = target
+        .pinned_harnesses
+        .iter()
+        .map(|(adapter, version)| (adapter.clone(), HarnessFacts { version: version.clone(), models: BTreeMap::new() }))
+        .collect::<BTreeMap<_, _>>();
+    let probed = target.harnesses.iter().filter(|harness| !facts.contains_key(harness.adapter)).collect::<Vec<_>>();
+    let outputs =
+        futures::future::join_all(probed.iter().map(|harness| run_in_realisation(target, harness.binary, &["--version"], scratch))).await;
+    for (Harness { adapter: harness, .. }, output) in probed.into_iter().zip(outputs) {
         if let Ok(output) = output {
             let version = harness_version(&output.stdout);
             if output.success() && !version.is_empty() {
@@ -251,6 +258,7 @@ mod tests {
                 provider: provider.as_ref(),
                 context: &Default::default(),
                 harnesses: &built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
+                pinned_harnesses: &BTreeMap::new(),
             },
             false,
             runner.as_ref(),
@@ -268,6 +276,42 @@ mod tests {
         assert_eq!(state, ModelProbeState::default());
         assert_eq!(runner.calls.lock().expect("calls").len(), TOOLCHAINS.len() + built_in_harnesses(&TestEnvVars::default()).count());
         assert_eq!(runner.inference_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    // #4093: a target whose crews are given pinned harnesses reports the pins, and never
+    // runs the host's own binaries for them, even where it has a newer one installed.
+    #[tokio::test]
+    async fn pinned_harnesses_are_reported_at_their_pin_and_not_probed() {
+        let runner = Arc::new(NoInference::default());
+        let provider = command_provider(EnvironmentInput::HostDirect, runner.clone());
+        let spec = FulfilmentKindSpec::builder()
+            .host_ref("ssh-host".into())
+            .pool("cleat".into())
+            .realisation(FulfilmentRealisation::HostDirect)
+            .build();
+        let pinned = BTreeMap::from([("claude-code".to_string(), "2.1.287".to_string())]);
+        let facts = probe_kind(
+            &spec,
+            DetectionTarget {
+                image: None,
+                provider: provider.as_ref(),
+                context: &Default::default(),
+                harnesses: &built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
+                pinned_harnesses: &pinned,
+            },
+            true,
+            runner.as_ref(),
+            &TestEnvVars::default(),
+            Path::new("/tmp/probe"),
+            &mut Default::default(),
+        )
+        .await
+        .expect("facts");
+        assert_eq!(facts.harnesses["claude-code"].version, "2.1.287", "the pin, not the installed 2.1.300");
+        assert_eq!(facts.harnesses["codex"].version, "0.160.0", "an unpinned harness is still probed");
+        let calls = runner.calls.lock().expect("calls").clone();
+        assert!(!calls.contains(&"claude".to_string()), "{calls:?}");
+        assert!(calls.contains(&"codex".to_string()), "{calls:?}");
     }
 
     // A harness a registered adapter contributes is looked for beside the built-in ones,
@@ -288,7 +332,13 @@ mod tests {
         ] {
             let facts = probe_kind(
                 &spec,
-                DetectionTarget { image: None, provider: provider.as_ref(), context: &Default::default(), harnesses: &harnesses },
+                DetectionTarget {
+                    image: None,
+                    provider: provider.as_ref(),
+                    context: &Default::default(),
+                    harnesses: &harnesses,
+                    pinned_harnesses: &BTreeMap::new(),
+                },
                 true,
                 runner.as_ref(),
                 &TestEnvVars::new([("HOME", "/fake-operator")]),
@@ -324,6 +374,7 @@ mod tests {
                     provider: provider.as_ref(),
                     context: &Default::default(),
                     harnesses: &built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
+                    pinned_harnesses: &BTreeMap::new(),
                 },
                 true,
                 runner.as_ref(),
@@ -403,6 +454,7 @@ mod tests {
                 provider: &provider,
                 context: &Default::default(),
                 harnesses: &built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
+                pinned_harnesses: &BTreeMap::new(),
             },
             true,
             runner.as_ref(),
