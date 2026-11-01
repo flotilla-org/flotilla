@@ -42,6 +42,14 @@ impl std::fmt::Debug for TerminalReadSlot {
     }
 }
 
+#[derive(Default)]
+struct AttentionSlot(std::sync::OnceLock<std::sync::Arc<dyn flotilla_resources::attentions::Attentions>>);
+impl std::fmt::Debug for AttentionSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AttentionSlot")
+    }
+}
+
 /// Cloneable handle chosen by the composition root.
 #[derive(Debug, Clone)]
 pub struct ResourceBackend {
@@ -50,13 +58,20 @@ pub struct ResourceBackend {
     terminal_reads: std::sync::Arc<TerminalReadSlot>,
     terminal_launches:
         std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<dyn flotilla_resources::terminal_launches::TerminalLaunches>>>>,
+    attentions: std::sync::Arc<AttentionSlot>,
 }
 impl ResourceBackend {
     pub fn new(store: impl Into<Self>) -> Self {
         store.into()
     }
     pub fn from_arc(store: std::sync::Arc<dyn crate::Store>) -> Self {
-        Self { store, engines: EngineSlot::default(), terminal_reads: Default::default(), terminal_launches: Default::default() }
+        Self {
+            store,
+            engines: EngineSlot::default(),
+            terminal_reads: Default::default(),
+            terminal_launches: Default::default(),
+            attentions: Default::default(),
+        }
     }
     /// Serves the kinds `records` names from it, the engine's, behind `[primitives]`: every handle
     /// cloned or derived from this backend reads and writes them there. A daemon runtime restarted
@@ -76,6 +91,19 @@ impl ResourceBackend {
     }
     pub fn terminal_readings(&self) -> Option<std::sync::Arc<dyn LifecycleReads>> {
         self.terminal_reads.0.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// Installs the engine's attentions behind `[primitives]`; refused if some are installed already.
+    pub fn install_attentions(&self, attentions: std::sync::Arc<dyn flotilla_resources::attentions::Attentions>) -> Result<(), String> {
+        self.attentions.0.set(attentions).map_err(|_| "attentions are already installed".to_owned())
+    }
+
+    /// The attentions: the engine's once installed, the old store's before.
+    pub fn attentions(&self) -> std::sync::Arc<dyn flotilla_resources::attentions::Attentions> {
+        match self.attentions.0.get() {
+            Some(engine) => std::sync::Arc::clone(engine),
+            None => std::sync::Arc::new(crate::OldStoreAttentions::new(self.clone())),
+        }
     }
 
     /// Installed with the local engine; every clone shares the same launch writer.
@@ -117,6 +145,7 @@ impl ResourceBackend {
             engines: self.engines.clone(),
             terminal_reads: self.terminal_reads.clone(),
             terminal_launches: self.terminal_launches.clone(),
+            attentions: self.attentions.clone(),
         }
     }
     pub fn read_observer(&self) -> Option<&dyn crate::ReadObserver> {
@@ -134,6 +163,7 @@ impl ResourceBackend {
             engines: self.engines.clone(),
             terminal_reads: self.terminal_reads.clone(),
             terminal_launches: self.terminal_launches.clone(),
+            attentions: self.attentions.clone(),
         }
     }
     pub fn local_root(&self) -> Result<NodeId, ResourceError> {
