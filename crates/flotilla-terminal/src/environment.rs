@@ -34,6 +34,17 @@ const TERMINAL_RUNTIME_KEYS: &[&str] = &[
 ];
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
+const DEFAULT_LANG: &str = "C.UTF-8";
+
+/// #4173: a session has a UTF-8 locale. `LANG` defaults where neither it nor
+/// `LC_ALL` is declared; cloud images often declare none. Sessions only: the
+/// Cleat client keeps exactly the discovered values.
+fn declare_locale(environment: &mut BTreeMap<String, String>) {
+    if !environment.contains_key("LANG") && !environment.contains_key("LC_ALL") {
+        environment.insert("LANG".to_string(), DEFAULT_LANG.to_string());
+    }
+}
+
 /// Declared environment for terminal children and Cleat clients.
 /// Public so core's `cleat_roll` can reuse the same controlled runner.
 pub struct ControlledTerminalEnvironment {
@@ -46,16 +57,18 @@ impl ControlledTerminalEnvironment {
         let mut host = BTreeMap::from([("PATH".to_string(), DEFAULT_PATH.to_string())]);
         if let Some(configured) = bag.provisioned_environment() {
             host.extend(configured.iter().map(|(key, value)| (key.clone(), value.clone())));
-            let host: TerminalEnvVars = host.into_iter().collect();
-            return Self { client: host.clone(), host };
+            let client: TerminalEnvVars = host.clone().into_iter().collect();
+            declare_locale(&mut host);
+            return Self { client, host: host.into_iter().collect() };
         }
         for &key in host_environment_keys() {
             if let Some(value) = bag.find_env_var(key) {
                 host.insert(key.to_string(), value.to_string());
             }
         }
+        let mut client: TerminalEnvVars = host.clone().into_iter().collect();
+        declare_locale(&mut host);
         let mut host: TerminalEnvVars = host.into_iter().collect();
-        let mut client = host.clone();
         for &key in CLEAT_CLIENT_KEYS {
             if let Some(value) = bag.find_env_var(key) {
                 client.push((key.to_string(), value.to_string()));
@@ -203,6 +216,8 @@ mod tests {
             Some("host")
         } else if key == "PATH" {
             Some(DEFAULT_PATH)
+        } else if key == "LANG" {
+            Some(DEFAULT_LANG)
         } else {
             None
         };
