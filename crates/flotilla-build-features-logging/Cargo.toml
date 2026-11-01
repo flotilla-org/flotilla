@@ -12,11 +12,12 @@ lazy_static = { version = "1", default-features = false, features = ["spin_no_st
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
 once_cell = { version = "1", features = ["std", "critical-section", "portable-atomic", "race"] }
+regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["alloc", "dfa-build", "dfa-onepass", "dfa-search", "hybrid", "meta", "nfa-backtrack", "nfa-pikevm", "nfa-thompson", "perf-inline", "perf-literal", "perf-literal-multisubstring", "perf-literal-substring", "std", "syntax", "unicode", "unicode-age", "unicode-bool", "unicode-case", "unicode-gencat", "unicode-perl", "unicode-script", "unicode-segment", "unicode-word-boundary"] }
 regex-syntax = { version = "0.8" }
 serde = { version = "1", features = ["derive"] }
 serde_core = { version = "1", features = ["alloc"] }
-serde_json = { version = "1", features = ["alloc", "raw_value"] }
+serde_json = { version = "1", features = ["alloc", "float_roundtrip", "raw_value"] }
 smallvec = { version = "1", default-features = false, features = ["const_generics", "const_new"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }

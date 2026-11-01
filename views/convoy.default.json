@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "view": {
+    "rows": {
+      "sort": [{ "id": "metadata.creationTimestamp", "direction": "descending" }]
+    },
+    "cols": {
+      "hidden": [
+        "metadata.resourceVersion",
+        "metadata.deletionTimestamp",
+        "metadata.labels",
+        "metadata.annotations",
+        "status.conditions",
+        "spec",
+        "status"
+      ]
+    }
+  },
+  "order": {
+    "cols": ["metadata.name", "status.phase", "metadata.namespace", "metadata.creationTimestamp"]
+  }
+}

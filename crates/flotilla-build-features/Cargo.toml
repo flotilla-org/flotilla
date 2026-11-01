@@ -11,6 +11,7 @@ publish = false
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
+syn3 = { package = "syn", version = "3", features = ["clone-impls", "default", "derive", "full", "parsing", "printing", "proc-macro", "visit-mut"] }
 
 [lints]
 workspace = true

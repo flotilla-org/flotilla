@@ -102,6 +102,12 @@ rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", rev = "8
 # The condition language (#4108). Pinned ahead of the other rigging crates, which drydock's pin holds back; it
 # depends on no other rigging crate.
 rigging-condition = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
+binnacle-core = { git = "https://github.com/flotilla-org/binnacle", rev = "d842ba64b301bb4ac9fba76c92f59bb1c0f1023b" }
+binnacle-described = { git = "https://github.com/flotilla-org/binnacle", rev = "d842ba64b301bb4ac9fba76c92f59bb1c0f1023b" }
+binnacle-described-http = { git = "https://github.com/flotilla-org/binnacle", rev = "d842ba64b301bb4ac9fba76c92f59bb1c0f1023b" }
+binnacle-format = { git = "https://github.com/flotilla-org/binnacle", rev = "d842ba64b301bb4ac9fba76c92f59bb1c0f1023b" }
+binnacle-layout = { git = "https://github.com/flotilla-org/binnacle", rev = "d842ba64b301bb4ac9fba76c92f59bb1c0f1023b" }
+binnacle-ratatui = { git = "https://github.com/flotilla-org/binnacle", rev = "d842ba64b301bb4ac9fba76c92f59bb1c0f1023b", features = ["described", "clap"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde_yml = "0.0.12"
 tokio-util = "0.7"
@@ -165,6 +171,13 @@ flotilla-protocol = { path = "crates/flotilla-protocol" }
 flotilla-resources = { path = "crates/flotilla-resources" }
 flotilla-tui = { path = "crates/flotilla-tui", optional = true }
 flotilla-cli = { path = "crates/flotilla-cli" }
+# #4106: `flotilla table` renders described tables through binnacle.
+binnacle-core = { workspace = true }
+binnacle-described = { workspace = true }
+binnacle-described-http = { workspace = true }
+binnacle-format = { workspace = true }
+binnacle-layout = { workspace = true }
+binnacle-ratatui = { workspace = true }
 ratatui = { version = "0.30", optional = true }
 tokio = { workspace = true }
 color-eyre = { workspace = true }

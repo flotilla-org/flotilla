@@ -265,6 +265,98 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "binnacle-core"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/binnacle?rev=d842ba64b301bb4ac9fba76c92f59bb1c0f1023b#d842ba64b301bb4ac9fba76c92f59bb1c0f1023b"
+
+[[package]]
+name = "binnacle-described"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/binnacle?rev=d842ba64b301bb4ac9fba76c92f59bb1c0f1023b#d842ba64b301bb4ac9fba76c92f59bb1c0f1023b"
+dependencies = [
+ "binnacle-core",
+ "binnacle-format",
+ "binnacle-group",
+ "binnacle-layout",
+ "binnacle-memory",
+ "ciborium",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "binnacle-described-http"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/binnacle?rev=d842ba64b301bb4ac9fba76c92f59bb1c0f1023b#d842ba64b301bb4ac9fba76c92f59bb1c0f1023b"
+dependencies = [
+ "binnacle-described",
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "tokio",
+]
+
+[[package]]
+name = "binnacle-format"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/binnacle?rev=d842ba64b301bb4ac9fba76c92f59bb1c0f1023b#d842ba64b301bb4ac9fba76c92f59bb1c0f1023b"
+dependencies = [
+ "serde_json",
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "binnacle-group"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/binnacle?rev=d842ba64b301bb4ac9fba76c92f59bb1c0f1023b#d842ba64b301bb4ac9fba76c92f59bb1c0f1023b"
+dependencies = [
+ "binnacle-core",
+ "binnacle-memory",
+]
+
+[[package]]
+name = "binnacle-layout"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/binnacle?rev=d842ba64b301bb4ac9fba76c92f59bb1c0f1023b#d842ba64b301bb4ac9fba76c92f59bb1c0f1023b"
+dependencies = [
+ "binnacle-core",
+ "ciborium",
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "binnacle-memory"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/binnacle?rev=d842ba64b301bb4ac9fba76c92f59bb1c0f1023b#d842ba64b301bb4ac9fba76c92f59bb1c0f1023b"
+dependencies = [
+ "binnacle-core",
+ "regex",
+]
+
+[[package]]
+name = "binnacle-ratatui"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/binnacle?rev=d842ba64b301bb4ac9fba76c92f59bb1c0f1023b#d842ba64b301bb4ac9fba76c92f59bb1c0f1023b"
+dependencies = [
+ "binnacle-core",
+ "binnacle-described",
+ "binnacle-format",
+ "binnacle-group",
+ "binnacle-layout",
+ "binnacle-memory",
+ "clap",
+ "ratatui",
+ "regex",
+ "serde_json",
+ "signal-hook",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -430,6 +522,33 @@ dependencies = [
  "serde",
  "wasm-bindgen",
  "windows-link",
+]
+
+[[package]]
+name = "ciborium"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42e69ffd6f0917f5c029256a24d0161db17cea3997d185db0d35926308770f0e"
+dependencies = [
+ "ciborium-io",
+ "ciborium-ll",
+ "serde",
+]
+
+[[package]]
+name = "ciborium-io"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05afea1e0a06c9be33d539b876f1ce3692f4afea2cb41f740e7743225ed1c757"
+
+[[package]]
+name = "ciborium-ll"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9"
+dependencies = [
+ "ciborium-io",
+ "half",
 ]
 
 [[package]]
@@ -703,6 +822,12 @@ checksum = "acdd7c62a3665c7f6830a51635d9ac9b23ed385797f70a83bb8bafe9c572ab2b"
 dependencies = [
  "winapi",
 ]
+
+[[package]]
+name = "crunchy"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crypto-bigint"
@@ -1103,6 +1228,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
+name = "dyn-clone"
+version = "1.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
+
+[[package]]
 name = "ecdsa"
 version = "0.16.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1330,6 +1461,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "binnacle-core",
+ "binnacle-described",
+ "binnacle-described-http",
+ "binnacle-format",
+ "binnacle-layout",
+ "binnacle-ratatui",
  "bon",
  "chrono",
  "clap",
@@ -1539,6 +1676,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -1574,6 +1712,7 @@ dependencies = [
  "sha2",
  "slab",
  "subtle",
+ "zerocopy",
  "zeroize",
 ]
 
@@ -1630,6 +1769,7 @@ dependencies = [
  "tower-http 0.6.8",
  "tracing",
  "tracing-core",
+ "zerocopy",
  "zeroize",
 ]
 
@@ -1675,6 +1815,7 @@ dependencies = [
  "log",
  "memchr",
  "once_cell",
+ "regex",
  "regex-automata",
  "regex-syntax",
  "serde",
@@ -4163,6 +4304,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "half"
+version = "2.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
+dependencies = [
+ "cfg-if",
+ "crunchy",
+ "zerocopy",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5927,6 +6079,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ref-cast"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e440fb4e4b4147295338efb76001ab9e4efc0e5839df2c47fc5ac2381d365c3"
+dependencies = [
+ "ref-cast-impl",
+]
+
+[[package]]
+name = "ref-cast-impl"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92ecd8964f8453721699a1ed72037b0db49ce2f5a5138486ee89bed6f67cdf3a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
+]
+
+[[package]]
 name = "regex"
 version = "1.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6374,6 +6546,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "schemars"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab508826f74a77ca9d5aba6ff19b522583ee3eaf28a19384ff3d0e5835fadf6e"
+dependencies = [
+ "dyn-clone",
+ "ref-cast",
+ "schemars_derive",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "schemars_derive"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1c3a92094fa7d61aa124645844facb6b554dfc797136d0f5fd1f890e2bffc69"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde_derive_internals",
+ "syn 3.0.6",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6461,6 +6658,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "serde_derive_internals"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f852137cce035d6a4df67ccce505ff6b3e9fd3a10e3e52b24dc71e650bb1a9bd"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
 ]
 
 [[package]]
