@@ -79,6 +79,7 @@ add_post_install_fixture() {
 if [[ "\${1:-}" == --socket && "\${3:-}" == fleet && "\${4:-}" == check ]]; then
   if [[ -n "\${FLEET_CHECK_LOG:-}" ]]; then printf '%s|%s|%s\\n' "\$0" "\$*" "\${FLOTILLA_CONTAINED_HOST_DAEMON:-}" >>"\$FLEET_CHECK_LOG"; fi
   if [[ "\${FLEET_HEALTH_FAIL_FOR:-}" == "$2" ]]; then printf 'fixture readiness failure\\n' >&2; exit 1; fi
+  if [[ -n "\${FLEET_HEALTH_GATE:-}" && ! -e "\${FLEET_HEALTH_GATE:-}" ]]; then exit 1; fi
   exit 0
 fi
 if [[ "\${1:-}" == --socket && "\${3:-}" == fleet && "\${4:-}" == spread ]]; then
@@ -178,6 +179,14 @@ if [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then
 fi
 if [[ "${1:-}" == --socket && "${3:-}" == resource && "${4:-}" == validate ]]; then
   [[ "${FLEET_VALIDATE_FAIL_FOR:-}" != "$(basename "$(dirname "$(dirname "$0")")")" ]] || exit 1
+  if [[ -n "${WINDOW_STATE_LOG:-}" ]]; then
+    {
+      [[ ! -e "$XDG_CONFIG_HOME/flotilla/run/install-in-progress" ]] || echo marker
+      [[ -f "$LAUNCHCTL_STATE.loaded" ]] || echo unloaded
+      cmp -s "$FLEET_INSTALL_ROOT/tcc/bin/flotilla" "$FLEET_INSTALL_ROOT/current/bin/flotilla" || echo stale-tcc
+      echo validated
+    } >>"$WINDOW_STATE_LOG"
+  fi
 fi
 SH
     fi
@@ -366,6 +375,7 @@ case "$1" in
   kickstart)
     [[ -f "$LAUNCHCTL_STATE.loaded" ]] || exit 1
     printf '%s\n' "$current" >"$LAUNCHCTL_STATE.running"
+    if [[ "${ABORT_AT_KICKSTART:-0}" == 1 ]]; then kill -KILL "$PPID"; fi
     ;;
 esac
 if [[ "$1" == print-disabled ]]; then
@@ -844,6 +854,69 @@ for abort_signal in TERM INT; do
   test -f "$darwin_home/launchctl-state.running" || fail 'aborted handoff left daemon down'
   test "$(cat "$darwin_home/launchctl-state.running")" = "releases/$generation_one" || fail 'recovery ran the wrong generation'
 done
+
+darwin_root="$darwin_home/.local/opt/flotilla-fleet"
+darwin_marker="$darwin_home/.config/flotilla/run/install-in-progress"
+darwin_window_lock="$darwin_home/.config/flotilla/run/install-window.lock"
+if ABORT_AFTER_BOOTOUT=1 ABORT_SIGNAL=KILL run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-killed.out" 2>&1; then
+  fail 'killed Darwin install succeeded'
+fi
+test -f "$darwin_marker" || fail 'killed installer left no marker to reclaim'
+test ! -f "$darwin_home/launchctl-state.loaded" || fail 'killed installer fixture left the agent loaded'
+chmod u+w "$darwin_root/tcc/bin/flotilla"
+printf 'partial payload\n' >"$darwin_root/tcc/bin/flotilla"
+
+printf 'fleet_root=%s\n' "$test_root/other-fleet-root" >"$darwin_marker"
+: >"$test_root/launchctl.log"
+if run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-foreign-window.out" 2>&1; then
+  fail 'retry reclaimed a window abandoned by another fleet root'
+fi
+grep -Fq "rerunning fleet-install with FLEET_INSTALL_ROOT=$test_root/other-fleet-root" "$test_root/darwin-foreign-window.out" \
+  || fail 'foreign abandoned window did not name its fleet root'
+test -f "$darwin_marker" || fail 'foreign abandoned window lost its marker'
+printf 'fleet_root=%s\n' "$darwin_root" >"$darwin_marker"
+
+exec 7>>"$darwin_window_lock"
+python3 "$repo_root/ci/fleet-candidates/generation_validation.py" lock-window -- 7
+if run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-held-window.out" 2>&1 7>&-; then
+  fail 'retry reopened an install window another installer holds'
+fi
+exec 7>&-
+grep -Fq 'holds the daemon install window' "$test_root/darwin-held-window.out" || fail 'held window refusal was unclear'
+test -f "$darwin_marker" || fail 'held window lost its marker'
+if grep -Ev '^print-disabled ' "$test_root/launchctl.log" | grep -q .; then fail 'retry touched launchd while the window was held'; fi
+
+: >"$test_root/window-state.log"
+WINDOW_STATE_LOG="$test_root/window-state.log" run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-reclaimed.out" 2>&1 \
+  || fail 'abandoned install window needed manual recovery'
+grep -Fq 'recovering an interrupted daemon install window' "$test_root/darwin-reclaimed.out" || fail 'reclaim was not reported'
+test "$(cat "$test_root/window-state.log")" = validated \
+  || fail "live-store validation ran before the abandoned window recovered: $(cat "$test_root/window-state.log")"
+test ! -e "$darwin_marker" || fail 'reclaimed install leaked marker'
+test "$(cat "$darwin_home/launchctl-state.running")" = "releases/$generation_two" || fail 'reclaimed install ran the wrong generation'
+assert_darwin_tcc_payload "$generation_two"
+
+health_gate="$test_root/darwin-health-gate"
+if FLEET_HEALTH_GATE="$health_gate" ABORT_AT_KICKSTART=1 run_darwin_installer "$darwin_home" "$generation_one" >"$test_root/darwin-orphaned-watchdog.out" 2>&1; then
+  fail 'installer killed during restart succeeded'
+fi
+test -f "$darwin_marker" || fail 'installer killed during restart left no marker'
+: >"$test_root/launchctl.log"
+if run_darwin_installer "$darwin_home" "$generation_one" >"$test_root/darwin-watchdog-window.out" 2>&1; then
+  fail 'retry reopened the window an orphaned health watchdog holds'
+fi
+grep -Fq 'holds the daemon install window' "$test_root/darwin-watchdog-window.out" || fail 'watchdog-held refusal was unclear'
+test -f "$darwin_marker" || fail 'watchdog-held window lost its marker'
+if grep -Ev '^print-disabled ' "$test_root/launchctl.log" | grep -q .; then fail 'retry touched launchd while the watchdog held the window'; fi
+touch "$health_gate"
+python3 -c 'import fcntl, sys; fcntl.flock(open(sys.argv[1], "a"), fcntl.LOCK_EX)' "$darwin_window_lock"
+grep -Fq "generation $generation_one confirmed healthy" "$darwin_root"/.confirmation.*.log || fail 'orphaned watchdog did not confirm'
+run_darwin_installer "$darwin_home" "$generation_one" >"$test_root/darwin-after-watchdog.out" 2>&1 \
+  || fail 'window released by the watchdog was not reclaimed'
+grep -Fq 'recovering an interrupted daemon install window' "$test_root/darwin-after-watchdog.out" || fail 'post-watchdog reclaim was not reported'
+test ! -e "$darwin_marker" || fail 'post-watchdog reclaim leaked marker'
+test "$(cat "$darwin_home/launchctl-state.running")" = "releases/$generation_one" || fail 'post-watchdog reclaim ran the wrong generation'
+assert_darwin_tcc_payload "$generation_one"
 
 # A launchd recovery error must be reported, preserve the selection, and fail
 # installation. Retrying the current generation after launchd recovers is safe.

@@ -14,6 +14,7 @@ readonly LAUNCH_AGENT_LABEL="work.flotilla.flotillad"
 readonly DAEMON_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/flotilla"
 readonly DAEMON_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/flotilla"
 readonly DAEMON_INSTALL_MARKER="$DAEMON_CONFIG_DIR/run/install-in-progress"
+readonly DAEMON_INSTALL_WINDOW_LOCK="$DAEMON_CONFIG_DIR/run/install-window.lock"
 readonly DAEMON_SOCKET="$DAEMON_CONFIG_DIR/run/flotilla.sock"
 readonly LAUNCH_LOG_DIR="$HOME/Library/Logs/flotilla"
 readonly RELEASES_DIR="$FLEET_ROOT/releases"
@@ -44,6 +45,7 @@ INSTALL_LOCK_PATH=""
 INSTALL_LOCK_OWNER=""
 INSTALL_LOCK_HELD=0
 DAEMON_INSTALL_MARKER_HELD=0
+DAEMON_INSTALL_WINDOW_OPEN=0
 DAEMON_SERVICE_DISABLED=0
 DARWIN_RECOVERY_GENERATION=""
 CONFIRMATION_PID=""
@@ -510,27 +512,82 @@ write_launchd_agent() {
   mv -f "$temporary" "$plist"
 }
 
+# Fd 9 holds this config's install-window flock for the whole replacement window.
+# Children inherit it, so a detached health watchdog keeps the window owned after
+# this process dies; the kernel releases it only when its last holder exits.
+lock_install_window() {
+  if ((!DAEMON_INSTALL_WINDOW_OPEN)); then
+    mkdir -p "$(dirname "$DAEMON_INSTALL_WINDOW_LOCK")"
+    exec 9>>"$DAEMON_INSTALL_WINDOW_LOCK"
+    DAEMON_INSTALL_WINDOW_OPEN=1
+  fi
+  python3 "$GENERATION_VALIDATOR" lock-window -- 9 && return 0
+  unlock_install_window
+  return 1
+}
+
+unlock_install_window() {
+  if ((DAEMON_INSTALL_WINDOW_OPEN)); then
+    exec 9>&-
+    DAEMON_INSTALL_WINDOW_OPEN=0
+  fi
+}
+
 end_darwin_install_window() {
   if ((DAEMON_INSTALL_MARKER_HELD)); then
     rm -f -- "$DAEMON_INSTALL_MARKER"
     DAEMON_INSTALL_MARKER_HELD=0
   fi
+  unlock_install_window
 }
 
-prepare_darwin_daemon_service() {
-  [[ "$PLATFORM" == darwin-* ]] || return 0
+read_darwin_service_disabled() {
   command -v launchctl >/dev/null || die "cannot install $LAUNCH_AGENT_LABEL: launchctl is not available"
-  local domain="gui/$(id -u)"
   local disabled_services
-  disabled_services="$(launchctl print-disabled "$domain")" \
+  disabled_services="$(launchctl print-disabled "gui/$(id -u)")" \
     || die "cannot determine whether $LAUNCH_AGENT_LABEL is disabled"
   if grep -Fq "\"$LAUNCH_AGENT_LABEL\" => true" <<<"$disabled_services"; then
     DAEMON_SERVICE_DISABLED=1
   fi
+}
+
+# A marker whose window lock is free was left by an installer that died
+# uncatchably. Restore the service it interrupted before clients may spawn, and
+# before live-store validation needs that daemon.
+reclaim_install_window() {
+  [[ -e "$DAEMON_INSTALL_MARKER" ]] || return 0
+  lock_install_window \
+    || die "another fleet-install or its health watchdog holds the daemon install window ($DAEMON_INSTALL_MARKER); retry after it finishes"
+  if [[ ! -e "$DAEMON_INSTALL_MARKER" ]]; then
+    unlock_install_window
+    return 0
+  fi
+  local owner
+  owner="$(python3 "$GENERATION_VALIDATOR" window-owner -- "$DAEMON_INSTALL_MARKER")" \
+    || die "cannot read the abandoned daemon install marker $DAEMON_INSTALL_MARKER"
+  if [[ -n "$owner" && "$owner" != "$FLEET_ROOT" ]]; then
+    die "the fleet-install for $owner abandoned the daemon install window ($DAEMON_INSTALL_MARKER); recover it by rerunning fleet-install with FLEET_INSTALL_ROOT=$owner"
+  fi
+  printf 'fleet-install: recovering an interrupted daemon install window\n'
+  if [[ "$PLATFORM" == darwin-* && -n "$(current_generation)" ]]; then
+    read_darwin_service_disabled
+    restart_darwin_daemon_service \
+      || die "could not restore the interrupted launch agent; bootstrap $LAUNCH_AGENT_DIR/$LAUNCH_AGENT_LABEL.plist and retry fleet-install"
+  fi
+  DAEMON_INSTALL_MARKER_HELD=1
+  end_darwin_install_window
+}
+
+prepare_darwin_daemon_service() {
+  [[ "$PLATFORM" == darwin-* ]] || return 0
+  local domain="gui/$(id -u)"
+  read_darwin_service_disabled
+  lock_install_window \
+    || die 'another fleet-install or its health watchdog holds the daemon install window; retry after it finishes'
   # Publish under the same flock used by clients. Previously admitted spawns
   # finish before bootout; later contenders recheck the marker under that lock.
   DAEMON_INSTALL_MARKER_HELD=1
-  python3 "$GENERATION_VALIDATOR" begin-install -- "$DAEMON_SOCKET" "$DAEMON_INSTALL_MARKER" \
+  python3 "$GENERATION_VALIDATOR" begin-install -- "$DAEMON_SOCKET" "$DAEMON_INSTALL_MARKER" "$FLEET_ROOT" \
     || die 'could not establish daemon install window'
   # Unload before publishing the refreshed plist. Enabled clients then defer
   # to launchd, whose kickstart cannot race the generation flip while the job
@@ -707,7 +764,7 @@ start_confirmation_watchdog() {
   CONFIRMATION_LOG="$FLEET_ROOT/.confirmation.$token.log"
   FLEET_INSTALL_STARTUP_SINCE="$(startup_timestamp)" || die 'cannot start health confirmation without a startup timestamp'
   export FLEET_INSTALL_STARTUP_SINCE
-  nohup "$installer" __confirm "$generation" "$rollback_generation" "$token" >"$CONFIRMATION_LOG" 2>&1 </dev/null &
+  FLEET_INSTALL_WINDOW_INHERITED="$DAEMON_INSTALL_WINDOW_OPEN" nohup "$installer" __confirm "$generation" "$rollback_generation" "$token" >"$CONFIRMATION_LOG" 2>&1 </dev/null &
   CONFIRMATION_PID=$!
 }
 
@@ -831,6 +888,7 @@ activate_staged_generation() {
   local release="$RELEASES_DIR/$generation"
   host_preflight
   make_work_dir
+  reclaim_install_window
   [[ -d "$release" ]] || die "staged generation is missing: $generation"
   [[ -f "$release/.generation.json" ]] || die "staged generation has no verified generation metadata: $generation"
   verify_installed_release "$release" "$release/.generation.json"
@@ -1023,6 +1081,7 @@ rollback() {
   require_generation_validator
   host_preflight
   acquire_install_lock
+  reclaim_install_window
   [[ -L "$CURRENT_LINK" ]] || die 'no current generation to roll back'
   [[ -L "$PREVIOUS_LINK" ]] || die 'no previous generation to roll back to'
   local current previous
@@ -1146,6 +1205,8 @@ main() {
     [[ $# -eq 4 ]] || usage
     PLATFORM="$(host_platform)"
     CONFIRMATION_DONE="$FLEET_ROOT/.confirmation.$4.log.done"
+    DAEMON_INSTALL_WINDOW_OPEN="${FLEET_INSTALL_WINDOW_INHERITED:-0}"
+    unset FLEET_INSTALL_WINDOW_INHERITED
     confirmation_watchdog "$2" "$3" "$4"
     return
   fi

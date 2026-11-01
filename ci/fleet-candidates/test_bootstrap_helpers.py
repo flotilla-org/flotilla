@@ -95,12 +95,41 @@ class BootstrapHelperTests(unittest.TestCase):
                      patch.object(validation.time, "monotonic", side_effect=ticks), \
                      patch.object(validation.time, "sleep"):
                     if settle:
-                        validation.begin_daemon_install(socket, marker)
-                        self.assertTrue(Path(marker).is_file())
+                        validation.begin_daemon_install(socket, marker, "/fleet")
+                        self.assertEqual(validation.install_window_owner(marker), "/fleet")
                     else:
                         with self.assertRaisesRegex(ValueError, "spawn lock did not settle"):
-                            validation.begin_daemon_install(socket, marker)
+                            validation.begin_daemon_install(socket, marker, "/fleet")
                         self.assertFalse(Path(marker).exists())
+
+    @unittest.skipUnless(os.name == "posix", "macOS bootstrap flock")
+    def test_install_window_lock_follows_open_descriptors(self):
+        def lock(fd):
+            return subprocess.run([sys.executable, validation.__file__, "lock-window", "--", str(fd)],
+                                  pass_fds=(fd,), capture_output=True, text=True)
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "install-window.lock"
+            with open(path, "a") as installer:
+                self.assertEqual(lock(installer.fileno()).returncode, 0)
+                with open(path, "a") as retry:
+                    refused = lock(retry.fileno())
+                    self.assertEqual(refused.returncode, 1)
+                    self.assertIn("holds the daemon install window", refused.stderr)
+                watchdog = os.dup(installer.fileno())
+                self.assertEqual(lock(watchdog).returncode, 0)
+            with open(path, "a") as retry:
+                self.assertEqual(lock(retry.fileno()).returncode, 1)
+            os.close(watchdog)
+            with open(path, "a") as retry:
+                self.assertEqual(lock(retry.fileno()).returncode, 0)
+
+    def test_install_window_owner_accepts_markers_without_a_root(self):
+        with tempfile.TemporaryDirectory() as root:
+            marker = Path(root) / "install-in-progress"
+            marker.write_text("fleet-install\n")
+            self.assertEqual(validation.install_window_owner(marker), "")
+            marker.write_text("fleet_root=/a fleet/root\n")
+            self.assertEqual(validation.install_window_owner(marker), "/a fleet/root")
 
     # The OS boundary stands in for the bootstrap filesystem and entropy source.
     # Every ownership/entry shape is exercised without a process or live fleet.
