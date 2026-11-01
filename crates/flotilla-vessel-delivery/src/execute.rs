@@ -39,6 +39,14 @@ pub trait TreeDelivery: Send + Sync {
         target: &Path,
         agent: &dyn VesselAgent,
     ) -> Result<(), StepFailure>;
+
+    /// Whether the tree lands as links into the agent's content store. Such a
+    /// tree is kept only while one of those links is still a use: a shared
+    /// store collects an entry no live vessel uses (#4087), and a home that
+    /// outlived its vessel then keeps a record of content that is gone.
+    fn linked_from_store(&self) -> bool {
+        false
+    }
 }
 
 /// Why a tree's delivery failed, and whether trying the same content again can help.
@@ -159,7 +167,8 @@ pub async fn deliver(
         })?;
         read.insert(name.clone(), record.map(|bytes| decode_record(&String::from_utf8_lossy(&bytes))).unwrap_or_default());
     }
-    let landed = read.values().flatten().map(|(need, landed)| (need.clone(), landed.clone())).collect();
+    let mut landed: BTreeMap<NeedName, Landed> = read.values().flatten().map(|(need, landed)| (need.clone(), landed.clone())).collect();
+    forget_collected(needs, trees, &homes, &mut landed, agent).await?;
     // The planner refuses a tree whose home is not a home need, so every step's home is in `homes`.
     let plan = plan(needs, mechanisms, &landed, costs).map_err(DeliveryError::Plan)?;
     if let Some(step) =
@@ -218,6 +227,33 @@ pub async fn deliver(
         }
     }
     Ok(Delivered { homes, plan })
+}
+
+/// Drop from `landed` each tree linked from the content store that no live
+/// link of the store reaches any more, so it is delivered again.
+async fn forget_collected(
+    needs: &[Need],
+    trees: &BTreeMap<NeedName, Arc<dyn TreeDelivery>>,
+    homes: &BTreeMap<NeedName, PathBuf>,
+    landed: &mut BTreeMap<NeedName, Landed>,
+    agent: &dyn VesselAgent,
+) -> Result<(), DeliveryError> {
+    let linked = needs
+        .iter()
+        .filter(|need| landed.contains_key(&need.name) && trees.get(&need.name).is_some_and(|tree| tree.linked_from_store()))
+        .filter_map(|need| match &need.item {
+            Item::Tree { home, path, .. } => homes.get(home).map(|home| (need.name.clone(), path.under(home))),
+            Item::Home { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let Some(first) = linked.first().map(|(need, _)| need.clone()) else { return Ok(()) };
+    let links = agent.artifact_links().await.map_err(|error| DeliveryError::Step { need: first, error, permanent: false })?;
+    for (need, target) in linked {
+        if !links.iter().any(|link| link.starts_with(&target)) {
+            landed.remove(&need);
+        }
+    }
+    Ok(())
 }
 
 /// A record field holds no tab or line break.

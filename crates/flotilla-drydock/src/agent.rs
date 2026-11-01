@@ -278,6 +278,9 @@ impl AgentClient for DrydockClient {
     async fn link_artifact(&self, path: &Path, sha256: &str, member: &Path, file: &flotilla::FileOptions) -> io::Result<()> {
         self.0.link_artifact(path, sha256, member, &options(file)).await
     }
+    async fn artifact_links(&self) -> io::Result<Vec<std::path::PathBuf>> {
+        Ok(self.0.artifacts().await?.into_iter().flat_map(|artifact| artifact.links).collect())
+    }
     async fn put_outward_forward(&self, forward: flotilla::OutwardForward, host: flotilla::Endpoint) -> io::Result<()> {
         let forward = drydock_agent::OutwardForward { id: forward.id, unix: forward.unix, tcp: forward.tcp };
         self.0.put_outward_forward(forward, endpoint(host)).await

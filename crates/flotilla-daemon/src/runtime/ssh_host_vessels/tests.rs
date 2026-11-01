@@ -610,6 +610,9 @@ fn vessel_paths_are_stable_private_per_vessel_and_bounded() {
     assert!(a.agent.starts_with("/run/user/1000/flotilla/v"));
     assert!(a.state.starts_with("/home/crew/.local/state/flotilla/vessels"));
     assert_eq!(a.daemon_socket(), a.agent.join("flotilla.sock"));
+    // #4087: content lives on durable disk, in one store every vessel shares.
+    assert_eq!(a.store, Path::new("/home/crew/.local/state/flotilla/content-store"));
+    assert_eq!(a.store, paths(&EnvironmentId::new("host-direct-b2"), "convoy-2-work").store);
     assert_ne!(a, paths(&environment, "convoy-2-work"));
     assert_ne!(a, paths(&EnvironmentId::new("host-direct-b2"), "convoy-1-work"));
     // Length framing: moving a boundary between the names moves the vessel.
@@ -619,7 +622,9 @@ fn vessel_paths_are_stable_private_per_vessel_and_bounded() {
         .with(EnvironmentAssertion::env_var("HOME", "/home/crew"))
         .with(EnvironmentAssertion::env_var("XDG_STATE_HOME", "/state"))
         .with(EnvironmentAssertion::env_var("XDG_RUNTIME_DIR", "/run/user/1000"));
-    assert!(VesselPaths::new(&state, &VesselKey::new(&environment, "v")).unwrap().state.starts_with("/state/flotilla/vessels"));
+    let under_state = VesselPaths::new(&state, &VesselKey::new(&environment, "v")).unwrap();
+    assert!(under_state.state.starts_with("/state/flotilla/vessels"));
+    assert_eq!(under_state.store, Path::new("/state/flotilla/content-store"));
     let no_runtime = EnvironmentBag::new().with(EnvironmentAssertion::env_var("HOME", "/home/crew"));
     assert!(VesselPaths::new(&no_runtime, &VesselKey::new(&environment, "v")).unwrap_err().contains("XDG_RUNTIME_DIR"));
     let long = EnvironmentBag::new()

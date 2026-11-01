@@ -17,10 +17,13 @@ use crate::agent::tests::{SocketAgent, Sshd};
 use flotilla_environment::environment::{agent::AgentRunner, VesselAgent};
 
 /// A host whose commands run for real in local temporary directories. Its
-/// supervisor is the one part played in process: the executable flotilla
-/// copies there is a stub that records `--supervise`, and the host then serves
-/// the vessel socket with drydock's real Agent, unless one already serves it,
-/// as the supervisor's lock would decide.
+/// drydock agent is the one part played in process: the executable flotilla
+/// copies there is a stub that records how `--supervise` was asked for, and
+/// the host then serves the vessel socket with drydock's real Agent and the
+/// store options it was given, unless one already serves it, as the
+/// supervisor's lock would decide. Without a store the agent keeps drydock's
+/// default beside the vessel's executable. A `--collect` of the copied
+/// executable runs drydock's real collection.
 struct FakeHost {
     local: ProcessCommandRunner,
     agents: StdMutex<BTreeMap<PathBuf, Arc<SocketAgent>>>,
@@ -28,10 +31,9 @@ struct FakeHost {
     starts: AtomicUsize,
 }
 
-/// The stub copied as the agent executable: it records the request and the
-/// environment it was started with.
-const STUB_AGENT: &[u8] =
-    b"#!/bin/sh\nenv > \"$(dirname \"$0\")/started-environment\"\n[ \"$1\" = --supervise ] && : > \"$(dirname \"$0\")/supervise-requested\"\n";
+/// The stub copied as the agent executable: it records the request, one
+/// argument per line, and the environment it was started with.
+const STUB_AGENT: &[u8] = b"#!/bin/sh\nenv > \"$(dirname \"$0\")/started-environment\"\n[ \"$1\" = --supervise ] && printf '%s\\n' \"$@\" > \"$(dirname \"$0\")/supervise-requested\"\n";
 
 impl FakeHost {
     fn new() -> Arc<Self> {
@@ -45,16 +47,28 @@ impl FakeHost {
 
     fn supervise(&self, directory: &Path) {
         let request = directory.join("supervise-requested");
-        if std::fs::remove_file(&request).is_err() {
-            return;
-        }
+        let Ok(arguments) = std::fs::read_to_string(&request) else { return };
+        std::fs::remove_file(&request).unwrap();
+        let option = |name: &str| {
+            let mut lines = arguments.lines();
+            lines.find(|line| *line == name).and_then(|_| lines.next()).map(PathBuf::from)
+        };
+        let store = option("--store").unwrap_or_else(|| directory.join(format!("{AGENT_EXECUTABLE}.store")));
+        let holder = option("--holder");
         let socket = directory.join(AGENT_SOCKET);
         let mut agents = self.agents.lock().unwrap();
         if agents.contains_key(&socket) {
             return;
         }
         self.starts.fetch_add(1, Ordering::SeqCst);
-        agents.insert(socket.clone(), SocketAgent::start(socket, &self.current, false));
+        let agent = SocketAgent::start_with(socket.clone(), &self.current, false, move |agent| {
+            let agent = agent.with_store(store.clone());
+            match &holder {
+                Some(holder) => agent.with_holder(holder.clone()),
+                None => agent,
+            }
+        });
+        agents.insert(socket, agent);
     }
 
     /// The supervisor and its agent die, as on a host reboot.
@@ -68,7 +82,22 @@ impl FakeHost {
 #[async_trait]
 impl CommandRunner for FakeHost {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
-        self.local.run(cmd, args, cwd, label).await
+        if let ["--collect", "--store", store, "--grace", grace] = args {
+            if std::fs::read(cmd).map_err(|error| format!("{cmd}: {error}"))? != STUB_AGENT {
+                return Err(format!("{cmd}: not this generation's agent"));
+            }
+            let grace = Duration::from_secs(grace.parse().unwrap());
+            let collected = drydock_agent::collect(PathBuf::from(store), grace).await.map_err(|error| error.to_string())?;
+            return Ok(format!("removed {} entries and {} blobs from {store}\n", collected.entries, collected.blobs));
+        }
+        let output = self.local.run(cmd, args, cwd, label).await;
+        // The stopped vessel's supervisor and agent die with it.
+        if let ["-c", script, "flotilla-vessel-agent-retire", directory, ..] = args {
+            if *script == STOP {
+                self.kill(Path::new(directory));
+            }
+        }
+        output
     }
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
         let output = self.local.run_output(cmd, args, cwd, label).await;
@@ -178,6 +207,166 @@ async fn a_reboot_removes_the_executable_and_the_next_connect_copies_it_again() 
     assert_eq!(fixture.host.starts.load(Ordering::SeqCst), 2);
 }
 
+/// Dials the agent socket directly, counting the bytes its connections write.
+#[derive(Default)]
+struct CountedTransport {
+    written: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl AgentTransport for CountedTransport {
+    async fn open(&self, socket: &Path) -> io::Result<ByteStream> {
+        Ok(Box::new(Counted { stream: UnixStream::connect(socket).await?, written: Arc::clone(&self.written) }))
+    }
+}
+struct Counted {
+    stream: UnixStream,
+    written: Arc<AtomicUsize>,
+}
+impl tokio::io::AsyncRead for Counted {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+impl tokio::io::AsyncWrite for Counted {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<io::Result<usize>> {
+        let written = std::pin::Pin::new(&mut self.stream).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(count)) = &written {
+            self.written.fetch_add(*count, Ordering::SeqCst);
+        }
+        written
+    }
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+/// A base layer with the system tools the stub agent runs.
+fn system_base() -> BaseLayer {
+    BaseLayer::declared([("PATH".to_string(), "/usr/bin:/bin".to_string())], &Default::default()).unwrap()
+}
+
+/// Every regular file under `root`.
+fn files_under(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).into_iter().flatten().flatten() {
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                files.push(entry.path());
+            }
+        }
+    }
+    files
+}
+
+// #4087 acceptance: two vessels on one host, with the same harness pin, share
+// the host user's durable store. The harness bytes cross once: the second
+// vessel's push is answered from the store's index, and nothing of the
+// artifact lands under the runtime directory. Retiring one vessel keeps the
+// entry the other still links; retiring both lets the retirement's
+// collection remove it, read-only as drydock keeps it, though the crews'
+// homes, with their links, outlive their vessels. Mutation check: starting
+// the agents without the shared `--store` sends the bytes twice and fails
+// this scenario.
+#[tokio::test]
+async fn vessels_on_one_host_share_the_durable_store_and_retirement_collects_it() {
+    let root = tempfile::Builder::new().prefix("fvs-").tempdir_in("/tmp").unwrap();
+    let (runtime, state) = (root.path().join("run/flotilla/v"), root.path().join("state/flotilla"));
+    let store = SharedStore { grace: Duration::ZERO, ..SharedStore::new(state.join("content-store")) };
+    let executable = root.path().join("drydock-agent-build");
+    std::fs::write(&executable, STUB_AGENT).unwrap();
+    let harness = (0..1024 * 1024).map(|byte: u32| (byte % 251) as u8).collect::<Vec<_>>();
+    let digest = format!("{:x}", Sha256::digest(&harness));
+    let pinned = root.path().join("claude");
+    std::fs::write(&pinned, &harness).unwrap();
+    let host = FakeHost::new();
+    let mut vessels = Vec::new();
+    for name in ["a", "b"] {
+        let (directory, holder) = (runtime.join(name), state.join("vessels").join(name));
+        std::fs::create_dir_all(&holder).unwrap();
+        let transport = Arc::new(CountedTransport::default());
+        let written = Arc::clone(&transport.written);
+        let connector = HostAgentConnector::new(
+            host.clone(),
+            transport,
+            directory.clone(),
+            Platform::current(),
+            executable.clone(),
+            Duration::from_secs(10),
+            &system_base(),
+        )
+        .with_store(store.path.clone(), holder.clone());
+        let controller = root.path().join(format!("controller-{name}"));
+        std::fs::create_dir(&controller).unwrap();
+        let runner = Arc::new(AgentRunner::new(Arc::new(connector), controller));
+        VesselAgent::ready(&runner).await.unwrap();
+        let before = written.load(Ordering::SeqCst);
+        VesselAgent::push_artifact(&runner, &digest, &pinned, flotilla_resources::PinUnpack::File).await.unwrap();
+        let link = state.join(format!("agent-homes/{name}/.flotilla/harness/bin/claude"));
+        VesselAgent::link_artifact(&runner, &link, &digest, Path::new("")).await.unwrap();
+        vessels.push((directory, holder, link, runner, written.load(Ordering::SeqCst) - before));
+    }
+    assert!(vessels[0].4 >= harness.len(), "the first vessel pushes the harness: {} bytes", vessels[0].4);
+    assert!(vessels[1].4 < 64 * 1024, "the second vessel sends no harness bytes: {} bytes", vessels[1].4);
+    assert_eq!(std::fs::read(&vessels[1].2).unwrap(), harness);
+    let large =
+        files_under(&runtime).into_iter().filter(|file| std::fs::metadata(file).unwrap().len() >= harness.len() as u64).collect::<Vec<_>>();
+    assert!(large.is_empty(), "the runtime directory holds artifact files: {large:?}");
+
+    let (directory, holder, ..) = &vessels[0];
+    retire_host_agent(host.as_ref(), directory, std::slice::from_ref(holder), Some(&store)).await.unwrap();
+    assert!(!directory.exists() && !holder.exists());
+    assert_eq!(std::fs::read(&vessels[1].2).unwrap(), harness, "the entry another live vessel links is kept");
+
+    let (directory, holder, link, ..) = &vessels[1];
+    retire_host_agent(host.as_ref(), directory, std::slice::from_ref(holder), Some(&store)).await.unwrap();
+    assert!(std::fs::symlink_metadata(link).is_ok(), "the crew's home outlives its vessel");
+    assert_eq!(std::fs::read(link).map_err(|error| error.kind()), Err(io::ErrorKind::NotFound), "no live vessel uses the entry");
+    assert_eq!(std::fs::read_dir(store.path.join("artifacts")).unwrap().count(), 0);
+}
+
+// An executable an earlier generation installed refuses this generation's
+// store options; the bootstrap replaces it with this generation's build and
+// starts that.
+#[tokio::test]
+async fn an_executable_refusing_the_store_options_is_replaced_and_started() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::Builder::new().prefix("fvo-").tempdir_in("/tmp").unwrap();
+    let directory = root.path().join("run/flotilla/v/vessel");
+    std::fs::create_dir_all(&directory).unwrap();
+    let earlier = b"#!/bin/sh\nfor argument; do [ \"$argument\" = --store ] && { echo 'usage: drydock-agent --supervise --socket PATH' >&2; exit 1; }; done\n";
+    std::fs::write(directory.join(AGENT_EXECUTABLE), earlier).unwrap();
+    std::fs::set_permissions(directory.join(AGENT_EXECUTABLE), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let executable = root.path().join("drydock-agent-build");
+    std::fs::write(&executable, STUB_AGENT).unwrap();
+    let holder = root.path().join("state/vessel");
+    std::fs::create_dir_all(&holder).unwrap();
+    let host = FakeHost::new();
+    let connector = HostAgentConnector::new(
+        host.clone(),
+        Arc::new(LocalTransport),
+        directory.clone(),
+        Platform::current(),
+        executable,
+        Duration::from_secs(10),
+        &system_base(),
+    )
+    .with_store(root.path().join("store"), holder);
+    connector.connect().await.map(drop).unwrap();
+    assert_eq!(std::fs::read(directory.join(AGENT_EXECUTABLE)).unwrap(), STUB_AGENT);
+    assert_eq!(host.starts.load(Ordering::SeqCst), 1);
+}
+
 // Teardown stops exactly the processes serving this vessel's socket, the
 // supervisor with them, and removes its directories. Another vessel's agent,
 // whose socket path only shares a prefix, keeps running.
@@ -203,7 +392,7 @@ async fn retire_kills_this_vessels_supervisor_and_agent_and_removes_its_director
     };
     let mut ours = [spawn(&directory.join(AGENT_SOCKET), true), spawn(&directory.join(AGENT_SOCKET), false)];
     let mut theirs = spawn(&neighbour.join(AGENT_SOCKET), false);
-    retire_host_agent(&ProcessCommandRunner, &directory, std::slice::from_ref(&state)).await.unwrap();
+    retire_host_agent(&ProcessCommandRunner, &directory, std::slice::from_ref(&state), None).await.unwrap();
     for child in &mut ours {
         assert!(child.wait().is_ok_and(|status| !status.success()), "killed");
     }
@@ -211,7 +400,7 @@ async fn retire_kills_this_vessels_supervisor_and_agent_and_removes_its_director
     assert!(!directory.exists() && !state.exists());
     assert!(neighbour.exists());
     // Retiring again, with nothing left, succeeds.
-    retire_host_agent(&ProcessCommandRunner, &directory, &[state]).await.unwrap();
+    retire_host_agent(&ProcessCommandRunner, &directory, &[state], None).await.unwrap();
     // SAFETY: the stand-in leads its own process group.
     unsafe {
         libc::kill(-(theirs.id() as i32), libc::SIGKILL);
@@ -232,7 +421,7 @@ async fn retire_removes_read_only_content_cache_entries() {
     for dir in entry.ancestors().take_while(|dir| dir.starts_with(&directory)) {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
     }
-    retire_host_agent(&ProcessCommandRunner, &directory, &[]).await.unwrap();
+    retire_host_agent(&ProcessCommandRunner, &directory, &[], None).await.unwrap();
     assert!(!directory.exists());
 }
 

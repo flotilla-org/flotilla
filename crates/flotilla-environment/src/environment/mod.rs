@@ -357,6 +357,12 @@ pub trait VesselAgent: Send + Sync {
         let _ = member;
         Err(format!("this vessel agent has no artifact store to link {} to {sha256}", path.display()))
     }
+    /// Every link into a stored entry that still counts as a use. An entry no
+    /// live vessel uses can be collected from a shared store (#4087), leaving
+    /// the links that pointed into it out of this list.
+    async fn artifact_links(&self) -> Result<Vec<PathBuf>, String> {
+        Err("this vessel agent has no artifact store to list links of".into())
+    }
 }
 
 /// A live handle to a provisioned sandbox environment.

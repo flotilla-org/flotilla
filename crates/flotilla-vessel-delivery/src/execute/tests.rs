@@ -18,7 +18,12 @@ use crate::vocabulary::{HomeBase, RelativePath, TreeSources};
 struct LocalVessel {
     base: tempfile::TempDir,
     runtime: tempfile::TempDir,
+    store: StoreLinks,
 }
+
+/// The links a vessel's content store counts as uses, shared with the trees
+/// that place them.
+type StoreLinks = Arc<Mutex<Vec<PathBuf>>>;
 
 #[async_trait]
 impl VesselAgent for LocalVessel {
@@ -55,11 +60,14 @@ impl VesselAgent for LocalVessel {
     async fn symlink(&self, path: &Path, target: &Path) -> Result<(), String> {
         self.local().symlink(path, target).await
     }
+    async fn artifact_links(&self) -> Result<Vec<PathBuf>, String> {
+        Ok(self.store.lock().expect("store").clone())
+    }
 }
 
 impl LocalVessel {
     fn new() -> Self {
-        Self { base: tempfile::tempdir().expect("base"), runtime: tempfile::tempdir().expect("runtime base") }
+        Self { base: tempfile::tempdir().expect("base"), runtime: tempfile::tempdir().expect("runtime base"), store: StoreLinks::default() }
     }
 
     fn local(&self) -> RunnerVesselAgent {
@@ -72,11 +80,18 @@ struct Tree {
     content: Mutex<String>,
     fail: AtomicBool,
     deliveries: Mutex<Vec<Mechanism>>,
+    /// The store this tree is linked from, as a pinned harness is.
+    store: Option<StoreLinks>,
 }
 
 impl Tree {
     fn new(content: &str) -> Arc<Self> {
-        Arc::new(Self { content: Mutex::new(content.into()), fail: AtomicBool::new(false), deliveries: Mutex::default() })
+        Arc::new(Self { content: Mutex::new(content.into()), fail: AtomicBool::new(false), deliveries: Mutex::default(), store: None })
+    }
+
+    fn linked_from(store: &StoreLinks, content: &str) -> Arc<Self> {
+        let tree = Arc::into_inner(Self::new(content)).expect("unshared");
+        Arc::new(Self { store: Some(Arc::clone(store)), ..tree })
     }
 
     fn deliveries(&self) -> usize {
@@ -94,7 +109,13 @@ impl TreeDelivery for Tree {
         let content = self.content.lock().expect("content").clone();
         agent.write(&target.join("SKILL.md"), content.into_bytes(), 0o644).await?;
         self.deliveries.lock().expect("deliveries").push(mechanism);
+        if let Some(store) = &self.store {
+            store.lock().expect("store").push(target.join("SKILL.md"));
+        }
         Ok(())
+    }
+    fn linked_from_store(&self) -> bool {
+        self.store.is_some()
     }
 }
 
@@ -180,6 +201,28 @@ async fn re_runs_deliver_only_what_changed_or_failed() {
     assert!(!std::fs::read_to_string(&record).expect("record").contains("notes"), "the record follows the plan");
     run(needs("s3", "n2")).await.expect("notes again");
     assert_eq!((skills.deliveries(), notes.deliveries()), (3, 4));
+}
+
+// Behaviour (#4087): a tree linked from the content store is kept only while a
+// link the store counts reaches it. Once the store has collected its entry, as
+// a shared store does when no live vessel uses it, the next run delivers it
+// again; a tree landed otherwise keeps its record's word.
+#[tokio::test]
+async fn a_tree_whose_store_entry_was_collected_is_delivered_again() {
+    let vessel = LocalVessel::new();
+    let (skills, notes) = (Tree::linked_from(&vessel.store, "skills"), Tree::new("notes"));
+    let trees = BTreeMap::from([
+        (NeedName::new("skills"), skills.clone() as Arc<dyn TreeDelivery>),
+        (NeedName::new("notes"), notes.clone() as Arc<dyn TreeDelivery>),
+    ]);
+    let (needs, mechanisms, costs) = (needs("s1", "n1"), ProviderMechanisms::default(), CostTable::default());
+    let run = || deliver(&needs, &trees, &mechanisms, &costs, &vessel);
+    run().await.expect("first delivery");
+    let again = run().await.expect("re-run");
+    assert!(again.plan.steps.iter().all(|step| step.action == Action::Keep), "{:?}", again.plan);
+    vessel.store.lock().expect("store").clear();
+    run().await.expect("after the collection");
+    assert_eq!((skills.deliveries(), notes.deliveries()), (2, 1), "only the collected tree is delivered again");
 }
 
 // Behaviour (#4012): a runtime home lands under the writable base, apart from the

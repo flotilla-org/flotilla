@@ -26,3 +26,16 @@ fn layer_identity_cache_skips_reads_and_detects_atomic_replacement() {
     assert_eq!(changed.files[0].2, b"new");
     assert_ne!(changed.sources, first.sources);
 }
+
+// #4087 contract 5: a store whose filesystem cannot hold an artifact fails
+// the delivery, before launch, with a named reason that keeps the agent's
+// account of the store's path and free space; other refusals are not named so.
+#[test]
+fn a_full_store_is_a_named_refusal() {
+    let agent =
+        "1048576 more bytes do not fit in the 4096 free on the filesystem of the store /home/crew/.local/state/flotilla/content-store";
+    let refused = store_refusal("push artifact abc".into(), io::Error::new(io::ErrorKind::StorageFull, agent));
+    assert_eq!(refused, format!("{STORE_FULL}: push artifact abc: {agent}"));
+    let other = store_refusal("fetch artifact abc".into(), io::Error::new(io::ErrorKind::NotFound, "no source answered"));
+    assert_eq!(other, "fetch artifact abc: no source answered");
+}

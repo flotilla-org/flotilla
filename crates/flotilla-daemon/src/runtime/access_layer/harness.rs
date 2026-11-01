@@ -96,6 +96,9 @@ impl TreeDelivery for PinnedHarness {
             PinUnpack::TarGz | PinUnpack::TarXz => agent.link_artifact(target, &self.sha256, Path::new("")).await,
         }?)
     }
+    fn linked_from_store(&self) -> bool {
+        true
+    }
 }
 
 /// Stream `url` to a private temporary file on the controller, kept only when its bytes

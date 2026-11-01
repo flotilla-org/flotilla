@@ -19,6 +19,8 @@ pub(super) struct RecordedVessel {
     pub(super) attach_forwards: Vec<PathBuf>,
     /// Artifacts made store entries, by digest, with how their bytes arrived.
     pub(super) artifacts: Vec<(String, ArtifactArrival)>,
+    /// Links placed into the store, which the store keeps as uses.
+    pub(super) links: Vec<PathBuf>,
     pub(super) closed: bool,
 }
 
@@ -113,7 +115,12 @@ impl VesselAgent for RunnerVessel {
         let host = RunnerVesselAgent(self.runner.clone());
         host.create_dir(path.parent().ok_or("a link needs a directory")?, 0o755).await?;
         let entry = store_entry(&self.agent, sha256);
-        host.symlink(path, &if member.as_os_str().is_empty() { entry } else { entry.join(member) }).await
+        host.symlink(path, &if member.as_os_str().is_empty() { entry } else { entry.join(member) }).await?;
+        self.record(|vessel| vessel.links.push(path.into()));
+        Ok(())
+    }
+    async fn artifact_links(&self) -> Result<Vec<PathBuf>, String> {
+        Ok(self.vessels.lock().expect("vessels").get(&self.agent).map(|vessel| vessel.links.clone()).unwrap_or_default())
     }
     async fn ready(&self) -> Result<(), String> {
         Ok(())

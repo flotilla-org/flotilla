@@ -346,6 +346,9 @@ impl TreeDelivery for SkillsDelivery {
         tracing::info!(target = %target.display(), sha256 = %archive.sha256, "delivered frozen crew skills");
         Ok(())
     }
+    fn linked_from_store(&self) -> bool {
+        true
+    }
 }
 
 /// Put `archive` into the agent's content cache and point `target` at it. A real

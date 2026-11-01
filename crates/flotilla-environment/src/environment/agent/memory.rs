@@ -249,6 +249,9 @@ impl AgentClient for Agent {
     async fn link_artifact(&self, _: &Path, _: &str, _: &Path, _: &FileOptions) -> io::Result<()> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "the memory agent keeps no artifacts"))
     }
+    async fn artifact_links(&self) -> io::Result<Vec<std::path::PathBuf>> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "the memory agent keeps no artifacts"))
+    }
     async fn put_outward_forward(&self, forward: OutwardForward, endpoint: Endpoint) -> io::Result<()> {
         self.live()?;
         let Endpoint::Unix(host) = endpoint else {
