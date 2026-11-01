@@ -111,7 +111,7 @@ pub use state::{RowEdit, State};
 pub use time::Timestamp;
 pub use traits::{CodeEnum, Column, Columns, Element, Flat, Intern, KeyColumn, Kind, KindSpec, StateData, SUPPORTED_ATTRIBUTES};
 pub use value::{Hash, Identity, KindCode, Row, Rows, Value};
-pub use verb::{Param, ParamDeclaration, ParamType, Verb, VerbDeclaration, VerbEffect};
+pub use verb::{address_kind, Param, ParamDeclaration, ParamType, SubjectParam, Verb, VerbDeclaration, VerbEffect};
 pub use view::{column_count, enum_columns, render_table_view, render_view, state_data, WIDE};
 
 mod frictionless;

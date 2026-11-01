@@ -16,22 +16,28 @@ use axum::{
     Router,
 };
 use flotilla_address::{Address, Kind};
-use flotilla_protocol::table::{Message, Row};
-use flotilla_resources::{Convoy, ConvoySpec, InputMeta};
-use flotilla_schema::{Table, Verb, VerbDeclaration};
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_protocol::{
+    table::{Message, Row},
+    CallerProcess, CommandCaller, PrincipalRef,
+};
+use flotilla_resources::{Convoy, ConvoySpec, InputMeta, PROJECT_LABEL, ROLE_LABEL};
+use flotilla_schema::{Table, Verb};
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_tracing::{SdkTracerProvider, TracerProvider as _};
-use serde_json::{json, Map, Value};
+use serde::Deserialize;
+use serde_json::{json, Value};
 use tower::ServiceExt;
 use tracing_subscriber::layer::SubscriberExt;
 
-use super::{CallerAuth, HttpRouter, ListenerOrigin, LoginStore};
+use super::{auth::PeerEvidence, CallerAuth, HttpRouter, ListenerOrigin, LoginStore};
 use crate::server::{
+    caller::PeerCredential,
     tables,
     verbs::{
         catalog::{Catalog, NativeVerb, Picks, Presentation, Subject, Subjects},
-        invoke::{allow_all, FIELD_LIMIT, INVOCATION_LIMIT},
+        invoke::{allow_all, FIELD_LIMIT, INVOCATION_LIMIT, SUBJECT_LIMIT},
         Verbs,
     },
 };
@@ -42,9 +48,8 @@ use span_exporter::InMemorySpanExporter;
 
 /// A write verb that counts its runs and answers with its parameter. Its effect marks each
 /// subject once per invocation id, so a repeat runs again and changes nothing.
-#[derive(Verb)]
+#[derive(Verb, Deserialize)]
 #[verb(name = "convoy.touch", subject = "convoy", effect = "write", invocation)]
-#[expect(dead_code, reason = "only its derived declaration is used")]
 struct Touch {
     #[param(text)]
     note: Option<String>,
@@ -57,21 +62,19 @@ struct Counted {
 
 #[async_trait]
 impl NativeVerb for Counted {
-    fn declaration(&self) -> VerbDeclaration {
-        Touch::declaration()
-    }
+    type Params = Touch;
 
-    async fn run(&self, subjects: &[Subject], params: &Map<String, Value>, invocation: &str) -> Result<Option<Value>, String> {
+    async fn run(&self, subjects: &[Subject], params: &Touch, invocation: &str) -> Result<Option<Value>, String> {
         let _span = tracing::info_span!("convoy.touch.effect").entered();
         self.runs.fetch_add(1, Ordering::SeqCst);
         let mut touched = self.touched.lock().unwrap();
         touched.extend(subjects.iter().map(|subject| (subject.address.to_string(), invocation.to_owned())));
-        Ok(Some(json!({"subjects": subjects.len(), "note": params.get("note")})))
+        Ok(Some(json!({"subjects": subjects.len(), "note": params.note})))
     }
 }
 
 /// A read verb that answers nothing.
-#[derive(Verb)]
+#[derive(Verb, Deserialize)]
 #[verb(name = "convoy.look", subject = "convoy", effect = "read")]
 struct Look {}
 
@@ -79,11 +82,9 @@ struct Looked;
 
 #[async_trait]
 impl NativeVerb for Looked {
-    fn declaration(&self) -> VerbDeclaration {
-        Look::declaration()
-    }
+    type Params = Look;
 
-    async fn run(&self, _subjects: &[Subject], _params: &Map<String, Value>, _invocation: &str) -> Result<Option<Value>, String> {
+    async fn run(&self, _subjects: &[Subject], _params: &Look, _invocation: &str) -> Result<Option<Value>, String> {
         Ok(None)
     }
 }
@@ -108,11 +109,15 @@ const LANDED: &str = "project:flotilla/convoy:landed";
 
 struct Fixture {
     router: Router,
+    daemon: Arc<InProcessDaemon>,
     runs: Arc<AtomicUsize>,
     touched: Arc<Mutex<BTreeSet<(String, String)>>>,
+    _dir: tempfile::TempDir,
 }
 
-fn fixture() -> Fixture {
+/// The route over test verbs and rows; the daemon serves only caller resolution.
+async fn fixture() -> Fixture {
+    let (dir, daemon) = super::super::tests::empty_daemon().await;
     let runs = Arc::new(AtomicUsize::new(0));
     let touched = Arc::new(Mutex::new(BTreeSet::new()));
     let rows = [(RUNNING, "Running"), (OTHER, "Running"), (LANDED, "Landed")]
@@ -133,14 +138,27 @@ fn fixture() -> Fixture {
     let verbs = Verbs { catalog, subjects, policy: allow_all };
     let router = HttpRouter::builder()
         .backend(ResourceBackend::new(InMemoryBackend::default()))
+        .daemon(Arc::clone(&daemon))
         .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
         .verbs(Arc::new(verbs))
         .build()
         .into_router();
-    Fixture { router, runs, touched }
+    Fixture { router, daemon, runs, touched, _dir: dir }
 }
 
 async fn send(router: &Router, caller: CallerAuth, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Vec<u8>) {
+    send_with(router, caller, None, method, path, body).await
+}
+
+/// A request from `caller`, with `evidence` standing in for its socket peer's own.
+async fn send_with(
+    router: &Router,
+    caller: CallerAuth,
+    evidence: Option<Arc<PeerEvidence>>,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (StatusCode, Vec<u8>) {
     let mut request = Request::builder()
         .method(method)
         .uri(path)
@@ -149,6 +167,9 @@ async fn send(router: &Router, caller: CallerAuth, method: &str, path: &str, bod
         .body(body.map_or_else(Body::empty, |body| Body::from(body.to_string())))
         .unwrap();
     request.extensions_mut().insert(caller);
+    if let Some(evidence) = evidence {
+        request.extensions_mut().insert(evidence);
+    }
     let response = router.clone().oneshot(request).await.unwrap();
     let status = response.status();
     (status, to_bytes(response.into_body(), 8 * 1024 * 1024).await.unwrap().to_vec())
@@ -157,6 +178,27 @@ async fn send(router: &Router, caller: CallerAuth, method: &str, path: &str, bod
 async fn invoke(router: &Router, caller: CallerAuth, verb: &str, body: Value) -> (StatusCode, Value) {
     let (status, bytes) = send(router, caller, "POST", &format!("/verbs/{verb}"), Some(body)).await;
     (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// A crew agent on the main socket: a host-direct process whose environment names its crew.
+fn crew_on_the_main_socket() -> (CallerAuth, Arc<PeerEvidence>) {
+    let claims = [
+        ("FLOTILLA_NAMESPACE", "flotilla"),
+        ("FLOTILLA_CONVOY", "convoy-1"),
+        ("FLOTILLA_VESSEL", "work"),
+        ("FLOTILLA_CREW_ROLE", "coder"),
+        ("FLOTILLA_CREW_ID", "crew-1"),
+    ];
+    let evidence = PeerEvidence {
+        caller: CommandCaller {
+            principal_ref: PrincipalRef::implicit_for_namespace("flotilla"),
+            process: Some(CallerProcess::builder().pid(42).uid(501).build()),
+            crew: None,
+        },
+        claims: claims.into_iter().map(|(name, value)| (name.to_owned(), value.to_owned())).collect(),
+        mounts: None,
+    };
+    (CallerAuth::Socket(Some(PeerCredential::from_kernel(501, Some(42)))), Arc::new(evidence))
 }
 
 async fn rows(router: &Router, path: &str) -> Vec<Row> {
@@ -178,7 +220,7 @@ async fn rows(router: &Router, path: &str) -> Vec<Row> {
 // the derived rows as to any table's.
 #[tokio::test]
 async fn the_verbs_table_lists_native_verbs_and_their_parameters() {
-    let Fixture { router, .. } = fixture();
+    let Fixture { router, .. } = fixture().await;
     let verbs = rows(&router, "/tables/verbs/rows").await;
     let names = |rows: &[Row]| rows.iter().map(|row| row["name"].clone()).collect::<Vec<_>>();
     assert_eq!(names(&verbs), [json!("convoy.look"), json!("convoy.touch")], "sorted by name by default");
@@ -214,7 +256,7 @@ async fn the_verbs_table_lists_native_verbs_and_their_parameters() {
 // answers an outcome for each, in the order given.
 #[tokio::test]
 async fn each_runs_once_per_subject() {
-    let Fixture { router, runs, .. } = fixture();
+    let Fixture { router, runs, .. } = fixture().await;
     let (status, body) = invoke(
         &router,
         CallerAuth::Bearer,
@@ -239,7 +281,7 @@ async fn each_runs_once_per_subject() {
 // is refused before the body is read.
 #[tokio::test]
 async fn the_route_negotiates_and_refuses_callers_before_reading_the_body() {
-    let Fixture { router, runs, .. } = fixture();
+    let Fixture { router, runs, .. } = fixture().await;
     let invocation = json!({"invocation": "w", "subjects": [RUNNING], "params": {"note": "hi"}});
     let (status, expected) = invoke(&router, CallerAuth::Bearer, "convoy.touch", invocation.clone()).await;
     assert_eq!(status, StatusCode::OK);
@@ -299,7 +341,7 @@ async fn the_route_negotiates_and_refuses_callers_before_reading_the_body() {
 // run would.
 #[tokio::test]
 async fn a_repeated_invocation_leaves_the_subject_as_one_run_would() {
-    let Fixture { router, runs, touched } = fixture();
+    let Fixture { router, runs, touched, .. } = fixture().await;
     let request = json!({"invocation": "once", "subjects": [RUNNING]});
     let (status, first) = invoke(&router, CallerAuth::Bearer, "convoy.touch", request.clone()).await;
     assert_eq!(status, StatusCode::OK, "{first}");
@@ -316,7 +358,7 @@ async fn a_repeated_invocation_leaves_the_subject_as_one_run_would() {
 // answers `not_applicable` with the failing condition, without running the verb.
 #[tokio::test]
 async fn a_failing_when_answers_not_applicable_with_the_condition() {
-    let Fixture { router, runs, .. } = fixture();
+    let Fixture { router, runs, .. } = fixture().await;
     let (status, body) = invoke(&router, CallerAuth::Bearer, "convoy.touch", json!({"invocation": "n", "subjects": [LANDED]})).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["outcomes"], json!([{"subject": LANDED, "status": "not_applicable", "condition": ".status.phase != Landed"}]));
@@ -343,21 +385,24 @@ async fn the_invocation_span_records_the_intent_and_the_outcomes() {
     let _subscriber = tracing::subscriber::set_default(
         tracing_subscriber::registry().with(flotilla_tracing::layer().with_tracer(provider.tracer("verbs"))),
     );
-    let Fixture { router, .. } = fixture();
+    let Fixture { router, daemon, .. } = fixture().await;
     let missing = "project:flotilla/convoy:missing";
     let request = json!({"invocation": "rec", "subjects": [RUNNING, missing], "params": {"note": "why"}});
-    let (status, body) = invoke(&router, CallerAuth::Bearer, "convoy.touch", request).await;
+    let (crew, evidence) = crew_on_the_main_socket();
+    let (status, bytes) = send_with(&router, crew, Some(evidence), "POST", "/verbs/convoy.touch", Some(request)).await;
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["outcomes"][1], json!({"subject": missing, "status": "failed", "error": format!("no convoy at `{missing}`")}));
-    let (status, _) = invoke(&router, CallerAuth::Socket(None), "convoy.touch", json!({"invocation": "bad", "subjects": []})).await;
+    let (status, _) = invoke(&router, CallerAuth::Bearer, "convoy.touch", json!({"invocation": "bad", "subjects": []})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let long = json!({"invocation": "long", "subjects": [RUNNING], "params": {"note": "é".repeat(FIELD_LIMIT)}});
     let (status, _) = invoke(&router, CallerAuth::Bearer, "convoy.touch", long).await;
     assert_eq!(status, StatusCode::OK);
-    // A request refused for its size is still traced, within the limit.
-    let many = vec![RUNNING; FIELD_LIMIT / RUNNING.len() + 1];
-    let (status, _) = invoke(&router, CallerAuth::Bearer, "convoy.touch", json!({"invocation": "many", "subjects": many})).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // More distinct subjects than the field holds: each is answered, and the record is cut.
+    let many: Vec<_> = (0..=FIELD_LIMIT / RUNNING.len()).map(|index| format!("{RUNNING}-{index}")).collect();
+    let (status, answered) = invoke(&router, CallerAuth::Bearer, "convoy.touch", json!({"invocation": "many", "subjects": many})).await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    assert_eq!(answered["outcomes"].as_array().map(Vec::len), Some(many.len()));
     provider.force_flush().unwrap();
     let spans = exporter.get_finished_spans().unwrap();
     let invocation = |id: &str| {
@@ -367,7 +412,8 @@ async fn the_invocation_span_records_the_intent_and_the_outcomes() {
             .unwrap_or_else(|| panic!("no span for {id}: {spans:?}"))
     };
     let span = invocation("rec");
-    assert_eq!(attribute(span, "verb.caller").as_deref(), Some("bearer"));
+    // A crew on the main socket is recorded as the crew, not as its process's uid.
+    assert_eq!(attribute(span, "verb.caller").as_deref(), Some("crew:flotilla/convoy-1/work/coder#crew-1"));
     assert_eq!(attribute(span, "verb.name").as_deref(), Some("convoy.touch"));
     assert_eq!(attribute(span, "verb.subjects").map(|text| serde_json::from_str::<Value>(&text).unwrap()), Some(json!([RUNNING, missing])));
     assert_eq!(attribute(span, "verb.params").map(|text| serde_json::from_str::<Value>(&text).unwrap()), Some(json!({"note": "why"})));
@@ -378,13 +424,17 @@ async fn the_invocation_span_records_the_intent_and_the_outcomes() {
     let effect = spans.iter().find(|span| span.name == "convoy.touch.effect").expect("the verb's span");
     assert_eq!(effect.parent_span_id, span.span_context.span_id(), "the verb's spans nest under the invocation");
     let refused = invocation("bad");
-    assert_eq!(attribute(refused, "verb.caller").as_deref(), Some("socket"));
+    let user = PrincipalRef::implicit_for_namespace(&daemon.provisioning_namespace().await);
+    assert_eq!(attribute(refused, "verb.caller"), Some(format!("{}/{}", user.namespace, user.name)), "the bearer token holder is the user");
     assert!(attribute(refused, "verb.refusal").expect("refusal").contains("at least one subject"));
     assert_eq!(attribute(refused, "verb.outcomes"), None);
     let params = attribute(invocation("long"), "verb.params").expect("params");
     assert!(params.len() <= FIELD_LIMIT && params.ends_with('…'), "{} bytes", params.len());
-    let subjects = attribute(invocation("many"), "verb.subjects").expect("subjects");
-    assert!(subjects.len() <= FIELD_LIMIT && subjects.ends_with('…'), "{} bytes", subjects.len());
+    let many = invocation("many");
+    for field in ["verb.subjects", "verb.outcomes"] {
+        let text = attribute(many, field).expect(field);
+        assert!(text.len() <= FIELD_LIMIT && text.ends_with('…'), "{field}: {} bytes", text.len());
+    }
     provider.shutdown().unwrap();
 }
 
@@ -392,7 +442,8 @@ async fn the_invocation_span_records_the_intent_and_the_outcomes() {
 // only callers acting as the user reach the route.
 #[tokio::test]
 async fn requests_that_do_not_fit_the_verb_are_refused_whole() {
-    let Fixture { router, runs, .. } = fixture();
+    let Fixture { router, runs, .. } = fixture().await;
+    let too_many: Vec<_> = (0..=SUBJECT_LIMIT).map(|index| format!("{RUNNING}-{index}")).collect();
     for (verb, body, status) in [
         ("convoy.nothing", json!({"invocation": "x", "subjects": [RUNNING]}), StatusCode::NOT_FOUND),
         ("convoy.touch", json!({"invocation": "x", "subjects": []}), StatusCode::BAD_REQUEST),
@@ -400,6 +451,7 @@ async fn requests_that_do_not_fit_the_verb_are_refused_whole() {
         ("convoy.touch", json!({"invocation": "x".repeat(INVOCATION_LIMIT + 1), "subjects": [RUNNING]}), StatusCode::BAD_REQUEST),
         ("convoy.touch", json!({"invocation": "x", "subjects": ["project:flotilla"]}), StatusCode::BAD_REQUEST),
         ("convoy.touch", json!({"invocation": "x", "subjects": [RUNNING, RUNNING]}), StatusCode::BAD_REQUEST),
+        ("convoy.touch", json!({"invocation": "x", "subjects": too_many}), StatusCode::BAD_REQUEST),
         ("convoy.touch", json!({"invocation": "x", "subjects": [RUNNING], "params": {"other": 1}}), StatusCode::BAD_REQUEST),
         ("convoy.touch", json!({"invocation": "x", "subjects": [RUNNING], "params": {"note": 1}}), StatusCode::BAD_REQUEST),
         ("convoy.touch", json!({"subjects": [RUNNING]}), StatusCode::BAD_REQUEST),
@@ -458,5 +510,38 @@ async fn convoy_explain_is_listed_and_runs_through_the_route() {
     assert_eq!(
         body["outcomes"][1],
         json!({"subject": "project:other/convoy:explained", "status": "failed", "error": "no convoy at `project:other/convoy:explained`"})
+    );
+}
+
+// Behaviour (#4234): a convoy's address names it by role, not by its record name. A
+// project-qualified role finds the record under that project, a bare role finds it when it is
+// unambiguous, and the role under another project names nothing.
+#[tokio::test]
+async fn convoy_explain_finds_a_convoy_by_its_role() {
+    let (_dir, daemon) = super::super::tests::empty_daemon().await;
+    let namespace = daemon.provisioning_namespace().await;
+    let labels = BTreeMap::from([(PROJECT_LABEL.to_owned(), "flotilla".to_owned()), (ROLE_LABEL.to_owned(), "fix-3774".to_owned())]);
+    daemon
+        .resource_backend()
+        .using::<Convoy>(&namespace)
+        .create(
+            &InputMeta::builder().name("convoy-0123".into()).labels(labels).build(),
+            &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).role("fix-3774".into()).build(),
+        )
+        .await
+        .unwrap();
+    let router =
+        HttpRouter::for_daemon(Arc::clone(&daemon), Arc::new(LoginStore::new(daemon.clock_for_scenarios())), ListenerOrigin::default())
+            .into_router();
+    let subjects = ["project:flotilla/convoy:fix-3774", "convoy:fix-3774", "project:other/convoy:fix-3774"];
+    let (status, body) = invoke(&router, CallerAuth::Bearer, "convoy.explain", json!({"invocation": "r", "subjects": subjects})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for outcome in &body["outcomes"].as_array().unwrap()[..2] {
+        assert_eq!(outcome["status"], "done", "{body}");
+        assert!(outcome["result"].is_object(), "{body}");
+    }
+    assert_eq!(
+        body["outcomes"][2],
+        json!({"subject": subjects[2], "status": "failed", "error": format!("no convoy at `{}`", subjects[2])})
     );
 }

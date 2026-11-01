@@ -30,7 +30,10 @@ use tokio::sync::{
 use tokio::{task::JoinHandle, time::Instant};
 use uuid::Uuid;
 
-use super::{CallerAuth, RouterState};
+use super::{
+    auth::{injected_evidence, main_socket_caller},
+    CallerAuth, RouterState,
+};
 use crate::server::{
     caller, client_connection::QuerySubscriptions, environment_connection, environment_supervision, remote_commands::RemoteCommandRouter,
     request_dispatch::RequestDispatcher,
@@ -46,14 +49,6 @@ const MAX_WAIT: f64 = 300.0;
 const MAX_STEPS: usize = 256;
 const MAX_PROGRESS_BYTES: usize = 256 * 1024;
 const UNKNOWN_RETENTION: Duration = Duration::from_secs(300);
-
-// Test double only for the kernel/procfs evidence boundary; resolution remains real.
-#[cfg(test)]
-struct PeerEvidence {
-    caller: CommandCaller,
-    claims: std::collections::HashMap<String, String>,
-    mounts: Option<caller::PeerMounts>,
-}
 
 pub(super) struct Commands {
     router: RemoteCommandRouter,
@@ -156,6 +151,11 @@ fn owner_key(caller: &CommandCaller) -> Option<(&str, &str)> {
 }
 
 impl Commands {
+    /// The main socket's path, whose directory a contained peer's mounts are checked against.
+    pub(super) fn socket_path(&self) -> &std::path::Path {
+        &self.socket_path
+    }
+
     pub(super) fn new(router: RemoteCommandRouter, shutdown: mpsc::UnboundedSender<()>, socket_path: PathBuf) -> Self {
         Self {
             router,
@@ -271,8 +271,7 @@ pub(super) async fn handle(
             None => return refuse(encoding, StatusCode::METHOD_NOT_ALLOWED, "method is not available on this route"),
         }
     };
-    #[cfg(test)]
-    let injected_evidence = request.extensions().get::<Arc<PeerEvidence>>().cloned();
+    let evidence = injected_evidence(request.extensions());
     let body = match Body::read(request, limit).await {
         Ok(body) => body,
         Err(refused) => return refuse(encoding, refused.status(), refused.message()),
@@ -280,44 +279,13 @@ pub(super) async fn handle(
     let namespace = daemon.provisioning_namespace().await;
     let mut transport_bound = false;
     let caller = match &authenticated {
-        CallerAuth::Socket(Some(peer)) => {
-            let peer = *peer;
-            let socket_path = commands.socket_path.clone();
-            let evidence = tokio::task::spawn_blocking(move || {
-                #[cfg(test)]
-                if let Some(evidence) = injected_evidence {
-                    return Ok((
-                        evidence.caller.clone(),
-                        evidence.claims.clone(),
-                        evidence
-                            .mounts
-                            .as_ref()
-                            .map(|m| caller::PeerMounts { mountinfo: m.mountinfo.clone(), legacy_main_directory: m.legacy_main_directory }),
-                    ));
-                }
-                let claims = caller::claims_from_peer(Some(peer));
-                let caller = caller::caller_from_peer(Some(peer), &namespace)?;
-                let mounts = caller
-                    .process
-                    .as_ref()
-                    .filter(|p| p.container.is_some())
-                    .map(|p| caller::peer_mounts(p.pid, Some(&socket_path)))
-                    .transpose()?;
-                Ok::<_, String>((caller, claims, mounts))
-            })
-            .await;
-            match evidence {
-                Ok(Ok((caller, claims, mounts))) => match caller::resolve_main_caller(daemon, caller, &claims, mounts.as_ref()).await {
-                    Ok(resolved) => {
-                        transport_bound = resolved.transport_bound;
-                        resolved.caller
-                    }
-                    Err(error) => return refuse(encoding, StatusCode::FORBIDDEN, error),
-                },
-                Ok(Err(error)) => return refuse(encoding, StatusCode::FORBIDDEN, error),
-                Err(error) => return refuse(encoding, StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        CallerAuth::Socket(Some(peer)) => match main_socket_caller(daemon, *peer, Some(commands.socket_path.clone()), evidence).await {
+            Ok(resolved) => {
+                transport_bound = resolved.transport_bound;
+                resolved.caller
             }
-        }
+            Err((status, error)) => return refuse(encoding, status, error),
+        },
         CallerAuth::Environment { environment, peer } => {
             let crews = match environment_connection::environment_crews(daemon, environment).await {
                 Ok(c) => c,
@@ -696,6 +664,7 @@ mod tests {
 
     use super::*;
     use crate::blob_store::{BlobStore, TieredBlobStore};
+    use crate::server::http::auth::PeerEvidence;
     use crate::server::http::{HttpRouter, ListenerOrigin, LoginStore};
     use crate::server::tests::{caller_mountinfo, placed_crew_daemon, supervisor_daemon};
 

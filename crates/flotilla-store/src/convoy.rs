@@ -21,6 +21,11 @@ pub fn live_convoys_query() -> crate::StoreQuery {
 
 /// Resolves a convoy address to its local record name.
 pub async fn resolve_local_convoy_name(backend: &crate::ResourceBackend, namespace: &str, address: &str) -> Result<String, String> {
+    find_local_convoy_name(backend, namespace, address).await?.ok_or_else(|| format!("no convoy matches `{address}`"))
+}
+
+/// Resolves a convoy address to its local record name, or none when no convoy matches it.
+pub async fn find_local_convoy_name(backend: &crate::ResourceBackend, namespace: &str, address: &str) -> Result<Option<String>, String> {
     let convoys = backend.clone().using::<flotilla_resources::Convoy>(namespace);
     let candidates = convoys.list().await.map_err(|error| error.to_string())?.items;
     let identities = candidates
@@ -34,8 +39,8 @@ pub async fn resolve_local_convoy_name(backend: &crate::ResourceBackend, namespa
         .collect::<Vec<_>>();
     let selected = flotilla_resources::resolve_convoy_candidate_indices(&identities, address)?;
     match selected.as_slice() {
-        [index] => Ok(candidates[*index].metadata.name.clone()),
-        [] => Err(format!("no convoy matches `{address}`")),
+        [index] => Ok(Some(candidates[*index].metadata.name.clone())),
+        [] => Ok(None),
         _ => Err(format!("convoy record `{address}` is present from multiple sources")),
     }
 }

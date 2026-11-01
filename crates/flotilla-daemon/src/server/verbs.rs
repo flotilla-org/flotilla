@@ -17,11 +17,11 @@ use flotilla_core::in_process::InProcessDaemon;
 use flotilla_store::ResourceBackend;
 
 use crate::server::tables::DerivedSet;
-use catalog::{Catalog, NativeVerb, Picks, Presentation};
+use catalog::{Catalog, Handler, Picks, Presentation};
 pub(crate) use invoke::{Refusal, Verbs};
 
 /// The built-in native verbs.
-fn natives(daemon: Option<Arc<InProcessDaemon>>) -> Vec<Arc<dyn NativeVerb>> {
+fn natives(daemon: Option<Arc<InProcessDaemon>>) -> Vec<Arc<dyn Handler>> {
     vec![Arc::new(convoy::ExplainConvoy { daemon })]
 }
 

@@ -2,12 +2,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use flotilla_address::{record_name, Address, Kind};
+use flotilla_address::{Address, Kind};
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_protocol::table::Row;
-use flotilla_schema::{Table, Verb, VerbDeclaration};
-use flotilla_store::{query_resource_kind, ResourceBackend, StoreQuery};
-use serde_json::{Map, Value};
+use flotilla_schema::{Table, Verb};
+use flotilla_store::{find_local_convoy_name, query_resource_kind, ResourceBackend, StoreQuery};
+use serde_json::Value;
 
 use super::catalog::{NativeVerb, Subject, Subjects};
 use crate::server::tables;
@@ -30,6 +30,18 @@ impl ResourceSubjects {
             None => "default".into(),
         }
     }
+
+    /// The `convoys` row of the record `name`, when it is `project`'s (or there is no project).
+    async fn read(&self, namespace: &str, table: &Table, name: &str, project: Option<&str>) -> Result<Option<Row>, String> {
+        let query = StoreQuery::names([name.to_owned()], false);
+        let document = query_resource_kind(&self.backend, namespace, "convoys", &query).await.map_err(|error| error.to_string())?;
+        let row = tables::resource_rows(&document, table)?.into_iter().next();
+        // A convoy under a project is that project's: `project:other/convoy:c` names no convoy of `flotilla`.
+        // The `convoys` table keeps `spec` as one whole-object column, so `project_ref` is read inside it.
+        Ok(row.filter(|row| {
+            project.is_none_or(|project| row.get("spec").and_then(|spec| spec.get("project_ref")).and_then(Value::as_str) == Some(project))
+        }))
+    }
 }
 
 #[async_trait]
@@ -40,18 +52,25 @@ impl Subjects for ResourceSubjects {
 
     async fn row(&self, address: &Address) -> Result<Option<Row>, String> {
         let Some(table) = self.table(address.kind()) else { return Err(format!("no table serves `{}` subjects", address.kind())) };
-        let name = record_name(address).ok_or_else(|| format!("`{address}` names no record"))?;
-        let query = StoreQuery::names([name], false);
-        let document =
-            query_resource_kind(&self.backend, &self.namespace().await, "convoys", &query).await.map_err(|error| error.to_string())?;
-        let row = tables::resource_rows(&document, &table)?.into_iter().next();
-        // A convoy under a project is that project's: `project:other/convoy:c` names no convoy of `flotilla`.
-        // The `convoys` table keeps `spec` as one whole-object column, so `project_ref` is read inside it.
-        Ok(row.filter(|row| {
-            address
-                .get(Kind::Project)
-                .is_none_or(|project| row.get("spec").and_then(|spec| spec.get("project_ref")).and_then(Value::as_str) == Some(project))
-        }))
+        let namespace = self.namespace().await;
+        let project = address.get(Kind::Project);
+        // A convoy's address names it by role (ADR 0066); its record is `convoy-<uuid>` or
+        // `ensure-<hash>`. As the resolver does, an exact record name wins over a role. The
+        // resolver matches `role@project` only by role, so under a project the record name is
+        // read first.
+        if project.is_some() {
+            if let Some(row) = self.read(&namespace, &table, address.name(), project).await? {
+                return Ok(Some(row));
+            }
+        }
+        let wanted = match project {
+            Some(project) => format!("{}@{project}", address.name()),
+            None => address.name().to_owned(),
+        };
+        match find_local_convoy_name(&self.backend, &namespace, &wanted).await? {
+            Some(name) => self.read(&namespace, &table, &name, project).await,
+            None => Ok(None),
+        }
     }
 }
 
@@ -67,11 +86,9 @@ pub(crate) struct ExplainConvoy {
 
 #[async_trait]
 impl NativeVerb for ExplainConvoy {
-    fn declaration(&self) -> VerbDeclaration {
-        Explain::declaration()
-    }
+    type Params = Explain;
 
-    async fn run(&self, subjects: &[Subject], _params: &Map<String, Value>, _invocation: &str) -> Result<Option<Value>, String> {
+    async fn run(&self, subjects: &[Subject], _params: &Explain, _invocation: &str) -> Result<Option<Value>, String> {
         let daemon = self.daemon.as_ref().ok_or("the daemon is unavailable")?;
         let [subject] = subjects else { return Err("convoy.explain runs on one convoy at a time".into()) };
         let name = subject.row.get("metadata.name").and_then(Value::as_str).ok_or("the convoy row has no name")?;
