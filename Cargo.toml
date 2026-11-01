@@ -88,18 +88,18 @@ license = "Apache-2.0 OR MIT"
 # When adding dependencies anywhere in the workspace, update the external-crate
 # allowlist in clippy.toml (use the library crate name, including any rename).
 [workspace.dependencies]
-drydock = { git = "https://github.com/flotilla-org/drydock", rev = "3d5413806018224d93fc330a8e2e6c97cb0ceae6" }
-drydock-protocol = { git = "https://github.com/flotilla-org/drydock", rev = "3d5413806018224d93fc330a8e2e6c97cb0ceae6" }
-drydock-agent = { git = "https://github.com/flotilla-org/drydock", rev = "3d5413806018224d93fc330a8e2e6c97cb0ceae6" }
-drydock-transport = { git = "https://github.com/flotilla-org/drydock", rev = "3d5413806018224d93fc330a8e2e6c97cb0ceae6" }
-drydock-host = { git = "https://github.com/flotilla-org/drydock", rev = "3d5413806018224d93fc330a8e2e6c97cb0ceae6" }
-rigging-stream = { git = "https://github.com/flotilla-org/rigging", rev = "8cc41c32d79f61a77c2566ae98817b5a619d60fe" }
-rigging-tls = { git = "https://github.com/flotilla-org/rigging", rev = "8cc41c32d79f61a77c2566ae98817b5a619d60fe" }
-rigging-process = { git = "https://github.com/flotilla-org/rigging", rev = "8cc41c32d79f61a77c2566ae98817b5a619d60fe" }
-rigging-http-client = { git = "https://github.com/flotilla-org/rigging", rev = "8cc41c32d79f61a77c2566ae98817b5a619d60fe" }
-rigging-replay-testkit = { git = "https://github.com/flotilla-org/rigging", rev = "8cc41c32d79f61a77c2566ae98817b5a619d60fe" }
-rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", rev = "8cc41c32d79f61a77c2566ae98817b5a619d60fe" }
-rigging-http-wire = { git = "https://github.com/flotilla-org/rigging", rev = "8cc41c32d79f61a77c2566ae98817b5a619d60fe" }
+drydock = { git = "https://github.com/flotilla-org/drydock", rev = "9f3d305ed6330ae40c3716df9cc9dc9e472728db" }
+drydock-protocol = { git = "https://github.com/flotilla-org/drydock", rev = "9f3d305ed6330ae40c3716df9cc9dc9e472728db" }
+drydock-agent = { git = "https://github.com/flotilla-org/drydock", rev = "9f3d305ed6330ae40c3716df9cc9dc9e472728db" }
+drydock-transport = { git = "https://github.com/flotilla-org/drydock", rev = "9f3d305ed6330ae40c3716df9cc9dc9e472728db" }
+drydock-host = { git = "https://github.com/flotilla-org/drydock", rev = "9f3d305ed6330ae40c3716df9cc9dc9e472728db" }
+rigging-stream = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
+rigging-tls = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
+rigging-process = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
+rigging-http-client = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
+rigging-replay-testkit = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
+rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
+rigging-http-wire = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
 # The condition language (#4108). Pinned ahead of the other rigging crates, which drydock's pin holds back; it
 # depends on no other rigging crate.
 rigging-condition = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
