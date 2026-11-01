@@ -2365,7 +2365,7 @@ impl Aggregator {
     fn next_escalation_delay(&self, now: chrono::DateTime<chrono::Utc>) -> Option<std::time::Duration> {
         self.attentions
             .iter()
-            .filter(|open| open.sender == Sender::Standing && matches!(open.subject, AttentionSubject::Convoy { .. }))
+            .filter(|open| open.is_hold())
             .map(|open| open.raised_at + HOLD_ESCALATES_AFTER)
             .filter(|at| *at > now)
             .min()

@@ -70,7 +70,7 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
                     turn_delivery: Default::default(),
                     vessels: vec![VesselRequirement::builder()
                         .name("work".to_string())
-                        .credential_refs(BTreeSet::from(["github-app".to_string()]))
+                        .credential_refs(BTreeSet::from(["github-app".to_string(), "forgejo".to_string()]))
                         .crew(Vec::new())
                         .build()],
                 }),
@@ -153,6 +153,17 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     assert_eq!(open().await.len(), 1);
     reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[], &raised).await.expect("clear on recovery");
     assert!(open().await.is_empty());
+
+    // Each change of the failing set is told: {github-app}, then {github-app, forgejo}, then {github-app}.
+    let forgejo = CredentialRefreshError { credential_name: Some("forgejo".to_string()), ..failure("token refused", true) };
+    for (failing, told) in
+        [(vec![failure("outage", true)], 1), (vec![failure("outage", true), forgejo], 2), (vec![failure("outage", true)], 1)]
+    {
+        reconcile_credential_refresh_attention(&daemon, NAMESPACE, &failing, &raised).await.expect("raise attention");
+        let open = open().await;
+        assert_eq!(open.len(), 1, "one attention per vessel");
+        assert_eq!(open[0].reason.lines().count(), told, "{}", open[0].reason);
+    }
 }
 
 #[test]

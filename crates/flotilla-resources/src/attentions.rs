@@ -150,9 +150,14 @@ pub struct OpenAttention {
 }
 
 impl OpenAttention {
+    /// A standing convoy's hold.
+    pub fn is_hold(&self) -> bool {
+        self.sender == Sender::Standing && matches!(self.subject, Subject::Convoy { .. })
+    }
+
     /// A standing convoy's hold left open past [`HOLD_ESCALATES_AFTER`].
     pub fn escalated_at(&self, now: DateTime<Utc>) -> bool {
-        self.sender == Sender::Standing && matches!(self.subject, Subject::Convoy { .. }) && now - self.raised_at >= HOLD_ESCALATES_AFTER
+        self.is_hold() && now - self.raised_at >= HOLD_ESCALATES_AFTER
     }
 }
 

@@ -20,7 +20,7 @@ use flotilla_charter::ops_entry::{
     PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
 };
 use flotilla_protocol::{PlacementTargetHost, PrincipalRef};
-use flotilla_resources::attentions::{Attention, Attentions, Fact, Sender, Subject};
+use flotilla_resources::attentions::{Attention, Attentions, Fact, OpenAttention, Sender, Subject};
 use flotilla_resources::{
     Clock, ConditionValue, ControllerRetry, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureConfigDrift,
     ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyEnsureStatusPatch, ConvoyPhase, FulfilmentKind,
@@ -87,9 +87,31 @@ pub struct EnsureReconciler {
     engine: Option<Arc<dyn EngineEnsures>>,
     /// The daemon's ManifestRoots (#3824 layer 2c); the old store's when absent.
     manifest_roots: Option<Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>>,
-    /// Holds whose acknowledgement already released one admission, by namespace and held convoy.
     #[builder(skip)]
-    released_holds: Mutex<HashSet<(String, String)>>,
+    released_holds: ReleasedHolds,
+}
+
+/// The held convoy whose acknowledgement last released an admission, by namespace and ensure.
+/// One acknowledgement releases once, until the ensure's hold is raised again.
+#[derive(Default)]
+struct ReleasedHolds(std::sync::Mutex<HashMap<(String, String), String>>);
+
+impl ReleasedHolds {
+    /// Whether this acknowledged hold on `convoy` releases an admission now.
+    fn release(&self, namespace: &str, ensure: &str, convoy: &str) -> bool {
+        let mut released = self.0.lock().expect("released holds");
+        let key = (namespace.to_owned(), ensure.to_owned());
+        if released.get(&key).is_some_and(|held| held == convoy) {
+            return false;
+        }
+        released.insert(key, convoy.to_owned());
+        true
+    }
+
+    /// The ensure is held again: its next acknowledgement releases again.
+    fn rehold(&self, namespace: &str, ensure: &str) {
+        self.0.lock().expect("released holds").remove(&(namespace.to_owned(), ensure.to_owned()));
+    }
 }
 
 impl EnsureReconciler {
@@ -137,7 +159,7 @@ impl EnsureReconciler {
 #[derive(bon::Builder)]
 struct EnsurePass<'a> {
     attentions: Arc<dyn Attentions>,
-    released_holds: &'a Mutex<HashSet<(String, String)>>,
+    released_holds: &'a ReleasedHolds,
     teardown: &'a Arc<dyn ConvoyTeardown>,
     resource_backend: &'a ResourceBackend,
     manifest_roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
@@ -624,7 +646,7 @@ impl EnsurePass<'_> {
                 self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
                 consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES
             }
-            Some(latest) => self.release_acknowledged_hold(namespace, &latest.metadata.name).await?,
+            Some(latest) => self.release_acknowledged_hold(namespace, &ensure.metadata.name, &latest.metadata.name).await?,
             None => false,
         };
 
@@ -1089,6 +1111,7 @@ impl EnsurePass<'_> {
         convoy: &ResourceObject<ResourceConvoy>,
         reason: &str,
     ) -> Result<(), String> {
+        self.released_holds.rehold(&convoy.metadata.namespace, &ensure.metadata.name);
         let fact = Fact::Hold { ensure: ensure.metadata.name.clone(), convoy: convoy.metadata.name.clone() };
         self.attentions.raise(&convoy.metadata.namespace, &Attention::new(fact, reason)).await
     }
@@ -1096,26 +1119,20 @@ impl EnsurePass<'_> {
     async fn hold_is_open(&self, namespace: &str, convoy: &str) -> Result<bool, String> {
         let subject = Subject::convoy(convoy);
         let open = self.attentions.open(namespace, Some(&subject)).await?;
-        Ok(open.iter().any(|attention| attention.sender == Sender::Standing && attention.subject == subject))
+        Ok(open.iter().any(|attention| attention.is_hold() && attention.subject == subject))
     }
 
     /// Whether a person acknowledged the hold on `convoy` since it last released an admission.
-    async fn release_acknowledged_hold(&self, namespace: &str, convoy: &str) -> Result<bool, String> {
+    async fn release_acknowledged_hold(&self, namespace: &str, ensure: &str, convoy: &str) -> Result<bool, String> {
         if !self.attentions.acknowledged(namespace, Sender::Standing, &Subject::convoy(convoy)).await? {
             return Ok(false);
         }
-        Ok(self.released_holds.lock().await.insert((namespace.to_owned(), convoy.to_owned())))
+        Ok(self.released_holds.release(namespace, ensure, convoy))
     }
 
     /// Clears the hold on any of the ensure's generations.
     async fn clear_ensure_attention(&self, namespace: &str, ensure_name: &str) -> Result<(), String> {
-        let holds: Vec<_> = self
-            .attentions
-            .open(namespace, None)
-            .await?
-            .into_iter()
-            .filter(|open| open.sender == Sender::Standing && matches!(open.subject, Subject::Convoy { .. }))
-            .collect();
+        let holds: Vec<_> = self.attentions.open(namespace, None).await?.into_iter().filter(OpenAttention::is_hold).collect();
         if holds.is_empty() {
             return Ok(());
         }
@@ -1230,6 +1247,17 @@ mod tests {
 
     use super::*;
     use flotilla_resources::{Demand as ResourceDemand, InputMeta};
+
+    #[test]
+    fn an_acknowledged_hold_releases_once_until_it_is_held_again() {
+        let released = ReleasedHolds::default();
+        assert!(released.release("ns", "standing", "generation-3"));
+        assert!(!released.release("ns", "standing", "generation-3"), "a refused admission does not release again");
+        assert!(released.release("ns", "other", "generation-3"), "each ensure releases on its own");
+        released.rehold("ns", "standing");
+        assert!(released.release("ns", "standing", "generation-3"), "held again, the next acknowledgement releases");
+        assert!(released.release("ns", "standing", "generation-4"));
+    }
 
     // Stands in for provider-backed admission and lifecycle operations. Resource
     // storage, status patches, the clock and the reconcile loop are real.
