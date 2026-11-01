@@ -297,7 +297,8 @@ mod tests {
         assert!(code.contains("const DATA : & 'static [& 'static str] = & []"), "{code}");
     }
 
-    // Behaviour (DESIGN indexes): `eq` and `order` name top-level single-column fields, `when`
+    // Behaviour (DESIGN indexes): `eq` and `order` name top-level single-column fields (or `eq` a
+    // child list alone, below), `when`
     // allows only `<state field> in [..]` and `<optional field> is_some`, and an optional order
     // field must be required by `is_some`, and `order` refuses interned and reference fields
     // (local ids, ordered differently in every store) while `eq` accepts them. Everything else is
@@ -326,7 +327,7 @@ mod tests {
             quote!(index(name = "x")),
             quote!(index(name = "Bad", eq(a))),
             quote!(index(name = "x", eq(nope))),
-            quote!(index(name = "x", eq(e))),
+            quote!(index(name = "x", eq(e, a))),
             quote!(index(name = "x", eq(f))),
             quote!(index(name = "x", eq(s))),
             quote!(index(name = "x", eq(a), order(a))),
@@ -586,6 +587,38 @@ mod tests {
         assert!(!part.contains("IndexQuery"), "no constructor");
         assert!(!part.contains("Flat for Event"));
         assert!(error(quote! { #[store(index(name = "x", order(nope)))] struct A { a: u8 } }).contains("not a field of this struct"));
+    }
+
+    // Behaviour: an index whose one `eq` field is a `child` Vec is laid out on that list's table,
+    // and its constructor takes an element; any other use of a table field in an index is refused.
+    #[test]
+    fn child_list_indexes_take_an_element() {
+        let kind = expanded(quote! {
+            #[store(kind = "Change", code = "k1", index(name = "by_closed", eq(closes)))]
+            struct Change { number: u64, #[store(child)] closes: Vec<Subject> }
+        });
+        for expected in [
+            "layout . element_index (\"by_closed\" , \"closes\")",
+            "pub fn by_closed (closes : & Subject) -> :: flotilla_schema :: IndexQuery < Self >",
+            ":: flotilla_schema :: element_values :: < Subject > (closes)",
+            "Subject : :: flotilla_schema :: Element",
+        ] {
+            assert!(kind.contains(expected), "missing {expected} in {kind}");
+        }
+        for (case, problem) in [
+            (quote!(index(name = "x", eq(set))), "needs a `child` Vec"),
+            (quote!(index(name = "x", eq(list), order(n))), "belongs on a kind"),
+            (quote!(index(name = "x", eq(list), when(m is_some))), "belongs on a kind"),
+            (quote!(index(name = "x", eq(list, n))), "single-column field"),
+        ] {
+            let message = error(quote! {
+                #[store(kind = "A", code = "k1", #case)]
+                struct A { n: u64, m: Option<u64>, #[store(child)] list: Vec<S>, #[store(child)] set: BTreeSet<u64> }
+            });
+            assert!(message.contains(SUPPORTED) && message.contains(problem), "{case}: {message}");
+        }
+        let part = error(quote! { #[store(index(name = "x", eq(list)))] struct A { #[store(child)] list: Vec<S> } });
+        assert!(part.contains("belongs on a kind"), "{part}");
     }
 
     // Behaviour: a newtype wrapping String is internable; other newtypes are not.
