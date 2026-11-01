@@ -272,6 +272,21 @@ pub(super) fn actor_is_working(
     working && !silent
 }
 
+/// Evidence for a holding convoy with no actionable row. A Landing convoy whose
+/// workflow omits `exit` is a Standing Convoy: nothing can settle it, so name
+/// that dead end rather than an absent maker (#4278). A Done claim's observed
+/// digest still anchors settlement without an exit; its own evidence is attention.
+fn empty_row_evidence(status: &ConvoyStatus) -> String {
+    let standing = status.workflow_snapshot.as_ref().and_then(|snapshot| snapshot.exit.as_ref()).is_none();
+    let digest_anchored =
+        status.crew_work.values().flat_map(BTreeMap::values).any(|work| work.phase == CrewWorkPhase::Done && work.claim_evidence.is_some());
+    if status.phase == ConvoyPhase::Landing && standing && !digest_anchored {
+        "no exit: the workflow declares no exit, so nothing can settle this Landing convoy; an operator reaps it".into()
+    } else {
+        "no armed row with an able maker".into()
+    }
+}
+
 pub(super) fn stalled_source_actor(condition: &StalledCondition) -> Option<(&str, &str)> {
     let leaf = condition.leaves.first()?;
     let LeafAddress::Work { work, .. } = &leaf.address else { return None };
@@ -1195,7 +1210,7 @@ impl ReconcilerWake {
                 let (leaves, maker, evidence, source) = if let Some((row, evidence, source)) = unable.as_ref() {
                     (row.leaves.clone(), Some(row.maker.clone()), evidence.clone(), source.clone())
                 } else {
-                    (Vec::new(), None, "no armed row with an able maker".into(), StallEvidenceSource::LeafEngine)
+                    (Vec::new(), None, empty_row_evidence(status), StallEvidenceSource::LeafEngine)
                 };
                 let prior = status.stalled.as_ref().filter(|prior| prior.leaves == leaves && prior.maker == maker);
                 let nudge_history = obligations

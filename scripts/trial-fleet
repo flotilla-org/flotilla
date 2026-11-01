@@ -683,10 +683,7 @@ class Trial:
             'cloud_sandbox_per_vessel': {'image': self.image, 'size': CLOUD_SIZE, 'checkout': 'clone_in_vessel', 'env': {}}})
         self.wait('fulfilment kind from the placement policy', lambda: [item for item in self.objects('fulfilmentkinds')
                                                                         if item['metadata']['name'] == 'trial'], timeout=120)
-        crew = {'role': 'coder', 'selector': {'capability': 'code'}, 'promises': [{'kind': 'decision-ledger', 'owner': 'coder'}]}
-        if self.args.until == 'landed':
-            crew['deliverer'] = True
-        self.apply('WorkflowTemplate', 'trial', {'vessels': [{'name': 'work', 'crew': [crew]}]})
+        self.apply('WorkflowTemplate', 'trial', workflow_spec(self.args.until))
 
     def start_convoy(self):
         agent = SCRIPTED_ADAPTER if self.args.crew == 'scripted' else self.args.crew
@@ -752,7 +749,8 @@ class Trial:
             raise TrialFailure(f'the crew reports: {failed[-1][-300:]}')
 
     def landed(self):
-        self.until('convoy Landing', lambda: [name for name, phase in self.phase('convoys') if phase in ('Landing', 'Landed')])
+        # Landing settles on the merged pull request; a stall while it does fails the trial (#4278).
+        self.until('convoy Landed', lambda: [name for name, phase in self.phase('convoys') if phase == 'Landed'])
 
     # -- teardown --------------------------------------------------------
 
@@ -991,6 +989,17 @@ def remove_tree(path):
     except OSError:
         pass
     return not Path(path).exists()
+
+
+def workflow_spec(until):
+    """The single-agent workflow's shape. Its exit table lands the convoy on the
+    crew's merged pull request; a workflow without `exit` is a standing convoy,
+    which nothing settles, so it would stall in Landing (#4278)."""
+    crew = {'role': 'coder', 'selector': {'capability': 'code'}, 'promises': [{'kind': 'decision-ledger', 'owner': 'coder'}]}
+    if until == 'landed':
+        crew['deliverer'] = True
+    return {'exit': {'merged': '$cr.state == merged', 'closed-unmerged': '$cr.state == closed'},
+            'vessels': [{'name': 'work', 'crew': [crew]}]}
 
 
 def next_end_point(reached):

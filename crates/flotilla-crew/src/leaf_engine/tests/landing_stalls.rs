@@ -398,7 +398,172 @@ async fn landing_with_nothing_owed_stalls_with_evidence() {
     wake.judge_stalls_at("flotilla", &objects, Utc::now()).await.unwrap();
     let stall = convoys.get("dead-end").await.unwrap().status.unwrap().stalled.expect("genuine dead end stalls");
     assert_eq!(stall.source, flotilla_resources::StallEvidenceSource::LeafEngine);
-    assert_eq!(stall.evidence, "no armed row with an able maker");
+    assert!(stall.evidence.starts_with("no exit"), "{}", stall.evidence);
+}
+
+// #4278: a deliverer submits its PR, the forge merges it, and its promises
+// settle before Landing, so the crew is Done by promises and Landing records
+// no claims. With an exit declared, some row names who owes settlement
+// evidence: the forge observer of the bound PR, the branch scan, the
+// producing Vessel or the Convoy controller.
+// A workflow that omits `exit` is a Standing Convoy (CONTEXT.md): nothing can
+// settle it, so it is a genuine dead end whose stall names the missing exit.
+#[hegel::test]
+fn merged_submission_entering_landing_owes_settlement_or_names_no_exit(tc: hegel::TestCase) {
+    use flotilla_resources::promises::{self, PromiseKind, PromiseOperation, PromiseSource, Submission, SubmissionVerdict};
+    use hegel::generators as gs;
+    // Covers each settlement producer (scan pending, checkout missing behind a
+    // live Vessel, checkout present) and merged evidence from fresh to far
+    // older than the stale threshold: merged evidence stays final.
+    let declared_exit = tc.draw(gs::booleans());
+    let scanned = tc.draw(gs::booleans());
+    let checkout_present = tc.draw(gs::booleans());
+    let merged_age = tc.draw(gs::integers::<i64>().min_value(0).max_value(3600));
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let mut wake = supervision_wake(&backend);
+        let now = Utc::now();
+        wake.subscriptions = wake.subscriptions.with_clock(Arc::new(flotilla_store_testkit::VirtualClock::new(now)));
+        let workflow = flotilla_resources::single_agent_workflow_spec();
+        let mut status = ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
+                stall_nudges: Default::default(),
+                supervision: None,
+                exit: declared_exit.then_some(workflow.exit).flatten(),
+                turn_delivery: Default::default(),
+                vessels: workflow.vessels,
+            }),
+            work: BTreeMap::from([(
+                "work".into(),
+                WorkState::builder()
+                    .phase(WorkPhase::Running)
+                    .placement(flotilla_resources::PlacementStatus {
+                        fields: BTreeMap::from([("checkout_refs".into(), serde_json::json!({"repo": "checkout"}))]),
+                    })
+                    .build(),
+            )]),
+            crew_work: BTreeMap::from([(
+                "work".into(),
+                BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+            )]),
+            branch_subject_scan_at: scanned.then_some(now),
+            ..Default::default()
+        };
+        let merged_at = now - chrono::Duration::seconds(merged_age);
+        for (id, kind, reference) in
+            [("template/pr", PromiseKind::Pr, "cr/github.com/team/one/22"), ("ledger", PromiseKind::DecisionLedger, "artifact/ledger")]
+        {
+            let submitted_at = merged_at - chrono::Duration::seconds(10);
+            let submission = Submission { reference: reference.into(), metadata: BTreeMap::new(), submitted_at, verdict: None };
+            promises::apply(
+                &mut status,
+                "work",
+                "coder",
+                &PromiseOperation::Submit { id: id.into(), kind, source: PromiseSource::Template, submission },
+            );
+            let verdict = SubmissionVerdict { accepted: true, who: "forge".into(), at: merged_at, why: "PR merged".into() };
+            promises::apply(
+                &mut status,
+                "work",
+                "coder",
+                &PromiseOperation::Verdict { id: id.into(), reference: reference.into(), submitted_at, verdict },
+            );
+        }
+        // The convoy controller's own edge: settled promises make the crew
+        // Done and enter Landing with no claims.
+        flotilla_resources::ConvoyStatusPatch::DeriveCrewDone { vessel: "work".into(), role: "coder".into(), at: now, engine: false }
+            .apply(&mut status);
+        assert_eq!(status.phase, ConvoyPhase::Landing);
+        assert_eq!(status.landing_entry.as_ref().map(|entry| entry.claims.len()), Some(0));
+        create_convoy(&backend, "merged", status).await;
+
+        let records = backend.using::<ChangeRequest>("flotilla");
+        let name = cr_name("github.com", "team/one", 22);
+        let created = records
+            .create(
+                &InputMeta::builder().name(name.clone()).build(),
+                &flotilla_resources::ChangeRequestSpec::builder()
+                    .service("github.com".into())
+                    .scope("team/one".into())
+                    .number(22)
+                    .observing_authority("owner".into())
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let observation = flotilla_resources::ChangeRequestStatus {
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
+            state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, merged_at),
+            head_sha: Default::default(),
+            checks: Default::default(),
+            review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: Default::default() },
+            mergeable: Default::default(),
+        };
+        records.update_status(&name, &created.metadata.resource_version, &observation).await.unwrap();
+        let vessels = backend.using::<Vessel>("flotilla");
+        let vessel = vessels
+            .create(
+                &InputMeta::builder().name("producer".into()).labels(BTreeMap::from([(CONVOY_LABEL.into(), "merged".into())])).build(),
+                &flotilla_resources::VesselSpec {
+                    convoy_ref: "merged".into(),
+                    vessel_name: "work".into(),
+                    fulfilment_kind_ref: "policy".into(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+            )
+            .await
+            .unwrap();
+        vessels
+            .update_status(
+                "producer",
+                &vessel.metadata.resource_version,
+                &flotilla_resources::VesselStatus {
+                    checkout_refs: BTreeMap::from([(RepositoryKey("repo".into()), "checkout".into())]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        if checkout_present {
+            backend
+                .using::<Checkout>("flotilla")
+                .create(
+                    &InputMeta::builder().name("checkout".into()).labels(BTreeMap::from([(CONVOY_LABEL.into(), "merged".into())])).build(),
+                    &CheckoutSpec::Observed(
+                        ObservedCheckoutSpec::builder()
+                            .r#ref("branch".into())
+                            .path("/unused".into())
+                            .repo_ref(RepositoryKey("repo".into()))
+                            .host_ref("host".into())
+                            .is_main(false)
+                            .build(),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+
+        let convoys = backend.using::<Convoy>("flotilla");
+        let objects = HashMap::from([("merged".into(), convoys.get("merged").await.unwrap())]);
+        wake.sync_rows("flotilla", &objects).await.unwrap();
+        wake.judge_stalls_at("flotilla", &objects, now).await.unwrap();
+        let stalled = convoys.get("merged").await.unwrap().status.unwrap().stalled;
+        let rows = wake.subscriptions.rows().await;
+        if declared_exit {
+            assert!(stalled.is_none(), "a merged submission entering Landing must not stall: {stalled:?}");
+            assert!(!rows.is_empty(), "some row must name who owes settlement evidence");
+        } else {
+            assert!(rows.is_empty());
+            let stalled = stalled.expect("a standing convoy in Landing is a dead end");
+            assert_eq!((stalled.maker, stalled.leaves), (None, Vec::new()));
+            assert!(stalled.evidence.contains("no exit"), "the stall must name the missing exit: {}", stalled.evidence);
+        }
+    });
 }
 
 // #3428: Git owes missing/stale digest evidence while the checkout exists.
@@ -481,7 +646,10 @@ fn landing_digest_evidence_obligations_follow_observations(tc: hegel::TestCase) 
             let objects = HashMap::from([("digest".into(), convoys.get("digest").await.unwrap())]);
             wake.sync_rows("flotilla", &objects).await.unwrap();
             wake.judge_stalls_at("flotilla", &objects, now).await.unwrap();
-            assert_eq!(convoys.get("digest").await.unwrap().status.unwrap().stalled.is_some(), step == 3);
+            let stalled = convoys.get("digest").await.unwrap().status.unwrap().stalled;
+            assert_eq!(stalled.is_some(), step == 3);
+            // The claim's digest anchors settlement without an exit: not a standing dead end.
+            assert!(stalled.is_none_or(|stalled| !stalled.evidence.starts_with("no exit")));
             let rows = wake.subscriptions.rows().await;
             if step < 2 {
                 assert!(rows
