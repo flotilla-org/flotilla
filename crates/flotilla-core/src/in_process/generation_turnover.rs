@@ -1,51 +1,24 @@
 #[cfg(test)]
 use flotilla_store_memory::InMemoryBackend;
-use std::{
-    collections::{BTreeSet, HashMap},
-    path::Path,
-};
+use std::path::Path;
 
-use flotilla_protocol::result_set::CleatEndpoint;
+use flotilla_discovery::generation_turnover::{AdvanceRequest, GenerationTurnovers, RecordedSession, RecordedSessions};
 use flotilla_resources::{Environment, HostCondition, TerminalSession, TerminalSessionPhase};
+use flotilla_terminal::generation::{persist, RollReport};
 
 use super::InProcessDaemon;
-use crate::cleat_roll;
-use crate::cleat_roll::CleatEnvironment;
-use crate::cleat_roll::CleatTarget;
-use crate::cleat_roll::RollReport;
-use flotilla_discovery::environment_manager::ManagedEnvironmentKind;
-use flotilla_provider_runtime::ChannelLabel;
-
-#[derive(Default)]
-struct CleatInventory {
-    targets: Vec<CleatTarget>,
-    errors: Vec<String>,
-    information: BTreeSet<String>,
-}
-
-fn retain_unattempted_failures(previous: &RollReport, current: &mut RollReport, registered: &BTreeSet<String>) {
-    for attempt in &previous.attempts {
-        if attempt.error.is_some()
-            && registered.contains(&attempt.environment)
-            && !current
-                .attempts
-                .iter()
-                .any(|new| new.environment == attempt.environment && new.runtime_root == attempt.runtime_root && new.name == attempt.name)
-        {
-            current.attempts.push(attempt.clone());
-        }
-    }
-}
 
 impl InProcessDaemon {
-    async fn crew_cleat_targets(&self, require_local: bool) -> Result<CleatInventory, String> {
+    fn generation_turnovers(&self) -> GenerationTurnovers<'_> {
+        GenerationTurnovers::new(&self.environment_manager, &self.pool_turnovers)
+    }
+
+    async fn recorded_sessions(&self) -> Result<RecordedSessions, String> {
         let namespaces = self.resource_backend.local_namespaces::<TerminalSession>().await.map_err(|error| error.to_string())?;
-        let mut endpoints = HashMap::<_, Vec<CleatEndpoint>>::new();
-        let mut inventory = CleatInventory::default();
-        let mut vessels = HashMap::<_, BTreeSet<String>>::new();
+        let mut recorded = RecordedSessions::default();
         for namespace in namespaces {
             let sessions = self.resource_backend.using::<TerminalSession>(&namespace).list().await.map_err(|error| error.to_string())?;
-            for session in sessions.items.into_iter().filter(|session| session.spec.pool == "cleat") {
+            for session in sessions.items {
                 let (session, _) = flotilla_store::read_terminal_session(self.lifecycle_reads(), &session, None)
                     .await
                     .map_err(|error| error.to_string())?;
@@ -59,148 +32,61 @@ impl InProcessDaemon {
                     .get(flotilla_resources::VESSEL_REF_LABEL)
                     .cloned()
                     .unwrap_or_else(|| session.spec.env_ref.clone());
+                let pool = session.spec.pool.clone();
+                let endpoint = session.status.and_then(|status| status.cleat_endpoint);
                 if let Some(environment) = self.resolve_environment_ref(&session.spec.env_ref) {
-                    if let Some(endpoint) = session.status.and_then(|status| status.cleat_endpoint) {
-                        vessels.entry(environment.id.clone()).or_default().insert(vessel);
-                        endpoints.entry(environment.id).or_default().push(endpoint);
-                    }
-                } else if session.status.is_some_and(|status| status.cleat_endpoint.is_some()) {
+                    recorded.running.push(RecordedSession { pool, environment: environment.id, vessel, endpoint });
+                } else if endpoint.is_some() {
                     let environment = self.resource_backend.using::<Environment>(&namespace).get(&session.spec.env_ref).await.ok();
                     if environment
                         .as_ref()
                         .and_then(|environment| environment.spec.docker.as_ref())
                         .is_some_and(|docker| docker.host_ref == self.environment_manager.local_host_id().as_str())
                     {
-                        inventory.errors.push(format!("{vessel}: cleat environment runner unavailable: {}", session.spec.env_ref));
+                        let message = format!("{vessel}: {pool} environment runner unavailable: {}", session.spec.env_ref);
+                        recorded.unavailable.push((pool, message));
                     } else if environment
                         .as_ref()
                         .and_then(|environment| environment.spec.host_direct.as_ref())
                         .is_some_and(|direct| direct.host_ref == self.environment_manager.local_host_id().as_str())
                     {
-                        inventory.errors.push(format!("host cleat environment unavailable: {}", session.spec.env_ref));
+                        let message = format!("host {pool} environment unavailable: {}", session.spec.env_ref);
+                        recorded.unavailable.push((pool, message));
                     }
                     // Missing or foreign environment evidence cannot establish
                     // actionable local host skew.
                 }
             }
         }
-        for (id, state) in self.environment_manager.managed_environments() {
-            let (bag, local, contained) = match state {
-                ManagedEnvironmentKind::Direct(state) => {
-                    (state.env_bag, state.host_id.as_ref() == Some(self.environment_manager.local_host_id()), false)
-                }
-                ManagedEnvironmentKind::Provisioned(state) => {
-                    (state.env_bag, &state.owning_host_id == self.environment_manager.local_host_id(), true)
-                }
-            };
-            if !local
-                || (bag.find_binary("cleat").is_none()
-                    && !endpoints.contains_key(&id)
-                    && !(require_local && id == self.local_environment_id))
-            {
-                continue;
-            }
-            let Some(runner) = self.environment_manager.environment_runner(&id) else {
-                inventory.errors.push(format!("cleat runner unavailable for {id}"));
-                continue;
-            };
-            let environment = CleatEnvironment::builder().id(id.clone()).bag(bag).runner(runner).contained(contained).build();
-            match cleat_roll::crew_targets(&environment, endpoints.get(&id).map_or(&[], Vec::as_slice)) {
-                Ok(environment_targets) => inventory.targets.extend(environment_targets.into_iter().map(|mut target| {
-                    target.vessels = vessels.get(&id).map_or_else(Vec::new, |vessels| vessels.iter().cloned().collect());
-                    target
-                })),
-                Err(error) => inventory.errors.push(format!("{id}: {error}")),
-            }
-        }
-        Ok(inventory)
+        Ok(recorded)
     }
 
     pub async fn post_install_cleat(&self, incoming: &Path, generation: &str, diagnostics_dir: &Path) -> Result<RollReport, String> {
         self.wait_for_environment_adoption().await;
-        let inventory = self.crew_cleat_targets(true).await?;
-        #[cfg(unix)]
-        let mut inventory = inventory;
-        // Refresh current-layout shared mounts independently of handover.
-        // Legacy targets remain reachable even if this publication fails.
-        #[cfg(unix)]
-        if inventory.targets.iter().any(|target| target.contained) {
-            let root = self.config.state_dir().join("environment-tools/fleet");
-            let result = incoming
-                .parent()
-                .and_then(Path::parent)
-                .ok_or_else(|| "incoming cleat has no release root".to_string())
-                .and_then(|release| {
-                    flotilla_environment::guest_tools::GuestTools::resolve(release, &flotilla_environment::guest_tools::linux_amd64())
-                })
-                .and_then(|tools| flotilla_environment::tools::publish(root.as_path(), (&tools).into()).map_err(|error| error.to_string()));
-            if let Err(error) = result {
-                inventory.errors.push(format!("publish vessel tools: {error}"));
-            }
-        }
-        let mut report =
-            cleat_roll::drain(self.host_name.to_string(), generation.to_string(), incoming, &inventory.targets, inventory.errors).await;
-        report.information.extend(inventory.information);
-        // A registered environment can temporarily lose its runner. Retain its
-        // previous failed attempt until a retry actually addresses that target.
-        if let Some(previous) = self.cleat_roll_report.lock().await.as_ref() {
-            let registered = self.environment_manager.managed_environments().into_iter().map(|(id, _)| id.to_string()).collect();
-            retain_unattempted_failures(previous, &mut report, &registered);
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            let root = self.config.state_dir().join("environment-tools/fleet");
-            if root.as_path().exists() {
-                if let Err(error) = flotilla_environment::tools::prune_local(root.as_path()) {
-                    report.errors.push(format!("prune vessel tools: {error}"));
-                }
-            }
-        }
-        cleat_roll::persist(&mut report, diagnostics_dir).await;
-        *self.cleat_roll_report.lock().await = Some(report.clone());
+        let sessions = self.recorded_sessions().await?;
+        let previous = self.turnover_report.lock().await.clone();
+        let tools_root = self.config.state_dir().join("environment-tools/fleet");
+        let mut report = self
+            .generation_turnovers()
+            .advance(AdvanceRequest {
+                host: self.host_name.to_string(),
+                generation,
+                incoming,
+                tools_root: tools_root.as_path(),
+                sessions: &sessions,
+                previous: previous.as_ref(),
+            })
+            .await;
+        persist(&mut report, diagnostics_dir).await;
+        *self.turnover_report.lock().await = Some(report.clone());
         Ok(report)
     }
 
-    pub async fn cleat_build_skew_condition(&self) -> Option<HostCondition> {
-        let bag = self.local_environment_bag()?;
-        let binary = bag.find_binary("cleat")?;
-        let runner = self.local_command_runner()?;
-        let output = runner
-            .run_with_timeout(
-                &binary.as_path().display().to_string(),
-                &["version", "--json"],
-                Path::new("/"),
-                &ChannelLabel::Default,
-                std::time::Duration::from_secs(5),
-            )
-            .await;
-        let installed = output
-            .ok()
-            .and_then(|output| serde_json::from_str::<serde_json::Value>(&output).ok())
-            .and_then(|value| value["client"]["git_sha"].as_str().map(str::to_string));
-        let inventory = match self.crew_cleat_targets(false).await {
-            Ok(inventory) => inventory,
-            Err(error) => CleatInventory { errors: vec![error], ..Default::default() },
-        };
-        let mut report = self.cleat_roll_report.lock().await.clone();
-        if let Some(report) = &mut report {
-            // A relaunched/destroyed environment no longer carries the failed
-            // handover. Keep failures only for still-registered runtime targets.
-            report.attempts.retain(|attempt| {
-                inventory.targets.iter().any(|target| {
-                    target.environment == attempt.environment && target.runtime_root == attempt.runtime_root && target.name == attempt.name
-                })
-            });
-        }
-        let mut assessment = cleat_roll::build_skew(installed.as_deref(), &inventory.targets, report.as_ref()).await;
-        assessment.actionable.extend(inventory.errors);
-        assessment.information.extend(inventory.information);
-        if let Some(report) = report.as_ref() {
-            let drain = cleat_roll::assess_drain(report);
-            assessment.actionable.extend(drain.actionable);
-        }
-        assessment.into_condition(self.clock.now())
+    pub async fn generation_conditions(&self) -> Vec<HostCondition> {
+        let sessions =
+            self.recorded_sessions().await.unwrap_or_else(|error| RecordedSessions { errors: vec![error], ..Default::default() });
+        let previous = self.turnover_report.lock().await.clone();
+        self.generation_turnovers().conditions(&sessions, previous.as_ref(), self.clock.now()).await
     }
 }
 
@@ -210,7 +96,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use async_trait::async_trait;
-    use flotilla_protocol::{qualified_path::HostId, EnvironmentId, HostName, ImageId};
+    use flotilla_protocol::{qualified_path::HostId, result_set::CleatEndpoint, EnvironmentId, HostName, ImageId};
     use flotilla_resources::{ConditionValue, InputMeta, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus};
     use flotilla_store::ResourceBackend;
 
@@ -374,22 +260,6 @@ mod tests {
             )
             .await
             .expect("retained endpoint");
-        let inventory = daemon.crew_cleat_targets(true).await.expect("known targets");
-        assert_eq!(inventory.errors.len(), 1);
-        assert!(inventory.errors[0].contains("work-vessel: cleat environment runner unavailable"));
-        assert!(inventory.information.is_empty());
-        let targets = inventory.targets;
-        assert_eq!(targets.len(), 4);
-        assert!(targets.iter().any(|target| target.runtime_root == Path::new("/host-home/.local/state/cleat") && target.name == "default"));
-        assert!(targets.iter().any(|target| target.environment == "contained-work"
-            && target.runtime_root == Path::new("/var/lib/flotilla/cleat")
-            && target.name == "default"
-            && target.contained));
-        assert_eq!(targets.iter().filter(|target| target.name == "named").count(), 1);
-        assert!(!targets.iter().any(|target| target.environment == "remote"));
-        assert!(runner.calls().is_empty(), "enumeration is a resource/environment read");
-        // Missing incoming artifacts produce an attempt for every target and
-        // leave the contained runners untouched.
         let report = daemon
             .post_install_cleat(
                 &directory.path().join("missing-release/bin/cleat"),
@@ -398,6 +268,19 @@ mod tests {
             )
             .await
             .unwrap();
+        let unavailable: Vec<_> = report.errors.iter().filter(|error| error.contains("runner unavailable")).collect();
+        assert_eq!(unavailable.len(), 1);
+        assert!(unavailable[0].contains("work-vessel: cleat environment runner unavailable"));
+        assert!(!report.information.iter().any(|information| information.contains("offers no generation turnover")));
+        let targets = &report.attempts;
+        assert!(targets.iter().any(|target| target.runtime_root == Path::new("/host-home/.local/state/cleat") && target.name == "default"));
+        assert!(targets.iter().any(|target| target.environment == "contained-work"
+            && target.runtime_root == Path::new("/var/lib/flotilla/cleat")
+            && target.name == "default"));
+        assert_eq!(targets.iter().filter(|target| target.name == "named").count(), 1);
+        assert!(!targets.iter().any(|target| target.environment == "remote"));
+        // Missing incoming artifacts produce an attempt for every target and
+        // leave the contained runners untouched.
         assert_eq!(report.attempts.len(), 4);
         assert!(report
             .attempts
@@ -514,45 +397,6 @@ mod tests {
         );
     }
 
-    // Unavailable registered targets retain their last failed evidence. A real
-    // attempt replaces it, including success; removed environments lose it.
-    #[hegel::test]
-    fn retry_evidence_changes_only_for_attempted_or_removed_targets(tc: hegel::TestCase) {
-        use crate::cleat_roll::DrainAttempt;
-        use hegel::generators as gs;
-        // Generate registered/removed, attempted/unavailable, and success/failure.
-        let registered = tc.draw(gs::booleans());
-        let attempted = tc.draw(gs::booleans());
-        let successful = tc.draw(gs::booleans());
-        let old = DrainAttempt::builder()
-            .environment("crew".into())
-            .runtime_root("/runtime".into())
-            .name("default".into())
-            .stdout("previous raw evidence".into())
-            .stderr("failure".into())
-            .success(false)
-            .error("failed handover".into())
-            .build();
-        let previous =
-            RollReport::builder().host("host".into()).generation("old".into()).attempts(vec![old.clone()]).errors(vec![]).build();
-        let mut attempts = vec![];
-        if attempted {
-            let mut new = old;
-            new.stdout = "new verified evidence".into();
-            new.success = successful;
-            new.error = (!successful).then(|| "retry failed".into());
-            attempts.push(new);
-        }
-        let mut current = RollReport::builder().host("host".into()).generation("new".into()).attempts(attempts).errors(vec![]).build();
-        let environments = if registered { BTreeSet::from(["crew".to_string()]) } else { BTreeSet::new() };
-        retain_unattempted_failures(&previous, &mut current, &environments);
-        assert_eq!(current.attempts.len(), usize::from(attempted || registered));
-        if let Some(evidence) = current.attempts.first() {
-            assert_eq!(evidence.stdout, if attempted { "new verified evidence" } else { "previous raw evidence" });
-            assert_eq!(evidence.error.is_none(), attempted && successful);
-        }
-    }
-
     // The advisory host condition gives fleet-wide users exact installed and
     // serving SHAs. A later matching observation clears it without blocking crews.
     #[tokio::test]
@@ -657,11 +501,11 @@ mod tests {
             .with(EnvironmentAssertion::binary("cleat", "/installed/cleat"))
             .with(EnvironmentAssertion::env_var("CLEAT_RUNTIME_DIR", "/crew/cleat"));
         daemon.environment_manager.update_direct_environment_bag(daemon.local_environment_id(), bag).expect("local bag");
-        let condition = daemon.cleat_build_skew_condition().await.expect("skew condition");
+        let condition = daemon.generation_conditions().await.into_iter().next().expect("skew condition");
         assert_eq!(condition.condition_type, "CleatBuildSkew");
         assert_eq!(condition.value, ConditionValue::False);
         assert!(!condition.blocks_readiness());
         assert!(condition.message.contains("/crew/cleat/default: installed new vs serving old"));
-        assert!(daemon.cleat_build_skew_condition().await.is_none());
+        assert!(daemon.generation_conditions().await.is_empty());
     }
 }

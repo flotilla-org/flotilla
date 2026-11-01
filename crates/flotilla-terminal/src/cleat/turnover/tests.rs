@@ -1,7 +1,10 @@
 use super::*;
-use crate::testkits::replay::testing::MockRunner;
+use crate::generation::persist;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
+use flotilla_protocol::result_set::CleatEndpoint;
+use flotilla_replay_testkit::testing::MockRunner;
+use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct RecordedOutput {
@@ -20,6 +23,37 @@ fn recorded(name: &str) -> CommandOutput {
     };
     let output: RecordedOutput = serde_json::from_str(json).expect("recorded output");
     CommandOutput { stdout: output.stdout, stderr: output.stderr, exit_code: Some(if output.success { 0 } else { 1 }) }
+}
+
+#[cfg(unix)]
+fn guest_files(incoming: &Path) -> Result<BTreeMap<String, PathBuf>, String> {
+    let release = incoming.parent().and_then(Path::parent).ok_or("incoming cleat has no release root")?;
+    flotilla_environment::guest_tools::GuestTools::resolve(release, &flotilla_environment::guest_tools::linux_amd64())
+        .map(|tools| tools.files())
+}
+
+#[cfg(not(unix))]
+fn guest_files(_incoming: &Path) -> Result<BTreeMap<String, PathBuf>, String> {
+    Err("contained delivery requires a supported guest-tool controller".into())
+}
+
+fn build(generation: &str, incoming: &Path) -> IncomingBuild {
+    IncomingBuild {
+        generation: generation.into(),
+        host: BTreeMap::from([(CLEAT_ROLE.to_string(), incoming.to_path_buf())]),
+        guest: guest_files(incoming),
+    }
+}
+
+async fn drain(host: String, generation: String, incoming: &Path, targets: &[CleatTarget], errors: Vec<String>) -> RollReport {
+    let turnover = super::drain(&build(&generation, incoming), targets, errors).await;
+    RollReport::builder()
+        .host(host)
+        .generation(generation)
+        .attempts(turnover.attempts)
+        .errors(turnover.errors)
+        .information(turnover.information)
+        .build()
 }
 
 fn target(runner: Arc<dyn CommandRunner>, name: &str, contained: bool) -> CleatTarget {
@@ -111,13 +145,18 @@ fn crew_inventory_uses_owned_roots_and_logical_names() {
     let bag = EnvironmentBag::new()
         .with(EnvironmentAssertion::env_var("CLEAT_RUNTIME_DIR", "/contained-cleat/work"))
         .with(EnvironmentAssertion::env_var("CLEAT_DAEMON", "named@4"));
-    let environment =
-        CleatEnvironment::builder().id(EnvironmentId::new("contained-work")).bag(bag).runner(runner.clone()).contained(true).build();
-    let endpoints = [
+    let endpoints = vec![
         CleatEndpoint { runtime_root: "/named private/root".into(), daemon: "other@1".into(), session: "first".into() },
         CleatEndpoint { runtime_root: "/named private/root".into(), daemon: "other@2".into(), session: "second".into() },
     ];
-    let targets = crew_targets(&environment, &endpoints).expect("targets");
+    let environment = TurnoverEnvironment::builder()
+        .id("contained-work".into())
+        .bag(bag)
+        .runner(runner.clone())
+        .contained(true)
+        .endpoints(endpoints)
+        .build();
+    let targets = crew_targets(&environment).expect("targets");
     assert_eq!(
         targets.iter().map(|target| (target.runtime_root.display().to_string(), target.name.clone())).collect::<Vec<_>>(),
         vec![
@@ -128,7 +167,7 @@ fn crew_inventory_uses_owned_roots_and_logical_names() {
     );
     assert!(targets.iter().all(|target| target.contained && target.environment == "contained-work"));
     assert!(runner.calls().is_empty(), "inventory must not rediscover daemons in shell");
-    assert_eq!(crew_targets(&environment, &[]).expect("empty inventory").len(), 2);
+    assert_eq!(crew_targets(&TurnoverEnvironment { endpoints: vec![], ..environment }).expect("empty inventory").len(), 2);
 }
 
 // Persistent root precedence is CLEAT_RUNTIME_DIR, absolute XDG_STATE_HOME,
@@ -148,15 +187,15 @@ fn default_runtime_roots_follow_injected_environment() {
         if let Some(home) = home {
             bag = bag.with(EnvironmentAssertion::env_var("HOME", home));
         }
-        let environment = CleatEnvironment::builder()
-            .id(EnvironmentId::new("host"))
+        let environment = TurnoverEnvironment::builder()
+            .id("host".into())
             .bag(bag)
             .runner(Arc::new(MockRunner::with_outputs(vec![])))
             .contained(false)
             .build();
         match expected {
-            Some(root) => assert_eq!(crew_targets(&environment, &[]).expect("root")[0].runtime_root, Path::new(root)),
-            None => assert!(crew_targets(&environment, &[]).is_err()),
+            Some(root) => assert_eq!(crew_targets(&environment).expect("root")[0].runtime_root, Path::new(root)),
+            None => assert!(crew_targets(&environment).is_err()),
         }
     }
 }
@@ -305,7 +344,7 @@ async fn partial_handover_results_are_actionable_without_session_destruction() {
         assert!(report.failed());
         assert_eq!(report.attempts[0].stdout, stdout);
         assert!(report.attempts[0].error.as_ref().unwrap().contains("live-shell"));
-        assert_eq!(assess_drain(&report).into_condition(chrono::Utc::now()).unwrap().condition_type, "CleatBuildSkew");
+        assert!(!assess_drain(&report).actionable.is_empty());
         assert_eq!(runner.calls().len(), 1);
         assert_eq!(&runner.calls()[0].1[4..], ["server", "handover", "--json"]);
     }
@@ -534,14 +573,6 @@ fn recorded_current_observations_degrade_only_actionable_runtime_skew(tc: hegel:
     assert_eq!(!assessment.actionable.is_empty(), class == 1 && installed_known);
     let informational = !installed_known || class >= 2;
     assert_eq!(assessment.information.len(), usize::from(informational));
-    let condition = assessment.into_condition(chrono::Utc::now());
-    if class == 1 && installed_known {
-        assert_eq!(condition.expect("actionable condition").value, flotilla_resources::ConditionValue::False);
-    } else if informational {
-        assert_eq!(condition.expect("informational condition").value, flotilla_resources::ConditionValue::True);
-    } else {
-        assert!(condition.is_none());
-    }
 }
 
 // #2671: a failed connection with a confirmed empty daemon inventory is a
@@ -698,9 +729,8 @@ async fn discovered_roll_targets_start_replacements_with_a_controlled_environmen
         .with(EnvironmentAssertion::env_var("PATH", "/execution/bin:/usr/bin:/bin"))
         .with(EnvironmentAssertion::env_var("NO_COLOR", "1"))
         .with(EnvironmentAssertion::env_var("CLAUDE_CODE_MESSAGING_TOKEN", "fake-unrelated-token"));
-    let environment =
-        CleatEnvironment::builder().id(EnvironmentId::new("host-direct")).bag(bag).runner(runner.clone()).contained(false).build();
-    let targets = crew_targets(&environment, &[]).expect("registered roll target");
+    let environment = TurnoverEnvironment::builder().id("host-direct".into()).bag(bag).runner(runner.clone()).contained(false).build();
+    let targets = crew_targets(&environment).expect("registered roll target");
     let report = drain("host".into(), "generation-2".into(), Path::new("/incoming/bin/cleat"), &targets, vec![]).await;
     assert!(!report.failed(), "{report:?}");
     assert_eq!(
@@ -794,13 +824,13 @@ async fn interrupted_delivery_retains_old_payload_and_diagnostics_until_verified
     assert!(!again.failed(), "same-generation retry must not stream again: {again:?}");
     assert_eq!(std::fs::metadata(&delivered).expect("same executable").modified().expect("mtime"), metadata.modified().expect("mtime"));
     first.runner = Arc::new(ProcessCommandRunner);
-    let (left, right) =
-        tokio::join!(incoming_for_target(&first, "concurrent", &incoming), incoming_for_target(&first, "concurrent", &incoming));
+    let concurrent = build("concurrent", &incoming);
+    let (left, right) = tokio::join!(incoming_for_target(&first, &concurrent), incoming_for_target(&first, &concurrent));
     assert_eq!(left.expect("first publisher"), right.expect("concurrent publisher"));
     let original = std::fs::read(&delivered).expect("published bytes");
     let mut different = original.clone();
     different.extend_from_slice(b"# different verified release\n");
-    let guest = contained_incoming(&incoming).expect("verified guest");
+    let guest = contained_incoming(&guest_files(&incoming)).expect("verified guest");
     std::fs::write(&guest.cleat, different).expect("different incoming guest bytes");
     refresh_guest_catalog(incoming.parent().and_then(Path::parent).expect("release"));
     let collision = drain("host".into(), "new".into(), &incoming, std::slice::from_ref(&first), vec![]).await;

@@ -545,6 +545,8 @@ impl TerminalPool for CleatTerminalPool {
     }
 }
 
+pub mod turnover;
+
 #[cfg(test)]
 mod tests {
     use std::{path::Path, sync::Arc};

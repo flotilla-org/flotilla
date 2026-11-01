@@ -19,7 +19,7 @@ as emitted, including warnings and all embedded build fields.
 
 `generations.json` was recorded with the installed r531 CLI
 (`c1e7a7692bbbb93d7c246e2669bebae922343c88`). Run
-`python3 crates/flotilla-core/src/cleat_roll/fixtures/record_generations.py` from
+`python3 crates/flotilla-terminal/src/cleat/turnover/fixtures/record_generations.py` from
 the repository root to re-record it. The script uses a private temporary root,
 a contract-enforcing old-daemon stand-in (three sessions, protocol 11), and a
 real successor launched by `server drain --json`. It records the successful

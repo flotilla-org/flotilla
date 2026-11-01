@@ -49,7 +49,6 @@ fn declare_locale(environment: &mut BTreeMap<String, String>) {
 }
 
 /// Declared environment for terminal children and Cleat clients.
-/// Public so core's `cleat_roll` can reuse the same controlled runner.
 pub struct ControlledTerminalEnvironment {
     host: TerminalEnvVars,
     client: TerminalEnvVars,

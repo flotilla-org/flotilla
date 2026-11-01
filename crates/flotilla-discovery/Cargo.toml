@@ -28,6 +28,7 @@ flotilla-terminal = { path = "../flotilla-terminal" }
 flotilla-vcs = { path = "../flotilla-vcs" }
 async-trait.workspace = true
 bon.workspace = true
+chrono.workspace = true
 futures.workspace = true
 indexmap.workspace = true
 tokio.workspace = true
