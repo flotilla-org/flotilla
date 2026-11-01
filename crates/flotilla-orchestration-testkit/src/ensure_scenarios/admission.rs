@@ -214,6 +214,16 @@ pub async fn standing_ensure_records_admitted_config_and_surfaces_drift_without_
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("drift attention persists across refreshes");
     let fleet = daemon.fleet_list_internal().await.expect("public fleet listing");
     assert_eq!(fleet.declaration_attention.len(), 1, "one drift attention, not raised again");
+
+    // Its running convoy gone, nothing admitted has drifted: the next pass clears the drift.
+    backend
+        .using::<ResourceConvoy>("flotilla")
+        .delete(first_status.convoy_ref.as_deref().expect("running convoy"))
+        .await
+        .expect("convoy gone");
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("restart the absent generation");
+    let fleet = daemon.fleet_list_internal().await.expect("public fleet listing");
+    assert!(fleet.declaration_attention.is_empty(), "{:?}", fleet.declaration_attention);
 }
 
 pub async fn ensure_reconciliation_recovers_a_roll_interrupted_after_retirement(factory: &dyn EnsureScenarioController) {

@@ -972,6 +972,9 @@ impl EnsurePass<'_> {
         now: DateTime<Utc>,
     ) -> Result<Option<String>, String> {
         self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
+        // With no running convoy, no admitted configuration can have drifted.
+        let role = Subject::StandingRole { project: ensure.spec.project_ref.clone(), role: ensure.spec.role.clone() };
+        self.attentions.clear(namespace, Sender::Standing, &role).await?;
         match self.start_ensured_convoy(namespace, ensure).await {
             Ok(convoy_ref) => {
                 self.ensure_admission_retries.lock().await.remove(&(namespace.to_string(), ensure.metadata.name.clone()));
@@ -1098,8 +1101,8 @@ impl EnsurePass<'_> {
 
     async fn hold_is_open(&self, namespace: &str, convoy: &str) -> Result<bool, String> {
         let subject = Subject::convoy(convoy);
-        let open = self.attentions.open(namespace, Some(Sender::Standing), Some(&subject)).await?;
-        Ok(open.iter().any(|attention| attention.is_hold() && attention.subject == subject))
+        // A standing role's attention about a convoy is its hold.
+        Ok(!self.attentions.open(namespace, Some(Sender::Standing), Some(&subject)).await?.is_empty())
     }
 
     /// Ends the hold on `convoy`, open or acknowledged.

@@ -163,6 +163,19 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
         assert_eq!(open.len(), 1, "one attention per vessel");
         assert_eq!(open[0].reason.lines().count(), told, "{}", open[0].reason);
     }
+    // A partial fix keeps an acknowledged attention; a full fix clears it; the next failure is told.
+    let forgejo = CredentialRefreshError { credential_name: Some("forgejo".to_string()), ..failure("token refused", true) };
+    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage", true), forgejo]).await.expect("two fail");
+    for demand in demands.list().await.expect("list demands").items {
+        let acknowledge =
+            flotilla_resources::DemandStatusPatch::Acknowledge { as_of: chrono::Utc::now(), authority: "operator".to_string() };
+        flotilla_store::apply_status_patch(&demands, &demand.metadata.name, &acknowledge).await.expect("acknowledge demand");
+    }
+    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage", true)]).await.expect("partial fix");
+    assert!(open().await.is_empty(), "a partial fix leaves the acknowledgement standing");
+    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[]).await.expect("full fix");
+    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage", true)]).await.expect("fails again");
+    assert_eq!(open().await.len(), 1, "after a full fix, a new failure is told");
 }
 
 #[test]
