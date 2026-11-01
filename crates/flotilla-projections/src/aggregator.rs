@@ -2707,12 +2707,10 @@ impl Aggregator {
             .filter(|_| !phase.is_terminal());
         // A standing role's drift is about the role, told on its running convoy.
         let drift = convoy
-            .metadata
-            .annotations
-            .contains_key(ENSURED_FROM_ANNOTATION)
-            .then(|| convoy.spec.project_ref.as_ref())
-            .flatten()
-            .filter(|_| !phase.is_terminal())
+            .spec
+            .project_ref
+            .as_ref()
+            .filter(|_| convoy.metadata.annotations.contains_key(ENSURED_FROM_ANNOTATION) && !phase.is_terminal())
             .and_then(|project| {
                 let role = AttentionSubject::StandingRole { project: project.clone(), role: convoy.spec.role.clone() };
                 self.attentions.iter().find(|open| open.sender == Sender::Standing && open.subject == role)
