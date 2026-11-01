@@ -19,6 +19,11 @@ pub(super) struct RecordedVessel {
     pub(super) attach_forwards: Vec<PathBuf>,
     /// Artifacts made store entries, by digest, with how their bytes arrived.
     pub(super) artifacts: Vec<(String, ArtifactArrival)>,
+    /// What the agent's store holds now, by digest: a reboot that clears the store
+    /// empties it, leaving the links into it dangling (#4088).
+    pub(super) stored: BTreeSet<String>,
+    /// Links the agent placed into its store, by path.
+    pub(super) links: BTreeMap<PathBuf, String>,
     pub(super) closed: bool,
 }
 
@@ -53,6 +58,14 @@ impl RunnerVesselAgents {
 
     pub(super) fn recorded(&self, paths: &VesselPaths) -> RecordedVessel {
         self.vessels.lock().expect("vessels").get(&paths.agent).cloned().unwrap_or_default()
+    }
+
+    /// The host rebooted onto a fresh agent whose store is empty: every link the old
+    /// store held now dangles (#4088).
+    pub(super) fn clear_store(&self, paths: &VesselPaths) {
+        if let Some(vessel) = self.vessels.lock().expect("vessels").get_mut(&paths.agent) {
+            vessel.stored.clear();
+        }
     }
 }
 
@@ -98,7 +111,10 @@ impl VesselAgent for RunnerVessel {
         Ok("amd64".into())
     }
     async fn fetch_artifact(&self, sha256: &str, urls: &[String], _: flotilla_resources::PinUnpack) -> Result<(), String> {
-        self.record(|vessel| vessel.artifacts.push((sha256.into(), ArtifactArrival::Fetched(urls.to_vec()))));
+        self.record(|vessel| {
+            vessel.artifacts.push((sha256.into(), ArtifactArrival::Fetched(urls.to_vec())));
+            vessel.stored.insert(sha256.into());
+        });
         Ok(())
     }
     async fn push_artifact(&self, sha256: &str, file: &Path, unpack: flotilla_resources::PinUnpack) -> Result<(), String> {
@@ -106,14 +122,31 @@ impl VesselAgent for RunnerVessel {
             flotilla_resources::PinUnpack::TarGz => archive_files(&fs::read(file).map_err(|error| error.to_string())?),
             _ => Vec::new(),
         };
-        self.record(|vessel| vessel.artifacts.push((sha256.into(), ArtifactArrival::Pushed(files))));
+        self.record(|vessel| {
+            vessel.artifacts.push((sha256.into(), ArtifactArrival::Pushed(files)));
+            vessel.stored.insert(sha256.into());
+        });
         Ok(())
     }
     async fn link_artifact(&self, path: &Path, sha256: &str, member: &Path) -> Result<(), String> {
         let host = RunnerVesselAgent(self.runner.clone());
         host.create_dir(path.parent().ok_or("a link needs a directory")?, 0o755).await?;
         let entry = store_entry(&self.agent, sha256);
-        host.symlink(path, &if member.as_os_str().is_empty() { entry } else { entry.join(member) }).await
+        host.symlink(path, &if member.as_os_str().is_empty() { entry } else { entry.join(member) }).await?;
+        self.record(|vessel| {
+            vessel.links.insert(path.into(), sha256.into());
+        });
+        Ok(())
+    }
+    async fn linked_artifact(&self, path: &Path) -> Result<Option<String>, String> {
+        let linked = self
+            .vessels
+            .lock()
+            .expect("vessels")
+            .get(&self.agent)
+            .and_then(|vessel| vessel.links.get(path).filter(|sha256| vessel.stored.contains(*sha256)).cloned());
+        let still_linked = RunnerVesselAgent(self.runner.clone()).stat(path).await? == Some(EntryKind::Symlink);
+        Ok(linked.filter(|_| still_linked))
     }
     async fn ready(&self) -> Result<(), String> {
         Ok(())

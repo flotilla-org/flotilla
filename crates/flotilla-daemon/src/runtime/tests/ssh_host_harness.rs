@@ -570,6 +570,37 @@ async fn ssh_host_claude_crew_starts_in_a_prepared_flotilla_home() {
     assert_host_harness_untouched(&launch);
 }
 
+// Acceptance (#4088): a reboot that clears the agent's store leaves the crew home's harness
+// and skills links dangling while its delivery record still names them. The relaunch pushes
+// both again by their recorded mechanisms and links them afresh; a relaunch with both
+// still present sends nothing. Mutation check: keeping on the record alone fails this.
+#[tokio::test]
+async fn a_cleared_store_has_the_harness_and_skills_delivered_again_before_the_relaunch() {
+    let runtime_dir = flotilla_test_support::TestSocketDir::new();
+    let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
+    let runtime = ssh_host_runtime(ssh_host(&host, &runtime_dir), "claude-code").await;
+    bind_account(&runtime.daemon.resource_backend(), "demo", "coder", "claude-max", "crew@example.com").await;
+    let first = runtime.launch().await.expect("launch");
+    let arrived = first.artifacts.len();
+    assert_eq!(arrived, 2, "the harness and the skills: {:?}", first.artifacts);
+
+    let kept = runtime.launch().await.expect("relaunch with everything present");
+    assert_eq!(kept.artifacts.len(), arrived, "nothing is sent again: {:?}", kept.artifacts);
+
+    runtime.agents.clear_store(&runtime.vessel);
+    let relaunched = runtime.launch().await.expect("relaunch after the store was cleared");
+    let again = &relaunched.artifacts[arrived..];
+    let pinned = pinned_harness_sha256("claude-code");
+    assert!(again.iter().any(|(sha256, arrival)| *sha256 == pinned && matches!(arrival, ArtifactArrival::Fetched(_))), "{again:?}");
+    assert!(again.iter().any(|(_, arrival)| matches!(arrival, ArtifactArrival::Pushed(files) if !files.is_empty())), "{again:?}");
+    let home = format!("{HOST_BASE}/agent-homes/requesters/demo/coder/claude");
+    let recorded = runtime.agents.recorded(&runtime.vessel);
+    for link in [format!("{home}/.flotilla/harness/bin/claude"), format!("{home}/skills")] {
+        let linked = recorded.links.get(Path::new(&link)).unwrap_or_else(|| panic!("{link} was linked"));
+        assert!(recorded.stored.contains(linked), "{link} resolves into the store again");
+    }
+}
+
 // Acceptance (#3655, #3964, #4037): a Codex crew on an SSH host starts with
 // `CODEX_HOME` at its own flotilla-owned home under the host's durable state base, its
 // frozen skills staged there, with workspace trust for the checkout in that home's own

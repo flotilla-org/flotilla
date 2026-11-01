@@ -71,12 +71,19 @@ impl LocalVessel {
 struct Tree {
     content: Mutex<String>,
     fail: AtomicBool,
+    /// What the tree says of its landed content: gone, as a link into a cleared store.
+    gone: AtomicBool,
     deliveries: Mutex<Vec<Mechanism>>,
 }
 
 impl Tree {
     fn new(content: &str) -> Arc<Self> {
-        Arc::new(Self { content: Mutex::new(content.into()), fail: AtomicBool::new(false), deliveries: Mutex::default() })
+        Arc::new(Self {
+            content: Mutex::new(content.into()),
+            fail: AtomicBool::new(false),
+            gone: AtomicBool::new(false),
+            deliveries: Mutex::default(),
+        })
     }
 
     fn deliveries(&self) -> usize {
@@ -94,7 +101,11 @@ impl TreeDelivery for Tree {
         let content = self.content.lock().expect("content").clone();
         agent.write(&target.join("SKILL.md"), content.into_bytes(), 0o644).await?;
         self.deliveries.lock().expect("deliveries").push(mechanism);
+        self.gone.store(false, Ordering::SeqCst);
         Ok(())
+    }
+    async fn present(&self, _: &Path, _: &dyn VesselAgent) -> Result<bool, String> {
+        Ok(!self.gone.load(Ordering::SeqCst))
     }
 }
 
@@ -175,11 +186,20 @@ async fn re_runs_deliver_only_what_changed_or_failed() {
     run(needs("s3", "n2")).await.expect("garbled record");
     assert_eq!((skills.deliveries(), notes.deliveries()), (3, 3), "only the unreadable entry is delivered again");
 
+    // #4088: a record whose content is gone is delivered again by the same mechanism,
+    // and nothing else is.
+    skills.gone.store(true, Ordering::SeqCst);
+    let rerun = run(needs("s3", "n2")).await.expect("gone skills");
+    assert_eq!((skills.deliveries(), notes.deliveries()), (4, 3), "only the missing tree is delivered again");
+    assert_eq!(skills.deliveries.lock().expect("deliveries").last(), Some(&Mechanism::AgentFetch { by: crate::FetchBy::Url }));
+    let action = |name: &str| rerun.plan.steps.iter().find(|step| step.need.as_str() == name).map(|step| step.action);
+    assert_eq!((action("skills"), action("notes")), (Some(Action::Deliver), Some(Action::Keep)));
+
     // A need no longer asked for leaves the record, so asking again delivers it.
     run(needs("s3", "n2").into_iter().filter(|need| need.name.as_str() != "notes").collect()).await.expect("drop notes");
     assert!(!std::fs::read_to_string(&record).expect("record").contains("notes"), "the record follows the plan");
     run(needs("s3", "n2")).await.expect("notes again");
-    assert_eq!((skills.deliveries(), notes.deliveries()), (3, 4));
+    assert_eq!((skills.deliveries(), notes.deliveries()), (4, 4));
 }
 
 // Behaviour (#4012): a runtime home lands under the writable base, apart from the

@@ -3,7 +3,9 @@
 //! Every step is keyed by content digest. What landed is written beside the
 //! content, in each home's delivery record, as soon as a step completes, so a
 //! re-run plans `Keep` for it and does nothing. A replaced vessel has no record
-//! and receives everything again.
+//! and receives everything again. A record alone is not presence (#4088): a
+//! tree whose delivery can tell it is gone, as a link into a store a reboot
+//! cleared, is delivered again by the same planning.
 
 use std::{
     collections::BTreeMap,
@@ -39,6 +41,14 @@ pub trait TreeDelivery: Send + Sync {
         target: &Path,
         agent: &dyn VesselAgent,
     ) -> Result<(), StepFailure>;
+
+    /// Whether what an earlier delivery of this content placed at `target` is still
+    /// there. Only then does its record keep it. A tree whose content the home itself
+    /// holds stays as long as its record, which lives beside it.
+    async fn present(&self, target: &Path, agent: &dyn VesselAgent) -> Result<bool, String> {
+        let _ = (target, agent);
+        Ok(true)
+    }
 }
 
 /// Why a tree's delivery failed, and whether trying the same content again can help.
@@ -159,7 +169,26 @@ pub async fn deliver(
         })?;
         read.insert(name.clone(), record.map(|bytes| decode_record(&String::from_utf8_lossy(&bytes))).unwrap_or_default());
     }
-    let landed = read.values().flatten().map(|(need, landed)| (need.clone(), landed.clone())).collect();
+    let mut landed = BTreeMap::new();
+    for (name, recorded) in read.values().flatten() {
+        if let Some(need) = needs.iter().find(|need| need.name == *name && need.digest == recorded.digest) {
+            if let (Item::Tree { home, path, .. }, Some(tree)) = (&need.item, trees.get(name)) {
+                let Some(home) = homes.get(home) else { continue };
+                match tree.present(&path.under(home), agent).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::info!(need = %name, "a recorded delivery is no longer present; delivering it again");
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(need = %name, %error, "could not tell whether a recorded delivery is present; delivering it again");
+                        continue;
+                    }
+                }
+            }
+        }
+        landed.insert(name.clone(), recorded.clone());
+    }
     // The planner refuses a tree whose home is not a home need, so every step's home is in `homes`.
     let plan = plan(needs, mechanisms, &landed, costs).map_err(DeliveryError::Plan)?;
     if let Some(step) =

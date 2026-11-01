@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use std::{
     collections::BTreeMap,
     io,
-    path::Path,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -247,6 +247,9 @@ impl AgentClient for Agent {
         Err(io::Error::new(io::ErrorKind::Unsupported, "the memory agent keeps no artifacts"))
     }
     async fn link_artifact(&self, _: &Path, _: &str, _: &Path, _: &FileOptions) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "the memory agent keeps no artifacts"))
+    }
+    async fn artifacts(&self) -> io::Result<Vec<(String, Vec<PathBuf>)>> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "the memory agent keeps no artifacts"))
     }
     async fn put_outward_forward(&self, forward: OutwardForward, endpoint: Endpoint) -> io::Result<()> {
