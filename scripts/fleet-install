@@ -1195,7 +1195,7 @@ host_preflight() {
 
 usage() {
   echo 'usage: fleet-install [--min-free-bytes N] [--max-wait-seconds N] [--from DIR] [--rollback --reason WHY] [--skip-canary] <latest|generation> | --canary <generation> | status | rollback | --prune-dry-run | --prune' >&2
-  echo '--rollback --reason WHY installs a generation whose flotilla commit is older than the live one; every install compares commits, which needs github.com (override: FLEET_INSTALL_FLOTILLA_REPOSITORY, for tests)' >&2
+  echo '--rollback --reason WHY installs a generation whose flotilla commit is older than the live one (on a forward install the flag is ignored and no reason is recorded); every install compares commits, which needs github.com (override: FLEET_INSTALL_FLOTILLA_REPOSITORY, for tests)' >&2
   echo 'defaults: --min-free-bytes 5368709120 (5 GiB); --max-wait-seconds 600; ordinary confirmation 90 seconds' >&2
   echo '--from DIR installs a named generation from a pushed package directory (DIR/<generation>/generation.json and archive) instead of Forgejo; no package token is read' >&2
   exit 2
