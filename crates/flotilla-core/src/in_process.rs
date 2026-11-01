@@ -729,6 +729,8 @@ impl flotilla_vcs::vcs::CheckoutVcsResolver for InProcessDaemon {
 
 use flotilla_projections::dispatch_board::DispatchBoardInputs;
 
+const ENVIRONMENT_ADOPTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
 pub struct InProcessDaemon {
     change_stream_rounds: change_stream::Rounds,
     decided_store: std::sync::Mutex<Option<Arc<flotilla_schema_sqlite::stream::Service>>>,
@@ -757,7 +759,6 @@ pub struct InProcessDaemon {
     environment_manager: Arc<EnvironmentManager>,
     cleat_roll_report: Mutex<Option<crate::cleat_roll::RollReport>>,
     environment_adoption: tokio::sync::watch::Sender<bool>,
-    environment_adoption_deadline_ms: AtomicU64,
     /// Discovery dependencies and configuration used for all daemon-side
     /// provider detection, both at startup and for later repo additions.
     discovery: Arc<DiscoveryRuntime>,
@@ -1359,7 +1360,6 @@ impl InProcessDaemon {
             environment_manager: Arc::clone(&environment_manager),
             cleat_roll_report: Mutex::new(None),
             environment_adoption: tokio::sync::watch::channel(true).0,
-            environment_adoption_deadline_ms: AtomicU64::new(120_000),
             discovery: Arc::clone(&discovery),
             change_request_query_port: Arc::clone(&query_port),
             issue_query_port: Arc::clone(&issue_query_port),
@@ -2102,7 +2102,6 @@ impl InProcessDaemon {
         self.resolve_environment_ref(env_ref).map(|environment| environment.runner)
     }
 
-    /// Resolve once when a caller needs both the runner and its registered identity.
     /// Marks start-up environment adoption as pending; call before clients can reach the daemon.
     pub fn begin_environment_adoption(&self) {
         self.environment_adoption.send_replace(false);
@@ -2114,11 +2113,13 @@ impl InProcessDaemon {
     }
 
     async fn wait_for_environment_adoption(&self) {
-        let deadline = std::time::Duration::from_millis(self.environment_adoption_deadline_ms.load(Ordering::Relaxed));
         let mut adopted = self.environment_adoption.subscribe();
-        let _ = tokio::time::timeout(deadline, adopted.wait_for(|adopted| *adopted)).await;
+        if tokio::time::timeout(ENVIRONMENT_ADOPTION_DEADLINE, adopted.wait_for(|adopted| *adopted)).await.is_err() {
+            tracing::warn!(deadline = ?ENVIRONMENT_ADOPTION_DEADLINE, "environment adoption still pending at deadline; taking inventory anyway");
+        }
     }
 
+    /// Resolve once when a caller needs both the runner and its registered identity.
     pub fn resolve_environment_ref(&self, env_ref: &str) -> Option<ResolvedEnvironment> {
         self.environment_manager.resolve_environment_ref(env_ref)
     }

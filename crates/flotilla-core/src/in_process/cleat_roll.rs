@@ -417,7 +417,7 @@ mod tests {
         assert!(malformed.diagnostics_path.expect("durable report").exists());
     }
 
-    async fn daemon_with_unadopted_vessel(deadline_ms: u64) -> (Arc<InProcessDaemon>, tempfile::TempDir) {
+    async fn daemon_with_unadopted_vessel() -> (Arc<InProcessDaemon>, tempfile::TempDir) {
         let directory = tempfile::tempdir().expect("config");
         std::fs::write(directory.path().join("daemon.toml"), "machine_id = \"cleat-roll-test\"\n").expect("daemon identity");
         let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -430,7 +430,6 @@ mod tests {
             std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
-        daemon.environment_adoption_deadline_ms.store(deadline_ms, std::sync::atomic::Ordering::Relaxed);
         let spec = serde_json::from_value(serde_json::json!({"docker": {
             "host_ref": daemon.environment_manager.local_host_id().as_str(), "image": "pinned-image"
         }}))
@@ -482,9 +481,9 @@ mod tests {
         daemon.register_provisioned_environment(id, handle, bag, None).expect("adopt");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn post_install_waits_for_pending_adoption_then_turns_over_the_vessel() {
-        let (daemon, directory) = daemon_with_unadopted_vessel(30_000).await;
+        let (daemon, directory) = daemon_with_unadopted_vessel().await;
         daemon.begin_environment_adoption();
         let adopter = Arc::clone(&daemon);
         tokio::spawn(async move {
@@ -500,9 +499,9 @@ mod tests {
         assert!(report.attempts.iter().any(|attempt| attempt.environment == "vessel-env"));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn post_install_reports_environment_that_never_comes_back_after_the_deadline() {
-        let (daemon, directory) = daemon_with_unadopted_vessel(100).await;
+        let (daemon, directory) = daemon_with_unadopted_vessel().await;
         daemon.begin_environment_adoption();
         let report = daemon
             .post_install_cleat(Path::new("/missing/release/bin/cleat"), "gen", &directory.path().join("diagnostics"))
