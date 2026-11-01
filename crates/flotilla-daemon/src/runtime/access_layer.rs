@@ -346,6 +346,12 @@ impl TreeDelivery for SkillsDelivery {
         tracing::info!(target = %target.display(), sha256 = %archive.sha256, "delivered frozen crew skills");
         Ok(())
     }
+    /// #4088: landed means the skills link still resolves into a store entry. Any entry
+    /// will do: `present` is asked only once the record's digest matches the need, so
+    /// which skills belong there is already settled.
+    async fn present(&self, target: &Path, agent: &dyn VesselAgent) -> Result<bool, String> {
+        Ok(agent.linked_artifact(target).await?.is_some())
+    }
 }
 
 /// Put `archive` into the agent's content cache and point `target` at it. A real
@@ -600,6 +606,10 @@ mod tests {
             self.links.lock().expect("links").insert(path.into());
             self.calls.lock().expect("calls").push(format!("link {} {sha256}/{}", path.display(), member.display()));
             Ok(())
+        }
+        // Its content cache is never cleared: a link it placed still resolves.
+        async fn linked_artifact(&self, path: &Path) -> Result<Option<String>, String> {
+            Ok(self.links.lock().expect("links").contains(path).then(|| "linked".into()))
         }
     }
 

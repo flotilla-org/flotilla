@@ -171,6 +171,11 @@ vessel's commands, files, forwards and tool layers:
   bytes, and the runtime directory holds only the agent, its sockets and its
   supervisor's lock. An entry that does not fit fails delivery before launch
   with `ContentStoreFull`, naming the store and its free bytes.
+- A crew home's record of what landed keeps a harness or skill tree only
+  while its link still resolves into the store. If the store was cleared (by a
+  reboot of an older layout, or by hand), the next launch delivers both again by
+  the same mechanism before the crew starts. It never falls back to a harness
+  installed on the host.
 - The vessel's crews reach the owning daemon through `flotilla.sock` in the
   agent's directory, which the agent forwards over the daemon's own
   connection. Nothing forwards while the daemon is stopped.

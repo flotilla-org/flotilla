@@ -357,6 +357,12 @@ pub trait VesselAgent: Send + Sync {
         let _ = member;
         Err(format!("this vessel agent has no artifact store to link {} to {sha256}", path.display()))
     }
+    /// The digest of the store entry the link at `path` points into, while the link
+    /// still resolves into a complete entry; `None` once the link or the entry is gone,
+    /// as after a reboot cleared a store (#4088).
+    async fn linked_artifact(&self, path: &Path) -> Result<Option<String>, String> {
+        Err(format!("this vessel agent has no artifact store for {}", path.display()))
+    }
 }
 
 /// A live handle to a provisioned sandbox environment.

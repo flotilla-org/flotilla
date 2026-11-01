@@ -436,7 +436,7 @@ async fn delivery_operations_cross_the_agent(agent: Arc<dyn TestAgent>) {
 }
 
 // #3909: a pushed artifact becomes a verified store entry, and a link into it reads as
-// the pushed bytes; bytes that do not hash to the digest, or a kind the store cannot
+// the pushed bytes and names its entry (#4088); bytes that do not hash to the digest, or a kind the store cannot
 // unpack, leave nothing behind.
 over_each_transport!(artifacts_cross_the_agent_by_digest);
 async fn artifacts_cross_the_agent_by_digest(agent: Arc<dyn TestAgent>) {
@@ -452,6 +452,13 @@ async fn artifacts_cross_the_agent_by_digest(agent: Arc<dyn TestAgent>) {
     vessel.push_artifact(&sha256, &local, PinUnpack::File).await.unwrap();
     vessel.link_artifact(&link, &sha256, Path::new("")).await.unwrap();
     assert_eq!(std::fs::read(&link).unwrap(), b"pinned harness");
+    // #4088: the agent names a link by the path it was asked to place, so the path the
+    // daemon linked finds its entry, and nothing else does.
+    assert_eq!(vessel.linked_artifact(&link).await.unwrap(), Some(sha256.clone()));
+    assert_eq!(vessel.linked_artifact(&directory.path().join("home/skills")).await.unwrap(), None);
+    std::fs::remove_file(&link).unwrap();
+    assert_eq!(vessel.linked_artifact(&link).await.unwrap(), None, "a removed link no longer resolves");
+    vessel.link_artifact(&link, &sha256, Path::new("")).await.unwrap();
     assert!(vessel.push_artifact(&sha256, &local, PinUnpack::TarXz).await.unwrap_err().contains("tar.xz"));
 }
 
