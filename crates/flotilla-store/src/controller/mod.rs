@@ -631,13 +631,11 @@ impl<R: Reconciler> ControllerLoop<R> {
                 let resolver = backend.using::<crate::TerminalSession>(namespace);
                 Self::create_if_missing(&resolver, meta, spec).await
             }
-            Actuation::CreateDemand { meta, spec } => {
-                let resolver = backend.using::<crate::Demand>(namespace);
-                Self::create_if_missing(&resolver, meta, spec).await
+            Actuation::RaiseAttention { attention } => {
+                backend.attentions().raise(namespace, &attention).await.map_err(ResourceError::other)
             }
-            Actuation::DeleteDemand { name } => {
-                let resolver = backend.using::<crate::Demand>(namespace);
-                Self::delete_if_lifecycle_owned(&resolver, &name).await
+            Actuation::ClearAttention { sender, subject } => {
+                backend.attentions().clear(namespace, sender, &subject).await.map_err(ResourceError::other)
             }
             Actuation::PruneTerminalMessages { name } => {
                 let resolver = backend.using::<crate::TerminalSession>(namespace);

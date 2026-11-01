@@ -19,10 +19,10 @@ use flotilla_credentials::{
 use flotilla_crew::ports::WorkCredentialReconciler;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
-use flotilla_resources::Resource;
+use flotilla_resources::attentions::{Attention, Attentions, Sender, Subject};
 use flotilla_resources::{
-    ControllerRetry, ControllerRetryDisposition, Convoy, Demand, DemandKind, DemandSpec, Environment, EnvironmentStatusPatch, InputMeta,
-    Repository, RepositoryTrust, ResourceError, RetryBackoff, TerminalSession, TerminalSessionSource, Vessel, VesselStatusPatch,
+    ControllerRetry, ControllerRetryDisposition, Convoy, Environment, EnvironmentStatusPatch, Repository, RepositoryTrust, ResourceError,
+    RetryBackoff, TerminalSession, TerminalSessionSource, Vessel, VesselStatusPatch,
 };
 use flotilla_store::ResourceBackend;
 use tokio::task::JoinHandle;
@@ -571,93 +571,75 @@ pub(super) fn spawn_codex_central_refresh_task(env: Arc<dyn EnvVars>, interval: 
     })
 }
 
-pub(super) use flotilla_resources::{CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION};
-
 pub(super) async fn reconcile_credential_refresh_attention(
     daemon: &InProcessDaemon,
     namespace: &str,
     errors: &[CredentialRefreshError],
 ) -> Result<(), String> {
-    reconcile_credential_refresh_attention_in(&daemon.resource_backend(), namespace, errors).await
+    reconcile_credential_refresh_attention_in(&*daemon.attentions(), &daemon.resource_backend(), namespace, errors).await
 }
 
+/// The credentials an open attention names, one per line of its reason.
+fn told(reason: &str) -> BTreeSet<String> {
+    reason.lines().filter_map(|line| line.split_once(": ")).map(|(credential, _)| credential.to_owned()).collect()
+}
+
+/// Each vessel's attention names the credentials that keep failing. It is raised when that set
+/// changes, cleared when none fails, and a person's acknowledgement stands until it is cleared.
 pub(super) async fn reconcile_credential_refresh_attention_in(
+    attentions: &dyn Attentions,
     backend: &ResourceBackend,
     namespace: &str,
     errors: &[CredentialRefreshError],
 ) -> Result<(), String> {
     record_credential_refresh_dispositions(backend, namespace, errors).await?;
-    let demands = backend.using::<Demand>(namespace);
-    let existing = demands.list().await.map_err(|error| error.to_string())?;
-    if errors.is_empty()
-        && existing.items.iter().all(|demand| !demand.metadata.annotations.contains_key(CREDENTIAL_REFRESH_REASON_ANNOTATION))
-    {
-        return Ok(());
-    }
+    let open: BTreeMap<Subject, BTreeSet<String>> = attentions
+        .open(namespace, Some(Sender::Capabilities), None)
+        .await?
+        .into_iter()
+        .map(|open| (open.subject, told(&open.reason)))
+        .collect();
     let vessels = backend.using::<Vessel>(namespace).list().await.map_err(|error| error.to_string())?;
     let convoys =
         backend.query_declared::<Convoy>(namespace, &flotilla_store::live_convoys_query()).await.map_err(|error| error.to_string())?;
     let convoys = convoys.items.into_iter().map(|source| (source.object.metadata.name.clone(), source.object)).collect::<BTreeMap<_, _>>();
-    let mut desired = BTreeMap::new();
-    let mut still_failing = BTreeSet::new();
-    for error in errors {
-        let Some(credential) = error.credential_name.as_ref() else { continue };
-        for vessel in &vessels.items {
-            if vessel.status.as_ref().and_then(|status| status.environment_ref.as_ref()) != Some(&error.environment_ref) {
-                continue;
-            }
-            let Some(convoy) = convoys.get(&vessel.spec.convoy_ref) else { continue };
-            let holds_credential = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).is_some_and(|snapshot| {
-                snapshot
-                    .vessels
-                    .iter()
-                    .any(|requirement| requirement.name == vessel.spec.vessel_name && requirement.credential_refs.contains(credential))
-            });
-            if !holds_credential {
-                continue;
-            }
-            let name = format!("credential-refresh-{}-{credential}", vessel.metadata.name);
-            still_failing.insert(name.clone());
-            if !error.should_surface {
-                continue;
-            }
-            let target = flotilla_protocol::ResourceRef::new(
-                flotilla_resources::api_version(Convoy::API_PATHS),
-                Convoy::API_PATHS.kind,
-                namespace,
-                &convoy.metadata.name,
-            );
-            let spec = DemandSpec::for_dispatching_principal(target, DemandKind::HumanGate, convoy.spec.dispatching_principal_ref.clone());
-            let meta = InputMeta::builder()
-                .name(name.clone())
-                .annotations(BTreeMap::from([
-                    (CREDENTIAL_REFRESH_REASON_ANNOTATION.to_string(), error.message.clone()),
-                    (CREDENTIAL_REFRESH_VESSEL_ANNOTATION.to_string(), vessel.spec.vessel_name.clone()),
-                ]))
-                .build();
-            desired.insert(name, (meta, spec));
-        }
-    }
-    for demand in existing.items {
-        if !demand.metadata.annotations.contains_key(CREDENTIAL_REFRESH_REASON_ANNOTATION) {
+    // Every vessel that holds a credential, with its failing ones: why, and whether persistent enough to tell a person.
+    let mut held: BTreeMap<(String, String), BTreeMap<String, (String, bool)>> = BTreeMap::new();
+    for vessel in &vessels.items {
+        let Some(convoy) = convoys.get(&vessel.spec.convoy_ref) else { continue };
+        let Some(requirement) = convoy
+            .status
+            .as_ref()
+            .and_then(|status| status.workflow_snapshot.as_ref())
+            .and_then(|snapshot| snapshot.vessels.iter().find(|requirement| requirement.name == vessel.spec.vessel_name))
+            .filter(|requirement| !requirement.credential_refs.is_empty())
+        else {
             continue;
-        }
-        if let Some((meta, spec)) = desired.remove(&demand.metadata.name) {
-            if !matches!(
-                demand.status.as_ref().map_or(flotilla_resources::DemandState::Raised, |status| status.state),
-                flotilla_resources::DemandState::Raised | flotilla_resources::DemandState::Escalated
-            ) {
-                demands.delete(&demand.metadata.name).await.map_err(|error| error.to_string())?;
-                demands.create(&meta, &spec).await.map_err(|error| error.to_string())?;
-            } else if demand.metadata.annotations != meta.annotations || demand.spec != spec {
-                demands.update(&meta, &demand.metadata.resource_version, &spec).await.map_err(|error| error.to_string())?;
+        };
+        let failing = held.entry((convoy.metadata.name.clone(), vessel.spec.vessel_name.clone())).or_default();
+        for error in errors {
+            let Some(credential) = error.credential_name.as_ref() else { continue };
+            if vessel.status.as_ref().and_then(|status| status.environment_ref.as_ref()) == Some(&error.environment_ref)
+                && requirement.credential_refs.contains(credential)
+            {
+                failing.insert(credential.clone(), (error.message.clone(), error.should_surface));
             }
-        } else if !still_failing.contains(&demand.metadata.name) {
-            demands.delete(&demand.metadata.name).await.map_err(|error| error.to_string())?;
         }
     }
-    for (_, (meta, spec)) in desired {
-        demands.create(&meta, &spec).await.map_err(|error| error.to_string())?;
+    for ((convoy, vessel), credentials) in held {
+        let subject = Subject::Vessel { convoy: convoy.clone(), vessel: vessel.clone() };
+        let before = open.get(&subject);
+        // A credential already told stays told while it keeps failing, persistent or not.
+        let told: BTreeMap<String, String> = credentials
+            .into_iter()
+            .filter(|(credential, (_, surface))| *surface || before.is_some_and(|before| before.contains(credential)))
+            .map(|(credential, (why, _))| (credential, why))
+            .collect();
+        if told.is_empty() {
+            attentions.clear(namespace, Sender::Capabilities, &subject).await?;
+        } else if before.is_none_or(|before| told.keys().ne(before.iter())) {
+            attentions.raise(namespace, &Attention::credential_refresh(&convoy, &vessel, told)).await?;
+        }
     }
     Ok(())
 }

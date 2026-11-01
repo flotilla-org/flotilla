@@ -150,9 +150,14 @@ pub struct OpenAttention {
 }
 
 impl OpenAttention {
+    /// A standing convoy's hold.
+    pub fn is_hold(&self) -> bool {
+        self.sender == Sender::Standing && matches!(self.subject, Subject::Convoy { .. })
+    }
+
     /// A standing convoy's hold left open past [`HOLD_ESCALATES_AFTER`].
     pub fn escalated_at(&self, now: DateTime<Utc>) -> bool {
-        self.sender == Sender::Standing && matches!(self.subject, Subject::Convoy { .. }) && now - self.raised_at >= HOLD_ESCALATES_AFTER
+        self.is_hold() && now - self.raised_at >= HOLD_ESCALATES_AFTER
     }
 }
 
@@ -179,6 +184,12 @@ pub trait Attentions: Send + Sync {
     /// Whether a person acknowledged the latest attention from `sender` about `subject`, and its
     /// writer has not cleared it since.
     async fn acknowledged(&self, namespace: &str, sender: Sender, subject: &Subject) -> Result<bool, String>;
+
+    /// A signal after an attention here is raised, cleared or acknowledged, for a reader to read
+    /// them again; none where the store's own watch says so.
+    fn changes(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
+        None
+    }
 }
 
 #[cfg(test)]

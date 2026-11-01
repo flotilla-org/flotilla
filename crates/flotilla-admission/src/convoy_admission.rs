@@ -26,23 +26,22 @@ use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::result_set::ConvoyChangeRequest;
 use flotilla_protocol::{
-    AttachBinding, CanonicalHostId, CommandValue, ConvoyDispatchRegard, ConvoyNaming, EnvironmentId, FulfilmentAllocation,
-    FulfilmentAllocationCandidate, HostName, PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate,
-    PrincipalRef, ResourceRef, ViewAddress,
+    CanonicalHostId, CommandValue, ConvoyNaming, EnvironmentId, FulfilmentAllocation, FulfilmentAllocationCandidate, HostName,
+    PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ViewAddress,
 };
 use flotilla_provider_runtime::{CommandRunner, ObservationError};
 use flotilla_resources::address::{record_name, remote_change_request_address};
 use flotilla_resources::checkout_path::checkout_path;
 use flotilla_resources::convoy_address::{convoy_address, convoy_record_name};
 use flotilla_resources::{
-    api_version, capped_github_app_permissions, is_prepared_snapshot, normalize_issue_source, AllocationDecision, BoundChangeRequest,
-    CapabilityNeed, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, Clock, Convoy as ResourceConvoy, ConvoyEnsure,
-    ConvoyIssue, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewSource,
-    CrewSpec, Forge, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host as ResourceHost, InputMeta,
-    InputValue, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, ObjectMeta, ObservedChangeRequestState, Platform, Project,
-    ProjectSpec, ReadResourceObject, Repository, RepositoryKey, RepositoryTrust, Resource, ResourceError, ResourceObject,
-    ResourceProvenance, RoleHandoff, SupervisionTarget, TerminalCrewContext, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
-    BRIEF_ARTIFACTS_ANNOTATION, CODEX_CENTRAL_LOGIN_CAPABILITY, GENERATION_LABEL, PLACEMENT_SNAPSHOT_KIND, PROJECT_LABEL, ROLE_LABEL,
+    capped_github_app_permissions, is_prepared_snapshot, normalize_issue_source, AllocationDecision, BoundChangeRequest, CapabilityNeed,
+    ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, Clock, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyIssue,
+    ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewSource, CrewSpec, Forge,
+    FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host as ResourceHost, InputMeta, InputValue, IssueSnapshot,
+    IssueSourceResolution, IssueSourceUnavailable, ObjectMeta, ObservedChangeRequestState, Platform, Project, ProjectSpec,
+    ReadResourceObject, Repository, RepositoryKey, RepositoryTrust, ResourceError, ResourceObject, ResourceProvenance, RoleHandoff,
+    SupervisionTarget, TerminalCrewContext, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, BRIEF_ARTIFACTS_ANNOTATION,
+    CODEX_CENTRAL_LOGIN_CAPABILITY, GENERATION_LABEL, PLACEMENT_SNAPSHOT_KIND, PROJECT_LABEL, ROLE_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{HoldAct, RepositorySpec, SystemClock};
@@ -57,7 +56,6 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 
 use crate::project_ops;
-use crate::regard_lifecycle::{RegardLifecycle, SurfaceGestureOutcome};
 use crate::support::{
     authoritative_placement_host, check_placement_capacity, ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot,
     home_copy_wins_by_name, host_generation, host_occupancies, host_occupancy, is_ssh_host, placement_actuator_host_ref,
@@ -128,7 +126,6 @@ pub struct ConvoyAdmission {
     change_request_observation_source: Arc<ProviderChangeRequestObservationSource>,
     brief_artifact_writer: Arc<RwLock<Option<Arc<dyn BriefArtifactWriter>>>>,
     admission_free_space_path: Arc<std::sync::RwLock<PathBuf>>,
-    regard_lifecycle: Arc<RegardLifecycle>,
     host_name: HostName,
     clock: Arc<dyn Clock>,
     /// The draw that selects a requester's account (#3884); tests fix the seed.
@@ -755,7 +752,6 @@ impl ConvoyAdmission {
                 vessel_placements: Some(&admission.vessel_placements),
                 image_builds: &admission.image_builds,
             },
-            intent.auto_attach.into(),
         )
         .await?;
         self.accounts.open(namespace, bindings).await?;
@@ -851,7 +847,6 @@ impl ConvoyAdmission {
         namespace: &str,
         name: &str,
         bundle: ConvoySnapshotBundle<'_>,
-        dispatch_regard: ConvoyDispatchRegard,
     ) -> Result<(), String> {
         let ConvoySnapshotBundle { spec, workflow, placement, placement_decision, vessel_placements, image_builds, evidence } = bundle;
         let workflow_value = serde_json::to_value(workflow).map_err(|error| error.to_string())?;
@@ -869,7 +864,7 @@ impl ConvoyAdmission {
             annotations.extend(self.prepare_vessel_placement_annotations(namespace, name, vessel_placements).await?);
         }
         let created = crate::image_build::create_planned_builds(&self.backend, namespace, image_builds).await?;
-        let result = self.create_convoy_with_annotations(namespace, name, spec, placement_decision, dispatch_regard, annotations).await;
+        let result = self.create_convoy_with_annotations(namespace, name, spec, placement_decision, annotations).await;
         if result.is_err() {
             crate::image_build::remove_created_builds(&self.backend, namespace, &created).await;
         }
@@ -1309,7 +1304,6 @@ impl ConvoyAdmission {
         name: &str,
         spec: &ConvoySpec,
         placement_decision: Option<PlacementDecision>,
-        dispatch_regard: ConvoyDispatchRegard,
         mut annotations: BTreeMap<String, String>,
     ) -> Result<(), String> {
         // Publish admission inputs and initial status in one create. Publishing
@@ -1330,27 +1324,7 @@ impl ConvoyAdmission {
             .create(&InputMeta::builder().name(name.to_string()).labels(labels).annotations(annotations).build(), spec)
             .await
             .map_err(|error| error.to_string())?;
-        if dispatch_regard == ConvoyDispatchRegard::Emit {
-            if let Err(error) = self.emit_implicit_convoy_regard(namespace, name, &spec.dispatching_principal_ref).await {
-                warn!(%error, %namespace, %name, "failed to emit convoy dispatch regard");
-            }
-        }
         Ok(())
-    }
-
-    pub async fn emit_implicit_convoy_regard(&self, namespace: &str, name: &str, principal_ref: &PrincipalRef) -> Result<(), String> {
-        let target = ResourceRef::new(api_version(ResourceConvoy::API_PATHS), ResourceConvoy::API_PATHS.kind, namespace, name);
-        self.regard_lifecycle.emit_implicit(principal_ref, &target, "convoy-dispatch").await
-    }
-
-    pub async fn emit_attach_regard(&self, binding: &AttachBinding, surface_id: uuid::Uuid) -> Result<(), String> {
-        let target = binding.resource_ref().ok_or_else(|| "resolved attach target has no resource identity".to_string())?;
-        match self.regard_lifecycle.emit_expressed_for_surface(surface_id, &target).await? {
-            SurfaceGestureOutcome::Handled => Ok(()),
-            SurfaceGestureOutcome::UnknownSurface => {
-                self.regard_lifecycle.emit_expressed(&PrincipalRef::implicit_for_namespace(&binding.namespace), &target).await
-            }
-        }
     }
 
     /// Freeze each vessel's composed image for a ConvoyCreate placement. The
@@ -1474,14 +1448,7 @@ impl ConvoyAdmission {
         annotations.extend(self.prepare_vessel_placement_annotations(namespace, &admission.name, &admission.vessel_placements).await?);
         let created = crate::image_build::create_planned_builds(&self.backend, namespace, &admission.image_builds).await?;
         let result = self
-            .create_convoy_with_annotations(
-                namespace,
-                &admission.name,
-                &admission.spec,
-                admission.placement_decision,
-                ConvoyDispatchRegard::Suppress,
-                annotations,
-            )
+            .create_convoy_with_annotations(namespace, &admission.name, &admission.spec, admission.placement_decision, annotations)
             .await;
         if result.is_err() {
             crate::image_build::remove_created_builds(&self.backend, namespace, &created).await;
@@ -1609,7 +1576,6 @@ impl ConvoyAdmission {
                     vessel_placements: (!vessel_placements.is_empty()).then_some(&vessel_placements),
                     image_builds: &image_builds,
                 },
-                ConvoyDispatchRegard::Emit,
             )
             .await
         {
@@ -4919,7 +4885,6 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
     let brief_artifact_writer = Arc::new(RwLock::new(None));
     let admission_free_space_path = Arc::new(std::sync::RwLock::new(temp.path().to_path_buf()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let regard_lifecycle = Arc::new(RegardLifecycle::new(resource_backend.clone(), clock.clone(), chrono::Duration::hours(1)));
     let host_name = HostName::new("host");
     let admission = ConvoyAdmission::builder()
         .backend(resource_backend.clone())
@@ -4937,7 +4902,6 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
         .change_request_observation_source(Arc::clone(&observation_source))
         .brief_artifact_writer(Arc::clone(&brief_artifact_writer))
         .admission_free_space_path(Arc::clone(&admission_free_space_path))
-        .regard_lifecycle(Arc::clone(&regard_lifecycle))
         .host_name(host_name.clone())
         .clock(Arc::clone(&clock))
         .fulfilment_decider(Arc::new(StaticFulfilmentDecider))

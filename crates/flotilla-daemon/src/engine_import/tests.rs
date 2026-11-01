@@ -396,6 +396,7 @@ fn rows_of_kinds_no_importer_reads_are_dropped_kept_or_refused_here_only() {
         row("widgets", HERE, "widget"),
         row("widgets", THERE, "their-widget"),
         row("regards", THERE, "their-regard"),
+        row("accessdeliveries", HERE, "delivery"),
     ]);
     let target = Import::in_memory(HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
     assert!(target.imports(HERE) && !target.imports(THERE));
@@ -403,7 +404,12 @@ fn rows_of_kinds_no_importer_reads_are_dropped_kept_or_refused_here_only() {
     plan_rows(&source, &target, &mut summary);
     assert_eq!(summary.kinds["Usage"].dropped, 1);
     assert_eq!(summary.kinds["Event"].dropped, 1);
-    assert_eq!(summary.staying.get("Regard"), Some(&("#3938", 1)), "a kind still moving stays on the old store");
+    assert_eq!(summary.kinds["Regard"].dropped, 1, "only this home's row is dropped here");
+    assert_eq!(
+        summary.staying.get("AccessDelivery"),
+        Some(&("#3824, plain like AccountProvision", 1)),
+        "a kind still moving stays on the old store"
+    );
     assert_eq!(
         summary.refusals,
         vec![Refusal { kind: "widgets".into(), name: "widget".into(), reason: "no import plan for its kind".into() }]

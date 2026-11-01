@@ -567,10 +567,9 @@ mod tests {
     use flotilla_protocol::{
         AwarenessKind, DemandBackedMetadata, Issue, IssueRef, IssueSource, IssueState, QueryCursor, ResultSetState, Rows,
     };
-    use flotilla_resources::PrincipalRef;
 
     use super::*;
-    use crate::salience::RegardFact;
+    use crate::salience::RaisedFact;
 
     fn scope_in(namespace: &str, name: &str) -> QueryScope {
         QueryScope::new(namespace, name)
@@ -1016,9 +1015,9 @@ mod tests {
         assert!(
             state
                 .replace_salience_facts(SalienceFacts {
-                    regards: vec![RegardFact {
-                        principal: PrincipalRef { namespace: "flotilla".into(), name: "operator".into() },
+                    raised: vec![RaisedFact {
                         target: ResourceRef::new("flotilla.work/v1", "Project", "flotilla", "roadmap"),
+                        escalated: false,
                         as_of: Utc::now(),
                     }],
                     ..SalienceFacts::default()

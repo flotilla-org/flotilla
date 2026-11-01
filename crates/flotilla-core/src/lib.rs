@@ -5,7 +5,6 @@
 pub mod cleat_roll;
 pub mod command_target;
 pub mod convert;
-pub mod demand_lifecycle;
 pub mod host_identity;
 pub mod in_process;
 pub mod model;

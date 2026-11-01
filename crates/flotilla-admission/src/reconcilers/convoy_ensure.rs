@@ -16,17 +16,16 @@ use crate::ports::ConvoyTeardown;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use flotilla_charter::ops_entry::{
-    materialized_workflow_name, ENSURED_FROM_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, ENSURE_DRIFT_ATTENTION_PREFIX,
-    ENSURE_PROVENANCE_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION,
-    SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
+    materialized_workflow_name, ENSURED_FROM_ANNOTATION, ENSURE_PROVENANCE_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION,
+    PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
 };
-use flotilla_protocol::{PlacementTargetHost, PrincipalRef, ResourceRef};
+use flotilla_protocol::{PlacementTargetHost, PrincipalRef};
+use flotilla_resources::attentions::{Attention, Attentions, Fact, OpenAttention, Sender, Subject};
 use flotilla_resources::{
-    api_version, Clock, ConditionValue, ControllerRetry, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition,
-    ConvoyEnsureConfigDrift, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyEnsureStatusPatch, ConvoyPhase,
-    Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, FulfilmentKind,
-    Host as ResourceHost, InputMeta, ObjectEvent, Project, ReadResourceObject, Repository, Resource, ResourceError, ResourceObject,
-    ResourceProvenance, WorkflowTemplate, DRIVER_ADMISSION_CONDITION_TYPE, ENSURE_HOLD_REASON_ANNOTATION,
+    Clock, ConditionValue, ControllerRetry, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureConfigDrift,
+    ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyEnsureStatusPatch, ConvoyPhase, FulfilmentKind,
+    Host as ResourceHost, ObjectEvent, Project, ReadResourceObject, Repository, ResourceError, ResourceObject, ResourceProvenance,
+    WorkflowTemplate, DRIVER_ADMISSION_CONDITION_TYPE,
 };
 use flotilla_store::{apply_status_patch as apply_resource_status_patch, EventRecorder, ResourceBackend, StoreQuery};
 use sha2::{Digest, Sha256};
@@ -34,8 +33,6 @@ use tokio::sync::Mutex;
 use tracing::debug;
 const ENSURE_BACKOFF_RESET_AFTER: ChronoDuration = ChronoDuration::minutes(10);
 const ENSURE_MAX_CONSECUTIVE_FAILURES: u32 = 3;
-const ENSURE_ESCALATION_AFTER: ChronoDuration = ChronoDuration::minutes(15);
-const ENSURE_HOLD_ATTENTION_PREFIX: &str = "ensure-attention-";
 #[derive(Debug, Clone)]
 struct EnsureAdmissionRetry {
     config_hash: String,
@@ -99,6 +96,7 @@ impl EnsureReconciler {
             .clone()
             .unwrap_or_else(|| Arc::new(flotilla_store::OldStoreManifestRoots::new(self.resource_backend.clone())));
         EnsurePass::builder()
+            .attentions(self.resource_backend.attentions())
             .teardown(&self.teardown)
             .resource_backend(&self.resource_backend)
             .manifest_roots(manifest_roots)
@@ -134,6 +132,7 @@ impl EnsureReconciler {
 }
 #[derive(bon::Builder)]
 struct EnsurePass<'a> {
+    attentions: Arc<dyn Attentions>,
     teardown: &'a Arc<dyn ConvoyTeardown>,
     resource_backend: &'a ResourceBackend,
     manifest_roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
@@ -612,24 +611,23 @@ impl EnsurePass<'_> {
             .take_while(|convoy| convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Failed))
             .count() as u32;
 
-        let demands = self.resource_backend.clone().using::<ResourceDemand>(namespace);
-        let demand_name = format!("{ENSURE_HOLD_ATTENTION_PREFIX}{}", ensure.metadata.name);
-        let resolved_escalation = match demands.get(&demand_name).await {
-            Ok(demand)
-                if demand.status.as_ref().is_none_or(|status| matches!(status.state, DemandState::Raised | DemandState::Escalated)) =>
-            {
+        let resolved_escalation = match generations.last() {
+            Some(latest) if self.hold_is_open(namespace, &latest.metadata.name).await? => {
                 if consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES && !force_now {
                     return Ok(None);
                 }
-                demands.delete(&demand_name).await.map_err(|error| error.to_string())?;
+                self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
                 consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES
             }
-            Ok(_) => {
-                demands.delete(&demand_name).await.map_err(|error| error.to_string())?;
+            // A person's acknowledgement releases the hold once: its end is cleared with it.
+            Some(latest)
+                if self.attentions.acknowledged(namespace, Sender::Standing, &Subject::convoy(latest.metadata.name.clone())).await? =>
+            {
+                self.clear_hold(namespace, &latest.metadata.name).await?;
                 true
             }
-            Err(ResourceError::NotFound { .. }) => false,
-            Err(error) => return Err(error.to_string()),
+            Some(_) => false,
+            None => false,
         };
 
         let retry_key = (namespace.to_string(), ensure.metadata.name.clone());
@@ -655,7 +653,7 @@ impl EnsurePass<'_> {
         if !resolved_escalation && !force_now && consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES {
             let latest = latest.expect("a positive failure count requires a generation");
             let failure = format!("ensured convoy entered a terminal failure phase; {consecutive_failures} consecutive generations failed");
-            self.raise_ensure_attention(ensure, latest, &failure, Some(self.clock.now() + ENSURE_ESCALATION_AFTER)).await?;
+            self.raise_ensure_attention(ensure, latest, &failure).await?;
             return Ok(Some(format!("ConvoyEnsure/{} exhausted restart budget", ensure.metadata.name)));
         }
         // `reconcile-now` is the operator's explicit acknowledgement that any
@@ -860,10 +858,10 @@ impl EnsurePass<'_> {
 
         let convoy = convoy.expect("terminal branch requires an existing convoy");
         if status.hold_reason == Some(ConvoyEnsureHoldReason::RestartLimit) {
-            if !force_now && self.ensure_attention_is_active(namespace, &ensure.metadata.name).await? {
+            if !force_now && self.hold_is_open(namespace, &convoy.metadata.name).await? {
                 return Ok(None);
             }
-            self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
+            self.clear_hold(namespace, &convoy.metadata.name).await?;
             if !force_now {
                 self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
                 return Ok(Some(format!("ConvoyEnsure/{} restart hold cleared", ensure.metadata.name)));
@@ -884,7 +882,7 @@ impl EnsurePass<'_> {
                     .record(ObjectEvent::for_object(&convoy, "BackingEvidenceRefused", failure.clone()), now)
                     .await
                     .map_err(|error| format!("record backing-evidence event: {error}"))?;
-                self.raise_ensure_attention(ensure, &convoy, &failure, None).await?;
+                self.raise_ensure_attention(ensure, &convoy, &failure).await?;
                 if status.retry_at.is_some() || status.last_failure.as_deref() != Some(&failure) {
                     self.patch_convoy_ensure(
                         namespace,
@@ -898,12 +896,13 @@ impl EnsurePass<'_> {
             }
         }
         self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
+        self.clear_hold(namespace, &convoy.metadata.name).await?;
 
         if status.retry_at.is_none() && !force_now {
             let failure = "ensured convoy entered a terminal failure phase";
             if status.restart_count.saturating_add(1) >= ENSURE_MAX_CONSECUTIVE_FAILURES {
                 let failure = format!("{failure}; {} consecutive generations failed", ENSURE_MAX_CONSECUTIVE_FAILURES);
-                self.raise_ensure_attention(ensure, &convoy, &failure, Some(now + ENSURE_ESCALATION_AFTER)).await?;
+                self.raise_ensure_attention(ensure, &convoy, &failure).await?;
                 self.patch_convoy_ensure(
                     namespace,
                     &ensure.metadata.name,
@@ -973,6 +972,9 @@ impl EnsurePass<'_> {
         now: DateTime<Utc>,
     ) -> Result<Option<String>, String> {
         self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
+        // With no running convoy, no admitted configuration can have drifted.
+        let role = Subject::StandingRole { project: ensure.spec.project_ref.clone(), role: ensure.spec.role.clone() };
+        self.attentions.clear(namespace, Sender::Standing, &role).await?;
         match self.start_ensured_convoy(namespace, ensure).await {
             Ok(convoy_ref) => {
                 self.ensure_admission_retries.lock().await.remove(&(namespace.to_string(), ensure.metadata.name.clone()));
@@ -1073,35 +1075,18 @@ impl EnsurePass<'_> {
             Err(ResourceError::NotFound { .. }) => return Ok(()),
             Err(error) => return Err(error.to_string()),
         }
-        let demands = self.resource_backend.using::<ResourceDemand>(namespace);
-        let name = format!("{ENSURE_DRIFT_ATTENTION_PREFIX}{}", ensure.metadata.name);
+        let role = Subject::StandingRole { project: ensure.spec.project_ref.clone(), role: ensure.spec.role.clone() };
         if changes.is_empty() {
-            match demands.delete(&name).await {
-                Ok(()) | Err(ResourceError::NotFound { .. }) => return Ok(()),
-                Err(error) => return Err(error.to_string()),
-            }
+            return self.attentions.clear(namespace, Sender::Standing, &role).await;
         }
-        let target =
-            ResourceRef::new(api_version(ResourceConvoy::API_PATHS), ResourceConvoy::API_PATHS.kind, namespace, &convoy.metadata.name);
-        let meta = InputMeta::builder()
-            .name(name)
-            .annotations(BTreeMap::from([(
-                ENSURE_CONFIG_DRIFT_REASON_ANNOTATION.to_string(),
-                format!("ConfigDrift: {}; run flotilla ensure roll {}", changes.join("; "), ensure.metadata.name),
-            )]))
-            .build();
-        let spec = DemandSpec::for_dispatching_principal(target, DemandKind::HumanGate, convoy.spec.dispatching_principal_ref.clone());
-        match demands.create(&meta, &spec).await {
-            Ok(_) => Ok(()),
-            Err(ResourceError::Conflict { .. }) => {
-                let current = demands.get(&meta.name).await.map_err(|error| error.to_string())?;
-                if current.metadata.annotations == meta.annotations && current.spec == spec {
-                    return Ok(());
-                }
-                demands.update(&meta, &current.metadata.resource_version, &spec).await.map(|_| ()).map_err(|error| error.to_string())
-            }
-            Err(error) => Err(error.to_string()),
-        }
+        let fact = Fact::Drift {
+            ensure: ensure.metadata.name.clone(),
+            project: ensure.spec.project_ref.clone(),
+            role: ensure.spec.role.clone(),
+            convoy: convoy.metadata.name.clone(),
+        };
+        let reason = format!("ConfigDrift: {}; run flotilla ensure roll {}", changes.join("; "), ensure.metadata.name);
+        self.attentions.raise(namespace, &Attention::new(fact, reason)).await
     }
 
     async fn raise_ensure_attention(
@@ -1109,49 +1094,37 @@ impl EnsurePass<'_> {
         ensure: &ResourceObject<ConvoyEnsure>,
         convoy: &ResourceObject<ResourceConvoy>,
         reason: &str,
-        escalation_deadline: Option<DateTime<Utc>>,
     ) -> Result<(), String> {
-        let demands = self.resource_backend.clone().using::<ResourceDemand>(&convoy.metadata.namespace);
-        let name = format!("{ENSURE_HOLD_ATTENTION_PREFIX}{}", ensure.metadata.name);
-        let target = ResourceRef::new(
-            api_version(ResourceConvoy::API_PATHS),
-            ResourceConvoy::API_PATHS.kind,
-            &convoy.metadata.namespace,
-            &convoy.metadata.name,
-        );
-        let meta = InputMeta::builder()
-            .name(name)
-            .annotations(BTreeMap::from([(ENSURE_HOLD_REASON_ANNOTATION.to_string(), reason.to_string())]))
-            .build();
-        let mut spec = DemandSpec::for_dispatching_principal(target, DemandKind::HumanGate, convoy.spec.dispatching_principal_ref.clone());
-        spec.expiry = escalation_deadline.map(|deadline| DemandExpiry { deadline, disposition: DemandExpiryDisposition::Escalate });
-        match demands.create(&meta, &spec).await {
-            Ok(_) => Ok(()),
-            Err(ResourceError::Conflict { .. }) => {
-                let current = demands.get(&meta.name).await.map_err(|error| error.to_string())?;
-                demands.update(&meta, &current.metadata.resource_version, &spec).await.map(|_| ()).map_err(|error| error.to_string())
-            }
-            Err(error) => Err(error.to_string()),
-        }
+        let fact = Fact::Hold { ensure: ensure.metadata.name.clone(), convoy: convoy.metadata.name.clone() };
+        self.attentions.raise(&convoy.metadata.namespace, &Attention::new(fact, reason)).await
     }
 
-    async fn ensure_attention_is_active(&self, namespace: &str, ensure_name: &str) -> Result<bool, String> {
-        let name = format!("{ENSURE_HOLD_ATTENTION_PREFIX}{ensure_name}");
-        match self.resource_backend.clone().using::<ResourceDemand>(namespace).get(&name).await {
-            Ok(demand) => {
-                Ok(demand.status.as_ref().is_none_or(|status| matches!(status.state, DemandState::Raised | DemandState::Escalated)))
-            }
-            Err(ResourceError::NotFound { .. }) => Ok(false),
-            Err(error) => Err(error.to_string()),
-        }
+    async fn hold_is_open(&self, namespace: &str, convoy: &str) -> Result<bool, String> {
+        let subject = Subject::convoy(convoy);
+        // A standing role's attention about a convoy is its hold.
+        Ok(!self.attentions.open(namespace, Some(Sender::Standing), Some(&subject)).await?.is_empty())
     }
 
+    /// Ends the hold on `convoy`, open or acknowledged.
+    async fn clear_hold(&self, namespace: &str, convoy: &str) -> Result<(), String> {
+        self.attentions.clear(namespace, Sender::Standing, &Subject::convoy(convoy)).await
+    }
+
+    /// Clears the hold on any of the ensure's generations.
     async fn clear_ensure_attention(&self, namespace: &str, ensure_name: &str) -> Result<(), String> {
-        let name = format!("{ENSURE_HOLD_ATTENTION_PREFIX}{ensure_name}");
-        match self.resource_backend.clone().using::<ResourceDemand>(namespace).delete(&name).await {
-            Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
-            Err(error) => Err(error.to_string()),
+        let holds: Vec<_> =
+            self.attentions.open(namespace, Some(Sender::Standing), None).await?.into_iter().filter(OpenAttention::is_hold).collect();
+        if holds.is_empty() {
+            return Ok(());
         }
+        let generations: HashSet<String> =
+            self.ensured_convoy_generations(namespace, ensure_name).await?.into_iter().map(|convoy| convoy.metadata.name).collect();
+        for hold in holds {
+            if matches!(&hold.subject, Subject::Convoy { convoy } if generations.contains(convoy)) {
+                self.attentions.clear(namespace, Sender::Standing, &hold.subject).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn patch_convoy_ensure(&self, namespace: &str, name: &str, patch: ConvoyEnsureStatusPatch) -> Result<(), String> {
@@ -1254,6 +1227,7 @@ mod tests {
     use flotilla_store_testkit::VirtualClock;
 
     use super::*;
+    use flotilla_resources::{Demand as ResourceDemand, InputMeta};
 
     // Stands in for provider-backed admission and lifecycle operations. Resource
     // storage, status patches, the clock and the reconcile loop are real.
@@ -1576,7 +1550,7 @@ mod tests {
             .expect("fixture operation succeeds")
             .is_empty());
         assert_eq!(admission.commits.load(Ordering::SeqCst), 3);
-        assert!(demands.get("ensure-attention-standing").await.expect("ensure attention").spec.expiry.is_some());
+        assert!(demands.get("ensure-attention-standing").await.is_ok(), "the restart limit holds it for a person");
     }
 
     // #2220: reaping is idempotent for absence and refuses another ensure's

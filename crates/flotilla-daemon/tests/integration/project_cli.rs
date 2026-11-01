@@ -864,8 +864,13 @@ async fn ops_entries_materialization_scenario() {
     assert_eq!(refusal.entry_path, "quartermaster: named.entry");
     let ensure = ensures.get(&ensure_name).await.expect("last accepted ensure remains");
     assert!(ensure.status.expect("ensure status").declaration_refused.is_some());
-    let demands = backend.using::<flotilla_resources::Demand>("flotilla").list().await.expect("attention").items;
-    assert!(demands.iter().any(|demand| demand.spec.originating_work_ref.name == "demo"));
+    let refused = |fleet: flotilla_protocol::FleetListResponse| {
+        fleet
+            .declaration_attention
+            .iter()
+            .any(|row| row.resource.name == "demo" && row.condition == flotilla_protocol::DeclarationAttentionKind::DeclarationRefused)
+    };
+    assert!(refused(daemon.fleet_list_internal().await.expect("fleet list")), "the refusal needs a person");
 
     std::fs::write(&ensure_path,
         "---\nkind: ensure\nrole: quartermaster\nrepos: [operations]\n---\nworkflow: all-code\npresents-as: fleet\nagents: [quartermaster=claude-code:claude-fable-5-1]\n")
@@ -884,14 +889,7 @@ async fn ops_entries_materialization_scenario() {
         .declaration_refused
         .is_none());
     assert!(ensures.get(&ensure_name).await.expect("retained ensure").status.expect("status").declaration_refused.is_none());
-    assert!(!backend
-        .using::<flotilla_resources::Demand>("flotilla")
-        .list()
-        .await
-        .expect("attention")
-        .items
-        .iter()
-        .any(|demand| demand.metadata.name == "declaration-refused-demo"));
+    assert!(!refused(daemon.fleet_list_internal().await.expect("fleet list")), "a repaired declaration needs no one");
 
     std::fs::remove_file(ensure_path).expect("remove ensure entry");
     assert_eq!(

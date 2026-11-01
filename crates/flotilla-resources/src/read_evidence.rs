@@ -1,6 +1,5 @@
 use crate::{
-    Demand as ResourceDemand, DemandState, ResourceObject, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
-    UnmetSettlementExpectation, ROLE_LABEL, VESSEL_LABEL,
+    ResourceObject, TerminalSession, TerminalSessionPhase, TerminalSessionSource, UnmetSettlementExpectation, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_protocol::ExplainedUnmetExpectation;
 use std::collections::BTreeMap;
@@ -128,19 +127,6 @@ pub fn explain_unmet_expectation(expectation: UnmetSettlementExpectation) -> Exp
         },
     }
 }
-pub fn credential_refresh_alert_for_vessel(demand: &ResourceObject<ResourceDemand>, convoy: &str, vessel: &str) -> Option<String> {
-    if demand.spec.originating_work_ref.name != convoy
-        || demand.metadata.annotations.get("flotilla.work/credential-refresh-vessel").is_none_or(|name| name != vessel)
-        || !matches!(
-            demand.status.as_ref().map_or(DemandState::Raised, |status| status.state),
-            DemandState::Raised | DemandState::Escalated
-        )
-    {
-        return None;
-    }
-    demand.metadata.annotations.get(crate::CREDENTIAL_REFRESH_REASON_ANNOTATION).cloned()
-}
-
 use crate::{TerminalAttentionState, TerminalSessionStatus};
 pub fn crew_attention(
     status: Option<&TerminalSessionStatus>,

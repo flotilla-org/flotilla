@@ -6,15 +6,15 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, LifecycleReading, PrincipalRef, ResourceRef};
+use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, LifecycleReading};
 use flotilla_resources::{
-    api_version, Convoy, ConvoyPhase, CrewMessageDelivery, Demand, DemandAddressee, DemandKind, DemandSpec, Environment, EnvironmentPhase,
-    InputMeta, LifecycleAuthority, OwnerReference, Resource, ResourceError, ResourceObject, ResourceProvenance, TerminalAttention,
-    TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec, TerminalSessionStatusPatch, TerminalSessionTarget, Vessel, ACTUATOR_HOST_REF_ANNOTATION,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_SESSION_TAG,
-    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG,
-    TERMINAL_DELIVERY_EXPIRED_REASON, TERMINAL_DELIVERY_NOT_SUBMITTED_REASON, TERMINAL_DELIVERY_UNCONFIRMED_REASON, VESSEL_REF_LABEL,
+    attentions::Attention, Convoy, ConvoyPhase, CrewMessageDelivery, Demand, Environment, EnvironmentPhase, LifecycleAuthority, Resource,
+    ResourceError, ResourceObject, ResourceProvenance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
+    TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatusPatch,
+    TerminalSessionTarget, Vessel, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
+    CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG,
+    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG, TERMINAL_DELIVERY_EXPIRED_REASON, TERMINAL_DELIVERY_NOT_SUBMITTED_REASON,
+    TERMINAL_DELIVERY_UNCONFIRMED_REASON, VESSEL_REF_LABEL,
 };
 use flotilla_store::{
     controller::{ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler},
@@ -383,8 +383,8 @@ pub enum TerminalPrepared {
 }
 
 use flotilla_resources::delivery_hold::{
-    delivery_acceptance_evidence, delivery_demand, delivery_demand_name, delivery_retry_delay, delivery_retry_exhausted, DELIVERY_HOLD_FOR,
-    DELIVERY_MAX_ATTEMPTS, DELIVERY_WORKING_DEBOUNCE_FOR,
+    delivery_acceptance_evidence, delivery_retry_delay, delivery_retry_exhausted, DELIVERY_HOLD_FOR, DELIVERY_MAX_ATTEMPTS,
+    DELIVERY_WORKING_DEBOUNCE_FOR,
 };
 
 fn pending_delivery_hold(session: &ResourceObject<TerminalSession>) -> Option<&flotilla_resources::TerminalSessionDegradedCondition> {
@@ -761,13 +761,7 @@ where
             return self.reconcile(obj, prepared, now);
         }
         if matches!(prepared, TerminalPrepared::OwnerMissing) {
-            return ReconcileOutcome::with_actuations(
-                None,
-                vec![
-                    Actuation::DeleteTerminalSession { name: obj.metadata.name.clone() },
-                    Actuation::DeleteDemand { name: attention_demand_name(obj) },
-                ],
-            );
+            return ReconcileOutcome::with_actuations(None, vec![Actuation::DeleteTerminalSession { name: obj.metadata.name.clone() }]);
         }
 
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
@@ -983,19 +977,7 @@ where
                 .then_some(TerminalSessionStatusPatch::ClearReconcileDegraded)
         });
 
-        let mut actuations = match prepared {
-            TerminalPrepared::Attention(observation) => vec![attention_demand_actuation(obj, observation)],
-            TerminalPrepared::Stopped | TerminalPrepared::AgentExited(_) | TerminalPrepared::OwnerTerminal => {
-                vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }]
-            }
-            TerminalPrepared::Lost(_) | TerminalPrepared::EnvironmentLost(_) | TerminalPrepared::AttentionStale => {
-                vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }]
-            }
-            _ if matches!(phase, TerminalSessionPhase::Lost | TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed) => {
-                vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }]
-            }
-            _ => Vec::new(),
-        };
+        let mut actuations = Vec::new();
         let delivery_failure_visible = flotilla_resources::delivery_hold::legacy_delivery_gate_needed(obj);
         if delivery_failure_visible
             && (consumed
@@ -1011,7 +993,7 @@ where
                 )
                 || matches!(phase, TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed | TerminalSessionPhase::Lost))
         {
-            actuations.push(Actuation::DeleteDemand { name: delivery_demand_name(obj) });
+            actuations.extend(delivery_clear(obj));
         } else if delivery_failure_visible
             || expired
             || matches!(
@@ -1025,10 +1007,7 @@ where
                 .is_some_and(|condition| condition.is_controller_fence_unverifiable())
             || matches!(prepared, TerminalPrepared::MessageDeliveryNotSubmitted { message_id, .. } if delivery_retry_exhausted(obj.status.as_ref().map_or(1, |status| status.next_delivery_failure_count(message_id))))
         {
-            actuations.push({
-                let (meta, spec) = delivery_demand(obj);
-                Actuation::CreateDemand { meta, spec }
-            });
+            actuations.extend(delivery_raise(obj));
         }
         if let TerminalSessionSource::Agent { message: Some(head), .. } = &obj.spec.source {
             let delivered = obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref());
@@ -1101,7 +1080,13 @@ where
                 errors.push(error);
             }
         }
-        for name in [attention_demand_name(obj), delivery_demand_name(obj)] {
+        if let Some(fact) = flotilla_resources::delivery_hold::delivery_fact(obj) {
+            if let Err(error) = self.backend.attentions().clear(&obj.metadata.namespace, fact.sender(), &fact.subject()).await {
+                errors.push(error);
+            }
+        }
+        {
+            let name = attention_demand_name(obj);
             match self.demands.get(&name).await {
                 Ok(demand) if demand.metadata.lifecycle_authority()? == Some(LifecycleAuthority::Managed) => {
                     if let Err(error) = self.demands.delete(&demand.metadata.name).await {
@@ -1208,41 +1193,22 @@ fn held_delivery_consumed(
     delivery_acceptance_evidence(false, false, observation.attention.as_ref().is_some_and(working), observed_working, changed_output)
 }
 
-fn attention_demand_actuation(session: &ResourceObject<TerminalSession>, observation: &TerminalObservation) -> Actuation {
-    let name = attention_demand_name(session);
-    let demands_attention = observation.occupancy == TerminalOccupancy::Vacant
-        && observation.attention.as_ref().is_some_and(|attention| attention.state == TerminalAttentionState::NeedsInput);
-    if !demands_attention {
-        return Actuation::DeleteDemand { name };
-    }
-
-    terminal_demand_actuation(session, name)
+fn delivery_raise(session: &ResourceObject<TerminalSession>) -> Option<Actuation> {
+    let fact = flotilla_resources::delivery_hold::delivery_fact(session)?;
+    let held = session.status.as_ref().and_then(|status| status.degraded.as_ref()).map(|condition| condition.message.as_str());
+    let reason = match held {
+        Some(why) => format!("Turn delivery to session `{}` is held: {why}", session.metadata.name),
+        None => format!("Turn delivery to session `{}` is held until a person rules.", session.metadata.name),
+    };
+    Some(Actuation::RaiseAttention { attention: Attention::new(fact, reason) })
 }
 
-fn terminal_demand_actuation(session: &ResourceObject<TerminalSession>, name: String) -> Actuation {
-    let target = ResourceRef::new(
-        api_version(TerminalSession::API_PATHS),
-        TerminalSession::API_PATHS.kind,
-        &session.metadata.namespace,
-        &session.metadata.name,
-    );
-    let meta = InputMeta::builder()
-        .name(name)
-        .owner_references(vec![OwnerReference {
-            api_version: api_version(TerminalSession::API_PATHS),
-            kind: TerminalSession::API_PATHS.kind.to_string(),
-            name: session.metadata.name.clone(),
-            controller: true,
-        }])
-        .build();
-    let spec = DemandSpec::builder()
-        .originating_work_ref(target)
-        .kind(DemandKind::HumanGate)
-        .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef::implicit_for_namespace(&session.metadata.namespace) })
-        .build();
-    Actuation::CreateDemand { meta, spec }
+fn delivery_clear(session: &ResourceObject<TerminalSession>) -> Option<Actuation> {
+    let fact = flotilla_resources::delivery_hold::delivery_fact(session)?;
+    Some(Actuation::ClearAttention { sender: fact.sender(), subject: fact.subject() })
 }
 
+/// A session's former input-needed Demand, deleted at teardown until the kind is deleted.
 fn attention_demand_name(session: &ResourceObject<TerminalSession>) -> String {
     format!("terminal-attention-{}", session.metadata.name)
 }

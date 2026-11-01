@@ -493,13 +493,11 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     async fn dispatch_request_observe_focus(&self, id: u64, request: Request) -> Message {
-        let Request::ObserveFocus { targets } = request else {
+        // A surface's focus feeds no salience and is recorded nowhere.
+        let Request::ObserveFocus { .. } = request else {
             return Message::error_response(id, "ObserveFocus request selected the wrong handler");
         };
-        match self.daemon.observe_surface_focus(self.session_id, targets).await {
-            Ok(()) => Message::ok_response(id, Response::ObserveFocus),
-            Err(error) => Message::error_response(id, error),
-        }
+        Message::ok_response(id, Response::ObserveFocus)
     }
 
     async fn dispatch_request_subscribe_wait(&self, id: u64, request: Request) -> Message {

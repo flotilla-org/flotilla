@@ -191,6 +191,7 @@ impl Attentions for MessagePrimitives {
         for older in replaced {
             self.supersede(older.message.name(), &id, false).await;
         }
+        let _ = self.attention_changes.send(());
         Ok(())
     }
 
@@ -217,6 +218,7 @@ impl Attentions for MessagePrimitives {
                 continue;
             }
             self.withdraw_attention(&held).await?;
+            let _ = self.attention_changes.send(());
         }
         Ok(())
     }
@@ -235,5 +237,9 @@ impl Attentions for MessagePrimitives {
 
     async fn acknowledged(&self, namespace: &str, sender: Sender, subject: &Subject) -> Result<bool, String> {
         Ok(acknowledged(&self.about(namespace, sender, subject).await?).is_some())
+    }
+
+    fn changes(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
+        Some(self.attention_changes.subscribe())
     }
 }

@@ -13,11 +13,11 @@ use std::{
 
 use crate::{
     aggregator_projection::AggregatorProjectionState,
-    salience::{AttentionFact, DemandFact, RegardFact, SalienceFacts},
+    salience::{AttentionFact, RaisedFact, SalienceFacts},
     terminal_health,
 };
 use async_trait::async_trait;
-use flotilla_charter::ops_entry::{ENSURED_FROM_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION};
+use flotilla_charter::ops_entry::ENSURED_FROM_ANNOTATION;
 #[cfg(test)]
 use flotilla_daemon_api::event_sink::BroadcastEventSink;
 use flotilla_protocol::{
@@ -29,14 +29,14 @@ use flotilla_protocol::{
     Change, ConfiguredResourceLimits, DaemonEvent, EnvironmentKind, HostName, LifecycleAuthority, RepoDelta, RepoIdentity, RepositoryKey,
     ResourceRef, UNKNOWN_REPOSITORY_LABEL,
 };
+use flotilla_resources::attentions::{Attentions, OpenAttention, Sender, Subject as AttentionSubject, HOLD_ESCALATES_AFTER};
 use flotilla_resources::{
     api_version, convoy_subject_rows, repository_display_labels, subject_relationship_conflicts, Checkout, CheckoutSpec,
     Clone as CloneResource, Convoy, ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource,
-    Demand, DemandAddressee, DemandState, Environment, FulfilmentKind, FulfilmentRealisation, PlacementPolicy, Project, ReadResourceObject,
-    ReadWatchEvent, Regard, RegardExpiryPolicy, Repository, Resource, ResourceError, ResourceObject, ResourceProvenance, StallRung,
-    StalledCondition, TerminalAttention, TerminalAttentionState, TerminalSession, TerminalSessionPhase, Vessel, VesselPhase,
-    VesselRequirement, WatchEvent, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, RECLAIM_REFUSAL_REASON_ANNOTATION,
-    REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    Demand, Environment, FulfilmentKind, FulfilmentRealisation, PlacementPolicy, Project, ReadResourceObject, ReadWatchEvent, Repository,
+    Resource, ResourceError, ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalAttention, TerminalAttentionState,
+    TerminalSession, TerminalSessionPhase, Vessel, VesselPhase, VesselRequirement, WatchEvent, WatchStream, WorkPhase as ResourceWorkPhase,
+    WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{ReadResourceList, ResourceList, WatchStart};
@@ -86,7 +86,6 @@ pub struct AggregatorResolvers {
     durable_projects: ReplicaReadResolver<Project>,
     durable_fleet_designation: Option<ReplicaReadResolver<flotilla_resources::FleetDesignation>>,
     durable_repositories: ReplicaReadResolver<Repository>,
-    durable_regards: TypedResolver<Regard>,
     durable_vessels: ReplicaReadResolver<Vessel>,
     durable_hosts: ReplicaReadResolver<flotilla_resources::Host>,
     durable_checkouts: ReplicaReadResolver<Checkout>,
@@ -109,7 +108,6 @@ struct AggregatorSourceRefs<'a> {
     durable_projects: &'a dyn AggregatorReplicaWatchSource<Project>,
     durable_fleet_designation: Option<&'a dyn AggregatorReplicaWatchSource<flotilla_resources::FleetDesignation>>,
     durable_repositories: &'a dyn AggregatorReplicaWatchSource<Repository>,
-    durable_regards: &'a dyn AggregatorWatchSource<Regard>,
     durable_vessels: &'a dyn AggregatorReplicaWatchSource<Vessel>,
     durable_hosts: &'a dyn AggregatorReplicaWatchSource<flotilla_resources::Host>,
     durable_checkouts: &'a dyn AggregatorReplicaWatchSource<Checkout>,
@@ -201,7 +199,11 @@ pub struct Aggregator {
     #[builder(skip)]
     convoys_by_source: HashMap<LocalSource, HashMap<ConvoyKey, Arc<ReadResourceObject<Convoy>>>>,
     #[builder(skip)]
-    demands: HashMap<ResourceRef, ResourceObject<Demand>>,
+    attentions: Vec<OpenAttention>,
+    #[builder(skip)]
+    attention_namespace: String,
+    #[builder(skip)]
+    attention_port: Option<Arc<dyn Attentions>>,
     #[builder(skip)]
     convoy_keys_by_name: HashMap<(String, String), HashSet<ConvoyKey>>,
     #[builder(skip)]
@@ -216,8 +218,6 @@ pub struct Aggregator {
     convoy_ensures: BTreeMap<EnsureKey, ResourceObject<ConvoyEnsure>>,
     repositories: HashMap<RepositoryKey, ResourceObject<Repository>>,
     repository_sources: BTreeMap<RepositorySourceKey, ReadResourceObject<Repository>>,
-    #[builder(skip)]
-    regards: HashMap<ResourceRef, ResourceObject<Regard>>,
     #[builder(skip)]
     attention_expired_through: Option<chrono::DateTime<chrono::Utc>>,
     observed_checkouts: HashMap<ResourceRef, ResourceObject<Checkout>>,
@@ -347,7 +347,9 @@ impl Aggregator {
             state,
             local_host,
             convoys_by_source: HashMap::new(),
-            demands: HashMap::new(),
+            attentions: Vec::new(),
+            attention_namespace: String::new(),
+            attention_port: None,
             convoy_keys_by_name: HashMap::new(),
             sessions_by_source: HashMap::new(),
             terminal_sessions: HashMap::new(),
@@ -358,7 +360,6 @@ impl Aggregator {
             convoy_ensures: BTreeMap::new(),
             repositories: HashMap::new(),
             repository_sources: BTreeMap::new(),
-            regards: HashMap::new(),
             attention_expired_through: None,
             observed_checkouts: HashMap::new(),
             readiness_vessels: BTreeMap::new(),
@@ -406,6 +407,13 @@ impl Aggregator {
     pub fn with_convoy_engine(mut self, engine: flotilla_resources::convoy::engine::EngineConvoyPath, namespace: &str) -> Self {
         self.convoy_engine = engine;
         self.engine_namespace = namespace.to_owned();
+        self
+    }
+
+    /// Rows and salience read the open attentions of `namespace` through `port`.
+    pub fn with_attentions(mut self, port: Arc<dyn Attentions>, namespace: &str) -> Self {
+        self.attention_port = Some(port);
+        self.attention_namespace = namespace.to_owned();
         self
     }
 
@@ -457,7 +465,6 @@ impl Aggregator {
             durable_projects,
             durable_fleet_designation,
             durable_repositories,
-            durable_regards,
             durable_vessels,
             durable_hosts,
             durable_checkouts,
@@ -486,7 +493,6 @@ impl Aggregator {
                     .map(|resolver| resolver as &dyn AggregatorReplicaWatchSource<flotilla_resources::FleetDesignation>),
             )
             .durable_repositories(&durable_repositories)
-            .durable_regards(&durable_regards)
             .durable_vessels(&durable_vessels)
             .durable_hosts(&durable_hosts)
             .durable_checkouts(&durable_checkouts)
@@ -511,7 +517,6 @@ impl Aggregator {
             durable_projects,
             durable_fleet_designation,
             durable_repositories,
-            durable_regards,
             durable_vessels,
             durable_hosts,
             durable_checkouts,
@@ -569,7 +574,6 @@ impl Aggregator {
         let mut durable_project_stream = self.recover_project_watch(durable_projects).await?;
         let mut durable_ensure_stream = self.recover_convoy_ensure_watch(durable_convoy_ensures).await?;
         let mut durable_repository_stream = self.recover_repository_watch(durable_repositories).await?;
-        let mut durable_regard_stream = self.recover_regard_watch(durable_regards).await?;
         let mut observed_convoy_stream = self.recover_convoy_watch(LocalSource::Observed, observed_convoys).await?;
         let mut observed_session_stream = self.recover_observed_session_watch(observed_sessions).await?;
         let mut observed_checkout_stream = self.recover_checkout_watch(observed_checkouts).await?;
@@ -596,20 +600,21 @@ impl Aggregator {
         // An engine edge writes no old record: follow the engine's changes to
         // re-project the convoy's row (#3587 layer 8).
         let mut engine_changes = self.convoy_engine.get().map(|engine| engine.changes());
+        let mut attention_changes = self.attention_port.as_ref().and_then(|port| port.changes());
         let mut change_request_sweep =
             tokio::time::interval_at(Instant::now() + CHANGE_REQUEST_SWEEP_INTERVAL, CHANGE_REQUEST_SWEEP_INTERVAL);
         change_request_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            let regard_expiry_delay = self.next_regard_expiry_delay();
+            let escalation_delay = self.next_escalation_delay(chrono::Utc::now());
             let attention_expiry_delay = self.next_attention_expiry_delay();
-            let regard_expiry = async move {
-                match regard_expiry_delay {
+            let escalation = async move {
+                match escalation_delay {
                     Some(delay) => tokio::time::sleep(delay).await,
                     None => futures::future::pending().await,
                 }
             };
-            tokio::pin!(regard_expiry);
+            tokio::pin!(escalation);
             let attention_expiry = async move {
                 match attention_expiry_delay {
                     Some(delay) => tokio::time::sleep(delay).await,
@@ -628,6 +633,12 @@ impl Aggregator {
                 }
             };
             tokio::pin!(projection_flush);
+            let attention_change = async {
+                match attention_changes.as_mut() {
+                    Some(changes) => changes.recv().await,
+                    None => futures::future::pending().await,
+                }
+            };
             let engine_change = async {
                 match engine_changes.as_mut() {
                     Some(changes) => changes.recv().await,
@@ -635,6 +646,10 @@ impl Aggregator {
                 }
             };
             tokio::select! {
+                change = attention_change => match change {
+                    Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => self.refresh_attentions().await,
+                    Err(broadcast::error::RecvError::Closed) => attention_changes = None,
+                },
                 change = engine_change => match change {
                     Ok(name) => self.engine_convoy_changed(&name).await,
                     Err(broadcast::error::RecvError::Lagged(missed)) => {
@@ -651,8 +666,7 @@ impl Aggregator {
                 _ = change_request_sweep.tick() => {
                     self.sweep_active_change_request_subjects();
                 }
-                () = &mut regard_expiry => {
-                    self.prune_expired_regards(chrono::Utc::now());
+                () = &mut escalation => {
                     if self.rebuild_salience_projection().await {
                         self.emit_awareness_result_sets().await;
                     }
@@ -895,14 +909,6 @@ impl Aggregator {
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator durable repository watch ended")),
                 },
-                event = durable_regard_stream.next() => match event {
-                    Some(Ok(event)) => self.apply_regard_event(event).await,
-                    Some(Err(ResourceError::WatchExpired { .. })) => {
-                        durable_regard_stream = self.recover_regard_watch(durable_regards).await?;
-                    }
-                    Some(Err(err)) => return Err(err),
-                    None => return Err(ResourceError::other("aggregator durable regard watch ended")),
-                },
                 event = observed_convoy_stream.next() => match event {
                     Some(Ok(event)) => self.apply_convoy_event_from(LocalSource::Observed, event).await,
                     Some(Err(ResourceError::WatchExpired { .. })) => {
@@ -960,10 +966,6 @@ impl Aggregator {
 
     async fn recover_demand_watch(&mut self, resolver: &dyn AggregatorWatchSource<Demand>) -> Result<WatchStream<Demand>, ResourceError> {
         self.list_and_watch_demands(resolver).await
-    }
-
-    async fn recover_regard_watch(&mut self, resolver: &dyn AggregatorWatchSource<Regard>) -> Result<WatchStream<Regard>, ResourceError> {
-        self.list_and_watch_regards(resolver).await
     }
 
     async fn recover_environment_watch(
@@ -1113,24 +1115,37 @@ impl Aggregator {
         Ok(watch)
     }
 
+    /// Demands are the old store's attentions: their watch says when to read them again.
     async fn list_and_watch_demands(&mut self, resolver: &dyn AggregatorWatchSource<Demand>) -> Result<WatchStream<Demand>, ResourceError> {
-        let (listed, watch) = recover_local_view(resolver).await?;
-        self.demands =
-            listed.items.into_iter().map(|demand| (self.demand_ref(&demand.metadata.namespace, &demand.metadata.name), demand)).collect();
-        if self.rebuild_salience_projection().await && !self.bootstrapping {
+        let (_, watch) = recover_local_view(resolver).await?;
+        if self.read_attentions().await && self.rebuild_salience_projection().await && !self.bootstrapping {
             self.emit_awareness_result_sets().await;
         }
         Ok(watch)
     }
 
-    async fn list_and_watch_regards(&mut self, resolver: &dyn AggregatorWatchSource<Regard>) -> Result<WatchStream<Regard>, ResourceError> {
-        let (listed, watch) = recover_local_view(resolver).await?;
-        self.regards =
-            listed.items.into_iter().map(|regard| (self.regard_ref(&regard.metadata.namespace, &regard.metadata.name), regard)).collect();
-        if self.rebuild_salience_projection().await && !self.bootstrapping {
-            self.emit_awareness_result_sets().await;
+    /// Reads the open attentions; whether they changed.
+    async fn read_attentions(&mut self) -> bool {
+        let Some(port) = &self.attention_port else { return false };
+        let mut open = match port.open(&self.attention_namespace, None, None).await {
+            Ok(open) => open,
+            Err(error) => {
+                tracing::warn!(%error, "the open attentions did not read; rows keep the last read");
+                return false;
+            }
+        };
+        open.sort_by(|left, right| (left.sender, &left.subject, &left.reason).cmp(&(right.sender, &right.subject, &right.reason)));
+        if open == self.attentions {
+            return false;
         }
-        Ok(watch)
+        self.attentions = open;
+        true
+    }
+
+    async fn refresh_attentions(&mut self) {
+        if self.read_attentions().await {
+            self.rebuild_local_projection().await;
+        }
     }
 
     async fn replace_convoy_source(&mut self, source: LocalSource, convoys: Vec<ResourceObject<Convoy>>) {
@@ -1192,42 +1207,8 @@ impl Aggregator {
         Ok(watch)
     }
 
-    async fn apply_demand_event(&mut self, event: WatchEvent<Demand>) {
-        match event {
-            WatchEvent::Added(demand) | WatchEvent::Modified(demand) => {
-                let reference = self.demand_ref(&demand.metadata.namespace, &demand.metadata.name);
-                self.demands.insert(reference, demand);
-            }
-            WatchEvent::Deleted(demand) => {
-                let reference = self.demand_ref(&demand.metadata.namespace, &demand.metadata.name);
-                self.demands.remove(&reference);
-            }
-            WatchEvent::DeletedByName(tombstone) => {
-                let reference = self.demand_ref(&tombstone.namespace, &tombstone.name);
-                self.demands.remove(&reference);
-            }
-        }
-        self.rebuild_local_projection().await;
-    }
-
-    async fn apply_regard_event(&mut self, event: WatchEvent<Regard>) {
-        match event {
-            WatchEvent::Added(regard) | WatchEvent::Modified(regard) => {
-                let reference = self.regard_ref(&regard.metadata.namespace, &regard.metadata.name);
-                self.regards.insert(reference, regard);
-            }
-            WatchEvent::Deleted(regard) => {
-                let reference = self.regard_ref(&regard.metadata.namespace, &regard.metadata.name);
-                self.regards.remove(&reference);
-            }
-            WatchEvent::DeletedByName(tombstone) => {
-                let reference = self.regard_ref(&tombstone.namespace, &tombstone.name);
-                self.regards.remove(&reference);
-            }
-        }
-        if self.rebuild_salience_projection().await && !self.bootstrapping {
-            self.emit_awareness_result_sets().await;
-        }
+    async fn apply_demand_event(&mut self, _: WatchEvent<Demand>) {
+        self.refresh_attentions().await;
     }
 
     async fn apply_convoy_event_from(&mut self, source: LocalSource, event: WatchEvent<Convoy>) {
@@ -2304,37 +2285,13 @@ impl Aggregator {
     }
 
     fn salience_facts_at(&self, now: chrono::DateTime<chrono::Utc>) -> SalienceFacts {
-        let mut demand_resources = self.demands.values().collect::<Vec<_>>();
-        demand_resources
-            .sort_by(|left, right| (&left.metadata.namespace, &left.metadata.name).cmp(&(&right.metadata.namespace, &right.metadata.name)));
-        let demands = demand_resources
-            .into_iter()
-            .map(|demand| {
-                let state = demand.status.as_ref().map_or(DemandState::Raised, |status| status.state);
-                let as_of = demand
-                    .status
-                    .as_ref()
-                    .and_then(|status| match state {
-                        DemandState::Raised => status.raised.as_ref(),
-                        DemandState::Satisfied => status.satisfied.as_ref(),
-                        DemandState::Escalated => status.escalated.as_ref(),
-                        DemandState::Acknowledged => status.acknowledged.as_ref(),
-                    })
-                    .map_or(demand.metadata.creation_timestamp, |transition| transition.as_of);
-                let DemandAddressee::Principal { principal_ref } = &demand.spec.addressee;
-                let addressee = Some(principal_ref.clone());
-                DemandFact { target: demand.spec.originating_work_ref.clone(), addressee, state, as_of }
-            })
-            .collect();
-        let mut regard_resources = self.regards.values().collect::<Vec<_>>();
-        regard_resources
-            .sort_by(|left, right| (&left.metadata.namespace, &left.metadata.name).cmp(&(&right.metadata.namespace, &right.metadata.name)));
-        let regards = regard_resources
-            .into_iter()
-            .filter_map(|regard| {
-                let as_of = regard_as_of(regard);
-                let live = regard_expiry_at(regard).is_none_or(|expiry| now < expiry);
-                live.then(|| RegardFact { principal: regard.spec.principal_ref.clone(), target: regard.spec.target.clone(), as_of })
+        let raised = self
+            .attentions
+            .iter()
+            .map(|open| RaisedFact {
+                target: self.attention_target(&open.subject),
+                escalated: open.escalated_at(now),
+                as_of: open.raised_at,
             })
             .collect();
         let mut sessions = self.terminal_sessions.values().collect::<Vec<_>>();
@@ -2372,11 +2329,7 @@ impl Aggregator {
                     .collect()
             })
             .collect();
-        SalienceFacts { demands, regards, attention }
-    }
-
-    fn next_regard_expiry_delay(&self) -> Option<std::time::Duration> {
-        self.next_regard_expiry_delay_at(chrono::Utc::now())
+        SalienceFacts { raised, attention }
     }
 
     fn next_attention_expiry_delay(&self) -> Option<std::time::Duration> {
@@ -2408,12 +2361,30 @@ impl Aggregator {
         self.rebuild_local_projection().await;
     }
 
-    fn next_regard_expiry_delay_at(&self, now: chrono::DateTime<chrono::Utc>) -> Option<std::time::Duration> {
-        self.regards.values().filter_map(regard_expiry_at).min().map(|expiry| (expiry - now).to_std().unwrap_or_default())
+    /// How long until the next open hold escalates.
+    fn next_escalation_delay(&self, now: chrono::DateTime<chrono::Utc>) -> Option<std::time::Duration> {
+        self.attentions
+            .iter()
+            .filter(|open| open.is_hold())
+            .map(|open| open.raised_at + HOLD_ESCALATES_AFTER)
+            .filter(|at| *at > now)
+            .min()
+            .map(|at| (at - now).to_std().unwrap_or_default())
     }
 
-    fn prune_expired_regards(&mut self, now: chrono::DateTime<chrono::Utc>) {
-        self.regards.retain(|_, regard| regard_expiry_at(regard).is_none_or(|expiry| expiry > now));
+    /// The record salience joins an attention onto: its convoy or vessel, else its project.
+    fn attention_target(&self, subject: &AttentionSubject) -> ResourceRef {
+        match subject {
+            AttentionSubject::Convoy { convoy } | AttentionSubject::ConvoyRole { convoy, .. } => {
+                self.convoy_ref(&self.attention_namespace, convoy)
+            }
+            AttentionSubject::Vessel { convoy, vessel } => {
+                self.convoy_ref(&self.attention_namespace, convoy).subresource(format!("vessels/{vessel}"))
+            }
+            AttentionSubject::StandingRole { project, .. } => {
+                ResourceRef::new(api_version(Project::API_PATHS), Project::API_PATHS.kind, &self.attention_namespace, project)
+            }
+        }
     }
 
     async fn emit_awareness_result_sets(&self) {
@@ -2483,14 +2454,6 @@ impl Aggregator {
             )
             .on_host(self.read_host(&session.provenance)?),
         )
-    }
-
-    fn demand_ref(&self, namespace: &str, name: &str) -> ResourceRef {
-        ResourceRef::new(api_version(Demand::API_PATHS), Demand::API_PATHS.kind, namespace, name).on_host(self.local_host.clone())
-    }
-
-    fn regard_ref(&self, namespace: &str, name: &str) -> ResourceRef {
-        ResourceRef::new(api_version(Regard::API_PATHS), Regard::API_PATHS.kind, namespace, name).on_host(self.local_host.clone())
     }
 
     fn checkout_ref(&self, namespace: &str, name: &str) -> ResourceRef {
@@ -2732,44 +2695,32 @@ impl Aggregator {
         }
         // #3455: a held message batch for one of this convoy's crews names
         // itself, why it is held and the command that clears it.
-        let delivery_hold = self
-            .convoy_sessions(&resource.namespace, &resource.name)
-            .flat_map(|session| {
-                let session = &session.object.metadata;
-                self.convoy_demands(&session.namespace, &session.name).filter(move |demand| {
-                    let target = &demand.spec.originating_work_ref;
-                    target.kind == "TerminalSession" && target.namespace == session.namespace && target.name == session.name
-                })
-            })
-            .filter(|demand| {
-                matches!(
-                    demand.status.as_ref().map_or(DemandState::Raised, |status| status.state),
-                    DemandState::Raised | DemandState::Escalated
-                )
-            })
-            .filter_map(|demand| demand.metadata.annotations.get(flotilla_resources::delivery_hold::DELIVERY_HOLD_REASON_ANNOTATION))
-            // Several held crews show one, chosen lexicographically so the row is stable;
-            // explain lists every held batch.
+        let attentions: Vec<&OpenAttention> = self.convoy_attentions(&resource.namespace, &resource.name).collect();
+        // #3455: a held message batch for one of this convoy's crews names
+        // itself, why it is held and the command that clears it. Several held
+        // crews show one, chosen lexicographically so the row is stable.
+        let delivery_hold = attentions
+            .iter()
+            .filter(|open| open.sender == Sender::TurnRules)
+            .map(|open| open.reason.clone())
             .min()
-            .cloned()
             .filter(|_| !phase.is_terminal());
-        let attention_demand = self
-            .convoy_demands(&resource.namespace, &resource.name)
-            .filter(|demand| {
-                let state = demand.status.as_ref().map_or(DemandState::Raised, |status| status.state);
-                let target = &demand.spec.originating_work_ref;
-                matches!(state, DemandState::Raised | DemandState::Escalated)
-                    && target.api_version == resource.api_version
-                    && target.kind == resource.kind
-                    && target.namespace == resource.namespace
-                    && target.name == resource.name
-                    && (demand.metadata.annotations.contains_key(RECLAIM_REFUSAL_REASON_ANNOTATION)
-                        || demand.metadata.annotations.contains_key(ENSURE_CONFIG_DRIFT_REASON_ANNOTATION)
-                        || demand.metadata.annotations.contains_key(flotilla_resources::CREDENTIAL_REFRESH_REASON_ANNOTATION))
-            })
-            .min_by_key(|demand| {
-                (if demand.metadata.annotations.contains_key(RECLAIM_REFUSAL_REASON_ANNOTATION) { 0 } else { 1 }, &demand.metadata.name)
+        // A standing role's drift is about the role, told on its running convoy.
+        let drift = convoy
+            .spec
+            .project_ref
+            .as_ref()
+            .filter(|_| convoy.metadata.annotations.contains_key(ENSURED_FROM_ANNOTATION) && !phase.is_terminal())
+            .and_then(|project| {
+                let role = AttentionSubject::StandingRole { project: project.clone(), role: convoy.spec.role.clone() };
+                self.attentions.iter().find(|open| open.sender == Sender::Standing && open.subject == role)
             });
+        let attention_demand = attentions
+            .iter()
+            .copied()
+            .filter(|open| open.sender != Sender::TurnRules)
+            .chain(drift)
+            .min_by_key(|open| (open.sender != Sender::Teardown, open.sender, &open.subject));
         // Terminal records retain delivery history for explain, but delivery can no
         // longer require a turn. Filter at projection so old stored holds need no repair.
         let delivery_status = status.filter(|_| !phase.is_terminal());
@@ -2835,17 +2786,7 @@ impl Aggregator {
             .initializing(convoy_is_initializing(status))
             .maybe_message(
                 delivery_hold
-                    .or_else(|| {
-                        attention_demand.and_then(|demand| {
-                            demand
-                                .metadata
-                                .annotations
-                                .get(RECLAIM_REFUSAL_REASON_ANNOTATION)
-                                .or_else(|| demand.metadata.annotations.get(ENSURE_CONFIG_DRIFT_REASON_ANNOTATION))
-                                .or_else(|| demand.metadata.annotations.get(flotilla_resources::CREDENTIAL_REFRESH_REASON_ANNOTATION))
-                                .cloned()
-                        })
-                    })
+                    .or_else(|| attention_demand.map(|open| open.reason.clone()))
                     .or_else(|| {
                         (!subject_conflicts.is_empty()).then(|| {
                             let details =
@@ -3052,18 +2993,10 @@ impl Aggregator {
             .filter_map(|session| session.object.status.as_ref()?.completion_pending.as_ref())
             .min_by_key(|pending| pending.attempted_at)
             .cloned();
+        let vessel_subject = AttentionSubject::Vessel { convoy: convoy_ref.name.clone(), vessel: definition.name.clone() };
         let credential_attention = self
-            .convoy_demands(&convoy_ref.namespace, &convoy_ref.name)
-            .filter(|demand| {
-                demand.spec.originating_work_ref.namespace == convoy_ref.namespace
-                    && demand.spec.originating_work_ref.name == convoy_ref.name
-                    && demand.metadata.annotations.get("flotilla.work/credential-refresh-vessel") == Some(&definition.name)
-                    && matches!(
-                        demand.status.as_ref().map_or(DemandState::Raised, |status| status.state),
-                        DemandState::Raised | DemandState::Escalated
-                    )
-            })
-            .min_by_key(|demand| &demand.metadata.name);
+            .convoy_attentions(&convoy_ref.namespace, &convoy_ref.name)
+            .find(|open| open.sender == Sender::Capabilities && open.subject == vessel_subject);
         let terminal_conditions = matching_sessions()
             .filter_map(|session| {
                 let condition = session.object.status.as_ref().and_then(terminal_health::condition)?;
@@ -3145,17 +3078,15 @@ impl Aggregator {
             .maybe_started_at(state.and_then(|state| state.started_at))
             .maybe_finished_at(state.and_then(|state| state.finished_at))
             .maybe_message(loss_reason.or_else(|| {
-                credential_attention
-                    .and_then(|demand| demand.metadata.annotations.get(flotilla_resources::CREDENTIAL_REFRESH_REASON_ANNOTATION).cloned())
-                    .or_else(|| {
-                        state
-                            .filter(|state| state.phase == ResourceWorkPhase::Interrupted)
-                            .and_then(|state| state.message.clone())
-                            .or_else(|| completion_pending.map(|pending| format!("completion pending: {}", pending.last_error)))
-                            .or_else(|| obstruction.clone())
-                            .or_else(|| terminal_condition.clone())
-                            .or_else(|| state.and_then(|state| state.message.clone()))
-                    })
+                credential_attention.map(|open| open.reason.clone()).or_else(|| {
+                    state
+                        .filter(|state| state.phase == ResourceWorkPhase::Interrupted)
+                        .and_then(|state| state.message.clone())
+                        .or_else(|| completion_pending.map(|pending| format!("completion pending: {}", pending.last_error)))
+                        .or_else(|| obstruction.clone())
+                        .or_else(|| terminal_condition.clone())
+                        .or_else(|| state.and_then(|state| state.message.clone()))
+                })
             }))
             .maybe_requested_stance(requested_stance)
             .maybe_effective_stance(effective_stance)
@@ -3290,19 +3221,6 @@ fn session_key(session: &ReadResourceObject<TerminalSession>) -> SessionKey {
     (session.object.metadata.namespace.clone(), session.object.metadata.name.clone(), origin)
 }
 
-fn regard_as_of(regard: &ResourceObject<Regard>) -> chrono::DateTime<chrono::Utc> {
-    regard.status.as_ref().and_then(|status| status.refreshed_at.or(status.created_at)).unwrap_or(regard.metadata.creation_timestamp)
-}
-
-fn regard_expiry_at(regard: &ResourceObject<Regard>) -> Option<chrono::DateTime<chrono::Utc>> {
-    let RegardExpiryPolicy::Decaying { expires_after_seconds } = &regard.spec.expiry else {
-        return None;
-    };
-    let seconds = i64::try_from(*expires_after_seconds).ok()?;
-    let duration = chrono::TimeDelta::try_seconds(seconds)?;
-    regard_as_of(regard).checked_add_signed(duration)
-}
-
 fn terminal_surface_state(state: TerminalAttentionState) -> SurfaceState {
     match state {
         TerminalAttentionState::NeedsInput => SurfaceState::NeedsYou,
@@ -3387,9 +3305,8 @@ mod tests {
     use chrono::Utc;
     use flotilla_protocol::{result_set::Rows, PrincipalRef, Subject};
     use flotilla_resources::{
-        BoundChangeRequest, ConvoyRepositorySpec, ConvoySpec, CrewSpec, DeclaredSubject, DemandKind, DemandSpec, DemandStatus,
-        DemandTransition, EnvironmentSpec, HostDirectEnvironmentSpec, InputMeta, ObjectMeta, ObservedCheckoutSpec, PlacementStatus,
-        PrincipalRef as AttentionPrincipalRef, ProjectSpec, RegardSource, RegardSpec, RegardStatus, RepositorySpec, TerminalAttention,
+        BoundChangeRequest, ConvoyRepositorySpec, ConvoySpec, CrewSpec, DeclaredSubject, EnvironmentSpec, HostDirectEnvironmentSpec,
+        InputMeta, ObjectMeta, ObservedCheckoutSpec, PlacementStatus, ProjectSpec, RepositorySpec, TerminalAttention,
         TerminalAttentionSource, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
     };
     use flotilla_store::ResourceBackend;
@@ -3541,98 +3458,58 @@ mod tests {
     }
 
     #[test]
-    fn decaying_regards_schedule_expiry_and_handle_unrepresentable_durations() {
+    fn an_open_hold_schedules_its_escalation() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
         let mut aggregator = Aggregator::new(state, HostName::new("local"), event_tx);
         let now = Utc::now();
-        let principal = AttentionPrincipalRef { namespace: "flotilla".into(), name: "operator".into() };
-        let target = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy-a");
-        let decaying = ResourceObject {
-            metadata: attention_meta("decaying", now),
-            spec: RegardSpec::builder()
-                .principal_ref(principal.clone())
-                .target(target.clone())
-                .source(RegardSource::Expressed)
-                .expiry(RegardExpiryPolicy::Decaying { expires_after_seconds: 5 })
-                .build(),
-            status: Some(RegardStatus { created_at: Some(now), refreshed_at: None }),
+        let open = |sender, subject, minutes| OpenAttention {
+            sender,
+            subject,
+            reason: "held".into(),
+            raised_at: now - chrono::Duration::minutes(minutes),
         };
-        let unbounded = ResourceObject {
-            metadata: attention_meta("unbounded", now),
-            spec: RegardSpec::builder()
-                .principal_ref(principal)
-                .target(target)
-                .source(RegardSource::Expressed)
-                .expiry(RegardExpiryPolicy::Decaying { expires_after_seconds: u64::MAX })
-                .build(),
-            status: Some(RegardStatus { created_at: Some(now), refreshed_at: None }),
-        };
-        aggregator.regards.insert(aggregator.regard_ref("flotilla", "decaying"), decaying);
-        aggregator.regards.insert(aggregator.regard_ref("flotilla", "unbounded"), unbounded);
-
-        assert_eq!(aggregator.next_regard_expiry_delay_at(now), Some(Duration::from_secs(5)));
-        assert_eq!(aggregator.salience_facts_at(now).regards.len(), 2);
-        assert_eq!(aggregator.salience_facts_at(now + chrono::Duration::seconds(5)).regards.len(), 1);
-        aggregator.prune_expired_regards(now + chrono::Duration::seconds(5));
-        assert_eq!(aggregator.regards.len(), 1);
-        assert_eq!(aggregator.next_regard_expiry_delay_at(now + chrono::Duration::seconds(5)), None);
+        aggregator.attentions = vec![
+            open(Sender::Standing, AttentionSubject::convoy("held"), 5),
+            open(Sender::Standing, AttentionSubject::convoy("escalated"), 20),
+            open(Sender::Teardown, AttentionSubject::convoy("refused"), 1),
+            open(Sender::Standing, AttentionSubject::StandingRole { project: "p".into(), role: "r".into() }, 1),
+        ];
+        assert_eq!(aggregator.next_escalation_delay(now), Some(Duration::from_secs(10 * 60)));
+        assert_eq!(aggregator.next_escalation_delay(now + chrono::Duration::minutes(10)), None);
     }
 
     #[tokio::test]
-    async fn credential_refresh_demand_marks_convoy_and_vessel_until_deleted() {
+    async fn credential_refresh_attention_marks_convoy_and_vessel_until_cleared() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let attentions = Arc::new(SetAttentions::default());
+        let mut aggregator =
+            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attentions(attentions.clone(), "flotilla");
         let query = QueryId::Convoys { scope: None };
         state.replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query, since: None }]);
         aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
-        let mut demand = ResourceObject {
-            metadata: attention_meta("credential-refresh-vessel-github-app", Utc::now()),
-            spec: DemandSpec::for_dispatching_principal(
-                ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy-a"),
-                DemandKind::HumanGate,
-                AttentionPrincipalRef::implicit_for_namespace("flotilla"),
-            ),
-            status: None,
-        };
-        demand.metadata.annotations = BTreeMap::from([
-            (
-                flotilla_resources::CREDENTIAL_REFRESH_REASON_ANNOTATION.to_string(),
-                "credential `github-app` failed; expires in 120 seconds".to_string(),
-            ),
-            ("flotilla.work/credential-refresh-vessel".to_string(), "implement".to_string()),
-        ]);
-        aggregator.apply_demand_event(WatchEvent::Added(demand.clone())).await;
+        let credential = open_attention(
+            Sender::Capabilities,
+            AttentionSubject::Vessel { convoy: "convoy-a".into(), vessel: "implement".into() },
+            "github-app: credential `github-app` failed; expires in 120 seconds",
+        );
+        attentions.set(vec![credential.clone()]);
+        aggregator.refresh_attentions().await;
         let result_set = state.result_set().await;
         let convoy = &result_set.rows.as_convoys().expect("convoy rows")[0];
         assert!(convoy.surface_state.needs_attention());
         assert!(convoy.vessels[0].surface_state.needs_attention());
         assert!(convoy.vessels[0].message.as_deref().is_some_and(|message| message.contains("github-app")));
 
-        let mut second_credential = demand.clone();
-        second_credential.metadata.name = "credential-refresh-vessel-zed".to_string();
-        second_credential.metadata.annotations.insert(
-            flotilla_resources::CREDENTIAL_REFRESH_REASON_ANNOTATION.to_string(),
-            "credential `zed` failed; expires in 1 minute".to_string(),
-        );
-        aggregator.apply_demand_event(WatchEvent::Added(second_credential.clone())).await;
-        let result_set = state.result_set().await;
-        assert!(result_set.rows.as_convoys().expect("convoy rows")[0].vessels[0]
-            .message
-            .as_deref()
-            .is_some_and(|message| message.contains("github-app")));
-        aggregator.apply_demand_event(WatchEvent::Deleted(second_credential)).await;
-
-        let mut reclaim = demand.clone();
-        reclaim.metadata.name = "reclaim-refusal-convoy-a".to_string();
-        reclaim.metadata.annotations = BTreeMap::from([(RECLAIM_REFUSAL_REASON_ANNOTATION.to_string(), "reclaim failed".to_string())]);
-        aggregator.apply_demand_event(WatchEvent::Added(reclaim.clone())).await;
+        let reclaim = open_attention(Sender::Teardown, AttentionSubject::convoy("convoy-a"), "reclaim failed");
+        attentions.set(vec![credential, reclaim]);
+        aggregator.refresh_attentions().await;
         let result_set = state.result_set().await;
         assert_eq!(result_set.rows.as_convoys().expect("convoy rows")[0].message.as_deref(), Some("reclaim failed"));
-        aggregator.apply_demand_event(WatchEvent::Deleted(reclaim)).await;
 
-        aggregator.apply_demand_event(WatchEvent::Deleted(demand)).await;
+        attentions.set(Vec::new());
+        aggregator.refresh_attentions().await;
         let result_set = state.result_set().await;
         let convoy = &result_set.rows.as_convoys().expect("convoy rows")[0];
         assert!(!convoy.surface_state.needs_attention());
@@ -3694,7 +3571,9 @@ mod tests {
     async fn held_message_batch_names_itself_in_convoy_attention() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let attentions = Arc::new(SetAttentions::default());
+        let mut aggregator =
+            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attentions(attentions.clone(), "flotilla");
         state
             .replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: QueryId::Convoys { scope: None }, since: None }]);
         aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
@@ -3708,25 +3587,24 @@ mod tests {
         let description = "message batch `message-0` is held for flotilla/convoy-a/implement/coder (1 message: message-0): delivery held: \
             terminal was not ready before submission; attempt 3/3; clear it with \
             `flotilla resource fail-message-batch message-0 --namespace flotilla --reason '<why>'`";
-        let gate = |session: &ResourceObject<TerminalSession>| {
-            let (meta, spec) = flotilla_resources::delivery_hold::delivery_demand(session);
-            let mut metadata = attention_meta(&meta.name, Utc::now());
-            metadata.annotations =
-                BTreeMap::from([(flotilla_resources::delivery_hold::DELIVERY_HOLD_REASON_ANNOTATION.to_string(), description.to_string())]);
-            ResourceObject { metadata, spec, status: None }
+        let held = |convoy: &str| {
+            open_attention(Sender::TurnRules, AttentionSubject::ConvoyRole { convoy: convoy.into(), role: "coder".into() }, description)
         };
         // Another convoy's held crew does not reach this convoy.
-        aggregator.apply_demand_event(WatchEvent::Added(gate(&other))).await;
+        attentions.set(vec![held("convoy-b")]);
+        aggregator.refresh_attentions().await;
         let result_set = state.result_set().await;
         assert!(!result_set.rows.as_convoys().expect("convoy rows")[0].surface_state.needs_attention());
 
-        aggregator.apply_demand_event(WatchEvent::Added(gate(&session))).await;
+        attentions.set(vec![held("convoy-b"), held("convoy-a")]);
+        aggregator.refresh_attentions().await;
         let result_set = state.result_set().await;
         let convoy = &result_set.rows.as_convoys().expect("convoy rows")[0];
         assert_eq!(convoy.surface_state, SurfaceState::NeedsYou);
         assert_eq!(convoy.message.as_deref(), Some(description));
 
-        aggregator.apply_demand_event(WatchEvent::Deleted(gate(&session))).await;
+        attentions.set(vec![held("convoy-b")]);
+        aggregator.refresh_attentions().await;
         let result_set = state.result_set().await;
         let convoy = &result_set.rows.as_convoys().expect("convoy rows")[0];
         assert!(!convoy.surface_state.needs_attention());
@@ -4343,7 +4221,6 @@ mod tests {
             .durable_sessions(durable.including_replicas::<TerminalSession>("flotilla"))
             .durable_projects(durable.including_replicas::<Project>("flotilla"))
             .durable_repositories(durable.including_replicas::<Repository>("flotilla"))
-            .durable_regards(durable.using::<Regard>("flotilla"))
             .durable_vessels(durable.including_replicas::<Vessel>("flotilla"))
             .durable_hosts(durable.including_replicas::<flotilla_resources::Host>("flotilla"))
             .durable_checkouts(durable.including_replicas::<Checkout>("flotilla"))
@@ -4604,10 +4481,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn awareness_salience_recomputes_on_attention_demand_and_regard_changes() {
+    async fn awareness_salience_recomputes_on_terminal_attention_and_open_attention_changes() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(16);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let attentions = Arc::new(SetAttentions::default());
+        let mut aggregator =
+            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attentions(attentions.clone(), "flotilla");
         let query = QueryId::Awareness {
             scope: None,
             grouping: flotilla_protocol::AwarenessGrouping::Convoy,
@@ -4625,47 +4504,33 @@ mod tests {
         aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session.clone())).await;
         assert_eq!(awareness_vessel_salience(&state, &query).await, flotilla_protocol::Salience::Attention);
 
-        let principal = AttentionPrincipalRef::implicit_for_namespace("flotilla");
-        let target = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy-a").subresource("vessels/implement");
-        let mut demand = ResourceObject {
-            metadata: attention_meta("input-demand", now),
-            spec: DemandSpec::builder()
-                .originating_work_ref(target)
-                .kind(DemandKind::Permission)
-                .addressee(DemandAddressee::Principal { principal_ref: principal.clone() })
-                .build(),
-            status: Some(
-                DemandStatus::builder()
-                    .state(DemandState::Raised)
-                    .raised(DemandTransition { as_of: now, authority: "hook".to_string() })
-                    .build(),
-            ),
-        };
-        aggregator.apply_demand_event(WatchEvent::Added(demand.clone())).await;
+        let credential = open_attention(
+            Sender::Capabilities,
+            AttentionSubject::Vessel { convoy: "convoy-a".into(), vessel: "implement".into() },
+            "github-app: refresh failed",
+        );
+        attentions.set(vec![credential.clone()]);
+        aggregator.refresh_attentions().await;
         assert_eq!(awareness_vessel_salience(&state, &query).await, flotilla_protocol::Salience::Attention);
 
-        let regard = ResourceObject {
-            metadata: attention_meta("convoy-regard", now),
-            spec: RegardSpec::builder()
-                .principal_ref(principal)
-                .target(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy-a"))
-                .source(RegardSource::Expressed)
-                .expiry(RegardExpiryPolicy::Pin)
-                .build(),
-            status: Some(RegardStatus { created_at: Some(now), refreshed_at: Some(now) }),
+        let hold = OpenAttention {
+            raised_at: now - HOLD_ESCALATES_AFTER,
+            ..open_attention(Sender::Standing, AttentionSubject::convoy("convoy-a"), "held")
         };
-        aggregator.apply_regard_event(WatchEvent::Added(regard)).await;
-        assert_eq!(awareness_vessel_salience(&state, &query).await, flotilla_protocol::Salience::Urgent);
+        attentions.set(vec![credential, hold]);
+        aggregator.refresh_attentions().await;
+        assert_eq!(
+            awareness_entry_salience(&state, &query, flotilla_protocol::AwarenessKind::Convoy).await,
+            flotilla_protocol::Salience::Urgent
+        );
 
-        let acknowledged_at = now + chrono::Duration::seconds(1);
-        demand.metadata.resource_version = "2".to_string();
-        demand.status.as_mut().expect("demand status").state = DemandState::Acknowledged;
-        demand.status.as_mut().expect("demand status").acknowledged =
-            Some(DemandTransition { as_of: acknowledged_at, authority: "principal".to_string() });
-        aggregator.apply_demand_event(WatchEvent::Modified(demand)).await;
-        let (salience, as_of) = awareness_vessel_salience_and_time(&state, &query).await;
-        assert_eq!(salience, flotilla_protocol::Salience::Attention);
-        assert_eq!(as_of, acknowledged_at);
+        attentions.set(Vec::new());
+        aggregator.refresh_attentions().await;
+        assert_eq!(
+            awareness_entry_salience(&state, &query, flotilla_protocol::AwarenessKind::Convoy).await,
+            flotilla_protocol::Salience::None
+        );
+        assert_eq!(awareness_vessel_salience(&state, &query).await, flotilla_protocol::Salience::Attention);
 
         let working_at = now + chrono::Duration::seconds(2);
         session.status.as_mut().expect("running status").attention =
@@ -4674,25 +4539,66 @@ mod tests {
         let (salience, as_of) = awareness_vessel_salience_and_time(&state, &query).await;
         assert_eq!(salience, flotilla_protocol::Salience::Info);
         assert_eq!(as_of, working_at);
-    }
 
-    fn attention_meta(name: &str, creation_timestamp: chrono::DateTime<Utc>) -> ObjectMeta {
-        ObjectMeta {
-            name: name.to_string(),
-            namespace: "flotilla".to_string(),
-            resource_version: "1".to_string(),
-            labels: BTreeMap::new(),
-            annotations: BTreeMap::new(),
-            owner_references: Vec::new(),
-            finalizers: Vec::new(),
-            deletion_timestamp: None,
-            creation_timestamp,
-            merge: None,
-        }
+        // A vessel's attention raises that vessel, not only its convoy.
+        attentions.set(vec![open_attention(
+            Sender::Capabilities,
+            AttentionSubject::Vessel { convoy: "convoy-a".into(), vessel: "implement".into() },
+            "github-app: refresh failed",
+        )]);
+        aggregator.refresh_attentions().await;
+        assert_eq!(awareness_vessel_salience(&state, &query).await, flotilla_protocol::Salience::Attention);
     }
 
     async fn awareness_vessel_salience(state: &AggregatorProjectionState, query: &QueryId) -> flotilla_protocol::Salience {
         awareness_vessel_salience_and_time(state, query).await.0
+    }
+
+    async fn awareness_entry_salience(
+        state: &AggregatorProjectionState,
+        query: &QueryId,
+        kind: flotilla_protocol::AwarenessKind,
+    ) -> flotilla_protocol::Salience {
+        let result = state.result_set_for(query).await.expect("awareness result set");
+        let node = result.rows.as_awareness().expect("awareness rows").first().expect("convoy node");
+        node.entries.iter().find(|entry| entry.kind == kind).expect("entry").salience
+    }
+
+    fn open_attention(sender: Sender, subject: AttentionSubject, reason: &str) -> OpenAttention {
+        OpenAttention { sender, subject, reason: reason.into(), raised_at: Utc::now() }
+    }
+
+    /// The open attentions a test sets: the aggregator's reads of them, not their writers', are under test.
+    #[derive(Default)]
+    struct SetAttentions(std::sync::Mutex<Vec<OpenAttention>>);
+
+    impl SetAttentions {
+        fn set(&self, open: Vec<OpenAttention>) {
+            *self.0.lock().expect("attentions") = open;
+        }
+    }
+
+    #[async_trait]
+    impl Attentions for SetAttentions {
+        async fn raise(&self, _: &str, _: &flotilla_resources::attentions::Attention) -> Result<(), String> {
+            Err("the test sets attentions".into())
+        }
+        async fn clear(&self, _: &str, _: Sender, _: &AttentionSubject) -> Result<(), String> {
+            Err("the test sets attentions".into())
+        }
+        async fn open(&self, _: &str, from: Option<Sender>, scope: Option<&AttentionSubject>) -> Result<Vec<OpenAttention>, String> {
+            Ok(self
+                .0
+                .lock()
+                .expect("attentions")
+                .iter()
+                .filter(|open| from.is_none_or(|from| from == open.sender) && scope.is_none_or(|scope| open.subject.within(scope)))
+                .cloned()
+                .collect())
+        }
+        async fn acknowledged(&self, _: &str, _: Sender, _: &AttentionSubject) -> Result<bool, String> {
+            Ok(false)
+        }
     }
 
     async fn awareness_vessel_salience_and_time(
@@ -4928,7 +4834,6 @@ mod tests {
         let durable_projects = ScriptedSource::<Project>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_convoy_ensures = ScriptedSource::<ConvoyEnsure>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_repositories = ScriptedSource::<Repository>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let durable_regards = ScriptedSource::<Regard>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_vessels = ScriptedSource::<Vessel>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_hosts = ScriptedSource::<flotilla_resources::Host>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_clones = ScriptedSource::<CloneResource>::new(vec![empty_list()], vec![Ok(pending_watch())]);
@@ -4944,7 +4849,6 @@ mod tests {
             .durable_projects(&durable_projects)
             .durable_convoy_ensures(&durable_convoy_ensures)
             .durable_repositories(&durable_repositories)
-            .durable_regards(&durable_regards)
             .durable_vessels(&durable_vessels)
             .durable_hosts(&durable_hosts)
             .durable_checkouts(&durable_checkouts)
@@ -5433,34 +5337,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reclaim_refusal_demand_marks_convoy_for_attention_with_reason() {
+    async fn reclaim_refusal_attention_marks_convoy_for_attention_with_reason() {
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(8);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let attentions = Arc::new(SetAttentions::default());
+        let mut aggregator =
+            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attentions(attentions.clone(), "flotilla");
         let convoy = convoy_object("stuck-reclaim").await;
         aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
         let awareness_query =
             QueryId::Awareness { scope: None, grouping: flotilla_protocol::AwarenessGrouping::Convoy, limit: Default::default() };
         state.replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: awareness_query.clone(), since: None }]);
-        let backend = ResourceBackend::new(InMemoryBackend::default());
         let reason = "checkout checkout-orphan: Pushed=False (1 unpushed commit)";
-        let demand = backend
-            .using::<Demand>("flotilla")
-            .create(
-                &InputMeta::builder()
-                    .name("reclaim-refusal-stuck-reclaim".to_string())
-                    .annotations(BTreeMap::from([(RECLAIM_REFUSAL_REASON_ANNOTATION.to_string(), reason.to_string())]))
-                    .build(),
-                &DemandSpec::for_dispatching_principal(
-                    ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "stuck-reclaim"),
-                    DemandKind::HumanGate,
-                    Default::default(),
-                ),
-            )
-            .await
-            .expect("create reclaim refusal demand");
-
-        aggregator.apply_demand_event(WatchEvent::Added(demand)).await;
+        attentions.set(vec![open_attention(Sender::Teardown, AttentionSubject::convoy("stuck-reclaim"), reason)]);
+        aggregator.refresh_attentions().await;
 
         timeout(Duration::from_secs(1), async {
             loop {
@@ -5843,7 +5733,6 @@ mod tests {
         let durable_projects = ScriptedSource::<Project>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_convoy_ensures = ScriptedSource::<ConvoyEnsure>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_repositories = ScriptedSource::<Repository>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let durable_regards = ScriptedSource::<Regard>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_convoys = ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_vessels = ScriptedSource::<Vessel>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_hosts = ScriptedSource::<flotilla_resources::Host>::new(vec![empty_list()], vec![Ok(pending_watch())]);
@@ -5860,7 +5749,6 @@ mod tests {
             .durable_projects(&durable_projects)
             .durable_convoy_ensures(&durable_convoy_ensures)
             .durable_repositories(&durable_repositories)
-            .durable_regards(&durable_regards)
             .durable_vessels(&durable_vessels)
             .durable_hosts(&durable_hosts)
             .durable_checkouts(&durable_checkouts)
@@ -7834,7 +7722,6 @@ mod tests {
                     .durable_sessions(durable.including_replicas::<TerminalSession>("flotilla"))
                     .durable_projects(durable.including_replicas::<Project>("flotilla"))
                     .durable_repositories(durable.including_replicas::<Repository>("flotilla"))
-                    .durable_regards(durable.using::<Regard>("flotilla"))
                     .durable_vessels(durable.including_replicas::<Vessel>("flotilla"))
                     .durable_hosts(durable.including_replicas::<flotilla_resources::Host>("flotilla"))
                     .durable_checkouts(durable.including_replicas::<Checkout>("flotilla"))
@@ -7914,7 +7801,6 @@ mod tests {
         let durable_projects = Arc::new(ScriptedSource::<Project>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_convoy_ensures = Arc::new(ScriptedSource::<ConvoyEnsure>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_repositories = Arc::new(ScriptedSource::<Repository>::new(vec![empty_list()], vec![Ok(pending_watch())]));
-        let durable_regards = Arc::new(ScriptedSource::<Regard>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let observed_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_vessels = ScriptedSource::<Vessel>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_hosts = ScriptedSource::<flotilla_resources::Host>::new(vec![empty_list()], vec![Ok(pending_watch())]);
@@ -7937,7 +7823,6 @@ mod tests {
                 .durable_projects(durable_projects.as_ref())
                 .durable_convoy_ensures(durable_convoy_ensures.as_ref())
                 .durable_repositories(durable_repositories.as_ref())
-                .durable_regards(durable_regards.as_ref())
                 .durable_vessels(&durable_vessels)
                 .durable_hosts(&durable_hosts)
                 .durable_checkouts(&durable_checkouts)
@@ -8294,7 +8179,6 @@ mod tests {
             .durable_sessions(d.including_replicas::<TerminalSession>("flotilla"))
             .durable_projects(d.including_replicas::<Project>("flotilla"))
             .durable_repositories(d.including_replicas::<Repository>("flotilla"))
-            .durable_regards(d.using::<Regard>("flotilla"))
             .durable_vessels(d.including_replicas::<Vessel>("flotilla"))
             .durable_hosts(d.including_replicas::<flotilla_resources::Host>("flotilla"))
             .durable_checkouts(d.including_replicas::<Checkout>("flotilla"))

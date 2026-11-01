@@ -14,7 +14,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use flotilla_admission::reconcilers::vessel_placement::VesselPlacementProjector;
-use flotilla_core::{demand_lifecycle::DemandLifecycle, in_process::InProcessDaemon};
+use flotilla_core::in_process::InProcessDaemon;
 use flotilla_projections::aggregator_projection::AggregatorProjectionState;
 use flotilla_provisioning::reconcilers::checkout::runtime::sweep_host_empty_convoy_directories;
 
@@ -24,7 +24,7 @@ use flotilla_environment::environment::EnvironmentInput;
 use flotilla_protocol::{CanonicalHostId, NodeId};
 use flotilla_resources::{
     Checkout, Clone, Convoy, ForgeRead, ForgeReadHeartbeat, FulfilmentFacts, Host, HostStatusPatch, ReadWatchEvent, Resource,
-    ResourceError, ResourceProvenance, RetryBackoff, SystemClock, TerminalSession, Vessel,
+    ResourceError, ResourceProvenance, RetryBackoff, TerminalSession, Vessel,
 };
 use flotilla_store::{watch_resource_kind, watch_resource_kind_including_replicas, ResourceBackend};
 use flotilla_vcs::vcs::REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT;
@@ -721,19 +721,6 @@ where
     (task, ready_rx)
 }
 
-pub(super) fn spawn_demand_expiry_task(backend: ResourceBackend, namespace: String, interval: Duration) -> JoinHandle<()> {
-    let lifecycle = Arc::new(DemandLifecycle::new(backend, Arc::new(SystemClock)));
-    spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
-        let lifecycle = Arc::clone(&lifecycle);
-        let namespace = namespace.clone();
-        async move {
-            if let Err(error) = lifecycle.expire_due(&namespace).await {
-                warn!(%error, %namespace, "failed to expire demands");
-            }
-        }
-    })
-}
-
 pub(super) fn spawn_event_expiry_task(backend: ResourceBackend, namespace: String, interval: Duration) -> JoinHandle<()> {
     let recorder = flotilla_store::EventRecorder::new(backend);
     spawn_periodic_task(interval, PeriodicTaskStart::AfterInterval, move || {
@@ -847,6 +834,19 @@ pub(super) async fn convoy_ensure_dependency_watches(
             Ok(watch) => watches.push(watch.stream),
             Err(error) => warn!(%kind, %error, "could not watch standing convoy admission dependency"),
         }
+    }
+    // A person acknowledging a hold releases it on the next pass.
+    if let Some(changes) = backend.attentions().changes() {
+        let acknowledged = futures::stream::unfold(changes, |mut changes| async move {
+            loop {
+                match changes.recv().await {
+                    Ok(()) => return Some((Ok(Value::Null), changes)),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        });
+        watches.push(Box::pin(acknowledged) as BoxStream<'static, Result<Value, ResourceError>>);
     }
     futures::stream::select_all(watches)
 }

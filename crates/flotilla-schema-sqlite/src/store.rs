@@ -149,6 +149,7 @@ pub struct Store {
 struct Runtime {
     change_page_bytes: usize,
     watermarks: crate::stream::Watermarks,
+    applied: crate::stream::AppliedListeners,
     home: String,
     kinds: KindRegistry,
     sql: BTreeMap<KindCode, KindSql>,
@@ -238,6 +239,7 @@ impl Store {
         };
         let runtime = Runtime {
             watermarks: std::sync::Arc::new(std::sync::RwLock::new(watermarks)),
+            applied: Default::default(),
             home: home.to_owned(),
             kinds,
             sql,
@@ -259,6 +261,10 @@ impl Store {
 
     pub(crate) fn watermarks(&self) -> crate::stream::Watermarks {
         std::sync::Arc::clone(&self.runtime.watermarks)
+    }
+
+    pub(crate) fn applied_listeners(&self) -> crate::stream::AppliedListeners {
+        std::sync::Arc::clone(&self.runtime.applied)
     }
 
     /// Committed local gate input, independent of the store transaction lock.
@@ -847,7 +853,15 @@ impl Write<'_> {
     pub fn commit(self) -> Result<(), StoreError> {
         self.tx.commit()?;
         let Pending { strings, identities, ids, watermarks, .. } = self.pending;
+        // A follower's commit that moved a home's sequence applied that home's entries.
+        let applied =
+            watermarks.iter().any(|(home, mark)| mark.home_seq > crate::stream::watermark(&self.runtime.watermarks, home).home_seq);
         self.runtime.watermarks.write().unwrap_or_else(std::sync::PoisonError::into_inner).extend(watermarks);
+        if applied {
+            for listener in self.runtime.applied.read().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
+                listener();
+            }
+        }
         for (string, id) in strings {
             self.runtime.strings.insert(string, id);
         }

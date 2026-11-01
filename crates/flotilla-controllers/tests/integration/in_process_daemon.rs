@@ -106,11 +106,11 @@ use flotilla_resources::{
     DockerPerVesselPlacementPolicySpec, FulfilmentFacts, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation,
     HarnessFacts, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta,
     LifecycleAuthority, ModelFact, ModelFactSource, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
-    ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositoryKey, RepositoryRelation,
-    RepositorySpec, ResourceError, Stance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, WatchEvent,
-    WatchStart, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL,
-    HELD_CREDENTIALS_CAPABILITY, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositoryRelation, RepositorySpec, ResourceError, Stance,
+    TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, WatchEvent, WatchStart, WorkPhase, WorkState, WorkflowSnapshot,
+    WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, HELD_CREDENTIALS_CAPABILITY, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL,
+    VESSEL_LABEL,
 };
 use flotilla_store::{apply_status_patch, ResourceBackend, TypedResolver};
 use flotilla_terminal::TerminalPool;
@@ -4314,11 +4314,6 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     assert_eq!(persisted.spec.placement_policy.as_deref(), Some("docker-test"));
     assert_eq!(persisted.spec.repositories.len(), 2);
     assert_eq!(persisted.spec.instruction.as_deref(), Some("Keep the snapshot durable."));
-    let regards = backend.using::<Regard>("flotilla").list().await.expect("list dispatcher regards");
-    assert!(
-        regards.items.iter().all(|regard| regard.spec.target.name != "issue-732"),
-        "--no-attach must leave the convoy outside the dispatching principal's searchlight"
-    );
     let persisted_issue = persisted.spec.issues.first().expect("issue snapshot");
     assert_eq!(persisted_issue.reference, reference);
     assert_eq!(persisted_issue.repository_ref, Some(repository.key()));
@@ -4480,16 +4475,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             binding: None
         }
     );
-    let default_convoy = admitted_convoy(&backend, "default-regard").await;
-    let regards = backend.using::<Regard>("flotilla").list().await.expect("list default dispatcher regard");
-    let regard = regards
-        .items
-        .iter()
-        .find(|regard| regard.spec.target.name == default_convoy.metadata.name)
-        .expect("default implicit dispatcher regard");
-    assert_eq!(regard.spec.principal_ref, default_convoy.spec.dispatching_principal_ref);
-    assert_eq!(regard.spec.source, RegardSource::Implicit { policy: "convoy-dispatch".to_string() });
-    assert_eq!(regard.spec.expiry, RegardExpiryPolicy::Decaying { expires_after_seconds: 300 });
+    admitted_convoy(&backend, "default-regard").await;
 
     let batch_id = daemon
         .execute(
@@ -4550,11 +4536,6 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     let batch = admitted_convoy(&backend, "batch-732-733").await;
     assert_eq!(batch.spec.issues.iter().map(|issue| &issue.reference).collect::<Vec<_>>(), vec![&reference, &reference_two]);
     assert_eq!(batch.spec.instruction.as_deref(), Some("Fix both issues in one convoy."));
-    let regards = backend.using::<Regard>("flotilla").list().await.expect("list batch dispatcher regards");
-    assert!(
-        regards.items.iter().all(|regard| regard.spec.target.name != "batch-732-733"),
-        "batch --no-attach must not add a dispatch regard"
-    );
 
     utility.fail.store(true, Ordering::SeqCst);
     let fallback_id = daemon

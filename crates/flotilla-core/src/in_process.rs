@@ -66,7 +66,7 @@ use std::{
 
 use async_trait::async_trait;
 use attach::AttachResolver;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::Utc;
 #[cfg(test)]
 use flotilla_admission::convoy_admission::PlacementResolution;
 use flotilla_admission::convoy_admission::PreparedConvoyAdmission;
@@ -123,12 +123,10 @@ use crate::repo_state::RepoRootState;
 use crate::repo_state::RepoState;
 use crate::repository_inspection::GitRepositoryInspector;
 use flotilla_admission::convoy_ensure::{ConvoyEnsureAdmission, ConvoyEnsureReconciler, StandingConvoyBackingInspector};
-use flotilla_admission::regard_lifecycle::RegardLifecycle;
-use flotilla_admission::regard_lifecycle::DEFAULT_REGARD_DECAY_SECONDS;
-use flotilla_admission::regard_lifecycle::DEFAULT_REGARD_REFRESH_SECONDS;
 use flotilla_admission::repository_inspection::RepositoryContinuity;
 use flotilla_admission::repository_inspection::RepositoryInspection;
 use flotilla_admission::repository_inspection::RepositoryInspector;
+use flotilla_admission::surfaces::Surfaces;
 use flotilla_cloud_agent::RepoCriteria;
 use flotilla_config::ConfigStore;
 use flotilla_config::StaticEnvironmentConfig;
@@ -799,7 +797,7 @@ pub struct InProcessDaemon {
     daemon_socket_path: RwLock<Option<PathBuf>>,
     resource_backend: ResourceBackend,
     clock: Arc<dyn Clock>,
-    regard_lifecycle: Arc<RegardLifecycle>,
+    surfaces: Surfaces,
     observed_resource_backend: ResourceBackend,
     /// Serializes observed Checkout publication with repository removal so a
     /// refresh captured before untracking cannot recreate deleted resources.
@@ -1296,11 +1294,6 @@ impl InProcessDaemon {
         let aggregator_projection_state = AggregatorProjectionState::new();
         let repository_change_requests = Arc::new(RwLock::new(HashMap::new()));
         let brief_artifact_writer = Arc::new(RwLock::new(None));
-        let regard_lifecycle = Arc::new(RegardLifecycle::new(
-            resource_backend.clone(),
-            Arc::clone(&clock),
-            ChronoDuration::seconds(DEFAULT_REGARD_DECAY_SECONDS),
-        ));
         let admission_free_space_path = Arc::new(std::sync::RwLock::new(admission_free_space_path));
         let observed_checkout_reconciliation = Arc::new(Mutex::new(()));
         let accounts = Arc::new(flotilla_store::SwitchedAccounts::new(resource_backend.clone()));
@@ -1387,7 +1380,6 @@ impl InProcessDaemon {
                 .change_request_observation_source(Arc::clone(&observation_source))
                 .brief_artifact_writer(Arc::clone(&brief_artifact_writer))
                 .admission_free_space_path(Arc::clone(&admission_free_space_path))
-                .regard_lifecycle(Arc::clone(&regard_lifecycle))
                 .host_name(host_name.clone())
                 .clock(Arc::clone(&clock))
                 .fulfilment_decider(Arc::new(StaticFulfilmentDecider))
@@ -1407,7 +1399,7 @@ impl InProcessDaemon {
             agent_state_store,
             daemon_socket_path: RwLock::new(None),
             clock: Arc::clone(&clock),
-            regard_lifecycle: Arc::clone(&regard_lifecycle),
+            surfaces: Surfaces::default(),
             decided_store: Default::default(),
             change_stream_rounds: Default::default(),
             lifecycle_reads: Arc::clone(&lifecycle_reads),
@@ -1499,31 +1491,6 @@ impl InProcessDaemon {
                         .retain(|(cached_namespace, key), _| cached_namespace != &namespace || key.to_string() != name);
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        });
-
-        let weak = Arc::downgrade(&daemon);
-        tokio::spawn(async move {
-            let mut expiry = tokio::time::interval(Duration::from_secs(1));
-            expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut refresh = tokio::time::interval(Duration::from_secs(DEFAULT_REGARD_REFRESH_SECONDS));
-            refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    _ = expiry.tick() => {
-                        let Some(daemon) = weak.upgrade() else { break };
-                        let namespace = daemon.provisioning_namespace().await;
-                        if let Err(error) = daemon.regard_lifecycle.expire_due(&namespace).await {
-                            warn!(%error, "failed to expire due regards");
-                        }
-                    }
-                    _ = refresh.tick() => {
-                        let Some(daemon) = weak.upgrade() else { break };
-                        if let Err(error) = daemon.regard_lifecycle.refresh_focused().await {
-                            warn!(%error, "failed to refresh focused regards");
-                        }
-                    }
-                }
             }
         });
 
@@ -2277,6 +2244,11 @@ impl InProcessDaemon {
         self.accounts.install(records)
     }
 
+    /// The attentions: the engine's once its Message path is installed, the old store's before.
+    pub fn attentions(&self) -> Arc<dyn flotilla_resources::attentions::Attentions> {
+        self.resource_backend.attentions()
+    }
+
     /// The account kinds' records: the engine's once installed, the old store's before.
     pub fn account_records(&self) -> Arc<dyn flotilla_resources::account_access::AccountRecords> {
         self.accounts.clone()
@@ -2499,11 +2471,11 @@ impl InProcessDaemon {
     }
 
     pub fn connect_surface(&self, surface_id: uuid::Uuid, declaration: SurfaceDeclaration) {
-        self.regard_lifecycle.connect_surface(surface_id, declaration);
+        self.surfaces.connect(surface_id, declaration);
     }
 
     pub fn principal_for_surface(&self, surface_id: uuid::Uuid) -> Result<Option<PrincipalRef>, String> {
-        self.regard_lifecycle.principal_for_surface(surface_id)
+        self.surfaces.principal(surface_id)
     }
 
     fn should_auto_attach(&self, requested: flotilla_protocol::ConvoyAutoAttach) -> bool {
@@ -2511,17 +2483,14 @@ impl InProcessDaemon {
             flotilla_protocol::ConvoyAutoAttach::Always => true,
             flotilla_protocol::ConvoyAutoAttach::Never => false,
             flotilla_protocol::ConvoyAutoAttach::Default => {
-                self.config.load_config().convoy.auto_attach.unwrap_or_else(|| !self.regard_lifecycle.has_ambient_surface())
+                self.config.load_config().convoy.auto_attach.unwrap_or_else(|| !self.surfaces.has_ambient())
             }
         }
     }
 
     pub async fn disconnect_surface(&self, surface_id: uuid::Uuid) -> Result<(), String> {
-        self.regard_lifecycle.disconnect_surface(surface_id).await
-    }
-
-    pub async fn observe_surface_focus(&self, surface_id: uuid::Uuid, targets: Vec<ResourceRef>) -> Result<(), String> {
-        self.regard_lifecycle.observe_focus(surface_id, targets).await
+        self.surfaces.disconnect(surface_id);
+        Ok(())
     }
 
     pub fn observed_resource_backend(&self) -> ResourceBackend {
@@ -3631,10 +3600,6 @@ impl InProcessDaemon {
         self.admission.check_remote_placement_free_space_floor(namespace, placement).await
     }
 
-    async fn emit_attach_regard(&self, binding: &AttachBinding, surface_id: uuid::Uuid) -> Result<(), String> {
-        self.admission.emit_attach_regard(binding, surface_id).await
-    }
-
     async fn run_convoy_start(
         &self,
         intent: flotilla_protocol::ConvoyStartIntent,
@@ -4353,6 +4318,7 @@ impl InProcessDaemon {
             convoy_engine: &self.convoy_engine_path,
             accounts: &*self.accounts,
             manifest_roots: &*self.manifest_roots,
+            attentions: self.resource_backend.attentions(),
         }
     }
 
@@ -5924,15 +5890,11 @@ impl DaemonHandle for InProcessDaemon {
         self.execute_for_caller(command, None).await
     }
 
-    async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
+    async fn execute_query(&self, command: Command, _session_id: uuid::Uuid) -> Result<CommandValue, String> {
         if matches!(command.action, CommandAction::QueryChangeStream { .. }) {
             return Err("change-stream queries require peer replication transport".into());
         }
-        self.projections_actions().execute_query(command, session_id).await
-    }
-
-    async fn observe_focus(&self, surface_id: uuid::Uuid, targets: Vec<ResourceRef>) -> Result<(), String> {
-        self.observe_surface_focus(surface_id, targets).await
+        self.projections_actions().execute_query(command).await
     }
 
     async fn cancel(&self, command_id: u64) -> Result<(), String> {
@@ -6137,9 +6099,6 @@ impl projections_actions::ProjectionsActionPort for InProcessDaemon {
     }
     async fn explain_convoy_internal(&self, requested_namespace: Option<&str>, name: &str) -> Result<ConvoyExplanation, String> {
         self.explain_convoy_internal(requested_namespace, name).await
-    }
-    async fn emit_attach_regard(&self, binding: &AttachBinding, surface_id: uuid::Uuid) -> Result<(), String> {
-        self.emit_attach_regard(binding, surface_id).await
     }
     async fn dispatch_queue_internal(&self, project_filter: Option<&str>) -> Result<DispatchQueueResponse, String> {
         self.dispatch_queue_internal(project_filter).await

@@ -376,6 +376,7 @@ pub struct Service {
     store: std::sync::Arc<Mutex<Store>>,
     source: Source,
     watermarks: Watermarks,
+    applied: AppliedListeners,
     serve_observer: OnceLock<Arc<ServeObserver>>,
 }
 /// A completed serving round. Tail success does not prove snapshot servability.
@@ -384,12 +385,19 @@ pub struct ServedRound {
     pub snapshot: bool,
 }
 
+/// Called after a follower commits another home's entries; listeners must not block.
+pub type AppliedListeners = std::sync::Arc<std::sync::RwLock<Vec<std::sync::Arc<dyn Fn() + Send + Sync>>>>;
+
 /// Synchronous observation after a serving attempt; callbacks must not block.
 pub type ServeObserver = dyn Fn(&Result<ServedRound, StoreError>) + Send + Sync;
 
 impl Service {
     pub fn observe_serving(&self, observer: Arc<ServeObserver>) -> Result<(), String> {
         self.serve_observer.set(observer).map_err(|_| "stream observer already installed".into())
+    }
+    /// Calls `listener` after each commit that applies another home's entries here.
+    pub fn on_applied(&self, listener: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.applied.write().unwrap_or_else(std::sync::PoisonError::into_inner).push(listener);
     }
     /// Gates read committed progress independently of database writers and network delivery.
     pub fn watermark(&self, home: &str) -> Result<Watermark, StoreError> {
@@ -423,7 +431,8 @@ impl Service {
         let source = Source { path: path.to_owned(), home: home.to_owned(), kinds: kinds.clone() };
         let store = Store::open(conn, home, kinds)?;
         let watermarks = store.watermarks();
-        Ok(Self { store: std::sync::Arc::new(Mutex::new(store)), source, watermarks, serve_observer: OnceLock::new() })
+        let applied = store.applied_listeners();
+        Ok(Self { store: std::sync::Arc::new(Mutex::new(store)), source, watermarks, applied, serve_observer: OnceLock::new() })
     }
     pub fn serve(&self, after: Option<u64>, now: Timestamp, sink: impl FnMut(&[u8]) -> Result<(), StoreError>) -> Result<u64, StoreError> {
         // Wait for any writer currently holding the mutex before taking the read snapshot;
