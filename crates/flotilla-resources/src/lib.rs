@@ -150,12 +150,12 @@ pub use convoy_ensure::{
     ConvoyEnsureStatusPatch, DRIVER_ADMISSION_CONDITION_TYPE,
 };
 pub use credential::{
-    capped_github_app_permissions, permission_level_rank, validate_matching_grant_permissions, CredentialConsumer, CredentialGrant,
-    CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
-    CredentialSpecSpec, LandingCredentialScope, RepositoryTrust, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV,
-    CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG,
-    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, CREW_SKILLS_ENV, INITIAL_AUTHORIZATION_EPOCH,
-    RESOLVED_SKILLS_ENV, RETIRED_CREW_HOME_KEYS_ENV,
+    capped_github_app_permissions, permission_level_rank, validate_matching_grant_permissions, CloneCredentials, CredentialConsumer,
+    CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource,
+    CredentialSpec, CredentialSpecSpec, LandingCredentialScope, RepositoryTrust, CREDENTIAL_PERMISSIONS_ANNOTATION,
+    CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
+    CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, CREW_SKILLS_ENV,
+    INITIAL_AUTHORIZATION_EPOCH, RESOLVED_SKILLS_ENV, RETIRED_CREW_HOME_KEYS_ENV,
 };
 pub use environment::{
     host_direct_environment_name, validate_environment_provider_address, CloudSandboxEnvironmentSpec, CloudSandboxSize,

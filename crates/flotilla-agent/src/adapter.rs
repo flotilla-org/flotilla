@@ -703,6 +703,28 @@ enum AdapterFlavor {
     Codex { trust_config: Option<CodexTrustConfig>, trust_lock: Arc<Mutex<()>> },
 }
 
+/// Names the bash or zsh Claude Code's Bash tool runs in, instead of one it picks
+/// from `SHELL` or the first it finds (#4173). Claude Code 2.1.287 accepts a path
+/// containing `bash` or `zsh` that is executable, and otherwise detects one.
+pub const CLAUDE_CODE_SHELL_ENV: &str = "CLAUDE_CODE_SHELL";
+
+/// The Claude Code harness version whose `CLAUDE_CODE_SHELL` handling was read;
+/// `ci/crew-image/test-harness-pins.py` fails when the stdlib pin moves past it.
+pub const CLAUDE_CODE_SHELL_VERIFIED: &str = "2.1.287";
+
+/// The Codex harness version whose shell configuration was read for
+/// [`CODEX_LAUNCH_ENVIRONMENT_OVERRIDES`]; `ci/crew-image/test-harness-pins.py`
+/// fails when the stdlib pin moves past it.
+pub const CODEX_LAUNCH_ENVIRONMENT_VERIFIED: &str = "0.160.0";
+
+/// Keep the launch environment, `PATH` included, in Codex's tool commands (#4173).
+/// At openai/codex rust-v0.160.0, `allow_login_shell` (default true,
+/// codex-rs/config/src/config_toml.rs) runs model commands as `$shell -lc`, and the
+/// stable `shell_snapshot` feature (codex-rs/features/src/lib.rs) replays the exports of
+/// a login shell taken from passwd, `PATH` included, over every command. Both are needed:
+/// the snapshot is taken whatever `allow_login_shell` says.
+pub const CODEX_LAUNCH_ENVIRONMENT_OVERRIDES: &[&str] = &["allow_login_shell=false", "features.shell_snapshot=false"];
+
 /// Names the flotilla environment a session runs in. Docker vessels and
 /// SSH hosts with daemon reach applied carry it; a host-direct session on
 /// the daemon's own host does not.
@@ -769,6 +791,9 @@ impl CliAgentAdapter {
         }
         if matches!(&self.flavor, AdapterFlavor::Codex { .. }) {
             args.push(Arg::Literal("--no-daemon".into()));
+            for override_value in CODEX_LAUNCH_ENVIRONMENT_OVERRIDES {
+                args.extend([Arg::Literal("-c".into()), Arg::Literal((*override_value).into())]);
+            }
             for override_value in crate::codex_hook_overrides() {
                 args.extend([Arg::Literal("-c".into()), Arg::Quoted(override_value)]);
             }
@@ -936,7 +961,7 @@ impl CliAgentAdapter {
                 }
                 // The runtime supplies a hook URL and token only to host-direct sessions
                 // while flotillad has a loopback listener; vessel sessions keep commands.
-                let mut settings = crate::claude_code_hook_settings_for(environment);
+                let mut settings = crate::claude_code_hook_settings_over(crate::ClaudeCodeHookTransport::from_environment(environment));
                 settings["skipDangerousModePermissionPrompt"] = serde_json::Value::Bool(true);
                 settings["promptSuggestionEnabled"] = serde_json::Value::Bool(false);
                 if contained {
@@ -2857,6 +2882,8 @@ mod tests {
         assert_eq!(plan.command.matches("-c 'notify=[]'").count(), 1);
         assert!(plan.command.contains("flotilla hook codex stop"));
         assert!(plan.command.contains("--no-daemon"));
+        // #4173: tool commands keep the launch environment.
+        assert!(plan.command.contains("-c allow_login_shell=false -c features.shell_snapshot=false"), "{}", plan.command);
         assert_eq!(super::minimum_harness_version("codex"), Some("0.160.0"));
     }
 

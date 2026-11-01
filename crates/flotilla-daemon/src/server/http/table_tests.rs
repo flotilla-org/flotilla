@@ -462,6 +462,12 @@ async fn served_tables_type_addresses_and_carry_enum_names() {
                     assert_eq!(field["constraints"]["enum"], json!(names), "{table}.{name}");
                     enums.insert(name.to_owned(), names);
                 }
+                // A derived table has no stored columns; its declared value set is what its rows must use.
+                _ if stored.is_none() => {
+                    if let Some(names) = field["constraints"]["enum"].as_array() {
+                        enums.insert(name.to_owned(), names.clone());
+                    }
+                }
                 _ => assert!(field["constraints"].get("enum").is_none(), "{table}.{name} is no enum"),
             }
         }

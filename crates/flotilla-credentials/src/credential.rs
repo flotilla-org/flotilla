@@ -1844,7 +1844,7 @@ impl CredentialStore {
         expand_path(&*self.env, path)
     }
 
-    async fn delivery_paths(&self, runner: &dyn CommandRunner) -> Result<CredentialDeliveryPaths, String> {
+    pub(crate) async fn delivery_paths(&self, runner: &dyn CommandRunner) -> Result<CredentialDeliveryPaths, String> {
         let runtime_dir =
             self.env.get("XDG_RUNTIME_DIR").map(|value| PathBuf::from(value.trim())).filter(|value| !value.as_os_str().is_empty());
         let base = runner.writable_config_base(runtime_dir.as_deref(), &self.state_dir).await?;
@@ -2339,7 +2339,7 @@ async fn write_executable(runner: &dyn CommandRunner, path: &Path, contents: &st
     runner.write_file_with_mode(path, contents, 0o700).await.map_err(|error| format!("write {context}: {error}"))
 }
 
-fn shell_single_quote(value: &str) -> String {
+pub(crate) fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
