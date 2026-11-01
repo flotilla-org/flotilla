@@ -281,24 +281,36 @@ fn the_observation_keeps_the_facts_admission_and_health_read() {
     }
 }
 
-// Behaviour (#3824 layer 4c): a kind the probe found with no free slots, its crew pool missing,
-// keeps that fact; any other slot count is a judgement and is dropped.
+/// The imported crew-pool flag of the kind `host-direct` holding `slots`, and whether the slot
+/// count was counted as a dropped judgement.
+fn pool_missing(spec: HostSpec, slots: Option<u32>) -> (bool, bool) {
+    let status = HostStatus {
+        fulfilment_facts: serde_json::from_value(json!({"host-direct": {
+            "gui_session_logged_in": false, "observed_at": "2026-10-29T00:00:00Z", "free_vessel_slots": slots}}))
+        .expect("facts"),
+        ..HostStatus::default()
+    };
+    let (_, observation, dropped) = records(import_host(&object("kiwi", spec, Some(status)), "kiwi").expect("imports"));
+    let counted = dropped.contains(&("HostObservation", "free vessel slots, a judgement"));
+    (observation.expect("observed").facts["host-direct"].crew_pool_missing, counted)
+}
+
+// Behaviour (#3824 layer 4c): on a host without a vessel cap, no free slots means the kind's crew
+// pool is missing, and that fact is kept; any other slot count is a judgement and is dropped.
 #[test]
 fn a_kind_without_its_crew_pool_stays_full() {
-    let facts = |slots: Option<u32>| {
-        let status = HostStatus {
-            fulfilment_facts: serde_json::from_value(json!({"host-direct": {
-                "gui_session_logged_in": false, "observed_at": "2026-10-29T00:00:00Z", "free_vessel_slots": slots}}))
-            .expect("facts"),
-            ..HostStatus::default()
-        };
-        let (_, observation, dropped) = records(import_host(&object("kiwi", HostSpec::default(), Some(status)), "kiwi").expect("imports"));
-        let counted = dropped.contains(&("HostObservation", "free vessel slots, a judgement"));
-        (observation.expect("observed").facts["host-direct"].crew_pool_missing, counted)
-    };
-    assert_eq!(facts(Some(0)), (true, false));
-    assert_eq!(facts(Some(3)), (false, true));
-    assert_eq!(facts(None), (false, false));
+    assert_eq!(pool_missing(HostSpec::default(), Some(0)), (true, false));
+    assert_eq!(pool_missing(HostSpec::default(), Some(3)), (false, true));
+    assert_eq!(pool_missing(HostSpec::default(), None), (false, false));
+}
+
+// Behaviour (#3824 layer 4c): a capped host that is full, its pool present, also has no free
+// slots; that is a judgement and is dropped, not taken for a missing pool.
+#[test]
+fn a_full_host_with_its_crew_pool_is_not_missing_it() {
+    let capped = HostSpec { max_vessels: Some(2), ..HostSpec::default() };
+    assert_eq!(pool_missing(capped, Some(0)), (false, true));
+    assert_eq!(pool_missing(ssh("kiwi"), Some(0)), (false, true));
 }
 
 // Behaviour (#3824 layer 4c, owner's answer 1): a Host imports only at its home, a daemon's own at

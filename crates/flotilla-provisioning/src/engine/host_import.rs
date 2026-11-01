@@ -8,7 +8,7 @@
 //! | Deleted | dropped |
 //! | `spec` | a Host record; `expected_concurrent_rust_crews` dropped, as nothing reads it, and counted when not the default |
 //! | `status` | a HostObservation record: generation, protocol fingerprint, architecture, the free-space floor as a flag, conditions (`observed_at` as `since`), providers, adapters and their baseline, held credentials and their expiry, image digests, the Codex central login |
-//! | `status.fulfilment_facts` | facts by FulfilmentKind name: a missing crew pool (no free slots), GUI login, image and its presence, harness and toolchain versions; each fact's observation time, any other free slot count and model facts dropped, as judgements or kept by nothing |
+//! | `status.fulfilment_facts` | facts by FulfilmentKind name: a missing crew pool (no free slots on a host without a vessel cap), GUI login, image and its presence, harness and toolchain versions; each fact's observation time, any other free slot count and model facts dropped, as judgements or kept by nothing |
 //! | Heartbeat time, readiness, `sleeping_until`, model probes | dropped: readiness is a judgement, and nothing sets the others |
 //! | The host summary (but its architecture), daemon version and start time, sleep inhibition state | dropped: display only; the sleep condition carries what readiness needs |
 //! | Free disk and the free-space floor | only whether free disk is below the floor |
@@ -26,10 +26,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_engine_store::ImportTarget;
 use flotilla_protocol::provider::ProviderAdvertisement;
 use flotilla_resources::{
-    image_architecture::canonical_image_architecture, CredentialExpiry, Host, HostConnection, HostSpec, HostStatus, LocalImageInventories,
-    ModelProbeState, ResourceObject, AGENT_ADAPTERS_CAPABILITY, CODEX_CENTRAL_LOGIN_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY,
-    ENVIRONMENT_PROVIDERS_CAPABILITY, HELD_CREDENTIALS_CAPABILITY, IMAGE_DIGESTS_CAPABILITY, OWNING_DAEMON_CAPABILITY,
-    PLACEMENT_CAPABILITY, SSH_HOST_CAPABILITY, TERMINAL_POOLS_CAPABILITY, TRANSPORT_CAPABILITY,
+    image_architecture::canonical_image_architecture, CredentialExpiry, FulfilmentFacts, Host, HostConnection, HostSpec, HostStatus,
+    LocalImageInventories, ModelProbeState, ResourceObject, AGENT_ADAPTERS_CAPABILITY, CODEX_CENTRAL_LOGIN_CAPABILITY,
+    CREDENTIAL_EXPIRY_CAPABILITY, ENVIRONMENT_PROVIDERS_CAPABILITY, HELD_CREDENTIALS_CAPABILITY, IMAGE_DIGESTS_CAPABILITY,
+    OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, SSH_HOST_CAPABILITY, TERMINAL_POOLS_CAPABILITY, TRANSPORT_CAPABILITY,
 };
 use flotilla_schema::{Kind, Timestamp};
 
@@ -110,7 +110,7 @@ pub fn import_host(old: &ResourceObject<Host>, own_host: &str) -> Result<Importe
     if old.spec.expected_concurrent_rust_crews != HostSpec::default().expected_concurrent_rust_crews {
         dropped.push((HOST, "expected_concurrent_rust_crews, which nothing reads"));
     }
-    let observation = old.status.as_ref().map(|status| observation(&old.spec.connection, status, &mut dropped)).transpose()?;
+    let observation = old.status.as_ref().map(|status| observation(&old.spec, status, &mut dropped)).transpose()?;
     Ok(Imported::Records { host: Box::new(HostRecord::new(&old.spec)), observation: observation.map(Box::new), dropped })
 }
 
@@ -123,11 +123,7 @@ fn capability<T: serde::de::DeserializeOwned + Default>(status: &HostStatus, key
         .map(Option::unwrap_or_default)
 }
 
-fn observation(
-    connection: &HostConnection,
-    status: &HostStatus,
-    dropped: &mut Vec<(&'static str, &'static str)>,
-) -> Result<HostObservation, String> {
+fn observation(spec: &HostSpec, status: &HostStatus, dropped: &mut Vec<(&'static str, &'static str)>) -> Result<HostObservation, String> {
     let mut uncarried = |reason: &'static str| {
         if !dropped.contains(&(OBSERVATION, reason)) {
             dropped.push((OBSERVATION, reason));
@@ -141,7 +137,7 @@ fn observation(
         }
     }
     let owner: Option<String> = capability(status, OWNING_DAEMON_CAPABILITY)?;
-    if let (Some(owner), HostConnection::SshHost { owning_daemon, .. }) = (&owner, connection) {
+    if let (Some(owner), HostConnection::SshHost { owning_daemon, .. }) = (&owner, &spec.connection) {
         if owner != owning_daemon {
             return Err(format!("its `{OWNING_DAEMON_CAPABILITY}` capability names `{owner}`, and its connection `{owning_daemon}`"));
         }
@@ -188,9 +184,12 @@ fn observation(
     if status.daemon_rss_bytes.is_some() || status.resource_store.is_some() || status.blob_sync.is_some() {
         uncarried("metrics");
     }
+    // Without a vessel cap only a missing pool gives no free slots; under a cap a full host does too,
+    // so there the first probe says whether the pool is missing.
+    let pool_missing = |facts: &FulfilmentFacts| spec.max_vessels.is_none() && facts.free_vessel_slots == Some(0);
     for facts in status.fulfilment_facts.values() {
         uncarried("each fact's observation time, a judgement");
-        if facts.free_vessel_slots.is_some_and(|slots| slots > 0) {
+        if facts.free_vessel_slots.is_some() && !pool_missing(facts) {
             uncarried("free vessel slots, a judgement");
         }
         if facts.harnesses.values().any(|harness| !harness.models.is_empty()) {
@@ -222,7 +221,7 @@ fn observation(
             })
             .collect(),
         image_digests: images.0.into_iter().map(|(instance, images)| (instance, ProviderImages { images })).collect(),
-        facts: status.fulfilment_facts.iter().map(|(kind, facts)| (kind.clone(), Facts::new(facts))).collect(),
+        facts: status.fulfilment_facts.iter().map(|(kind, facts)| (kind.clone(), Facts::new(facts, pool_missing(facts)))).collect(),
     })
 }
 

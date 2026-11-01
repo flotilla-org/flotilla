@@ -259,11 +259,11 @@ pub struct Facts {
 }
 
 impl Facts {
-    pub fn new(facts: &FulfilmentFacts) -> Self {
+    /// No free slots means a missing pool only where no vessel cap applies, so the caller says.
+    pub fn new(facts: &FulfilmentFacts, crew_pool_missing: bool) -> Self {
         let image = facts.image.as_ref();
         Self {
-            // The probe publishes no free slots at all as the sign of a missing pool.
-            crew_pool_missing: facts.free_vessel_slots == Some(0),
+            crew_pool_missing,
             gui_session_logged_in: facts.gui_session_logged_in,
             image_ref: image.map(|image| image.image_ref.clone()),
             local_image_id: image.and_then(|image| image.local_image_id.clone()),
