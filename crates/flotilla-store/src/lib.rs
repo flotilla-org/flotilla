@@ -6,7 +6,9 @@ use flotilla_resources::*;
 use flotilla_resources::{error, field_ownership, host, labels, resource, retention};
 
 mod account_records;
+mod attentions;
 pub use account_records::{OldStoreAccounts, SwitchedAccounts};
+pub use attentions::{OldStoreAttentions, SwitchedAttentions};
 mod backend;
 pub use backend::*;
 pub mod controller;

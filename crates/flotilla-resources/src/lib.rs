@@ -10,6 +10,7 @@ pub use account_access::{AccountBinding, AccountBindingSpec, AccountProvision, A
 #[doc(hidden)]
 pub mod address;
 pub mod artifact;
+pub mod attentions;
 #[doc(hidden)]
 pub mod change_request;
 mod charter_store;
@@ -201,8 +202,8 @@ pub use prepared_snapshot::{content_hash, is_prepared_snapshot, PLACEMENT_SNAPSH
 pub use principal_attention::{
     Demand, DemandAddressee, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, DemandStatus, DemandStatusPatch,
     DemandTransition, Regard, RegardExpiryPolicy, RegardSource, RegardSpec, RegardStatus, RegardStatusPatch,
-    CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION, ENSURE_HOLD_REASON_ANNOTATION,
-    RECLAIM_REFUSAL_REASON_ANNOTATION,
+    CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION,
+    ENSURE_DRIFT_ATTENTION_PREFIX, ENSURE_HOLD_REASON_ANNOTATION, RECLAIM_REFUSAL_REASON_ANNOTATION,
 };
 pub use project::{
     normalize_issue_source, normalize_project_spec, resolve_project_issue_sources_from_inventory, DeclarationRefusedCondition,

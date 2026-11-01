@@ -21,6 +21,10 @@ pub const RECLAIM_REFUSAL_REASON_ANNOTATION: &str = "flotilla.work/reclaim-refus
 pub const ENSURE_HOLD_REASON_ANNOTATION: &str = RECLAIM_REFUSAL_REASON_ANNOTATION;
 /// Why a credential stopped refreshing for a vessel.
 pub const CREDENTIAL_REFRESH_REASON_ANNOTATION: &str = "flotilla.work/credential-refresh-reason";
+/// The demand a standing role's configuration drift is raised as, by its ConvoyEnsure's name.
+pub const ENSURE_DRIFT_ATTENTION_PREFIX: &str = "ensure-config-drift-";
+/// Why a standing role's configuration drifted, and the command that rolls it.
+pub const ENSURE_CONFIG_DRIFT_REASON_ANNOTATION: &str = "flotilla.work/ensure-config-drift-reason";
 /// The convoy's name for the vessel whose credential stopped refreshing.
 pub const CREDENTIAL_REFRESH_VESSEL_ANNOTATION: &str = "flotilla.work/credential-refresh-vessel";
 
