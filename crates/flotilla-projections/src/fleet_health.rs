@@ -46,9 +46,13 @@ pub fn spread(result: Result<CommandValue, String>) -> String {
 
 /// The newest `limit` roll records of one host, oldest first, from the installer's
 /// append-only log (tab-separated: time, generation, replaced, flotilla, cleat, by,
-/// reason). Lines that do not parse are skipped.
+/// reason). Lines that do not parse, or whose time is not a timestamp, are skipped.
 pub fn rolls(host: &str, log: &str, limit: usize) -> String {
-    let records: Vec<[&str; 7]> = log.lines().filter_map(|line| line.split('\t').collect::<Vec<_>>().try_into().ok()).collect();
+    let records: Vec<[&str; 7]> = log
+        .lines()
+        .filter_map(|line| line.split('\t').collect::<Vec<_>>().try_into().ok())
+        .filter(|record: &[&str; 7]| record[0].len() >= 16)
+        .collect();
     let mut output = String::new();
     for [time, generation, replaced, flotilla, cleat, by, reason] in &records[records.len().saturating_sub(limit)..] {
         let time = time.get(..16).map_or(*time, |minute| minute).to_string() + "Z";
@@ -194,6 +198,7 @@ mod tests {
             line("2026-10-29T01:00:00Z", 3, 2, "bad build"),
             line("2026-10-30T04:59:12Z", 4, 3, ""),
             "garbage\n".to_string(),
+            line("soon", 5, 4, ""),
         ]
         .concat();
         let shown = rolls("udder", &log, 3);

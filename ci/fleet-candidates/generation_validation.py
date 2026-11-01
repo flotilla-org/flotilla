@@ -101,7 +101,7 @@ def fetched_history(repository, commits, label, run=git_run):
         for args in (["init", "--quiet"], ["remote", "add", "origin", repository]):
             run(args, cwd=scratch, check=True)
         for commit in commits:
-            fetched = run(["fetch", "--quiet", "--filter=blob:none", "origin", commit], cwd=scratch)
+            fetched = run(["fetch", "--quiet", "--filter=tree:0", "--no-tags", "origin", commit], cwd=scratch)
             if fetched.returncode != 0:
                 raise AncestryError(f"cannot fetch {label} {commit}: {fetched.stderr.strip()}")
         yield scratch
