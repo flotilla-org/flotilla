@@ -171,8 +171,9 @@ impl Class {
             .map_err(|error| format!("class {class:?} has no stored class: {error}"))
     }
 
-    pub fn environment_class(self) -> EnvironmentClass {
-        serde_json::to_value(self).and_then(serde_json::from_value).expect("every stored class names an environment class")
+    /// None for a stored class no environment class names any more.
+    pub fn environment_class(self) -> Option<EnvironmentClass> {
+        serde_json::to_value(self).and_then(serde_json::from_value).ok()
     }
 }
 
