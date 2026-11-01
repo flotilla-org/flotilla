@@ -4541,6 +4541,15 @@ mod tests {
         let (salience, as_of) = awareness_vessel_salience_and_time(&state, &query).await;
         assert_eq!(salience, flotilla_protocol::Salience::Info);
         assert_eq!(as_of, working_at);
+
+        // A vessel's attention raises that vessel, not only its convoy.
+        attentions.set(vec![open_attention(
+            Sender::Capabilities,
+            AttentionSubject::Vessel { convoy: "convoy-a".into(), vessel: "implement".into() },
+            "github-app: refresh failed",
+        )]);
+        aggregator.refresh_attentions().await;
+        assert_eq!(awareness_vessel_salience(&state, &query).await, flotilla_protocol::Salience::Attention);
     }
 
     async fn awareness_vessel_salience(state: &AggregatorProjectionState, query: &QueryId) -> flotilla_protocol::Salience {
