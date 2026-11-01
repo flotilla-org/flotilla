@@ -5,8 +5,9 @@
 use std::collections::BTreeMap;
 
 use flotilla_schema::{ColumnType, NewChange, Table, Value};
-use flotilla_schema_sqlite::{Store, TableFilter};
+use flotilla_schema_sqlite::Store;
 use hegel::TestCase;
+use rigging_condition::{CheckError, Checked, Condition, Field, Literal, Operand, Relop};
 
 use crate::fixtures::{
     origin, store, AgentSession, AwaitingReply, Convoy, Dossier, Ensure, Fixture, Message, Person, Pick, Referral, Resource,
@@ -33,12 +34,16 @@ fn filled<K: Fixture>(tc: &TestCase) -> Store {
     store
 }
 
-fn read(store: &Store, table: &str, filters: &[TableFilter]) -> Result<(Table, Rows), flotilla_schema_sqlite::StoreError> {
-    store.table_read(LOCAL, table, filters, 10_000).map(|read| (read.descriptor, read.rows))
+fn read(store: &Store, table: &str, filter: Option<&Checked<Condition>>) -> Result<(Table, Rows), flotilla_schema_sqlite::StoreError> {
+    store.table_read(LOCAL, table, filter, 10_000).map(|read| (read.descriptor, read.rows))
 }
 
-fn equal(column: &str, value: &str) -> TableFilter {
-    TableFilter::Compare { field: column.into(), operator: "==".into(), value: Value::Text(value.into()) }
+/// `column == "value"`, checked against the read's description.
+fn equal(descriptor: &Table, column: &str, value: &str) -> Result<Checked<Condition>, CheckError> {
+    let fields = descriptor.filterable();
+    let field = Field::new(fields.path(column).expect("a filterable column").clone());
+    let condition = Condition::Compare { field, op: Relop::Eq, operand: Operand::Literal(Literal::String(value.into())) };
+    Checked::new(condition, fields.schema())
 }
 
 /// The column's cells in an independent reading of storage: the table's readable view, which
@@ -82,14 +87,14 @@ fn sorted(mut cells: Vec<Value>) -> Vec<Value> {
 // Behaviour (#4214): on every table of `K` and on its log, the read's description declares each
 // enum column's values as its readable names, in code order; every cell is null or one of them,
 // and is the name storage's own readable view gives that row's code; a filter on a name selects
-// exactly the rows carrying it, and a stored code that is no name is refused as a filter value.
+// exactly the rows carrying it, and a stored code that is no name does not check as a filter value.
 fn enums_read_as_names<K: Fixture>(tc: &TestCase) {
     let store = filled::<K>(tc);
     let set = K::table_set();
     let mut tables: Vec<(Table, bool)> = set.tables.iter().map(|table| (table.clone(), false)).collect();
     tables.push((set.log_projection(), true));
     for (stored, log) in tables {
-        let (descriptor, rows) = read(&store, &stored.name, &[]).expect("read");
+        let (descriptor, rows) = read(&store, &stored.name, None).expect("read");
         let natural = stored.with_natural_references();
         for column in descriptor.key.iter().chain(&descriptor.columns) {
             let ColumnType::Code(values) = &column.ty else { continue };
@@ -110,12 +115,13 @@ fn enums_read_as_names<K: Fixture>(tc: &TestCase) {
                 assert_eq!(sorted(cells.clone()), sorted(expected), "{at}: the read names each row's code as storage does");
             }
             let Some(Value::Text(name)) = cells.iter().find(|cell| **cell != Value::Null) else { continue };
-            let (_, selected) = read(&store, &stored.name, &[equal(&column.name, name)]).expect("a name filters");
+            let filter = equal(&descriptor, &column.name, name).expect("a name checks");
+            let (_, selected) = read(&store, &stored.name, Some(&filter)).expect("a name filters");
             assert_eq!(selected.len(), cells.iter().filter(|cell| **cell == Value::Text(name.clone())).count(), "{at} == {name:?}");
             assert!(selected.iter().all(|row| row[&column.name] == Value::Text(name.clone())));
             let code = &source.categories.iter().find(|(_, candidate)| candidate == name).expect("a declared name").0;
             if !names.contains(code) {
-                assert!(read(&store, &stored.name, &[equal(&column.name, code)]).is_err(), "{at}: the code {code:?} is no wire value");
+                assert!(equal(&descriptor, &column.name, code).is_err(), "{at}: the code {code:?} is no wire value");
             }
         }
     }

@@ -65,6 +65,7 @@ mod descriptor;
 pub use describe::{Describe, DescribeChild, DescribeElement};
 mod edge;
 mod event;
+mod filter;
 mod frozen;
 mod history;
 mod inline;
@@ -93,6 +94,7 @@ pub use edge::{
     LabelCheck, RecordsOf, RowPath, StateOf,
 };
 pub use event::{whole_log_topic, Cause, Change, ChangeHeader, ChangeItem, Effect, Event, EventError, Named, NewChange, Step, LOG_LIMITS};
+pub use filter::{condition_type, where_operators, Filterable};
 pub use flotilla_address::Address;
 pub use flotilla_schema_derive::{Describe, Stored, Verb};
 pub use frozen::{Freezable, Frozen};

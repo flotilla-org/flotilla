@@ -2,8 +2,14 @@
 //! identifier and comparison before preparing a statement, and applies all predicates.
 //! Enum columns read as their readable names ([`Table::readable`]): short codes stay in
 //! storage and in the SQL below, and filters compare names.
+//!
+//! A filter is a checked condition in the `rigging-condition` language (#4108), translated through
+//! a [`ColumnMap`] of the expressions this module writes: field paths never reach the SQL, and
+//! every literal is a parameter. An address column is matched by its interned id, so `under` and
+//! equality search the `strings` table's `UNIQUE(domain, s)` index.
 use crate::{ddl::text_literal, quote_ident, StoreError};
-use flotilla_schema::{ColumnDef, ColumnType, KindRegistry, Table, Value};
+use flotilla_schema::{ColumnDef, ColumnType, Filterable, KindRegistry, Table, Value};
+use rigging_condition::{Checked, Column, ColumnMap, Condition, InternTable, Param, Path};
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection};
 use std::collections::BTreeMap;
 
@@ -25,40 +31,48 @@ pub struct TableRead {
     pub rows: Vec<BTreeMap<String, Value>>,
     pub sequence: u64,
 }
-/// A comparison on a described field. Values remain logical, never store-local ids.
-pub enum TableFilter {
-    Compare {
-        field: String,
-        operator: String,
-        value: Value,
-    },
-    /// An unsatisfiable conjunction, evaluated by SQLite without loading any rows.
-    None,
+
+/// Each filterable column of a read, by the path the table's [`Filterable`] gives it.
+struct Columns {
+    fields: Filterable,
+    columns: BTreeMap<String, Column>,
 }
 
-fn validate_filter_value(column: &ColumnDef, value: &Value) -> Result<(), StoreError> {
-    let valid = match (&column.ty, value) {
-        (_, Value::Null) => column.nullable,
-        (ColumnType::Integer | ColumnType::Timestamp, Value::Int(_)) => true,
-        (ColumnType::Bool, Value::Int(value)) => matches!(value, 0 | 1),
-        (ColumnType::Text | ColumnType::Interned(_) | ColumnType::Ref, Value::Text(_) | Value::Str(_)) => true,
-        (ColumnType::Code(codes), Value::Text(value) | Value::Str(value)) => codes.contains(value),
-        _ => false,
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(StoreError::Stream("filter type mismatch".into()))
+impl ColumnMap for Columns {
+    fn column(&self, path: &Path) -> Option<Column> {
+        self.fields.column(path).and_then(|name| self.columns.get(name)).cloned()
     }
 }
 
-pub(crate) fn read(
-    conn: &Connection,
+/// The `WHERE` text of `filter` and its parameters, numbered from `?1`; `1` with none.
+fn translate(filter: Option<&Checked<Condition>>, columns: &Columns) -> Result<(String, Vec<SqlValue>), StoreError> {
+    let Some(filter) = filter else { return Ok(("1".into(), vec![])) };
+    let (sql, params) = filter.to_sql(columns).map_err(|error| StoreError::Stream(format!("filter: {error}")))?;
+    let params = params
+        .into_iter()
+        .map(|param| match param {
+            Param::Integer(value) => SqlValue::Integer(value),
+            Param::Real(value) => SqlValue::Real(value),
+            Param::Text(value) => SqlValue::Text(value),
+        })
+        .collect();
+    Ok((sql, params))
+}
+
+/// A stored enum column's readable names mapped to their codes, as parameters.
+fn codes(column: &ColumnDef) -> Option<BTreeMap<String, Param>> {
+    (matches!(column.ty, ColumnType::Code(_)) && !column.categories.is_empty())
+        .then(|| column.categories.iter().map(|(code, name)| (name.clone(), Param::Text(code.clone()))).collect())
+}
+
+/// The statement that reads table `name` of `home` with `filter` applied, its arguments, and the
+/// table it describes.
+pub(crate) fn statement(
     kinds: &KindRegistry,
     home: &str,
     name: &str,
-    filters: &[TableFilter],
-) -> Result<TableRead, StoreError> {
+    filter: Option<&Checked<Condition>>,
+) -> Result<(String, Vec<SqlValue>, Table), StoreError> {
     let (set, source) = kinds
         .iter()
         .find_map(|set| set.tables.iter().find(|table| table.name == name).map(|table| (set, table)))
@@ -75,10 +89,32 @@ pub(crate) fn read(
         "(SELECT s FROM strings WHERE id=i.home) AS \"resource.home\"".into(),
         "(SELECT s FROM strings WHERE id=i.name) AS \"resource.name\"".into(),
     ];
+    // What a filter reads: the projected expression, except that an address is matched by its
+    // interned id and a stored enum by its code, so SQLite can search their indexes.
+    let mut filterable = BTreeMap::from([
+        ("resource.home".to_owned(), Column::Value { expr: "(SELECT s FROM strings WHERE id=i.home)".into(), codes: None }),
+        ("resource.name".to_owned(), Column::Value { expr: "(SELECT s FROM strings WHERE id=i.name)".into(), codes: None }),
+    ]);
     for column in table.key.iter().skip(2).chain(&table.columns) {
         let original = source.key.iter().chain(&source.columns).find(|original| original.name == column.name);
         let expression = if let Some(original) = original {
             let value = format!("t.{}", quote_ident(&original.name));
+            match &original.ty {
+                ColumnType::Interned(domain) if original.address => {
+                    let strings = InternTable {
+                        table: "strings".into(),
+                        id: "id".into(),
+                        domain_column: "domain".into(),
+                        text_column: "s".into(),
+                        domain: domain.to_string(),
+                    };
+                    filterable.insert(column.name.clone(), Column::Interned { expr: value.clone(), strings });
+                }
+                ColumnType::Code(_) => {
+                    filterable.insert(column.name.clone(), Column::Value { expr: value.clone(), codes: codes(original) });
+                }
+                _ => {}
+            }
             match original.ty {
                 ColumnType::Interned(_) => format!("(SELECT s FROM strings WHERE id={value})"),
                 ColumnType::Ref => format!("(SELECT s FROM strings WHERE id=(SELECT name FROM resource_identity WHERE id={value}))"),
@@ -94,51 +130,32 @@ pub(crate) fn read(
                 return Err(StoreError::Stream("unknown reference component".into()));
             }
         };
+        filterable.entry(column.name.clone()).or_insert_with(|| Column::Value { expr: expression.clone(), codes: None });
         expressions.push(format!("{expression} AS {}", quote_ident(&column.name)));
     }
-    let base = format!(
-        "SELECT {} FROM {} t JOIN resource_identity i ON i.id=t.{} WHERE i.home=(SELECT id FROM strings WHERE domain=? AND s=?)",
+    let table = table.readable();
+    let (clause, mut arguments) = translate(filter, &Columns { fields: table.filterable(), columns: filterable })?;
+    // The filter's parameters are `?1`…`?n`; the home's follow them.
+    let (domain, home_param) = (arguments.len() + 1, arguments.len() + 2);
+    arguments.extend([SqlValue::Text(flotilla_schema::HOME_DOMAIN.to_string()), SqlValue::Text(home.into())]);
+    let sql = format!(
+        "SELECT {} FROM {} t JOIN resource_identity i ON i.id=t.{} WHERE i.home=(SELECT id FROM strings WHERE domain=?{domain} AND s=?{home_param}) AND ({clause})",
         expressions.join(","),
         quote_ident(name),
         quote_ident(owner)
     );
-    let table = table.readable();
+    Ok((sql, arguments, table))
+}
+
+pub(crate) fn read(
+    conn: &Connection,
+    kinds: &KindRegistry,
+    home: &str,
+    name: &str,
+    filter: Option<&Checked<Condition>>,
+) -> Result<TableRead, StoreError> {
+    let (sql, arguments, table) = statement(kinds, home, name, filter)?;
     let columns: Vec<_> = table.key.iter().chain(&table.columns).collect();
-    let mut arguments = vec![SqlValue::Text(flotilla_schema::HOME_DOMAIN.to_string()), SqlValue::Text(home.into())];
-    let mut clauses = vec![];
-    for filter in filters {
-        let TableFilter::Compare { field, operator, value } = filter else {
-            clauses.push("0".into());
-            continue;
-        };
-        let column =
-            columns.iter().find(|column| column.name == *field).ok_or_else(|| StoreError::Stream("unknown filter field".into()))?;
-        if !["==", "!=", "<", "<=", ">", ">="].contains(&operator.as_str())
-            || matches!(column.ty, ColumnType::Frozen | ColumnType::Cbor | ColumnType::Blob)
-        {
-            return Err(StoreError::Stream("unsupported filter".into()));
-        }
-        validate_filter_value(column, value)?;
-        let value = match value {
-            Value::Null => SqlValue::Null,
-            Value::Int(value) => SqlValue::Integer(*value),
-            Value::Text(value) | Value::Str(value) => SqlValue::Text(value.clone()),
-            _ => return Err(StoreError::Stream("filter type mismatch".into())),
-        };
-        let operator = if matches!(value, SqlValue::Null) {
-            match operator.as_str() {
-                "==" => "IS",
-                "!=" => "IS NOT",
-                _ => return Err(StoreError::Stream("unsupported null comparison".into())),
-            }
-        } else {
-            operator.as_str()
-        };
-        clauses.push(format!("{} {} ?", quote_ident(field), operator));
-        arguments.push(value);
-    }
-    let sql =
-        format!("SELECT * FROM ({base}){}", if clauses.is_empty() { String::new() } else { format!(" WHERE {}", clauses.join(" AND ")) });
     let tx = conn.unchecked_transaction()?;
     let sequence = tx.query_row(
         "SELECT coalesce((SELECT last FROM home_sequence WHERE home=(SELECT id FROM strings WHERE domain=? AND s=?)),0)",
@@ -186,7 +203,7 @@ pub(crate) fn read_log(
     kinds: &KindRegistry,
     home: &str,
     name: &str,
-    filters: &[TableFilter],
+    filter: Option<&Checked<Condition>>,
     limit: usize,
 ) -> Result<TableRead, StoreError> {
     if !(1..=10_001).contains(&limit) {
@@ -196,42 +213,21 @@ pub(crate) fn read_log(
     let set = kinds.iter().find(|set| set.tables[0].name == root).ok_or_else(|| StoreError::Stream("unknown log kind".into()))?;
     let stored = set.log_projection();
     let descriptor = stored.readable();
-    let mut clauses = vec!["1".to_owned()];
-    // Bound in placeholder order: the inner query's `kind` and `home`, then the filters, then the limit.
-    let mut values = vec![SqlValue::Text(set.code.to_string()), SqlValue::Text(home.into())];
-    for filter in filters {
-        let TableFilter::Compare { field, operator, value } = filter else {
-            clauses.push("0".into());
-            continue;
-        };
-        let column = descriptor
-            .key
-            .iter()
-            .chain(&descriptor.columns)
-            .find(|column| column.name == *field)
-            .ok_or_else(|| StoreError::Stream("unknown log filter field".into()))?;
-        if !["==", "!=", "<", "<=", ">", ">="].contains(&operator.as_str()) {
-            return Err(StoreError::Stream("unsupported log filter".into()));
-        }
-        validate_filter_value(column, value)?;
-        let field = if *field == "sequence" { "home_seq" } else { field };
-        let operator = if matches!(value, Value::Null) {
-            match operator.as_str() {
-                "==" => "IS",
-                "!=" => "IS NOT",
-                _ => return Err(StoreError::Stream("unsupported null comparison".into())),
-            }
-        } else {
-            operator.as_str()
-        };
-        clauses.push(format!("{} {} ?", quote_ident(field), operator));
-        values.push(match value {
-            Value::Null => SqlValue::Null,
-            Value::Text(value) | Value::Str(value) => SqlValue::Text(value.clone()),
-            Value::Int(value) => SqlValue::Integer(*value),
-            _ => return Err(StoreError::Stream("log filter type mismatch".into())),
-        });
-    }
+    // The outer query reads the projection's readable names, so every column compares as the
+    // rows carry it.
+    let columns = descriptor
+        .key
+        .iter()
+        .chain(&descriptor.columns)
+        .map(|column| {
+            let source = if column.name == "sequence" { "home_seq" } else { &column.name };
+            (column.name.clone(), Column::Value { expr: quote_ident(source), codes: None })
+        })
+        .collect();
+    let (clause, mut values) = translate(filter, &Columns { fields: descriptor.filterable(), columns })?;
+    // The filter's parameters are `?1`…`?n`; the inner query's `kind` and `home`, and the limit, follow.
+    let (kind_param, home_param, limit_param) = (values.len() + 1, values.len() + 2, values.len() + 3);
+    values.extend([SqlValue::Text(set.code.to_string()), SqlValue::Text(home.into()), SqlValue::Integer(limit as i64)]);
     let tx = conn.unchecked_transaction()?;
     let sequence = tx.query_row(
         "SELECT coalesce((SELECT last FROM home_sequence WHERE home=(SELECT id FROM strings WHERE domain=? AND s=?)),0)",
@@ -249,11 +245,9 @@ pub(crate) fn read_log(
             })
             .collect();
         let sql = format!(
-            "SELECT * FROM (SELECT {} FROM log_view WHERE kind=? AND home=?) WHERE {} ORDER BY home_seq LIMIT ?",
+            "SELECT * FROM (SELECT {} FROM log_view WHERE kind=?{kind_param} AND home=?{home_param}) WHERE {clause} ORDER BY home_seq LIMIT ?{limit_param}",
             projected.join(","),
-            clauses.join(" AND ")
         );
-        values.push(SqlValue::Integer(limit as i64));
         let mut statement = tx.prepare(&sql)?;
         let mapped = statement.query_map(params_from_iter(values), |row| {
             descriptor

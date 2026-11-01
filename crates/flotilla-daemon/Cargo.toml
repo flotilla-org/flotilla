@@ -21,6 +21,7 @@ flotilla-engine-store = { path = "../flotilla-engine-store" }
 flotilla-inbox = { path = "../flotilla-inbox" }
 flotilla-state-machines = { path = "../flotilla-state-machines" }
 flotilla-schema = { path = "../flotilla-schema" }
+rigging-condition = { workspace = true }
 flotilla-address = { path = "../flotilla-address" }
 flotilla-messaging = { path = "../flotilla-messaging" }
 flotilla-agent-connector = { path = "../flotilla-agent-connector" }

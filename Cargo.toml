@@ -99,6 +99,9 @@ rigging-process = { git = "https://github.com/flotilla-org/rigging", rev = "8c5f
 rigging-http-client = { git = "https://github.com/flotilla-org/rigging", rev = "8c5fef84c6ce9c01ea56fb680a83986c1f14941d" }
 rigging-replay-testkit = { git = "https://github.com/flotilla-org/rigging", rev = "8c5fef84c6ce9c01ea56fb680a83986c1f14941d" }
 rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", rev = "8c5fef84c6ce9c01ea56fb680a83986c1f14941d" }
+# The condition language (#4108). Pinned ahead of the other rigging crates, which drydock's pin holds back; it
+# depends on no other rigging crate.
+rigging-condition = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde_yml = "0.0.12"
 tokio-util = "0.7"

@@ -1,7 +1,7 @@
 //! SQLite table source. All store operations run on blocking workers.
 use super::{Query, Row, Table};
 use flotilla_schema::{ColumnType, Value as Cell};
-use flotilla_schema_sqlite::{stream::Service, TableFilter};
+use flotilla_schema_sqlite::stream::Service;
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, sync::Arc};
 pub(super) async fn blocking<T: Send + 'static>(
@@ -35,44 +35,17 @@ pub(super) fn home(namespace: &str, local: &str) -> String {
     }
 }
 
-pub(super) async fn read(service: &Arc<Service>, name: &str, table: &Table, query: &Query) -> Result<(u64, Table, Vec<Row>), String> {
-    let (service, name, table, query) = (Arc::clone(service), name.to_owned(), table.clone(), query.clone());
-    tokio::task::spawn_blocking(move || read_sync(&service, &name, &table, &query)).await.map_err(|error| error.to_string())?
+pub(super) async fn read(service: &Arc<Service>, name: &str, query: &Query) -> Result<(u64, Table, Vec<Row>), String> {
+    let (service, name, query) = (Arc::clone(service), name.to_owned(), query.clone());
+    tokio::task::spawn_blocking(move || read_sync(&service, &name, &query)).await.map_err(|error| error.to_string())?
 }
 
-fn read_sync(service: &Service, name: &str, table: &Table, query: &Query) -> Result<(u64, Table, Vec<Row>), String> {
+fn read_sync(service: &Service, name: &str, query: &Query) -> Result<(u64, Table, Vec<Row>), String> {
     service
         .with_store(|store| {
             let home = home(&query.namespace, store.home());
-            // Validate and coerce literals using the same descriptor that is served.
-            let mut filters = vec![];
-            for condition in &query.filter {
-                let (field, literal) = (&condition.field, &condition.literal);
-                let column = table
-                    .key
-                    .iter()
-                    .chain(&table.columns)
-                    .find(|column| &column.name == field)
-                    .ok_or_else(|| flotilla_schema_sqlite::StoreError::Stream("unknown column".into()))?;
-                let value = match column.ty {
-                    ColumnType::Integer => {
-                        Cell::Int(literal.parse().map_err(|_| flotilla_schema_sqlite::StoreError::Stream("type mismatch".into()))?)
-                    }
-                    ColumnType::Timestamp => Cell::Int(
-                        chrono::DateTime::parse_from_rfc3339(literal)
-                            .map_err(|_| flotilla_schema_sqlite::StoreError::Stream("type mismatch".into()))?
-                            .timestamp_micros(),
-                    ),
-                    ColumnType::Bool => Cell::Int(match literal.as_str() {
-                        "true" => 1,
-                        "false" => 0,
-                        _ => return Err(flotilla_schema_sqlite::StoreError::Stream("type mismatch".into())),
-                    }),
-                    _ => Cell::Text(literal.clone()),
-                };
-                filters.push(TableFilter::Compare { field: field.clone(), operator: condition.operator.as_str().into(), value });
-            }
-            let result = store.table_read(&home, name, &filters, query.limit + 1)?;
+            // The filter checked against the served description, which is the store's own readable one.
+            let result = store.table_read(&home, name, query.filter.as_ref(), query.limit + 1)?;
             let columns: BTreeMap<_, _> =
                 result.descriptor.key.iter().chain(&result.descriptor.columns).map(|column| (column.name.as_str(), &column.ty)).collect();
             let rows = result

@@ -85,6 +85,10 @@ async fn error_body(response: axum::response::Response) -> serde_json::Value {
         serde_json::from_slice(&bytes).unwrap()
     }
 }
+/// A `where` condition as a query value, every byte but a letter or digit percent-encoded.
+fn condition(text: &str) -> String {
+    text.bytes().map(|byte| if byte.is_ascii_alphanumeric() { char::from(byte).to_string() } else { format!("%{byte:02X}") }).collect()
+}
 async fn messages(router: &Router, path: &str, cbor: bool) -> Vec<Message> {
     let response = call(router, path, cbor).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -107,7 +111,11 @@ async fn table_carriers_share_paging_filter_count_and_resync_contract() {
     let description = call(&router, "/tables/convoys", false).await;
     let description: serde_json::Value = serde_json::from_slice(&to_bytes(description.into_body(), 1024 * 1024).await.unwrap()).unwrap();
     assert_eq!(description["primaryKey"], json!(["metadata.name"]));
-    let path="/tables/convoys/rows?namespace=test&where=.metadata.labels.group%20%3D%3D%20yes&limit=1&sort=-metadata.name&columns=spec&count=exact";
+    let path = format!(
+        "/tables/convoys/rows?namespace=test&where={}&limit=1&sort=-metadata.name&columns=spec&count=exact",
+        condition(r#"metadata.labels["group"] == "yes""#)
+    );
+    let path = path.as_str();
     let json = messages(&router, path, false).await;
     let cbor = messages(&router, path, true).await;
     assert_eq!(json, cbor);
@@ -130,7 +138,7 @@ async fn table_carriers_share_paging_filter_count_and_resync_contract() {
         assert!(next.iter().any(|message| matches!(message,Message::Rows{rows,cursor:None,..} if rows[0]["metadata.name"]=="a")));
         let reset = messages(&router, &format!("{path}&cursor=broken"), cbor).await;
         assert!(matches!(reset[0], Message::Resync { .. }));
-        let contradiction = messages(&router, &format!("{path}&where=.metadata.labels.group%20%3D%3D%20no"), cbor).await;
+        let contradiction = messages(&router, &format!("{path}&where={}", condition(r#"metadata.labels["group"] == "no""#)), cbor).await;
         assert!(contradiction.iter().any(|message| matches!(message, Message::Count { count: 0, .. })));
         let offset = messages(&router, "/tables/convoys/rows?namespace=test&offset=2&count=estimate", cbor).await;
         assert!(offset.iter().any(|message| matches!(message,Message::Rows{rows,partial:true,..} if rows[0]["metadata.name"]=="z")));
@@ -140,11 +148,19 @@ async fn table_carriers_share_paging_filter_count_and_resync_contract() {
     // The indexed store read returned two matches, rather than listing three and filtering.
     assert!(reads.0.lock().unwrap().iter().any(|(operation, count)| *operation == ReadOperation::Query && *count == 2));
     reads.0.lock().unwrap().clear();
+    // #4108: the former spelling is refused before any read.
     let refused = call(&router, "/tables/convoys/rows?namespace=test&where=.metadata.name%20%21%3D%20a", false).await;
     assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
     let refused: serde_json::Value = serde_json::from_slice(&to_bytes(refused.into_body(), 1024 * 1024).await.unwrap()).unwrap();
-    assert_eq!(refused["code"], "unsupported_filter");
+    assert_eq!(refused["code"], "invalid_filter");
     assert!(reads.0.lock().unwrap().is_empty());
+    // What the store does not index is evaluated over the rows it returns, before paging.
+    let path = format!("/tables/convoys/rows?namespace=test&where={}&count=exact", condition(r#"metadata.name != "a""#));
+    let others = messages(&router, &path, false).await;
+    assert!(others.iter().any(|message| matches!(message, Message::Count { count: 2, .. })));
+    assert!(others
+        .iter()
+        .any(|message| matches!(message, Message::Rows { rows, .. } if rows.iter().all(|row| row["metadata.name"] != "a"))));
 }
 
 // Table reads inherit the exact user-caller gate of the resource routes.
@@ -252,25 +268,18 @@ async fn derived_table_router_uses_native_values_and_sql_predicates() {
         .unwrap();
     service
         .with_store(|store| {
-            let bounded = store.table_read("home", "table_sample.log", &[], 1)?;
+            let bounded = store.table_read("home", "table_sample.log", None, 1)?;
             assert_eq!(bounded.rows.len(), 1, "SQL must apply the log limit before materializing rows");
-            for (field, value) in [
-                ("sequence", flotilla_schema::Value::Text("abc".into())),
-                ("cause", flotilla_schema::Value::Int(3)),
-                ("at", flotilla_schema::Value::Text("not-a-time".into())),
-                ("sequence", flotilla_schema::Value::Null),
-            ] {
-                let filters = [flotilla_schema_sqlite::TableFilter::Compare { field: field.into(), operator: "==".into(), value }];
-                assert!(store.table_read("home", "table_sample.log", &filters, 1).is_err(), "{field}");
+            let fields = bounded.descriptor.filterable();
+            let check =
+                |text: &str| rigging_condition::Checked::new(rigging_condition::Condition::parse_strict(text).unwrap(), fields.schema());
+            for text in [r#"sequence == "abc""#, "cause == 3", r#"at == "not-a-time""#, r#"cause == "Nope""#] {
+                assert!(check(text).is_err(), "{text}");
             }
-            let null_edge = [flotilla_schema_sqlite::TableFilter::Compare {
-                field: "edge".into(),
-                operator: "==".into(),
-                value: flotilla_schema::Value::Null,
-            }];
-            assert_eq!(store.table_read("home", "table_sample.log", &null_edge, 1)?.rows.len(), 1);
-            assert!(store.table_read("home", "table_sample.log", &[], 0).is_err());
-            assert!(store.table_read("home", "table_sample.log", &[], 10_002).is_err());
+            let null_edge = check("!has(edge)").unwrap();
+            assert_eq!(store.table_read("home", "table_sample.log", Some(&null_edge), 1)?.rows.len(), 1);
+            assert!(store.table_read("home", "table_sample.log", None, 0).is_err());
+            assert!(store.table_read("home", "table_sample.log", None, 10_002).is_err());
             Ok(())
         })
         .unwrap();
@@ -281,24 +290,26 @@ async fn derived_table_router_uses_native_values_and_sql_predicates() {
         .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
         .build()
         .into_router();
-    let path = "/tables/table_sample/rows?where=.text%20%3D%3D%20match&count=exact";
-    let json = messages(&router, path, false).await;
-    assert_eq!(json, messages(&router, path, true).await);
+    let path = format!("/tables/table_sample/rows?where={}&count=exact", condition(r#"text == "match""#));
+    let json = messages(&router, &path, false).await;
+    assert_eq!(json, messages(&router, &path, true).await);
     assert!(json.iter().any(|message|matches!(message,Message::Rows{rows,..} if rows.len()==1&&rows[0]["text"]=="match"&&rows[0]["resource.name"]=="one"&&rows[0]["number"]==1&&rows[0]["bytes"]=="AP8B"&&rows[0]["reference.home"]=="remote"&&rows[0]["reference"]=="one")));
     let projected = messages(&router, "/tables/table_sample/rows?columns=reference", true).await;
     assert!(projected
         .iter()
         .any(|message| matches!(message,Message::Rows{rows,..}if rows[0]["reference.home"]=="remote"&&rows[0]["reference"]=="one")));
-    let target = messages(&router, "/tables/table_sample/rows?namespace=remote&where=.resource.name%20%3D%3D%20one", false).await;
+    let target =
+        messages(&router, &format!("/tables/table_sample/rows?namespace=remote&where={}", condition(r#"resource.name == "one""#)), false)
+            .await;
     assert!(target.iter().any(|message|matches!(message,Message::Rows{rows,..}if rows.len()==1&&rows[0]["text"]=="remote target"&&rows[0]["resource.home"]=="remote")));
     let ranged = messages(
         &router,
-        "/tables/table_sample/rows?where=.number%20%3E%3D%201&where=.number%20%3C%3D%202&where=.number%20%21%3D%201",
+        &format!("/tables/table_sample/rows?where={}&where={}", condition("number >= 1 && number <= 2"), condition("number != 1")),
         false,
     )
     .await;
     assert!(ranged.iter().any(|message| matches!(message,Message::Rows{rows,..}if rows.len()==1&&rows[0]["number"]==2)));
-    let log_range = messages(&router, "/tables/table_sample.log/rows?where=.sequence%20%3E%200", true).await;
+    let log_range = messages(&router, &format!("/tables/table_sample.log/rows?where={}", condition("sequence > 0")), true).await;
     assert!(log_range.iter().any(|message| matches!(message,Message::Rows{rows,..}if !rows.is_empty())));
     let schema = call(&router, "/tables/table_sample", false).await;
     let schema: serde_json::Value = serde_json::from_slice(&to_bytes(schema.into_body(), 1024 * 1024).await.unwrap()).unwrap();
@@ -313,24 +324,42 @@ async fn derived_table_router_uses_native_values_and_sql_predicates() {
         assert!(log.iter().any(|message| matches!(message,Message::Rows{rows,..} if rows[0]["cause"]=="Create")));
     }
     for cbor in [false, true] {
+        let labels = condition(r#"metadata.labels["group"] == "match""#);
         for (path, code) in [
-            ("/tables/table_sample/rows?where=.metadata.labels.group%20%3D%3D%20match", "unsupported_filter"),
-            ("/tables/table_sample_tags/rows?where=.metadata.labels.group%20%3D%3D%20match", "unsupported_filter"),
-            ("/tables/table_sample/rows?sort=bytes", "unsupported_sort"),
-            ("/tables/table_sample.log/rows?watch", "unsupported_watch"),
-            ("/tables/table_sample.log/rows?count=exact", "unsupported_log_paging"),
-            ("/tables/table_sample.log/rows?cursor=anything", "unsupported_log_paging"),
-            ("/tables/table_sample.log/rows?offset=1", "unsupported_log_paging"),
-            ("/tables/table_sample.log/rows?sort=-sequence", "unsupported_log_paging"),
-        ] {
+            (format!("/tables/table_sample/rows?where={labels}"), "unknown_column"),
+            (format!("/tables/table_sample_tags/rows?where={labels}"), "unknown_column"),
+            (format!("/tables/table_sample/rows?where={}", condition(r#"bytes == "AP8B""#)), "unsupported_filter"),
+            (format!("/tables/table_sample/rows?where={}", condition(r#"text.under("project:flotilla")"#)), "type_mismatch"),
+        ]
+        .into_iter()
+        .chain(
+            [
+                ("/tables/table_sample/rows?sort=bytes", "unsupported_sort"),
+                ("/tables/table_sample.log/rows?watch", "unsupported_watch"),
+                ("/tables/table_sample.log/rows?count=exact", "unsupported_log_paging"),
+                ("/tables/table_sample.log/rows?cursor=anything", "unsupported_log_paging"),
+                ("/tables/table_sample.log/rows?offset=1", "unsupported_log_paging"),
+                ("/tables/table_sample.log/rows?sort=-sequence", "unsupported_log_paging"),
+            ]
+            .map(|(path, code)| (path.to_owned(), code)),
+        ) {
+            let path = path.as_str();
             let response = call(&router, path, cbor).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
             let body = error_body(response).await;
             assert_eq!(body["code"], code, "{path}");
         }
     }
-    let empty =
-        messages(&router, "/tables/table_sample/rows?where=.text%20%3D%3D%20match&where=.text%20%3D%3D%20other&count=exact", false).await;
+    let empty = messages(
+        &router,
+        &format!(
+            "/tables/table_sample/rows?where={}&where={}&count=exact",
+            condition(r#"text == "match""#),
+            condition(r#"text == "other""#)
+        ),
+        false,
+    )
+    .await;
     assert!(empty.iter().any(|message| matches!(message, Message::Count { count: 0, .. })));
     let markdown = call(&router, "/tables/table_sample?format=markdown", false).await;
     assert_eq!(markdown.status(), StatusCode::OK);
@@ -487,12 +516,12 @@ async fn served_tables_type_addresses_and_carry_enum_names() {
     let rows = |messages: Vec<Message>| -> Vec<flotilla_protocol::table::Row> {
         messages.into_iter().flat_map(|message| if let Message::Rows { rows, .. } = message { rows } else { vec![] }).collect()
     };
-    let ended = rows(messages(&router, "/tables/agent_session/rows?where=.state%20%3D%3D%20Ended", false).await);
+    let ended = rows(messages(&router, &format!("/tables/agent_session/rows?where={}", condition(r#"state == "Ended""#)), false).await);
     assert_eq!(
         ended.iter().map(|row| (row["resource.name"].clone(), row["state"].clone(), row["reason"].clone())).collect::<Vec<_>>(),
         [(json!("ended"), json!("Ended"), json!("Completed"))]
     );
-    let response = call(&router, "/tables/agent_session/rows?where=.state%20%3D%3D%20en", false).await;
+    let response = call(&router, &format!("/tables/agent_session/rows?where={}", condition(r#"state == "en""#)), false).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(error_body(response).await["code"], "type_mismatch", "a stored code is no wire value");
     let log = rows(messages(&router, "/tables/agent_session.log/rows", false).await);
@@ -522,16 +551,19 @@ async fn quiet_table_watch_sends_progress() {
 async fn table_request_errors_and_content_negotiation_are_explicit() {
     let router = router(ResourceBackend::new(InMemoryBackend::default()));
     for (query, code) in [
-        ("where=.unknown%20%3D%3D%20x", "unknown_column"),
-        ("where=.spec%20%3D%3D%20x", "type_mismatch"),
-        ("where=.status.phase%20%21%3D%20x", "unsupported_filter"),
-        ("limit=0", "invalid_paging"),
-        ("columns=absent", "unknown_column"),
+        (format!("where={}", condition(r#"unknown == "x""#)), "unknown_column"),
+        (format!("where={}", condition(r#"spec == "x""#)), "unsupported_filter"),
+        (format!("where={}", condition(r#"metadata.creationTimestamp == "x""#)), "type_mismatch"),
+        (format!("where={}", condition(r#"status.phase < 3"#)), "type_mismatch"),
+        (format!("where={}", condition("status.phase == Running")), "invalid_filter"),
+        ("where=.status.phase%20%3D%3D%20x".into(), "invalid_filter"),
+        ("limit=0".into(), "invalid_paging"),
+        ("columns=absent".into(), "unknown_column"),
     ] {
         let response = call(&router, &format!("/tables/convoys/rows?{query}"), false).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = error_body(response).await;
-        assert_eq!(body["code"], code);
+        assert_eq!(body["code"], code, "{query}");
     }
     let response = call(&router, "/tables/convoys?format=markdown", false).await;
     let markdown = String::from_utf8(to_bytes(response.into_body(), 1024 * 1024).await.unwrap().to_vec()).unwrap();
@@ -569,8 +601,12 @@ async fn table_watch_interleaving_preserves_filter_membership() {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         seed(&backend, "before", "yes").await;
         let router = router(backend.clone());
-        let response =
-            call(&router, "/tables/convoys/rows?namespace=test&watch&count=exact&where=.metadata.labels.group%20%3D%3D%20yes", cbor).await;
+        let response = call(
+            &router,
+            &format!("/tables/convoys/rows?namespace=test&watch&count=exact&where={}", condition(r#"metadata.labels["group"] == "yes""#)),
+            cbor,
+        )
+        .await;
         let mut stream = response.into_body().into_data_stream();
         for _ in 0..4 {
             stream.next().await.unwrap().unwrap();
@@ -778,4 +814,115 @@ fn tables_doc_lists_the_routes_of_the_code() {
         .collect();
     assert_eq!(routes.len(), source.matches("\"/tables").count());
     assert_eq!(sorted(routes), sorted(documented("routes")));
+}
+
+// #4108: `where` speaks the condition language. A message's `inbox` is an address column whose
+// `whereOperators` admit `under`; `under` a convoy keeps the messages of the convoy's roles,
+// not a sibling convoy whose name extends it (`fix-37740`) nor the same convoy in another project.
+// A page's cursor binds the canonical text, so any spelling of the same condition continues it,
+// while a cursor of the former `where` (version 1, which embedded comparisons) answers `resync`.
+#[tokio::test]
+async fn messages_filter_under_a_convoy_address() {
+    use flotilla_engine_store::MessageLog;
+    use flotilla_schema::{Address, Timestamp};
+    use flotilla_state_machines::{
+        machines::message::{MemoryMessageWorld, Message as Mail, MessageBody, MessageSpec, Relation},
+        Home,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let registry = crate::runtime::decided_registry().unwrap();
+    let service = Arc::new(flotilla_schema_sqlite::stream::Service::open(&directory.path().join("messages.db"), "home", registry).unwrap());
+    let mut mail = Home::<Mail, MessageLog>::with_log("home", MessageLog::new(service.store())).unwrap();
+    let world = MemoryMessageWorld::default();
+    let inboxes = [
+        "project:flotilla/convoy:fix-3774/role:coder",
+        "project:flotilla/convoy:fix-3774/role:reviewer",
+        "project:flotilla/convoy:fix-37740/role:coder",
+        "project:flotilla2/convoy:fix-3774/role:coder",
+    ];
+    for (index, inbox) in inboxes.iter().enumerate() {
+        let inbox: Address = inbox.parse().unwrap();
+        let sender = "project:flotilla/role:governor".parse().unwrap();
+        let spec = MessageSpec::new(sender, inbox.clone(), Relation::System, MessageBody::text("hello").unwrap());
+        let name = Address::message(&inbox, &format!("m{index}")).unwrap();
+        mail.create(name.as_str(), spec, &world, Timestamp(1)).unwrap();
+    }
+    let router = HttpRouter::builder()
+        .backend(ResourceBackend::new(InMemoryBackend::default()))
+        .table_store(service)
+        .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
+        .build()
+        .into_router();
+    let schema = json(&router, "/tables/message").await;
+    let field = |name: &str| schema["fields"].as_array().unwrap().iter().find(|field| field["name"] == name).unwrap().clone();
+    assert_eq!(field("inbox")["type"], "address");
+    assert_eq!(field("inbox")["whereOperators"], json!(["==", "!=", "in", "under", "has"]));
+    assert_eq!(field("admitted_seq")["whereOperators"], json!(["==", "!=", "<", "<=", ">", ">=", "in", "has"]));
+    assert_eq!(field("state")["whereOperators"], json!(["==", "!=", "in", "has"]));
+    assert_eq!(field("body")["whereOperators"], json!([]));
+
+    let inbox_of = |messages: &[Message]| -> Vec<String> {
+        let mut inboxes: Vec<String> = messages
+            .iter()
+            .flat_map(|message| if let Message::Rows { rows, .. } = message { rows.clone() } else { vec![] })
+            .map(|row| row["inbox"].as_str().unwrap().to_owned())
+            .collect();
+        inboxes.sort();
+        inboxes
+    };
+    let under = condition(r#"inbox.under("project:flotilla/convoy:fix-3774")"#);
+    let selected = messages(&router, &format!("/tables/message/rows?where={under}&count=exact"), false).await;
+    assert_eq!(inbox_of(&selected), ["project:flotilla/convoy:fix-3774/role:coder", "project:flotilla/convoy:fix-3774/role:reviewer"]);
+    assert!(selected.iter().any(|message| matches!(message, Message::Count { count: 2, .. })));
+    let outside = condition(r#"!inbox.under("project:flotilla/convoy:fix-3774") && state == "Pending""#);
+    let outside = messages(&router, &format!("/tables/message/rows?where={outside}"), true).await;
+    assert_eq!(inbox_of(&outside), ["project:flotilla/convoy:fix-37740/role:coder", "project:flotilla2/convoy:fix-3774/role:coder"]);
+
+    let first = messages(&router, &format!("/tables/message/rows?where={under}&limit=1"), false).await;
+    let cursor = first.iter().find_map(|message| if let Message::Rows { cursor, .. } = message { cursor.clone() } else { None }).unwrap();
+    let respelled = condition(r#"inbox.under( 'project:flotilla/convoy:fix-3774' )"#);
+    let next = messages(&router, &format!("/tables/message/rows?where={respelled}&limit=1&cursor={cursor}"), false).await;
+    assert!(!matches!(next[0], Message::Resync { .. }), "the canonical text binds the cursor");
+    assert_eq!(inbox_of(&[first, next].concat()).len(), 2);
+
+    let former = json!({
+        "version": 1,
+        "table": "message",
+        "namespace": "default",
+        "sort": [["resource.home", false], ["resource.name", false]],
+        "filter": [{"field": "inbox", "operator": "==", "literal": "project:flotilla/convoy:fix-3774"}],
+        "values": ["home", "m0"],
+    });
+    let former = {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(flotilla_cbor::to_vec(&former, &Default::default()).unwrap())
+    };
+    let resumed = messages(&router, &format!("/tables/message/rows?where={under}&cursor={former}"), false).await;
+    assert!(matches!(resumed[0], Message::Resync { .. }), "{resumed:?}");
+    assert_eq!(inbox_of(&resumed).len(), 2, "a fresh first page follows the resync");
+}
+
+#[test]
+fn tables_doc_lists_the_where_operators_of_the_code() {
+    use rigging_condition::Type;
+    let mut covered = BTreeSet::new();
+    for line in documented("where-operators") {
+        let (names, operators) = line.split_once(": ").expect("`types: operators`");
+        for name in names.split(", ") {
+            let ty = match name {
+                "integer" => Type::Int,
+                "number" => Type::Number,
+                "string" => Type::String,
+                "datetime" => Type::Timestamp,
+                "boolean" => Type::Bool,
+                "enum" => Type::enumeration(["Pending"]),
+                "address" => Type::Address,
+                "map" => Type::Map(Box::new(Type::String)),
+                other => panic!("docs/tables.md lists an unknown type {other}"),
+            };
+            assert_eq!(flotilla_schema::where_operators(Some(&ty)).join(" "), operators, "{name}");
+            covered.insert(name);
+        }
+    }
+    assert_eq!(covered.len(), 8, "every filterable type is listed");
 }

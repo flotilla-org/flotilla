@@ -1,12 +1,12 @@
 //! Carrier-neutral table reads. Sources lower conditions; paging and live reconciliation
 //! have one implementation shared by every carrier and both storage adapters.
 mod decided;
+mod filter;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use flotilla_address::{Operator, Template};
 use flotilla_protocol::table::{Message, Row};
 use flotilla_resources::WatchStart;
-use flotilla_schema::{ColumnType, Layout, Table, TableSet};
-use flotilla_store::{query_resource_kind, watch_resource_kind_from, ResourceBackend, StoreQuery, REGISTERED_RESOURCE_KINDS};
+use flotilla_schema::{ColumnType, Filterable, Layout, Table, TableSet};
+use flotilla_store::{query_resource_kind, watch_resource_kind_from, ResourceBackend, REGISTERED_RESOURCE_KINDS};
 use futures::{stream::BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -42,23 +42,6 @@ impl std::fmt::Display for Failure {
 fn bad(code: &str, message: impl ToString) -> Failure {
     Failure::new(code, message)
 }
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub(crate) struct Condition {
-    pub field: String,
-    #[serde(with = "comparison")]
-    pub operator: Operator,
-    pub literal: String,
-}
-mod comparison {
-    use super::Operator;
-    use serde::{Deserialize, Deserializer, Serializer};
-    pub(super) fn serialize<S: Serializer>(operator: &Operator, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(operator.as_str())
-    }
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Operator, D::Error> {
-        String::deserialize(deserializer)?.parse().map_err(serde::de::Error::custom)
-    }
-}
 /// Bound batches by approximate JSON size; a single large resource stays one message.
 pub(crate) fn batches(rows: Vec<Row>, sequence: u64, partial: bool, cursor: Option<String>) -> Result<Vec<Message>, String> {
     let mut messages = vec![];
@@ -86,7 +69,7 @@ pub(crate) fn descriptor(kind: &str) -> Table {
             "lastTransitionTime":{"type":"string","format":"date-time"}
         }
     });
-    let label_values = json!({"type":"string","whereOperators":["=="],"sortable":false});
+    let label_values = json!({"type":"string","sortable":false});
     let mut layout = Layout::description(kind);
     layout.key(|layout| layout.column(KEY, ColumnType::Text, true));
     for (name, ty, required) in [
@@ -113,19 +96,16 @@ pub(crate) fn descriptor(kind: &str) -> Table {
         }
     }
     let mut table = layout.finish().tables.remove(0);
-    let declared = flotilla_store::declared_resource_kinds().into_iter().find(|entry| entry.paths.plural == kind);
     for field in
         [KEY, "metadata.namespace", "metadata.resourceVersion", "metadata.creationTimestamp", "metadata.deletionTimestamp", "status.phase"]
     {
-        let operators: Vec<&str> = if declared.is_some_and(|entry| entry.queryable_fields.contains(&field)) { vec!["=="] } else { vec![] };
         let column = table.key.iter_mut().chain(&mut table.columns).find(|column| column.name == field).expect("declared column");
         column.properties.insert("sortable".into(), json!(field != "metadata.resourceVersion"));
-        column.properties.insert("whereOperators".into(), json!(operators));
     }
     for column in table.key.iter_mut().chain(&mut table.columns) {
         column.properties.entry("sortable".into()).or_insert(json!(false));
-        column.properties.entry("whereOperators".into()).or_insert(json!([]));
     }
+    filter::describe_operators(&mut table);
     for (field, title) in [
         (KEY, "Name"),
         ("metadata.namespace", "Namespace"),
@@ -151,7 +131,10 @@ pub(crate) fn descriptor(kind: &str) -> Table {
 #[derive(Clone)]
 pub(crate) struct Query {
     pub(crate) namespace: String,
-    pub(crate) filter: Vec<Condition>,
+    /// Every `where`, conjoined and checked against the description.
+    pub(crate) filter: Option<rigging_condition::Checked<rigging_condition::Condition>>,
+    /// The fields the filter reads, for sources that evaluate it over their rows.
+    fields: Filterable,
     pub(crate) sort: Vec<(String, bool)>,
     pub(crate) columns: Vec<String>,
     pub(crate) limit: usize,
@@ -162,60 +145,24 @@ pub(crate) struct Query {
     pub(crate) keys: Vec<String>,
     sort_types: Vec<(ColumnType, bool)>,
 }
+/// Version 2 binds the filter's canonical text (#4108); a version 1 cursor, which embedded the
+/// former comparisons, does not decode and answers `resync`.
 #[derive(Debug, Serialize, Deserialize)]
 struct Cursor {
     version: u8,
     table: String,
     namespace: String,
     sort: Vec<(String, bool)>,
-    filter: Value,
+    filter: Option<String>,
     values: Vec<Value>,
 }
+const CURSOR_VERSION: u8 = 2;
 impl Query {
     pub(crate) fn parse(params: &[(String, String)], table: &Table) -> Result<Self, Failure> {
         let get = |name: &str| params.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str());
         let fields: BTreeSet<_> = table.key.iter().chain(&table.columns).map(|column| column.name.as_str()).collect();
-        let mut filter = Vec::new();
-        for (_, expression) in params.iter().filter(|(name, _)| name == "where") {
-            let clause: Template = format!("$row {expression}").parse().map_err(|err| bad("invalid_filter", err))?;
-            let path = clause.path.segments().join(".");
-            let label = clause.path.segments().strip_prefix(&["metadata".into(), "labels".into()]);
-            let label = label.filter(|parts| parts.len() == 1).map(|parts| parts[0].clone());
-            if label.is_some() && !fields.contains("metadata.labels") {
-                return Err(bad("unsupported_filter", "table does not declare metadata.labels"));
-            }
-            if !fields.contains(path.as_str()) && label.is_none() {
-                return Err(bad("unknown_column", &path));
-            }
-            if let Some(column) = table.key.iter().chain(&table.columns).find(|column| column.name == path) {
-                let valid = match &column.ty {
-                    ColumnType::Integer => clause.literal.parse::<i64>().is_ok(),
-                    ColumnType::Bool => matches!(clause.literal.as_str(), "true" | "false"),
-                    ColumnType::Timestamp => chrono::DateTime::parse_from_rfc3339(&clause.literal).is_ok(),
-                    ColumnType::Code(codes) => codes.iter().any(|code| code.as_str() == clause.literal),
-                    ColumnType::Cbor | ColumnType::Frozen | ColumnType::Blob => false,
-                    _ => true,
-                };
-                if !valid {
-                    return Err(bad("type_mismatch", format!("incompatible literal for {path}")));
-                }
-            }
-            let operators = if label.is_some() {
-                Some(json!(["=="]))
-            } else {
-                table
-                    .key
-                    .iter()
-                    .chain(&table.columns)
-                    .find(|column| column.name == path)
-                    .and_then(|column| column.properties.get("whereOperators"))
-                    .cloned()
-            };
-            if !operators.as_ref().and_then(Value::as_array).is_some_and(|ops| ops.contains(&json!(clause.operator.as_str()))) {
-                return Err(bad("unsupported_filter", &path));
-            }
-            filter.push(Condition { field: path, operator: clause.operator, literal: clause.literal });
-        }
+        let filterable = filter::fields(table);
+        let filter = filter::parse(params, table, &filterable)?;
 
         let mut sort = Vec::new();
         let default_sort = table.key.iter().map(|column| column.name.as_str()).collect::<Vec<_>>().join(",");
@@ -291,6 +238,7 @@ impl Query {
             keys: table.key.iter().map(|column| column.name.clone()).collect(),
             namespace: get("namespace").unwrap_or("default").into(),
             filter,
+            fields: filterable,
             sort,
             columns,
             limit,
@@ -299,6 +247,13 @@ impl Query {
             count,
             watch: get("watch").is_some_and(|value| value.is_empty() || value == "true"),
         })
+    }
+    fn filter_text(&self) -> Option<String> {
+        self.filter.as_ref().map(ToString::to_string)
+    }
+    /// Whether the filter keeps `row`, for sources that evaluate it in memory.
+    fn keeps(&self, row: &Row) -> bool {
+        self.filter.as_ref().is_none_or(|filter| filter::keeps(filter, &self.fields, row))
     }
     pub(crate) fn values(&self, row: &Row) -> Vec<Value> {
         self.sort.iter().map(|(name, _)| row.get(name).cloned().unwrap_or(Value::Null)).collect()
@@ -328,11 +283,11 @@ impl Query {
     }
     pub(crate) fn cursor(&self, table: &str, row: &Row) -> Result<String, String> {
         let cursor = Cursor {
-            version: 1,
+            version: CURSOR_VERSION,
             table: table.into(),
             namespace: self.namespace.clone(),
             sort: self.sort.clone(),
-            filter: json!(self.filter),
+            filter: self.filter_text(),
             values: self.values(row),
         };
         flotilla_cbor::to_vec(&cursor, &Default::default()).map(|bytes| URL_SAFE_NO_PAD.encode(bytes)).map_err(|error| error.to_string())
@@ -341,11 +296,11 @@ impl Query {
         let Some(cursor) = &self.cursor else { return Ok(None) };
         let bytes = URL_SAFE_NO_PAD.decode(cursor).map_err(|_| "invalid cursor")?;
         let cursor: Cursor = flotilla_cbor::from_slice(&bytes, &Default::default()).map_err(|_| "invalid cursor")?;
-        if cursor.version != 1
+        if cursor.version != CURSOR_VERSION
             || cursor.table != table
             || cursor.namespace != self.namespace
             || cursor.sort != self.sort
-            || cursor.filter != json!(self.filter)
+            || cursor.filter != self.filter_text()
             || cursor.values.len() != self.sort.len()
         {
             return Err("cursor does not describe this query".into());
@@ -531,10 +486,8 @@ impl TableSource {
                 for column in table.key.iter_mut().chain(&mut table.columns) {
                     let scalar = !matches!(column.ty, ColumnType::Blob | ColumnType::Cbor | ColumnType::Frozen);
                     column.properties.insert("sortable".into(), json!(scalar));
-                    column
-                        .properties
-                        .insert("whereOperators".into(), json!(if scalar { vec!["==", "!=", "<", "<=", ">", ">="] } else { vec![] }));
                 }
+                filter::describe_operators(&mut table);
                 Ok(Description { schema: set.frictionless(&table), table, markdown })
             }
             Self::Derived { derived, name } => {
@@ -542,10 +495,8 @@ impl TableSource {
                 for column in table.key.iter_mut().chain(&mut table.columns) {
                     let scalar = !matches!(column.ty, ColumnType::Blob | ColumnType::Cbor | ColumnType::Frozen);
                     column.properties.insert("sortable".into(), json!(scalar));
-                    column
-                        .properties
-                        .insert("whereOperators".into(), json!(if scalar { vec!["==", "!=", "<", "<=", ">", ">="] } else { vec![] }));
                 }
+                filter::describe_operators(&mut table);
                 Ok(Description { schema: derived.set.frictionless(&table), markdown: flotilla_schema::render_view([&derived.set]), table })
             }
         }
@@ -582,7 +533,9 @@ impl TableSource {
     async fn snapshot(&self, table: &Table, query: &Query) -> Result<Snapshot, Failure> {
         match self {
             Self::Resource { backend, name } => {
-                let filter = resource_filter(&query.filter)?;
+                let declared = flotilla_store::declared_resource_kinds().into_iter().find(|entry| entry.paths.plural == *name);
+                let queryable = declared.map_or(&[][..], |entry| entry.queryable_fields);
+                let filter = filter::pushdown(query.filter.as_ref(), &query.fields, queryable);
                 let document = query_resource_kind(backend, &query.namespace, name, &filter).await.map_err(source_failure)?;
                 let sequence = snapshot_sequence(&document)?;
                 let generation = document.pointer("/metadata/generation").and_then(Value::as_str).map(str::to_owned);
@@ -591,26 +544,19 @@ impl TableSource {
                     |generation| WatchStart::FromVersionInGeneration { generation, resource_version: sequence.to_string() },
                 );
                 Ok(Snapshot {
-                    rows: resource_rows(&document, table)?,
+                    rows: resource_rows(&document, table)?.into_iter().filter(|row| query.keeps(row)).collect(),
                     sequence,
                     incarnation: generation.unwrap_or_else(|| "durable".into()),
                     start,
                 })
             }
             Self::Decided { service, name } => {
-                let (sequence, _, rows) = decided::read(service, name, table, query).await?;
+                let (sequence, _, rows) = decided::read(service, name, query).await?;
                 Ok(Snapshot { rows, sequence, incarnation: "durable".into(), start: WatchStart::Now })
             }
             Self::Derived { derived, name } => {
-                let rows = derived.rows[derived.table(name).expect("opened table")]
-                    .iter()
-                    .filter(|row| {
-                        query.filter.iter().all(|condition| {
-                            holds(row.get(&condition.field).unwrap_or(&Value::Null), condition.operator, &condition.literal)
-                        })
-                    })
-                    .cloned()
-                    .collect();
+                let rows =
+                    derived.rows[derived.table(name).expect("opened table")].iter().filter(|row| query.keeps(row)).cloned().collect();
                 // Derived rows change only with the daemon, so one snapshot serves its life. A catalog
                 // that reloads (verbs from `verbs/*.yaml`, #4198) needs events here.
                 Ok(Snapshot { rows, sequence: 1, incarnation: "derived".into(), start: WatchStart::Now })
@@ -767,24 +713,6 @@ struct Live {
     pending: VecDeque<Message>,
     failures: u8,
     done: bool,
-}
-fn resource_filter(conditions: &[Condition]) -> Result<StoreQuery, Failure> {
-    let mut query = StoreQuery::default();
-    for condition in conditions {
-        if condition.operator != Operator::Equal {
-            return Err(bad("unsupported_filter", &condition.field));
-        }
-        let target = if let Some(label) = condition.field.strip_prefix("metadata.labels.") {
-            (&mut query.labels, label)
-        } else {
-            (&mut query.fields, condition.field.as_str())
-        };
-        if target.0.get(target.1).is_some_and(|value| value != &condition.literal) {
-            query.field_values.insert(KEY.into(), vec![]);
-        }
-        target.0.insert(target.1.into(), condition.literal.clone());
-    }
-    Ok(query)
 }
 fn source_failure(error: flotilla_resources::ResourceError) -> Failure {
     use flotilla_resources::ResourceError;
@@ -1133,32 +1061,6 @@ mod properties {
         assert_eq!(seen, expected);
     }
 }
-/// Whether `cell` compares as `operator` with `literal`, as a `where` condition and a verb's
-/// `when` both compare: numerically when both are numbers, by text otherwise. A null cell, or one
-/// with no order for the operator, satisfies only `!=`.
-pub(crate) fn holds(cell: &Value, operator: Operator, literal: &str) -> bool {
-    let order = match cell {
-        Value::Null => return operator == Operator::NotEqual,
-        Value::Number(number) => match (number.as_f64(), literal.parse::<f64>()) {
-            (Some(number), Ok(literal)) => number.partial_cmp(&literal),
-            _ => Some(number.to_string().as_str().cmp(literal)),
-        },
-        // Booleans have no order.
-        Value::Bool(flag) => matches!(operator, Operator::Equal | Operator::NotEqual).then(|| flag.to_string().as_str().cmp(literal)),
-        Value::String(text) => Some(text.as_str().cmp(literal)),
-        Value::Array(_) | Value::Object(_) => None,
-    };
-    let Some(order) = order else { return operator == Operator::NotEqual };
-    match operator {
-        Operator::Equal => order == Ordering::Equal,
-        Operator::NotEqual => order != Ordering::Equal,
-        Operator::LessThan => order == Ordering::Less,
-        Operator::LessThanOrEqual => order != Ordering::Greater,
-        Operator::GreaterThan => order == Ordering::Greater,
-        Operator::GreaterThanOrEqual => order != Ordering::Less,
-    }
-}
-
 pub(crate) fn resource_rows(document: &Value, table: &Table) -> Result<Vec<Row>, String> {
     document["items"]
         .as_array()

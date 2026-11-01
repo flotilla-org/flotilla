@@ -135,6 +135,7 @@ absolute-paths-allowed-crates = [
     "regex_automata",
     "regex_syntax",
     "reqwest",
+    "rigging_condition",
     "rigging_http_client",
     "rigging_http_serve",
     "rigging_process",

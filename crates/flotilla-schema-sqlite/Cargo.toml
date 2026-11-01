@@ -9,6 +9,7 @@ description = "The rusqlite runtime for flotilla-schema: shared tables, generate
 serde = { workspace = true }
 flotilla-cbor = { path = "../flotilla-cbor" }
 flotilla-schema = { path = "../flotilla-schema" }
+rigging-condition = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
 thiserror = "2"
 

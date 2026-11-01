@@ -59,9 +59,11 @@ AGENT_CONNECTOR_FORBIDDEN = (
 TERMINAL_FORBIDDEN = ("flotilla-resources",)
 # #3320: the storage derive stack, lowest first. Each may depend in production only on
 # flotilla-address (#3392 G1: references outside the store are addresses), flotilla-cbor,
-# the schema crates below it and the build-feature anchors.
+# rigging-condition (#4108: a table's `where` vocabulary and its SQL translation; like
+# flotilla-cbor it has no project dependencies), the schema crates below it and the
+# build-feature anchors.
 SCHEMA_CRATES = ("flotilla-schema-derive", "flotilla-schema", "flotilla-schema-sqlite")
-SCHEMA_ALLOWED = ("flotilla-address", "flotilla-cbor")
+SCHEMA_ALLOWED = ("flotilla-address", "flotilla-cbor", "rigging-condition")
 # ADR 0064, #3320 ruling 3: the state-machine engine is backend-free. In production it
 # reaches only flotilla-schema (its code enums, records, timestamps and edge events) and
 # what flotilla-schema may reach, and no production crate depends on it until the stack
@@ -234,12 +236,12 @@ def violations(metadata):
         for target in sorted(reached_from(schema)):
             if target not in allowed and not target.startswith("flotilla-build-features"):
                 errors.append(f"{schema}: must not depend on {target}, directly or transitively; schema crates depend only "
-                              "on flotilla-address, flotilla-cbor, lower schema crates and flotilla-build-features anchors")
+                              "on flotilla-address, flotilla-cbor, rigging-condition, lower schema crates and flotilla-build-features anchors")
     if STATE_MACHINES in packages:
         for target in sorted(reached_from(STATE_MACHINES)):
             if target not in STATE_MACHINES_ALLOWED and not target.startswith("flotilla-build-features"):
                 errors.append(f"{STATE_MACHINES}: must not depend on {target}, directly or transitively; the engine depends only "
-                              "on flotilla-schema and what it may reach (flotilla-schema-derive, flotilla-address, flotilla-cbor and "
+                              "on flotilla-schema and what it may reach (flotilla-schema-derive, flotilla-address, flotilla-cbor, rigging-condition and "
                               "flotilla-build-features anchors)")
         for name in sorted(packages):
             if name != STATE_MACHINES and STATE_MACHINES in production[name] and name not in STATE_MACHINE_DEPENDENTS:
