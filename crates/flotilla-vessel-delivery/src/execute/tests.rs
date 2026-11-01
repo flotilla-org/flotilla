@@ -22,6 +22,8 @@ struct LocalVessel {
     store: tempfile::TempDir,
     /// Every link placed into the store, in order.
     links: Mutex<Vec<PathBuf>>,
+    /// Fail every store lookup, as an agent that cannot answer does.
+    lookup_fails: AtomicBool,
 }
 
 #[async_trait]
@@ -63,6 +65,9 @@ impl VesselAgent for LocalVessel {
         std::fs::copy(file, self.store.path().join(sha256)).map(drop).map_err(|error| error.to_string())
     }
     async fn has_artifact(&self, sha256: &str) -> Result<bool, String> {
+        if self.lookup_fails.load(Ordering::SeqCst) {
+            return Err("the agent cannot be reached".into());
+        }
         Ok(self.store.path().join(sha256).is_file())
     }
     async fn link_artifact(&self, path: &Path, sha256: &str, _: &Path) -> Result<(), String> {
@@ -84,6 +89,7 @@ impl LocalVessel {
             runtime: tempfile::tempdir().expect("runtime base"),
             store: tempfile::tempdir().expect("store"),
             links: Mutex::default(),
+            lookup_fails: AtomicBool::new(false),
         }
     }
 
@@ -244,7 +250,8 @@ async fn re_runs_deliver_only_what_changed_or_failed() {
 // the use. Once the store no longer holds it (collected after the vessel that linked it
 // retired, or cleared by hand), the tree is stored again by the mechanism it landed by,
 // before anything that needs it runs. A record line from before stored trees named their
-// entry is stored again once. A placed tree beside it is kept throughout.
+// entry is stored again once. A placed tree beside it is kept throughout. A lookup the
+// agent cannot answer fails the delivery at that tree, not permanently.
 #[tokio::test]
 async fn a_stored_tree_is_kept_only_while_the_store_holds_its_entry() {
     let vessel = LocalVessel::new();
@@ -282,6 +289,12 @@ async fn a_stored_tree_is_kept_only_while_the_store_holds_its_entry() {
     assert_eq!((skills.stored().len(), links(), notes.deliveries()), (3, 4, 1), "a record naming no entry is stored again once");
     run().await.expect("kept");
     assert_eq!((skills.stored().len(), links()), (3, 5));
+
+    // A lookup that fails keeps nothing it cannot see: the delivery fails at that tree, to be retried.
+    vessel.lookup_fails.store(true, Ordering::SeqCst);
+    let error = run().await.expect_err("the lookup failed");
+    assert_eq!(error, DeliveryError::Step { need: NeedName::new("skills"), error: "the agent cannot be reached".into(), permanent: false });
+    assert_eq!((skills.stored().len(), links()), (3, 5), "nothing was stored or linked");
 }
 
 // Behaviour (#4012): a runtime home lands under the writable base, apart from the

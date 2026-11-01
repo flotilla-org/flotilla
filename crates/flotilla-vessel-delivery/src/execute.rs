@@ -10,7 +10,10 @@
 //! the entry's digest. A home outlives the vessels it is delivered on, and the
 //! store collects an entry once no live vessel links it (#4088), so such a record
 //! is kept only while the store still holds that exact entry, and keeping it
-//! places the link again, so the use is recorded under this vessel's agent.
+//! places the link again, so the use is recorded under this vessel's agent. A
+//! collection that removes the entry between that lookup and the link fails the
+//! link; the failure is not permanent, and the retry finds the entry gone and
+//! delivers the tree again.
 
 use std::{
     collections::BTreeMap,
@@ -78,6 +81,11 @@ pub struct StoreEntry {
 impl StoreEntry {
     fn link_at(&self, target: &Path) -> PathBuf {
         self.link.as_ref().map_or_else(|| target.to_path_buf(), |link| link.under(target))
+    }
+
+    /// The link as its record field holds it: empty for the place itself.
+    fn link_field(&self) -> String {
+        self.link.as_ref().map(|link| link.as_path().display().to_string()).unwrap_or_default()
     }
 }
 
@@ -289,8 +297,7 @@ pub async fn deliver(
                     }
                     Delivery::Stored(tree) => {
                         let entry = tree.store(step.mechanism, &target, agent).await.map_err(refused)?;
-                        let link_text = entry.link.as_ref().map(|link| link.as_path().to_string_lossy().into_owned()).unwrap_or_default();
-                        if !recordable(entry.sha256.as_str()) || !recordable(&link_text) {
+                        if !recordable(entry.sha256.as_str()) || !recordable(&entry.link_field()) {
                             return Err(DeliveryError::Unrecordable(need.name.clone()));
                         }
                         link(&entry, &target, agent).await.map_err(failed)?;
@@ -337,10 +344,7 @@ fn encode_record(record: &BTreeMap<NeedName, Recorded>) -> String {
             let source = landed.guest_source.as_ref().map(|source| source.display().to_string()).unwrap_or_default();
             let line = format!("{need}\t{}\t{}\t{source}", landed.digest, landed.mechanism);
             match stored {
-                Some(entry) => {
-                    let link = entry.link.as_ref().map(|link| link.as_path().display().to_string()).unwrap_or_default();
-                    format!("{line}\t{}\t{link}\n", entry.sha256)
-                }
+                Some(entry) => format!("{line}\t{}\t{}\n", entry.sha256, entry.link_field()),
                 None => format!("{line}\n"),
             }
         })
