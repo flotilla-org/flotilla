@@ -1888,14 +1888,8 @@ impl CredentialStore {
                 let token_file = github_app_token_file(delivery_paths, name);
                 write_github_app_token_file(&*runner, &token_file, material).await?;
                 let token_file = token_file.to_string_lossy().into_owned();
-                let gh_path = runner
-                    .run("sh", &["-c", "command -v gh"], Path::new("/"), &ChannelLabel::Default)
-                    .await
-                    .map_err(|error| format!("locate gh binary: {error}"))?;
-                let gh_path = gh_path.trim();
-                if gh_path.is_empty() {
-                    return Err("locate gh binary: command returned an empty path".to_string());
-                }
+                let gh_path = locate_binary(&*runner, "gh").await?;
+                let gh_path = gh_path.as_str();
                 let path = runner
                     .run("sh", &["-c", "printf '%s' \"$PATH\""], Path::new("/"), &ChannelLabel::Default)
                     .await
@@ -2315,6 +2309,22 @@ async fn cleanup_stale_github_app_token_files_with_runner(runner: &dyn CommandRu
         .await
         .map(|_| ())
         .map_err(|error| format!("clean delivered GitHub App token staging files: {error}"))
+}
+
+/// `command -v` reports a missing binary only through its exit status, so the
+/// failure is named here rather than taken from its empty stderr.
+async fn locate_binary(runner: &dyn CommandRunner, binary: &str) -> Result<String, String> {
+    let output = runner
+        .run_output("sh", &["-c", &format!("command -v {binary}")], Path::new("/"), &ChannelLabel::Default)
+        .await
+        .map_err(|error| format!("locate {binary} binary: {error}"))?;
+    let path = output.stdout.trim();
+    if !output.success() || path.is_empty() {
+        let stderr = output.stderr.trim();
+        let detail = if stderr.is_empty() { String::new() } else { format!(": {stderr}") };
+        return Err(format!("locate {binary} binary: `{binary}` is not on the environment's PATH{detail}"));
+    }
+    Ok(path.to_string())
 }
 
 async fn write_github_app_token_file(runner: &dyn CommandRunner, path: &Path, token: &str) -> Result<(), String> {
@@ -3346,6 +3356,30 @@ mod tests {
             self.protected_writes.lock().expect("protected writes lock").push((path.to_path_buf(), mode));
             self.write_file(path, content).await
         }
+    }
+
+    struct MissingBinaryRunner;
+
+    #[async_trait]
+    impl CommandRunner for MissingBinaryRunner {
+        async fn run(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            Err(String::new())
+        }
+
+        async fn run_output(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+            Ok(CommandOutput { stdout: String::new(), stderr: String::new(), exit_code: Some(1) })
+        }
+
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            false
+        }
+    }
+
+    // `command -v` exits 1 with no output for a missing binary; the error names the binary.
+    #[tokio::test]
+    async fn missing_binary_error_names_the_binary() {
+        let error = locate_binary(&MissingBinaryRunner, "gh").await.expect_err("gh is missing");
+        assert_eq!(error, "locate gh binary: `gh` is not on the environment's PATH");
     }
 
     struct FailedTokenWriteRunner;
