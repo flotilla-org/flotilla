@@ -10,6 +10,15 @@ fn refused_shapes_fail_to_compile() {
     cases.compile_fail("tests/ui/*.rs");
 }
 
+// Behaviour (#4234): a verb declaration names its subject kinds as ADR 0066 kinds, checked when it
+// compiles: an unknown kind, an `Address` parameter without `#[param(subject = ...)]`, or that
+// attribute on another type does not build.
+#[test]
+fn refused_verbs_fail_to_compile() {
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/ui_verb/*.rs");
+}
+
 // The snapshots must keep naming the list: a refreshed snapshot that lost it is a regression.
 #[test]
 fn refusal_snapshots_name_the_closed_list() {

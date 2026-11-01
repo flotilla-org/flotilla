@@ -1,7 +1,7 @@
 //! Carrier-neutral table reads. Sources lower conditions; paging and live reconciliation
 //! have one implementation shared by every carrier and both storage adapters.
 mod decided;
-mod filter;
+pub(crate) mod filter;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use flotilla_protocol::table::{Message, Row};
 use flotilla_resources::WatchStart;
@@ -483,20 +483,12 @@ impl TableSource {
                 }
                 // The rows wire names enum values; codes stay in storage (ADR 0047: wire only).
                 table = table.with_natural_references().readable();
-                for column in table.key.iter_mut().chain(&mut table.columns) {
-                    let scalar = !matches!(column.ty, ColumnType::Blob | ColumnType::Cbor | ColumnType::Frozen);
-                    column.properties.insert("sortable".into(), json!(scalar));
-                }
-                filter::describe_operators(&mut table);
+                mark_scalar_columns(&mut table);
                 Ok(Description { schema: set.frictionless(&table), table, markdown })
             }
             Self::Derived { derived, name } => {
                 let mut table = derived.set.tables[derived.table(name).expect("opened table")].clone();
-                for column in table.key.iter_mut().chain(&mut table.columns) {
-                    let scalar = !matches!(column.ty, ColumnType::Blob | ColumnType::Cbor | ColumnType::Frozen);
-                    column.properties.insert("sortable".into(), json!(scalar));
-                }
-                filter::describe_operators(&mut table);
+                mark_scalar_columns(&mut table);
                 Ok(Description { schema: derived.set.frictionless(&table), markdown: flotilla_schema::render_view([&derived.set]), table })
             }
         }
@@ -621,6 +613,16 @@ impl TableSource {
         let state = Live { source: self, description, query, snapshot, events, pending: initial.into(), failures: 0, done: false };
         Ok(live(state))
     }
+}
+
+/// Marks a decided or derived table's scalar columns sortable, and describes each column's
+/// `where` operators.
+fn mark_scalar_columns(table: &mut Table) {
+    for column in table.key.iter_mut().chain(&mut table.columns) {
+        let scalar = !matches!(column.ty, ColumnType::Blob | ColumnType::Cbor | ColumnType::Frozen);
+        column.properties.insert("sortable".into(), json!(scalar));
+    }
+    filter::describe_operators(table);
 }
 
 fn live(state: Live) -> BoxStream<'static, Message> {

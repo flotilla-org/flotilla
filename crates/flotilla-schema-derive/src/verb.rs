@@ -4,9 +4,10 @@
 //! `invocation`, `idempotent` and `result = "kind"`; each
 //! named field is a parameter, typed by its Rust type through `Param`, and refined by
 //! `#[param(text)]`, `#[param(options("a", "b"))]`, `#[param(subject = "kind")]` and
-//! `#[param(default = "...")]`.
+//! `#[param(default = "...")]`. Each kind is an ADR 0066 address kind, checked as the declaration
+//! compiles.
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{quote, quote_spanned};
 use syn::{ext::IdentExt, Data, DeriveInput, Fields, LitStr};
 
 struct VerbAttrs {
@@ -59,7 +60,8 @@ fn verb_attrs(input: &DeriveInput) -> syn::Result<VerbAttrs> {
     Ok(VerbAttrs { name, subject, effect: effect.ok_or_else(|| missing("effect"))?, invocation, idempotent, result })
 }
 
-fn param(field: &syn::Field) -> syn::Result<TokenStream> {
+/// One parameter's declaration; a subject parameter's kind joins `subjects`.
+fn param(field: &syn::Field, subjects: &mut Vec<LitStr>) -> syn::Result<TokenStream> {
     let name = field.ident.as_ref().expect("named field").unraw().to_string();
     let ty = &field.ty;
     let (mut text, mut options, mut subject, mut default) = (false, Vec::<LitStr>::new(), None::<LitStr>, None::<LitStr>);
@@ -85,6 +87,7 @@ fn param(field: &syn::Field) -> syn::Result<TokenStream> {
         return Err(syn::Error::new_spanned(field, "a parameter is text, an enum or a subject, not several"));
     }
     let declared = quote!(<#ty as ::flotilla_schema::Param>::TYPE);
+    let mut required = quote!(<#ty as ::flotilla_schema::Param>::REQUIRED);
     let ty_tokens = if text {
         quote!({
             const _: () = assert!(matches!(#declared, ::flotilla_schema::ParamType::Str), "#[param(text)] is for String fields");
@@ -96,10 +99,9 @@ fn param(field: &syn::Field) -> syn::Result<TokenStream> {
             ::flotilla_schema::ParamType::Enum
         })
     } else if let Some(kind) = &subject {
-        quote!({
-            const _: () = assert!(matches!(#declared, ::flotilla_schema::ParamType::Subject(_)), "#[param(subject = ...)] is for Address fields");
-            ::flotilla_schema::ParamType::Subject(#kind)
-        })
+        subjects.push(kind.clone());
+        required = quote!(<#ty as ::flotilla_schema::SubjectParam>::REQUIRED);
+        quote!(::flotilla_schema::ParamType::Subject(const { ::flotilla_schema::address_kind(#kind) }))
     } else {
         declared
     };
@@ -110,7 +112,7 @@ fn param(field: &syn::Field) -> syn::Result<TokenStream> {
     Ok(quote!(::flotilla_schema::ParamDeclaration {
         name: #name,
         ty: #ty_tokens,
-        required: <#ty as ::flotilla_schema::Param>::REQUIRED,
+        required: #required,
         default: #default,
         options: ::std::vec![#(#options),*],
     }))
@@ -118,9 +120,10 @@ fn param(field: &syn::Field) -> syn::Result<TokenStream> {
 
 pub(crate) fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
     let attrs = verb_attrs(input)?;
+    let mut subjects = Vec::new();
     let params = match &input.data {
         Data::Struct(data) => match &data.fields {
-            Fields::Named(fields) => fields.named.iter().map(param).collect::<syn::Result<Vec<_>>>()?,
+            Fields::Named(fields) => fields.named.iter().map(|field| param(field, &mut subjects)).collect::<syn::Result<Vec<_>>>()?,
             Fields::Unit => Vec::new(),
             Fields::Unnamed(fields) => return Err(syn::Error::new_spanned(fields, "a verb's parameters are named fields")),
         },
@@ -129,16 +132,24 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
     let ident = &input.ident;
     let (implementation, ty, clause) = input.generics.split_for_impl();
     let VerbAttrs { name, subject, effect, invocation, idempotent, result } = attrs;
+    // Item consts are evaluated even by `cargo check`, so a kind that is none fails there too.
+    let checks = std::iter::once(&subject)
+        .chain(&result)
+        .chain(&subjects)
+        .map(|kind| quote_spanned!(kind.span()=> const _: () = { ::flotilla_schema::address_kind(#kind); };));
+    let checks = quote!(#(#checks)*);
     let result = match result {
-        Some(kind) => quote!(::core::option::Option::Some(#kind)),
+        Some(kind) => quote!(::core::option::Option::Some(const { ::flotilla_schema::address_kind(#kind) })),
         None => quote!(::core::option::Option::None),
     };
     Ok(quote! {
+        #checks
+
         impl #implementation ::flotilla_schema::Verb for #ident #ty #clause {
             fn declaration() -> ::flotilla_schema::VerbDeclaration {
                 ::flotilla_schema::VerbDeclaration {
                     name: #name,
-                    subject: #subject,
+                    subject: const { ::flotilla_schema::address_kind(#subject) },
                     effect: #effect,
                     invocation: #invocation,
                     idempotent: #idempotent,

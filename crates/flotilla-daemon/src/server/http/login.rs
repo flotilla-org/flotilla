@@ -28,12 +28,6 @@ pub(in crate::server) const SESSION_LIMIT: usize = 16;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(in crate::server) struct SessionId(u64);
 
-impl SessionId {
-    pub(in crate::server) fn number(self) -> u64 {
-        self.0
-    }
-}
-
 pub(in crate::server) struct LoginCode {
     pub code: String,
     pub expires_at: DateTime<Utc>,

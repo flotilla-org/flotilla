@@ -6,7 +6,7 @@ use flotilla_schema::{where_operators, ColumnType, Filterable, Table};
 use flotilla_store::StoreQuery;
 use rigging_condition::{CheckError, Checked, Condition, Field, Literal, Lookup, Operand, Path, Relop, Type, Value as Cell};
 use serde_json::{json, Value};
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::BTreeSet};
 
 /// The columns a table's conditions may read. A resource kind's `metadata.labels`, inline CBOR
 /// in rows, is the one map: `"k" in metadata.labels` and `metadata.labels["k"]`.
@@ -100,6 +100,27 @@ fn cell(ty: &Type, value: &Value) -> Option<Cell> {
 /// Whether `filter` keeps `row`: only a true condition does (§4.5).
 pub(crate) fn keeps(filter: &Checked<Condition>, fields: &Filterable, row: &Row) -> bool {
     filter.evaluate(&Cells { row, fields }).is_true()
+}
+
+/// The columns `filter` reads.
+pub(crate) fn columns(filter: &Checked<Condition>, fields: &Filterable) -> BTreeSet<String> {
+    fn walk<'a>(condition: &'a Condition, paths: &mut Vec<&'a Path>) {
+        match condition {
+            Condition::And(terms) | Condition::Or(terms) => terms.iter().for_each(|term| walk(term, paths)),
+            Condition::Not(term) => walk(term, paths),
+            Condition::Has(path) => paths.push(path),
+            Condition::Compare { field, .. }
+            | Condition::In { field, .. }
+            | Condition::Member { field, .. }
+            | Condition::Under { field, .. }
+            | Condition::Field(field) => paths.push(&field.path),
+            // `Bool`, and any form rigging adds, reads no field this walk knows.
+            _ => {}
+        }
+    }
+    let mut paths = Vec::new();
+    walk(filter, &mut paths);
+    paths.into_iter().filter_map(|path| fields.column(path)).map(str::to_owned).collect()
 }
 
 /// The equalities among `filter`'s top-level conjuncts that the resource store indexes: a string

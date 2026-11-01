@@ -332,7 +332,9 @@ pub use read_evidence::*;
 
 pub mod convoy_address;
 // Preserve existing root query APIs; admission naming is imported directly from the module.
-pub use convoy_address::{convoy_disambiguation_address, parse_role_address, resolve_convoy_candidate_indices, ConvoyAddressIdentity};
+pub use convoy_address::{
+    convoy_disambiguation_address, parse_role_address, resolve_convoy_candidate_indices, resolve_convoy_role_indices, ConvoyAddressIdentity,
+};
 
 mod host_projection;
 pub use host_projection::canonical_placement_host_ref_from_sources;

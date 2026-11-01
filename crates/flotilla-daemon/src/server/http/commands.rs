@@ -18,8 +18,7 @@ use axum::{
 };
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
-    CommandCaller, CommandValue, DaemonEvent, DispatcherErrorClass, Message, PrincipalRef, Request as RpcRequest, Response as RpcResponse,
-    ResponseResult,
+    CommandCaller, CommandValue, DaemonEvent, DispatcherErrorClass, Message, Request as RpcRequest, Response as RpcResponse, ResponseResult,
 };
 use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
@@ -30,9 +29,9 @@ use tokio::sync::{
 use tokio::{task::JoinHandle, time::Instant};
 use uuid::Uuid;
 
-use super::{CallerAuth, RouterState};
+use super::{auth::command_caller, CallerAuth, RouterState};
 use crate::server::{
-    caller, client_connection::QuerySubscriptions, environment_connection, environment_supervision, remote_commands::RemoteCommandRouter,
+    client_connection::QuerySubscriptions, environment_supervision, remote_commands::RemoteCommandRouter,
     request_dispatch::RequestDispatcher,
 };
 
@@ -46,14 +45,6 @@ const MAX_WAIT: f64 = 300.0;
 const MAX_STEPS: usize = 256;
 const MAX_PROGRESS_BYTES: usize = 256 * 1024;
 const UNKNOWN_RETENTION: Duration = Duration::from_secs(300);
-
-// Test double only for the kernel/procfs evidence boundary; resolution remains real.
-#[cfg(test)]
-struct PeerEvidence {
-    caller: CommandCaller,
-    claims: std::collections::HashMap<String, String>,
-    mounts: Option<caller::PeerMounts>,
-}
 
 pub(super) struct Commands {
     router: RemoteCommandRouter,
@@ -156,6 +147,11 @@ fn owner_key(caller: &CommandCaller) -> Option<(&str, &str)> {
 }
 
 impl Commands {
+    /// The main socket's path, whose directory a contained peer's mounts are checked against.
+    pub(super) fn socket_path(&self) -> &std::path::Path {
+        &self.socket_path
+    }
+
     pub(super) fn new(router: RemoteCommandRouter, shutdown: mpsc::UnboundedSender<()>, socket_path: PathBuf) -> Self {
         Self {
             router,
@@ -243,7 +239,7 @@ pub(super) async fn handle(
     State(RouterState(state)): State<RouterState>,
     Extension(authenticated): Extension<CallerAuth>,
     encoding: Encoding,
-    request: Request,
+    mut request: Request,
 ) -> Response {
     if matches!(authenticated, CallerAuth::Anonymous) {
         return refuse(encoding, StatusCode::UNAUTHORIZED, "authentication required");
@@ -271,78 +267,15 @@ pub(super) async fn handle(
             None => return refuse(encoding, StatusCode::METHOD_NOT_ALLOWED, "method is not available on this route"),
         }
     };
-    #[cfg(test)]
-    let injected_evidence = request.extensions().get::<Arc<PeerEvidence>>().cloned();
+    // The caller is resolved once the body is read; its extensions move out first, uncloned.
+    let extensions = std::mem::take(request.extensions_mut());
     let body = match Body::read(request, limit).await {
         Ok(body) => body,
         Err(refused) => return refuse(encoding, refused.status(), refused.message()),
     };
-    let namespace = daemon.provisioning_namespace().await;
-    let mut transport_bound = false;
-    let caller = match &authenticated {
-        CallerAuth::Socket(Some(peer)) => {
-            let peer = *peer;
-            let socket_path = commands.socket_path.clone();
-            let evidence = tokio::task::spawn_blocking(move || {
-                #[cfg(test)]
-                if let Some(evidence) = injected_evidence {
-                    return Ok((
-                        evidence.caller.clone(),
-                        evidence.claims.clone(),
-                        evidence
-                            .mounts
-                            .as_ref()
-                            .map(|m| caller::PeerMounts { mountinfo: m.mountinfo.clone(), legacy_main_directory: m.legacy_main_directory }),
-                    ));
-                }
-                let claims = caller::claims_from_peer(Some(peer));
-                let caller = caller::caller_from_peer(Some(peer), &namespace)?;
-                let mounts = caller
-                    .process
-                    .as_ref()
-                    .filter(|p| p.container.is_some())
-                    .map(|p| caller::peer_mounts(p.pid, Some(&socket_path)))
-                    .transpose()?;
-                Ok::<_, String>((caller, claims, mounts))
-            })
-            .await;
-            match evidence {
-                Ok(Ok((caller, claims, mounts))) => match caller::resolve_main_caller(daemon, caller, &claims, mounts.as_ref()).await {
-                    Ok(resolved) => {
-                        transport_bound = resolved.transport_bound;
-                        resolved.caller
-                    }
-                    Err(error) => return refuse(encoding, StatusCode::FORBIDDEN, error),
-                },
-                Ok(Err(error)) => return refuse(encoding, StatusCode::FORBIDDEN, error),
-                Err(error) => return refuse(encoding, StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-            }
-        }
-        CallerAuth::Environment { environment, peer } => {
-            let crews = match environment_connection::environment_crews(daemon, environment).await {
-                Ok(c) => c,
-                Err(e) => return refuse(encoding, StatusCode::FORBIDDEN, e),
-            };
-            let peer = *peer;
-            let claims = match tokio::task::spawn_blocking(move || caller::claims_from_peer(peer)).await {
-                Ok(c) => c,
-                Err(e) => return refuse(encoding, StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-            };
-            let crew = match caller::check_claims(crews, &claims) {
-                Ok(c) => c,
-                Err(e) => return refuse(encoding, StatusCode::FORBIDDEN, e),
-            };
-            transport_bound = true;
-            CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace(&crew.namespace), process: None, crew: Some(crew) }
-        }
-        CallerAuth::Bearer | CallerAuth::Session(_) => {
-            CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace(&namespace), process: None, crew: None }
-        }
-        CallerAuth::Socket(None) => {
-            return refuse(encoding, StatusCode::FORBIDDEN, "CallerIdentityUnavailable: socket peer credentials unavailable")
-        }
-        CallerAuth::Hook { .. } => return refuse(encoding, StatusCode::FORBIDDEN, "a hook token reaches only the hook routes"),
-        CallerAuth::Anonymous => return refuse(encoding, StatusCode::UNAUTHORIZED, "authentication required"),
+    let (caller, transport_bound) = match command_caller(daemon, Some(commands.socket_path()), &authenticated, &extensions).await {
+        Ok(resolved) => (resolved.caller, resolved.transport_bound),
+        Err((status, error)) => return refuse(encoding, status, error),
     };
     if transport_bound && method == Method::DELETE && command_resource.is_some() {
         return refuse(encoding, StatusCode::FORBIDDEN, "EnvironmentCommandDenied: cancellation is outside supervisor authority");
@@ -698,6 +631,8 @@ mod tests {
     use crate::blob_store::{BlobStore, TieredBlobStore};
     use crate::server::http::{HttpRouter, ListenerOrigin, LoginStore};
     use crate::server::tests::{caller_mountinfo, placed_crew_daemon, supervisor_daemon};
+    use crate::server::{caller, http::auth::PeerEvidence};
+    use flotilla_protocol::PrincipalRef;
 
     struct Harness {
         _temp: tempfile::TempDir,

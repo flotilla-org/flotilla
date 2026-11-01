@@ -47,7 +47,7 @@ use flotilla_resources::{
     TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, Vessel,
     WorkPhase as ResourceWorkPhase, WorkflowTemplate, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
-use flotilla_store::{EventRecorder, ProjectHierarchyStoreExt, ResourceBackend, StoreQuery};
+use flotilla_store::{convoy_role_query, EventRecorder, ProjectHierarchyStoreExt, ResourceBackend, StoreQuery};
 use tracing::warn;
 
 use crate::resource_explain::{explain_condition, explained_provenance, observed_freshness};
@@ -1242,11 +1242,7 @@ impl ReadProjections<'_> {
     ) -> Result<(ConvoyExplanation, ResourceObject<ResourceConvoy>), String> {
         let mut candidates = vec![StoreQuery::names([name.to_string()], true)];
         if let Ok((role, project)) = flotilla_resources::parse_role_address(name) {
-            let mut labels = BTreeMap::from([(ROLE_LABEL.into(), role.into())]);
-            if let Some(project) = project {
-                labels.insert(PROJECT_LABEL.into(), project.into());
-            }
-            candidates.push(StoreQuery::labels(&labels, true, true));
+            candidates.push(StoreQuery { include_replicas: true, suppress_self_origin: true, ..convoy_role_query(role, project) });
         }
         let selected_query =
             StoreQuery { any_of: (!candidates.is_empty()).then_some(candidates), include_replicas: true, ..Default::default() };
