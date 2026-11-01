@@ -782,8 +782,8 @@ async fn designate_fleet(daemon: &Incarnation, fleet: &str) {
         .expect("designation");
 }
 
-// The root document names the build and links only what the daemon serves: no verbs or
-// presentations tables, no commands without a command router.
+// The root document names the build and links only what the daemon serves: the `verbs` table and
+// its route (#4197), no presentations table, no commands without a command router.
 #[tokio::test]
 async fn root_document_links_only_what_is_served() {
     let daemon = Incarnation::new();
@@ -794,8 +794,10 @@ async fn root_document_links_only_what_is_served() {
         let root = reply.json();
         assert_eq!(root["build_id"], flotilla_daemon_api::build_info::build_id());
         assert_eq!(root["protocol_fingerprint"], flotilla_protocol::PROTOCOL_FINGERPRINT);
-        assert_eq!(rels(&root), ["tables"]);
+        assert_eq!(rels(&root), ["tables", "verbs", "verb"]);
         assert_eq!(root["links"][0]["href"], "/tables");
+        assert_eq!(root["links"][1]["href"], "/tables/verbs/rows");
+        assert_eq!((&root["links"][2]["href"], &root["links"][2]["templated"]), (&"/verbs/{name}".into(), &true.into()));
     }
     assert_eq!(daemon.call(CallerAuth::Anonymous, get("/")).await.status, StatusCode::UNAUTHORIZED);
 }
@@ -841,7 +843,7 @@ async fn root_document_has_a_cbor_twin() {
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.headers[header::CONTENT_TYPE], "application/vnd.flotilla.root+cbor");
     let root: serde_json::Value = flotilla_cbor::from_slice(&reply.body, &super::wire::LIMITS).expect("CBOR root document");
-    assert_eq!(rels(&root), ["tables"]);
+    assert_eq!(rels(&root), ["tables", "verbs", "verb"]);
     assert_eq!(root["build_id"], flotilla_daemon_api::build_info::build_id());
 }
 

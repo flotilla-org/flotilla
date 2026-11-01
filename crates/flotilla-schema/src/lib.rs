@@ -77,6 +77,7 @@ mod state;
 mod time;
 mod traits;
 mod value;
+mod verb;
 mod view;
 
 #[doc(hidden)]
@@ -93,7 +94,7 @@ pub use edge::{
 };
 pub use event::{whole_log_topic, Cause, Change, ChangeHeader, ChangeItem, Effect, Event, EventError, Named, NewChange, Step, LOG_LIMITS};
 pub use flotilla_address::Address;
-pub use flotilla_schema_derive::{Describe, Stored};
+pub use flotilla_schema_derive::{Describe, Stored, Verb};
 pub use frozen::{Freezable, Frozen};
 pub use history::{EdgeEvent, Labelled};
 pub use inline::{Cbor, INLINE_LIMITS};
@@ -108,6 +109,7 @@ pub use state::{RowEdit, State};
 pub use time::Timestamp;
 pub use traits::{CodeEnum, Column, Columns, Element, Flat, Intern, KeyColumn, Kind, KindSpec, StateData, SUPPORTED_ATTRIBUTES};
 pub use value::{Hash, Identity, KindCode, Row, Rows, Value};
+pub use verb::{Param, ParamDeclaration, ParamType, Verb, VerbDeclaration, VerbEffect};
 pub use view::{column_count, enum_columns, render_table_view, render_view, state_data, WIDE};
 
 mod frictionless;
