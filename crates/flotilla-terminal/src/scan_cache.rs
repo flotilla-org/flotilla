@@ -63,6 +63,22 @@ impl TerminalPool for SharedTerminalPool {
         result
     }
 
+    async fn ensure_declared_session(
+        &self,
+        session_name: &str,
+        script: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &TerminalEnvVars,
+        tags: &[crate::TerminalSessionTag],
+        initial_size: Option<TerminalSize>,
+    ) -> Result<(), String> {
+        let result = self.inner.ensure_declared_session(session_name, script, cwd, env_vars, tags, initial_size).await;
+        if result.is_ok() {
+            self.sessions.invalidate();
+        }
+        result
+    }
+
     fn attach_args(
         &self,
         session_name: &str,

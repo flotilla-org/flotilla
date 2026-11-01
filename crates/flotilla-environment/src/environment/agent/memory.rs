@@ -62,6 +62,16 @@ impl Agent {
         let mut command = tokio::process::Command::new(&exec.program);
         command.args(&exec.args).current_dir(exec.cwd.as_deref().unwrap_or(Path::new("/")));
         command.envs(&self.configuration.lock().expect("configuration").0.environment);
+        // Drydock's agent sets these pipeline defaults over its configuration.
+        command.envs([
+            ("CI", "1"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("NO_COLOR", "1"),
+            ("TERM", "dumb"),
+            ("PAGER", "cat"),
+            ("GIT_PAGER", "cat"),
+            ("DEBIAN_FRONTEND", "noninteractive"),
+        ]);
         command
     }
 }
