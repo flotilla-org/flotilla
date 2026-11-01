@@ -88,11 +88,11 @@ license = "Apache-2.0 OR MIT"
 # When adding dependencies anywhere in the workspace, update the external-crate
 # allowlist in clippy.toml (use the library crate name, including any rename).
 [workspace.dependencies]
-drydock = { git = "https://github.com/flotilla-org/drydock", rev = "9f3d305ed6330ae40c3716df9cc9dc9e472728db" }
-drydock-protocol = { git = "https://github.com/flotilla-org/drydock", rev = "9f3d305ed6330ae40c3716df9cc9dc9e472728db" }
-drydock-agent = { git = "https://github.com/flotilla-org/drydock", rev = "9f3d305ed6330ae40c3716df9cc9dc9e472728db" }
-drydock-transport = { git = "https://github.com/flotilla-org/drydock", rev = "9f3d305ed6330ae40c3716df9cc9dc9e472728db" }
-drydock-host = { git = "https://github.com/flotilla-org/drydock", rev = "9f3d305ed6330ae40c3716df9cc9dc9e472728db" }
+drydock = { git = "https://github.com/flotilla-org/drydock", rev = "1fdf9513913d69d12933d6414b067d116cc3da3d" }
+drydock-protocol = { git = "https://github.com/flotilla-org/drydock", rev = "1fdf9513913d69d12933d6414b067d116cc3da3d" }
+drydock-agent = { git = "https://github.com/flotilla-org/drydock", rev = "1fdf9513913d69d12933d6414b067d116cc3da3d" }
+drydock-transport = { git = "https://github.com/flotilla-org/drydock", rev = "1fdf9513913d69d12933d6414b067d116cc3da3d" }
+drydock-host = { git = "https://github.com/flotilla-org/drydock", rev = "1fdf9513913d69d12933d6414b067d116cc3da3d" }
 rigging-stream = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
 rigging-tls = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
 rigging-process = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
