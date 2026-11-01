@@ -639,6 +639,12 @@ async fn crew_talks_back_through_an_outward_exposure() {
 // drydock#132 case 3, lab service: the lab's name in the guest is an outward
 // exposure drydock gives an address and a hosts line, reaching the lab from
 // drydock's machine. Re-adoption leaves the standing exposure as it is.
+//
+// Linux only: drydock gives each guest name its own 127.x.y.z address, and the
+// guest side runs on this host. Linux routes all of 127/8 to lo; macOS has only
+// 127.0.0.1 on lo0 until an alias is added, so the bind fails there. Real
+// guests are Linux, so the exposure itself is unaffected.
+#[cfg_attr(not(target_os = "linux"), ignore = "needs 127/8 on loopback; macOS lo0 has only 127.0.0.1")]
 #[tokio::test]
 async fn the_lab_service_is_a_named_outward_exposure() {
     let host = HostFixture::start().await;
