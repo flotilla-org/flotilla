@@ -135,7 +135,8 @@ fn show_live(socket: &Path, table: &str, namespace: &str, flags: &Flags, interac
     if namespace.is_empty() {
         return Err(eyre!("--namespace can't be empty"));
     }
-    // A print fails on a daemon that is down; a terminal keeps trying, saying so.
+    // A print gives up after a few failed attempts on a daemon that is down; a terminal retries,
+    // saying so, until it has rows. Both stop at [`FIRST_READ`] if no rows come.
     let options = Options::new(Endpoint::Unix(socket.to_path_buf()));
     let options = if interactive { options } else { options.retries(Some(PRINT_RETRIES)) };
     let transport = Blocking::new(options)?;
