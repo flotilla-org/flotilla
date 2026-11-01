@@ -68,9 +68,16 @@ pub fn harness_pins(layers: &[ImageLayerSpec]) -> BTreeMap<String, String> {
     pins.into_iter().filter_map(|(adapter, version)| Some((adapter, version?))).collect()
 }
 
-/// [`harness_pins`] of this release's stdlib; empty when the stdlib does not parse.
+/// [`harness_pins`] of this release's stdlib; empty, with a warning, when the stdlib does
+/// not parse, so SSH hosts fall back to offering what their PATH holds.
 pub fn stdlib_harness_pins() -> BTreeMap<String, String> {
-    stdlib_image_layers().map(harness_pins).unwrap_or_default()
+    match stdlib_image_layers() {
+        Ok(layers) => harness_pins(layers),
+        Err(error) => {
+            tracing::warn!(%error, "stdlib image layers do not parse; no harness is pinned");
+            BTreeMap::new()
+        }
+    }
 }
 
 #[cfg(test)]

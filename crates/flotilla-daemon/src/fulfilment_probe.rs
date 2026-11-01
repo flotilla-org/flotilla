@@ -58,6 +58,7 @@ fn harness_version(stdout: &str) -> String {
 /// provider's isolated harness --version output. No login or model request
 /// participates; an absent version leaves this harness unknown.
 async fn harness_facts(target: &DetectionTarget<'_>, scratch: &Path) -> BTreeMap<String, HarnessFacts> {
+    // A pin's models stay unknown, as a probed harness's do: availability never asks for models.
     let mut facts = target
         .pinned_harnesses
         .iter()
