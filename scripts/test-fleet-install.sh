@@ -818,6 +818,28 @@ test "$(roll_field 7)" = 'tab broke it' || fail 'rollback reason was not recorde
 test "$(roll_field 3)" = "$generation_two" || fail 'rollback record omitted the replaced generation'
 test "$(last_roll | awk -F'\t' '{print NF}')" = 7 || fail 'roll record is not seven fields'
 
+if FAKE_GIT_ORDER="$test_root/order-forward" run_installer --rollback --reason x rollback >/dev/null 2>&1; then
+  fail '--rollback was accepted with the rollback subcommand'
+fi
+
+live_metadata="$test_root/home/.local/opt/flotilla-fleet/releases/$generation_one/.generation.json"
+cp "$live_metadata" "$test_root/live-metadata.json"
+chmod u+w "$live_metadata" "$(dirname "$live_metadata")"
+python3 - "$live_metadata" <<'PY'
+import json, sys
+path = sys.argv[1]
+document = json.load(open(path))
+del document["sources"]["flotilla"]
+json.dump(document, open(path, "w"))
+PY
+if FAKE_GIT_ORDER="$test_root/order-forward" run_installer "$generation_two" >"$test_root/roll-unreadable.out" 2>&1; then
+  fail 'an install was accepted without the live flotilla commit'
+fi
+grep -Fq 'cannot compare with live r1' "$test_root/roll-unreadable.out" || fail 'unreadable live commit did not refuse as a rollback'
+grep -Fq 'unbound variable' "$test_root/roll-unreadable.out" && fail 'unreadable live commit crashed the guard'
+cp "$test_root/live-metadata.json" "$live_metadata"
+chmod a-w "$live_metadata" "$(dirname "$live_metadata")"
+
 custom_root="$test_root/custom-root"
 custom_bin="$test_root/custom-bin"
 HOME="$test_root/home" XDG_CONFIG_HOME="$test_root/home/.config" PATH="$custom_bin:$fake_bin:$PATH" \

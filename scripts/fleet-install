@@ -1025,7 +1025,7 @@ guard_roll_direction() {
   unset FLEET_INSTALL_ROLLBACK_REASON
   ((CANARY_ONLY)) && return 0
   [[ -n "$live" && "$live" != "$generation" ]] || return 0
-  local live_commit incoming_commit verdict direction count="" summary
+  local live_commit="" incoming_commit="" verdict direction count="" summary
   if incoming_commit="$(manifest_value "$manifest" sources.flotilla)" \
     && live_commit="$(manifest_value "$RELEASES_DIR/$live/.generation.json" sources.flotilla)" \
     && verdict="$(python3 "$GENERATION_VALIDATOR" roll-direction -- "$live_commit" "$incoming_commit")"; then
@@ -1195,6 +1195,7 @@ host_preflight() {
 
 usage() {
   echo 'usage: fleet-install [--min-free-bytes N] [--max-wait-seconds N] [--from DIR] [--rollback --reason WHY] [--skip-canary] <latest|generation> | --canary <generation> | status | rollback | --prune-dry-run | --prune' >&2
+  echo '--rollback --reason WHY installs a generation whose flotilla commit is older than the live one; every install compares commits, which needs github.com (override: FLEET_INSTALL_FLOTILLA_REPOSITORY, for tests)' >&2
   echo 'defaults: --min-free-bytes 5368709120 (5 GiB); --max-wait-seconds 600; ordinary confirmation 90 seconds' >&2
   echo '--from DIR installs a named generation from a pushed package directory (DIR/<generation>/generation.json and archive) instead of Forgejo; no package token is read' >&2
   exit 2
@@ -1219,6 +1220,9 @@ main() {
   done
   if ((rollback_requested)); then
     [[ -n "$ROLLBACK_REASON" ]] || die '--rollback needs --reason "<why>"'
+    case "${*: -1}" in
+      status|rollback|--prune|--prune-dry-run|--canary|-h|--help|__*) die '--rollback only goes with installing a generation' ;;
+    esac
   else
     [[ -z "$ROLLBACK_REASON" ]] || die '--reason only goes with --rollback'
   fi
