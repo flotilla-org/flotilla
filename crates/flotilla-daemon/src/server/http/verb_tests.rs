@@ -277,6 +277,15 @@ async fn the_route_negotiates_and_refuses_callers_before_reading_the_body() {
     let mut request = Request::post("/verbs/convoy.touch").header("content-length", 2 << 20).body(body).unwrap();
     request.extensions_mut().insert(CallerAuth::Anonymous);
     assert_eq!(router.clone().oneshot(request).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    // Accept is checked before the caller, as on the command and table routes: an environment
+    // with an unacceptable Accept is 406, and with an acceptable one 403.
+    let environment = CallerAuth::Environment { environment: flotilla_protocol::EnvironmentId::new("env"), peer: None };
+    for (accept, status) in [("text/html", StatusCode::NOT_ACCEPTABLE), ("application/json", StatusCode::FORBIDDEN)] {
+        let mut request = Request::post("/verbs/convoy.touch").header("accept", accept).body(Body::from(invocation.to_string())).unwrap();
+        request.extensions_mut().insert(environment.clone());
+        assert_eq!(router.clone().oneshot(request).await.unwrap().status(), status, "{accept}");
+    }
 }
 
 // Behaviour (#4182 ruling 7): the route keeps no record of past invocations. A repeated
