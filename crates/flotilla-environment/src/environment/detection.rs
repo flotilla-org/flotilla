@@ -30,12 +30,16 @@ mkdir -m 700 "$root"
 child=
 watchdog=
 cleanup() {
-    if [ -n "$watchdog" ]; then kill -KILL -- "-$watchdog" 2>/dev/null || :; wait "$watchdog" 2>/dev/null || :; fi
+    # Signals during cleanup must not cut it short. The watchdog stays alive until
+    # the child is stopped and the root is gone, so a cleanup that is still cut short
+    # (SIGKILL) leaves the watchdog to finish it.
+    trap '' HUP INT TERM
     if [ -n "$child" ]; then kill -KILL -- "-$child" 2>/dev/null || :; wait "$child" 2>/dev/null || :; fi
     rm -rf -- "$root"
+    if [ -n "$watchdog" ]; then kill -KILL -- "-$watchdog" 2>/dev/null || :; wait "$watchdog" 2>/dev/null || :; fi
 }
 trap cleanup EXIT
-trap 'exit 143' HUP INT TERM
+trap 'trap "" HUP INT TERM; exit 143' HUP INT TERM
 mkdir -p "$root/home" "$root/config" "$root/cache" "$root/state" "$root/runtime" "$root/accounts" "$root/tmp" "$root/cwd"
 overlay=(HOME="$root/home" XDG_CONFIG_HOME="$root/config" XDG_CACHE_HOME="$root/cache" XDG_STATE_HOME="$root/state" XDG_RUNTIME_DIR="$root/runtime" TMPDIR="$root/tmp")
 for name in ${homes[@]+"${homes[@]}"}; do
@@ -43,13 +47,17 @@ for name in ${homes[@]+"${homes[@]}"}; do
     overlay+=("$name=$root/accounts/$name")
 done
 cd "$root/cwd"
+parent=$$
 (
     set +m
     status=0
     env -i ${base[@]+"${base[@]}"} "${overlay[@]}" "$@" || status=$?
     printf '%s' "$status" > "$root/status.tmp"
     mv "$root/status.tmp" "$root/status"
-    while :; do sleep 1; done
+    # Holding the group until cleanup is bounded and ends with the wrapper, so a
+    # child whose wrapper is gone never loops on.
+    limit=$((SECONDS + 12))
+    while [ "$SECONDS" -lt "$limit" ] && kill -0 "$parent" 2>/dev/null; do sleep 1; done
 ) &
 child=$!
 # A target-local fallback survives a disconnected SSH client or a hard local
@@ -219,8 +227,11 @@ mod tests {
     // watchdog scaled to 2s and 3s, keeping their order, so a cancelled live harness is
     // still cleaned up by the script's own deadline without ten seconds of waiting.
     fn scaled_deadlines(arg: &str) -> String {
-        const SCALES: [(&str, &str); 2] =
-            [("deadline=$((SECONDS + 10))", "deadline=$((SECONDS + 2))"), ("(sleep 11; kill", "(sleep 3; kill")];
+        const SCALES: [(&str, &str); 3] = [
+            ("deadline=$((SECONDS + 10))", "deadline=$((SECONDS + 2))"),
+            ("(sleep 11; kill", "(sleep 3; kill"),
+            ("limit=$((SECONDS + 12))", "limit=$((SECONDS + 4))"),
+        ];
         if !arg.contains("deadline=$((SECONDS") {
             return arg.to_string();
         }
@@ -344,6 +355,64 @@ case "$1" in success|failure)
         assert_eq!(std::fs::read_dir(&operator).expect("operator directory").count(), 2);
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(!marker.with_extension("leak").exists(), "no surviving child may recreate state");
+    }
+
+    /// Processes whose command line, environment or working directory names `root`.
+    #[cfg(target_os = "linux")]
+    fn processes_naming(root: &Path) -> Vec<u32> {
+        let needle = root.to_string_lossy().into_owned();
+        let names = |bytes: Vec<u8>| String::from_utf8_lossy(&bytes).contains(&needle);
+        std::fs::read_dir("/proc")
+            .expect("proc")
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| {
+                let proc = Path::new("/proc").join(pid.to_string());
+                std::fs::read(proc.join("cmdline")).is_ok_and(names)
+                    || std::fs::read(proc.join("environ")).is_ok_and(names)
+                    || std::fs::read_link(proc.join("cwd")).is_ok_and(|cwd| cwd.to_string_lossy().contains(&needle))
+            })
+            .collect()
+    }
+
+    // #4090: however the wrapper ends, nothing it started outlives the bound and its root is gone.
+    // Deadlines are scaled as for the endpoint (watchdog 3s, child limit 4s).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn no_probe_outlives_its_bound_however_the_wrapper_ends() {
+        use std::os::unix::process::CommandExt;
+        for ending in ["sigkill-wrapper", "sigkill-group", "term-during-cleanup"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path().join("flotilla-observation-probe");
+            let args = observation_args(&root.to_string_lossy(), &test_observation(), "sleep", &["30"]);
+            let args = args.iter().map(|arg| scaled_deadlines(arg)).collect::<Vec<_>>();
+            let mut wrapper = std::process::Command::new("env").args(&args).process_group(0).spawn().expect("wrapper");
+            let pid = wrapper.id() as i32;
+            while !root.join("cwd").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            match ending {
+                "sigkill-wrapper" => unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                },
+                "sigkill-group" => unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                },
+                _ => {
+                    // A burst of TERMs lands during cleanup, which must run to the end.
+                    for _ in 0..50 {
+                        unsafe {
+                            libc::kill(pid, libc::SIGTERM);
+                        }
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                }
+            }
+            let _ = wrapper.wait();
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            assert_eq!(processes_naming(&root), Vec::<u32>::new(), "{ending}: processes survive the bound");
+            assert!(!root.exists(), "{ending}: the root remains");
+        }
     }
 
     // The same sentinel contract exercises local, SSH host, and image
