@@ -160,6 +160,9 @@ impl VesselPaths {
 /// `$XDG_RUNTIME_DIR/flotilla/v`: owner-only and on a tmpfs, so a reboot
 /// clears it and the next connect bootstraps again. No root, no sticky
 /// directory.
+/// Every vessel agent directory of the login is a sibling here: retirement
+/// finds a neighbour's executable to collect the shared store with by that
+/// (`flotilla_drydock::host`'s retire script).
 pub(super) fn agent_root(bag: &EnvironmentBag) -> Result<PathBuf, String> {
     bag.find_env_var("XDG_RUNTIME_DIR")
         .filter(|directory| directory.starts_with('/'))
