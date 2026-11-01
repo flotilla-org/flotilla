@@ -260,12 +260,18 @@ async fn the_route_negotiates_and_refuses_callers_before_reading_the_body() {
     assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
     let response = post("text/plain", "application/json", Body::from(invocation.to_string())).await.unwrap();
     assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(runs.load(Ordering::SeqCst), 2, "a refused request runs nothing");
+    // A body with no Content-Type is read as JSON, as the command routes always have.
+    let mut request = Request::post("/verbs/convoy.touch").body(Body::from(invocation.to_string())).unwrap();
+    request.extensions_mut().insert(CallerAuth::Bearer);
+    assert_eq!(router.clone().oneshot(request).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(runs.load(Ordering::SeqCst), 3);
     // A body that is not an invocation is the wire's 400, under the status-named code.
     let response = post("application/json", "application/json", Body::from("{")).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let refused: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
     assert_eq!(refused["code"], "bad_request");
-    assert_eq!(runs.load(Ordering::SeqCst), 2);
+    assert_eq!(runs.load(Ordering::SeqCst), 3);
 
     // An oversized declared length that would be 413 for the user: an anonymous caller is 401,
     // and the body is never polled.

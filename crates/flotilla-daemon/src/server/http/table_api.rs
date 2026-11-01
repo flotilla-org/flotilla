@@ -181,8 +181,8 @@ mod tests {
 
     // The JSON tagged-integer profile and its CBOR counterpart both round-trip a table
     // message's full u64 range through flotilla-protocol's decoder.
-    #[tokio::test]
-    async fn table_integer_profiles_preserve_full_u64() {
+    #[test]
+    fn table_integer_profiles_preserve_full_u64() {
         let message = flotilla_protocol::table::Message::Count { count: u64::MAX, estimate: false, sequence: u64::MAX };
         for encoding in [Encoding::Json, Encoding::Cbor] {
             let bytes = encoding.encode(&message).unwrap();
