@@ -12,11 +12,14 @@ use super::*;
 use flotilla_orchestration_testkit::InProcessDiscoveryExt;
 
 use flotilla_provider_runtime::host_environment::{HostEnvironment, HostSupply};
+#[cfg(target_os = "linux")]
 use flotilla_provider_runtime::ssh_runner::SshCommandRunner;
 
 use super::super::account_access::reconcile_place_provisions;
 use super::ssh_host_vessels::{VesselKey, VesselPaths};
-use super::vessel_support::{store_entry, vessels_over, ArtifactArrival, RunnerVesselAgents};
+#[cfg(target_os = "linux")]
+use super::vessel_support::store_entry;
+use super::vessel_support::{vessels_over, ArtifactArrival, RunnerVesselAgents};
 
 const HOST_HOME: &str = "/home/crew";
 /// What `SshCommandRunner::writable_config_base` resolves on a host whose login has
@@ -605,11 +608,14 @@ async fn ssh_host_claude_crew_without_a_delivered_credential_is_refused_with_the
 /// Stands in for `ssh` to an SSH host and its sshd: the remote command
 /// string runs in `/bin/sh -c`, as sshd runs it for a user whose shell is
 /// POSIX, in a clean login environment whose home is a temporary directory.
+/// Only the Linux acceptance test below uses it.
+#[cfg(target_os = "linux")]
 struct LoopbackSshHost {
     home: PathBuf,
     runtime_dir: PathBuf,
 }
 
+#[cfg(target_os = "linux")]
 impl LoopbackSshHost {
     fn login_environment(&self) -> Vec<String> {
         vec![
@@ -637,6 +643,7 @@ impl LoopbackSshHost {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[async_trait]
 impl CommandRunner for LoopbackSshHost {
     async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
@@ -675,6 +682,7 @@ pub(super) fn pinned_harness_sha256(adapter: &str) -> String {
     layer.pins.values().next().and_then(|pin| pin.artifact("amd64")).expect("amd64 artifact").sha256.clone()
 }
 
+#[cfg(target_os = "linux")]
 fn write_executable(path: &Path, script: &str) {
     use std::os::unix::fs::PermissionsExt;
     fs::create_dir_all(path.parent().expect("parent")).expect("executable directory");

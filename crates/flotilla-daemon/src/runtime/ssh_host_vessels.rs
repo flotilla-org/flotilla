@@ -141,7 +141,7 @@ impl VesselPaths {
     }
 
     /// Where the published CLI entry point lands in the vessel.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn cli(&self) -> PathBuf {
         let cli = flotilla_environment::composition::flotilla_tools().member(flotilla_environment::composition::role::CLI);
         self.state.join(cli.and_then(|member| member.install.as_deref()).expect("the CLI is published"))
