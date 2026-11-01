@@ -246,7 +246,11 @@ impl Attentions for OldStoreAttentions {
                 .map_or(demand.metadata.creation_timestamp, |raised| raised.as_of);
             let reason = match &subject {
                 Subject::Vessel { convoy, vessel } => {
-                    let prefix = format!("{CREDENTIAL}{}-", self.vessel_record(namespace, convoy, vessel).await.unwrap_or_default());
+                    let record = self.vessel_record(namespace, convoy, vessel).await.unwrap_or_else(|error| {
+                        tracing::debug!(%error, "a credential attention's vessel is gone; its demand keeps its full name");
+                        String::new()
+                    });
+                    let prefix = format!("{CREDENTIAL}{record}-");
                     let credential = demand.metadata.name.strip_prefix(&prefix).unwrap_or(&demand.metadata.name);
                     let why =
                         demand.metadata.annotations.get(CREDENTIAL_REFRESH_REASON_ANNOTATION).map_or("refresh failed", String::as_str);

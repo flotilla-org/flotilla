@@ -157,6 +157,10 @@ impl OpenAttention {
 }
 
 /// The attentions port.
+///
+/// Each fact has one writer, at one home, which raises and clears it; callers serialize the
+/// raises and clears of one fact (a reconciler's pass, or one periodic task). An attention homed
+/// at another home is read, but only its own home supersedes or withdraws it.
 #[async_trait]
 pub trait Attentions: Send + Sync {
     /// Tells a person, unless the same attention is open. One open from the same sender about the

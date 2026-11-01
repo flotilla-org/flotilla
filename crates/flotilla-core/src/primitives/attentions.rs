@@ -25,26 +25,25 @@ use super::{
     MessagePrimitives,
 };
 
-/// One attention message in this replica, with its home and what it is.
+/// One attention message in this replica, with its home, what it is and the reason it gives.
 struct Held {
     home: String,
     sender: Sender,
     sender_address: Address,
     subject: Subject,
     subject_address: Address,
+    reason: String,
     message: Resource<Message>,
 }
 
 impl Held {
     fn reason(&self) -> String {
-        match self.message.spec().body.value() {
-            MessageBody::Text(text) => text.clone(),
-            MessageBody::Request(request) => format!("{request:?}"),
-        }
+        self.reason.clone()
     }
 
+    /// When it was raised; an unreadable time reads as now, so it never counts as long open.
     fn raised_at(&self) -> DateTime<Utc> {
-        self.message.since().to_datetime().unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+        self.message.since().to_datetime().unwrap_or_else(Utc::now)
     }
 
     fn pending(&self) -> bool {
@@ -84,7 +83,11 @@ impl MessagePrimitives {
                 }
                 let sender = Sender::from_role(roles.role_of(&spec.sender)?)?;
                 let subject_address = spec.subject()?.address.clone();
+                // An attention's body is always text; a typed request is no attention.
+                let MessageBody::Text(reason) = spec.body.value() else { return None };
+                let reason = reason.clone();
                 Some(Held {
+                    reason,
                     home,
                     sender,
                     sender_address: spec.sender.clone(),
@@ -203,7 +206,7 @@ impl Attentions for MessagePrimitives {
         if about.iter().any(Held::pending) {
             return Ok(false);
         }
-        Ok(about.iter().max_by_key(|held| held.message.since()).is_some_and(|latest| {
+        Ok(about.iter().max_by_key(|held| (held.message.since(), held.message.name())).is_some_and(|latest| {
             matches!(latest.message.state(), MessageState::Settled { receiver: Some(receiver) } if receiver.kind == ConsumerKind::Person)
         }))
     }

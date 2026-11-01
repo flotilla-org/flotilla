@@ -159,7 +159,15 @@ fn attention(fact: usize, reason: &str) -> Attention {
             Fact::Drift { ensure: "standing-gui".into(), project: NAMESPACE.into(), role: "gui".into(), convoy: convoy() },
             reason,
         ),
-        3 => Attention::credential_refresh("demo", "work", BTreeMap::from([("github".to_owned(), reason.to_owned())])),
+        // The second reason adds a credential, so the first drops one: the old store deletes its demand.
+        3 => {
+            let credentials: &[&str] = if reason == "still held" { &["github", "gitlab"] } else { &["github"] };
+            Attention::credential_refresh(
+                "demo",
+                "work",
+                credentials.iter().map(|credential| (credential.to_string(), reason.to_owned())).collect(),
+            )
+        }
         _ => Attention::new(Fact::DeliveryHeld { session: "session-1".into(), convoy: convoy(), role: "coder".into() }, reason),
     }
 }
