@@ -566,8 +566,9 @@ async fn on_the_engine_a_long_runner_exchanges_its_turns_before_landing() {
     fleet.assert_on_the_engine().await;
 }
 
-// Behaviour: with no FleetDesignation the controllers keep running and health names the missing
-// record; once it is recorded the waiting convoy delivers without a restart.
+// Behaviour: with no FleetDesignation the controllers keep running and explain names the missing
+// record; once it is recorded the waiting convoy delivers without a restart. On the engine the
+// Host keeps only conditions that can block, so health's diagnostic naming it is not recorded there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_missing_fleet_designation_waits_and_delivery_resumes_when_it_arrives() {
     let supervision = flotilla_daemon::supervisor::ControllerSupervision {
@@ -579,21 +580,21 @@ async fn a_missing_fleet_designation_waits_and_delivery_resumes_when_it_arrives(
     };
     let fleet = DummyDaemon::start_with_relay().host("dummy-load").designated(false).supervision(supervision).call().await;
     fleet.dispatch("undesignated", CrewMix::Coder).await;
-    let named = tokio::time::timeout(Duration::from_secs(20), async {
+    let convoy = fleet.convoy("undesignated").await.expect("convoy");
+    let explained = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let conditions = fleet.host_conditions().await;
-            if let Some(condition) = conditions.iter().find(|c| c.condition_type == "Message/FleetDesignation") {
-                return condition.message.clone();
+            let explained = fleet.daemon.explain_convoy_internal(Some(NAMESPACE), &convoy.metadata.name).await.expect("explain");
+            if explained.warnings.iter().any(|warning| warning.contains("FleetDesignation `fleet` is missing")) {
+                return explained;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("health names the missing FleetDesignation");
-    assert!(named.contains("FleetDesignation `fleet` is missing"), "{named}");
-    let convoy = fleet.convoy("undesignated").await.expect("convoy");
-    let explained = fleet.daemon.explain_convoy_internal(Some(NAMESPACE), &convoy.metadata.name).await.expect("explain");
-    assert!(explained.warnings.iter().any(|warning| warning.contains("FleetDesignation `fleet` is missing")), "{:?}", explained.warnings);
+    .expect("explain names the missing FleetDesignation");
+    assert!(!explained.warnings.is_empty());
+    let conditions = fleet.host_conditions().await;
+    assert!(conditions.iter().all(|c| c.condition_type != "Message/FleetDesignation"), "a diagnostic is not recorded: {conditions:?}");
     tokio::time::sleep(Duration::from_secs(1)).await;
     let conditions = fleet.host_conditions().await;
     assert!(conditions.iter().all(|c| !c.condition_type.starts_with("Controller/")), "no controller exhausted its budget: {conditions:?}");
@@ -1450,6 +1451,8 @@ impl DummyDaemon {
                 collect!(stored flotilla_provisioning::stored::forge_observation::IssueRecord);
                 collect!(stored flotilla_provisioning::stored::forge_observation::ForgeReadRecord);
                 collect!(stored flotilla_provisioning::stored::placement::FulfilmentKindDefinition);
+                collect!(stored flotilla_provisioning::stored::host::HostRecord);
+                collect!(stored flotilla_provisioning::stored::host::HostObservation);
                 assert_eq!(covered, registered, "every registered engine kind needs a transport fixture");
                 Ok(snapshots)
             })

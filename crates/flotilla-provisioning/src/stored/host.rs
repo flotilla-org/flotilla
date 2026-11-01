@@ -170,6 +170,10 @@ impl Class {
             .and_then(serde_json::from_value)
             .map_err(|error| format!("class {class:?} has no stored class: {error}"))
     }
+
+    pub fn environment_class(self) -> EnvironmentClass {
+        serde_json::to_value(self).and_then(serde_json::from_value).expect("every stored class names an environment class")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]

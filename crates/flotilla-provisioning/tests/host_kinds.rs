@@ -13,7 +13,7 @@ use flotilla_protocol::{
 };
 use flotilla_provisioning::{
     engine::{
-        host_import::{import_host, rehearse_hosts, HostCopies, HostCopy, Imported},
+        host_import::{import_host, import_hosts, rehearse_hosts, HostCopies, HostCopy, Imported},
         import::ImportReport,
     },
     stored::{
@@ -64,12 +64,10 @@ fn host_statements_search_by_key() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-// Behaviour (#3373 ruling 6): Host holds `ho` and HostObservation `ob`, codes no production kind
-// holds, so they register beside them.
+// Behaviour (#3373 ruling 6): Host holds `ho` and HostObservation `ob` among the production kinds.
 #[test]
-fn host_kind_codes_are_pinned_and_free() {
-    let mut registry = stored::production_kinds().expect("production kinds");
-    host_kinds::register(&mut registry).expect("no production kind holds ho or ob");
+fn host_kind_codes_are_pinned() {
+    let registry = stored::production_kinds().expect("no code is held twice");
     let held = |kind: &str| registry.iter().find(|set| set.kind == kind).map(|set| set.code);
     assert_eq!(held("Host"), Some(KindCode::new("ho")));
     assert_eq!(held("HostObservation"), Some(KindCode::new("ob")));
@@ -449,4 +447,52 @@ fn every_environment_class_is_stored() {
     ] {
         assert_eq!(Class::new(class), Ok(stored));
     }
+}
+
+/// A rehearsal whose HostObservation writes are refused.
+struct RefusingObservations(flotilla_engine_store::Rehearsal);
+
+impl flotilla_engine_store::ImportTarget for RefusingObservations {
+    fn imports(&self, home: &str) -> bool {
+        self.0.imports(home)
+    }
+
+    fn write_with<K: flotilla_schema::Kind + PartialEq>(
+        &mut self,
+        home: &str,
+        name: &str,
+        change: &flotilla_schema::NewChange,
+        version: u64,
+        make: impl FnOnce(u64) -> K,
+    ) -> Result<K, String> {
+        if K::KIND == "HostObservation" {
+            return Err("refused".to_owned());
+        }
+        self.0.write_with(home, name, change, version, make)
+    }
+
+    fn holds<K: flotilla_schema::Kind>(&mut self, name: &str, home: &str) -> Result<bool, String> {
+        self.0.holds::<K>(name, home)
+    }
+}
+
+// Behaviour (#3824 layer 4d): a Host whose observation write is refused is refused with it and
+// counted as neither imported, so the cut-over import, which puts no store in place after a
+// refusal, never serves a Host without its observation.
+#[test]
+fn a_refused_observation_write_refuses_its_host() {
+    let status = HostStatus { daemon_generation: Some("g7".into()), ..HostStatus::default() };
+    let copies = HostCopies {
+        copies: vec![copy(object("kiwi", HostSpec::default(), Some(status)), "flotilla", "kiwi-node")],
+        homes: [("kiwi-node".into(), "kiwi".into())].into(),
+    };
+    let mut target =
+        RefusingObservations(flotilla_engine_store::Rehearsal::open(host_kinds::registry().expect("registry")).expect("rehearsal"));
+    let mut report = ImportReport::default();
+    import_hosts(&copies, &mut target, &mut report);
+    assert_eq!(
+        report.refused.iter().map(|refusal| (refusal.kind, refusal.record.as_str())).collect::<Vec<_>>(),
+        [("HostObservation", "kiwi")]
+    );
+    assert!(report.imported.is_empty(), "{report:?}");
 }

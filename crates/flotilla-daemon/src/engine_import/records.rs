@@ -1,15 +1,16 @@
-//! The importers of the kinds whose records map one to one: ManifestRoot, Repository, Artifact
-//! and the account kinds.
+//! The importers of the kinds whose records map one to one: ManifestRoot, Repository, Host,
+//! Artifact and the account kinds.
 
 use flotilla_engine_store::Import;
 use flotilla_provisioning::engine::{
     account::import_accounts,
     artifact_import::{import_artifacts, ArtifactCopy},
+    host_import::{import_hosts, HostCopies, HostCopy},
     import::ImportReport,
     manifest_root_import::import_roots,
     repository_import::{import_repositories, RepositoryCopy},
 };
-use flotilla_resources::{AccountBinding, AccountProvision, Artifact, ManifestRoot, Repository};
+use flotilla_resources::{AccountBinding, AccountProvision, Artifact, Host, ManifestRoot, Repository};
 
 use super::{Carried, Source};
 
@@ -34,6 +35,21 @@ pub(super) fn repositories(source: &Source, target: &mut Import, _: &mut Carried
         .map(|copy| RepositoryCopy { namespace: copy.namespace, object: copy.object, home: copy.home })
         .collect();
     import_repositories(&copies, target, report);
+}
+
+/// Every namespace's at once: the engine has no namespaces. Each home imported here is this
+/// daemon's, whose own host the source names.
+pub(super) fn hosts(source: &Source, target: &mut Import, _: &mut Carried, report: &mut ImportReport) {
+    let copies: Vec<_> = source
+        .owned::<Host>("hosts", None, "Host", target, report)
+        .into_iter()
+        .map(|copy| HostCopy { namespace: copy.namespace, object: copy.object, home: copy.home })
+        .collect();
+    let homes = match &source.own_host {
+        Some(own_host) => copies.iter().map(|copy| (copy.home.clone(), own_host.clone())).collect(),
+        None => Default::default(),
+    };
+    import_hosts(&HostCopies { copies, homes }, target, report);
 }
 
 /// Every namespace's at once: the engine has no namespaces.

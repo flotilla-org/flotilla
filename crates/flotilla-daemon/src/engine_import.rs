@@ -53,6 +53,8 @@ pub struct Row {
 #[derive(Debug, Default)]
 pub struct Source {
     rows: Vec<Row>,
+    /// The host this daemon describes, which its Host records are homed with; None when unknown.
+    own_host: Option<String>,
 }
 
 /// A row decoded as its old resource.
@@ -79,7 +81,12 @@ fn decode<R: Resource>(document: &Value) -> Result<ResourceObject<R>, String> {
 
 impl Source {
     pub fn new(rows: Vec<Row>) -> Self {
-        Self { rows }
+        Self { rows, own_host: None }
+    }
+
+    /// This source, read by the daemon describing `own_host`.
+    pub fn with_own_host(self, own_host: Option<String>) -> Self {
+        Self { own_host, ..self }
     }
 
     /// The records of the store at `path`, its own homed at `home`. The store is only read.
@@ -172,6 +179,7 @@ pub const STEPS: &[Step] = &[
     Step { name: "manifest roots", kinds: &["manifestroots"], run: records::manifest_roots },
     Step { name: "definitions", kinds: &definitions::KINDS, run: definitions::definitions },
     Step { name: "repositories", kinds: &["repositories"], run: records::repositories },
+    Step { name: "hosts", kinds: &["hosts"], run: records::hosts },
     Step { name: "artifacts", kinds: &["artifacts"], run: records::artifacts },
     Step { name: "forge observations", kinds: &observations::KINDS, run: observations::observations },
     Step { name: "accounts", kinds: &records::ACCOUNT_KINDS, run: records::accounts },
@@ -350,14 +358,15 @@ fn log_summary(summary: &Summary, report: &Path) {
     tracing::info!(report = %report.display(), refused = summary.refusals.len(), "engine import report written");
 }
 
-/// The cut-over import at a daemon's start with `[primitives]` on, homed at `home`: when
+/// The cut-over import at a daemon's start with `[primitives]` on, homed at `home` and describing
+/// `own_host`: when
 /// `state_dir` holds an old store and no engine store, imports the old store into a new engine
 /// store, writes the report, and puts the engine store in place only if nothing was refused. A
 /// refusal is an error, leaving `decided.sqlite.importing` for inspection; the next start imports
 /// again from the beginning. Returns the report's path, or `None` when there was nothing to import.
 /// The report is written before the rename, so a failed rename leaves an `imported` report beside
 /// no engine store; the next start imports again and writes a new one.
-pub fn first_start(state_dir: &Path, home: &str) -> Result<Option<PathBuf>, String> {
+pub fn first_start(state_dir: &Path, home: &str, own_host: Option<&str>) -> Result<Option<PathBuf>, String> {
     let engine = state_dir.join(ENGINE_STORE);
     let old = state_dir.join(OLD_STORE);
     if engine.exists() || !old.exists() {
@@ -366,7 +375,7 @@ pub fn first_start(state_dir: &Path, home: &str) -> Result<Option<PathBuf>, Stri
     let importing = state_dir.join(IMPORTING);
     remove_store(&importing)?;
     tracing::info!(source = %old.display(), target = %importing.display(), home, "engine import: first start with [primitives]");
-    let source = Source::read(&old, home)?;
+    let source = Source::read(&old, home)?.with_own_host(own_host.map(str::to_owned));
     let registry = crate::runtime::decided_registry().map_err(|error| format!("decided store registry: {error:?}"))?;
     let summary = {
         let mut target = Import::create(&importing, home, registry)?;

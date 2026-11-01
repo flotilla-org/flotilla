@@ -232,7 +232,7 @@ async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _held = populated(dir.path()).await;
     let old = old_store(dir.path());
-    let written = first_start(dir.path(), HERE).expect("imports").expect("a report");
+    let written = first_start(dir.path(), HERE, None).expect("imports").expect("a report");
     assert_eq!(old_store(dir.path()), old, "the old store is only read");
     for file in [IMPORTING, "decided.sqlite.importing-journal", "decided.sqlite.importing-wal", "decided.sqlite-wal"] {
         assert!(!dir.path().join(file).exists(), "{file}: the engine store is whole in one file when renamed");
@@ -271,7 +271,7 @@ async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
     drop(store);
 
     let engine_digest = digest(&dir.path().join(ENGINE_STORE));
-    assert_eq!(first_start(dir.path(), HERE).expect("starts"), None, "an engine store present is never imported over");
+    assert_eq!(first_start(dir.path(), HERE, None).expect("starts"), None, "an engine store present is never imported over");
     assert_eq!(digest(&dir.path().join(ENGINE_STORE)), engine_digest);
     assert_eq!(old_store(dir.path()), old);
 }
@@ -280,11 +280,11 @@ async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
 async fn moving_the_engine_store_aside_imports_the_same_records_again() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _held = populated(dir.path()).await;
-    let first = report(&first_start(dir.path(), HERE).expect("imports").expect("a report"));
+    let first = report(&first_start(dir.path(), HERE, None).expect("imports").expect("a report"));
     let imported = entries(&dir.path().join(ENGINE_STORE));
     assert!(!imported.is_empty());
     std::fs::rename(dir.path().join(ENGINE_STORE), dir.path().join("decided.sqlite.aside")).expect("aside");
-    let again = report(&first_start(dir.path(), HERE).expect("imports").expect("a report"));
+    let again = report(&first_start(dir.path(), HERE, None).expect("imports").expect("a report"));
     assert_eq!(again["kinds"], first["kinds"]);
     assert_eq!(entries(&dir.path().join(ENGINE_STORE)), imported);
 }
@@ -295,7 +295,7 @@ async fn an_imported_record_is_created_at_its_old_creation_time() {
     let backend = SqliteBackend::open(dir.path().join(OLD_STORE)).expect("old store");
     let stored = own::<Artifact>(&backend, artifact("ours")).await;
     drop(backend);
-    first_start(dir.path(), HERE).expect("imports");
+    first_start(dir.path(), HERE, None).expect("imports");
     let created: chrono::DateTime<Utc> = stored["metadata"]["creationTimestamp"].as_str().expect("created").parse().expect("time");
     let mut store = engine(dir.path());
     let mut read = store.read().expect("read");
@@ -323,7 +323,7 @@ async fn a_refused_record_keeps_the_import_for_inspection_and_puts_no_engine_sto
     )
     .await;
     let old = old_store(dir.path());
-    let error = first_start(dir.path(), HERE).expect_err("refused");
+    let error = first_start(dir.path(), HERE, None).expect_err("refused");
     assert!(error.contains("refused 1 records"), "{error}");
     assert!(!dir.path().join(ENGINE_STORE).exists());
     assert!(dir.path().join(IMPORTING).exists(), "kept for inspection");
@@ -340,7 +340,7 @@ async fn a_refused_record_keeps_the_import_for_inspection_and_puts_no_engine_sto
     assert_eq!(report["refusals"][0]["kind"], "TerminalSession");
     assert_eq!(report["refusals"][0]["name"], "missing-identity");
     // The next start imports again from the beginning, over the kept file.
-    assert!(first_start(dir.path(), HERE).is_err());
+    assert!(first_start(dir.path(), HERE, None).is_err());
     assert!(!dir.path().join(ENGINE_STORE).exists());
     drop(backend);
 }
@@ -352,7 +352,7 @@ async fn messages_are_refused_together_when_no_designation_names_the_fleet() {
     own::<Message>(&backend, message("one")).await;
     own::<Message>(&backend, message("two")).await;
     drop(backend);
-    let error = first_start(dir.path(), HERE).expect_err("refused");
+    let error = first_start(dir.path(), HERE, None).expect_err("refused");
     assert!(error.contains("refused 1 records"), "{error}");
     let summary = rehearse(&Source::read(&dir.path().join(OLD_STORE), HERE).expect("source"), HERE);
     assert_eq!(summary.kinds["Message"], Counts { imported: 0, dropped: 0, refused: 1 });
@@ -366,7 +366,7 @@ async fn the_rehearsal_reports_what_the_import_writes() {
     let _held = populated(dir.path()).await;
     let summary = rehearse(&Source::read(&dir.path().join(OLD_STORE), HERE).expect("source"), HERE);
     assert_eq!(summary.staying.get("FulfilmentKind").map(|(_, rows)| *rows), Some(1), "not in the engine store at this build");
-    let written = report(&first_start(dir.path(), HERE).expect("imports").expect("a report"));
+    let written = report(&first_start(dir.path(), HERE, None).expect("imports").expect("a report"));
     assert_eq!(serde_json::to_value(&summary.kinds).expect("kinds"), written["kinds"]);
 }
 
@@ -613,7 +613,7 @@ async fn an_import_left_by_a_crash_is_replaced_by_a_clean_one() {
     std::fs::write(dir.path().join(IMPORTING), b"half an import").expect("stale import");
     std::fs::write(dir.path().join(format!("{IMPORTING}-journal")), b"stale journal").expect("stale journal");
     std::fs::write(dir.path().join(format!("{IMPORTING}-wal")), b"stale log").expect("stale log");
-    let written = report(&first_start(dir.path(), HERE).expect("imports").expect("a report"));
+    let written = report(&first_start(dir.path(), HERE, None).expect("imports").expect("a report"));
     assert_eq!(written["outcome"], "imported", "{written:#}");
     for suffix in ["", "-journal", "-wal"] {
         assert!(!dir.path().join(format!("{IMPORTING}{suffix}")).exists(), "{suffix}");
@@ -770,4 +770,28 @@ fn hosts_importing_together_write_each_observation_once_at_its_observer() {
         ("Issue".to_owned(), vec![ELSEWHERE.to_owned()]),
     ]);
     assert_eq!(written, expected);
+}
+
+fn host(name: &str, spec: flotilla_resources::HostSpec) -> Value {
+    document("Host", name, serde_json::to_value(spec).expect("spec"), json!({"daemon_generation": "g7"}))
+}
+
+// Behaviour (#3824 layer 4d): the Host step imports the Hosts homed at this daemon, its own and
+// the SSH hosts it owns, each with its observation; a copy of another daemon's Host is dropped. A
+// daemon that does not know its own host id refuses its Hosts rather than guess.
+#[test]
+fn the_hosts_this_daemon_describes_import_here() {
+    let ssh = flotilla_resources::HostSpec {
+        connection: flotilla_resources::HostConnection::SshHost { owning_daemon: "kiwi".into(), destination: "crew@b1".into() },
+        ..Default::default()
+    };
+    let documents = || vec![host("kiwi", Default::default()), host("b1", ssh.clone()), host("feta", Default::default())];
+    let summary = rehearse(&rows(documents()).with_own_host(Some("kiwi".into())), HERE);
+    assert!(summary.refusals.is_empty(), "{summary:?}");
+    // Dropped: feta's copy, and b1's destination.
+    assert_eq!(summary.kinds["Host"], Counts { imported: 2, dropped: 2, refused: 0 }, "{summary:?}");
+    assert_eq!(summary.kinds["HostObservation"].imported, 2, "{summary:?}");
+
+    let summary = rehearse(&rows(documents()), HERE);
+    assert_eq!(refused(&summary), [("Host", "kiwi"), ("Host", "b1"), ("Host", "feta")], "{summary:?}");
 }

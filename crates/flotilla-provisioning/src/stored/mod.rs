@@ -97,6 +97,7 @@ pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     artifact::register(registry)?;
     forge_observation::register(registry)?;
     placement::register(registry)?;
+    host::register(registry)?;
     Ok(())
 }
 
