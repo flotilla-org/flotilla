@@ -346,7 +346,9 @@ impl TreeDelivery for SkillsDelivery {
         tracing::info!(target = %target.display(), sha256 = %archive.sha256, "delivered frozen crew skills");
         Ok(())
     }
-    /// #4088: landed means the skills link still resolves into a store entry.
+    /// #4088: landed means the skills link still resolves into a store entry. Any entry
+    /// will do: `present` is asked only once the record's digest matches the need, so
+    /// which skills belong there is already settled.
     async fn present(&self, target: &Path, agent: &dyn VesselAgent) -> Result<bool, String> {
         Ok(agent.linked_artifact(target).await?.is_some())
     }
