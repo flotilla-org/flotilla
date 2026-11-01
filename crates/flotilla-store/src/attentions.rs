@@ -183,6 +183,10 @@ fn is_open(demand: &ResourceObject<Demand>) -> bool {
     matches!(demand.status.as_ref().map_or(DemandState::Raised, |status| status.state), DemandState::Raised | DemandState::Escalated)
 }
 
+fn is_acknowledged(demand: &ResourceObject<Demand>) -> bool {
+    demand.status.as_ref().is_some_and(|status| status.state == DemandState::Acknowledged)
+}
+
 fn reason(demand: &ResourceObject<Demand>) -> String {
     let annotations = &demand.metadata.annotations;
     [ENSURE_HOLD_REASON_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, DELIVERY_HOLD_REASON_ANNOTATION]
@@ -195,10 +199,21 @@ fn reason(demand: &ResourceObject<Demand>) -> String {
 impl Attentions for OldStoreAttentions {
     async fn raise(&self, namespace: &str, attention: &Attention) -> Result<(), String> {
         let demands = self.demands(namespace);
-        let desired = self.desired(namespace, attention).await?;
         let (sender, subject) = (attention.fact.sender(), attention.fact.subject());
-        for (held_by, about, current) in self.attentions(namespace, None).await? {
-            if held_by == sender && about == subject && !desired.contains_key(&current.metadata.name) {
+        let about: Vec<_> = self
+            .attentions(namespace, None)
+            .await?
+            .into_iter()
+            .filter(|(held_by, about, _)| *held_by == sender && *about == subject)
+            .map(|(_, _, demand)| demand)
+            .collect();
+        // An acknowledged attention stays acknowledged until its writer clears it.
+        if !about.iter().any(is_open) && about.iter().any(is_acknowledged) {
+            return Ok(());
+        }
+        let desired = self.desired(namespace, attention).await?;
+        for current in &about {
+            if !desired.contains_key(&current.metadata.name) {
                 self.delete(namespace, &current.metadata.name).await?;
             }
         }
@@ -210,6 +225,7 @@ impl Attentions for OldStoreAttentions {
                     }
                     continue;
                 }
+                // A demand of this name about another subject: this one replaces it.
                 Ok(_) => self.delete(namespace, &name).await?,
                 Err(ResourceError::NotFound { .. }) => {}
                 Err(error) => return Err(error.to_string()),
@@ -221,14 +237,14 @@ impl Attentions for OldStoreAttentions {
 
     async fn clear(&self, namespace: &str, sender: Sender, subject: &Subject) -> Result<(), String> {
         for (held_by, about, demand) in self.attentions(namespace, None).await? {
-            if held_by == sender && &about == subject && is_open(&demand) {
+            if held_by == sender && &about == subject {
                 self.delete(namespace, &demand.metadata.name).await?;
             }
         }
         Ok(())
     }
 
-    async fn open(&self, namespace: &str, scope: Option<&Subject>) -> Result<Vec<OpenAttention>, String> {
+    async fn open(&self, namespace: &str, from: Option<Sender>, scope: Option<&Subject>) -> Result<Vec<OpenAttention>, String> {
         let mut open: BTreeMap<(Sender, Subject), OpenAttention> = BTreeMap::new();
         // A vessel's attentions target its convoy; the other subjects are found by name.
         let about = match scope {
@@ -236,7 +252,7 @@ impl Attentions for OldStoreAttentions {
             _ => None,
         };
         for (sender, subject, demand) in self.attentions(namespace, about).await? {
-            if !is_open(&demand) || scope.is_some_and(|scope| !subject.within(scope)) {
+            if !is_open(&demand) || from.is_some_and(|from| from != sender) || scope.is_some_and(|scope| !subject.within(scope)) {
                 continue;
             }
             let raised_at = demand
@@ -271,7 +287,6 @@ impl Attentions for OldStoreAttentions {
     async fn acknowledged(&self, namespace: &str, sender: Sender, subject: &Subject) -> Result<bool, String> {
         let found = self.attentions(namespace, None).await?;
         let about: Vec<_> = found.iter().filter(|(held_by, about, _)| *held_by == sender && about == subject).collect();
-        Ok(!about.is_empty()
-            && about.iter().all(|(_, _, demand)| demand.status.as_ref().is_some_and(|status| status.state == DemandState::Acknowledged)))
+        Ok(!about.iter().any(|(_, _, demand)| is_open(demand)) && about.iter().any(|(_, _, demand)| is_acknowledged(demand)))
     }
 }

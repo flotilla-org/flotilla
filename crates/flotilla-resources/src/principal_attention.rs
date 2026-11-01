@@ -83,11 +83,13 @@ pub struct DemandSpec {
     pub addressee: DemandAddressee,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expiry: Option<DemandExpiry>,
-    /// Retired response options, read so the import refuses a record that offers any.
+    /// Retired response options, read so the import refuses a record that offers any. Remove one
+    /// roll after this ships.
     #[serde(default, rename = "response_options", skip_serializing)]
     #[builder(skip)]
     pub retired_response_options: Option<serde_json::Value>,
-    /// A retired human gate's context, read so the import refuses a record that carries one.
+    /// A retired human gate's context, read so the import refuses a record that carries one. Remove
+    /// one roll after this ships.
     #[serde(default, rename = "human_gate", skip_serializing)]
     #[builder(skip)]
     pub retired_human_gate: Option<serde_json::Value>,
@@ -144,7 +146,8 @@ pub struct DemandStatus {
     pub acknowledged: Option<DemandTransition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub escalated: Option<DemandTransition>,
-    /// A retired verdict, read so the import refuses a record that carries one.
+    /// A retired verdict, read so the import refuses a record that carries one. Remove one roll
+    /// after this ships.
     #[serde(default, rename = "verdict", skip_serializing)]
     #[builder(skip)]
     pub retired_verdict: Option<serde_json::Value>,

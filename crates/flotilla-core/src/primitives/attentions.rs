@@ -49,6 +49,19 @@ impl Held {
     fn pending(&self) -> bool {
         *self.message.state() == MessageState::Pending
     }
+
+    fn settled_by_person(&self) -> bool {
+        matches!(self.message.state(), MessageState::Settled { receiver: Some(receiver) } if receiver.kind == ConsumerKind::Person)
+    }
+}
+
+/// The attention a person acknowledged, when none is open and it is the latest: its writer has not
+/// cleared it since.
+fn acknowledged(about: &[Held]) -> Option<&Held> {
+    if about.iter().any(Held::pending) {
+        return None;
+    }
+    about.iter().max_by_key(|held| (held.message.since(), held.message.name())).filter(|latest| latest.settled_by_person())
 }
 
 /// The old-shaped subject an engine address names.
@@ -155,7 +168,11 @@ impl MessagePrimitives {
 impl Attentions for MessagePrimitives {
     async fn raise(&self, namespace: &str, attention: &attentions::Attention) -> Result<(), String> {
         let (sender, subject) = (attention.fact.sender(), attention.fact.subject());
-        let open: Vec<Held> = self.about(namespace, sender, &subject).await?.into_iter().filter(Held::pending).collect();
+        let about = self.about(namespace, sender, &subject).await?;
+        if acknowledged(&about).is_some() {
+            return Ok(());
+        }
+        let open: Vec<Held> = about.into_iter().filter(Held::pending).collect();
         if open.iter().any(|held| held.reason() == attention.reason) {
             return Ok(());
         }
@@ -178,7 +195,20 @@ impl Attentions for MessagePrimitives {
     }
 
     async fn clear(&self, namespace: &str, sender: Sender, subject: &Subject) -> Result<(), String> {
-        for held in self.about(namespace, sender, subject).await? {
+        let about = self.about(namespace, sender, subject).await?;
+        // A settled message takes no edge: the end of an acknowledged attention is a successor,
+        // withdrawn at once, so the next raise is told again.
+        if let Some(seen) = acknowledged(&about).filter(|seen| seen.home == self.home) {
+            let mut spec = seen.message.spec().clone();
+            spec.admitted_seq = 0;
+            spec.supersedes = None;
+            let id = self.inbox.enqueue(spec).await.map_err(|error| error.to_string())?;
+            let authority = seen.subject_address.clone();
+            self.world.update(|world| world.authority.put(&flotilla_state_machines::Ref::new(authority.as_str()), true));
+            let reason = DropReason::Withdrawn { by: seen.sender_address.clone(), authority };
+            return self.inbox.drop(&id, reason).await.map_err(|error| error.to_string());
+        }
+        for held in about {
             if !held.pending() {
                 continue;
             }
@@ -191,23 +221,19 @@ impl Attentions for MessagePrimitives {
         Ok(())
     }
 
-    async fn open(&self, namespace: &str, scope: Option<&Subject>) -> Result<Vec<OpenAttention>, String> {
+    async fn open(&self, namespace: &str, from: Option<Sender>, scope: Option<&Subject>) -> Result<Vec<OpenAttention>, String> {
         Ok(self
             .held(namespace)
             .await?
             .into_iter()
-            .filter(|held| held.pending() && scope.is_none_or(|scope| held.subject.within(scope)))
+            .filter(|held| {
+                held.pending() && from.is_none_or(|from| from == held.sender) && scope.is_none_or(|scope| held.subject.within(scope))
+            })
             .map(|held| OpenAttention { sender: held.sender, reason: held.reason(), raised_at: held.raised_at(), subject: held.subject })
             .collect())
     }
 
     async fn acknowledged(&self, namespace: &str, sender: Sender, subject: &Subject) -> Result<bool, String> {
-        let about = self.about(namespace, sender, subject).await?;
-        if about.iter().any(Held::pending) {
-            return Ok(false);
-        }
-        Ok(about.iter().max_by_key(|held| (held.message.since(), held.message.name())).is_some_and(|latest| {
-            matches!(latest.message.state(), MessageState::Settled { receiver: Some(receiver) } if receiver.kind == ConsumerKind::Person)
-        }))
+        Ok(acknowledged(&self.about(namespace, sender, subject).await?).is_some())
     }
 }

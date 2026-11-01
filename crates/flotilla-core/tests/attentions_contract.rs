@@ -195,7 +195,7 @@ async fn check(implementation: &Implementation, model: &mut Model, after: &[Step
     let seen = |open: Vec<flotilla_resources::attentions::OpenAttention>| {
         open.into_iter().map(|open| ((open.sender, open.subject), open.reason)).collect::<BTreeMap<_, _>>()
     };
-    let open = attentions.open(NAMESPACE, None).await.expect("open");
+    let open = attentions.open(NAMESPACE, None, None).await.expect("open");
     for attention in &open {
         let key = (attention.sender, attention.subject.clone());
         let first = *model.raised_at.entry(key.clone()).or_insert(attention.raised_at);
@@ -204,7 +204,7 @@ async fn check(implementation: &Implementation, model: &mut Model, after: &[Step
     let all = seen(open);
     assert_eq!(all, model.open, "every open attention after {after:?}");
     let convoy = Subject::convoy("demo");
-    let under = seen(attentions.open(NAMESPACE, Some(&convoy)).await.expect("open"));
+    let under = seen(attentions.open(NAMESPACE, None, Some(&convoy)).await.expect("open"));
     let expected: BTreeMap<_, _> = model
         .open
         .iter()
@@ -213,10 +213,14 @@ async fn check(implementation: &Implementation, model: &mut Model, after: &[Step
         .collect();
     assert_eq!(under, expected, "open about the convoy after {after:?}");
     let vessel = Subject::Vessel { convoy: "demo".into(), vessel: "work".into() };
-    let about_vessel = seen(attentions.open(NAMESPACE, Some(&vessel)).await.expect("open"));
+    let about_vessel = seen(attentions.open(NAMESPACE, None, Some(&vessel)).await.expect("open"));
     let expected: BTreeMap<_, _> =
         model.open.iter().filter(|((_, subject), _)| *subject == vessel).map(|(k, v)| (k.clone(), v.clone())).collect();
     assert_eq!(about_vessel, expected, "open about the vessel after {after:?}");
+    let standing = seen(attentions.open(NAMESPACE, Some(Sender::Standing), None).await.expect("open"));
+    let expected: BTreeMap<_, _> =
+        model.open.iter().filter(|((sender, _), _)| *sender == Sender::Standing).map(|(k, v)| (k.clone(), v.clone())).collect();
+    assert_eq!(standing, expected, "open from standing after {after:?}");
     for fact in 0..FACTS {
         let key = {
             let fact = attention(fact, "").fact;
@@ -249,7 +253,11 @@ fn contract(tc: TestCase, engine: bool) {
                     let attention = attention(fact, ["held", "still held"][reason]);
                     implementation.attentions().raise(NAMESPACE, &attention).await.expect("raise");
                     let key = (attention.fact.sender(), attention.fact.subject());
-                    model.acknowledged.remove(&key);
+                    // An acknowledged attention stays acknowledged until its writer clears it.
+                    if model.acknowledged.contains(&key) {
+                        check(&implementation, &mut model, &steps[..=index]).await;
+                        continue;
+                    }
                     if model.open.insert(key.clone(), attention.reason.clone()).is_none_or(|before| before != attention.reason) {
                         model.raised_at.remove(&key);
                     }
@@ -258,9 +266,8 @@ fn contract(tc: TestCase, engine: bool) {
                     let fact = attention(fact, "").fact;
                     implementation.attentions().clear(NAMESPACE, fact.sender(), &fact.subject()).await.expect("clear");
                     let key = (fact.sender(), fact.subject());
-                    if model.open.remove(&key).is_some() {
-                        model.acknowledged.remove(&key);
-                    }
+                    model.open.remove(&key);
+                    model.acknowledged.remove(&key);
                     model.raised_at.remove(&key);
                 }
                 Step::Acknowledge { fact } => {
@@ -286,4 +293,32 @@ fn the_old_store_keeps_the_attentions_contract(tc: TestCase) {
 #[hegel::test(test_cases = 100)]
 fn the_engine_keeps_the_attentions_contract(tc: TestCase) {
     contract(tc, true);
+}
+
+async fn acknowledged_until_cleared(implementation: Implementation) {
+    let attentions = implementation.attentions();
+    let hold = attention(0, "held");
+    let (sender, subject) = (hold.fact.sender(), hold.fact.subject());
+    let open = || async { attentions.open(NAMESPACE, Some(sender), Some(&subject)).await.expect("open") };
+    attentions.raise(NAMESPACE, &hold).await.expect("raise");
+    implementation.acknowledge(&hold.fact).await;
+    attentions.raise(NAMESPACE, &hold).await.expect("raise again");
+    attentions.raise(NAMESPACE, &attention(0, "still held")).await.expect("raise for another reason");
+    assert!(open().await.is_empty(), "raising again leaves an acknowledged attention acknowledged");
+    assert!(attentions.acknowledged(NAMESPACE, sender, &subject).await.expect("acknowledged"));
+    attentions.clear(NAMESPACE, sender, &subject).await.expect("clear");
+    assert!(!attentions.acknowledged(NAMESPACE, sender, &subject).await.expect("acknowledged"));
+    attentions.raise(NAMESPACE, &hold).await.expect("raise after clear");
+    assert_eq!(open().await.len(), 1, "cleared, the next raise opens a new attention");
+}
+
+// Behaviour: raise, acknowledge, raise again stays acknowledged; clear, then raise opens a new one.
+#[tokio::test]
+async fn the_old_store_keeps_an_acknowledgement_until_cleared() {
+    acknowledged_until_cleared(Implementation::old().await).await;
+}
+
+#[tokio::test]
+async fn the_engine_keeps_an_acknowledgement_until_cleared() {
+    acknowledged_until_cleared(Implementation::engine().await).await;
 }

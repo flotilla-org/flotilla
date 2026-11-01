@@ -163,19 +163,21 @@ impl OpenAttention {
 /// at another home is read, but only its own home supersedes or withdraws it.
 #[async_trait]
 pub trait Attentions: Send + Sync {
-    /// Tells a person, unless the same attention is open. One open from the same sender about the
-    /// same subject for another reason is replaced.
+    /// Tells a person, unless the same attention is open or a person acknowledged it and its writer
+    /// has not cleared it since. One open from the same sender about the same subject for another
+    /// reason is replaced.
     async fn raise(&self, namespace: &str, attention: &Attention) -> Result<(), String>;
 
-    /// Settles the open attention from `sender` about `subject`: its fact ended. None open is no
-    /// error, and one a person acknowledged stays acknowledged.
+    /// Ends the attention from `sender` about `subject`: its fact ended. An open one is settled, and
+    /// an acknowledged one no longer holds back the next raise. None is no error.
     async fn clear(&self, namespace: &str, sender: Sender, subject: &Subject) -> Result<(), String>;
 
-    /// The open attentions about `scope` or a record under it; every one with no scope.
-    async fn open(&self, namespace: &str, scope: Option<&Subject>) -> Result<Vec<OpenAttention>, String>;
+    /// The open attentions from `from`, or every sender, about `scope` or a record under it, or
+    /// about every record.
+    async fn open(&self, namespace: &str, from: Option<Sender>, scope: Option<&Subject>) -> Result<Vec<OpenAttention>, String>;
 
-    /// Whether a person acknowledged the latest attention from `sender` about `subject`, and
-    /// nothing has been raised about it since.
+    /// Whether a person acknowledged the latest attention from `sender` about `subject`, and its
+    /// writer has not cleared it since.
     async fn acknowledged(&self, namespace: &str, sender: Sender, subject: &Subject) -> Result<bool, String>;
 }
 
