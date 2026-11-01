@@ -161,6 +161,10 @@ impl std::fmt::Debug for AccountProvisioners {
     }
 }
 
+/// The variable Claude Code reads for its temp directory (task outputs).
+pub const CLAUDE_CODE_TMPDIR_ENV: &str = "CLAUDE_CODE_TMPDIR";
+/// The crew's harness temp directory within its material directory.
+pub const CLAUDE_TMP_DIR: &str = "tmp";
 /// The variable naming the requester's delivered token file. The Claude launch reads the token
 /// from it when the harness starts; the token itself never enters the session's environment.
 pub const CLAUDE_OAUTH_TOKEN_FILE_ENV: &str = "FLOTILLA_CLAUDE_OAUTH_TOKEN_FILE";
@@ -214,6 +218,8 @@ impl AccountProvisioner for ClaudeDirect {
         vec![
             ("CLAUDE_CONFIG_DIR".to_string(), home.to_string()),
             (CLAUDE_OAUTH_TOKEN_FILE_ENV.to_string(), Path::new(dir).join(CLAUDE_OAUTH_TOKEN_FILE).display().to_string()),
+            // The harness's temp files (task outputs) live with the crew's material, so they go with it.
+            (CLAUDE_CODE_TMPDIR_ENV.to_string(), Path::new(dir).join(CLAUDE_TMP_DIR).display().to_string()),
         ]
     }
 
@@ -221,8 +227,8 @@ impl AccountProvisioner for ClaudeDirect {
         if !Path::new(dir).is_absolute() {
             return Err(format!("requester material directory `{dir}` is not absolute"));
         }
-        let script = "umask 077 && mkdir -p \"$1\" && chmod 700 \"$1\"";
-        runner.run("sh", &["-c", script, "flotilla-requester-home", dir], Path::new("/"), &ChannelLabel::Default).await?;
+        let script = format!("umask 077 && mkdir -p \"$1\" \"$1/{CLAUDE_TMP_DIR}\" && chmod 700 \"$1\" \"$1/{CLAUDE_TMP_DIR}\"");
+        runner.run("sh", &["-c", &script, "flotilla-requester-home", dir], Path::new("/"), &ChannelLabel::Default).await?;
         let token_file = Path::new(dir).join(CLAUDE_OAUTH_TOKEN_FILE);
         runner.write_file_with_mode(&token_file, material, 0o600).await
     }

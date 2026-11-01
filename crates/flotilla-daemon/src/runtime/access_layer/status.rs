@@ -2,10 +2,13 @@
 //! (access, place), holding the home, each need's mechanism and digest, and the retry
 //! state of a delivery that failed. `convoy explain` reads it; launch honours its retry.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, path::Path, time::Duration};
+
+use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
 
 use flotilla_resources::{
     access_delivery::{DeliveredNeed, DeliveryMechanism, DeliveryRetry},
+    account_access::{requester_convoy_dir, REQUESTER_HOME_DIR, REQUESTER_MATERIAL_DIR},
     AccessDelivery, AccessDeliverySpec, Convoy, Environment, InputMeta, ResourceError, ResourceObject, CONVOY_LABEL,
 };
 use flotilla_schema::Timestamp;
@@ -225,12 +228,49 @@ impl AccessStatusReconciler {
         if !(place_gone || convoy_gone) {
             return Ok(());
         }
+        // The access ended with its convoy: its requester state goes from an SSH host, whose
+        // dirs nothing else removes. A failure keeps the record, so the next pass retries.
+        if convoy_gone && !place_gone {
+            if let (Some(convoy), Some(profile)) = (record.metadata.labels.get(CONVOY_LABEL), self.state.ssh_host.get(place)) {
+                remove_requester_state(profile.runner.as_ref(), convoy).await?;
+            }
+        }
         match backend.using::<AccessDelivery>(&self.namespace).delete(&record.metadata.name).await {
             Ok(_) | Err(ResourceError::NotFound { .. }) => Ok(()),
             Err(error) => Err(format!("remove access delivery `{}`: {error}", record.metadata.name)),
         }
     }
 }
+
+/// Remove every requester directory of `convoy` from a host: its material (credential-bearing,
+/// under the runtime base), its home (under the durable base), and the homes a runtime base held
+/// before #4012. Missing paths are not errors; read-only content is made writable first (#4070).
+async fn remove_requester_state(runner: &dyn CommandRunner, convoy: &str) -> Result<(), String> {
+    let fallback = Path::new(flotilla_environment::environment::runner::CONTAINED_WRITABLE_CONFIG_BASE);
+    let runtime = runner.writable_config_base(None, fallback).await?;
+    let durable = flotilla_environment::environment::runner::home_base(runner).await?;
+    let paths = [
+        requester_convoy_dir(&runtime, REQUESTER_MATERIAL_DIR, convoy),
+        requester_convoy_dir(&durable, REQUESTER_HOME_DIR, convoy),
+        requester_convoy_dir(&runtime, REQUESTER_HOME_DIR, convoy),
+    ];
+    let mut args = vec!["-c", REMOVE_TREES, "flotilla-requester-remove"];
+    let paths = paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>();
+    args.extend(paths.iter().map(String::as_str));
+    runner
+        .run("sh", &args, Path::new("/"), &ChannelLabel::Default)
+        .await
+        .map(drop)
+        .map_err(|error| format!("remove requester state of convoy `{convoy}`: {error}"))
+}
+
+/// Each argument is a directory to remove; a read-only tree is made writable first.
+const REMOVE_TREES: &str = r#"for path in "$@"; do
+  case "$path" in /?*) ;; *) echo "refusing $path" >&2; exit 1;; esac
+  [ -e "$path" ] || [ -L "$path" ] || continue
+  chmod -R u+rwX -- "$path" 2>/dev/null
+  rm -rf -- "$path" || exit 1
+done"#;
 
 impl Reconciler for AccessStatusReconciler {
     type Resource = AccessDelivery;

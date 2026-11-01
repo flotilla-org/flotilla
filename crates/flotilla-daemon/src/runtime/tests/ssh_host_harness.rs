@@ -87,6 +87,10 @@ impl CommandRunner for FakeHost {
             }
             ("mkdir" | "chmod" | "mv" | "rm", _) => ok(),
             ("sh", ["-c", _, "flotilla-requester-home", _]) => ok(),
+            ("sh", ["-c", _, "flotilla-requester-remove", paths @ ..]) => {
+                self.files.lock().expect("files").retain(|file, _| !paths.iter().any(|path| file.starts_with(path)));
+                ok()
+            }
             ("sh", ["-c", _, "flotilla-create-dir", _, _]) => ok(),
             ("sh", ["-c", _, "flotilla-stat", path]) => Ok(match self.entry(path) {
                 Some(HostEntry::File(_)) => "file\n".into(),
@@ -1203,6 +1207,32 @@ async fn access_status_goes_with_its_convoy() {
     backend.using::<Convoy>(NAMESPACE).delete("demo").await.expect("convoy ended");
     reconciler.retire(&record).await.expect("retire");
     assert!(records.list().await.expect("records").items.is_empty(), "removed with its convoy");
+}
+
+// #4089: retiring a convoy's access on an SSH host removes the requester's home and material
+// from the host, and again is a no-op.
+#[tokio::test]
+async fn retiring_a_convoy_removes_its_requester_state_from_the_ssh_host() {
+    let tokens = TempDir::new().expect("token dir");
+    let token = tokens.path().join("box-a");
+    fs::write(&token, "box-a-token").expect("token");
+    let (runtime, host, _runtime_dir) = bound_ssh_host_crew(&token).await;
+    let requester_files = |host: &FakeHost| {
+        let files = host.files.lock().expect("files");
+        files.keys().filter(|path| path.components().any(|part| part.as_os_str() == "requesters")).cloned().collect::<Vec<_>>()
+    };
+    let before = requester_files(&host);
+    assert!(before.iter().any(|path| path.starts_with(BOUND_MATERIAL)), "the material landed: {before:?}");
+    let backend = runtime.daemon.resource_backend();
+    let records = backend.clone().using::<flotilla_resources::AccessDelivery>(NAMESPACE);
+    let [record] = records.list().await.expect("records").items.try_into().expect("one record");
+    let (_, reconciler) = super::super::access_layer::status::status_controller(Arc::clone(&runtime.state), NAMESPACE.to_string());
+    reconciler.retire(&record).await.expect("retire");
+    assert_eq!(requester_files(&host), before, "kept while its convoy remains");
+    backend.using::<Convoy>(NAMESPACE).delete("demo").await.expect("convoy ended");
+    reconciler.retire(&record).await.expect("retire");
+    assert_eq!(requester_files(&host), Vec::<PathBuf>::new(), "removed with its convoy");
+    reconciler.retire(&record).await.expect("retiring again is a no-op");
 }
 
 // #4037 contract 2: when the refresher rotates the central login, the next redelivery pass

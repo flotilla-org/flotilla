@@ -281,7 +281,7 @@ impl AccountBindingSpec {
 /// injectively: a name of ASCII alphanumerics, `-` and `_` is used as it is; any other has the
 /// rest replaced by `-` and a digest of the whole name appended, so `a.b` and `a-b` never share.
 pub fn requester_home(base: &std::path::Path, convoy: &str, role: &str, harness: &str) -> std::path::PathBuf {
-    requester_path(base, "agent-homes", convoy, role, harness)
+    requester_path(base, REQUESTER_HOME_DIR, convoy, role, harness)
 }
 
 /// Where a place's requester material directories live under its runtime base.
@@ -294,6 +294,19 @@ pub const REQUESTER_MATERIAL_DIR: &str = "agent-material";
 pub fn requester_material(base: &std::path::Path, convoy: &str, role: &str, harness: &str) -> std::path::PathBuf {
     requester_path(base, REQUESTER_MATERIAL_DIR, convoy, role, harness)
 }
+
+/// The directory holding every requester of `convoy` under `tree` of `base`: the parent of
+/// [`requester_home`]'s role directory, which the convoy's retirement removes whole.
+pub fn requester_convoy_dir(base: &std::path::Path, tree: &str, convoy: &str) -> std::path::PathBuf {
+    requester_path(base, tree, convoy, "role", "harness")
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("a requester path has a convoy directory")
+        .to_path_buf()
+}
+
+/// Where a place's requester home directories live under its durable base.
+pub const REQUESTER_HOME_DIR: &str = "agent-homes";
 
 fn requester_path(base: &std::path::Path, tree: &str, convoy: &str, role: &str, harness: &str) -> std::path::PathBuf {
     fn component(name: &str) -> String {
