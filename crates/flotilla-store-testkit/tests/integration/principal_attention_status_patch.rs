@@ -1,9 +1,8 @@
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
-    DemandAddressee, DemandKind, DemandPoolRef, DemandResponseOption, DemandSpec, DemandState, DemandStatus, DemandStatusPatch,
-    DemandVerdict, DemandVerdictDisposition, PrincipalRef, RegardStatus, RegardStatusPatch, StatusPatch,
+    DemandAddressee, DemandKind, DemandSpec, DemandState, DemandStatus, DemandStatusPatch, PrincipalRef, RegardStatus, RegardStatusPatch,
+    StatusPatch,
 };
-use flotilla_store::{resolve_demand, ResourceBackend};
 use flotilla_store_testkit::fixtures::timestamp;
 
 #[test]
@@ -58,118 +57,4 @@ fn demand_spec_defaults_to_dispatching_principal_via_constructor() {
 
     assert_eq!(spec.originating_work_ref, work_ref);
     assert_eq!(spec.addressee, DemandAddressee::Principal { principal_ref });
-}
-
-#[test]
-fn demand_spec_can_route_unroutable_work_to_a_pool() {
-    let work_ref = ResourceRef::new("flotilla.work/v1", "Vessel", "flotilla", "demo-review");
-    let spec = DemandSpec::for_pool(work_ref, DemandKind::Review, DemandPoolRef("project/default".to_string()));
-
-    assert_eq!(spec.addressee, DemandAddressee::Pool { pool_ref: DemandPoolRef("project/default".to_string()) });
-}
-
-#[tokio::test]
-async fn demand_resolution_records_a_typed_offered_verdict() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let demands = backend.using::<flotilla_resources::Demand>("flotilla");
-    demands
-        .create(
-            &flotilla_resources::InputMeta::builder().name("review-demo".to_string()).build(),
-            &DemandSpec::builder()
-                .originating_work_ref(ResourceRef::new("flotilla.work/v1", "Vessel", "flotilla", "demo-review"))
-                .kind(DemandKind::Review)
-                .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef::implicit_for_namespace("flotilla") })
-                .response_options(vec![
-                    DemandResponseOption::builder().name("approve".to_string()).title("Approve".to_string()).build(),
-                    DemandResponseOption::builder().name("revise".to_string()).title("Request revisions".to_string()).build(),
-                ])
-                .build(),
-        )
-        .await
-        .expect("create demand");
-    let verdict = DemandVerdict::builder()
-        .responding_principal_ref(PrincipalRef::implicit_for_namespace("flotilla"))
-        .disposition(DemandVerdictDisposition::Selected { option: "revise".to_string() })
-        .comment("Please cover the retry path".to_string())
-        .build();
-
-    let resolved = resolve_demand(&demands, "review-demo", verdict.clone(), timestamp(20), "principal/default".to_string())
-        .await
-        .expect("resolve with offered option");
-
-    let status = resolved.status.expect("demand status");
-    assert_eq!(status.state, DemandState::Satisfied);
-    assert_eq!(status.verdict, Some(verdict));
-}
-
-#[tokio::test]
-async fn demand_resolution_rejects_an_unoffered_verdict_but_accepts_explicit_other() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let demands = backend.using::<flotilla_resources::Demand>("flotilla");
-    demands
-        .create(
-            &flotilla_resources::InputMeta::builder().name("review-demo".to_string()).build(),
-            &DemandSpec::builder()
-                .originating_work_ref(ResourceRef::new("flotilla.work/v1", "Vessel", "flotilla", "demo-review"))
-                .kind(DemandKind::Review)
-                .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef::implicit_for_namespace("flotilla") })
-                .response_options(vec![DemandResponseOption::builder().name("approve".to_string()).title("Approve".to_string()).build()])
-                .build(),
-        )
-        .await
-        .expect("create demand");
-    let unoffered = DemandVerdict::builder()
-        .responding_principal_ref(PrincipalRef::implicit_for_namespace("flotilla"))
-        .disposition(DemandVerdictDisposition::Selected { option: "abandon".to_string() })
-        .build();
-
-    let error = resolve_demand(&demands, "review-demo", unoffered, timestamp(20), "principal/default".to_string())
-        .await
-        .expect_err("unoffered option must be rejected");
-    assert!(error.to_string().contains("not offered"));
-
-    let other = DemandVerdict::builder()
-        .responding_principal_ref(PrincipalRef::implicit_for_namespace("flotilla"))
-        .disposition(DemandVerdictDisposition::Other)
-        .comment("Use the manual recovery path".to_string())
-        .build();
-    let resolved = resolve_demand(&demands, "review-demo", other.clone(), timestamp(30), "principal/default".to_string())
-        .await
-        .expect("explicit other is valid");
-    assert_eq!(resolved.status.expect("status").verdict, Some(other));
-}
-
-#[tokio::test]
-async fn acknowledged_demand_cannot_report_a_successful_resolution_without_a_verdict() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let demands = backend.using::<flotilla_resources::Demand>("flotilla");
-    demands
-        .create(
-            &flotilla_resources::InputMeta::builder().name("dismissed".to_string()).build(),
-            &DemandSpec::for_dispatching_principal(
-                ResourceRef::new("flotilla.work/v1", "Vessel", "flotilla", "demo-review"),
-                DemandKind::Review,
-                PrincipalRef::implicit_for_namespace("flotilla"),
-            ),
-        )
-        .await
-        .expect("create demand");
-    flotilla_store::apply_status_patch(
-        &demands,
-        "dismissed",
-        &DemandStatusPatch::Acknowledge { as_of: timestamp(20), authority: "principal/default".to_string() },
-    )
-    .await
-    .expect("acknowledge demand");
-    let verdict = DemandVerdict::builder()
-        .responding_principal_ref(PrincipalRef::implicit_for_namespace("flotilla"))
-        .disposition(DemandVerdictDisposition::Other)
-        .build();
-
-    let error = resolve_demand(&demands, "dismissed", verdict, timestamp(30), "principal/default".to_string())
-        .await
-        .expect_err("acknowledged demand cannot resolve");
-
-    assert!(error.to_string().contains("acknowledged demand cannot be resolved"));
-    assert!(demands.get("dismissed").await.expect("demand").status.expect("status").verdict.is_none());
 }

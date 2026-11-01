@@ -12,9 +12,9 @@ use flotilla_core::primitives::{
 };
 use flotilla_protocol::{PrincipalRef, ResourceRef};
 use flotilla_resources::{
-    Convoy, ConvoyEnsure, ConvoySpec, Demand, DemandAddressee, DemandKind, DemandPoolRef, DemandResponseOption, DemandSpec, DemandState,
-    DemandStatus, DemandTransition, DemandVerdict, DemandVerdictDisposition, ObjectMeta, ResourceObject, TerminalSession, Vessel,
-    CONVOY_LABEL, CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION, ROLE_LABEL,
+    Convoy, ConvoyEnsure, ConvoySpec, Demand, DemandKind, DemandSpec, DemandState, DemandStatus, DemandTransition, ObjectMeta,
+    ResourceObject, TerminalSession, Vessel, CONVOY_LABEL, CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION,
+    ROLE_LABEL,
 };
 use flotilla_state_machines::machines::message::MessageState;
 use hegel::{generators as gs, generators::Generator, TestCase};
@@ -74,7 +74,6 @@ const STATES: [DemandState; 4] = [DemandState::Raised, DemandState::Escalated, D
 struct Drawn {
     writer: Writer,
     state: DemandState,
-    pooled: bool,
     options: bool,
     verdict: bool,
 }
@@ -100,21 +99,13 @@ fn demand(index: usize, drawn: &Drawn) -> ResourceObject<Demand> {
         Writer::Unknown => (format!("surprise-{index}"), convoy("demo")),
     };
     let mut spec = DemandSpec::for_dispatching_principal(target, DemandKind::HumanGate, PrincipalRef::implicit_for_namespace("flotilla"));
-    if drawn.pooled {
-        spec.addressee = DemandAddressee::Pool { pool_ref: DemandPoolRef("reviewers".into()) };
-    }
     if drawn.options {
-        spec.response_options =
-            vec![DemandResponseOption { name: "approve".into(), title: "Approve".into(), description: None, prompt_fill: None }];
+        spec.retired_response_options = Some(json!([{"name": "approve", "title": "Approve"}]));
     }
     let status = DemandStatus {
         state: drawn.state,
         raised: Some(DemandTransition { as_of: at(2_000 + index as i64), authority: "writer".into() }),
-        verdict: drawn.verdict.then(|| DemandVerdict {
-            responding_principal_ref: PrincipalRef::implicit_for_namespace("flotilla"),
-            disposition: DemandVerdictDisposition::Other,
-            comment: None,
-        }),
+        retired_verdict: drawn.verdict.then(|| json!({"disposition": {"kind": "other"}})),
         ..DemandStatus::default()
     };
     let mut metadata = meta(&name);
@@ -133,7 +124,6 @@ fn every_generated_demand_is_converted_dropped_or_refused_once(tc: TestCase) {
         .map(|_| Drawn {
             writer: tc.draw(gs::sampled_from(WRITERS.to_vec()).print_as_debug()),
             state: tc.draw(gs::sampled_from(STATES.to_vec()).print_as_debug()),
-            pooled: tc.draw(gs::booleans()),
             options: tc.draw(gs::booleans()),
             verdict: tc.draw(gs::booleans()),
         })
@@ -193,7 +183,7 @@ fn every_generated_demand_is_converted_dropped_or_refused_once(tc: TestCase) {
             })
             .unwrap_or_else(|| panic!("{name} is accounted for"));
         let resolved = matches!(drawn.state, DemandState::Satisfied | DemandState::Acknowledged);
-        let shape_refused = !resolved && (drawn.pooled || drawn.options || drawn.verdict || drawn.writer == Writer::Unknown);
+        let shape_refused = !resolved && (drawn.options || drawn.verdict || drawn.writer == Writer::Unknown);
         let held_by_another_record = matches!(drawn.writer, Writer::TerminalAttention | Writer::DeclarationRefused);
         match result {
             Err(refusal) => assert!(shape_refused, "{name} refused: {}", refusal.reason),

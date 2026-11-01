@@ -72,7 +72,6 @@ mod fulfilment_kind;
 pub mod host;
 mod issue;
 pub mod labels;
-mod landing_gate;
 mod leaf;
 pub mod lifecycle_reads;
 mod manifest_root;
@@ -184,7 +183,6 @@ pub use labels::{
     GENERATION_LABEL, MANAGED_BY_LABEL, PROJECT_LABEL, REPO_KEY_LABEL, REPO_LABEL, RESERVED_PREFIX, ROLE_LABEL, VESSEL_LABEL,
     VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
-pub use landing_gate::{evaluate_landing_gate, settlement_human_gate, LandingGateDecision, LANDING_APPROVE_OPTION, LANDING_REFUSE_OPTION};
 pub use leaf::{
     actor_obligation, admit_leaf, evaluate_leaf, ArtifactLeafSubject, ChangeRequestLeafSubject, ConvoyLeafSubject, IssueLeafSubject,
     LeafEvaluation, LeafSubject, LeafValue, ThreeValue, VesselLeafSubject, WorkLeafSubject, ADMITTED_LEAF_VOCABULARY,
@@ -201,10 +199,10 @@ pub use placement_policy::{
 pub use platform::Platform;
 pub use prepared_snapshot::{content_hash, is_prepared_snapshot, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND};
 pub use principal_attention::{
-    Demand, DemandAddressee, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandPoolRef, DemandResponseOption, DemandSpec,
-    DemandState, DemandStatus, DemandStatusPatch, DemandTransition, DemandVerdict, DemandVerdictDisposition, HumanGateContext, Regard,
-    RegardExpiryPolicy, RegardSource, RegardSpec, RegardStatus, RegardStatusPatch, CREDENTIAL_REFRESH_REASON_ANNOTATION,
-    CREDENTIAL_REFRESH_VESSEL_ANNOTATION, ENSURE_HOLD_REASON_ANNOTATION, RECLAIM_REFUSAL_REASON_ANNOTATION,
+    Demand, DemandAddressee, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, DemandStatus, DemandStatusPatch,
+    DemandTransition, Regard, RegardExpiryPolicy, RegardSource, RegardSpec, RegardStatus, RegardStatusPatch,
+    CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION, ENSURE_HOLD_REASON_ANNOTATION,
+    RECLAIM_REFUSAL_REASON_ANNOTATION,
 };
 pub use project::{
     normalize_issue_source, normalize_project_spec, resolve_project_issue_sources_from_inventory, DeclarationRefusedCondition,

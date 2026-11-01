@@ -47,5 +47,4 @@ async fn expired_demand_escalates_without_settling() {
     assert_eq!(status.state, DemandState::Escalated);
     assert_eq!(status.escalated.expect("escalation").as_of, timestamp(20));
     assert!(status.satisfied.is_none());
-    assert!(status.verdict.is_none());
 }

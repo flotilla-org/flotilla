@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::{PrincipalRef, ResourceRef};
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch, ResourceError, SettlementClaimEvidence};
+use crate::{resource::define_resource, status_patch::StatusPatch};
 
 define_resource!(Regard, "regards", RegardSpec, RegardStatus, RegardStatusPatch);
 define_resource!(
@@ -23,10 +23,6 @@ pub const ENSURE_HOLD_REASON_ANNOTATION: &str = RECLAIM_REFUSAL_REASON_ANNOTATIO
 pub const CREDENTIAL_REFRESH_REASON_ANNOTATION: &str = "flotilla.work/credential-refresh-reason";
 /// The convoy's name for the vessel whose credential stopped refreshing.
 pub const CREDENTIAL_REFRESH_VESSEL_ANNOTATION: &str = "flotilla.work/credential-refresh-vessel";
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct DemandPoolRef(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct RegardSpec {
@@ -81,13 +77,16 @@ pub struct DemandSpec {
     pub originating_work_ref: ResourceRef,
     pub kind: DemandKind,
     pub addressee: DemandAddressee,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[builder(default)]
-    pub response_options: Vec<DemandResponseOption>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expiry: Option<DemandExpiry>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub human_gate: Option<HumanGateContext>,
+    /// Retired response options, read so the import refuses a record that offers any.
+    #[serde(default, rename = "response_options", skip_serializing)]
+    #[builder(skip)]
+    pub retired_response_options: Option<serde_json::Value>,
+    /// A retired human gate's context, read so the import refuses a record that carries one.
+    #[serde(default, rename = "human_gate", skip_serializing)]
+    #[builder(skip)]
+    pub retired_human_gate: Option<serde_json::Value>,
 }
 
 impl DemandSpec {
@@ -96,48 +95,11 @@ impl DemandSpec {
             originating_work_ref,
             kind,
             addressee: DemandAddressee::Principal { principal_ref: dispatching_principal_ref },
-            response_options: Vec::new(),
             expiry: None,
-            human_gate: None,
+            retired_response_options: None,
+            retired_human_gate: None,
         }
     }
-
-    pub fn for_pool(originating_work_ref: ResourceRef, kind: DemandKind, pool_ref: DemandPoolRef) -> Self {
-        Self {
-            originating_work_ref,
-            kind,
-            addressee: DemandAddressee::Pool { pool_ref },
-            response_options: Vec::new(),
-            expiry: None,
-            human_gate: None,
-        }
-    }
-
-    pub fn validate_verdict(&self, verdict: &DemandVerdict) -> Result<(), ResourceError> {
-        let DemandVerdictDisposition::Selected { option } = &verdict.disposition else {
-            return Ok(());
-        };
-        if self.response_options.iter().any(|candidate| candidate.name == *option) {
-            Ok(())
-        } else {
-            Err(ResourceError::invalid(format!("demand verdict option {option:?} was not offered")))
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
-pub struct HumanGateContext {
-    pub claim: SettlementClaimEvidence,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
-pub struct DemandResponseOption {
-    pub name: String,
-    pub title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_fill: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -164,7 +126,6 @@ pub enum DemandKind {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DemandAddressee {
     Principal { principal_ref: PrincipalRef },
-    Pool { pool_ref: DemandPoolRef },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -179,23 +140,10 @@ pub struct DemandStatus {
     pub acknowledged: Option<DemandTransition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub escalated: Option<DemandTransition>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verdict: Option<DemandVerdict>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
-pub struct DemandVerdict {
-    pub responding_principal_ref: PrincipalRef,
-    pub disposition: DemandVerdictDisposition,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum DemandVerdictDisposition {
-    Selected { option: String },
-    Other,
+    /// A retired verdict, read so the import refuses a record that carries one.
+    #[serde(default, rename = "verdict", skip_serializing)]
+    #[builder(skip)]
+    pub retired_verdict: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]

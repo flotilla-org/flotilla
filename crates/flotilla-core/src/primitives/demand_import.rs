@@ -1,7 +1,8 @@
 //! The Demand import: each open Demand a live writer raises becomes the Pending attention that
 //! writer sends on the engine, keeping the demand's name as its id. A demand already resolved,
 //! one whose fact another record holds, or one whose record is gone is dropped, counted by
-//! reason; any shape no live writer makes is refused, named.
+//! reason; any shape no live writer makes is refused, named. A demand addressed to a pool no longer
+//! decodes, and is refused as such.
 //!
 //! | Demand name | Attention |
 //! |---|---|
@@ -179,14 +180,13 @@ fn classify<'r>(old: &'r OldDemand<'_>, records: &DemandRecords<'_>) -> Class<'r
     if resolved {
         return Class::Dropped("resolved");
     }
-    let principal = match addressed(record) {
-        Ok(principal) => principal,
-        Err(reason) => return Class::Refused(reason),
-    };
-    if !spec.response_options.is_empty() || spec.human_gate.is_some() {
+    let principal = addressed(record);
+    if spec.retired_response_options.as_ref().is_some_and(|options| options.as_array().is_none_or(|options| !options.is_empty()))
+        || spec.retired_human_gate.is_some()
+    {
         return Class::Refused("it is a human gate with response options; no live writer raises one".into());
     }
-    if record.status.as_ref().is_some_and(|status| status.verdict.is_some()) {
+    if record.status.as_ref().is_some_and(|status| status.retired_verdict.is_some()) {
         return Class::Refused("it carries a verdict; no live writer rules on one".into());
     }
     if name.starts_with(TERMINAL_ATTENTION) {
@@ -227,12 +227,10 @@ fn classify<'r>(old: &'r OldDemand<'_>, records: &DemandRecords<'_>) -> Class<'r
     }
 }
 
-/// The person a demand is addressed to; a pool is refused.
-fn addressed(record: &ResourceObject<Demand>) -> Result<String, String> {
-    match &record.spec.addressee {
-        DemandAddressee::Principal { principal_ref } => Ok(format!("principal:{}", principal_ref.name)),
-        DemandAddressee::Pool { pool_ref } => Err(format!("it is addressed to pool `{}`; no live writer raises one", pool_ref.0)),
-    }
+/// The person a demand is addressed to.
+fn addressed(record: &ResourceObject<Demand>) -> String {
+    let DemandAddressee::Principal { principal_ref } = &record.spec.addressee;
+    format!("principal:{}", principal_ref.name)
 }
 
 fn convoy_target(record: &ResourceObject<Demand>) -> Result<&str, String> {
@@ -319,7 +317,7 @@ fn credential(
     conversion: &Conversion<'_>,
     records: &DemandRecords<'_>,
 ) -> Result<Mapped, String> {
-    if group.iter().any(|old| addressed(old.record).ok().as_ref() != Some(&principal)) {
+    if group.iter().any(|old| addressed(old.record) != principal) {
         return Err("its vessel's credential demands are addressed to different people".into());
     }
     let Some(convoy) = records.convoys.get(convoy) else { return Ok(Mapped::Dropped("its convoy is gone")) };

@@ -35,8 +35,6 @@ mod placement_policy;
 pub use placement_policy::*;
 mod prepared_snapshot;
 pub use prepared_snapshot::*;
-mod principal_attention;
-pub use principal_attention::*;
 mod project;
 pub use project::*;
 mod project_hierarchy;
