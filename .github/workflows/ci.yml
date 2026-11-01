@@ -324,6 +324,14 @@ jobs:
           STACK: ${{ toJSON(github.event.pull_request.stack) }}
           GH_TOKEN: ${{ github.token }}
         run: bash ci/affected/select-job.sh
+      # A full-workspace test build ran the runner out of disk on main. Remove
+      # preinstalled SDKs this job never uses, and record the headroom.
+      - name: Free runner disk
+        if: steps.packages.outputs.selection != 'none'
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
       # Caches dependency artifacts only (workspace-member artifacts are
       # pruned before save) — the previous whole-target cache reached 4.5GB
       # and thrashed the repo's 10GB cache pool against compose's blobs.
@@ -343,6 +351,11 @@ jobs:
         env:
           SELECTION: ${{ steps.packages.outputs.selection }}
         run: ci/affected/run.sh "$SELECTION"
+      - name: Disk after tests
+        if: always() && steps.packages.outputs.selection != 'none'
+        run: |
+          df -h /
+          du -sh target 2>/dev/null || true
 
   changes:
     name: Platform changes
