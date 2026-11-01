@@ -387,7 +387,9 @@ case "$1" in success|failure)
             let args = args.iter().map(|arg| scaled_deadlines(arg)).collect::<Vec<_>>();
             let mut wrapper = std::process::Command::new("env").args(&args).process_group(0).spawn().expect("wrapper");
             let pid = wrapper.id() as i32;
+            let started = std::time::Instant::now();
             while !root.join("cwd").exists() {
+                assert!(started.elapsed() < Duration::from_secs(10), "{ending}: the wrapper did not start");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -401,6 +403,9 @@ case "$1" in success|failure)
                 _ => {
                     // A burst of TERMs lands during cleanup, which must run to the end.
                     for _ in 0..50 {
+                        if wrapper.try_wait().expect("wrapper status").is_some() {
+                            break;
+                        }
                         unsafe {
                             libc::kill(pid, libc::SIGTERM);
                         }
