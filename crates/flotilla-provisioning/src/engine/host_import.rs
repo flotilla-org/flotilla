@@ -6,11 +6,12 @@
 //! | Old copy | Imported |
 //! |---|---|
 //! | Deleted | dropped |
-//! | `spec` | a Host record; `expected_concurrent_rust_crews` dropped, as nothing reads it, and counted when not the default |
-//! | `status` | a HostObservation record: generation, protocol fingerprint, architecture, the free-space floor as a flag, conditions (`observed_at` as `since`), providers, adapters and their baseline, held credentials and their expiry, image digests, the Codex central login |
-//! | `status.fulfilment_facts` | facts by FulfilmentKind name: a missing crew pool (no free slots on a host without a vessel cap), GUI login, image and its presence, harness and toolchain versions; each fact's observation time, any other free slot count and model facts dropped, as judgements or kept by nothing |
+//! | `spec` | a Host record; `expected_concurrent_rust_crews` and an SSH host's destination dropped, as nothing reads them from here, and counted when set |
+//! | `status` | a HostObservation record: generation, architecture, the free-space floor as a flag, the conditions that can block readiness or forge observation, providers (class, readiness and capabilities), adapters and their baseline, held credentials and their expiry, image digests, the Codex central login |
+//! | `status.conditions` | each condition's observation time, and diagnostic conditions (blocking neither readiness nor forge observation, or named in `DIAGNOSTIC_CONDITIONS`), dropped: a judgement, and metrics |
+//! | `status.fulfilment_facts` | facts by FulfilmentKind name: a missing crew pool (no free slots on a host without a vessel cap), GUI login, harness and toolchain versions; each fact's observation time, any other free slot count, the image and its presence, and model facts dropped, as judgements or read by nothing |
 //! | Heartbeat time, readiness, `sleeping_until`, model probes | dropped: readiness is a judgement, and nothing sets the others |
-//! | The host summary (but its architecture), daemon version and start time, sleep inhibition state | dropped: display only; the sleep condition carries what readiness needs |
+//! | The host summary (but its architecture), protocol fingerprint, daemon version and start time, sleep inhibition state, provider implementation names | dropped: display only or read by nothing; the sleep condition carries what readiness needs |
 //! | Free disk and the free-space floor | only whether free disk is below the floor |
 //! | Memory, store and blob-sync figures, `io_pressure`, `store_read_retries`, `forge_budgets` | dropped: metrics |
 //! | `terminal_pools`, `docker` and `os` capabilities | dropped: no decision reads them |
@@ -65,6 +66,11 @@ const CARRIED_CAPABILITIES: [&str; 7] = [
     OWNING_DAEMON_CAPABILITY,
 ];
 
+/// Conditions that report on the daemon itself rather than on what the host can take, whatever
+/// their blocking flags; they belong in metrics.
+const DIAGNOSTIC_CONDITIONS: [&str; 4] =
+    ["FileDescriptors", "ResourceStore/ReadRetries", "ResourceStore/DecodeQuarantine", "CleatBuildSkew"];
+
 /// One old copy of a Host: its namespace, the object, and the home that wrote it.
 pub struct HostCopy {
     pub namespace: String,
@@ -110,6 +116,9 @@ pub fn import_host(old: &ResourceObject<Host>, own_host: &str) -> Result<Importe
     if old.spec.expected_concurrent_rust_crews != HostSpec::default().expected_concurrent_rust_crews {
         dropped.push((HOST, "expected_concurrent_rust_crews, which nothing reads"));
     }
+    if matches!(&old.spec.connection, HostConnection::SshHost { destination, .. } if !destination.is_empty()) {
+        dropped.push((HOST, "the SSH destination, which its owning daemon's profile holds"));
+    }
     let observation = old.status.as_ref().map(|status| observation(&old.spec, status, &mut dropped)).transpose()?;
     Ok(Imported::Records { host: Box::new(HostRecord::new(&old.spec)), observation: observation.map(Box::new), dropped })
 }
@@ -144,12 +153,22 @@ fn observation(spec: &HostSpec, status: &HostStatus, dropped: &mut Vec<(&'static
     }
     let mut conditions = BTreeMap::new();
     for condition in &status.conditions {
+        uncarried("each condition's observation time, a judgement");
+        if DIAGNOSTIC_CONDITIONS.contains(&condition.condition_type.as_str())
+            || (!condition.blocks_readiness && !condition.blocks_forge_observation)
+        {
+            uncarried("diagnostic conditions, which belong in metrics");
+            continue;
+        }
         if conditions.insert(condition.condition_type.clone(), Condition::new(condition)).is_some() {
             return Err(format!("it holds condition `{}` twice", condition.condition_type));
         }
     }
     let mut providers = BTreeMap::new();
     for advertisement in capability::<Vec<ProviderAdvertisement>>(status, ENVIRONMENT_PROVIDERS_CAPABILITY)? {
+        if advertisement.kind.is_some() {
+            uncarried("provider implementation names, which nothing reads");
+        }
         let provider = Provider::new(&advertisement).map_err(|reason| format!("provider `{}`: {reason}", advertisement.instance))?;
         if providers.insert(advertisement.instance.clone(), provider).is_some() {
             return Err(format!("it advertises provider instance `{}` twice", advertisement.instance));
@@ -162,6 +181,9 @@ fn observation(spec: &HostSpec, status: &HostStatus, dropped: &mut Vec<(&'static
     let description = status.description.as_ref();
     if description.is_some() {
         uncarried("the host summary but its architecture, display only");
+    }
+    if status.protocol_fingerprint.is_some() {
+        uncarried("the protocol fingerprint, display only");
     }
     if status.daemon_version.is_some() || status.daemon_started_at.is_some() {
         uncarried("the daemon's version and start time, display only");
@@ -189,6 +211,9 @@ fn observation(spec: &HostSpec, status: &HostStatus, dropped: &mut Vec<(&'static
     let pool_missing = |facts: &FulfilmentFacts| spec.max_vessels.is_none() && facts.free_vessel_slots == Some(0);
     for facts in status.fulfilment_facts.values() {
         uncarried("each fact's observation time, a judgement");
+        if facts.image.is_some() || facts.image_present.is_some() {
+            uncarried("image identity and presence, which nothing reads");
+        }
         if facts.free_vessel_slots.is_some() && !pool_missing(facts) {
             uncarried("free vessel slots, a judgement");
         }
@@ -198,7 +223,6 @@ fn observation(spec: &HostSpec, status: &HostStatus, dropped: &mut Vec<(&'static
     }
     Ok(HostObservation {
         daemon_generation: status.daemon_generation.clone(),
-        protocol_fingerprint: status.protocol_fingerprint.clone(),
         architecture: description
             .and_then(|summary| summary.system.arch.as_deref())
             .map(|arch| canonical_image_architecture(arch).to_owned()),

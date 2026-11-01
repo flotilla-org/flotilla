@@ -17,7 +17,8 @@ pub enum Connection {
     #[store(code = "dm")]
     Daemon,
     #[store(code = "ss")]
-    SshHost { owning_daemon: String, destination: String },
+    /// The destination is not carried: its owning daemon reads it from its own profile.
+    SshHost { owning_daemon: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
@@ -57,9 +58,7 @@ impl HostRecord {
             display_name: spec.display_name.clone(),
             connection: match &spec.connection {
                 HostConnection::Daemon => Connection::Daemon,
-                HostConnection::SshHost { owning_daemon, destination } => {
-                    Connection::SshHost { owning_daemon: owning_daemon.clone(), destination: destination.clone() }
-                }
+                HostConnection::SshHost { owning_daemon, .. } => Connection::SshHost { owning_daemon: owning_daemon.clone() },
             },
             image_builds: spec.image_build_capacity.as_ref().map(|capacity| match capacity {
                 ImageBuildCapacity::None => ImageBuilds::None,
@@ -79,8 +78,8 @@ impl HostRecord {
             display_name: self.display_name.clone(),
             connection: match &self.connection {
                 Connection::Daemon => HostConnection::Daemon,
-                Connection::SshHost { owning_daemon, destination } => {
-                    HostConnection::SshHost { owning_daemon: owning_daemon.clone(), destination: destination.clone() }
+                Connection::SshHost { owning_daemon } => {
+                    HostConnection::SshHost { owning_daemon: owning_daemon.clone(), destination: String::new() }
                 }
             },
             image_build_capacity: self.image_builds.as_ref().map(|builds| match builds {
@@ -133,8 +132,6 @@ pub struct Condition {
     pub value: Value,
     pub reason: String,
     pub message: String,
-    /// When the condition took its current value, so observing it again writes nothing.
-    pub since: Timestamp,
     pub blocks_readiness: bool,
     pub blocks_forge_observation: bool,
 }
@@ -145,7 +142,6 @@ impl Condition {
             value: condition.value.into(),
             reason: condition.reason.clone(),
             message: condition.message.clone(),
-            since: Timestamp::from_datetime(&condition.observed_at),
             blocks_readiness: condition.blocks_readiness,
             blocks_forge_observation: condition.blocks_forge_observation,
         }
@@ -203,7 +199,6 @@ impl From<&ProviderReadiness> for Readiness {
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
 pub struct Provider {
     pub class: Option<Class>,
-    pub implementation: Option<String>,
     pub readiness: Readiness,
     pub workspace_root: String,
     #[store(cbor)]
@@ -218,7 +213,6 @@ impl Provider {
         let root = &advertisement.capabilities.workspace_root;
         Ok(Self {
             class: advertisement.kind.as_ref().map(|kind| Class::new(kind.class)).transpose()?,
-            implementation: advertisement.kind.as_ref().map(|kind| kind.implementation.clone()),
             readiness: (&advertisement.readiness).into(),
             workspace_root: root.to_str().ok_or_else(|| format!("workspace root {} is not UTF-8", root.display()))?.to_owned(),
             material_modes: advertisement.capabilities.material_modes.clone(),
@@ -246,10 +240,6 @@ pub struct Facts {
     /// The kind's crew terminal pool is missing here, which keeps the kind full.
     pub crew_pool_missing: bool,
     pub gui_session_logged_in: bool,
-    pub image_ref: Option<String>,
-    pub local_image_id: Option<String>,
-    pub registry_digest: Option<String>,
-    pub image_present: Option<bool>,
     /// Version by harness.
     #[store(child)]
     pub harnesses: BTreeMap<String, String>,
@@ -261,14 +251,9 @@ pub struct Facts {
 impl Facts {
     /// No free slots means a missing pool only where no vessel cap applies, so the caller says.
     pub fn new(facts: &FulfilmentFacts, crew_pool_missing: bool) -> Self {
-        let image = facts.image.as_ref();
         Self {
             crew_pool_missing,
             gui_session_logged_in: facts.gui_session_logged_in,
-            image_ref: image.map(|image| image.image_ref.clone()),
-            local_image_id: image.and_then(|image| image.local_image_id.clone()),
-            registry_digest: image.and_then(|image| image.registry_digest.clone()),
-            image_present: facts.image_present,
             harnesses: facts.harnesses.iter().map(|(harness, facts)| (harness.clone(), facts.version.clone())).collect(),
             toolchains: facts.toolchains.clone(),
         }
@@ -279,13 +264,13 @@ impl Facts {
 #[store(kind = "HostObservation", code = "ob")]
 pub struct HostObservation {
     pub daemon_generation: Option<String>,
-    pub protocol_fingerprint: Option<String>,
     /// The image architecture (`amd64`, `arm64`); none for an SSH host.
     pub architecture: Option<String>,
     /// Free disk is below admission's floor; false when either figure is unknown.
     pub below_free_space_floor: bool,
     /// An SSH host's owning daemon keeps a central Codex login.
     pub codex_central_login: bool,
+    /// Only conditions that can block readiness or forge observation; diagnostics are metrics.
     #[store(child)]
     pub conditions: BTreeMap<String, Condition>,
     #[store(child)]

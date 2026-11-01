@@ -56,7 +56,6 @@ CREATE TABLE "host" (
   "display_name" TEXT NOT NULL,
   "connection" TEXT NOT NULL CHECK ("connection" IN ('dm', 'ss')),
   "connection_owning_daemon" TEXT,
-  "connection_destination" TEXT,
   "image_builds" TEXT CHECK ("image_builds" IN ('bu', 'no')),
   "image_builds_architecture" TEXT,
   "image_builds_slots" INTEGER,
@@ -66,11 +65,9 @@ CREATE TABLE "host" (
   "single_tenant" INTEGER NOT NULL CHECK ("single_tenant" IN (0, 1)),
   CHECK (CASE WHEN "connection" = 'dm'
       THEN "connection_owning_daemon" IS NULL
-      AND "connection_destination" IS NULL
       END),
   CHECK (CASE WHEN "connection" = 'ss'
       THEN "connection_owning_daemon" IS NOT NULL
-      AND "connection_destination" IS NOT NULL
       END),
   CHECK (CASE WHEN "image_builds" = 'no'
       THEN "image_builds_architecture" IS NULL
@@ -103,7 +100,6 @@ CREATE VIEW "host_view" AS SELECT
   "host"."display_name",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ho' AND "field" = 'connection' AND "code" = "host"."connection") AS "connection",
   "host"."connection_owning_daemon",
-  "host"."connection_destination",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ho' AND "field" = 'image_builds' AND "code" = "host"."image_builds") AS "image_builds",
   "host"."image_builds_architecture",
   "host"."image_builds_slots",
@@ -116,7 +112,6 @@ CREATE TABLE "host_observation" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
   "daemon_generation" TEXT,
-  "protocol_fingerprint" TEXT,
   "architecture" TEXT,
   "below_free_space_floor" INTEGER NOT NULL CHECK ("below_free_space_floor" IN (0, 1)),
   "codex_central_login" INTEGER NOT NULL CHECK ("codex_central_login" IN (0, 1))
@@ -127,7 +122,6 @@ CREATE TABLE "host_observation_conditions" (
   "value" TEXT NOT NULL CHECK ("value" IN ('f', 't', 'u')),
   "reason" TEXT NOT NULL,
   "message" TEXT NOT NULL,
-  "since" INTEGER NOT NULL,
   "blocks_readiness" INTEGER NOT NULL CHECK ("blocks_readiness" IN (0, 1)),
   "blocks_forge_observation" INTEGER NOT NULL CHECK ("blocks_forge_observation" IN (0, 1)),
   PRIMARY KEY ("host_observation", "key"),
@@ -137,7 +131,6 @@ CREATE TABLE "host_observation_providers" (
   "host_observation" INTEGER NOT NULL,
   "key" TEXT NOT NULL,
   "class" TEXT CHECK ("class" IN ('cs', 'ct', 'dy', 'hd', 'mv')),
-  "implementation" TEXT,
   "readiness" TEXT NOT NULL CHECK ("readiness" IN ('mc', 'mt', 'rd', 'un')),
   "readiness_reason" TEXT,
   "workspace_root" TEXT NOT NULL,
@@ -202,10 +195,6 @@ CREATE TABLE "host_observation_facts" (
   "key" TEXT NOT NULL,
   "crew_pool_missing" INTEGER NOT NULL CHECK ("crew_pool_missing" IN (0, 1)),
   "gui_session_logged_in" INTEGER NOT NULL CHECK ("gui_session_logged_in" IN (0, 1)),
-  "image_ref" TEXT,
-  "local_image_id" TEXT,
-  "registry_digest" TEXT,
-  "image_present" INTEGER CHECK ("image_present" IN (0, 1)),
   PRIMARY KEY ("host_observation", "key"),
   FOREIGN KEY ("host_observation") REFERENCES "host_observation" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
@@ -242,7 +231,6 @@ CREATE VIEW "host_observation_view" AS SELECT
   "host_observation"."id",
   "host_observation"."version",
   "host_observation"."daemon_generation",
-  "host_observation"."protocol_fingerprint",
   "host_observation"."architecture",
   "host_observation"."below_free_space_floor",
   "host_observation"."codex_central_login"
@@ -253,7 +241,6 @@ CREATE VIEW "host_observation_conditions_view" AS SELECT
   (SELECT "name" FROM "codes" WHERE "kind" = 'ob' AND "field" = 'conditions.value' AND "code" = "host_observation_conditions"."value") AS "value",
   "host_observation_conditions"."reason",
   "host_observation_conditions"."message",
-  "host_observation_conditions"."since",
   "host_observation_conditions"."blocks_readiness",
   "host_observation_conditions"."blocks_forge_observation"
 FROM "host_observation_conditions";
@@ -261,7 +248,6 @@ CREATE VIEW "host_observation_providers_view" AS SELECT
   "host_observation_providers"."host_observation",
   "host_observation_providers"."key",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ob' AND "field" = 'providers.class' AND "code" = "host_observation_providers"."class") AS "class",
-  "host_observation_providers"."implementation",
   (SELECT "name" FROM "codes" WHERE "kind" = 'ob' AND "field" = 'providers.readiness' AND "code" = "host_observation_providers"."readiness") AS "readiness",
   "host_observation_providers"."readiness_reason",
   "host_observation_providers"."workspace_root",
@@ -299,11 +285,7 @@ CREATE VIEW "host_observation_facts_view" AS SELECT
   "host_observation_facts"."host_observation",
   "host_observation_facts"."key",
   "host_observation_facts"."crew_pool_missing",
-  "host_observation_facts"."gui_session_logged_in",
-  "host_observation_facts"."image_ref",
-  "host_observation_facts"."local_image_id",
-  "host_observation_facts"."registry_digest",
-  "host_observation_facts"."image_present"
+  "host_observation_facts"."gui_session_logged_in"
 FROM "host_observation_facts";
 CREATE VIEW "host_observation_facts_harnesses_view" AS SELECT
   "host_observation_facts_harnesses"."host_observation",

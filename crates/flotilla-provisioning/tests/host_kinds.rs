@@ -146,7 +146,8 @@ fn records(imported: Imported) -> (host_kinds::HostRecord, Option<host_kinds::Ho
 }
 
 // Behaviour (ADR 0047, stored data rule): every Host spec reads back as it was, but for
-// `expected_concurrent_rust_crews`, which is not carried and reads as its default.
+// `expected_concurrent_rust_crews` and an SSH host's destination, which are not carried and read
+// as their defaults.
 #[hegel::test]
 fn every_host_spec_reads_back_but_the_crew_sizing(tc: hegel::TestCase) {
     let connection = if tc.draw(gs::booleans()) {
@@ -174,7 +175,13 @@ fn every_host_spec_reads_back_but_the_crew_sizing(tc: hegel::TestCase) {
         max_vessels: tc.draw(gs::optional(gs::integers::<u32>())),
         single_tenant: tc.draw(gs::booleans()),
     };
-    assert_eq!(host_kinds::HostRecord::new(&spec).spec(), HostSpec { expected_concurrent_rust_crews: 4, ..spec.clone() });
+    let connection = match &spec.connection {
+        HostConnection::SshHost { owning_daemon, .. } => {
+            HostConnection::SshHost { owning_daemon: owning_daemon.clone(), destination: String::new() }
+        }
+        HostConnection::Daemon => HostConnection::Daemon,
+    };
+    assert_eq!(host_kinds::HostRecord::new(&spec).spec(), HostSpec { expected_concurrent_rust_crews: 4, connection, ..spec.clone() });
     let owner = match &spec.connection {
         HostConnection::SshHost { owning_daemon, .. } => owning_daemon.clone(),
         HostConnection::Daemon => "kiwi".to_owned(),
@@ -213,8 +220,7 @@ fn the_corpus_imports_at_each_hosts_own_home() {
     let observation = observation.expect("observed");
     assert_eq!(observation.agent_adapters, BTreeSet::from(["claude-code".to_owned(), "codex".to_owned()]));
     assert_eq!(observation.agent_adapter_baseline, observation.agent_adapters);
-    let facts = observation.facts.values().next().expect("the corpus host's facts");
-    assert!(facts.image_ref.is_some(), "a previous generation's image string reads as its ref");
+    assert!(!observation.facts.is_empty(), "the corpus host's facts");
     assert!(observation.held_credentials.contains("claude-max"));
     let expiry = &observation.credential_expiry["ambient:claude"];
     assert_eq!(
@@ -224,10 +230,11 @@ fn the_corpus_imports_at_each_hosts_own_home() {
 }
 
 // Behaviour (#3824 layer 4c): the observation keeps the basic facts admission and health read:
-// the architecture, canonical; the free-space floor, as a flag; each condition by its type, its
-// observation time as `since`; providers by instance; the image cache by instance; the Codex login;
-// the probed facts by FulfilmentKind name (owner's answer: option A), without their age, free
-// slots or model facts.
+// the architecture, canonical; the free-space floor, as a flag; each condition that can block
+// readiness or forge observation, by its type, without its observation time, and no diagnostic
+// condition, which is one blocking neither or one the owner named; providers by instance and class; the image cache by instance; the Codex login; the
+// probed facts by FulfilmentKind name (owner's answer: option A), without their age, free slots,
+// image or model facts.
 #[test]
 fn the_observation_keeps_the_facts_admission_and_health_read() {
     let summary: HostSummary = serde_json::from_value(json!({
@@ -241,7 +248,12 @@ fn the_observation_keeps_the_facts_admission_and_health_read() {
             disk_free_bytes: free,
             admission_free_space_floor_bytes: floor,
             daemon_generation: Some("g7".into()),
-            conditions: vec![condition("Transport/SSH", ConditionValue::False), condition("FileDescriptors", ConditionValue::True)],
+            conditions: vec![
+                condition("Transport/SSH", ConditionValue::False),
+                HostCondition { blocks_readiness: false, ..condition("Archive", ConditionValue::True) },
+                condition("FileDescriptors", ConditionValue::False),
+                HostCondition { blocks_forge_observation: true, ..condition("ResourceStore/DecodeQuarantine", ConditionValue::False) },
+            ],
             capabilities: BTreeMap::from([
                 ("environment_providers".to_owned(), json!([provider("docker")])),
                 ("image_digests".to_owned(), json!({"docker": ["sha256:a"]})),
@@ -255,7 +267,15 @@ fn the_observation_keeps_the_facts_admission_and_health_read() {
             ..HostStatus::default()
         };
         let (_, observation, dropped) = records(import_host(&object("kiwi", HostSpec::default(), Some(status)), "kiwi").expect("imports"));
-        for reason in ["each fact's observation time, a judgement", "free vessel slots, a judgement", "model facts, which nothing keeps"] {
+        for reason in [
+            "each fact's observation time, a judgement",
+            "free vessel slots, a judgement",
+            "model facts, which nothing keeps",
+            "image identity and presence, which nothing reads",
+            "each condition's observation time, a judgement",
+            "diagnostic conditions, which belong in metrics",
+            "provider implementation names, which nothing reads",
+        ] {
             assert!(dropped.contains(&("HostObservation", reason)), "{reason}: {dropped:?}");
         }
         let observation = observation.expect("observed");
@@ -263,18 +283,14 @@ fn the_observation_keeps_the_facts_admission_and_health_read() {
         assert_eq!(observation.architecture.as_deref(), Some("arm64"));
         assert_eq!(observation.daemon_generation.as_deref(), Some("g7"));
         assert!(observation.codex_central_login);
+        assert_eq!(observation.conditions.keys().collect::<Vec<_>>(), ["Transport/SSH"]);
         let ssh = &observation.conditions["Transport/SSH"];
-        assert_eq!((ssh.value, ssh.since.micros()), (Value::False, 1_800_000_000_000_000));
-        assert!(ssh.blocks_readiness);
+        assert_eq!((ssh.value, ssh.blocks_readiness), (Value::False, true));
         let docker = &observation.providers["docker"];
-        assert_eq!((docker.class, docker.implementation.as_deref()), (Some(Class::Container), Some("docker")));
+        assert_eq!(docker.class, Some(Class::Container));
         assert_eq!(docker.readiness, Readiness::MissingCredential { reason: "no login".into() });
         assert_eq!(observation.image_digests["docker"].images, BTreeSet::from(["sha256:a".to_owned()]));
         let facts = &observation.facts["docker-on-kiwi"];
-        assert_eq!(
-            (facts.image_ref.as_deref(), facts.local_image_id.as_deref(), facts.registry_digest.as_deref(), facts.image_present),
-            (Some("crew:1"), Some("sha256:b"), None, Some(true))
-        );
         assert_eq!(facts.harnesses, BTreeMap::from([("claude-code".to_owned(), "2.1".to_owned())]));
         assert_eq!(facts.toolchains, BTreeMap::from([("rust".to_owned(), "1.99.0".to_owned())]));
         assert!(!facts.crew_pool_missing);
@@ -317,7 +333,7 @@ fn a_full_host_with_its_crew_pool_is_not_missing_it() {
 // that daemon and an SSH host's at its owning daemon. A copy elsewhere is a stray and a deleted copy
 // is gone: both are dropped before the namespace check, so neither is refused for its namespaces, and
 // a deleted copy needs no known home. Any other copy at a home whose own host is not known is refused.
-// The crew sizing is counted only where it was set.
+// The crew sizing and the SSH destination are counted only where they were set.
 #[test]
 fn a_host_imports_only_at_its_home() {
     let status = HostStatus { capabilities: BTreeMap::from([("owning_daemon".to_owned(), json!("udder"))]), ..HostStatus::default() };
@@ -347,7 +363,8 @@ fn a_host_imports_only_at_its_home() {
             ("a copy of an SSH host another daemon owns", 2),
             ("a copy of another daemon's Host", 2),
             ("deleted", 1),
-            ("expected_concurrent_rust_crews, which nothing reads", 1)
+            ("expected_concurrent_rust_crews, which nothing reads", 1),
+            ("the SSH destination, which its owning daemon's profile holds", 1)
         ]
     );
     let refused: Vec<_> = report.refused.iter().map(|refusal| refusal.record.as_str()).collect();
@@ -397,8 +414,8 @@ fn a_status_the_engine_cannot_hold_is_refused() {
         (
             "conditions",
             HostSpec::default(),
-            with(json!({}), vec![condition("FileDescriptors", ConditionValue::True), condition("FileDescriptors", ConditionValue::False)]),
-            "condition `FileDescriptors` twice",
+            with(json!({}), vec![condition("Transport/SSH", ConditionValue::True), condition("Transport/SSH", ConditionValue::False)]),
+            "condition `Transport/SSH` twice",
         ),
         ("owner", ssh("udder"), with(json!({"owning_daemon": "feta"}), vec![]), "names `feta`, and its connection `udder`"),
     ];
