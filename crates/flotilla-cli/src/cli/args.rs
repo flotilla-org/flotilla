@@ -112,6 +112,10 @@ pub enum SubCommand {
         #[command(subcommand)]
         command: WebSubCommand,
     },
+    /// Show a described table through binnacle: printed when piped, inline in a terminal
+    ///
+    /// With no name, lists the tables the daemon describes.
+    Table(TableArgs),
     /// Inspect raw daemon resources
     Resource {
         #[command(subcommand)]
@@ -217,6 +221,57 @@ pub struct LsArgs {
     /// Show the whole fleet, including inside a crew
     #[arg(long, conflicts_with = "project")]
     pub all: bool,
+}
+
+/// How `flotilla table` prints a table.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableFormat {
+    /// Columns under their titles, aligned (binnacle's `aligned`)
+    Text,
+    /// A header of field names, then raw values separated by tabs
+    Tsv,
+    /// One JSON array of objects keyed by field name
+    Json,
+    /// One JSON object per line
+    Jsonl,
+}
+
+/// `flotilla table`'s arguments. The view flags mirror binnacle's CLI host flags; this crate
+/// stays free of binnacle and ratatui (the vessel CLI excludes renderers), so the root package
+/// hands them to binnacle. `TableArgs` and `TableFormat` copy binnacle's `FlagArgs` and `Format`
+/// until those move into a binnacle crate without ratatui (flotilla-org/binnacle#361); then this
+/// flattens that group instead.
+#[derive(clap::Args, Debug, Default, PartialEq, Eq)]
+pub struct TableArgs {
+    /// Described table name, e.g. convoys; omit to list the tables
+    pub name: Option<String>,
+    /// Namespace the rows are read within
+    #[arg(long, default_value = "flotilla")]
+    pub namespace: String,
+    /// Show only these columns, in this order (field names, comma-separated)
+    #[arg(long, value_delimiter = ',')]
+    pub columns: Option<Vec<String>>,
+    /// Sort the rows by a field, descending with a leading `-`; repeat or comma-separate for more
+    #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+    pub sort: Vec<String>,
+    /// Keep the rows a condition keeps: `field==v`, `!=`, `<`, `<=`, `>`, `>=` or `field~text`
+    #[arg(long = "where")]
+    pub wheres: Vec<String>,
+    /// Start from the named view (`default`)
+    #[arg(long)]
+    pub view: Option<String>,
+    /// Show the hidden columns too
+    #[arg(long)]
+    pub wide: bool,
+    /// How a printed table is written (piped, or with --no-interactive)
+    #[arg(long, value_enum)]
+    pub format: Option<TableFormat>,
+    /// Open the table inline even when not in a terminal
+    #[arg(long, conflicts_with = "no_interactive")]
+    pub interactive: bool,
+    /// Print the table even in a terminal
+    #[arg(long)]
+    pub no_interactive: bool,
 }
 
 #[derive(clap::Args)]

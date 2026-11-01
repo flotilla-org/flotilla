@@ -11,6 +11,10 @@ publish = false
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
+# syn 3 is a second major beside syn 2: async-trait and other host proc-macros take it, and
+# binnacle's layout schema derives (schemars_derive, serde_derive_internals, ref-cast-impl) select
+# `default` and `derive`.
+syn3 = { package = "syn", version = "3", features = ["clone-impls", "default", "derive", "full", "parsing", "printing", "proc-macro", "visit-mut"] }
 
 [lints]
 workspace = true

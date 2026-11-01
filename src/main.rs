@@ -19,7 +19,7 @@ use cli::{
     dispatch, query_installer_health, run_artifact_command, run_attach, run_complete, run_completions, run_control_command, run_daemon,
     run_daemon_bridge, run_daemon_dev_mode, run_daemon_stop, run_ensure_command, run_fleet_health, run_fleet_list, run_hook,
     run_hooks_command, run_image_command, run_logs, run_manifest_command, run_pm_command, run_resource_command, run_status,
-    run_topology_command, run_tui, run_wait, run_watch, run_web_command,
+    run_table_command, run_topology_command, run_tui, run_wait, run_watch, run_web_command,
 };
 
 fn binary_version() -> &'static str {
@@ -47,6 +47,11 @@ fn main() -> Result<()> {
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let result = runtime.block_on(Box::pin(run_command(cli, command, format)));
+    // The runtime shuts down before an interrupted `table` exits with its signal's status.
+    drop(runtime);
+    if let Some(status) = cli::table_exit_status() {
+        std::process::exit(status);
+    }
 
     if let Err(error) = &result {
         let message = format!("{error:?}");
@@ -140,6 +145,7 @@ async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat
         Some(SubCommand::Pm { command }) => run_pm_command(&cli, command).await,
         Some(SubCommand::Ensure { command }) => run_ensure_command(&cli, command, format).await,
         Some(SubCommand::Web { command }) => run_web_command(&cli, command).await,
+        Some(SubCommand::Table(args)) => run_table_command(&cli, args).await,
         Some(SubCommand::Resource { command }) => run_resource_command(&cli, command, format).await,
         Some(SubCommand::Manifest { command }) => run_manifest_command(&cli, command, format).await,
         Some(SubCommand::Artifact { command }) => run_artifact_command(&cli, command, format).await,

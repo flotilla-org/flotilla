@@ -229,6 +229,16 @@ whereOperators
 
 The columns are not listed here; `?format=markdown` on a table describes its own.
 
+## Reading a table from the CLI
+
+`flotilla table <name>` renders a table through [binnacle](https://github.com/flotilla-org/binnacle), reading `/tables/<name>/rows?watch&namespace=flotilla` over this host's daemon socket; `--namespace` (default `flotilla`) reads another. `flotilla table` with no name lists the tables.
+
+- Piped, or with `--no-interactive`, it prints aligned text (`--format text`, the default), `tsv`, `json` or `jsonl`.
+- In a terminal it opens binnacle's grid inline below the prompt, live: sort, filter, find and column choice are binnacle's. `q` or Esc leaves; Enter leaves and prints the chosen row's key. The rows shown stay in the scrollback.
+- `--columns`, `--sort`, `--where`, `--wide` and `--view` adjust the view. `--where` filters the rows already read, not the server's read.
+
+A table's built-in view is a binnacle Layout document (`version: 2`) under `views/`, named `<kind>.<name>.json`; `views/convoy.default.json` is the first. The binary includes these files, and a table without one shows binnacle's default view: the nested columns hidden and the key and state columns first.
+
 ## Not built yet
 
 Named queries as tables and a WebSocket carrier (#3249), parent keys on child tables (#3600) and view subscriptions (#3447).
