@@ -11,13 +11,13 @@ use std::{
 };
 
 use binnacle_core::{Axis, ChangeNotice};
-use binnacle_described::{decode_json_line, DescribedSource, Received, Scope};
+use binnacle_described::{decode_json_line, DescribedSource, HostRequest, Received, Scope};
 use binnacle_described_http::{Blocking, Endpoint, Event, Options};
 use binnacle_format::Timestamp;
 use binnacle_layout::{IdMap, JsonId, Layout};
 use binnacle_ratatui::cli::{print, run_inline, Exit, FlagArgs, Flags, InlineOptions, Live};
 use color_eyre::{eyre::eyre, Result};
-use flotilla_cli::cli::args::{Cli, TableArgs};
+use flotilla_cli::cli::args::{Cli, TableArgs, TableFormat};
 use serde_json::{json, Value as Json};
 
 /// A view file baked into the binary: the presentation of one table.
@@ -65,7 +65,15 @@ fn layout(source: &mut DescribedSource, table: &str, flags: &Flags) -> Result<La
 
 /// The binnacle flags `args` carries; `text` names binnacle's aligned format.
 fn flags(args: &TableArgs) -> Result<Flags> {
-    let format = args.format.clone().map(|format| if format == "text" { "aligned".into() } else { format });
+    let format = args.format.map(|format| {
+        match format {
+            TableFormat::Text => "aligned",
+            TableFormat::Tsv => "tsv",
+            TableFormat::Json => "json",
+            TableFormat::Jsonl => "jsonl",
+        }
+        .to_owned()
+    });
     FlagArgs {
         columns: args.columns.clone(),
         sort: args.sort.clone(),
@@ -81,9 +89,10 @@ fn flags(args: &TableArgs) -> Result<Flags> {
 }
 
 pub(crate) async fn run_table_command(cli: &Cli, args: TableArgs) -> Result<()> {
+    // Remote daemons: #4241.
     if let Some(remote) = cli.remote_daemon().map_err(|error| eyre!(error))? {
         return Err(eyre!(
-            "`table` reads this host's daemon socket and cannot target {remote} yet; drop --daemon or unset FLOTILLA_DAEMON"
+            "`table` reads this host's daemon socket and cannot target {remote} yet (#4241); drop --daemon or unset FLOTILLA_DAEMON"
         ));
     }
     let flags = flags(&args)?;
@@ -104,6 +113,9 @@ pub(crate) async fn run_table_command(cli: &Cli, args: TableArgs) -> Result<()> 
         }
     };
     if let Some(status) = exit.status() {
+        // Exiting skips destructors: what this command wrote goes out first.
+        io::stdout().flush()?;
+        io::stderr().flush()?;
         std::process::exit(status);
     }
     Ok(())
@@ -115,6 +127,8 @@ const PRINT_RETRIES: u32 = 4;
 const FIRST_READ: Duration = Duration::from_secs(30);
 /// The longest one drain of the live feed takes, so frames still draw during a burst.
 const BUDGET: Duration = Duration::from_millis(30);
+/// How long the first read waits for each next event before checking its deadline.
+const FIRST_WAIT: Duration = Duration::from_millis(100);
 
 /// Watches `table` over `socket` until its rows have come, then shows it.
 fn show_live(socket: &Path, table: &str, namespace: &str, flags: &Flags, interactive: bool) -> Result<Exit> {
@@ -133,19 +147,28 @@ fn show_live(socket: &Path, table: &str, namespace: &str, flags: &Flags, interac
             transport.open(request);
         }
         let said = reconnecting.clone();
-        drain(&mut source, &transport, &mut reconnecting).map_err(|error| eyre!("table {table}: {error}"))?;
+        // Wait for the first event, then take what else has come without waiting.
+        let mut first = Some(FIRST_WAIT);
+        let next = || match first.take() {
+            Some(wait) => transport.recv_timeout(wait),
+            None => transport.try_recv(),
+        };
+        drain(&mut source, next, |request| transport.open(request), &mut reconnecting).map_err(|error| eyre!("table {table}: {error}"))?;
         if reconnecting.is_some() && reconnecting != said {
             eprintln!("flotilla table: {}", reconnecting.as_deref().unwrap_or_default());
         }
         if Instant::now() > deadline {
             return Err(eyre!("table {table}: no rows within {} s from {}", FIRST_READ.as_secs(), socket.display()));
         }
-        std::thread::sleep(Duration::from_millis(10));
     }
     let failed = std::cell::RefCell::new(None);
     let reconnecting = std::cell::RefCell::new(reconnecting);
+    // A refusal mid-session ends it (the feed returning `None` leaves as Esc does), so no stale
+    // table stays open; the refusal is reported once the terminal is restored.
     let live: Live<'_, DescribedSource> = Box::new(|source: &mut DescribedSource| {
-        drain(source, &transport, &mut reconnecting.borrow_mut()).map_err(|error| *failed.borrow_mut() = Some(error)).ok()
+        drain(source, || transport.try_recv(), |request| transport.open(request), &mut reconnecting.borrow_mut())
+            .map_err(|error| *failed.borrow_mut() = Some(error))
+            .ok()
     });
     let exit = show(&mut source, table, flags, interactive, Some((live, &reconnecting)))?;
     if let Some(error) = failed.take() {
@@ -154,18 +177,19 @@ fn show_live(socket: &Path, table: &str, namespace: &str, flags: &Flags, interac
     Ok(exit)
 }
 
-/// Feeds `source` what the watch has brought, for up to [`BUDGET`]; keeps `reconnecting` saying
-/// why the transport is retrying, while it is. Returns the Change Notices, or the daemon's
-/// refusal.
+/// Feeds `source` the watch's events from `next`, for up to [`BUDGET`]; `open` serves the
+/// requests the source makes (the watch again after it ended). Keeps `reconnecting` saying why
+/// the transport is retrying, while it is. Returns the Change Notices, or the daemon's refusal.
 fn drain(
     source: &mut DescribedSource,
-    transport: &Blocking,
+    mut next: impl FnMut() -> Option<Event>,
+    mut open: impl FnMut(HostRequest),
     reconnecting: &mut Option<String>,
 ) -> std::result::Result<Vec<(Axis, ChangeNotice)>, String> {
     let mut notices = Vec::new();
     let until = Instant::now() + BUDGET;
     while Instant::now() < until {
-        let Some(event) = transport.try_recv() else {
+        let Some(event) = next() else {
             break;
         };
         match event {
@@ -187,7 +211,7 @@ fn drain(
             _ => {}
         }
         if let Some(request) = source.poll_request() {
-            transport.open(request);
+            open(request);
         }
     }
     Ok(notices)
@@ -303,6 +327,8 @@ fn listing_source(listing: &Json) -> Result<DescribedSource> {
         })
         .collect();
     rows.sort_by(|a, b| a["table"].as_str().cmp(&b["table"].as_str()));
+    // A table name routes to one source (`/tables/{table}`), so the daemon lists each once; the
+    // dedup only keeps the key unique should two kinds ever list the same name.
     rows.dedup_by(|a, b| a["table"] == b["table"]);
     let field = |name: &str, title: &str, roles: &[&str], required: bool| json!({"name": name, "title": title, "type": "string", "roles": roles, "constraints": {"required": required}});
     let messages = [

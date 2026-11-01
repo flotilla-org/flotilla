@@ -231,7 +231,7 @@ The columns are not listed here; `?format=markdown` on a table describes its own
 
 ## Reading a table from the CLI
 
-`flotilla table <name>` renders a table through [binnacle](https://github.com/flotilla-org/binnacle), reading `/tables/<name>/rows?watch&namespace=flotilla` over this host's daemon socket (`--namespace` reads another). `flotilla table` with no name lists the tables.
+`flotilla table <name>` renders a table through [binnacle](https://github.com/flotilla-org/binnacle), reading `/tables/<name>/rows?watch&namespace=flotilla` over this host's daemon socket; `--namespace` (default `flotilla`) reads another. `flotilla table` with no name lists the tables.
 
 - Piped, or with `--no-interactive`, it prints aligned text (`--format text`, the default), `tsv`, `json` or `jsonl`.
 - In a terminal it opens binnacle's grid inline below the prompt, live: sort, filter, find and column choice are binnacle's. `q` or Esc leaves; Enter leaves and prints the chosen row's key. The rows shown stay in the scrollback.
