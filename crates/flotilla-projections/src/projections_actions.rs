@@ -9,7 +9,6 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::commands::AttachMode;
-use flotilla_protocol::AttachBinding;
 use flotilla_protocol::CliListKind;
 use flotilla_protocol::CliListResponse;
 use flotilla_protocol::Command;
@@ -110,7 +109,6 @@ pub trait ProjectionsActionPort: Send + Sync {
     async fn fleet_health_internal(&self) -> Result<FleetHealthResponse, String>;
     async fn explain_project_internal(&self, name: &str) -> Result<serde_json::Value, String>;
     async fn explain_convoy_internal(&self, requested_namespace: Option<&str>, name: &str) -> Result<ConvoyExplanation, String>;
-    async fn emit_attach_regard(&self, binding: &AttachBinding, surface_id: uuid::Uuid) -> Result<(), String>;
     async fn dispatch_queue_internal(&self, project_filter: Option<&str>) -> Result<DispatchQueueResponse, String>;
     async fn dispatch_board_internal(&self, project_filter: Option<&str>) -> Result<DispatchBoardResponse, String>;
 }
@@ -187,7 +185,7 @@ impl ProjectionsActions<'_> {
 }
 
 impl ProjectionsActions<'_> {
-    pub async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
+    pub async fn execute_query(&self, command: Command) -> Result<CommandValue, String> {
         use CommandAction;
         match &command.action {
             CommandAction::QueryResolveRepository { repo } => {
@@ -444,14 +442,7 @@ impl ProjectionsActions<'_> {
             CommandAction::Attach { reference, host, mode } => {
                 let project_context = self.port.attach_project_context(command.context_repo.as_ref()).await?;
                 match self.port.resolve_attach_with_context(reference, host.as_ref(), false, *mode, project_context.as_deref()).await {
-                    Ok(resolved) => {
-                        if let Some(binding) = &resolved.binding {
-                            if let Err(error) = self.port.emit_attach_regard(binding, session_id).await {
-                                warn!(%error, "failed to emit attach regard");
-                            }
-                        }
-                        Ok(CommandValue::AttachCommandResolved { plan: resolved.plan, binding: resolved.binding })
-                    }
+                    Ok(resolved) => Ok(CommandValue::AttachCommandResolved { plan: resolved.plan, binding: resolved.binding }),
                     Err(message) => Ok(CommandValue::Error { message }),
                 }
             }

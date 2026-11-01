@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::aggregator_projection::AggregatorProjectionState;
 use flotilla_daemon_api::event_sink::EventSink;
 use flotilla_protocol::{DaemonEvent, HostName};
-use flotilla_resources::{Checkout, Convoy, Demand, Environment, Project, Regard, Repository, ResourceError};
+use flotilla_resources::{Checkout, Convoy, Demand, Environment, Project, Repository, ResourceError};
 use flotilla_store::ResourceBackend;
 use futures::future::BoxFuture;
 use tokio::sync::broadcast;
@@ -59,7 +59,8 @@ pub fn run(
             .with_change_request_resolver_arc(context.change_requests)
             .with_issue_resolver_arc(context.issues)
             .with_issue_polling_health(issue_polling)
-            .with_convoy_engine(context.convoy_engine, namespace);
+            .with_convoy_engine(context.convoy_engine, namespace)
+            .with_attentions(durable.attentions(), namespace);
         aggregator
             .run(
                 AggregatorResolvers::builder()
@@ -73,7 +74,6 @@ pub fn run(
                     .durable_projects(durable.including_replicas::<Project>(namespace))
                     .durable_fleet_designation(durable.including_replicas::<flotilla_resources::FleetDesignation>(namespace))
                     .durable_repositories(durable.including_replicas::<Repository>(namespace))
-                    .durable_regards(durable.using::<Regard>(namespace))
                     .durable_vessels(durable.including_replicas::<flotilla_resources::Vessel>(namespace))
                     .durable_hosts(durable.including_replicas::<flotilla_resources::Host>(namespace))
                     .durable_checkouts(durable.including_replicas::<Checkout>(namespace))

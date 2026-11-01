@@ -316,6 +316,8 @@ pub struct MessagePrimitives {
     located: Mutex<BTreeMap<String, (String, String)>>,
     /// Old-store records, reread at most once a second per namespace.
     records: tokio::sync::Mutex<BTreeMap<String, (std::time::Instant, Arc<OldStoreRecords>)>>,
+    /// Signalled after an attention here is raised, cleared or acknowledged.
+    attention_changes: tokio::sync::broadcast::Sender<()>,
 }
 
 impl MessagePrimitives {
@@ -375,6 +377,7 @@ impl MessagePrimitives {
             home_reads: std::sync::OnceLock::new(),
             located: Mutex::new(BTreeMap::new()),
             records: tokio::sync::Mutex::new(BTreeMap::new()),
+            attention_changes: tokio::sync::broadcast::channel(16).0,
             backend,
         })
     }
@@ -550,6 +553,7 @@ impl MessagePrimitives {
         }
         self.inbox.receive(&person, &id, Transport::Turn).await.map_err(|error| error.to_string())?;
         self.inbox.deliver(&id, Deliver { receiver: person, transport: Transport::Turn }).await.map_err(|error| error.to_string())?;
+        let _ = self.attention_changes.send(());
         self.inbox.get_async(&id).await.map_err(|error| error.to_string())?.ok_or_else(|| format!("message `{record}` is gone"))
     }
 

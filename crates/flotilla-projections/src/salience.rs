@@ -2,27 +2,19 @@
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{ResourceRef, Salience};
-use flotilla_resources::{DemandState, PrincipalRef, TerminalAttentionState};
+use flotilla_resources::TerminalAttentionState;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SalienceFacts {
-    pub demands: Vec<DemandFact>,
-    pub regards: Vec<RegardFact>,
+    pub raised: Vec<RaisedFact>,
     pub attention: Vec<AttentionFact>,
 }
 
+/// An open attention a person has not yet acknowledged.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DemandFact {
+pub struct RaisedFact {
     pub target: ResourceRef,
-    pub addressee: Option<PrincipalRef>,
-    pub state: DemandState,
-    pub as_of: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RegardFact {
-    pub principal: PrincipalRef,
-    pub target: ResourceRef,
+    pub escalated: bool,
     pub as_of: DateTime<Utc>,
 }
 
@@ -39,85 +31,37 @@ pub struct SalienceEvaluation {
     pub as_of: DateTime<Utc>,
 }
 
-/// Compute the surface-independent salience judgment for one projection
-/// entry. Idle evidence alone contributes information; stall routing is
-/// projected separately from the authority's condition.
-pub fn compute_salience(demand: Option<DemandState>, regard_covers: bool, attention: Option<TerminalAttentionState>) -> Salience {
-    let attention_needs_human = matches!(attention, Some(TerminalAttentionState::NeedsInput));
-    let demand_is_unacknowledged = matches!(demand, Some(DemandState::Raised | DemandState::Satisfied | DemandState::Escalated));
-    if demand_is_unacknowledged && regard_covers && attention_needs_human {
-        return Salience::Urgent;
-    }
-
-    let demand_salience = match demand {
-        Some(DemandState::Raised) => Salience::Attention,
-        Some(DemandState::Satisfied) => Salience::Info,
-        Some(DemandState::Escalated) => Salience::Urgent,
-        Some(DemandState::Acknowledged) | None => Salience::None,
+/// The surface-independent salience of one open attention, or of one terminal observation.
+/// Idle evidence alone contributes information; stall routing is projected separately from the
+/// authority's condition.
+pub fn compute_salience(raised: Option<&RaisedFact>, attention: Option<TerminalAttentionState>) -> Salience {
+    let raised_salience = match raised {
+        Some(raised) if raised.escalated => Salience::Urgent,
+        Some(_) => Salience::Attention,
+        None => Salience::None,
     };
     let attention_salience = match attention {
         Some(TerminalAttentionState::NeedsInput) => Salience::Attention,
         Some(TerminalAttentionState::Working | TerminalAttentionState::Idle) => Salience::Info,
         Some(TerminalAttentionState::Unobservable) | None => Salience::None,
     };
-    let regard_salience = if regard_covers { Salience::Info } else { Salience::None };
-    demand_salience.max(attention_salience).max(regard_salience)
+    raised_salience.max(attention_salience)
 }
 
-/// Evaluate all facts related to one entry's resource identities. The
-/// timestamp advances only from facts participating in that entry's join.
-pub fn evaluate_entry(
-    targets: &[ResourceRef],
-    coverage_targets: &[ResourceRef],
-    facts: &SalienceFacts,
-    base_as_of: DateTime<Utc>,
-) -> SalienceEvaluation {
-    let demands =
-        facts.demands.iter().filter(|demand| targets.iter().any(|target| references_match(&demand.target, target))).collect::<Vec<_>>();
-    let attention = facts
-        .attention
-        .iter()
-        .filter(|observation| targets.iter().any(|target| references_match(&observation.target, target)))
-        .collect::<Vec<_>>();
-
+/// Evaluate all facts about one entry's resource identities. The timestamp advances only from
+/// facts about that entry.
+pub fn evaluate_entry(targets: &[ResourceRef], facts: &SalienceFacts, base_as_of: DateTime<Utc>) -> SalienceEvaluation {
     let mut result = SalienceEvaluation { salience: Salience::None, as_of: base_as_of };
-    evaluate_combination(None, None, coverage_targets, facts, &mut result);
-    for &observation in &attention {
-        evaluate_combination(None, Some(observation), coverage_targets, facts, &mut result);
+    let about = |target: &ResourceRef| targets.iter().any(|entry| references_match(target, entry));
+    for raised in facts.raised.iter().filter(|raised| about(&raised.target)) {
+        result.salience = result.salience.max(compute_salience(Some(raised), None));
+        result.as_of = result.as_of.max(raised.as_of);
     }
-    for demand in demands {
-        evaluate_combination(Some(demand), None, coverage_targets, facts, &mut result);
-        for &observation in &attention {
-            evaluate_combination(Some(demand), Some(observation), coverage_targets, facts, &mut result);
-        }
+    for observation in facts.attention.iter().filter(|observation| about(&observation.target)) {
+        result.salience = result.salience.max(compute_salience(None, Some(observation.state)));
+        result.as_of = result.as_of.max(observation.as_of);
     }
     result
-}
-
-fn evaluate_combination(
-    demand: Option<&DemandFact>,
-    attention: Option<&AttentionFact>,
-    targets: &[ResourceRef],
-    facts: &SalienceFacts,
-    result: &mut SalienceEvaluation,
-) {
-    let matching_regards = facts.regards.iter().filter(|regard| {
-        demand.is_none_or(|demand| demand.addressee.as_ref() == Some(&regard.principal))
-            && targets.iter().any(|target| reference_covers(&regard.target, target))
-    });
-    let mut regard_covers = false;
-    for regard in matching_regards {
-        regard_covers = true;
-        result.as_of = result.as_of.max(regard.as_of);
-    }
-    let candidate = compute_salience(demand.map(|demand| demand.state), regard_covers, attention.map(|attention| attention.state));
-    result.salience = result.salience.max(candidate);
-    if let Some(demand) = demand {
-        result.as_of = result.as_of.max(demand.as_of);
-    }
-    if let Some(attention) = attention {
-        result.as_of = result.as_of.max(attention.as_of);
-    }
 }
 
 fn references_match(left: &ResourceRef, right: &ResourceRef) -> bool {
@@ -129,67 +73,29 @@ fn references_match(left: &ResourceRef, right: &ResourceRef) -> bool {
         && left.host.as_ref().zip(right.host.as_ref()).is_none_or(|(left, right)| left == right)
 }
 
-fn reference_covers(ancestor: &ResourceRef, target: &ResourceRef) -> bool {
-    if ancestor.api_version != target.api_version
-        || ancestor.kind != target.kind
-        || ancestor.namespace != target.namespace
-        || ancestor.name != target.name
-        || ancestor.host.as_ref().zip(target.host.as_ref()).is_some_and(|(left, right)| left != right)
-    {
-        return false;
-    }
-    match (&ancestor.subresource, &target.subresource) {
-        (None, _) => true,
-        (Some(ancestor), Some(target)) => target == ancestor || target.strip_prefix(ancestor).is_some_and(|suffix| suffix.starts_with('/')),
-        (Some(_), None) => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn demand_regard_attention_join_has_one_central_precedence_table() {
+    fn an_open_attention_needs_a_person_and_an_escalated_hold_is_urgent() {
+        let raised = |escalated| RaisedFact {
+            target: ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "demo"),
+            escalated,
+            as_of: DateTime::<Utc>::UNIX_EPOCH,
+        };
         let cases = [
-            (None, false, None, Salience::None, "no facts"),
-            (None, true, None, Salience::Info, "regarded work"),
-            (None, false, Some(TerminalAttentionState::Working), Salience::Info, "working observation"),
-            (None, false, Some(TerminalAttentionState::Idle), Salience::Info, "idle observation"),
-            (None, false, Some(TerminalAttentionState::NeedsInput), Salience::Attention, "unrouted input need"),
-            (Some(DemandState::Raised), false, Some(TerminalAttentionState::Working), Salience::Attention, "raised demand"),
-            (Some(DemandState::Raised), true, Some(TerminalAttentionState::Working), Salience::Attention, "regarded raised demand"),
-            (Some(DemandState::Raised), true, Some(TerminalAttentionState::NeedsInput), Salience::Urgent, "in-searchlight input demand"),
-            (Some(DemandState::Raised), true, Some(TerminalAttentionState::Idle), Salience::Attention, "in-searchlight idle demand"),
-            (Some(DemandState::Raised), false, Some(TerminalAttentionState::NeedsInput), Salience::Attention, "out-of-searchlight demand"),
-            (Some(DemandState::Satisfied), false, None, Salience::Info, "satisfied demand awaiting acknowledgement"),
-            (Some(DemandState::Escalated), false, None, Salience::Urgent, "expired demand escalated"),
-            (
-                Some(DemandState::Satisfied),
-                true,
-                Some(TerminalAttentionState::NeedsInput),
-                Salience::Urgent,
-                "satisfied demand remains unacknowledged",
-            ),
-            (Some(DemandState::Acknowledged), false, None, Salience::None, "acknowledged demand"),
-            (
-                Some(DemandState::Acknowledged),
-                true,
-                Some(TerminalAttentionState::NeedsInput),
-                Salience::Attention,
-                "live input remains visible after acknowledgement",
-            ),
-            (
-                Some(DemandState::Raised),
-                true,
-                Some(TerminalAttentionState::Unobservable),
-                Salience::Attention,
-                "unobservable raised demand",
-            ),
+            (None, None, Salience::None, "no facts"),
+            (None, Some(TerminalAttentionState::Working), Salience::Info, "working observation"),
+            (None, Some(TerminalAttentionState::Idle), Salience::Info, "idle observation"),
+            (None, Some(TerminalAttentionState::NeedsInput), Salience::Attention, "input need"),
+            (None, Some(TerminalAttentionState::Unobservable), Salience::None, "unobservable"),
+            (Some(raised(false)), None, Salience::Attention, "open attention"),
+            (Some(raised(false)), Some(TerminalAttentionState::NeedsInput), Salience::Attention, "no combination outranks it"),
+            (Some(raised(true)), None, Salience::Urgent, "escalated hold"),
         ];
-
-        for (demand, regard_covers, attention, expected, description) in cases {
-            assert_eq!(compute_salience(demand, regard_covers, attention), expected, "{description}");
+        for (raised, attention, expected, description) in cases {
+            assert_eq!(compute_salience(raised.as_ref(), attention), expected, "{description}");
         }
     }
 }

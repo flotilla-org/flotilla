@@ -361,7 +361,6 @@ impl DaemonRuntime {
             spawn_credential_refresh_task(Arc::clone(&daemon), options.namespace.clone(), Arc::clone(&credential_store)),
             spawn_host_description_projection_task(Arc::clone(&daemon), options.namespace.clone(), options.heartbeat_interval),
             spawn_codex_central_refresh_task(Arc::clone(&daemon.discovery_runtime().env), options.codex_central_refresh_interval),
-            spawn_demand_expiry_task(daemon.resource_backend(), options.namespace.clone(), options.heartbeat_interval),
             spawn_event_expiry_task(daemon.resource_backend(), options.namespace.clone(), options.heartbeat_interval),
             spawn_projection_parity_task(
                 daemon.resource_backend(),
@@ -425,6 +424,10 @@ impl DaemonRuntime {
                     }
                 }
             }));
+        }
+        // Behind `[primitives]` a hold's escalation is judged where it is read.
+        if daemon.message_primitives().is_none() {
+            tasks.push(spawn_demand_expiry_task(daemon.resource_backend(), options.namespace.clone(), options.heartbeat_interval));
         }
         let desired_manifest_root = manifests
             .as_ref()
