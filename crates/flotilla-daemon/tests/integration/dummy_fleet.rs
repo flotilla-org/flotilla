@@ -1920,3 +1920,98 @@ async fn on_the_engine_acknowledging_a_standing_convoys_hold_admits_its_next_gen
     let CommandValue::PersonInbox(listing) = fleet.execute_as_operator(inbox).await else { panic!("a person inbox") };
     assert!(listing.items.iter().all(|left| left.message != item.message), "an acknowledged hold waits no more");
 }
+
+// Behaviour (#3824 layer 8b): the input-needed and declaration-refused Demands are gone; their
+// facts are read from the records that hold them, with the switch off and on. A crew session that
+// needs input raises its vessel's salience, and a refused declaration is listed by `fleet list`.
+async fn judgements_scenario(primitives: bool) {
+    use flotilla_protocol::{AwarenessGrouping, AwarenessKind, DeclarationAttentionKind, QueryCursor, QueryId, Salience};
+    use flotilla_resources::{
+        DeclarationRefusedCondition, Project, ProjectStatusPatch, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
+        TerminalSession, TerminalSessionStatusPatch, CONVOY_LABEL,
+    };
+
+    let fleet =
+        DummyDaemon::start_switched(&format!("{SCENARIO_AGENT}stall_rate = 1.0\n"), "", Duration::from_millis(200), primitives).await;
+    fleet.dispatch("needs-input", CrewMix::Coder).await;
+    let convoy = fleet.wait_for_stall("needs-input").await;
+    let backend = fleet.backend();
+    let sessions = backend.using::<TerminalSession>(NAMESPACE);
+    let session = sessions
+        .list()
+        .await
+        .expect("sessions")
+        .items
+        .into_iter()
+        .find(|session| session.metadata.labels.get(CONVOY_LABEL) == Some(&convoy.metadata.name))
+        .expect("the crew's session");
+    let query = QueryId::Awareness { scope: None, grouping: AwarenessGrouping::Convoy, limit: Default::default() };
+    let subscriber = uuid::Uuid::new_v4();
+    let salience = || async {
+        let events =
+            fleet.daemon.subscribe_queries(subscriber, &[QueryCursor { query: query.clone(), since: None }]).await.expect("subscribe");
+        events.into_iter().find_map(|event| match event {
+            DaemonEvent::ResultSet(result) => result.rows.as_awareness().and_then(|nodes| {
+                nodes.iter().flat_map(|node| &node.entries).find(|entry| entry.kind == AwarenessKind::Vessel).map(|entry| entry.salience)
+            }),
+            _ => None,
+        })
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let needs_input = TerminalSessionStatusPatch::ObserveAttention {
+            attention: TerminalAttention {
+                state: TerminalAttentionState::NeedsInput,
+                as_of: chrono::Utc::now(),
+                source: TerminalAttentionSource::Hook,
+            },
+        };
+        let _ = flotilla_store::apply_status_patch(&sessions, &session.metadata.name, &needs_input).await;
+        if salience().await == Some(Salience::Attention) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "a session needing input never raised its vessel: {:?}", salience().await);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let projects = backend.definitions::<Project>(NAMESPACE);
+    projects
+        .create(
+            &InputMeta::builder().name("refusing".into()).build(),
+            &flotilla_resources::ProjectSpec::builder()
+                .display_name("Refusing".to_string())
+                .default_workflow_ref(CrewMix::Coder.workflow_name().to_string())
+                .repositories(Vec::new())
+                .build(),
+        )
+        .await
+        .expect("project");
+    let now = chrono::Utc::now();
+    let refused = ProjectStatusPatch::DeclarationRefused {
+        condition: Some(DeclarationRefusedCondition {
+            entry_path: "ops/broken.md".into(),
+            message: "unknown_option".into(),
+            since: now,
+            observed_at: now,
+        }),
+    };
+    flotilla_store::apply_status_patch(&backend.using::<Project>(NAMESPACE), "refusing", &refused).await.expect("refusal");
+    let listed = fleet.daemon.fleet_list_internal().await.expect("fleet list");
+    assert!(
+        listed.declaration_attention.iter().any(|row| row.resource.name == "refusing"
+            && row.condition == DeclarationAttentionKind::DeclarationRefused
+            && row.message.contains("unknown_option")),
+        "{:?}",
+        listed.declaration_attention
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn input_needed_and_declaration_refusals_are_read_from_their_records() {
+    judgements_scenario(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn on_the_engine_input_needed_and_declaration_refusals_are_read_from_their_records() {
+    judgements_scenario(true).await;
+}
