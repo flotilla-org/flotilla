@@ -1,5 +1,6 @@
 //! Crew outcomes, lifecycle teardown, and serialized crew message delivery.
-use flotilla_resources::{credential_refresh_alert_for_vessel, LANDING_EVIDENCE_TTL};
+use flotilla_resources::attentions::{Sender, Subject};
+use flotilla_resources::LANDING_EVIDENCE_TTL;
 use tracing::Instrument;
 
 use flotilla_agent::brief_artifact::BriefArtifactWriter;
@@ -29,9 +30,9 @@ use flotilla_resources::{
     },
     expected_change_request_leaves, external_patches as convoy_external_patches, ChangeRequest as ResourceChangeRequest,
     Checkout as ResourceCheckout, CheckoutIntegrationStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyPhase,
-    ConvoyStatusPatch, CrewCompletionPending, CrewMessageSender, CrewSource, CrewWorkPhase, Demand as ResourceDemand, Forge, HoldAct,
-    InputMeta, IntegrationCondition, LifecycleAuthority, ObservedChangeRequestState, Project, Repository, RepositoryKey, Resource,
-    ResourceError, ResourceObject, ResourceProvenance, TerminalAttentionState, TerminalBrief, TerminalCrewContext,
+    ConvoyStatusPatch, CrewCompletionPending, CrewMessageSender, CrewSource, CrewWorkPhase, Forge, HoldAct, InputMeta,
+    IntegrationCondition, LifecycleAuthority, ObservedChangeRequestState, Project, Repository, RepositoryKey, ResourceError,
+    ResourceObject, ResourceProvenance, TerminalAttentionState, TerminalBrief, TerminalCrewContext,
     TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
     TerminalSessionSource, TerminalSessionStatusPatch, TurnDeliveryRung, Vessel, WorkCompletionAuthority, CONVOY_LABEL,
     CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION, ROLE_LABEL, VESSEL_LABEL,
@@ -1004,19 +1005,15 @@ impl CrewService {
             .into_iter()
             .map(|(role, session)| (role, session.object))
             .collect();
+        let vessel = Subject::Vessel { convoy: context.convoy.clone(), vessel: context.vessel.clone() };
         let credential_alerts = self
             .resource_backend
-            .clone()
-            .using::<ResourceDemand>(&context.namespace)
-            .query_declared(&StoreQuery {
-                fields: BTreeMap::from([("spec.originating_work_ref.name".into(), context.convoy.clone())]),
-                ..Default::default()
-            })
-            .await
-            .map_err(|err| err.to_string())?
-            .items
+            .attentions()
+            .open(&context.namespace, Some(&vessel))
+            .await?
             .into_iter()
-            .filter_map(|demand| credential_refresh_alert_for_vessel(&demand.object, &context.convoy, &context.vessel))
+            .filter(|open| open.sender == Sender::Capabilities)
+            .flat_map(|open| open.reason.lines().map(str::to_owned).collect::<Vec<_>>())
             .collect::<Vec<_>>();
         let crew_work = convoy.status.as_ref().and_then(|status| status.crew_work.get(&context.vessel));
         let loss_reason =
@@ -1721,28 +1718,9 @@ impl CrewService {
         delete_lifecycle_owned_matching(&self.resource_backend.clone().using::<ResourceCheckout>(namespace), &selector)
             .await
             .map_err(|error| error.to_string())?;
-        let demands = self.resource_backend.clone().using::<ResourceDemand>(namespace);
-        for source in demands
-            .query_declared(&StoreQuery {
-                fields: BTreeMap::from([("spec.originating_work_ref.name".into(), name.into())]),
-                ..Default::default()
-            })
-            .await
-            .map_err(|error| error.to_string())?
-            .items
-        {
-            let demand = source.object;
-            let target = &demand.spec.originating_work_ref;
-            if target.api_version == flotilla_resources::api_version(ResourceConvoy::API_PATHS)
-                && target.kind == ResourceConvoy::API_PATHS.kind
-                && target.namespace == namespace
-                && target.name == name
-            {
-                match demands.delete(&demand.metadata.name).await {
-                    Ok(()) | Err(ResourceError::NotFound { .. }) => {}
-                    Err(error) => return Err(error.to_string()),
-                }
-            }
+        let attentions = self.resource_backend.attentions();
+        for open in attentions.open(namespace, Some(&Subject::convoy(name))).await? {
+            attentions.clear(namespace, open.sender, &open.subject).await?;
         }
         Ok(())
     }

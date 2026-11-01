@@ -4358,6 +4358,7 @@ impl InProcessDaemon {
             convoy_engine: &self.convoy_engine_path,
             accounts: &*self.accounts,
             manifest_roots: &*self.manifest_roots,
+            attentions: self.resource_backend.attentions(),
         }
     }
 

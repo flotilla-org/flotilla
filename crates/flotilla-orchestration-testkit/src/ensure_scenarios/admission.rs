@@ -168,24 +168,6 @@ pub async fn declaration_refusal_staleness_uses_the_daemon_clock_at_the_24_hour_
     )
     .await
     .expect("record refusal");
-    backend
-        .using::<ResourceDemand>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name("declaration-refused-standing-project".to_string())
-                .annotations(BTreeMap::from([
-                    (flotilla_charter::ops_entry::DECLARATION_REFUSAL_REASON_ANNOTATION.into(), "invalid declaration".into()),
-                    (flotilla_charter::ops_entry::DECLARATION_REFUSED_SINCE_ANNOTATION.into(), clock.now().to_rfc3339()),
-                ]))
-                .build(),
-            &DemandSpec::for_dispatching_principal(
-                ResourceRef::new("flotilla.work/v1", "Project", "flotilla", "standing-project"),
-                DemandKind::HumanGate,
-                PrincipalRef::implicit_for_namespace("flotilla"),
-            ),
-        )
-        .await
-        .expect("refusal attention");
     let stale = || async {
         daemon
             .list_projects_internal()
@@ -227,18 +209,11 @@ pub async fn standing_ensure_records_admitted_config_and_surfaces_drift_without_
     assert_eq!(drifted.admitted_config_hash, first_status.admitted_config_hash);
     assert_ne!(drifted.admitted_config_hash, drifted.observed_config_hash);
     assert!(drifted.config_drift.expect("typed drift").changes.iter().any(|change| change.contains("presentation")));
-    assert!(backend
-        .using::<ResourceDemand>("flotilla")
-        .list()
-        .await
-        .expect("attention")
-        .items
-        .iter()
-        .any(|demand| demand.metadata.name == "ensure-config-drift-quartermaster"));
     let fleet = daemon.fleet_list_internal().await.expect("public fleet listing");
     assert!(fleet.declaration_attention.iter().any(|row| row.message.contains("presentation")));
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("drift attention persists across refreshes");
-    assert_eq!(backend.using::<ResourceDemand>("flotilla").list().await.expect("attention").items.len(), 1);
+    let fleet = daemon.fleet_list_internal().await.expect("public fleet listing");
+    assert_eq!(fleet.declaration_attention.len(), 1, "one drift attention, not raised again");
 }
 
 pub async fn ensure_reconciliation_recovers_a_roll_interrupted_after_retirement(factory: &dyn EnsureScenarioController) {

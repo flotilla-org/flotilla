@@ -13,15 +13,14 @@ use flotilla_protocol::{
     SubjectKind,
 };
 use flotilla_resources::{
-    ChangeRequestStatus, Clock, Convoy as ResourceConvoy, ConvoyStatus, CrewWorkPhase, Demand as ResourceDemand, FulfilmentKind,
-    FulfilmentRealisation, Host as ResourceHost, HostStatus as ResourceHostStatus, Project, ReadResourceObject, ResourceProvenance,
+    ChangeRequestStatus, Clock, Convoy as ResourceConvoy, ConvoyStatus, CrewWorkPhase, FulfilmentKind, FulfilmentRealisation,
+    Host as ResourceHost, HostStatus as ResourceHostStatus, Project, ReadResourceObject, ResourceProvenance,
     TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, WorkPhase as ResourceWorkPhase,
     CONVOY_LABEL, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::ResourceBackend;
 
 use flotilla_projections::fleet::FleetService;
-use flotilla_resources::credential_refresh_alert_for_vessel;
 
 use flotilla_projections::read_projections::*;
 #[cfg(test)]
@@ -48,9 +47,8 @@ mod tests {
     use flotilla_provider_runtime::ProcessCommandRunner;
     use flotilla_resources::{
         ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ConvoyPhase, ConvoySpec, CrewWorkState, DeclaredSubject,
-        DemandKind, DemandSpec, DispatchQueueEntry, FulfilmentKindSpec, HostSpec, InputMeta, Observation, ObservedChangeRequestState,
-        ObservedChecks, ObservedMergeability, ObservedReviewDecision, ProjectSpec, ProjectStatus, SystemClock, TerminalSessionSource,
-        TerminalSessionSpec,
+        DispatchQueueEntry, FulfilmentKindSpec, HostSpec, InputMeta, Observation, ObservedChangeRequestState, ObservedChecks,
+        ObservedMergeability, ObservedReviewDecision, ProjectSpec, ProjectStatus, SystemClock, TerminalSessionSource, TerminalSessionSpec,
     };
     use flotilla_store_memory::InMemoryBackend;
     use hegel::generators as gs;
@@ -399,6 +397,7 @@ mod tests {
                 convoy_engine: &NO_CONVOY_ENGINE,
                 accounts: &self.accounts,
                 manifest_roots: &self.manifest_roots,
+                attentions: self.backend.attentions(),
             }
         }
 
@@ -1343,35 +1342,6 @@ mod tests {
         assert!(ledgers.iter().any(|ledger| {
             ledger.role == "reviewer" && ledger.missing && ledger.comment_url.as_deref() == Some("https://example.test/pull/1#comment-2")
         }));
-    }
-
-    #[tokio::test]
-    async fn credential_alerts_match_the_exact_convoy_and_vessel() {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let demand = backend
-            .using::<ResourceDemand>("flotilla")
-            .create(
-                &InputMeta::builder()
-                    .name("credential-refresh-conv-implement-review-github-app".to_string())
-                    .annotations(BTreeMap::from([
-                        ("flotilla.work/credential-refresh-vessel".to_string(), "implement-review".to_string()),
-                        ("flotilla.work/credential-refresh-reason".to_string(), "github-app expires in 2 minutes".to_string()),
-                    ]))
-                    .build(),
-                &DemandSpec::for_dispatching_principal(
-                    flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "conv"),
-                    DemandKind::HumanGate,
-                    flotilla_resources::PrincipalRef::implicit_for_namespace("flotilla"),
-                ),
-            )
-            .await
-            .expect("create credential attention demand");
-        assert_eq!(
-            credential_refresh_alert_for_vessel(&demand, "conv", "implement-review"),
-            Some("github-app expires in 2 minutes".to_string())
-        );
-        assert_eq!(credential_refresh_alert_for_vessel(&demand, "conv", "implement"), None);
-        assert_eq!(credential_refresh_alert_for_vessel(&demand, "other-convoy", "implement-review"), None);
     }
 
     #[tokio::test]

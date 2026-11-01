@@ -35,8 +35,6 @@ use flotilla_resources::CrewSpec;
 use flotilla_resources::CrewWorkPhase;
 use flotilla_resources::CrewWorkState;
 use flotilla_resources::Demand as ResourceDemand;
-use flotilla_resources::DemandKind;
-use flotilla_resources::DemandSpec;
 use flotilla_resources::DemandStatusPatch;
 use flotilla_resources::Environment as ResourceEnvironment;
 use flotilla_resources::EnvironmentPhase;
@@ -551,7 +549,7 @@ async fn create_docker_placement(backend: &ResourceBackend, kind_name: &str, hos
 
 use chrono::Duration as ChronoDuration;
 use flotilla_charter::ops_entry::{MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION};
-use flotilla_protocol::{PrincipalRef, ResourceRef};
+use flotilla_protocol::PrincipalRef;
 use flotilla_resources::{CheckoutStatus as ResourceCheckoutStatus, ConvoySpec, FulfilmentKind, LifecycleAuthority};
 use flotilla_store::apply_status_patch as apply_resource_status_patch;
 use sha2::{Digest, Sha256};

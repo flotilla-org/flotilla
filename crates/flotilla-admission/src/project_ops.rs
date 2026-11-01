@@ -11,9 +11,9 @@ use std::{
 use async_trait::async_trait;
 use flotilla_charter::{
     ops_entry::{
-        parse_operational_entry, OperationalEntryDefinition, DECLARATION_REFUSAL_ATTENTION_PREFIX, DECLARATION_REFUSAL_REASON_ANNOTATION,
-        DECLARATION_REFUSED_SINCE_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION,
-        SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION,
+        parse_operational_entry, OperationalEntryDefinition, MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION,
+        SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION,
+        VERIFICATION_PROVENANCE_ANNOTATION,
     },
     project_declaration::{
         parse_project_declaration, ProjectDeclaration, BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION,
@@ -22,14 +22,14 @@ use flotilla_charter::{
 };
 use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
-    PrincipalRef, ProviderData, ResourceRef,
+    ProviderData,
 };
 use flotilla_resources::{checkout_path::checkout_path, definition_provenance::WHOLE_REPOSITORY_PROJECT_MANAGER};
 use flotilla_resources::{
     normalize_project_spec, Clock, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyRepositorySpec,
-    DeclarationRefusedCondition, Demand, DemandKind, DemandSpec, Forge, InputMeta, Project, ProjectRepositoryRole, ProjectRepositorySpec,
-    ProjectSpec, ProjectStatusPatch, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceError, ResourceObject,
-    WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity, MANAGED_BY_LABEL,
+    DeclarationRefusedCondition, Forge, InputMeta, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
+    Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceError, ResourceObject, WorkflowTemplate, WorkflowTemplateSpec,
+    WriterIdentity, MANAGED_BY_LABEL,
 };
 use flotilla_store::{apply_status_patch as apply_resource_status_patch, ensure_repository, ResourceBackend};
 use tracing::debug;
@@ -1074,38 +1074,6 @@ impl ProjectService<'_> {
             observed_at: now,
         });
         let mut errors = Vec::new();
-        // Raise attention before fan-out, then attempt every condition patch.
-        // One failed status write must not hide the refusal from the governor.
-        let attention = async {
-            let demands = self.resource_backend.using::<Demand>(namespace);
-            let name = format!("{DECLARATION_REFUSAL_ATTENTION_PREFIX}{project_name}");
-            if ready {
-                return match demands.delete(&name).await {
-                    Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
-                    Err(error) => Err(error.to_string()),
-                };
-            }
-            let target = ResourceRef::new("flotilla.work/v1", "Project", namespace, project_name);
-            let spec =
-                DemandSpec::for_dispatching_principal(target, DemandKind::HumanGate, PrincipalRef::implicit_for_namespace(namespace));
-            let mut annotations = BTreeMap::from([(DECLARATION_REFUSAL_REASON_ANNOTATION.into(), message.into())]);
-            if let Some(condition) = &condition {
-                annotations.insert(DECLARATION_REFUSED_SINCE_ANNOTATION.into(), condition.since.to_rfc3339());
-            }
-            let meta = InputMeta::builder().name(name).annotations(annotations).build();
-            match demands.create(&meta, &spec).await {
-                Ok(_) => Ok(()),
-                Err(ResourceError::Conflict { .. }) => {
-                    let current = demands.get(&meta.name).await.map_err(|error| error.to_string())?;
-                    demands.update(&meta, &current.metadata.resource_version, &spec).await.map(|_| ()).map_err(|error| error.to_string())
-                }
-                Err(error) => Err(error.to_string()),
-            }
-        }
-        .await;
-        if let Err(error) = attention {
-            errors.push(error);
-        }
         for patch in [
             ProjectStatusPatch::ReplaceOperationalEntries { ready, message: message.to_string() },
             ProjectStatusPatch::DeclarationRefused { condition: condition.clone() },
