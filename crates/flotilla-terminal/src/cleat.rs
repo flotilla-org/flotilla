@@ -42,6 +42,8 @@ struct SessionInfo {
     id: String,
     cwd: Option<std::path::PathBuf>,
     cmd: Option<String>,
+    #[serde(default)]
+    argv: Option<Vec<String>>,
     status: SessionStatus,
     screen_activity: Option<ScreenActivityWire>,
     #[serde(default)]
@@ -69,12 +71,38 @@ enum ScreenActivityWire {
     Stable,
 }
 
+/// The shell a declared session's script runs in: `sh -c`, which reads no
+/// profile. An absolute path, because the child's declared `PATH` is searched.
+const DECLARED_SHELL: &str = "/bin/sh";
+
+/// What a session runs. `Command` keeps cleat's normal terminal behaviour
+/// (`$SHELL -lc`); `Declared` runs a script in [`DECLARED_SHELL`] with exactly
+/// the session's environment, so no login profile rebuilds it (#4173).
+#[derive(Clone, Copy)]
+enum SessionProgram<'a> {
+    Command(&'a str),
+    Declared(&'a str),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LaunchCapability {
+    /// `launch --env-clear` (cleat#318).
+    env_clear: bool,
+    /// `launch -- PROGRAM [ARG]...`, run without a shell (cleat#333).
+    argv: bool,
+}
+
+impl LaunchCapability {
+    fn from_help(help: &str) -> Self {
+        Self { env_clear: help.split_whitespace().any(|word| word == "--env-clear"), argv: help.contains("[-- <PROGRAM>...]") }
+    }
+}
+
 pub struct CleatTerminalPool {
     runner: Arc<dyn CommandRunner>,
     binary: String,
     environment: ControlledTerminalEnvironment,
-    /// Whether this cleat accepts `launch --env-clear` (cleat#318).
-    launch_capability: tokio::sync::OnceCell<bool>,
+    launch_capability: tokio::sync::OnceCell<LaunchCapability>,
     attach_capability: tokio::sync::OnceCell<()>,
     endpoint_cache: tokio::sync::Mutex<Option<EndpointCache>>,
     last_recording_prune: tokio::sync::Mutex<Instant>,
@@ -160,7 +188,7 @@ impl CleatTerminalPool {
     async fn ensure_session_at_size(
         &self,
         session_name: &str,
-        command: &str,
+        program: SessionProgram<'_>,
         cwd: &ExecutionEnvironmentPath,
         env_vars: &TerminalEnvVars,
         tags: &[TerminalSessionTag],
@@ -171,13 +199,13 @@ impl CleatTerminalPool {
             return Ok(());
         }
 
-        let env_clear = *self
+        let capability = *self
             .launch_capability
             .get_or_try_init(|| async {
                 let help = run!(self.runner, &self.binary, &["launch", "--help"], Path::new("/"))
                     .map_err(|_| format!("cleat '{}' cannot verify declared environment support (--env-clear)", self.binary))?;
-                let supported = help.split_whitespace().any(|word| word == "--env-clear");
-                if !supported {
+                let capability = LaunchCapability::from_help(&help);
+                if !capability.env_clear {
                     // Until cleat#318 ships, sessions inherit the cleat daemon's environment. The
                     // client itself runs under the controlled envelope, so a daemon it starts is
                     // clean; only a daemon started elsewhere can leak ambient variables.
@@ -186,16 +214,29 @@ impl CleatTerminalPool {
                     // pool and an upgraded cleat is only picked up after a daemon restart.
                     tracing::warn!(binary = %self.binary, "cleat lacks --env-clear; launching without clearing inherited environment (cleat#318)");
                 }
-                Ok::<bool, String>(supported)
+                if !capability.argv {
+                    // A cleat older than the pinned CLEAT_NEW_REVISION runs every command through
+                    // `$SHELL -lc`, whose profile may reset PATH. Fleet candidates pair cleat with
+                    // that pin, so this is only a mixed roll. Remove once fleets carry cleat#333.
+                    tracing::warn!(binary = %self.binary, "cleat lacks argv launch; declared sessions run through a login shell (cleat#333)");
+                }
+                Ok::<LaunchCapability, String>(capability)
             })
             .await?;
 
         let cwd = cwd.as_path().display().to_string();
         let mut args = vec!["launch"];
-        if env_clear {
+        if capability.env_clear {
             args.push("--env-clear");
         }
-        args.extend(["--json", "--record", session_name, "--cwd", &cwd, "--cmd", command]);
+        args.extend(["--json", "--record", session_name, "--cwd", &cwd]);
+        let argv = match program {
+            SessionProgram::Declared(script) if capability.argv => Some(script),
+            SessionProgram::Declared(command) | SessionProgram::Command(command) => {
+                args.extend(["--cmd", command]);
+                None
+            }
+        };
         let encoded_size = initial_size.map(|size| size.to_string());
         if let Some(size) = &encoded_size {
             args.extend(["--size", size]);
@@ -214,9 +255,23 @@ impl CleatTerminalPool {
             args.push("--tag");
             args.push(tag);
         }
+        if let Some(script) = argv {
+            // Everything after `--` is the argv, verbatim: no shell parses it.
+            args.extend(["--", DECLARED_SHELL, "-c", script]);
+        }
         run!(self.runner, &self.binary, &args, Path::new("/"))?;
         Ok(())
     }
+}
+
+/// A session's command as flotilla launched it: a declared session reports its script.
+fn session_command(cmd: Option<String>, argv: Option<Vec<String>>) -> Option<String> {
+    cmd.or_else(|| {
+        argv.map(|argv| match argv.as_slice() {
+            [shell, flag, script] if shell == DECLARED_SHELL && flag == "-c" => script.clone(),
+            _ => argv.join(" "),
+        })
+    })
 }
 
 fn valid_recording_daemon(daemon: &DaemonInfo) -> bool {
@@ -303,7 +358,7 @@ impl TerminalPool for CleatTerminalPool {
                 TerminalSession {
                     session_name: session.id,
                     status,
-                    command: session.cmd,
+                    command: session_command(session.cmd, session.argv),
                     working_directory: session.cwd.map(ExecutionEnvironmentPath::new),
                     screen_activity: session.screen_activity.map(|activity| match activity {
                         ScreenActivityWire::Active => ScreenActivity::Active,
@@ -322,7 +377,7 @@ impl TerminalPool for CleatTerminalPool {
         env_vars: &TerminalEnvVars,
         tags: &[TerminalSessionTag],
     ) -> Result<(), String> {
-        self.ensure_session_at_size(session_name, command, cwd, env_vars, tags, None).await
+        self.ensure_session_at_size(session_name, SessionProgram::Command(command), cwd, env_vars, tags, None).await
     }
 
     async fn ensure_session_with_size(
@@ -334,7 +389,19 @@ impl TerminalPool for CleatTerminalPool {
         tags: &[TerminalSessionTag],
         initial_size: Option<TerminalSize>,
     ) -> Result<(), String> {
-        self.ensure_session_at_size(session_name, command, cwd, env_vars, tags, initial_size).await
+        self.ensure_session_at_size(session_name, SessionProgram::Command(command), cwd, env_vars, tags, initial_size).await
+    }
+
+    async fn ensure_declared_session(
+        &self,
+        session_name: &str,
+        script: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &TerminalEnvVars,
+        tags: &[TerminalSessionTag],
+        initial_size: Option<TerminalSize>,
+    ) -> Result<(), String> {
+        self.ensure_session_at_size(session_name, SessionProgram::Declared(script), cwd, env_vars, tags, initial_size).await
     }
 
     fn attach_args(
@@ -481,9 +548,12 @@ mod tests {
 
     // Existing command-layout tests exercise their operation after the launch
     // capability has been established. environment_tests covers the real probe.
+    /// `cleat launch --help` usage at the pinned revision (cleat#333).
+    const LAUNCH_HELP: &str = "Usage: cleat launch [OPTIONS] [ID] [-- <PROGRAM>...]\n      --env <NAME=VALUE>\n      --env-clear\n";
+
     fn test_pool(runner: Arc<dyn CommandRunner>, binary: &str) -> CleatTerminalPool {
         let pool = CleatTerminalPool::new(runner, binary, &EnvironmentBag::new());
-        pool.launch_capability.set(true).expect("known launch capability");
+        pool.launch_capability.set(LaunchCapability { env_clear: true, argv: true }).expect("known launch capability");
         pool
     }
 
@@ -662,7 +732,10 @@ mod tests {
         let calls = logical_calls(&runner);
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1].0, "cleat");
-        assert_eq!(calls[1].1, vec!["launch", "--env-clear", "--json", "--record", "my-session", "--cwd", "/repo", "--cmd", "bash"]);
+        assert_eq!(
+            calls[1].1,
+            vec!["launch", "--env-clear", "--json", "--record", "my-session", "--cwd", "/repo", "--cmd", "bash", "--env", "LANG=C.UTF-8"]
+        );
     }
 
     #[tokio::test]
@@ -677,7 +750,79 @@ mod tests {
         let calls = logical_calls(&runner);
         assert_eq!(calls.len(), 3);
         assert_eq!(calls[1].1, vec!["launch", "--help"]);
-        assert_eq!(calls[2].1, vec!["launch", "--json", "--record", "my-session", "--cwd", "/repo", "--cmd", "bash"]);
+        assert_eq!(
+            calls[2].1,
+            vec!["launch", "--json", "--record", "my-session", "--cwd", "/repo", "--cmd", "bash", "--env", "LANG=C.UTF-8"]
+        );
+    }
+
+    // #4173: a declared session runs its script in `sh -c` after `--`, so no
+    // login shell or profile runs between the declared environment and it.
+    #[tokio::test]
+    async fn declared_session_runs_its_script_without_a_login_shell() {
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok("[]".into()),
+            Ok(LAUNCH_HELP.into()),
+            Ok("{}".into()),
+            Ok(r#"[{"id":"crew","cwd":"/repo","cmd":null,"argv":["/bin/sh","-c","exec claude --flag 'two words'"],"status":"Detached"}]"#
+                .into()),
+        ]));
+        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat", &EnvironmentBag::new());
+        let env = vec![("PATH".to_string(), "/opt/flotilla/bin:/usr/bin:/bin".to_string())];
+
+        pool.ensure_declared_session(
+            "crew",
+            "exec claude --flag 'two words'",
+            &ExecutionEnvironmentPath::new("/repo"),
+            &env,
+            &[],
+            Some(TerminalSize::new(200, 50)),
+        )
+        .await
+        .expect("declared session");
+
+        assert_eq!(
+            logical_calls(&runner)[2].1,
+            vec![
+                "launch",
+                "--env-clear",
+                "--json",
+                "--record",
+                "crew",
+                "--cwd",
+                "/repo",
+                "--size",
+                "200x50",
+                "--env",
+                "LANG=C.UTF-8",
+                "--env",
+                "PATH=/opt/flotilla/bin:/usr/bin:/bin",
+                "--",
+                "/bin/sh",
+                "-c",
+                "exec claude --flag 'two words'",
+            ]
+        );
+        let sessions = pool.list_sessions().await.expect("list");
+        assert_eq!(sessions[0].command.as_deref(), Some("exec claude --flag 'two words'"));
+    }
+
+    // A cleat without argv launch (older than cleat#333) still starts the
+    // session, through its login shell, rather than refusing the crew.
+    #[tokio::test]
+    async fn declared_session_falls_back_to_a_command_when_cleat_lacks_argv() {
+        let help = "Usage: cleat launch [OPTIONS] [ID]\n      --cmd <CMD>\n      --env-clear\n";
+        let runner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok(help.into()), Ok("{}".into())]));
+        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat", &EnvironmentBag::new());
+
+        pool.ensure_declared_session("crew", "exec claude", &ExecutionEnvironmentPath::new("/repo"), &vec![], &[], None)
+            .await
+            .expect("declared session");
+
+        assert_eq!(
+            logical_calls(&runner)[2].1,
+            vec!["launch", "--env-clear", "--json", "--record", "crew", "--cwd", "/repo", "--cmd", "exec claude", "--env", "LANG=C.UTF-8"]
+        );
     }
 
     #[tokio::test]
@@ -698,7 +843,21 @@ mod tests {
 
         assert_eq!(
             logical_calls(&runner)[1].1,
-            vec!["launch", "--env-clear", "--json", "--record", "my-session", "--cwd", "/repo", "--cmd", "bash", "--size", "200x50",]
+            vec![
+                "launch",
+                "--env-clear",
+                "--json",
+                "--record",
+                "my-session",
+                "--cwd",
+                "/repo",
+                "--cmd",
+                "bash",
+                "--size",
+                "200x50",
+                "--env",
+                "LANG=C.UTF-8",
+            ]
         );
     }
 
@@ -757,6 +916,8 @@ mod tests {
                 "/repo",
                 "--cmd",
                 "codex",
+                "--env",
+                "LANG=C.UTF-8",
                 "--tag",
                 "convoy=demo",
                 "--tag",
@@ -1159,7 +1320,11 @@ mod tests {
         let cmd_idx = calls[1].1.iter().position(|a| a == "--cmd").expect("--cmd present");
         assert_eq!(calls[1].1[cmd_idx + 1], "claude");
         let launch_env = calls[1].1.windows(2).filter(|args| args[0] == "--env").map(|args| args[1].clone()).collect::<Vec<_>>();
-        let expected_env = caller_env.iter().map(|(name, value)| format!("{name}={value}")).collect::<std::collections::BTreeSet<_>>();
+        let expected_env = caller_env
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .chain(["LANG=C.UTF-8".to_string()])
+            .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(launch_env.into_iter().collect::<std::collections::BTreeSet<_>>(), expected_env);
     }
 }
