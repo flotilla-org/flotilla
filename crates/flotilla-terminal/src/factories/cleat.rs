@@ -100,7 +100,7 @@ mod tests {
             }
             assert!(calls[2].1.iter().any(|arg| arg == "--env-clear"));
             let env = calls[2].1.windows(2).filter(|args| args[0] == "--env").map(|args| args[1].as_str()).collect::<Vec<_>>();
-            assert_eq!(env, vec!["HOME=/execution/home", "PATH=/execution/bin:/usr/bin:/bin"]);
+            assert_eq!(env, vec!["HOME=/execution/home", "LANG=C.UTF-8", "PATH=/execution/bin:/usr/bin:/bin"]);
         }
     }
 

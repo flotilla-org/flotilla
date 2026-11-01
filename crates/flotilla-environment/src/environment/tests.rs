@@ -1389,6 +1389,8 @@ async fn docker_cleat_launch_does_not_forward_outer_terminal_identity() {
             "--cmd",
             "codex",
             "--env",
+            "LANG=C.UTF-8",
+            "--env",
             "PATH=/usr/local/bin:/usr/bin:/bin",
         ]
     );
