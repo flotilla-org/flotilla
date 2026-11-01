@@ -164,12 +164,24 @@ vessel's commands, files, forwards and tool layers:
   to `${XDG_STATE_HOME:-~/.local/state}/flotilla/vessels/<vessel>/`, beside
   its cleat state. These tools come from the owning daemon's generation, so
   the host must share the owning daemon's platform.
+- Content-cache entries a crew needs (its pinned harness, its skill tree)
+  live in one store all of the login's vessels share, durable across
+  reboots: `${XDG_STATE_HOME:-~/.local/state}/flotilla/content-store/`. A
+  second vessel needing an entry the store already holds sends none of its
+  bytes, and the runtime directory holds only the agent, its sockets and its
+  supervisor's lock. An entry that does not fit fails delivery before launch
+  with `ContentStoreFull`, naming the store and its free bytes.
 - The vessel's crews reach the owning daemon through `flotilla.sock` in the
   agent's directory, which the agent forwards over the daemon's own
   connection. Nothing forwards while the daemon is stopped.
 - Attach goes through the agent to the vessel's cleat.
 - Removing the vessel stops its agent and removes its directories; an
   unreachable host does not block teardown, and a later pass retries.
+  Removal also releases the vessel's uses of the shared store and removes
+  every entry no remaining vessel links, unless it was stored or fetched in
+  the last ten minutes; a later removal collects those. A vessel started
+  before this store existed keeps its own until its agent's supervisor
+  restarts, as after a reboot.
 
 Checkouts and host probes (free space, platform, model facts) still run over
 the daemon's SSH connection. Only crew sessions run on an SSH host; a

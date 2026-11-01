@@ -6,7 +6,9 @@
 //! Each vessel gets its own supervised agent in a private directory under the
 //! remote user's `$XDG_RUNTIME_DIR`, bootstrapped through the host's SSH runner
 //! and reached through drydock's SSH transport. Its tool layer and cleat state
-//! live under the user's state directory. The agent's pushed environment, its
+//! live under the user's state directory, and its content-cache entries (pinned
+//! harnesses, skill trees) in one store there that the host's vessels share
+//! (#4087). The agent's pushed environment, its
 //! forwards and its claimed endpoints belong to that vessel alone, however many
 //! vessels share the host and its one Environment.
 //!
@@ -26,7 +28,7 @@ use async_trait::async_trait;
 use flotilla_config::ConfigStore;
 use flotilla_discovery::{registry::ProviderRegistry, DiscoveryRuntime};
 use flotilla_discovery_api::EnvironmentBag;
-use flotilla_drydock::host::{platform_from_uname, retire_host_agent, HostAgentConnector, SshAgentTransport};
+use flotilla_drydock::host::{platform_from_uname, retire_host_agent, HostAgentConnector, SharedStore, SshAgentTransport};
 use flotilla_environment::environment::agent::{AgentRunner, WritableBases};
 use flotilla_environment::environment::{VesselAgent, CONTAINED_DAEMON_REQUIRED_ENV, DAEMON_SOCKET_ENV};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
@@ -96,13 +98,16 @@ pub(super) struct VesselPaths {
     pub(super) agent: PathBuf,
     /// The vessel's durable state: its generation layer and cleat state.
     pub(super) state: PathBuf,
+    /// The durable content store every vessel of the host user shares.
+    pub(super) store: PathBuf,
 }
 
 impl VesselPaths {
     /// Deterministic, so sessions launched before a controller restart find
     /// their vessel where they left it.
     pub(super) fn new(bag: &EnvironmentBag, key: &VesselKey) -> Result<Self, String> {
-        let paths = Self { agent: agent_root(bag)?.join(key.directory()), state: state_root(bag)?.join(key.directory()) };
+        let paths =
+            Self { agent: agent_root(bag)?.join(key.directory()), state: state_root(bag)?.join(key.directory()), store: store_root(bag)? };
         for (socket, room) in [
             (paths.daemon_socket(), 0),
             (paths.agent.join(flotilla_drydock::host::AGENT_SOCKET), 0),
@@ -163,11 +168,22 @@ pub(super) fn agent_root(bag: &EnvironmentBag) -> Result<PathBuf, String> {
 }
 
 pub(super) fn state_root(bag: &EnvironmentBag) -> Result<PathBuf, String> {
+    Ok(durable_base(bag)?.join("vessels"))
+}
+
+/// The host user's shared content store: durable, unlike the runtime dir,
+/// and one for all of the user's vessels (#4087).
+pub(super) fn store_root(bag: &EnvironmentBag) -> Result<PathBuf, String> {
+    Ok(durable_base(bag)?.join("content-store"))
+}
+
+/// `$XDG_STATE_HOME/flotilla`, or `~/.local/state/flotilla`.
+fn durable_base(bag: &EnvironmentBag) -> Result<PathBuf, String> {
     let state = match bag.find_env_var("XDG_STATE_HOME").filter(|directory| directory.starts_with('/')) {
         Some(state) => PathBuf::from(state),
         None => Path::new(bag.find_env_var("HOME").ok_or("the host login has no HOME")?).join(".local/state"),
     };
-    Ok(state.join("flotilla/vessels"))
+    Ok(state.join("flotilla"))
 }
 
 /// A host's operating system and architecture, as drydock names them: one
@@ -498,6 +514,7 @@ impl VesselAgents for SshVesselAgents {
             &vessel_base(profile, paths)?,
         )
         .with_executable_cache(cache)
+        .with_store(paths.store.clone())
         .with_vessel(format!("{}/{}", vessel.environment, vessel.vessel));
         let runner = AgentRunner::new(Arc::new(connector), local.into()).with_writable_bases(WritableBases::Host);
         Ok(Arc::new(AgentVessel { agent: Arc::new(runner), host: profile.runner.clone() }))
@@ -716,7 +733,10 @@ impl SshHostVessels {
         }
         match VesselPaths::new(&profile.env_bag, &key) {
             Ok(paths) => {
-                if let Err(error) = retire_host_agent(profile.runner.as_ref(), &paths.agent, std::slice::from_ref(&paths.state)).await {
+                let store = SharedStore::new(paths.store.clone());
+                if let Err(error) =
+                    retire_host_agent(profile.runner.as_ref(), &paths.agent, std::slice::from_ref(&paths.state), Some(&store)).await
+                {
                     warn!(environment = %key.environment, %vessel, %error, "vessel agent cleanup failed; continuing teardown");
                 }
             }

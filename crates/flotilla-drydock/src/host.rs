@@ -2,6 +2,12 @@
 //! on (an SSH host). Flotilla owns the host. Each vessel gets its own
 //! supervised drydock agent in a private directory, bootstrapped through the
 //! host's existing command runner and reached through drydock's SSH transport.
+//!
+//! #4087: the vessels of one host user share one durable content store, so a
+//! harness or skill tree one vessel stored is a lookup for the next, and the
+//! private directory (on the runtime dir, a tmpfs) holds only the agent, its
+//! sockets and its supervisor's lock. Retiring a vessel releases its uses of
+//! the store and collects what no live vessel links any more.
 use std::{
     io,
     path::{Path, PathBuf},
@@ -36,15 +42,17 @@ const MISSING_EXECUTABLE: i32 = 64;
 /// Start the vessel's supervisor unless it already runs. The supervisor's lock
 /// makes this idempotent, so every reconnect may run it. The agent runs with
 /// the login's identity and the prepared base layer, passed as `NAME=value`
-/// words after the directory: never the SSH session's own environment.
-const BOOTSTRAP: &str = r#"dir=$1
-shift
+/// words after the directory and the store: never the SSH session's own
+/// environment. An empty store keeps drydock's own, beside the executable.
+const BOOTSTRAP: &str = r#"dir=$1 store=$2
+shift 2
 umask 077
 mkdir -p -- "$dir" && chmod -- 700 "$dir" || exit 1
+[ -z "$store" ] || mkdir -p -- "$store" || exit 1
 [ -x "$dir/drydock-agent" ] || exit 64
 exec env -i HOME="${HOME:-/}" USER="${USER:-}" LOGNAME="${LOGNAME:-}" SHELL="${SHELL:-/bin/sh}" \
   XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" "$@" \
-  "$dir/drydock-agent" --supervise --socket "$dir/agent.sock""#;
+  "$dir/drydock-agent" --supervise ${store:+--store "$store"} --socket "$dir/agent.sock""#;
 
 /// Publish the copied executable only once it is complete and executable.
 const INSTALL: &str = r#"chmod -- 700 "$1" && mv -f -- "$1" "$2""#;
@@ -52,11 +60,14 @@ const INSTALL: &str = r#"chmod -- 700 "$1" && mv -f -- "$1" "$2""#;
 /// Kill the supervisor and agent serving one socket, then remove the vessel's
 /// directories. Both processes end their argv with `--socket <socket>`; the
 /// supervisor is killed in the same signal, so it cannot restart the agent.
-/// Drydock stores content-cache entries read-only, so the owner gets write
-/// permission on the trees before they are removed.
-/// `ps` rather than `/proc` keeps this portable to macOS hosts.
-const RETIRE: &str = r#"dir=$1
-shift
+/// With a shared store, the vessel's own executable (or, once that is gone, a
+/// neighbour's) then releases the vessel's uses and collects what no live
+/// vessel links; a collection that cannot run is said so and retirement goes
+/// on, leaving it to the next. Drydock stores content-cache entries
+/// read-only, so the owner gets write permission on the trees before they
+/// are removed. `ps` rather than `/proc` keeps this portable to macOS hosts.
+const RETIRE: &str = r#"dir=$1 store=$2 idle=$3
+shift 3
 suffix=" --socket $dir/agent.sock"
 for round in 1 2 3; do
   pids=$(ps -axww -o pid= -o command= | awk -v s="$suffix" 'length($0) >= length(s) && substr($0, length($0) - length(s) + 1) == s { print $1 }')
@@ -64,8 +75,35 @@ for round in 1 2 3; do
   kill -KILL $pids 2>/dev/null
   sleep 1
 done
+if [ -n "$store" ]; then
+  collected=
+  for collector in "$dir/drydock-agent" "${dir%/*}"/*/drydock-agent; do
+    [ -x "$collector" ] || continue
+    "$collector" --collect --store "$store" --release "$dir/agent.sock" --idle "$idle" >/dev/null && { collected=1; break; }
+  done
+  [ -n "$collected" ] || echo "no vessel agent could collect the content store $store" >&2
+fi
 chmod -R u+w -- "$dir" "$@" 2>/dev/null
 rm -rf -- "$dir" "$@""#;
+
+/// How long an entry stays in a shared store after it was stored or last
+/// fetched, whoever links it: the fetch's link follows it.
+pub const STORE_IDLE: Duration = Duration::from_secs(600);
+
+/// The content store the vessels of one host user share (#4087), durable
+/// across reboots, and how a retirement collects it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedStore {
+    pub root: PathBuf,
+    /// Entries stored or fetched this recently are left for a later collection.
+    pub idle: Duration,
+}
+
+impl SharedStore {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root, idle: STORE_IDLE }
+    }
+}
 
 /// The explicit recipe for reaching a host's agents. Drydock's SSH transport
 /// reads no ambient SSH configuration or agent: the key file is named and the
@@ -128,6 +166,8 @@ pub struct HostAgentConnector {
     executable_bytes: Arc<OnceCell<Vec<u8>>>,
     timeout: Duration,
     base: Vec<String>,
+    /// The host's shared content store, when the agent keeps its entries there.
+    store: Option<PathBuf>,
     /// The vessel this agent serves, as its abandoned upgrades are logged.
     vessel: String,
 }
@@ -147,7 +187,26 @@ impl HostAgentConnector {
     ) -> Self {
         let base = base.environment().into_iter().map(|(name, value)| format!("{name}={value}")).collect();
         let vessel = directory.display().to_string();
-        Self { host, transport, directory, platform, executable, executable_bytes: Arc::new(OnceCell::new()), timeout, base, vessel }
+        Self {
+            host,
+            transport,
+            directory,
+            platform,
+            executable,
+            executable_bytes: Arc::new(OnceCell::new()),
+            timeout,
+            base,
+            store: None,
+            vessel,
+        }
+    }
+
+    /// Keep the agent's content store in `store`, shared with the host's
+    /// other vessels, rather than beside its executable. A running supervisor
+    /// keeps the store it started with until the host restarts it.
+    pub fn with_store(mut self, store: PathBuf) -> Self {
+        self.store = Some(store);
+        self
     }
 
     /// Name the vessel in this connector's logs; its directory otherwise.
@@ -195,7 +254,8 @@ impl HostAgentConnector {
 
     async fn start(&self) -> Result<bool, String> {
         let directory = self.directory.to_string_lossy();
-        let mut args = vec!["-c", BOOTSTRAP, "flotilla-vessel-agent", &directory];
+        let store = self.store.as_deref().map(Path::to_string_lossy).unwrap_or_default();
+        let mut args = vec!["-c", BOOTSTRAP, "flotilla-vessel-agent", &directory, &store];
         args.extend(self.base.iter().map(String::as_str));
         let output = self
             .host
@@ -341,13 +401,20 @@ impl HostAgentConnector {
     }
 }
 
-/// Stop the agent serving `directory` and its supervisor, then remove
-/// `directory` and every path in `also`. Stopped processes and missing paths
-/// are not errors.
-pub async fn retire_host_agent(host: &dyn CommandRunner, directory: &Path, also: &[PathBuf]) -> Result<(), String> {
+/// Stop the agent serving `directory` and its supervisor, collect the shared
+/// `store` it used, then remove `directory` and every path in `also`.
+/// Stopped processes and missing paths are not errors.
+pub async fn retire_host_agent(
+    host: &dyn CommandRunner,
+    directory: &Path,
+    also: &[PathBuf],
+    store: Option<&SharedStore>,
+) -> Result<(), String> {
     let directory = directory.to_string_lossy().into_owned();
+    let (root, idle) =
+        store.map_or((String::new(), String::new()), |store| (store.root.to_string_lossy().into_owned(), store.idle.as_secs().to_string()));
     let also = also.iter().map(|path| path.to_string_lossy().into_owned()).collect::<Vec<_>>();
-    let mut args = vec!["-c", RETIRE, "flotilla-vessel-agent-retire", directory.as_str()];
+    let mut args = vec!["-c", RETIRE, "flotilla-vessel-agent-retire", directory.as_str(), root.as_str(), idle.as_str()];
     args.extend(also.iter().map(String::as_str));
     host.run("sh", &args, Path::new("/"), &ChannelLabel::Default)
         .await
