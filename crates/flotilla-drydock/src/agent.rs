@@ -61,6 +61,8 @@ fn is_transient(error: &io::Error) -> bool {
             | ErrorKind::InvalidData
             | ErrorKind::InvalidInput
             | ErrorKind::Unsupported => false,
+            // Unchanged from the former hand list: kinds that may in fact be permanent refusals
+            // (InvalidFilename, DigestMismatch, ReadOnlyFilesystem, ...) still retry; see #4257.
             ErrorKind::NotFound
             | ErrorKind::ConnectionRefused
             | ErrorKind::ConnectionReset

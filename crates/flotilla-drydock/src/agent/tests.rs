@@ -1049,9 +1049,19 @@ fn connect_errors_of_a_starting_vessel_are_transient() {
 fn an_agent_refusal_of_the_request_is_final_and_a_starting_vessel_is_not() {
     use drydock_agent::{AgentError, ErrorKind};
     let refused = |kind| AgentError::new("file.write", "/x", kind, "refused").into_io();
-    for kind in
-        [ErrorKind::Conflict, ErrorKind::StorageFull, ErrorKind::PayloadTooLarge, ErrorKind::PermissionDenied, ErrorKind::Unsupported]
-    {
+    // Every final kind, so a kind moving between arms is caught.
+    for kind in [
+        ErrorKind::Conflict,
+        ErrorKind::AlreadyExists,
+        ErrorKind::FileTooLarge,
+        ErrorKind::PayloadTooLarge,
+        ErrorKind::StorageFull,
+        ErrorKind::QuotaExceeded,
+        ErrorKind::PermissionDenied,
+        ErrorKind::InvalidData,
+        ErrorKind::InvalidInput,
+        ErrorKind::Unsupported,
+    ] {
         assert!(!is_transient(&refused(kind)), "{kind:?}");
     }
     for kind in [ErrorKind::NotFound, ErrorKind::ConnectionRefused, ErrorKind::TimedOut, ErrorKind::Other] {
