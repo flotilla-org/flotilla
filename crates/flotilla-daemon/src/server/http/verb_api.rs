@@ -3,30 +3,29 @@
 //! span.
 use std::sync::Arc;
 
-use axum::{body::Bytes, extract::Path, http::StatusCode, response::Response, Extension};
+use axum::{extract::Path, http::StatusCode, response::Response, Extension};
 use flotilla_protocol::verbs::Invocation;
+use rigging_http_wire::{Encoding, Wire};
 
-use super::{wire::Encoding, CallerAuth};
+use super::auth::UserCaller;
 use crate::server::verbs::{Refusal, Verbs};
+
+/// An invocation names subjects and a few parameters; a larger body is not one.
+const BODY_LIMIT: usize = 1024 * 1024;
 
 pub(super) async fn invoke(
     Extension(verbs): Extension<Arc<Verbs>>,
-    Extension(caller): Extension<CallerAuth>,
     Path(name): Path<String>,
-    body: Bytes,
-) -> Response {
+    encoding: Encoding,
     // Only callers acting as the user run verbs until policy decides per caller (#4182 ruling 6).
-    if let Some((status, message)) = caller.user_refusal() {
-        return Encoding::Json.error_code(status, "unauthorized", message);
-    }
-    let request: Invocation = match serde_json::from_slice(&body) {
-        Ok(request) => request,
-        Err(error) => return Encoding::Json.error_code(StatusCode::BAD_REQUEST, "invalid_request", error.to_string()),
-    };
+    // The caller is checked before `Wire` reads the body.
+    UserCaller(caller): UserCaller,
+    Wire(request): Wire<Invocation, BODY_LIMIT>,
+) -> Response {
     match verbs.invoke(&caller.principal(), &name, request).await {
-        Ok(invoked) => Encoding::Json.render(StatusCode::OK, invoked),
-        Err(Refusal::UnknownVerb(name)) => Encoding::Json.error_code(StatusCode::NOT_FOUND, "not_found", format!("no verb `{name}`")),
-        Err(Refusal::Invalid(message)) => Encoding::Json.error_code(StatusCode::BAD_REQUEST, "invalid_request", message),
-        Err(Refusal::Conflict(message)) => Encoding::Json.error_code(StatusCode::CONFLICT, "conflict", message),
+        Ok(invoked) => encoding.render(StatusCode::OK, invoked),
+        Err(Refusal::UnknownVerb(name)) => encoding.error_code(StatusCode::NOT_FOUND, "not_found", format!("no verb `{name}`")),
+        Err(Refusal::Invalid(message)) => encoding.error_code(StatusCode::BAD_REQUEST, "invalid_request", message),
+        Err(Refusal::Conflict(message)) => encoding.error_code(StatusCode::CONFLICT, "conflict", message),
     }
 }

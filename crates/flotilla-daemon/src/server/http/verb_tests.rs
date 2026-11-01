@@ -233,6 +233,67 @@ async fn each_runs_once_per_subject() {
     assert_eq!(runs.load(Ordering::SeqCst), 2);
 }
 
+// Behaviour (#33 in rigging): the route takes the stack's wire rules by signature. A CBOR
+// invocation gets the same answer as its JSON twin, in CBOR when asked; an unacceptable Accept
+// is 406 and another media type 415, before anything runs; and a caller not acting as the user
+// is refused before the body is read.
+#[tokio::test]
+async fn the_route_negotiates_and_refuses_callers_before_reading_the_body() {
+    let Fixture { router, runs, .. } = fixture();
+    let invocation = json!({"invocation": "w", "subjects": [RUNNING], "params": {"note": "hi"}});
+    let (status, expected) = invoke(&router, CallerAuth::Bearer, "convoy.touch", invocation.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let post = |content_type: &str, accept: &str, body: Body| {
+        let mut request =
+            Request::post("/verbs/convoy.touch").header("content-type", content_type).header("accept", accept).body(body).unwrap();
+        request.extensions_mut().insert(CallerAuth::Bearer);
+        router.clone().oneshot(request)
+    };
+    let cbor = flotilla_cbor::to_vec(&invocation, &rigging_http_wire::LIMITS).unwrap();
+    let response = post("application/cbor", "application/cbor", Body::from(cbor.clone())).await.unwrap();
+    assert_eq!((response.status(), &response.headers()["content-type"]), (StatusCode::OK, &"application/cbor".parse().unwrap()));
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    assert_eq!(flotilla_cbor::from_slice::<Value>(&bytes, &rigging_http_wire::LIMITS).unwrap(), expected);
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+
+    let response = post("application/cbor", "text/html", Body::from(cbor.clone())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+    let response = post("text/plain", "application/json", Body::from(invocation.to_string())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(runs.load(Ordering::SeqCst), 2, "a refused request runs nothing");
+    // A body with no Content-Type is read as JSON, as the command routes always have.
+    let mut request = Request::post("/verbs/convoy.touch").body(Body::from(invocation.to_string())).unwrap();
+    request.extensions_mut().insert(CallerAuth::Bearer);
+    assert_eq!(router.clone().oneshot(request).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(runs.load(Ordering::SeqCst), 3);
+    // A body that is not an invocation is the wire's 400, under the status-named code.
+    let response = post("application/json", "application/json", Body::from("{")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let refused: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(refused["code"], "bad_request");
+    assert_eq!(runs.load(Ordering::SeqCst), 3);
+
+    // An oversized declared length that would be 413 for the user: an anonymous caller is 401,
+    // and the body is never polled.
+    let body = Body::from_stream(futures::stream::once(async {
+        panic!("a refused caller's body must not be read");
+        #[allow(unreachable_code)]
+        Ok::<_, std::io::Error>(axum::body::Bytes::new())
+    }));
+    let mut request = Request::post("/verbs/convoy.touch").header("content-length", 2 << 20).body(body).unwrap();
+    request.extensions_mut().insert(CallerAuth::Anonymous);
+    assert_eq!(router.clone().oneshot(request).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    // Accept is checked before the caller, as on the command and table routes: an environment
+    // with an unacceptable Accept is 406, and with an acceptable one 403.
+    let environment = CallerAuth::Environment { environment: flotilla_protocol::EnvironmentId::new("env"), peer: None };
+    for (accept, status) in [("text/html", StatusCode::NOT_ACCEPTABLE), ("application/json", StatusCode::FORBIDDEN)] {
+        let mut request = Request::post("/verbs/convoy.touch").header("accept", accept).body(Body::from(invocation.to_string())).unwrap();
+        request.extensions_mut().insert(environment.clone());
+        assert_eq!(router.clone().oneshot(request).await.unwrap().status(), status, "{accept}");
+    }
+}
+
 // Behaviour (#4182 ruling 7): the route keeps no record of past invocations. A repeated
 // invocation id of a write verb runs again, and the id in its effect leaves the subject as one
 // run would.

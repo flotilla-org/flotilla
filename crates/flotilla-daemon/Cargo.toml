@@ -45,6 +45,7 @@ flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
 flotilla-store-memory = { path = "../flotilla-store-memory" }
 rigging-tls = { workspace = true }
 rigging-http-serve = { workspace = true }
+rigging-http-wire = { workspace = true }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-paths = { path = "../flotilla-paths" }
 flotilla-daemon-api = { path = "../flotilla-daemon-api" }

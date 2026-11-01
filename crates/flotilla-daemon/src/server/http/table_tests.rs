@@ -616,6 +616,7 @@ async fn table_request_errors_and_content_negotiation_are_explicit() {
         assert_eq!(body["code"], code, "{query}");
     }
     let response = call(&router, "/tables/convoys?format=markdown", false).await;
+    assert_eq!(response.headers()["vary"], "Accept");
     let markdown = String::from_utf8(to_bytes(response.into_body(), 1024 * 1024).await.unwrap().to_vec()).unwrap();
     assert!(markdown.contains("`metadata.name`"));
     assert!(!markdown.contains("`id`"));
@@ -638,6 +639,8 @@ async fn table_request_errors_and_content_negotiation_are_explicit() {
         assert_eq!(response.status(), status);
         assert_eq!(response.headers()["content-type"], media);
         assert_eq!(response.headers()["cache-control"], "no-store");
+        // Streamed rows and refusals alike vary by Accept.
+        assert_eq!(response.headers()["vary"], "Accept");
     }
     let response = call(&router, "/tables/convoys/rows?format=arrow", false).await;
     assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);

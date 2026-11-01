@@ -2,11 +2,13 @@
 //! request before routing; routes read it and never inspect the transport (ADR 0065).
 
 use axum::{
-    http::StatusCode,
+    extract::FromRequestParts,
+    http::{request::Parts, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use flotilla_protocol::{AgentHookTerminalRef, EnvironmentId};
+use rigging_http_wire::Encoding;
 
 use super::login::SessionId;
 use crate::server::caller::PeerCredential;
@@ -67,6 +69,25 @@ impl CallerAuth {
             Self::Anonymous => Some(unauthenticated()),
             Self::Hook { .. } => Some(refusal(StatusCode::FORBIDDEN, "a hook token reaches only the hook routes")),
             _ => None,
+        }
+    }
+}
+
+/// A caller acting as the user, taken by signature. Any other caller is refused in the
+/// negotiated error encoding, before a later extractor such as `Wire` reads the body.
+pub(super) struct UserCaller(pub(super) CallerAuth);
+
+impl<S: Send + Sync> FromRequestParts<S> for UserCaller {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        let caller = parts.extensions.get::<CallerAuth>().cloned().unwrap_or(CallerAuth::Anonymous);
+        match caller.user_refusal() {
+            None => Ok(Self(caller)),
+            Some((status, message)) => {
+                let encoding = Encoding::negotiate(&parts.headers).unwrap_or_else(|_| Encoding::for_errors(&parts.headers));
+                Err(encoding.error_code(status, "unauthorized", message))
+            }
         }
     }
 }

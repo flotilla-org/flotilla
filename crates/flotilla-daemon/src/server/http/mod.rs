@@ -24,7 +24,6 @@ mod unix;
 mod verb_api;
 #[cfg(test)]
 mod verb_tests;
-mod wire;
 
 use std::sync::{Arc, OnceLock};
 

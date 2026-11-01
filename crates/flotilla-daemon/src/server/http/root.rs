@@ -11,7 +11,9 @@ use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE;
 use flotilla_resources::{FleetDesignation, ResourceError, FLEET_DESIGNATION_NAME};
 use serde::Serialize;
 
-use super::{wire, CallerAuth, HttpRouter, RouterState};
+use rigging_http_wire::{self as wire, Encoding};
+
+use super::{CallerAuth, HttpRouter, RouterState};
 use crate::server::tables::TableSource;
 
 const ROOT_JSON: &str = "application/vnd.flotilla.root+json";
@@ -99,23 +101,19 @@ pub(super) async fn handle(
     if let Some(refused) = caller.refusal_unless_authenticated() {
         return refused;
     }
-    let accept = match headers.get(header::ACCEPT).map(|value| value.to_str()).transpose() {
-        Ok(accept) => accept.unwrap_or(""),
-        Err(_) => return wire::Encoding::Json.error_code(StatusCode::NOT_ACCEPTABLE, "unsupported_format", "invalid Accept header"),
-    };
-    let chosen = match wire::negotiate(accept, &REPRESENTATIONS) {
+    let chosen = match wire::accept(&headers).and_then(|accept| wire::negotiate(accept, &REPRESENTATIONS)) {
         Ok(index) => REPRESENTATIONS[index],
-        Err(error) => return wire::Encoding::error_encoding(&headers).error_code(StatusCode::NOT_ACCEPTABLE, "unsupported_format", error),
+        Err(error) => return error.respond(&headers),
     };
     let fleet = fleet(&state).await;
     let link_prefix = link_prefix(state.link_prefix.as_deref(), fleet.as_deref());
     if chosen == "text/html" {
         // flotillad does not render pages: send a browser where they are rendered, else the JSON.
         if let Some(prefix) = &link_prefix {
-            return with_vary(Redirect::temporary(prefix).into_response());
+            return wire::vary_accept(Redirect::temporary(prefix).into_response());
         }
     }
-    let encoding = if matches!(chosen, ROOT_CBOR | "application/cbor") { wire::Encoding::Cbor } else { wire::Encoding::Json };
+    let encoding = if matches!(chosen, ROOT_CBOR | "application/cbor") { Encoding::Cbor } else { Encoding::Json };
     let root = Root {
         fleet,
         build_id: flotilla_daemon_api::build_info::build_id().to_owned(),
@@ -127,11 +125,6 @@ pub(super) async fn handle(
     if matches!(chosen, ROOT_JSON | ROOT_CBOR) {
         response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(chosen));
     }
-    with_vary(response)
-}
-
-fn with_vary(mut response: Response) -> Response {
-    response.headers_mut().insert(header::VARY, HeaderValue::from_static("Accept"));
     response
 }
 
