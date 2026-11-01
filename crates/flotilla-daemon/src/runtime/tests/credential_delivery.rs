@@ -1,6 +1,6 @@
 use super::*;
-use flotilla_store_memory::InMemoryBackend;
 use flotilla_resources::attentions::Subject;
+use flotilla_store_memory::InMemoryBackend;
 
 #[tokio::test]
 async fn credential_refresh_retry_waits_until_deadline_without_rewriting_status() {
@@ -1074,15 +1074,14 @@ async fn credential_attention_reads_only_live_convoys() {
         message: "unavailable".into(),
         should_surface: true,
     };
-    let (result, reads) =
-        measure_reads(super::super::credentials::reconcile_credential_refresh_attention_in(
-            &flotilla_store::OldStoreAttentions::new(backend.clone()),
-            &backend,
-            "flotilla",
-            &[failure],
-            &Default::default(),
-        ))
-        .await;
+    let (result, reads) = measure_reads(super::super::credentials::reconcile_credential_refresh_attention_in(
+        &flotilla_store::OldStoreAttentions::new(backend.clone()),
+        &backend,
+        "flotilla",
+        &[failure],
+        &Default::default(),
+    ))
+    .await;
     result.expect("attention");
     assert_eq!(reads.of(&backend).objects_by_kind().get("Convoy"), Some(&10));
 }

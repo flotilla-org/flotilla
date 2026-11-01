@@ -173,6 +173,7 @@ fn attention(fact: usize, reason: &str) -> Attention {
 }
 
 const FACTS: usize = 5;
+const DELIVERY: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
 enum Step {
@@ -250,6 +251,8 @@ fn contract(tc: TestCase, engine: bool) {
         for (index, step) in steps.iter().enumerate() {
             match *step {
                 Step::Raise { fact, reason } => {
+                    // On the old store the old Message controller owns a held delivery's reason.
+                    let reason = if fact == DELIVERY && !engine { 0 } else { reason };
                     let attention = attention(fact, ["held", "still held"][reason]);
                     implementation.attentions().raise(NAMESPACE, &attention).await.expect("raise");
                     let key = (attention.fact.sender(), attention.fact.subject());

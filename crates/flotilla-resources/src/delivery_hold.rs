@@ -44,6 +44,17 @@ pub fn delivery_hold_overdue(started_at: DateTime<Utc>, now: DateTime<Utc>) -> b
 /// convoy attention can say more than "needs you" (#3455).
 pub const DELIVERY_HOLD_REASON_ANNOTATION: &str = "flotilla.work/delivery-hold-reason";
 
+/// The held turns of a crew session's convoy role, for a person to rule on.
+pub fn delivery_fact(session: &ResourceObject<TerminalSession>) -> Option<crate::attentions::Fact> {
+    let convoy = match (session.metadata.labels.get(crate::CONVOY_LABEL), &session.spec.source) {
+        (Some(convoy), _) => convoy.clone(),
+        (None, crate::TerminalSessionSource::Agent { context, .. }) => context.convoy.clone(),
+        (None, _) => return None,
+    };
+    let role = session.metadata.labels.get(crate::ROLE_LABEL).cloned().unwrap_or_else(|| session.spec.role.clone());
+    Some(crate::attentions::Fact::DeliveryHeld { session: session.metadata.name.clone(), convoy, role })
+}
+
 pub fn delivery_demand_name(session: &ResourceObject<TerminalSession>) -> String {
     format!("terminal-delivery-{}", session.metadata.name)
 }

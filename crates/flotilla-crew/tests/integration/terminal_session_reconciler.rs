@@ -407,8 +407,7 @@ async fn terminal_session_is_reclaimed_when_its_environment_is_gone() {
 
     assert!(matches!(
         outcome.actuations.as_slice(),
-        [Actuation::DeleteTerminalSession { name }, Actuation::DeleteDemand { name: demand_name }]
-            if name == "terminal-orphan" && demand_name == "terminal-attention-terminal-orphan"
+        [Actuation::DeleteTerminalSession { name }] if name == "terminal-orphan"
     ));
 }
 
@@ -542,7 +541,7 @@ async fn managed_terminal_session_is_reclaimed_when_its_vessel_owner_is_gone() {
 
     assert!(matches!(
         outcome.actuations.as_slice(),
-        [Actuation::DeleteTerminalSession { name }, Actuation::DeleteDemand { .. }] if name == "terminal-orphan"
+        [Actuation::DeleteTerminalSession { name }] if name == "terminal-orphan"
     ));
 }
 
@@ -608,9 +607,7 @@ async fn abandoned_convoy_reaps_terminal_without_calling_its_runtime() {
 
     assert!(matches!(
         outcome.actuations.as_slice(),
-        [Actuation::DeleteTerminalSession { name }, Actuation::DeleteDemand { name: demand_name }]
-            if name == "terminal-abandoned-convoy-work-coder"
-                && demand_name == "terminal-attention-terminal-abandoned-convoy-work-coder"
+        [Actuation::DeleteTerminalSession { name }] if name == "terminal-abandoned-convoy-work-coder"
     ));
 }
 
@@ -682,7 +679,7 @@ async fn failed_convoy_terminal_stops_without_probing_its_gone_environment_runti
         let outcome = reconciler.reconcile(&session, &prepared, Utc::now());
 
         assert!(matches!(outcome.patch, Some(TerminalSessionStatusPatch::MarkFailed { .. })));
-        assert!(matches!(outcome.actuations.as_slice(), [Actuation::DeleteDemand { .. }]));
+        assert!(outcome.actuations.is_empty());
         assert_eq!(runtime.probes.load(Ordering::SeqCst), 0, "terminal owner state must short-circuit the unavailable runtime");
     }
 }
@@ -732,7 +729,7 @@ async fn failed_environment_terminal_stops_without_probing_its_runtime() {
         let outcome = reconciler.reconcile(&session, &prepared, Utc::now());
 
         assert!(matches!(outcome.patch, Some(TerminalSessionStatusPatch::MarkFailed { .. })));
-        assert!(matches!(outcome.actuations.as_slice(), [Actuation::DeleteDemand { .. }]));
+        assert!(outcome.actuations.is_empty());
         assert_eq!(runtime.probes.load(Ordering::SeqCst), 0, "terminal environment state must short-circuit the unavailable runtime");
     }
 }
@@ -1093,8 +1090,7 @@ impl ReconcileStep<GhostRecoveryWorld> for GhostRecoveryStep {
         world.ownerless_recovery_rejected = outcome.patch.is_none()
             && matches!(
                 outcome.actuations.as_slice(),
-                [Actuation::DeleteTerminalSession { name }, Actuation::DeleteDemand { name: demand_name }]
-                    if name == GHOST_SESSION_NAME && demand_name == "terminal-attention-terminal-deleted-convoy-work-coder"
+                [Actuation::DeleteTerminalSession { name }] if name == GHOST_SESSION_NAME
             );
         Ok(LivenessStep::new(outcome.patch, outcome.actuations))
     }
@@ -1110,12 +1106,6 @@ impl ReconcileStep<GhostRecoveryWorld> for GhostRecoveryStep {
         match actuation {
             Actuation::DeleteTerminalSession { name } => {
                 match world.backend.clone().using::<TerminalSession>("flotilla").delete(&name).await {
-                    Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
-                    Err(error) => Err(error.to_string()),
-                }
-            }
-            Actuation::DeleteDemand { name } => {
-                match world.backend.clone().using::<flotilla_resources::Demand>("flotilla").delete(&name).await {
                     Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
                     Err(error) => Err(error.to_string()),
                 }
@@ -1506,10 +1496,7 @@ async fn a_disappeared_running_session_is_observed_as_stopped() {
         outcome.patch,
         Some(flotilla_resources::TerminalSessionStatusPatch::MarkStopped { stopped_at, .. }) if stopped_at == now
     ));
-    assert!(matches!(
-        outcome.actuations.as_slice(),
-        [Actuation::DeleteDemand { name }] if name == "terminal-attention-term-a"
-    ));
+    assert!(outcome.actuations.is_empty());
 }
 
 /// A live session whose crew's daemon reach the test controls (#3618).
@@ -2015,7 +2002,7 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
             let prepared = flotilla_crew::reconcilers::terminal_session::TerminalPrepared::MessageDeliveryPending;
             let outcome = reconciler.reconcile(&flagged, &prepared, held_at + chrono::Duration::seconds(elapsed));
             assert!(
-                outcome.actuations.iter().any(|a| matches!(a, Actuation::CreateDemand { .. })),
+                outcome.actuations.iter().any(|a| matches!(a, Actuation::RaiseAttention { .. })),
                 "held delivery is visible at {elapsed}s"
             );
         }
@@ -2093,12 +2080,12 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
             runtime.pool_failure.store(failure, Ordering::SeqCst);
             let prepared = reconciler.prepare(&flagged).await.expect("expired hold despite unavailable pool");
             let outcome = reconciler.reconcile(&flagged, &prepared, Utc::now());
-            assert!(outcome.actuations.iter().any(|a| matches!(a, Actuation::CreateDemand { .. })));
+            assert!(outcome.actuations.iter().any(|a| matches!(a, Actuation::RaiseAttention { .. })));
         }
         runtime.pool_failure.store(0, Ordering::SeqCst);
         let prepared = reconciler.prepare(&flagged).await.expect("expired observation");
         let outcome = reconciler.reconcile(&flagged, &prepared, Utc::now());
-        assert!(outcome.actuations.iter().any(|a| matches!(a, Actuation::CreateDemand { .. })));
+        assert!(outcome.actuations.iter().any(|a| matches!(a, Actuation::RaiseAttention { .. })));
         outcome.patch.expect("visible timeout").apply(&mut status);
         assert!(status.degraded.as_ref().expect("timeout").message.contains("deadline"));
         flagged = sessions.update_status("term-a", &flagged.metadata.resource_version, &status).await.expect("persist timeout");
@@ -2106,7 +2093,7 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
         let prepared = fresh.prepare(&flagged).await.expect("observe expired hold after restart");
         let outcome = fresh.reconcile(&flagged, &prepared, Utc::now());
         assert!(
-            outcome.actuations.iter().any(|a| matches!(a, Actuation::CreateDemand { .. })),
+            outcome.actuations.iter().any(|a| matches!(a, Actuation::RaiseAttention { .. })),
             "restart repairs or retains the same durable gate"
         );
         assert_eq!(runtime.delivered.lock().expect("delivery log").len(), 1);
@@ -2137,7 +2124,7 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
             occupancy: TerminalOccupancy::Vacant,
         });
         let outcome = fresh.reconcile(&flagged, &prepared, refresh_at);
-        assert!(outcome.actuations.iter().any(|a| matches!(a, Actuation::DeleteDemand { name } if name == "terminal-delivery-term-a")));
+        assert!(outcome.actuations.iter().any(|a| matches!(a, Actuation::ClearAttention { .. })));
         outcome.patch.expect("late acknowledgement").apply(&mut status);
         assert_eq!(status.delivered_message_id.as_deref(), Some("message-new"));
         assert!(status.degraded.is_none());
@@ -2283,65 +2270,6 @@ async fn screen_obstruction_is_recorded_while_attention_is_debounced() {
         let status = sessions.get("stray-crew").await.expect("session").status.expect("status");
         assert_eq!(status.idle_obstruction(), obstruction.as_ref(), "second {second}");
     }
-}
-
-#[tokio::test]
-async fn attached_session_suppresses_input_demand_and_detach_surfaces_it_while_still_true() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let sessions = backend.clone().using::<TerminalSession>("flotilla");
-    let created = sessions
-        .create(
-            &meta("term-a"),
-            &TerminalSessionSpec {
-                env_ref: "env-a".to_string(),
-                role: "coder".to_string(),
-                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
-                cwd: "/workspace".to_string(),
-                env: Default::default(),
-                pool: "cleat".to_string(),
-            },
-        )
-        .await
-        .expect("session");
-    let mut status = TerminalSessionStatus::default();
-    TerminalSessionStatusPatch::MarkRunning {
-        configured_limits: None,
-        session_id: "cleat-session".into(),
-        pid: None,
-        started_at: Utc::now(),
-        crew: None,
-        launch_command: "cargo test".into(),
-        delivered_message_id: None,
-    }
-    .apply(&mut status);
-    let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
-    let reconciler = TerminalSessionReconciler::new(Arc::new(HooklessTerminalRuntime), backend, "flotilla");
-    let attention =
-        TerminalAttention { state: TerminalAttentionState::NeedsInput, as_of: Utc::now(), source: TerminalAttentionSource::Hook };
-
-    let attached = reconciler.reconcile(
-        &session,
-        &flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
-            obstruction: None,
-            output_digest: None,
-            attention: Some(attention.clone()),
-            occupancy: TerminalOccupancy::Occupied,
-        }),
-        Utc::now(),
-    );
-    assert!(!attached.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreateDemand { .. })));
-
-    let detached = reconciler.reconcile(
-        &session,
-        &flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
-            obstruction: None,
-            output_digest: None,
-            attention: Some(attention),
-            occupancy: TerminalOccupancy::Vacant,
-        }),
-        Utc::now(),
-    );
-    assert!(matches!(detached.actuations.as_slice(), [Actuation::CreateDemand { spec, .. }] if spec.originating_work_ref.name == "term-a"));
 }
 
 #[tokio::test]

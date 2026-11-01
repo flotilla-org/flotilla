@@ -21,8 +21,8 @@ use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
 use flotilla_resources::attentions::{Attention, Attentions, Sender, Subject};
 use flotilla_resources::{
-    ControllerRetry, ControllerRetryDisposition, Convoy, Environment, EnvironmentStatusPatch,
-    Repository, RepositoryTrust, ResourceError, RetryBackoff, TerminalSession, TerminalSessionSource, Vessel, VesselStatusPatch,
+    ControllerRetry, ControllerRetryDisposition, Convoy, Environment, EnvironmentStatusPatch, Repository, RepositoryTrust, ResourceError,
+    RetryBackoff, TerminalSession, TerminalSessionSource, Vessel, VesselStatusPatch,
 };
 use flotilla_store::ResourceBackend;
 use tokio::task::JoinHandle;
@@ -572,7 +572,6 @@ pub(super) fn spawn_codex_central_refresh_task(env: Arc<dyn EnvVars>, interval: 
         }
     })
 }
-
 
 /// The failing credentials last raised for each vessel, by namespace, convoy and vessel name. A
 /// vessel's attention is raised again only when that set changes, so an acknowledged one stays

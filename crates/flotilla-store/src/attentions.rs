@@ -9,11 +9,10 @@ use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
     api_version,
     attentions::{Attention, Attentions, Fact, OpenAttention, Sender, Subject},
-    delivery_hold::{delivery_demand, DELIVERY_HOLD_REASON_ANNOTATION},
+    delivery_hold::{delivery_demand, delivery_fact, DELIVERY_HOLD_REASON_ANNOTATION},
     Convoy, ConvoyEnsure, Demand, DemandKind, DemandSpec, DemandState, InputMeta, Resource, ResourceError, ResourceObject, TerminalSession,
-    Vessel, CONVOY_LABEL, CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION,
-    ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, ENSURE_DRIFT_ATTENTION_PREFIX, ENSURE_HOLD_REASON_ANNOTATION, RECLAIM_REFUSAL_REASON_ANNOTATION,
-    ROLE_LABEL,
+    Vessel, CREDENTIAL_REFRESH_REASON_ANNOTATION, CREDENTIAL_REFRESH_VESSEL_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION,
+    ENSURE_DRIFT_ATTENTION_PREFIX, ENSURE_HOLD_REASON_ANNOTATION, RECLAIM_REFUSAL_REASON_ANNOTATION,
 };
 
 use crate::{ResourceBackend, TypedResolver};
@@ -84,7 +83,14 @@ impl OldStoreAttentions {
                     .map_err(|error| error.to_string())?
                     .object;
                 let (mut meta, spec) = delivery_demand(&terminal);
-                meta.annotations.insert(DELIVERY_HOLD_REASON_ANNOTATION.to_owned(), attention.reason.clone());
+                // The old Message controller keeps an open hold's reason current as its batch changes.
+                match self.demands(namespace).get(&meta.name).await {
+                    Ok(current) if is_open(&current) => meta.annotations = current.metadata.annotations,
+                    Ok(_) | Err(ResourceError::NotFound { .. }) => {
+                        meta.annotations.insert(DELIVERY_HOLD_REASON_ANNOTATION.to_owned(), attention.reason.clone());
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
                 BTreeMap::from([(meta.name.clone(), (meta, spec))])
             }
         })
@@ -157,13 +163,7 @@ impl OldStoreAttentions {
         }
         if let Some(session) = name.strip_prefix(DELIVERY) {
             return match self.backend.including_replicas::<TerminalSession>(namespace).get(session).await {
-                Ok(terminal) => {
-                    let labels = &terminal.object.metadata.labels;
-                    Ok(labels
-                        .get(CONVOY_LABEL)
-                        .zip(labels.get(ROLE_LABEL))
-                        .map(|(convoy, role)| (Sender::TurnRules, Subject::ConvoyRole { convoy: convoy.clone(), role: role.clone() })))
-                }
+                Ok(terminal) => Ok(delivery_fact(&terminal.object).map(|fact| (fact.sender(), fact.subject()))),
                 Err(ResourceError::NotFound { .. }) => Ok(None),
                 Err(error) => Err(error.to_string()),
             };

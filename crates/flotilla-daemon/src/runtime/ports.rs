@@ -640,7 +640,6 @@ fn unauthorised_clone(url: &str, credentials: &CloneCredentials, error: String) 
 
 pub(super) const RECLAIM_REFUSAL_ATTENTION_AFTER: u64 = 3;
 
-
 pub(super) const RECONCILE_NOW_ANNOTATION: &str = "flotilla.work/reconcile-now-at";
 
 #[cfg(test)]
