@@ -665,13 +665,14 @@ class Trial:
             'identity': {'kind': 'forge', 'forge_ref': forge_id, 'owner': owner, 'repo_name': name}, 'remotes': [url],
             'forge': {'service_url': service, 'repository': repository}})
 
-    def forge_api(self, method, path, body):
+    def forge_api(self, method, path, body=None):
         header = self.root / 'forge-issue-header'
         header.write_text(f'Authorization: token {Path(self.real["issue_token"]).read_text().strip()}\n')
         header.chmod(0o600)
         try:
-            return json.loads(self.run(['curl', '-fsS', '-X', method, '-H', f'@{header}', '-H', 'Content-Type: application/json',
-                                        '-d', json.dumps(body), f'{self.real["service_url"]}/api/v1{path}']).stdout)
+            data = ['-H', 'Content-Type: application/json', '-d', json.dumps(body)] if body is not None else []
+            out = self.run(['curl', '-fsS', '-X', method, '-H', f'@{header}', *data, f'{self.real["service_url"]}/api/v1{path}']).stdout
+            return json.loads(out) if out.strip() else None
         finally:
             header.unlink()
 
@@ -706,7 +707,9 @@ class Trial:
             for item in self.objects(kind):
                 status = item.get('status') or {}
                 if status.get('phase') in ('Failed', 'Lost') or status.get('stalled'):
-                    message = status.get('message') or status.get('reason') or json.dumps(status)[:600]
+                    stall = status.get('stalled')
+                    message = (status.get('message') or status.get('reason')
+                               or (f'stalled: {json.dumps(stall)[:1200]}' if stall else json.dumps(status)[:600]))
                     return f'{kind[:-1]} {item["metadata"]["name"]} {status.get("phase")}: {message}'
         return None
 
@@ -752,6 +755,14 @@ class Trial:
             raise TrialFailure(f'the crew reports: {failed[-1][-300:]}')
 
     def landed(self):
+        if self.real:
+            # The fake forge merges the crew's pull request itself; on a real forge
+            # the operator's issue identity merges it, as a reviewer would.
+            repository = self.real['repository']
+            number = self.until('crew pull request', lambda: [pull['number'] for pull in
+                                self.forge_api('GET', f'/repos/{repository}/pulls?state=open&limit=50')
+                                if f'Closes #{self.issue}' in (pull.get('body') or '')])[0]
+            self.forge_api('POST', f'/repos/{repository}/pulls/{number}/merge', {'Do': 'merge'})
         self.until('convoy Landing', lambda: [name for name, phase in self.phase('convoys') if phase in ('Landing', 'Landed')])
 
     # -- teardown --------------------------------------------------------
