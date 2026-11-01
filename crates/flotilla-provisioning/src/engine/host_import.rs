@@ -132,7 +132,12 @@ fn capability<T: serde::de::DeserializeOwned + Default>(status: &HostStatus, key
         .map(Option::unwrap_or_default)
 }
 
-fn observation(spec: &HostSpec, status: &HostStatus, dropped: &mut Vec<(&'static str, &'static str)>) -> Result<HostObservation, String> {
+/// The observation `status` maps to, with what it does not carry pushed to `dropped`.
+pub(crate) fn observation(
+    spec: &HostSpec,
+    status: &HostStatus,
+    dropped: &mut Vec<(&'static str, &'static str)>,
+) -> Result<HostObservation, String> {
     let mut uncarried = |reason: &'static str| {
         if !dropped.contains(&(OBSERVATION, reason)) {
             dropped.push((OBSERVATION, reason));
