@@ -47,6 +47,11 @@ fn main() -> Result<()> {
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let result = runtime.block_on(Box::pin(run_command(cli, command, format)));
+    // The runtime shuts down before an interrupted `table` exits with its signal's status.
+    drop(runtime);
+    if let Some(status) = cli::table_exit_status() {
+        std::process::exit(status);
+    }
 
     if let Err(error) = &result {
         let message = format!("{error:?}");

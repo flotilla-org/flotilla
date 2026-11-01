@@ -5,20 +5,28 @@
 //! With no name, the daemon's described tables are listed the same way.
 
 use std::{
+    cell::RefCell,
+    collections::BTreeMap,
     io::{self, Write},
     path::Path,
+    sync::OnceLock,
     time::{Duration, Instant, SystemTime},
 };
 
 use binnacle_core::{Axis, ChangeNotice};
-use binnacle_described::{decode_json_line, DescribedSource, HostRequest, Received, Scope};
+use binnacle_described::{
+    DescribedSource, Field, FieldType, HostRequest, Message, Received, Row, RowsMessage, Schema, Scope, TableMessage, Wire,
+};
 use binnacle_described_http::{Blocking, Endpoint, Event, Options};
 use binnacle_format::Timestamp;
 use binnacle_layout::{IdMap, JsonId, Layout};
 use binnacle_ratatui::cli::{print, run_inline, Exit, FlagArgs, Flags, InlineOptions, Live};
 use color_eyre::{eyre::eyre, Result};
 use flotilla_cli::cli::args::{Cli, TableArgs, TableFormat};
-use serde_json::{json, Value as Json};
+use serde_json::Value as Json;
+
+use super::daemon::connect_daemon;
+use super::daemon_http::refusal_message;
 
 /// A view file baked into the binary: the presentation of one table.
 struct BuiltinView {
@@ -27,8 +35,9 @@ struct BuiltinView {
     document: &'static str,
 }
 
-/// The built-in view files, by table. Read from a plain include until the baked data files
-/// (#4198) land; a table without one presents with binnacle's default view.
+/// The built-in view files, by table; a table without one presents with binnacle's default view.
+/// Replaced by #4198: this plain include goes once the view files are baked into the binary
+/// with the verb files.
 const VIEWS: &[BuiltinView] =
     &[BuiltinView { table: "convoys", name: "default", document: include_str!("../../views/convoy.default.json") }];
 
@@ -50,22 +59,24 @@ fn views(table: &str) -> Result<Vec<(&'static str, Layout<JsonId, JsonId>)>> {
 /// view of the table.
 fn layout(source: &mut DescribedSource, table: &str, flags: &Flags) -> Result<Layout<JsonId, JsonId>> {
     let views = views(table)?;
-    let presentation = |name: &str| {
-        let view = views.iter().find(|(view, _)| *view == name).map(|(_, layout)| layout);
-        (view.is_some() || name == "default").then(|| source.presentation(view, None))
+    let generic = source.default_layout();
+    // `DescribedSource::presentation` with no user Layout, without holding the source.
+    let present = |name: &str| {
+        let view = views.iter().find(|(view, _)| *view == name).map(|(_, layout)| layout.clone());
+        match (view, name) {
+            (Some(view), _) => Some(Layout::layered(generic.clone(), view)),
+            (None, "default") => Some(generic.clone()),
+            (None, _) => None,
+        }
     };
-    let base = presentation("default").unwrap_or_default();
-    let named: Vec<_> = views.iter().map(|(name, _)| (*name, presentation(name))).collect();
-    let lookup = |name: &str| match name {
-        "default" => Some(base.clone()),
-        name => named.iter().find(|(view, _)| *view == name).and_then(|(_, layout)| layout.clone()),
-    };
-    flags.apply_to(source, &base, lookup).map_err(|error| eyre!("{error}"))
+    let base = present("default").unwrap_or_default();
+    flags.apply_to(source, &base, present).map_err(|error| eyre!("{error}"))
 }
 
-/// The binnacle flags `args` carries; `text` names binnacle's aligned format.
-fn flags(args: &TableArgs) -> Result<Flags> {
-    let format = args.format.map(|format| {
+/// The binnacle flags `args` carries; `text` names binnacle's aligned format, and the global
+/// `--json` asks for `json` unless `--format` says otherwise.
+fn flags(args: &TableArgs, json: bool) -> Result<Flags> {
+    let format = args.format.or(json.then_some(TableFormat::Json)).map(|format| {
         match format {
             TableFormat::Text => "aligned",
             TableFormat::Tsv => "tsv",
@@ -88,15 +99,24 @@ fn flags(args: &TableArgs) -> Result<Flags> {
     .map_err(|error| eyre!("{error}"))
 }
 
+/// The status an interrupted `flotilla table` exits with (128 and the signal), once the runtime
+/// has shut down.
+static EXIT_STATUS: OnceLock<i32> = OnceLock::new();
+
+pub(crate) fn table_exit_status() -> Option<i32> {
+    EXIT_STATUS.get().copied()
+}
+
 pub(crate) async fn run_table_command(cli: &Cli, args: TableArgs) -> Result<()> {
     // Remote daemons: #4241.
-    if let Some(remote) = cli.remote_daemon().map_err(|error| eyre!(error))? {
-        return Err(eyre!(
-            "`table` reads this host's daemon socket and cannot target {remote} yet (#4241); drop --daemon or unset FLOTILLA_DAEMON"
-        ));
+    cli.require_local_daemon("table")?;
+    let flags = flags(&args, cli.json)?;
+    if cfg!(not(unix)) {
+        return Err(eyre!(NO_UNIX_SOCKET));
     }
-    let flags = flags(&args)?;
-    let socket = cli.socket_path();
+    // Start the daemon if none is running, as other commands do; the rows come over its socket.
+    drop(connect_daemon(cli).await?);
+    let socket = cli.client_paths().map_err(|error| eyre!(error))?.socket_path;
     let interactive = flags.interactive.now();
     let exit = match args.name {
         None => {
@@ -113,10 +133,7 @@ pub(crate) async fn run_table_command(cli: &Cli, args: TableArgs) -> Result<()> 
         }
     };
     if let Some(status) = exit.status() {
-        // Exiting skips destructors: what this command wrote goes out first.
-        io::stdout().flush()?;
-        io::stderr().flush()?;
-        std::process::exit(status);
+        let _ = EXIT_STATUS.set(status);
     }
     Ok(())
 }
@@ -134,9 +151,6 @@ const FIRST_WAIT: Duration = Duration::from_millis(100);
 fn show_live(socket: &Path, table: &str, namespace: &str, flags: &Flags, interactive: bool) -> Result<Exit> {
     if namespace.is_empty() {
         return Err(eyre!("--namespace can't be empty"));
-    }
-    if cfg!(not(unix)) {
-        return Err(eyre!(NO_UNIX_SOCKET));
     }
     // A print gives up after a few failed attempts on a daemon that is down; a terminal retries,
     // saying so, until it has rows. Both stop at [`FIRST_READ`] if no rows come.
@@ -165,8 +179,8 @@ fn show_live(socket: &Path, table: &str, namespace: &str, flags: &Flags, interac
             return Err(eyre!("table {table}: no rows within {} s from {}", FIRST_READ.as_secs(), socket.display()));
         }
     }
-    let failed = std::cell::RefCell::new(None);
-    let reconnecting = std::cell::RefCell::new(reconnecting);
+    let failed = RefCell::new(None);
+    let reconnecting = RefCell::new(reconnecting);
     // A refusal mid-session ends it (the feed returning `None` leaves as Esc does), so no stale
     // table stays open; the refusal is reported once the terminal is restored.
     let live: Live<'_, DescribedSource> = Box::new(|source: &mut DescribedSource| {
@@ -221,15 +235,9 @@ fn drain(
     Ok(notices)
 }
 
-/// The daemon's answer as one line: its status, then the JSON body's `message`, else the
-/// body's first line.
+/// The daemon's answer as one line: its status, then what the body says.
 fn refusal(status: u16, body: &[u8]) -> String {
-    let text = String::from_utf8_lossy(body);
-    let message = serde_json::from_slice::<Json>(body)
-        .ok()
-        .and_then(|body| body["message"].as_str().map(str::to_owned))
-        .or_else(|| text.lines().map(str::trim).find(|line| !line.is_empty()).map(str::to_owned))
-        .unwrap_or_default();
+    let message = refusal_message(body);
     match status {
         0 => message,
         status => format!("{status} {message}").trim_end().to_owned(),
@@ -242,7 +250,7 @@ fn show(
     table: &str,
     flags: &Flags,
     interactive: bool,
-    live: Option<(Live<'_, DescribedSource>, &std::cell::RefCell<Option<String>>)>,
+    live: Option<(Live<'_, DescribedSource>, &RefCell<Option<String>>)>,
 ) -> Result<Exit> {
     let layout = layout(source, table, flags)?;
     if !interactive {
@@ -293,74 +301,71 @@ fn now() -> Timestamp {
     Timestamp::from_unix_nanos(now.map_or(0, |since| since.as_nanos() as i128))
 }
 
-#[cfg(unix)]
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// What `flotilla table` says on a platform that hosts no local daemon socket.
 const NO_UNIX_SOCKET: &str = "`table` reads this host's daemon over its Unix socket, which this platform does not host";
 
 /// `GET /tables` over the daemon's socket.
+#[cfg(unix)]
+async fn listing(socket: &Path) -> Result<Json> {
+    super::daemon_http::request_json(socket, reqwest::Method::GET, "/tables", "the table listing").await
+}
+
 #[cfg(not(unix))]
 async fn listing(_socket: &Path) -> Result<Json> {
     Err(eyre!(NO_UNIX_SOCKET))
-}
-
-/// `GET /tables` over the daemon's socket.
-#[cfg(unix)]
-async fn listing(socket: &Path) -> Result<Json> {
-    let client = rigging_tls::client_builder()
-        .unix_socket(socket)
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .map_err(|error| eyre!("build daemon HTTP client: {error}"))?;
-    let response = client
-        .get("http://flotilla.local/tables")
-        .header("accept", "application/json")
-        .send()
-        .await
-        .map_err(|error| eyre!("could not reach the daemon at {}: {error}", socket.display()))?;
-    let status = response.status();
-    let body = response.bytes().await.map_err(|error| eyre!("read daemon response ({status}): {error}"))?;
-    if !status.is_success() {
-        return Err(eyre!("daemon refused the table listing: {}", refusal(status.as_u16(), &body)));
-    }
-    serde_json::from_slice(&body).map_err(|error| eyre!("daemon table listing is not JSON: {error}"))
 }
 
 /// The table listing as a described table of its own: one row per table, with its kind and the
 /// built-in views it has.
 fn listing_source(listing: &Json) -> Result<DescribedSource> {
     let kinds = listing["kinds"].as_array().ok_or_else(|| eyre!("daemon table listing has no kinds: {listing}"))?;
-    let mut rows: Vec<Json> = kinds
-        .iter()
-        .flat_map(|kind| {
-            let tables = kind["tables"].as_array().cloned().unwrap_or_default();
-            tables.into_iter().filter_map(|table| table.as_str().map(str::to_owned)).map(move |table| {
-                let views: Vec<&str> = VIEWS.iter().filter(|view| view.table == table).map(|view| view.name).collect();
-                json!({"table": table, "kind": kind["kind"], "views": (!views.is_empty()).then(|| views.join(","))})
-            })
-        })
-        .collect();
-    rows.sort_by(|a, b| a["table"].as_str().cmp(&b["table"].as_str()));
-    // A table name routes to one source (`/tables/{table}`), so the daemon lists each once; the
-    // dedup only keeps the key unique should two kinds ever list the same name. `dedup_by` drops
-    // adjacent rows only, so it must follow the sort.
-    rows.dedup_by(|a, b| a["table"] == b["table"]);
-    let field = |name: &str, title: &str, roles: &[&str], required: bool| json!({"name": name, "title": title, "type": "string", "roles": roles, "constraints": {"required": required}});
+    // A table name routes to one source (`/tables/{table}`), so the daemon lists each once; keyed
+    // by name, the rows come out sorted and a name listed twice keeps its first kind.
+    let mut rows: BTreeMap<String, Row> = BTreeMap::new();
+    for kind in kinds {
+        let kind_name = kind["kind"].as_str().map_or(Wire::Null, |kind| Wire::Text(kind.to_owned()));
+        for table in kind["tables"].as_array().into_iter().flatten().filter_map(Json::as_str) {
+            let views: Vec<&str> = VIEWS.iter().filter(|view| view.table == table).map(|view| view.name).collect();
+            let views = if views.is_empty() { Wire::Null } else { Wire::Text(views.join(",")) };
+            rows.entry(table.to_owned()).or_insert_with(|| {
+                Row::from([("table".into(), Wire::Text(table.to_owned())), ("kind".into(), kind_name.clone()), ("views".into(), views)])
+            });
+        }
+    }
+    let field = |name: &str, title: &str, roles: &[&str], required: bool| {
+        let mut field = Field::new(name, FieldType::String);
+        field.title = Some(title.into());
+        field.roles = roles.iter().map(|role| (*role).to_owned()).collect();
+        field.required = Some(required);
+        field
+    };
     let messages = [
-        json!({"type": "table", "table": "tables", "schema": {
-            "fields": [field("table", "Table", &["key"], true), field("kind", "Kind", &[], true), field("views", "Views", &[], false)],
-            "primaryKey": ["table"],
-            "foreignKeys": [],
-        }}),
-        json!({"type": "rows", "rows": rows, "partial": false}),
-        json!({"type": "synced"}),
+        Message::Table(TableMessage {
+            schema: Schema {
+                fields: vec![
+                    field("table", "Table", &["key"], true),
+                    field("kind", "Kind", &[], true),
+                    field("views", "Views", &[], false),
+                ],
+                primary_key: vec!["table".into()],
+                foreign_keys: Vec::new(),
+            },
+            incarnation: None,
+            table: Some("tables".into()),
+            sequence: None,
+        }),
+        Message::Rows(RowsMessage { rows: rows.into_values().collect(), cursor: None, partial: false, sequence: None }),
+        Message::Synced { sequence: None },
     ];
     let mut source = DescribedSource::new("tables", Scope::new("flotilla"));
     let _ = source.poll_request();
     for message in messages {
-        let message = decode_json_line(message.to_string().as_bytes()).map_err(|error| eyre!("table listing: {error}"))?;
-        let _ = source.receive(message);
+        if let Received::Unhandled(unhandled) = source.receive(message) {
+            return Err(eyre!("table listing: the source did not take {unhandled:?}"));
+        }
+    }
+    if !source.status().synced {
+        return Err(eyre!("table listing: the source is not synced"));
     }
     Ok(source)
 }

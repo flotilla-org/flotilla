@@ -31,18 +31,19 @@ fn convoys(table: &str) -> DescribedSource {
     source
 }
 
-fn table_args(args: &[&str]) -> TableArgs {
+/// The binnacle flags `flotilla table <args>` parses to, the global `--json` included.
+fn parsed(args: &[&str]) -> Flags {
     use clap::Parser;
     let cli = Cli::try_parse_from(["flotilla", "table"].into_iter().chain(args.iter().copied())).expect("table args parse");
-    match cli.command {
-        Some(flotilla_cli::cli::args::SubCommand::Table(args)) => args,
+    match &cli.command {
+        Some(flotilla_cli::cli::args::SubCommand::Table(table)) => flags(table, cli.json).expect("flags"),
         _ => panic!("not the table command"),
     }
 }
 
 /// `source` printed as `table` with `args`.
 fn printed(source: &mut DescribedSource, table: &str, args: &[&str]) -> String {
-    let flags = flags(&table_args(args)).expect("flags");
+    let flags = parsed(args);
     let layout = layout(source, table, &flags).expect("layout");
     let (mut out, mut note) = (Vec::new(), Vec::new());
     print(source, &layout, flags.format.unwrap_or_default(), &mut out, &mut note, None).expect("print");
@@ -77,6 +78,12 @@ fn convoys_print_with_the_view_files_columns_and_sort() {
     assert!(landed[3].starts_with("20") && landed[3].ends_with('Z'), "raw RFC 3339: {landed:?}");
 
     let json: Json = serde_json::from_str(&printed(&mut convoys("convoys"), "convoys", &["--format", "json"])).expect("json");
+    // The global `--json` asks for the same; an explicit `--format` wins.
+    assert_eq!(
+        printed(&mut convoys("convoys"), "convoys", &["--json"]),
+        printed(&mut convoys("convoys"), "convoys", &["--format", "json"])
+    );
+    assert_eq!(printed(&mut convoys("convoys"), "convoys", &["--json", "--format", "tsv"]), tsv);
     let rows = json.as_array().expect("an array of rows");
     assert_eq!(rows.len(), 6);
     let fields: Vec<&String> = rows[0].as_object().unwrap().keys().collect();
@@ -94,7 +101,7 @@ fn flags_patch_the_view() {
     // The default view by name is the view file; a view the table lacks is an error.
     let text = printed(&mut convoys("convoys"), "convoys", &["--format", "tsv", "--view", "default"]);
     assert_eq!(names(&text), NEWEST_FIRST, "{text}");
-    let flags = flags(&table_args(&["--view", "nosuch"])).unwrap();
+    let flags = parsed(&["--view", "nosuch"]);
     let unknown = layout(&mut convoys("convoys"), "convoys", &flags).unwrap_err().to_string();
     assert!(unknown.contains("nosuch"), "{unknown}");
     // An unknown format is refused while parsing, naming the formats.
@@ -118,25 +125,32 @@ fn a_table_with_no_view_file_prints_binnacles_default_view() {
     assert_eq!(names(&text), served, "{text}");
 }
 
+// Replaced by #4198, whose baked view files get their meaning check there: this test goes with
+// the include in `VIEWS`.
 #[test]
 fn every_built_in_view_parses_and_names_only_columns_its_table_has() {
-    let description: Json = serde_json::from_slice(&fixture("convoys.json")).expect("description");
-    let fields: Vec<&str> = description["fields"].as_array().unwrap().iter().filter_map(|field| field["name"].as_str()).collect();
     for view in VIEWS {
-        assert_eq!(view.table, "convoys", "only the convoys description is recorded");
-        let layout: Json = serde_json::from_str(view.document).expect("view file is JSON");
-        let mut named: Vec<&str> = Vec::new();
-        for sort in layout["view"]["rows"]["sort"].as_array().into_iter().flatten() {
-            named.push(sort["id"].as_str().unwrap());
+        // Each view's table needs its recorded description, `tests/fixtures/tables/<table>.json`.
+        let description: Json = serde_json::from_slice(&fixture(&format!("{}.json", view.table))).expect("description");
+        let fields: Vec<&str> = description["fields"].as_array().unwrap().iter().filter_map(|field| field["name"].as_str()).collect();
+        let layout = Layout::<JsonId, JsonId>::from_json(view.document.as_bytes()).expect("view file is a binnacle Layout");
+        let mut named: Vec<&JsonId> = Vec::new();
+        if let Some(spec) = &layout.view {
+            named.extend(spec.rows.sort.iter().map(|sort| &sort.id));
+            named.extend(spec.rows.filter.conditions.iter().map(|condition| &condition.id));
+            named.extend(&spec.cols.hidden);
         }
-        for list in [&layout["view"]["cols"]["hidden"], &layout["order"]["cols"]] {
-            named.extend(list.as_array().into_iter().flatten().map(|id| id.as_str().unwrap()));
+        if let Some(order) = &layout.order {
+            named.extend(order.cols.iter().flatten());
         }
-        assert!(!named.is_empty());
-        for name in named {
+        if let Some(pins) = &layout.pins {
+            named.extend(pins.cols.leading.iter().chain(&pins.cols.trailing));
+        }
+        assert!(!named.is_empty(), "{}.{} names no columns", view.table, view.name);
+        for id in named {
+            let name = id.value().as_str().unwrap_or_else(|| panic!("{}.{}: column {id} is not a field name", view.table, view.name));
             assert!(fields.contains(&name), "{}.{} names {name}, which {} lacks", view.table, view.name, view.table);
         }
-        assert!(!views(view.table).unwrap().is_empty(), "{}.{} is a binnacle Layout", view.table, view.name);
     }
 }
 
@@ -144,6 +158,7 @@ fn every_built_in_view_parses_and_names_only_columns_its_table_has() {
 fn the_listing_prints_each_table_with_its_kind_and_views() {
     let listing: Json = serde_json::from_slice(&fixture("listing.json")).expect("listing");
     let mut source = listing_source(&listing).expect("listing source");
+    assert!(listing_source(&serde_json::json!({"tables": []})).is_err(), "a listing without kinds is an error");
     let text = printed(&mut source, "", &["--format", "tsv"]);
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines[0], "table\tkind\tviews");
@@ -205,7 +220,7 @@ fn typed(text: &str) -> Vec<Option<TermEvent>> {
 /// (as `flotilla table` prints it) and what stayed on the terminal.
 fn inline(events: Vec<Option<TermEvent>>) -> (Exit, Vec<String>, String) {
     let mut source = convoys("convoys");
-    let layout = layout(&mut source, "convoys", &flags(&TableArgs::default()).unwrap()).unwrap();
+    let layout = layout(&mut source, "convoys", &flags(&TableArgs::default(), false).unwrap()).unwrap();
     let mut terminal = Terminal::with_options(TestBackend::new(120, 30), TerminalOptions { viewport: Viewport::Inline(12) }).unwrap();
     let options = InlineOptions { origin: Some(Timestamp::from_unix_secs(1_793_232_000)), ..InlineOptions::default() };
     let exit = run_inline_with(&mut terminal, events, &mut source, &layout, options).unwrap();

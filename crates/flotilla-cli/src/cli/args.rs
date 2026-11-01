@@ -238,7 +238,9 @@ pub enum TableFormat {
 
 /// `flotilla table`'s arguments. The view flags mirror binnacle's CLI host flags; this crate
 /// stays free of binnacle and ratatui (the vessel CLI excludes renderers), so the root package
-/// hands them to binnacle.
+/// hands them to binnacle. `TableArgs` and `TableFormat` copy binnacle's `FlagArgs` and `Format`
+/// until those move into a binnacle crate without ratatui (flotilla-org/binnacle#361); then this
+/// flattens that group instead.
 #[derive(clap::Args, Debug, Default, PartialEq, Eq)]
 pub struct TableArgs {
     /// Described table name, e.g. convoys; omit to list the tables
