@@ -12,7 +12,9 @@ use std::{
 use async_trait::async_trait;
 use flotilla_environment::environment::VesselAgent;
 use flotilla_resources::{is_legacy_template, stdlib::stdlib_image_layers, ImageLayerSpec, PinUnpack};
-use flotilla_vessel_delivery::{FetchBy, Mechanism, StepFailure, TreeDelivery, TreeSources, Visibility};
+use flotilla_vessel_delivery::{
+    ContentDigest, FetchBy, Mechanism, RelativePath, StepFailure, StoreDelivery, StoreEntry, TreeSources, Visibility,
+};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
@@ -75,20 +77,11 @@ impl PinnedHarness {
     pub(super) fn executable(&self, place: &Path) -> PathBuf {
         place.join("bin").join(self.binary)
     }
-
-    /// Where the store entry is linked for a harness placed at `target`: a single file
-    /// is the executable itself; an archive's entry is the harness tree.
-    fn link(&self, target: &Path) -> PathBuf {
-        match self.unpack {
-            PinUnpack::File => self.executable(target),
-            PinUnpack::TarGz | PinUnpack::TarXz => target.to_path_buf(),
-        }
-    }
 }
 
 #[async_trait]
-impl TreeDelivery for PinnedHarness {
-    async fn deliver(&self, mechanism: Mechanism, _: Option<&Path>, target: &Path, agent: &dyn VesselAgent) -> Result<(), StepFailure> {
+impl StoreDelivery for PinnedHarness {
+    async fn store(&self, mechanism: Mechanism, _: &Path, agent: &dyn VesselAgent) -> Result<StoreEntry, StepFailure> {
         match mechanism {
             Mechanism::AgentFetch { by: FetchBy::Digest } => {
                 agent.fetch_artifact(&self.sha256, std::slice::from_ref(&self.url), self.unpack).await?
@@ -99,14 +92,12 @@ impl TreeDelivery for PinnedHarness {
             }
             other => return Err(format!("a harness cannot be delivered by {other}").into()),
         }
-        Ok(agent.link_artifact(&self.link(target), &self.sha256, Path::new("")).await?)
-    }
-
-    /// #4088: the harness is linked from the agent's store, which a reboot may clear
-    /// under the durable home, so a recorded harness is kept only while its link
-    /// still points into the pinned digest's entry.
-    async fn present(&self, _: Mechanism, _: Option<&Path>, target: &Path, agent: &dyn VesselAgent) -> Result<bool, String> {
-        Ok(agent.linked_artifact(&self.link(target)).await?.as_deref() == Some(self.sha256.as_str()))
+        // A single file is the executable itself; an archive's entry is the harness tree.
+        let link = match self.unpack {
+            PinUnpack::File => Some(RelativePath::new(Path::new("bin").join(self.binary)).expect("a relative executable path")),
+            PinUnpack::TarGz | PinUnpack::TarXz => None,
+        };
+        Ok(StoreEntry { sha256: ContentDigest::new(&self.sha256), link })
     }
 }
 
@@ -199,8 +190,7 @@ mod tests {
         assert!(missing.contains(&StatusCode::NOT_FOUND.as_u16().to_string()), "{missing}");
     }
 
-    /// A vessel agent whose store records what arrived and where it was linked; delivery
-    /// uses nothing else.
+    /// A vessel agent whose store records what arrived; storing uses nothing else.
     #[derive(Default)]
     struct Store(std::sync::Mutex<Vec<String>>);
 
@@ -245,15 +235,11 @@ mod tests {
             self.0.lock().expect("store").push(format!("pushed {sha256} ({} bytes)", bytes.len()));
             Ok(())
         }
-        async fn link_artifact(&self, path: &Path, sha256: &str, member: &Path) -> Result<(), String> {
-            self.0.lock().expect("store").push(format!("linked {} to {sha256}/{}", path.display(), member.display()));
-            Ok(())
-        }
     }
 
     // Behaviour (#3909): the harness lands as the image layers lay it out, its executable
     // at `bin/<binary>` under its place, whether the vessel fetched it or the controller
-    // pushed it: a single file is linked there itself, an archive's entry as the place.
+    // pushed it: a single file's entry is linked there itself, an archive's as the place.
     #[tokio::test]
     async fn the_harness_executable_lands_at_bin_binary_by_fetch_or_push() {
         use axum::{routing::get, Router};
@@ -272,12 +258,14 @@ mod tests {
         ] {
             let harness = PinnedHarness { binary: "claude", sha256: sha256.clone(), url: url.clone(), unpack };
             let store = Store::default();
-            harness.deliver(mechanism, None, place, &store).await.expect("delivered");
-            assert_eq!(*store.0.lock().expect("store"), [arrived, format!("linked {link} to {sha256}/")], "{unpack:?} by {mechanism}");
+            let entry = harness.store(mechanism, place, &store).await.expect("stored");
+            assert_eq!(*store.0.lock().expect("store"), [arrived], "{unpack:?} by {mechanism}");
+            assert_eq!(entry.sha256.as_str(), sha256);
+            assert_eq!(entry.link.map_or_else(|| place.to_path_buf(), |entry| entry.under(place)), Path::new(link), "{unpack:?}");
             assert_eq!(harness.executable(place), Path::new("/home/.flotilla/harness/bin/claude"));
         }
         let refused = PinnedHarness { binary: "claude", sha256, url, unpack: PinUnpack::File };
-        let error = refused.deliver(Mechanism::AgentFetch { by: FetchBy::Url }, None, place, &Store::default()).await.unwrap_err();
+        let error = refused.store(Mechanism::AgentFetch { by: FetchBy::Url }, place, &Store::default()).await.unwrap_err();
         assert!(error.error.contains("cannot be delivered by agent-fetch(url)"), "{error:?}");
     }
 }

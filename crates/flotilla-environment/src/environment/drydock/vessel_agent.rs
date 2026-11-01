@@ -76,7 +76,7 @@ impl VesselAgent for DrydockVesselAgent {
     async fn link_artifact(&self, path: &Path, sha256: &str, member: &Path) -> Result<(), String> {
         VesselAgent::link_artifact(&self.runner, path, sha256, member).await
     }
-    async fn linked_artifact(&self, path: &Path) -> Result<Option<String>, String> {
-        VesselAgent::linked_artifact(&self.runner, path).await
+    async fn has_artifact(&self, sha256: &str) -> Result<bool, String> {
+        VesselAgent::has_artifact(&self.runner, sha256).await
     }
 }

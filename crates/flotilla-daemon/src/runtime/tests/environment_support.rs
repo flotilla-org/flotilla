@@ -163,12 +163,6 @@ impl ContentCache {
         self.links.lock().expect("links").insert(path.to_path_buf(), sha256.to_string());
         Ok(())
     }
-
-    /// The entry `path` is linked into, while the cache still holds it.
-    pub(super) fn linked(&self, path: &Path) -> Option<String> {
-        let digest = self.links.lock().expect("links").get(path).cloned()?;
-        self.entries.lock().expect("entries").contains_key(&digest).then_some(digest)
-    }
 }
 
 /// The regular files of a gzipped tar, by path.
@@ -242,8 +236,8 @@ impl flotilla_environment::environment::VesselAgent for CachedAgent {
     async fn link_artifact(&self, path: &Path, sha256: &str, member: &Path) -> Result<(), String> {
         self.cache.link(path, sha256, member)
     }
-    async fn linked_artifact(&self, path: &Path) -> Result<Option<String>, String> {
-        Ok(self.cache.linked(path))
+    async fn has_artifact(&self, sha256: &str) -> Result<bool, String> {
+        Ok(self.cache.entries.lock().expect("entries").contains_key(sha256))
     }
 }
 

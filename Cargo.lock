@@ -3921,6 +3921,7 @@ dependencies = [
  "async-trait",
  "flotilla-environment",
  "flotilla-provider-runtime",
+ "flotilla-resources",
  "hegeltest",
  "libc",
  "proc-macro2",

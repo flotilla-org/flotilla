@@ -455,31 +455,29 @@ async fn artifacts_cross_the_agent_by_digest(agent: Arc<dyn TestAgent>) {
     assert!(vessel.push_artifact(&sha256, &local, PinUnpack::TarXz).await.unwrap_err().contains("tar.xz"));
 }
 
-// #4088: a link placed into the store reads back as the entry it points into, at the
-// path it was placed at, even through a symlinked directory; a path never linked reads
-// as none. Clearing the store, as a reboot clears its tmpfs, leaves the link dangling
-// and it reads as none.
-over_each_transport!(a_link_reads_back_as_its_entry_until_the_store_is_cleared);
-async fn a_link_reads_back_as_its_entry_until_the_store_is_cleared(agent: Arc<dyn TestAgent>) {
+// #4088: the store answers for one entry by its exact digest: held once stored, and a
+// digest never stored is not. A store cleared since, as collection or a hand clears
+// it, holds nothing, and the link placed into it dangles.
+over_each_transport!(the_store_answers_for_one_entry_by_digest);
+async fn the_store_answers_for_one_entry_by_digest(agent: Arc<dyn TestAgent>) {
     let directory = tempfile::tempdir().unwrap();
     let vessel: Arc<dyn VesselAgent> = Arc::new(runner_for(&agent, directory.path()));
     let local = directory.path().join("harness");
     std::fs::write(&local, b"pinned harness").unwrap();
     let sha256 = format!("{:x}", Sha256::digest(b"pinned harness"));
-    std::fs::create_dir_all(directory.path().join("durable/home")).unwrap();
-    std::os::unix::fs::symlink(directory.path().join("durable"), directory.path().join("alias")).unwrap();
-    let link = directory.path().join("alias/home/.flotilla/harness/bin/claude");
+    let link = directory.path().join("home/.flotilla/harness/bin/claude");
+    assert!(!vessel.has_artifact(&sha256).await.unwrap(), "nothing is stored yet");
     vessel.push_artifact(&sha256, &local, PinUnpack::File).await.unwrap();
     vessel.link_artifact(&link, &sha256, Path::new("")).await.unwrap();
 
-    assert_eq!(vessel.linked_artifact(&link).await.unwrap(), Some(sha256.clone()));
-    assert_eq!(vessel.linked_artifact(&directory.path().join("alias/home/skills")).await.unwrap(), None);
+    assert!(vessel.has_artifact(&sha256).await.unwrap());
+    assert!(!vessel.has_artifact(&format!("{:x}", Sha256::digest(b"other bytes"))).await.unwrap());
 
     let entry = std::fs::read_link(&link).unwrap();
     let store = entry.ancestors().find(|path| path.extension().is_some_and(|extension| extension == "store")).expect("the store");
     clear(store);
     assert!(std::fs::metadata(&link).is_err(), "the link dangles");
-    assert_eq!(vessel.linked_artifact(&link).await.unwrap(), None);
+    assert!(!vessel.has_artifact(&sha256).await.unwrap());
 }
 
 /// Remove `root` and everything in it, write-protected as a store's entries are.

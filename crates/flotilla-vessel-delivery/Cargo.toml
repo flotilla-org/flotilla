@@ -12,6 +12,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
+flotilla-resources = { path = "../flotilla-resources" }
 hegeltest = { workspace = true }
 tempfile = { workspace = true }
 # `test-util` is unused here, but keeps the test-graph tokio features aligned with the

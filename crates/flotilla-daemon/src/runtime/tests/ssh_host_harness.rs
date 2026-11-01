@@ -289,6 +289,8 @@ struct SshHostRuntime {
     agents: Arc<RunnerVesselAgents>,
     vessel: VesselPaths,
     spec: flotilla_resources::TerminalSessionSpec,
+    /// The host's discovery bag, which places each vessel's paths.
+    bag: EnvironmentBag,
 }
 
 /// The runtime for one crew of `adapter` on `host`, with the Claude credential
@@ -366,6 +368,7 @@ async fn ssh_host_runtime(host: SshHost, adapter: &str) -> SshHostRuntime {
     ));
     let agents = RunnerVesselAgents::new(Arc::clone(&runner), registry);
     let vessel = VesselPaths::new(&profile.env_bag, &VesselKey::new(&environment_id, "demo-work")).expect("vessel paths");
+    let bag = profile.env_bag.clone();
     let state = Arc::new(
         ControllerRuntimeState::new(
             Arc::clone(&daemon),
@@ -409,7 +412,7 @@ async fn ssh_host_runtime(host: SshHost, adapter: &str) -> SshHostRuntime {
         env: session_env,
         pool: "cleat".to_string(),
     };
-    SshHostRuntime { _temp: temp, daemon_home, daemon, state, pool, agents, vessel, spec }
+    SshHostRuntime { _temp: temp, daemon_home, daemon, state, pool, agents, vessel, spec, bag }
 }
 
 /// The owning daemon's central Codex login under `home`, as its refresher leaves it.
@@ -575,8 +578,7 @@ async fn ssh_host_claude_crew_starts_in_a_prepared_flotilla_home() {
 // frozen skills staged there, with workspace trust for the checkout in that home's own
 // `config.toml`. The home holds a read-only copy of the owning daemon's central login; the
 // host's own `~/.codex` login and config are never linked or written.
-/// The runtime for a Claude crew on a fresh SSH host, bound and launched once. A reboot
-/// of the host is [`reboot`].
+/// The runtime for a Claude crew on a fresh SSH host, bound and launched once.
 async fn launched_claude_crew() -> (SshHostRuntime, Arc<FakeHost>, flotilla_test_support::TestSocketDir, LaunchedSession) {
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
@@ -586,49 +588,112 @@ async fn launched_claude_crew() -> (SshHostRuntime, Arc<FakeHost>, flotilla_test
     (runtime, host, runtime_dir, launched)
 }
 
-/// A reboot of `host`: its tmpfs is cleared, taking the vessel agent's store and the crew's
-/// runtime material, while the durable home and its delivery record remain.
-fn reboot(runtime: &SshHostRuntime, host: &FakeHost) {
-    runtime.agents.clear_store(&runtime.vessel);
-    host.files.lock().expect("files").retain(|path, _| !path.starts_with(RUNTIME_BASE));
+impl SshHostRuntime {
+    /// Move the crew to `vessel_ref`, a new vessel of its convoy on the same host, as one
+    /// replacing a retired vessel is: the same home, under another vessel agent.
+    async fn move_to_vessel(&mut self, vessel_ref: &str) {
+        let vessel = flotilla_resources::VesselSpec {
+            convoy_ref: "demo".into(),
+            vessel_name: "work".into(),
+            fulfilment_kind_ref: "policy".into(),
+            adopted_checkout_refs: Default::default(),
+        };
+        self.daemon.resource_backend().using::<Vessel>(NAMESPACE).create(&empty_meta(vessel_ref), &vessel).await.expect("vessel");
+        self.vessel = VesselPaths::new(&self.bag, &VesselKey::new(&EnvironmentId::new(ENVIRONMENT), vessel_ref)).expect("vessel paths");
+        let TerminalSessionSource::Agent { context, .. } = &mut self.spec.source else { panic!("an agent session") };
+        context.vessel_ref = vessel_ref.into();
+    }
 }
 
-// Acceptance (#4088): after a reboot the durable home's record still names the harness and
-// skills, but their links into the cleared store dangle. The relaunch delivers both again,
-// by the mechanisms they first landed by, before the harness starts, and its links resolve.
-// An unchanged relaunch with everything in place sends nothing.
+/// The launched home's harness and skills links each resolve into the entry its record
+/// names, and each is a use the runtime's current vessel agent holds, so collecting the
+/// store after any other vessel retires leaves them in place.
+#[cfg(target_os = "linux")]
+fn assert_linked_under_current_vessel(runtime: &SshHostRuntime, host: &FakeHost, launched: &LaunchedSession) {
+    let home = launched.env_vars.iter().find(|(name, _)| name == "CLAUDE_CONFIG_DIR").map(|(_, home)| home.clone()).expect("home");
+    let Some(HostEntry::File(record)) = host.entry(format!("{home}/{}", flotilla_vessel_delivery::DELIVERY_RECORD)) else {
+        panic!("no delivery record in the launched home")
+    };
+    let store = runtime.agents.store();
+    for (need, place) in [("harness", ".flotilla/harness"), ("skills", "skills")] {
+        let line = record.lines().find(|line| line.starts_with(&format!("{need}\t"))).unwrap_or_else(|| panic!("{need}: {record}"));
+        let [_, _, _, _, sha256, link] = line.split('\t').collect::<Vec<_>>()[..] else { panic!("{need} names no entry: {line}") };
+        let path = Path::new(&home).join(place).join(link);
+        let path = if link.is_empty() { Path::new(&home).join(place) } else { path };
+        assert_eq!(store.holder(&path, sha256), Some(runtime.vessel.agent.as_path()), "{need} at {}: {store:?}", path.display());
+        assert_eq!(host.entry(&path), Some(HostEntry::Link(store_entry(&runtime.vessel.store, sha256))), "{need}");
+    }
+    assert!(launched.command.contains(&format!("{home}/.flotilla/harness/bin/claude ")), "{}", launched.command);
+}
+
+// Acceptance (#4088): a crew home outlives its vessel. Once vessel A retires and the shared
+// store is collected, the home's record still names the harness and skills, but the store
+// no longer holds them. Relaunched on vessel B, both are delivered again by the mechanisms
+// they first landed by, before the harness starts, and each link is a use B's agent holds.
+// An unchanged relaunch on A sends nothing.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn a_relaunch_after_a_reboot_delivers_the_cleared_harness_and_skills_again() {
-    let (runtime, host, _runtime_dir, first) = launched_claude_crew().await;
+async fn a_home_relaunched_after_its_vessel_is_collected_receives_its_harness_and_skills_again() {
+    let (mut runtime, host, _runtime_dir, first) = launched_claude_crew().await;
     let arrived = first.artifacts.clone();
     assert_eq!(arrived.len(), 2, "the skills pushed and the harness fetched: {arrived:?}");
     let kept = runtime.launch().await.expect("unchanged relaunch");
     assert_eq!(kept.artifacts, arrived, "nothing still in place is sent again");
 
-    reboot(&runtime, &host);
-    let rebooted = runtime.launch().await.expect("relaunch after the reboot");
+    runtime.agents.collect(&runtime.vessel.agent.clone());
+    assert!(runtime.agents.store().entries.is_empty(), "A held the only uses");
+    runtime.move_to_vessel("demo-work-b").await;
+    let relaunched = runtime.launch().await.expect("relaunch on vessel B");
 
-    assert_eq!(rebooted.artifacts[arrived.len()..], arrived[..], "both are delivered again, the same way");
-    let store = runtime.agents.recorded(&runtime.vessel);
-    let linked = store.links.values().cloned().collect::<BTreeSet<_>>();
-    assert_eq!(linked, arrived.iter().map(|(sha256, _)| sha256.clone()).collect(), "each is linked again");
-    for (link, sha256) in &store.links {
-        assert!(store.store.contains(sha256), "{} links into a stored entry", link.display());
-        assert_eq!(host.entry(link), Some(HostEntry::Link(store_entry(&runtime.vessel.agent, sha256))));
-    }
-    let home = rebooted.env_vars.iter().find(|(name, _)| name == "CLAUDE_CONFIG_DIR").map(|(_, home)| home.clone()).expect("home");
-    assert!(rebooted.command.contains(&format!("{home}/.flotilla/harness/bin/claude ")), "{}", rebooted.command);
-    assert!(store.links.keys().any(|link| link.starts_with(format!("{home}/.flotilla/harness"))), "{:?}", store.links);
+    assert_eq!(relaunched.artifacts, arrived, "B receives both again, the same way");
+    assert_linked_under_current_vessel(&runtime, &host, &relaunched);
 }
 
-// Acceptance (#4088 contract 3): a harness that cannot be delivered again after a reboot
-// fails the launch with the need it failed at. No harness starts, and the host's own
-// `claude` is never run in its place.
+// Acceptance (#4088): an entry another vessel still holds outlives A's collection, so B
+// receives no bytes for it, but B's agent places the home's links again and holds those
+// uses. Once the other vessel retires too, its collection leaves the entries to B.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_entry_another_vessel_holds_is_linked_again_under_the_new_vessel() {
+    let (mut runtime, host, _runtime_dir, first) = launched_claude_crew().await;
+    let neighbour = runtime.vessel.agent.with_file_name("neighbour");
+    {
+        let mut store = runtime.agents.store.lock().expect("store");
+        for (sha256, _) in &first.artifacts {
+            store.uses.insert(Path::new("/home/crew/neighbour").join(sha256), (sha256.clone(), neighbour.clone()));
+        }
+    }
+
+    runtime.agents.collect(&runtime.vessel.agent.clone());
+    runtime.move_to_vessel("demo-work-b").await;
+    let relaunched = runtime.launch().await.expect("relaunch on vessel B");
+    runtime.agents.collect(&neighbour);
+
+    assert_eq!(relaunched.artifacts, [], "the store still held both: no bytes were sent");
+    let held = first.artifacts.iter().map(|(sha256, _)| sha256.clone()).collect::<BTreeSet<_>>();
+    assert_eq!(runtime.agents.store().entries, held, "B's uses keep both entries");
+    assert_linked_under_current_vessel(&runtime, &host, &relaunched);
+}
+
+// Acceptance (#4088): a store cleared by hand under a durable home is noticed the same way:
+// the relaunch delivers the harness and skills again, the same way, and links them.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_relaunch_after_the_store_is_cleared_by_hand_delivers_the_harness_and_skills_again() {
+    let (runtime, host, _runtime_dir, first) = launched_claude_crew().await;
+    runtime.agents.clear_store();
+    let relaunched = runtime.launch().await.expect("relaunch after the store was cleared");
+    assert_eq!(relaunched.artifacts[first.artifacts.len()..], first.artifacts[..], "both are delivered again, the same way");
+    assert_linked_under_current_vessel(&runtime, &host, &relaunched);
+}
+
+// Acceptance (#4088 contract 3): a harness that cannot be delivered again once the store
+// no longer holds it fails the launch with the need it failed at. No harness starts, and
+// the host's own `claude` is never run in its place.
 #[tokio::test]
 async fn a_harness_that_cannot_be_delivered_again_fails_the_launch_by_name() {
-    let (runtime, host, _runtime_dir, _) = launched_claude_crew().await;
-    reboot(&runtime, &host);
+    let (runtime, _host, _runtime_dir, _) = launched_claude_crew().await;
+    runtime.agents.clear_store();
     runtime.agents.refuse_artifacts.store(true, std::sync::atomic::Ordering::SeqCst);
 
     let error = runtime.launch().await.expect_err("nothing to run");
@@ -830,7 +895,7 @@ async fn ssh_host_harness_path_is_composed_and_never_the_login_profile() {
     write_executable(&cli, "#!/bin/sh\necho generation-cli\n");
     // The pinned harness's verified bytes in the vessel agent's store: it reports what it sees.
     write_executable(
-        &store_entry(&vessel.agent, &pinned_harness_sha256("claude-code")),
+        &store_entry(&vessel.store, &pinned_harness_sha256("claude-code")),
         "#!/bin/sh\n{ printf '%s\\n' \"$PATH\"; command -v gh; command -v flotilla; printf '%s\\n' \"${RUSTUP_HOME-unset}\"; } > \"$HOME/harness-report\"\n",
     );
 
