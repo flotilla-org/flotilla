@@ -575,8 +575,8 @@ reclaim_install_window() {
     restart_darwin_daemon_service \
       || die "could not restore the interrupted launch agent; bootstrap $LAUNCH_AGENT_DIR/$LAUNCH_AGENT_LABEL.plist and retry fleet-install"
   fi
-  DAEMON_INSTALL_MARKER_HELD=1
-  end_darwin_install_window
+  rm -f -- "$DAEMON_INSTALL_MARKER"
+  unlock_install_window
 }
 
 prepare_darwin_daemon_service() {
