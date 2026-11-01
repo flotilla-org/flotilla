@@ -494,12 +494,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 // loopback TCP, and in a Docker vessel through its agent's forward. SSH host
                 // and cloud vessels keep command hooks. The token binds the hooks to this terminal.
                 if requirement.adapter == "claude-code" {
-                    // #4173: the Bash tool runs in a declared bash, never one chosen from a
-                    // `SHELL` the place may not declare or a passwd entry.
-                    if let Some(bash) = place_bash(&*launch_runner()?, &credential_env).await {
-                        credential_env.retain(|(key, _)| key != CLAUDE_CODE_SHELL_ENV);
-                        credential_env.push((CLAUDE_CODE_SHELL_ENV.to_string(), bash));
-                    }
+                    declare_claude_shell(&*launch_runner()?, &mut credential_env, name).await;
                     let hooks = if spec.env_ref == self.state.host_direct_environment_name {
                         self.host_direct_hooks(&context.namespace, name).await
                     } else if vessel.is_none() {
@@ -982,6 +977,23 @@ impl TerminalControllerRuntime {
 }
 
 pub(super) const CREW_SESSION_SIZE: TerminalSize = TerminalSize::new(200, 50);
+
+/// #4173: Claude Code's Bash tool runs in a declared shell, never one it picks from a
+/// `SHELL` the place may not declare or from passwd. A shell the session already
+/// declares is kept; otherwise it is the bash the session's `PATH` finds. Every kind
+/// takes it, host-direct included. Without one, Claude Code detects a shell itself.
+pub(super) async fn declare_claude_shell(runner: &dyn CommandRunner, environment: &mut Vec<(String, String)>, session: &str) {
+    if environment.iter().any(|(key, value)| key == CLAUDE_CODE_SHELL_ENV && !value.is_empty()) {
+        return;
+    }
+    match place_bash(runner, environment).await {
+        Some(bash) => {
+            environment.retain(|(key, _)| key != CLAUDE_CODE_SHELL_ENV);
+            environment.push((CLAUDE_CODE_SHELL_ENV.to_string(), bash));
+        }
+        None => warn!(%session, "no bash on the session's PATH; Claude Code chooses its own shell"),
+    }
+}
 
 /// The absolute path of the bash the session's `PATH`, or the place's own where the
 /// session declares none, finds; none where it finds no bash.

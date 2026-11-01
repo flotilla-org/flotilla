@@ -938,9 +938,7 @@ impl FakeTerminalPool {
     pub async fn set_attach_preflight_error(&self, error: impl Into<String>) {
         *self.attach_preflight_error.lock().await = Some(error.into());
     }
-}
 
-impl FakeTerminalPool {
     async fn record_session(
         &self,
         session_name: &str,

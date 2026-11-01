@@ -93,7 +93,11 @@ struct LaunchCapability {
 }
 
 impl LaunchCapability {
-    fn from_help(help: &str) -> Self {
+    /// `argv` matches clap's usage line for cleat#333's trailing argument
+    /// (`cleat launch [OPTIONS] [ID] [-- <PROGRAM>...]`). The real contract suite
+    /// checks it against the pinned binary, so a cleat that renders it otherwise
+    /// fails there, not silently here.
+    pub(crate) fn from_help(help: &str) -> Self {
         Self { env_clear: help.split_whitespace().any(|word| word == "--env-clear"), argv: help.contains("[-- <PROGRAM>...]") }
     }
 }
@@ -214,12 +218,6 @@ impl CleatTerminalPool {
                     // pool and an upgraded cleat is only picked up after a daemon restart.
                     tracing::warn!(binary = %self.binary, "cleat lacks --env-clear; launching without clearing inherited environment (cleat#318)");
                 }
-                if !capability.argv {
-                    // A cleat older than the pinned CLEAT_NEW_REVISION runs every command through
-                    // `$SHELL -lc`, whose profile may reset PATH. Fleet candidates pair cleat with
-                    // that pin, so this is only a mixed roll. Remove once fleets carry cleat#333.
-                    tracing::warn!(binary = %self.binary, "cleat lacks argv launch; declared sessions run through a login shell (cleat#333)");
-                }
                 Ok::<LaunchCapability, String>(capability)
             })
             .await?;
@@ -232,7 +230,17 @@ impl CleatTerminalPool {
         args.extend(["--json", "--record", session_name, "--cwd", &cwd]);
         let argv = match program {
             SessionProgram::Declared(script) if capability.argv => Some(script),
-            SessionProgram::Declared(command) | SessionProgram::Command(command) => {
+            // A cleat older than CLEAT_NEW_REVISION would run the script through `$SHELL -lc`,
+            // whose profile may reset PATH: the failure #4173 removes. Fleet candidates pair
+            // cleat with that pin, so refuse rather than launch a crew without its environment.
+            SessionProgram::Declared(_) => {
+                return Err(format!(
+                    "cleat '{}' cannot launch a session without a login shell (`launch -- PROGRAM`, cleat#333); \
+                     install the cleat flotilla pins",
+                    self.binary
+                ))
+            }
+            SessionProgram::Command(command) => {
                 args.extend(["--cmd", command]);
                 None
             }
@@ -807,22 +815,41 @@ mod tests {
         assert_eq!(sessions[0].command.as_deref(), Some("exec claude --flag 'two words'"));
     }
 
-    // A cleat without argv launch (older than cleat#333) still starts the
-    // session, through its login shell, rather than refusing the crew.
+    // A cleat without argv launch (older than cleat#333) would run the script
+    // through a login shell, so a declared session is refused, never launched.
     #[tokio::test]
-    async fn declared_session_falls_back_to_a_command_when_cleat_lacks_argv() {
+    async fn declared_session_is_refused_when_cleat_lacks_argv() {
         let help = "Usage: cleat launch [OPTIONS] [ID]\n      --cmd <CMD>\n      --env-clear\n";
-        let runner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok(help.into()), Ok("{}".into())]));
+        let runner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok(help.into())]));
         let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat", &EnvironmentBag::new());
 
-        pool.ensure_declared_session("crew", "exec claude", &ExecutionEnvironmentPath::new("/repo"), &vec![], &[], None)
+        let error = pool
+            .ensure_declared_session("crew", "exec claude", &ExecutionEnvironmentPath::new("/repo"), &vec![], &[], None)
             .await
-            .expect("declared session");
+            .expect_err("refused");
 
-        assert_eq!(
-            logical_calls(&runner)[2].1,
-            vec!["launch", "--env-clear", "--json", "--record", "crew", "--cwd", "/repo", "--cmd", "exec claude", "--env", "LANG=C.UTF-8"]
-        );
+        assert!(error.contains("without a login shell"), "{error}");
+        assert_eq!(logical_calls(&runner).len(), 2, "no launch follows the refusal");
+    }
+
+    // #4173: a caller's declared locale wins over the default, once on the argv.
+    #[tokio::test]
+    async fn declared_locale_replaces_the_default_on_the_launch() {
+        for (name, value, expected) in
+            [("LANG", "de_DE.UTF-8", vec!["LANG=de_DE.UTF-8"]), ("LC_ALL", "C", vec!["LANG=C.UTF-8", "LC_ALL=C"])]
+        {
+            let runner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok("{}".into())]));
+            let pool = test_pool(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+            let env = vec![(name.to_string(), value.to_string())];
+            pool.ensure_declared_session("crew", "true", &ExecutionEnvironmentPath::new("/"), &env, &[], None).await.expect("launch");
+            let launch = logical_calls(&runner)[1].1.clone();
+            let locale = launch
+                .windows(2)
+                .filter(|pair| pair[0] == "--env" && (pair[1].starts_with("LANG=") || pair[1].starts_with("LC_ALL=")))
+                .map(|pair| pair[1].clone())
+                .collect::<Vec<_>>();
+            assert_eq!(locale, expected, "{name}");
+        }
     }
 
     #[tokio::test]

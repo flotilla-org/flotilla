@@ -36,9 +36,12 @@ const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 const DEFAULT_LANG: &str = "C.UTF-8";
 
-/// #4173: a session has a UTF-8 locale. `LANG` defaults where neither it nor
-/// `LC_ALL` is declared; cloud images often declare none. Sessions only: the
-/// Cleat client keeps exactly the discovered values.
+/// #4173: a session has a UTF-8 locale. `LANG` defaults where the place declares
+/// neither it nor `LC_ALL`; cloud images often declare none. Every session the
+/// pool launches gets it, a person's shell as well as a crew, so both see the same
+/// environment; a session's own `LANG` replaces it, and its `LC_ALL` takes
+/// precedence over it. The Cleat client keeps exactly the discovered values.
+/// `C.UTF-8` is missing from some libcs (older macOS), which then fall back to `C`.
 fn declare_locale(environment: &mut BTreeMap<String, String>) {
     if !environment.contains_key("LANG") && !environment.contains_key("LC_ALL") {
         environment.insert("LANG".to_string(), DEFAULT_LANG.to_string());

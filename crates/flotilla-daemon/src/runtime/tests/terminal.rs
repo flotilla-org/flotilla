@@ -823,3 +823,32 @@ async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listen
         assert!(!home.join(".claude.json").exists(), "host-direct launch wrote the host user's Claude state");
     }
 }
+
+// #4173: Claude Code's shell is the session's declared one, else the bash its
+// PATH finds; a place without bash still launches, leaving the choice to Claude.
+#[tokio::test]
+async fn claude_shell_is_declared_from_the_session_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let runner = flotilla_provider_runtime::ProcessCommandRunner;
+    let with_bash = tempfile::tempdir().expect("bin");
+    let bash = with_bash.path().join("bash");
+    std::fs::write(&bash, "#!/bin/sh\n").expect("bash");
+    std::fs::set_permissions(&bash, std::fs::Permissions::from_mode(0o755)).expect("executable");
+    let without_bash = tempfile::tempdir().expect("empty bin");
+    let shell = |environment: &[(String, String)]| {
+        environment.iter().filter(|(key, _)| key == "CLAUDE_CODE_SHELL").map(|(_, value)| value.clone()).collect::<Vec<_>>()
+    };
+
+    let mut found = vec![("PATH".to_string(), with_bash.path().display().to_string())];
+    super::terminal::declare_claude_shell(&runner, &mut found, "session").await;
+    assert_eq!(shell(&found), [bash.display().to_string()]);
+
+    let mut declared =
+        vec![("PATH".to_string(), with_bash.path().display().to_string()), ("CLAUDE_CODE_SHELL".to_string(), "/bin/zsh".to_string())];
+    super::terminal::declare_claude_shell(&runner, &mut declared, "session").await;
+    assert_eq!(shell(&declared), ["/bin/zsh"], "a declared shell is kept");
+
+    let mut missing = vec![("PATH".to_string(), without_bash.path().display().to_string())];
+    super::terminal::declare_claude_shell(&runner, &mut missing, "session").await;
+    assert!(shell(&missing).is_empty(), "no bash leaves the shell to Claude Code");
+}

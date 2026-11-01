@@ -64,6 +64,8 @@ impl Harness {
                 assert_eq!(version["client"]["git_sha"].as_str(), Some(revision), "wrong binary source revision");
                 let help = harness.raw(&["launch", "--help"]).await.expect("real help");
                 assert_eq!(help.split_whitespace().any(|word| word == "--env-clear"), supports_clear, "wrong cleat revision");
+                // #4173: the argv probe reads clap's usage line; the new pin must render it.
+                assert_eq!(super::super::LaunchCapability::from_help(&help).argv, supports_clear, "argv launch probe");
                 if matches!(scenario, Scenario::PollutedDaemon) {
                     // Inventory does not start an idle daemon in real Cleat. Seed a
                     // live daemon with an additive launch before the controlled client.
