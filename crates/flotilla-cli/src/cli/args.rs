@@ -803,6 +803,8 @@ pub enum FleetSubCommand {
     Check,
     /// Show hosts grouped by wire generation (never starts a daemon)
     Spread,
+    /// Show this host's most recent fleet-install roll records (never starts a daemon)
+    Status,
     /// Prune local generations (caller must hold the fleet installer lock)
     Prune {
         #[arg(long)]
@@ -1713,6 +1715,12 @@ mod tests {
     fn cli_parses_host_noun() {
         let cli = Cli::try_parse_from(["flotilla", "host", "list"]).expect("host list should parse");
         assert!(matches!(cli.command, Some(SubCommand::Domain(DomainCommand::Host(_)))));
+    }
+
+    #[test]
+    fn cli_parses_fleet_status() {
+        let cli = Cli::try_parse_from(["flotilla", "fleet", "status"]).expect("fleet status should parse");
+        assert!(matches!(cli.command, Some(SubCommand::Fleet { command: Some(super::FleetSubCommand::Status) })));
     }
 
     #[test]

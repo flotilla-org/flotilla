@@ -44,6 +44,37 @@ pub fn spread(result: Result<CommandValue, String>) -> String {
     output
 }
 
+/// The newest `limit` roll records of one host, oldest first, from the installer's
+/// append-only log (tab-separated: time, generation, replaced, flotilla, cleat, by,
+/// reason). Lines that do not parse, or whose time is not a timestamp, are skipped.
+pub fn rolls(host: &str, log: &str, limit: usize) -> String {
+    let records: Vec<[&str; 7]> = log
+        .lines()
+        .filter_map(|line| line.split('\t').collect::<Vec<_>>().try_into().ok())
+        .filter(|record: &[&str; 7]| record[0].len() >= 16)
+        .collect();
+    let mut output = String::new();
+    for [time, generation, replaced, flotilla, cleat, by, reason] in &records[records.len().saturating_sub(limit)..] {
+        let time = time.get(..16).map_or(*time, |minute| minute).to_string() + "Z";
+        let rollback = if reason.is_empty() { String::new() } else { format!("  ROLLBACK \"{reason}\"") };
+        writeln!(
+            output,
+            "{host}  {time}  {}  replaced {}{rollback}  flotilla {}  cleat {}  by {by}",
+            roll_label(generation),
+            roll_label(replaced),
+            flotilla.get(..8).unwrap_or(flotilla),
+            cleat.get(..8).unwrap_or(cleat),
+        )
+        .expect("write to string");
+    }
+    output
+}
+
+/// `20261028T015132Z-r900-f…-c…` is shown as `r900`.
+fn roll_label(generation: &str) -> &str {
+    generation.split('-').nth(1).unwrap_or(generation)
+}
+
 #[cfg(test)]
 mod tests {
     use flotilla_protocol::{
@@ -150,5 +181,33 @@ mod tests {
         assert!(spread(Err("transport failed".into())).contains("daemon query failed"));
         assert!(spread(Ok(CommandValue::Error { message: "query failed".into() })).contains("daemon query failed"));
         assert!(spread(Ok(CommandValue::Ok)).contains("invalid daemon response"));
+    }
+
+    #[test]
+    fn rolls_show_the_newest_three_with_rollbacks_marked() {
+        let line = |time: &str, rev: u32, replaced: u32, reason: &str| {
+            format!(
+                "{time}\t20261028T000000Z-r{rev}-fabc-cdef\t20261028T000000Z-r{replaced}-fabc-cdef\t{}\t{}\trobert\t{reason}\n",
+                "b5e684bb".repeat(5),
+                "caa0458f".repeat(5)
+            )
+        };
+        let log = [
+            line("2026-10-27T01:00:00Z", 1, 0, ""),
+            line("2026-10-28T01:00:00Z", 2, 1, ""),
+            line("2026-10-29T01:00:00Z", 3, 2, "bad build"),
+            line("2026-10-30T04:59:12Z", 4, 3, ""),
+            "garbage\n".to_string(),
+            line("soon", 5, 4, ""),
+        ]
+        .concat();
+        let shown = rolls("udder", &log, 3);
+        assert_eq!(
+            shown,
+            "udder  2026-10-28T01:00Z  r2  replaced r1  flotilla b5e684bb  cleat caa0458f  by robert\n\
+             udder  2026-10-29T01:00Z  r3  replaced r2  ROLLBACK \"bad build\"  flotilla b5e684bb  cleat caa0458f  by robert\n\
+             udder  2026-10-30T04:59Z  r4  replaced r3  flotilla b5e684bb  cleat caa0458f  by robert\n"
+        );
+        assert_eq!(rolls("udder", "", 3), "");
     }
 }

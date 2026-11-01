@@ -405,6 +405,29 @@ fi
 SH
 chmod 0755 "$fake_bin/codesign"
 
+# Process boundary double for the flotilla history the installer fetches: with
+# no FAKE_GIT_ORDER every commit descends from every other; otherwise the file
+# lists full commits oldest first.
+cat >"$fake_bin/git" <<'SH'
+#!/usr/bin/env bash
+position() { grep -nFx -- "$1" "$FAKE_GIT_ORDER" | cut -d: -f1; }
+case "$1" in
+  init|remote) exit 0 ;;
+  fetch)
+    [[ -z "${FAKE_GIT_ORDER:-}" ]] || position "${*: -1}" >/dev/null || { echo "unknown commit" >&2; exit 128; }
+    exit 0 ;;
+  merge-base)
+    [[ -n "${FAKE_GIT_ORDER:-}" ]] || exit 0
+    (( $(position "$3") <= $(position "$4") )) ;;
+  rev-list)
+    [[ -n "${FAKE_GIT_ORDER:-}" ]] || { echo 1; exit 0; }
+    range="${*: -1}"
+    echo $(( $(position "${range#*..}") - $(position "${range%%..*}") )) ;;
+  *) exit 2 ;;
+esac
+SH
+chmod 0755 "$fake_bin/git"
+
 run_installer() {
   : "${SYSTEMCTL_LOG:=$test_root/systemctl.log}"
   : "${LOGINCTL_LOG:=$test_root/loginctl.log}"
@@ -748,6 +771,74 @@ test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = 
 run_installer rollback >"$test_root/rollback.out"
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'rollback did not restore previous generation'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/previous")" = "$generation_two" || fail 'rollback did not retain displaced generation'
+
+roll_log="$test_root/home/.config/flotilla/fleet-rolls.log"
+current_link="$test_root/home/.local/opt/flotilla-fleet/current"
+commit_one="$(printf '1%.0s' $(seq 40))"
+commit_two="222222222222$(printf '1%.0s' $(seq 28))"
+last_roll() { tail -n 1 "$roll_log"; }
+roll_field() { last_roll | cut -f"$1"; }
+test "$(roll_field 2)" = "$generation_one" || fail 'rollback command was not recorded'
+test "$(roll_field 3)" = "$generation_two" || fail 'rollback record omitted the replaced generation'
+
+printf '%s\n%s\n' "$commit_one" "$commit_two" >"$test_root/order-forward"
+FAKE_GIT_ORDER="$test_root/order-forward" run_installer "$generation_two" >"$test_root/roll-forward.out" 2>&1 \
+  || { cat "$test_root/roll-forward.out" >&2; fail 'a descendant install needed a flag'; }
+head -n 1 "$test_root/roll-forward.out" | grep -Fxq 'flotilla 11111111 -> 22222222 (1 commit ahead)' \
+  || fail 'install did not lead with the flotilla comparison'
+test "$(link_generation "$current_link")" = "$generation_two" || fail 'descendant install did not activate'
+test "$(roll_field 2)" = "$generation_two" && test "$(roll_field 3)" = "$generation_one" \
+  || fail 'install did not record the generation it replaced'
+test "$(roll_field 4)" = "$commit_two" || fail 'install did not record the flotilla commit'
+test -n "$(roll_field 5)" || fail 'install did not record the cleat commit'
+test "$(roll_field 6)" = "$(id -un)" || fail 'install did not record who installed it'
+test -z "$(roll_field 7)" || fail 'a forward install recorded a rollback reason'
+
+rolls_before="$(wc -l <"$roll_log")"
+if FAKE_GIT_ORDER="$test_root/order-forward" run_installer "$generation_one" >"$test_root/roll-refused.out" 2>&1; then
+  fail 'a non-descendant install was accepted'
+fi
+head -n 1 "$test_root/roll-refused.out" | grep -Fxq 'flotilla 22222222 -> 11111111 (ROLLBACK: 1 commit behind live r2)' \
+  || fail 'refusal did not lead with the ROLLBACK comparison'
+grep -Fq 'refused: pass --rollback --reason "<why>" to install an older generation' "$test_root/roll-refused.out" \
+  || fail 'refusal did not say how to roll back deliberately'
+grep -Fq "$generation_one" "$test_root/roll-refused.out" && grep -Fq "$generation_two" "$test_root/roll-refused.out" \
+  && grep -Fq "$commit_one" "$test_root/roll-refused.out" && grep -Fq "$commit_two" "$test_root/roll-refused.out" \
+  || fail 'refusal did not name both generations and commits'
+test "$(link_generation "$current_link")" = "$generation_two" || fail 'a refused install changed the live generation'
+test "$(wc -l <"$roll_log")" = "$rolls_before" || fail 'a refused install was recorded'
+
+if FAKE_GIT_ORDER="$test_root/order-forward" run_installer --rollback "$generation_one" >/dev/null 2>&1; then
+  fail '--rollback without a reason was accepted'
+fi
+FAKE_GIT_ORDER="$test_root/order-forward" run_installer --rollback --reason $'tab\tbroke it' "$generation_one" >"$test_root/roll-accepted.out" 2>&1 \
+  || { cat "$test_root/roll-accepted.out" >&2; fail '--rollback with a reason was refused'; }
+test "$(link_generation "$current_link")" = "$generation_one" || fail 'accepted rollback did not activate'
+test "$(roll_field 7)" = 'tab broke it' || fail 'rollback reason was not recorded'
+test "$(roll_field 3)" = "$generation_two" || fail 'rollback record omitted the replaced generation'
+test "$(last_roll | awk -F'\t' '{print NF}')" = 7 || fail 'roll record is not seven fields'
+
+if FAKE_GIT_ORDER="$test_root/order-forward" run_installer --rollback --reason x rollback >/dev/null 2>&1; then
+  fail '--rollback was accepted with the rollback subcommand'
+fi
+
+live_metadata="$test_root/home/.local/opt/flotilla-fleet/releases/$generation_one/.generation.json"
+cp "$live_metadata" "$test_root/live-metadata.json"
+chmod u+w "$live_metadata" "$(dirname "$live_metadata")"
+python3 - "$live_metadata" <<'PY'
+import json, sys
+path = sys.argv[1]
+document = json.load(open(path))
+del document["sources"]["flotilla"]
+json.dump(document, open(path, "w"))
+PY
+if FAKE_GIT_ORDER="$test_root/order-forward" run_installer "$generation_two" >"$test_root/roll-unreadable.out" 2>&1; then
+  fail 'an install was accepted without the live flotilla commit'
+fi
+grep -Fq 'cannot compare with live r1' "$test_root/roll-unreadable.out" || fail 'unreadable live commit did not refuse as a rollback'
+grep -Fq 'unbound variable' "$test_root/roll-unreadable.out" && fail 'unreadable live commit crashed the guard'
+cp "$test_root/live-metadata.json" "$live_metadata"
+chmod a-w "$live_metadata" "$(dirname "$live_metadata")"
 
 custom_root="$test_root/custom-root"
 custom_bin="$test_root/custom-bin"

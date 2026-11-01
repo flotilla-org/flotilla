@@ -31,7 +31,10 @@ fn binary_version() -> &'static str {
 // builders and the dispatch future both need large frames in unoptimised
 // builds, and stacking them overflowed Windows' 1 MiB main thread (#2588).
 fn allows_daemon_reexec(command: &Option<SubCommand>) -> bool {
-    !matches!(command, Some(SubCommand::Fleet { command: Some(FleetSubCommand::Check | FleetSubCommand::Spread) }))
+    !matches!(
+        command,
+        Some(SubCommand::Fleet { command: Some(FleetSubCommand::Check | FleetSubCommand::Spread | FleetSubCommand::Status) })
+    )
 }
 
 fn main() -> Result<()> {
@@ -105,6 +108,19 @@ async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat
                 _ => {}
             }
             print!("{}", flotilla_projections::fleet_health::spread(result));
+            Ok(())
+        }
+        Some(SubCommand::Fleet { command: Some(FleetSubCommand::Status) }) => {
+            cli.require_local_daemon("fleet status")?;
+            let paths = cli.client_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
+            // scripts/fleet-install appends to the same file in its DAEMON_CONFIG_DIR.
+            let log = match std::fs::read_to_string(paths.config_dir.join("fleet-rolls.log")) {
+                Ok(log) => log,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(error) => return Err(color_eyre::eyre::eyre!("cannot read the fleet roll log: {error}")),
+            };
+            let host = flotilla_protocol::HostName::local();
+            print!("{}", flotilla_projections::fleet_health::rolls(host.as_str(), &log, 3));
             Ok(())
         }
         Some(SubCommand::Fleet { command: Some(FleetSubCommand::Prune { fleet_root, keep_others, dry_run }) }) => {
