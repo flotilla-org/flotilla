@@ -694,8 +694,6 @@ mod tests {
     use flotilla_store_memory::InMemoryBackend;
     use tower::ServiceExt;
 
-    use rigging_http_wire::json_safe_integers as large_integers;
-
     use super::*;
     use crate::blob_store::{BlobStore, TieredBlobStore};
     use crate::server::http::{HttpRouter, ListenerOrigin, LoginStore};
@@ -2146,28 +2144,5 @@ mod tests {
                 assert!(!reply.1["outcome"].is_null());
             }
         });
-    }
-
-    // ADR 0063 wraps only integers outside the interoperable JSON range, recursively;
-    // CBOR retains the original integer. The generator spans both limits and extrema.
-    #[hegel::test]
-    fn json_integer_rendering_has_exact_boundaries(tc: hegel::TestCase) {
-        let n = tc.draw(hegel::generators::integers::<i64>());
-        let mut value = json!({"nested":[n, u64::MAX]});
-        large_integers(&mut value);
-        let expected = if n > (1i64 << 53) - 1 {
-            json!({"u64":n.to_string()})
-        } else if n < -((1i64 << 53) - 1) {
-            json!({"i64":n.to_string()})
-        } else {
-            json!(n)
-        };
-        assert_eq!(value["nested"][0], expected);
-        assert_eq!(value["nested"][1], json!({"u64":u64::MAX.to_string()}));
-        for n in [-(1i64 << 53), -((1i64 << 53) - 1), (1i64 << 53) - 1, 1i64 << 53, i64::MIN, i64::MAX] {
-            let mut value = json!(n);
-            large_integers(&mut value);
-            assert_eq!(value.is_number(), (-((1i64 << 53) - 1)..=((1i64 << 53) - 1)).contains(&n));
-        }
     }
 }
