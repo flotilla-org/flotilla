@@ -233,6 +233,47 @@ async fn each_runs_once_per_subject() {
     assert_eq!(runs.load(Ordering::SeqCst), 2);
 }
 
+// Behaviour (#33 in rigging): the route takes the stack's wire rules by signature. A CBOR
+// invocation gets the same answer as its JSON twin, in CBOR when asked; an unacceptable Accept
+// is 406 and another media type 415, before anything runs; and a caller not acting as the user
+// is refused before the body is read.
+#[tokio::test]
+async fn the_route_negotiates_and_refuses_callers_before_reading_the_body() {
+    let Fixture { router, runs, .. } = fixture();
+    let invocation = json!({"invocation": "w", "subjects": [RUNNING], "params": {"note": "hi"}});
+    let (status, expected) = invoke(&router, CallerAuth::Bearer, "convoy.touch", invocation.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let post = |content_type: &str, accept: &str, body: Body| {
+        let mut request =
+            Request::post("/verbs/convoy.touch").header("content-type", content_type).header("accept", accept).body(body).unwrap();
+        request.extensions_mut().insert(CallerAuth::Bearer);
+        router.clone().oneshot(request)
+    };
+    let cbor = flotilla_cbor::to_vec(&invocation, &rigging_http_wire::LIMITS).unwrap();
+    let response = post("application/cbor", "application/cbor", Body::from(cbor.clone())).await.unwrap();
+    assert_eq!((response.status(), &response.headers()["content-type"]), (StatusCode::OK, &"application/cbor".parse().unwrap()));
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    assert_eq!(flotilla_cbor::from_slice::<Value>(&bytes, &rigging_http_wire::LIMITS).unwrap(), expected);
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+
+    let response = post("application/cbor", "text/html", Body::from(cbor.clone())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+    let response = post("text/plain", "application/json", Body::from(invocation.to_string())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+
+    // An oversized declared length that would be 413 for the user: an anonymous caller is 401,
+    // and the body is never polled.
+    let body = Body::from_stream(futures::stream::once(async {
+        panic!("a refused caller's body must not be read");
+        #[allow(unreachable_code)]
+        Ok::<_, std::io::Error>(axum::body::Bytes::new())
+    }));
+    let mut request = Request::post("/verbs/convoy.touch").header("content-length", 2 << 20).body(body).unwrap();
+    request.extensions_mut().insert(CallerAuth::Anonymous);
+    assert_eq!(router.clone().oneshot(request).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+}
+
 // Behaviour (#4182 ruling 7): the route keeps no record of past invocations. A repeated
 // invocation id of a write verb runs again, and the id in its effect leaves the subject as one
 // run would.
