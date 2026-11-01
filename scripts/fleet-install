@@ -1220,6 +1220,7 @@ main() {
   done
   if ((rollback_requested)); then
     [[ -n "$ROLLBACK_REASON" ]] || die '--rollback needs --reason "<why>"'
+    # The operand is last: no subcommand takes a trailing argument.
     case "${*: -1}" in
       status|rollback|--prune|--prune-dry-run|--canary|-h|--help|__*) die '--rollback only goes with installing a generation' ;;
     esac
