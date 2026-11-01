@@ -48,19 +48,57 @@ const MAX_BACKOFF: Duration = Duration::from_secs(2);
 fn is_transient(error: &io::Error) -> bool {
     use drydock_agent::{AgentError, ErrorKind};
     if let Some(refusal) = AgentError::of(error) {
-        return !matches!(
-            refusal.kind,
+        // No wildcard: a kind drydock adds fails to compile here at the repin, so someone
+        // decides whether retrying it can help instead of it defaulting to "retry".
+        return match refusal.kind {
             ErrorKind::Conflict
-                | ErrorKind::AlreadyExists
-                | ErrorKind::FileTooLarge
-                | ErrorKind::PayloadTooLarge
-                | ErrorKind::StorageFull
-                | ErrorKind::QuotaExceeded
-                | ErrorKind::PermissionDenied
-                | ErrorKind::InvalidData
-                | ErrorKind::InvalidInput
-                | ErrorKind::Unsupported
-        );
+            | ErrorKind::AlreadyExists
+            | ErrorKind::FileTooLarge
+            | ErrorKind::PayloadTooLarge
+            | ErrorKind::StorageFull
+            | ErrorKind::QuotaExceeded
+            | ErrorKind::PermissionDenied
+            | ErrorKind::InvalidData
+            | ErrorKind::InvalidInput
+            | ErrorKind::Unsupported => false,
+            // Unchanged from the former hand list: kinds that may in fact be permanent refusals
+            // (InvalidFilename, DigestMismatch, ReadOnlyFilesystem, ...) still retry; see #4257.
+            ErrorKind::NotFound
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::HostUnreachable
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::NotConnected
+            | ErrorKind::AddrInUse
+            | ErrorKind::AddrNotAvailable
+            | ErrorKind::NetworkDown
+            | ErrorKind::BrokenPipe
+            | ErrorKind::WouldBlock
+            | ErrorKind::NotADirectory
+            | ErrorKind::IsADirectory
+            | ErrorKind::DirectoryNotEmpty
+            | ErrorKind::ReadOnlyFilesystem
+            | ErrorKind::TimedOut
+            | ErrorKind::WriteZero
+            | ErrorKind::NotSeekable
+            | ErrorKind::ResourceBusy
+            | ErrorKind::ExecutableFileBusy
+            | ErrorKind::Deadlock
+            | ErrorKind::CrossesDevices
+            | ErrorKind::TooManyLinks
+            | ErrorKind::InvalidFilename
+            | ErrorKind::ArgumentListTooLong
+            | ErrorKind::Interrupted
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::OutOfMemory
+            | ErrorKind::DigestMismatch
+            | ErrorKind::PreconditionFailed
+            | ErrorKind::RangeNotSatisfiable
+            | ErrorKind::UnsupportedMediaType
+            | ErrorKind::MethodNotAllowed
+            | ErrorKind::Other => true,
+        };
     }
     // A plain PermissionDenied is not listed: an ssh-level denial can clear
     // while the host is still being provisioned. The agent's own refusal is final.
