@@ -663,21 +663,26 @@ fn evaluate_exit_with_disposition(
     }
 }
 
+/// The Done crews' claims whose head digests anchor settlement (mode
+/// ObservedDigest), with or without a declared exit. Stall evidence shares
+/// this predicate so a digest-anchored convoy is never read as standing.
+pub fn observed_digest_claims(status: &super::ConvoyStatus) -> Vec<&crate::SettlementClaimEvidence> {
+    status
+        .crew_work
+        .values()
+        .flat_map(BTreeMap::values)
+        .filter(|work| work.phase == crate::CrewWorkPhase::Done)
+        .filter_map(|work| work.claim_evidence.as_ref())
+        .collect()
+}
+
 fn evaluate_observed_digest_anchor(
     convoy: &ResourceObject<Convoy>,
     checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     stale_after: std::time::Duration,
     now: DateTime<Utc>,
 ) -> Option<LandingSettlement> {
-    let claims = convoy
-        .status
-        .as_ref()?
-        .crew_work
-        .values()
-        .flat_map(BTreeMap::values)
-        .filter(|work| work.phase == crate::CrewWorkPhase::Done)
-        .filter_map(|work| work.claim_evidence.as_ref())
-        .collect::<Vec<_>>();
+    let claims = observed_digest_claims(convoy.status.as_ref()?);
     if claims.is_empty() {
         return None;
     }

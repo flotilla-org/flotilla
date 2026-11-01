@@ -282,10 +282,7 @@ pub const NO_EXIT_STALL_EVIDENCE: &str =
 /// digest still anchors settlement without an exit; its own evidence is attention.
 fn empty_row_evidence(status: &ConvoyStatus) -> String {
     let standing = status.workflow_snapshot.as_ref().and_then(|snapshot| snapshot.exit.as_ref()).is_none();
-    // Mirrors `evaluate_observed_digest_anchor`: Done crews' claim evidence anchors
-    // settlement (mode ObservedDigest) even when the workflow declares no exit.
-    let digest_anchored =
-        status.crew_work.values().flat_map(BTreeMap::values).any(|work| work.phase == CrewWorkPhase::Done && work.claim_evidence.is_some());
+    let digest_anchored = !flotilla_resources::observed_digest_claims(status).is_empty();
     if status.phase == ConvoyPhase::Landing && standing && !digest_anchored {
         NO_EXIT_STALL_EVIDENCE.into()
     } else {
