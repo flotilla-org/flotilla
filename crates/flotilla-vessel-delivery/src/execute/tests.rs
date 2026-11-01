@@ -96,6 +96,10 @@ impl TreeDelivery for Tree {
         self.deliveries.lock().expect("deliveries").push(mechanism);
         Ok(())
     }
+
+    async fn present(&self, _: Mechanism, _: Option<&Path>, target: &Path, agent: &dyn VesselAgent) -> Result<bool, String> {
+        Ok(agent.stat(&target.join("SKILL.md")).await? == Some(EntryKind::File))
+    }
 }
 
 fn needs(skills: &str, notes: &str) -> Vec<Need> {
@@ -180,6 +184,34 @@ async fn re_runs_deliver_only_what_changed_or_failed() {
     assert!(!std::fs::read_to_string(&record).expect("record").contains("notes"), "the record follows the plan");
     run(needs("s3", "n2")).await.expect("notes again");
     assert_eq!((skills.deliveries(), notes.deliveries()), (3, 4));
+}
+
+// Behaviour (#4088 contract 1): a record counts only while what it names is still
+// aboard. A tree gone from under its record, as a reboot clears the store a durable
+// home links into, is delivered again by the mechanism it landed by, before anything
+// that needs it runs; a tree still there is kept.
+#[tokio::test]
+async fn a_recorded_tree_gone_from_under_its_record_is_delivered_again() {
+    let vessel = LocalVessel::new();
+    let (skills, notes) = (Tree::new("skills"), Tree::new("notes"));
+    let trees = BTreeMap::from([
+        (NeedName::new("skills"), skills.clone() as Arc<dyn TreeDelivery>),
+        (NeedName::new("notes"), notes.clone() as Arc<dyn TreeDelivery>),
+    ]);
+    let (needs, mechanisms, costs) = (needs("s1", "n1"), ProviderMechanisms::default(), CostTable::default());
+    let run = || deliver(&needs, &trees, &mechanisms, &costs, &vessel);
+    let first = run().await.expect("first delivery");
+    let home = &first.homes[&NeedName::new("home")];
+    std::fs::remove_dir_all(home.join("skills/skills")).expect("clear skills");
+
+    let again = run().await.expect("delivered again");
+    let actions = again.plan.steps.iter().map(|step| (step.need.as_str(), step.action)).collect::<BTreeMap<_, _>>();
+    assert_eq!(actions, BTreeMap::from([("home", Action::Keep), ("notes", Action::Keep), ("skills", Action::Deliver)]));
+    assert_eq!((skills.deliveries(), notes.deliveries()), (2, 1), "only the missing tree is delivered");
+    assert_eq!(*skills.deliveries.lock().expect("deliveries"), vec![Mechanism::AgentFetch { by: crate::FetchBy::Url }; 2]);
+    assert_eq!(std::fs::read_to_string(home.join("skills/skills/SKILL.md")).expect("skills"), "skills");
+    run().await.expect("kept");
+    assert_eq!((skills.deliveries(), notes.deliveries()), (2, 1), "a tree back in place is kept");
 }
 
 // Behaviour (#4012): a runtime home lands under the writable base, apart from the

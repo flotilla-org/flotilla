@@ -149,6 +149,9 @@ pub trait AgentClient: Send + Sync {
     /// An interrupted push resumes where the agent's upload stopped.
     async fn fetch_artifact_or_push(&self, sha256: &str, fetch: &Fetch, length: u64, content: tokio::fs::File) -> io::Result<()>;
     async fn link_artifact(&self, path: &Path, sha256: &str, member: &Path, options: &FileOptions) -> io::Result<()>;
+    /// Each store entry's digest, with the links placed through
+    /// [`AgentClient::link_artifact`] that still point into it.
+    async fn artifact_links(&self) -> io::Result<Vec<(String, Vec<PathBuf>)>>;
     /// Register `forward` reaching `endpoint`. The endpoint stays claimed by
     /// this connection's vessel; a refused upsert releases it.
     async fn put_outward_forward(&self, forward: OutwardForward, endpoint: Endpoint) -> io::Result<()>;

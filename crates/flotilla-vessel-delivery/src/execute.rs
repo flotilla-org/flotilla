@@ -3,7 +3,10 @@
 //! Every step is keyed by content digest. What landed is written beside the
 //! content, in each home's delivery record, as soon as a step completes, so a
 //! re-run plans `Keep` for it and does nothing. A replaced vessel has no record
-//! and receives everything again.
+//! and receives everything again. A record is not proof on its own: what it names
+//! counts as landed only while its tree's delivery still finds it aboard (#4088),
+//! so content a reboot or a hand wiped from under a durable record is delivered
+//! again.
 
 use std::{
     collections::BTreeMap,
@@ -39,6 +42,21 @@ pub trait TreeDelivery: Send + Sync {
         target: &Path,
         agent: &dyn VesselAgent,
     ) -> Result<(), StepFailure>;
+
+    /// Whether what an earlier delivery placed at `target` through `mechanism` is
+    /// still there, so its record may be kept (#4088). The default trusts the record,
+    /// for content that lies beside it and goes with it. Content the record only
+    /// points at, such as a link into the agent's store on a tmpfs, is looked for.
+    async fn present(
+        &self,
+        mechanism: Mechanism,
+        guest_source: Option<&Path>,
+        target: &Path,
+        agent: &dyn VesselAgent,
+    ) -> Result<bool, String> {
+        let _ = (mechanism, guest_source, target, agent);
+        Ok(true)
+    }
 }
 
 /// Why a tree's delivery failed, and whether trying the same content again can help.
@@ -159,7 +177,14 @@ pub async fn deliver(
         })?;
         read.insert(name.clone(), record.map(|bytes| decode_record(&String::from_utf8_lossy(&bytes))).unwrap_or_default());
     }
-    let landed = read.values().flatten().map(|(need, landed)| (need.clone(), landed.clone())).collect();
+    let mut landed = BTreeMap::new();
+    for (name, recorded) in read.values().flatten() {
+        if still_present(needs, trees, &homes, name, recorded, agent).await? {
+            landed.insert(name.clone(), recorded.clone());
+        } else {
+            tracing::info!(need = %name, digest = %recorded.digest, mechanism = %recorded.mechanism, "a recorded delivery is missing aboard; delivering it again");
+        }
+    }
     // The planner refuses a tree whose home is not a home need, so every step's home is in `homes`.
     let plan = plan(needs, mechanisms, &landed, costs).map_err(DeliveryError::Plan)?;
     if let Some(step) =
@@ -218,6 +243,26 @@ pub async fn deliver(
         }
     }
     Ok(Delivered { homes, plan })
+}
+
+/// Whether the tree `name`'s recorded delivery is still at its place in its home.
+/// Only a record the plan could keep is looked for: one naming a tree still asked
+/// for with the same digest. Anything else is delivered again or dropped anyway.
+async fn still_present(
+    needs: &[Need],
+    trees: &BTreeMap<NeedName, Arc<dyn TreeDelivery>>,
+    homes: &BTreeMap<NeedName, PathBuf>,
+    name: &NeedName,
+    recorded: &Landed,
+    agent: &dyn VesselAgent,
+) -> Result<bool, DeliveryError> {
+    let Some(need) = needs.iter().find(|need| need.name == *name && need.digest == recorded.digest) else { return Ok(true) };
+    let Item::Tree { home, path, .. } = &need.item else { return Ok(true) };
+    // A tree whose home or delivery is missing is refused by the planner or the executor.
+    let (Some(home), Some(tree)) = (homes.get(home), trees.get(name)) else { return Ok(true) };
+    tree.present(recorded.mechanism, recorded.guest_source.as_deref(), &path.under(home), agent)
+        .await
+        .map_err(|error| DeliveryError::Step { need: name.clone(), error, permanent: false })
 }
 
 /// A record field holds no tab or line break.

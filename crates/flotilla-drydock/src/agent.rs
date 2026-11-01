@@ -1,6 +1,11 @@
 //! Drydock's vessel agent client behind flotilla's [`AgentClient`], and the
 //! [`AgentLink`] that connects it.
-use std::{io, path::Path, sync::Arc, time::Duration};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use flotilla_environment::environment::{
@@ -329,6 +334,9 @@ impl AgentClient for DrydockClient {
     }
     async fn link_artifact(&self, path: &Path, sha256: &str, member: &Path, file: &flotilla::FileOptions) -> io::Result<()> {
         self.0.link_artifact(path, sha256, member, &options(file)).await
+    }
+    async fn artifact_links(&self) -> io::Result<Vec<(String, Vec<PathBuf>)>> {
+        Ok(self.0.artifacts().await?.into_iter().map(|artifact| (artifact.sha256, artifact.links)).collect())
     }
     async fn put_outward_forward(&self, forward: flotilla::OutwardForward, host: flotilla::Endpoint) -> io::Result<()> {
         let forward = drydock_agent::OutwardForward { id: forward.id, unix: forward.unix, tcp: forward.tcp };

@@ -575,6 +575,70 @@ async fn ssh_host_claude_crew_starts_in_a_prepared_flotilla_home() {
 // frozen skills staged there, with workspace trust for the checkout in that home's own
 // `config.toml`. The home holds a read-only copy of the owning daemon's central login; the
 // host's own `~/.codex` login and config are never linked or written.
+/// The runtime for a Claude crew on a fresh SSH host, bound and launched once. A reboot
+/// of the host is [`reboot`].
+async fn launched_claude_crew() -> (SshHostRuntime, Arc<FakeHost>, flotilla_test_support::TestSocketDir, LaunchedSession) {
+    let runtime_dir = flotilla_test_support::TestSocketDir::new();
+    let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
+    let runtime = ssh_host_runtime(ssh_host(&host, &runtime_dir), "claude-code").await;
+    bind_account(&runtime.daemon.resource_backend(), "demo", "coder", "claude-max", "crew@example.com").await;
+    let launched = runtime.launch().await.expect("first launch");
+    (runtime, host, runtime_dir, launched)
+}
+
+/// A reboot of `host`: its tmpfs is cleared, taking the vessel agent's store and the crew's
+/// runtime material, while the durable home and its delivery record remain.
+fn reboot(runtime: &SshHostRuntime, host: &FakeHost) {
+    runtime.agents.clear_store(&runtime.vessel);
+    host.files.lock().expect("files").retain(|path, _| !path.starts_with(RUNTIME_BASE));
+}
+
+// Acceptance (#4088): after a reboot the durable home's record still names the harness and
+// skills, but their links into the cleared store dangle. The relaunch delivers both again,
+// by the mechanisms they first landed by, before the harness starts, and its links resolve.
+// An unchanged relaunch with everything in place sends nothing.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_relaunch_after_a_reboot_delivers_the_cleared_harness_and_skills_again() {
+    let (runtime, host, _runtime_dir, first) = launched_claude_crew().await;
+    let arrived = first.artifacts.clone();
+    assert_eq!(arrived.len(), 2, "the skills pushed and the harness fetched: {arrived:?}");
+    let kept = runtime.launch().await.expect("unchanged relaunch");
+    assert_eq!(kept.artifacts, arrived, "nothing still in place is sent again");
+
+    reboot(&runtime, &host);
+    let rebooted = runtime.launch().await.expect("relaunch after the reboot");
+
+    assert_eq!(rebooted.artifacts[arrived.len()..], arrived[..], "both are delivered again, the same way");
+    let store = runtime.agents.recorded(&runtime.vessel);
+    let linked = store.links.values().cloned().collect::<BTreeSet<_>>();
+    assert_eq!(linked, arrived.iter().map(|(sha256, _)| sha256.clone()).collect(), "each is linked again");
+    for (link, sha256) in &store.links {
+        assert!(store.store.contains(sha256), "{} links into a stored entry", link.display());
+        assert_eq!(host.entry(link), Some(HostEntry::Link(store_entry(&runtime.vessel.agent, sha256))));
+    }
+    let home = rebooted.env_vars.iter().find(|(name, _)| name == "CLAUDE_CONFIG_DIR").map(|(_, home)| home.clone()).expect("home");
+    assert!(rebooted.command.contains(&format!("{home}/.flotilla/harness/bin/claude ")), "{}", rebooted.command);
+    assert!(store.links.keys().any(|link| link.starts_with(format!("{home}/.flotilla/harness"))), "{:?}", store.links);
+}
+
+// Acceptance (#4088 contract 3): a harness that cannot be delivered again after a reboot
+// fails the launch with the need it failed at. No harness starts, and the host's own
+// `claude` is never run in its place.
+#[tokio::test]
+async fn a_harness_that_cannot_be_delivered_again_fails_the_launch_by_name() {
+    let (runtime, host, _runtime_dir, _) = launched_claude_crew().await;
+    reboot(&runtime, &host);
+    runtime.agents.refuse_artifacts.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let error = runtime.launch().await.expect_err("nothing to run");
+
+    assert!(error.contains("deliver `harness`") && error.contains("unreachable"), "{error}");
+    let deliveries = runtime.deliveries().await;
+    let [delivery] = deliveries.as_slice() else { panic!("one access: {deliveries:?}") };
+    assert_eq!(delivery.retry.as_ref().map(|retry| retry.need.as_str()), Some("harness"), "{delivery:?}");
+}
+
 #[tokio::test]
 async fn ssh_host_codex_crew_starts_in_a_prepared_flotilla_home() {
     let launch = launch_on_ssh_host("codex").await;

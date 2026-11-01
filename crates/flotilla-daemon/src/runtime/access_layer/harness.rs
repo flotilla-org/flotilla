@@ -75,6 +75,15 @@ impl PinnedHarness {
     pub(super) fn executable(&self, place: &Path) -> PathBuf {
         place.join("bin").join(self.binary)
     }
+
+    /// Where the store entry is linked for a harness placed at `target`: a single file
+    /// is the executable itself; an archive's entry is the harness tree.
+    fn link(&self, target: &Path) -> PathBuf {
+        match self.unpack {
+            PinUnpack::File => self.executable(target),
+            PinUnpack::TarGz | PinUnpack::TarXz => target.to_path_buf(),
+        }
+    }
 }
 
 #[async_trait]
@@ -90,11 +99,14 @@ impl TreeDelivery for PinnedHarness {
             }
             other => return Err(format!("a harness cannot be delivered by {other}").into()),
         }
-        // A single file is the executable itself; an archive's entry is the harness tree.
-        Ok(match self.unpack {
-            PinUnpack::File => agent.link_artifact(&self.executable(target), &self.sha256, Path::new("")).await,
-            PinUnpack::TarGz | PinUnpack::TarXz => agent.link_artifact(target, &self.sha256, Path::new("")).await,
-        }?)
+        Ok(agent.link_artifact(&self.link(target), &self.sha256, Path::new("")).await?)
+    }
+
+    /// #4088: the harness is linked from the agent's store, which a reboot may clear
+    /// under the durable home, so a recorded harness is kept only while its link
+    /// still points into the pinned digest's entry.
+    async fn present(&self, _: Mechanism, _: Option<&Path>, target: &Path, agent: &dyn VesselAgent) -> Result<bool, String> {
+        Ok(agent.linked_artifact(&self.link(target)).await?.as_deref() == Some(self.sha256.as_str()))
     }
 }
 

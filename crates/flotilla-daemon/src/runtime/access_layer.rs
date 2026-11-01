@@ -346,6 +346,13 @@ impl TreeDelivery for SkillsDelivery {
         tracing::info!(target = %target.display(), sha256 = %archive.sha256, "delivered frozen crew skills");
         Ok(())
     }
+
+    /// #4088: the skills link points into the agent's store, which a reboot may clear
+    /// under the durable home. The entry is content-addressed and its tree's digest
+    /// is the record's, so a link still into an entry is the tree the record names.
+    async fn present(&self, _: Mechanism, _: Option<&Path>, target: &Path, agent: &dyn VesselAgent) -> Result<bool, String> {
+        Ok(agent.linked_artifact(target).await?.is_some())
+    }
 }
 
 /// Put `archive` into the agent's content cache and point `target` at it. A real
@@ -522,7 +529,10 @@ mod tests {
     struct Recording {
         files: Mutex<BTreeMap<PathBuf, Vec<u8>>>,
         directories: Mutex<BTreeSet<PathBuf>>,
-        links: Mutex<BTreeSet<PathBuf>>,
+        /// Each link into the content cache, with the entry it points into.
+        links: Mutex<BTreeMap<PathBuf, String>>,
+        /// The content cache's entries, by digest.
+        stored: Mutex<BTreeSet<String>>,
         calls: Mutex<Vec<String>>,
         /// Refuse the next link, as an agent connection lost mid-delivery would.
         refuse_link: std::sync::atomic::AtomicBool,
@@ -555,7 +565,7 @@ mod tests {
             Ok("/home/crew/flotilla".into())
         }
         async fn stat(&self, path: &Path) -> Result<Option<EntryKind>, String> {
-            Ok(if self.links.lock().expect("links").contains(path) {
+            Ok(if self.links.lock().expect("links").contains_key(path) {
                 Some(EntryKind::Symlink)
             } else if self.directories.lock().expect("directories").contains(path) {
                 Some(EntryKind::Directory)
@@ -587,6 +597,7 @@ mod tests {
         }
         async fn push_artifact(&self, sha256: &str, _: &Path, unpack: PinUnpack) -> Result<(), String> {
             self.calls.lock().expect("calls").push(format!("push {sha256} {}", unpack.as_str()));
+            self.stored.lock().expect("stored").insert(sha256.into());
             Ok(())
         }
         async fn link_artifact(&self, path: &Path, sha256: &str, member: &Path) -> Result<(), String> {
@@ -597,9 +608,13 @@ mod tests {
             if self.directories.lock().expect("directories").contains(path) {
                 return Err(format!("{} is a directory", path.display()));
             }
-            self.links.lock().expect("links").insert(path.into());
+            self.links.lock().expect("links").insert(path.into(), sha256.into());
             self.calls.lock().expect("calls").push(format!("link {} {sha256}/{}", path.display(), member.display()));
             Ok(())
+        }
+        async fn linked_artifact(&self, path: &Path) -> Result<Option<String>, String> {
+            let linked = self.links.lock().expect("links").get(path).cloned();
+            Ok(linked.filter(|sha256| self.stored.lock().expect("stored").contains(sha256)))
         }
     }
 
@@ -629,6 +644,8 @@ mod tests {
     // a real `skills` directory left by an older delivery is moved aside once, before the
     // first link, and never again. A link that fails after the move leaves the access
     // undelivered (no harness starts), and the retry links without moving anything.
+    // #4088: a cache cleared under the record leaves the link dangling, so the tree is
+    // pushed and linked again.
     #[tokio::test]
     async fn skills_are_pushed_by_digest_and_linked_and_a_legacy_directory_is_moved_aside_once() {
         let cache = tempfile::tempdir().expect("cache");
@@ -657,6 +674,9 @@ mod tests {
         assert_eq!(agent.calls(), [push.clone(), link.clone()], "the retry links; nothing is left to move aside");
         run(tree.digest()).await.expect("kept");
         assert_eq!(agent.calls(), Vec::<String>::new(), "the record already names this digest");
+        agent.stored.lock().expect("stored").clear();
+        run(tree.digest()).await.expect("delivered again");
+        assert_eq!(agent.calls(), [push.clone(), link.clone()], "a cleared cache is pushed into again");
         run(format!("{}-reselected", tree.digest())).await.expect("redelivered");
         assert_eq!(agent.calls(), [push, link], "a later delivery finds a link, not a directory");
     }
