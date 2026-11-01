@@ -784,7 +784,7 @@ test "$(roll_field 3)" = "$generation_two" || fail 'rollback record omitted the 
 printf '%s\n%s\n' "$commit_one" "$commit_two" >"$test_root/order-forward"
 FAKE_GIT_ORDER="$test_root/order-forward" run_installer "$generation_two" >"$test_root/roll-forward.out" 2>&1 \
   || { cat "$test_root/roll-forward.out" >&2; fail 'a descendant install needed a flag'; }
-head -n 1 "$test_root/roll-forward.out" | grep -Fxq 'flotilla 11111111 -> 22222222 (1 commits ahead)' \
+head -n 1 "$test_root/roll-forward.out" | grep -Fxq 'flotilla 11111111 -> 22222222 (1 commit ahead)' \
   || fail 'install did not lead with the flotilla comparison'
 test "$(link_generation "$current_link")" = "$generation_two" || fail 'descendant install did not activate'
 test "$(roll_field 2)" = "$generation_two" && test "$(roll_field 3)" = "$generation_one" \
@@ -798,7 +798,7 @@ rolls_before="$(wc -l <"$roll_log")"
 if FAKE_GIT_ORDER="$test_root/order-forward" run_installer "$generation_one" >"$test_root/roll-refused.out" 2>&1; then
   fail 'a non-descendant install was accepted'
 fi
-head -n 1 "$test_root/roll-refused.out" | grep -Fxq 'flotilla 22222222 -> 11111111 (ROLLBACK: 1 commits behind live r2)' \
+head -n 1 "$test_root/roll-refused.out" | grep -Fxq 'flotilla 22222222 -> 11111111 (ROLLBACK: 1 commit behind live r2)' \
   || fail 'refusal did not lead with the ROLLBACK comparison'
 grep -Fq 'refused: pass --rollback --reason "<why>" to install an older generation' "$test_root/roll-refused.out" \
   || fail 'refusal did not say how to roll back deliberately'

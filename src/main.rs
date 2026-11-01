@@ -113,6 +113,7 @@ async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat
         Some(SubCommand::Fleet { command: Some(FleetSubCommand::Status) }) => {
             cli.require_local_daemon("fleet status")?;
             let paths = cli.client_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
+            // scripts/fleet-install appends to the same file in its DAEMON_CONFIG_DIR.
             let log = match std::fs::read_to_string(paths.config_dir.join("fleet-rolls.log")) {
                 Ok(log) => log,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),

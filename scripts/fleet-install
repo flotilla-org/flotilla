@@ -1025,18 +1025,19 @@ guard_roll_direction() {
   unset FLEET_INSTALL_ROLLBACK_REASON
   ((CANARY_ONLY)) && return 0
   [[ -n "$live" && "$live" != "$generation" ]] || return 0
-  local live_commit="" incoming_commit="" verdict direction count="" summary
+  local live_commit="" incoming_commit="" verdict direction count="" summary noun=commits
   if incoming_commit="$(manifest_value "$manifest" sources.flotilla)" \
     && live_commit="$(manifest_value "$RELEASES_DIR/$live/.generation.json" sources.flotilla)" \
     && verdict="$(python3 "$GENERATION_VALIDATOR" roll-direction -- "$live_commit" "$incoming_commit")"; then
     read -r direction count <<<"$verdict"
+    [[ "$count" != 1 ]] || noun=commit
   else
     direction=unknown
   fi
   case "$direction" in
     same) summary="unchanged" ;;
-    forward) summary="$count commits ahead" ;;
-    rollback) summary="ROLLBACK: $count commits behind live $(roll_label "$live")" ;;
+    forward) summary="$count $noun ahead" ;;
+    rollback) summary="ROLLBACK: $count $noun behind live $(roll_label "$live")" ;;
     diverged) summary="ROLLBACK: diverged from live $(roll_label "$live")" ;;
     *) summary="ROLLBACK: cannot compare with live $(roll_label "$live")" ;;
   esac
