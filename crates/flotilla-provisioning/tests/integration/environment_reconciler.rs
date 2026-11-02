@@ -700,6 +700,7 @@ async fn cloud_ready_and_finalization_use_generic_backing() {
                 cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
                     probe_needs: Default::default(),
                     image: "image@sha256:digest".into(),
+                    image_build_ref: None,
                     size: flotilla_resources::CloudSandboxSize { cpus: 2, memory_bytes: 1024, disk_bytes: 1024 },
                     lifetime_cap_seconds: None,
                     env: Default::default(),
@@ -723,6 +724,66 @@ async fn cloud_ready_and_finalization_use_generic_backing() {
     let ready = environments.get(&environment.metadata.name).await.unwrap();
     reconciler.run_finalizer(&ready).await.unwrap();
     assert_eq!(*runtime.destroyed.lock().unwrap(), vec!["opaque-cloud-backing"]);
+}
+
+// A composed cloud Environment waits for its ImageBuild like a Docker one, then provisions
+// the build's registry digest; a build delivered only to its builder's local store fails,
+// since a cloud provider reads images from the fleet image cache alone.
+#[rstest::rstest]
+#[case::registry(flotilla_resources::ImageDelivery::Registry { repository: "registry.test/crew".into() })]
+#[case::local(flotilla_resources::ImageDelivery::Local)]
+#[tokio::test]
+async fn composed_cloud_environment_provisions_the_registry_digest(#[case] delivery: flotilla_resources::ImageDelivery) {
+    use flotilla_resources::{ImageBuild, ImageBuildPhase, ImageBuildStatus, ImageDelivery};
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let (name, spec) = composed_build(delivery.clone());
+    let environments = backend.using::<Environment>("flotilla");
+    let environment = environments
+        .create(
+            &InputMeta::builder().name("cloud-composed".to_string()).build(),
+            &EnvironmentSpec {
+                provider_address: Some("account:daytona/provider:daytona".parse().unwrap()),
+                cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+                    probe_needs: Default::default(),
+                    image: String::new(),
+                    image_build_ref: Some(name.clone()),
+                    size: flotilla_resources::CloudSandboxSize { cpus: 2, memory_bytes: 1024, disk_bytes: 1024 },
+                    lifetime_cap_seconds: None,
+                    env: Default::default(),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let runtime = Arc::new(CloudRuntime { destroyed: Default::default() });
+    let reconciler = EnvironmentReconciler::new(runtime.clone(), backend.clone(), "flotilla");
+    let builds = backend.using::<ImageBuild>("flotilla");
+    let created = builds.create(&InputMeta::builder().name(name.clone()).build(), &spec.into()).await.expect("build");
+    let prepared = reconciler.prepare(&environment).await.unwrap();
+    match reconciler.reconcile(&environment, &prepared, chrono::Utc::now()).patch {
+        Some(EnvironmentStatusPatch::WaitForImageBuild { message }) => assert_eq!(message, format!("ImageBuild {name} Queued")),
+        other => panic!("expected to wait for the image build, got {other:?}"),
+    }
+    let digest = format!("registry.test/crew@sha256:{}", "e".repeat(64));
+    let built = ImageBuildStatus { phase: ImageBuildPhase::Built, digest: Some(digest.clone()), ..Default::default() };
+    builds.update_status(&name, &created.metadata.resource_version, &built).await.expect("built");
+    let prepared = reconciler.prepare(&environment).await.unwrap();
+    let patch = reconciler.reconcile(&environment, &prepared, chrono::Utc::now()).patch;
+    match delivery {
+        ImageDelivery::Registry { .. } => {
+            assert!(
+                matches!(patch, Some(EnvironmentStatusPatch::MarkCloudReady { ref image_ref, .. }) if *image_ref == digest),
+                "{patch:?}"
+            )
+        }
+        ImageDelivery::Local => {
+            assert!(
+                matches!(patch, Some(EnvironmentStatusPatch::MarkFailed { ref message }) if message.contains("fleet image cache")),
+                "{patch:?}"
+            )
+        }
+    }
 }
 
 // #3765 B1: restart between creation and status publication may adopt an

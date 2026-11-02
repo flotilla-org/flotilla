@@ -1,7 +1,7 @@
 //! Local and SSH host discovery and fulfilment observations.
 
 use flotilla_discovery_api::EnvironmentBag;
-use flotilla_store::DockerImageSourceStoreExt;
+use flotilla_store::PlacementImageSourceStoreExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,

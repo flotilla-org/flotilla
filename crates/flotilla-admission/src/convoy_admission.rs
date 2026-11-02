@@ -47,8 +47,8 @@ use flotilla_resources::{
 #[cfg(test)]
 use flotilla_resources::{HoldAct, RepositorySpec, SystemClock};
 use flotilla_store::{
-    apply_status_patch as apply_resource_status_patch, resolve_project_issue_sources, DockerImageSourceStoreExt, ResolvedCascadeStoreExt,
-    ResourceBackend, StoreQuery,
+    apply_status_patch as apply_resource_status_patch, resolve_project_issue_sources, PlacementImageSourceStoreExt,
+    ResolvedCascadeStoreExt, ResourceBackend, StoreQuery,
 };
 #[cfg(test)]
 use flotilla_store_memory::InMemoryBackend;
@@ -1715,12 +1715,12 @@ struct AdmittedPlacements<'a> {
 }
 
 impl PlacementBuildJoiner<'_> {
-    /// Admission only. For a docker-per-vessel kind that omits the image,
-    /// resolve every vessel's composition against the replica-inclusive
-    /// catalogue, plan its ImageBuild for the placement host's architecture,
-    /// and return the kind each vessel runs (`Built`) with the builds to
-    /// create once admission commits. A literal image returns no entries.
-    /// Nothing is written here.
+    /// Admission only. For a docker-per-vessel or cloud kind that omits the
+    /// image, resolve every vessel's composition against the replica-inclusive
+    /// catalogue, plan its ImageBuild (for the placement host's architecture,
+    /// or the cloud platform through the image cache), and return the kind
+    /// each vessel runs (`Built`) with the builds to create once admission
+    /// commits. A literal image returns no entries. Nothing is written here.
     async fn compose_placement_images(
         &self,
         namespace: &str,
@@ -1729,20 +1729,27 @@ impl PlacementBuildJoiner<'_> {
         placement: &PlacementResolution,
     ) -> Result<(BTreeMap<String, FulfilmentKindSpec>, Vec<crate::image_build::PlannedImageBuild>), String> {
         let Some(kind) = placement.selected.as_ref() else { return Ok(Default::default()) };
-        if kind.spec.realisation != (FulfilmentRealisation::DockerPerVessel { image: None }) {
-            return Ok(Default::default());
-        }
+        let cloud = match &kind.spec.realisation {
+            FulfilmentRealisation::DockerPerVessel { image: None } => false,
+            FulfilmentRealisation::CloudSandboxPerVessel { image: None, .. } => true,
+            _ => return Ok(Default::default()),
+        };
         let resolved = resolve_vessel_images(self.backend, namespace, project_ref, workflow).await?;
         let mut images = BTreeMap::new();
         let mut builds = Vec::new();
         for (vessel, image) in resolved {
-            let planned = crate::image_build::plan_image_build(self.backend, namespace, &image, &kind.spec.host_ref).await?;
+            let planned = if cloud {
+                crate::image_build::plan_cloud_image_build(self.backend, namespace, &image).await?
+            } else {
+                crate::image_build::plan_image_build(self.backend, namespace, &image, &kind.spec.host_ref).await?
+            };
+            let built = flotilla_resources::PlacementImageSource::Built { identity: image.identity, image_build_ref: planned.name.clone() };
             let mut spec = kind.spec.clone();
-            spec.realisation = FulfilmentRealisation::DockerPerVessel {
-                image: Some(flotilla_resources::DockerImageSource::Built {
-                    identity: image.identity,
-                    image_build_ref: planned.name.clone(),
-                }),
+            spec.realisation = match &kind.spec.realisation {
+                FulfilmentRealisation::CloudSandboxPerVessel { size, .. } => {
+                    FulfilmentRealisation::CloudSandboxPerVessel { image: Some(built), size: size.clone() }
+                }
+                _ => FulfilmentRealisation::DockerPerVessel { image: Some(built) },
             };
             images.insert(vessel, spec);
             builds.push(planned);
@@ -2734,7 +2741,14 @@ impl AdmissionReadContext<'_> {
             // A kind that omits its image realises each vessel's composed
             // image: resolution provides every image need or refuses, naming it.
             let composed = match &kind.spec.realisation {
-                FulfilmentRealisation::DockerPerVessel { image: None } => {
+                FulfilmentRealisation::CloudSandboxPerVessel { image: None, .. }
+                    if crate::image_build::fleet_image_cache(&self.backend, namespace).await?.is_none() =>
+                {
+                    rejected.push(refusal(crate::image_build::CLOUD_IMAGE_CACHE_MISSING.to_string()));
+                    continue;
+                }
+                FulfilmentRealisation::DockerPerVessel { image: None }
+                | FulfilmentRealisation::CloudSandboxPerVessel { image: None, .. } => {
                     match composed_images.get_or_init(|| resolve_vessel_images(&self.backend, namespace, project_ref, workflow)).await {
                         Ok(images) => Some(images),
                         Err(error) => {
@@ -2809,7 +2823,7 @@ impl AdmissionReadContext<'_> {
                     // A literal image is checked now; composed images freeze per vessel once the
                     // placement is final.
                     if let FulfilmentRealisation::DockerPerVessel {
-                        image: Some(image @ flotilla_resources::DockerImageSource::Literal(_)),
+                        image: Some(image @ flotilla_resources::PlacementImageSource::Literal(_)),
                     } = &selected.spec.realisation
                     {
                         image.resolve()?;
@@ -4282,7 +4296,7 @@ pub async fn validate_workflow_agent_adapters(
     if placement.is_some_and(|kind| {
         matches!(
             kind.spec.realisation,
-            FulfilmentRealisation::DockerPerVessel { image: None | Some(flotilla_resources::DockerImageSource::Built { .. }) }
+            FulfilmentRealisation::DockerPerVessel { image: None | Some(flotilla_resources::PlacementImageSource::Built { .. }) }
         )
     }) {
         return Ok(());
@@ -4677,7 +4691,7 @@ pub async fn placement_agent_adapters(
         // resolve to (resolution refuses otherwise); a literal image's are what
         // its host probed it for.
         match image {
-            None | Some(flotilla_resources::DockerImageSource::Built { .. }) => Ok((BTreeSet::new(), "composed image".to_string())),
+            None | Some(flotilla_resources::PlacementImageSource::Built { .. }) => Ok((BTreeSet::new(), "composed image".to_string())),
             Some(image) => {
                 let detail = format!("image `{}`", image.resolve()?);
                 let target_host = placement_target_host(backend, namespace, placement).await?;
@@ -4819,7 +4833,7 @@ async fn image_placement_cost(
     lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
 ) -> Result<flotilla_resources::ImageAcquisitionCost, String> {
     use flotilla_resources::{
-        DockerImageSource, FleetDesignation, FulfilmentRealisation, ImageAcquisitionCost, ImageBuildPhase, FLEET_DESIGNATION_NAME,
+        FleetDesignation, FulfilmentRealisation, ImageAcquisitionCost, ImageBuildPhase, PlacementImageSource, FLEET_DESIGNATION_NAME,
         IMAGE_DIGESTS_CAPABILITY,
     };
     let image = match realisation {
@@ -4870,7 +4884,7 @@ async fn image_placement_cost(
         return Ok(cost);
     }
     let image = match image {
-        Some(DockerImageSource::Literal(image)) => Some(image.as_str()),
+        Some(PlacementImageSource::Literal(image)) => Some(image.as_str()),
         _ => None,
     };
     if image.is_some_and(is_held) {
@@ -5494,7 +5508,7 @@ mod tests {
             .pool("cleat".into())
             .grants(BTreeSet::from([flotilla_resources::FulfilmentGrant::network("scoped".into())]))
             .realisation(FulfilmentRealisation::DockerPerVessel {
-                image: Some(flotilla_resources::DockerImageSource::Literal("ubuntu:24.04".into())),
+                image: Some(flotilla_resources::PlacementImageSource::Literal("ubuntu:24.04".into())),
             })
             .build();
         kinds.create(&InputMeta::builder().name("docker-on-host".into()).build(), &docker).await.unwrap();
@@ -5811,7 +5825,7 @@ mod tests {
             let host = hosts.get("host").await.expect("host");
             let instance = if other_instance { "cache-b" } else { "cache-a" };
             let realisation = flotilla_resources::FulfilmentRealisation::DockerPerVessel {
-                image: Some(flotilla_resources::DockerImageSource::Literal(digest)),
+                image: Some(flotilla_resources::PlacementImageSource::Literal(digest)),
             };
             let cost = image_placement_cost(
                 &backend,

@@ -6704,7 +6704,7 @@ mod tests {
             (FulfilmentRealisation::DockerPerVessel { image: None }, EnvironmentKind::Provisioned),
             (
                 FulfilmentRealisation::DockerPerVessel {
-                    image: Some(flotilla_resources::DockerImageSource::Literal("ubuntu:24.04".into())),
+                    image: Some(flotilla_resources::PlacementImageSource::Literal("ubuntu:24.04".into())),
                 },
                 EnvironmentKind::Provisioned,
             ),

@@ -194,9 +194,9 @@ pub use manifest_root::{
     ResolutionAction, ResolutionOutcome,
 };
 pub use placement_policy::{
-    CloudSandboxCheckout, CloudSandboxPerVesselPlacementPolicySpec, DockerCheckoutStrategy, DockerImagePullPolicy, DockerImageSource,
-    DockerPerVesselPlacementPolicySpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, PlacementPolicy,
-    PlacementPolicySpec, ProviderRequirements, DOCKER_POLICY_NAME_PREFIX,
+    CloudSandboxCheckout, CloudSandboxPerVesselPlacementPolicySpec, DockerCheckoutStrategy, DockerImagePullPolicy,
+    DockerPerVesselPlacementPolicySpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, PlacementImageSource,
+    PlacementPolicy, PlacementPolicySpec, ProviderRequirements, DOCKER_POLICY_NAME_PREFIX,
 };
 pub use platform::Platform;
 pub use prepared_snapshot::{content_hash, is_prepared_snapshot, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND};

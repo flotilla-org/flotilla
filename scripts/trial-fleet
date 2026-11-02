@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run one convoy through a throwaway flotilla built from this checkout (#4165).
 
-    scripts/trial-fleet run [--provider-config FILE [--provider NAME] [--image REF]]
+    scripts/trial-fleet run [--provider-config FILE [--provider NAME] [--image REF | --image-cache FILE]]
                             [--crew scripted|<agent>] [--until provisioned|attached|landed]
                             [--guest-tools DIR]
 
@@ -24,6 +24,11 @@ Issues, pull requests and git come from the fake forge on this machine,
 which a cloud vessel cannot reach. --forge FILE runs the trial against a real
 Forgejo repository instead (see forge_config), with the crew's credential
 delivered through a CredentialSpec and CredentialGrant as on the fleet.
+
+--image-cache FILE runs the vessel on its composed crew image instead of a
+named one (see image_cache_config): this machine builds it for linux/amd64
+through Docker and pushes it to that registry, as a fleet's builder does, and
+the provider pulls it from there with the cache's pull credential.
 
 The guest tools pushed into a vessel are linux-amd64. On another host
 --guest-tools names an installed generation's guest tools
@@ -274,9 +279,10 @@ def adopt_guest_tools(generation, source):
 # Provider
 
 
-def provider_config(path, root, instance=None, image=None):
+def provider_config(path, root, instance=None, image=None, composed=False):
     """The drydock.toml the trial daemon reads, the trial's provider instance and
-    the image its placement names (--image, else the provider table's own)."""
+    the image its placement names (--image, else the provider table's own; None
+    for the composed image)."""
     if path is None:
         text = (f'[providers.local]\nmodule = "local"\nimage = "{LOCAL_IMAGE}"\n'
                 f'settings = {{ root = "{root / "vessels"}", agent = "{root / "generation/bin/drydock-agent"}" }}\n')
@@ -296,8 +302,8 @@ def provider_config(path, root, instance=None, image=None):
     if instance not in providers:
         raise TrialFailure(f'{path}: no [providers.{instance}] table')
     name, table = instance, providers[instance]
-    image = image or (table.get('image') if isinstance(table, dict) else None)
-    if not isinstance(image, str) or '@sha256:' not in image:
+    image = image or (None if composed else table.get('image') if isinstance(table, dict) else None)
+    if not composed and (not isinstance(image, str) or '@sha256:' not in image):
         raise TrialFailure(f'{path}: [providers.{name}] needs an image pinned by digest (--image or image = "...@sha256:...")')
     local_root = None
     if table.get('module') == 'local':
@@ -305,6 +311,38 @@ def provider_config(path, root, instance=None, image=None):
         if not local_root.is_absolute():
             raise TrialFailure(f'{path}: a local provider needs an absolute settings.root to be checked at teardown')
     return text, name, image, local_root
+
+
+def image_cache_config(path):
+    """The registry a composed image goes through: TOML with `repository` (registry
+    host and path, no tag), and `username` and `token` (a file holding a token that
+    may push and pull there). The trial declares it as a fleet does: a
+    FleetDesignation image cache with push and pull CredentialSpecs, granted to
+    this machine for those host actions."""
+    try:
+        parsed = tomllib.loads(Path(path).read_text())
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise TrialFailure(f'{path}: {error}') from error
+    for key in ('repository', 'username', 'token'):
+        if not isinstance(parsed.get(key), str) or not parsed[key]:
+            raise TrialFailure(f'{path}: needs `{key}`')
+    token = Path(parsed['token']).expanduser()
+    if not token.is_file():
+        raise TrialFailure(f'{path}: token file {token} is missing')
+    return {**parsed, 'token': str(token)}
+
+
+def docker_endpoint():
+    """The Docker CLI's directory and the endpoint of this user's current context, which
+    the trial daemon's own HOME would not find."""
+    docker = shutil.which('docker')
+    if docker is None:
+        raise TrialFailure('--image-cache builds the image with Docker, and docker is not on PATH')
+    host = subprocess.run([docker, 'context', 'inspect', '--format', '{{.Endpoints.docker.Host}}'], text=True,
+                          capture_output=True, timeout=30)
+    if host.returncode or not host.stdout.strip():
+        raise TrialFailure(f'docker context inspect failed: {host.stderr.strip()[-400:]}')
+    return Path(docker).resolve().parent, host.stdout.strip()
 
 
 def forge_config(path):
@@ -377,6 +415,7 @@ trap 'echo "flotilla trial crew · failed at line $LINENO: $BASH_COMMAND"; while
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$here/trial.env"
 echo "flotilla trial crew · ${TRIAL_UNTIL} · started"
+echo "flotilla trial crew · gh $(command -v gh || echo absent)"
 if [[ $TRIAL_UNTIL == landed ]]; then
   branch="$(git rev-parse --abbrev-ref HEAD)"
   date -u +%FT%TZ >trial-change.txt
@@ -426,6 +465,8 @@ class Trial:
         self.convoy = None
         self.forge = None
         self.real = forge_config(args.forge) if getattr(args, 'forge', None) else None
+        self.cache = image_cache_config(args.image_cache) if getattr(args, 'image_cache', None) else None
+        self.docker = docker_endpoint() if self.cache else None
 
     # -- processes -------------------------------------------------------
 
@@ -445,6 +486,10 @@ class Trial:
         for name in ('USER', 'LOGNAME', 'TERM'):
             if name in os.environ:
                 env[name] = os.environ[name]
+        if self.docker is not None:
+            directory, host = self.docker
+            env['PATH'] += f':{directory}'
+            env['DOCKER_HOST'] = host
         return env
 
     def run(self, args, *, timeout=60, check=True, cwd=None, operator=False):
@@ -540,7 +585,8 @@ class Trial:
         for directory in ('state', 'home', 'cleat'):
             (self.root / directory).mkdir()
         text, self.instance, self.image, self.local_root = provider_config(self.args.provider_config, self.root,
-                                                                           self.args.provider, self.args.image)
+                                                                           self.args.provider, self.args.image,
+                                                                           composed=self.cache is not None)
         (config / 'drydock.toml').write_text(text)
         # macOS has no /etc/machine-id; each trial is its own machine anyway.
         # The fleet's 20 GiB floor guards a host's own vessels; a trial vessel is throwaway.
@@ -676,12 +722,37 @@ class Trial:
         finally:
             header.unlink()
 
+    def declare_image_cache(self):
+        """The fleet's image cache, its credentials and grants, this machine as an amd64
+        builder, and a harness layer for the scripted crew, whose adapter ships none."""
+        cache = self.cache
+        registry = cache['repository'].split('/', 1)[0]
+        for name in ('trial-registry-push', 'trial-registry-pull'):
+            self.apply('CredentialSpec', name, {
+                'consumer': {'adapter': 'docker-registry', 'registry': registry, 'username': cache['username']},
+                'source': {'kind': 'file', 'path': cache['token']}, 'lifecycle': 'static', 'placement': {}})
+        for action in ('push', 'pull'):
+            self.apply('CredentialGrant', f'trial-registry-{action}', {
+                'selector': {'host_action': {'action': f'image-{action}', 'hosts': [self.host]}},
+                'credentials': [f'trial-registry-{action}']})
+        self.apply('FleetDesignation', 'fleet', {'project': TRIAL_PROJECT, 'image_cache': {
+            'repository': cache['repository'], 'pull_credential': 'trial-registry-pull', 'push_credential': 'trial-registry-push'}})
+        host, = [item for item in self.objects('hosts') if item['metadata']['name'] == self.host]
+        self.apply('Host', self.host, {**host['spec'], 'image_build_capacity': {
+            'kind': 'builder', 'architecture': 'amd64', 'slots': 1, 'reservation': {'cpu': 2, 'disk_bytes': 8 << 30}}})
+        self.apply('ImageLayer', 'installation-harness-fleet-canary-1.0.0', {
+            'name': 'harness-fleet-canary', 'version': '1.0.0', 'tier': 'agent_runtime', 'source': 'installation',
+            'fragment': 'FROM ${BASE}\n', 'provides': [f'harness:{SCRIPTED_ADAPTER}'], 'probe': 'command -v bash\n'})
+
     def place(self):
         # Placement as an operator gives it: a policy naming the provider instance,
-        # which the daemon turns into the FulfilmentKind of its name.
+        # which the daemon turns into the FulfilmentKind of its name. Without an
+        # image the vessel runs its composed one.
+        if self.cache is not None:
+            self.declare_image_cache()
+        cloud = {'size': CLOUD_SIZE, 'checkout': 'clone_in_vessel', 'env': {}, **({'image': self.image} if self.image else {})}
         self.apply('PlacementPolicy', 'trial', {
-            'pool': 'cleat', 'provider_requirements': {'instance': self.instance},
-            'cloud_sandbox_per_vessel': {'image': self.image, 'size': CLOUD_SIZE, 'checkout': 'clone_in_vessel', 'env': {}}})
+            'pool': 'cleat', 'provider_requirements': {'instance': self.instance}, 'cloud_sandbox_per_vessel': cloud})
         self.wait('fulfilment kind from the placement policy', lambda: [item for item in self.objects('fulfilmentkinds')
                                                                         if item['metadata']['name'] == 'trial'], timeout=120)
         self.apply('WorkflowTemplate', 'trial', workflow_spec(self.args.until))
@@ -750,6 +821,8 @@ class Trial:
         failed = [line.strip() for line in lines if '· failed' in line]
         if failed:
             raise TrialFailure(f'the crew reports: {failed[-1][-300:]}')
+        if self.cache is not None and not [line for line in lines if re.search(r'· gh /', line)]:
+            raise TrialFailure(f'the composed image puts no gh on the crew\'s PATH: {lines[-3:]!r}')
 
     def landed(self):
         if self.real:
@@ -1023,7 +1096,9 @@ def main(argv=None):
     trial = commands.add_parser('run', help='run one convoy through a throwaway flotilla')
     trial.add_argument('--provider-config', type=Path, help='a drydock.toml with [providers.NAME] tables (default: local)')
     trial.add_argument('--provider', help="the trial's provider instance, when --provider-config names more than one")
-    trial.add_argument('--image', help="the image the trial's placement names, pinned by digest (default: the provider table's)")
+    images = trial.add_mutually_exclusive_group()
+    images.add_argument('--image', help="the image the trial's placement names, pinned by digest (default: the provider table's)")
+    images.add_argument('--image-cache', type=Path, help='a registry (TOML) for the composed crew image; see image_cache_config')
     trial.add_argument('--forge', type=Path, help='a real Forgejo repository for the trial (TOML; default: the fake forge)')
     trial.add_argument('--guest-tools', type=Path,
                        help='an installed generation\'s share/flotilla/guest-tools to push instead of building them')

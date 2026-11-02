@@ -18,6 +18,10 @@ pub trait RegistryAuthMaterial: Send + Sync {
         text
     }
     fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder;
+    /// The username and secret, for a tool that takes them with each request rather than as a file.
+    fn basic(&self) -> Result<(String, String), String> {
+        Err("this registry credential has no username and secret".into())
+    }
 }
 
 /// A private, operation-owned tool configuration. Dropping its owner cleans up,
@@ -83,6 +87,12 @@ impl RegistryAuth {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| ())
             .map_err(|_| "registry auth already used for an operation".into())
+    }
+    /// The username and secret for `reference`, once: like [`Self::config`], this claims the handle.
+    pub fn basic(&self, reference: &str, action: HostImageAction) -> Result<(String, String), String> {
+        self.validate(reference, action)?;
+        self.claim()?;
+        self.material.basic()
     }
     pub fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         self.material.authorize(request)

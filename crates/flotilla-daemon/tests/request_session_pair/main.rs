@@ -3741,7 +3741,7 @@ async fn remote_docker_admission_refusal_scenario(provider_case: Option<usize>, 
                     flotilla_resources::FulfilmentGrant::network("scoped".to_string()),
                 ]))
                 .realisation(flotilla_resources::FulfilmentRealisation::DockerPerVessel {
-                    image: Some(flotilla_resources::DockerImageSource::Literal("crew:latest".into())),
+                    image: Some(flotilla_resources::PlacementImageSource::Literal("crew:latest".into())),
                 })
                 .build(),
         )

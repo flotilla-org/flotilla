@@ -2,7 +2,7 @@ use flotilla_resources::account_access::AccountRecords;
 use flotilla_resources::checkout_path::checkout_path_component;
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::Actuation;
-use flotilla_store::DockerImageSourceStoreExt;
+use flotilla_store::PlacementImageSourceStoreExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
     marker::PhantomData,
@@ -21,9 +21,9 @@ use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, LifecycleRead
 use flotilla_resources::{
     address::artifact_slot_record_name, canonicalize_repo_url, host_direct_environment_name, is_prepared_snapshot,
     repository_workspace_slugs, Artifact, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy,
-    CrewSource, CrewWorkPhase, DockerEnvironmentSpec, DockerImageSource, Environment, EnvironmentMount, EnvironmentMountMode,
-    EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, InputMeta,
-    LifecycleAuthority, OwnerReference, PlacementPolicy, Repository, RepositoryKey, RepositorySpec, Resource, ResourceError,
+    CrewSource, CrewWorkPhase, DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase,
+    EnvironmentSpec, FreshCloneCheckoutSpec, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, InputMeta, LifecycleAuthority,
+    OwnerReference, PlacementImageSource, PlacementPolicy, Repository, RepositoryKey, RepositorySpec, Resource, ResourceError,
     ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec,
     Vessel, VesselImage, VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
     CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION,
@@ -447,8 +447,8 @@ struct Placement {
 #[derive(Debug, Clone)]
 enum PlacementStrategy {
     HostDirect { host_ref: String, pool: String },
-    DockerHostCheckoutAndMount { host_ref: String, pool: String, image: Option<DockerImageSource> },
-    CloneInVessel { host_ref: String, pool: String, image: String, clone_path: String },
+    DockerHostCheckoutAndMount { host_ref: String, pool: String, image: Option<PlacementImageSource> },
+    CloneInVessel { host_ref: String, pool: String, image: Option<PlacementImageSource>, clone_path: String },
 }
 
 impl PlacementStrategy {
@@ -521,7 +521,8 @@ struct ImageStamp {
 /// The composed identity a placement froze at admission (ADR 0062).
 fn composed_image(placement: &Placement, digest: Option<String>) -> Option<VesselImage> {
     match &placement.kind.spec.realisation {
-        FulfilmentRealisation::DockerPerVessel { image: Some(DockerImageSource::Built { identity, .. }) } => {
+        FulfilmentRealisation::DockerPerVessel { image: Some(PlacementImageSource::Built { identity, .. }) }
+        | FulfilmentRealisation::CloudSandboxPerVessel { image: Some(PlacementImageSource::Built { identity, .. }), .. } => {
             Some(VesselImage { identity: identity.clone(), digest })
         }
         _ => None,
@@ -531,10 +532,10 @@ fn composed_image(placement: &Placement, digest: Option<String>) -> Option<Vesse
 /// The Environment's image fields: a composed image names its per-identity
 /// ImageBuild and receives the build's digest from the Environment reconciler;
 /// a literal image resolves now.
-fn environment_image(image: &Option<DockerImageSource>) -> Result<(String, Option<String>), String> {
+fn environment_image(image: &Option<PlacementImageSource>) -> Result<(String, Option<String>), String> {
     match image {
         None => Err("composed image was not frozen at admission; readmit the convoy".into()),
-        Some(DockerImageSource::Built { image_build_ref, .. }) => Ok((String::new(), Some(image_build_ref.clone()))),
+        Some(PlacementImageSource::Built { image_build_ref, .. }) => Ok((String::new(), Some(image_build_ref.clone()))),
         Some(image) => image.resolve().map(|image| (image, None)),
     }
 }
@@ -1685,12 +1686,12 @@ fn image_stamp(environment: &ResourceObject<Environment>, placement: &Placement)
     let local_image_id =
         status.local_image_id.clone().ok_or_else(|| format!("environment {} is missing its image digest", environment.metadata.name))?;
     // A composed environment provisioned from its build's digest.
-    let composed = environment
-        .spec
-        .docker
-        .as_ref()
-        .and_then(|docker| docker.image_build_ref.as_ref())
-        .and_then(|_| composed_image(placement, Some(image_ref.clone())));
+    let image_build_ref = match (&environment.spec.docker, &environment.spec.cloud_sandbox) {
+        (Some(docker), _) => docker.image_build_ref.as_ref(),
+        (None, Some(cloud)) => cloud.image_build_ref.as_ref(),
+        (None, None) => None,
+    };
+    let composed = image_build_ref.and_then(|_| composed_image(placement, Some(image_ref.clone())));
     Ok(ImageStamp { image_ref, local_image_id, registry_digest: status.registry_digest.clone(), composed })
 }
 
@@ -1826,7 +1827,7 @@ fn enabling_env(required_adapters: &BTreeSet<String>) -> BTreeMap<String, String
 
 fn cloud_environment_spec(
     placement: &Placement,
-    image: &str,
+    image: &Option<PlacementImageSource>,
     probe_needs: BTreeSet<flotilla_resources::CapabilityNeed>,
     required_adapters: &BTreeSet<String>,
 ) -> Result<EnvironmentSpec, String> {
@@ -1841,10 +1842,12 @@ fn cloud_environment_spec(
         FulfilmentRealisation::CloudSandboxPerVessel { size: Some(size), .. } => size.clone(),
         _ => realisation_settings::CLOUD_SANDBOX_SIZE,
     };
+    let (image, image_build_ref) = environment_image(image)?;
     Ok(EnvironmentSpec {
         provider_address: Some(address),
         cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
-            image: image.to_owned(),
+            image,
+            image_build_ref,
             size,
             lifetime_cap_seconds: None,
             probe_needs,
@@ -2353,7 +2356,7 @@ mod tests {
         let spec = FulfilmentKindSpec::builder()
             .host_ref(String::new())
             .pool("cleat".into())
-            .realisation(FulfilmentRealisation::CloudSandboxPerVessel { image: "image@sha256:digest".into(), size: None })
+            .realisation(FulfilmentRealisation::CloudSandboxPerVessel { image: Some("image@sha256:digest".into()), size: None })
             .build();
         let kind: flotilla_resources::ResourceObject<FulfilmentKind> = serde_json::from_value(serde_json::json!({
             "metadata": { "name": "cloud", "namespace": "flotilla", "resource_version": "1", "annotations": {}, "labels": {},
@@ -2363,11 +2366,12 @@ mod tests {
         .unwrap();
         let needs: BTreeSet<flotilla_resources::CapabilityNeed> = ["toolchain:rust".parse().unwrap()].into_iter().collect();
         let unfrozen = Placement { kind: kind.clone(), instance: None };
-        assert!(cloud_environment_spec(&unfrozen, "image@sha256:digest", needs.clone(), &BTreeSet::new())
+        assert!(cloud_environment_spec(&unfrozen, &Some("image@sha256:digest".into()), needs.clone(), &BTreeSet::new())
             .unwrap_err()
             .contains("names no provider instance"));
         let placement = Placement { kind, instance: Some("daytona".into()) };
-        let spec = cloud_environment_spec(&placement, "image@sha256:digest", needs.clone(), &BTreeSet::new()).expect("a typed spec");
+        let spec =
+            cloud_environment_spec(&placement, &Some("image@sha256:digest".into()), needs.clone(), &BTreeSet::new()).expect("a typed spec");
         assert!(spec.docker.is_none() && spec.host_direct.is_none());
         assert_eq!(spec.provider_address.unwrap().to_string(), "account:daytona/provider:daytona");
         assert_eq!(
@@ -2382,10 +2386,42 @@ mod tests {
         let policy_size = flotilla_resources::CloudSandboxSize { cpus: 4, memory_bytes: 8 << 30, disk_bytes: 10 << 30 };
         let mut sized_kind = placement.kind;
         sized_kind.spec.realisation =
-            FulfilmentRealisation::CloudSandboxPerVessel { image: "image@sha256:digest".into(), size: Some(policy_size.clone()) };
+            FulfilmentRealisation::CloudSandboxPerVessel { image: Some("image@sha256:digest".into()), size: Some(policy_size.clone()) };
         let sized = Placement { kind: sized_kind, instance: Some("daytona".into()) };
-        let spec = cloud_environment_spec(&sized, "image@sha256:digest", needs, &BTreeSet::new()).expect("a typed spec");
-        assert_eq!(spec.cloud_sandbox.unwrap().size, policy_size);
+        let spec =
+            cloud_environment_spec(&sized, &Some("image@sha256:digest".into()), needs.clone(), &BTreeSet::new()).expect("a typed spec");
+        let cloud = spec.cloud_sandbox.unwrap();
+        assert_eq!(cloud.size, policy_size);
+        assert_eq!((cloud.image.as_str(), cloud.image_build_ref), ("image@sha256:digest", None), "a literal resolves now");
+    }
+
+    // A composed cloud image names its ImageBuild and leaves the digest to the Environment
+    // reconciler; one admission never froze cannot provision.
+    #[test]
+    fn composed_cloud_environment_names_its_build() {
+        use super::{cloud_environment_spec, composed_image, Placement};
+        let built = flotilla_resources::PlacementImageSource::Built {
+            identity: "identity".into(),
+            image_build_ref: "image-identity-amd64-registry".into(),
+        };
+        let spec = FulfilmentKindSpec::builder()
+            .host_ref(String::new())
+            .pool("cleat".into())
+            .realisation(FulfilmentRealisation::CloudSandboxPerVessel { image: Some(built.clone()), size: None })
+            .build();
+        let kind: flotilla_resources::ResourceObject<FulfilmentKind> = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "cloud", "namespace": "flotilla", "resource_version": "1", "annotations": {}, "labels": {},
+                "creation_timestamp": "2026-10-23T00:00:00Z" },
+            "spec": spec
+        }))
+        .unwrap();
+        let placement = Placement { kind, instance: Some("daytona".into()) };
+        let cloud = cloud_environment_spec(&placement, &Some(built), BTreeSet::new(), &BTreeSet::new()).unwrap().cloud_sandbox.unwrap();
+        assert_eq!((cloud.image.as_str(), cloud.image_build_ref.as_deref()), ("", Some("image-identity-amd64-registry")));
+        assert_eq!(composed_image(&placement, None).map(|image| image.identity), Some("identity".to_string()));
+        assert!(cloud_environment_spec(&placement, &None, BTreeSet::new(), &BTreeSet::new())
+            .unwrap_err()
+            .contains("not frozen at admission"));
     }
 
     // A cloud vessel's discovery reads its adapters' enabling variables from the
@@ -2397,7 +2433,7 @@ mod tests {
         let spec = FulfilmentKindSpec::builder()
             .host_ref(String::new())
             .pool("cleat".into())
-            .realisation(FulfilmentRealisation::CloudSandboxPerVessel { image: "image@sha256:digest".into(), size: None })
+            .realisation(FulfilmentRealisation::CloudSandboxPerVessel { image: Some("image@sha256:digest".into()), size: None })
             .build();
         let kind: flotilla_resources::ResourceObject<FulfilmentKind> = serde_json::from_value(serde_json::json!({
             "metadata": { "name": "cloud", "namespace": "flotilla", "resource_version": "1", "annotations": {}, "labels": {},
@@ -2408,7 +2444,11 @@ mod tests {
         let placement = Placement { kind, instance: Some("daytona".into()) };
         let env = |adapters: &[&str]| {
             let adapters = adapters.iter().map(|adapter| adapter.to_string()).collect();
-            cloud_environment_spec(&placement, "image@sha256:digest", BTreeSet::new(), &adapters).unwrap().cloud_sandbox.unwrap().env
+            cloud_environment_spec(&placement, &Some("image@sha256:digest".into()), BTreeSet::new(), &adapters)
+                .unwrap()
+                .cloud_sandbox
+                .unwrap()
+                .env
         };
         assert_eq!(env(&["fleet-canary"]), BTreeMap::from([("FLOTILLA_FLEET_CANARY".to_string(), "1".to_string())]));
         assert!(env(&["claude"]).is_empty());

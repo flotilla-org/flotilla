@@ -1,11 +1,11 @@
 use crate::*;
 
 #[allow(async_fn_in_trait)]
-pub trait DockerImageSourceStoreExt: Sized {
+pub trait PlacementImageSourceStoreExt: Sized {
     /// A literal now; a composed image's once its ImageBuild is built.
     fn resolve(&self) -> Result<String, String>;
 }
-impl DockerImageSourceStoreExt for DockerImageSource {
+impl PlacementImageSourceStoreExt for PlacementImageSource {
     fn resolve(&self) -> Result<String, String> {
         match self {
             Self::Built { image_build_ref, .. } => Err(format!("composed image awaits image build `{image_build_ref}`")),

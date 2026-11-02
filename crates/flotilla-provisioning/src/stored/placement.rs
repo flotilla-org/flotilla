@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 
 use flotilla_resources::{
-    CloudSandboxSize, DockerImageSource, FulfilmentCostClass, FulfilmentGrant, FulfilmentKindSpec, FulfilmentRealisation,
+    CloudSandboxSize, FulfilmentCostClass, FulfilmentGrant, FulfilmentKindSpec, FulfilmentRealisation, PlacementImageSource,
 };
 use flotilla_schema::{KindRegistry, RegistryError, Stored};
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,15 @@ pub enum KindRealisation {
         sandbox_image: String,
         /// Absent in rows written before the policy's size was carried; remove this default one roll later.
         #[serde(default)]
+        size: Option<CloudSandboxSize>,
+    },
+    /// The vessel's composed image, frozen per vessel at admission.
+    CloudSandboxComposed {
+        size: Option<CloudSandboxSize>,
+    },
+    CloudSandboxBuilt {
+        identity: String,
+        image_build_ref: String,
         size: Option<CloudSandboxSize>,
     },
     /// The vessel's composed image, frozen per vessel at admission.
@@ -49,13 +58,22 @@ impl FulfilmentKindDefinition {
     pub fn new(spec: &FulfilmentKindSpec) -> Result<Self, String> {
         let realisation = match &spec.realisation {
             FulfilmentRealisation::CloudSandboxPerVessel { image, size } => {
-                KindRealisation::CloudSandboxPerVessel { sandbox_image: image.clone(), size: size.clone() }
+                let size = size.clone();
+                match image {
+                    None => KindRealisation::CloudSandboxComposed { size },
+                    Some(PlacementImageSource::Literal(image)) => {
+                        KindRealisation::CloudSandboxPerVessel { sandbox_image: image.clone(), size }
+                    }
+                    Some(PlacementImageSource::Built { identity, image_build_ref }) => {
+                        KindRealisation::CloudSandboxBuilt { identity: identity.clone(), image_build_ref: image_build_ref.clone(), size }
+                    }
+                }
             }
             FulfilmentRealisation::HostDirect => KindRealisation::HostDirect,
             FulfilmentRealisation::DockerPerVessel { image } => match image {
                 None => KindRealisation::DockerComposed,
-                Some(DockerImageSource::Literal(image)) => KindRealisation::DockerLiteral { image: image.clone() },
-                Some(DockerImageSource::Built { identity, image_build_ref }) => {
+                Some(PlacementImageSource::Literal(image)) => KindRealisation::DockerLiteral { image: image.clone() },
+                Some(PlacementImageSource::Built { identity, image_build_ref }) => {
                     KindRealisation::DockerBuilt { identity: identity.clone(), image_build_ref: image_build_ref.clone() }
                 }
             },
@@ -71,16 +89,24 @@ impl FulfilmentKindDefinition {
 
     pub fn spec(&self) -> FulfilmentKindSpec {
         let realisation = match &self.realisation {
-            KindRealisation::CloudSandboxPerVessel { sandbox_image, size } => {
-                FulfilmentRealisation::CloudSandboxPerVessel { image: sandbox_image.clone(), size: size.clone() }
+            KindRealisation::CloudSandboxPerVessel { sandbox_image, size } => FulfilmentRealisation::CloudSandboxPerVessel {
+                image: Some(PlacementImageSource::Literal(sandbox_image.clone())),
+                size: size.clone(),
+            },
+            KindRealisation::CloudSandboxComposed { size } => {
+                FulfilmentRealisation::CloudSandboxPerVessel { image: None, size: size.clone() }
             }
+            KindRealisation::CloudSandboxBuilt { identity, image_build_ref, size } => FulfilmentRealisation::CloudSandboxPerVessel {
+                image: Some(PlacementImageSource::Built { identity: identity.clone(), image_build_ref: image_build_ref.clone() }),
+                size: size.clone(),
+            },
             KindRealisation::HostDirect => FulfilmentRealisation::HostDirect,
             KindRealisation::DockerComposed => FulfilmentRealisation::DockerPerVessel { image: None },
             KindRealisation::DockerLiteral { image } => {
-                FulfilmentRealisation::DockerPerVessel { image: Some(DockerImageSource::Literal(image.clone())) }
+                FulfilmentRealisation::DockerPerVessel { image: Some(PlacementImageSource::Literal(image.clone())) }
             }
             KindRealisation::DockerBuilt { identity, image_build_ref } => FulfilmentRealisation::DockerPerVessel {
-                image: Some(DockerImageSource::Built { identity: identity.clone(), image_build_ref: image_build_ref.clone() }),
+                image: Some(PlacementImageSource::Built { identity: identity.clone(), image_build_ref: image_build_ref.clone() }),
             },
         };
         FulfilmentKindSpec {

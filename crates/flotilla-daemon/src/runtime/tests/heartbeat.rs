@@ -884,7 +884,7 @@ async fn capped_docker_kind_publishes_free_slots_from_the_hosts_vessels() {
                 .pool("cleat".to_string())
                 .grants(BTreeSet::from([FulfilmentGrant::platform("linux".to_string()), FulfilmentGrant::network("scoped".to_string())]))
                 .realisation(FulfilmentRealisation::DockerPerVessel {
-                    image: Some(flotilla_resources::DockerImageSource::Literal("crew:test".into())),
+                    image: Some(flotilla_resources::PlacementImageSource::Literal("crew:test".into())),
                 })
                 .build(),
         )

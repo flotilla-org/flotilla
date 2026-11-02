@@ -153,8 +153,22 @@ pub struct PrepareRequest {
     pub platform: Option<Platform>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<ImageRouteKind>,
+    /// Pull access to `image_digest`'s registry, which drydock sends nowhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_pull: Option<RegistryCredential>,
     pub image_digest: String,
     pub tools_digest: String,
+}
+/// Pull access to one registry. Its secret never reaches a `Debug` rendering.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegistryCredential {
+    pub username: String,
+    pub secret: String,
+}
+impl std::fmt::Debug for RegistryCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryCredential").field("username", &self.username).finish_non_exhaustive()
+    }
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Prepared {

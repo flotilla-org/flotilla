@@ -9,10 +9,10 @@ use flotilla_core::in_process::InProcessDaemon;
 
 use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_resources::{
-    canonical_host_id, definition_provenance::SEEDING_MANAGER, descriptive_repo_slug, is_prepared_snapshot, Clone, CloneSpec,
-    DockerImageSource, Environment, EnvironmentSpec, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host,
-    HostDirectEnvironmentSpec, HostSpec, InputMeta, PlacementPolicy, Platform, Repository, ResourceError, ResourceObject,
-    DOCKER_POLICY_NAME_PREFIX, HOST_DIRECT_NAME_PREFIX, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND,
+    canonical_host_id, definition_provenance::SEEDING_MANAGER, descriptive_repo_slug, is_prepared_snapshot, Clone, CloneSpec, Environment,
+    EnvironmentSpec, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostDirectEnvironmentSpec, HostSpec,
+    InputMeta, PlacementImageSource, PlacementPolicy, Platform, Repository, ResourceError, ResourceObject, DOCKER_POLICY_NAME_PREFIX,
+    HOST_DIRECT_NAME_PREFIX, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND,
 };
 use flotilla_store::ResourceBackend;
 use tracing::warn;
@@ -225,7 +225,7 @@ pub(super) async fn ensure_default_kinds(
             pool: profile.docker_pool.clone(),
             cost_class: Default::default(),
             grants: BTreeSet::from([FulfilmentGrant::platform(Platform::Linux.to_string()), FulfilmentGrant::network("scoped".to_owned())]),
-            realisation: FulfilmentRealisation::DockerPerVessel { image: Some(DockerImageSource::Literal(DEFAULT_DOCKER_IMAGE.into())) },
+            realisation: FulfilmentRealisation::DockerPerVessel { image: Some(PlacementImageSource::Literal(DEFAULT_DOCKER_IMAGE.into())) },
         };
         seed_kind(backend, namespace, &profile.docker_policy_name(), docker).await?;
     }

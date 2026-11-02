@@ -160,7 +160,7 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
         .host_ref(feta_host_ref.clone())
         .pool("passthrough".to_string())
         .realisation(if docker {
-            FulfilmentRealisation::DockerPerVessel { image: Some(flotilla_resources::DockerImageSource::Literal("test-image".into())) }
+            FulfilmentRealisation::DockerPerVessel { image: Some(flotilla_resources::PlacementImageSource::Literal("test-image".into())) }
         } else {
             FulfilmentRealisation::HostDirect
         })
