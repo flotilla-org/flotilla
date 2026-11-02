@@ -70,7 +70,8 @@ impl CommandRunner for Gh {
                 assert_eq!((aliases(query, "issue"), aliases(query, "pr")), (issues, pulls));
             }
         }
-        Ok(CommandOutput { stdout: response, stderr: String::new(), exit_code: Some(0) })
+        let succeeded = response.starts_with("HTTP/2 2") || response.starts_with("HTTP/2 304");
+        Ok(CommandOutput { stdout: response, stderr: String::new(), exit_code: Some(if succeeded { 0 } else { 1 }) })
     }
 
     async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
@@ -81,6 +82,10 @@ impl CommandRunner for Gh {
 fn ok(etag: Option<&str>, body: &Value) -> String {
     let etag = etag.map(|etag| format!("ETag: {etag}\r\n")).unwrap_or_default();
     format!("HTTP/2 200 OK\r\n{etag}\r\n{body}")
+}
+
+fn status(line: &str) -> String {
+    format!("HTTP/2 {line}\r\n\r\n{{\"message\": \"{line}\"}}")
 }
 
 fn not_modified() -> String {
@@ -201,6 +206,28 @@ async fn a_requested_item_the_lists_omit_is_read_whole_and_a_missing_one_is_unre
     let unread = pass.unread.iter().map(|(item, number, _)| (*item, *number)).collect::<Vec<_>>();
     assert_eq!(unread, [(FeedItem::Issue, 12), (FeedItem::ChangeRequest, 7)]);
     assert!(pass.cursor.issues.is_some_and(|cursor| cursor.seen.is_empty()), "an empty first list starts from the pass");
+    gh.finished();
+}
+
+#[tokio::test]
+async fn an_issue_github_lacks_deleted_or_moved_is_gone() {
+    let gh = Gh::new();
+    let feed = provider(&gh);
+    gh.rest(&[&list("open", "issues")], ok(Some("i1"), &json!([issue(1, "open")])));
+    gh.rest(&[&list("open", "pulls")], ok(None, &json!([])));
+    gh.rest(&[&list("open", "issues"), "-H", "If-None-Match: i1"], not_modified());
+    gh.rest(&["repos/team/repo/issues/3"], status("404 Not Found"));
+    gh.rest(&["repos/team/repo/issues/4"], status("410 Gone"));
+    let mut moved = issue(6, "open");
+    moved["repository_url"] = json!("https://api.github.com/repos/team/elsewhere");
+    gh.rest(&["repos/team/repo/issues/6"], ok(None, &moved));
+    gh.rest(&["repos/team/repo/issues/8"], status("502 Bad Gateway"));
+    gh.graphql(&[1], &[], json!({"issue1": issue_detail()}));
+    let request = FeedRequest { issues: BTreeSet::from([3, 8]), open_issues: Some(BTreeSet::from([1, 4, 6])), ..Default::default() };
+    let pass = feed.pass(&source(), &request).await.expect("pass");
+    assert_eq!(pass.gone, [(FeedItem::Issue, 3), (FeedItem::Issue, 4), (FeedItem::Issue, 6)]);
+    assert_eq!(pass.unread.iter().map(|(item, number, _)| (*item, *number)).collect::<Vec<_>>(), [(FeedItem::Issue, 8)]);
+    assert_eq!(pass.issues.iter().map(|issue| issue.number).collect::<Vec<_>>(), [1], "a held issue still open is not read directly");
     gh.finished();
 }
 

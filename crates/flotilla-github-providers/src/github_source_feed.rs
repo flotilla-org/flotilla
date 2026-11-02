@@ -1,6 +1,7 @@
 //! GitHub's whole-source feed: the REST issue and pull lists from the cursor, the REST
 //! representation of each requested issue the list did not report, and GraphQL batches for what
-//! the lists lack (links, issue types, checks, reviews and the pull requests' own fields).
+//! the lists lack (links, issue types, checks, reviews and the pull requests' own fields). An issue
+//! GitHub answers 404 or 410 for, or reports in another repository, is gone.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -123,10 +124,10 @@ fn feed_issue(item: &Value, detail: &Value) -> Result<FeedIssue, String> {
     })
 }
 
-fn feed_change_request(number: u64, detail: &Value) -> Result<FeedChangeRequest, String> {
+fn feed_change_request(number: u64, detail: &Value, now: DateTime<Utc>) -> Result<FeedChangeRequest, String> {
     let mut node = detail.clone();
     node["statusCheckRollup"] = detail["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"].clone();
-    let status = parse_gh_observation_value_with_crew_identity(&node, Utc::now(), DEFAULT_REVIEW_BOT_LOGIN, None, &[]);
+    let status = parse_gh_observation_value_with_crew_identity(&node, now, DEFAULT_REVIEW_BOT_LOGIN, None, &[]);
     Ok(FeedChangeRequest {
         number,
         title: detail["title"].as_str().ok_or("pull request lacks title")?.to_string(),
@@ -159,7 +160,36 @@ fn batch_query(scope: &str, issues: &[u64], pulls: &[u64]) -> Result<String, Str
     Ok(query)
 }
 
+/// A requested issue as GitHub's REST representation, or why it is not one.
+enum Direct {
+    Issue(Value),
+    Unread(String),
+    Gone,
+}
+
 impl GitHubIssueProvider {
+    async fn direct_issue(&self, scope: &str, number: u64) -> Direct {
+        let endpoint = format!("repos/{scope}/issues/{number}");
+        let label = flotilla_provider_runtime::gh_api_channel_label("GET", &endpoint);
+        let response = match self.api.get_classified_response(&endpoint, &self.host_root, &label).await {
+            Ok(response) => response,
+            Err(failure) if failure.response.as_ref().is_some_and(|response| matches!(response.status, 404 | 410)) => return Direct::Gone,
+            Err(failure) => return Direct::Unread(failure.error.to_string()),
+        };
+        let item = match serde_json::from_str::<Value>(&response.body) {
+            Ok(item) => item,
+            Err(error) => return Direct::Unread(error.to_string()),
+        };
+        let here = format!("/repos/{scope}");
+        if item["repository_url"].as_str().is_some_and(|url| !url.to_ascii_lowercase().ends_with(&here.to_ascii_lowercase())) {
+            Direct::Gone
+        } else if item.get("pull_request").is_some() {
+            Direct::Unread("is a pull request".into())
+        } else {
+            Direct::Issue(item)
+        }
+    }
+
     /// One GraphQL batch's nodes by alias; a refused or failed batch fails the pass.
     async fn batch(&self, scope: &str, issues: &[u64], pulls: &[u64]) -> Result<serde_json::Map<String, Value>, String> {
         let argument = format!("query={}", batch_query(scope, issues, pulls)?);
@@ -190,23 +220,25 @@ impl GitHubIssueProvider {
 impl SourceFeed for GitHubIssueProvider {
     async fn pass(&self, source: &IssueSource, request: &FeedRequest) -> Result<FeedPass, String> {
         let scope = source.scope.as_str();
-        let started = Utc::now();
+        let started = request.started;
         let mut issues = listed(self, scope, "issues", request.cursor.issues.as_ref()).await?;
         let pulls = listed(self, scope, "pulls", request.cursor.pulls.as_ref()).await?;
         let cursor = SourceCursor {
             issues: Some(advanced(request.cursor.issues.as_ref(), &issues, started)?),
             pulls: Some(advanced(request.cursor.pulls.as_ref(), &pulls, started)?),
         };
-        let mut unread = Vec::new();
+        let mut wanted_issues = request.issues.clone();
+        if let Some(held) = &request.open_issues {
+            let open = listed(self, scope, "issues", None).await?.iter().map(number).collect::<Result<BTreeSet<_>, _>>()?;
+            wanted_issues.extend(held.difference(&open));
+        }
+        let (mut unread, mut gone) = (Vec::new(), Vec::new());
         let listed_issues = issues.iter().map(number).collect::<Result<BTreeSet<_>, _>>()?;
-        for wanted in request.issues.difference(&listed_issues) {
-            let endpoint = format!("repos/{scope}/issues/{wanted}");
-            let item = flotilla_forge_github::gh_api_get_with_headers!(self.api, &endpoint, &self.host_root)
-                .and_then(|response| serde_json::from_str::<Value>(&response.body).map_err(|error| error.to_string()));
-            match item {
-                Ok(item) if item.get("pull_request").is_some() => unread.push((FeedItem::Issue, *wanted, "is a pull request".into())),
-                Ok(item) => issues.push(item),
-                Err(error) => unread.push((FeedItem::Issue, *wanted, error)),
+        for wanted in wanted_issues.difference(&listed_issues) {
+            match self.direct_issue(scope, *wanted).await {
+                Direct::Issue(item) => issues.push(item),
+                Direct::Unread(error) => unread.push((FeedItem::Issue, *wanted, error)),
+                Direct::Gone => gone.push((FeedItem::Issue, *wanted)),
             }
         }
         let issue_numbers = issues.iter().map(number).collect::<Result<Vec<_>, _>>()?;
@@ -225,7 +257,7 @@ impl SourceFeed for GitHubIssueProvider {
             (issue_at, pull_at) = (issue_at + issue_count, pull_at + pull_count);
         }
 
-        let mut feed = FeedPass { cursor, issues: Vec::new(), pulls: Vec::new(), unread };
+        let mut feed = FeedPass { cursor, issues: Vec::new(), pulls: Vec::new(), unread, gone };
         for item in &issues {
             let number = number(item)?;
             match nodes.get(&format!("issue{number}")).filter(|node| !node.is_null()) {
@@ -238,7 +270,7 @@ impl SourceFeed for GitHubIssueProvider {
         }
         for number in pull_numbers {
             match nodes.get(&format!("pr{number}")).filter(|node| !node.is_null()) {
-                Some(detail) => match feed_change_request(number, detail) {
+                Some(detail) => match feed_change_request(number, detail, started) {
                     Ok(pull) => feed.pulls.push(pull),
                     Err(error) => feed.unread.push((FeedItem::ChangeRequest, number, error)),
                 },

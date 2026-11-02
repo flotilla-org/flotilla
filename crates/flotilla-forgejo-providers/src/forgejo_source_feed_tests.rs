@@ -98,7 +98,7 @@ async fn forgejo_passes_list_from_the_cursor_and_read_only_what_changed() {
 }
 
 #[tokio::test]
-async fn a_requested_item_that_is_missing_or_a_pull_is_unread() {
+async fn a_requested_item_the_forge_lacks_is_gone_and_a_pull_asked_for_as_an_issue_is_unread() {
     let world = World::new();
     let new_pull =
         NewPull { head: "feature".into(), base: "main".into(), title: "Observer".into(), body: String::new(), user: None, draft: false };
@@ -106,6 +106,22 @@ async fn a_requested_item_that_is_missing_or_a_pull_is_unread() {
     let request = FeedRequest { issues: BTreeSet::from([pull, 40]), pulls: BTreeSet::from([41]), ..Default::default() };
     let pass = world.feed.pass(&world.source, &request).await.expect("pass");
     let unread = pass.unread.iter().map(|(item, number, _)| (*item, *number)).collect::<Vec<_>>();
-    assert_eq!(unread, [(FeedItem::Issue, pull), (FeedItem::Issue, 40), (FeedItem::ChangeRequest, 41)]);
+    assert_eq!(unread, [(FeedItem::Issue, pull)]);
+    assert_eq!(pass.gone, [(FeedItem::Issue, 40), (FeedItem::ChangeRequest, 41)]);
     assert_eq!(pass.pulls.iter().map(|pr| pr.number).collect::<Vec<_>>(), [pull]);
+}
+
+#[tokio::test]
+async fn a_held_open_issue_the_open_list_lacks_is_read_directly() {
+    let world = World::new();
+    let open = world.issue("Open work");
+    let closed = world.issue("Closed quietly");
+    world.tick();
+    world.fake.edit(&world.repo, closed, ItemEdit { state: Some(ItemState::Closed), ..ItemEdit::default() }).expect("close");
+    let first = world.feed.pass(&world.source, &FeedRequest::default()).await.expect("first pass");
+    let request = FeedRequest { cursor: first.cursor, open_issues: Some(BTreeSet::from([open, closed, 40])), ..Default::default() };
+    let pass = world.feed.pass(&world.source, &request).await.expect("pass");
+    assert_eq!(pass.issues.iter().map(|issue| (issue.number, issue.state)).collect::<Vec<_>>(), [(closed, ObservedIssueState::Closed)]);
+    assert_eq!(pass.gone, [(FeedItem::Issue, 40)]);
+    world.assert_no_refusals();
 }

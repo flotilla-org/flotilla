@@ -84,12 +84,12 @@ fn cursor(seconds: i64) -> SourceCursor {
 }
 
 fn feed(issues: Vec<FeedIssue>, pulls: Vec<FeedChangeRequest>) -> FeedPass {
-    FeedPass { cursor: cursor(0), issues, pulls, unread: vec![] }
+    FeedPass { cursor: cursor(0), issues, pulls, unread: vec![], gone: vec![] }
 }
 
 /// This home's records: written only when a value changes, each write counted as one log entry.
 struct Records {
-    clock: Arc<VirtualClock>,
+    clock: Arc<dyn Clock>,
     issues: Mutex<BTreeMap<String, (IssueRecord, Timestamp)>>,
     pulls: Mutex<BTreeMap<String, (ChangeRequestRecord, Timestamp)>>,
     entries: Mutex<usize>,
@@ -97,7 +97,7 @@ struct Records {
 }
 
 impl Records {
-    fn new(clock: Arc<VirtualClock>) -> Arc<Self> {
+    fn new(clock: Arc<dyn Clock>) -> Arc<Self> {
         Arc::new(Self { clock, issues: Mutex::default(), pulls: Mutex::default(), entries: Mutex::default(), whole: Mutex::default() })
     }
 
@@ -216,8 +216,8 @@ impl SourceStates for States {
     }
 }
 
-/// The forge's feed for the test source: each pass answers with the next scripted result and
-/// records what it was asked for.
+/// The forge's feed for the test source: each pass answers with the next scripted result, or
+/// reports nothing once the script is spent, and records what it was asked for.
 #[derive(Default)]
 struct Feed {
     script: Mutex<VecDeque<Result<FeedPass, String>>>,
@@ -232,6 +232,15 @@ impl Feed {
     fn last_request(&self) -> FeedRequest {
         self.requests.lock().expect("requests").last().cloned().expect("a pass was made")
     }
+
+    fn requests(&self) -> Vec<FeedRequest> {
+        self.requests.lock().expect("requests").clone()
+    }
+
+    /// Each pass's start, in seconds after `at(0)`.
+    fn starts(&self) -> Vec<i64> {
+        self.requests().iter().map(|request| (request.started - at(0)).num_seconds()).collect()
+    }
 }
 
 #[async_trait]
@@ -239,7 +248,18 @@ impl SourceFeed for Feed {
     async fn pass(&self, source: &IssueSource, request: &FeedRequest) -> Result<FeedPass, String> {
         assert_eq!(source, &feed_source());
         self.requests.lock().expect("requests").push(request.clone());
-        self.script.lock().expect("script").pop_front().expect("a scripted pass")
+        self.script.lock().expect("script").pop_front().unwrap_or_else(|| Ok(feed(vec![], vec![])))
+    }
+}
+
+/// The observer's clock in tests of `run`: `at(0)` plus the paused tokio time elapsed.
+struct TokioClock {
+    start: tokio::time::Instant,
+}
+
+impl Clock for TokioClock {
+    fn now(&self) -> DateTime<Utc> {
+        at(0) + chrono::Duration::from_std(self.start.elapsed()).expect("elapsed")
     }
 }
 
@@ -272,13 +292,26 @@ impl IssueProvider for Provider {
     }
 }
 
-struct Queries(Arc<Feed>);
+struct Queries {
+    feed: Arc<Feed>,
+    /// Whether the local provider lookup fails.
+    refuse: std::sync::atomic::AtomicBool,
+}
+
+impl Queries {
+    fn new(feed: &Arc<Feed>) -> Arc<Self> {
+        Arc::new(Self { feed: Arc::clone(feed), refuse: Default::default() })
+    }
+}
 
 #[async_trait]
 impl IssueQueryPort for Queries {
     async fn provider_for_source(&self, source: &IssueSource) -> Result<Arc<dyn IssueProvider>, String> {
         assert_eq!(source, &feed_source());
-        Ok(Arc::new(Provider(Arc::clone(&self.0))))
+        if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("credentials unreadable".into());
+        }
+        Ok(Arc::new(Provider(Arc::clone(&self.feed))))
     }
 }
 
@@ -288,32 +321,43 @@ struct World {
     records: Arc<Records>,
     states: Arc<States>,
     feed: Arc<Feed>,
+    queries: Arc<Queries>,
     observer: SourceObserver,
 }
 
 impl World {
     async fn new() -> Self {
+        let clock = Arc::new(VirtualClock::new(at(0)));
+        Self::with_clock(clock.clone(), clock).await
+    }
+
+    /// A world whose observer's clock follows the paused tokio time, for tests of `run`.
+    async fn running() -> Self {
+        Self::with_clock(Arc::new(VirtualClock::new(at(0))), Arc::new(TokioClock { start: tokio::time::Instant::now() })).await
+    }
+
+    async fn with_clock(clock: Arc<VirtualClock>, observer_clock: Arc<dyn Clock>) -> Self {
         let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("owner"));
         let spec = ProjectSpec::builder()
             .display_name("Shared".into())
             .issue_source_bindings(vec![IssueSourceBindingSpec::builder().source(feed_source()).alias("shared".into()).build()])
             .build();
         backend.using::<Project>(NS).create(&InputMeta::builder().name("shared".into()).build(), &spec).await.expect("project");
-        let clock = Arc::new(VirtualClock::new(at(0)));
-        let records = Records::new(Arc::clone(&clock));
+        let records = Records::new(Arc::clone(&observer_clock));
         let states = Arc::new(States::default());
         let feed = Arc::new(Feed::default());
+        let queries = Queries::new(&feed);
         let observer = SourceObserver::new(
             SourceObserverParts::builder()
                 .backend(backend.clone())
                 .namespace(NS.into())
-                .queries(Arc::new(Queries(Arc::clone(&feed))))
+                .queries(queries.clone())
                 .records(records.clone())
                 .states(states.clone())
-                .clock(clock.clone())
+                .clock(observer_clock)
                 .build(),
         );
-        Self { backend, clock, records, states, feed, observer }
+        Self { backend, clock, records, states, feed, queries, observer }
     }
 
     async fn source(&self) -> Observed {
@@ -322,10 +366,23 @@ impl World {
         source.clone()
     }
 
-    async fn pass(&self, pass: Result<FeedPass, String>) -> Result<(), String> {
+    async fn pass(&self, pass: Result<FeedPass, String>) -> Result<(), PassError> {
         self.feed.next(pass);
+        self.pass_asking(Asks { pending: true, ..Asks::default() }).await
+    }
+
+    async fn pass_asking(&self, asks: Asks) -> Result<(), PassError> {
         let source = self.source().await;
-        self.observer.pass(&source).await.map(|_| ())
+        self.observer.pass(&source, &asks).await.map(|_| ())
+    }
+
+    async fn address(&self, kind: Kind, number: u64) -> Address {
+        self.source().await.repository.child(kind, &number.to_string()).expect("address")
+    }
+
+    fn run(&self) -> tokio::task::JoinHandle<()> {
+        let observer = self.observer.clone();
+        tokio::spawn(async move { observer.run().await })
     }
 
     async fn convoy_refers_to(&self, name: &str, kind: SubjectKind, number: u64) {
@@ -349,11 +406,12 @@ async fn the_preferred_observer_observes_its_sources_whole() {
     let world = World::new().await;
     let source = world.source().await;
     assert_eq!((source.service.as_str(), source.scope.as_str()), ("github.com", "org/shared"));
+    assert!(source.relayed, "the relay hints GitHub change requests");
     let elsewhere = SourceObserver::new(
         SourceObserverParts::builder()
             .backend(ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("other")))
             .namespace(NS.into())
-            .queries(Arc::new(Queries(Arc::clone(&world.feed))))
+            .queries(Queries::new(&world.feed))
             .records(world.records.clone())
             .states(world.states.clone())
             .clock(world.clock.clone())
@@ -522,8 +580,10 @@ async fn file_states_survive_a_restart() {
         scope: "org/shared".into(),
         cursor: cursor(5),
         retry_issues: BTreeSet::from([3]),
-        retry_pulls: BTreeSet::new(),
         failing: true,
+        gone_issues: BTreeSet::from([4]),
+        inventoried_at: Some(at(5)),
+        ..SourceState::default()
     };
     FileSourceStates::new(directory.path().into()).save(&state).expect("save");
     let reopened = FileSourceStates::new(directory.path().into());
@@ -545,4 +605,97 @@ async fn an_undecodable_state_is_rebuilt_rather_than_fatal() {
     assert!(states.sources().expect("sources").is_empty());
     let partial: SourceState = serde_json::from_str(r#"{"service": "github.com", "scope": "org/shared"}"#).expect("missing fields default");
     assert_eq!(partial.cursor, SourceCursor::default());
+}
+
+#[tokio::test]
+async fn a_failed_local_read_writes_nothing_and_marks_nothing_failing() {
+    let world = World::new().await;
+    world.pass(Ok(feed(vec![issue(1, ObservedIssueState::Open)], vec![pull(5, ObservedChecks::Pass)]))).await.expect("pass");
+    let (entries, saves) = (world.records.entries(), *world.states.saves.lock().expect("saves"));
+    world.queries.refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+    let requests = world.feed.requests().len();
+    assert!(matches!(world.pass_asking(Asks::default()).await, Err(PassError::Local(_))));
+    assert_eq!(world.feed.requests().len(), requests, "the forge was not called");
+    assert_eq!((world.records.entries(), *world.states.saves.lock().expect("saves")), (entries, saves));
+    assert_eq!(world.records.issue(1).expect("issue").failing_since, None);
+    assert!(!world.states.load("github.com", "org/shared").expect("load").expect("state").failing);
+}
+
+#[tokio::test]
+async fn a_gone_item_is_removed_and_not_asked_for_again_unless_hinted() {
+    let world = World::new().await;
+    world.convoy_refers_to("worker", SubjectKind::Issue, 4).await;
+    world.pass(Ok(feed(vec![issue(1, ObservedIssueState::Open), issue(4, ObservedIssueState::Open)], vec![]))).await.expect("pass");
+    world.pass(Ok(FeedPass { gone: vec![(FeedItem::Issue, 4)], ..feed(vec![], vec![]) })).await.expect("gone");
+    assert!(world.records.issue(4).is_none(), "a deleted issue is not held as open");
+    world.pass(Ok(feed(vec![], vec![]))).await.expect("pass");
+    assert!(world.feed.last_request().issues.is_empty(), "a gone item the convoy still names is not read again");
+    world.pass_asking(Asks { issues: BTreeSet::from([4]), ..Asks::default() }).await.expect("hinted");
+    assert_eq!(world.feed.last_request().issues, BTreeSet::from([4]), "a hint reads it again");
+}
+
+#[tokio::test]
+async fn held_open_issues_are_checked_against_the_open_list_daily() {
+    let world = World::new().await;
+    world.pass(Ok(feed(vec![issue(1, ObservedIssueState::Open), issue(2, ObservedIssueState::Closed)], vec![]))).await.expect("pass");
+    assert_eq!(world.feed.last_request().open_issues, Some(BTreeSet::new()), "the first pass checks the inventory");
+    world.clock.advance(chrono::Duration::hours(23));
+    world.pass(Ok(feed(vec![], vec![]))).await.expect("pass");
+    assert_eq!(world.feed.last_request().open_issues, None);
+    world.clock.advance(chrono::Duration::hours(1));
+    world.pass(Ok(feed(vec![], vec![]))).await.expect("pass");
+    assert_eq!(world.feed.last_request().open_issues, Some(BTreeSet::from([1])), "only open issues are checked");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_scheduler_passes_each_source_on_its_cadence() {
+    let world = World::running().await;
+    world.feed.next(Ok(feed(vec![], vec![pull(5, ObservedChecks::Pending)])));
+    let running = world.run();
+    tokio::time::sleep(Duration::from_secs(40)).await;
+    assert_eq!(world.feed.starts(), [0, 15, 30], "pending checks are read every fifteen seconds");
+    assert!(world.feed.requests()[1..].iter().all(|request| request.pulls == BTreeSet::from([5])));
+    world.feed.next(Ok(feed(vec![], vec![pull(5, ObservedChecks::Pass)])));
+    tokio::time::sleep(Duration::from_secs(160)).await;
+    assert_eq!(world.feed.starts(), [0, 15, 30, 45, 105, 165], "then every minute");
+    running.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hint_passes_its_source_early_and_reads_the_hinted_item() {
+    let world = World::running().await;
+    let running = world.run();
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    world.observer.hint(&world.address(Kind::ChangeRequest, 8).await);
+    world.observer.hint(&world.address(Kind::Issue, 9).await);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(world.feed.starts(), [0, 10]);
+    let request = world.feed.last_request();
+    assert_eq!((request.issues, request.pulls), (BTreeSet::from([9]), BTreeSet::from([8])));
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(world.feed.starts(), [0, 10, 70], "the cadence resumes from the hinted pass");
+    assert!(world.feed.last_request().pulls.is_empty(), "a hinted item read once is not asked for again");
+    running.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_healthy_relay_slows_only_pending_check_reads_and_a_resync_passes_every_source() {
+    let world = World::running().await;
+    world.observer.set_relay_healthy(true);
+    world.feed.next(Ok(feed(vec![issue(1, ObservedIssueState::Open)], vec![pull(5, ObservedChecks::Pending)])));
+    let running = world.run();
+    tokio::time::sleep(Duration::from_secs(130)).await;
+    assert_eq!(world.feed.starts(), [0, 60, 120], "issue edits keep the minute cadence");
+    assert!(world.feed.requests()[1..].iter().all(|request| request.pulls.is_empty()), "the relay hints check changes");
+
+    world.observer.wake_all();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(world.feed.starts(), [0, 60, 120, 130], "a resync passes the source now");
+    assert_eq!(world.feed.last_request().pulls, BTreeSet::from([5]), "and reads pending checks again");
+
+    tokio::time::sleep(Duration::from_secs(900)).await;
+    let requests = world.feed.requests();
+    let pending = requests.iter().filter(|request| request.pulls.contains(&5)).map(|request| (request.started - at(0)).num_seconds());
+    assert_eq!(pending.collect::<Vec<_>>(), [130, 1030], "pending checks are read again every fifteen minutes");
+    running.abort();
 }

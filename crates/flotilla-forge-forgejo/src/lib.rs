@@ -135,6 +135,20 @@ impl ForgejoClient {
         serde_json::from_str(&body).map(|value| (value, has_more)).map_err(|error| error.to_string())
     }
 
+    /// One item, or none when the forge says it is not there (404) or was deleted (410).
+    pub async fn get_item(&self, path: &str) -> Result<Option<serde_json::Value>, String> {
+        let response = forge_http_execute!(self, self.issue_request(path, &[])?)?;
+        let status = response.status();
+        if matches!(status, reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE) {
+            return Ok(None);
+        }
+        let body = String::from_utf8_lossy(response.body()).to_string();
+        if !status.is_success() {
+            return Err(format!("Forgejo HTTP {status}: {body}"));
+        }
+        serde_json::from_str(&body).map(Some).map_err(|error| error.to_string())
+    }
+
     pub fn repository_request(
         &self,
         repo_slug: &str,

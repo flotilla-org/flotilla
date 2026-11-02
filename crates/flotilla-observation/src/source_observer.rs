@@ -1,6 +1,7 @@
 //! Whole-source forge observation: each source's preferred observer reads the source's change
 //! feed and writes one Issue record per issue and one ChangeRequest record per change request,
-//! only when a value changes. No other host calls the forge for that source.
+//! only when a value changes. Until the subject observers are removed, they still read the items
+//! convoys bind, from whichever host binds them.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -15,15 +16,15 @@ use std::{
 use chrono::{DateTime, Utc};
 use flotilla_address::{Address, Kind};
 use flotilla_issue_tracker::{
-    source_feed::{Fact, FeedChangeRequest, FeedIssue, FeedItem, FeedRequest, SourceCursor},
+    source_feed::{Fact, FeedChangeRequest, FeedIssue, FeedItem, FeedPass, FeedRequest, SourceCursor},
     IssueProvider,
 };
 use flotilla_protocol::{IssueRef, IssueSource, ReferenceContext};
 use flotilla_resources::{
-    address::{issue_reference_address, record_name, stored_repository_address, stored_service_scope, subject_address},
+    address::{issue_reference_address, record_name, stored_repository_address, stored_service_scope, subject_address, GITHUB_FORGE_ID},
     convoy_subject_rows,
-    forge_observation::{ChangeRequestRecord, IssueRecord, IssueState, IssueSubject, ObservedKind, SourceRecords},
-    Clock, Convoy, Forge, ForgeSpec,
+    forge_observation::{ChangeRequestRecord, Held, IssueRecord, IssueState, IssueSubject, ObservedKind, SourceRecords},
+    Clock, Convoy, Forge, ForgeKind, ForgeSpec,
 };
 use flotilla_schema::Timestamp;
 use flotilla_store::ResourceBackend;
@@ -38,12 +39,16 @@ use crate::sources::IssueQueryPort;
 const CLOSED_RETENTION: chrono::Duration = chrono::Duration::days(30);
 /// How often a source's closed items are considered for sweeping.
 const SWEEP_INTERVAL: chrono::Duration = chrono::Duration::hours(1);
+/// How often the held open issues are checked against the source's open list, which is how an
+/// issue deleted or moved elsewhere is found.
+const INVENTORY_INTERVAL: chrono::Duration = chrono::Duration::days(1);
 
 #[derive(Debug, Clone, Copy)]
 pub struct SourceCadence {
     pub state: Duration,
     pub checks_pending: Duration,
-    /// The longest wait while the relay delivers hints, which prompt early passes.
+    /// How often change requests with pending checks are read again while the relay, which hints
+    /// GitHub change requests, is healthy.
     pub relay_healthy: Duration,
 }
 
@@ -66,6 +71,12 @@ pub struct SourceState {
     pub retry_pulls: BTreeSet<u64>,
     /// Whether this observer marked the source's records failing.
     pub failing: bool,
+    /// Items the forge said are no longer in the source, not asked for again while still referred
+    /// to unless hinted.
+    pub gone_issues: BTreeSet<u64>,
+    pub gone_pulls: BTreeSet<u64>,
+    /// When the held open issues were last checked against the source's open list.
+    pub inventoried_at: Option<DateTime<Utc>>,
 }
 
 /// The observer's durable state for each source it observes.
@@ -161,6 +172,8 @@ struct Observed {
     scope: String,
     feed: IssueSource,
     repository: Address,
+    /// Whether the relay hints this source's change requests.
+    relayed: bool,
 }
 
 impl Observed {
@@ -324,6 +337,49 @@ struct Passed {
     pending: bool,
 }
 
+/// What a pass asks for beyond what the source's lists report.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Asks {
+    issues: BTreeSet<u64>,
+    pulls: BTreeSet<u64>,
+    /// Whether change requests with pending checks are read again.
+    pending: bool,
+}
+
+impl Asks {
+    fn extend(&mut self, other: Asks) {
+        self.issues.extend(other.issues);
+        self.pulls.extend(other.pulls);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.issues.is_empty() && self.pulls.is_empty()
+    }
+}
+
+/// Hinted items by repository, and whether every source is due.
+#[derive(Default)]
+struct Hints {
+    items: BTreeMap<Address, Asks>,
+    all: bool,
+}
+
+/// Why a pass did not complete: a local read, which writes nothing, or the forge.
+#[derive(Debug)]
+enum PassError {
+    Local(String),
+    Forge(String),
+}
+
+impl std::fmt::Display for PassError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local(error) => write!(formatter, "{error}"),
+            Self::Forge(error) => write!(formatter, "forge: {error}"),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SourceObserver {
     inner: Arc<Inner>,
@@ -338,7 +394,7 @@ struct Inner {
     clock: Arc<dyn Clock>,
     cadence: SourceCadence,
     wake: Notify,
-    hinted: StdMutex<BTreeSet<Address>>,
+    hints: StdMutex<Hints>,
     relay_healthy: AtomicBool,
     /// Providers held across passes, so a provider's conditional-request cache survives.
     providers: tokio::sync::Mutex<BTreeMap<(String, String), Arc<dyn IssueProvider>>>,
@@ -372,23 +428,31 @@ impl SourceObserver {
                 clock: parts.clock,
                 cadence: parts.cadence,
                 wake: Notify::new(),
-                hinted: StdMutex::default(),
+                hints: StdMutex::default(),
                 relay_healthy: AtomicBool::new(false),
                 providers: Default::default(),
             }),
         }
     }
 
-    /// Prompts an early pass of the source holding the issue or change request `address`.
+    /// Prompts an early pass of the source holding the issue or change request `address`, which
+    /// reads that item again.
     pub fn hint(&self, address: &Address) {
-        if let Some(repository) = address.parent().filter(|_| matches!(address.kind(), Kind::Issue | Kind::ChangeRequest)) {
-            locked(&self.inner.hinted).insert(repository);
-            self.inner.wake.notify_one();
-        }
+        let (Some(repository), Some(number)) = (address.parent(), address.number()) else { return };
+        let mut hints = locked(&self.inner.hints);
+        let asks = hints.items.entry(repository).or_default();
+        match address.kind() {
+            Kind::Issue => asks.issues.insert(number),
+            Kind::ChangeRequest => asks.pulls.insert(number),
+            _ => return,
+        };
+        drop(hints);
+        self.inner.wake.notify_one();
     }
 
-    /// Prompts an early pass of every source.
+    /// Prompts an early pass of every source, reading pending checks again.
     pub fn wake_all(&self) {
+        locked(&self.inner.hints).all = true;
         self.inner.wake.notify_one();
     }
 
@@ -398,17 +462,16 @@ impl SourceObserver {
 
     /// Observes this host's sources until dropped.
     pub async fn run(&self) {
-        let mut due = BTreeMap::<(String, String), tokio::time::Instant>::new();
+        let cadence = self.inner.cadence;
+        let mut due = BTreeMap::<(String, String), DateTime<Utc>>::new();
+        let mut pending_read = BTreeMap::<(String, String), DateTime<Utc>>::new();
         let mut swept = BTreeMap::<(String, String), DateTime<Utc>>::new();
         loop {
             let owned = match self.owned().await {
                 Ok(owned) => owned,
                 Err(error) => {
                     tracing::warn!(%error, "forge source ownership unavailable");
-                    tokio::select! {
-                        _ = tokio::time::sleep(self.inner.cadence.state) => {}
-                        _ = self.inner.wake.notified() => {}
-                    }
+                    self.wait(self.inner.clock.now() + chrono_duration(cadence.state)).await;
                     continue;
                 }
             };
@@ -419,24 +482,32 @@ impl SourceObserver {
                 tracing::warn!(%error, "release forge sources this host no longer observes");
             }
             due.retain(|key, _| owned.iter().any(|source| source.key() == *key));
-            let hinted = std::mem::take(&mut *locked(&self.inner.hinted));
-            let now = tokio::time::Instant::now();
+            let (mut hinted, all) = {
+                let mut hints = locked(&self.inner.hints);
+                (std::mem::take(&mut hints.items), std::mem::take(&mut hints.all))
+            };
             for source in &owned {
                 let key = source.key();
-                if due.get(&key).is_some_and(|at| *at > now) && !hinted.contains(&source.repository) {
+                let mut asks = hinted.remove(&source.repository).unwrap_or_default();
+                let now = self.inner.clock.now();
+                if !all && asks.is_empty() && due.get(&key).is_some_and(|at| *at > now) {
                     continue;
                 }
-                let passed = self.pass(source).await;
-                let delay = match passed {
-                    Ok(Passed { pending: true }) => self.inner.cadence.checks_pending,
-                    Ok(Passed { pending: false }) | Err(_) => self.inner.cadence.state,
+                let floor = source.relayed && self.inner.relay_healthy.load(Ordering::SeqCst);
+                asks.pending = all || !floor || pending_read.get(&key).is_none_or(|at| now - *at >= chrono_duration(cadence.relay_healthy));
+                let passed = self.pass(source, &asks).await;
+                let delay = match &passed {
+                    Ok(Passed { pending: true }) if !floor => cadence.checks_pending,
+                    _ => cadence.state,
                 };
-                let delay =
-                    if self.inner.relay_healthy.load(Ordering::SeqCst) { delay.max(self.inner.cadence.relay_healthy) } else { delay };
-                due.insert(key.clone(), tokio::time::Instant::now() + delay);
+                due.insert(key.clone(), self.inner.clock.now() + chrono_duration(delay));
                 if let Err(error) = passed {
                     tracing::warn!(service = %source.service, scope = %source.scope, %error, "forge source pass failed");
+                    locked(&self.inner.hints).items.entry(source.repository.clone()).or_default().extend(asks);
                     continue;
+                }
+                if asks.pending {
+                    pending_read.insert(key.clone(), now);
                 }
                 let now = self.inner.clock.now();
                 if swept.get(&key).is_none_or(|at| now.signed_duration_since(*at) >= SWEEP_INTERVAL) {
@@ -448,11 +519,17 @@ impl SourceObserver {
                     }
                 }
             }
-            let next = due.values().min().copied().unwrap_or_else(|| tokio::time::Instant::now() + self.inner.cadence.state);
-            tokio::select! {
-                _ = tokio::time::sleep_until(next) => {}
-                _ = self.inner.wake.notified() => {}
-            }
+            let next = due.values().min().copied().unwrap_or_else(|| self.inner.clock.now() + chrono_duration(cadence.state));
+            self.wait(next).await;
+        }
+    }
+
+    /// Waits until `until` by the injected clock, or until a hint or a resync arrives.
+    async fn wait(&self, until: DateTime<Utc>) {
+        let wait = (until - self.inner.clock.now()).to_std().unwrap_or(Duration::ZERO);
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = self.inner.wake.notified() => {}
         }
     }
 
@@ -463,8 +540,8 @@ impl SourceObserver {
         self.release_unowned(&owned).await?;
         let mut first = None;
         for source in &owned {
-            if let Err(error) = self.pass(source).await {
-                first.get_or_insert(error);
+            if let Err(error) = self.pass(source, &Asks { pending: true, ..Asks::default() }).await {
+                first.get_or_insert(error.to_string());
             }
         }
         first.map_or(Ok(()), Err)
@@ -492,7 +569,10 @@ impl SourceObserver {
                 }
             };
             let Some((service, scope)) = stored_service_scope(&repository) else { continue };
-            owned.insert(Observed { service, scope, feed, repository });
+            let forge = repository.get(Kind::Forge).unwrap_or_default();
+            let relayed =
+                forge == GITHUB_FORGE_ID || declarations.forges.iter().any(|spec| spec.forge_id == forge && spec.kind == ForgeKind::Github);
+            owned.insert(Observed { service, scope, feed, repository, relayed });
         }
         Ok(owned.into_iter().collect())
     }
@@ -554,96 +634,154 @@ impl SourceObserver {
     }
 
     /// One pass over `source`: what changed since its cursor, the items convoys and open issues
-    /// refer to that are not held, the items whose last read failed, and the change requests whose
-    /// checks are pending.
-    async fn pass(&self, source: &Observed) -> Result<Passed, String> {
+    /// refer to that are not held, the items whose last read failed, the hinted items, and the
+    /// change requests whose checks are pending. Only a failed forge read marks records failing; a
+    /// failed local read writes nothing.
+    async fn pass(&self, source: &Observed, asks: &Asks) -> Result<Passed, PassError> {
         let records = &self.inner.records;
         records.observe_whole(&source.service, &source.scope);
-        let saved = self.inner.states.load(&source.service, &source.scope)?;
+        let local = PassError::Local;
+        let saved = self.inner.states.load(&source.service, &source.scope).map_err(local)?;
         let mut state = saved.clone().unwrap_or_else(|| SourceState {
             service: source.service.clone(),
             scope: source.scope.clone(),
             ..SourceState::default()
         });
-        let issues = records.issues(&source.service, &source.scope).await?;
-        let pulls = records.change_requests(&source.service, &source.scope).await?;
+        let issues = records.issues(&source.service, &source.scope).await.map_err(local)?;
+        let pulls = records.change_requests(&source.service, &source.scope).await.map_err(local)?;
         let held_issues = issues.iter().map(|held| (held.record.number, held)).collect::<BTreeMap<_, _>>();
         let held_pulls = pulls.iter().map(|held| (held.record.number, held)).collect::<BTreeMap<_, _>>();
+        let forges = self.forges().await.map_err(local)?;
+        let referenced = self.referenced(&forges).await.map_err(local)?;
 
-        let result = async {
-            let forges = self.forges().await?;
-            let referenced = self.referenced(&forges).await?;
-            let (mut want_issues, mut want_pulls) = referenced.of(&source.repository);
-            want_issues.extend(issues.iter().filter(|held| held.record.state == Some(IssueState::Open)).flat_map(|held| {
-                let parent = (held.record.parent_service.as_ref(), held.record.parent_scope.as_ref(), held.record.parent_number);
-                let parent = match parent {
-                    (Some(service), Some(scope), Some(number)) => {
-                        Some(IssueSubject { service: service.clone(), scope: scope.clone(), number })
-                    }
-                    _ => None,
-                };
-                held.record
-                    .blocked_by
-                    .iter()
-                    .cloned()
-                    .chain(parent)
-                    .filter(|link| link.service == source.service && link.scope == source.scope)
-                    .map(|link| link.number)
-            }));
-            want_issues.retain(|number| !held_issues.contains_key(number));
-            want_pulls.retain(|number| !held_pulls.contains_key(number));
-            want_issues.extend(&state.retry_issues);
-            want_pulls.extend(&state.retry_pulls);
+        let (mut want_issues, mut want_pulls) = referenced.of(&source.repository);
+        want_issues.extend(issues.iter().filter(|held| held.record.state == Some(IssueState::Open)).flat_map(|held| {
+            let parent = (held.record.parent_service.as_ref(), held.record.parent_scope.as_ref(), held.record.parent_number);
+            let parent = match parent {
+                (Some(service), Some(scope), Some(number)) => Some(IssueSubject { service: service.clone(), scope: scope.clone(), number }),
+                _ => None,
+            };
+            held.record
+                .blocked_by
+                .iter()
+                .cloned()
+                .chain(parent)
+                .filter(|link| link.service == source.service && link.scope == source.scope)
+                .map(|link| link.number)
+        }));
+        want_issues.retain(|number| !held_issues.contains_key(number));
+        want_pulls.retain(|number| !held_pulls.contains_key(number));
+        state.gone_issues.retain(|number| want_issues.contains(number) && !asks.issues.contains(number));
+        state.gone_pulls.retain(|number| want_pulls.contains(number) && !asks.pulls.contains(number));
+        want_issues.retain(|number| !state.gone_issues.contains(number));
+        want_pulls.retain(|number| !state.gone_pulls.contains(number));
+        want_issues.extend(&state.retry_issues);
+        want_pulls.extend(&state.retry_pulls);
+        want_issues.extend(&asks.issues);
+        want_pulls.extend(&asks.pulls);
+        if asks.pending {
             want_pulls.extend(pulls.iter().filter(|held| pending(&held.record)).map(|held| held.record.number));
-            let provider = self.feed_provider(source).await?;
-            let feed = provider.source_feed().ok_or_else(|| format!("no source feed for {} {}", source.feed.service, source.feed.scope))?;
-            let request = FeedRequest { cursor: state.cursor.clone(), issues: want_issues, pulls: want_pulls };
-            let feed = feed.pass(&source.feed, &request).await?;
-            Ok::<_, String>((feed, forges))
         }
-        .await;
+        let started = self.inner.clock.now();
+        let inventory = state.inventoried_at.is_none_or(|at| started - at >= INVENTORY_INTERVAL);
+        let open_issues = inventory
+            .then(|| issues.iter().filter(|held| held.record.state == Some(IssueState::Open)).map(|held| held.record.number).collect());
+        let provider = self.feed_provider(source).await.map_err(local)?;
+        let feed = provider
+            .source_feed()
+            .ok_or_else(|| PassError::Local(format!("no source feed for {} {}", source.feed.service, source.feed.scope)))?;
+        let request = FeedRequest { cursor: state.cursor.clone(), issues: want_issues, pulls: want_pulls, started, open_issues };
 
-        let (feed, forges) = match result {
-            Ok(read) => read,
+        let feed = match feed.pass(&source.feed, &request).await {
+            Ok(feed) => feed,
             Err(error) => {
                 let since = self.now();
                 for held in &issues {
                     if held.record.failing_since.is_none() {
-                        records.write_issue(&held.name, &IssueRecord { failing_since: Some(since), ..held.record.clone() }).await?;
+                        records
+                            .write_issue(&held.name, &IssueRecord { failing_since: Some(since), ..held.record.clone() })
+                            .await
+                            .map_err(local)?;
                     }
                 }
                 for held in &pulls {
                     if held.record.failing_since.is_none() {
                         records
                             .write_change_request(&held.name, &ChangeRequestRecord { failing_since: Some(since), ..held.record.clone() })
-                            .await?;
+                            .await
+                            .map_err(local)?;
                     }
                 }
                 state.failing = true;
                 if saved.as_ref() != Some(&state) {
-                    self.inner.states.save(&state)?;
+                    self.inner.states.save(&state).map_err(local)?;
                 }
-                return Err(error);
+                return Err(PassError::Forge(error));
             }
         };
+        self.apply(source, &feed, &forges, &issues, &pulls, &mut state).await.map_err(local)?;
+        if inventory {
+            state.inventoried_at = Some(started);
+        }
+        if saved.as_ref() != Some(&state) {
+            self.inner.states.save(&state).map_err(local)?;
+        }
+        let pending =
+            records.change_requests(&source.service, &source.scope).await.map_err(local)?.iter().any(|held| pending(&held.record));
+        Ok(Passed { pending })
+    }
 
-        let mut written = BTreeSet::new();
+    /// Writes what a pass read, removes what the forge said is gone, and moves `state` past it.
+    async fn apply(
+        &self,
+        source: &Observed,
+        feed: &FeedPass,
+        forges: &[ForgeSpec],
+        issues: &[Held<IssueRecord>],
+        pulls: &[Held<ChangeRequestRecord>],
+        state: &mut SourceState,
+    ) -> Result<(), String> {
+        let records = &self.inner.records;
+        let held_issues = issues.iter().map(|held| (held.record.number, held)).collect::<BTreeMap<_, _>>();
+        let held_pulls = pulls.iter().map(|held| (held.record.number, held)).collect::<BTreeMap<_, _>>();
+        let mut touched = BTreeSet::new();
         for issue in &feed.issues {
             let name = source.name(Kind::Issue, issue.number)?;
             let held = held_issues.get(&issue.number).map(|held| &held.record);
-            records.write_issue(&name, &issue_record(held, &source.service, &source.scope, issue, &forges)).await?;
-            written.insert((ObservedKind::Issue, issue.number));
+            records.write_issue(&name, &issue_record(held, &source.service, &source.scope, issue, forges)).await?;
+            touched.insert((FeedItem::Issue, issue.number));
+            state.gone_issues.remove(&issue.number);
         }
         for pull in &feed.pulls {
             let name = source.name(Kind::ChangeRequest, pull.number)?;
             let held = held_pulls.get(&pull.number).map(|held| &held.record);
-            records.write_change_request(&name, &change_request_record(held, &source.service, &source.scope, pull, &forges)).await?;
-            written.insert((ObservedKind::ChangeRequest, pull.number));
+            records.write_change_request(&name, &change_request_record(held, &source.service, &source.scope, pull, forges)).await?;
+            touched.insert((FeedItem::ChangeRequest, pull.number));
+            state.gone_pulls.remove(&pull.number);
+        }
+        for (item, number) in &feed.gone {
+            tracing::debug!(service = %source.service, scope = %source.scope, number, ?item, "forge item gone");
+            touched.insert((*item, *number));
+            match item {
+                FeedItem::Issue => {
+                    state.gone_issues.insert(*number);
+                    if let Some(held) = held_issues.get(number) {
+                        records.remove(ObservedKind::Issue, &held.name).await?;
+                    }
+                }
+                FeedItem::ChangeRequest => {
+                    state.gone_pulls.insert(*number);
+                    if let Some(held) = held_pulls.get(number) {
+                        records.remove(ObservedKind::ChangeRequest, &held.name).await?;
+                    }
+                }
+            }
         }
         let since = self.now();
         let (mut retry_issues, mut retry_pulls) = (BTreeSet::new(), BTreeSet::new());
         for (item, number, error) in &feed.unread {
             tracing::debug!(service = %source.service, scope = %source.scope, number, %error, "forge item unread");
+            touched.insert((*item, *number));
             match item {
                 FeedItem::Issue => {
                     retry_issues.insert(*number);
@@ -662,29 +800,21 @@ impl SourceObserver {
             }
         }
         if state.failing {
-            let touched = |kind, number| {
-                written.contains(&(kind, number)) || feed.unread.iter().any(|(item, n, _)| *n == number && kind == observed_kind(*item))
-            };
-            for held in
-                issues.iter().filter(|held| held.record.failing_since.is_some() && !touched(ObservedKind::Issue, held.record.number))
-            {
+            let cleared = |item, held: &u64| !touched.contains(&(item, *held));
+            for held in issues.iter().filter(|held| held.record.failing_since.is_some() && cleared(FeedItem::Issue, &held.record.number)) {
                 records.write_issue(&held.name, &IssueRecord { failing_since: None, ..held.record.clone() }).await?;
             }
             for held in
-                pulls.iter().filter(|held| held.record.failing_since.is_some() && !touched(ObservedKind::ChangeRequest, held.record.number))
+                pulls.iter().filter(|held| held.record.failing_since.is_some() && cleared(FeedItem::ChangeRequest, &held.record.number))
             {
                 records.write_change_request(&held.name, &ChangeRequestRecord { failing_since: None, ..held.record.clone() }).await?;
             }
         }
-        state.cursor = feed.cursor;
+        state.cursor = feed.cursor.clone();
         state.retry_issues = retry_issues;
         state.retry_pulls = retry_pulls;
         state.failing = false;
-        if saved.as_ref() != Some(&state) {
-            self.inner.states.save(&state)?;
-        }
-        let pending = records.change_requests(&source.service, &source.scope).await?.iter().any(|held| pending(&held.record));
-        Ok(Passed { pending })
+        Ok(())
     }
 
     /// Deletes the source's closed items nothing refers to, once they have been closed long enough.
@@ -718,11 +848,8 @@ impl SourceObserver {
     }
 }
 
-fn observed_kind(item: FeedItem) -> ObservedKind {
-    match item {
-        FeedItem::Issue => ObservedKind::Issue,
-        FeedItem::ChangeRequest => ObservedKind::ChangeRequest,
-    }
+fn chrono_duration(duration: Duration) -> chrono::Duration {
+    chrono::Duration::from_std(duration).unwrap_or(chrono::Duration::MAX)
 }
 
 #[cfg(test)]

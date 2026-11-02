@@ -1,6 +1,6 @@
 //! Forgejo's whole-source feed: the issue list from the cursor with `since`, the pull list by
 //! recent update down to the cursor, each requested item the lists did not report, and each
-//! reported pull request's reviews. Forgejo reads no issue links, types or fields, and flotilla
+//! reported pull request's reviews. An item the forge answers 404 or 410 for is gone. Forgejo reads no issue links, types or fields, and flotilla
 //! reads no checks, mergeability or closing references from it.
 
 use std::collections::BTreeSet;
@@ -131,28 +131,35 @@ fn advanced(cursor: Option<&ListCursor>, items: &[Value], started: DateTime<Utc>
 impl SourceFeed for ForgejoIssueProvider {
     async fn pass(&self, source: &IssueSource, request: &FeedRequest) -> Result<FeedPass, String> {
         let scope = source.scope.as_str();
-        let started = Utc::now();
+        let started = request.started;
         let mut issues = self.listed(scope, List::Issues, request.cursor.issues.as_ref()).await?;
         let mut pulls = self.listed(scope, List::Pulls, request.cursor.pulls.as_ref()).await?;
         let cursor = SourceCursor {
             issues: Some(advanced(request.cursor.issues.as_ref(), &issues, started)?),
             pulls: Some(advanced(request.cursor.pulls.as_ref(), &pulls, started)?),
         };
-        let mut feed = FeedPass { cursor, issues: Vec::new(), pulls: Vec::new(), unread: Vec::new() };
+        let mut wanted_issues = request.issues.clone();
+        if let Some(held) = &request.open_issues {
+            let open = self.listed(scope, List::Issues, None).await?.iter().map(number).collect::<Result<BTreeSet<_>, _>>()?;
+            wanted_issues.extend(held.difference(&open));
+        }
+        let mut feed = FeedPass { cursor, issues: Vec::new(), pulls: Vec::new(), unread: Vec::new(), gone: Vec::new() };
         let listed = issues.iter().map(number).collect::<Result<BTreeSet<_>, _>>()?;
-        for wanted in request.issues.difference(&listed) {
-            match self.forge.get_json(&format!("repos/{scope}/issues/{wanted}"), &[]).await {
-                Ok((item, _)) if !item["pull_request"].is_null() => {
+        for wanted in wanted_issues.difference(&listed) {
+            match self.forge.get_item(&format!("repos/{scope}/issues/{wanted}")).await {
+                Ok(Some(item)) if !item["pull_request"].is_null() => {
                     feed.unread.push((FeedItem::Issue, *wanted, "is a pull request".into()))
                 }
-                Ok((item, _)) => issues.push(item),
+                Ok(Some(item)) => issues.push(item),
+                Ok(None) => feed.gone.push((FeedItem::Issue, *wanted)),
                 Err(error) => feed.unread.push((FeedItem::Issue, *wanted, error)),
             }
         }
         let listed = pulls.iter().map(number).collect::<Result<BTreeSet<_>, _>>()?;
         for wanted in request.pulls.difference(&listed) {
-            match self.forge.get_json(&format!("repos/{scope}/pulls/{wanted}"), &[]).await {
-                Ok((pull, _)) => pulls.push(pull),
+            match self.forge.get_item(&format!("repos/{scope}/pulls/{wanted}")).await {
+                Ok(Some(pull)) => pulls.push(pull),
+                Ok(None) => feed.gone.push((FeedItem::ChangeRequest, *wanted)),
                 Err(error) => feed.unread.push((FeedItem::ChangeRequest, *wanted, error)),
             }
         }
