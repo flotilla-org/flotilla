@@ -35,6 +35,7 @@ pub mod definition_import;
 pub mod definitions;
 pub mod environment;
 pub mod forge_observation_import;
+pub mod host_import;
 pub mod image_build;
 pub mod import;
 pub mod kinds;

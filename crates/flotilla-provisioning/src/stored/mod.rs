@@ -36,6 +36,7 @@ pub mod clone;
 pub mod definition;
 pub mod environment;
 pub mod forge_observation;
+pub mod host;
 pub mod image_build;
 pub mod manifest_root;
 pub mod placement;
