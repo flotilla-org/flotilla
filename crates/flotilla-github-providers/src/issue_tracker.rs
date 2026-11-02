@@ -492,6 +492,10 @@ impl flotilla_issue_tracker::IssueProvider for GitHubIssueProvider {
         is_github_source(source)
     }
 
+    fn source_feed(&self) -> Option<&dyn flotilla_issue_tracker::source_feed::SourceFeed> {
+        Some(self)
+    }
+
     async fn query(&self, source: &IssueSource, params: &IssueQuery, page: u32, count: usize) -> Result<IssueResultPage, String> {
         let per_page = clamp_per_page(count);
         let as_of = Utc::now();
@@ -1210,6 +1214,9 @@ mod tests {
         session.finish();
     }
 }
+
+#[path = "github_source_feed.rs"]
+mod source_feed;
 
 #[cfg(test)]
 #[path = "github_board_tests.rs"]

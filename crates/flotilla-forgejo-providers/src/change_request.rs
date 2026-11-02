@@ -76,6 +76,58 @@ fn review_decision(reviews: &[serde_json::Value]) -> Option<ObservedReviewDecisi
     }
 }
 
+/// A pull request's state as Forgejo's pull JSON reports it.
+pub(crate) fn pull_state(value: &serde_json::Value) -> Option<ObservedChangeRequestState> {
+    if value["merged"].as_bool() == Some(true) || !value["merged_at"].is_null() {
+        Some(ObservedChangeRequestState::Merged)
+    } else if value["state"] == "closed" {
+        Some(ObservedChangeRequestState::Closed)
+    } else if value["draft"].as_bool() == Some(true) {
+        Some(ObservedChangeRequestState::Draft)
+    } else if value["state"] == "open" {
+        Some(ObservedChangeRequestState::Open)
+    } else {
+        None
+    }
+}
+
+/// The aggregate review decision of pull request `number`, read from every page of its reviews.
+pub(crate) async fn read_review_decision(
+    forge: &ForgejoClient,
+    repo_slug: &str,
+    number: u64,
+) -> Result<Option<ObservedReviewDecision>, ObservationError> {
+    const PAGE_SIZE: usize = 50;
+    const MAX_PAGES: usize = 100;
+    let mut reviews = Vec::new();
+    for page in 1..=MAX_PAGES {
+        let request = forge.repository_request(
+            repo_slug,
+            reqwest::Method::GET,
+            &format!("pulls/{number}/reviews"),
+            &[("limit", PAGE_SIZE.to_string()), ("page", page.to_string())],
+            None,
+        )?;
+        let response = flotilla_forge_forgejo::forge_http_execute!(forge, request)?;
+        crate::observation::check_response(&forge.config.service_url, response.status(), response.headers(), response.body())?;
+        // Forgejo counts all returned reviews, including stale and
+        // dismissed ones. If a proxy strips the header, an empty page
+        // still terminates the scan safely.
+        let total =
+            response.headers().get("x-total-count").and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<usize>().ok());
+        let batch: Vec<serde_json::Value> =
+            serde_json::from_slice(response.body()).map_err(|error| format!("Forgejo review response was not an array: {error}"))?;
+        if batch.is_empty() {
+            return Ok(review_decision(&reviews));
+        }
+        reviews.extend(batch);
+        if total.is_some_and(|total| reviews.len() >= total) {
+            return Ok(review_decision(&reviews));
+        }
+    }
+    Err(format!("Forgejo review page limit ({MAX_PAGES}) reached for pull request {number}").into())
+}
+
 impl ForgejoChangeRequestProvider {
     pub fn new(http: Arc<dyn HttpClient>, runner: Arc<dyn CommandRunner>, config: ForgejoIssueProviderConfig, repo_slug: String) -> Self {
         Self { forge: ForgejoClient::new(http, config), runner, repo_slug, operator_login: None }
@@ -88,17 +140,7 @@ impl ForgejoChangeRequestProvider {
 
     fn observed_status(&self, value: &serde_json::Value) -> ObservedStatus {
         let observed_at = Utc::now();
-        let state = if value["merged"].as_bool() == Some(true) || !value["merged_at"].is_null() {
-            Some(ObservedChangeRequestState::Merged)
-        } else if value["state"] == "closed" {
-            Some(ObservedChangeRequestState::Closed)
-        } else if value["draft"].as_bool() == Some(true) {
-            Some(ObservedChangeRequestState::Draft)
-        } else if value["state"] == "open" {
-            Some(ObservedChangeRequestState::Open)
-        } else {
-            None
-        };
+        let state = pull_state(value);
         let requested = self.operator_login.as_deref().and_then(|operator| {
             value["requested_reviewers"].as_array().map(|reviewers| {
                 reviewers.iter().any(|reviewer| reviewer["login"].as_str().is_some_and(|login| login.eq_ignore_ascii_case(operator)))
@@ -119,35 +161,7 @@ impl ForgejoChangeRequestProvider {
     }
 
     async fn read_review_decision(&self, number: u64) -> Result<Option<ObservedReviewDecision>, ObservationError> {
-        const PAGE_SIZE: usize = 50;
-        const MAX_PAGES: usize = 100;
-        let mut reviews = Vec::new();
-        for page in 1..=MAX_PAGES {
-            let request = self.forge.repository_request(
-                &self.repo_slug,
-                reqwest::Method::GET,
-                &format!("pulls/{number}/reviews"),
-                &[("limit", PAGE_SIZE.to_string()), ("page", page.to_string())],
-                None,
-            )?;
-            let response = flotilla_forge_forgejo::forge_http_execute!(self.forge, request)?;
-            crate::observation::check_response(&self.forge.config.service_url, response.status(), response.headers(), response.body())?;
-            // Forgejo counts all returned reviews, including stale and
-            // dismissed ones. If a proxy strips the header, an empty page
-            // still terminates the scan safely.
-            let total =
-                response.headers().get("x-total-count").and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<usize>().ok());
-            let batch: Vec<serde_json::Value> =
-                serde_json::from_slice(response.body()).map_err(|error| format!("Forgejo review response was not an array: {error}"))?;
-            if batch.is_empty() {
-                return Ok(review_decision(&reviews));
-            }
-            reviews.extend(batch);
-            if total.is_some_and(|total| reviews.len() >= total) {
-                return Ok(review_decision(&reviews));
-            }
-        }
-        Err(format!("Forgejo review page limit ({MAX_PAGES}) reached for pull request {number}").into())
+        read_review_decision(&self.forge, &self.repo_slug, number).await
     }
 
     fn parse(&self, value: &serde_json::Value) -> Option<(String, ChangeRequest)> {

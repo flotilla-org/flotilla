@@ -295,6 +295,8 @@ pub struct PullFilter {
     pub state: StateFilter,
     /// Exact head branch; a deleted head never matches.
     pub head: Option<String>,
+    /// Most recently updated first, as `sort=recentupdate` asks; otherwise newest first.
+    pub recent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -641,11 +643,12 @@ impl FakeForge {
         Ok(item.clone())
     }
 
-    /// Pull requests, newest first, as Forgejo's default listing orders them.
+    /// Pull requests, newest first as Forgejo's default listing orders them, or most recently
+    /// updated first.
     pub fn list_pulls(&self, repo: &RepoRef, filter: &PullFilter, page: usize, limit: usize) -> Result<Page<Item>, ForgeError> {
         let mut inner = self.lock();
         let repository = inner.repository(repo)?;
-        let matching = repository
+        let mut matching: Vec<Item> = repository
             .items
             .values()
             .rev()
@@ -657,6 +660,9 @@ impl FakeForge {
             })
             .cloned()
             .collect();
+        if filter.recent {
+            matching.sort_by(|left, right| right.updated_at.cmp(&left.updated_at).then(right.number.cmp(&left.number)));
+        }
         Ok(Page::of(matching, page, limit))
     }
 

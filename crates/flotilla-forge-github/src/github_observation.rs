@@ -49,6 +49,7 @@ impl ParsedObservationResponse {
 pub enum QueryShape {
     BoundBatch,
     BoardBatch,
+    SourceBatch,
     HistoryComments,
     HistoryReviews,
     HistoryThreads,
@@ -59,6 +60,7 @@ impl QueryShape {
         match self {
             Self::BoundBatch => "bound-batch",
             Self::BoardBatch => "board-batch",
+            Self::SourceBatch => "source-batch",
             Self::HistoryComments => "history-comments",
             Self::HistoryReviews => "history-reviews",
             Self::HistoryThreads => "history-threads",
@@ -66,7 +68,7 @@ impl QueryShape {
         }
     }
     fn is_history(self) -> bool {
-        !matches!(self, Self::BoundBatch | Self::BoardBatch)
+        !matches!(self, Self::BoundBatch | Self::BoardBatch | Self::SourceBatch)
     }
 }
 
@@ -97,6 +99,10 @@ impl<'a> ObservationTelemetry<'a> {
 
     pub fn board(scope: &'a str, subjects: usize) -> Self {
         Self::builder().scope(scope).subjects(subjects).observer("dispatch board").build()
+    }
+
+    pub fn source(scope: &'a str, subjects: usize) -> Self {
+        Self::builder().scope(scope).subjects(subjects).observer("source observer").build()
     }
 
     pub fn call(&mut self, shape: QueryShape, subjects: usize) -> ObservationCall<'_, 'a> {

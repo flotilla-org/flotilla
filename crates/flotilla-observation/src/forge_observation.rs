@@ -591,6 +591,9 @@ impl IssueProvider for ObservedIssueProvider {
     fn supports(&self, source: &IssueSource) -> bool {
         self.inner.supports(source)
     }
+    fn source_feed(&self) -> Option<&dyn flotilla_issue_tracker::source_feed::SourceFeed> {
+        self.inner.source_feed()
+    }
     async fn query(&self, source: &IssueSource, params: &IssueQuery, page: u32, count: usize) -> Result<IssueResultPage, String> {
         self.reads
             .read(source, ForgeReadRequest::Query { params: params.clone(), page, count }, || self.inner.query(source, params, page, count))

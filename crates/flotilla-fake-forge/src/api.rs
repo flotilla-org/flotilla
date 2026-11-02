@@ -265,15 +265,25 @@ impl Call<'_> {
     }
 
     fn list_pulls(&self, repo: &RepoRef, query: &Query) -> Result<Response, Failure> {
-        query.only(&["state", "limit", "page", "head"])?;
+        query.only(&["state", "sort", "limit", "page", "head"])?;
         let state = query.state()?;
+        let recent = match query.get("sort") {
+            None => false,
+            Some("recentupdate") => true,
+            Some(other) => {
+                return Err(Failure::refuse(
+                    StatusCode::BAD_REQUEST,
+                    format!("`sort={other}` is not served; flotilla sorts by recentupdate"),
+                ))
+            }
+        };
         let limit = query.limit()?;
         let page = query.page(true)?;
         let head = query.get("head").map(str::to_string);
         if head.as_deref().is_some_and(str::is_empty) {
             return Err(Failure::refuse(StatusCode::BAD_REQUEST, "`head` must name a branch"));
         }
-        let pulls = self.forge.list_pulls(repo, &PullFilter { state, head }, page, limit)?;
+        let pulls = self.forge.list_pulls(repo, &PullFilter { state, head, recent }, page, limit)?;
         let urls = self.urls(repo)?;
         let body = Value::Array(pulls.items.iter().map(|item| render::pull(&urls.as_urls(), item)).collect());
         Ok(self.paged(json_response(StatusCode::OK, &body), pulls.total, page, limit, query))

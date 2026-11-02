@@ -106,6 +106,10 @@ impl flotilla_issue_tracker::IssueProvider for ForgejoIssueProvider {
         is_forgejo_source(source, &self.forge.config.service_url)
     }
 
+    fn source_feed(&self) -> Option<&dyn flotilla_issue_tracker::source_feed::SourceFeed> {
+        Some(self)
+    }
+
     async fn query(&self, source: &IssueSource, params: &IssueQuery, page: u32, count: usize) -> Result<IssueResultPage, String> {
         let limit = clamp_limit(count);
         let mut query = vec![
@@ -638,6 +642,9 @@ mod tests {
         assert_eq!(runner.calls(), vec![(expected_cmd.into(), expected_args)]);
     }
 }
+
+#[path = "forgejo_source_feed.rs"]
+mod source_feed;
 
 #[cfg(test)]
 #[path = "issue_tracker_testing.rs"]

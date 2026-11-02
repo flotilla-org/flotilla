@@ -1,6 +1,7 @@
 //! Forge-neutral source-addressed issue providers and mission-field decoding.
 pub mod match_fields;
 pub mod mission_fields;
+pub mod source_feed;
 
 use std::sync::Arc;
 
@@ -39,6 +40,11 @@ pub trait IssueProvider: Send + Sync {
         None
     }
     fn supports(&self, source: &IssueSource) -> bool;
+
+    /// The source's whole-source feed, where the forge has one.
+    fn source_feed(&self) -> Option<&dyn source_feed::SourceFeed> {
+        None
+    }
 
     /// Returns one native page after provider-interpreted project filtering.
     /// Pages may be short or empty with `has_more = true`; callers must use

@@ -230,6 +230,7 @@ async fn requests_outside_the_provider_shapes_are_refused() {
             StatusCode::BAD_REQUEST,
         ),
         ("unserved sort", Request::get(&format!("{ISSUES}?state=open&type=issues&sort=oldest&limit=30")), StatusCode::BAD_REQUEST),
+        ("unserved pull sort", Request::get(&format!("{PULLS}?state=open&sort=oldest&page=1&limit=30")), StatusCode::BAD_REQUEST),
         (
             "issue match field Forgejo ignores",
             Request::get(&format!("{ISSUES}?state=open&type=issues&sort=recentupdate&limit=30&component=terminal")),
@@ -521,13 +522,32 @@ fn merge_due_merges_ready_pulls_after_the_delay() {
     assert_eq!(forge.pull(&repo(), young.number).expect("pull").pull.expect("facts").checks, Some(CheckState::Success));
 }
 
+// Behaviour: pulls list newest first, or most recently updated first when asked.
+#[tokio::test]
+async fn pull_listing_orders_by_recent_update_when_asked() {
+    let clock = ManualClock::new();
+    let forge = forge_with(clock.clone());
+    let first = forge.create_pull(&repo(), new_pull("first")).expect("pull");
+    clock.advance(Duration::from_secs(60));
+    let second = forge.create_pull(&repo(), new_pull("second")).expect("pull");
+    clock.advance(Duration::from_secs(60));
+    forge.edit_pull(&repo(), first.number, crate::ItemEdit { title: Some("Retitled".into()), ..crate::ItemEdit::default() }).expect("edit");
+    let numbers = |reply: &Reply| -> Vec<u64> {
+        reply.body.as_array().expect("array").iter().map(|pull| pull["number"].as_u64().expect("n")).collect()
+    };
+    let newest = Request::get(&format!("{PULLS}?state=all&page=1&limit=30")).send(&forge).await;
+    assert_eq!(numbers(&newest), vec![second.number, first.number]);
+    let recent = Request::get(&format!("{PULLS}?state=all&sort=recentupdate&page=1&limit=30")).send(&forge).await;
+    assert_eq!(numbers(&recent), vec![first.number, second.number]);
+}
+
 // Behaviour: the model-level filters agree with the API's (glue for the
 // admin layer, which calls the model directly).
 #[test]
 fn model_filters_select_by_state() {
     let forge = forge();
     forge.create_pull(&repo(), new_pull("a")).expect("pull");
-    let page = forge.list_pulls(&repo(), &PullFilter { state: StateFilter::Closed, head: None }, 1, 10).expect("list");
+    let page = forge.list_pulls(&repo(), &PullFilter { state: StateFilter::Closed, head: None, recent: false }, 1, 10).expect("list");
     assert_eq!(page.total, 0);
     let issues = forge
         .list_issues(&repo(), &IssueFilter { state: StateFilter::All, labels: vec![], query: None, since: None }, 1, 10)

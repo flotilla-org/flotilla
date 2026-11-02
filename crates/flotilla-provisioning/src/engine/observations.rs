@@ -20,6 +20,7 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::{
     engine_records::{EngineObject, EngineRecords, ObservationFailures},
+    forge_observation::{Held as SourceHeld, IssueState, IssueSubject, ObservedKind, SourceRecords},
     ChangeRequestSpec, ChangeRequestStatus, IssueSpec, IssueStatus,
 };
 use flotilla_schema::{Kind, KindCode, NewChange, Timestamp};
@@ -69,8 +70,11 @@ trait Observed: Kind + PartialEq + Clone {
 
     /// The record of `spec`'s subject, keeping `current`'s observed values when there is one.
     fn of_subject(current: Option<Self>, spec: &Self::Spec) -> Self;
-    /// `self`'s subject as observed in `status`, which a successful read wrote, so not failing.
+    /// `self`'s subject as observed in `status`, which a successful read wrote, so not failing. The
+    /// values a status does not carry are kept: the source's whole-source observer writes them.
     fn observed(&self, home: &str, status: &Self::Status) -> Self;
+    /// The source the record's subject belongs to, in its stored spelling.
+    fn source(&self) -> (&str, &str);
     fn failing_since(&self) -> Option<Timestamp>;
     fn failing(self, since: Timestamp) -> Self;
 }
@@ -86,7 +90,17 @@ impl Observed for ChangeRequestRecord {
     }
 
     fn observed(&self, home: &str, status: &ChangeRequestStatus) -> Self {
-        Self::from_old(&self.old_spec(home), status)
+        Self {
+            head_branch: self.head_branch.clone(),
+            base_branch: self.base_branch.clone(),
+            closes: self.closes.clone(),
+            closes_observed: self.closes_observed,
+            ..Self::from_old(&self.old_spec(home), status)
+        }
+    }
+
+    fn source(&self) -> (&str, &str) {
+        (&self.service, &self.scope)
     }
 
     fn failing_since(&self) -> Option<Timestamp> {
@@ -109,7 +123,22 @@ impl Observed for IssueRecord {
     }
 
     fn observed(&self, home: &str, status: &IssueStatus) -> Self {
-        Self::from_old(&self.old_spec(home), status)
+        Self {
+            body: self.body.clone(),
+            issue_type: self.issue_type.clone(),
+            parent_service: self.parent_service.clone(),
+            parent_scope: self.parent_scope.clone(),
+            parent_number: self.parent_number,
+            parent_observed: self.parent_observed,
+            blocked_by: self.blocked_by.clone(),
+            blocked_by_observed: self.blocked_by_observed,
+            fields: self.fields.clone(),
+            ..Self::from_old(&self.old_spec(home), status)
+        }
+    }
+
+    fn source(&self) -> (&str, &str) {
+        (&self.service, &self.scope)
     }
 
     fn failing_since(&self) -> Option<Timestamp> {
@@ -202,6 +231,8 @@ pub struct EngineObservations {
     log: PlainLog,
     resident: Mutex<Resident>,
     clock: Arc<dyn flotilla_resources::Clock>,
+    /// The sources observed whole here, by stored service and scope.
+    whole: Mutex<BTreeSet<(String, String)>>,
 }
 
 impl std::fmt::Debug for EngineObservations {
@@ -217,7 +248,7 @@ impl EngineObservations {
         let home = log.home().to_owned();
         let follower = Follower::new([CHANGE_REQUEST_CODE, ISSUE_CODE]);
         let resident = Resident { follower, records: Records::new(), warned: Default::default() };
-        let opened = Self { service, home, log, resident: Mutex::new(resident), clock };
+        let opened = Self { service, home, log, resident: Mutex::new(resident), clock, whole: Mutex::default() };
         let homes = opened.service.homes();
         {
             let mut resident = locked(&opened.resident);
@@ -379,7 +410,15 @@ impl EngineObservations {
 
     fn delete_as<K: Observed>(&self, kind: &'static str, name: &str) -> Result<(), String> {
         let Some(current) = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())? else { return Ok(()) };
-        match self.log.delete::<K>(name, current.version, &self.change()) {
+        let (service, scope) = current.spec.source();
+        if locked(&self.whole).contains(&(service.to_owned(), scope.to_owned())) {
+            return Ok(());
+        }
+        self.remove_as::<K>(kind, name, current.version)
+    }
+
+    fn remove_as<K: Observed>(&self, kind: &'static str, name: &str, version: u64) -> Result<(), String> {
+        match self.log.delete::<K>(name, version, &self.change()) {
             Ok(()) | Err(PlainError::Missing { .. }) => Ok(()),
             Err(error) => Err(format!("delete {kind} {name}: {error}")),
         }
@@ -480,5 +519,97 @@ impl ObservationFailures for EngineObservations {
             CHANGE_REQUEST => self.failing_as::<ChangeRequestRecord>(name),
             _ => self.failing_as::<IssueRecord>(name),
         }
+    }
+}
+
+impl EngineObservations {
+    fn held<K: Clone>(&self, service: &str, scope: &str, pick: impl Fn(&Held) -> Option<&K>) -> Result<Vec<SourceHeld<K>>, String>
+    where
+        K: Observed,
+    {
+        let resident = self.refresh()?;
+        Ok(resident
+            .records
+            .iter()
+            .filter(|((_, _, home), _)| *home == self.home)
+            .filter_map(|((_, name, _), held)| pick(held).map(|record| (name, record)))
+            .filter(|(_, record)| record.source() == (service, scope))
+            .map(|(name, record)| SourceHeld { name: name.clone(), record: record.clone() })
+            .collect())
+    }
+
+    fn write_whole<K: Kind + PartialEq>(&self, name: &str, value: &K) -> Result<bool, String> {
+        let current = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())?;
+        if current.is_some_and(|current| current.spec == *value) {
+            return Ok(false);
+        }
+        self.write(name, value)?;
+        Ok(true)
+    }
+}
+
+#[async_trait::async_trait]
+impl SourceRecords for EngineObservations {
+    fn observe_whole(&self, service: &str, scope: &str) {
+        locked(&self.whole).insert((service.to_owned(), scope.to_owned()));
+    }
+
+    async fn issues(&self, service: &str, scope: &str) -> Result<Vec<SourceHeld<IssueRecord>>, String> {
+        self.held(service, scope, |held| match held {
+            Held::Issue(_, record) => Some(record),
+            Held::ChangeRequest(..) => None,
+        })
+    }
+
+    async fn change_requests(&self, service: &str, scope: &str) -> Result<Vec<SourceHeld<ChangeRequestRecord>>, String> {
+        self.held(service, scope, |held| match held {
+            Held::ChangeRequest(_, record) => Some(record),
+            Held::Issue(..) => None,
+        })
+    }
+
+    async fn write_issue(&self, name: &str, record: &IssueRecord) -> Result<bool, String> {
+        self.write_whole(name, record)
+    }
+
+    async fn write_change_request(&self, name: &str, record: &ChangeRequestRecord) -> Result<bool, String> {
+        self.write_whole(name, record)
+    }
+
+    async fn last_written(&self, kind: ObservedKind, name: &str) -> Result<Option<Timestamp>, String> {
+        let header = match kind {
+            ObservedKind::ChangeRequest => self.log.last_change::<ChangeRequestRecord>(name, &self.home),
+            ObservedKind::Issue => self.log.last_change::<IssueRecord>(name, &self.home),
+        };
+        Ok(header.map_err(|error| error.to_string())?.map(|header| header.at))
+    }
+
+    async fn remove(&self, kind: ObservedKind, name: &str) -> Result<(), String> {
+        match kind {
+            ObservedKind::ChangeRequest => match self.log.get::<ChangeRequestRecord>(name, &self.home).map_err(|e| e.to_string())? {
+                Some(current) => self.remove_as::<ChangeRequestRecord>(CHANGE_REQUEST, name, current.version),
+                None => Ok(()),
+            },
+            ObservedKind::Issue => match self.log.get::<IssueRecord>(name, &self.home).map_err(|e| e.to_string())? {
+                Some(current) => self.remove_as::<IssueRecord>(ISSUE, name, current.version),
+                None => Ok(()),
+            },
+        }
+    }
+
+    async fn referenced_by_open_issues(&self) -> Result<BTreeSet<IssueSubject>, String> {
+        let resident = self.refresh()?;
+        let mut referenced = BTreeSet::new();
+        for held in resident.records.values() {
+            let Held::Issue(_, issue) = held else { continue };
+            if issue.state != Some(IssueState::Open) {
+                continue;
+            }
+            referenced.extend(issue.blocked_by.iter().cloned());
+            if let (Some(service), Some(scope), Some(number)) = (&issue.parent_service, &issue.parent_scope, issue.parent_number) {
+                referenced.insert(IssueSubject { service: service.clone(), scope: scope.clone(), number });
+            }
+        }
+        Ok(referenced)
     }
 }
