@@ -26,6 +26,8 @@ use super::project_ops::{repository_transport_url_with_backend, ProjectService};
 pub enum LayerHome {
     /// Read the directory here.
     Source(CharterSource),
+    /// A charter-delegated project with no recorded declaration: its layer, if any, is the charter's.
+    Absent,
     /// Nothing can be read, and the reason is reported rather than skipped.
     Refused(String),
 }
@@ -46,6 +48,7 @@ pub async fn primary_layer_home(
         {
             project.spec.repositories[0].repo.to_string()
         }
+        None if project.spec.charter.is_some() => return Ok(LayerHome::Absent),
         None => {
             return Ok(LayerHome::Refused(format!(
                 "its declaration source is unknown (no `{BOOTSTRAP_REPOSITORY_ANNOTATION}` annotation), so its `{PROJECT_IMAGE_LAYER_PATH}/` cannot be located"
@@ -178,6 +181,10 @@ impl ProjectService<'_> {
             }
             let source = match self.layer_home(&namespace, &project).await {
                 Ok(LayerHome::Source(source)) => source,
+                Ok(LayerHome::Absent) => {
+                    self.image_layer_refresh.lock().await.refusals.remove(&(namespace.clone(), project.metadata.name.clone()));
+                    continue;
+                }
                 Ok(LayerHome::Refused(reason)) => {
                     self.image_layer_refresh.lock().await.refused(&namespace, &project.metadata.name, None, reason);
                     continue;
@@ -577,6 +584,16 @@ mod tests {
         project.spec.repositories[1].default_branch = Some("develop".into());
         assert_eq!(read(project.clone(), None).await, "develop");
         assert_eq!(read(project, Some("feature")).await, "feature");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn charter_project_without_declaration_is_not_refused() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        seed(&backend, Some(CharterPointer::Inline { documents: Vec::new(), files: BTreeMap::new() })).await;
+        let mut project = backend.using::<Project>("flotilla").get("app").await.unwrap();
+        project.metadata.annotations.clear();
+        let home = primary_layer_home(&backend, "flotilla", &project, None).await.unwrap();
+        assert_eq!(home, LayerHome::Absent);
     }
 
     // Host heartbeat diagnoses are capped at 4096 UTF-8 bytes, preserving
