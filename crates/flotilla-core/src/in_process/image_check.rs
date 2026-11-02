@@ -82,10 +82,13 @@ pub async fn check_image(
         reused: false,
     };
 
-    // The project layer at the ref. A project without a code repository has
-    // none at any ref.
     let mut branch_layer = None;
-    if let Some(LayerHome::Source(source)) = primary_layer_home(backend, namespace, &project, Some(&request.git_ref)).await? {
+    let home = primary_layer_home(backend, namespace, &project, Some(&request.git_ref)).await?;
+    if let LayerHome::Refused(reason) = &home {
+        report.refusals.push(ImageCheckRefusal { layers: vec![format!("{PROJECT_IMAGE_LAYER_PATH}/")], message: reason.clone() });
+        return Ok(report);
+    }
+    if let LayerHome::Source(source) = home {
         source.validate()?;
         if let Some(snapshot) = source_read(sources.layer_snapshot(&source))
             .await
