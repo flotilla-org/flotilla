@@ -119,7 +119,14 @@ async fn fixture() -> (ResourceBackend, Arc<Branches>) {
     project.repositories =
         vec![ProjectRepositorySpec::builder().repo(repository.key()).roles([ProjectRepositoryRole::Code].into()).build()];
     project.image = Some(ImageSelection { base: None, layers: vec!["rust".into()] });
-    backend.using::<Project>(NS).create(&InputMeta::builder().name(PROJECT.into()).build(), &project).await.expect("project");
+    let meta = InputMeta::builder()
+        .name(PROJECT.into())
+        .annotations(BTreeMap::from([(
+            flotilla_resources::definition_provenance::BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(),
+            repository.key().to_string(),
+        )]))
+        .build();
+    backend.using::<Project>(NS).create(&meta, &project).await.expect("project");
 
     for layer in [
         shared("base-ubuntu-24.04", ImageLayerTier::Base, &[]),
