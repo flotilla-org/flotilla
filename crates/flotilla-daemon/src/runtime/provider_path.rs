@@ -16,7 +16,7 @@ use std::{
 use async_trait::async_trait;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_environment::environment::{
-    EnvironmentHandle, EnvironmentProvisionError, EnvironmentToolAssetKind, EnvironmentVariableUpdate, VesselAgent,
+    EnvironmentHandle, EnvironmentProvisionError, EnvironmentToolAssetKind, EnvironmentVariableUpdate, PrepareOpts, VesselAgent,
     CONTAINED_DAEMON_REQUIRED_ENV, DAEMON_SOCKET_ENV,
 };
 use flotilla_protocol::EnvironmentId;
@@ -28,7 +28,7 @@ use flotilla_provisioning::reconcilers::{CloudProvisioning, EnvironmentProvision
 use flotilla_resources::EnvironmentSpec;
 use sha2::Digest;
 
-use super::docker::{discard_failed_environment, probe_provisioned_environment};
+use super::docker::{composed_image_pull_auth, discard_failed_environment, probe_provisioned_environment};
 use super::environments::ActiveProvisionedEnvironment;
 use super::state::ControllerRuntimeState;
 use crate::environment_tools::{EnvironmentToolContext, EnvironmentToolProviderKind, DOCKER_PROVIDER_KIND, SSH_HOST_PROVIDER_KIND};
@@ -53,7 +53,15 @@ pub(super) async fn provision(
     spec: &EnvironmentSpec,
 ) -> Result<EnvironmentProvisioning, EnvironmentProvisionError> {
     let provider = state.provider_for_environment(name).await?;
-    let prepared = provider.prepare(spec, &Default::default()).await?;
+    // A cloud vessel's composed image is read from the fleet image cache with its pull credential.
+    let prepared_auth = match (&spec.cloud_sandbox, state.credential_store.as_deref()) {
+        (Some(cloud), Some(store)) => composed_image_pull_auth(state, store, &cloud.image, cloud.image_build_ref.as_deref()).await?,
+        (Some(cloud), None) if cloud.image_build_ref.is_some() => {
+            return Err(format!("composed image {} needs a credential store for its pull credential", cloud.image).into())
+        }
+        _ => None,
+    };
+    let prepared = provider.prepare(spec, &PrepareOpts { prepared_auth, ..Default::default() }).await?;
     let id = EnvironmentId::new(name);
     let handle = provider.provision(id.clone(), &prepared, Default::default()).await?;
     // A cloud backing's Ready status records its provider's facts: a provider
@@ -308,7 +316,7 @@ pub(super) async fn verify_cloud_image_needs(
         pool: "cleat".into(),
         cost_class: Default::default(),
         grants: Default::default(),
-        realisation: flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { image: image.to_owned(), size: None },
+        realisation: flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { image: Some(image.into()), size: None },
     };
     let facts = crate::fulfilment_probe::probe_kind(
         &kind,

@@ -10744,7 +10744,10 @@ mod account_bindings {
                     pool: "passthrough".to_string(),
                     cost_class: Default::default(),
                     grants: BTreeSet::new(),
-                    realisation: flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { image: "crew".to_string(), size: None },
+                    realisation: flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel {
+                        image: Some("crew".into()),
+                        size: None,
+                    },
                 },
             )
             .await

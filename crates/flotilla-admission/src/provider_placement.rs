@@ -22,7 +22,7 @@ mod tests {
         match class {
             EnvironmentClass::HostDirect => FulfilmentRealisation::HostDirect,
             EnvironmentClass::CloudSandbox => {
-                FulfilmentRealisation::CloudSandboxPerVessel { image: "image@sha256:digest".into(), size: None }
+                FulfilmentRealisation::CloudSandboxPerVessel { image: Some("image@sha256:digest".into()), size: None }
             }
             _ => FulfilmentRealisation::DockerPerVessel { image: None },
         }

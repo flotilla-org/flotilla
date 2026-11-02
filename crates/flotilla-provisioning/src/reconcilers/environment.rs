@@ -149,6 +149,50 @@ pub enum EnvironmentPrepared {
     RetryAdoption(String),
 }
 
+impl<R> EnvironmentReconciler<R> {
+    /// The composed image is the per-identity build's digest, with the build's delivery.
+    /// Never fall back to another image: until the build is ready, wait with the reason.
+    async fn built_image(&self, name: &str) -> Result<Result<(String, Option<ImageDelivery>), EnvironmentPrepared>, ResourceError> {
+        let reading = match flotilla_store::read_image_build(&self.backend, &self.namespace, name, Arc::clone(&self.lifecycle_reads)).await
+        {
+            Ok(build) => build,
+            Err(ResourceError::NotFound { .. }) => {
+                // A previous-generation per-stage build can never
+                // be satisfied: fail so recreation relaunches it.
+                let retired = match self.backend.including_replicas::<flotilla_resources::ImageBuild>(&self.namespace).get(name).await {
+                    Ok(record) => record.object.spec.is_retired(),
+                    Err(ResourceError::NotFound { .. }) => false,
+                    Err(error) => return Err(error),
+                };
+                if retired {
+                    return Ok(Err(EnvironmentPrepared::Failed(format!(
+                        "ImageBuild {name} is a previous-generation image build; relaunch the vessel"
+                    ))));
+                }
+                return Ok(Err(EnvironmentPrepared::Waiting(format!("ImageBuild {name} awaiting replicated build status"))));
+            }
+            Err(error) => return Err(error),
+        };
+        let build = reading.build.object;
+        let status = build.status.clone().unwrap_or_default();
+        let digest = match reading.lifecycle {
+            Some(LifecycleReading::Ready { identity }) => identity,
+            Some(reading) => {
+                let reason = reading.reason().filter(|reason| !reason.is_empty()).map(|reason| format!(": {reason}")).unwrap_or_default();
+                return Ok(Err(EnvironmentPrepared::Waiting(format!("ImageBuild {name} {}{reason}", reading.label()))));
+            }
+            None => match (status.phase, &status.digest) {
+                (ImageBuildPhase::Built, Some(digest)) => digest.clone(),
+                (phase, _) => {
+                    let reason = status.failure.as_ref().map(|failure| format!(": {}", failure.reason)).unwrap_or_default();
+                    return Ok(Err(EnvironmentPrepared::Waiting(format!("ImageBuild {name} {phase:?}{reason}"))));
+                }
+            },
+        };
+        Ok(Ok((digest, build.spec.current().map(|spec| spec.delivery.clone()))))
+    }
+}
+
 impl<R> Reconciler for EnvironmentReconciler<R>
 where
     R: EnvironmentRuntime + 'static,
@@ -161,94 +205,50 @@ where
             return Ok(EnvironmentPrepared::Foreign);
         }
         let reading = self.reading(obj).map_err(ResourceError::other)?;
-        if Self::provisioning(obj, reading.as_ref()) {
-            if let Some(original) = &obj.spec.docker {
-                let mut spec = original.clone();
-                if let Some(name) = &original.image_build_ref {
-                    // The composed image is the per-identity build's digest.
-                    // Never fall back to another image: wait with the reason.
-                    let reading =
-                        match flotilla_store::read_image_build(&self.backend, &self.namespace, name, Arc::clone(&self.lifecycle_reads))
-                            .await
-                        {
-                            Ok(build) => build,
-                            Err(ResourceError::NotFound { .. }) => {
-                                // A previous-generation per-stage build can never
-                                // be satisfied: fail so recreation relaunches it.
-                                let retired = match self
-                                    .backend
-                                    .including_replicas::<flotilla_resources::ImageBuild>(&self.namespace)
-                                    .get(name)
-                                    .await
-                                {
-                                    Ok(record) => record.object.spec.is_retired(),
-                                    Err(ResourceError::NotFound { .. }) => false,
-                                    Err(error) => return Err(error),
-                                };
-                                if retired {
-                                    return Ok(EnvironmentPrepared::Failed(format!(
-                                        "ImageBuild {name} is a previous-generation image build; relaunch the vessel"
-                                    )));
-                                }
-                                return Ok(EnvironmentPrepared::Waiting(format!("ImageBuild {name} awaiting replicated build status")));
-                            }
-                            Err(error) => return Err(error),
-                        };
-                    let build = reading.build.object;
-                    let status = build.status.clone().unwrap_or_default();
-                    let digest = match reading.lifecycle {
-                        Some(LifecycleReading::Ready { identity }) => identity,
-                        Some(reading) => {
-                            let reason = reading
-                                .reason()
-                                .filter(|reason| !reason.is_empty())
-                                .map(|reason| format!(": {reason}"))
-                                .unwrap_or_default();
-                            return Ok(EnvironmentPrepared::Waiting(format!("ImageBuild {name} {}{reason}", reading.label())));
-                        }
-                        None => match (status.phase, &status.digest) {
-                            (ImageBuildPhase::Built, Some(digest)) => digest.clone(),
-                            (phase, _) => {
-                                let reason = status.failure.as_ref().map(|failure| format!(": {}", failure.reason)).unwrap_or_default();
-                                return Ok(EnvironmentPrepared::Waiting(format!("ImageBuild {name} {phase:?}{reason}")));
-                            }
-                        },
-                    };
-                    spec.image = digest;
-                    // A local build exists only on its builder. A registry
-                    // digest is pinned, so pulling it if absent is always
-                    // safe; the provider pulls with its pull credential.
-                    spec.pull_policy = match build.spec.current().map(|spec| &spec.delivery) {
-                        Some(ImageDelivery::Local) => DockerImagePullPolicy::Never,
-                        _ => DockerImagePullPolicy::IfNotPresent,
-                    };
-                }
-                match self
-                    .runtime
-                    .provision_environment(
-                        &obj.metadata.name,
-                        &flotilla_resources::EnvironmentSpec { docker: Some(spec), ..obj.spec.clone() },
-                    )
-                    .await
-                {
-                    Ok(provisioning) => Ok(EnvironmentPrepared::Ready(Box::new(provisioning))),
-                    Err(EnvironmentProvisionError::RetryAdoption(message)) => {
-                        Ok(EnvironmentPrepared::RetryAdoption(format!("Unknown: adoption failed; backing retained for retry: {message}")))
-                    }
-                    Err(error) if error.to_string().starts_with("waiting on build:") => Ok(EnvironmentPrepared::Waiting(error.to_string())),
-                    Err(error) => Ok(EnvironmentPrepared::Failed(error.to_string())),
-                }
-            } else {
-                match self.runtime.provision_environment(&obj.metadata.name, &obj.spec).await {
-                    Ok(provisioning) => Ok(EnvironmentPrepared::Ready(Box::new(provisioning))),
-                    Err(EnvironmentProvisionError::RetryAdoption(message)) => {
-                        Ok(EnvironmentPrepared::RetryAdoption(format!("Unknown: adoption failed; backing retained for retry: {message}")))
-                    }
-                    Err(error) => Ok(EnvironmentPrepared::Failed(error.to_string())),
-                }
+        if !Self::provisioning(obj, reading.as_ref()) {
+            return Ok(EnvironmentPrepared::None);
+        }
+        let mut spec = obj.spec.clone();
+        if let Some(docker) = spec.docker.as_mut() {
+            if let Some(name) = docker.image_build_ref.clone() {
+                let (digest, delivery) = match self.built_image(&name).await? {
+                    Ok(built) => built,
+                    Err(prepared) => return Ok(prepared),
+                };
+                docker.image = digest;
+                // A local build exists only on its builder. A registry
+                // digest is pinned, so pulling it if absent is always
+                // safe; the provider pulls with its pull credential.
+                docker.pull_policy = match delivery {
+                    Some(ImageDelivery::Local) => DockerImagePullPolicy::Never,
+                    _ => DockerImagePullPolicy::IfNotPresent,
+                };
             }
-        } else {
-            Ok(EnvironmentPrepared::None)
+        } else if let Some(cloud) = spec.cloud_sandbox.as_mut() {
+            if let Some(name) = cloud.image_build_ref.clone() {
+                let (digest, delivery) = match self.built_image(&name).await? {
+                    Ok(built) => built,
+                    Err(prepared) => return Ok(prepared),
+                };
+                // A cloud provider reads the image from a registry, never from a builder's local store.
+                if !matches!(delivery, Some(ImageDelivery::Registry { .. })) {
+                    return Ok(EnvironmentPrepared::Failed(format!(
+                        "ImageBuild {name} is not delivered to the fleet image cache, where a cloud sandbox reads its image"
+                    )));
+                }
+                cloud.image = digest;
+            }
+        }
+        let docker = spec.docker.is_some();
+        match self.runtime.provision_environment(&obj.metadata.name, &spec).await {
+            Ok(provisioning) => Ok(EnvironmentPrepared::Ready(Box::new(provisioning))),
+            Err(EnvironmentProvisionError::RetryAdoption(message)) => {
+                Ok(EnvironmentPrepared::RetryAdoption(format!("Unknown: adoption failed; backing retained for retry: {message}")))
+            }
+            Err(error) if docker && error.to_string().starts_with("waiting on build:") => {
+                Ok(EnvironmentPrepared::Waiting(error.to_string()))
+            }
+            Err(error) => Ok(EnvironmentPrepared::Failed(error.to_string())),
         }
     }
 

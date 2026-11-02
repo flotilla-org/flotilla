@@ -1454,7 +1454,7 @@ async fn a_cloud_vessel_clones_below_the_workspace_root_and_crews_run_at_the_rec
         FulfilmentKindSpec::builder()
             .host_ref(HOST_REF.to_string())
             .pool("cleat".to_string())
-            .realisation(FulfilmentRealisation::CloudSandboxPerVessel { image: image.clone(), size: None })
+            .realisation(FulfilmentRealisation::CloudSandboxPerVessel { image: Some(image.clone().into()), size: None })
             .build(),
     )
     .await;
@@ -1466,6 +1466,7 @@ async fn a_cloud_vessel_clones_below_the_workspace_root_and_crews_run_at_the_rec
             &EnvironmentSpec {
                 cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
                     image: image.clone(),
+                    image_build_ref: None,
                     size: flotilla_resources::realisation_settings::CLOUD_SANDBOX_SIZE,
                     lifetime_cap_seconds: None,
                     probe_needs: Default::default(),

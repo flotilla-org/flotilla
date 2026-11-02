@@ -401,6 +401,7 @@ fn a_cloud_sandbox_environment_stays_on_the_old_path() {
     cloud.spec.cloud_sandbox = Some(CloudSandboxEnvironmentSpec {
         probe_needs: Default::default(),
         image: "registry/flotilla@sha256:00".into(),
+        image_build_ref: None,
         size: CloudSandboxSize { cpus: 2, memory_bytes: 1 << 30, disk_bytes: 1 << 33 },
         lifetime_cap_seconds: None,
         env: Default::default(),

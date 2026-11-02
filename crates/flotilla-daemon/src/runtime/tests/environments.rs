@@ -738,6 +738,7 @@ async fn cloud_backing_without_a_descriptor_is_discarded() {
             cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
                 probe_needs: Default::default(),
                 image: image.clone(),
+                image_build_ref: None,
                 size: flotilla_resources::CloudSandboxSize { cpus: 1, memory_bytes: 1024, disk_bytes: 1024 },
                 lifetime_cap_seconds: None,
                 env: Default::default(),

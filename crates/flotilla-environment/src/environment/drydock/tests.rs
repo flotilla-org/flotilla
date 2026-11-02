@@ -32,6 +32,7 @@ fn spec() -> flotilla_resources::EnvironmentSpec {
         cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
             probe_needs: Default::default(),
             image: format!("example.test/crew@sha256:{}", "a".repeat(64)),
+            image_build_ref: None,
             size: flotilla_resources::CloudSandboxSize { cpus: 1, memory_bytes: 1024, disk_bytes: 1024 },
             lifetime_cap_seconds: None,
             env: Default::default(),
@@ -59,6 +60,44 @@ async fn readiness_and_capabilities_follow_the_declaration() {
     let absent =
         DrydockEnvironmentProvider::new(fixture.api.clone(), Arc::new(MemoryLink(fixture.agent.clone())), "other".into(), "other".into());
     assert!(matches!(absent.detect_readiness().await, ProviderReadiness::Unknown { reason } if reason.contains("absent")));
+}
+
+struct PullMaterial;
+impl crate::environment::registry_auth::RegistryAuthMaterial for PullMaterial {
+    fn config(&self) -> Result<crate::environment::registry_auth::RegistryConfig, String> {
+        Err("drydock takes the credential with the request, never as a file".into())
+    }
+    fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request
+    }
+    fn basic(&self) -> Result<(String, String), String> {
+        Ok(("puller".into(), "pull-secret".into()))
+    }
+}
+
+fn pull_auth(repository: &str) -> Option<RegistryAuth> {
+    Some(RegistryAuth::new(repository.into(), HostImageAction::ImagePull, Arc::new(PullMaterial)))
+}
+
+// A pull credential for the image's own repository goes to drydock with the prepare
+// request, once per handle and never in a Debug rendering; one for another repository is
+// refused before drydock is asked; without one, no credential is sent.
+#[tokio::test]
+async fn the_image_pull_credential_accompanies_its_own_image() {
+    let fixture = Fixture::new();
+    let provider = fixture.provider();
+    provider.prepare(&spec(), &Default::default()).await.unwrap();
+    let opts = PrepareOpts { prepared_auth: pull_auth("example.test/crew"), ..Default::default() };
+    provider.prepare(&spec(), &opts).await.unwrap();
+    assert!(provider.prepare(&spec(), &opts).await.is_err(), "a handle admits one operation");
+    let foreign = PrepareOpts { prepared_auth: pull_auth("example.test/other"), ..Default::default() };
+    assert!(provider.prepare(&spec(), &foreign).await.is_err(), "a credential for another repository");
+    let prepares = fixture.api.prepares.lock().unwrap();
+    assert_eq!(prepares.len(), 2);
+    assert_eq!(prepares[0].image_pull, None);
+    let credential = prepares[1].image_pull.as_ref().expect("pull credential");
+    assert_eq!((credential.username.as_str(), credential.secret.as_str()), ("puller", "pull-secret"));
+    assert!(!format!("{:?}", prepares[1]).contains("pull-secret"));
 }
 
 // Preparation names the link's tools image; provision is idempotent by label,

@@ -404,4 +404,23 @@ mod size_tests {
             serde_json::from_value(serde_json::json!({"realisation": "cloud_sandbox_per_vessel", "image": "i@sha256:d"})).unwrap();
         assert_eq!(legacy, FulfilmentRealisation::CloudSandboxPerVessel { image: Some("i@sha256:d".into()), size: None });
     }
+
+    // A cloud policy that omits its image derives a kind that composes one; a literal keeps
+    // its stored string shape.
+    #[test]
+    fn cloud_policy_image_is_optional_and_a_literal_keeps_its_shape() {
+        let policy = |image: Option<&str>| {
+            let mut cloud = serde_json::json!({"size": {"cpus": 1, "memory_bytes": 1, "disk_bytes": 1}, "checkout": "clone_in_vessel"});
+            if let Some(image) = image {
+                cloud["image"] = image.into();
+            }
+            serde_json::from_value::<crate::PlacementPolicySpec>(serde_json::json!({"pool": "cleat", "cloud_sandbox_per_vessel": cloud}))
+                .expect("policy")
+        };
+        let composed = crate::FulfilmentKindSpec::from_policy(&policy(None), "linux").expect("kind");
+        assert!(matches!(composed.realisation, FulfilmentRealisation::CloudSandboxPerVessel { image: None, .. }));
+        assert!(serde_json::to_value(&composed.realisation).expect("encode").get("image").is_none());
+        let literal = crate::FulfilmentKindSpec::from_policy(&policy(Some("i@sha256:d")), "linux").expect("kind");
+        assert_eq!(serde_json::to_value(&literal.realisation).expect("encode")["image"], "i@sha256:d");
+    }
 }

@@ -1715,12 +1715,12 @@ struct AdmittedPlacements<'a> {
 }
 
 impl PlacementBuildJoiner<'_> {
-    /// Admission only. For a docker-per-vessel kind that omits the image,
-    /// resolve every vessel's composition against the replica-inclusive
-    /// catalogue, plan its ImageBuild for the placement host's architecture,
-    /// and return the kind each vessel runs (`Built`) with the builds to
-    /// create once admission commits. A literal image returns no entries.
-    /// Nothing is written here.
+    /// Admission only. For a docker-per-vessel or cloud kind that omits the
+    /// image, resolve every vessel's composition against the replica-inclusive
+    /// catalogue, plan its ImageBuild (for the placement host's architecture,
+    /// or the cloud platform through the image cache), and return the kind
+    /// each vessel runs (`Built`) with the builds to create once admission
+    /// commits. A literal image returns no entries. Nothing is written here.
     async fn compose_placement_images(
         &self,
         namespace: &str,
@@ -1729,20 +1729,26 @@ impl PlacementBuildJoiner<'_> {
         placement: &PlacementResolution,
     ) -> Result<(BTreeMap<String, FulfilmentKindSpec>, Vec<crate::image_build::PlannedImageBuild>), String> {
         let Some(kind) = placement.selected.as_ref() else { return Ok(Default::default()) };
-        if kind.spec.realisation != (FulfilmentRealisation::DockerPerVessel { image: None }) {
-            return Ok(Default::default());
-        }
+        let cloud = match &kind.spec.realisation {
+            FulfilmentRealisation::DockerPerVessel { image: None } => false,
+            FulfilmentRealisation::CloudSandboxPerVessel { image: None, .. } => true,
+            _ => return Ok(Default::default()),
+        };
         let resolved = resolve_vessel_images(self.backend, namespace, project_ref, workflow).await?;
         let mut images = BTreeMap::new();
         let mut builds = Vec::new();
         for (vessel, image) in resolved {
-            let planned = crate::image_build::plan_image_build(self.backend, namespace, &image, &kind.spec.host_ref).await?;
+            let planned = match cloud {
+                true => crate::image_build::plan_cloud_image_build(self.backend, namespace, &image).await?,
+                false => crate::image_build::plan_image_build(self.backend, namespace, &image, &kind.spec.host_ref).await?,
+            };
+            let built = flotilla_resources::PlacementImageSource::Built { identity: image.identity, image_build_ref: planned.name.clone() };
             let mut spec = kind.spec.clone();
-            spec.realisation = FulfilmentRealisation::DockerPerVessel {
-                image: Some(flotilla_resources::PlacementImageSource::Built {
-                    identity: image.identity,
-                    image_build_ref: planned.name.clone(),
-                }),
+            spec.realisation = match &kind.spec.realisation {
+                FulfilmentRealisation::CloudSandboxPerVessel { size, .. } => {
+                    FulfilmentRealisation::CloudSandboxPerVessel { image: Some(built), size: size.clone() }
+                }
+                _ => FulfilmentRealisation::DockerPerVessel { image: Some(built) },
             };
             images.insert(vessel, spec);
             builds.push(planned);
@@ -2734,7 +2740,14 @@ impl AdmissionReadContext<'_> {
             // A kind that omits its image realises each vessel's composed
             // image: resolution provides every image need or refuses, naming it.
             let composed = match &kind.spec.realisation {
-                FulfilmentRealisation::DockerPerVessel { image: None } => {
+                FulfilmentRealisation::CloudSandboxPerVessel { image: None, .. }
+                    if crate::image_build::fleet_image_cache(&self.backend, namespace).await?.is_none() =>
+                {
+                    rejected.push(refusal(crate::image_build::CLOUD_IMAGE_CACHE_MISSING.to_string()));
+                    continue;
+                }
+                FulfilmentRealisation::DockerPerVessel { image: None }
+                | FulfilmentRealisation::CloudSandboxPerVessel { image: None, .. } => {
                     match composed_images.get_or_init(|| resolve_vessel_images(&self.backend, namespace, project_ref, workflow)).await {
                         Ok(images) => Some(images),
                         Err(error) => {

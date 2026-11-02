@@ -657,6 +657,29 @@ async fn foreign_architectures_and_hosts_are_ignored() {
     assert_eq!(service.calls.load(Ordering::SeqCst), 0);
 }
 
+// A declared builder capacity is the operator's word: an arm64 host that declares amd64
+// builds amd64 (emulated), while one that declares nothing builds only its own architecture.
+#[rstest::rstest]
+#[case::declared(builder(1), true)]
+#[case::undeclared(None, false)]
+#[tokio::test]
+async fn a_declared_architecture_builds_on_another_host_architecture(#[case] capacity: Option<ImageBuildCapacity>, #[case] runs: bool) {
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    host(&backend, "aarch64", capacity).await;
+    let spec = build_spec(layers(0, &[]), "amd64", ImageDelivery::Local, 1);
+    let service = BuildService::new(Behaviour::Succeed);
+    service.expect(&spec);
+    let materials = Arc::new(Materials::default());
+    let clock = Arc::new(VirtualClock::new(Utc::now()));
+    let reconciler = reconciler(&backend, &service, &materials, &clock);
+    let name = create(&backend, &spec).await;
+    for _ in 0..5 {
+        tick(&backend, &reconciler, &clock, &name).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(service.calls.load(Ordering::SeqCst) > 0, runs);
+}
+
 // Deleting a Building ImageBuild (the operator retry, or withdrawn demand)
 // abandons its running job; nothing is recorded and the service future is
 // dropped.

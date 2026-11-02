@@ -2389,6 +2389,9 @@ impl RegistryAuthMaterial for RegistryMaterial {
     fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         request.basic_auth(&self.username, Some(&self.password))
     }
+    fn basic(&self) -> Result<(String, String), String> {
+        Ok((self.username.clone(), self.password.clone()))
+    }
 }
 
 async fn remove_registry_config(path: &Path) -> Result<(), std::io::Error> {

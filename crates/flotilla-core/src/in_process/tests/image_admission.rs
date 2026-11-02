@@ -164,8 +164,8 @@ async fn admit(
 
 fn docker_image(spec: &FulfilmentKindSpec) -> Option<PlacementImageSource> {
     match &spec.realisation {
-        FulfilmentRealisation::DockerPerVessel { image } => image.clone(),
-        other => panic!("Docker realisation expected: {other:?}"),
+        FulfilmentRealisation::DockerPerVessel { image } | FulfilmentRealisation::CloudSandboxPerVessel { image, .. } => image.clone(),
+        other => panic!("an image-bearing realisation expected: {other:?}"),
     }
 }
 
@@ -325,4 +325,91 @@ async fn registry_delivery_uses_the_deterministic_builder() {
     let spec = build.spec.current().expect("current");
     assert_eq!(spec.host_ref, "feta");
     assert_eq!(spec.delivery, ImageDelivery::Registry { repository: "registry.test/flotilla/crew-images".into() });
+}
+
+const CLOUD_SIZE: flotilla_resources::CloudSandboxSize =
+    flotilla_resources::CloudSandboxSize { cpus: 4, memory_bytes: 8 << 30, disk_bytes: 20 << 30 };
+
+/// Turn the fixture's kind into a cloud sandbox kind that leaves its image to composition.
+async fn make_cloud(fixture: &Fixture) {
+    let kinds = fixture.backend.using::<FulfilmentKind>(NS);
+    let mut kind = kinds.get("crew-policy").await.expect("kind");
+    kind.spec.realisation = FulfilmentRealisation::CloudSandboxPerVessel { image: None, size: Some(CLOUD_SIZE) };
+    kinds.update(&test_meta("crew-policy"), &kind.metadata.resource_version, &kind.spec).await.expect("cloud kind");
+}
+
+async fn declare_image_cache(backend: &ResourceBackend) {
+    backend
+        .definitions::<FleetDesignation>(NS)
+        .apply(
+            &test_meta(FLEET_DESIGNATION_NAME),
+            &FleetDesignationSpec {
+                fleet: None,
+                project: "flotilla".into(),
+                image_cache: Some(ImageCacheBinding {
+                    repository: "registry.test/flotilla/crew-images".into(),
+                    pull_credential: "pull".into(),
+                    push_credential: "push".into(),
+                }),
+            },
+        )
+        .await
+        .expect("fleet");
+}
+
+// A cloud kind without an image runs each vessel's composed image: built for the cloud
+// platform (amd64), whatever the placement host runs, by a builder that declares amd64
+// (here an arm64 host building emulated), pushed to the image cache, and frozen with the
+// kind's size.
+#[tokio::test]
+async fn cloud_composed_image_builds_for_amd64_through_the_image_cache() {
+    let fixture = fixture(catalogue(), None).await;
+    make_cloud(&fixture).await;
+    set_architecture(&fixture.backend, "host-a", "aarch64", None).await;
+    let amd64_builder = ImageBuildCapacity::Builder {
+        architecture: "amd64".into(),
+        slots: 1,
+        reservation: ImageBuildReservation { cpu: 2, disk_bytes: 1 << 30 },
+    };
+    set_architecture(&fixture.backend, "kiwi", "aarch64", Some(amd64_builder)).await;
+    declare_image_cache(&fixture.backend).await;
+    let workflow = WorkflowTemplateSpec::builder().vessels(vec![vessel("work", vec![agent("coder", "codex")], &[])]).build();
+    let (image, pins) = admit(&fixture, &workflow).await.expect("admit");
+    assert!(pins.is_empty());
+    let build = build_for(&fixture, &image).await;
+    let spec = build.spec.current().expect("current");
+    assert_eq!(spec.architecture, "amd64");
+    assert_eq!(spec.host_ref, "kiwi");
+    assert_eq!(spec.delivery, ImageDelivery::Registry { repository: "registry.test/flotilla/crew-images".into() });
+    let kind = fixture.backend.using::<FulfilmentKind>(NS).get("crew-policy").await.expect("kind");
+    let mut placement = PlacementResolution::selected(kind);
+    fixture.daemon.admission.join_convoy_placement_builds(NS, Some("flotilla"), &workflow, &mut placement, None).await.expect("join");
+    assert!(
+        matches!(
+            placement.selected.expect("selected").spec.realisation,
+            FulfilmentRealisation::CloudSandboxPerVessel { image: Some(PlacementImageSource::Built { .. }), size: Some(size) } if size == CLOUD_SIZE
+        ),
+        "the frozen kind keeps its cloud realisation and size"
+    );
+}
+
+// Without a fleet image cache a cloud provider cannot read a composed image, so admission
+// refuses the kind, naming the missing `image_cache`, and plans no build.
+#[tokio::test]
+async fn cloud_composed_image_without_an_image_cache_is_refused() {
+    let fixture = fixture(catalogue(), None).await;
+    make_cloud(&fixture).await;
+    let workflow = WorkflowTemplateSpec::builder().vessels(vec![vessel("work", Vec::new(), &[])]).build();
+    let refused =
+        match fixture.daemon.admission.resolve_created_convoy_placement(NS, Some("flotilla"), &[], &workflow, Some("crew-policy")).await {
+            Ok(placement) => {
+                assert!(placement.selected.is_none(), "a cloud kind without an image cache must not be selected");
+                placement.refused_candidates.into_iter().map(|candidate| candidate.reason).collect::<Vec<_>>().join("\n")
+            }
+            Err(error) => error,
+        };
+    assert!(refused.contains("declares no `image_cache`"), "{refused}");
+    let error = admit(&fixture, &workflow).await.expect_err("no build is planned without an image cache");
+    assert!(error.contains("declares no `image_cache`"), "{error}");
+    assert!(fixture.backend.using::<ImageBuild>(NS).list().await.expect("builds").items.is_empty());
 }

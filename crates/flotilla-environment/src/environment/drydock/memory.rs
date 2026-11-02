@@ -18,6 +18,8 @@ pub(crate) struct MemoryApi {
     pub streams: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<ObservationStream>>,
     /// Refuse each provision with this reason.
     pub refuse_provision: Mutex<Option<String>>,
+    /// Every prepare request, in order.
+    pub prepares: Mutex<Vec<PrepareRequest>>,
     pub agent_socket: std::path::PathBuf,
     next: Mutex<u64>,
 }
@@ -44,6 +46,7 @@ impl MemoryApi {
             cursors: Default::default(),
             streams: tokio::sync::Mutex::new(receiver),
             refuse_provision: Default::default(),
+            prepares: Default::default(),
             agent_socket,
             next: Default::default(),
         };
@@ -79,6 +82,7 @@ impl ProviderApi for MemoryApi {
         Ok(declaration)
     }
     async fn prepare(&self, provider: &str, request: &PrepareRequest) -> ApiResult<Prepared> {
+        self.prepares.lock().expect("prepares").push(request.clone());
         Ok(Prepared {
             provider: provider.into(),
             id: format!("prepared-{}", request.image_digest.len()),

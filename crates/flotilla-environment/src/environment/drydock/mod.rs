@@ -22,6 +22,7 @@ pub use api::ProviderApi;
 use api::{self as wire, ApiError};
 pub use connector::installed_agent_build;
 use flotilla_protocol::provider::AgentConnectionReport;
+use flotilla_resources::HostImageAction;
 use std::{collections::BTreeMap, sync::RwLock, time::Duration};
 
 /// Where the guest's agent and lab service are.
@@ -262,6 +263,13 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
         if !matches!(self.detect_readiness().await, ProviderReadiness::Ready) {
             return Err("drydock provider is not ready".into());
         }
+        let image_pull = match &opts.prepared_auth {
+            Some(auth) => {
+                let (username, secret) = auth.basic(&spec.image, HostImageAction::ImagePull)?;
+                Some(wire::RegistryCredential { username, secret })
+            }
+            None => None,
+        };
         let prepared = self
             .api
             .prepare(
@@ -269,9 +277,10 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
                 &wire::PrepareRequest {
                     platform: Some(platform.clone()),
                     // Temporary: the route should follow the image's disposition
-                    // (flotilla-org/drydock#175). Safe only because no pull credentials are
-                    // sent, so only public images can be fetched and pushed.
+                    // (flotilla-org/drydock#175); until then every image may be pushed
+                    // to the provider's own registry.
                     route: None,
+                    image_pull,
                     image_digest: spec.image.clone(),
                     tools_digest: self.link.tools_image()?,
                     size: size(&spec.size),

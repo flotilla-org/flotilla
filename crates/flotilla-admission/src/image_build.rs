@@ -151,20 +151,7 @@ pub fn choose_builder(
     image_cache: Option<&flotilla_resources::ImageCacheBinding>,
 ) -> Result<(String, ImageDelivery, ImageBuildReservation), String> {
     match image_cache {
-        Some(cache) => {
-            let mut builders = hosts
-                .iter()
-                .filter(|host| host_architecture(host).is_none_or(|actual| actual == architecture))
-                .filter_map(|host| {
-                    builder_slot(host.spec.image_build_capacity.as_ref(), architecture)
-                        .map(|reservation| (host.metadata.name.clone(), reservation))
-                })
-                .collect::<Vec<_>>();
-            builders.sort_by(|left, right| left.0.cmp(&right.0));
-            let (host, reservation) =
-                builders.into_iter().next().ok_or_else(|| format!("no host can build images for architecture {architecture}"))?;
-            Ok((host, ImageDelivery::Registry { repository: cache.repository.clone() }, reservation))
-        }
+        Some(cache) => registry_builder(hosts, architecture, cache),
         None => {
             let reservation = match &placement.spec.image_build_capacity {
                 // An absent declaration preserves placement-host builds.
@@ -180,6 +167,30 @@ pub fn choose_builder(
         }
     }
 }
+
+/// The lowest-named host whose declared builder capacity covers `architecture`, pushing to the
+/// image cache. A declaration is the operator's word that the host builds that architecture,
+/// natively or emulated, so the host's own architecture does not filter it.
+fn registry_builder(
+    hosts: &[ResourceObject<Host>],
+    architecture: &str,
+    cache: &flotilla_resources::ImageCacheBinding,
+) -> Result<(String, ImageDelivery, ImageBuildReservation), String> {
+    let mut builders = hosts
+        .iter()
+        .filter_map(|host| {
+            builder_slot(host.spec.image_build_capacity.as_ref(), architecture).map(|reservation| (host.metadata.name.clone(), reservation))
+        })
+        .collect::<Vec<_>>();
+    builders.sort_by(|left, right| left.0.cmp(&right.0));
+    let (host, reservation) =
+        builders.into_iter().next().ok_or_else(|| format!("no host can build images for architecture {architecture}"))?;
+    Ok((host, ImageDelivery::Registry { repository: cache.repository.clone() }, reservation))
+}
+
+/// Why a cloud kind that runs the composed image cannot place without a fleet image cache.
+pub const CLOUD_IMAGE_CACHE_MISSING: &str =
+    "a cloud sandbox runs its vessel's composed image from the fleet image cache, and FleetDesignation declares no `image_cache`";
 
 /// The ImageBuild a vessel's composed image uses on its placement: its name,
 /// and the spec to create when no copy of that name exists yet.
@@ -225,6 +236,36 @@ pub async fn plan_image_build_for(
         None => placement_architecture,
     };
     let name = expected_build_name(&resolved.identity, &architecture, image_cache.as_ref(), &placement.metadata.name);
+    plan_named_build(backend, namespace, resolved, name, &architecture, || {
+        choose_builder(&hosts, placement, &architecture, image_cache.as_ref())
+    })
+    .await
+}
+
+/// Plan, without writing, a cloud vessel's ImageBuild: built for the cloud platform and pushed to
+/// the fleet image cache, the only place a cloud provider reads it from.
+pub async fn plan_cloud_image_build(
+    backend: &ResourceBackend,
+    namespace: &str,
+    resolved: &ResolvedImage,
+) -> Result<PlannedImageBuild, String> {
+    let cache = fleet_image_cache(backend, namespace).await?.ok_or(CLOUD_IMAGE_CACHE_MISSING)?;
+    let architecture = flotilla_resources::realisation_settings::CLOUD_SANDBOX_ARCHITECTURE;
+    let name = expected_build_name(&resolved.identity, architecture, Some(&cache), "");
+    let hosts = hosts(backend, namespace).await?;
+    plan_named_build(backend, namespace, resolved, name, architecture, || registry_builder(&hosts, architecture, &cache)).await
+}
+
+/// An existing build with this name, local or replicated, is reused whatever its copies say;
+/// otherwise `choose` names the builder and delivery of the build to create.
+async fn plan_named_build(
+    backend: &ResourceBackend,
+    namespace: &str,
+    resolved: &ResolvedImage,
+    name: String,
+    architecture: &str,
+    choose: impl FnOnce() -> Result<(String, ImageDelivery, ImageBuildReservation), String>,
+) -> Result<PlannedImageBuild, String> {
     // Planning only needs existence; source phase ranking cannot affect whether demand already exists.
     if backend
         .including_replicas::<ImageBuild>(namespace)
@@ -237,10 +278,10 @@ pub async fn plan_image_build_for(
     {
         return Ok(PlannedImageBuild { name, create: None });
     }
-    let (host_ref, delivery, reservation) = choose_builder(&hosts, placement, &architecture, image_cache.as_ref())?;
+    let (host_ref, delivery, reservation) = choose()?;
     let spec = ImageBuildSpec::builder()
         .identity(resolved.identity.clone())
-        .architecture(architecture)
+        .architecture(architecture.to_string())
         .layers(resolved.layers.clone())
         .host_ref(host_ref)
         .delivery(delivery)

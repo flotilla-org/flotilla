@@ -409,6 +409,7 @@ async fn stand_in_with(declared_path: Option<&str>, harness_in_image: bool, host
         cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
             probe_needs: Default::default(),
             image: format!("example.test/crew@sha256:{}", "a".repeat(64)),
+            image_build_ref: None,
             size: flotilla_resources::CloudSandboxSize { cpus: 1, memory_bytes: 1024, disk_bytes: 1024 },
             lifetime_cap_seconds: None,
             env,

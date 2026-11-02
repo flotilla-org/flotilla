@@ -146,18 +146,18 @@ impl ImageBuildReconciler {
 
     /// Build slots this host offers for `architecture`, or `None` when it
     /// does not build that architecture. An undeclared capacity is the
-    /// single-host local mode default of one slot.
+    /// single-host local mode default of one slot, for the host's own
+    /// architecture; a declared one may name another, built emulated.
     async fn slots(&self, architecture: &str) -> Result<Option<u32>, ResourceError> {
         let host = match self.hosts.get(&self.local_host_ref).await {
             Ok(host) => host,
             Err(ResourceError::NotFound { .. }) => return Ok(None),
             Err(error) => return Err(error),
         };
-        if flotilla_resources::image_architecture::host_architecture(&host).is_some_and(|actual| actual != architecture) {
-            return Ok(None);
-        }
         Ok(match host.spec.image_build_capacity {
-            None => Some(1),
+            None => {
+                flotilla_resources::image_architecture::host_architecture(&host).is_none_or(|actual| actual == architecture).then_some(1)
+            }
             Some(ImageBuildCapacity::None) => None,
             Some(ImageBuildCapacity::Builder { architecture: builds, slots, .. }) => {
                 (flotilla_resources::image_architecture::canonical_image_architecture(&builds) == architecture && slots > 0)
