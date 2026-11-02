@@ -578,3 +578,58 @@ impl EngineRecords for EngineHosts {
         Ok(Box::pin(stream))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stored::host;
+
+    fn observed_at(version: u64) -> Held {
+        Held { host: None, observation: Some((HostObservation::default(), version)) }
+    }
+
+    // Behaviour (#3824 layer 4d): a Host several homes hold reads as this home's records, else
+    // the lexically first home's, and never as another name's.
+    #[test]
+    fn a_host_several_homes_hold_reads_as_this_homes_else_the_first() {
+        let records: Records = [("b1", "gamma", 1), ("b1", "alpha", 2), ("b1", "beta", 3), ("b10", "delta", 4)]
+            .into_iter()
+            .map(|(name, home, version)| ((name.to_owned(), home.to_owned()), observed_at(version)))
+            .collect();
+        let read = |home: &str, name: &str| {
+            resolve(&records, home, name).map(|(owner, held)| (owner.to_owned(), held.observation.as_ref().map(|(_, version)| *version)))
+        };
+        assert_eq!(read("gamma", "b1"), Some(("gamma".to_owned(), Some(1))));
+        assert_eq!(read("delta", "b1"), Some(("alpha".to_owned(), Some(2))), "delta holds only b10");
+        assert_eq!(read("alpha", "b10"), Some(("delta".to_owned(), Some(4))));
+        assert!(read("alpha", "b2").is_none());
+    }
+
+    // Behaviour (#3824 layer 4d): a rescan of a home replaces what the map held for that home with
+    // what the store holds, and leaves every other home's records alone.
+    #[test]
+    fn a_rescan_replaces_only_its_homes_records() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut kinds = flotilla_schema::KindRegistry::new();
+        host::register(&mut kinds).expect("register");
+        let service = Arc::new(Service::open(&directory.path().join("decided.sqlite"), "alpha", kinds).expect("store"));
+        let log = PlainLog::new(service.store());
+        let change = PendingChange::new(NewChange::new(SPEC_WRITER, Timestamp::from_datetime(&Utc::now())));
+        log.create("kiwi", &HostRecord::new(&HostSpec::default()), &change).expect("written");
+
+        let mut records: Records = [("gone", "alpha"), ("kiwi", "beta")]
+            .into_iter()
+            .map(|(name, home)| ((name.to_owned(), home.to_owned()), observed_at(9)))
+            .collect();
+        service
+            .with_store(|store| {
+                let mut read = store.read()?;
+                rescan(&mut read, &mut records, "alpha")
+            })
+            .expect("rescan");
+        let keys: Vec<_> = records.keys().map(|(name, home)| (name.as_str(), home.as_str())).collect();
+        assert_eq!(keys, [("kiwi", "alpha"), ("kiwi", "beta")]);
+        let kiwi = &records[&("kiwi".to_owned(), "alpha".to_owned())];
+        assert!(kiwi.host.is_some() && kiwi.observation.is_none());
+    }
+}
