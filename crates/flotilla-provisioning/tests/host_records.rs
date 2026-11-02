@@ -205,3 +205,44 @@ async fn a_host_is_written_only_at_its_home() {
     hosts.delete("kiwi").await.expect("delete");
     assert!(hosts.get("kiwi").await.is_err());
 }
+
+// Behaviour (#3824 layer 4d): the daemon's own conditions that block are recorded and judged as
+// before. A full file-descriptor table holds readiness, and a quarantined record holds readiness
+// and forge observation.
+#[tokio::test]
+async fn the_daemons_blocking_conditions_hold_readiness() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let (_, backend) = engine(directory.path());
+    let hosts = backend.using::<Host>(NS);
+    let host = hosts.create(&InputMeta { name: "kiwi".into(), ..Default::default() }, &HostSpec::default()).await.expect("create");
+    let mut version = host.metadata.resource_version;
+    for (blocking, forge) in [
+        (
+            HostCondition::builder()
+                .condition_type("FileDescriptors")
+                .value(ConditionValue::False)
+                .reason("Exhausted")
+                .message("1024 of 1024")
+                .observed_at(at(0))
+                .blocks_forge_observation(false)
+                .build(),
+            false,
+        ),
+        (
+            HostCondition {
+                blocks_forge_observation: true,
+                ..condition("ResourceStore/DecodeQuarantine", ConditionValue::False, "1 record", at(0))
+            },
+            true,
+        ),
+    ] {
+        let mut status = observed(at(0), "12 GB free");
+        status.conditions.push(blocking.clone());
+        let written = hosts.update_status("kiwi", &version, &status).await.expect("status");
+        version = written.metadata.resource_version.clone();
+        let status = written.status.expect("status");
+        assert!(!status.ready, "{} holds readiness", blocking.condition_type);
+        let held = status.conditions.iter().find(|condition| condition.condition_type == blocking.condition_type).expect("recorded");
+        assert_eq!((held.value, held.blocks_readiness, held.blocks_forge_observation), (ConditionValue::False, true, forge));
+    }
+}

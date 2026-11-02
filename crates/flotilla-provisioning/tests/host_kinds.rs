@@ -230,7 +230,7 @@ fn the_corpus_imports_at_each_hosts_own_home() {
 // Behaviour (#3824 layer 4c): the observation keeps the basic facts admission and health read:
 // the architecture, canonical; the free-space floor, as a flag; each condition that can block
 // readiness or forge observation, by its type, without its observation time, and no diagnostic
-// condition, which is one blocking neither or one the owner named; providers by instance and class; the image cache by instance; the Codex login; the
+// condition, one blocking neither; providers by instance and class; the image cache by instance; the Codex login; the
 // probed facts by FulfilmentKind name (owner's answer: option A), without their age, free slots,
 // image or model facts.
 #[test]
@@ -281,7 +281,11 @@ fn the_observation_keeps_the_facts_admission_and_health_read() {
         assert_eq!(observation.architecture.as_deref(), Some("arm64"));
         assert_eq!(observation.daemon_generation.as_deref(), Some("g7"));
         assert!(observation.codex_central_login);
-        assert_eq!(observation.conditions.keys().collect::<Vec<_>>(), ["Transport/SSH"]);
+        assert_eq!(
+            observation.conditions.keys().collect::<Vec<_>>(),
+            ["FileDescriptors", "ResourceStore/DecodeQuarantine", "Transport/SSH"]
+        );
+        assert!(observation.conditions["ResourceStore/DecodeQuarantine"].blocks_forge_observation);
         let ssh = &observation.conditions["Transport/SSH"];
         assert_eq!((ssh.value, ssh.blocks_readiness), (Value::False, true));
         let docker = &observation.providers["docker"];
