@@ -11,6 +11,7 @@ absolute-paths-allowed-crates = [
     "async_trait",
     "axum",
     "base64",
+    "binnacle_cli",
     "binnacle_core",
     "binnacle_described",
     "binnacle_described_http",

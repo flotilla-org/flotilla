@@ -30,7 +30,14 @@ pub(crate) async fn run_web_command(cli: &Cli, command: WebSubCommand) -> Result
 /// Ask the daemon over its Unix socket for a one-time login URL on its HTTP listener.
 #[cfg(unix)]
 async fn mint_login_url(socket: &Path) -> Result<String> {
-    let body = super::daemon_http::request_json(socket, reqwest::Method::POST, LOGIN_CODES_PATH, "a login code").await?;
+    let body = flotilla_cli::frontend::daemon_http::request_json(
+        socket,
+        flotilla_cli::frontend::daemon_http::Method::POST,
+        LOGIN_CODES_PATH,
+        "a login code",
+    )
+    .await
+    .map_err(|error| eyre!(error))?;
     body["url"].as_str().map(str::to_owned).ok_or_else(|| eyre!("daemon login code response has no url: {body}"))
 }
 

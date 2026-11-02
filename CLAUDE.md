@@ -167,9 +167,10 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-paths` | Shared path policy, filesystem canonicalization and protocol path context |
 | `flotilla-config` | Host-local config files (`config.toml`, `daemon.toml`, `hosts.toml`, observation roots, open views), provider preference values, default checkout path and bounded log files |
 | `flotilla-daemon-api` | `DaemonHandle` and event publication interfaces, query subscription token, build identity and lifecycle lock file |
-| `flotilla-client` | Socket client: `SocketDaemon`, `connect_or_spawn`, gap recovery |
+| `flotilla-client` | Socket client: `SocketDaemon`, `connect_or_spawn`, gap recovery, client socket resolution and the sibling-binary handoff contract |
 | `flotilla-cli` | Shared CLI parsing/output, image-check client, PM connector and foreground terminal attachment; no dashboard renderer |
 | `flotilla-vessel` (in `flotilla-cli`) | Pushed CLI for domain commands, artifacts and hooks; no daemon or TUI. Drydock owns the resident agent |
+| `flotilla-table` | The `flotilla-table` sibling binary (#4249): described tables through binnacle, inline or printed; `flotilla table` hands off to it |
 | `flotilla-tui` | UI rendering (widget tree), input handling, binding table, keymap and event loop; selected by the root default-on `tui` feature |
 | `flotilla-daemon` | Runtime supervision, socket server and the one HTTP router (ADR 0065) on every listener, replication composition and routed transport, peer networking, multi-host command routing |
 | `flotilla-address` | ADR 0066 addresses: typed `kind:value` segments, canonical encoding, forge-kind normalisation, lenient input through a Forge lookup, `record_name`, references and the condition/template grammar; no flotilla dependencies |

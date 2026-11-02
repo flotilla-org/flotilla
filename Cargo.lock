@@ -265,14 +265,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "binnacle-cli"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/binnacle?rev=cb1822f6afeffbbefbd460fbe06826668e3c467d#cb1822f6afeffbbefbd460fbe06826668e3c467d"
+dependencies = [
+ "binnacle-core",
+ "binnacle-described",
+ "binnacle-format",
+ "binnacle-group",
+ "binnacle-layout",
+ "binnacle-memory",
+ "clap",
+ "serde_json",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
 name = "binnacle-core"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?rev=d842ba64b301bb4ac9fba76c92f59bb1c0f1023b#d842ba64b301bb4ac9fba76c92f59bb1c0f1023b"
+source = "git+https://github.com/flotilla-org/binnacle?rev=cb1822f6afeffbbefbd460fbe06826668e3c467d#cb1822f6afeffbbefbd460fbe06826668e3c467d"
 
 [[package]]
 name = "binnacle-described"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?rev=d842ba64b301bb4ac9fba76c92f59bb1c0f1023b#d842ba64b301bb4ac9fba76c92f59bb1c0f1023b"
+source = "git+https://github.com/flotilla-org/binnacle?rev=cb1822f6afeffbbefbd460fbe06826668e3c467d#cb1822f6afeffbbefbd460fbe06826668e3c467d"
 dependencies = [
  "binnacle-core",
  "binnacle-format",
@@ -287,7 +304,7 @@ dependencies = [
 [[package]]
 name = "binnacle-described-http"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?rev=d842ba64b301bb4ac9fba76c92f59bb1c0f1023b#d842ba64b301bb4ac9fba76c92f59bb1c0f1023b"
+source = "git+https://github.com/flotilla-org/binnacle?rev=cb1822f6afeffbbefbd460fbe06826668e3c467d#cb1822f6afeffbbefbd460fbe06826668e3c467d"
 dependencies = [
  "binnacle-described",
  "bytes",
@@ -300,7 +317,7 @@ dependencies = [
 [[package]]
 name = "binnacle-format"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?rev=d842ba64b301bb4ac9fba76c92f59bb1c0f1023b#d842ba64b301bb4ac9fba76c92f59bb1c0f1023b"
+source = "git+https://github.com/flotilla-org/binnacle?rev=cb1822f6afeffbbefbd460fbe06826668e3c467d#cb1822f6afeffbbefbd460fbe06826668e3c467d"
 dependencies = [
  "serde_json",
  "unicode-segmentation",
@@ -309,7 +326,7 @@ dependencies = [
 [[package]]
 name = "binnacle-group"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?rev=d842ba64b301bb4ac9fba76c92f59bb1c0f1023b#d842ba64b301bb4ac9fba76c92f59bb1c0f1023b"
+source = "git+https://github.com/flotilla-org/binnacle?rev=cb1822f6afeffbbefbd460fbe06826668e3c467d#cb1822f6afeffbbefbd460fbe06826668e3c467d"
 dependencies = [
  "binnacle-core",
  "binnacle-memory",
@@ -318,7 +335,7 @@ dependencies = [
 [[package]]
 name = "binnacle-layout"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?rev=d842ba64b301bb4ac9fba76c92f59bb1c0f1023b#d842ba64b301bb4ac9fba76c92f59bb1c0f1023b"
+source = "git+https://github.com/flotilla-org/binnacle?rev=cb1822f6afeffbbefbd460fbe06826668e3c467d#cb1822f6afeffbbefbd460fbe06826668e3c467d"
 dependencies = [
  "binnacle-core",
  "ciborium",
@@ -330,7 +347,7 @@ dependencies = [
 [[package]]
 name = "binnacle-memory"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?rev=d842ba64b301bb4ac9fba76c92f59bb1c0f1023b#d842ba64b301bb4ac9fba76c92f59bb1c0f1023b"
+source = "git+https://github.com/flotilla-org/binnacle?rev=cb1822f6afeffbbefbd460fbe06826668e3c467d#cb1822f6afeffbbefbd460fbe06826668e3c467d"
 dependencies = [
  "binnacle-core",
  "regex",
@@ -339,15 +356,14 @@ dependencies = [
 [[package]]
 name = "binnacle-ratatui"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?rev=d842ba64b301bb4ac9fba76c92f59bb1c0f1023b#d842ba64b301bb4ac9fba76c92f59bb1c0f1023b"
+source = "git+https://github.com/flotilla-org/binnacle?rev=cb1822f6afeffbbefbd460fbe06826668e3c467d#cb1822f6afeffbbefbd460fbe06826668e3c467d"
 dependencies = [
+ "binnacle-cli",
  "binnacle-core",
- "binnacle-described",
  "binnacle-format",
  "binnacle-group",
  "binnacle-layout",
  "binnacle-memory",
- "clap",
  "ratatui",
  "regex",
  "serde_json",
@@ -1461,12 +1477,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
- "binnacle-core",
- "binnacle-described",
- "binnacle-described-http",
- "binnacle-format",
- "binnacle-layout",
- "binnacle-ratatui",
  "bon",
  "chrono",
  "clap",
@@ -2025,6 +2035,8 @@ dependencies = [
  "humantime",
  "insta",
  "libc",
+ "reqwest 0.13.2",
+ "rigging-tls",
  "serde",
  "serde_json",
  "serde_yml",
@@ -3889,6 +3901,38 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "flotilla-table"
+version = "0.1.0"
+dependencies = [
+ "binnacle-cli",
+ "binnacle-core",
+ "binnacle-described",
+ "binnacle-described-http",
+ "binnacle-format",
+ "binnacle-layout",
+ "binnacle-ratatui",
+ "clap",
+ "color-eyre",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-hmac",
+ "flotilla-build-features-http",
+ "flotilla-build-features-logging",
+ "flotilla-build-features-os",
+ "flotilla-build-features-time",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-cli",
+ "flotilla-client",
+ "flotilla-daemon-api",
+ "ratatui",
+ "rigging-tls",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

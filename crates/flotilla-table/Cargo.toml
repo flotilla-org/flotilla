@@ -1,0 +1,47 @@
+[package]
+name = "flotilla-table"
+description = "flotilla's table viewer: described tables through binnacle, inline, full-screen or printed (#4249)"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[[bin]]
+name = "flotilla-table"
+path = "src/main.rs"
+
+[dependencies]
+binnacle-cli = { workspace = true }
+binnacle-core = { workspace = true }
+binnacle-described = { workspace = true }
+binnacle-described-http = { workspace = true }
+binnacle-format = { workspace = true }
+binnacle-layout = { workspace = true }
+binnacle-ratatui = { workspace = true }
+flotilla-cli = { path = "../flotilla-cli" }
+flotilla-client = { path = "../flotilla-client" }
+flotilla-daemon-api = { path = "../flotilla-daemon-api" }
+rigging-tls = { workspace = true }
+clap = { version = "4", features = ["derive", "string"] }
+color-eyre = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+ratatui = "0.30"
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
+
+# Keep native library features stable across build and test commands.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-hmac = { path = "../flotilla-build-features-hmac" }
+flotilla-build-features-http = { path = "../flotilla-build-features-http" }
+flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
+flotilla-build-features-os = { path = "../flotilla-build-features-os" }
+flotilla-build-features-time = { path = "../flotilla-build-features-time" }
+flotilla-build-features-tracing = { path = "../flotilla-build-features-tracing" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }

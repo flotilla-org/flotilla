@@ -125,7 +125,10 @@ fn main() {
     println!("cargo::rerun-if-env-changed=FLOTILLA_BUILD_ID");
 
     let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir.as_path();
+    // The root package, or a sibling binary's crate under `crates/` (#4249): both fingerprint the
+    // whole workspace, so `flotilla` and its siblings built together share one id.
+    let workspace_root =
+        manifest_dir.ancestors().find(|dir| dir.join("crates").join("build_identity.rs").is_file()).unwrap_or(manifest_dir.as_path());
     if let Some(head) = git_output(workspace_root, &["rev-parse", "--git-path", "HEAD"]) {
         println!("cargo::rerun-if-changed={head}");
     }

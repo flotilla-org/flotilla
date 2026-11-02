@@ -29,6 +29,7 @@ pub mod endpoint;
 pub mod launchd;
 pub mod reconnect;
 pub mod resource;
+pub mod sibling;
 pub mod systemd;
 pub use flotilla_daemon_api::build_info::build_id;
 

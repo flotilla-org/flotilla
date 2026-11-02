@@ -50,9 +50,9 @@ fn main() -> Result<()> {
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let result = runtime.block_on(Box::pin(run_command(cli, command, format)));
-    // The runtime shuts down before an interrupted `table` exits with its signal's status.
+    // The runtime shuts down before this exits with the status of a sibling it ran as a child.
     drop(runtime);
-    if let Some(status) = cli::table_exit_status() {
+    if let Some(status) = cli::handoff_exit_status() {
         std::process::exit(status);
     }
 

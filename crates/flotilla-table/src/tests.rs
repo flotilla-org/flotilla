@@ -1,10 +1,11 @@
-//! `flotilla table` over recorded `/tables` responses: `tests/fixtures/tables/convoys.ndjson` is
+//! flotilla-table over recorded `/tables` responses: `fixtures/convoys.ndjson` is
 //! the convoys rows stream and `convoys.json` its description, recorded from the daemon's router
 //! (`GET /tables/convoys/rows?namespace=flotilla`) over six seeded convoys; `listing.json` is its
 //! `GET /tables`.
 
 use binnacle_described::Decoder;
-use binnacle_ratatui::cli::{print, run_inline_with};
+use binnacle_ratatui::cli::run_inline_with;
+use clap::Parser;
 use ratatui::{
     backend::TestBackend,
     crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers},
@@ -14,7 +15,7 @@ use ratatui::{
 use super::*;
 
 fn fixture(name: &str) -> Vec<u8> {
-    let path = format!("{}/tests/fixtures/tables/{name}", env!("CARGO_MANIFEST_DIR"));
+    let path = format!("{}/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
     std::fs::read(&path).unwrap_or_else(|error| panic!("{path}: {error}"))
 }
 
@@ -31,14 +32,14 @@ fn convoys(table: &str) -> DescribedSource {
     source
 }
 
-/// The binnacle flags `flotilla table <args>` parses to, the global `--json` included.
+/// `flotilla-table <args>`.
+fn arguments(args: &[&str]) -> Args {
+    Args::try_parse_from(["flotilla-table"].into_iter().chain(args.iter().copied())).expect("flotilla-table args parse")
+}
+
+/// The binnacle flags `flotilla-table <args>` parses to, `--json` included.
 fn parsed(args: &[&str]) -> Flags {
-    use clap::Parser;
-    let cli = Cli::try_parse_from(["flotilla", "table"].into_iter().chain(args.iter().copied())).expect("table args parse");
-    match &cli.command {
-        Some(flotilla_cli::cli::args::SubCommand::Table(table)) => flags(table, cli.json).expect("flags"),
-        _ => panic!("not the table command"),
-    }
+    flags(&arguments(args)).expect("flags")
 }
 
 /// `source` printed as `table` with `args`.
@@ -60,7 +61,7 @@ const NEWEST_FIRST: [&str; 6] = ["convoy-5f6a", "convoy-4e5b", "convoy-3d4c", "c
 
 #[test]
 fn convoys_print_with_the_view_files_columns_and_sort() {
-    let text = printed(&mut convoys("convoys"), "convoys", &["--format", "text"]);
+    let text = printed(&mut convoys("convoys"), "convoys", &["--format", "aligned"]);
     let header: Vec<&str> = text.lines().next().unwrap().split_whitespace().collect();
     assert_eq!(header, ["Name", "Phase", "Namespace", "Created"], "{text}");
     assert_eq!(names(&text), NEWEST_FIRST, "{text}");
@@ -105,9 +106,8 @@ fn flags_patch_the_view() {
     let unknown = layout(&mut convoys("convoys"), "convoys", &flags).unwrap_err().to_string();
     assert!(unknown.contains("nosuch"), "{unknown}");
     // An unknown format is refused while parsing, naming the formats.
-    use clap::Parser;
-    let refused = Cli::try_parse_from(["flotilla", "table", "convoys", "--format", "csv"]).err().expect("csv refused").to_string();
-    assert!(refused.contains("text") && refused.contains("jsonl"), "{refused}");
+    let refused = Args::try_parse_from(["flotilla-table", "convoys", "--format", "csv"]).expect_err("csv refused").to_string();
+    assert!(refused.contains("aligned") && refused.contains("jsonl"), "{refused}");
     assert!(show_live(Path::new("/nonexistent"), "convoys", "", &flags, false).unwrap_err().to_string().contains("--namespace"));
 }
 
@@ -130,7 +130,7 @@ fn a_table_with_no_view_file_prints_binnacles_default_view() {
 #[test]
 fn every_built_in_view_parses_and_names_only_columns_its_table_has() {
     for view in VIEWS {
-        // Each view's table needs its recorded description, `tests/fixtures/tables/<table>.json`.
+        // Each view's table needs its recorded description, `fixtures/<table>.json`.
         let description: Json = serde_json::from_slice(&fixture(&format!("{}.json", view.table))).expect("description");
         let fields: Vec<&str> = description["fields"].as_array().unwrap().iter().filter_map(|field| field["name"].as_str()).collect();
         let layout = Layout::<JsonId, JsonId>::from_json(view.document.as_bytes()).expect("view file is a binnacle Layout");
@@ -197,6 +197,12 @@ fn drain_feeds_messages_reports_retries_and_stops_at_a_refusal() {
     assert_eq!(opened.len(), 1);
 }
 
+#[tokio::test]
+async fn a_remote_daemon_is_refused_naming_its_issue() {
+    let refused = run(arguments(&["--daemon", "ssh://udder", "convoys"])).await.unwrap_err().to_string();
+    assert!(refused.contains("ssh://udder") && refused.contains("#4241"), "{refused}");
+}
+
 #[test]
 fn a_refusal_reads_as_the_daemons_message() {
     assert_eq!(refusal(404, br#"{"code":"not_found","message":"unknown table"}"#), "404 unknown table");
@@ -220,7 +226,7 @@ fn typed(text: &str) -> Vec<Option<TermEvent>> {
 /// (as `flotilla table` prints it) and what stayed on the terminal.
 fn inline(events: Vec<Option<TermEvent>>) -> (Exit, Vec<String>, String) {
     let mut source = convoys("convoys");
-    let layout = layout(&mut source, "convoys", &flags(&TableArgs::default(), false).unwrap()).unwrap();
+    let layout = layout(&mut source, "convoys", &parsed(&[])).unwrap();
     let mut terminal = Terminal::with_options(TestBackend::new(120, 30), TerminalOptions { viewport: Viewport::Inline(12) }).unwrap();
     let options = InlineOptions { origin: Some(Timestamp::from_unix_secs(1_793_232_000)), ..InlineOptions::default() };
     let exit = run_inline_with(&mut terminal, events, &mut source, &layout, options).unwrap();

@@ -1,6 +1,6 @@
 # Recorded `/tables` responses
 
-`flotilla table`'s tests (`src/cli/table/tests.rs`) render these:
+`flotilla-table`'s tests (`src/tests.rs`) render these:
 
 | File | Request |
 |---|---|
@@ -39,7 +39,7 @@ async fn record_table_fixtures() {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     let router = router(backend);
-    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/tables");
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../flotilla-table/fixtures");
     for (path, file) in [
         ("/tables/convoys/rows?namespace=flotilla&limit=10000", "convoys.ndjson"),
         ("/tables/convoys", "convoys.json"),
