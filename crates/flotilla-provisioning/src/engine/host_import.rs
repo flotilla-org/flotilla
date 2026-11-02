@@ -8,7 +8,7 @@
 //! | Deleted | dropped |
 //! | `spec` | a Host record; `expected_concurrent_rust_crews` and an SSH host's destination dropped, as nothing reads them from here, and counted when set |
 //! | `status` | a HostObservation record: generation, architecture, the free-space floor as a flag, the conditions that can block readiness or forge observation, providers (class, readiness and capabilities), adapters and their baseline, held credentials and their expiry, image digests, the Codex central login |
-//! | `status.conditions` | each condition's observation time, and diagnostic conditions (blocking neither readiness nor forge observation, or named in `DIAGNOSTIC_CONDITIONS`), dropped: a judgement, and metrics |
+//! | `status.conditions` | each condition's observation time, and diagnostic conditions (blocking neither readiness nor forge observation), dropped: a judgement, and metrics |
 //! | `status.fulfilment_facts` | facts by FulfilmentKind name: a missing crew pool (no free slots on a host without a vessel cap), GUI login, harness and toolchain versions; each fact's observation time, any other free slot count, the image and its presence, and model facts dropped, as judgements or read by nothing |
 //! | Heartbeat time, readiness, `sleeping_until`, model probes | dropped: readiness is a judgement, and nothing sets the others |
 //! | The host summary (but its architecture), protocol fingerprint, daemon version and start time, sleep inhibition state, provider implementation names | dropped: display only or read by nothing; the sleep condition carries what readiness needs |
@@ -65,11 +65,6 @@ const CARRIED_CAPABILITIES: [&str; 7] = [
     CODEX_CENTRAL_LOGIN_CAPABILITY,
     OWNING_DAEMON_CAPABILITY,
 ];
-
-/// Conditions that report on the daemon itself rather than on what the host can take, whatever
-/// their blocking flags; they belong in metrics.
-const DIAGNOSTIC_CONDITIONS: [&str; 4] =
-    ["FileDescriptors", "ResourceStore/ReadRetries", "ResourceStore/DecodeQuarantine", "CleatBuildSkew"];
 
 /// One old copy of a Host: its namespace, the object, and the home that wrote it.
 pub struct HostCopy {
@@ -132,7 +127,12 @@ fn capability<T: serde::de::DeserializeOwned + Default>(status: &HostStatus, key
         .map(Option::unwrap_or_default)
 }
 
-fn observation(spec: &HostSpec, status: &HostStatus, dropped: &mut Vec<(&'static str, &'static str)>) -> Result<HostObservation, String> {
+/// The observation `status` maps to, with what it does not carry pushed to `dropped`.
+pub(crate) fn observation(
+    spec: &HostSpec,
+    status: &HostStatus,
+    dropped: &mut Vec<(&'static str, &'static str)>,
+) -> Result<HostObservation, String> {
     let mut uncarried = |reason: &'static str| {
         if !dropped.contains(&(OBSERVATION, reason)) {
             dropped.push((OBSERVATION, reason));
@@ -154,9 +154,7 @@ fn observation(spec: &HostSpec, status: &HostStatus, dropped: &mut Vec<(&'static
     let mut conditions = BTreeMap::new();
     for condition in &status.conditions {
         uncarried("each condition's observation time, a judgement");
-        if DIAGNOSTIC_CONDITIONS.contains(&condition.condition_type.as_str())
-            || (!condition.blocks_readiness && !condition.blocks_forge_observation)
-        {
+        if !condition.blocks_readiness && !condition.blocks_forge_observation {
             uncarried("diagnostic conditions, which belong in metrics");
             continue;
         }

@@ -52,7 +52,7 @@ pub const PLAN: &[(&str, Plan)] = &[
     // Mapped by the placement import (#3824 layer 4a), but the engine store holds no FulfilmentKind until
     // a layer serves it from there.
     ("FulfilmentKind", Plan::Moving("the layer that serves FulfilmentKind from the engine")),
-    ("Host", Plan::Moving("#3824 layer 4c")),
+    ("Host", Plan::Imported("hosts")),
     // Each policy becomes a FulfilmentKind of its name.
     ("PlacementPolicy", Plan::Moving("the layer that serves FulfilmentKind from the engine")),
     ("ChangeRequest", Plan::Imported("forge observations import (#3824 layer 5)")),
