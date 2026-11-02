@@ -11,6 +11,7 @@
 //! one implementation.
 
 pub mod attention;
+pub mod attentions;
 pub mod awaiting;
 pub mod convert;
 pub mod convoy_engine;

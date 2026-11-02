@@ -2321,10 +2321,8 @@ impl Aggregator {
                         DemandState::Acknowledged => status.acknowledged.as_ref(),
                     })
                     .map_or(demand.metadata.creation_timestamp, |transition| transition.as_of);
-                let addressee = match &demand.spec.addressee {
-                    DemandAddressee::Principal { principal_ref } => Some(principal_ref.clone()),
-                    DemandAddressee::Pool { .. } => None,
-                };
+                let DemandAddressee::Principal { principal_ref } = &demand.spec.addressee;
+                let addressee = Some(principal_ref.clone());
                 DemandFact { target: demand.spec.originating_work_ref.clone(), addressee, state, as_of }
             })
             .collect();

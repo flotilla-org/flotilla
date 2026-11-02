@@ -7,11 +7,11 @@ use std::{
 use chrono::Utc;
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
-    Convoy, Demand, DemandAddressee, DemandKind, DemandPoolRef, DemandSpec, Host, HostSpec, HostStatus, InputMeta, IssueSource,
-    OwnerReference, PrincipalRef, Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, RegardSpec,
-    RepositoryKey, Resource, ResourceError, ResourceObject, ResourceProvenance, TerminalSession, TerminalSessionIdentity,
-    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, WatchEvent, WatchStart, WorkflowTemplate,
-    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    Convoy, Demand, DemandAddressee, DemandKind, DemandSpec, Host, HostSpec, HostStatus, InputMeta, IssueSource, OwnerReference,
+    PrincipalRef, Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, RegardSpec, RepositoryKey,
+    Resource, ResourceError, ResourceObject, ResourceProvenance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, WatchEvent, WatchStart, WorkflowTemplate, CONVOY_LABEL, ROLE_LABEL,
+    VESSEL_LABEL,
 };
 use flotilla_store::{delete_resource_kind, ResourceBackend, TypedResolver};
 use futures::StreamExt;
@@ -238,7 +238,7 @@ impl ResourceContractFixture for DemandFixture {
         DemandSpec::builder()
             .originating_work_ref(resource_ref("Vessel", "alpha-review"))
             .kind(DemandKind::Review)
-            .addressee(DemandAddressee::Pool { pool_ref: DemandPoolRef("project/default".to_string()) })
+            .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef::implicit_for_namespace("flotilla") })
             .build()
     }
 
