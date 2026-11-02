@@ -476,6 +476,20 @@ mod tests {
         assert_eq!(conditions[0].condition_type, "ProjectImageLayer/flotilla/app");
         assert!(conditions[0].message.contains("no default branch"), "{}", conditions[0].message);
         assert!(source.reads.lock().unwrap().is_empty());
+
+        *source.files.lock().unwrap() = Some(layer_files("1.0.0"));
+        let repository = repositories.get(&repository_name).await.unwrap();
+        repositories
+            .update_status(
+                &repository_name,
+                &repository.metadata.resource_version,
+                &RepositoryStatus { default_branch: Some("main".into()), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        service.reconcile_project_image_layers().await.unwrap();
+        assert!(service.image_layer_refresh.lock().await.conditions().is_empty());
+        assert!(backend.using::<ImageLayer>("flotilla").get(&layer_name("1.0.0")).await.is_ok());
     }
 
     #[tokio::test(start_paused = true)]
