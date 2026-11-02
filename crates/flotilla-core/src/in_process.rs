@@ -746,7 +746,7 @@ pub struct InProcessDaemon {
     issue_observer: flotilla_observation::issue_observer::IssueRefresher,
     /// The whole-source forge observer's records, installed with the engine's observation records,
     /// and the observer once it runs.
-    source_records: std::sync::OnceLock<Arc<dyn flotilla_resources::forge_observation::SourceRecords>>,
+    source_records: tokio::sync::watch::Sender<Option<Arc<dyn flotilla_resources::forge_observation::SourceRecords>>>,
     source_observer: std::sync::OnceLock<flotilla_observation::source_observer::SourceObserver>,
     repos: Arc<RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
@@ -1421,7 +1421,7 @@ impl InProcessDaemon {
             manifest_roots,
             change_request_observer,
             issue_observer,
-            source_records: Default::default(),
+            source_records: tokio::sync::watch::channel(None).0,
             source_observer: Default::default(),
             resource_backend: resource_backend.clone(),
             observed_resource_backend: observed_resource_backend.clone(),
@@ -2300,11 +2300,16 @@ impl InProcessDaemon {
         failures: Arc<dyn flotilla_resources::engine_records::ObservationFailures>,
         sources: Arc<dyn flotilla_resources::forge_observation::SourceRecords>,
     ) -> Result<(), String> {
-        // Sources observed whole before a restart keep their records until the observer runs.
-        for (service, scope) in self.source_states().sources()? {
-            sources.observe_whole(&service, &scope);
+        if self.source_records.borrow().is_some() {
+            return Err("the whole-source records are already installed".to_owned());
         }
-        self.source_records.set(sources).map_err(|_| "the whole-source records are already installed".to_owned())?;
+        // Sources observed whole before a restart keep their records until the observer runs. An
+        // unreadable state directory only means none are claimed early.
+        match self.source_states().sources() {
+            Ok(previous) => previous.iter().for_each(|(service, scope)| sources.observe_whole(service, scope)),
+            Err(error) => tracing::warn!(%error, "forge source states unreadable; none claimed at install"),
+        }
+        self.source_records.send_replace(Some(sources));
         self.resource_backend().install_engine_records(records);
         self.change_request_observer.engine().install(Arc::clone(&failures))?;
         self.issue_observer.engine().install(failures)?;
@@ -2441,13 +2446,16 @@ impl InProcessDaemon {
     /// installed.
     pub async fn watch_forge_sources(&self, namespace: &str) {
         use flotilla_observation::source_observer::{SourceObserver, SourceObserverParts};
-        let Some(records) = self.source_records.get() else { return futures::future::pending().await };
+        let mut installed = self.source_records.subscribe();
+        let Ok(records) = installed.wait_for(Option::is_some).await.map(|records| records.clone().expect("installed")) else {
+            return futures::future::pending().await;
+        };
         let observer = SourceObserver::new(
             SourceObserverParts::builder()
                 .backend(self.resource_backend.clone())
                 .namespace(namespace.to_owned())
                 .queries(Arc::clone(&self.issue_query_port))
-                .records(Arc::clone(records))
+                .records(records)
                 .states(self.source_states())
                 .clock(Arc::clone(&self.clock))
                 .build(),

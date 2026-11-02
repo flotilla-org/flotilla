@@ -53,8 +53,10 @@ impl Default for SourceCadence {
     }
 }
 
-/// What the observer keeps of a source between passes, durably at its own host.
+/// What the observer keeps of a source between passes, durably at its own host. It is rebuildable:
+/// without it the next pass reads the source's open inventory again.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SourceState {
     pub service: String,
     pub scope: String,
@@ -94,7 +96,11 @@ impl FileSourceStates {
 impl SourceStates for FileSourceStates {
     fn load(&self, service: &str, scope: &str) -> Result<Option<SourceState>, String> {
         match std::fs::read(self.path(service, scope)) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| format!("decode source state: {error}")),
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)
+                .inspect_err(
+                    |error| tracing::warn!(service, scope, %error, "forge source state undecodable; the source is read again whole"),
+                )
+                .ok()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(format!("read source state: {error}")),
         }
@@ -135,9 +141,13 @@ impl SourceStates for FileSourceStates {
         for entry in entries {
             let path = entry.map_err(|error| error.to_string())?.path();
             if path.extension().is_some_and(|extension| extension == "json") {
-                let bytes = std::fs::read(&path).map_err(|error| format!("read source state: {error}"))?;
-                let state: SourceState = serde_json::from_slice(&bytes).map_err(|error| format!("decode source state: {error}"))?;
-                sources.push((state.service, state.scope));
+                let state = std::fs::read(&path)
+                    .map_err(|error| error.to_string())
+                    .and_then(|bytes| serde_json::from_slice::<SourceState>(&bytes).map_err(|error| error.to_string()));
+                match state {
+                    Ok(state) => sources.push((state.service, state.scope)),
+                    Err(error) => tracing::warn!(path = %path.display(), %error, "forge source state unreadable; skipped"),
+                }
             }
         }
         Ok(sources)

@@ -20,6 +20,21 @@ use crate::change_request::{pull_state, read_review_decision};
 /// Pages one list may take in one pass before the pass refuses to move the cursor.
 const MAX_PAGES: usize = 200;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum List {
+    Issues,
+    Pulls,
+}
+
+impl List {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Issues => "issues",
+            Self::Pulls => "pulls",
+        }
+    }
+}
+
 fn updated_at(item: &Value) -> Result<DateTime<Utc>, String> {
     let at = item["updated_at"].as_str().ok_or("Forgejo item lacks updated_at")?;
     at.parse().map_err(|error| format!("Forgejo item updated_at {at}: {error}"))
@@ -55,13 +70,14 @@ fn feed_issue(item: &Value) -> Result<FeedIssue, String> {
 }
 
 impl ForgejoIssueProvider {
-    /// The items `kind`'s list reports since `cursor`, most recently updated first.
-    async fn listed(&self, scope: &str, kind: &str, cursor: Option<&ListCursor>) -> Result<Vec<Value>, String> {
+    /// The items `list` reports since `cursor`, most recently updated first.
+    async fn listed(&self, scope: &str, list: List, cursor: Option<&ListCursor>) -> Result<Vec<Value>, String> {
+        let kind = list.path();
         let state = if cursor.is_some() { "all" } else { "open" };
         let mut reported = Vec::new();
         for page in 1..=MAX_PAGES {
             let mut query = vec![("state", state.to_string())];
-            if kind == "issues" {
+            if list == List::Issues {
                 query.push(("type", "issues".to_string()));
                 if let Some(cursor) = cursor {
                     query.push(("since", cursor.at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)));
@@ -116,8 +132,8 @@ impl SourceFeed for ForgejoIssueProvider {
     async fn pass(&self, source: &IssueSource, request: &FeedRequest) -> Result<FeedPass, String> {
         let scope = source.scope.as_str();
         let started = Utc::now();
-        let mut issues = self.listed(scope, "issues", request.cursor.issues.as_ref()).await?;
-        let mut pulls = self.listed(scope, "pulls", request.cursor.pulls.as_ref()).await?;
+        let mut issues = self.listed(scope, List::Issues, request.cursor.issues.as_ref()).await?;
+        let mut pulls = self.listed(scope, List::Pulls, request.cursor.pulls.as_ref()).await?;
         let cursor = SourceCursor {
             issues: Some(advanced(request.cursor.issues.as_ref(), &issues, started)?),
             pulls: Some(advanced(request.cursor.pulls.as_ref(), &pulls, started)?),

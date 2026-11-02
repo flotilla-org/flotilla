@@ -532,3 +532,17 @@ async fn file_states_survive_a_restart() {
     reopened.remove("github.com", "org/shared").expect("remove");
     assert_eq!(reopened.load("github.com", "org/shared").expect("load"), None);
 }
+
+#[tokio::test]
+async fn an_undecodable_state_is_rebuilt_rather_than_fatal() {
+    let directory = tempfile::tempdir().expect("directory");
+    let states = FileSourceStates::new(directory.path().into());
+    states.save(&SourceState { service: "github.com".into(), scope: "org/shared".into(), ..SourceState::default() }).expect("save");
+    for entry in std::fs::read_dir(directory.path()).expect("list") {
+        std::fs::write(entry.expect("entry").path(), b"not json").expect("corrupt");
+    }
+    assert_eq!(states.load("github.com", "org/shared").expect("load"), None, "the source is read again whole");
+    assert!(states.sources().expect("sources").is_empty());
+    let partial: SourceState = serde_json::from_str(r#"{"service": "github.com", "scope": "org/shared"}"#).expect("missing fields default");
+    assert_eq!(partial.cursor, SourceCursor::default());
+}
