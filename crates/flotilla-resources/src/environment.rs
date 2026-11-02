@@ -160,7 +160,11 @@ impl<'de> Deserialize<'de> for EnvironmentSpec {
 pub struct CloudSandboxEnvironmentSpec {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub probe_needs: BTreeSet<crate::CapabilityNeed>,
+    /// Empty for a composed image until the Environment reconciler resolves its build's registry digest.
     pub image: String,
+    /// The per-identity ImageBuild that realises `image`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_build_ref: Option<String>,
     pub size: CloudSandboxSize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifetime_cap_seconds: Option<u64>,
@@ -173,6 +177,9 @@ impl<'de> Deserialize<'de> for CloudSandboxEnvironmentSpec {
         #[derive(Deserialize)]
         struct Stored {
             image: String,
+            /// Absent in specs written before cloud vessels ran composed images; remove this default one roll later.
+            #[serde(default)]
+            image_build_ref: Option<String>,
             size: CloudSandboxSize,
             lifetime_cap_seconds: Option<u64>,
             #[serde(default)]
@@ -200,7 +207,14 @@ impl<'de> Deserialize<'de> for CloudSandboxEnvironmentSpec {
             Some(needs) => needs,
             None => needs.map(|value| serde_json::from_str(&value)).transpose().map_err(serde::de::Error::custom)?.unwrap_or_default(),
         };
-        Ok(Self { image: stored.image, size: stored.size, lifetime_cap_seconds: stored.lifetime_cap_seconds, env: stored.env, probe_needs })
+        Ok(Self {
+            image: stored.image,
+            image_build_ref: stored.image_build_ref,
+            size: stored.size,
+            lifetime_cap_seconds: stored.lifetime_cap_seconds,
+            env: stored.env,
+            probe_needs,
+        })
     }
 }
 
@@ -690,11 +704,13 @@ mod cloud_schema_tests {
         let disk_bytes = tc.draw(gs::integers::<u64>().min_value(1));
         let lifetime_cap_seconds = tc.draw(gs::booleans()).then(|| tc.draw(gs::integers::<u64>().min_value(1)));
         let value = tc.draw(gs::text().max_size(30));
+        let image_build_ref = tc.draw(gs::booleans()).then(|| "image-abc-amd64-registry".to_string());
         let spec = EnvironmentSpec {
             provider_address: Some("account:test/provider:daytona".parse().unwrap()),
             cloud_sandbox: Some(CloudSandboxEnvironmentSpec {
                 probe_needs: Default::default(),
                 image: "registry/image@sha256:digest".into(),
+                image_build_ref,
                 size: CloudSandboxSize { cpus, memory_bytes, disk_bytes },
                 lifetime_cap_seconds,
                 env: BTreeMap::from([("VALUE".into(), value)]),

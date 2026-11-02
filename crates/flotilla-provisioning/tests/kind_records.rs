@@ -56,9 +56,16 @@ async fn contract(backend: &ResourceBackend) {
     kinds.create(&labelled("host-direct-kiwi", &[]), &kind("passthrough", FulfilmentRealisation::HostDirect)).await.expect("operator's");
 
     let size = flotilla_resources::CloudSandboxSize { cpus: 4, memory_bytes: 8 << 30, disk_bytes: 10 << 30 };
-    let cloud = kind("cleat", FulfilmentRealisation::CloudSandboxPerVessel { image: "image@sha256:digest".into(), size: Some(size) });
-    kinds.create(&labelled("cloud-sized", &[]), &cloud).await.expect("cloud");
-    assert_eq!(kinds.get("cloud-sized").await.expect("get cloud").spec, cloud, "the policy's size survives storage");
+    // A literal, the composed image a policy leaves to admission, and the build admission froze.
+    for (name, image) in [
+        ("cloud-sized", Some(PlacementImageSource::Literal("image@sha256:digest".into()))),
+        ("cloud-composed", None),
+        ("cloud-built", Some(PlacementImageSource::Built { identity: "identity".into(), image_build_ref: "image-identity-amd64".into() })),
+    ] {
+        let cloud = kind("cleat", FulfilmentRealisation::CloudSandboxPerVessel { image, size: Some(size.clone()) });
+        kinds.create(&labelled(name, &[]), &cloud).await.expect("cloud");
+        assert_eq!(kinds.get(name).await.expect("get cloud").spec, cloud, "the image and the policy's size survive storage");
+    }
 
     let read = kinds.get("placement-snapshot-012345abcdef").await.expect("get snapshot");
     assert_eq!(read.spec, frozen);
@@ -69,8 +76,11 @@ async fn contract(backend: &ResourceBackend) {
 
     let mut names: Vec<_> = kinds.list().await.expect("list").items.into_iter().map(|kind| kind.metadata.name).collect();
     names.sort();
-    assert_eq!(names, ["cloud-sized", "docker-on-kiwi", "host-direct-kiwi", "placement-snapshot-012345abcdef"]);
-    assert_eq!(backend.including_replicas::<FulfilmentKind>(NS).list().await.expect("replicas").items.len(), 4);
+    assert_eq!(
+        names,
+        ["cloud-built", "cloud-composed", "cloud-sized", "docker-on-kiwi", "host-direct-kiwi", "placement-snapshot-012345abcdef"]
+    );
+    assert_eq!(backend.including_replicas::<FulfilmentKind>(NS).list().await.expect("replicas").items.len(), 6);
 
     let mut observed = read.spec.clone();
     observed.grants.insert(FulfilmentGrant::gui_session());
@@ -81,7 +91,7 @@ async fn contract(backend: &ResourceBackend) {
 
     kinds.delete("placement-snapshot-012345abcdef").await.expect("delete");
     assert!(kinds.get("placement-snapshot-012345abcdef").await.is_err());
-    assert_eq!(kinds.list().await.expect("list").items.len(), 3);
+    assert_eq!(kinds.list().await.expect("list").items.len(), 5);
 }
 
 #[tokio::test]

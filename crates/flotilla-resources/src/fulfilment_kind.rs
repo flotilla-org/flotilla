@@ -326,7 +326,9 @@ impl fmt::Display for FulfilmentCostClass {
 #[serde(tag = "realisation", rename_all = "snake_case")]
 pub enum FulfilmentRealisation {
     CloudSandboxPerVessel {
-        image: String,
+        /// `None` is the vessel's composed image. A stored plain string decodes as a literal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image: Option<crate::PlacementImageSource>,
         /// The policy's size; `None` provisions at `realisation_settings::CLOUD_SANDBOX_SIZE`.
         /// Kinds stored before the size was carried decode with `None`; remove this default one roll later.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -400,6 +402,6 @@ mod size_tests {
     fn cloud_realisation_without_a_size_decodes_to_none() {
         let legacy: FulfilmentRealisation =
             serde_json::from_value(serde_json::json!({"realisation": "cloud_sandbox_per_vessel", "image": "i@sha256:d"})).unwrap();
-        assert_eq!(legacy, FulfilmentRealisation::CloudSandboxPerVessel { image: "i@sha256:d".into(), size: None });
+        assert_eq!(legacy, FulfilmentRealisation::CloudSandboxPerVessel { image: Some("i@sha256:d".into()), size: None });
     }
 }

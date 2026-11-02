@@ -112,7 +112,10 @@ pub struct PlacementPolicySpec {
 /// Checkout stays inside this input until the generated-table move (#3108).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloudSandboxPerVesselPlacementPolicySpec {
-    pub image: String,
+    /// Omitted means the vessel's composed image, built for the cloud platform and
+    /// delivered through the fleet image cache. A stored plain string decodes as a literal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<PlacementImageSource>,
     pub size: crate::CloudSandboxSize,
     pub checkout: CloudSandboxCheckout,
     #[serde(default)]

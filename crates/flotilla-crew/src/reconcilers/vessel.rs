@@ -448,7 +448,7 @@ struct Placement {
 enum PlacementStrategy {
     HostDirect { host_ref: String, pool: String },
     DockerHostCheckoutAndMount { host_ref: String, pool: String, image: Option<PlacementImageSource> },
-    CloneInVessel { host_ref: String, pool: String, image: String, clone_path: String },
+    CloneInVessel { host_ref: String, pool: String, image: Option<PlacementImageSource>, clone_path: String },
 }
 
 impl PlacementStrategy {
@@ -521,7 +521,8 @@ struct ImageStamp {
 /// The composed identity a placement froze at admission (ADR 0062).
 fn composed_image(placement: &Placement, digest: Option<String>) -> Option<VesselImage> {
     match &placement.kind.spec.realisation {
-        FulfilmentRealisation::DockerPerVessel { image: Some(PlacementImageSource::Built { identity, .. }) } => {
+        FulfilmentRealisation::DockerPerVessel { image: Some(PlacementImageSource::Built { identity, .. }) }
+        | FulfilmentRealisation::CloudSandboxPerVessel { image: Some(PlacementImageSource::Built { identity, .. }), .. } => {
             Some(VesselImage { identity: identity.clone(), digest })
         }
         _ => None,
@@ -1685,12 +1686,12 @@ fn image_stamp(environment: &ResourceObject<Environment>, placement: &Placement)
     let local_image_id =
         status.local_image_id.clone().ok_or_else(|| format!("environment {} is missing its image digest", environment.metadata.name))?;
     // A composed environment provisioned from its build's digest.
-    let composed = environment
-        .spec
-        .docker
-        .as_ref()
-        .and_then(|docker| docker.image_build_ref.as_ref())
-        .and_then(|_| composed_image(placement, Some(image_ref.clone())));
+    let image_build_ref = match (&environment.spec.docker, &environment.spec.cloud_sandbox) {
+        (Some(docker), _) => docker.image_build_ref.as_ref(),
+        (None, Some(cloud)) => cloud.image_build_ref.as_ref(),
+        (None, None) => None,
+    };
+    let composed = image_build_ref.and_then(|_| composed_image(placement, Some(image_ref.clone())));
     Ok(ImageStamp { image_ref, local_image_id, registry_digest: status.registry_digest.clone(), composed })
 }
 
@@ -1826,7 +1827,7 @@ fn enabling_env(required_adapters: &BTreeSet<String>) -> BTreeMap<String, String
 
 fn cloud_environment_spec(
     placement: &Placement,
-    image: &str,
+    image: &Option<PlacementImageSource>,
     probe_needs: BTreeSet<flotilla_resources::CapabilityNeed>,
     required_adapters: &BTreeSet<String>,
 ) -> Result<EnvironmentSpec, String> {
@@ -1841,10 +1842,12 @@ fn cloud_environment_spec(
         FulfilmentRealisation::CloudSandboxPerVessel { size: Some(size), .. } => size.clone(),
         _ => realisation_settings::CLOUD_SANDBOX_SIZE,
     };
+    let (image, image_build_ref) = environment_image(image)?;
     Ok(EnvironmentSpec {
         provider_address: Some(address),
         cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
-            image: image.to_owned(),
+            image,
+            image_build_ref,
             size,
             lifetime_cap_seconds: None,
             probe_needs,
