@@ -193,6 +193,8 @@ impl SourceRecords for Records {
 struct States {
     saved: Mutex<BTreeMap<(String, String), SourceState>>,
     saves: Mutex<usize>,
+    /// Whether saving fails.
+    refuse: std::sync::atomic::AtomicBool,
 }
 
 impl SourceStates for States {
@@ -201,6 +203,9 @@ impl SourceStates for States {
     }
 
     fn save(&self, state: &SourceState) -> Result<(), String> {
+        if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("disk full".into());
+        }
         *self.saves.lock().expect("saves") += 1;
         self.saved.lock().expect("states").insert((state.service.clone(), state.scope.clone()), state.clone());
         Ok(())
@@ -566,6 +571,11 @@ async fn a_source_this_host_no_longer_observes_is_released() {
     let owned = world.observer.owned().await.expect("owned");
     world.observer.release_unowned(&owned).await.expect("still owned");
     assert!(world.records.issue(1).is_some());
+    world.observer.release_unowned(&[]).await.expect("unowned");
+    world.clock.advance(chrono::Duration::minutes(14));
+    world.observer.release_unowned(&[]).await.expect("unowned");
+    assert!(world.records.issue(1).is_some(), "a source is released only once unowned for fifteen minutes");
+    world.clock.advance(chrono::Duration::minutes(1));
     world.observer.release_unowned(&[]).await.expect("released");
     assert!(world.records.issue(1).is_none() && world.records.pull(5).is_none());
     assert!(world.states.sources().expect("sources").is_empty());
@@ -603,6 +613,11 @@ async fn an_undecodable_state_is_rebuilt_rather_than_fatal() {
     }
     assert_eq!(states.load("github.com", "org/shared").expect("load"), None, "the source is read again whole");
     assert!(states.sources().expect("sources").is_empty());
+    for entry in std::fs::read_dir(directory.path()).expect("list") {
+        std::fs::write(entry.expect("entry").path(), br#"{"service": "github.com", "scope": "org/shared", "cursor": 5}"#).expect("older");
+    }
+    assert_eq!(states.load("github.com", "org/shared").expect("load"), None);
+    assert_eq!(states.sources().expect("sources"), [("github.com".into(), "org/shared".into())], "it is still released");
     let partial: SourceState = serde_json::from_str(r#"{"service": "github.com", "scope": "org/shared"}"#).expect("missing fields default");
     assert_eq!(partial.cursor, SourceCursor::default());
 }
@@ -697,5 +712,52 @@ async fn a_healthy_relay_slows_only_pending_check_reads_and_a_resync_passes_ever
     let requests = world.feed.requests();
     let pending = requests.iter().filter(|request| request.pulls.contains(&5)).map(|request| (request.started - at(0)).num_seconds());
     assert_eq!(pending.collect::<Vec<_>>(), [130, 1030], "pending checks are read again every fifteen minutes");
+    running.abort();
+}
+
+#[tokio::test]
+async fn declarations_briefly_missing_release_nothing() {
+    let world = World::new().await;
+    world.pass(Ok(feed(vec![issue(1, ObservedIssueState::Open)], vec![]))).await.expect("pass");
+    let project = world.backend.using::<Project>(NS).get("shared").await.expect("project");
+    world.backend.using::<Project>(NS).delete("shared").await.expect("declarations not yet replicated");
+    world.observer.observe_owned().await.expect("nothing owned");
+    world.clock.advance(chrono::Duration::minutes(10));
+    world.observer.observe_owned().await.expect("nothing owned");
+    assert!(world.records.issue(1).is_some(), "nothing is deleted while the declarations catch up");
+    world.backend.using::<Project>(NS).create(&InputMeta::builder().name("shared".into()).build(), &project.spec).await.expect("back");
+    world.observer.observe_owned().await.expect("owned again");
+    world.backend.using::<Project>(NS).delete("shared").await.expect("gone again");
+    world.clock.advance(chrono::Duration::minutes(10));
+    world.observer.observe_owned().await.expect("nothing owned");
+    assert!(world.records.issue(1).is_some(), "the grace restarts once the source is owned again");
+    assert!(world.records.whole.lock().expect("whole").contains(&("github.com".into(), "org/shared".into())));
+}
+
+#[tokio::test]
+async fn a_source_whose_state_cannot_be_saved_writes_nothing() {
+    let world = World::new().await;
+    world.states.refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+    world.feed.next(Ok(feed(vec![issue(1, ObservedIssueState::Open)], vec![])));
+    assert!(matches!(world.pass_asking(Asks::default()).await, Err(PassError::Local(_))));
+    assert_eq!(world.records.entries(), 0, "a host writes records only for a source its release can find");
+    assert!(world.feed.requests().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_pass_waits_for_its_backoff_whatever_wakes_the_loop() {
+    let world = World::running().await;
+    let running = world.run();
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    world.feed.next(Err("forge down".into()));
+    world.observer.hint(&world.address(Kind::ChangeRequest, 8).await);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let elsewhere = flotilla_resources::address::stored_repository_address("github.com", "org/other", &[]).expect("repository");
+    world.observer.hint(&elsewhere.child(Kind::ChangeRequest, "3").expect("address"));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(world.feed.starts(), [0, 10], "a hint for another source does not retry this one early");
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(world.feed.starts(), [0, 10, 70]);
+    assert_eq!(world.feed.last_request().pulls, BTreeSet::from([8]), "the failed pass's hinted item is asked for again");
     running.abort();
 }

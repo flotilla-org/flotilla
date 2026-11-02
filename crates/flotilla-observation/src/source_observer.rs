@@ -42,6 +42,9 @@ const SWEEP_INTERVAL: chrono::Duration = chrono::Duration::hours(1);
 /// How often the held open issues are checked against the source's open list, which is how an
 /// issue deleted or moved elsewhere is found.
 const INVENTORY_INTERVAL: chrono::Duration = chrono::Duration::days(1);
+/// How long a source must stay unowned before its records and state are released, so declarations
+/// that are briefly incomplete, as while replication catches up, release nothing.
+const RELEASE_GRACE: chrono::Duration = chrono::Duration::minutes(15);
 
 #[derive(Debug, Clone, Copy)]
 pub struct SourceCadence {
@@ -126,7 +129,8 @@ impl SourceStates for FileSourceStates {
             let mut file = std::fs::File::create(&temporary).map_err(|error| error.to_string())?;
             file.write_all(&serde_json::to_vec(state).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
             file.sync_all().map_err(|error| error.to_string())?;
-            std::fs::rename(&temporary, &path).map_err(|error| error.to_string())
+            std::fs::rename(&temporary, &path).map_err(|error| error.to_string())?;
+            std::fs::File::open(&self.directory).and_then(|directory| directory.sync_all()).map_err(|error| error.to_string())
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(&temporary);
@@ -152,9 +156,15 @@ impl SourceStates for FileSourceStates {
         for entry in entries {
             let path = entry.map_err(|error| error.to_string())?.path();
             if path.extension().is_some_and(|extension| extension == "json") {
+                // Only the source is read, so a state that no longer decodes whole is still released.
+                #[derive(Deserialize)]
+                struct Named {
+                    service: String,
+                    scope: String,
+                }
                 let state = std::fs::read(&path)
                     .map_err(|error| error.to_string())
-                    .and_then(|bytes| serde_json::from_slice::<SourceState>(&bytes).map_err(|error| error.to_string()));
+                    .and_then(|bytes| serde_json::from_slice::<Named>(&bytes).map_err(|error| error.to_string()));
                 match state {
                     Ok(state) => sources.push((state.service, state.scope)),
                     Err(error) => tracing::warn!(path = %path.display(), %error, "forge source state unreadable; skipped"),
@@ -347,6 +357,7 @@ struct Asks {
 }
 
 impl Asks {
+    /// Adds `other`'s items; whether pending checks are read is each pass's own choice.
     fn extend(&mut self, other: Asks) {
         self.issues.extend(other.issues);
         self.pulls.extend(other.pulls);
@@ -395,6 +406,8 @@ struct Inner {
     cadence: SourceCadence,
     wake: Notify,
     hints: StdMutex<Hints>,
+    /// When each source with saved state was first seen unowned.
+    unowned_since: StdMutex<BTreeMap<(String, String), DateTime<Utc>>>,
     relay_healthy: AtomicBool,
     /// Providers held across passes, so a provider's conditional-request cache survives.
     providers: tokio::sync::Mutex<BTreeMap<(String, String), Arc<dyn IssueProvider>>>,
@@ -429,6 +442,7 @@ impl SourceObserver {
                 cadence: parts.cadence,
                 wake: Notify::new(),
                 hints: StdMutex::default(),
+                unowned_since: StdMutex::default(),
                 relay_healthy: AtomicBool::new(false),
                 providers: Default::default(),
             }),
@@ -466,6 +480,7 @@ impl SourceObserver {
         let mut due = BTreeMap::<(String, String), DateTime<Utc>>::new();
         let mut pending_read = BTreeMap::<(String, String), DateTime<Utc>>::new();
         let mut swept = BTreeMap::<(String, String), DateTime<Utc>>::new();
+        let mut carried = BTreeMap::<(String, String), Asks>::new();
         loop {
             let owned = match self.owned().await {
                 Ok(owned) => owned,
@@ -481,7 +496,11 @@ impl SourceObserver {
             if let Err(error) = self.release_unowned(&owned).await {
                 tracing::warn!(%error, "release forge sources this host no longer observes");
             }
-            due.retain(|key, _| owned.iter().any(|source| source.key() == *key));
+            let keys = owned.iter().map(Observed::key).collect::<BTreeSet<_>>();
+            due.retain(|key, _| keys.contains(key));
+            pending_read.retain(|key, _| keys.contains(key));
+            swept.retain(|key, _| keys.contains(key));
+            carried.retain(|key, _| keys.contains(key));
             let (mut hinted, all) = {
                 let mut hints = locked(&self.inner.hints);
                 (std::mem::take(&mut hints.items), std::mem::take(&mut hints.all))
@@ -493,6 +512,7 @@ impl SourceObserver {
                 if !all && asks.is_empty() && due.get(&key).is_some_and(|at| *at > now) {
                     continue;
                 }
+                asks.extend(carried.remove(&key).unwrap_or_default());
                 let floor = source.relayed && self.inner.relay_healthy.load(Ordering::SeqCst);
                 asks.pending = all || !floor || pending_read.get(&key).is_none_or(|at| now - *at >= chrono_duration(cadence.relay_healthy));
                 let passed = self.pass(source, &asks).await;
@@ -503,7 +523,7 @@ impl SourceObserver {
                 due.insert(key.clone(), self.inner.clock.now() + chrono_duration(delay));
                 if let Err(error) = passed {
                     tracing::warn!(service = %source.service, scope = %source.scope, %error, "forge source pass failed");
-                    locked(&self.inner.hints).items.entry(source.repository.clone()).or_default().extend(asks);
+                    carried.entry(key).or_default().extend(asks);
                     continue;
                 }
                 if asks.pending {
@@ -577,13 +597,22 @@ impl SourceObserver {
         Ok(owned.into_iter().collect())
     }
 
-    /// Deletes this host's records and state of each source it observed whole but no longer does.
+    /// Deletes this host's records and state of each source it observed whole but has not owned
+    /// for [`RELEASE_GRACE`].
     async fn release_unowned(&self, owned: &[Observed]) -> Result<(), String> {
         let records = &self.inner.records;
-        for (service, scope) in self.inner.states.sources()? {
-            if owned.iter().any(|source| source.service == service && source.scope == scope) {
-                continue;
-            }
+        let now = self.inner.clock.now();
+        let saved = self.inner.states.sources()?;
+        let expired = {
+            let mut unowned_since = locked(&self.inner.unowned_since);
+            let unowned = saved
+                .into_iter()
+                .filter(|(service, scope)| !owned.iter().any(|source| source.service == *service && source.scope == *scope))
+                .collect::<BTreeSet<_>>();
+            unowned_since.retain(|key, _| unowned.contains(key));
+            unowned.into_iter().filter(|key| now - *unowned_since.entry(key.clone()).or_insert(now) >= RELEASE_GRACE).collect::<Vec<_>>()
+        };
+        for (service, scope) in expired {
             records.release_whole(&service, &scope);
             for issue in records.issues(&service, &scope).await? {
                 records.remove(ObservedKind::Issue, &issue.name).await?;
@@ -592,6 +621,7 @@ impl SourceObserver {
                 records.remove(ObservedKind::ChangeRequest, &pull.name).await?;
             }
             self.inner.states.remove(&service, &scope)?;
+            locked(&self.inner.unowned_since).remove(&(service.clone(), scope.clone()));
             self.inner.providers.lock().await.remove(&(service, scope));
         }
         Ok(())
@@ -641,12 +671,17 @@ impl SourceObserver {
         let records = &self.inner.records;
         records.observe_whole(&source.service, &source.scope);
         let local = PassError::Local;
-        let saved = self.inner.states.load(&source.service, &source.scope).map_err(local)?;
+        let mut saved = self.inner.states.load(&source.service, &source.scope).map_err(local)?;
         let mut state = saved.clone().unwrap_or_else(|| SourceState {
             service: source.service.clone(),
             scope: source.scope.clone(),
             ..SourceState::default()
         });
+        if saved.is_none() {
+            // Saved before any record is written, so a release finds every source this host wrote.
+            self.inner.states.save(&state).map_err(local)?;
+            saved = Some(state.clone());
+        }
         let issues = records.issues(&source.service, &source.scope).await.map_err(local)?;
         let pulls = records.change_requests(&source.service, &source.scope).await.map_err(local)?;
         let held_issues = issues.iter().map(|held| (held.record.number, held)).collect::<BTreeMap<_, _>>();
