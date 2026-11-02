@@ -1957,19 +1957,32 @@ async fn judgements_scenario(primitives: bool) {
             _ => None,
         })
     };
+    // The stalled crew's hook reports it idle; the person's input is asked after that.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        let needs_input = TerminalSessionStatusPatch::ObserveAttention {
-            attention: TerminalAttention {
-                state: TerminalAttentionState::NeedsInput,
-                as_of: chrono::Utc::now(),
-                source: TerminalAttentionSource::Hook,
-            },
-        };
-        let _ = flotilla_store::apply_status_patch(&sessions, &session.metadata.name, &needs_input).await;
-        if salience().await == Some(Salience::Attention) {
-            break;
-        }
+    while sessions
+        .get(&session.metadata.name)
+        .await
+        .expect("session")
+        .status
+        .and_then(|status| status.attention)
+        .map(|attention| attention.state)
+        != Some(TerminalAttentionState::Idle)
+    {
+        assert!(tokio::time::Instant::now() < deadline, "the stalled crew never reported idle");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let before = salience().await;
+    assert!(before < Some(Salience::Attention), "the stalled vessel is not yet raised: {before:?}");
+    let needs_input = TerminalSessionStatusPatch::ObserveAttention {
+        attention: TerminalAttention {
+            state: TerminalAttentionState::NeedsInput,
+            as_of: chrono::Utc::now(),
+            source: TerminalAttentionSource::Hook,
+        },
+    };
+    flotilla_store::apply_status_patch(&sessions, &session.metadata.name, &needs_input).await.expect("needs input");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while salience().await != Some(Salience::Attention) {
         assert!(tokio::time::Instant::now() < deadline, "a session needing input never raised its vessel: {:?}", salience().await);
         tokio::time::sleep(Duration::from_millis(200)).await;
     }

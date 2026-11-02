@@ -1,6 +1,7 @@
 //! Teardown scenarios using the shared daemon harness.
 
 use super::*;
+use flotilla_resources::attentions::{Attention, Fact};
 
 pub async fn refused_convoy_reclaim_leaves_runtime_children_untouched(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
@@ -510,8 +511,31 @@ pub async fn convoy_teardown_removes_its_managed_children(factory: &dyn EnsureSc
         )
         .await
         .expect("session");
+    // Attentions about the convoy, its vessel and its role, every one acknowledged, end with them.
+    let attentions = backend.attentions();
+    let now = chrono::Utc::now();
+    for attention in [
+        Attention::new(Fact::Hold { ensure: "quartermaster".into(), convoy: convoy_ref.clone() }, "held", now),
+        Attention::credential_refresh(&convoy_ref, "work", BTreeMap::from([("github".into(), "expired".into())]), now),
+        Attention::new(
+            Fact::DeliveryHeld { session: "quartermaster-work".into(), convoy: convoy_ref.clone(), role: "tool".into() },
+            "held",
+            now,
+        ),
+    ] {
+        attentions.raise("flotilla", &attention).await.expect("raise");
+    }
+    let demands = backend.using::<ResourceDemand>("flotilla");
+    let raised = demands.list().await.expect("demands").items;
+    assert_eq!(raised.len(), 3, "one demand per attention");
+    for demand in raised {
+        let patch = flotilla_resources::DemandStatusPatch::Acknowledge { as_of: chrono::Utc::now(), authority: "person".into() };
+        flotilla_store::apply_status_patch(&demands, &demand.metadata.name, &patch).await.expect("acknowledge");
+    }
 
     daemon.reap_convoy_internal("flotilla", &convoy_ref, true).await.expect("convoy teardown");
+
+    assert!(demands.list().await.expect("demands").items.is_empty(), "no attention is left about the reaped convoy");
 
     assert!(matches!(vessels.get("quartermaster-work").await, Err(ResourceError::NotFound { .. })));
     assert!(matches!(sessions.get("quartermaster-work").await, Err(ResourceError::NotFound { .. })));

@@ -1007,7 +1007,7 @@ where
                 .is_some_and(|condition| condition.is_controller_fence_unverifiable())
             || matches!(prepared, TerminalPrepared::MessageDeliveryNotSubmitted { message_id, .. } if delivery_retry_exhausted(obj.status.as_ref().map_or(1, |status| status.next_delivery_failure_count(message_id))))
         {
-            actuations.extend(delivery_raise(obj));
+            actuations.extend(delivery_raise(obj, now));
         }
         if let TerminalSessionSource::Agent { message: Some(head), .. } = &obj.spec.source {
             let delivered = obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref());
@@ -1193,14 +1193,16 @@ fn held_delivery_consumed(
     delivery_acceptance_evidence(false, false, observation.attention.as_ref().is_some_and(working), observed_working, changed_output)
 }
 
-fn delivery_raise(session: &ResourceObject<TerminalSession>) -> Option<Actuation> {
+/// The hold's episode began when its condition was observed; one not yet recorded begins now.
+fn delivery_raise(session: &ResourceObject<TerminalSession>, now: DateTime<Utc>) -> Option<Actuation> {
     let fact = flotilla_resources::delivery_hold::delivery_fact(session)?;
-    let held = session.status.as_ref().and_then(|status| status.degraded.as_ref()).map(|condition| condition.message.as_str());
+    let held = session.status.as_ref().and_then(|status| status.degraded.as_ref());
     let reason = match held {
-        Some(why) => format!("Turn delivery to session `{}` is held: {why}", session.metadata.name),
+        Some(condition) => format!("Turn delivery to session `{}` is held: {}", session.metadata.name, condition.message),
         None => format!("Turn delivery to session `{}` is held until a person rules.", session.metadata.name),
     };
-    Some(Actuation::RaiseAttention { attention: Attention::new(fact, reason) })
+    let began_at = held.map_or(now, |condition| condition.observed_at);
+    Some(Actuation::RaiseAttention { attention: Attention::new(fact, reason, began_at) })
 }
 
 fn delivery_clear(session: &ResourceObject<TerminalSession>) -> Option<Actuation> {

@@ -8,7 +8,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use flotilla_capability_contract::CredentialCapability;
 use flotilla_capability_contract::SessionCapabilitySource;
 use flotilla_core::in_process::InProcessDaemon;
@@ -605,6 +605,8 @@ pub(super) async fn reconcile_credential_refresh_attention_in(
     let convoys = convoys.items.into_iter().map(|source| (source.object.metadata.name.clone(), source.object)).collect::<BTreeMap<_, _>>();
     // Every vessel that holds a credential, with its failing ones: why, and whether persistent enough to tell a person.
     let mut held: BTreeMap<(String, String), BTreeMap<String, (String, bool)>> = BTreeMap::new();
+    // When each vessel's credentials began failing: the episode its attention tells.
+    let mut since: BTreeMap<(String, String), DateTime<Utc>> = BTreeMap::new();
     for vessel in &vessels.items {
         let Some(convoy) = convoys.get(&vessel.spec.convoy_ref) else { continue };
         let Some(requirement) = convoy
@@ -616,7 +618,11 @@ pub(super) async fn reconcile_credential_refresh_attention_in(
         else {
             continue;
         };
-        let failing = held.entry((convoy.metadata.name.clone(), vessel.spec.vessel_name.clone())).or_default();
+        let key = (convoy.metadata.name.clone(), vessel.spec.vessel_name.clone());
+        if let Some(retry) = vessel.status.as_ref().and_then(|status| status.credential_refresh_retry.as_ref()) {
+            since.insert(key.clone(), retry.first_failure_at);
+        }
+        let failing = held.entry(key).or_default();
         for error in errors {
             let Some(credential) = error.credential_name.as_ref() else { continue };
             if vessel.status.as_ref().and_then(|status| status.environment_ref.as_ref()) == Some(&error.environment_ref)
@@ -627,6 +633,7 @@ pub(super) async fn reconcile_credential_refresh_attention_in(
         }
     }
     for ((convoy, vessel), credentials) in held {
+        let began_at = since.get(&(convoy.clone(), vessel.clone())).copied().unwrap_or_else(Utc::now);
         let subject = Subject::Vessel { convoy: convoy.clone(), vessel: vessel.clone() };
         let before = open.get(&subject);
         // A credential already told stays told while it keeps failing, persistent or not.
@@ -638,7 +645,7 @@ pub(super) async fn reconcile_credential_refresh_attention_in(
         if told.is_empty() {
             attentions.clear(namespace, Sender::Capabilities, &subject).await?;
         } else if before.is_none_or(|before| told.keys().ne(before.iter())) {
-            attentions.raise(namespace, &Attention::credential_refresh(&convoy, &vessel, told)).await?;
+            attentions.raise(namespace, &Attention::credential_refresh(&convoy, &vessel, told, began_at)).await?;
         }
     }
     Ok(())

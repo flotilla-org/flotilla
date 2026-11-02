@@ -316,8 +316,11 @@ pub struct MessagePrimitives {
     located: Mutex<BTreeMap<String, (String, String)>>,
     /// Old-store records, reread at most once a second per namespace.
     records: tokio::sync::Mutex<BTreeMap<String, (std::time::Instant, Arc<OldStoreRecords>)>>,
-    /// Signalled after an attention here is raised, cleared or acknowledged.
+    /// Signalled after an attention here is raised, cleared or acknowledged, and after another
+    /// home's Messages are applied.
     attention_changes: tokio::sync::broadcast::Sender<()>,
+    /// Signalled after a person acknowledges an attention here.
+    acknowledgements: tokio::sync::broadcast::Sender<()>,
 }
 
 impl MessagePrimitives {
@@ -360,8 +363,10 @@ impl MessagePrimitives {
         // Attentions homed elsewhere arrive with their homes' entries; their readers read again then.
         let attention_changes = tokio::sync::broadcast::channel(16).0;
         let replicated = attention_changes.clone();
-        service.on_applied(Arc::new(move || {
-            let _ = replicated.send(());
+        service.on_applied(Arc::new(move |kinds| {
+            if kinds.contains(&<Resource<Message> as StoredKind>::CODE) {
+                let _ = replicated.send(());
+            }
         }));
         Ok(Self {
             home: home.to_owned(),
@@ -384,6 +389,7 @@ impl MessagePrimitives {
             located: Mutex::new(BTreeMap::new()),
             records: tokio::sync::Mutex::new(BTreeMap::new()),
             attention_changes,
+            acknowledgements: tokio::sync::broadcast::channel(16).0,
             backend,
         })
     }
@@ -560,6 +566,7 @@ impl MessagePrimitives {
         self.inbox.receive(&person, &id, Transport::Turn).await.map_err(|error| error.to_string())?;
         self.inbox.deliver(&id, Deliver { receiver: person, transport: Transport::Turn }).await.map_err(|error| error.to_string())?;
         let _ = self.attention_changes.send(());
+        let _ = self.acknowledgements.send(());
         self.inbox.get_async(&id).await.map_err(|error| error.to_string())?.ok_or_else(|| format!("message `{record}` is gone"))
     }
 

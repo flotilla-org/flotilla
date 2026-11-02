@@ -467,6 +467,8 @@ impl Read<'_> {
 #[derive(Default)]
 struct Pending {
     watermarks: HashMap<String, crate::stream::Watermark>,
+    /// The kinds of other homes' entries and snapshots applied.
+    applied: std::collections::BTreeSet<KindCode>,
     strings: HashMap<StringKey, i64>,
     identities: HashMap<Identity, ResourceId>,
     ids: HashMap<ResourceId, Identity>,
@@ -836,7 +838,11 @@ impl Write<'_> {
     /// `home_seq`. An expunge removes the identity's entries and identity if this store holds
     /// them, and is logged (`Expunged`).
     pub fn apply(&mut self, event: &Event) -> Result<Applied, StoreError> {
-        self.guarded(|ctx| ctx.apply(event))
+        let applied = self.guarded(|ctx| ctx.apply(event))?;
+        if !matches!(applied, Applied::Duplicate(_)) {
+            self.pending.applied.insert(event.kind);
+        }
+        Ok(applied)
     }
 
     /// Seeds a replica with a resource homed elsewhere from its snapshot, as replication's catch-up
@@ -847,19 +853,18 @@ impl Write<'_> {
     /// store's own resources, `UnknownKind`, and `Exists` when the resource's rows or an entry at
     /// or past the version are already here.
     pub fn restore(&mut self, snapshot: &Snapshot) -> Result<Stamp, StoreError> {
-        self.guarded(|ctx| ctx.restore(snapshot))
+        let stamp = self.guarded(|ctx| ctx.restore(snapshot))?;
+        self.pending.applied.insert(snapshot.kind);
+        Ok(stamp)
     }
 
     pub fn commit(self) -> Result<(), StoreError> {
         self.tx.commit()?;
-        let Pending { strings, identities, ids, watermarks, .. } = self.pending;
-        // A follower's commit that moved a home's sequence applied that home's entries.
-        let applied =
-            watermarks.iter().any(|(home, mark)| mark.home_seq > crate::stream::watermark(&self.runtime.watermarks, home).home_seq);
+        let Pending { strings, identities, ids, watermarks, applied, .. } = self.pending;
         self.runtime.watermarks.write().unwrap_or_else(std::sync::PoisonError::into_inner).extend(watermarks);
-        if applied {
+        if !applied.is_empty() {
             for listener in self.runtime.applied.read().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
-                listener();
+                listener(&applied);
             }
         }
         for (string, id) in strings {

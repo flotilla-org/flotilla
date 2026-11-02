@@ -7,7 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::in_process::OperatorReconciler;
 use flotilla_credentials::CloneDelivery;
@@ -44,6 +44,8 @@ pub(super) struct DaemonConvoyTeardownRuntime {
 pub(super) struct ReclaimRefusal {
     pub(super) error: String,
     pub(super) attempts: u64,
+    /// When this run of refusals began: the episode its attention tells.
+    pub(super) since: DateTime<Utc>,
 }
 
 pub(super) struct RuntimeOperatorReconciler {
@@ -136,9 +138,9 @@ impl DaemonConvoyTeardownRuntime {
         Self { daemon, reclaim_refusals: StdMutex::new(HashMap::new()) }
     }
 
-    pub(super) async fn raise_attention(&self, convoy: &ResourceObject<Convoy>, reason: &str) -> Result<(), String> {
+    pub(super) async fn raise_attention(&self, convoy: &ResourceObject<Convoy>, reason: &str, since: DateTime<Utc>) -> Result<(), String> {
         let fact = Fact::ReclaimRefused { convoy: convoy.metadata.name.clone() };
-        self.daemon.attentions().raise(&convoy.metadata.namespace, &Attention::new(fact, reason)).await
+        self.daemon.attentions().raise(&convoy.metadata.namespace, &Attention::new(fact, reason, since)).await
     }
 
     pub(super) async fn clear_attention(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String> {
@@ -153,17 +155,18 @@ impl ConvoyTeardownRuntime for DaemonConvoyTeardownRuntime {
         let key = format!("{}/{}", convoy.metadata.namespace, convoy.metadata.name);
         match &result {
             Err(error) => {
-                let attempts = {
+                let (attempts, since) = {
                     let mut refusals = self.reclaim_refusals.lock().expect("reclaim refusal lock poisoned");
                     match refusals.get_mut(&key) {
                         Some(refusal) => {
                             refusal.error.clone_from(error);
                             refusal.attempts += 1;
-                            refusal.attempts
+                            (refusal.attempts, refusal.since)
                         }
                         _ => {
-                            refusals.insert(key, ReclaimRefusal { error: error.clone(), attempts: 1 });
-                            1
+                            let since = Utc::now();
+                            refusals.insert(key, ReclaimRefusal { error: error.clone(), attempts: 1, since });
+                            (1, since)
                         }
                     }
                 };
@@ -177,7 +180,7 @@ impl ConvoyTeardownRuntime for DaemonConvoyTeardownRuntime {
                     );
                 }
                 if attempts >= RECLAIM_REFUSAL_ATTENTION_AFTER {
-                    if let Err(attention_error) = self.raise_attention(convoy, error).await {
+                    if let Err(attention_error) = self.raise_attention(convoy, error, since).await {
                         warn!(
                             namespace = %convoy.metadata.namespace,
                             convoy = %convoy.metadata.name,
@@ -227,7 +230,7 @@ struct DefaultBranchCache {
 #[derive(Default)]
 struct BranchLookup {
     success: Option<(tokio::time::Instant, String)>,
-    retry_at: Option<chrono::DateTime<Utc>>,
+    retry_at: Option<DateTime<Utc>>,
 }
 impl GhForgeDefaultBranchResolver {
     pub(super) fn new(runner: Arc<dyn CommandRunner>) -> Self {

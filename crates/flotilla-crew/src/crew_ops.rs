@@ -1707,6 +1707,9 @@ impl CrewService {
     }
 
     async fn cascade_convoy_children(&self, namespace: &str, name: &str) -> Result<(), String> {
+        // Every attention about the convoy and the records under it ends with them, acknowledged or
+        // not; first, while the records still name what each is about.
+        self.resource_backend.attentions().clear_within(namespace, &Subject::convoy(name)).await?;
         let selector = BTreeMap::from([(CONVOY_LABEL.to_string(), name.to_string())]);
         delete_lifecycle_owned_matching(&self.resource_backend.clone().using::<Vessel>(namespace), &selector)
             .await
@@ -1717,10 +1720,6 @@ impl CrewService {
         delete_lifecycle_owned_matching(&self.resource_backend.clone().using::<ResourceCheckout>(namespace), &selector)
             .await
             .map_err(|error| error.to_string())?;
-        let attentions = self.resource_backend.attentions();
-        for open in attentions.open(namespace, None, Some(&Subject::convoy(name))).await? {
-            attentions.clear(namespace, open.sender, &open.subject).await?;
-        }
         Ok(())
     }
 

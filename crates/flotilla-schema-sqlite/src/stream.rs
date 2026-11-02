@@ -5,7 +5,7 @@
 
 //! See the [implementation choice](https://github.com/flotilla-org/flotilla/blob/main/docs/implementation-choices/change-stream.md).
 
-use flotilla_schema::{ChangeHeader, Event, Identity, Timestamp, LOG_LIMITS};
+use flotilla_schema::{ChangeHeader, Event, Identity, KindCode, Timestamp, LOG_LIMITS};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -385,8 +385,10 @@ pub struct ServedRound {
     pub snapshot: bool,
 }
 
-/// Called after a follower commits another home's entries; listeners must not block.
-pub type AppliedListeners = std::sync::Arc<std::sync::RwLock<Vec<std::sync::Arc<dyn Fn() + Send + Sync>>>>;
+/// Called after a follower commits another home's entries, with the kinds they are of; listeners
+/// must not block.
+pub type AppliedListener = dyn Fn(&std::collections::BTreeSet<KindCode>) + Send + Sync;
+pub type AppliedListeners = std::sync::Arc<std::sync::RwLock<Vec<std::sync::Arc<AppliedListener>>>>;
 
 /// Synchronous observation after a serving attempt; callbacks must not block.
 pub type ServeObserver = dyn Fn(&Result<ServedRound, StoreError>) + Send + Sync;
@@ -395,8 +397,9 @@ impl Service {
     pub fn observe_serving(&self, observer: Arc<ServeObserver>) -> Result<(), String> {
         self.serve_observer.set(observer).map_err(|_| "stream observer already installed".into())
     }
-    /// Calls `listener` after each commit that applies another home's entries here.
-    pub fn on_applied(&self, listener: std::sync::Arc<dyn Fn() + Send + Sync>) {
+    /// Calls `listener` after each commit that applies another home's entries here, with the kinds
+    /// they are of.
+    pub fn on_applied(&self, listener: std::sync::Arc<AppliedListener>) {
         self.applied.write().unwrap_or_else(std::sync::PoisonError::into_inner).push(listener);
     }
     /// Gates read committed progress independently of database writers and network delivery.
@@ -446,7 +449,7 @@ impl Service {
         }
         result.map(|round| round.watermark)
     }
-    pub fn query(&self, kind: flotilla_schema::KindCode, name: &str, now: Timestamp) -> Result<Vec<u8>, StoreError> {
+    pub fn query(&self, kind: KindCode, name: &str, now: Timestamp) -> Result<Vec<u8>, StoreError> {
         let mut store = Store::open_reader(&self.source.path, &self.source.home, self.source.kinds.clone())?;
         let mut read = store.read()?;
         let value = read.resolve(kind, name, &self.source.home)?.map(|id| read.load_snapshot(id)).transpose()?.flatten();

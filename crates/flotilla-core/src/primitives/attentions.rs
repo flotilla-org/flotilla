@@ -1,7 +1,7 @@
 //! Attentions on the engine: ordinary Messages from a fleet role to the person role of their
 //! context, about one subject, expecting nothing. Raising sends one, or supersedes an open one
 //! whose reason changed; clearing withdraws it on its subject's authority; a person's receipt
-//! settles it.
+//! settles it, and answers every raise of an episode that began before.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -11,6 +11,7 @@ use flotilla_resources::{
     attentions::{self, Attentions, Fact, OpenAttention, Sender, Subject},
     ConvoyEnsure, ResourceObject, Vessel,
 };
+use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::{
         consumer::ConsumerKind,
@@ -50,18 +51,12 @@ impl Held {
         *self.message.state() == MessageState::Pending
     }
 
-    fn settled_by_person(&self) -> bool {
+    /// Whether a person acknowledged it at or after `began_at`: a settled message's time is when
+    /// it settled.
+    fn answers(&self, began_at: DateTime<Utc>) -> bool {
         matches!(self.message.state(), MessageState::Settled { receiver: Some(receiver) } if receiver.kind == ConsumerKind::Person)
+            && self.message.since() >= Timestamp::from_datetime(&began_at)
     }
-}
-
-/// The attention a person acknowledged, when none is open and it is the latest: its writer has not
-/// cleared it since.
-fn acknowledged(about: &[Held]) -> Option<&Held> {
-    if about.iter().any(Held::pending) {
-        return None;
-    }
-    about.iter().max_by_key(|held| (held.message.since(), held.message.name())).filter(|latest| latest.settled_by_person())
 }
 
 /// The old-shaped subject an engine address names.
@@ -155,12 +150,20 @@ impl MessagePrimitives {
         Ok((cause, inbox))
     }
 
-    /// Withdraws an attention homed here, on its subject's authority.
-    async fn withdraw_attention(&self, held: &Held) -> Result<(), String> {
-        let authority = held.subject_address.clone();
-        self.world.update(|world| world.authority.put(&flotilla_state_machines::Ref::new(authority.as_str()), true));
-        let reason = DropReason::Withdrawn { by: held.sender_address.clone(), authority };
-        self.inbox.drop(held.message.name(), reason).await.map_err(|error| error.to_string())
+    /// Withdraws the open ones homed here, each on its subject's authority; the others stay.
+    async fn withdraw_open(&self, held: Vec<Held>) -> Result<(), String> {
+        for held in held.into_iter().filter(Held::pending) {
+            if held.home != self.home {
+                tracing::debug!(message = held.message.name(), home = %held.home, "an attention homed elsewhere is cleared there");
+                continue;
+            }
+            let authority = held.subject_address.clone();
+            self.world.update(|world| world.authority.put(&flotilla_state_machines::Ref::new(authority.as_str()), true));
+            let reason = DropReason::Withdrawn { by: held.sender_address.clone(), authority };
+            self.inbox.drop(held.message.name(), reason).await.map_err(|error| error.to_string())?;
+            let _ = self.attention_changes.send(());
+        }
+        Ok(())
     }
 }
 
@@ -169,7 +172,7 @@ impl Attentions for MessagePrimitives {
     async fn raise(&self, namespace: &str, attention: &attentions::Attention) -> Result<(), String> {
         let (sender, subject) = (attention.fact.sender(), attention.fact.subject());
         let about = self.about(namespace, sender, &subject).await?;
-        if acknowledged(&about).is_some() {
+        if about.iter().any(|held| held.answers(attention.began_at)) {
             return Ok(());
         }
         let open: Vec<Held> = about.into_iter().filter(Held::pending).collect();
@@ -196,31 +199,12 @@ impl Attentions for MessagePrimitives {
     }
 
     async fn clear(&self, namespace: &str, sender: Sender, subject: &Subject) -> Result<(), String> {
-        let about = self.about(namespace, sender, subject).await?;
-        // A settled message takes no edge: the end of an acknowledged attention is a successor,
-        // withdrawn at once, so the next raise is told again.
-        if let Some(seen) = acknowledged(&about).filter(|seen| seen.home == self.home) {
-            let mut spec = seen.message.spec().clone();
-            spec.admitted_seq = 0;
-            spec.supersedes = None;
-            let id = self.inbox.enqueue(spec).await.map_err(|error| error.to_string())?;
-            let authority = seen.subject_address.clone();
-            self.world.update(|world| world.authority.put(&flotilla_state_machines::Ref::new(authority.as_str()), true));
-            let reason = DropReason::Withdrawn { by: seen.sender_address.clone(), authority };
-            return self.inbox.drop(&id, reason).await.map_err(|error| error.to_string());
-        }
-        for held in about {
-            if !held.pending() {
-                continue;
-            }
-            if held.home != self.home {
-                tracing::debug!(message = held.message.name(), home = %held.home, "an attention homed elsewhere is cleared there");
-                continue;
-            }
-            self.withdraw_attention(&held).await?;
-            let _ = self.attention_changes.send(());
-        }
-        Ok(())
+        self.withdraw_open(self.about(namespace, sender, subject).await?).await
+    }
+
+    async fn clear_within(&self, namespace: &str, scope: &Subject) -> Result<(), String> {
+        let within = self.held(namespace).await?.into_iter().filter(|held| held.subject.within(scope)).collect();
+        self.withdraw_open(within).await
     }
 
     async fn open(&self, namespace: &str, from: Option<Sender>, scope: Option<&Subject>) -> Result<Vec<OpenAttention>, String> {
@@ -235,11 +219,15 @@ impl Attentions for MessagePrimitives {
             .collect())
     }
 
-    async fn acknowledged(&self, namespace: &str, sender: Sender, subject: &Subject) -> Result<bool, String> {
-        Ok(acknowledged(&self.about(namespace, sender, subject).await?).is_some())
+    async fn acknowledged(&self, namespace: &str, sender: Sender, subject: &Subject, began_at: DateTime<Utc>) -> Result<bool, String> {
+        Ok(self.about(namespace, sender, subject).await?.iter().any(|held| held.answers(began_at)))
     }
 
     fn changes(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
         Some(self.attention_changes.subscribe())
+    }
+
+    fn acknowledgements(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
+        Some(self.acknowledgements.subscribe())
     }
 }

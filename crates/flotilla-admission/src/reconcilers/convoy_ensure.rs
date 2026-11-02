@@ -611,23 +611,23 @@ impl EnsurePass<'_> {
             .take_while(|convoy| convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Failed))
             .count() as u32;
 
-        let resolved_escalation = match generations.last() {
+        // The driver path keeps no hold record: a hold is about the latest generation, and its
+        // episode began with that generation, as a generation is held once.
+        let (resolved_escalation, released) = match generations.last() {
             Some(latest) if self.hold_is_open(namespace, &latest.metadata.name).await? => {
                 if consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES && !force_now {
                     return Ok(None);
                 }
                 self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
-                consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES
+                (consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES, false)
             }
-            // A person's acknowledgement releases the hold once: its end is cleared with it.
-            Some(latest)
-                if self.attentions.acknowledged(namespace, Sender::Standing, &Subject::convoy(latest.metadata.name.clone())).await? =>
-            {
-                self.clear_hold(namespace, &latest.metadata.name).await?;
-                true
+            // A person's acknowledgement releases the hold; admission keeps its own backoff.
+            Some(latest) => {
+                let subject = Subject::convoy(latest.metadata.name.clone());
+                let began_at = latest.metadata.creation_timestamp;
+                (false, self.attentions.acknowledged(namespace, Sender::Standing, &subject, began_at).await?)
             }
-            Some(_) => false,
-            None => false,
+            None => (false, false),
         };
 
         let retry_key = (namespace.to_string(), ensure.metadata.name.clone());
@@ -650,10 +650,10 @@ impl EnsurePass<'_> {
         }
 
         let latest = generations.last();
-        if !resolved_escalation && !force_now && consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES {
+        if !resolved_escalation && !released && !force_now && consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES {
             let latest = latest.expect("a positive failure count requires a generation");
             let failure = format!("ensured convoy entered a terminal failure phase; {consecutive_failures} consecutive generations failed");
-            self.raise_ensure_attention(ensure, latest, &failure).await?;
+            self.raise_ensure_attention(ensure, latest, &failure, latest.metadata.creation_timestamp).await?;
             return Ok(Some(format!("ConvoyEnsure/{} exhausted restart budget", ensure.metadata.name)));
         }
         // `reconcile-now` is the operator's explicit acknowledgement that any
@@ -882,7 +882,7 @@ impl EnsurePass<'_> {
                     .record(ObjectEvent::for_object(&convoy, "BackingEvidenceRefused", failure.clone()), now)
                     .await
                     .map_err(|error| format!("record backing-evidence event: {error}"))?;
-                self.raise_ensure_attention(ensure, &convoy, &failure).await?;
+                self.raise_ensure_attention(ensure, &convoy, &failure, hold_began_at(&status, now)).await?;
                 if status.retry_at.is_some() || status.last_failure.as_deref() != Some(&failure) {
                     self.patch_convoy_ensure(
                         namespace,
@@ -902,7 +902,8 @@ impl EnsurePass<'_> {
             let failure = "ensured convoy entered a terminal failure phase";
             if status.restart_count.saturating_add(1) >= ENSURE_MAX_CONSECUTIVE_FAILURES {
                 let failure = format!("{failure}; {} consecutive generations failed", ENSURE_MAX_CONSECUTIVE_FAILURES);
-                self.raise_ensure_attention(ensure, &convoy, &failure).await?;
+                // Raised once, as the hold begins; one on its backing earlier is another episode.
+                self.raise_ensure_attention(ensure, &convoy, &failure, now).await?;
                 self.patch_convoy_ensure(
                     namespace,
                     &ensure.metadata.name,
@@ -1086,7 +1087,14 @@ impl EnsurePass<'_> {
             convoy: convoy.metadata.name.clone(),
         };
         let reason = format!("ConfigDrift: {}; run flotilla ensure roll {}", changes.join("; "), ensure.metadata.name);
-        self.attentions.raise(namespace, &Attention::new(fact, reason)).await
+        // The drift began when its changes were first observed.
+        let began_at = ensure
+            .status
+            .as_ref()
+            .and_then(|status| status.config_drift.as_ref())
+            .filter(|seen| seen.changes == changes)
+            .map_or_else(|| self.clock.now(), |seen| seen.observed_at);
+        self.attentions.raise(namespace, &Attention::new(fact, reason, began_at)).await
     }
 
     async fn raise_ensure_attention(
@@ -1094,9 +1102,10 @@ impl EnsurePass<'_> {
         ensure: &ResourceObject<ConvoyEnsure>,
         convoy: &ResourceObject<ResourceConvoy>,
         reason: &str,
+        began_at: DateTime<Utc>,
     ) -> Result<(), String> {
         let fact = Fact::Hold { ensure: ensure.metadata.name.clone(), convoy: convoy.metadata.name.clone() };
-        self.attentions.raise(&convoy.metadata.namespace, &Attention::new(fact, reason)).await
+        self.attentions.raise(&convoy.metadata.namespace, &Attention::new(fact, reason, began_at)).await
     }
 
     async fn hold_is_open(&self, namespace: &str, convoy: &str) -> Result<bool, String> {
@@ -1105,7 +1114,7 @@ impl EnsurePass<'_> {
         Ok(!self.attentions.open(namespace, Some(Sender::Standing), Some(&subject)).await?.is_empty())
     }
 
-    /// Ends the hold on `convoy`, open or acknowledged.
+    /// Withdraws the hold on `convoy` if it is open.
     async fn clear_hold(&self, namespace: &str, convoy: &str) -> Result<(), String> {
         self.attentions.clear(namespace, Sender::Standing, &Subject::convoy(convoy)).await
     }
@@ -1211,6 +1220,12 @@ async fn canonical_placement_host_ref(
 ) -> Result<Option<PlacementTargetHost>, String> {
     let hosts = backend.including_replicas::<ResourceHost>(namespace).list().await.map_err(|error| error.to_string())?;
     canonical_placement_host_ref_from_sources(&hosts.items, host_ref)
+}
+
+/// When a backing hold's episode began: its retry episode's first failure, which releasing a
+/// hold resets, or now for one not yet recorded.
+fn hold_began_at(status: &ConvoyEnsureStatus, now: DateTime<Utc>) -> DateTime<Utc> {
+    status.retry.as_ref().map_or(now, |retry| retry.first_failure_at)
 }
 
 #[cfg(test)]

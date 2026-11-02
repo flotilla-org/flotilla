@@ -835,8 +835,9 @@ pub(super) async fn convoy_ensure_dependency_watches(
             Err(error) => warn!(%kind, %error, "could not watch standing convoy admission dependency"),
         }
     }
-    // A person acknowledging a hold releases it on the next pass.
-    if let Some(changes) = backend.attentions().changes() {
+    // A person acknowledging a hold releases it on the next pass; holds are acknowledged at
+    // their own home, the reconciler's.
+    if let Some(changes) = backend.attentions().acknowledgements() {
         let acknowledged = futures::stream::unfold(changes, |mut changes| async move {
             loop {
                 match changes.recv().await {
