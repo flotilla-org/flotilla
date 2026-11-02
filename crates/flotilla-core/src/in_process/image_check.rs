@@ -85,7 +85,7 @@ pub async fn check_image(
     // The project layer at the ref. A project without a code repository has
     // none at any ref.
     let mut branch_layer = None;
-    if let Some(LayerHome::Source(source)) = primary_layer_home(backend, namespace, &project.spec, Some(&request.git_ref)).await? {
+    if let Some(LayerHome::Source(source)) = primary_layer_home(backend, namespace, &project, Some(&request.git_ref)).await? {
         source.validate()?;
         if let Some(snapshot) = source_read(sources.layer_snapshot(&source))
             .await
