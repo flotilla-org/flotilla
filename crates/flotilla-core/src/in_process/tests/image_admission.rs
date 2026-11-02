@@ -9,9 +9,9 @@ use std::sync::Arc;
 use flotilla_config::ConfigStore;
 use flotilla_protocol::{HostName, PlacementDecision};
 use flotilla_resources::{
-    image_build_name, image_identity, CrewDefaults, CrewDefaultsSpec, CrewSource, CrewSpec, DockerImageSource, FleetDesignation,
-    FleetDesignationSpec, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, ImageBuild, ImageBuildCapacity,
-    ImageBuildReservation, ImageCacheBinding, ImageDelivery, ImageLayer, ImageLayerSource, ImageLayerSpec, ImageLayerTier, ImageSelection,
+    image_build_name, image_identity, CrewDefaults, CrewDefaultsSpec, CrewSource, CrewSpec, FleetDesignation, FleetDesignationSpec,
+    FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, ImageBuild, ImageBuildCapacity, ImageBuildReservation,
+    ImageCacheBinding, ImageDelivery, ImageLayer, ImageLayerSource, ImageLayerSpec, ImageLayerTier, ImageSelection, PlacementImageSource,
     Project, ProjectSpec, VesselRequirement, WorkflowTemplateSpec, FLEET_DESIGNATION_NAME,
 };
 use flotilla_store::ResourceBackend;
@@ -142,7 +142,7 @@ fn decision() -> PlacementDecision {
 async fn admit(
     fixture: &Fixture,
     workflow: &WorkflowTemplateSpec,
-) -> Result<(Option<DockerImageSource>, BTreeMap<String, Option<DockerImageSource>>), String> {
+) -> Result<(Option<PlacementImageSource>, BTreeMap<String, Option<PlacementImageSource>>), String> {
     let kind = fixture.backend.using::<FulfilmentKind>(NS).get("crew-policy").await.expect("kind");
     let mut placement = PlacementResolution::selected(kind);
     let (pins, builds) =
@@ -162,7 +162,7 @@ async fn admit(
     Ok((image, pins.into_iter().map(|(vessel, (spec, _))| (vessel, docker_image(&spec))).collect()))
 }
 
-fn docker_image(spec: &FulfilmentKindSpec) -> Option<DockerImageSource> {
+fn docker_image(spec: &FulfilmentKindSpec) -> Option<PlacementImageSource> {
     match &spec.realisation {
         FulfilmentRealisation::DockerPerVessel { image } => image.clone(),
         other => panic!("Docker realisation expected: {other:?}"),
@@ -173,8 +173,8 @@ fn layer_names(build: &flotilla_resources::ResourceObject<ImageBuild>) -> Vec<St
     build.spec.current().expect("current build").layers.iter().map(|layer| layer.name.clone()).collect()
 }
 
-async fn build_for(fixture: &Fixture, image: &Option<DockerImageSource>) -> flotilla_resources::ResourceObject<ImageBuild> {
-    let Some(DockerImageSource::Built { identity, image_build_ref }) = image else {
+async fn build_for(fixture: &Fixture, image: &Option<PlacementImageSource>) -> flotilla_resources::ResourceObject<ImageBuild> {
+    let Some(PlacementImageSource::Built { identity, image_build_ref }) = image else {
         panic!("composed image is frozen as Built: {image:?}")
     };
     let build = fixture.backend.using::<ImageBuild>(NS).get(image_build_ref).await.expect("image build");

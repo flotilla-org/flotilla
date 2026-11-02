@@ -148,7 +148,7 @@ pub struct DockerPerVesselPlacementPolicySpec {
     /// Omitted means the vessel's composed image (ADR 0062): admission writes a
     /// `Built` source into each prepared placement snapshot.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub image: Option<DockerImageSource>,
+    pub image: Option<PlacementImageSource>,
     /// Controls registry access for the resolved image tag. Image build recipes
     /// are intentionally outside placement policy and are tracked separately.
     #[serde(default)]
@@ -172,7 +172,7 @@ pub struct DockerPerVesselPlacementPolicySpec {
 struct StoredDockerPerVessel {
     host_ref: String,
     #[serde(default, deserialize_with = "decode_optional_image_source")]
-    image: Option<DockerImageSource>,
+    image: Option<PlacementImageSource>,
     #[serde(default)]
     pull_policy: DockerImagePullPolicy,
     #[serde(default)]
@@ -235,7 +235,7 @@ pub enum DockerCheckoutStrategy {
 /// prepared snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum DockerImageSource {
+pub enum PlacementImageSource {
     Literal(String),
     /// The vessel's composed image: its identity and the per-identity ImageBuild
     /// (`image-<hex>-<arch>`) that realises it on the placement architecture.
@@ -252,7 +252,7 @@ pub enum DockerImageSource {
 /// after CrewImageBaseline retires.
 pub(crate) fn decode_optional_image_source<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
-) -> Result<Option<DockerImageSource>, D::Error> {
+) -> Result<Option<PlacementImageSource>, D::Error> {
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
     match value {
         None | Some(serde_json::Value::Null) => Ok(None),
@@ -275,7 +275,7 @@ pub(crate) fn decode_optional_image_source<'de, D: serde::Deserializer<'de>>(
 /// then a literal base, then a generation-1 baseline image. A selection-only
 /// composition carried none and decodes as omitted. ADR 0047: remove with the
 /// composition shim one roll after ADR 0062 images land.
-fn retired_composition_image(composition: &serde_json::Value) -> Option<DockerImageSource> {
+fn retired_composition_image(composition: &serde_json::Value) -> Option<PlacementImageSource> {
     fn text(value: Option<&serde_json::Value>) -> Option<&str> {
         value.and_then(serde_json::Value::as_str).filter(|text| !text.trim().is_empty())
     }
@@ -284,16 +284,16 @@ fn retired_composition_image(composition: &serde_json::Value) -> Option<DockerIm
         .or_else(|| text(identity.and_then(|identity| identity.get("local_image_id"))))
         .or_else(|| text(composition.get("literal_base")))
         .or_else(|| text(composition.get("baseline_image")))
-        .map(|image| DockerImageSource::Literal(image.to_string()))
+        .map(|image| PlacementImageSource::Literal(image.to_string()))
 }
 
-impl From<String> for DockerImageSource {
+impl From<String> for PlacementImageSource {
     fn from(image: String) -> Self {
         Self::Literal(image)
     }
 }
 
-impl From<&str> for DockerImageSource {
+impl From<&str> for PlacementImageSource {
     fn from(image: &str) -> Self {
         Self::Literal(image.to_string())
     }
@@ -323,12 +323,12 @@ mod image_source_tests {
             (Some(composition), None),
             (
                 Some(serde_json::json!("registry.test/crew@sha256:abc")),
-                Some(DockerImageSource::Literal("registry.test/crew@sha256:abc".into())),
+                Some(PlacementImageSource::Literal("registry.test/crew@sha256:abc".into())),
             ),
             (Some(serde_json::json!({"image_baseline_ref": "crew"})), None),
             (
                 Some(serde_json::json!({"identity": "sha256:abc", "image_build_ref": "image-abc-amd64"})),
-                Some(DockerImageSource::Built { identity: "sha256:abc".into(), image_build_ref: "image-abc-amd64".into() }),
+                Some(PlacementImageSource::Built { identity: "sha256:abc".into(), image_build_ref: "image-abc-amd64".into() }),
             ),
         ] {
             let spec: PlacementPolicySpec = serde_json::from_value(policy(image)).expect("policy decodes");
@@ -356,7 +356,7 @@ mod image_source_tests {
             (serde_json::json!({"composition": {"selection": {}, "baseline_image": "crew:baseline"}}), "crew:baseline"),
         ] {
             let spec: PlacementPolicySpec = serde_json::from_value(policy(Some(composition))).expect("old composition");
-            assert_eq!(spec.docker_per_vessel.expect("docker").image, Some(DockerImageSource::Literal(expected.into())));
+            assert_eq!(spec.docker_per_vessel.expect("docker").image, Some(PlacementImageSource::Literal(expected.into())));
         }
         let kind: crate::FulfilmentKindSpec = serde_json::from_value(serde_json::json!({
             "host_ref": "feta", "pool": "lab", "grants": [],

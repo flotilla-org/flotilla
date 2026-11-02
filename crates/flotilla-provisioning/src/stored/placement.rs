@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 
 use flotilla_resources::{
-    CloudSandboxSize, DockerImageSource, FulfilmentCostClass, FulfilmentGrant, FulfilmentKindSpec, FulfilmentRealisation,
+    CloudSandboxSize, FulfilmentCostClass, FulfilmentGrant, FulfilmentKindSpec, FulfilmentRealisation, PlacementImageSource,
 };
 use flotilla_schema::{KindRegistry, RegistryError, Stored};
 use serde::{Deserialize, Serialize};
@@ -54,8 +54,8 @@ impl FulfilmentKindDefinition {
             FulfilmentRealisation::HostDirect => KindRealisation::HostDirect,
             FulfilmentRealisation::DockerPerVessel { image } => match image {
                 None => KindRealisation::DockerComposed,
-                Some(DockerImageSource::Literal(image)) => KindRealisation::DockerLiteral { image: image.clone() },
-                Some(DockerImageSource::Built { identity, image_build_ref }) => {
+                Some(PlacementImageSource::Literal(image)) => KindRealisation::DockerLiteral { image: image.clone() },
+                Some(PlacementImageSource::Built { identity, image_build_ref }) => {
                     KindRealisation::DockerBuilt { identity: identity.clone(), image_build_ref: image_build_ref.clone() }
                 }
             },
@@ -77,10 +77,10 @@ impl FulfilmentKindDefinition {
             KindRealisation::HostDirect => FulfilmentRealisation::HostDirect,
             KindRealisation::DockerComposed => FulfilmentRealisation::DockerPerVessel { image: None },
             KindRealisation::DockerLiteral { image } => {
-                FulfilmentRealisation::DockerPerVessel { image: Some(DockerImageSource::Literal(image.clone())) }
+                FulfilmentRealisation::DockerPerVessel { image: Some(PlacementImageSource::Literal(image.clone())) }
             }
             KindRealisation::DockerBuilt { identity, image_build_ref } => FulfilmentRealisation::DockerPerVessel {
-                image: Some(DockerImageSource::Built { identity: identity.clone(), image_build_ref: image_build_ref.clone() }),
+                image: Some(PlacementImageSource::Built { identity: identity.clone(), image_build_ref: image_build_ref.clone() }),
             },
         };
         FulfilmentKindSpec {

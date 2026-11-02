@@ -578,7 +578,7 @@ pub(super) async fn create_docker_placement(
                 .pool("passthrough".to_string())
                 .grants(BTreeSet::from([FulfilmentGrant::platform("linux".to_string()), FulfilmentGrant::network("scoped".to_string())]))
                 .realisation(FulfilmentRealisation::DockerPerVessel {
-                    image: Some(flotilla_resources::DockerImageSource::Literal("crew:latest".to_string())),
+                    image: Some(flotilla_resources::PlacementImageSource::Literal("crew:latest".to_string())),
                 })
                 .build(),
         )

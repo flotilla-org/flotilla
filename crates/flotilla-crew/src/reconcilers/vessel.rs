@@ -2,7 +2,7 @@ use flotilla_resources::account_access::AccountRecords;
 use flotilla_resources::checkout_path::checkout_path_component;
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::Actuation;
-use flotilla_store::DockerImageSourceStoreExt;
+use flotilla_store::PlacementImageSourceStoreExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
     marker::PhantomData,
@@ -21,9 +21,9 @@ use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, LifecycleRead
 use flotilla_resources::{
     address::artifact_slot_record_name, canonicalize_repo_url, host_direct_environment_name, is_prepared_snapshot,
     repository_workspace_slugs, Artifact, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy,
-    CrewSource, CrewWorkPhase, DockerEnvironmentSpec, DockerImageSource, Environment, EnvironmentMount, EnvironmentMountMode,
-    EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, InputMeta,
-    LifecycleAuthority, OwnerReference, PlacementPolicy, Repository, RepositoryKey, RepositorySpec, Resource, ResourceError,
+    CrewSource, CrewWorkPhase, DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase,
+    EnvironmentSpec, FreshCloneCheckoutSpec, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, InputMeta, LifecycleAuthority,
+    OwnerReference, PlacementImageSource, PlacementPolicy, Repository, RepositoryKey, RepositorySpec, Resource, ResourceError,
     ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec,
     Vessel, VesselImage, VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
     CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION,
@@ -447,7 +447,7 @@ struct Placement {
 #[derive(Debug, Clone)]
 enum PlacementStrategy {
     HostDirect { host_ref: String, pool: String },
-    DockerHostCheckoutAndMount { host_ref: String, pool: String, image: Option<DockerImageSource> },
+    DockerHostCheckoutAndMount { host_ref: String, pool: String, image: Option<PlacementImageSource> },
     CloneInVessel { host_ref: String, pool: String, image: String, clone_path: String },
 }
 
@@ -521,7 +521,7 @@ struct ImageStamp {
 /// The composed identity a placement froze at admission (ADR 0062).
 fn composed_image(placement: &Placement, digest: Option<String>) -> Option<VesselImage> {
     match &placement.kind.spec.realisation {
-        FulfilmentRealisation::DockerPerVessel { image: Some(DockerImageSource::Built { identity, .. }) } => {
+        FulfilmentRealisation::DockerPerVessel { image: Some(PlacementImageSource::Built { identity, .. }) } => {
             Some(VesselImage { identity: identity.clone(), digest })
         }
         _ => None,
@@ -531,10 +531,10 @@ fn composed_image(placement: &Placement, digest: Option<String>) -> Option<Vesse
 /// The Environment's image fields: a composed image names its per-identity
 /// ImageBuild and receives the build's digest from the Environment reconciler;
 /// a literal image resolves now.
-fn environment_image(image: &Option<DockerImageSource>) -> Result<(String, Option<String>), String> {
+fn environment_image(image: &Option<PlacementImageSource>) -> Result<(String, Option<String>), String> {
     match image {
         None => Err("composed image was not frozen at admission; readmit the convoy".into()),
-        Some(DockerImageSource::Built { image_build_ref, .. }) => Ok((String::new(), Some(image_build_ref.clone()))),
+        Some(PlacementImageSource::Built { image_build_ref, .. }) => Ok((String::new(), Some(image_build_ref.clone()))),
         Some(image) => image.resolve().map(|image| (image, None)),
     }
 }

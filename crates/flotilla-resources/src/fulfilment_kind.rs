@@ -339,7 +339,7 @@ pub enum FulfilmentRealisation {
             deserialize_with = "crate::placement_policy::decode_optional_image_source",
             skip_serializing_if = "Option::is_none"
         )]
-        image: Option<crate::DockerImageSource>,
+        image: Option<crate::PlacementImageSource>,
     },
     HostDirect,
 }

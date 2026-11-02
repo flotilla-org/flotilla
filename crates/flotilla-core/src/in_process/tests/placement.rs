@@ -164,7 +164,7 @@ async fn remote_placement_resolves_replicated_credentials_before_admission() {
                 .host_ref("udder-id".to_string())
                 .pool("passthrough".to_string())
                 .realisation(FulfilmentRealisation::DockerPerVessel {
-                    image: Some(flotilla_resources::DockerImageSource::Literal("crew:latest".to_string())),
+                    image: Some(flotilla_resources::PlacementImageSource::Literal("crew:latest".to_string())),
                 })
                 .build(),
         )

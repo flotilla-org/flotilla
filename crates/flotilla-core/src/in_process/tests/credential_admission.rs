@@ -544,7 +544,7 @@ async fn remote_placement_uses_replicated_host_capabilities() {
                 .host_ref("feta-host".to_string())
                 .pool("passthrough".to_string())
                 .realisation(FulfilmentRealisation::DockerPerVessel {
-                    image: Some(flotilla_resources::DockerImageSource::Literal("crew:latest".to_string())),
+                    image: Some(flotilla_resources::PlacementImageSource::Literal("crew:latest".to_string())),
                 })
                 .build(),
         )

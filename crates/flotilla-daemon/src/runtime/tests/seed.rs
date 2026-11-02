@@ -1,6 +1,6 @@
 use super::*;
 use crate::startup::busy_store::BusyStore;
-use flotilla_resources::{definition_provenance::SEEDING_MANAGER, DockerImageSource, FulfilmentGrant};
+use flotilla_resources::{definition_provenance::SEEDING_MANAGER, FulfilmentGrant, PlacementImageSource};
 use flotilla_store_sqlite::SqliteBackend;
 
 #[tokio::test]
@@ -315,7 +315,7 @@ fn docker_kind_spec(profile: &LocalProvisioningProfile) -> FulfilmentKindSpec {
         pool: profile.docker_pool.clone(),
         cost_class: Default::default(),
         grants: BTreeSet::from([FulfilmentGrant::platform("linux".to_string()), FulfilmentGrant::network("scoped".to_string())]),
-        realisation: FulfilmentRealisation::DockerPerVessel { image: Some(DockerImageSource::Literal("ubuntu:24.04".into())) },
+        realisation: FulfilmentRealisation::DockerPerVessel { image: Some(PlacementImageSource::Literal("ubuntu:24.04".into())) },
     }
 }
 
@@ -406,7 +406,7 @@ async fn kind_seeding_refreshes_platform_and_adopts_unlabelled_kinds() {
     let kinds = backend.clone().using::<FulfilmentKind>(NAMESPACE);
     let mut stale_docker = docker_kind_spec(&profile);
     stale_docker.realisation =
-        FulfilmentRealisation::DockerPerVessel { image: Some(DockerImageSource::Literal("operator/image:1".into())) };
+        FulfilmentRealisation::DockerPerVessel { image: Some(PlacementImageSource::Literal("operator/image:1".into())) };
     stale_docker.grants.insert(FulfilmentGrant::gpu());
     kinds.create(&empty_meta(&profile.docker_policy_name()), &stale_docker).await.expect("unlabelled docker kind");
 

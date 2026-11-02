@@ -541,7 +541,7 @@ async fn create_docker_placement(backend: &ResourceBackend, kind_name: &str, hos
                     flotilla_resources::FulfilmentGrant::network("scoped".to_string()),
                 ]))
                 .realisation(FulfilmentRealisation::DockerPerVessel {
-                    image: Some(flotilla_resources::DockerImageSource::Literal("crew:latest".into())),
+                    image: Some(flotilla_resources::PlacementImageSource::Literal("crew:latest".into())),
                 })
                 .build(),
         )

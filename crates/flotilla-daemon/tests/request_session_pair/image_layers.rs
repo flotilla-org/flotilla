@@ -1,6 +1,6 @@
 use flotilla_resources::{
-    image_build_name, single_agent_workflow_spec, DockerImageSource, FulfilmentGrant, FulfilmentRealisation, ImageBuild, ImageDelivery,
-    ImageLayer, ImageLayerSource, ImageLayerSpec, ImageLayerTier, Project, ResourceObject,
+    image_build_name, single_agent_workflow_spec, FulfilmentGrant, FulfilmentRealisation, ImageBuild, ImageDelivery, ImageLayer,
+    ImageLayerSource, ImageLayerSpec, ImageLayerTier, PlacementImageSource, Project, ResourceObject,
 };
 
 use super::*;
@@ -21,7 +21,7 @@ fn layer(name: &str, tier: ImageLayerTier, provides: &[&str]) -> ImageLayerSpec 
 }
 
 /// The composed image a convoy's vessel placement froze.
-async fn frozen_image(backend: &ResourceBackend, convoy: &ResourceObject<Convoy>) -> DockerImageSource {
+async fn frozen_image(backend: &ResourceBackend, convoy: &ResourceObject<Convoy>) -> PlacementImageSource {
     let snapshot = flotilla_resources::vessel_placement_pin(convoy, "work")
         .map(|pin| pin.kind_ref)
         .unwrap_or_else(|| convoy.metadata.annotations[flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION].clone());
@@ -191,7 +191,7 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
     let convoys = backend.using::<Convoy>("flotilla").list().await.expect("convoys").items;
     assert_eq!(convoys.len(), 1);
     assert!(!convoys[0].metadata.annotations.contains_key("flotilla.work/frozen-image-layers"), "the retired annotation is never written");
-    let DockerImageSource::Built { identity, image_build_ref } = frozen_image(&backend, &convoys[0]).await else {
+    let PlacementImageSource::Built { identity, image_build_ref } = frozen_image(&backend, &convoys[0]).await else {
         panic!("composed placement freezes a Built source");
     };
     assert_eq!(image_build_ref, image_build_name(&identity, "amd64", &ImageDelivery::Local, &host_id));
@@ -210,7 +210,9 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
     let convoys = backend.using::<Convoy>("flotilla").list().await.expect("both admitted").items;
     assert_eq!(convoys.len(), 2);
     for convoy in &convoys {
-        assert!(matches!(frozen_image(&backend, convoy).await, DockerImageSource::Built { identity: ref other, .. } if *other == identity));
+        assert!(
+            matches!(frozen_image(&backend, convoy).await, PlacementImageSource::Built { identity: ref other, .. } if *other == identity)
+        );
     }
     assert_eq!(backend.using::<ImageBuild>("flotilla").list().await.expect("shared build").items.len(), 1);
 
@@ -239,7 +241,7 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
         .into_iter()
         .find(|convoy| convoy.spec.role == "created-composed-work")
         .expect("created role");
-    assert_eq!(frozen_image(&backend, &created).await, DockerImageSource::Built { identity, image_build_ref });
+    assert_eq!(frozen_image(&backend, &created).await, PlacementImageSource::Built { identity, image_build_ref });
     assert_eq!(backend.using::<ImageBuild>("flotilla").list().await.expect("shared create build").items.len(), 1);
 
     // Refusal atomicity: admission resolves every vessel before creating any

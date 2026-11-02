@@ -3,8 +3,8 @@
 //! Load drivers and scenarios create these resources before dispatching.
 
 use flotilla_resources::{
-    CrewSource, CrewSpec, DockerImageSource, ExitDeclaration, ForgeKind, ForgeSpec, FulfilmentGrant, FulfilmentKindSpec,
-    FulfilmentRealisation, Platform, RepositorySpec, Selector, VesselRequirement, WorkflowTemplateSpec,
+    CrewSource, CrewSpec, ExitDeclaration, ForgeKind, ForgeSpec, FulfilmentGrant, FulfilmentKindSpec, FulfilmentRealisation,
+    PlacementImageSource, Platform, RepositorySpec, Selector, VesselRequirement, WorkflowTemplateSpec,
 };
 
 use crate::{
@@ -148,7 +148,7 @@ pub fn fulfilment_kind(host_ref: &str) -> FulfilmentKindSpec {
         .host_ref(host_ref.into())
         .pool(DUMMY_TERMINAL_POOL.to_string())
         .grants([FulfilmentGrant::platform(Platform::Linux.to_string()), FulfilmentGrant::network("scoped".into())].into())
-        .realisation(FulfilmentRealisation::DockerPerVessel { image: Some(DockerImageSource::Literal(DUMMY_IMAGE.into())) })
+        .realisation(FulfilmentRealisation::DockerPerVessel { image: Some(PlacementImageSource::Literal(DUMMY_IMAGE.into())) })
         .build()
 }
 

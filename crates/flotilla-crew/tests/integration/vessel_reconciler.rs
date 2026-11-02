@@ -3354,11 +3354,11 @@ async fn create_labeled_terminal(backend: &ResourceBackend, namespace: &str, nam
 // starts and the digest once its Environment is Ready.
 #[tokio::test]
 async fn composed_placement_records_identity_then_digest() {
-    use flotilla_resources::{DockerImageSource, VesselImage, VesselStatusPatch};
+    use flotilla_resources::{PlacementImageSource, VesselImage, VesselStatusPatch};
     let identity = format!("sha256:{}", "c".repeat(64));
     let image_build_ref = format!("image-{}-amd64", "c".repeat(40));
     let digest = format!("registry.test/crew@sha256:{}", "d".repeat(64));
-    let built = DockerImageSource::Built { identity: identity.clone(), image_build_ref: image_build_ref.clone() };
+    let built = PlacementImageSource::Built { identity: identity.clone(), image_build_ref: image_build_ref.clone() };
     let kind = FulfilmentKindSpec::builder()
         .host_ref(HOST_REF.to_string())
         .pool("cleat".to_string())

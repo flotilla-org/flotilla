@@ -5,8 +5,8 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use flotilla_provisioning::{engine::kinds::EngineKinds, stored::placement::FulfilmentKindDefinition};
 use flotilla_resources::{
-    definition_provenance::SEEDING_MANAGER, Clock, DockerImageSource, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec,
-    FulfilmentRealisation, InputMeta, SystemClock, CONVOY_LABEL, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL,
+    definition_provenance::SEEDING_MANAGER, Clock, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, InputMeta,
+    PlacementImageSource, SystemClock, CONVOY_LABEL, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL,
 };
 use flotilla_schema::{ChangeHeader, Kind};
 use flotilla_schema_sqlite::stream::Service;
@@ -37,14 +37,15 @@ fn snapshot_labels(convoy: &str) -> [(&'static str, String); 2] {
 
 async fn contract(backend: &ResourceBackend) {
     let kinds = backend.clone().using::<FulfilmentKind>(NS);
-    let docker = kind("cleat", FulfilmentRealisation::DockerPerVessel { image: Some(DockerImageSource::Literal("ubuntu:24.04".into())) });
+    let docker =
+        kind("cleat", FulfilmentRealisation::DockerPerVessel { image: Some(PlacementImageSource::Literal("ubuntu:24.04".into())) });
     let seeded = kinds.create(&labelled("docker-on-kiwi", &[(MANAGED_BY_LABEL, SEEDING_MANAGER)]), &docker).await.expect("seed");
     assert_eq!(seeded.spec, docker);
 
     let frozen = kind(
         "cleat",
         FulfilmentRealisation::DockerPerVessel {
-            image: Some(DockerImageSource::Built { identity: "identity".into(), image_build_ref: "image-identity-amd64".into() }),
+            image: Some(PlacementImageSource::Built { identity: "identity".into(), image_build_ref: "image-identity-amd64".into() }),
         },
     );
     let [(snapshot, kind_value), (convoy, convoy_value)] = snapshot_labels("convoy-0001");
