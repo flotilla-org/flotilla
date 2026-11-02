@@ -585,7 +585,9 @@ fn told(reason: &str) -> BTreeSet<String> {
 }
 
 /// Each vessel's attention names the credentials that keep failing. It is raised when that set
-/// changes, cleared when none fails, and a person's acknowledgement stands until it is cleared.
+/// changes, cleared when none fails, and a person's acknowledgement stands for its episode: the
+/// vessel's retry episode, which a full fix ends. A credential that starts failing while the
+/// attention is acknowledged begins a new episode, so the person is told again.
 pub(super) async fn reconcile_credential_refresh_attention_in(
     attentions: &dyn Attentions,
     backend: &ResourceBackend,
@@ -644,9 +646,21 @@ pub(super) async fn reconcile_credential_refresh_attention_in(
             .collect();
         if told.is_empty() {
             attentions.clear(namespace, Sender::Capabilities, &subject).await?;
-        } else if before.is_none_or(|before| told.keys().ne(before.iter())) {
-            attentions.raise(namespace, &Attention::credential_refresh(&convoy, &vessel, told, began_at)).await?;
+            continue;
         }
+        if before.is_some_and(|before| told.keys().eq(before.iter())) {
+            continue;
+        }
+        let began_at = match before {
+            Some(_) => began_at,
+            // None open: one a person acknowledged answers only the credentials it named.
+            None => match attentions.acknowledged(namespace, Sender::Capabilities, &subject, began_at).await? {
+                Some(seen) if told.keys().all(|credential| self::told(&seen).contains(credential)) => continue,
+                Some(_) => Utc::now(),
+                None => began_at,
+            },
+        };
+        attentions.raise(namespace, &Attention::credential_refresh(&convoy, &vessel, told, began_at)).await?;
     }
     Ok(())
 }

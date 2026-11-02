@@ -190,9 +190,16 @@ pub trait Attentions: Send + Sync {
     /// about every record.
     async fn open(&self, namespace: &str, from: Option<Sender>, scope: Option<&Subject>) -> Result<Vec<OpenAttention>, String>;
 
-    /// Whether a person acknowledged an attention from `sender` about `subject` at or after
-    /// `began_at`: the episode that began then is answered.
-    async fn acknowledged(&self, namespace: &str, sender: Sender, subject: &Subject, began_at: DateTime<Utc>) -> Result<bool, String>;
+    /// The reason a person acknowledged, when they acknowledged an attention from `sender` about
+    /// `subject` at or after `began_at`: the episode that began then is answered. The latest, when
+    /// several were.
+    async fn acknowledged(
+        &self,
+        namespace: &str,
+        sender: Sender,
+        subject: &Subject,
+        began_at: DateTime<Utc>,
+    ) -> Result<Option<String>, String>;
 
     /// A signal after an attention is raised, cleared or acknowledged here, or arrives from another
     /// home, for a reader to read them again; none where the store's own watch says so.

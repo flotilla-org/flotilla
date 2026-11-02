@@ -4599,8 +4599,14 @@ mod tests {
         async fn clear_within(&self, _: &str, _: &AttentionSubject) -> Result<(), String> {
             Ok(())
         }
-        async fn acknowledged(&self, _: &str, _: Sender, _: &AttentionSubject, _: chrono::DateTime<chrono::Utc>) -> Result<bool, String> {
-            Ok(false)
+        async fn acknowledged(
+            &self,
+            _: &str,
+            _: Sender,
+            _: &AttentionSubject,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Option<String>, String> {
+            Ok(None)
         }
     }
 

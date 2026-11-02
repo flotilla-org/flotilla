@@ -625,7 +625,7 @@ impl EnsurePass<'_> {
             Some(latest) => {
                 let subject = Subject::convoy(latest.metadata.name.clone());
                 let began_at = latest.metadata.creation_timestamp;
-                (false, self.attentions.acknowledged(namespace, Sender::Standing, &subject, began_at).await?)
+                (false, self.attentions.acknowledged(namespace, Sender::Standing, &subject, began_at).await?.is_some())
             }
             None => (false, false),
         };

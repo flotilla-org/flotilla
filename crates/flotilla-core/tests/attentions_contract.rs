@@ -215,12 +215,13 @@ struct Episode {
     ended: bool,
 }
 
-/// What a person sees, per sender and subject: the open reason, and which episode a person answered.
+/// What a person sees, per sender and subject: the open reason, and what a person answered.
 #[derive(Default, Clone)]
 struct Model {
     open: BTreeMap<(Sender, Subject), String>,
     episodes: BTreeMap<(Sender, Subject), Episode>,
-    answered: BTreeMap<(Sender, Subject), DateTime<Utc>>,
+    /// The episode a person answered, and the reason they acknowledged.
+    answered: BTreeMap<(Sender, Subject), (DateTime<Utc>, String)>,
     /// When each open attention was first seen raised; a repeated raise keeps it.
     raised_at: BTreeMap<(Sender, Subject), DateTime<Utc>>,
 }
@@ -277,7 +278,8 @@ async fn check(implementation: &Implementation, model: &mut Model, after: &[Step
     // A writer asks about its live episode; an ended one is never raised again.
     for (key, episode) in model.episodes.iter().filter(|(_, episode)| !episode.ended) {
         let acknowledged = attentions.acknowledged(NAMESPACE, key.0, &key.1, episode.began_at).await.expect("acknowledged");
-        assert_eq!(acknowledged, model.answered.get(key) == Some(&episode.began_at), "{key:?} acknowledged after {after:?}");
+        let answered = model.answered.get(key).filter(|(began_at, _)| *began_at == episode.began_at).map(|(_, reason)| reason.clone());
+        assert_eq!(acknowledged, answered, "{key:?} acknowledged after {after:?}");
     }
 }
 
@@ -309,7 +311,7 @@ fn contract(tc: TestCase, engine: bool) {
                     let attention = attention(fact, ["held", "still held"][reason], began_at);
                     implementation.attentions().raise(NAMESPACE, &attention).await.expect("raise");
                     // An acknowledgement answers every raise of its episode.
-                    if model.answered.get(&key) != Some(&began_at)
+                    if model.answered.get(&key).is_none_or(|(answered, _)| *answered != began_at)
                         && model.open.insert(key.clone(), attention.reason.clone()).is_none_or(|before| before != attention.reason)
                     {
                         model.raised_at.remove(&key);
@@ -323,9 +325,9 @@ fn contract(tc: TestCase, engine: bool) {
                 Step::Acknowledge { fact } => {
                     let key = key(fact);
                     implementation.acknowledge(&attention(fact, "", DateTime::UNIX_EPOCH).fact).await;
-                    if model.open.remove(&key).is_some() {
+                    if let Some(reason) = model.open.remove(&key) {
                         model.raised_at.remove(&key);
-                        model.answered.insert(key.clone(), model.episodes[&key].began_at);
+                        model.answered.insert(key.clone(), (model.episodes[&key].began_at, reason));
                     }
                 }
                 Step::ClearWithin => {
@@ -375,12 +377,12 @@ async fn an_acknowledgement_answers_its_episode(implementation: Implementation) 
     attentions.raise(NAMESPACE, &hold).await.expect("raise again");
     attentions.raise(NAMESPACE, &attention(0, "still held", first)).await.expect("raise for another reason");
     assert!(open().await.is_empty(), "the acknowledgement answers every raise of its episode");
-    assert!(attentions.acknowledged(NAMESPACE, sender, &subject, first).await.expect("acknowledged"));
+    assert_eq!(attentions.acknowledged(NAMESPACE, sender, &subject, first).await.expect("acknowledged").as_deref(), Some("held"));
     let stored = implementation.stored().await;
     attentions.clear(NAMESPACE, sender, &subject).await.expect("clear");
     assert_eq!(implementation.stored().await, stored, "clearing an acknowledged attention writes nothing");
     let second = episode_start().await;
-    assert!(!attentions.acknowledged(NAMESPACE, sender, &subject, second).await.expect("acknowledged"));
+    assert_eq!(attentions.acknowledged(NAMESPACE, sender, &subject, second).await.expect("acknowledged"), None);
     attentions.raise(NAMESPACE, &attention(0, "held", second)).await.expect("raise a new episode");
     assert_eq!(open().await.len(), 1, "a new episode is told again");
     attentions.clear(NAMESPACE, sender, &subject).await.expect("clear");
@@ -493,5 +495,5 @@ async fn another_homes_attentions_signal_their_readers_when_they_arrive() {
     follow(&a_store, "home-a", &b_store, &mut cursor);
     signal.try_recv().expect("the acknowledgement's entries signal home b's readers");
     assert!(b.open(NAMESPACE, Some(sender), Some(&subject)).await.expect("open at home b").is_empty());
-    assert!(b.acknowledged(NAMESPACE, sender, &subject, hold.began_at).await.expect("acknowledged at home b"));
+    assert!(b.acknowledged(NAMESPACE, sender, &subject, hold.began_at).await.expect("acknowledged at home b").is_some());
 }

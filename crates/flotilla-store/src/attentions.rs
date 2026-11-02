@@ -172,6 +172,19 @@ impl OldStoreAttentions {
         Ok(None)
     }
 
+    /// The reason a demand tells: a credential's demand tells one line of its vessel's reason.
+    async fn reason(&self, namespace: &str, subject: &Subject, demand: &ResourceObject<Demand>) -> String {
+        let Subject::Vessel { convoy, vessel } = subject else { return reason(demand) };
+        let record = self.vessel_record(namespace, convoy, vessel).await.unwrap_or_else(|error| {
+            tracing::debug!(%error, "a credential attention's vessel is gone; its demand keeps its full name");
+            String::new()
+        });
+        let prefix = format!("{CREDENTIAL}{record}-");
+        let credential = demand.metadata.name.strip_prefix(&prefix).unwrap_or(&demand.metadata.name);
+        let why = demand.metadata.annotations.get(CREDENTIAL_REFRESH_REASON_ANNOTATION).map_or("refresh failed", String::as_str);
+        format!("{credential}: {why}")
+    }
+
     async fn delete(&self, namespace: &str, name: &str) -> Result<(), String> {
         match self.demands(namespace).delete(name).await {
             Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
@@ -272,20 +285,7 @@ impl Attentions for OldStoreAttentions {
                 .as_ref()
                 .and_then(|status| status.raised.as_ref())
                 .map_or(demand.metadata.creation_timestamp, |raised| raised.as_of);
-            let reason = match &subject {
-                Subject::Vessel { convoy, vessel } => {
-                    let record = self.vessel_record(namespace, convoy, vessel).await.unwrap_or_else(|error| {
-                        tracing::debug!(%error, "a credential attention's vessel is gone; its demand keeps its full name");
-                        String::new()
-                    });
-                    let prefix = format!("{CREDENTIAL}{record}-");
-                    let credential = demand.metadata.name.strip_prefix(&prefix).unwrap_or(&demand.metadata.name);
-                    let why =
-                        demand.metadata.annotations.get(CREDENTIAL_REFRESH_REASON_ANNOTATION).map_or("refresh failed", String::as_str);
-                    format!("{credential}: {why}")
-                }
-                _ => reason(&demand),
-            };
+            let reason = self.reason(namespace, &subject, &demand).await;
             open.entry((sender, subject.clone()))
                 .and_modify(|merged| {
                     merged.reason = [merged.reason.as_str(), reason.as_str()].join("\n");
@@ -296,8 +296,19 @@ impl Attentions for OldStoreAttentions {
         Ok(open.into_values().collect())
     }
 
-    async fn acknowledged(&self, namespace: &str, sender: Sender, subject: &Subject, began_at: DateTime<Utc>) -> Result<bool, String> {
-        let found = self.attentions(namespace, None).await?;
-        Ok(found.iter().any(|(held_by, about, demand)| *held_by == sender && about == subject && answers(demand, began_at)))
+    async fn acknowledged(
+        &self,
+        namespace: &str,
+        sender: Sender,
+        subject: &Subject,
+        began_at: DateTime<Utc>,
+    ) -> Result<Option<String>, String> {
+        let mut told = Vec::new();
+        for (held_by, about, demand) in self.attentions(namespace, None).await? {
+            if held_by == sender && &about == subject && answers(&demand, began_at) {
+                told.push(self.reason(namespace, subject, &demand).await);
+            }
+        }
+        Ok((!told.is_empty()).then(|| told.join("\n")))
     }
 }

@@ -44,7 +44,10 @@ impl Held {
 
     /// When it was raised; an unreadable time reads as now, so it never counts as long open.
     fn raised_at(&self) -> DateTime<Utc> {
-        self.message.since().to_datetime().unwrap_or_else(Utc::now)
+        self.message.since().to_datetime().unwrap_or_else(|| {
+            tracing::debug!(message = self.message.name(), "an attention's time is unreadable; it reads as raised now");
+            Utc::now()
+        })
     }
 
     fn pending(&self) -> bool {
@@ -157,6 +160,8 @@ impl MessagePrimitives {
                 tracing::debug!(message = held.message.name(), home = %held.home, "an attention homed elsewhere is cleared there");
                 continue;
             }
+            // The withdraw gate asks that the sender holds authority over the subject; the writer of
+            // an attention does, and this home's world is told so before the edge.
             let authority = held.subject_address.clone();
             self.world.update(|world| world.authority.put(&flotilla_state_machines::Ref::new(authority.as_str()), true));
             let reason = DropReason::Withdrawn { by: held.sender_address.clone(), authority };
@@ -186,6 +191,7 @@ impl Attentions for MessagePrimitives {
         let mut spec = Attention { cause, reason: attention.reason.clone() }.spec(&roles, inbox)?;
         let replaced: Vec<&Held> = open.iter().filter(|held| held.home == self.home).collect();
         if let Some(older) = replaced.first() {
+            // The supersede gate asks that the sender saw the message it replaces, at its version.
             let reference = MessageRef::new(older.message.name(), older.home.clone());
             self.world.update(|world| world.sent.put_at(&sent(&reference), (), Version(older.message.version().0)));
             spec.supersedes = Some(reference);
@@ -219,8 +225,16 @@ impl Attentions for MessagePrimitives {
             .collect())
     }
 
-    async fn acknowledged(&self, namespace: &str, sender: Sender, subject: &Subject, began_at: DateTime<Utc>) -> Result<bool, String> {
-        Ok(self.about(namespace, sender, subject).await?.iter().any(|held| held.answers(began_at)))
+    async fn acknowledged(
+        &self,
+        namespace: &str,
+        sender: Sender,
+        subject: &Subject,
+        began_at: DateTime<Utc>,
+    ) -> Result<Option<String>, String> {
+        let about = self.about(namespace, sender, subject).await?;
+        let latest = about.iter().filter(|held| held.answers(began_at)).max_by_key(|held| (held.message.since(), held.message.name()));
+        Ok(latest.map(Held::reason))
     }
 
     fn changes(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {

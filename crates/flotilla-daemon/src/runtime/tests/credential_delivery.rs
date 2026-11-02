@@ -79,6 +79,20 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
         )
         .await
         .expect("set convoy status");
+    // The vessel's environment keeps its credential retry episode.
+    backend
+        .using::<Environment>(NAMESPACE)
+        .create(
+            &empty_meta("standing-vessel"),
+            &EnvironmentSpec {
+                cloud_sandbox: None,
+                provider_address: None,
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
+                docker: None,
+            },
+        )
+        .await
+        .expect("create environment");
     let vessels = backend.using::<Vessel>(NAMESPACE);
     let vessel = vessels
         .create(
@@ -176,6 +190,28 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[]).await.expect("full fix");
     reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage", true)]).await.expect("fails again");
     assert_eq!(open().await.len(), 1, "after a full fix, a new failure is told");
+
+    // Owner decision of 2026-11-02: a credential that starts failing while the attention is
+    // acknowledged begins a new episode, and the person is told again.
+    let acknowledge_all = || async {
+        for demand in demands.list().await.expect("list demands").items {
+            let acknowledge =
+                flotilla_resources::DemandStatusPatch::Acknowledge { as_of: chrono::Utc::now(), authority: "operator".to_string() };
+            flotilla_store::apply_status_patch(&demands, &demand.metadata.name, &acknowledge).await.expect("acknowledge demand");
+        }
+    };
+    acknowledge_all().await;
+    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[failure("outage", true)]).await.expect("still failing");
+    assert!(open().await.is_empty(), "acknowledged while the same credential fails");
+    let forgejo = CredentialRefreshError { credential_name: Some("forgejo".to_string()), ..failure("token refused", true) };
+    let both = [failure("outage", true), forgejo];
+    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &both).await.expect("another starts failing");
+    let told = open().await;
+    assert_eq!(told.len(), 1, "a newly failing credential is told again");
+    assert_eq!(told[0].reason.lines().count(), 2, "{}", told[0].reason);
+    acknowledge_all().await;
+    reconcile_credential_refresh_attention(&daemon, NAMESPACE, &both).await.expect("both still failing");
+    assert!(open().await.is_empty(), "the new episode's acknowledgement stands while both fail");
 }
 
 #[test]
