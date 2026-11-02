@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
     api_version,
@@ -183,8 +184,11 @@ fn is_open(demand: &ResourceObject<Demand>) -> bool {
     matches!(demand.status.as_ref().map_or(DemandState::Raised, |status| status.state), DemandState::Raised | DemandState::Escalated)
 }
 
-fn is_acknowledged(demand: &ResourceObject<Demand>) -> bool {
-    demand.status.as_ref().is_some_and(|status| status.state == DemandState::Acknowledged)
+/// Whether a person acknowledged it at or after `began_at`.
+fn answers(demand: &ResourceObject<Demand>, began_at: DateTime<Utc>) -> bool {
+    demand.status.as_ref().is_some_and(|status| {
+        status.state == DemandState::Acknowledged && status.acknowledged.as_ref().is_some_and(|seen| seen.as_of >= began_at)
+    })
 }
 
 fn reason(demand: &ResourceObject<Demand>) -> String {
@@ -207,8 +211,7 @@ impl Attentions for OldStoreAttentions {
             .filter(|(held_by, about, _)| *held_by == sender && *about == subject)
             .map(|(_, _, demand)| demand)
             .collect();
-        // An acknowledged attention stays acknowledged until its writer clears it.
-        if !about.iter().any(is_open) && about.iter().any(is_acknowledged) {
+        if about.iter().any(|demand| answers(demand, attention.began_at)) {
             return Ok(());
         }
         let desired = self.desired(namespace, attention).await?;
@@ -237,7 +240,16 @@ impl Attentions for OldStoreAttentions {
 
     async fn clear(&self, namespace: &str, sender: Sender, subject: &Subject) -> Result<(), String> {
         for (held_by, about, demand) in self.attentions(namespace, None).await? {
-            if held_by == sender && &about == subject {
+            if held_by == sender && &about == subject && is_open(&demand) {
+                self.delete(namespace, &demand.metadata.name).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn clear_within(&self, namespace: &str, scope: &Subject) -> Result<(), String> {
+        for (_, about, demand) in self.attentions(namespace, None).await? {
+            if about.within(scope) {
                 self.delete(namespace, &demand.metadata.name).await?;
             }
         }
@@ -284,9 +296,8 @@ impl Attentions for OldStoreAttentions {
         Ok(open.into_values().collect())
     }
 
-    async fn acknowledged(&self, namespace: &str, sender: Sender, subject: &Subject) -> Result<bool, String> {
+    async fn acknowledged(&self, namespace: &str, sender: Sender, subject: &Subject, began_at: DateTime<Utc>) -> Result<bool, String> {
         let found = self.attentions(namespace, None).await?;
-        let about: Vec<_> = found.iter().filter(|(held_by, about, _)| *held_by == sender && about == subject).collect();
-        Ok(!about.iter().any(|(_, _, demand)| is_open(demand)) && about.iter().any(|(_, _, demand)| is_acknowledged(demand)))
+        Ok(found.iter().any(|(held_by, about, demand)| *held_by == sender && about == subject && answers(demand, began_at)))
     }
 }

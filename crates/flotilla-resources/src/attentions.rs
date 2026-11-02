@@ -1,6 +1,7 @@
 //! Attentions: a fleet role telling a person about one record. The writer of a fact raises its
-//! attention when the fact begins and clears it when the fact ends; a person acknowledges it.
-//! One is open until then, and is known by its sender and subject.
+//! attention while the fact holds, naming when this episode of it began, and clears it when the
+//! fact ends; a person acknowledges it. One is open until then, and is known by its sender and
+//! subject. An acknowledgement answers its episode: the next episode is told again.
 //!
 //! The port names records as the old store does, by name in a namespace; each implementation maps
 //! them onto its own records.
@@ -121,22 +122,24 @@ impl Fact {
     }
 }
 
-/// One attention to raise: its fact, and the reason a person reads.
+/// One attention to raise: its fact, the reason a person reads, and when this episode of the fact
+/// began, on the clock of the home that raises it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attention {
     pub fact: Fact,
     pub reason: String,
+    pub began_at: DateTime<Utc>,
 }
 
 impl Attention {
-    pub fn new(fact: Fact, reason: impl Into<String>) -> Self {
-        Self { fact, reason: reason.into() }
+    pub fn new(fact: Fact, reason: impl Into<String>, began_at: DateTime<Utc>) -> Self {
+        Self { fact, reason: reason.into(), began_at }
     }
 
     /// A vessel's failing credentials, one line each.
-    pub fn credential_refresh(convoy: &str, vessel: &str, failures: BTreeMap<String, String>) -> Self {
+    pub fn credential_refresh(convoy: &str, vessel: &str, failures: BTreeMap<String, String>, began_at: DateTime<Utc>) -> Self {
         let reason = failures.iter().map(|(credential, why)| format!("{credential}: {why}")).collect::<Vec<_>>().join("\n");
-        Self { fact: Fact::CredentialRefresh { convoy: convoy.into(), vessel: vessel.into(), failures }, reason }
+        Self { fact: Fact::CredentialRefresh { convoy: convoy.into(), vessel: vessel.into(), failures }, reason, began_at }
     }
 }
 
@@ -160,25 +163,31 @@ impl OpenAttention {
 ///
 /// Each fact has one writer, at one home, which raises and clears it; callers serialize the
 /// raises and clears of one fact (a reconciler's pass, or one periodic task). An attention homed
-/// at another home is read, but only its own home supersedes or withdraws it.
+/// at another home is read, but only its own home supersedes or withdraws it. Each write is one
+/// store write per record it tells or withdraws.
 #[async_trait]
 pub trait Attentions: Send + Sync {
-    /// Tells a person, unless the same attention is open or a person acknowledged it and its writer
-    /// has not cleared it since. One open from the same sender about the same subject for another
-    /// reason is replaced.
+    /// Tells a person, unless the same attention is open or a person acknowledged one from the
+    /// same sender about the same subject at or after `began_at`: that answered this episode. One
+    /// open for another reason is replaced.
     async fn raise(&self, namespace: &str, attention: &Attention) -> Result<(), String>;
 
-    /// Ends the attention from `sender` about `subject`: its fact ended. An open one is settled, and
-    /// an acknowledged one no longer holds back the next raise. None is no error.
+    /// Withdraws the open attention from `sender` about `subject`: its fact ended. An acknowledged
+    /// one stays as it was. None is no error.
     async fn clear(&self, namespace: &str, sender: Sender, subject: &Subject) -> Result<(), String>;
+
+    /// Ends every attention about `scope` or a record under it, from every sender and in every
+    /// state: the records are gone. Open ones are withdrawn; the old store deletes acknowledged
+    /// ones too, while the engine keeps a settled message as what was said.
+    async fn clear_within(&self, namespace: &str, scope: &Subject) -> Result<(), String>;
 
     /// The open attentions from `from`, or every sender, about `scope` or a record under it, or
     /// about every record.
     async fn open(&self, namespace: &str, from: Option<Sender>, scope: Option<&Subject>) -> Result<Vec<OpenAttention>, String>;
 
-    /// Whether a person acknowledged the latest attention from `sender` about `subject`, and its
-    /// writer has not cleared it since.
-    async fn acknowledged(&self, namespace: &str, sender: Sender, subject: &Subject) -> Result<bool, String>;
+    /// Whether a person acknowledged an attention from `sender` about `subject` at or after
+    /// `began_at`: the episode that began then is answered.
+    async fn acknowledged(&self, namespace: &str, sender: Sender, subject: &Subject, began_at: DateTime<Utc>) -> Result<bool, String>;
 }
 
 #[cfg(test)]

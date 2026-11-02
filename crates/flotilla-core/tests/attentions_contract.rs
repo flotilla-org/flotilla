@@ -1,16 +1,16 @@
 //! The Attentions contract, run against the old store and the engine: raise is idempotent per
-//! sender and subject, a changed reason replaces the open one, clear settles it, a person's
-//! acknowledgement settles it, and open for a subject sees only the open ones about it or under it.
+//! sender and subject, a changed reason replaces the open one, clear withdraws it, a person's
+//! acknowledgement settles it and answers its episode, and open for a subject sees only the open
+//! ones about it or under it.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
+
+use chrono::{DateTime, Utc};
 
 use flotilla_core::primitives::{view::record_name, MessagePrimitives};
 use flotilla_resources::{
     attentions::{Attention, Attentions, Fact, Sender, Subject},
-    Convoy, ConvoyEnsure, Demand, DemandStatusPatch, FleetDesignation, FleetDesignationSpec, InputMeta, Project, ProjectSpec,
+    Convoy, ConvoyEnsure, Demand, DemandState, DemandStatusPatch, FleetDesignation, FleetDesignationSpec, InputMeta, Project, ProjectSpec,
     ResourceObject, SystemClock, TerminalSession, Vessel, CONVOY_LABEL, FLEET_DESIGNATION_NAME, ROLE_LABEL,
 };
 use flotilla_schema_sqlite::stream::Service;
@@ -116,7 +116,11 @@ impl Implementation {
                 };
                 let demands = backend.using::<Demand>(NAMESPACE);
                 let listed: Vec<ResourceObject<Demand>> = demands.list().await.expect("demands").items;
-                for demand in listed.iter().filter(|demand| demand.metadata.name.starts_with(prefix)) {
+                // A person acknowledges what is open.
+                let open = |demand: &&ResourceObject<Demand>| {
+                    demand.status.as_ref().is_none_or(|status| matches!(status.state, DemandState::Raised | DemandState::Escalated))
+                };
+                for demand in listed.iter().filter(|demand| demand.metadata.name.starts_with(prefix)).filter(open) {
                     let patch = DemandStatusPatch::Acknowledge { as_of: chrono::Utc::now(), authority: "person".into() };
                     flotilla_store::apply_status_patch(&demands, &demand.metadata.name, &patch).await.expect("acknowledge");
                 }
@@ -150,14 +154,15 @@ fn subject_suffix(subject: &Subject) -> String {
 }
 
 /// Every fact one writer raises, each from its sender about its subject; two share the convoy.
-fn attention(fact: usize, reason: &str) -> Attention {
+fn attention(fact: usize, reason: &str, began_at: DateTime<Utc>) -> Attention {
     let convoy = || "demo".to_owned();
     match fact {
-        0 => Attention::new(Fact::Hold { ensure: "standing-gui".into(), convoy: convoy() }, reason),
-        1 => Attention::new(Fact::ReclaimRefused { convoy: convoy() }, reason),
+        0 => Attention::new(Fact::Hold { ensure: "standing-gui".into(), convoy: convoy() }, reason, began_at),
+        1 => Attention::new(Fact::ReclaimRefused { convoy: convoy() }, reason, began_at),
         2 => Attention::new(
             Fact::Drift { ensure: "standing-gui".into(), project: NAMESPACE.into(), role: "gui".into(), convoy: convoy() },
             reason,
+            began_at,
         ),
         // The second reason adds a credential, so the first drops one: the old store deletes its demand.
         3 => {
@@ -166,28 +171,79 @@ fn attention(fact: usize, reason: &str) -> Attention {
                 "demo",
                 "work",
                 credentials.iter().map(|credential| (credential.to_string(), reason.to_owned())).collect(),
+                began_at,
             )
         }
-        _ => Attention::new(Fact::DeliveryHeld { session: "session-1".into(), convoy: convoy(), role: "coder".into() }, reason),
+        _ => Attention::new(Fact::DeliveryHeld { session: "session-1".into(), convoy: convoy(), role: "coder".into() }, reason, began_at),
     }
+}
+
+fn key(fact: usize) -> (Sender, Subject) {
+    let fact = attention(fact, "", DateTime::UNIX_EPOCH).fact;
+    (fact.sender(), fact.subject())
+}
+
+/// An episode's start, on a later microsecond than anything before it, as the stores keep time.
+async fn episode_start() -> DateTime<Utc> {
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    Utc::now()
 }
 
 const FACTS: usize = 5;
 
 #[derive(Debug, Clone, Copy)]
 enum Step {
-    Raise { fact: usize, reason: usize },
-    Clear { fact: usize },
-    Acknowledge { fact: usize },
+    Raise {
+        fact: usize,
+        reason: usize,
+    },
+    Clear {
+        fact: usize,
+    },
+    Acknowledge {
+        fact: usize,
+    },
+    /// Every attention about the convoy and the records under it ends.
+    ClearWithin,
 }
 
-/// What a person sees, per sender and subject: the open reason, and whether the last was acknowledged.
+/// One fact's episode, as its writer knows it.
+#[derive(Clone, Copy)]
+struct Episode {
+    began_at: DateTime<Utc>,
+    ended: bool,
+}
+
+/// What a person sees, per sender and subject: the open reason, and which episode a person answered.
 #[derive(Default, Clone)]
 struct Model {
     open: BTreeMap<(Sender, Subject), String>,
-    acknowledged: BTreeSet<(Sender, Subject)>,
+    episodes: BTreeMap<(Sender, Subject), Episode>,
+    answered: BTreeMap<(Sender, Subject), DateTime<Utc>>,
     /// When each open attention was first seen raised; a repeated raise keeps it.
-    raised_at: BTreeMap<(Sender, Subject), chrono::DateTime<chrono::Utc>>,
+    raised_at: BTreeMap<(Sender, Subject), DateTime<Utc>>,
+}
+
+impl Model {
+    /// The episode a raise belongs to: the current one, or a new one once the last ended.
+    async fn episode(&mut self, key: &(Sender, Subject)) -> DateTime<Utc> {
+        match self.episodes.get(key) {
+            Some(episode) if !episode.ended => episode.began_at,
+            _ => {
+                let began_at = episode_start().await;
+                self.episodes.insert(key.clone(), Episode { began_at, ended: false });
+                began_at
+            }
+        }
+    }
+
+    fn end(&mut self, key: &(Sender, Subject)) {
+        self.open.remove(key);
+        self.raised_at.remove(key);
+        if let Some(episode) = self.episodes.get_mut(key) {
+            episode.ended = true;
+        }
+    }
 }
 
 async fn check(implementation: &Implementation, model: &mut Model, after: &[Step]) {
@@ -205,12 +261,8 @@ async fn check(implementation: &Implementation, model: &mut Model, after: &[Step
     assert_eq!(all, model.open, "every open attention after {after:?}");
     let convoy = Subject::convoy("demo");
     let under = seen(attentions.open(NAMESPACE, None, Some(&convoy)).await.expect("open"));
-    let expected: BTreeMap<_, _> = model
-        .open
-        .iter()
-        .filter(|((_, subject), _)| !matches!(subject, Subject::StandingRole { .. }))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let expected: BTreeMap<_, _> =
+        model.open.iter().filter(|((_, subject), _)| subject.within(&convoy)).map(|(k, v)| (k.clone(), v.clone())).collect();
     assert_eq!(under, expected, "open about the convoy after {after:?}");
     let vessel = Subject::Vessel { convoy: "demo".into(), vessel: "work".into() };
     let about_vessel = seen(attentions.open(NAMESPACE, None, Some(&vessel)).await.expect("open"));
@@ -221,25 +273,24 @@ async fn check(implementation: &Implementation, model: &mut Model, after: &[Step
     let expected: BTreeMap<_, _> =
         model.open.iter().filter(|((sender, _), _)| *sender == Sender::Standing).map(|(k, v)| (k.clone(), v.clone())).collect();
     assert_eq!(standing, expected, "open from standing after {after:?}");
-    for fact in 0..FACTS {
-        let key = {
-            let fact = attention(fact, "").fact;
-            (fact.sender(), fact.subject())
-        };
-        let acknowledged = attentions.acknowledged(NAMESPACE, key.0, &key.1).await.expect("acknowledged");
-        assert_eq!(acknowledged, model.acknowledged.contains(&key), "{key:?} acknowledged after {after:?}");
+    // A writer asks about its live episode; an ended one is never raised again.
+    for (key, episode) in model.episodes.iter().filter(|(_, episode)| !episode.ended) {
+        let acknowledged = attentions.acknowledged(NAMESPACE, key.0, &key.1, episode.began_at).await.expect("acknowledged");
+        assert_eq!(acknowledged, model.answered.get(key) == Some(&episode.began_at), "{key:?} acknowledged after {after:?}");
     }
 }
 
 fn contract(tc: TestCase, engine: bool) {
-    let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(12));
+    let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(14));
+    // Raises, clears and acknowledgements of every fact, and the convoy's records ending.
     let steps: Vec<Step> = (0..count)
         .map(|_| {
             let fact = tc.draw(gs::integers::<usize>().min_value(0).max_value(FACTS - 1));
-            match tc.draw(gs::integers::<u8>().min_value(0).max_value(3)) {
-                0 | 1 => Step::Raise { fact, reason: tc.draw(gs::integers::<usize>().min_value(0).max_value(1)) },
-                2 => Step::Clear { fact },
-                _ => Step::Acknowledge { fact },
+            match tc.draw(gs::integers::<u8>().min_value(0).max_value(6)) {
+                0..=2 => Step::Raise { fact, reason: tc.draw(gs::integers::<usize>().min_value(0).max_value(1)) },
+                3 => Step::Clear { fact },
+                4 | 5 => Step::Acknowledge { fact },
+                _ => Step::ClearWithin,
             }
         })
         .collect();
@@ -250,33 +301,38 @@ fn contract(tc: TestCase, engine: bool) {
         for (index, step) in steps.iter().enumerate() {
             match *step {
                 Step::Raise { fact, reason } => {
-                    let attention = attention(fact, ["held", "still held"][reason]);
+                    let key = key(fact);
+                    let began_at = model.episode(&key).await;
+                    let attention = attention(fact, ["held", "still held"][reason], began_at);
                     implementation.attentions().raise(NAMESPACE, &attention).await.expect("raise");
-                    let key = (attention.fact.sender(), attention.fact.subject());
-                    // An acknowledged attention stays acknowledged until its writer clears it.
-                    if model.acknowledged.contains(&key) {
-                        check(&implementation, &mut model, &steps[..=index]).await;
-                        continue;
-                    }
-                    if model.open.insert(key.clone(), attention.reason.clone()).is_none_or(|before| before != attention.reason) {
+                    // An acknowledgement answers every raise of its episode.
+                    if model.answered.get(&key) != Some(&began_at)
+                        && model.open.insert(key.clone(), attention.reason.clone()).is_none_or(|before| before != attention.reason)
+                    {
                         model.raised_at.remove(&key);
                     }
                 }
                 Step::Clear { fact } => {
-                    let fact = attention(fact, "").fact;
-                    implementation.attentions().clear(NAMESPACE, fact.sender(), &fact.subject()).await.expect("clear");
-                    let key = (fact.sender(), fact.subject());
-                    model.open.remove(&key);
-                    model.acknowledged.remove(&key);
-                    model.raised_at.remove(&key);
+                    let key = key(fact);
+                    implementation.attentions().clear(NAMESPACE, key.0, &key.1).await.expect("clear");
+                    model.end(&key);
                 }
                 Step::Acknowledge { fact } => {
-                    let fact = attention(fact, "").fact;
-                    implementation.acknowledge(&fact).await;
-                    let key = (fact.sender(), fact.subject());
+                    let key = key(fact);
+                    implementation.acknowledge(&attention(fact, "", DateTime::UNIX_EPOCH).fact).await;
                     if model.open.remove(&key).is_some() {
                         model.raised_at.remove(&key);
-                        model.acknowledged.insert(key);
+                        model.answered.insert(key.clone(), model.episodes[&key].began_at);
+                    }
+                }
+                Step::ClearWithin => {
+                    let convoy = Subject::convoy("demo");
+                    implementation.attentions().clear_within(NAMESPACE, &convoy).await.expect("clear within");
+                    for fact in 0..FACTS {
+                        let key = key(fact);
+                        if key.1.within(&convoy) {
+                            model.end(&key);
+                        }
                     }
                 }
             }
@@ -295,30 +351,76 @@ fn the_engine_keeps_the_attentions_contract(tc: TestCase) {
     contract(tc, true);
 }
 
-async fn acknowledged_until_cleared(implementation: Implementation) {
+impl Implementation {
+    /// How many records this implementation stores, open or not.
+    async fn stored(&self) -> usize {
+        match self {
+            Implementation::Old { backend, .. } => backend.using::<Demand>(NAMESPACE).list().await.expect("demands").items.len(),
+            Implementation::Engine { primitives, .. } => primitives.messages().expect("messages").len(),
+        }
+    }
+}
+
+async fn an_acknowledgement_answers_its_episode(implementation: Implementation) {
     let attentions = implementation.attentions();
-    let hold = attention(0, "held");
+    let first = episode_start().await;
+    let hold = attention(0, "held", first);
     let (sender, subject) = (hold.fact.sender(), hold.fact.subject());
     let open = || async { attentions.open(NAMESPACE, Some(sender), Some(&subject)).await.expect("open") };
     attentions.raise(NAMESPACE, &hold).await.expect("raise");
     implementation.acknowledge(&hold.fact).await;
     attentions.raise(NAMESPACE, &hold).await.expect("raise again");
-    attentions.raise(NAMESPACE, &attention(0, "still held")).await.expect("raise for another reason");
-    assert!(open().await.is_empty(), "raising again leaves an acknowledged attention acknowledged");
-    assert!(attentions.acknowledged(NAMESPACE, sender, &subject).await.expect("acknowledged"));
+    attentions.raise(NAMESPACE, &attention(0, "still held", first)).await.expect("raise for another reason");
+    assert!(open().await.is_empty(), "the acknowledgement answers every raise of its episode");
+    assert!(attentions.acknowledged(NAMESPACE, sender, &subject, first).await.expect("acknowledged"));
+    let stored = implementation.stored().await;
     attentions.clear(NAMESPACE, sender, &subject).await.expect("clear");
-    assert!(!attentions.acknowledged(NAMESPACE, sender, &subject).await.expect("acknowledged"));
-    attentions.raise(NAMESPACE, &hold).await.expect("raise after clear");
-    assert_eq!(open().await.len(), 1, "cleared, the next raise opens a new attention");
+    assert_eq!(implementation.stored().await, stored, "clearing an acknowledged attention writes nothing");
+    let second = episode_start().await;
+    assert!(!attentions.acknowledged(NAMESPACE, sender, &subject, second).await.expect("acknowledged"));
+    attentions.raise(NAMESPACE, &attention(0, "held", second)).await.expect("raise a new episode");
+    assert_eq!(open().await.len(), 1, "a new episode is told again");
+    attentions.clear(NAMESPACE, sender, &subject).await.expect("clear");
+    assert!(open().await.is_empty(), "clearing withdraws the open one");
 }
 
-// Behaviour: raise, acknowledge, raise again stays acknowledged; clear, then raise opens a new one.
+// Behaviour: an acknowledgement answers its episode's raises, a clear leaves it as it is, and the
+// next episode is told again.
 #[tokio::test]
-async fn the_old_store_keeps_an_acknowledgement_until_cleared() {
-    acknowledged_until_cleared(Implementation::old().await).await;
+async fn the_old_store_answers_an_episode_once() {
+    an_acknowledgement_answers_its_episode(Implementation::old().await).await;
 }
 
 #[tokio::test]
-async fn the_engine_keeps_an_acknowledgement_until_cleared() {
-    acknowledged_until_cleared(Implementation::engine().await).await;
+async fn the_engine_answers_an_episode_once() {
+    an_acknowledgement_answers_its_episode(Implementation::engine().await).await;
+}
+
+async fn nothing_open_is_left_within(implementation: Implementation) {
+    let attentions = implementation.attentions();
+    let began_at = episode_start().await;
+    for fact in 0..FACTS {
+        attentions.raise(NAMESPACE, &attention(fact, "held", began_at)).await.expect("raise");
+    }
+    implementation.acknowledge(&attention(0, "", began_at).fact).await;
+    attentions.clear_within(NAMESPACE, &Subject::convoy("demo")).await.expect("clear within");
+    let left: Vec<_> = attentions.open(NAMESPACE, None, None).await.expect("open").into_iter().map(|open| open.subject).collect();
+    assert_eq!(left, [key(2).1], "only the standing role's drift is not under the convoy");
+    if let Implementation::Old { backend, .. } = &implementation {
+        let names: Vec<_> =
+            backend.using::<Demand>(NAMESPACE).list().await.expect("demands").items.into_iter().map(|d| d.metadata.name).collect();
+        assert_eq!(names, ["ensure-config-drift-standing-gui"], "the acknowledged hold's demand is deleted too");
+    }
+}
+
+// Behaviour: clearing within a convoy ends every attention about it and its records, acknowledged
+// or open, and none about another record.
+#[tokio::test]
+async fn the_old_store_clears_every_attention_within_a_convoy() {
+    nothing_open_is_left_within(Implementation::old().await).await;
+}
+
+#[tokio::test]
+async fn the_engine_clears_every_attention_within_a_convoy() {
+    nothing_open_is_left_within(Implementation::engine().await).await;
 }
