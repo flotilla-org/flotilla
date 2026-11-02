@@ -2425,7 +2425,14 @@ async fn image_check_command_reads_the_ref_and_reports_its_build() {
     // are installation definitions (shadowing stdlib layers of the same name)
     // and the project names its base beside the stdlib's.
     project.image = Some(flotilla_resources::ImageSelection { base: Some("base".into()), layers: Vec::new() });
-    backend.using::<Project>("flotilla").create(&InputMeta::builder().name("demo".into()).build(), &project).await.expect("project");
+    let meta = InputMeta::builder()
+        .name("demo".into())
+        .annotations(BTreeMap::from([(
+            flotilla_resources::definition_provenance::BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(),
+            repository.key().to_string(),
+        )]))
+        .build();
+    backend.using::<Project>("flotilla").create(&meta, &project).await.expect("project");
     let layer = |name: &str, tier: ImageLayerTier, provides: &[&str]| {
         ImageLayerSpec::builder()
             .name(name.into())

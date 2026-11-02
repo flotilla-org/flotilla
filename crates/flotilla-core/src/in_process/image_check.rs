@@ -1,8 +1,8 @@
 //! `flotilla image check --project X --ref <branch>` (ADR 0062, decision B3):
 //! build and probe a branch's composed image before merge, with no CI.
 //!
-//! The project's primary repository's `.flotilla/image/` is read at the ref
-//! through the VCS seam and substituted for the synced primary-repository
+//! The project's declaring repository's `.flotilla/image/` is read at the ref
+//! through the VCS seam and substituted for the synced declaring-repository
 //! layer in the replica-inclusive catalogue; a charter-authored layer is kept,
 //! and a branch defining both is refused as the sync refuses it. The
 //! composition then resolves exactly as
@@ -82,10 +82,12 @@ pub async fn check_image(
         reused: false,
     };
 
-    // The project layer at the ref. A project without a code repository has
-    // none at any ref.
     let mut branch_layer = None;
-    if let Some(LayerHome::Source(source)) = primary_layer_home(backend, namespace, &project.spec, Some(&request.git_ref)).await? {
+    let home = primary_layer_home(backend, namespace, &project, Some(&request.git_ref)).await?;
+    if let LayerHome::Refused(reason) = &home {
+        report.refusals.push(ImageCheckRefusal { layers: vec![format!("{PROJECT_IMAGE_LAYER_PATH}/")], message: reason.clone() });
+    }
+    if let LayerHome::Source(source) = home {
         source.validate()?;
         if let Some(snapshot) = source_read(sources.layer_snapshot(&source))
             .await
@@ -111,7 +113,7 @@ pub async fn check_image(
         report.refusals.push(ImageCheckRefusal {
             layers: vec![layer.name.clone(), charter_layer.clone()],
             message: format!(
-                "project `{}` defines its image layer twice: `{PROJECT_IMAGE_LAYER_PATH}/` in its primary repository and \
+                "project `{}` defines its image layer twice: `{PROJECT_IMAGE_LAYER_PATH}/` in its declaring repository and \
                  `{CHARTER_IMAGE_LAYER_PATH}/` in its charter (ImageLayer `{charter_layer}`)",
                 request.project
             ),

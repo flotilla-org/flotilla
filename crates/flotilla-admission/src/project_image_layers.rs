@@ -1,7 +1,7 @@
 //! Project image layers (ADR 0062): the `.flotilla/image/` directory at the
-//! root of a project's primary repository, read at the default-branch head as
+//! root of a project's declaring repository, read at the default-branch head as
 //! last fetched, becomes its project-source ImageLayer. Every project's
-//! primary repository is read, charter-delegated projects included; a
+//! declaring repository is read, charter-delegated projects included; a
 //! delegated charter may instead author the layer at `<charter path>/image/`
 //! (charter delegation), and a project defining both is refused, naming both
 //! locations. Removing the directory removes the layer.
@@ -10,10 +10,11 @@ use std::collections::BTreeMap;
 use flotilla_charter::{
     charter_store::{CHARTER_IMAGE_LAYER_PATH, PROJECT_IMAGE_LAYER_PATH, PROJECT_IMAGE_MANAGER},
     ops_entry::{MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION},
+    project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION,
 };
 use flotilla_resources::{
-    parse_layer_directory, CharterSource, ConditionValue, HostCondition, ImageLayer, ImageLayerSource, InputMeta, Project,
-    ProjectRepositoryRole, ProjectSpec, Repository, ResourceError, ResourceObject, MANAGED_BY_LABEL,
+    definition_provenance::WHOLE_REPOSITORY_PROJECT_MANAGER, parse_layer_directory, CharterSource, ConditionValue, HostCondition,
+    ImageLayer, ImageLayerSource, InputMeta, Project, Repository, ResourceError, ResourceObject, MANAGED_BY_LABEL,
 };
 use flotilla_store::ResourceBackend;
 use tracing::warn;
@@ -25,41 +26,56 @@ use super::project_ops::{repository_transport_url_with_backend, ProjectService};
 pub enum LayerHome {
     /// Read the directory here.
     Source(CharterSource),
-    /// Nothing can be read yet (no default branch); leave the layer as it is.
-    Elsewhere,
+    /// A charter-delegated project with no recorded declaration: its layer, if any, is the charter's.
+    Absent,
+    /// Nothing can be read, and the reason is reported rather than skipped.
+    Refused(String),
 }
 
-/// The project's primary (first code) repository's layer directory, at
-/// `branch` or else the repository's default branch. `None`: the project has
-/// no code repository.
+/// The layer directory beside the project's declaration, at `branch` or else
+/// the declaring repository's default branch. Member order plays no part. A
+/// generated whole-repository project is declared by its one repository.
 pub async fn primary_layer_home(
     backend: &ResourceBackend,
     namespace: &str,
-    project: &ProjectSpec,
+    project: &ResourceObject<Project>,
     branch: Option<&str>,
-) -> Result<Option<LayerHome>, String> {
-    let Some(primary) = project.repositories.iter().find(|member| member.roles.contains(&ProjectRepositoryRole::Code)) else {
-        return Ok(None);
+) -> Result<LayerHome, String> {
+    let declaring = match project.metadata.annotations.get(BOOTSTRAP_REPOSITORY_ANNOTATION) {
+        Some(key) => key.clone(),
+        None if project.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some(WHOLE_REPOSITORY_PROJECT_MANAGER)
+            && project.spec.repositories.len() == 1 =>
+        {
+            project.spec.repositories[0].repo.to_string()
+        }
+        None if project.spec.charter.is_some() => return Ok(LayerHome::Absent),
+        None => {
+            return Ok(LayerHome::Refused(format!(
+                "its declaration source is unknown (no `{BOOTSTRAP_REPOSITORY_ANNOTATION}` annotation), so its `{PROJECT_IMAGE_LAYER_PATH}/` cannot be located"
+            )))
+        }
     };
     let repository = backend
         .including_replicas::<Repository>(namespace)
-        .get(&primary.repo.to_string())
+        .get(&declaring)
         .await
-        .map_err(|error| format!("repository {}: {error}", primary.repo))?
+        .map_err(|error| format!("declaring repository {declaring}: {error}"))?
         .object;
+    let member_branch = project
+        .spec
+        .repositories
+        .iter()
+        .find(|member| member.repo.to_string() == declaring)
+        .and_then(|member| member.default_branch.clone());
     let Some(branch) = branch
         .map(str::to_string)
-        .or_else(|| primary.default_branch.clone())
+        .or(member_branch)
         .or_else(|| repository.status.as_ref().and_then(|status| status.default_branch.clone()))
     else {
-        return Ok(Some(LayerHome::Elsewhere));
+        return Ok(LayerHome::Refused(format!("declaring repository {declaring} has no default branch yet")));
     };
     let repo = repository_transport_url_with_backend(backend, namespace, &repository.spec).await?;
-    let path = primary.subpath.as_deref().map_or_else(
-        || PROJECT_IMAGE_LAYER_PATH.to_string(),
-        |subpath| format!("{}/{PROJECT_IMAGE_LAYER_PATH}", subpath.trim_end_matches('/')),
-    );
-    Ok(Some(LayerHome::Source(CharterSource::Repository { repo, branch, path })))
+    Ok(LayerHome::Source(CharterSource::Repository { repo, branch, path: PROJECT_IMAGE_LAYER_PATH.to_string() }))
 }
 
 /// Maximum UTF-8 bytes in one project image-layer heartbeat message.
@@ -90,7 +106,7 @@ pub struct LayerRefreshState {
 }
 
 struct LayerRefusal {
-    source: CharterSource,
+    source: Option<CharterSource>,
     error: String,
     delay: std::time::Duration,
     retry_at: tokio::time::Instant,
@@ -121,20 +137,23 @@ impl LayerRefreshState {
     fn deferred(&self, namespace: &str, project: &str, source: &CharterSource) -> bool {
         self.refusals
             .get(&(namespace.into(), project.into()))
-            .is_some_and(|refusal| &refusal.source == source && tokio::time::Instant::now() < refusal.retry_at)
+            .is_some_and(|refusal| refusal.source.as_ref() == Some(source) && tokio::time::Instant::now() < refusal.retry_at)
     }
 
+    // Source-less refusals are never deferred, so their delay is unused.
     // Preserve the complete source/error identity. Different refusals get an
     // initial retry; repeated identical errors back off. Dynamic-message error
     // classification can be added when the inspector exposes typed errors.
-    fn refused(&mut self, namespace: &str, project: &str, source: &CharterSource, error: String) {
+    fn refused(&mut self, namespace: &str, project: &str, source: Option<&CharterSource>, error: String) {
         let key = (namespace.to_string(), project.to_string());
-        let previous = self.refusals.get(&key).filter(|previous| previous.source == *source && previous.error == error);
+        let previous = self.refusals.get(&key).filter(|previous| previous.source.as_ref() == source && previous.error == error);
         let observed_at = previous.map_or_else(chrono::Utc::now, |previous| previous.observed_at);
         let delay =
             previous.map_or(std::time::Duration::from_secs(60), |previous| (previous.delay * 2).min(std::time::Duration::from_secs(3600)));
-        self.refusals
-            .insert(key, LayerRefusal { source: source.clone(), error, delay, retry_at: tokio::time::Instant::now() + delay, observed_at });
+        self.refusals.insert(
+            key,
+            LayerRefusal { source: source.cloned(), error, delay, retry_at: tokio::time::Instant::now() + delay, observed_at },
+        );
     }
 }
 
@@ -161,9 +180,13 @@ impl ProjectService<'_> {
                 continue;
             }
             let source = match self.layer_home(&namespace, &project).await {
-                Ok(Some(LayerHome::Source(source))) => source,
-                Ok(None) | Ok(Some(LayerHome::Elsewhere)) => {
+                Ok(LayerHome::Source(source)) => source,
+                Ok(LayerHome::Absent) => {
                     self.image_layer_refresh.lock().await.refusals.remove(&(namespace.clone(), project.metadata.name.clone()));
+                    continue;
+                }
+                Ok(LayerHome::Refused(reason)) => {
+                    self.image_layer_refresh.lock().await.refused(&namespace, &project.metadata.name, None, reason);
                     continue;
                 }
                 Err(error) => {
@@ -179,14 +202,14 @@ impl ProjectService<'_> {
                 Ok(()) => {
                     self.image_layer_refresh.lock().await.refusals.remove(&(namespace.clone(), project.metadata.name.clone()));
                 }
-                Err(error) => self.image_layer_refresh.lock().await.refused(&namespace, &project.metadata.name, &source, error),
+                Err(error) => self.image_layer_refresh.lock().await.refused(&namespace, &project.metadata.name, Some(&source), error),
             }
         }
         Ok(())
     }
 
-    async fn layer_home(&self, namespace: &str, project: &ResourceObject<Project>) -> Result<Option<LayerHome>, String> {
-        primary_layer_home(self.resource_backend, namespace, &project.spec, None).await
+    async fn layer_home(&self, namespace: &str, project: &ResourceObject<Project>) -> Result<LayerHome, String> {
+        primary_layer_home(self.resource_backend, namespace, project, None).await
     }
 
     async fn sync_project_image_layer(&self, namespace: &str, project: &str, source: &CharterSource) -> Result<(), String> {
@@ -214,7 +237,7 @@ impl ProjectService<'_> {
                         .is_some_and(|spec| spec.source == ImageLayerSource::Project && spec.project.as_deref() == Some(project));
                 if charter_authored {
                     return Err(format!(
-                        "project `{project}` defines its image layer twice: `{PROJECT_IMAGE_LAYER_PATH}/` in its primary repository and \
+                        "project `{project}` defines its image layer twice: `{PROJECT_IMAGE_LAYER_PATH}/` in its declaring repository and \
                          `{CHARTER_IMAGE_LAYER_PATH}/` in its charter (ImageLayer `{}`)",
                         other.metadata.name
                     ));
@@ -267,7 +290,8 @@ mod tests {
     use async_trait::async_trait;
     use flotilla_charter::charter_store::LayerDirectorySnapshot;
     use flotilla_resources::{
-        CharterPointer, Clock, ImageLayerTier, ProjectRepositorySpec, ProjectSpec, RepositorySpec, RepositoryStatus, SystemClock,
+        CharterPointer, Clock, ImageLayerTier, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, RepositorySpec, RepositoryStatus,
+        SystemClock,
     };
     use flotilla_store::ResourceBackend;
     use flotilla_store_memory::InMemoryBackend;
@@ -346,7 +370,11 @@ mod tests {
                 .build(),
             ProjectRepositorySpec::builder().repo(repository.key()).roles([ProjectRepositoryRole::Code].into()).build(),
         ];
-        backend.using::<Project>("flotilla").create(&InputMeta::builder().name("app".into()).build(), &spec).await.expect("project");
+        let meta = InputMeta::builder()
+            .name("app".into())
+            .annotations(BTreeMap::from([(BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(), repository.key().to_string())]))
+            .build();
+        backend.using::<Project>("flotilla").create(&meta, &spec).await.expect("project");
     }
 
     // Repeated failures retain the previous layer, back off reads, and expose
@@ -406,51 +434,180 @@ mod tests {
         assert!(service.image_layer_refresh.lock().await.conditions().is_empty());
     }
 
-    // A refusal belongs to one readable layer home. Removing the code home,
-    // losing its default branch, or losing the repository clears that old
-    // diagnosis without retrying a fetch still inside its backoff window.
     #[tokio::test(start_paused = true)]
     async fn image_layer_refusal_clears_when_its_home_disappears() {
-        for mode in 0..3 {
-            let backend = ResourceBackend::new(InMemoryBackend::default());
-            let observed = ResourceBackend::new(InMemoryBackend::observed());
-            seed(&backend, None).await;
-            let source = Arc::new(LayerSource::default());
-            *source.error.lock().unwrap() = Some("old /cache/shallow.lock refusal".into());
-            let operations = Operations::with_inspector(source.clone());
-            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-            let namespace = std::sync::RwLock::new("flotilla".to_string());
-            let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
-            let service = service(&backend, &observed, &clock, &namespace, &operations, &roots);
-            service.reconcile_project_image_layers().await.unwrap();
-            assert_eq!(service.image_layer_refresh.lock().await.conditions().len(), 1);
-            let mut project = backend.using::<Project>("flotilla").get("app").await.unwrap();
-            let repository_name = project.spec.repositories[1].repo.to_string();
-            match mode {
-                0 => {
-                    project.spec.repositories.clear();
-                    backend
-                        .definitions::<Project>("flotilla")
-                        .apply(&InputMeta::builder().name("app".into()).build(), &project.spec)
-                        .await
-                        .unwrap();
-                }
-                1 => {
-                    let repositories = backend.using::<Repository>("flotilla");
-                    let repository = repositories.get(&repository_name).await.unwrap();
-                    repositories
-                        .update_status(&repository_name, &repository.metadata.resource_version, &RepositoryStatus::default())
-                        .await
-                        .unwrap();
-                }
-                _ => {
-                    backend.using::<Repository>("flotilla").delete(&repository_name).await.unwrap();
-                }
-            }
-            service.reconcile_project_image_layers().await.unwrap();
-            assert!(service.image_layer_refresh.lock().await.conditions().is_empty(), "obsolete home mode {mode} must lose its refusal");
-            assert_eq!(source.reads.lock().unwrap().len(), 1);
-        }
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let observed = ResourceBackend::new(InMemoryBackend::observed());
+        seed(&backend, None).await;
+        let source = Arc::new(LayerSource::default());
+        *source.error.lock().unwrap() = Some("old /cache/shallow.lock refusal".into());
+        let operations = Operations::with_inspector(source.clone());
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let namespace = std::sync::RwLock::new("flotilla".to_string());
+        let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
+        let service = service(&backend, &observed, &clock, &namespace, &operations, &roots);
+        service.reconcile_project_image_layers().await.unwrap();
+        assert_eq!(service.image_layer_refresh.lock().await.conditions().len(), 1);
+        let repository_name = backend.using::<Project>("flotilla").get("app").await.unwrap().spec.repositories[1].repo.to_string();
+        backend.using::<Repository>("flotilla").delete(&repository_name).await.unwrap();
+        service.reconcile_project_image_layers().await.unwrap();
+        assert!(service.image_layer_refresh.lock().await.conditions().is_empty());
+        assert_eq!(source.reads.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn declaring_repository_without_default_branch_is_refused_by_name() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let observed = ResourceBackend::new(InMemoryBackend::observed());
+        seed(&backend, None).await;
+        let source = Arc::new(LayerSource::default());
+        let operations = Operations::with_inspector(source.clone());
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let namespace = std::sync::RwLock::new("flotilla".to_string());
+        let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
+        let service = service(&backend, &observed, &clock, &namespace, &operations, &roots);
+        let repository_name = backend.using::<Project>("flotilla").get("app").await.unwrap().spec.repositories[1].repo.to_string();
+        let repositories = backend.using::<Repository>("flotilla");
+        let repository = repositories.get(&repository_name).await.unwrap();
+        repositories.update_status(&repository_name, &repository.metadata.resource_version, &RepositoryStatus::default()).await.unwrap();
+        service.reconcile_project_image_layers().await.unwrap();
+        let conditions = service.image_layer_refresh.lock().await.conditions();
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].condition_type, "ProjectImageLayer/flotilla/app");
+        assert!(conditions[0].message.contains("no default branch"), "{}", conditions[0].message);
+        assert!(source.reads.lock().unwrap().is_empty());
+
+        *source.files.lock().unwrap() = Some(layer_files("1.0.0"));
+        let repository = repositories.get(&repository_name).await.unwrap();
+        repositories
+            .update_status(
+                &repository_name,
+                &repository.metadata.resource_version,
+                &RepositoryStatus { default_branch: Some("main".into()), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        service.reconcile_project_image_layers().await.unwrap();
+        assert!(service.image_layer_refresh.lock().await.conditions().is_empty());
+        assert!(backend.using::<ImageLayer>("flotilla").get(&layer_name("1.0.0")).await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn project_without_recorded_declaration_is_refused() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let observed = ResourceBackend::new(InMemoryBackend::observed());
+        seed(&backend, None).await;
+        let project = backend.using::<Project>("flotilla").get("app").await.unwrap();
+        backend.definitions::<Project>("flotilla").apply(&InputMeta::builder().name("app".into()).build(), &project.spec).await.unwrap();
+        let source = Arc::new(LayerSource::default());
+        let operations = Operations::with_inspector(source.clone());
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let namespace = std::sync::RwLock::new("flotilla".to_string());
+        let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
+        let service = service(&backend, &observed, &clock, &namespace, &operations, &roots);
+        service.reconcile_project_image_layers().await.unwrap();
+        let conditions = service.image_layer_refresh.lock().await.conditions();
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].condition_type, "ProjectImageLayer/flotilla/app");
+        assert!(conditions[0].message.contains("declaration source is unknown"), "{}", conditions[0].message);
+        assert!(source.reads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn layer_is_read_from_the_declaring_repository_not_the_first_code_member() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let observed = ResourceBackend::new(InMemoryBackend::observed());
+        seed(&backend, None).await;
+        let mut project = backend.using::<Project>("flotilla").get("app").await.unwrap();
+        project.spec.repositories[0].roles = [ProjectRepositoryRole::Code].into();
+        backend.definitions::<Project>("flotilla").apply(&InputMeta::from(&project.metadata), &project.spec).await.unwrap();
+        let source = Arc::new(LayerSource::default());
+        *source.files.lock().unwrap() = Some(layer_files("1.0.0"));
+        let operations = Operations::with_inspector(source.clone());
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let namespace = std::sync::RwLock::new("flotilla".to_string());
+        let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
+        let service = service(&backend, &observed, &clock, &namespace, &operations, &roots);
+        service.reconcile_project_image_layers().await.unwrap();
+        assert_eq!(
+            *source.reads.lock().unwrap(),
+            [CharterSource::Repository {
+                repo: "https://github.com/example/app".into(),
+                branch: "main".into(),
+                path: PROJECT_IMAGE_LAYER_PATH.into()
+            }]
+        );
+        assert!(backend.using::<ImageLayer>("flotilla").get(&layer_name("1.0.0")).await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refusal_clears_once_the_declaration_is_recorded() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let observed = ResourceBackend::new(InMemoryBackend::observed());
+        seed(&backend, None).await;
+        let declared = backend.using::<Project>("flotilla").get("app").await.unwrap();
+        let definitions = backend.definitions::<Project>("flotilla");
+        definitions.apply(&InputMeta::builder().name("app".into()).build(), &declared.spec).await.unwrap();
+        let source = Arc::new(LayerSource::default());
+        *source.files.lock().unwrap() = Some(layer_files("1.0.0"));
+        let operations = Operations::with_inspector(source.clone());
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let namespace = std::sync::RwLock::new("flotilla".to_string());
+        let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
+        let service = service(&backend, &observed, &clock, &namespace, &operations, &roots);
+        service.reconcile_project_image_layers().await.unwrap();
+        assert_eq!(service.image_layer_refresh.lock().await.conditions().len(), 1);
+        definitions.apply(&InputMeta::from(&declared.metadata), &declared.spec).await.unwrap();
+        service.reconcile_project_image_layers().await.unwrap();
+        assert!(service.image_layer_refresh.lock().await.conditions().is_empty());
+        assert!(backend.using::<ImageLayer>("flotilla").get(&layer_name("1.0.0")).await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn whole_repository_project_is_declared_by_its_one_repository() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        seed(&backend, None).await;
+        let declared = backend.using::<Project>("flotilla").get("app").await.unwrap();
+        let mut spec = declared.spec.clone();
+        spec.repositories.remove(0);
+        let meta = InputMeta::builder()
+            .name("app".into())
+            .labels(BTreeMap::from([(MANAGED_BY_LABEL.to_string(), WHOLE_REPOSITORY_PROJECT_MANAGER.to_string())]))
+            .build();
+        backend.definitions::<Project>("flotilla").apply(&meta, &spec).await.unwrap();
+        let project = backend.using::<Project>("flotilla").get("app").await.unwrap();
+        assert!(!project.metadata.annotations.contains_key(BOOTSTRAP_REPOSITORY_ANNOTATION));
+        let home = primary_layer_home(&backend, "flotilla", &project, None).await.unwrap();
+        assert!(matches!(home, LayerHome::Source(CharterSource::Repository { ref repo, .. }) if repo == "https://github.com/example/app"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn explicit_branch_beats_member_default_branch_beats_repository_default() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        seed(&backend, None).await;
+        let mut project = backend.using::<Project>("flotilla").get("app").await.unwrap();
+        let branch = |home: LayerHome| match home {
+            LayerHome::Source(CharterSource::Repository { branch, .. }) => branch,
+            other => panic!("{other:?}"),
+        };
+        let read = |project: ResourceObject<Project>, explicit: Option<&'static str>| {
+            let backend = backend.clone();
+            async move { branch(primary_layer_home(&backend, "flotilla", &project, explicit).await.unwrap()) }
+        };
+        assert_eq!(read(project.clone(), None).await, "main");
+        project.spec.repositories[1].default_branch = Some("develop".into());
+        assert_eq!(read(project.clone(), None).await, "develop");
+        assert_eq!(read(project, Some("feature")).await, "feature");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn charter_project_without_declaration_is_not_refused() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        seed(&backend, Some(CharterPointer::Inline { documents: Vec::new(), files: BTreeMap::new() })).await;
+        let mut project = backend.using::<Project>("flotilla").get("app").await.unwrap();
+        project.metadata.annotations.clear();
+        let home = primary_layer_home(&backend, "flotilla", &project, None).await.unwrap();
+        assert_eq!(home, LayerHome::Absent);
     }
 
     // Host heartbeat diagnoses are capped at 4096 UTF-8 bytes, preserving
@@ -462,7 +619,7 @@ mod tests {
         let repeats = tc.draw(gs::integers::<usize>().min_value(0).max_value(1500));
         let error = format!("git progress: {} fatal: /cache/shallow.lock: File exists", "é界\n".repeat(repeats));
         let mut state = LayerRefreshState::default();
-        state.refused("ns", "app", &CharterSource::LocalDirectory { directory: "/source".into() }, error.clone());
+        state.refused("ns", "app", Some(&CharterSource::LocalDirectory { directory: "/source".into() }), error.clone());
         let conditions = state.conditions();
         let message = &conditions[0].message;
         assert!(message.len() <= 4096, "heartbeat message grew to {} bytes", message.len());
@@ -494,7 +651,7 @@ mod tests {
                 }
                 expected = if change == 0 && expected != 0 { (expected * 2).min(3600) } else { 60 };
                 let source = CharterSource::LocalDirectory { directory: directory.clone() };
-                state.refused("ns", "app", &source, error.clone());
+                state.refused("ns", "app", Some(&source), error.clone());
                 assert!(state.deferred("ns", "app", &source));
                 assert!(!state.deferred("ns", "app", &CharterSource::LocalDirectory { directory: "/other".into() }));
                 assert_eq!(state.conditions().len(), 1);
