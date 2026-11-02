@@ -99,6 +99,11 @@ impl ResourceBackend {
         *self.attentions.0.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(attentions);
     }
 
+    /// Whether the engine's attentions are installed, so Demand is written by no one.
+    pub fn attentions_on_engine(&self) -> bool {
+        self.attentions.0.read().unwrap_or_else(std::sync::PoisonError::into_inner).is_some()
+    }
+
     /// The attentions: the engine's once installed, the old store's before.
     pub fn attentions(&self) -> std::sync::Arc<dyn flotilla_resources::attentions::Attentions> {
         match self.attentions.0.read().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {

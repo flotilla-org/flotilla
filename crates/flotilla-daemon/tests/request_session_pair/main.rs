@@ -61,7 +61,6 @@ use flotilla_protocol::NodeInfo;
 use flotilla_protocol::PeerConnectionState;
 use flotilla_protocol::PrincipalRef;
 use flotilla_protocol::RepoSelector;
-use flotilla_protocol::ResourceRef;
 use flotilla_protocol::SurfaceCharacter;
 use flotilla_protocol::SurfaceDeclaration;
 use flotilla_protocol_testkit::TestIssue;
@@ -70,15 +69,15 @@ use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provisioning::reconcilers::{CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout};
 use flotilla_resources::{
-    api_version, Artifact, ArtifactSubjectBinding, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Convoy,
-    ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialGrantSelector,
-    CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec,
-    CrewCompletionExpectation, CrewSessionStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, FreshCloneCheckoutSpec,
-    FulfilmentKind, FulfilmentKindSpec, Host, HostSpec, HostStatus, InputMeta, LifecycleAuthority, Message, Regard, RepositoryKey,
-    Resource, ResourceError, ResourceProvenance, Selector, SystemClock, TerminalBrief, TerminalCrewContext, TerminalSession,
-    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkCompletionAuthority,
-    WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION,
-    AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    Artifact, ArtifactSubjectBinding, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Convoy, ConvoyPhase as ResourceConvoyPhase,
+    ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
+    CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewCompletionExpectation, CrewSessionStatus,
+    CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, FreshCloneCheckoutSpec, FulfilmentKind, FulfilmentKindSpec, Host, HostSpec,
+    HostStatus, InputMeta, LifecycleAuthority, Message, RepositoryKey, Resource, ResourceError, ResourceProvenance, Selector, SystemClock,
+    TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel,
+    VesselRequirement, VesselSpec, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
+    WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, GENERATION_LABEL,
+    HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::{controller::ControllerLoop, list_resource_kind, OwnerGarbageCollector, ResourceBackend, REGISTERED_RESOURCE_KINDS};
 use hegel::generators as gs;
@@ -1694,51 +1693,6 @@ async fn convoy_delete_routes_to_the_home_and_its_tombstone_does_not_resurrect()
     drop(reconnected);
 }
 
-#[tokio::test]
-async fn ambient_surface_observations_do_not_create_regards_over_the_client_protocol() {
-    let leader = empty_daemon_named("leader").await;
-    let follower = empty_daemon_named("follower").await;
-    let topology = spawn_in_memory_request_topology_stateful_with_surface(
-        Arc::clone(&leader),
-        follower,
-        SurfaceDeclaration { principal_ref: PrincipalRef::implicit_for_namespace("flotilla"), character: SurfaceCharacter::Ambient },
-    )
-    .await
-    .expect("spawn ambient client topology");
-
-    topology
-        .client
-        .observe_focus(
-            uuid::Uuid::nil(),
-            vec![ResourceRef::new(api_version(Convoy::API_PATHS), Convoy::API_PATHS.kind, "flotilla", "ambient-demo")],
-        )
-        .await
-        .expect("report ambient focus");
-
-    assert!(leader.resource_backend().using::<Regard>("flotilla").list().await.expect("list regards").items.is_empty());
-}
-
-#[tokio::test]
-async fn default_focal_surface_uses_the_daemons_provisioning_principal() {
-    let leader = empty_daemon_named("leader").await;
-    leader.set_provisioning_namespace("dev".to_string()).await;
-    let follower = empty_daemon_named("follower").await;
-    let topology = spawn_in_memory_request_topology_stateful(Arc::clone(&leader), follower).await.expect("spawn default client topology");
-
-    topology
-        .client
-        .observe_focus(
-            uuid::Uuid::nil(),
-            vec![ResourceRef::new(api_version(Convoy::API_PATHS), Convoy::API_PATHS.kind, "dev", "focused-demo")],
-        )
-        .await
-        .expect("report focal focus");
-
-    let regards = leader.resource_backend().using::<Regard>("dev").list().await.expect("list regards");
-    assert_eq!(regards.items.len(), 1);
-    assert_eq!(regards.items[0].spec.principal_ref, PrincipalRef::implicit_for_namespace("dev"));
-}
-
 #[test]
 fn convoy_creation_attributes_provenance_and_regard_to_the_surface_principal() {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("request runtime");
@@ -1793,9 +1747,6 @@ async fn convoy_creation_attribution_scenario() {
     let convoy =
         backend.using::<Convoy>("flotilla").get(&convoy_record_name(&backend, "alice-dispatch").await).await.expect("created convoy");
     assert_eq!(convoy.spec.dispatching_principal_ref, principal_ref);
-    let regards = leader.resource_backend().using::<Regard>("flotilla").list().await.expect("list regards");
-    assert_eq!(regards.items.len(), 1);
-    assert_eq!(regards.items[0].spec.principal_ref, convoy.spec.dispatching_principal_ref);
 }
 
 async fn assert_abandon_attribution(principal_ref: PrincipalRef, expected_authority: WorkCompletionAuthority, expected_actor: &str) {

@@ -46,7 +46,7 @@ use flotilla_provisioning::reconcilers::{
 use flotilla_resources::LANDING_EVIDENCE_TTL;
 use flotilla_resources::{
     host_direct_environment_name, ChangeRequest, Checkout, Clone, Convoy, Environment, Forge, Host, Repository, Resource, ResourceError,
-    SystemClock, TerminalSession, Vessel, WorkflowTemplate,
+    TerminalSession, Vessel, WorkflowTemplate,
 };
 use flotilla_store::{controller::ControllerLoop, ResourceBackend};
 use tokio::{sync::watch, task::JoinHandle};
@@ -75,8 +75,8 @@ use self::seed::register_startup_resources;
 use self::state::ControllerRuntimeState;
 use self::tasks::{
     run_artifact_gc, run_checkout_archive_gc, spawn_adopted_checkout_reconciliation_task, spawn_aggregator_task,
-    spawn_convoy_ensure_reconciler_task, spawn_demand_expiry_task, spawn_dispatch_reconciler_task, spawn_environment_orphan_sweep_task,
-    spawn_event_expiry_task, spawn_heartbeat_task_with_credentials, spawn_host_description_projection_task, spawn_liveness_watchdog_task,
+    spawn_convoy_ensure_reconciler_task, spawn_dispatch_reconciler_task, spawn_environment_orphan_sweep_task, spawn_event_expiry_task,
+    spawn_heartbeat_task_with_credentials, spawn_host_description_projection_task, spawn_liveness_watchdog_task,
     spawn_local_fulfilment_probe_task, spawn_manifest_reconciler_task, spawn_named_controller, spawn_periodic_task,
     spawn_provisioned_environment_reconciliation_task, spawn_resource_controller, spawn_sleep_inhibitor_task,
     spawn_ssh_fulfilment_probe_task, spawn_startup_restoration, spawn_vessel_placement_projector, supervise_controller,
@@ -361,7 +361,6 @@ impl DaemonRuntime {
             spawn_credential_refresh_task(Arc::clone(&daemon), options.namespace.clone(), Arc::clone(&credential_store)),
             spawn_host_description_projection_task(Arc::clone(&daemon), options.namespace.clone(), options.heartbeat_interval),
             spawn_codex_central_refresh_task(Arc::clone(&daemon.discovery_runtime().env), options.codex_central_refresh_interval),
-            spawn_demand_expiry_task(daemon.resource_backend(), options.namespace.clone(), options.heartbeat_interval),
             spawn_event_expiry_task(daemon.resource_backend(), options.namespace.clone(), options.heartbeat_interval),
             spawn_projection_parity_task(
                 daemon.resource_backend(),
@@ -475,11 +474,10 @@ impl DaemonRuntime {
         let ensure_engine = match provisioning_lifecycles {
             Some(_) => {
                 let store = daemon.decided_store()?.store();
-                let path = tokio::task::spawn_blocking(move || {
-                    flotilla_core::primitives::ensures::EngineEnsurePath::open(store, Arc::new(SystemClock))
-                })
-                .await
-                .map_err(|error| error.to_string())??;
+                let clock = daemon.clock_for_scenarios();
+                let path = tokio::task::spawn_blocking(move || flotilla_core::primitives::ensures::EngineEnsurePath::open(store, clock))
+                    .await
+                    .map_err(|error| error.to_string())??;
                 Some(Arc::new(path) as Arc<dyn flotilla_admission::convoy_ensure::EngineEnsures>)
             }
             None => None,
@@ -489,7 +487,7 @@ impl DaemonRuntime {
                 EnsureReconciler::builder()
                     .teardown(daemon.convoy_teardown())
                     .resource_backend(daemon.resource_backend())
-                    .clock(Arc::new(SystemClock))
+                    .clock(daemon.clock_for_scenarios())
                     .maybe_engine(ensure_engine)
                     .manifest_roots(daemon.manifest_roots())
                     .build(),

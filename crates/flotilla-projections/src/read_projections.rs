@@ -10,10 +10,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_change_request::observation::ChangeRequestKey;
-use flotilla_charter::ops_entry::{
-    DECLARATION_REFUSAL_ATTENTION_PREFIX, DECLARATION_REFUSAL_REASON_ANNOTATION, DECLARATION_REFUSED_SINCE_ANNOTATION,
-    DECLARATION_STALE_AFTER, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, ENSURE_DRIFT_ATTENTION_PREFIX,
-};
+use flotilla_charter::ops_entry::DECLARATION_STALE_AFTER;
 use flotilla_config::ConfigStore;
 use flotilla_manifest::{
     keys::{
@@ -36,16 +33,17 @@ use flotilla_protocol::{
     ResourceRef, Subject, SubjectKind, ViewAddress,
 };
 use flotilla_provider_runtime::ObservationError;
+use flotilla_resources::attentions::{self, Attentions, Sender};
 use flotilla_resources::resolve_project_issue_sources_from_inventory;
 use flotilla_resources::{
     address::{leaf_address, leaf_record_name, record_name},
     bound_change_request_address, convoy_subject_rows, evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs,
     repository_display_labels, ChangeRequestStatus, Checkout as ResourceCheckout, Clock, ConditionValue, Convoy as ResourceConvoy,
-    ConvoyStatus, CrewMessageSender, CrewWorkPhase, Demand as ResourceDemand, DemandState, Forge, FulfilmentKind, FulfilmentRealisation,
-    Host as ResourceHost, HostStatus as ResourceHostStatus, IssueSourceResolution, IssueSourceUnavailable, Project, ReadResourceObject,
-    Repository, RepositoryKey, ResourceObject, ResourceProvenance, SettlementMode, TerminalAttentionState,
-    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, Vessel,
-    WorkPhase as ResourceWorkPhase, WorkflowTemplate, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    ConvoyStatus, CrewMessageSender, CrewWorkPhase, Forge, FulfilmentKind, FulfilmentRealisation, Host as ResourceHost,
+    HostStatus as ResourceHostStatus, IssueSourceResolution, IssueSourceUnavailable, Project, ReadResourceObject, Repository,
+    RepositoryKey, ResourceObject, ResourceProvenance, SettlementMode, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, Vessel, WorkPhase as ResourceWorkPhase, WorkflowTemplate,
+    CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::{EventRecorder, ProjectHierarchyStoreExt, ResourceBackend, StoreQuery};
 use tracing::warn;
@@ -119,6 +117,8 @@ pub struct ReadProjections<'a> {
     pub accounts: &'a dyn flotilla_resources::account_access::AccountRecords,
     /// The ManifestRoots: the old store's, or the engine's behind `[primitives]` (#3824 layer 2c).
     pub manifest_roots: &'a dyn flotilla_resources::manifest_roots::ManifestRoots,
+    /// The attentions: the old store's, or the engine's behind `[primitives]`.
+    pub attentions: Arc<dyn Attentions>,
 }
 
 impl ReadProjections<'_> {
@@ -876,37 +876,26 @@ impl ReadProjections<'_> {
         });
         replicas.sort_by(|left, right| left.host.as_str().cmp(right.host.as_str()));
         let mut declaration_attention = Vec::new();
-        for source in
-            self.backend.query_declared::<ResourceDemand>(namespace, &attention_query(None)).await.map_err(|error| error.to_string())?.items
-        {
-            let demand = source.object;
-            if demand.status.as_ref().is_some_and(|status| !matches!(status.state, DemandState::Raised | DemandState::Escalated)) {
-                continue;
-            }
-            let condition = if demand.metadata.name.starts_with(DECLARATION_REFUSAL_ATTENTION_PREFIX) {
-                DeclarationAttentionKind::DeclarationRefused
-            } else if demand.metadata.name.starts_with(ENSURE_DRIFT_ATTENTION_PREFIX) {
-                DeclarationAttentionKind::ConfigDrift
-            } else {
-                continue;
-            };
-            let mut message = demand
-                .metadata
-                .annotations
-                .get(DECLARATION_REFUSAL_REASON_ANNOTATION)
-                .or_else(|| demand.metadata.annotations.get(ENSURE_CONFIG_DRIFT_REASON_ANNOTATION))
-                .cloned()
-                .unwrap_or_default();
-            if demand
-                .metadata
-                .annotations
-                .get(DECLARATION_REFUSED_SINCE_ANNOTATION)
-                .and_then(|since| DateTime::parse_from_rfc3339(since).ok())
-                .is_some_and(|since| self.clock.now() - since.with_timezone(&Utc) >= DECLARATION_STALE_AFTER)
-            {
+        for project in self.backend.definitions::<Project>(namespace).list().await.map_err(|error| error.to_string())? {
+            let Some(refused) = project.status.as_ref().and_then(|status| status.declaration_refused.as_ref()) else { continue };
+            let mut message = refused.message.clone();
+            if now - refused.since >= DECLARATION_STALE_AFTER {
                 message.push_str(" (stale)");
             }
-            declaration_attention.push(DeclarationAttentionRow { resource: demand.spec.originating_work_ref, condition, message });
+            declaration_attention.push(DeclarationAttentionRow {
+                resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Project", namespace, &project.metadata.name),
+                condition: DeclarationAttentionKind::DeclarationRefused,
+                message,
+            });
+        }
+        for open in self.attentions.open(namespace, Some(Sender::Standing), None).await? {
+            let (Sender::Standing, attentions::Subject::StandingRole { project, role }) = (open.sender, &open.subject) else { continue };
+            declaration_attention.push(DeclarationAttentionRow {
+                resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Project", namespace, project)
+                    .subresource(format!("roles/{role}")),
+                condition: DeclarationAttentionKind::ConfigDrift,
+                message: open.reason,
+            });
         }
         declaration_attention.sort_by(|left, right| {
             (&left.resource.namespace, &left.resource.kind, &left.resource.name).cmp(&(
@@ -936,11 +925,7 @@ impl ReadProjections<'_> {
         let mut fleet = self.with_backend(&reads).fleet_list(namespace, rows, self.clock.now()).await?;
         if let Some(selected_project) = selected_project {
             fleet.rows.retain(|row| row.convoy_ref.as_ref().is_some_and(|reference| matching.contains(reference)));
-            fleet.declaration_attention.retain(|row| match row.resource.kind.as_str() {
-                "Project" => row.resource.name == selected_project,
-                "Convoy" => matching.contains(&row.resource.name),
-                _ => false,
-            });
+            fleet.declaration_attention.retain(|row| row.resource.name == selected_project);
             fleet.replicas.clear();
         }
         Ok(fleet)
@@ -962,6 +947,7 @@ impl ReadProjections<'_> {
             convoy_engine: self.convoy_engine,
             accounts: self.accounts,
             manifest_roots: self.manifest_roots,
+            attentions: Arc::clone(&self.attentions),
         }
     }
 
@@ -1002,7 +988,6 @@ impl ReadProjections<'_> {
         snapshot.copy::<flotilla_resources::Environment>(&reads).await?;
         snapshot.copy::<ResourceHost>(&reads).await?;
         snapshot.copy::<ResourceCheckout>(&reads).await?;
-        snapshot.copy::<ResourceDemand>(&reads).await?;
         snapshot.copy::<Project>(&reads).await?;
         snapshot.copy::<flotilla_resources::FleetDesignation>(&reads).await?;
         snapshot.insert::<FulfilmentKind>(kinds)?;
@@ -1205,11 +1190,6 @@ impl ReadProjections<'_> {
             )
             .await
             .map_err(|error| error.to_string())?;
-        let demands = self
-            .backend
-            .query_declared::<ResourceDemand>(namespace, &attention_query(selected_project.as_deref().map(|project| (project, &matching))))
-            .await
-            .map_err(|error| error.to_string())?;
         // The graph is also the fleet-designation projection's complete catalog.
         let projects = project_ops::read_definition_catalog::<Project>(self.backend, namespace).await?;
         let fleet = self
@@ -1224,7 +1204,6 @@ impl ReadProjections<'_> {
         snapshot.insert::<Environment>(environments)?;
         snapshot.insert::<ResourceHost>(hosts)?;
         snapshot.insert::<ResourceCheckout>(checkouts)?;
-        snapshot.insert::<ResourceDemand>(demands)?;
         snapshot.insert_definitions::<Project>(projects)?;
         snapshot.insert_definitions::<FleetDesignation>(fleet)?;
         Ok((snapshot.finish(), selected_project, matching))
@@ -2035,49 +2014,6 @@ pub fn explain_subject_observation(
             freshness: observed_freshness(readiness_at, now, change_request_stale_after),
         },
     }
-}
-
-/// Active declaration attention, with history and other demand categories
-/// excluded by declared indexes before decoding.
-pub fn attention_query(scope: Option<(&str, &BTreeSet<String>)>) -> StoreQuery {
-    let states = [
-        StoreQuery { missing_fields: ["status.state".into()].into(), ..Default::default() },
-        StoreQuery {
-            field_values: BTreeMap::from([("status.state".into(), ["raised".into(), "escalated".into()].into())]),
-            ..Default::default()
-        },
-    ];
-    let origins = scope
-        .map(|(project, convoys)| {
-            vec![
-                StoreQuery {
-                    fields: BTreeMap::from([
-                        ("spec.originating_work_ref.kind".into(), "Project".into()),
-                        ("spec.originating_work_ref.name".into(), project.into()),
-                    ]),
-                    ..Default::default()
-                },
-                StoreQuery {
-                    fields: BTreeMap::from([("spec.originating_work_ref.kind".into(), "Convoy".into())]),
-                    field_values: BTreeMap::from([("spec.originating_work_ref.name".into(), convoys.clone().into_iter().collect())]),
-                    ..Default::default()
-                },
-            ]
-        })
-        .unwrap_or_else(|| vec![StoreQuery::default()]);
-    let mut selections = Vec::new();
-    for prefix in [DECLARATION_REFUSAL_ATTENTION_PREFIX, ENSURE_DRIFT_ATTENTION_PREFIX] {
-        for state in &states {
-            for origin in &origins {
-                let mut query = origin.clone();
-                query.missing_fields.extend(state.missing_fields.clone());
-                query.field_values.extend(state.field_values.clone());
-                query.field_prefixes.insert("metadata.name".into(), prefix.into());
-                selections.push(query);
-            }
-        }
-    }
-    StoreQuery { any_of: (!selections.is_empty()).then_some(selections), include_replicas: true, ..Default::default() }
 }
 
 /// Gather only the receiver evidence that can affect this convoy. The request

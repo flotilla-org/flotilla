@@ -190,6 +190,7 @@ async fn episode_start() -> DateTime<Utc> {
 }
 
 const FACTS: usize = 5;
+const DELIVERY: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
 enum Step {
@@ -305,6 +306,8 @@ fn contract(tc: TestCase, engine: bool) {
                 Step::Raise { fact, reason } => {
                     let key = key(fact);
                     let began_at = model.episode(&key).await;
+                    // On the old store the old Message controller owns a held delivery's reason.
+                    let reason = if fact == DELIVERY && !engine { 0 } else { reason };
                     let attention = attention(fact, ["held", "still held"][reason], began_at);
                     implementation.attentions().raise(NAMESPACE, &attention).await.expect("raise");
                     // An acknowledgement answers every raise of its episode.
@@ -425,4 +428,72 @@ async fn the_old_store_clears_every_attention_within_a_convoy() {
 #[tokio::test]
 async fn the_engine_clears_every_attention_within_a_convoy() {
     nothing_open_is_left_within(Implementation::engine().await).await;
+}
+
+/// A home's engine over its own decided store.
+fn engine_at(home: &str, backend: ResourceBackend, dir: &tempfile::TempDir) -> (Arc<Service>, Arc<MessagePrimitives>) {
+    let service = Arc::new(
+        Service::open(&dir.path().join(format!("{home}.sqlite")), home, flotilla_engine_store::registry().expect("registry"))
+            .expect("store"),
+    );
+    let primitives = MessagePrimitives::open(home, Arc::clone(&service), backend, Arc::new(SystemClock)).expect("primitives");
+    (service, Arc::new(primitives))
+}
+
+/// One round of `from`'s stream applied at `to`, as a follower does.
+fn follow(from: &Service, from_home: &str, to: &Service, cursor: &mut Option<u64>) {
+    let mut frames = Vec::new();
+    let next = from
+        .serve(*cursor, flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now()), |frame| {
+            frames.push(frame.to_vec());
+            Ok(())
+        })
+        .expect("serve");
+    to.with_store(|store| {
+        flotilla_schema_sqlite::stream::Follower::new(store).receive(from_home, |sink| {
+            for frame in &frames {
+                sink(frame)?;
+            }
+            Ok(())
+        })
+    })
+    .expect("follow");
+    *cursor = Some(next);
+}
+
+// Behaviour: an attention raised at one home, and its acknowledgement there, reach another home's
+// readers with the replicated entries: the signal fires when Messages are applied, with no local
+// write, and not for entries of another kind.
+#[tokio::test]
+async fn another_homes_attentions_signal_their_readers_when_they_arrive() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (a_store, a) = engine_at("home-a", records().await, &dir);
+    let (b_store, b) = engine_at("home-b", records().await, &dir);
+    let mut cursor = None;
+    follow(&a_store, "home-a", &b_store, &mut cursor);
+    let mut signal = b.changes().expect("the engine signals its readers");
+    a.register_person(flotilla_schema::Timestamp::from_datetime(&Utc::now())).await.expect("a person at home a");
+    follow(&a_store, "home-a", &b_store, &mut cursor);
+    assert!(signal.try_recv().is_err(), "another kind's entries are no attention: its readers are not signalled");
+    let hold = attention(0, "held", episode_start().await);
+    let (sender, subject) = (hold.fact.sender(), hold.fact.subject());
+    a.raise(NAMESPACE, &hold).await.expect("raise at home a");
+    assert!(signal.try_recv().is_err(), "nothing has reached home b yet");
+    follow(&a_store, "home-a", &b_store, &mut cursor);
+    signal.try_recv().expect("applying home a's entries signals home b's readers");
+    let seen = b.open(NAMESPACE, Some(sender), Some(&subject)).await.expect("open at home b");
+    assert_eq!(seen.len(), 1, "home b reads home a's hold");
+
+    let message = a
+        .messages()
+        .expect("messages")
+        .into_iter()
+        .map(|(_, message)| message)
+        .find(|message| *message.state() == MessageState::Pending)
+        .expect("the hold");
+    a.acknowledge(NAMESPACE, &record_name(message.name()).expect("record")).await.expect("acknowledge at home a");
+    follow(&a_store, "home-a", &b_store, &mut cursor);
+    signal.try_recv().expect("the acknowledgement's entries signal home b's readers");
+    assert!(b.open(NAMESPACE, Some(sender), Some(&subject)).await.expect("open at home b").is_empty());
+    assert!(b.acknowledged(NAMESPACE, sender, &subject, hold.began_at).await.expect("acknowledged at home b").is_some());
 }

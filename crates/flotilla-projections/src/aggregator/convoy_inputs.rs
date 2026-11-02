@@ -7,7 +7,6 @@ type Parent = (String, String);
 pub(super) struct ConvoyInputs {
     ready: bool,
     sessions: HashMap<Parent, Vec<SessionKey>>,
-    demands: HashMap<Parent, Vec<ResourceRef>>,
     vessels: HashMap<Parent, Vec<RepositorySourceKey>>,
     checkouts: HashMap<Parent, Vec<RepositorySourceKey>>,
     named_checkouts: HashMap<Parent, Vec<RepositorySourceKey>>,
@@ -20,10 +19,6 @@ impl Aggregator {
             if let Some(parent) = item.object.metadata.labels.get(CONVOY_LABEL) {
                 index.sessions.entry((item.object.metadata.namespace.clone(), parent.clone())).or_default().push(key.clone());
             }
-        }
-        for (key, item) in &self.demands {
-            let target = &item.spec.originating_work_ref;
-            index.demands.entry((target.namespace.clone(), target.name.clone())).or_default().push(key.clone());
         }
         for (key, item) in &self.readiness_vessels {
             index
@@ -60,13 +55,10 @@ impl Aggregator {
                 .filter_map(|key| self.terminal_sessions.get(key)),
         )
     }
-    pub(super) fn convoy_demands(&self, namespace: &str, name: &str) -> Box<dyn Iterator<Item = &ResourceObject<Demand>> + '_> {
-        if !self.convoy_inputs.ready {
-            return Box::new(self.demands.values());
-        }
-        Box::new(
-            self.convoy_inputs.demands.get(&(namespace.into(), name.into())).into_iter().flatten().filter_map(|key| self.demands.get(key)),
-        )
+    /// The open attentions about a convoy or a record under it.
+    pub(super) fn convoy_attentions<'a>(&'a self, namespace: &'a str, name: &'a str) -> impl Iterator<Item = &'a OpenAttention> + 'a {
+        let convoy = AttentionSubject::convoy(name);
+        self.attentions.iter().filter(move |open| namespace == self.attention_namespace && open.subject.within(&convoy))
     }
     pub(super) fn convoy_vessels(&self, namespace: &str, name: &str) -> Box<dyn Iterator<Item = &ReadResourceObject<Vessel>> + '_> {
         if !self.convoy_inputs.ready {

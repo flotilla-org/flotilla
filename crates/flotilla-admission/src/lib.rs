@@ -12,10 +12,10 @@ pub mod project_ops;
 pub mod provider_placement;
 pub mod random;
 pub mod reconcilers;
-pub mod regard_lifecycle;
 pub mod repository_addressing;
 pub mod repository_inspection;
 pub mod support;
+pub mod surfaces;
 
 #[cfg(test)]
 mod test_support;

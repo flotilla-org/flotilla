@@ -60,7 +60,7 @@ pub const PLAN: &[(&str, Plan)] = &[
     ("ForgeRead", Plan::Imported("forge observations import (#3824 layer 5)")),
     ("Artifact", Plan::Imported("Artifact import (#3824 layer 7)")),
     ("Demand", Plan::Imported("attention import (#3824 layer 8)")),
-    ("Regard", Plan::Moving("#3938")),
+    ("Regard", Plan::Retired("#3824 layer 8, 2026-11-01: dropped with its salience boost")),
     // A plain record beside AccountProvision; its type already derives `Stored` (#3964).
     ("AccessDelivery", Plan::Moving("#3824, plain like AccountProvision")),
 ];

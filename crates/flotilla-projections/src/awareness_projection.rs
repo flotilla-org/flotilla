@@ -66,12 +66,6 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
         let kind = group_kind_for_query(input.scope.as_ref(), input.grouping);
         let group = groups.entry(key.id.clone()).or_insert_with(|| Group::new(key, kind));
         group.refs.push(convoy.resource.clone());
-        let project_ancestors = convoy
-            .project_ref
-            .as_deref()
-            .map(|project| project_resource_ref(&convoy.resource.namespace, project))
-            .into_iter()
-            .collect::<Vec<_>>();
         group.add_entry(enrich_salience(
             AwarenessEntry::builder()
                 .id(format!("convoy/{}/{}", convoy.resource.namespace, convoy.resource.name))
@@ -85,13 +79,10 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .annotations(convoy_annotations(convoy))
                 .build(),
             &input.salience,
-            &project_ancestors,
         ));
         for vessel in &convoy.vessels {
             let mut refs = vec![vessel.resource.clone()];
             refs.extend(vessel.vessel_resource.clone());
-            let mut ancestors = vec![convoy.resource.clone()];
-            ancestors.extend(project_ancestors.clone());
             group.add_entry(enrich_salience(
                 AwarenessEntry::builder()
                     .id(format!("vessel/{}/{}/{}", convoy.resource.namespace, convoy.resource.name, vessel.name))
@@ -104,7 +95,6 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                     .annotations(repo_fact_annotations(convoy.repo.as_ref()))
                     .build(),
                 &input.salience,
-                &ancestors,
             ));
         }
     }
@@ -116,13 +106,6 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 GroupKey::new(format!("issue-source/{}", row.reference.source.scope), row.reference.source.scope.clone())
             });
         let group = groups.entry(key.id.clone()).or_insert_with(|| Group::new(key, AwarenessKind::Project));
-        let project_ancestors = issue
-            .scope
-            .as_ref()
-            .or(input.scope.as_ref())
-            .map(|scope| project_resource_ref(&scope.namespace, &scope.name))
-            .into_iter()
-            .collect::<Vec<_>>();
         group.add_entry(enrich_salience(
             AwarenessEntry::builder()
                 .id(format!("issue/{}/{}", row.reference.source.scope, row.reference.id))
@@ -134,7 +117,6 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .issue_refs(vec![row.reference.clone()])
                 .build(),
             &input.salience,
-            &project_ancestors,
         ));
     }
 
@@ -151,8 +133,6 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
             })
             .unwrap_or_else(|| GroupKey::new("unparented", "Unparented"));
         let group = groups.entry(key.id.clone()).or_insert_with(|| Group::new(key, AwarenessKind::Project));
-        let project_ancestors =
-            input.scope.as_ref().map(|scope| project_resource_ref(&scope.namespace, &scope.name)).into_iter().collect::<Vec<_>>();
         group.add_entry(enrich_salience(
             AwarenessEntry::builder()
                 .id(format!("independent/{}/{}", independent.resource.namespace, independent.name))
@@ -170,7 +150,6 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .annotations(repo_fact_annotations(independent.repo_fact.as_ref()))
                 .build(),
             &input.salience,
-            &project_ancestors,
         ));
     }
 
@@ -246,10 +225,8 @@ fn family_contains(family: AwarenessFamily, kind: AwarenessKind) -> bool {
     }
 }
 
-fn enrich_salience(mut entry: AwarenessEntry, facts: &SalienceFacts, ancestors: &[ResourceRef]) -> AwarenessEntry {
-    let mut coverage_targets = entry.refs.clone();
-    coverage_targets.extend_from_slice(ancestors);
-    let evaluation = evaluate_entry(&entry.refs, &coverage_targets, facts, entry.as_of);
+fn enrich_salience(mut entry: AwarenessEntry, facts: &SalienceFacts) -> AwarenessEntry {
+    let evaluation = evaluate_entry(&entry.refs, facts, entry.as_of);
     entry.salience = evaluation.salience;
     entry.as_of = evaluation.as_of;
     entry
@@ -438,10 +415,10 @@ fn entry_is_terminal(entry: &AwarenessEntry) -> bool {
 mod tests {
     use chrono::TimeZone;
     use flotilla_protocol::{HostName, Issue, IssueRef, IssueSource, IssueState, RepositoryKey, ResourceRef, SessionPhase};
-    use flotilla_resources::{DemandState, PrincipalRef, TerminalAttentionState};
+    use flotilla_resources::TerminalAttentionState;
 
     use super::*;
-    use crate::salience::{AttentionFact, DemandFact, RegardFact};
+    use crate::salience::{AttentionFact, RaisedFact};
 
     fn convoy(project_ref: Option<&str>, name: &str, phase: ConvoyPhase) -> ConvoyRow {
         ConvoyRow::builder()
@@ -706,19 +683,11 @@ mod tests {
                 .host(HostName::new("local"))
                 .build(),
         );
-        let principal = PrincipalRef::implicit_for_namespace("flotilla");
-
         let (nodes, _) = project_awareness(AwarenessInput {
             scope: Some(QueryScope::new("flotilla", "platform")),
             convoys: vec![convoy.clone()],
             salience: SalienceFacts {
-                demands: vec![DemandFact {
-                    target: vessel.clone(),
-                    addressee: Some(principal.clone()),
-                    state: DemandState::Raised,
-                    as_of: demand_at,
-                }],
-                regards: vec![RegardFact { principal, target: project_resource_ref("flotilla", "flotilla/platform"), as_of: base }],
+                raised: vec![RaisedFact { target: vessel.clone(), escalated: true, as_of: demand_at }],
                 attention: vec![AttentionFact { target: vessel, state: TerminalAttentionState::NeedsInput, as_of: attention_at }],
             },
             state: ResultSetState {

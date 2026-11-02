@@ -710,23 +710,6 @@ pub enum AttachMode {
     Take,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConvoyDispatchRegard {
-    #[default]
-    Emit,
-    Suppress,
-}
-
-impl From<ConvoyAutoAttach> for ConvoyDispatchRegard {
-    fn from(auto_attach: ConvoyAutoAttach) -> Self {
-        match auto_attach {
-            ConvoyAutoAttach::Never => Self::Suppress,
-            ConvoyAutoAttach::Default | ConvoyAutoAttach::Always => Self::Emit,
-        }
-    }
-}
-
 /// Explicit recovery input, distinct from naming a new branch or adopting a PR.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
@@ -2536,13 +2519,6 @@ mod tests {
         assert_eq!(value["records"][0]["type"], "CURRENT");
         assert_eq!(value["records"][0]["provenance"]["source"], "local");
         assert_json_roundtrip(&envelope);
-    }
-
-    #[test]
-    fn only_no_attach_suppresses_the_dispatch_regard() {
-        assert_eq!(ConvoyDispatchRegard::from(ConvoyAutoAttach::Never), ConvoyDispatchRegard::Suppress);
-        assert_eq!(ConvoyDispatchRegard::from(ConvoyAutoAttach::Default), ConvoyDispatchRegard::Emit);
-        assert_eq!(ConvoyDispatchRegard::from(ConvoyAutoAttach::Always), ConvoyDispatchRegard::Emit);
     }
 
     #[test]

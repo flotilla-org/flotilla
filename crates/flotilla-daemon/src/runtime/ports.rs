@@ -1,13 +1,13 @@
 //! Core controller ports and environment-routing Clone/Checkout adapters.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap},
     path::Path,
     sync::{Arc, Mutex as StdMutex},
 };
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::in_process::OperatorReconciler;
 use flotilla_credentials::CloneDelivery;
@@ -20,10 +20,11 @@ use flotilla_provisioning::reconcilers::clone::runtime::CloneControllerRuntime;
 use flotilla_provisioning::reconcilers::{
     CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneRuntime, ForgeDefaultBranchResolver, PreparedCheckout,
 };
+use flotilla_resources::attentions::{Attention, Fact, Sender, Subject};
 use flotilla_resources::checkout_path::checkout_path_from_status_and_spec;
 use flotilla_resources::{
     canonicalize_repo_url, ChangeRequest, Checkout, CheckoutIntegrationStatus, CheckoutSpec, Clone, CloneCredentials, ClonePhase, Convoy,
-    ConvoyTeardownRuntime, Demand, DemandKind, DemandSpec, Forge, ForgeIdentity, InputMeta, Resource, ResourceError, ResourceObject,
+    ConvoyTeardownRuntime, Forge, ForgeIdentity, InputMeta, Resource, ResourceObject,
 };
 use flotilla_store::{ReplicaReadResolver, ResourceBackend};
 use flotilla_vcs::vcs::CheckoutMaterialisationError;
@@ -43,6 +44,8 @@ pub(super) struct DaemonConvoyTeardownRuntime {
 pub(super) struct ReclaimRefusal {
     pub(super) error: String,
     pub(super) attempts: u64,
+    /// When this run of refusals began: the episode its attention tells.
+    pub(super) since: DateTime<Utc>,
 }
 
 pub(super) struct RuntimeOperatorReconciler {
@@ -135,40 +138,13 @@ impl DaemonConvoyTeardownRuntime {
         Self { daemon, reclaim_refusals: StdMutex::new(HashMap::new()) }
     }
 
-    pub(super) fn attention_name(convoy: &ResourceObject<Convoy>) -> String {
-        format!("reclaim-refusal-{}", convoy.metadata.name)
-    }
-
-    pub(super) async fn raise_attention(&self, convoy: &ResourceObject<Convoy>, reason: &str) -> Result<(), String> {
-        let demands = self.daemon.resource_backend().using::<Demand>(&convoy.metadata.namespace);
-        let name = Self::attention_name(convoy);
-        let target = flotilla_protocol::ResourceRef::new(
-            flotilla_resources::api_version(Convoy::API_PATHS),
-            Convoy::API_PATHS.kind,
-            &convoy.metadata.namespace,
-            &convoy.metadata.name,
-        );
-        let meta = InputMeta::builder()
-            .name(name)
-            .annotations(BTreeMap::from([(RECLAIM_REFUSAL_REASON_ANNOTATION.to_string(), reason.to_string())]))
-            .build();
-        let spec = DemandSpec::for_dispatching_principal(target, DemandKind::HumanGate, convoy.spec.dispatching_principal_ref.clone());
-        match demands.create(&meta, &spec).await {
-            Ok(_) => Ok(()),
-            Err(ResourceError::Conflict { .. }) => {
-                let current = demands.get(&meta.name).await.map_err(|error| error.to_string())?;
-                demands.update(&meta, &current.metadata.resource_version, &spec).await.map(|_| ()).map_err(|error| error.to_string())
-            }
-            Err(error) => Err(error.to_string()),
-        }
+    pub(super) async fn raise_attention(&self, convoy: &ResourceObject<Convoy>, reason: &str, since: DateTime<Utc>) -> Result<(), String> {
+        let fact = Fact::ReclaimRefused { convoy: convoy.metadata.name.clone() };
+        self.daemon.attentions().raise(&convoy.metadata.namespace, &Attention::new(fact, reason, since)).await
     }
 
     pub(super) async fn clear_attention(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String> {
-        let demands = self.daemon.resource_backend().using::<Demand>(&convoy.metadata.namespace);
-        match demands.delete(&Self::attention_name(convoy)).await {
-            Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
-            Err(error) => Err(error.to_string()),
-        }
+        self.daemon.attentions().clear(&convoy.metadata.namespace, Sender::Teardown, &Subject::convoy(convoy.metadata.name.clone())).await
     }
 }
 
@@ -179,17 +155,18 @@ impl ConvoyTeardownRuntime for DaemonConvoyTeardownRuntime {
         let key = format!("{}/{}", convoy.metadata.namespace, convoy.metadata.name);
         match &result {
             Err(error) => {
-                let attempts = {
+                let (attempts, since) = {
                     let mut refusals = self.reclaim_refusals.lock().expect("reclaim refusal lock poisoned");
                     match refusals.get_mut(&key) {
                         Some(refusal) => {
                             refusal.error.clone_from(error);
                             refusal.attempts += 1;
-                            refusal.attempts
+                            (refusal.attempts, refusal.since)
                         }
                         _ => {
-                            refusals.insert(key, ReclaimRefusal { error: error.clone(), attempts: 1 });
-                            1
+                            let since = Utc::now();
+                            refusals.insert(key, ReclaimRefusal { error: error.clone(), attempts: 1, since });
+                            (1, since)
                         }
                     }
                 };
@@ -203,7 +180,7 @@ impl ConvoyTeardownRuntime for DaemonConvoyTeardownRuntime {
                     );
                 }
                 if attempts >= RECLAIM_REFUSAL_ATTENTION_AFTER {
-                    if let Err(attention_error) = self.raise_attention(convoy, error).await {
+                    if let Err(attention_error) = self.raise_attention(convoy, error, since).await {
                         warn!(
                             namespace = %convoy.metadata.namespace,
                             convoy = %convoy.metadata.name,
@@ -253,7 +230,7 @@ struct DefaultBranchCache {
 #[derive(Default)]
 struct BranchLookup {
     success: Option<(tokio::time::Instant, String)>,
-    retry_at: Option<chrono::DateTime<Utc>>,
+    retry_at: Option<DateTime<Utc>>,
 }
 impl GhForgeDefaultBranchResolver {
     pub(super) fn new(runner: Arc<dyn CommandRunner>) -> Self {
@@ -665,8 +642,6 @@ fn unauthorised_clone(url: &str, credentials: &CloneCredentials, error: String) 
 }
 
 pub(super) const RECLAIM_REFUSAL_ATTENTION_AFTER: u64 = 3;
-
-pub(super) use flotilla_resources::RECLAIM_REFUSAL_REASON_ANNOTATION;
 
 pub(super) const RECONCILE_NOW_ANNOTATION: &str = "flotilla.work/reconcile-now-at";
 

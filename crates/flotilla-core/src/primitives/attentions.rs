@@ -166,6 +166,7 @@ impl MessagePrimitives {
             self.world.update(|world| world.authority.put(&flotilla_state_machines::Ref::new(authority.as_str()), true));
             let reason = DropReason::Withdrawn { by: held.sender_address.clone(), authority };
             self.inbox.drop(held.message.name(), reason).await.map_err(|error| error.to_string())?;
+            let _ = self.attention_changes.send(());
         }
         Ok(())
     }
@@ -199,6 +200,7 @@ impl Attentions for MessagePrimitives {
         for older in replaced {
             self.supersede(older.message.name(), &id, false).await;
         }
+        let _ = self.attention_changes.send(());
         Ok(())
     }
 
@@ -233,5 +235,13 @@ impl Attentions for MessagePrimitives {
         let about = self.about(namespace, sender, subject).await?;
         let latest = about.iter().filter(|held| held.answers(began_at)).max_by_key(|held| (held.message.since(), held.message.name()));
         Ok(latest.map(Held::reason))
+    }
+
+    fn changes(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
+        Some(self.attention_changes.subscribe())
+    }
+
+    fn acknowledgements(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
+        Some(self.acknowledgements.subscribe())
     }
 }
