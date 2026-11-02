@@ -3,6 +3,7 @@
 //! implementation of the API lives.
 use super::{memory::MemoryApi, *};
 use crate::environment::agent::memory::{MemoryAgent, MemoryLink, TOOLS_IMAGE};
+use crate::environment::registry_auth::{RegistryAuthMaterial, RegistryConfig};
 use hegel::generators as gs;
 
 struct Fixture {
@@ -63,8 +64,8 @@ async fn readiness_and_capabilities_follow_the_declaration() {
 }
 
 struct PullMaterial;
-impl crate::environment::registry_auth::RegistryAuthMaterial for PullMaterial {
-    fn config(&self) -> Result<crate::environment::registry_auth::RegistryConfig, String> {
+impl RegistryAuthMaterial for PullMaterial {
+    fn config(&self) -> Result<RegistryConfig, String> {
         Err("drydock takes the credential with the request, never as a file".into())
     }
     fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {

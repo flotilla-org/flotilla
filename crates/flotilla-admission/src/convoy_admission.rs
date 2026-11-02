@@ -1738,9 +1738,10 @@ impl PlacementBuildJoiner<'_> {
         let mut images = BTreeMap::new();
         let mut builds = Vec::new();
         for (vessel, image) in resolved {
-            let planned = match cloud {
-                true => crate::image_build::plan_cloud_image_build(self.backend, namespace, &image).await?,
-                false => crate::image_build::plan_image_build(self.backend, namespace, &image, &kind.spec.host_ref).await?,
+            let planned = if cloud {
+                crate::image_build::plan_cloud_image_build(self.backend, namespace, &image).await?
+            } else {
+                crate::image_build::plan_image_build(self.backend, namespace, &image, &kind.spec.host_ref).await?
             };
             let built = flotilla_resources::PlacementImageSource::Built { identity: image.identity, image_build_ref: planned.name.clone() };
             let mut spec = kind.spec.clone();
