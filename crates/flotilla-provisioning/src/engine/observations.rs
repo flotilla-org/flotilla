@@ -6,6 +6,10 @@
 //! judgement made when it is read: a record holds no observation times, so its values were last
 //! confirmed when its home was last heard (now, at this home), unless its reads are failing, in
 //! which case they were last confirmed when they started to fail.
+//!
+//! It is also the [`SourceRecords`] port the whole-source observer writes through. A subject's
+//! observer publishing a status keeps the values only the whole-source observer reads, and cannot
+//! delete a record of a source observed whole.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -523,10 +527,7 @@ impl ObservationFailures for EngineObservations {
 }
 
 impl EngineObservations {
-    fn held<K: Clone>(&self, service: &str, scope: &str, pick: impl Fn(&Held) -> Option<&K>) -> Result<Vec<SourceHeld<K>>, String>
-    where
-        K: Observed,
-    {
+    fn held<K: Observed>(&self, service: &str, scope: &str, pick: impl Fn(&Held) -> Option<&K>) -> Result<Vec<SourceHeld<K>>, String> {
         let resident = self.refresh()?;
         Ok(resident
             .records
@@ -552,6 +553,10 @@ impl EngineObservations {
 impl SourceRecords for EngineObservations {
     fn observe_whole(&self, service: &str, scope: &str) {
         locked(&self.whole).insert((service.to_owned(), scope.to_owned()));
+    }
+
+    fn release_whole(&self, service: &str, scope: &str) {
+        locked(&self.whole).remove(&(service.to_owned(), scope.to_owned()));
     }
 
     async fn issues(&self, service: &str, scope: &str) -> Result<Vec<SourceHeld<IssueRecord>>, String> {

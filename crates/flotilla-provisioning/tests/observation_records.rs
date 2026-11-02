@@ -254,3 +254,61 @@ async fn another_homes_values_are_confirmed_when_that_home_was_last_heard() {
     assert_eq!(alpha_records.sources("ChangeRequest").await.expect("sources").len(), 2);
     assert_eq!(alpha_records.list("ChangeRequest").await.expect("list").len(), 1);
 }
+
+fn issue_spec(number: u64) -> serde_json::Value {
+    serde_json::to_value(IssueSpec {
+        service: "github.com".into(),
+        scope: "flotilla-org/flotilla".into(),
+        number,
+        observing_authority: "alpha".into(),
+    })
+    .expect("spec")
+}
+
+// Behaviour (one writer per source): the whole-source observer writes a record only when a value
+// changes; a subject's observer publishing its status keeps the values only the whole-source
+// observer reads; while the source is observed whole, a subject's observer cannot delete its
+// records, and once released it can again.
+#[tokio::test]
+async fn a_source_observed_whole_keeps_its_records_against_subject_observers() {
+    use flotilla_resources::forge_observation::{IssueRecord, IssueSubject, ObservedKind, SourceRecords};
+    let directory = tempfile::tempdir().expect("temp dir");
+    let clock = ManualClock::at(1_800_000_000);
+    let (_, records) = open(&directory, "alpha", clock.clone());
+    records.apply("Issue", "issue-7", &BTreeMap::new(), &BTreeMap::new(), issue_spec(7)).await.expect("subject record");
+    let [held] = records.issues("github.com", "flotilla-org/flotilla").await.expect("held").try_into().expect("one record");
+    let whole = IssueRecord {
+        title: Some("Remaining kinds".into()),
+        body: Some("The contract.".into()),
+        issue_type: Some("Task".into()),
+        blocked_by: vec![IssueSubject { service: "github.com".into(), scope: "flotilla-org/flotilla".into(), number: 3 }],
+        blocked_by_observed: true,
+        fields: Some(BTreeMap::from([("Priority".into(), "High".into())])),
+        ..held.record
+    };
+    assert!(records.write_issue("issue-7", &whole).await.expect("write"));
+    let version = records.get("Issue", "issue-7").await.expect("get").expect("held").version;
+    assert!(!records.write_issue("issue-7", &whole).await.expect("write again"), "an equal record writes nothing");
+    assert_eq!(records.get("Issue", "issue-7").await.expect("get").expect("held").version, version);
+    assert_eq!(
+        records.last_written(ObservedKind::Issue, "issue-7").await.expect("written"),
+        Some(Timestamp::from_datetime(&epoch(1_800_000_000)))
+    );
+
+    let status = serde_json::to_value(issue_status(ObservedIssueState::Closed, epoch(0))).expect("status");
+    records.set_status("Issue", "issue-7", status).await.expect("subject observer publishes");
+    let [held] = records.issues("github.com", "flotilla-org/flotilla").await.expect("held").try_into().expect("one record");
+    assert_eq!(held.record.state, Some(flotilla_resources::forge_observation::IssueState::Closed));
+    assert_eq!(
+        (&held.record.body, &held.record.issue_type, &held.record.blocked_by, &held.record.fields),
+        (&whole.body, &whole.issue_type, &whole.blocked_by, &whole.fields)
+    );
+    assert!(records.referenced_by_open_issues().await.expect("referenced").is_empty(), "a closed issue blocks nothing");
+
+    records.observe_whole("github.com", "flotilla-org/flotilla");
+    records.delete("Issue", "issue-7").await.expect("subject observer deletes");
+    assert!(records.get("Issue", "issue-7").await.expect("get").is_some(), "the whole-source observer keeps it");
+    records.release_whole("github.com", "flotilla-org/flotilla");
+    records.delete("Issue", "issue-7").await.expect("subject observer deletes");
+    assert!(records.get("Issue", "issue-7").await.expect("get").is_none());
+}

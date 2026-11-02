@@ -421,6 +421,8 @@ pub trait SourceRecords: Send + Sync {
     /// Claims the source stored as `service`/`scope` for its whole-source observer: from now on its
     /// records here are deleted only by [`SourceRecords::remove`], never by a subject's observer.
     fn observe_whole(&self, service: &str, scope: &str);
+    /// Gives the source back to its subjects' observers.
+    fn release_whole(&self, service: &str, scope: &str);
     /// This home's issue records of the source.
     async fn issues(&self, service: &str, scope: &str) -> Result<Vec<Held<IssueRecord>>, String>;
     /// This home's change request records of the source.

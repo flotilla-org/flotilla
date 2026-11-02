@@ -9,6 +9,7 @@ uuid = { workspace = true, features = ["v4"] }
 flotilla-address = { path = "../flotilla-address" }
 flotilla-change-request = { path = "../flotilla-change-request" }
 flotilla-issue-tracker = { path = "../flotilla-issue-tracker" }
+flotilla-schema = { path = "../flotilla-schema" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-resources = { path = "../flotilla-resources" }
@@ -40,6 +41,7 @@ flotilla-store-testkit = { path = "../flotilla-store-testkit" }
 flotilla-relay-protocol = { path = "../flotilla-relay-protocol" }
 tokio = { workspace = true, features = ["test-util"] }
 hegeltest = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

@@ -744,6 +744,10 @@ pub struct InProcessDaemon {
     /// The forge observers, which the engine's observation records switch to observer-only writes.
     change_request_observer: flotilla_observation::change_request_observer::ChangeRequestRefresher,
     issue_observer: flotilla_observation::issue_observer::IssueRefresher,
+    /// The whole-source forge observer's records, installed with the engine's observation records,
+    /// and the observer once it runs.
+    source_records: std::sync::OnceLock<Arc<dyn flotilla_resources::forge_observation::SourceRecords>>,
+    source_observer: std::sync::OnceLock<flotilla_observation::source_observer::SourceObserver>,
     repos: Arc<RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
     event_source: Arc<BroadcastEventSink>,
@@ -1417,6 +1421,8 @@ impl InProcessDaemon {
             manifest_roots,
             change_request_observer,
             issue_observer,
+            source_records: Default::default(),
+            source_observer: Default::default(),
             resource_backend: resource_backend.clone(),
             observed_resource_backend: observed_resource_backend.clone(),
             observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),
@@ -2286,12 +2292,19 @@ impl InProcessDaemon {
 
     /// Serves ChangeRequest and Issue from the engine's records behind `[primitives]`, and switches
     /// the observers to write only what they observe. Records nothing demands after one lease are
-    /// swept.
+    /// swept. Each source this host is the preferred observer of is observed whole, through
+    /// `sources`.
     pub fn install_observation_records(
         &self,
         records: Arc<dyn flotilla_resources::engine_records::EngineRecords>,
         failures: Arc<dyn flotilla_resources::engine_records::ObservationFailures>,
+        sources: Arc<dyn flotilla_resources::forge_observation::SourceRecords>,
     ) -> Result<(), String> {
+        // Sources observed whole before a restart keep their records until the observer runs.
+        for (service, scope) in self.source_states().sources()? {
+            sources.observe_whole(&service, &scope);
+        }
+        self.source_records.set(sources).map_err(|_| "the whole-source records are already installed".to_owned())?;
         self.resource_backend().install_engine_records(records);
         self.change_request_observer.engine().install(Arc::clone(&failures))?;
         self.issue_observer.engine().install(failures)?;
@@ -2419,7 +2432,37 @@ impl InProcessDaemon {
         self.crew.change_request_stale_after()
     }
 
+    fn source_states(&self) -> Arc<dyn flotilla_observation::source_observer::SourceStates> {
+        let directory = self.config.state_dir().as_path().join("forge-sources");
+        Arc::new(flotilla_observation::source_observer::FileSourceStates::new(directory))
+    }
+
+    /// Observes this host's forge sources in `namespace` whole, once the engine's records are
+    /// installed.
+    pub async fn watch_forge_sources(&self, namespace: &str) {
+        use flotilla_observation::source_observer::{SourceObserver, SourceObserverParts};
+        let Some(records) = self.source_records.get() else { return futures::future::pending().await };
+        let observer = SourceObserver::new(
+            SourceObserverParts::builder()
+                .backend(self.resource_backend.clone())
+                .namespace(namespace.to_owned())
+                .queries(Arc::clone(&self.issue_query_port))
+                .records(Arc::clone(records))
+                .states(self.source_states())
+                .clock(Arc::clone(&self.clock))
+                .build(),
+        );
+        if self.source_observer.set(observer.clone()).is_err() {
+            tracing::warn!("the whole-source observer is already running");
+            return futures::future::pending().await;
+        }
+        observer.run().await
+    }
+
     pub async fn refresh_change_request_hint(&self, hint: &flotilla_address::Address) -> Result<(), String> {
+        if let Some(observer) = self.source_observer.get() {
+            observer.hint(hint);
+        }
         self.crew.refresh_change_request_hint(hint).await?;
         let Some(hint_text) = flotilla_relay_protocol::hint_subject(hint).filter(|_| hint.kind() == flotilla_address::Kind::ChangeRequest)
         else {
@@ -2492,10 +2535,16 @@ impl InProcessDaemon {
     }
 
     pub async fn refresh_demanded_owned_change_requests(&self) -> Result<(), String> {
+        if let Some(observer) = self.source_observer.get() {
+            observer.wake_all();
+        }
         self.crew.refresh_demanded_owned_change_requests().await
     }
 
     pub fn set_change_request_relay_healthy(&self, healthy: bool) {
+        if let Some(observer) = self.source_observer.get() {
+            observer.set_relay_healthy(healthy);
+        }
         self.crew.set_change_request_relay_healthy(healthy);
     }
 

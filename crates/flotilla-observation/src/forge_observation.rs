@@ -175,6 +175,34 @@ pub struct Declarations<H> {
 }
 
 impl<H: Ord + Clone> Declarations<H> {
+    /// Every source a Project binds, in its service-URL spelling, each once.
+    pub fn sources(&self) -> Vec<IssueSource> {
+        let mut sources = std::collections::BTreeSet::new();
+        let url = |source: &IssueSource| {
+            let mut source = canonical_source(source);
+            if let Some(forge) = self.forges.iter().find(|forge| forge.forge_id == source.service) {
+                source.service = forge.https_url.clone();
+            }
+            let source = normalize_issue_source(&source);
+            (source.service, source.scope)
+        };
+        for (project, _) in &self.projects {
+            sources.extend(project.issue_source_bindings.iter().filter(|binding| !binding.exclude).map(|binding| url(&binding.source)));
+            if let IssueSourceResolution::Available { bindings } = resolve_project_issue_sources_from_inventory(&self.repositories, project)
+            {
+                sources.extend(bindings.iter().map(|binding| url(&binding.source)));
+            }
+            for member in &project.repositories {
+                if let Some(Ok(repository)) = self.repositories.get(&member.repo.to_string()) {
+                    if let Some(forge) = repository.spec.forge() {
+                        sources.insert(url(&IssueSource { service: forge.service_url.clone(), scope: forge.repository.clone() }));
+                    }
+                }
+            }
+        }
+        sources.into_iter().map(|(service, scope)| IssueSource { service, scope }).collect()
+    }
+
     /// The earliest declaration of a Project bound to `source`, by an issue-source binding, a
     /// resolved binding, or a member repository's forge identity; its home is the preferred observer.
     pub fn preferred_observer(&self, source: &IssueSource) -> Option<(DateTime<Utc>, H)> {
@@ -211,7 +239,7 @@ impl<H: Ord + Clone> Declarations<H> {
     }
 }
 
-async fn declarations(backend: &ResourceBackend, namespace: &str) -> Result<Declarations<NodeId>, String> {
+pub(crate) async fn declarations(backend: &ResourceBackend, namespace: &str) -> Result<Declarations<NodeId>, String> {
     let forges =
         backend.definitions::<Forge>(namespace).list().await.map_err(|e| e.to_string())?.into_iter().map(|forge| forge.spec).collect();
     // Recover every declaration home in one store listing, rather than listing

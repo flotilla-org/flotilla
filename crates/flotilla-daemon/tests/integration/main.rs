@@ -7,6 +7,7 @@ mod crew_skills;
 mod dummy_fleet;
 mod dummy_fleet_writes;
 mod engine_import;
+mod forge_source_observation;
 mod overlay_replication;
 mod peer_connect_flow;
 mod project_cli;

@@ -101,6 +101,7 @@ drydock-agent.workspace = true
 drydock-transport.workspace = true
 flotilla-fake-forge = { path = "../flotilla-fake-forge" }
 flotilla-forge-github = { path = "../flotilla-forge-github" }
+flotilla-forge-forgejo = { path = "../flotilla-forge-forgejo" }
 flotilla-forgejo-providers = { path = "../flotilla-forgejo-providers" }
 flotilla-github-providers = { path = "../flotilla-github-providers" }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }

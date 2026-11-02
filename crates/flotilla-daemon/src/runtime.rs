@@ -679,6 +679,11 @@ impl StartupRestoration {
         controller_tasks.push(AbortOnDropHandle::new(tokio::spawn(async move {
             observation_daemon.watch_change_request_convoy_demands(&observation_namespace).await;
         })));
+        let source_daemon = Arc::clone(daemon);
+        let source_namespace = options.namespace.clone();
+        controller_tasks.push(AbortOnDropHandle::new(tokio::spawn(async move {
+            source_daemon.watch_forge_sources(&source_namespace).await;
+        })));
         let Some(state) = self.state.as_ref() else {
             return futures::future::pending::<Result<(), ResourceError>>().await;
         };
@@ -1351,7 +1356,7 @@ async fn open_provisioning_lifecycles(
             .await
             .map_err(|error| error.to_string())??;
     let observations = Arc::new(observations);
-    daemon.install_observation_records(observations.clone(), observations)?;
+    daemon.install_observation_records(observations.clone(), observations.clone(), observations)?;
     // FulfilmentKind, which admission and the vessel reconciler read and admission's snapshots write.
     let service = daemon.decided_store()?;
     let clock = daemon.clock_for_scenarios();
