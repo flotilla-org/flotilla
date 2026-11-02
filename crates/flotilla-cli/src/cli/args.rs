@@ -5,7 +5,7 @@ use std::{
 
 use clap::{CommandFactory, FromArgMatches, Parser};
 use color_eyre::Result;
-use flotilla_client::endpoint::{remote_daemon_from, DaemonEndpoint, SshEndpoint};
+use flotilla_client::endpoint::{client_socket_path, remote_daemon_from, socket_path_from, DaemonEndpoint, SshEndpoint};
 use flotilla_paths::path_policy::{daemon_socket_path, PathPolicy};
 
 /// Flotilla: development workspaces, fleet operations and vessel tools
@@ -112,6 +112,12 @@ pub enum SubCommand {
         #[command(subcommand)]
         command: WebSubCommand,
     },
+    /// Show a described table through binnacle: printed when piped, inline in a terminal
+    ///
+    /// Runs the flotilla-table binary beside this one; `flotilla table --help` shows its flags.
+    /// With no name, lists the tables the daemon describes.
+    #[command(disable_help_flag = true)]
+    Table(TableArgs),
     /// Inspect raw daemon resources
     Resource {
         #[command(subcommand)]
@@ -217,6 +223,16 @@ pub struct LsArgs {
     /// Show the whole fleet, including inside a crew
     #[arg(long, conflicts_with = "project")]
     pub all: bool,
+}
+
+/// `flotilla table`'s arguments, handed to the flotilla-table sibling as they are (#4249). Its
+/// flags (binnacle's) live there, so this crate stays free of binnacle and ratatui.
+#[derive(clap::Args, Debug, Default, PartialEq, Eq)]
+pub struct TableArgs {
+    /// A table name (omit to list the tables), then flotilla-table's flags: --view, --where,
+    /// --format, --columns, --sort, --namespace and the rest
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub args: Vec<std::ffi::OsString>,
 }
 
 #[derive(clap::Args)]
@@ -861,14 +877,8 @@ impl Cli {
     pub fn socket_path(&self) -> PathBuf {
         // Socket-only commands never spawn, so they may select a socket through
         // --config-dir without resolving the daemon's paired state directory.
-        let policy = PathPolicy::from_process_env();
-        let config_dir = self
-            .root
-            .as_deref()
-            .map(|root| root.join("config"))
-            .or_else(|| self.config_dir.clone())
-            .unwrap_or_else(|| policy.config_dir.into_path_buf());
-        socket_path_from(self.socket.as_deref(), &config_dir, std::env::var_os("FLOTILLA_DAEMON_SOCKET").as_deref())
+        let config_dir = self.root.as_deref().map(|root| root.join("config")).or_else(|| self.config_dir.clone());
+        client_socket_path(self.socket.as_deref(), config_dir.as_deref())
     }
 
     /// The remote daemon selected by `--daemon` or `FLOTILLA_DAEMON`, if any.
@@ -931,10 +941,6 @@ fn daemon_dirs_from(
         _ => Err("this command may start a daemon, so --config-dir and --state-dir must be supplied together; use --root to select both"
             .to_string()),
     }
-}
-
-fn socket_path_from(explicit: Option<&Path>, config_dir: &Path, environment: Option<&std::ffi::OsStr>) -> PathBuf {
-    environment.map(PathBuf::from).or_else(|| explicit.map(PathBuf::from)).unwrap_or_else(|| daemon_socket_path(config_dir))
 }
 
 fn daemon_paths_from(

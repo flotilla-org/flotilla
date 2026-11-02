@@ -3,6 +3,7 @@ pub mod archive;
 pub mod artifact;
 pub mod attach;
 pub mod connection;
+pub mod daemon_http;
 pub mod hooks;
 pub mod logs;
 pub mod manifest;

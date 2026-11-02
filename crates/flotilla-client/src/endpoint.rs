@@ -8,15 +8,16 @@
 //! Reaching a remote daemon never spawns a local one.
 
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fmt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
     time::Duration,
 };
 
+use flotilla_paths::path_policy::{daemon_socket_path, PathPolicy};
 use flotilla_protocol::arg::shell_quote;
 use flotilla_transport::message::{stream_message_session, MessageSession};
 use tokio::{
@@ -210,6 +211,19 @@ pub fn remote_daemon_from(flag: Option<&str>, environment: Option<&str>, explici
         return Ok(None);
     }
     flag.or(environment.filter(|value| !value.is_empty())).map(SshEndpoint::parse).transpose()
+}
+
+/// This host's daemon socket for a client: `FLOTILLA_DAEMON_SOCKET`, else `explicit` (`--socket`),
+/// else the one under `config_dir` (the default config directory when `None`). `flotilla` and its
+/// sibling binaries resolve it the same way.
+pub fn client_socket_path(explicit: Option<&Path>, config_dir: Option<&Path>) -> PathBuf {
+    let config_dir = config_dir.map(Path::to_path_buf).unwrap_or_else(|| PathPolicy::from_process_env().config_dir.into_path_buf());
+    socket_path_from(explicit, &config_dir, std::env::var_os("FLOTILLA_DAEMON_SOCKET").as_deref())
+}
+
+/// [`client_socket_path`] with the environment's socket given.
+pub fn socket_path_from(explicit: Option<&Path>, config_dir: &Path, environment: Option<&OsStr>) -> PathBuf {
+    environment.map(PathBuf::from).or_else(|| explicit.map(PathBuf::from)).unwrap_or_else(|| daemon_socket_path(config_dir))
 }
 
 #[cfg(test)]

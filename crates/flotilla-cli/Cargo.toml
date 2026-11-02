@@ -33,6 +33,9 @@ comfy-table = "7.2.2"
 crossterm = "0.29"
 clap = { version = "4", features = ["derive"] }
 uuid = { workspace = true, features = ["v4"] }
+# `frontend::daemon_http`: JSON requests to the daemon's HTTP router over its socket.
+reqwest = { workspace = true }
+rigging-tls = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }

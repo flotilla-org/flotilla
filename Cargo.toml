@@ -75,6 +75,7 @@ members = [
     "crates/flotilla-store-testkit",
     "crates/flotilla-test-support",
     "crates/flotilla-transport",
+    "crates/flotilla-table",
     "crates/flotilla-tui",
     "crates/flotilla-vessel-delivery",
     "crates/tender",
@@ -102,6 +103,13 @@ rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", rev = "3
 rigging-http-wire = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
 # The condition language (#4108).
 rigging-condition = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
+binnacle-cli = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d", features = ["described", "clap"] }
+binnacle-core = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d" }
+binnacle-described = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d" }
+binnacle-described-http = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d" }
+binnacle-format = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d" }
+binnacle-layout = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d" }
+binnacle-ratatui = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d", features = ["described"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde_yml = "0.0.12"
 tokio-util = "0.7"

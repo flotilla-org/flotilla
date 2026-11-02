@@ -25,7 +25,7 @@ once_cell = { version = "1", features = ["std", "critical-section", "portable-at
 percent-encoding = { version = "2" }
 serde = { version = "1", features = ["derive"] }
 serde_core = { version = "1", features = ["alloc"] }
-serde_json = { version = "1", features = ["alloc", "raw_value"] }
+serde_json = { version = "1", features = ["alloc", "float_roundtrip", "raw_value"] }
 smallvec = { version = "1", default-features = false, features = ["const_generics", "const_new"] }
 sync_wrapper = { version = "1", features = ["futures"] }
 tokio = { version = "1", features = ["full"] }
