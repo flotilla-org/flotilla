@@ -144,13 +144,21 @@ impl KindSql {
                     (field.name.clone(), format!("SELECT \"version\", {label} FROM {root} WHERE \"id\" = ?1"))
                 })
                 .collect(),
-            // Root indexes page resources; an index on a nested table (an edge log's) serves history
-            // reads, which have no query API yet.
+            // Root indexes page resources, and so do indexes on the root's `child` tables, by owner;
+            // an index on another nested table (an edge log's) serves history reads, which have no
+            // query API yet.
             indexes: set
                 .indexes
                 .iter()
-                .filter(|index| index.table == set.tables[0].name)
-                .map(|index| (index.name.clone(), IndexSql::render(&set.tables[0], index)))
+                .filter_map(|index| {
+                    let table = set.tables.iter().find(|table| table.name == index.table)?;
+                    let sql = match (table.parent, table.role) {
+                        (None, _) => IndexSql::render(table, index),
+                        (Some(0), TableRole::Child) => IndexSql::render_owners(set, table, index),
+                        _ => return None,
+                    };
+                    Some((index.name.clone(), sql))
+                })
                 .collect(),
             scan: format!(
                 "SELECT i.\"id\" FROM \"resource_identity\" AS i CROSS JOIN {root} AS r ON r.\"id\" = i.\"id\" \
@@ -259,6 +267,30 @@ impl IndexSql {
             order: order.len(),
             first: format!("{select} {} {}", first.join(" AND "), limit(next)),
             after: format!("{select} {} {}", after.join(" AND "), limit(next + order.len() + 1)),
+        }
+    }
+}
+
+impl IndexSql {
+    /// An `eq` index on one of the root's `child` tables: the owners holding a matching row, each
+    /// once, in id order.
+    fn render_owners(set: &TableSet, child: &Table, index: &Index) -> IndexSql {
+        let table = quote_ident(&child.name);
+        let owner = quote_ident(set.parent_key_column());
+        let terms: Vec<String> = index.eq.iter().enumerate().map(|(n, name)| format!("{} = ?{}", quote_ident(name), n + 1)).collect();
+        let next = index.eq.len() + 1;
+        let select = format!("SELECT DISTINCT {owner} FROM {table} WHERE {}", terms.join(" AND "));
+        IndexSql {
+            object: index.object_name(),
+            order: 0,
+            eq_columns: index
+                .eq
+                .iter()
+                .map(|name| child.columns.iter().find(|column| &column.name == name).expect("validated eq column").clone())
+                .collect(),
+            first: format!("{select} ORDER BY {owner} LIMIT ?{next}"),
+            after: format!("{select} AND {owner} > ?{next} ORDER BY {owner} LIMIT ?{}", next + 1),
+            integer_keys: None,
         }
     }
 }

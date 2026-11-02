@@ -2,7 +2,13 @@
 
 use std::{collections::BTreeSet, ops::Range};
 
-use crate::{code::Code, value::KindCode};
+use crate::{
+    code::Code,
+    value::{KindCode, Value},
+};
+
+/// The CBOR document `null` (RFC 8949 simple value 22).
+const CBOR_NULL: u8 = 0xf6;
 
 /// Reserved suffix of the backend's readable views.
 pub const VIEW_SUFFIX: &str = "_view";
@@ -205,6 +211,35 @@ impl ColumnDef {
             return None;
         }
         self.properties.get("previous_generation_default").and_then(serde_json::Value::as_i64)
+    }
+
+    /// Sets the explicit integer/bool default of a column the previous generation's table lacked.
+    pub fn mark_previous_generation_default(&mut self, default: i64) {
+        self.properties.insert("previous_generation_default".into(), default.into());
+    }
+
+    /// Marks a column the previous generation's table lacked, its rows reading as unobserved there:
+    /// see [`ColumnDef::previous_generation_value`].
+    pub fn mark_previous_generation_absent(&mut self) {
+        self.properties.insert("previous_generation_absent".into(), true.into());
+    }
+
+    /// What a row the previous generation stored holds in this column, which opening adds, and what
+    /// an entry that does not name it writes: the explicit integer default, or for a column marked
+    /// absent, null, or the CBOR document `null` in a CBOR column (an `Option` field's). None
+    /// otherwise: the column is not added.
+    pub fn previous_generation_value(&self) -> Option<Value> {
+        if let Some(default) = self.previous_generation_default() {
+            return Some(Value::Int(default));
+        }
+        if self.properties.get("previous_generation_absent") != Some(&serde_json::Value::Bool(true)) {
+            return None;
+        }
+        match self.ty {
+            ColumnType::Cbor => Some(Value::Blob(vec![CBOR_NULL])),
+            _ if self.nullable => Some(Value::Null),
+            _ => None,
+        }
     }
 
     pub fn new(name: impl Into<String>, ty: ColumnType, nullable: bool) -> Self {
@@ -594,5 +629,27 @@ impl TableSet {
         layout.column("effect", ColumnType::Cbor, true);
         layout.column("topic", ColumnType::Text, true);
         layout.finish().tables.remove(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ColumnDef, ColumnType, Value};
+
+    fn absent(ty: ColumnType, nullable: bool) -> Option<Value> {
+        let mut column = ColumnDef::new("c", ty, nullable);
+        column.mark_previous_generation_absent();
+        column.previous_generation_value()
+    }
+
+    #[test]
+    fn a_column_absent_from_the_previous_generation_reads_as_unobserved_where_it_can() {
+        assert_eq!(absent(ColumnType::Text, true), Some(Value::Null));
+        assert_eq!(absent(ColumnType::Cbor, false), Some(Value::Blob(vec![0xf6])));
+        assert_eq!(absent(ColumnType::Text, false), None);
+        assert_eq!(ColumnDef::new("c", ColumnType::Text, true).previous_generation_value(), None);
+        let mut flag = ColumnDef::new("c", ColumnType::Bool, false);
+        flag.mark_previous_generation_default(0);
+        assert_eq!(flag.previous_generation_value(), Some(Value::Int(0)));
     }
 }

@@ -65,9 +65,23 @@ CREATE TABLE "change_request" (
   "checks" TEXT CHECK ("checks" IN ('fa', 'pa', 'pe')),
   "actionable_at_head" INTEGER CHECK ("actionable_at_head" IN (0, 1)),
   "mergeable" TEXT CHECK ("mergeable" IN ('co', 'me')),
-  "failing_since" INTEGER
+  "failing_since" INTEGER,
+  "head_branch" TEXT,
+  "base_branch" TEXT,
+  "closes_observed" INTEGER NOT NULL CHECK ("closes_observed" IN (0, 1)) DEFAULT 0
 ) STRICT;
+CREATE TABLE "change_request_closes" (
+  "change_request" INTEGER NOT NULL,
+  "pos" INTEGER NOT NULL,
+  "service" TEXT NOT NULL,
+  "scope" TEXT NOT NULL,
+  "number" INTEGER NOT NULL,
+  PRIMARY KEY ("change_request", "pos"),
+  FOREIGN KEY ("change_request") REFERENCES "change_request" ("id") ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE INDEX "change_request_by_branch" ON "change_request" ("service", "scope", "head_branch");
 CREATE INDEX "change_request_by_subject" ON "change_request" ("service", "scope", "number");
+CREATE INDEX "change_request_closes_by_closed_issue" ON "change_request_closes" ("service", "scope", "number");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cq', 'state', 'cl', 'Closed'),
   ('cq', 'state', 'dr', 'Draft'),
@@ -97,8 +111,18 @@ CREATE VIEW "change_request_view" AS SELECT
   (SELECT "name" FROM "codes" WHERE "kind" = 'cq' AND "field" = 'checks' AND "code" = "change_request"."checks") AS "checks",
   "change_request"."actionable_at_head",
   (SELECT "name" FROM "codes" WHERE "kind" = 'cq' AND "field" = 'mergeable' AND "code" = "change_request"."mergeable") AS "mergeable",
-  "change_request"."failing_since"
+  "change_request"."failing_since",
+  "change_request"."head_branch",
+  "change_request"."base_branch",
+  "change_request"."closes_observed"
 FROM "change_request";
+CREATE VIEW "change_request_closes_view" AS SELECT
+  "change_request_closes"."change_request",
+  "change_request_closes"."pos",
+  "change_request_closes"."service",
+  "change_request_closes"."scope",
+  "change_request_closes"."number"
+FROM "change_request_closes";
 CREATE TABLE "forge_read" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -130,8 +154,27 @@ CREATE TABLE "issue" (
   "state" TEXT CHECK ("state" IN ('cl', 'op')),
   "labels" BLOB NOT NULL,
   "updated_at" INTEGER,
-  "failing_since" INTEGER
+  "failing_since" INTEGER,
+  "body" TEXT,
+  "issue_type" TEXT,
+  "parent_service" TEXT,
+  "parent_scope" TEXT,
+  "parent_number" INTEGER,
+  "parent_observed" INTEGER NOT NULL CHECK ("parent_observed" IN (0, 1)) DEFAULT 0,
+  "blocked_by_observed" INTEGER NOT NULL CHECK ("blocked_by_observed" IN (0, 1)) DEFAULT 0,
+  "fields" BLOB NOT NULL DEFAULT x'f6'
 ) STRICT;
+CREATE TABLE "issue_blocked_by" (
+  "issue" INTEGER NOT NULL,
+  "pos" INTEGER NOT NULL,
+  "service" TEXT NOT NULL,
+  "scope" TEXT NOT NULL,
+  "number" INTEGER NOT NULL,
+  PRIMARY KEY ("issue", "pos"),
+  FOREIGN KEY ("issue") REFERENCES "issue" ("id") ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE INDEX "issue_blocked_by_by_blocker" ON "issue_blocked_by" ("service", "scope", "number");
+CREATE INDEX "issue_by_parent" ON "issue" ("parent_service", "parent_scope", "parent_number");
 CREATE INDEX "issue_by_subject" ON "issue" ("service", "scope", "number");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('iu', 'state', 'cl', 'Closed'),
@@ -147,8 +190,23 @@ CREATE VIEW "issue_view" AS SELECT
   (SELECT "name" FROM "codes" WHERE "kind" = 'iu' AND "field" = 'state' AND "code" = "issue"."state") AS "state",
   "issue"."labels",
   "issue"."updated_at",
-  "issue"."failing_since"
+  "issue"."failing_since",
+  "issue"."body",
+  "issue"."issue_type",
+  "issue"."parent_service",
+  "issue"."parent_scope",
+  "issue"."parent_number",
+  "issue"."parent_observed",
+  "issue"."blocked_by_observed",
+  "issue"."fields"
 FROM "issue";
+CREATE VIEW "issue_blocked_by_view" AS SELECT
+  "issue_blocked_by"."issue",
+  "issue_blocked_by"."pos",
+  "issue_blocked_by"."service",
+  "issue_blocked_by"."scope",
+  "issue_blocked_by"."number"
+FROM "issue_blocked_by";
 CREATE VIEW "log_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "l"."home") AS "home",
   "l"."home_seq",

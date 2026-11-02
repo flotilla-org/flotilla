@@ -122,3 +122,77 @@ fn unstorable_arguments_are_refused() {
     assert_eq!(Counter::by_count(&u64::MAX).eq(), Err(EncodeError::OutOfRange { column: String::new(), value: u64::MAX }));
     assert_eq!(Counter::by_count(&5).eq(), Ok(&[Value::Int(5)][..]));
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Stored)]
+struct Book {
+    title: String,
+    copy: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Stored)]
+#[store(kind = "Shelf", code = "k5", index(name = "holding", eq(books)))]
+struct Shelf {
+    label: String,
+    #[store(child)]
+    books: Vec<Book>,
+}
+
+// Behaviour: an index on a child list is an index of the list's table on every column of its
+// element, and its constructor carries one element's values.
+#[test]
+fn child_list_indexes_key_the_lists_table_by_its_element() {
+    let set = Shelf::table_set();
+    set.validate().expect("valid");
+    let holding = index(&set, "holding");
+    assert_eq!((holding.table.as_str(), holding.eq.as_slice()), ("shelf_books", &["title".to_owned(), "copy".to_owned()][..]));
+    let ddl = render_ddl(&set);
+    assert!(ddl.contains(r#"CREATE INDEX "shelf_books_holding" ON "shelf_books" ("title", "copy");"#), "{ddl}");
+    let query = Shelf::holding(&Book { title: "a".into(), copy: 2 });
+    assert_eq!(query.eq(), Ok(&[Value::Text("a".into()), Value::Int(2)][..]));
+}
+
+// Behaviour: a child-list index query pages the resources holding an equal row, each once however
+// many equal rows it holds, in id order, through the index alone.
+#[hegel::test]
+fn child_list_queries_page_the_holders(tc: hegel::TestCase) {
+    use std::collections::BTreeSet;
+
+    use flotilla_schema::{KindRegistry, NewChange, Timestamp};
+    use flotilla_schema_sqlite::{Cursor, Store};
+    use hegel::generators as gs;
+
+    let book = |tc: &hegel::TestCase| Book {
+        title: tc.draw(gs::sampled_from(vec!["a".to_owned(), "b".to_owned()])),
+        copy: tc.draw(gs::integers::<u64>().max_value(1)),
+    };
+    let mut registry = KindRegistry::new();
+    registry.register::<Shelf>().expect("register");
+    let mut store = Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", registry).expect("open");
+    let shelves: Vec<Shelf> = (0..tc.draw(gs::integers::<usize>().max_value(6)))
+        .map(|n| Shelf { label: n.to_string(), books: (0..tc.draw(gs::integers::<usize>().max_value(3))).map(|_| book(&tc)).collect() })
+        .collect();
+    let mut write = store.write().expect("write");
+    for shelf in &shelves {
+        write.insert(&shelf.label, shelf, &NewChange::new("test", Timestamp(0))).expect("insert");
+    }
+    write.commit().expect("commit");
+
+    let wanted = book(&tc);
+    let limit = tc.draw(gs::integers::<u32>().min_value(1).max_value(3));
+    let mut read = store.read().expect("read");
+    let mut expected = BTreeSet::new();
+    for shelf in shelves.iter().filter(|shelf| shelf.books.contains(&wanted)) {
+        expected.insert(read.resolve(Shelf::CODE, &shelf.label, "home").expect("resolve").expect("stored"));
+    }
+    let query = Shelf::holding(&wanted);
+    let (mut ids, mut after): (Vec<_>, Option<Cursor>) = (Vec::new(), None);
+    loop {
+        let page = read.page(&query, after.as_ref(), limit).expect("page");
+        ids.extend(page.ids);
+        match page.next {
+            Some(cursor) => after = Some(cursor),
+            None => break,
+        }
+    }
+    assert_eq!(ids, expected.into_iter().collect::<Vec<_>>());
+}

@@ -1,5 +1,5 @@
 //! `#[store(index(...))]` on a kind or a kind's spec: the descriptor's `Index` on its root table
-//! and a typed query constructor; on a spec, `state` names the holder's state field (#3392 D5). On a part struct: an `Index` on each table holding its rows (an edge log's
+//! (or on a `child` list's table, below) and a typed query constructor; on a spec, `state` names the holder's state field (#3392 D5). On a part struct: an `Index` on each table holding its rows (an edge log's
 //! `EdgeEvent`), with no constructor; reads of those tables are the history views' to define.
 //!
 //! ```text
@@ -8,7 +8,11 @@
 //! index(name = "by_label", eq(label), unique)     // on a part: no two rows of one owner share `label`
 //! ```
 //!
-//! `eq` and `order` name top-level single-column fields: unattributed fields whose type (inside
+//! `eq` naming one `child` list field alone (`index(name = "by_closed", eq(closes))`) indexes that
+//! list's table by every column of its element; its constructor takes an element and finds the
+//! resources holding an equal row, in id order.
+//!
+//! Otherwise `eq` and `order` name top-level single-column fields: unattributed fields whose type (inside
 //! `Option`) is a `KeyColumn`, or `intern` fields. `order` refuses `intern` fields and references
 //! (`Ref`, `Identity`): their columns hold local surrogate ids, whose order is insertion order in one
 //! store and differs between stores, so it is no order a caller could mean. `when` conjoins `<state field> in [Variant, ...]`,
@@ -31,7 +35,7 @@ use syn::{
 use crate::{
     attrs::{refuse, refuse_at},
     fields::{schema, Field, Generics},
-    shape::{self, FieldShape},
+    shape::{self, Collection, FieldShape},
 };
 
 struct IndexAttr {
@@ -80,6 +84,10 @@ impl<'f, 'a> Indexes<'f, 'a> {
             if !names.insert(index.name.value()) {
                 return Err(refuse(&index.name, format_args!("index `{}` is declared twice", index.name.value())));
             }
+            if let Some(key) = element(&index, fields, part)? {
+                indexes.push((index, key));
+                continue;
+            }
             if index.unique && (!part || index.eq.is_empty() || !index.order.is_empty() || !index.when.is_empty()) {
                 return Err(refuse(
                     &index.name,
@@ -95,8 +103,15 @@ impl<'f, 'a> Indexes<'f, 'a> {
     /// Statements for `table_set`, after the root's layout: one `layout.index(..)` per index.
     pub(crate) fn layout(&self) -> TokenStream {
         let schema = schema();
-        let indexes = self.indexes.iter().map(|(index, (eq, order))| {
+        let indexes = self.indexes.iter().map(|(index, key)| {
             let name = &index.name;
+            let (eq, order) = match key {
+                Key::Columns(eq, order) => (eq, order),
+                Key::Element { field, .. } => {
+                    let field = &field.name;
+                    return quote!(layout.element_index(#name, #field););
+                }
+            };
             let unique = index.unique;
             let eq = eq.iter().map(|column| &column.field.name);
             let order = order.iter().map(|column| &column.field.name);
@@ -162,13 +177,28 @@ impl<'f, 'a> Indexes<'f, 'a> {
         let declares = if self.holder_state.is_some() { quote!(#schema::KindSpec) } else { quote!(#schema::Kind) };
         let mut bounds = vec![quote!(#ident #ty_generics: #declares)];
         let mut functions = Vec::new();
-        for (index, (eq, order)) in &self.indexes {
+        for (index, key) in &self.indexes {
+            let function = format_ident!("{}", index.name.value(), span = index.name.span());
+            let name = &index.name;
+            let (eq, order) = match key {
+                Key::Columns(eq, order) => (eq, order),
+                Key::Element { field, element } => {
+                    bounds.push(quote!(#element: #schema::Element));
+                    let arg = field.ident;
+                    let doc = format!("Resources holding a `{}` row equal to the argument, ordered by id.", field.name.value());
+                    functions.push(quote! {
+                        #[doc = #doc]
+                        pub fn #function(#arg: &#element) -> #schema::IndexQuery<Self> {
+                            #schema::IndexQuery::new(<Self as #declares>::CODE, #name, #schema::element_values::<#element>(#arg))
+                        }
+                    });
+                    continue;
+                }
+            };
             for column in eq.iter().chain(order).filter(|column| !column.interned) {
                 let inner = column.inner;
                 bounds.push(quote!(#inner: #schema::KeyColumn + #schema::Element));
             }
-            let function = format_ident!("{}", index.name.value(), span = index.name.span());
-            let name = &index.name;
             let args = eq.iter().map(|column| {
                 let (arg, inner) = (column.field.ident, column.inner);
                 quote!(#arg: &#inner)
@@ -323,8 +353,30 @@ fn column<'f, 'a>(fields: &'f [Field<'a>], ident: &Ident) -> syn::Result<Column<
     Ok(column)
 }
 
-/// An index's `eq` and `order` columns.
-type Key<'f, 'a> = (Vec<Column<'f, 'a>>, Vec<Column<'f, 'a>>);
+enum Key<'f, 'a> {
+    /// An index's `eq` and `order` columns.
+    Columns(Vec<Column<'f, 'a>>, Vec<Column<'f, 'a>>),
+    /// `eq(<child list>)`: the list's table, keyed by its element `element`.
+    Element { field: &'f Field<'a>, element: &'a Type },
+}
+
+/// The element index `index` declares, when its one `eq` field is a `child` list; such an index
+/// takes no other argument and belongs on a kind, whose query pages resources.
+fn element<'f, 'a>(index: &IndexAttr, fields: &'f [Field<'a>], part: bool) -> syn::Result<Option<Key<'f, 'a>>> {
+    let [ident] = index.eq.as_slice() else { return Ok(None) };
+    let Some(field) = find(fields, ident).filter(|field| matches!(field.shape, FieldShape::Child(_))) else { return Ok(None) };
+    if field.shape != FieldShape::Child(Collection::Vec) || field.state_datum {
+        return Err(refuse(ident, format_args!("an index on `{ident}` needs a `child` Vec field: its element's columns are the key")));
+    }
+    if part || index.unique || !index.order.is_empty() || !index.when.is_empty() {
+        return Err(refuse(
+            &index.name,
+            "an index on a child list belongs on a kind, with that field alone in `eq` and no `order`, `when` or `unique`",
+        ));
+    }
+    let element = shape::first_arg(field.ty).expect("classified Vec<T>");
+    Ok(Some(Key::Element { field, element }))
+}
 
 /// The name a kind spec's indexes give the holder's state field.
 const HOLDER_STATE: &str = "state";
@@ -384,5 +436,5 @@ fn check<'f, 'a>(index: &IndexAttr, fields: &'f [Field<'a>], holder_state: bool)
             format_args!("optional order field `{ident}` needs `when({ident} is_some)`: paging cannot compare a null"),
         ));
     }
-    Ok((eq, order))
+    Ok(Key::Columns(eq, order))
 }

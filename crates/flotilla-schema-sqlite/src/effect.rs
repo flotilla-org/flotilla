@@ -122,7 +122,7 @@ impl TableSql {
     /// those columns, and a column not named is null.
     fn values(&self, range: std::ops::Range<usize>, named: &Named) -> Result<Vec<Value>, StoreError> {
         let mut values: Vec<Value> =
-            self.data()[range.clone()].iter().map(|column| column.previous_generation_default().map_or(Value::Null, Value::Int)).collect();
+            self.data()[range.clone()].iter().map(|column| column.previous_generation_value().unwrap_or(Value::Null)).collect();
         for (name, value) in named {
             let current = self.current(name);
             let at = self.data()[range.clone()]
@@ -247,11 +247,7 @@ impl KindSql {
             return Ok(vec![Op::DeleteResource]);
         }
         let mut root = create.then(|| {
-            self.tables[0]
-                .data()
-                .iter()
-                .map(|column| column.previous_generation_default().map_or(Value::Null, Value::Int))
-                .collect::<Vec<_>>()
+            self.tables[0].data().iter().map(|column| column.previous_generation_value().unwrap_or(Value::Null)).collect::<Vec<_>>()
         });
         let mut ops = Vec::with_capacity(effect.changes.len() + 1);
         for change in &effect.changes {
