@@ -65,6 +65,27 @@ class ProviderConfigTest(unittest.TestCase):
             self.config(f'[providers.l]\nmodule = "local"\n{pinned}settings = {{ root = "{self.root}/v" }}\n'), self.root)
         self.assertEqual(local_root, self.root / 'v')
 
+    def test_a_composed_image_needs_no_named_image(self):
+        text = '[providers.daytona]\nmodule = "daytona"\n'
+        _, instance, image, _ = trial.provider_config(self.config(text), self.root, composed=True)
+        self.assertEqual((instance, image), ('daytona', None))
+
+
+class ImageCacheConfigTest(unittest.TestCase):
+    def test_an_image_cache_names_its_repository_and_an_existing_token_file(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        token = Path(directory.name) / 'token'
+        token.write_text('secret')
+        path = Path(directory.name) / 'cache.toml'
+        complete = f'repository = "registry.example/flotilla/crew-images"\nusername = "builder"\ntoken = "{token}"\n'
+        path.write_text(complete)
+        self.assertEqual(trial.image_cache_config(path)['token'], str(token))
+        for broken in [complete.replace(str(token), str(token) + '-missing'), complete.replace('username = "builder"\n', '')]:
+            path.write_text(broken)
+            with self.subTest(text=broken), self.assertRaises(trial.TrialFailure):
+                trial.image_cache_config(path)
+
 
 class ForgeConfigTest(unittest.TestCase):
     def test_a_real_forge_names_its_repository_and_absolute_identity_tokens(self):
