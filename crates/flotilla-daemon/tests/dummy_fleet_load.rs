@@ -51,22 +51,26 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_config::{ConfigStore, DaemonConfig};
 use flotilla_core::in_process::InProcessDaemon;
-use flotilla_daemon::runtime::RuntimeOptions;
-use flotilla_daemon_api::daemon::DaemonHandle;
-use flotilla_daemon_testkit::{
-    daemon::{TestDaemon, TestStore},
-    server::{spawn_in_memory_request_mesh_with_replication_metrics, InMemoryRequestMesh},
+use flotilla_daemon::{
+    dummy_fleet::{attach_dummy_fleet, install_dummy_fleet},
+    runtime::{DaemonRuntime, RuntimeOptions},
 };
+use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_daemon_testkit::server::{spawn_in_memory_request_mesh_with_replication_metrics, InMemoryRequestMesh};
+use flotilla_discovery_testkit::fake_discovery_with_host_directories;
 use flotilla_dummy_fleet::{
     catalog::{self, CrewMix, DUMMY_FULFILMENT_KIND},
-    CrewCommandPort, DaemonCommandPort, DummyFleet,
+    CrewCommandPort, DaemonCommandPort, DummyFleet, DUMMY_AGENT_ADAPTER,
 };
 use flotilla_load_driver::{ConvoyObservation, ConvoyState, FleetTarget, HomeSample, LoadPlan, TargetSample};
 use flotilla_observation::forge_observation::NO_READY_FORGE_OBSERVER;
-use flotilla_protocol::{commands::CommandValue, CommandAction};
+use flotilla_protocol::{commands::CommandValue, CommandAction, HostName};
 use flotilla_resources::{
-    Checkout, Convoy, ConvoyPhase, Host, Message, ReadWatchEvent, ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart,
+    Checkout, Convoy, ConvoyPhase, FleetDesignation, FleetDesignationSpec, Forge, Host, InputMeta, Message, Project, ProjectSpec,
+    ReadWatchEvent, Repository, ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
+    FLEET_DESIGNATION_NAME,
 };
 use flotilla_schema::{Cause, CodeEnum, KindCode, KindSpec};
 use flotilla_schema_sqlite::stream::{Frame, Service};
@@ -100,7 +104,7 @@ type Admissions = Arc<Mutex<HashMap<String, tokio::time::Instant>>>;
 struct Home {
     daemon: Arc<InProcessDaemon>,
     fleet: Arc<DummyFleet>,
-    test: TestDaemon,
+    runtime: DaemonRuntime,
     store: SqliteBackend,
     database: PathBuf,
     port: Arc<DaemonCommandPort>,
@@ -113,6 +117,7 @@ struct InProcessFleet {
     /// Refuse dispatches once the process holds this much resident memory.
     memory_limit: Option<u64>,
     _mesh: Option<InMemoryRequestMesh>,
+    _dir: tempfile::TempDir,
 }
 
 fn state_of(phase: ConvoyPhase) -> ConvoyState {
@@ -124,20 +129,34 @@ fn state_of(phase: ConvoyPhase) -> ConvoyState {
     }
 }
 
-async fn start_home(index: usize, long_runner_turns: u32, options: RuntimeOptions, admissions: Admissions) -> Home {
-    // The daemon's own SQLite store, opened where flotillad opens it.
-    let test = TestDaemon::builder()
-        .host(&format!("load-{index}"))
-        .primitives(load_primitives())
-        .agent(&format!("turn_delay_ms = {}", env_or("FLOTILLA_LOAD_TURN_DELAY_MS", 1_500u64)))
-        .long_runner_turns(long_runner_turns)
-        .change_request(&format!("merge_after_ms = {}", env_or("FLOTILLA_LOAD_MERGE_AFTER_MS", 0u64)))
-        .store(TestStore::Sqlite)
-        .options(options)
-        .start()
-        .await;
-    let daemon = Arc::clone(test.daemon());
+async fn start_home(root: &std::path::Path, index: usize, dummy_fleet: &str, options: RuntimeOptions, admissions: Admissions) -> Home {
+    let config_dir = root.join(format!("home-{index}"));
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    let switch = if load_primitives() { "[primitives]\n" } else { "" };
+    std::fs::write(config_dir.join("daemon.toml"), format!("machine_id = \"load-{index}\"\n\n{switch}[dummy_fleet]\n{dummy_fleet}"))
+        .expect("daemon.toml");
+    let config = Arc::new(ConfigStore::with_base(config_dir.clone()));
+    let daemon_config: DaemonConfig = config.load_daemon_config().expect("daemon config");
+    let mut discovery = fake_discovery_with_host_directories(&config_dir);
+    let fleet = install_dummy_fleet(&daemon_config, &mut discovery).expect("dummy fleet configured");
+    // The daemon's own store, opened where flotillad opens it.
+    let database = config.state_dir().as_path().join("resources.sqlite");
+    std::fs::create_dir_all(database.parent().expect("state dir")).expect("state dir");
+    let store = SqliteBackend::open_async(&database).await.expect("sqlite store");
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::clone(&config),
+        discovery,
+        HostName::new(format!("load-{index}")),
+        ResourceBackend::new(store.clone()),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    attach_dummy_fleet(&fleet, &daemon).expect("attach fleet");
+    let options = RuntimeOptions { namespace: NAMESPACE.into(), ..options };
+    let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options).await.expect("runtime");
     let backend = daemon.resource_backend();
+    seed(&backend, fleet.config(), daemon.message_primitives().is_some()).await;
     let view = Arc::new(HomeView::default());
     watch_convoys(&backend, Arc::clone(&view), admissions).await;
     watch_messages(&backend, Arc::clone(&view)).await;
@@ -145,16 +164,79 @@ async fn start_home(index: usize, long_runner_turns: u32, options: RuntimeOption
         watch_engine_messages(Arc::clone(primitives.service()), Arc::clone(&view));
     }
     let port = DaemonCommandPort::new(&(Arc::clone(&daemon) as Arc<dyn DaemonHandle>));
-    Home {
-        fleet: Arc::clone(test.fleet()),
-        store: test.sqlite().expect("sqlite store").clone(),
-        database: test.database_path().expect("sqlite store"),
-        daemon,
-        test,
-        port,
-        replication: Arc::default(),
-        view,
+    Home { daemon, fleet, runtime, store, database, port, replication: Arc::default(), view }
+}
+
+async fn seed(backend: &ResourceBackend, config: &flotilla_config::dummy_fleet::DummyFleetConfig, primitives: bool) {
+    if primitives {
+        // The engine path resolves fleet roles from the replicated fleet identity.
+        backend
+            .clone()
+            .using::<Project>(NAMESPACE)
+            .create(
+                &InputMeta::builder().name("fleet".to_string()).build(),
+                &ProjectSpec::builder()
+                    .display_name("Fleet".to_string())
+                    .default_workflow_ref(CrewMix::Coder.workflow_name().to_string())
+                    .repositories(Vec::new())
+                    .build(),
+            )
+            .await
+            .expect("fleet project");
+        backend
+            .clone()
+            .definitions::<FleetDesignation>(NAMESPACE)
+            .create(
+                &InputMeta::builder().name(FLEET_DESIGNATION_NAME.to_string()).build(),
+                &FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
+            )
+            .await
+            .expect("fleet designation");
     }
+    let host = backend.clone().using::<Host>(NAMESPACE).list().await.expect("hosts").items.into_iter().next().expect("local host");
+    let forge = catalog::forge(&config.forge_service_url);
+    backend
+        .clone()
+        .using::<Forge>(NAMESPACE)
+        .create(&InputMeta::builder().name(forge.forge_id.clone()).build(), &forge)
+        .await
+        .expect("dummy forge");
+    let repository = catalog::repository(&forge).expect("dummy repository");
+    let repositories = backend.clone().using::<Repository>(NAMESPACE);
+    repositories.create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository).await.expect("repository");
+    backend
+        .clone()
+        .using::<flotilla_resources::FulfilmentKind>(NAMESPACE)
+        .create(&InputMeta::builder().name(DUMMY_FULFILMENT_KIND.to_string()).build(), &catalog::fulfilment_kind(&host.metadata.name))
+        .await
+        .expect("dummy fulfilment kind");
+    for mix in CrewMix::ALL {
+        backend
+            .clone()
+            .using::<WorkflowTemplate>(NAMESPACE)
+            .create(&InputMeta::builder().name(mix.workflow_name().to_string()).build(), &mix.workflow(config.agent.long_runner_turns))
+            .await
+            .expect("dummy workflow");
+    }
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while repositories.get(&repository.key().to_string()).await.ok().and_then(|repository| repository.status?.default_branch).is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the dummy forge resolves the default branch");
+    // Admission places a literal image only once its host has probed the image's harnesses.
+    let hosts = backend.clone().using::<Host>(NAMESPACE);
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !hosts.get(&host.metadata.name).await.ok().and_then(|host| host.status).is_some_and(|status| {
+            status.fulfilment_facts.get(DUMMY_FULFILMENT_KIND).is_some_and(|facts| facts.harnesses.contains_key(DUMMY_AGENT_ADAPTER))
+        }) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the dummy kind's harness is observed");
 }
 
 /// Track the driver's local convoys, and time replicas arriving from other homes.
@@ -330,11 +412,12 @@ fn database_bytes(database: &std::path::Path) -> Option<u64> {
 
 impl InProcessFleet {
     /// `options` are each home's runtime options; the namespace is the fleet's.
-    async fn start(homes: usize, long_runner_turns: u32, options: RuntimeOptions) -> Self {
+    async fn start(homes: usize, dummy_fleet: &str, options: RuntimeOptions) -> Self {
+        let dir = tempfile::TempDir::new().expect("tempdir");
         let admissions = Admissions::default();
         let mut started = Vec::with_capacity(homes);
         for index in 0..homes {
-            started.push(start_home(index, long_runner_turns, options.clone(), Arc::clone(&admissions)).await);
+            started.push(start_home(dir.path(), index, dummy_fleet, options.clone(), Arc::clone(&admissions)).await);
         }
         let mesh = if homes > 1 {
             let daemons = started.iter().map(|home| Arc::clone(&home.daemon)).collect();
@@ -347,7 +430,7 @@ impl InProcessFleet {
             .ok()
             .and_then(|gib| gib.parse::<u64>().ok())
             .map(|gib| gib * 1024 * 1024 * 1024);
-        Self { homes: started, memory_limit, _mesh: mesh }
+        Self { homes: started, memory_limit, _mesh: mesh, _dir: dir }
     }
 }
 
@@ -468,7 +551,7 @@ impl FleetTarget for InProcessFleet {
             .iter()
             .map(|home| HomeSample {
                 store: Some(home.store.load_metrics().snapshot()),
-                controllers: home.test.runtime().controller_metrics.snapshot(),
+                controllers: home.runtime.controller_metrics.snapshot(),
                 replication: home.replication.snapshot(),
                 replication_lag: home.view.replication_lag.snapshot(),
                 turn_delivery: home.view.turn_delivery.snapshot(),
@@ -493,6 +576,15 @@ fn load_primitives() -> bool {
 
 fn catalog_forge_url() -> String {
     flotilla_config::dummy_fleet::DEFAULT_DUMMY_FORGE_SERVICE_URL.to_string()
+}
+
+fn dummy_fleet_settings(long_runner_turns: u32) -> String {
+    format!(
+        "[dummy_fleet.agent]\nturn_delay_ms = {}\nlong_runner_turns = {}\n[dummy_fleet.change_request]\nmerge_after_ms = {}\n",
+        env_or("FLOTILLA_LOAD_TURN_DELAY_MS", 1_500u64),
+        long_runner_turns,
+        env_or("FLOTILLA_LOAD_MERGE_AFTER_MS", 0u64)
+    )
 }
 
 fn smoke_plan() -> LoadPlan {
@@ -525,7 +617,7 @@ async fn load_driver_smoke() {
     // Production heartbeat and controller resync; the dummy kind, seeded after
     // startup, is probed on the next short pass rather than the production one.
     let options = RuntimeOptions { fulfilment_probe_interval: Duration::from_millis(200), ..RuntimeOptions::default() };
-    let fleet = InProcessFleet::start(1, 1, options).await;
+    let fleet = InProcessFleet::start(1, &dummy_fleet_settings(1), options).await;
     let plan = smoke_plan();
     let report = flotilla_load_driver::run(&fleet, &plan).await.expect("load report");
     eprintln!("{}", report.markdown());
@@ -557,7 +649,7 @@ async fn load_baseline() {
     }
     let homes = env_or("FLOTILLA_LOAD_DAEMONS", 1usize);
     // Production heartbeat, controller resync and probe cadences.
-    let fleet = InProcessFleet::start(homes, load_long_runner_turns(), RuntimeOptions::default()).await;
+    let fleet = InProcessFleet::start(homes, &dummy_fleet_settings(load_long_runner_turns()), RuntimeOptions::default()).await;
     let plan = LoadPlan {
         running: env_or("FLOTILLA_LOAD_RUNNING", 100),
         ramp_per_second: env_or("FLOTILLA_LOAD_RAMP_PER_SECOND", 20.0),
@@ -631,15 +723,7 @@ async fn load_baseline() {
     report.metadata.insert("commit".into(), revision);
     report.metadata.insert("source_status".into(), source_status);
     report.metadata.insert("source_diff".into(), source_diff);
-    report.metadata.insert(
-        "dummy_fleet".into(),
-        format!(
-            "turn_delay_ms = {}, long_runner_turns = {}, merge_after_ms = {}",
-            env_or("FLOTILLA_LOAD_TURN_DELAY_MS", 1_500u64),
-            load_long_runner_turns(),
-            env_or("FLOTILLA_LOAD_MERGE_AFTER_MS", 0u64)
-        ),
-    );
+    report.metadata.insert("dummy_fleet".into(), dummy_fleet_settings(load_long_runner_turns()));
     report.metadata.insert("primitives".into(), load_primitives().to_string());
     report.metadata.insert(
         "turn_delivery_definition".into(),
@@ -688,7 +772,7 @@ async fn receiver_snapshot_decode_measurement() {
     use flotilla_resources::TerminalSession;
     use flotilla_store_testkit::ReadCountsBackendExt;
 
-    let fleet = InProcessFleet::start(1, load_long_runner_turns(), RuntimeOptions::default()).await;
+    let fleet = InProcessFleet::start(1, &dummy_fleet_settings(load_long_runner_turns()), RuntimeOptions::default()).await;
     // This probe freezes active crew records for decoder comparisons. Reuse
     // the small fleet settings while deliberately leaving its tail open.
     let plan = LoadPlan { drain: Duration::ZERO, window: Duration::from_secs(25), ..smoke_plan() };
@@ -697,8 +781,7 @@ async fn receiver_snapshot_decode_measurement() {
     assert!(report.window.delivered >= 3, "{:?}", report.window);
     // VACUUM INTO captures a consistent database while the fleet is running;
     // receiver reads below use an isolated copy without controller traffic.
-    let frozen_dir = tempfile::tempdir().expect("tempdir");
-    let frozen = frozen_dir.path().join("receiver-measurement.sqlite");
+    let frozen = fleet._dir.path().join("receiver-measurement.sqlite");
     let live = rusqlite::Connection::open(&fleet.homes[0].database).expect("live database");
     live.execute("VACUUM INTO ?1", [frozen.to_str().expect("path")]).expect("freeze database");
     let store = SqliteBackend::open(&frozen).expect("frozen store");

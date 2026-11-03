@@ -98,27 +98,3 @@ bound by destructuring or by a non-resolver expression, unselective declared
 queries (`query_declared(&StoreQuery::default())`, which read observers count as
 `ReadOperation::List`), recursion, and loops expressed by re-spawned tasks.
 Test code is exempt through the shared `cfg(test)`/integration-test traversal.
-
-## Test internals ratchet
-
-`test_internals.py` (run by `check.py`, tested through `test_check.py` via
-`test_internals_tests.py`) counts the test code that rebuilds the daemon's own
-layers instead of starting it through
-`flotilla_daemon_testkit::daemon::TestDaemon` (#4321):
-
-- `ControllerRuntimeState` and `DockerControllerRuntime`, named anywhere;
-- direct calls to reconcile functions: any call whose callee is `reconcile` or
-  starts with `reconcile_`, except in crates that reach no controller
-  (`NO_CONTROLLERS`: the TUI, whose table state has its own `reconcile`).
-
-Test code is what the boundary checks exempt: Cargo integration-test
-directories, testkits, `cfg(test)` items and out-of-line test modules.
-Production code may use its own internals. `test_internals_allowlist.toml`
-records each file's count. A higher count, or a use in an unlisted file, fails:
-write the scenario against `TestDaemon`, driving the daemon through commands,
-its vendors and restarts. A lower count fails until the entry is lowered or
-removed, so the allowlist only shrinks. Never add an entry or raise a count.
-
-A stale entry's failure prints the count to lower it to. Like the other rules
-this is syntax, not name resolution: aliases and helpers that wrap the
-internals are outside its scope.

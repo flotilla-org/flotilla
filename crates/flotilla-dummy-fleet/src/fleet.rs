@@ -41,9 +41,7 @@ pub struct DummyFleet {
     /// Where coders open change requests instead of `forge`, when configured.
     pub(crate) shared_forge: Option<Arc<SharedForge>>,
     pub(crate) sessions: DummySessions,
-    /// The container and cloud-sandbox vendors, created on first install and
-    /// kept across daemon restarts, as a vendor's backings outlive a daemon.
-    pub(crate) environment_factories: OnceLock<[DummyEnvironmentFactory; 2]>,
+    pub(crate) vendor: DummyVendor,
     pub(crate) checkouts: DummyCheckouts,
     port: OnceLock<Arc<dyn CrewCommandPort>>,
     counters: Counters,
@@ -75,7 +73,7 @@ impl DummyFleet {
             forge: DummyForge::new(&config),
             shared_forge,
             sessions: DummySessions::default(),
-            environment_factories: OnceLock::new(),
+            vendor: DummyVendor::default(),
             checkouts: DummyCheckouts::default(),
             config,
             port: OnceLock::new(),
@@ -149,42 +147,14 @@ impl DummyFleet {
         self.command_error_samples.lock().expect("command errors").clone()
     }
 
-    fn vendors(&self) -> impl Iterator<Item = &DummyEnvironmentFactory> {
-        self.environment_factories.get().into_iter().flatten()
-    }
-
-    /// Act as the environment vendor: delete `environment`'s backing, by
-    /// Environment name or backing ID. Its crews' processes end with it.
-    /// False when no vendor holds it.
-    pub fn vanish_environment(&self, environment: &str) -> bool {
-        self.vendors().any(|vendor| vendor.vanish(environment))
-    }
-
-    /// Act as the environment vendor: stop `environment`'s backing.
-    pub fn stop_environment(&self, environment: &str) -> bool {
-        self.vendors().any(|vendor| vendor.stop(environment))
-    }
-
-    /// Act as the environment vendor: resume a backing it stopped.
-    pub fn resume_environment(&self, environment: &str) -> bool {
-        self.vendors().any(|vendor| vendor.resume(environment))
-    }
-
-    /// Act as the environment vendor: while set, refuse every new backing.
-    pub fn refuse_provisioning(&self, refuse: bool) {
-        self.vendors().for_each(|vendor| vendor.refuse_provisioning(refuse));
+    /// The environment vendors, as a test acts as them.
+    pub fn vendor(&self) -> &DummyVendor {
+        &self.vendor
     }
 
     pub fn snapshot(&self) -> DummyFleetSnapshot {
         let read = |counter| self.counters.get(counter).load(Ordering::Relaxed);
-        let environments = self.vendors().map(DummyEnvironmentFactory::counts).fold(DummyEnvironmentCounts::default(), |sum, counts| {
-            DummyEnvironmentCounts {
-                provisioned: sum.provisioned + counts.provisioned,
-                destroyed: sum.destroyed + counts.destroyed,
-                vanished: sum.vanished + counts.vanished,
-                live: sum.live + counts.live,
-            }
-        });
+        let environments = self.vendor.counts();
         DummyFleetSnapshot {
             environments_provisioned: environments.provisioned,
             environments_destroyed: environments.destroyed,
@@ -241,6 +211,46 @@ pub struct DummyFleetSnapshot {
     pub environments_vanished: u64,
     /// Backings the vendors hold now.
     pub live_environments: u64,
+}
+
+/// The container and cloud-sandbox environment vendors. They are created on
+/// the fleet's first install and kept across daemon restarts, as a vendor's
+/// backings outlive a daemon. Acting as the vendor changes only what its
+/// provider reports.
+#[derive(Default)]
+pub struct DummyVendor {
+    pub(crate) factories: OnceLock<[DummyEnvironmentFactory; 2]>,
+}
+
+impl DummyVendor {
+    fn each(&self) -> impl Iterator<Item = &DummyEnvironmentFactory> {
+        self.factories.get().into_iter().flatten()
+    }
+
+    /// Delete `environment`'s backing, by Environment name or backing ID; its
+    /// crews' processes end with it. False when no vendor holds it.
+    pub fn vanish(&self, environment: &str) -> bool {
+        self.each().any(|vendor| vendor.vanish(environment))
+    }
+
+    /// Stop `environment`'s backing. False when no vendor holds it running.
+    pub fn stop(&self, environment: &str) -> bool {
+        self.each().any(|vendor| vendor.stop(environment))
+    }
+
+    /// While set, refuse every new backing.
+    pub fn refuse_provisioning(&self, refuse: bool) {
+        self.each().for_each(|vendor| vendor.refuse_provisioning(refuse));
+    }
+
+    fn counts(&self) -> DummyEnvironmentCounts {
+        self.each().map(DummyEnvironmentFactory::counts).fold(DummyEnvironmentCounts::default(), |sum, counts| DummyEnvironmentCounts {
+            provisioned: sum.provisioned + counts.provisioned,
+            destroyed: sum.destroyed + counts.destroyed,
+            vanished: sum.vanished + counts.vanished,
+            live: sum.live + counts.live,
+        })
+    }
 }
 
 /// Results unclaimed for this long belong to other callers and are dropped.

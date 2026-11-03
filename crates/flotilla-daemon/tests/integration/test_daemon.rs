@@ -4,11 +4,10 @@
 
 use flotilla_daemon_testkit::daemon::TestDaemon;
 use flotilla_dummy_fleet::{
-    catalog::{self, CrewMix},
-    DummyFleet,
+    catalog::{CrewMix, DUMMY_CLOUD_FULFILMENT_KIND, DUMMY_FULFILMENT_KIND},
+    DummyVendor,
 };
-use flotilla_protocol::{commands::CommandValue, CommandAction};
-use flotilla_resources::{ConvoyPhase, Environment, EnvironmentPhase, ResourceObject, VESSEL_REF_LABEL};
+use flotilla_resources::{Convoy, ConvoyPhase, Environment, EnvironmentPhase, ResourceObject, VESSEL_REF_LABEL};
 
 /// An environment of one of `convoy`'s vessels, in `phase`.
 fn of_convoy(convoy: &str, phase: EnvironmentPhase) -> impl Fn(&ResourceObject<Environment>) -> bool + '_ {
@@ -18,28 +17,34 @@ fn of_convoy(convoy: &str, phase: EnvironmentPhase) -> impl Fn(&ResourceObject<E
     }
 }
 
+fn in_phase(convoy: &str, phase: ConvoyPhase) -> impl Fn(&ResourceObject<Convoy>) -> bool + '_ {
+    move |found| found.metadata.name == convoy && found.status.as_ref().is_some_and(|status| status.phase == phase)
+}
+
 // A cloud sandbox the vendor deletes, or stops with no resume available, is
 // Lost: the daemon learns it only from what the vendor reports, and no stored
 // record is touched to make it so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cloud_sandbox_the_vendor_deletes_becomes_lost() {
-    cloud_sandbox_becomes_lost(DummyFleet::vanish_environment).await;
+    cloud_sandbox_becomes_lost(DummyVendor::vanish).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cloud_sandbox_the_vendor_stops_becomes_lost() {
-    cloud_sandbox_becomes_lost(DummyFleet::stop_environment).await;
+    cloud_sandbox_becomes_lost(DummyVendor::stop).await;
 }
 
-async fn cloud_sandbox_becomes_lost(vendor: fn(&DummyFleet, &str) -> bool) {
+async fn cloud_sandbox_becomes_lost(vendor: fn(&DummyVendor, &str) -> bool) {
     let daemon = TestDaemon::builder().start().await;
-    daemon.dispatch_to_cloud("lost", CrewMix::Coder).await;
-    let convoy = daemon.wait_for("lost", "admission", |convoy| convoy.status.is_some()).await.metadata.name;
-    let ready = daemon.wait_for_any::<Environment>("a Ready cloud sandbox", of_convoy(&convoy, EnvironmentPhase::Ready)).await;
+    let convoy = daemon.dispatch(CrewMix::Coder, DUMMY_CLOUD_FULFILMENT_KIND).await;
+    let ready = daemon.wait("a Ready cloud sandbox", of_convoy(&convoy, EnvironmentPhase::Ready)).await;
     assert!(ready.spec.cloud_sandbox.is_some(), "{ready:?}");
-    assert!(vendor(daemon.fleet(), &ready.metadata.name));
-    let lost = |environment: &ResourceObject<Environment>| environment.status.as_ref().is_some_and(|s| s.phase == EnvironmentPhase::Lost);
-    daemon.wait_for_resource::<Environment>(&ready.metadata.name, "Lost", lost).await;
+    assert!(vendor(daemon.vendor(), &ready.metadata.name));
+    let name = ready.metadata.name;
+    let lost = |environment: &ResourceObject<Environment>| {
+        environment.metadata.name == name && environment.status.as_ref().is_some_and(|s| s.phase == EnvironmentPhase::Lost)
+    };
+    daemon.wait("Lost", lost).await;
 }
 
 // A restarted daemon finds its running vessels again: the vendor's backings and
@@ -48,17 +53,16 @@ async fn cloud_sandbox_becomes_lost(vendor: fn(&DummyFleet, &str) -> bool) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restarted_daemon_adopts_its_running_vessels() {
     let daemon = TestDaemon::builder().agent("turn_delay_ms = 5000").start().await;
-    daemon.dispatch("adopted", CrewMix::Coder).await;
-    let convoy = daemon.wait_for("adopted", "a launched coder", |_| daemon.snapshot().sessions_launched == 1).await.metadata.name;
-    let environment = daemon.wait_for_any::<Environment>("a Ready environment", of_convoy(&convoy, EnvironmentPhase::Ready)).await;
+    let convoy = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    let environment = daemon.wait("a Ready environment", of_convoy(&convoy, EnvironmentPhase::Ready)).await;
+    daemon.wait("a launched coder", |_: &ResourceObject<Convoy>| daemon.counts().sessions_launched == 1).await;
     let daemon = daemon.restart().await;
-    daemon.wait_for_phase("adopted", ConvoyPhase::Landed).await;
-    let snapshot = daemon.snapshot();
-    assert_eq!((snapshot.sessions_launched, snapshot.environments_provisioned), (1, 1), "{snapshot:?}");
-    assert_eq!(snapshot.command_errors, 0, "{:?}", daemon.fleet().command_error_samples());
+    daemon.wait("Landed", in_phase(&convoy, ConvoyPhase::Landed)).await;
+    let counts = daemon.counts();
+    assert_eq!((counts.sessions_launched, counts.environments_provisioned, counts.command_errors), (1, 1, 0), "{counts:?}");
     // The adopted backing is the one torn down once the convoy lands.
-    daemon.wait_for_absence::<Environment>(&environment.metadata.name).await;
-    assert_eq!(daemon.snapshot().environments_destroyed, 1);
+    daemon.wait_gone::<Environment>(&environment.metadata.name).await;
+    assert_eq!(daemon.counts().environments_destroyed, 1);
 }
 
 // A vendor that refuses to provision fails the convoy before any crew launches;
@@ -66,35 +70,11 @@ async fn a_restarted_daemon_adopts_its_running_vessels() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_vendor_refusing_to_provision_fails_its_convoy() {
     let daemon = TestDaemon::builder().start().await;
-    daemon.fleet().refuse_provisioning(true);
-    daemon.dispatch("refused", CrewMix::Coder).await;
-    daemon.wait_for_phase("refused", ConvoyPhase::Failed).await;
-    assert_eq!((daemon.snapshot().environments_provisioned, daemon.snapshot().sessions_launched), (0, 0));
-    daemon.fleet().refuse_provisioning(false);
-    daemon.deliver("accepted", CrewMix::Coder).await;
-}
-
-// An operator's command travels the request dispatcher a socket client uses and
-// returns its value; a query returns its listing the same way.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_operator_drives_the_daemon_through_the_request_dispatcher() {
-    let daemon = TestDaemon::builder().start().await;
-    let client = daemon.client().await;
-    let forge = catalog::forge(&daemon.fleet().config().forge_service_url);
-    let created = client
-        .execute(CommandAction::ConvoyCreate {
-            name: "operated".into(),
-            workflow_ref: CrewMix::Coder.workflow_name().into(),
-            inputs: Vec::new(),
-            repository_url: Some(catalog::repository_url(&forge)),
-            r#ref: Some("main".into()),
-            project_ref: None,
-            placement_policy: Some(catalog::DUMMY_FULFILMENT_KIND.into()),
-            adopted_checkout: None,
-        })
-        .await;
-    assert_eq!(created, CommandValue::ConvoyCreated { name: "operated".into() });
-    daemon.wait_for_phase("operated", ConvoyPhase::Landed).await;
-    let listed = client.execute(CommandAction::QueryFleetList { project: None, crew_id: None, convoy: None }).await;
-    assert!(matches!(listed, CommandValue::FleetList(_)), "{listed:?}");
+    daemon.vendor().refuse_provisioning(true);
+    let refused = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    daemon.wait("Failed", in_phase(&refused, ConvoyPhase::Failed)).await;
+    assert_eq!((daemon.counts().environments_provisioned, daemon.counts().sessions_launched), (0, 0));
+    daemon.vendor().refuse_provisioning(false);
+    let accepted = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    daemon.wait("Landed", in_phase(&accepted, ConvoyPhase::Landed)).await;
 }

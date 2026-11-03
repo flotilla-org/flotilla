@@ -9,19 +9,26 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_daemon_testkit::daemon::{DiscoveryFactory, TestDaemon, NAMESPACE};
+use flotilla_config::{ConfigStore, DaemonConfig};
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_daemon::{
+    dummy_fleet::{attach_dummy_fleet, install_dummy_fleet},
+    runtime::{DaemonRuntime, RuntimeOptions},
+};
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery_api::detectors::{parse_first_dotted_version, CommandDetector};
 use flotilla_discovery_testkit::fake_discovery_with_runner;
 use flotilla_fake_forge::{FakeForge, ForgeSettings, InProcessClient, NewPull, RepoRef, SystemClock};
 use flotilla_forgejo_providers::factories::{change_request::ForgejoChangeRequestFactory, issue_tracker::ForgejoIssueProviderFactory};
 use flotilla_github_providers::factories::{change_request::GitHubChangeRequestFactory, issue_tracker::GitHubIssueProviderFactory};
-use flotilla_protocol::{commands::CommandValue, Command, CommandAction, IssueSource, RepoSelector};
+use flotilla_protocol::{commands::CommandValue, Command, CommandAction, DaemonEvent, HostName, IssueSource, RepoSelector};
 use flotilla_provider_runtime::{ChannelLabel, CommandOutput, CommandRunner, HttpClient};
 use flotilla_resources::{
     CredentialConsumer, CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, Forge, ForgeKind, ForgeSpec, InputMeta,
     Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec,
 };
 
+const NAMESPACE: &str = "flotilla";
 const LAB_TOKEN: &str = "lab-daemon-token";
 
 /// Every request that reached a real forge, by transport.
@@ -106,16 +113,24 @@ impl CommandRunner for ForgeCommands {
 }
 
 struct CopiedStoreDaemon {
-    daemon: TestDaemon,
+    daemon: Arc<InProcessDaemon>,
     outbound: Arc<Outbound>,
     repositories: Vec<RepositoryKey>,
-    _token: tempfile::TempDir,
+    _runtime: DaemonRuntime,
+    _dir: tempfile::TempDir,
 }
 
 impl CopiedStoreDaemon {
     async fn start() -> Self {
-        let token_dir = tempfile::tempdir().expect("tempdir");
-        let token = token_dir.path().join("lab-token");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        std::fs::write(
+            config_dir.join("daemon.toml"),
+            "machine_id = \"rehearsal\"\n\n[credentials.forgejo]\nlab = \"lab-daemon\"\n\n[dummy_fleet]\n",
+        )
+        .expect("daemon.toml");
+        let token = dir.path().join("lab-token");
         std::fs::write(&token, format!("{LAB_TOKEN}\n")).expect("token");
 
         let fake = Arc::new(FakeForge::new("https://lab.example", Arc::new(SystemClock)));
@@ -136,31 +151,39 @@ impl CopiedStoreDaemon {
         let outbound = Arc::new(Outbound::default());
         let http: Arc<dyn HttpClient> =
             Arc::new(ForgeHttp { outbound: Arc::clone(&outbound), forge: InProcessClient::new(Arc::clone(&fake)) });
-        let commands = Arc::new(ForgeCommands { outbound: Arc::clone(&outbound) });
-        // The host's real forge providers, reached through recording stand-ins.
-        let discovery: DiscoveryFactory = Arc::new(move |_home| {
-            let mut discovery = fake_discovery_with_runner(false, Arc::clone(&commands) as Arc<dyn CommandRunner>);
-            Arc::get_mut(&mut discovery.host_detectors).expect("unshared detectors").push(Box::new(CommandDetector::new(
-                "gh",
-                &["--version"],
-                parse_first_dotted_version,
-            )));
-            discovery.factories.change_requests =
-                vec![Box::new(GitHubChangeRequestFactory), Box::new(ForgejoChangeRequestFactory::new(Arc::clone(&http)))];
-            discovery.factories.issue_trackers =
-                vec![Box::new(GitHubIssueProviderFactory), Box::new(ForgejoIssueProviderFactory::new(Arc::clone(&http)))];
-            discovery.http = Arc::clone(&http);
-            discovery
-        });
-        let daemon = TestDaemon::builder()
-            .host("rehearsal")
-            .settings("[credentials.forgejo]\nlab = \"lab-daemon\"\n")
-            .catalog(false)
-            .discovery(discovery)
-            .start()
-            .await;
+        let mut discovery = fake_discovery_with_runner(false, Arc::new(ForgeCommands { outbound: Arc::clone(&outbound) }));
+        Arc::get_mut(&mut discovery.host_detectors).expect("unshared detectors").push(Box::new(CommandDetector::new(
+            "gh",
+            &["--version"],
+            parse_first_dotted_version,
+        )));
+        discovery.factories.change_requests =
+            vec![Box::new(GitHubChangeRequestFactory), Box::new(ForgejoChangeRequestFactory::new(Arc::clone(&http)))];
+        discovery.factories.issue_trackers =
+            vec![Box::new(GitHubIssueProviderFactory), Box::new(ForgejoIssueProviderFactory::new(Arc::clone(&http)))];
+        discovery.http = http;
 
-        let backend = daemon.backend();
+        let config = Arc::new(ConfigStore::with_base(config_dir));
+        let daemon_config: DaemonConfig = config.load_daemon_config().expect("daemon config");
+        let fleet = install_dummy_fleet(&daemon_config, &mut discovery).expect("dummy fleet configured");
+        let daemon = InProcessDaemon::new(
+            vec![],
+            Arc::clone(&config),
+            discovery,
+            HostName::new("rehearsal"),
+            Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+        )
+        .await;
+        attach_dummy_fleet(&fleet, &daemon).expect("attach fleet");
+        let options = RuntimeOptions {
+            namespace: NAMESPACE.into(),
+            heartbeat_interval: Duration::from_secs(5),
+            controller_resync_interval: Duration::from_millis(200),
+            ..RuntimeOptions::default()
+        };
+        let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options).await.expect("runtime");
+
+        let backend = daemon.resource_backend();
         let github = ForgeSpec::builder()
             .forge_id("github".into())
             .kind(ForgeKind::Github)
@@ -218,13 +241,24 @@ impl CopiedStoreDaemon {
             )
             .await
             .expect("Project");
-        Self { daemon, outbound, repositories, _token: token_dir }
+        Self { daemon, outbound, repositories, _runtime: runtime, _dir: dir }
     }
 
     async fn run(&self, action: CommandAction, repository: &RepositoryKey) -> CommandValue {
-        self.daemon
-            .execute_command(Command::builder().action(action).context_repo(RepoSelector::Repository(repository.clone())).build())
-            .await
+        let mut events = self.daemon.subscribe();
+        let command = Command::builder().action(action).context_repo(RepoSelector::Repository(repository.clone())).build();
+        let id = self.daemon.execute(command).await.expect("admit command");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let DaemonEvent::CommandFinished { command_id, result, .. } = events.recv().await.expect("command event") {
+                    if command_id == id {
+                        return result;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("command finishes")
     }
 }
 

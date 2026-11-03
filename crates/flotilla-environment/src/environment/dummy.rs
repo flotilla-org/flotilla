@@ -13,14 +13,13 @@
 //! The provider is selected like any other instance: placement freezes
 //! [`DUMMY_ENVIRONMENT_INSTANCE`] for a Docker kind on a host where it is the
 //! only per-vessel provider. A cloud-sandbox-class instance,
-//! [`DUMMY_CLOUD_ENVIRONMENT_INSTANCE`], stands in for a sandbox vendor: it
-//! realises cloud-sandbox kinds and reports a provider descriptor for each
-//! backing, as every cloud backing must.
+//! [`DUMMY_CLOUD_ENVIRONMENT_INSTANCE`], stands in for a sandbox vendor and
+//! realises cloud-sandbox kinds.
 //!
 //! Tests act as the vendor through [`DummyEnvironmentProvider::vanish`],
-//! [`DummyEnvironmentProvider::stop`], [`DummyEnvironmentProvider::resume`]
-//! and [`DummyEnvironmentProvider::refuse_provisioning`]: what the provider
-//! then reports is what the daemon observes, with no stored record touched.
+//! [`DummyEnvironmentProvider::stop`] and
+//! [`DummyEnvironmentProvider::refuse_provisioning`]: the provider then reports
+//! only what the vendor did, and no stored record is touched.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -100,7 +99,6 @@ pub type DummyEnvironmentCleanup = Arc<dyn Fn(&str) + Send + Sync>;
 pub struct DummyEnvironmentProvider {
     behaviour: DummyEnvironmentBehaviour,
     class: DummyEnvironmentClass,
-    instance: String,
     cleanup: Option<DummyEnvironmentCleanup>,
     owner: Arc<()>,
     handles: Mutex<HashMap<EnvironmentId, Arc<DummyEnvironment>>>,
@@ -115,7 +113,6 @@ impl DummyEnvironmentProvider {
         Self {
             behaviour,
             class: DummyEnvironmentClass::Container,
-            instance: DUMMY_ENVIRONMENT_INSTANCE.into(),
             cleanup: None,
             owner: Arc::new(()),
             handles: Mutex::new(HashMap::new()),
@@ -126,9 +123,9 @@ impl DummyEnvironmentProvider {
         }
     }
 
-    /// A cloud-sandbox-class instance registered as `instance`.
-    pub fn cloud(behaviour: DummyEnvironmentBehaviour, instance: &str) -> Self {
-        Self { class: DummyEnvironmentClass::CloudSandbox, instance: instance.into(), ..Self::new(behaviour) }
+    /// A cloud-sandbox-class instance: it realises cloud-sandbox kinds.
+    pub fn cloud(behaviour: DummyEnvironmentBehaviour) -> Self {
+        Self { class: DummyEnvironmentClass::CloudSandbox, ..Self::new(behaviour) }
     }
 
     pub fn with_cleanup(mut self, cleanup: DummyEnvironmentCleanup) -> Self {
@@ -170,12 +167,6 @@ impl DummyEnvironmentProvider {
             .is_some_and(|handle| handle.vendor.compare_exchange(RUNNING, STOPPED, Ordering::AcqRel, Ordering::Acquire).is_ok())
     }
 
-    /// The vendor resumes a backing it stopped.
-    pub fn resume(&self, environment: &str) -> bool {
-        self.backing(environment)
-            .is_some_and(|handle| handle.vendor.compare_exchange(STOPPED, RUNNING, Ordering::AcqRel, Ordering::Acquire).is_ok())
-    }
-
     /// While set, the vendor refuses to realise any new backing.
     pub fn refuse_provisioning(&self, refuse: bool) {
         self.refusing.store(refuse, Ordering::Release);
@@ -188,18 +179,6 @@ impl DummyEnvironmentProvider {
             vanished: self.vanished.load(Ordering::Relaxed),
             live: self.handles().values().filter(|handle| handle.held()).count() as u64,
         }
-    }
-
-    fn descriptor(&self, image: &str) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
-        (self.class == DummyEnvironmentClass::CloudSandbox).then(|| flotilla_resources::EnvironmentProviderDescriptor {
-            instance: self.instance.clone(),
-            kind: self.kind(),
-            image_digest: dummy_image_id(image),
-            host_version: "dummy".into(),
-            module_version: "dummy".into(),
-            capabilities: self.capabilities(),
-            agent_connection: None,
-        })
     }
 }
 
@@ -235,7 +214,7 @@ impl EnvironmentProvider for DummyEnvironmentProvider {
         super::ProviderKind::new(class, "dummy")
     }
     fn capabilities(&self) -> super::ProviderCapabilities {
-        Self::capability_declaration(self.class)
+        Self::capability_declaration()
     }
 
     fn legacy_input(&self) -> Option<EnvironmentInput> {
@@ -288,8 +267,6 @@ impl EnvironmentProvider for DummyEnvironmentProvider {
         let handle = Arc::new(DummyEnvironment {
             container_name: format!("flotilla-dummy-{id}"),
             local_image_id: dummy_image_id(&image),
-            descriptor: self.descriptor(&image),
-            capabilities: self.capabilities(),
             image: ImageId::new(image),
             mounts: opts.provisioned_mounts,
             environment,
@@ -366,8 +343,6 @@ struct DummyEnvironment {
     vendor: AtomicU8,
     cleanup: Option<DummyEnvironmentCleanup>,
     destroyed_count: Arc<AtomicU64>,
-    descriptor: Option<flotilla_resources::EnvironmentProviderDescriptor>,
-    capabilities: super::ProviderCapabilities,
     id: EnvironmentId,
     image: ImageId,
     local_image_id: String,
@@ -387,10 +362,10 @@ impl DummyEnvironment {
 #[async_trait]
 impl ProvisionedEnvironment for DummyEnvironment {
     fn provider_descriptor(&self) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
-        self.descriptor.clone()
+        None
     }
     fn capabilities(&self) -> super::ProviderCapabilities {
-        self.capabilities.clone()
+        DummyEnvironmentProvider::capability_declaration()
     }
     fn backing_id(&self) -> &str {
         &self.container_name
@@ -648,20 +623,14 @@ impl super::EnvironmentDetection for DummyEnvironmentProvider {
 }
 
 impl DummyEnvironmentProvider {
-    fn capability_declaration(class: DummyEnvironmentClass) -> super::ProviderCapabilities {
-        // A sandbox vendor's guest shares nothing with the daemon's host.
-        let (material_modes, checkout_strategies) = match class {
-            DummyEnvironmentClass::Container => (
-                vec![super::MaterialMode::Frozen, super::MaterialMode::Pushed, super::MaterialMode::Shared],
-                vec![super::CheckoutStrategy::HostWorktree, super::CheckoutStrategy::HostClone, super::CheckoutStrategy::CloneInVessel],
-            ),
-            DummyEnvironmentClass::CloudSandbox => {
-                (vec![super::MaterialMode::Frozen, super::MaterialMode::Pushed], vec![super::CheckoutStrategy::CloneInVessel])
-            }
-        };
+    fn capability_declaration() -> super::ProviderCapabilities {
         super::ProviderCapabilities {
-            material_modes,
-            checkout_strategies,
+            material_modes: vec![super::MaterialMode::Frozen, super::MaterialMode::Pushed, super::MaterialMode::Shared],
+            checkout_strategies: vec![
+                super::CheckoutStrategy::HostWorktree,
+                super::CheckoutStrategy::HostClone,
+                super::CheckoutStrategy::CloneInVessel,
+            ],
             workspace_root: "/workspace".into(),
             reference_root: Some("/ref/repo".into()),
             fallback_runner: true,
@@ -728,11 +697,11 @@ mod tests {
     }
 
     // Behaviour: a test acting as the vendor changes only what the provider
-    // reports. A vanished backing leaves the inventory, reports eviction and
-    // ends its children; a stopped one stays listed until resumed; a refusing
-    // vendor realises nothing new; the counts follow each.
+    // reports. A vanished backing leaves the inventory, reports it gone and
+    // ends its children; a stopped one stays listed and reports it stopped; a
+    // refusing vendor realises nothing new; the counts follow each.
     #[tokio::test]
-    async fn the_vendor_vanishes_stops_resumes_and_refuses_backings() {
+    async fn the_vendor_vanishes_stops_and_refuses_backings() {
         let removed = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&removed);
         let provider = DummyEnvironmentProvider::new(DummyEnvironmentBehaviour::default())
@@ -751,9 +720,7 @@ mod tests {
             super::super::ObservationState::Stopped { cause: super::super::StoppedCause::PausedByProvider }
         );
         assert_eq!(provider.list().await.expect("list").len(), 1, "a stopped backing stays in the inventory");
-        assert!(provider.resume("paused"));
-        assert!(!provider.resume("paused"), "only a stopped backing resumes");
-        assert_eq!(paused.observe().await.state, super::super::ObservationState::Running);
+        assert!(!provider.stop("paused"), "a stopped backing stops once");
 
         provider.refuse_provisioning(true);
         assert!(provision(&provider, "refused").await.is_err());
@@ -765,11 +732,11 @@ mod tests {
         assert_eq!(provider.counts(), DummyEnvironmentCounts { provisioned: 3, destroyed: 1, vanished: 1, live: 1 });
     }
 
-    // A cloud-class vendor takes cloud sandbox inputs, offers no local image
-    // cache or legacy input, and describes each backing.
+    // A cloud-class vendor takes cloud sandbox inputs and offers no local image
+    // cache or legacy input.
     #[tokio::test]
-    async fn a_cloud_vendor_realises_described_sandboxes() {
-        let provider = DummyEnvironmentProvider::cloud(DummyEnvironmentBehaviour::default(), DUMMY_CLOUD_ENVIRONMENT_INSTANCE);
+    async fn a_cloud_vendor_realises_sandboxes() {
+        let provider = DummyEnvironmentProvider::cloud(DummyEnvironmentBehaviour::default());
         assert!(provider.prepare(&docker_spec("dummy/crew:latest"), &PrepareOpts::default()).await.is_err());
         let spec = EnvironmentSpec {
             cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
@@ -783,13 +750,10 @@ mod tests {
             ..Default::default()
         };
         let prepared = provider.prepare(&spec, &PrepareOpts::default()).await.expect("prepare");
-        let handle = provider.provision(EnvironmentId::new("env-cloud"), &prepared, Default::default()).await.expect("provision");
-        let descriptor = handle.provider_descriptor().expect("a cloud backing is described");
-        assert_eq!(descriptor.instance, DUMMY_CLOUD_ENVIRONMENT_INSTANCE);
-        assert_eq!(descriptor.kind.class, super::super::EnvironmentClass::CloudSandbox);
+        provider.provision(EnvironmentId::new("env-cloud"), &prepared, Default::default()).await.expect("provision");
+        assert_eq!(provider.kind().class, super::super::EnvironmentClass::CloudSandbox);
         assert!(provider.legacy_input().is_none());
         assert!(provider.local_image_cache().is_none());
-        assert_eq!(provider.capabilities().checkout_strategies, vec![super::super::CheckoutStrategy::CloneInVessel]);
     }
 
     #[test]

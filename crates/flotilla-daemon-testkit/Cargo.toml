@@ -24,7 +24,10 @@ flotilla-transport = { path = "../flotilla-transport" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
+toml = "0.8"
 uuid = { workspace = true, features = ["v4"] }
 
 flotilla-daemon = { path = "../flotilla-daemon" }

@@ -33,7 +33,7 @@ impl DummyEnvironmentFactory {
 
     /// The cloud-sandbox vendor, registered as [`DUMMY_CLOUD_ENVIRONMENT_INSTANCE`].
     pub fn cloud(behaviour: DummyEnvironmentBehaviour, cleanup: DummyEnvironmentCleanup) -> Self {
-        let provider = DummyEnvironmentProvider::cloud(behaviour, DUMMY_CLOUD_ENVIRONMENT_INSTANCE).with_cleanup(cleanup);
+        let provider = DummyEnvironmentProvider::cloud(behaviour).with_cleanup(cleanup);
         Self { instance: DUMMY_CLOUD_ENVIRONMENT_INSTANCE, provider: Arc::new(provider) }
     }
 
@@ -45,11 +45,6 @@ impl DummyEnvironmentFactory {
     /// Act as the vendor: see [`DummyEnvironmentProvider::stop`].
     pub fn stop(&self, environment: &str) -> bool {
         self.provider.stop(environment)
-    }
-
-    /// Act as the vendor: see [`DummyEnvironmentProvider::resume`].
-    pub fn resume(&self, environment: &str) -> bool {
-        self.provider.resume(environment)
     }
 
     /// Act as the vendor: see [`DummyEnvironmentProvider::refuse_provisioning`].

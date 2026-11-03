@@ -2562,6 +2562,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
+ "toml 0.8.23",
  "tower",
  "tracing",
  "tracing-subscriber",
@@ -2608,8 +2609,11 @@ dependencies = [
  "flotilla-store-memory",
  "flotilla-store-sqlite",
  "flotilla-transport",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
+ "toml 0.8.23",
  "uuid",
 ]
 
