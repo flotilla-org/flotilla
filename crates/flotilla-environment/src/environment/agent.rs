@@ -284,6 +284,10 @@ impl AgentRunner {
             return Ok(client.clone());
         }
         let client = self.connector.connect().await?;
+        // No tag means this handle has configured nothing: every configuration
+        // change connects through here first, so local configuration only ever
+        // builds on what the agent held. Staging configuration before the first
+        // connect would be overwritten by that adoption.
         if state.etag.is_none() {
             state.adopt(client.as_ref()).await?;
         } else {
@@ -501,6 +505,9 @@ impl AgentRunner {
             identity.update(destination.as_os_str().as_encoded_bytes());
         }
         let identity = format!("{:x}", identity.finalize());
+        // An unchanged layer needs nothing, and neither does an empty one: it
+        // has no `current` to name it, so no record either. Both are this
+        // handle's published layer from here on.
         if layer.as_ref().is_some_and(|layer| layer.content == identity) || (entries.is_empty() && links.is_empty()) {
             *layer = Some(PublishedLayer { sources, content: identity });
             return Ok(());

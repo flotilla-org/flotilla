@@ -415,8 +415,11 @@ async fn reconcile_cloud_environment(
         Some(handle) => match handle.observe().await.state {
             ObservationState::Running => {
                 if cached.is_none() {
-                    let image = realised_image(environment);
-                    if let Err(error) = super::provider_path::adopt(state, &environment.metadata.name, &environment.spec, image).await {
+                    let adopted = match realised_image(environment) {
+                        Some(image) => super::provider_path::adopt(state, &environment.metadata.name, &environment.spec, image).await,
+                        None => Err("its Ready status records no realised image".to_string()),
+                    };
+                    if let Err(error) = adopted {
                         record_cloud_health(
                             state,
                             namespace,
@@ -473,12 +476,15 @@ async fn reconcile_cloud_environment(
 }
 
 /// The image the backing runs, as its Ready status recorded it at provision.
-fn realised_image(environment: &ResourceObject<Environment>) -> &str {
-    let status = environment.status.as_ref();
+/// A backing with none recorded is not adopted: its handle would report an
+/// unknown image to anything comparing it with the desired one (#3610).
+fn realised_image(environment: &ResourceObject<Environment>) -> Option<&str> {
+    let status = environment.status.as_ref()?;
     status
-        .and_then(|status| status.image_ref.as_deref())
-        .or_else(|| status.and_then(|status| status.provider_descriptor.as_ref()).map(|descriptor| descriptor.image_digest.as_str()))
-        .unwrap_or_default()
+        .image_ref
+        .as_deref()
+        .or_else(|| status.provider_descriptor.as_ref().map(|descriptor| descriptor.image_digest.as_str()))
+        .filter(|image| !image.is_empty())
 }
 
 async fn record_cloud_health(

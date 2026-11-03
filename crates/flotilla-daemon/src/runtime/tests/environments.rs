@@ -927,6 +927,16 @@ async fn a_composed_image_cloud_vessel_is_adopted_after_a_restart() {
     let counted = (Arc::clone(&prepares), Arc::clone(&provisions));
     stand_in.restart(move |inner| Arc::new(CountingProvider { inner, prepares: counted.0, provisions: counted.1 })).await;
     let state = Arc::clone(&stand_in.state);
+    // A Ready status that records no realised image gives adoption no image to
+    // name the vessel by: refused, with the reason, until it does.
+    let current = environments.get(&name).await.expect("environment");
+    let unrecorded = EnvironmentStatus { image_ref: None, provider_descriptor: None, ..status.clone() };
+    environments.update_status(&name, &current.metadata.resource_version, &unrecorded).await.expect("unrecorded image");
+    let refused = reconcile_provisioned_environments(&state, NAMESPACE).await.expect_err("no realised image");
+    assert!(refused.contains("no realised image"), "{refused}");
+    assert!(state.daemon.environment_registry_for_environment(&EnvironmentId::new(&name)).is_none());
+    let current = environments.get(&name).await.expect("environment");
+    environments.update_status(&name, &current.metadata.resource_version, &status).await.expect("recorded image");
     reconcile_provisioned_environments(&state, NAMESPACE).await.expect("one adoption pass");
 
     assert_eq!((prepares.load(Ordering::SeqCst), provisions.load(Ordering::SeqCst)), (0, 0), "adoption never prepares or provisions");

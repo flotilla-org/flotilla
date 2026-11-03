@@ -30,6 +30,8 @@ pub(crate) struct Agent {
     inwards: Mutex<BTreeMap<String, Endpoint>>,
     stopped: AtomicBool,
     writes: std::sync::atomic::AtomicUsize,
+    /// How many more writes succeed; `None` for no limit.
+    write_allowance: Mutex<Option<usize>>,
 }
 
 impl MemoryAgent {
@@ -49,6 +51,11 @@ impl MemoryAgent {
     /// How many files have been written through the agent.
     pub(crate) fn writes(&self) -> usize {
         self.0.writes.load(Ordering::SeqCst)
+    }
+    /// Refuse every write after the next `allowance`, as a link lost mid-push does;
+    /// `None` lifts the limit.
+    pub(crate) fn allow_writes(&self, allowance: Option<usize>) {
+        *self.0.write_allowance.lock().expect("write allowance") = allowance;
     }
     /// A connection to the agent, whether or not it answers.
     pub(crate) fn client(&self) -> Arc<dyn AgentClient> {
@@ -225,6 +232,12 @@ impl AgentClient for Agent {
     async fn write(&self, path: &Path, mut content: Box<dyn tokio::io::AsyncRead + Unpin + Send>, options: &FileOptions) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         self.live()?;
+        if let Some(allowance) = self.write_allowance.lock().expect("write allowance").as_mut() {
+            if *allowance == 0 {
+                return Err(io::Error::new(io::ErrorKind::ConnectionReset, "memory agent refuses further writes"));
+            }
+            *allowance -= 1;
+        }
         self.writes.fetch_add(1, Ordering::SeqCst);
         parents(path, options).await?;
         if options.exclusive && tokio::fs::symlink_metadata(path).await.is_ok() {
