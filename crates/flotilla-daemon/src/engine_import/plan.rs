@@ -18,7 +18,8 @@ pub enum Plan {
 
 /// Every kind the old store has held, by kind name, with its plan. A retired kind the store no
 /// longer registers is still listed by a previous-generation daemon; while it is in
-/// `RETIRED_RESOURCE_KINDS` (one generation, ADR 0047) its rows are counted as dropped.
+/// `RETIRED_RESOURCE_KINDS` (one generation, ADR 0047) its rows are counted as dropped, or
+/// converted by an importer that keeps a decoder of its own.
 pub const PLAN: &[(&str, Plan)] = &[
     ("Message", Plan::Imported("Message import (#3317)")),
     ("Environment", Plan::Imported("lifecycle import (#3629)")),
@@ -49,12 +50,10 @@ pub const PLAN: &[(&str, Plan)] = &[
     ("WorkflowTemplate", Plan::Imported("definitions import (#3824 layer 2b)")),
     ("Project", Plan::Imported("definitions import (#3824 layer 3b)")),
     ("Repository", Plan::Imported("Repository import (#3824 layer 3a)")),
-    // Mapped by the placement import (#3824 layer 4a), but the engine store holds no FulfilmentKind until
-    // a layer serves it from there.
-    ("FulfilmentKind", Plan::Moving("the layer that serves FulfilmentKind from the engine")),
+    ("FulfilmentKind", Plan::Imported("placement import (#3824 layer 4b-iv)")),
     ("Host", Plan::Imported("hosts")),
-    // Each policy becomes a FulfilmentKind of its name.
-    ("PlacementPolicy", Plan::Moving("the layer that serves FulfilmentKind from the engine")),
+    // Retired; each policy without a kind of its name becomes one.
+    ("PlacementPolicy", Plan::Imported("placement import (#3824 layer 4b-iv)")),
     ("ChangeRequest", Plan::Imported("forge observations import (#3824 layer 5)")),
     ("Issue", Plan::Imported("forge observations import (#3824 layer 5)")),
     ("ForgeRead", Plan::Imported("forge observations import (#3824 layer 5)")),
@@ -97,12 +96,19 @@ mod tests {
         kinds.dedup();
         assert_eq!(kinds.len(), PLAN.len(), "a kind is planned twice");
         for retired in RETIRED_RESOURCE_KINDS {
-            assert!(matches!(plan(retired.plural), Some((_, Plan::Retired(_)))), "{} keeps a drop decoder, so it is retired", retired.kind);
+            assert!(
+                matches!(plan(retired.plural), Some((_, Plan::Retired(_) | Plan::Imported(_)))),
+                "{} keeps a drop decoder, so it is retired or its importer keeps a decoder of its own",
+                retired.kind
+            );
         }
         for (kind, plan) in PLAN {
-            if !REGISTERED_RESOURCE_KINDS.iter().any(|entry| entry.kind == *kind) {
-                assert!(matches!(plan, Plan::Retired(_)), "{kind} is not registered, so only a retired kind may be");
-            }
+            let registered = REGISTERED_RESOURCE_KINDS.iter().any(|entry| entry.kind == *kind);
+            let decoded = RETIRED_RESOURCE_KINDS.iter().any(|retired| retired.kind == *kind);
+            assert!(
+                registered || matches!(plan, Plan::Retired(_)) || (decoded && matches!(plan, Plan::Imported(_))),
+                "{kind} is not registered, so it is retired or imported by a decoder of its own"
+            );
         }
     }
 

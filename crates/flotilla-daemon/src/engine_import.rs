@@ -73,9 +73,6 @@ fn record_name(document: &Value) -> String {
 const UNREADABLE: &str = "flotilla.work/unreadable-body";
 
 fn decode<R: Resource>(document: &Value) -> Result<ResourceObject<R>, String> {
-    if let Some(error) = document.get(UNREADABLE).and_then(Value::as_str) {
-        return Err(format!("its stored body is not JSON: {error}"));
-    }
     let object = K8sResourceObject::<R>::deserialize(document).map_err(|error| error.to_string())?;
     ResourceObject::from_k8s_object(object).map_err(|error| error.to_string())
 }
@@ -134,10 +131,30 @@ impl Source {
         target: &impl ImportTarget,
         report: &mut ImportReport,
     ) -> Vec<Decoded<R>> {
+        self.owned_as(plural, namespace, kind, target, report, decode::<R>)
+            .into_iter()
+            .map(|(namespace, object, home)| Decoded { namespace, object, home })
+            .collect()
+    }
+
+    /// [`Self::owned`], each row decoded by `decode`: a retired kind's, by the type its importer keeps.
+    fn owned_as<T>(
+        &self,
+        plural: &str,
+        namespace: Option<&str>,
+        kind: &'static str,
+        target: &impl ImportTarget,
+        report: &mut ImportReport,
+        decode: impl Fn(&Value) -> Result<T, String>,
+    ) -> Vec<(String, T, String)> {
         let mut decoded = Vec::new();
         for row in self.of(plural, namespace) {
-            match decode::<R>(&row.document) {
-                Ok(object) => decoded.push(Decoded { namespace: row.namespace.clone(), object, home: row.home.clone() }),
+            let object = match row.document.get(UNREADABLE).and_then(Value::as_str) {
+                Some(error) => Err(format!("its stored body is not JSON: {error}")),
+                None => decode(&row.document),
+            };
+            match object {
+                Ok(object) => decoded.push((row.namespace.clone(), object, row.home.clone())),
                 Err(error) if target.imports(&row.home) => report.refused.push(flotilla_provisioning::engine::import::ImportRefusal {
                     kind,
                     record: record_name(&row.document),
@@ -183,6 +200,7 @@ pub const STEPS: &[Step] = &[
     Step { name: "definitions", kinds: &definitions::KINDS, run: definitions::definitions },
     Step { name: "repositories", kinds: &["repositories"], run: records::repositories },
     Step { name: "hosts", kinds: &["hosts"], run: records::hosts },
+    Step { name: "fulfilment kinds", kinds: &records::PLACEMENT_KINDS, run: records::placement },
     Step { name: "artifacts", kinds: &["artifacts"], run: records::artifacts },
     Step { name: "forge observations", kinds: &observations::KINDS, run: observations::observations },
     Step { name: "access deliveries", kinds: &["accessdeliveries"], run: records::access_deliveries },

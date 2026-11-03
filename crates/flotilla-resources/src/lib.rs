@@ -82,7 +82,7 @@ pub mod message;
 mod message_inbox;
 mod message_migration;
 #[doc(hidden)]
-pub mod placement_policy;
+pub mod placement;
 mod platform;
 #[doc(hidden)]
 pub mod prepared_snapshot;
@@ -192,11 +192,7 @@ pub use manifest_root::{
     DocumentKey, DocumentPhase, DocumentState, ManifestRoot, ManifestRootSpec, ManifestRootStatus, ManifestRootStatusPatch, Resolution,
     ResolutionAction, ResolutionOutcome,
 };
-pub use placement_policy::{
-    CloudSandboxCheckout, CloudSandboxPerVesselPlacementPolicySpec, DockerCheckoutStrategy, DockerImagePullPolicy,
-    DockerPerVesselPlacementPolicySpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, PlacementImageSource,
-    PlacementPolicy, PlacementPolicySpec, ProviderRequirements, DOCKER_POLICY_NAME_PREFIX,
-};
+pub use placement::{DockerImagePullPolicy, PlacementImageSource, DOCKER_POLICY_NAME_PREFIX};
 pub use platform::Platform;
 pub use prepared_snapshot::{content_hash, is_prepared_snapshot, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND};
 pub use principal_attention::{
@@ -281,7 +277,6 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::Event>($($argument),*);
         $callback::<$crate::Host>($($argument),*);
         $callback::<$crate::ManifestRoot>($($argument),*);
-        $callback::<$crate::PlacementPolicy>($($argument),*);
         $callback::<$crate::Project>($($argument),*);
         $callback::<$crate::Regard>($($argument),*);
         $callback::<$crate::Repository>($($argument),*);

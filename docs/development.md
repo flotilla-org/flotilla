@@ -116,9 +116,8 @@ a convoy on a fixed trial issue and waits for the end point:
 number of `[providers.NAME]` tables; `--provider` names the trial's instance when
 there is more than one, and `--image` the image pinned by digest (else the
 provider table's `image`). Placement is set up as an operator does it: a
-PlacementPolicy naming the instance and image, which the daemon turns into the
-trial's FulfilmentKind. Without a config, drydock's `local` module runs the
-vessel as a child process on this machine.
+FulfilmentKind on this host naming the instance and image. Without a config,
+drydock's `local` module runs the vessel as a child process on this machine.
 
 Issues, pull requests and git come from the fake forge on this machine, which a
 cloud vessel cannot reach. `--forge FILE` runs the trial against a real Forgejo

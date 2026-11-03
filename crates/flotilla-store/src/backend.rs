@@ -939,16 +939,6 @@ impl<T: FieldOwnedResource> TypedResolver<T> {
         self.write_spec_with_enforcement(writer, meta, resource_version, requested, T::OWNERSHIP_ENFORCEMENT).await
     }
 
-    pub(crate) async fn write_spec_rejecting_violations(
-        &self,
-        writer: &WriterIdentity,
-        meta: &InputMeta,
-        resource_version: &str,
-        requested: &T::Spec,
-    ) -> Result<ResourceObject<T>, ResourceError> {
-        self.write_spec_with_enforcement(writer, meta, resource_version, requested, OwnershipEnforcement::Enforce).await
-    }
-
     async fn write_spec_with_enforcement(
         &self,
         writer: &WriterIdentity,

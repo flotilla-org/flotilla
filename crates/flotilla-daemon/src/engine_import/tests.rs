@@ -405,7 +405,8 @@ async fn the_rehearsal_reports_what_the_import_writes() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _held = populated(dir.path()).await;
     let summary = rehearse(&Source::read(&dir.path().join(OLD_STORE), HERE).expect("source"), HERE);
-    assert_eq!(summary.staying.get("FulfilmentKind").map(|(_, rows)| *rows), Some(1), "not in the engine store at this build");
+    assert!(summary.staying.is_empty(), "every kind the old store holds here is imported: {:?}", summary.staying);
+    assert_eq!(summary.kinds["FulfilmentKind"].imported, 1);
     let written = report(&first_start(dir.path(), HERE, None).expect("imports").expect("a report"));
     assert_eq!(serde_json::to_value(&summary.kinds).expect("kinds"), written["kinds"]);
 }
@@ -448,7 +449,10 @@ fn rows_of_kinds_no_importer_reads_are_dropped_kept_or_refused_here_only() {
 #[test]
 fn every_imported_kind_has_one_importer() {
     for (kind, plan) in plan::PLAN {
-        let plural = REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.kind == *kind).map(|entry| entry.plural);
+        let plural =
+            REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.kind == *kind).map(|entry| entry.plural).or_else(|| {
+                flotilla_store::RETIRED_RESOURCE_KINDS.iter().find(|retired| retired.kind == *kind).map(|retired| retired.plural)
+            });
         let importers = STEPS.iter().filter(|step| plural.is_some_and(|plural| step.kinds.contains(&plural))).count();
         match plan {
             Plan::Imported(_) => assert_eq!(importers, 1, "{kind} is imported, so one step imports it"),
@@ -1016,4 +1020,55 @@ fn the_hosts_this_daemon_describes_import_here() {
 
     let summary = rehearse(&rows(documents()), HERE);
     assert_eq!(refused(&summary), [("Host", "kiwi"), ("Host", "b1"), ("Host", "feta")], "{summary:?}");
+}
+
+// Every FulfilmentKind and PlacementPolicy row an old store holds is imported: none stays behind
+// for the cut-over to delete. A policy, which this generation no longer registers, is read as the
+// row a previous generation stored and becomes the kind of its name.
+#[tokio::test]
+async fn placement_rows_import_as_kinds_and_none_stay_on_the_old_store() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(OLD_STORE);
+    let backend = SqliteBackend::open(&path).expect("old store");
+    own::<FulfilmentKind>(
+        &backend,
+        document(
+            "FulfilmentKind",
+            "host-direct-feta",
+            json!({"grants": ["platform:linux", "account:host", "network:host"], "host_ref": "feta", "pool": "cleat",
+                "realisation": "host_direct"}),
+            Value::Null,
+        ),
+    )
+    .await;
+    drop(backend);
+    let policy = |name: &str, spec: Value| document("PlacementPolicy", name, spec, Value::Null).to_string();
+    let docker = json!({"pool": "cleat", "docker_per_vessel": {"host_ref": "feta", "pull_policy": "always", "default_cwd": "/workspace",
+        "env": {}, "checkout": {"worktree_on_host_and_mount": {"mount_path": "/workspace"}}}});
+    let connection = rusqlite::Connection::open(&path).expect("raw");
+    for (name, spec) in [
+        ("docker-crew-image-feta", docker.clone()),
+        ("placement-snapshot-0123456789ab", json!({"pool": "cleat", "host_direct": {"host_ref": "feta", "checkout": "worktree"}})),
+        ("host-direct-feta", json!({"pool": "cleat", "host_direct": {"host_ref": "feta", "checkout": "worktree"}})),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO resource_objects (group_name, version, kind, namespace, name, resource_version, body_json) VALUES ('flotilla.work', 'v1', 'PlacementPolicy', ?1, ?2, 1, ?3)",
+                rusqlite::params![NS, name, policy(name, spec.clone())],
+            )
+            .expect("policy row");
+    }
+    drop(connection);
+
+    let source = Source::read(&path, HERE).expect("source");
+    let summary = rehearse(&source, HERE);
+    assert!(summary.refusals.is_empty(), "{:?}", summary.refusals);
+    assert!(summary.staying.is_empty(), "nothing stays on the old store: {:?}", summary.staying);
+    assert_eq!(summary.kinds["FulfilmentKind"].imported, 3, "the kind, and the two policies without one: {:?}", summary.kinds);
+
+    first_start(dir.path(), HERE, None).expect("imports").expect("a report");
+    let mut store = engine(dir.path());
+    for name in ["host-direct-feta", "docker-crew-image-feta", "placement-snapshot-0123456789ab"] {
+        assert!(holds::<flotilla_provisioning::stored::placement::FulfilmentKindDefinition>(&mut store, name, HERE), "{name}");
+    }
 }

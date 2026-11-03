@@ -68,8 +68,6 @@ impl PreparedSnapshotGarbageCollector {
         }
 
         result.placements_deleted += self.collect_placements::<FulfilmentKind>(&placement_refs).await?;
-        // ADR 0047: placement snapshots written before kinds; remove with PlacementPolicy.
-        result.placements_deleted += self.collect_placements::<PlacementPolicy>(&placement_refs).await?;
         Ok(result)
     }
 

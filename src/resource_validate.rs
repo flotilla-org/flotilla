@@ -972,7 +972,7 @@ mod tests {
 
     #[test]
     fn parses_multiple_yaml_documents() {
-        let yaml = "kind: PlacementPolicy\n---\nkind: Forge\n";
+        let yaml = "kind: FulfilmentKind\n---\nkind: Forge\n";
         assert_eq!(parse_documents(Path::new("resources.yaml"), yaml).expect("parse yaml").len(), 2);
     }
 
@@ -1288,7 +1288,7 @@ mod tests {
         let charter_dir = tempfile::tempdir().expect("local bound charter");
         let charter_file = charter_dir.path().join("policy.yaml");
         let charter_text =
-            "apiVersion: flotilla.work/v1\nkind: PlacementPolicy\nmetadata:\n  name: candidate-policy\nspec:\n  pool: default\n";
+            "apiVersion: flotilla.work/v1\nkind: FulfilmentKind\nmetadata:\n  name: candidate-kind\nspec:\n  host_ref: host\n  pool: default\n  realisation: host_direct\n";
         std::fs::write(&charter_file, charter_text).expect("charter document");
         backend
             .using::<flotilla_resources::ManifestRoot>("flotilla")
@@ -1765,7 +1765,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("flotilla-validate-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).expect("create test directory");
         let manifest = root.join("resource.yaml");
-        std::fs::write(&manifest, "kind: PlacementPolicy\n").expect("write manifest");
+        std::fs::write(&manifest, "kind: FulfilmentKind\n").expect("write manifest");
         std::os::unix::fs::symlink(&root, root.join("loop")).expect("create directory symlink");
 
         let mut files = Vec::new();

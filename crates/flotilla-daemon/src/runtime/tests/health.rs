@@ -158,52 +158,6 @@ async fn home_bound_authorship_collision_is_advisory_and_clears_after_removal() 
 }
 
 #[tokio::test]
-async fn field_ownership_violation_is_exposed_in_fleet_diagnosis() {
-    let temp = TempDir::new().expect("tempdir");
-    fs::write(temp.path().join("daemon.toml"), "machine_id = \"field-ownership-violation-test\"\n").expect("daemon config");
-    let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
-    let host_id = daemon.local_host_id().expect("local host id").to_string();
-    let profile = manual_profile(&host_id, false);
-    register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("register resources");
-
-    let policies = daemon.resource_backend().using::<PlacementPolicy>(NAMESPACE);
-    let policy = policies
-        .create(
-            &empty_meta(&profile.host_direct_policy_name()),
-            &PlacementPolicySpec::builder()
-                .pool(profile.host_direct_pool.clone())
-                .host_direct(HostDirectPlacementPolicySpec {
-                    host_ref: host_id.clone(),
-                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                })
-                .build(),
-        )
-        .await
-        .expect("policy under a seeded name");
-    policies
-        .write_spec(
-            &flotilla_resources::WriterIdentity::operator(),
-            &InputMeta::from(&policy.metadata),
-            &policy.metadata.resource_version,
-            &PlacementPolicySpec::builder()
-                .pool("operator-attempt".to_string())
-                .priority(8)
-                .host_direct(policy.spec.host_direct.clone().expect("host-direct policy"))
-                .build(),
-        )
-        .await
-        .expect("observe-mode operator write");
-
-    apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("publish heartbeat");
-    let fleet = daemon.fleet_health_internal().await.expect("fleet diagnosis");
-    let local = fleet.hosts.iter().find(|host| host.is_local).expect("local host");
-    let diagnosis = local.degraded_conditions.join("; ");
-    assert!(diagnosis.contains("ResourceStore/FieldOwnership"), "{diagnosis}");
-    assert!(diagnosis.contains("spec.pool"), "{diagnosis}");
-    assert!(diagnosis.contains("Operator"), "{diagnosis}");
-}
-
-#[tokio::test]
 async fn clone_controller_failure_is_visible_in_convoy_explain() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
