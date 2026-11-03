@@ -40,24 +40,51 @@ jobs:
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
 
-            Please review this pull request and provide feedback on:
-            - Code quality and best practices
-            - Potential bugs or issues
-            - Performance considerations
-            - Security concerns
-            - Test coverage
+            Review this pull request against the issue it implements. Find that issue from the
+            PR body ("Closes #N", "Part of #N", or the issue number in the title) and read it with
+            `gh issue view`. Its body is the contract: what to build, what is out of scope, and the
+            acceptance tests. If the PR names no issue, say so and review against the PR body.
 
-            Read the repository's CLAUDE.md and CODING_STANDARDS.md for guidance on style and conventions. Be constructive and helpful in your feedback.
+            Read CLAUDE.md (especially "Design and Substrate Work") and CODING_STANDARDS.md. The
+            owner's standing rules for this repository:
+            - One implementation per job. A change extends the existing code in place; it does
+              not build a second pipeline, reader, cache or store beside it.
+            - A change that replaces code deletes the code it replaces.
+            - No timers, polling loops, sleeps or retries as fixes. The writer of an event
+              records it; readers react to it.
+            - Write only what something reads: no stored fields, indexes, options, messages or
+              parameters without a reader.
+            - No defensive crouch: no speculative hardening, leniency (accepting several shapes
+              of one input) or limits that the contract does not ask for.
+
+            Report only these two kinds of finding:
+            1. **Bug**: a concrete failure inside the contract's use. Give the input or sequence,
+               what goes wrong, and file:line. No "consider", "might want to" or "it would be
+               worth" items.
+            2. **Waste**: code the change could do without. Code beyond the contract; code that
+               duplicates existing code (name the existing code with file:line); code nothing
+               calls; a timer, poll or retry; a new field, option or message without a reader;
+               a test that cannot fail. Say what to delete.
+
+            Do not suggest new features, options, limits, timeouts, validation or hardening
+            unless it fixes a Bug as defined above. A smaller diff that meets the contract is
+            better than a larger one. Mark each finding **blocking** or **non-blocking**, and
+            number them.
 
             You are a STATIC reviewer by design: you review the diff and repository source only.
             Dedicated CI jobs run cargo fmt/clippy/test on this PR and their results are visible
             as checks - do NOT attempt to run builds, tests, or linters, and do NOT disclaim or
             apologize for not running them. A static review is the complete job, not a degraded one.
 
-            AFTER reviewing, 
-              * CHECK your findings against the existing comments and replies on the PR. e.g if followup issues are filed or the implementor pushed back, make sure that is 
-              correct: drop issues that are already addressed, repeat issues that still need to be dealt with with an explanation.
-              * ALWAYS Use `gh pr comment` with your Bash tool to leave your review as a SINGLE comment on the PR, properly formatted as markdown, even if just to say that you found no issues.
+            AFTER reviewing,
+              * CHECK your findings against the existing comments and replies on the PR. Drop
+                findings that are already addressed or that the implementer declined with a
+                reason you accept. Repeat a finding only when it still applies, with the reason.
+                Do not raise new non-blocking findings on code an earlier round already reviewed.
+              * ALWAYS use `gh pr comment` with your Bash tool to leave your review as a SINGLE
+                comment on the PR, formatted as markdown, even if just to say that you found no
+                issues. Start it with the line count the PR adds and removes, and the count of
+                blocking findings.
 
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://docs.claude.com/en/docs/claude-code/cli-reference for available options
