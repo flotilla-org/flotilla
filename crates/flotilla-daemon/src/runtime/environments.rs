@@ -393,8 +393,10 @@ pub(super) async fn reconcile_provisioned_environment(
 /// Persist diagnostics before marking backing lost: dependency watchers may
 /// immediately start teardown, and neither inspect nor cgroup evidence survives it.
 /// Cloud liveness uses provider facts, including cap loss. Restart adoption
-/// re-enters ordinary idempotent provisioning so forwarding and credentials are
-/// restored together; a cached image/SSH recipe never proves liveness.
+/// (#3765 B1) reconnects, delivers the vessel layer where it differs and
+/// registers; it never prepares, and never reads the desired image. A desired
+/// spec that has moved from what the backing runs calls for replacing the
+/// vessel (#3610), not for adoption.
 async fn reconcile_cloud_environment(
     state: &Arc<ControllerRuntimeState>,
     namespace: &str,
@@ -413,7 +415,8 @@ async fn reconcile_cloud_environment(
         Some(handle) => match handle.observe().await.state {
             ObservationState::Running => {
                 if cached.is_none() {
-                    if let Err(error) = super::provider_path::provision(state, &environment.metadata.name, &environment.spec).await {
+                    let image = realised_image(environment);
+                    if let Err(error) = super::provider_path::adopt(state, &environment.metadata.name, &environment.spec, image).await {
                         record_cloud_health(
                             state,
                             namespace,
@@ -467,6 +470,15 @@ async fn reconcile_cloud_environment(
             .await
         }
     }
+}
+
+/// The image the backing runs, as its Ready status recorded it at provision.
+fn realised_image(environment: &ResourceObject<Environment>) -> &str {
+    let status = environment.status.as_ref();
+    status
+        .and_then(|status| status.image_ref.as_deref())
+        .or_else(|| status.and_then(|status| status.provider_descriptor.as_ref()).map(|descriptor| descriptor.image_digest.as_str()))
+        .unwrap_or_default()
 }
 
 async fn record_cloud_health(

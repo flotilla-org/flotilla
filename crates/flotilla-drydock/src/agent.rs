@@ -246,6 +246,10 @@ impl AgentClient for DrydockClient {
     async fn configuration_tag(&self) -> io::Result<String> {
         self.0.configuration().await.map(|current| current.etag)
     }
+    async fn configuration(&self) -> io::Result<(flotilla::Configuration, String)> {
+        let current = self.0.configuration().await?;
+        Ok((flotilla::Configuration { environment: current.value.environment }, current.etag))
+    }
     async fn run(&self, request: flotilla::Exec, limit: usize) -> io::Result<Output> {
         self.0.run(exec(request), limit).await.map(collected)
     }

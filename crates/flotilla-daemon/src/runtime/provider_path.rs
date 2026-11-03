@@ -86,24 +86,8 @@ pub(super) async fn provision(
     if provider.receives_host_tools() {
         let delivered = async {
             deliver_vessel_layer(state, &id, spec, &handle).await?;
-            let (bag, registry) = probe_provisioned_environment(state, &id, &handle).await?;
-            if let Some(cloud) = &spec.cloud_sandbox {
-                let factories = &state.daemon.discovery_runtime().factories;
-                let accounts = factories.account_variables();
-                verify_cloud_image_needs(
-                    &cloud.probe_needs,
-                    &cloud.image,
-                    &handle,
-                    &bag,
-                    &accounts,
-                    &factories.harnesses(&GuestProbeEnvironment(&bag)),
-                )
-                .await?;
-            }
-            state
-                .daemon
-                .register_provisioned_environment(id.clone(), Arc::clone(&handle), bag, Some(registry))
-                .map_err(|error| format!("failed to register provisioned environment {id}: {error}"))
+            let image = spec.cloud_sandbox.as_ref().map(|cloud| (&cloud.probe_needs, cloud.image.as_str()));
+            probe_and_register(state, &id, &handle, image).await
         }
         .await;
         if let Err(error) = delivered {
@@ -138,11 +122,53 @@ pub(super) async fn provision(
     Ok(facts)
 }
 
+/// Restart adoption of `name`'s live backing (#3765 B1): reconnect to its
+/// agent, deliver the vessel layer again where the vessel's differs (the
+/// crew socket this process lost, a newer generation's tools), probe and
+/// register. It never prepares or provisions, and never reads the desired
+/// image: the backing runs `image`, the one realised at provision. A failure
+/// leaves the backing, and its socket, for the next pass.
+pub(super) async fn adopt(state: &Arc<ControllerRuntimeState>, name: &str, spec: &EnvironmentSpec, image: &str) -> Result<(), String> {
+    let provider = state.provider_for_environment(name).await?;
+    let id = EnvironmentId::new(name);
+    let handle = provider.adopt(&id, image).await?.ok_or_else(|| format!("provider holds no backing for environment {name}"))?;
+    if provider.receives_host_tools() {
+        deliver_vessel_layer(state, &id, spec, &handle).await?;
+        // The image was checked against its needs when it was provisioned.
+        probe_and_register(state, &id, &handle, None).await?;
+    }
+    state.provisioned_environments.lock().await.insert(handle.backing_id().to_string(), ActiveProvisionedEnvironment { handle });
+    Ok(())
+}
+
+/// Interior discovery of a vessel whose layer has landed, the check of its
+/// image against `image`'s needs where given, and its registration.
+async fn probe_and_register(
+    state: &ControllerRuntimeState,
+    id: &EnvironmentId,
+    handle: &EnvironmentHandle,
+    image: Option<(&BTreeSet<flotilla_resources::CapabilityNeed>, &str)>,
+) -> Result<(), String> {
+    let (bag, registry) = probe_provisioned_environment(state, id, handle).await?;
+    if let Some((needs, image)) = image {
+        let factories = &state.daemon.discovery_runtime().factories;
+        let accounts = factories.account_variables();
+        verify_cloud_image_needs(needs, image, handle, &bag, &accounts, &factories.harnesses(&GuestProbeEnvironment(&bag))).await?;
+    }
+    state
+        .daemon
+        .register_provisioned_environment(id.clone(), Arc::clone(handle), bag, Some(registry))
+        .map_err(|error| format!("failed to register provisioned environment {id}: {error}"))
+}
+
 /// The vessel layer, through the vessel agent: the generation's tools pushed,
 /// the crew socket served in the vessel from this environment's own socket
 /// here, and the environment naming both, added to what the provider
-/// configured. Each step is idempotent, so re-adoption delivers it again; a
-/// step that fails on a retained backing leaves the earlier ones for the retry.
+/// configured. Each step is idempotent, so adoption delivers it again: the
+/// forward stands in the vessel and only its host end is claimed anew, the
+/// tools are pushed only where the vessel records another layer, and the
+/// environment extends what the agent already holds. A step that fails on a
+/// retained backing leaves the earlier ones for the retry.
 async fn deliver_vessel_layer(
     state: &ControllerRuntimeState,
     id: &EnvironmentId,

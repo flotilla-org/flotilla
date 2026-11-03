@@ -489,6 +489,15 @@ pub trait EnvironmentProvider: Send + Sync {
     async fn inspect(&self, id: &EnvironmentId) -> Result<Option<EnvironmentHandle>, String> {
         Ok(self.list().await?.into_iter().find(|handle| handle.id() == id))
     }
+    /// A live handle, with its vessel agent, to the backing an earlier
+    /// controller provisioned for `id` from `image`; `None` when the provider
+    /// holds no backing for it. Adoption never prepares or provisions: the
+    /// image, size, egress and reach were fixed at provision, and the vessel
+    /// keeps what its provider configured there.
+    async fn adopt(&self, id: &EnvironmentId, image: &str) -> Result<Option<EnvironmentHandle>, String> {
+        let _ = image;
+        Err(format!("provider {} cannot adopt environment {id} without provisioning it again", self.kind().implementation))
+    }
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String>;
     async fn list_backings(&self) -> Result<Vec<EnvironmentBacking>, String> {
         self.list()

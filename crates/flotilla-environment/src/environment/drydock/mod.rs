@@ -129,6 +129,14 @@ impl DrydockEnvironmentProvider {
         *self.declaration.write().expect("declaration lock") = Some(declaration.clone());
         Ok(declaration)
     }
+    /// The lock that serializes provision and adoption for one label.
+    fn provision_lock(&self, id: &EnvironmentId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.provision_locks.lock().expect("provision locks");
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let lock = locks.get(id).and_then(std::sync::Weak::upgrade).unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
+        locks.insert(id.clone(), Arc::downgrade(&lock));
+        lock
+    }
     /// A handle for `environment`. A provisioned handle gets an agent; an
     /// inventory handle has none until provision adopts it.
     fn handle(
@@ -305,13 +313,7 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
         let prepared = prepared.get::<Prepared>(&self.owner)?;
         // Only retries for this label serialize through complete guest setup.
         // Different sandboxes must not wait for another guest's SSH readiness.
-        let lock = {
-            let mut locks = self.provision_locks.lock().expect("provision locks");
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            let lock = locks.get(&id).and_then(std::sync::Weak::upgrade).unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
-            locks.insert(id.clone(), Arc::downgrade(&lock));
-            lock
-        };
+        let lock = self.provision_lock(&id);
         let _provision_guard = lock.lock().await;
         if !opts.provisioned_mounts.is_empty() {
             return Err("cloud sandbox does not support Shared material".into());
@@ -376,6 +378,28 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
         active.retain(|_, handle| handle.strong_count() > 0);
         active.insert(id, Arc::downgrade(&handle));
         Ok(handle)
+    }
+    /// Reconnect to the vessel drydock keeps under `id`'s label: its agent, as
+    /// it is, with the configuration it holds. Drydock re-establishes the
+    /// vessel's exposures itself, so nothing is set up again.
+    async fn adopt(&self, id: &EnvironmentId, image: &str) -> Result<Option<EnvironmentHandle>, String> {
+        let _guard = self.provision_lock(id).lock_owned().await;
+        if let Some(handle) = self.active.lock().await.get(id).and_then(std::sync::Weak::upgrade) {
+            return Ok(Some(handle));
+        }
+        let items = self.api.list(&self.instance).await.map_err(api_error)?;
+        let Some(environment) = items.into_iter().find(|e| e.label.as_deref() == Some(id.as_str())) else {
+            return Ok(None);
+        };
+        // The handle's capabilities are the instance's declaration.
+        self.declaration().await?;
+        let handle = self.handle(environment, image.to_string(), BTreeMap::new(), true)?;
+        let agent = handle.agent.as_ref().ok_or("adopted handle has no vessel agent")?;
+        *handle.env.write().expect("environment") = agent.environment().await?;
+        let mut active = self.active.lock().await;
+        active.retain(|_, handle| handle.strong_count() > 0);
+        active.insert(id.clone(), Arc::downgrade(&handle));
+        Ok(Some(handle))
     }
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
         let items = self.api.list(&self.instance).await.map_err(api_error)?;
@@ -606,7 +630,7 @@ fn observation(o: wire::Observation) -> ObservationState {
 mod tests;
 
 // Inventory handles report observations without opening guest transports. Restart
-// adoption re-enters idempotent provision before registering a runnable handle.
+// adoption takes a runnable handle through `adopt`.
 struct InventoryRunner;
 #[async_trait]
 impl CommandRunner for InventoryRunner {

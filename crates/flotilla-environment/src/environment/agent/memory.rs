@@ -29,6 +29,7 @@ pub(crate) struct Agent {
     forwards: Mutex<BTreeMap<String, tokio::task::JoinHandle<()>>>,
     inwards: Mutex<BTreeMap<String, Endpoint>>,
     stopped: AtomicBool,
+    writes: std::sync::atomic::AtomicUsize,
 }
 
 impl MemoryAgent {
@@ -44,6 +45,10 @@ impl MemoryAgent {
         let mut configuration = self.0.configuration.lock().expect("configuration");
         *configuration = (Configuration::default(), configuration.1 + 1);
         self.0.stopped.store(false, Ordering::SeqCst);
+    }
+    /// How many files have been written through the agent.
+    pub(crate) fn writes(&self) -> usize {
+        self.0.writes.load(Ordering::SeqCst)
     }
     /// A connection to the agent, whether or not it answers.
     pub(crate) fn client(&self) -> Arc<dyn AgentClient> {
@@ -141,6 +146,11 @@ impl AgentClient for Agent {
         self.live()?;
         Ok(self.configuration.lock().expect("configuration").1.to_string())
     }
+    async fn configuration(&self) -> io::Result<(Configuration, String)> {
+        self.live()?;
+        let current = self.configuration.lock().expect("configuration");
+        Ok((current.0.clone(), current.1.to_string()))
+    }
     async fn run(&self, exec: Exec, limit: usize) -> io::Result<Output> {
         self.run_with_input(exec, Vec::new(), limit).await
     }
@@ -215,6 +225,7 @@ impl AgentClient for Agent {
     async fn write(&self, path: &Path, mut content: Box<dyn tokio::io::AsyncRead + Unpin + Send>, options: &FileOptions) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         self.live()?;
+        self.writes.fetch_add(1, Ordering::SeqCst);
         parents(path, options).await?;
         if options.exclusive && tokio::fs::symlink_metadata(path).await.is_ok() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} exists", path.display())));

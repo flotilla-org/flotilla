@@ -85,6 +85,18 @@ struct Connection {
 impl Connection {
     async fn push(&mut self, client: &dyn AgentClient) -> Result<(), String> {
         self.etag = Some(client.configure(self.configuration.clone()).await.map_err(|e| e.to_string())?);
+        self.push_forwards(client).await
+    }
+    /// A handle that has configured nothing yet takes the configuration the
+    /// agent already holds: a restarted controller adopting a live vessel
+    /// keeps what its provider configured there, rather than clearing it.
+    async fn adopt(&mut self, client: &dyn AgentClient) -> Result<(), String> {
+        let (configuration, etag) = client.configuration().await.map_err(|e| format!("read vessel agent configuration: {e}"))?;
+        self.configuration = configuration;
+        self.etag = Some(etag);
+        self.push_forwards(client).await
+    }
+    async fn push_forwards(&self, client: &dyn AgentClient) -> Result<(), String> {
         for (forward, endpoint) in self.outward_forwards.values() {
             client
                 .put_outward_forward(forward.clone(), endpoint.clone())
@@ -272,7 +284,11 @@ impl AgentRunner {
             return Ok(client.clone());
         }
         let client = self.connector.connect().await?;
-        state.push(client.as_ref()).await?;
+        if state.etag.is_none() {
+            state.adopt(client.as_ref()).await?;
+        } else {
+            state.push(client.as_ref()).await?;
+        }
         state.client = Some(client.clone());
         Ok(client)
     }
@@ -426,13 +442,40 @@ impl AgentRunner {
         self.client().await?.write_bytes(path, bytes, &options).await.map_err(|e| e.to_string())
     }
 
+    /// What the vessel's commands run with, as this handle configured it or,
+    /// for a handle that has configured nothing, as the agent already held it.
+    pub async fn environment(&self) -> Result<BTreeMap<String, String>, String> {
+        self.client().await?;
+        Ok(self.state.lock().await.configuration.environment.clone())
+    }
+
+    /// Where the vessel records the identity of a delivered step, under its
+    /// writable base: a fact the vessel keeps, so a controller that did not
+    /// deliver the step (a restarted one) can tell whether it must again.
+    async fn step_record(&self, step: &str) -> Result<PathBuf, String> {
+        let fallback = Path::new(super::runner::CONTAINED_WRITABLE_CONFIG_BASE);
+        Ok(CommandRunner::writable_config_base(self, None, fallback).await?.join(STEP_RECORDS).join(step))
+    }
+
+    async fn recorded_step(&self, record: &Path) -> Result<Option<String>, String> {
+        match self.client().await?.read_bytes(record, STEP_RECORD_LIMIT).await {
+            Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("read {}: {error}", record.display())),
+        }
+    }
+
     /// Push each regular asset through files/write, then replace generation
     /// symlinks. Never follow a link on the source host while traversing a tree.
+    /// The vessel records the layer's content identity once `current` names it;
+    /// a handle that has pushed nothing yet (a restarted controller's) reads
+    /// that record and pushes only when the layer differs from it.
     pub async fn push_tools(&self, tools: &[EnvironmentTool]) -> Result<(), String> {
         // Snapshot once off the async executor: identity and publication use
         // exactly the same bytes even if a mutable source changes meanwhile.
         let mut layer = self.layer.lock().await;
         let previous_sources = layer.as_ref().map(|layer| layer.sources.clone());
+        let step = layer_step(tools);
         let tools = tools.to_vec();
         let snapshot = tokio::task::spawn_blocking(move || {
             let mut entries = Vec::new();
@@ -458,7 +501,12 @@ impl AgentRunner {
             identity.update(destination.as_os_str().as_encoded_bytes());
         }
         let identity = format!("{:x}", identity.finalize());
-        if layer.as_ref().is_some_and(|layer| layer.content == identity) {
+        if layer.as_ref().is_some_and(|layer| layer.content == identity) || (entries.is_empty() && links.is_empty()) {
+            *layer = Some(PublishedLayer { sources, content: identity });
+            return Ok(());
+        }
+        let record = self.step_record(&step).await?;
+        if layer.is_none() && self.recorded_step(&record).await?.as_deref() == Some(identity.as_str()) {
             *layer = Some(PublishedLayer { sources, content: identity });
             return Ok(());
         }
@@ -472,9 +520,36 @@ impl AgentRunner {
         for (target, destination) in links {
             client.symlink(&destination, &target, &options).await.map_err(|e| e.to_string())?;
         }
+        self.publish(&record, identity.clone().into_bytes(), Some(0o600)).await?;
         *layer = Some(PublishedLayer { sources, content: identity });
         Ok(())
     }
+}
+
+/// The directory, under a vessel's writable base, of its delivered steps' records.
+const STEP_RECORDS: &str = "vessel-steps";
+/// A step record holds one content digest.
+const STEP_RECORD_LIMIT: u64 = 4096;
+
+/// The tools layer's step, named by where its assets land rather than by their
+/// content, so one generation's record is the next one's to replace. Vessels
+/// sharing a filesystem keep their layers under their own prefixes, and so
+/// their records apart.
+fn layer_step(tools: &[EnvironmentTool]) -> String {
+    let mut roots = tools
+        .iter()
+        .flat_map(|tool| &tool.assets)
+        .filter(|asset| !asset.requires_mount())
+        .map(|asset| asset.environment_path.as_path().as_os_str().as_encoded_bytes().to_vec())
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    let mut digest = Sha256::new();
+    for root in roots {
+        digest.update((root.len() as u64).to_le_bytes());
+        digest.update(root);
+    }
+    format!("tools-{}", &format!("{:x}", digest.finalize())[..16])
 }
 impl AgentRunner {
     async fn host_base(&self) -> Result<PathBuf, String> {

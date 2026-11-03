@@ -793,3 +793,172 @@ async fn undescribed_cloud_backing_is_discarded(spec: flotilla_resources::Enviro
     );
     assert!(destroyed.load(Ordering::SeqCst), "the backing this provision created is destroyed");
 }
+
+/// A provider instance that counts what it is asked to do, around the real one.
+struct CountingProvider {
+    inner: Arc<dyn flotilla_environment::environment::EnvironmentProvider>,
+    prepares: Arc<AtomicUsize>,
+    provisions: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl flotilla_environment::environment::EnvironmentProvider for CountingProvider {
+    fn kind(&self) -> flotilla_protocol::provider::ProviderKind {
+        self.inner.kind()
+    }
+    fn capabilities(&self) -> flotilla_environment::environment::ProviderCapabilities {
+        self.inner.capabilities()
+    }
+    async fn detect_readiness(&self) -> flotilla_environment::environment::ProviderReadiness {
+        self.inner.detect_readiness().await
+    }
+    fn receives_host_tools(&self) -> bool {
+        self.inner.receives_host_tools()
+    }
+    async fn prepare(
+        &self,
+        spec: &EnvironmentSpec,
+        opts: &flotilla_environment::environment::PrepareOpts,
+    ) -> Result<flotilla_environment::environment::PreparedEnvironment, String> {
+        self.prepares.fetch_add(1, Ordering::SeqCst);
+        self.inner.prepare(spec, opts).await
+    }
+    async fn provision(
+        &self,
+        id: EnvironmentId,
+        prepared: &flotilla_environment::environment::PreparedEnvironment,
+        opts: flotilla_environment::environment::ProvisionOpts,
+    ) -> Result<EnvironmentHandle, flotilla_environment::environment::EnvironmentProvisionError> {
+        self.provisions.fetch_add(1, Ordering::SeqCst);
+        self.inner.provision(id, prepared, opts).await
+    }
+    async fn inspect(&self, id: &EnvironmentId) -> Result<Option<EnvironmentHandle>, String> {
+        self.inner.inspect(id).await
+    }
+    async fn adopt(&self, id: &EnvironmentId, image: &str) -> Result<Option<EnvironmentHandle>, String> {
+        self.inner.adopt(id, image).await
+    }
+    async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
+        self.inner.list().await
+    }
+    async fn list_backings(&self) -> Result<Vec<flotilla_environment::environment::EnvironmentBacking>, String> {
+        self.inner.list_backings().await
+    }
+    async fn destroy(&self, backing_id: &str) -> Result<(), String> {
+        self.inner.destroy(backing_id).await
+    }
+}
+
+// #4300 acceptance: a cloud vessel with a composed image stores an empty image
+// and its ImageBuild. After a flotillad restart, one adoption pass reconnects
+// to the live vessel without preparing or provisioning it again (the empty
+// image could not be prepared): the handle is registered, the crew socket in
+// the vessel reaches the new process again, the environment its provider
+// configured is kept, the unchanged tools layer is not uploaded again, and the
+// crew's work credentials are delivered through the adopted vessel.
+#[tokio::test]
+async fn a_composed_image_cloud_vessel_is_adopted_after_a_restart() {
+    use flotilla_environment::environment::DAEMON_SOCKET_ENV;
+    use flotilla_provisioning::reconcilers::EnvironmentProvisioning;
+    use flotilla_resources::EnvironmentStatus;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stand_in = super::drydock_launch::stand_in(None, true).await;
+    let name = stand_in.env_id.as_str().to_string();
+    let backend = stand_in.backend.clone();
+
+    // The first provision takes the image the Environment reconciler resolved
+    // from the build; the record keeps the composed shape and its Ready facts.
+    let runtime = DockerControllerRuntime { state: Arc::clone(&stand_in.state) };
+    let EnvironmentProvisioning::Cloud(facts) = runtime.provision_environment(&name, &stand_in.spec).await.expect("provision") else {
+        panic!("a cloud vessel reports cloud facts")
+    };
+    let environments = backend.using::<Environment>(NAMESPACE);
+    let record = environments.get(&name).await.expect("environment record");
+    let mut composed = record.spec.clone();
+    let cloud = composed.cloud_sandbox.as_mut().expect("cloud input");
+    cloud.image = String::new();
+    cloud.image_build_ref = Some("image-composed-amd64".into());
+    let record = environments.update(&empty_meta(&name), &record.metadata.resource_version, &composed).await.expect("composed spec");
+    let status = EnvironmentStatus {
+        phase: EnvironmentPhase::Ready,
+        ready: true,
+        backing_id: Some(facts.backing_id.clone()),
+        image_ref: Some(facts.image_ref.clone()),
+        provider_descriptor: Some(*facts.provider_descriptor),
+        ..Default::default()
+    };
+    environments.update_status(&name, &record.metadata.resource_version, &status).await.expect("ready status");
+
+    // The crew aboard runs, with a work credential to deliver.
+    backend
+        .clone()
+        .definitions::<CredentialSpec>(NAMESPACE)
+        .create(
+            &empty_meta("work-token"),
+            &CredentialSpecSpec {
+                consumer: CredentialConsumer::GitHttpToken { host: "github.com".to_string(), username: "bot".to_string() },
+                source: CredentialSource::Env { name: "TEST_WORK_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Issued,
+                placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
+            },
+        )
+        .await
+        .expect("credential declaration");
+    let convoys = backend.using::<Convoy>(NAMESPACE);
+    let convoy = convoys.get(&stand_in.convoy).await.expect("convoy");
+    let mut convoy_status = convoy.status.clone().expect("frozen workflow");
+    let snapshot = convoy_status.workflow_snapshot.as_mut().expect("workflow snapshot");
+    snapshot.vessels[0].credential_refs = BTreeSet::from(["work-token".to_string()]);
+    convoy_status.work.insert("work".into(), WorkState::builder().phase(WorkPhase::Running).build());
+    convoys.update_status(&stand_in.convoy, &convoy.metadata.resource_version, &convoy_status).await.expect("running work");
+    let vessels = backend.using::<Vessel>(NAMESPACE);
+    let vessel = vessels.get("demo-work").await.expect("vessel");
+    let placed = VesselStatus { phase: flotilla_resources::VesselPhase::Ready, environment_ref: Some(name.clone()), ..Default::default() };
+    vessels.update_status("demo-work", &vessel.metadata.resource_version, &placed).await.expect("placed vessel");
+    create_credential_test_session(&backend, "demo-work-coder", &stand_in.convoy, "demo-work", &name).await;
+    let cli = stand_in.root().join("vessel/opt/flotilla/bin/flotilla");
+    let pushed = {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(&cli).expect("pushed CLI").ino()
+    };
+
+    let (prepares, provisions) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let counted = (Arc::clone(&prepares), Arc::clone(&provisions));
+    stand_in.restart(move |inner| Arc::new(CountingProvider { inner, prepares: counted.0, provisions: counted.1 })).await;
+    let state = Arc::clone(&stand_in.state);
+    reconcile_provisioned_environments(&state, NAMESPACE).await.expect("one adoption pass");
+
+    assert_eq!((prepares.load(Ordering::SeqCst), provisions.load(Ordering::SeqCst)), (0, 0), "adoption never prepares or provisions");
+    let id = EnvironmentId::new(&name);
+    assert!(state.daemon.environment_registry_for_environment(&id).is_some(), "the adopted handle is registered");
+    let handle = stand_in.handle().await.expect("adopted handle");
+    assert_eq!(handle.backing_id(), facts.backing_id, "the vessel provisioned before the restart");
+    let message = environments.get(&name).await.expect("environment").status.and_then(|status| status.message);
+    assert!(!message.as_deref().is_some_and(|message| message.contains("adoption failed")), "{message:?}");
+
+    let commands = handle.agent().commands();
+    let shell = |script: String| {
+        let commands = Arc::clone(&commands);
+        async move { commands.run("sh", &["-c", &script], Path::new("/"), &ChannelLabel::Default).await.expect("vessel command") }
+    };
+    assert_eq!(shell("printf %s \"$LANG\"".into()).await, "C.UTF-8", "the provider's environment survives adoption");
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(fs::metadata(&cli).expect("CLI").ino(), pushed, "the unchanged tools layer is not uploaded again");
+    }
+    let guest_socket = PathBuf::from(shell(format!("printf %s \"${DAEMON_SOCKET_ENV}\"")).await);
+    let mut guest = tokio::net::UnixStream::connect(&guest_socket).await.expect("guest crew socket");
+    guest.write_all(b"hook").await.expect("guest write");
+    let (environment, _, mut controller) =
+        tokio::time::timeout(Duration::from_secs(5), stand_in.crew_connections.recv()).await.expect("accept").expect("crew connection");
+    assert_eq!(environment, id, "the vessel's crew socket reaches the restarted process");
+    let mut received = [0; 4];
+    controller.read_exact(&mut received).await.expect("controller read");
+    assert_eq!(&received, b"hook");
+
+    reconcile_work_credentials_for_environment(&state, NAMESPACE, &name).await.expect("credential delivery through the adopted vessel");
+
+    handle.destroy().await.expect("destroy");
+    stand_in.clean_up();
+}
