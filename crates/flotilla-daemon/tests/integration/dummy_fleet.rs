@@ -1321,9 +1321,7 @@ impl DummyDaemon {
         let record = flotilla_provisioning::stored::artifact::ArtifactRecord::from_spec(&artifact).expect("artifact");
         log.create("transport-artifact", &record, &change).expect("artifact record");
         // One record of each forge observation.
-        use flotilla_provisioning::stored::forge_observation::{
-            ChangeRequestRecord, ForgeReadRecord, IssueRecord, IssueState, IssueSubject, ReadValue,
-        };
+        use flotilla_provisioning::stored::forge_observation::{ChangeRequestRecord, ForgeReadRecord, IssueRecord, IssueState, ReadValue};
         let change_request = ChangeRequestRecord {
             service: "github.com".into(),
             scope: "transport/app".into(),
@@ -1338,10 +1336,6 @@ impl DummyDaemon {
             actionable_at_head: None,
             mergeable: None,
             failing_since: None,
-            head_branch: Some("transport".into()),
-            base_branch: Some("main".into()),
-            closes: vec![IssueSubject { service: "github.com".into(), scope: "transport/app".into(), number: 2 }],
-            closes_observed: true,
         };
         log.create("transport-cr", &change_request, &change).expect("change request record");
         let issue = IssueRecord {
@@ -1354,15 +1348,6 @@ impl DummyDaemon {
             labels: None,
             updated_at: Some(at),
             failing_since: None,
-            body: Some("transport".into()),
-            issue_type: Some("Task".into()),
-            parent_service: None,
-            parent_scope: None,
-            parent_number: None,
-            parent_observed: true,
-            blocked_by: Vec::new(),
-            blocked_by_observed: true,
-            fields: Some(std::collections::BTreeMap::from([("Weight".into(), "2".into())])),
         };
         log.create("transport-issue", &issue, &change).expect("issue record");
         let read = ForgeReadRecord {
