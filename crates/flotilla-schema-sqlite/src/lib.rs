@@ -20,8 +20,7 @@
 //! from a snapshot.
 
 //! Reads are by key or declared index only. [`Read::page`] runs a kind's generated
-//! [`IndexQuery`](flotilla_schema::IndexQuery) keyset-paged through its partial index (an index on a
-//! `child` list pages the owners of matching rows, by id), and
+//! [`IndexQuery`](flotilla_schema::IndexQuery) keyset-paged through its partial index, and
 //! [`Read::scan`] is the one pass over a whole kind (startup), keyset-paged by id through
 //! `resource_identity_by_home`. Both take a required limit. `Store::statements` lists every
 //! statement the runtime prepares, and the query-plan tests check each one searches by key.
