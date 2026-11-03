@@ -146,59 +146,6 @@ impl ResultSet {
     pub fn query(&self) -> QueryId {
         self.rows.query()
     }
-
-    /// Applies the next delta of the same query: changed rows replace or join theirs by key and
-    /// removed keys leave. Refuses a delta of another query or one that is not `seq + 1`.
-    pub fn apply(&mut self, delta: &ResultDelta) -> Result<(), String> {
-        fn merge<R: Clone, K: PartialEq>(rows: &mut Vec<R>, changed: &[R], removed: &[K], key: impl Fn(&R) -> K) {
-            rows.retain(|row| !removed.contains(&key(row)));
-            for row in changed {
-                let changed_key = key(row);
-                match rows.iter_mut().find(|existing| key(existing) == changed_key) {
-                    Some(existing) => *existing = row.clone(),
-                    None => rows.push(row.clone()),
-                }
-            }
-        }
-        if delta.query() != self.query() {
-            return Err(format!("delta for {} applied to {}", delta.query(), self.query()));
-        }
-        if delta.seq != self.seq.saturating_add(1) {
-            return Err(format!("{} delta {} does not follow {}", self.query(), delta.seq, self.seq));
-        }
-        match (&mut self.rows, &delta.changes) {
-            (Rows::Convoys { rows, .. }, QueryChanges::Convoys { changed, removed, .. }) => {
-                merge(rows, changed, removed, |row| row.resource.clone())
-            }
-            (Rows::Independents { rows, .. }, QueryChanges::Independents { changed, removed, .. }) => {
-                merge(rows, changed, removed, |row| row.resource.clone())
-            }
-            (Rows::Issues { rows, .. }, QueryChanges::Issues { changed, removed, .. }) => {
-                merge(rows, changed, removed, |row| row.reference.clone())
-            }
-            (Rows::Checkouts { rows, .. }, QueryChanges::Checkouts { changed, removed, .. }) => {
-                merge(rows, changed, removed, |row| row.resource.clone())
-            }
-            (Rows::Awareness { rows, .. }, QueryChanges::Awareness { changed, removed, .. }) => {
-                merge(rows, changed, removed, |row| row.id.clone())
-            }
-            (Rows::StandingRoles { rows, .. }, QueryChanges::StandingRoles { changed, removed, .. }) => {
-                merge(rows, changed, removed, |row| row.resource.clone())
-            }
-            (Rows::DispatchReady { rows, .. }, QueryChanges::DispatchReady { changed, removed, .. }) => {
-                merge(rows, changed, removed, |row| row.key())
-            }
-            (Rows::ProjectRepositories { rows, .. }, QueryChanges::ProjectRepositories { changed, removed, .. }) => {
-                merge(rows, changed, removed, |row| row.resource.clone())
-            }
-            _ => unreachable!("matching queries have matching row families"),
-        }
-        self.seq = delta.seq;
-        if let Some(state) = &delta.state {
-            self.state = state.clone();
-        }
-        Ok(())
-    }
 }
 
 /// Incremental update to a named query's result set.
@@ -1824,61 +1771,5 @@ mod serde_category_tests {
         categories!(Priority, None, Urgent => Priority::Urgent, High => Priority::High, Medium => Priority::Medium, Low => Priority::Low);
         categories!(SubjectKind, None, ChangeRequest => SubjectKind::ChangeRequest, Issue => SubjectKind::Issue);
         categories!(Relationship, None, WorksOn => Relationship::WorksOn, Produces => Relationship::Produces, Adopts => Relationship::Adopts, Supersedes => Relationship::Supersedes, References => Relationship::References);
-    }
-}
-
-#[cfg(test)]
-mod apply_tests {
-    use super::*;
-    use hegel::generators as gs;
-
-    fn node(id: &str, label: &str) -> AwarenessNode {
-        AwarenessNode::builder()
-            .id(id.into())
-            .kind(AwarenessKind::Project)
-            .label(label.into())
-            .state(AwarenessState::Idle)
-            .as_of(chrono::DateTime::UNIX_EPOCH)
-            .build()
-    }
-
-    // Behaviour: a delta applies exactly when it is the next of the same query; its changed rows
-    // replace or join theirs by key and its removed keys leave, as a framed client applies them.
-    // Ids collide across steps, so changes hit present and absent rows and removals hit both.
-    #[hegel::test]
-    fn deltas_apply_by_key_in_sequence(tc: hegel::TestCase) {
-        let ids = || gs::sampled_from(vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]);
-        let query = |grouping| Rows::Awareness { scope: None, grouping, limit: AwarenessLimit::UNBOUNDED, rows: vec![] };
-        let mut set = ResultSet { seq: 1, rows: query(AwarenessGrouping::Project), state: ResultSetState::default() };
-        let mut expected = BTreeMap::new();
-        for step in 0..tc.draw(gs::integers::<usize>().max_value(6)) {
-            let changed: Vec<_> = tc.draw(gs::vecs(ids()).max_size(2)).iter().map(|id| node(id, &format!("{id}{step}"))).collect();
-            let removed = tc.draw(gs::vecs(ids()).max_size(2));
-            let delta = |seq, grouping| ResultDelta {
-                seq,
-                changes: QueryChanges::Awareness {
-                    scope: None,
-                    grouping,
-                    limit: AwarenessLimit::UNBOUNDED,
-                    changed: changed.clone(),
-                    removed: removed.clone(),
-                },
-                state: None,
-            };
-            let before = set.clone();
-            assert!(set.apply(&delta(set.seq + 2, AwarenessGrouping::Project)).is_err());
-            assert!(set.apply(&delta(set.seq + 1, AwarenessGrouping::Convoy)).is_err());
-            assert_eq!(set, before);
-            set.apply(&delta(set.seq + 1, AwarenessGrouping::Project)).unwrap();
-            for id in &removed {
-                expected.remove(id);
-            }
-            for row in &changed {
-                expected.insert(row.id.clone(), row.label.clone());
-            }
-            let held: BTreeMap<_, _> = set.rows.as_awareness().unwrap().iter().map(|row| (row.id.clone(), row.label.clone())).collect();
-            assert_eq!(held.len(), set.rows.len());
-            assert_eq!(held, expected);
-        }
     }
 }

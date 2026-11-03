@@ -11,11 +11,15 @@ use axum::{
 };
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{DaemonEvent, QueryId, WaitSubscriptionRequest};
-use futures::{stream::BoxStream, SinkExt, StreamExt};
+use futures::{future::BoxFuture, stream::BoxStream, SinkExt, StreamExt};
 use rigging_http_wire::Encoding;
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Map, Value};
-use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
+use tokio::{
+    sync::{broadcast, mpsc},
+    task::JoinHandle,
+    time::Instant,
+};
 use tokio_tungstenite::{
     tungstenite::{
         handshake::derive_accept_key,
@@ -26,7 +30,7 @@ use tokio_tungstenite::{
 };
 
 use super::{CallerAuth, HttpRouter, RouterState};
-use crate::server::tables::{Failure, Query, QueryFeed, Resume, TableSource};
+use crate::server::tables::{Failure, Query, QueryFeed, Resume, TableSource, MAX_LIMIT};
 
 pub(super) const PATH: &str = "/v1/surface";
 pub(super) const CBOR: &str = "flotilla.surface.v1+cbor";
@@ -35,8 +39,6 @@ pub(super) const JSON: &str = "flotilla.surface.v1+json";
 pub(super) const FRAME_LIMIT: usize = 64 * 1024;
 /// Server frames queued for one connection; a consumer that falls this far behind is closed.
 const SEND_QUEUE: usize = 1024;
-/// A subscription's whole table in one snapshot, up to the table reader's page limit.
-const SNAPSHOT_LIMIT: &str = "10000";
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 /// A connection silent this long, pongs included, is closed.
 const IDLE_LIMIT: Duration = Duration::from_secs(60);
@@ -49,8 +51,7 @@ pub(super) const SERVER_TYPES: &[&str] = &["hello", "error", "command_step", "co
 const OVERFLOW: u16 = 1013;
 const TOO_BIG: u16 = 1009;
 
-pub(super) const CLIENT_TYPES: &[&str] =
-    &["subscribe", "unsubscribe", "cancel", "fetch_more", "observe_focus", "wait_subscribe", "command"];
+pub(super) const CLIENT_TYPES: &[&str] = &["subscribe", "unsubscribe", "cancel", "fetch_more", "wait_subscribe", "command"];
 
 type Socket = WebSocketStream<hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>>;
 
@@ -124,7 +125,6 @@ enum ClientMessage {
     Unsubscribe { id: Id },
     Cancel { id: Id },
     FetchMore { id: Id, query: QueryId },
-    ObserveFocus {},
     WaitSubscribe { id: Id, subscription: WaitSubscriptionRequest },
     Command { id: Id, command: String },
 }
@@ -134,12 +134,10 @@ struct Subscribe {
     id: Id,
     table: Option<String>,
     query: Option<QueryId>,
-    #[serde(rename = "where", default, deserialize_with = "texts")]
+    #[serde(rename = "where", default)]
     conditions: Vec<String>,
-    #[serde(default, deserialize_with = "list")]
-    sort: Option<String>,
-    #[serde(default, deserialize_with = "list")]
-    columns: Option<String>,
+    sort: Option<Vec<String>>,
+    columns: Option<Vec<String>>,
     namespace: Option<String>,
     count: Option<String>,
     cursor: Option<Cursor>,
@@ -152,25 +150,6 @@ struct Cursor {
     sequence: u64,
 }
 
-/// One text or a list of them.
-fn texts<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Texts {
-        One(String),
-        Many(Vec<String>),
-    }
-    Ok(match Texts::deserialize(deserializer)? {
-        Texts::One(text) => vec![text],
-        Texts::Many(texts) => texts,
-    })
-}
-
-/// A comma-separated list, as the GET routes take it, or a list of names.
-fn list<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
-    texts(deserializer).map(|names| Some(names.join(",")))
-}
-
 /// An unsigned integer, or the JSON profile's `{"u64": "…"}`.
 fn integer<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
     let value = Value::deserialize(deserializer)?;
@@ -180,77 +159,18 @@ fn integer<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> 
         .ok_or_else(|| serde::de::Error::custom("expected an unsigned integer"))
 }
 
-/// One decoded client frame: a map with its `type`. CBOR goes through the profile's safe reader;
-/// JSON refuses duplicate keys as that reader does.
+/// One decoded client frame, read as an HTTP body is: a map with its `type`.
 fn decode(encoding: Encoding, bytes: &[u8]) -> Result<Map<String, Value>, String> {
     let value = match encoding {
         Encoding::Cbor => {
             flotilla_cbor::from_slice::<Value>(bytes, &flotilla_cbor::Limits { max_message: FRAME_LIMIT, ..flotilla_cbor::DEFAULT_LIMITS })
                 .map_err(|error| error.to_string())?
         }
-        Encoding::Json => {
-            let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-            let Strict(value) = Strict::deserialize(&mut deserializer).map_err(|error| error.to_string())?;
-            deserializer.end().map_err(|error| error.to_string())?;
-            value
-        }
+        Encoding::Json => serde_json::from_slice(bytes).map_err(|error| error.to_string())?,
     };
     match value {
         Value::Object(map) => Ok(map),
         _ => Err("a message is a map".into()),
-    }
-}
-
-/// A JSON value whose maps have distinct keys.
-struct Strict(Value);
-
-impl<'de> Deserialize<'de> for Strict {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Visitor;
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = Strict;
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a JSON value")
-            }
-            fn visit_bool<E>(self, value: bool) -> Result<Strict, E> {
-                Ok(Strict(Value::Bool(value)))
-            }
-            fn visit_i64<E>(self, value: i64) -> Result<Strict, E> {
-                Ok(Strict(json!(value)))
-            }
-            fn visit_u64<E>(self, value: u64) -> Result<Strict, E> {
-                Ok(Strict(json!(value)))
-            }
-            fn visit_f64<E>(self, value: f64) -> Result<Strict, E> {
-                Ok(Strict(json!(value)))
-            }
-            fn visit_str<E>(self, value: &str) -> Result<Strict, E> {
-                Ok(Strict(Value::String(value.to_owned())))
-            }
-            fn visit_string<E>(self, value: String) -> Result<Strict, E> {
-                Ok(Strict(Value::String(value)))
-            }
-            fn visit_unit<E>(self) -> Result<Strict, E> {
-                Ok(Strict(Value::Null))
-            }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Strict, A::Error> {
-                let mut values = Vec::new();
-                while let Some(Strict(value)) = seq.next_element()? {
-                    values.push(value);
-                }
-                Ok(Strict(Value::Array(values)))
-            }
-            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Strict, A::Error> {
-                let mut values = Map::new();
-                while let Some((name, Strict(value))) = map.next_entry::<String, Strict>()? {
-                    if values.insert(name.clone(), value).is_some() {
-                        return Err(serde::de::Error::custom(format!("duplicate key `{name}`")));
-                    }
-                }
-                Ok(Strict(Value::Object(values)))
-            }
-        }
-        deserializer.deserialize_any(Visitor)
     }
 }
 
@@ -281,6 +201,7 @@ enum Event {
     Inbound(Option<Result<Frame, SocketError>>),
     Outbound(Value),
     Finished((String, u64)),
+    Daemon(Result<Box<DaemonEvent>, broadcast::error::RecvError>),
     Overflow,
     Ping,
 }
@@ -307,6 +228,16 @@ impl Outbox {
     }
 }
 
+type Work = BoxFuture<'static, Result<BoxStream<'static, Value>, Failure>>;
+
+/// An open request: its task, and the named query or wait watcher it holds until it ends.
+struct Open {
+    number: u64,
+    task: JoinHandle<()>,
+    query: Option<QueryId>,
+    watcher: Option<uuid::Uuid>,
+}
+
 struct Connection {
     state: Arc<HttpRouter>,
     caller: CallerAuth,
@@ -314,7 +245,9 @@ struct Connection {
     feed: Option<Arc<QueryFeed>>,
     /// Open requests by id: subscriptions, command observations, wait subscriptions and
     /// in-flight fetches. Each ends when its task does, or when it is cancelled.
-    open: HashMap<String, (u64, JoinHandle<()>)>,
+    open: HashMap<String, Open>,
+    /// The request id each open wait's fires answer, by watcher.
+    waits: HashMap<uuid::Uuid, Id>,
     /// Numbers each started request, so a late end of one does not remove its id's successor.
     started: u64,
 }
@@ -322,7 +255,7 @@ struct Connection {
 impl Connection {
     fn new(state: Arc<HttpRouter>, caller: CallerAuth, encoding: Encoding) -> Self {
         let feed = state.daemon.as_ref().map(|daemon| QueryFeed::new(Arc::clone(daemon), state.incarnation.clone()));
-        Self { state, caller, encoding, feed, open: HashMap::new(), started: 0 }
+        Self { state, caller, encoding, feed, open: HashMap::new(), waits: HashMap::new(), started: 0 }
     }
 
     async fn run(mut self, mut socket: Socket) {
@@ -332,6 +265,8 @@ impl Connection {
             "fingerprint": flotilla_protocol::PROTOCOL_FINGERPRINT,
             "incarnation": self.state.incarnation,
         });
+        // The connection's one daemon event receiver: wait fires and named-query changes.
+        let mut events = self.feed.as_ref().map(|feed| feed.daemon().subscribe());
         let (queue, mut outbound) = mpsc::channel(SEND_QUEUE);
         let (overflow, mut overflowed) = mpsc::channel(1);
         let (finished, mut ended) = mpsc::unbounded_channel::<(String, u64)>();
@@ -347,6 +282,9 @@ impl Connection {
                     frame = socket.next() => Event::Inbound(frame),
                     Some(message) = outbound.recv() => Event::Outbound(message),
                     Some(done) = ended.recv() => Event::Finished(done),
+                    event = async { match events.as_mut() { Some(events) => events.recv().await, None => std::future::pending().await } } => {
+                        Event::Daemon(event.map(Box::new))
+                    }
                     _ = ping.tick() => Event::Ping,
                 };
                 match event {
@@ -372,7 +310,7 @@ impl Connection {
                                 continue;
                             }
                         };
-                        self.receive(&bytes, &outbox, &finished);
+                        self.receive(&bytes, &outbox, &finished).await;
                     }
                     Event::Outbound(message) => {
                         if !self.write(&mut socket, message).await {
@@ -380,10 +318,33 @@ impl Connection {
                         }
                     }
                     Event::Finished((id, number)) => {
-                        if self.open.get(&id).is_some_and(|(open, _)| *open == number) {
-                            self.open.remove(&id);
+                        if self.open.get(&id).is_some_and(|open| open.number == number) {
+                            self.end(&id).await;
                         }
                     }
+                    Event::Daemon(Ok(event)) => match *event {
+                        DaemonEvent::LeafFired(fire) => {
+                            // A wait fires once; its request ends with the fire.
+                            if let Some(id) = self.waits.get(&fire.watcher_id).cloned() {
+                                let mut body = body_of(&fire);
+                                if body["type"] != "error" {
+                                    body["type"] = json!("wait_fired");
+                                }
+                                outbox.send(tagged(body, Some(&id)));
+                                self.end(&key(&id)).await;
+                            }
+                        }
+                        event => self.feed.iter().for_each(|feed| feed.offer(Some(&event))),
+                    },
+                    Event::Daemon(Err(broadcast::error::RecvError::Lagged(_))) => {
+                        self.feed.iter().for_each(|feed| feed.offer(None));
+                        let lagged: Vec<_> = self.waits.values().cloned().collect();
+                        for id in lagged {
+                            outbox.send(error("wait_lagged", "fires may have been missed; subscribe again", Some(&id)));
+                            self.end(&key(&id)).await;
+                        }
+                    }
+                    Event::Daemon(Err(broadcast::error::RecvError::Closed)) => events = None,
                     Event::Ping => {
                         if heard.elapsed() > IDLE_LIMIT {
                             close = Some((1001, "idle"));
@@ -402,8 +363,9 @@ impl Connection {
                 }
             }
         }
-        for (_, (_, task)) in self.open.drain() {
-            task.abort();
+        let open: Vec<_> = self.open.keys().cloned().collect();
+        for id in open {
+            self.end(&id).await;
         }
         if let Some((code, reason)) = close {
             let _ = socket.send(Frame::Close(Some(CloseFrame { code: CloseCode::from(code), reason: reason.into() }))).await;
@@ -428,8 +390,22 @@ impl Connection {
         socket.send(frame).await.is_ok()
     }
 
+    /// Ends open request `id`, releasing the named query or wait it holds.
+    async fn end(&mut self, id: &str) -> bool {
+        let Some(open) = self.open.remove(id) else { return false };
+        open.task.abort();
+        if let (Some(query), Some(feed)) = (open.query, &self.feed) {
+            feed.leave(&query).await;
+        }
+        if let (Some(watcher), Some(feed)) = (open.watcher, &self.feed) {
+            self.waits.remove(&watcher);
+            feed.daemon().unsubscribe_waits(watcher).await;
+        }
+        true
+    }
+
     /// Handles one client frame; work that waits runs as an open request of its own.
-    fn receive(&mut self, bytes: &[u8], outbox: &Outbox, finished: &mpsc::UnboundedSender<(String, u64)>) {
+    async fn receive(&mut self, bytes: &[u8], outbox: &Outbox, finished: &mpsc::UnboundedSender<(String, u64)>) {
         let map = match decode(self.encoding, bytes) {
             Ok(map) => map,
             Err(reason) => {
@@ -450,57 +426,46 @@ impl Connection {
                 return;
             }
         };
-        match message {
-            ClientMessage::Unsubscribe { id } | ClientMessage::Cancel { id } => match self.open.remove(&key(&id)) {
-                Some((_, task)) => task.abort(),
-                None => {
+        let (id, work, query, watcher) = match message {
+            ClientMessage::Unsubscribe { id } | ClientMessage::Cancel { id } => {
+                if !self.end(&key(&id)).await {
                     outbox.send(error("not_found", "no open request has this id", Some(&id)));
                 }
-            },
-            ClientMessage::ObserveFocus { .. } => {}
+                return;
+            }
             ClientMessage::Subscribe(subscribe) => {
                 let id = subscribe.id.clone();
-                let work = self.subscribe(subscribe);
-                self.start(id, work, outbox, finished);
+                match self.subscribe(subscribe) {
+                    Ok((query, work)) => (id, work, query, None),
+                    Err(reason) => {
+                        outbox.send(failure(reason, &id));
+                        return;
+                    }
+                }
             }
-            ClientMessage::FetchMore { id, query } => {
-                let work = self.fetch_more(query);
-                self.start(id, work, outbox, finished);
-            }
+            ClientMessage::FetchMore { id, query } => (id, self.fetch_more(query), None, None),
             ClientMessage::WaitSubscribe { id, subscription } => {
-                let work = self.wait(subscription);
-                self.start(id, work, outbox, finished);
+                let watcher = uuid::Uuid::new_v4();
+                (id, self.wait(watcher, subscription), None, Some(watcher))
             }
-            ClientMessage::Command { id, command } => {
-                let work = self.command(command);
-                self.start(id, work, outbox, finished);
-            }
-        }
-    }
-
-    /// Runs one open request: `work` opens a stream of message bodies, each sent with `id`.
-    fn start(
-        &mut self,
-        id: Id,
-        work: futures::future::BoxFuture<'static, Result<BoxStream<'static, Value>, Failure>>,
-        outbox: &Outbox,
-        finished: &mpsc::UnboundedSender<(String, u64)>,
-    ) {
-        let name = key(&id);
-        if self.open.get(&name).is_some_and(|(_, task)| !task.is_finished()) {
-            outbox.send(error("duplicate_id", "a request with this id is open", Some(&id)));
+            ClientMessage::Command { id, command } => (id, self.command(command), None, None),
+        };
+        if !self.admit(&id, outbox).await {
             return;
         }
-        if self.open.len() >= OPEN_LIMIT {
-            self.open.retain(|_, (_, task)| !task.is_finished());
+        if let (Some(query), Some(feed)) = (&query, &self.feed) {
+            if let Err(reason) = feed.join(query.clone()).await {
+                outbox.send(failure(reason, &id));
+                return;
+            }
         }
-        if self.open.len() >= OPEN_LIMIT && !self.open.contains_key(&name) {
-            outbox.send(error("too_many_requests", format!("a connection holds at most {OPEN_LIMIT} open requests"), Some(&id)));
-            return;
+        if let Some(watcher) = watcher {
+            self.waits.insert(watcher, id.clone());
         }
         self.started += 1;
         let number = self.started;
         let (outbox, finished) = (outbox.clone(), finished.clone());
+        let name = key(&id);
         let task = tokio::spawn(async move {
             match work.await {
                 Ok(mut messages) => {
@@ -516,34 +481,58 @@ impl Connection {
             }
             let _ = finished.send((key(&id), number));
         });
-        self.open.insert(name, (number, task));
+        self.open.insert(name, Open { number, task, query, watcher });
     }
 
-    fn subscribe(&self, subscribe: Subscribe) -> futures::future::BoxFuture<'static, Result<BoxStream<'static, Value>, Failure>> {
+    /// Whether request `id` may open: its id is free and the connection is under its limit.
+    /// A request whose task has finished, though its end is not yet handled, is ended here.
+    async fn admit(&mut self, id: &Id, outbox: &Outbox) -> bool {
+        let name = key(id);
+        let done: Vec<_> = self.open.iter().filter(|(_, open)| open.task.is_finished()).map(|(name, _)| name.clone()).collect();
+        for finished in done {
+            self.end(&finished).await;
+        }
+        if self.open.contains_key(&name) {
+            outbox.send(error("duplicate_id", "a request with this id is open", Some(id)));
+            return false;
+        }
+        if self.open.len() >= OPEN_LIMIT {
+            outbox.send(error("too_many_requests", format!("a connection holds at most {OPEN_LIMIT} open requests"), Some(id)));
+            return false;
+        }
+        true
+    }
+
+    /// A subscription's work, and the named query it reads, which the connection holds for it.
+    fn subscribe(&self, subscribe: Subscribe) -> Result<(Option<QueryId>, Work), Failure> {
         let catalog = self.state.catalog(self.feed.clone());
-        Box::pin(async move {
-            let table = match (subscribe.table, &subscribe.query) {
-                (Some(table), _) => table,
-                (None, Some(query)) => query.table_set().tables[0].name.clone(),
-                (None, None) => return Err(Failure::new("invalid_request", "subscribe names a table or a query")),
-            };
-            let source = TableSource::open(table, &catalog)?.with_query_id(subscribe.query)?;
+        let table = match (subscribe.table, &subscribe.query) {
+            (Some(table), _) => table,
+            (None, Some(query)) => query.table_set().tables[0].name.clone(),
+            (None, None) => return Err(Failure::new("invalid_request", "subscribe names a table or a query")),
+        };
+        let source = TableSource::open(table, &catalog)?.with_query_id(subscribe.query)?;
+        let query = match &source {
+            TableSource::Query(named) => Some(named.query()?.clone()),
+            _ => None,
+        };
+        let work = Box::pin(async move {
             let description = source.describe().await?;
-            let mut params: Vec<(String, String)> = vec![("watch".into(), "true".into()), ("limit".into(), SNAPSHOT_LIMIT.into())];
+            let mut params: Vec<(String, String)> = vec![("watch".into(), "true".into()), ("limit".into(), MAX_LIMIT.to_string())];
             params.extend(subscribe.conditions.into_iter().map(|condition| ("where".into(), condition)));
-            for (name, value) in
-                [("sort", subscribe.sort), ("columns", subscribe.columns), ("namespace", subscribe.namespace), ("count", subscribe.count)]
-            {
-                params.extend(value.map(|value| (name.to_owned(), value)));
-            }
+            let lists = [("sort", subscribe.sort), ("columns", subscribe.columns)];
+            params.extend(lists.into_iter().filter_map(|(name, list)| Some((name.to_owned(), list?.join(",")))));
+            params.extend(subscribe.namespace.map(|namespace| ("namespace".to_owned(), namespace)));
+            params.extend(subscribe.count.map(|count| ("count".to_owned(), count)));
             let query = Query::parse(&params, &description.table)?;
             let resume = subscribe.cursor.map(|cursor| Resume { incarnation: cursor.incarnation, sequence: cursor.sequence });
             let messages = source.messages(description, query, resume).await?;
             Ok(messages.map(body_of).boxed())
-        })
+        });
+        Ok((query, work))
     }
 
-    fn fetch_more(&self, query: QueryId) -> futures::future::BoxFuture<'static, Result<BoxStream<'static, Value>, Failure>> {
+    fn fetch_more(&self, query: QueryId) -> Work {
         let feed = self.feed.clone();
         Box::pin(async move {
             let feed = feed.ok_or_else(|| Failure::new("unavailable", "named queries need the daemon"))?;
@@ -555,45 +544,18 @@ impl Connection {
         })
     }
 
-    fn wait(
-        &self,
-        subscription: WaitSubscriptionRequest,
-    ) -> futures::future::BoxFuture<'static, Result<BoxStream<'static, Value>, Failure>> {
+    /// A wait subscription under its own watcher; the connection's receiver delivers its fires,
+    /// and ending the request releases just it.
+    fn wait(&self, watcher: uuid::Uuid, subscription: WaitSubscriptionRequest) -> Work {
         let feed = self.feed.clone();
         Box::pin(async move {
             let feed = feed.ok_or_else(|| Failure::new("unavailable", "wait subscriptions need the daemon"))?;
-            let daemon = Arc::clone(feed.daemon());
-            // Each wait is a watcher of its own, so ending the request releases just it.
-            let watcher = uuid::Uuid::new_v4();
-            // Listen before subscribing, so a leaf already true fires into this stream.
-            let events = daemon.subscribe();
-            let subscription_id = daemon.subscribe_wait(watcher, subscription).await.map_err(|reason| Failure::new("wait", reason))?;
-            let release = WaitRelease { daemon, watcher };
-            let fires = futures::stream::unfold(Some((events, release)), move |state| async move {
-                let (mut events, release) = state?;
-                loop {
-                    match events.recv().await {
-                        Ok(DaemonEvent::LeafFired(fire)) if fire.watcher_id == watcher && fire.subscription_id == subscription_id => {
-                            let mut body = body_of(&fire);
-                            if body["type"] != "error" {
-                                body["type"] = json!("wait_fired");
-                            }
-                            return Some((body, Some((events, release))));
-                        }
-                        Ok(_) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            let lost = error("wait_lagged", "fires may have been missed; subscribe again", None);
-                            return Some((lost, None));
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-                    }
-                }
-            });
-            Ok(fires.boxed())
+            feed.daemon().subscribe_wait(watcher, subscription).await.map_err(|reason| Failure::new("wait", reason))?;
+            Ok(futures::stream::pending().boxed())
         })
     }
 
-    fn command(&self, command: String) -> futures::future::BoxFuture<'static, Result<BoxStream<'static, Value>, Failure>> {
+    fn command(&self, command: String) -> Work {
         let (state, caller) = (Arc::clone(&self.state), self.caller.clone());
         Box::pin(async move {
             let (Some(daemon), Some(commands)) = (state.daemon.as_ref(), state.commands.as_ref()) else {
@@ -610,20 +572,5 @@ impl Connection {
             })?;
             Ok(progress.map(body_of).boxed())
         })
-    }
-}
-
-/// Releases one wait subscription when its request ends, by cancel or by connection close.
-struct WaitRelease {
-    daemon: Arc<flotilla_core::in_process::InProcessDaemon>,
-    watcher: uuid::Uuid,
-}
-
-impl Drop for WaitRelease {
-    fn drop(&mut self) {
-        let (daemon, watcher) = (Arc::clone(&self.daemon), self.watcher);
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move { daemon.unsubscribe_waits(watcher).await });
-        }
     }
 }

@@ -12,6 +12,7 @@ use futures::{stream::BoxStream, StreamExt};
 pub(crate) use query::QueryFeed;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -19,7 +20,9 @@ use std::{
     time::Duration,
 };
 const LIMIT: usize = 200;
-const MAX_LIMIT: usize = 10_000;
+pub(crate) const MAX_LIMIT: usize = 10_000;
+/// The longest a watch goes without a message.
+const PROGRESS: Duration = Duration::from_secs(15);
 const KEY: &str = "metadata.name";
 #[derive(Debug, Clone)]
 pub(crate) struct Failure {
@@ -414,6 +417,8 @@ pub(crate) struct Catalog {
     pub service: Option<Arc<flotilla_schema_sqlite::stream::Service>>,
     pub derived: Vec<Arc<DerivedSet>>,
     pub queries: Option<Arc<QueryFeed>>,
+    /// The daemon run, the incarnation of tables whose sequences restart with it.
+    pub incarnation: String,
 }
 
 /// A watch's resume point: the `incarnation` and `sequence` of the last message a client applied.
@@ -427,7 +432,7 @@ pub(crate) struct Resume {
 pub(crate) enum TableSource {
     Resource { backend: ResourceBackend, name: String },
     Decided { service: Arc<flotilla_schema_sqlite::stream::Service>, name: String },
-    Derived { derived: Arc<DerivedSet>, name: String },
+    Derived { derived: Arc<DerivedSet>, name: String, incarnation: String },
     Query(query::Source),
 }
 pub(crate) struct Description {
@@ -456,7 +461,7 @@ impl TableSource {
             return Ok(Self::Resource { backend: catalog.backend.clone(), name });
         }
         if let Some(derived) = catalog.derived.iter().find(|derived| derived.table(&name).is_some()) {
-            return Ok(Self::Derived { derived: Arc::clone(derived), name });
+            return Ok(Self::Derived { derived: Arc::clone(derived), name, incarnation: catalog.incarnation.clone() });
         }
         if let Some(source) = query::Source::open(&name, catalog.queries.as_ref()) {
             return Ok(Self::Query(source));
@@ -519,7 +524,7 @@ impl TableSource {
                 filter::describe_operators(&mut table);
                 Ok(Description { schema: set.frictionless(&table), table, markdown })
             }
-            Self::Derived { derived, name } => {
+            Self::Derived { derived, name, .. } => {
                 let mut table = derived.set.tables[derived.table(name).expect("opened table")].clone();
                 for column in table.key.iter_mut().chain(&mut table.columns) {
                     let scalar = !matches!(column.ty, ColumnType::Blob | ColumnType::Cbor | ColumnType::Frozen);
@@ -569,7 +574,22 @@ impl TableSource {
         }
         Ok(diagram)
     }
+    /// A snapshot whose incarnation also names the subscription's parameters, so a cursor
+    /// resumes only the subscription it came from.
     async fn snapshot(&self, table: &Table, query: &Query) -> Result<Snapshot, Failure> {
+        let mut snapshot = self.read(table, query).await?;
+        let named = match self {
+            Self::Query(source) => Some(source.query()?),
+            _ => None,
+        };
+        let parameters = serde_json::to_vec(&(self.name(), named, &query.namespace, query.filter_text(), &query.sort, &query.columns))
+            .map_err(|error| Failure::from(error.to_string()))?;
+        let digest = Sha256::digest(parameters);
+        snapshot.incarnation =
+            format!("{}~{}", snapshot.incarnation, digest[..8].iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+        Ok(snapshot)
+    }
+    async fn read(&self, table: &Table, query: &Query) -> Result<Snapshot, Failure> {
         match self {
             Self::Resource { backend, name } => {
                 let declared = flotilla_store::declared_resource_kinds().into_iter().find(|entry| entry.paths.plural == *name);
@@ -593,15 +613,15 @@ impl TableSource {
                 let (sequence, _, rows) = decided::read(service, name, query).await?;
                 Ok(Snapshot { rows, sequence, incarnation: "durable".into(), start: WatchStart::Now })
             }
-            Self::Derived { derived, name } => {
+            Self::Derived { derived, name, incarnation } => {
                 let rows =
                     derived.rows[derived.table(name).expect("opened table")].iter().filter(|row| query.keeps(row)).cloned().collect();
                 // Derived rows change only with the daemon, so one snapshot serves its life. A catalog
                 // that reloads (verbs from `verbs/*.yaml`, #4198) needs events here.
-                Ok(Snapshot { rows, sequence: 1, incarnation: "derived".into(), start: WatchStart::Now })
+                Ok(Snapshot { rows, sequence: 1, incarnation: incarnation.clone(), start: WatchStart::Now })
             }
             Self::Query(source) => {
-                let (rows, sequence, incarnation) = source.rows()?;
+                let (rows, sequence, incarnation) = source.rows().await?;
                 Ok(Snapshot {
                     rows: rows.into_iter().filter(|row| query.keeps(row)).collect(),
                     sequence,
@@ -651,7 +671,7 @@ impl TableSource {
     /// The row messages of `query`. A `resume` naming the snapshot's incarnation and sequence
     /// continues from it with `synced` alone; any other gets `resync` and a fresh snapshot.
     pub(crate) async fn messages(
-        mut self,
+        self,
         description: Description,
         query: Query,
         resume: Option<Resume>,
@@ -668,16 +688,9 @@ impl TableSource {
                 return Err(bad("unsupported_log_paging", "log reads support only bounded sequence-order snapshots without counts"));
             }
         }
-        if let Self::Query(source) = &mut self {
-            let since = resume.as_ref().filter(|resume| resume.incarnation == source.incarnation()).map(|resume| resume.sequence);
-            source.join(since).await?;
-        }
         let snapshot = self.snapshot(&description.table, &query).await?;
-        let resumed = resume.as_ref().is_some_and(|resume| {
-            resume.incarnation == snapshot.incarnation
-                && resume.sequence == snapshot.sequence
-                && !matches!(&self, Self::Query(source) if !source.resumed())
-        });
+        let resumed =
+            resume.as_ref().is_some_and(|resume| resume.incarnation == snapshot.incarnation && resume.sequence == snapshot.sequence);
         let initial = match resume {
             Some(_) if resumed => {
                 let count = query.count.as_ref().map(|mode| Message::Count {
@@ -698,7 +711,8 @@ impl TableSource {
             return Ok(futures::stream::iter(initial).boxed());
         }
         let events = self.events(&query, &snapshot);
-        let state = Live { source: self, description, query, snapshot, events, pending: initial.into(), failures: 0, done: false };
+        let quiet = tokio::time::Instant::now() + PROGRESS;
+        let state = Live { source: self, description, query, snapshot, events, pending: initial.into(), failures: 0, done: false, quiet };
         Ok(live(state))
     }
 }
@@ -707,6 +721,7 @@ fn live(state: Live) -> BoxStream<'static, Message> {
     futures::stream::unfold(state, |mut state| async move {
         loop {
             if let Some(message) = state.pending.pop_front() {
+                state.quiet = tokio::time::Instant::now() + PROGRESS;
                 return Some((message, state));
             }
             if state.done {
@@ -714,7 +729,10 @@ fn live(state: Live) -> BoxStream<'static, Message> {
             }
             let event = tokio::select! {
                 event=state.events.next()=>event.unwrap_or_else(||Err("table change feed ended".into())),
-                _=tokio::time::sleep(Duration::from_secs(15))=>return Some((Message::Progress{sequence:state.snapshot.sequence},state)),
+                _=tokio::time::sleep_until(state.quiet)=>{
+                    state.pending.push_back(Message::Progress{sequence:state.snapshot.sequence});
+                    continue;
+                }
             };
             let next = match event {
                 Ok(()) => state.source.snapshot(&state.description.table, &state.query).await,
@@ -793,6 +811,8 @@ struct Live {
     pending: VecDeque<Message>,
     failures: u8,
     done: bool,
+    /// When a silent subscription next sends `progress`.
+    quiet: tokio::time::Instant,
 }
 fn source_failure(error: flotilla_resources::ResourceError) -> Failure {
     use flotilla_resources::ResourceError;
@@ -1186,6 +1206,7 @@ mod source_contract_tests {
                 pending: VecDeque::new(),
                 failures: 0,
                 done: false,
+                quiet: tokio::time::Instant::now() + PROGRESS,
             });
             assert!(matches!(messages.next().await, Some(Message::Resync { .. })));
             assert!(matches!(messages.next().await, Some(Message::Table { .. })));

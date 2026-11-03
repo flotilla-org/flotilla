@@ -297,20 +297,10 @@ pub(super) async fn handle(
         return refuse(encoding, StatusCode::FORBIDDEN, "EnvironmentCommandDenied: cancellation is outside supervisor authority");
     }
     if let Some(id) = command_resource {
-        let id = match Uuid::parse_str(id) {
-            Ok(id) => id,
-            Err(_) => return refuse(encoding, StatusCode::BAD_REQUEST, "invalid command id"),
+        let (id, mut receiver, command_id) = match commands.record(id, &caller, transport_bound).await {
+            Ok(record) => record,
+            Err((status, message)) => return refuse(encoding, status, message),
         };
-        let records = commands.records.lock().await;
-        let Some(record) = records.get(&id) else {
-            return refuse(encoding, StatusCode::NOT_FOUND, "command not found");
-        };
-        if record.owner.crew != caller.crew || (transport_bound && caller.crew.is_none()) {
-            return refuse(encoding, StatusCode::FORBIDDEN, "command belongs to another caller");
-        }
-        let mut receiver = record.state.clone();
-        let command_id = record.command_id;
-        drop(records);
         if method == Method::DELETE {
             if receiver.borrow().outcome.is_some() {
                 return refuse(encoding, StatusCode::CONFLICT, "command has finished");
@@ -566,13 +556,24 @@ impl Commands {
             None,
         )
         .await?;
-        let id = Uuid::parse_str(id).map_err(|_| (StatusCode::BAD_REQUEST, "invalid command id".to_owned()))?;
+        let (_, state, _) = self.record(id, &caller, transport_bound).await.map_err(|(status, message)| (status, message.to_owned()))?;
+        Ok(progress(state))
+    }
+
+    /// Command record `id` as `caller` may see it: its id, state and daemon command id.
+    async fn record(
+        &self,
+        id: &str,
+        caller: &CommandCaller,
+        transport_bound: bool,
+    ) -> Result<(Uuid, watch::Receiver<CommandState>, Option<u64>), (StatusCode, &'static str)> {
+        let id = Uuid::parse_str(id).map_err(|_| (StatusCode::BAD_REQUEST, "invalid command id"))?;
         let records = self.records.lock().await;
-        let record = records.get(&id).ok_or((StatusCode::NOT_FOUND, "command not found".to_owned()))?;
-        if record.owner.crew != caller.crew || transport_bound {
-            return Err((StatusCode::FORBIDDEN, "command belongs to another caller".to_owned()));
+        let record = records.get(&id).ok_or((StatusCode::NOT_FOUND, "command not found"))?;
+        if record.owner.crew != caller.crew || (transport_bound && caller.crew.is_none()) {
+            return Err((StatusCode::FORBIDDEN, "command belongs to another caller"));
         }
-        Ok(progress(record.state.clone()))
+        Ok((id, record.state.clone(), record.command_id))
     }
 }
 

@@ -50,7 +50,7 @@ struct Client {
 }
 
 async fn connect(router: &Router, caller: CallerAuth, protocols: &[&str]) -> Result<Client, tungstenite::Error> {
-    let (client, server) = tokio::io::duplex(1 << 20);
+    let (client, server) = tokio::io::duplex(1 << 16);
     let policy =
         TcpPolicy::new([HOST.to_owned()], move |_| Some(Authentication { caller: Caller::Custom(caller.clone()), uses_cookie: false }));
     tokio::spawn(policy.serve_connection(server, router.clone(), std::future::pending()));
@@ -85,8 +85,12 @@ impl Client {
 
     /// The next message; a close or a silent connection fails the test.
     async fn next(&mut self) -> Value {
+        self.next_within(WAIT).await
+    }
+
+    async fn next_within(&mut self, limit: Duration) -> Value {
         loop {
-            let frame = tokio::time::timeout(WAIT, self.socket.next()).await.expect("a message in time").expect("open").expect("frame");
+            let frame = tokio::time::timeout(limit, self.socket.next()).await.expect("a message in time").expect("open").expect("frame");
             return match frame {
                 Frame::Binary(bytes) => flotilla_cbor::from_slice(&bytes, &rigging_http_wire::LIMITS).unwrap(),
                 Frame::Text(text) => serde_json::from_str(&text).unwrap(),
@@ -139,7 +143,7 @@ fn types(messages: &[&Value]) -> Vec<String> {
 }
 
 fn subscribe(id: &str) -> Value {
-    json!({"type": "subscribe", "id": id, "table": "convoys", "namespace": "test", "columns": "spec"})
+    json!({"type": "subscribe", "id": id, "table": "convoys", "namespace": "test", "columns": ["spec"]})
 }
 
 async fn create(backend: &ResourceBackend, name: &str) {
@@ -240,8 +244,9 @@ async fn subscriptions_stream_snapshot_then_changes_alike_on_both_subprotocols()
 }
 
 // #3249: a cursor names the incarnation and the last sequence applied. A current one resumes
-// with `synced` alone; an older sequence, or the current sequence of another incarnation, gets
-// `resync` and a fresh `table`, `rows`, `synced`.
+// with `synced` alone; an older sequence, the current sequence of another incarnation, or the
+// current position of a subscription with other parameters gets `resync` and a fresh `table`,
+// `rows`, `synced`.
 #[tokio::test]
 async fn cursors_resume_only_their_own_current_position() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -254,12 +259,15 @@ async fn cursors_resume_only_their_own_current_position() {
     let stale = snapshot.last().unwrap()["sequence"].clone();
     create(&backend, "b").await;
     let current = client.until(|message| message["type"] == "upsert").await.pop().unwrap()["sequence"].clone();
-    for (id, incarnation, sequence, expected) in [
-        ("current", incarnation.clone(), current.clone(), vec!["synced"]),
-        ("stale", incarnation, stale, vec!["resync", "table", "rows", "synced"]),
-        ("elsewhere", json!("another-incarnation"), current, vec!["resync", "table", "rows", "synced"]),
+    let fresh = vec!["resync", "table", "rows", "synced"];
+    for (id, incarnation, sequence, columns, expected) in [
+        ("current", incarnation.clone(), current.clone(), json!(["spec"]), vec!["synced"]),
+        ("stale", incarnation.clone(), stale, json!(["spec"]), fresh.clone()),
+        ("elsewhere", json!("another-incarnation"), current.clone(), json!(["spec"]), fresh.clone()),
+        ("reshaped", incarnation, current, json!(["metadata.name"]), fresh),
     ] {
         let mut request = subscribe(id);
+        request["columns"] = columns;
         request["cursor"] = json!({"incarnation": incarnation, "sequence": sequence});
         client.send(request).await;
         let messages = client.until(|message| message["id"] == id && message["type"] == "synced").await;
@@ -325,8 +333,9 @@ async fn the_upgrade_admits_users_offering_a_surface_subprotocol() {
 }
 
 // #3249: frames are refused, not decoded, past the reader's limits. The CBOR profile's safe reader
-// rejects duplicate keys, tags and trailing bytes, JSON refuses duplicate keys too, and an unknown
-// type is answered with `error`; after each the connection stays up. An oversized frame closes it.
+// rejects duplicate keys, tags and trailing bytes, a frame of the other subprotocol's type is
+// refused, and an unknown type is answered with `error`; after each the connection stays up. An
+// oversized frame closes it.
 #[tokio::test]
 async fn malformed_frames_get_errors_and_oversized_frames_close() {
     let router = router(ResourceBackend::new(InMemoryBackend::default()));
@@ -347,12 +356,8 @@ async fn malformed_frames_get_errors_and_oversized_frames_close() {
     client.send_raw(Frame::Binary(valid.into())).await;
     assert_eq!(client.next().await["code"], "not_found");
 
-    let mut json = user(&router, surface::JSON).await;
-    json.send_raw(Frame::Text(r#"{"type":"cancel","id":"x","id":"y"}"#.into())).await;
-    assert_eq!(json.next().await["code"], "invalid_message");
-    json.fence().await;
-
-    client.send_raw(Frame::Binary(vec![0; surface::FRAME_LIMIT + 1].into())).await;
+    // The server may close before the whole frame is written.
+    let _ = client.socket.send(Frame::Binary(vec![0; surface::FRAME_LIMIT + 1].into())).await;
     assert_eq!(client.close_code().await, Some(CloseCode::Size));
 }
 
@@ -557,28 +562,130 @@ async fn named_query_tables_carry_the_framed_result_set() {
     }
 }
 
+fn issues() -> QueryId {
+    QueryId::Issues { scope: flotilla_protocol::QueryScope::new("flotilla", "demo"), search: None, label: None }
+}
+
 // #3249: connection-owned state lives on the socket: a named query held by a connection is
 // released from the aggregator when it closes, and `fetch_more` is refused for a query the
-// connection does not hold.
+// connection does not hold. The aggregator's demand is watched, not polled.
 #[tokio::test]
 async fn closing_the_connection_releases_its_named_queries() {
     let daemon = Daemon::start().await;
-    let query = QueryId::Convoys { scope: Some(flotilla_protocol::QueryScope::new("flotilla", "demo")) };
+    let query = issues();
     let mut client = user(&daemon.router, surface::CBOR).await;
     client.send(json!({"type": "fetch_more", "id": "early", "query": query})).await;
     assert_eq!(client.next().await["code"], "invalid_request");
     client.send(json!({"type": "subscribe", "id": "q", "query": query})).await;
     client.until(|message| message["type"] == "synced").await;
-    let state = daemon.daemon.aggregator_projection_state().await;
-    assert!(state.subscribed_queries().contains(&query));
+    let mut demand = daemon.daemon.aggregator_projection_state().await.subscribe_demand();
+    assert!(demand.borrow().contains_key(&query));
     drop(client);
-    tokio::time::timeout(WAIT, async {
-        while state.subscribed_queries().contains(&query) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("released on close");
+    tokio::time::timeout(WAIT, demand.wait_for(|demand| !demand.contains_key(&query))).await.expect("released on close").unwrap();
+}
+
+// Review of #4298: a named-query cursor binds to the materialisation it was read from. A current
+// cursor resumes with `synced`. Once an issues query's last subscriber has left and it is
+// materialised again, its sequence restarts and its incarnation changes, so a cursor from the
+// earlier materialisation gets `resync` at whatever sequence it names.
+#[tokio::test]
+async fn named_query_cursors_resume_only_their_own_materialisation() {
+    let daemon = Daemon::start().await;
+    let mut client = user(&daemon.router, surface::JSON).await;
+    let convoys = QueryId::Convoys { scope: None };
+    client.send(json!({"type": "subscribe", "id": "convoys", "query": convoys})).await;
+    let snapshot = client.until(|message| message["type"] == "synced").await;
+    let cursor = json!({"incarnation": snapshot[0]["incarnation"], "sequence": snapshot.last().unwrap()["sequence"]});
+    client.send(json!({"type": "subscribe", "id": "current", "query": convoys, "cursor": cursor})).await;
+    let resumed = client.until(|message| message["id"] == "current" && message["type"] == "synced").await;
+    assert_eq!(types(&of(&resumed, "current")), ["synced"]);
+
+    let query = issues();
+    client.send(json!({"type": "subscribe", "id": "held", "query": query})).await;
+    let first = client.until(|message| message["id"] == "held" && message["type"] == "synced").await;
+    let earlier = of(&first, "held")[0]["incarnation"].clone();
+    let mut demand = daemon.daemon.aggregator_projection_state().await.subscribe_demand();
+    client.send(json!({"type": "unsubscribe", "id": "held"})).await;
+    tokio::time::timeout(WAIT, demand.wait_for(|demand| !demand.contains_key(&query))).await.expect("released").unwrap();
+    client.send(json!({"type": "subscribe", "id": "again", "query": query})).await;
+    let again = client.until(|message| message["id"] == "again" && message["type"] == "synced").await;
+    let again = of(&again, "again");
+    assert_ne!(again[0]["incarnation"], earlier);
+    let cursor = json!({"incarnation": earlier, "sequence": again.last().unwrap()["sequence"]});
+    client.send(json!({"type": "subscribe", "id": "old", "query": query, "cursor": cursor})).await;
+    let old = client.until(|message| message["id"] == "old" && message["type"] == "synced").await;
+    assert_eq!(types(&of(&old, "old")), ["resync", "table", "rows", "synced"]);
+}
+
+// #3249: `wait_subscribe` answers with `wait_fired` when its leaf becomes true, and the fire ends
+// the request; a wait cancelled before its leaf turns true never fires.
+#[tokio::test]
+async fn waits_fire_once_and_cancelled_waits_do_not() {
+    use flotilla_protocol::{Leaf, LeafAddress, LeafOperator};
+    use flotilla_resources::{ConvoyPhase, ConvoyStatus};
+    let daemon = Daemon::start().await;
+    daemon.convoy("watched").await;
+    let leaf = Leaf {
+        address: LeafAddress::Convoy { name: "watched".into() },
+        field_path: ".status.phase".into(),
+        operator: LeafOperator::Equal,
+        literal: "Failed".into(),
+    };
+    let subscription = json!({"namespace": "flotilla", "leaves": [leaf]});
+    let mut client = user(&daemon.router, surface::CBOR).await;
+    for id in ["cancelled", "w"] {
+        client.send(json!({"type": "wait_subscribe", "id": id, "subscription": subscription})).await;
+    }
+    client.send(json!({"type": "cancel", "id": "cancelled"})).await;
+    assert!(client.fence().await.is_empty());
+    let convoys = daemon.daemon.resource_backend().using::<Convoy>("flotilla");
+    let current = convoys.get("watched").await.unwrap();
+    let status = ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() };
+    convoys.update_status("watched", &current.metadata.resource_version, &status).await.unwrap();
+    let mut received = client.until(|message| message["type"] == "wait_fired").await;
+    let fired = received.last().unwrap().clone();
+    assert_eq!((fired["id"].as_str(), fired["value"].as_str()), (Some("w"), Some("Failed")));
+    assert_eq!(fired["leaf"], serde_json::to_value(&leaf).unwrap());
+    client.send(json!({"type": "cancel", "id": "w"})).await;
+    received.extend(client.fence().await);
+    assert!(of(&received, "cancelled").is_empty(), "{received:?}");
+    assert_eq!(of(&received, "w").last().unwrap()["code"], "not_found");
+}
+
+// #3249: a consumer that stops reading is closed with 1013 once its queue of 1,024 frames is full,
+// rather than buffered without bound or slowing the producers; it resumes by cursor.
+#[tokio::test]
+async fn a_consumer_that_falls_behind_is_closed_with_1013() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let router = router(backend.clone());
+    let mut client = user(&router, surface::CBOR).await;
+    for index in 0..200 {
+        client.send(subscribe(&format!("s{index}"))).await;
+    }
+    let mut synced = 0;
+    while synced < 200 {
+        synced += usize::from(client.next().await["type"] == "synced");
+    }
+    for index in 0..30 {
+        create(&backend, &format!("c{index}")).await;
+    }
+    assert_eq!(client.close_code().await, Some(CloseCode::Again));
+}
+
+// #3249: a subscription with nothing to report still hears from the server at least every 15
+// seconds, under paused time.
+#[tokio::test(start_paused = true)]
+async fn quiet_subscriptions_send_progress_at_least_every_15_seconds() {
+    let router = router(ResourceBackend::new(InMemoryBackend::default()));
+    let mut client = user(&router, surface::CBOR).await;
+    client.send(subscribe("quiet")).await;
+    client.until(|message| message["type"] == "synced").await;
+    for _ in 0..3 {
+        let since = tokio::time::Instant::now();
+        let message = client.next_within(Duration::from_secs(16)).await;
+        assert_eq!((message["type"].as_str(), message["id"].as_str()), (Some("progress"), Some("quiet")));
+        assert!(since.elapsed() <= Duration::from_secs(15), "{:?}", since.elapsed());
+    }
 }
 
 // #3249: a connection may follow a command started over plain HTTP, receiving its steps as

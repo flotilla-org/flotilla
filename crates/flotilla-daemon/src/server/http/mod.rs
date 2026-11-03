@@ -151,6 +151,7 @@ impl HttpRouter {
             service: table_api::store(self),
             derived: self.derived.clone(),
             queries: queries.or_else(|| self.daemon.as_ref().map(|daemon| QueryFeed::new(Arc::clone(daemon), self.incarnation.clone()))),
+            incarnation: self.incarnation.clone(),
         }
     }
 
