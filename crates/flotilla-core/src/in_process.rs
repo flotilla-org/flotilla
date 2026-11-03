@@ -941,7 +941,7 @@ impl InProcessDaemon {
             config: &self.config,
             active_commands: &self.active_commands,
             observed_checkout_reconciliation: &self.observed_checkout_reconciliation,
-            environment_manager: Arc::clone(&self.environment_manager) as Arc<dyn EnvironmentLifecycle>,
+            environment_lifecycle: Arc::clone(&self.environment_manager) as Arc<dyn EnvironmentLifecycle>,
             runner: &self.discovery.runner,
             env: &self.discovery.env,
             daemon_socket_path: &self.daemon_socket_path,
@@ -1373,7 +1373,7 @@ impl InProcessDaemon {
                 .observed_checkout_reconciliation(Arc::clone(&observed_checkout_reconciliation))
                 .config(Arc::clone(&config))
                 .discovery(Arc::clone(&discovery))
-                .environment_manager(Arc::clone(&environment_manager) as Arc<dyn Environments>)
+                .environments(Arc::clone(&environment_manager) as Arc<dyn Environments>)
                 .local_environment_id(local_environment_id.clone())
                 .provisioning_namespace(Arc::clone(&provisioning_namespace))
                 .repository_change_requests(Arc::clone(&repository_change_requests))
@@ -5435,7 +5435,7 @@ impl InProcessDaemon {
             daemon_socket_path,
 
             local_host: self.host_name.clone(),
-            environment_manager: Arc::clone(&self.environment_manager) as Arc<dyn EnvironmentLifecycle>,
+            environment_lifecycle: Arc::clone(&self.environment_manager) as Arc<dyn EnvironmentLifecycle>,
             vcs_resolver: self.self_weak.upgrade().ok_or("VCS resolver daemon unavailable")?
                 as Arc<dyn flotilla_vcs::vcs::CheckoutVcsResolver>,
         };

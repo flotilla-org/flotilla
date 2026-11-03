@@ -94,7 +94,7 @@ pub struct ExecutorActions<'a> {
     pub config: &'a Arc<ConfigStore>,
     pub active_commands: &'a Arc<Mutex<HashMap<u64, CancellationToken>>>,
     pub observed_checkout_reconciliation: &'a Arc<Mutex<()>>,
-    pub environment_manager: Arc<dyn EnvironmentLifecycle>,
+    pub environment_lifecycle: Arc<dyn EnvironmentLifecycle>,
     pub runner: &'a Arc<dyn CommandRunner>,
     pub env: &'a Arc<dyn EnvVars>,
     pub daemon_socket_path: &'a RwLock<Option<PathBuf>>,
@@ -474,7 +474,7 @@ impl ExecutorActions<'_> {
         let local_host = self.host_name.clone();
         let local_node_id = self.events.node_id.clone();
         let daemon_socket_path = self.daemon_socket_path.read().await.clone();
-        let environment_manager = Arc::clone(&self.environment_manager);
+        let environment_lifecycle = Arc::clone(&self.environment_lifecycle);
         let vcs_resolver = self.port.vcs_resolver()?;
         tokio::spawn(async move {
             let resolver_registry = Arc::clone(&registry);
@@ -516,7 +516,7 @@ impl ExecutorActions<'_> {
                         daemon_socket_path: daemon_socket_dhp.clone(),
 
                         local_host: resolver_local_host.clone(),
-                        environment_manager: Arc::clone(&environment_manager),
+                        environment_lifecycle: Arc::clone(&environment_lifecycle),
                         vcs_resolver: Arc::clone(&vcs_resolver),
                     };
                     let result = run_step_plan_with_remote_executor(
