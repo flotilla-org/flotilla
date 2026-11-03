@@ -2324,6 +2324,7 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
                 local_image_id: None,
                 registry_digest: None,
                 message: None,
+                backing_gone: false,
                 credential_delivery_retry: None,
                 credential_refresh_retry: None,
             },

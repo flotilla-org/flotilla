@@ -336,10 +336,25 @@ pub struct EnvironmentStatus {
     pub registry_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// The provider authoritatively reported the backing, and all storage it
+    /// held, gone (#4304). Work inside it is unrecoverable, so teardown no
+    /// longer waits on it. Absent in older records, which read as unconfirmed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub backing_gone: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_delivery_retry: Option<ControllerRetry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_refresh_retry: Option<ControllerRetry>,
+}
+
+impl EnvironmentStatus {
+    /// Why work inside this backing is unrecoverable, once it is Lost and its
+    /// provider confirmed the backing gone; `None` while the work may still
+    /// exist, as in a stopped backing or one whose loss is unconfirmed.
+    pub fn backing_gone_reason(&self) -> Option<&str> {
+        (self.phase == EnvironmentPhase::Lost && self.backing_gone)
+            .then(|| self.message.as_deref().unwrap_or("environment backing is gone"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -363,6 +378,11 @@ pub enum EnvironmentStatusPatch {
         message: String,
     },
     MarkLost {
+        message: String,
+    },
+    /// Lost, with the provider's authoritative word that the backing and its
+    /// storage are gone, so nothing inside it can be recovered.
+    MarkBackingGone {
         message: String,
     },
     MarkFailed {
@@ -418,6 +438,12 @@ impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
             Self::MarkLost { message } => {
                 status.phase = EnvironmentPhase::Lost;
                 status.ready = false;
+                status.message = Some(message.clone());
+            }
+            Self::MarkBackingGone { message } => {
+                status.phase = EnvironmentPhase::Lost;
+                status.ready = false;
+                status.backing_gone = true;
                 status.message = Some(message.clone());
             }
             Self::MarkFailed { message } => {

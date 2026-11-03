@@ -473,45 +473,131 @@ async fn failed_environment_readoption_does_not_block_a_live_sibling() {
     assert!(daemon.environment_registry_for_environment(&good_id).is_some(), "live sibling should still be adopted");
 }
 
+/// A cloud backing as its provider reports it: the remote API boundary.
+struct CloudHandle {
+    id: EnvironmentId,
+    state: flotilla_environment::environment::ObservationState,
+}
+#[async_trait]
+impl ProvisionedEnvironment for CloudHandle {
+    flotilla_discovery_testkit::injected_environment_handle!();
+    fn id(&self) -> &EnvironmentId {
+        &self.id
+    }
+    fn image(&self) -> &ImageId {
+        static IMAGE: std::sync::LazyLock<ImageId> = std::sync::LazyLock::new(|| ImageId::new("cloud"));
+        &IMAGE
+    }
+    async fn detect_readiness(&self) -> flotilla_environment::environment::ProviderReadiness {
+        flotilla_environment::environment::ProviderReadiness::Ready
+    }
+    fn health_message(&self) -> Option<String> {
+        Some("degraded: injected failure".into())
+    }
+    async fn observe(&self) -> flotilla_environment::environment::ProviderObservation {
+        flotilla_environment::environment::ProviderObservation::new(self.state.clone())
+    }
+    async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
+        Ok(Default::default())
+    }
+    fn runner(&self) -> Arc<dyn CommandRunner> {
+        Arc::new(DiscoveryMockRunner::builder().build())
+    }
+    async fn destroy(&self) -> Result<(), String> {
+        panic!("liveness must never destroy backing")
+    }
+}
+
+// #4304: the provider's authoritative word that a backing is gone, whether it
+// reports the sandbox gone or no longer lists it, is recorded as `backing_gone`,
+// including for a sandbox an earlier generation recorded only as Lost. A
+// stopped sandbox keeps its disk, so its work may still exist: never gone.
+#[tokio::test]
+async fn cloud_backing_confirmed_gone_is_recorded_even_after_an_unconfirmed_loss() {
+    use flotilla_environment::environment::{GoneCause, ObservationState, StoppedCause};
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("config")).unwrap();
+    fs::write(temp.path().join("config/daemon.toml"), r#"machine_id = "cloud-gone-test""#).unwrap();
+    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        config.clone(),
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+        HostName::new("controller"),
+        Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
+    let address: flotilla_address::Address = "account:cloud/provider:cloud".parse().unwrap();
+    let stopped = ObservationState::Stopped { cause: StoppedCause::SuspendedByRequest };
+    let gone = ObservationState::Gone { cause: GoneCause::LifetimeCapReached };
+    // (name, recorded phase, what the provider reports (None: absent from its inventory), recorded gone afterwards)
+    let cases = [
+        ("ready-missing", EnvironmentPhase::Ready, None, true),
+        ("ready-gone", EnvironmentPhase::Ready, Some(gone.clone()), true),
+        ("ready-stopped", EnvironmentPhase::Ready, Some(stopped.clone()), false),
+        ("lost-missing", EnvironmentPhase::Lost, None, true),
+        ("lost-gone", EnvironmentPhase::Lost, Some(gone), true),
+        ("lost-stopped", EnvironmentPhase::Lost, Some(stopped), false),
+    ];
+    let handles: Vec<EnvironmentHandle> = cases
+        .iter()
+        .filter_map(|(name, _, state, _)| {
+            state.clone().map(|state| Arc::new(CloudHandle { id: EnvironmentId::new(*name), state }) as EnvironmentHandle)
+        })
+        .collect();
+    let mut state = ControllerRuntimeState::new(
+        daemon.clone(),
+        config,
+        Arc::new(ProviderRegistry::new()),
+        None,
+        daemon.local_host_id().unwrap().to_string(),
+        "direct".into(),
+    );
+    state.environment_providers.insert(address.clone(), Arc::new(AdoptionEnvironmentProvider { handles: handles.clone() })).unwrap();
+    let state = Arc::new(state);
+    let environments = daemon.resource_backend().using::<Environment>(NAMESPACE);
+    for (name, phase, _, _) in &cases {
+        let spec: flotilla_resources::EnvironmentSpec = serde_json::from_value(serde_json::json!({
+            "provider_address": address.to_string(), "cloud_sandbox": {
+                "image": "cloud", "size": {"cpus":1,"memory_bytes":1024,"disk_bytes":1024}, "env": {} }
+        }))
+        .unwrap();
+        let object = environments.create(&empty_meta(name), &spec).await.unwrap();
+        environments
+            .update_status(
+                name,
+                &object.metadata.resource_version,
+                &flotilla_resources::EnvironmentStatus {
+                    phase: *phase,
+                    ready: *phase == EnvironmentPhase::Ready,
+                    backing_id: Some(format!("{name}-backing")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    for handle in &handles {
+        state
+            .provisioned_environments
+            .lock()
+            .await
+            .insert(handle.id().to_string(), ActiveProvisionedEnvironment { handle: handle.clone() });
+    }
+    reconcile_provisioned_environments(&state, NAMESPACE).await.unwrap();
+    for (name, _, _, expected_gone) in cases {
+        let status = environments.get(name).await.unwrap().status.unwrap();
+        assert_eq!(status.phase, EnvironmentPhase::Lost, "{name}");
+        assert_eq!(status.backing_gone_reason().is_some(), expected_gone, "{name}: {status:?}");
+    }
+}
+
 // #3765 S1/S6: cloud Unknown must not abort a sibling's loss detection.
 // The in-memory provider represents the remote API boundary; durable status
 // transitions run through the real runtime and resource backend.
 #[tokio::test]
 async fn cloud_unknown_does_not_abort_gone_sibling() {
-    use flotilla_environment::environment::{GoneCause, ObservationState, ProviderObservation, UnknownReason};
-    struct CloudHandle {
-        id: EnvironmentId,
-        state: ObservationState,
-    }
-    #[async_trait]
-    impl ProvisionedEnvironment for CloudHandle {
-        flotilla_discovery_testkit::injected_environment_handle!();
-        fn id(&self) -> &EnvironmentId {
-            &self.id
-        }
-        fn image(&self) -> &ImageId {
-            static IMAGE: std::sync::LazyLock<ImageId> = std::sync::LazyLock::new(|| ImageId::new("cloud"));
-            &IMAGE
-        }
-        async fn detect_readiness(&self) -> flotilla_environment::environment::ProviderReadiness {
-            flotilla_environment::environment::ProviderReadiness::Ready
-        }
-        fn health_message(&self) -> Option<String> {
-            Some("degraded: injected failure".into())
-        }
-        async fn observe(&self) -> ProviderObservation {
-            ProviderObservation::new(self.state.clone())
-        }
-        async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
-            Ok(Default::default())
-        }
-        fn runner(&self) -> Arc<dyn CommandRunner> {
-            Arc::new(DiscoveryMockRunner::builder().build())
-        }
-        async fn destroy(&self) -> Result<(), String> {
-            panic!("liveness must never destroy backing")
-        }
-    }
+    use flotilla_environment::environment::{GoneCause, ObservationState, UnknownReason};
     let temp = TempDir::new().unwrap();
     fs::create_dir_all(temp.path().join("config")).unwrap();
     fs::write(temp.path().join("config/daemon.toml"), r#"machine_id = "cloud-liveness-test""#).unwrap();

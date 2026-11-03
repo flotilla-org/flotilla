@@ -324,7 +324,11 @@ where
         if !self.backend.query_declared::<Checkout>(&self.namespace, &query).await?.items.is_empty() {
             return Err(ResourceError::FinalizerPending);
         }
-        if let Some(container_id) =
+        if obj.status.as_ref().is_some_and(|status| status.backing_gone_reason().is_some()) {
+            // The provider confirmed the backing gone: there is nothing to destroy,
+            // only this host's state for it to forget (#4304).
+            self.runtime.cleanup(&obj.metadata.name).await.map_err(ResourceError::other)?;
+        } else if let Some(container_id) =
             obj.status.as_ref().and_then(|status| status.backing_id.as_deref().or(status.docker_container_id.as_deref()))
         {
             self.runtime.destroy(&obj.metadata.name, container_id).await.map_err(ResourceError::other)?;

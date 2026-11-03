@@ -1635,6 +1635,10 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
                         Some(detail) if !detail.is_empty() => format!("failed to archive: {detail}"),
                         _ => "failed to archive".to_string(),
                     },
+                    flotilla_protocol::CheckoutArchiveStatus::Lost => match archive.detail.as_deref() {
+                        Some(detail) if !detail.is_empty() => format!("unrecoverable: {detail}"),
+                        _ => "unrecoverable: its environment's backing is gone".to_string(),
+                    },
                 };
                 output.push_str(&format!("\n  {}: {result}", archive.checkout));
             }

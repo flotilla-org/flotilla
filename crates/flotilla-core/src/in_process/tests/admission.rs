@@ -660,6 +660,123 @@ async fn abandon_archive_of_a_checkout_in_an_unreachable_environment_names_it_an
     );
 }
 
+// #4304: a checkout inside an environment whose provider confirmed the backing
+// gone is reported unrecoverable by abandon, and a forced delete names no hold
+// for it, since its teardown releases on its own. While the backing's loss is
+// unconfirmed, or the environment is merely unreachable, the work may still
+// exist: abandon reports it left in place, and a forced delete names the
+// failed teardown (and the lost environment) instead of reporting success.
+#[tokio::test]
+async fn abandon_and_forced_delete_release_a_checkout_whose_backing_is_gone() {
+    abandon_and_forced_delete_report_checkouts_by_whether_their_backing_is_gone(Some(true)).await;
+}
+
+#[tokio::test]
+async fn abandon_and_forced_delete_hold_a_checkout_whose_backing_loss_is_unconfirmed() {
+    abandon_and_forced_delete_report_checkouts_by_whether_their_backing_is_gone(Some(false)).await;
+}
+
+#[tokio::test]
+async fn abandon_and_forced_delete_hold_a_checkout_in_an_unreachable_environment() {
+    abandon_and_forced_delete_report_checkouts_by_whether_their_backing_is_gone(None).await;
+}
+
+async fn abandon_and_forced_delete_report_checkouts_by_whether_their_backing_is_gone(backing_gone: Option<bool>) {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"archive-test\"\n").unwrap();
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let mut discovery = fake_discovery_with_runner(false, Arc::new(flotilla_provider_runtime::ProcessCommandRunner));
+    discovery.repo_detectors.clear();
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        discovery,
+        HostName::local(),
+        backend.clone(),
+        Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    backend
+        .using::<ResourceConvoy>("flotilla")
+        .create(&test_meta("lost-convoy"), &ConvoySpec::builder().workflow_ref("workflow".to_string()).build())
+        .await
+        .unwrap();
+    if let Some(backing_gone) = backing_gone {
+        let environments = backend.using::<flotilla_resources::Environment>("flotilla");
+        let environment = environments.create(&test_meta("env-sandbox"), &Default::default()).await.unwrap();
+        environments
+            .update_status(
+                "env-sandbox",
+                &environment.metadata.resource_version,
+                &flotilla_resources::EnvironmentStatus {
+                    phase: flotilla_resources::EnvironmentPhase::Lost,
+                    backing_gone,
+                    message: Some("cloud sandbox missing from authoritative provider inventory".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let checkouts = backend.using::<ResourceCheckout>("flotilla");
+    let checkout = checkouts
+        .create(
+            &InputMeta::builder()
+                .name("sandbox-work".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "lost-convoy".to_string())]))
+                .finalizers(vec!["flotilla.work/checkout-cleanup".to_string()])
+                .build(),
+            &ResourceCheckoutSpec::Worktree(
+                ResourceCheckoutWorktreeSpec::builder()
+                    .repo_ref(RepositorySpec::remote("https://github.com/acme/archive").unwrap().key())
+                    .env_ref("env-sandbox".to_string())
+                    .r#ref("feature/lost".to_string())
+                    .target_path("/workspace/archive".to_string())
+                    .clone_ref("clone".to_string())
+                    .build(),
+            ),
+        )
+        .await
+        .unwrap();
+    checkouts
+        .update_status(
+            "sandbox-work",
+            &checkout.metadata.resource_version,
+            &ResourceCheckoutStatus { phase: ResourceCheckoutPhase::Ready, path: Some("/workspace/archive".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+
+    let outcomes = daemon.crew.archive_convoy_checkouts_best_effort("flotilla", "lost-convoy").await.unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].checkout, "sandbox-work");
+    let gone = backing_gone == Some(true);
+    assert_eq!(outcomes[0].status, if gone { CheckoutArchiveStatus::Lost } else { CheckoutArchiveStatus::Failed });
+    assert!(outcomes[0].detail.as_deref().unwrap().contains("/workspace/archive"), "{outcomes:?}");
+
+    // The checkout's teardown has run and failed, as it does against an unavailable environment.
+    checkouts.delete("sandbox-work").await.unwrap();
+    let deleting = checkouts.get("sandbox-work").await.unwrap();
+    checkouts
+        .update_status(
+            "sandbox-work",
+            &deleting.metadata.resource_version,
+            &ResourceCheckoutStatus {
+                phase: ResourceCheckoutPhase::Failed,
+                message: Some("checkout teardown failed: checkout environment env-sandbox is unavailable on this host".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let holds = daemon.crew.teardown_holds("flotilla", "lost-convoy").await.unwrap();
+    assert_eq!(holds.is_empty(), gone, "{holds:?}");
+    if !gone {
+        assert!(holds.iter().any(|hold| hold.starts_with("checkout sandbox-work: checkout teardown failed")), "{holds:?}");
+        assert_eq!(holds.iter().any(|hold| hold.starts_with("environment env-sandbox:")), backing_gone.is_some(), "{holds:?}");
+    }
+}
+
 // #4032: a host-direct checkout on the daemon's own host records the host's
 // Environment resource name as `env_ref`, not the local environment id. Archive
 // and delete's fresh inspection resolve it to the local environment.

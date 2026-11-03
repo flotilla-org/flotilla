@@ -324,7 +324,14 @@ impl CrewActions<'_> {
                         self.crew
                             .record_lifecycle_mutation_best_effort(&namespace, &record_name, "convoy_delete", caller.as_ref(), true)
                             .await;
-                        CommandValue::Ok
+                        // A forced delete names what it could not release rather than reporting success.
+                        match if *force { self.crew.teardown_holds(&namespace, &record_name).await } else { Ok(Vec::new()) } {
+                            Ok(holds) if holds.is_empty() => CommandValue::Ok,
+                            Ok(holds) => CommandValue::Error {
+                                message: format!("convoy {name} is deleting, but teardown is held:\n{}", holds.join("\n")),
+                            },
+                            Err(message) => CommandValue::Error { message },
+                        }
                     }
                     Err(message) => CommandValue::Error { message },
                 },

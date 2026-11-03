@@ -92,6 +92,18 @@ fn vessel_ending_reason(
     })
 }
 
+/// How the daemon begins the message of a backing its provider confirmed gone (#4304).
+const LOST_UNRECOVERABLE: &str = "lost, unrecoverable";
+
+/// A lost vessel cannot resume; only one whose backing may still exist is recoverable.
+fn lost_vessel_refusal(vessel: &str, reason: &str) -> String {
+    if reason.starts_with(LOST_UNRECOVERABLE) {
+        format!("vessel `{vessel}` is {reason}; it cannot be resumed")
+    } else {
+        format!("vessel `{vessel}` is lost, recoverable: {reason}; rehydration is not available yet (#2872)")
+    }
+}
+
 pub use flotilla_store::resolve_local_convoy_name;
 
 /// The sender's awaiting-reply record kind for a send (#3587 layer 7): none
@@ -1057,7 +1069,7 @@ impl CrewService {
                     .kind(if matches!(process.source, CrewSource::Agent { .. }) { "agent" } else { "tool" }.to_string())
                     .state(state.to_string())
                     .maybe_reason(member_loss.map(|reason| {
-                        if reason.starts_with("lost, recoverable") {
+                        if reason.starts_with("lost, recoverable") || reason.starts_with(LOST_UNRECOVERABLE) {
                             reason.clone()
                         } else {
                             format!("lost, recoverable: {reason}")
@@ -1947,6 +1959,17 @@ impl CrewService {
             }
             let name = checkout.metadata.name.clone();
             let left_at = checkout_work_location(&checkout.spec, path);
+            if let Some(reason) = self.checkout_backing_gone_reason(namespace, &checkout.spec).await? {
+                // Nothing can push from a backing that is gone: name what went with it (#4304).
+                outcomes.push(
+                    CheckoutArchiveOutcome::builder()
+                        .checkout(name)
+                        .status(CheckoutArchiveStatus::Lost)
+                        .detail(format!("work {left_at} went with its environment's backing: {reason}"))
+                        .build(),
+                );
+                continue;
+            }
             let failed = |detail: String| {
                 warn!(checkout = %name, %detail, "best-effort abandon archive push failed");
                 CheckoutArchiveOutcome::builder()
@@ -1984,6 +2007,23 @@ impl CrewService {
             outcomes.push(outcome);
         }
         Ok(outcomes)
+    }
+
+    /// Why a checkout's work is unrecoverable: its environment's provider
+    /// confirmed the backing that held it gone.
+    async fn checkout_backing_gone_reason(
+        &self,
+        namespace: &str,
+        spec: &flotilla_resources::CheckoutSpec,
+    ) -> Result<Option<String>, String> {
+        let Some(env_ref) = spec.env_ref().filter(|env_ref| !env_ref.is_empty()) else {
+            return Ok(None);
+        };
+        match self.resource_backend.clone().using::<Environment>(namespace).get(env_ref).await {
+            Ok(environment) => Ok(environment.status.as_ref().and_then(|status| status.backing_gone_reason()).map(str::to_owned)),
+            Err(ResourceError::NotFound { .. }) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     pub async fn abandon(
@@ -3025,7 +3065,7 @@ impl CrewService {
                     if !matches!(ending, flotilla_protocol::LifecycleReading::Lost) {
                         return Err(format!("vessel `{vessel}` lease ended: {reason}; it cannot be resumed"));
                     }
-                    return Err(format!("vessel `{vessel}` is lost, recoverable: {reason}; rehydration is not available yet (#2872)"));
+                    return Err(lost_vessel_refusal(vessel, &reason));
                 }
                 if let Some(environment_ref) = resource.object.status.as_ref().and_then(|status| status.environment_ref.as_ref()) {
                     match self.resource_backend.including_replicas::<Environment>(namespace).get(environment_ref).await {
@@ -3058,9 +3098,7 @@ impl CrewService {
                                         match status.phase {
                                             EnvironmentPhase::Lost => {
                                                 let reason = status.message.as_deref().unwrap_or("environment disappeared");
-                                                return Err(format!(
-                                                    "vessel `{vessel}` is lost, recoverable: {reason}; rehydration is not available yet (#2872)"
-                                                ));
+                                                return Err(lost_vessel_refusal(vessel, reason));
                                             }
                                             EnvironmentPhase::Failed => {
                                                 let reason = status.message.as_deref().unwrap_or("environment provisioning failed");
@@ -3817,6 +3855,79 @@ impl CrewService {
             Ok(_) => error,
             Err(restore_error) => format!("{error}; could not restore crew work after delivery failure: {restore_error}"),
         }
+    }
+
+    /// What a forced delete could not release, and why (#4304): children whose
+    /// teardown reported a failure, and environments whose lost backing may still
+    /// hold work. A child whose backing its provider confirmed gone releases on
+    /// its own, so it is never named. Empty once the convoy is gone.
+    pub async fn teardown_holds(&self, namespace: &str, name: &str) -> Result<Vec<String>, String> {
+        let convoy = match self.resource_backend.clone().using::<ResourceConvoy>(namespace).get(name).await {
+            Ok(convoy) => convoy,
+            Err(ResourceError::NotFound { .. }) => return Ok(Vec::new()),
+            Err(error) => return Err(error.to_string()),
+        };
+        let environments = self.resource_backend.clone().using::<Environment>(namespace);
+        let mut holds = Vec::new();
+        let mut environment_refs = BTreeSet::new();
+        let checkouts = self
+            .resource_backend
+            .clone()
+            .using::<ResourceCheckout>(namespace)
+            .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), name.to_string())]))
+            .await
+            .map_err(|error| error.to_string())?
+            .items;
+        for checkout in checkouts {
+            if let Some(env_ref) = checkout.spec.env_ref().filter(|env_ref| !env_ref.is_empty()) {
+                environment_refs.insert(env_ref.to_string());
+            }
+            if checkout.metadata.deletion_timestamp.is_none()
+                || self.checkout_backing_gone_reason(namespace, &checkout.spec).await?.is_some()
+            {
+                continue;
+            }
+            if let Some(message) = checkout
+                .status
+                .as_ref()
+                .filter(|status| status.phase == flotilla_resources::CheckoutPhase::Failed)
+                .and_then(|status| status.message.as_deref())
+            {
+                holds.push(format!("checkout {}: {message}", checkout.metadata.name));
+            }
+        }
+        let vessels = convoy
+            .status
+            .as_ref()
+            .and_then(|status| status.workflow_snapshot.as_ref())
+            .map(|snapshot| snapshot.vessels.clone())
+            .unwrap_or_default();
+        for vessel in vessels {
+            let selector = BTreeMap::from([(VESSEL_REF_LABEL.to_string(), flotilla_resources::vessel_resource_name(name, &vessel.name))]);
+            for environment in environments.list_matching_labels(&selector).await.map_err(|error| error.to_string())?.items {
+                environment_refs.insert(environment.metadata.name);
+            }
+        }
+        for environment_ref in environment_refs {
+            let environment = match environments.get(&environment_ref).await {
+                Ok(environment) => environment,
+                Err(ResourceError::NotFound { .. }) => continue,
+                Err(error) => return Err(error.to_string()),
+            };
+            let Some(status) = environment.status.as_ref() else { continue };
+            let message = status.message.as_deref().unwrap_or("no reason recorded");
+            match status.phase {
+                EnvironmentPhase::Lost if !status.backing_gone => holds.push(format!(
+                    "environment {environment_ref}: {message}; its teardown waits until that work is recovered \
+                     or its provider confirms the backing gone"
+                )),
+                EnvironmentPhase::Failed if environment.metadata.deletion_timestamp.is_some() => {
+                    holds.push(format!("environment {environment_ref}: {message}"))
+                }
+                _ => {}
+            }
+        }
+        Ok(holds)
     }
 
     pub async fn reap(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
