@@ -1,8 +1,9 @@
 //! The importers of the kinds whose records map one to one: ManifestRoot, Repository, Host,
-//! Artifact and the account kinds.
+//! Artifact, AccessDelivery and the account kinds.
 
 use flotilla_engine_store::Import;
 use flotilla_provisioning::engine::{
+    access_delivery_import::{import_access_deliveries, AccessDeliveryCopy},
     account::import_accounts,
     artifact_import::{import_artifacts, ArtifactCopy},
     host_import::{import_hosts, HostCopies, HostCopy},
@@ -10,7 +11,7 @@ use flotilla_provisioning::engine::{
     manifest_root_import::import_roots,
     repository_import::{import_repositories, RepositoryCopy},
 };
-use flotilla_resources::{AccountBinding, AccountProvision, Artifact, Host, ManifestRoot, Repository};
+use flotilla_resources::{AccessDelivery, AccountBinding, AccountProvision, Artifact, Host, ManifestRoot, Repository};
 
 use super::{Carried, Source};
 
@@ -76,4 +77,14 @@ pub(super) fn accounts(source: &Source, target: &mut Import, _: &mut Carried, re
             .collect();
         import_accounts(&bindings, &provisions, target, report);
     }
+}
+
+/// Every namespace's at once: the engine has no namespaces.
+pub(super) fn access_deliveries(source: &Source, target: &mut Import, _: &mut Carried, report: &mut ImportReport) {
+    let copies: Vec<_> = source
+        .owned::<AccessDelivery>("accessdeliveries", None, "AccessDelivery", target, report)
+        .into_iter()
+        .map(|copy| AccessDeliveryCopy { namespace: copy.namespace, object: copy.object, home: copy.home })
+        .collect();
+    import_access_deliveries(&copies, target, report);
 }

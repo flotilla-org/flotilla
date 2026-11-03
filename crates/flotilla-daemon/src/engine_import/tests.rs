@@ -5,10 +5,10 @@ use flotilla_engine_store::ImportTarget;
 use flotilla_protocol::{IssueSource, NodeId};
 use flotilla_provisioning::stored::forge_observation::{ChangeRequestRecord, ForgeReadRecord, IssueRecord};
 use flotilla_resources::{
-    forge_read_name, Artifact, ChangeRequestReviewObservation, ChangeRequestStatus, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure,
-    CredentialSpec, FleetDesignation, Forge, ForgeReadRequest, FulfilmentKind, InputMeta, IssueStatus, Message, Observation,
-    ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision, Project, Repository,
-    RepositorySpec, Resource, TerminalSession, Vessel,
+    forge_read_name, AccessDelivery, Artifact, ChangeRequestReviewObservation, ChangeRequestStatus, Checkout, Clone as CloneResource,
+    Convoy, ConvoyEnsure, CredentialSpec, FleetDesignation, Forge, ForgeReadRequest, FulfilmentKind, InputMeta, IssueStatus, Message,
+    Observation, ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision, Project,
+    Repository, RepositorySpec, Resource, TerminalSession, Vessel,
 };
 use flotilla_schema::{Kind, Timestamp};
 use flotilla_store::{replica::StoredReplicaEventKind, ResourceKind};
@@ -50,6 +50,27 @@ fn artifact(name: &str) -> Value {
         name,
         json!({"convoy": "demo", "producer": "coder", "kind": "brief", "subject": "demo", "summary": {"charter_commit": "abc"},
             "digest": "ef37", "size": 1, "media_type": "text/markdown", "expires_at": "2026-11-19T00:00:00Z"}),
+        Value::Null,
+    )
+}
+
+/// An access delivery as r974's access layer wrote it: the digest-named record, two needs, and for
+/// a failed delivery a permanent retry.
+fn access_delivery(name: &str, failed: bool) -> Value {
+    let retry = if failed {
+        json!({"need": "account", "attempts": 3, "error": "permanent, not retried: authority refused", "next_at": i64::MAX})
+    } else {
+        Value::Null
+    };
+    document(
+        "AccessDelivery",
+        name,
+        json!({"access": "flotilla/demo/implement/coder", "place": "env-a", "harness": "claude-code", "home": "/home/crew/.claude",
+            "needs": {
+                "home": {"mechanism": "agent-push", "digest": "ab12", "at": 1_790_000_000_000_000_i64},
+                "skills": {"mechanism": "host-path-read-only-live", "digest": "cd34", "at": 1_790_000_001_000_000_i64},
+            },
+            "retry": retry}),
         Value::Null,
     )
 }
@@ -102,6 +123,8 @@ async fn populated(dir: &Path) -> SqliteBackend {
     own::<Message>(&backend, message("waiting")).await;
     own::<Artifact>(&backend, artifact("ours")).await;
     own::<CloneResource>(&backend, clone("clone-a")).await;
+    own::<AccessDelivery>(&backend, access_delivery("access-delivered", false)).await;
+    own::<AccessDelivery>(&backend, access_delivery("access-failed", true)).await;
     own::<Checkout>(
         &backend,
         document(
@@ -192,6 +215,7 @@ async fn populated(dir: &Path) -> SqliteBackend {
     )
     .await;
     replica::<Artifact>(&backend, THERE, artifact("theirs")).await;
+    replica::<AccessDelivery>(&backend, THERE, access_delivery("access-theirs", false)).await;
     replica::<CloneResource>(&backend, THERE, clone("clone-b")).await;
     replica::<Forge>(&backend, THERE, forge()).await;
     backend
@@ -267,6 +291,7 @@ async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
     ] {
         assert_eq!(kinds[kind]["imported"], 1, "{kind}: {report:#}");
     }
+    assert_eq!(kinds["AccessDelivery"], json!({"imported": 2, "dropped": 0, "refused": 0}), "{report:#}");
     assert_eq!(kinds["Checkout"], json!({"imported": 0, "dropped": 1, "refused": 0}), "an observed checkout is no request");
     assert_eq!(kinds["Convoy"], json!({"imported": 0, "dropped": 1, "refused": 0}), "an unbootstrapped convoy stays old");
     assert!(kinds.get("Forge").is_none(), "another host's records are not this host's to count: {report:#}");
@@ -274,7 +299,11 @@ async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
     let mut store = engine(dir.path());
     assert!(holds::<flotilla_provisioning::stored::artifact::ArtifactRecord>(&mut store, "ours", HERE));
     assert!(holds::<flotilla_state_machines::Resource<flotilla_provisioning::stored::clone::Clone>>(&mut store, "clone-a", HERE));
+    for name in ["access-delivered", "access-failed"] {
+        assert!(holds::<flotilla_resources::AccessDeliverySpec>(&mut store, name, HERE), "{name}");
+    }
     for home in [HERE, THERE] {
+        assert!(!holds::<flotilla_resources::AccessDeliverySpec>(&mut store, "access-theirs", home), "{home}");
         assert!(!holds::<flotilla_provisioning::stored::artifact::ArtifactRecord>(&mut store, "theirs", home), "{home}");
         assert!(!holds::<flotilla_state_machines::Resource<flotilla_provisioning::stored::clone::Clone>>(&mut store, "clone-b", home));
         assert!(!holds::<flotilla_provisioning::stored::definition::ForgeDefinition>(&mut store, "lab", home), "{home}");
@@ -396,7 +425,7 @@ fn rows_of_kinds_no_importer_reads_are_dropped_kept_or_refused_here_only() {
         row("widgets", HERE, "widget"),
         row("widgets", THERE, "their-widget"),
         row("regards", THERE, "their-regard"),
-        row("accessdeliveries", HERE, "delivery"),
+        row("fulfilmentkinds", HERE, "docker"),
     ]);
     let target = Import::in_memory(HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
     assert!(target.imports(HERE) && !target.imports(THERE));
@@ -406,8 +435,8 @@ fn rows_of_kinds_no_importer_reads_are_dropped_kept_or_refused_here_only() {
     assert_eq!(summary.kinds["Event"].dropped, 1);
     assert_eq!(summary.kinds["Regard"].dropped, 1, "only this home's row is dropped here");
     assert_eq!(
-        summary.staying.get("AccessDelivery"),
-        Some(&("#3824, plain like AccountProvision", 1)),
+        summary.staying.get("FulfilmentKind"),
+        Some(&("the layer that serves FulfilmentKind from the engine", 1)),
         "a kind still moving stays on the old store"
     );
     assert_eq!(

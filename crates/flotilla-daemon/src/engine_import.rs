@@ -185,6 +185,7 @@ pub const STEPS: &[Step] = &[
     Step { name: "hosts", kinds: &["hosts"], run: records::hosts },
     Step { name: "artifacts", kinds: &["artifacts"], run: records::artifacts },
     Step { name: "forge observations", kinds: &observations::KINDS, run: observations::observations },
+    Step { name: "access deliveries", kinds: &["accessdeliveries"], run: records::access_deliveries },
     Step { name: "accounts", kinds: &records::ACCOUNT_KINDS, run: records::accounts },
     Step { name: "messages", kinds: &["messages"], run: messages::messages },
     Step { name: "attentions", kinds: &["demands"], run: attentions::attentions },
