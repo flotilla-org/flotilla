@@ -25,13 +25,11 @@ fn in_phase(convoy: &str, phase: ConvoyPhase) -> impl Fn(&ResourceObject<Convoy>
 // Lost: the daemon learns it only from what the vendor reports, and no stored
 // record is touched to make it so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "the daemon's cloud path fails a cloud backing that reports no provider descriptor (runtime/provider_path.rs); see #4325"]
 async fn a_cloud_sandbox_the_vendor_deletes_becomes_lost() {
     cloud_sandbox_becomes_lost(DummyVendor::vanish).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "the daemon's cloud path fails a cloud backing that reports no provider descriptor (runtime/provider_path.rs); see #4325"]
 async fn a_cloud_sandbox_the_vendor_stops_becomes_lost() {
     cloud_sandbox_becomes_lost(DummyVendor::stop).await;
 }

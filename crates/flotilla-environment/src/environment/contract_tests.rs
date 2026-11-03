@@ -255,6 +255,23 @@ async fn provider_instances_and_declarations() {
     assert!(providers().iter().any(|(provider, _)| provider.kind() == ProviderKind::new(EnvironmentClass::CloudSandbox, "dummy")));
 }
 
+// Every cloud sandbox backing describes its provider, and keeps describing it
+// (#4163); other classes describe none.
+#[tokio::test]
+async fn cloud_backings_describe_their_provider() {
+    for (provider, spec) in providers() {
+        let prepared = provider.prepare(&spec, &Default::default()).await.unwrap();
+        let handle = provider.provision(EnvironmentId::new("env-0"), &prepared, Default::default()).await.unwrap();
+        let cloud = provider.kind().class == EnvironmentClass::CloudSandbox;
+        assert_eq!(handle.provider_descriptor().is_some(), cloud, "{:?}", provider.kind());
+        if let Some(descriptor) = handle.provider_descriptor() {
+            assert_eq!(descriptor.kind, provider.kind());
+            assert_eq!(descriptor.capabilities, provider.capabilities());
+        }
+        handle.destroy().await.unwrap();
+    }
+}
+
 // A provider error means Unknown, never Gone. The same handle recovers
 // when the injected process boundary becomes available again.
 #[tokio::test]

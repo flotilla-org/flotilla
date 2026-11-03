@@ -2609,7 +2609,6 @@ dependencies = [
  "flotilla-resources",
  "flotilla-store",
  "flotilla-store-memory",
- "flotilla-store-sqlite",
  "flotilla-transport",
  "serde",
  "serde_json",

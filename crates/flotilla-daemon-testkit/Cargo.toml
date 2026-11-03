@@ -12,7 +12,6 @@ flotilla-discovery = { path = "../flotilla-discovery" }
 flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
 flotilla-dummy-fleet = { path = "../flotilla-dummy-fleet" }
 flotilla-store-memory = { path = "../flotilla-store-memory" }
-flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
 flotilla-client = { path = "../flotilla-client" }
 flotilla-agent = { path = "../flotilla-agent" }
 flotilla-core = { path = "../flotilla-core" }

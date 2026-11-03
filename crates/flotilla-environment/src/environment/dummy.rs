@@ -13,8 +13,9 @@
 //! The provider is selected like any other instance: placement freezes
 //! [`DUMMY_ENVIRONMENT_INSTANCE`] for a Docker kind on a host where it is the
 //! only per-vessel provider. A cloud-sandbox-class instance,
-//! [`DUMMY_CLOUD_ENVIRONMENT_INSTANCE`], stands in for a sandbox vendor and
-//! realises cloud-sandbox kinds.
+//! [`DUMMY_CLOUD_ENVIRONMENT_INSTANCE`], stands in for a sandbox vendor: it
+//! realises cloud-sandbox kinds and reports a provider descriptor for each
+//! backing, as every cloud backing must.
 //!
 //! Tests act as the vendor through [`DummyEnvironmentProvider::vanish`],
 //! [`DummyEnvironmentProvider::stop`] and
@@ -180,6 +181,20 @@ impl DummyEnvironmentProvider {
             live: self.handles().values().filter(|handle| handle.held()).count() as u64,
         }
     }
+
+    /// What a cloud vendor reports about a backing: the instance the kind
+    /// freezes, its class and capabilities, and the image it ran.
+    fn descriptor(&self, image: &str) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
+        (self.class == DummyEnvironmentClass::CloudSandbox).then(|| flotilla_resources::EnvironmentProviderDescriptor {
+            instance: DUMMY_CLOUD_ENVIRONMENT_INSTANCE.into(),
+            kind: self.kind(),
+            image_digest: dummy_image_id(image),
+            host_version: "dummy".into(),
+            module_version: "dummy".into(),
+            capabilities: Self::capability_declaration(),
+            agent_connection: None,
+        })
+    }
 }
 
 /// A stable draw in `[0, 1)` for one subject. FNV-1a keeps it reproducible
@@ -267,6 +282,7 @@ impl EnvironmentProvider for DummyEnvironmentProvider {
         let handle = Arc::new(DummyEnvironment {
             container_name: format!("flotilla-dummy-{id}"),
             local_image_id: dummy_image_id(&image),
+            descriptor: self.descriptor(&image),
             image: ImageId::new(image),
             mounts: opts.provisioned_mounts,
             environment,
@@ -347,6 +363,7 @@ struct DummyEnvironment {
     image: ImageId,
     local_image_id: String,
     container_name: String,
+    descriptor: Option<flotilla_resources::EnvironmentProviderDescriptor>,
     mounts: Vec<ProvisionedMount>,
     environment: HashMap<String, String>,
     runner: Arc<DummyCommandRunner>,
@@ -362,7 +379,7 @@ impl DummyEnvironment {
 #[async_trait]
 impl ProvisionedEnvironment for DummyEnvironment {
     fn provider_descriptor(&self) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
-        None
+        self.descriptor.clone()
     }
     fn capabilities(&self) -> super::ProviderCapabilities {
         DummyEnvironmentProvider::capability_declaration()
@@ -735,7 +752,7 @@ mod tests {
     // A cloud-class vendor takes cloud sandbox inputs and offers no local image
     // cache or legacy input.
     #[tokio::test]
-    async fn a_cloud_vendor_realises_sandboxes() {
+    async fn a_cloud_vendor_realises_and_describes_sandboxes() {
         let provider = DummyEnvironmentProvider::cloud(DummyEnvironmentBehaviour::default());
         assert!(provider.prepare(&docker_spec("dummy/crew:latest"), &PrepareOpts::default()).await.is_err());
         let spec = EnvironmentSpec {
@@ -750,7 +767,10 @@ mod tests {
             ..Default::default()
         };
         let prepared = provider.prepare(&spec, &PrepareOpts::default()).await.expect("prepare");
-        provider.provision(EnvironmentId::new("env-cloud"), &prepared, Default::default()).await.expect("provision");
+        let handle = provider.provision(EnvironmentId::new("env-cloud"), &prepared, Default::default()).await.expect("provision");
+        let descriptor = handle.provider_descriptor().expect("a cloud backing is described");
+        assert_eq!(descriptor.instance, DUMMY_CLOUD_ENVIRONMENT_INSTANCE);
+        assert_eq!(descriptor.kind.class, super::super::EnvironmentClass::CloudSandbox);
         assert_eq!(provider.kind().class, super::super::EnvironmentClass::CloudSandbox);
         assert!(provider.legacy_input().is_none());
         assert!(provider.local_image_cache().is_none());

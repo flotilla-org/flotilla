@@ -12,7 +12,9 @@
 //!   [`TestDaemon::apply`] and the waits);
 //! - the environment vendor, through [`TestDaemon::vendor`];
 //! - the daemon process, through [`TestDaemon::restart`] over the same store,
-//!   while vendor backings and running crews survive.
+//!   while vendor backings and running crews survive;
+//! - another daemon, through [`TestDaemon::peer`], as the daemon's own peer
+//!   runtime connects to one.
 
 use std::{
     sync::{
@@ -41,14 +43,15 @@ use flotilla_dummy_fleet::{
     catalog::{self, CrewMix, DUMMY_CLOUD_FULFILMENT_KIND, DUMMY_FULFILMENT_KIND},
     CrewCommandPort, DummyFleet, DummyFleetSnapshot, DummyVendor, DUMMY_AGENT_ADAPTER,
 };
-use flotilla_protocol::{commands::CommandValue, CommandAction, CommandCaller, DaemonEvent, HostName, PrincipalRef};
+use flotilla_protocol::{
+    commands::CommandValue, CommandAction, CommandCaller, DaemonEvent, HostName, PrincipalRef, QueryCursor, QueryId, ResultSet,
+};
 use flotilla_resources::{
     Clock, Convoy, FleetDesignation, FleetDesignationSpec, Forge, FulfilmentKind, Host, K8sResourceObject, Project, ProjectSpec,
     Repository, Resource, ResourceObject, SystemClock, WorkflowTemplate, FLEET_DESIGNATION_NAME,
 };
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
 use tokio::sync::{mpsc, watch, Notify};
 
 /// The namespace every test daemon provisions in.
@@ -58,21 +61,14 @@ const LONG_RUNNER_TURNS: u32 = 2;
 const WAIT: Duration = Duration::from_secs(30);
 const SEED_WAIT: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(100);
-
-/// Where a test daemon keeps its resource store.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum TestStore {
-    #[default]
-    Memory,
-    /// SQLite in the daemon's state directory, where `flotillad` opens it.
-    Sqlite,
-}
+const HARNESS_RESYNC: Duration = Duration::from_millis(200);
 
 /// What a restart rebuilds the daemon from.
 struct Composition {
     host: HostName,
     clock: Arc<dyn Clock>,
     backend: ResourceBackend,
+    resync: Duration,
 }
 
 pub struct TestDaemon {
@@ -104,8 +100,11 @@ impl TestDaemon {
         /// The rest of `daemon.toml`, such as `[primitives]` or `host_name`.
         #[builder(default)]
         settings: &str,
-        #[builder(default)] store: TestStore,
         clock: Option<Arc<dyn Clock>>,
+        /// The controllers' resync interval; the harness's is short, so
+        /// scenarios observe seeded kinds and changes promptly.
+        #[builder(default = HARNESS_RESYNC)]
+        resync: Duration,
     ) -> Self {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let config_dir = dir.path().join("config");
@@ -113,18 +112,11 @@ impl TestDaemon {
         std::fs::write(config_dir.join("daemon.toml"), daemon_toml(settings, agent, environment, change_request)).expect("daemon.toml");
         let config = Arc::new(ConfigStore::with_base(config_dir));
         let daemon_config: DaemonConfig = config.load_daemon_config().expect("daemon config");
-        let backend = match store {
-            TestStore::Memory => ResourceBackend::new(InMemoryBackend::default()),
-            TestStore::Sqlite => {
-                let database = config.state_dir().as_path().join("resources.sqlite");
-                std::fs::create_dir_all(database.parent().expect("state dir")).expect("state dir");
-                ResourceBackend::new(SqliteBackend::open_async(&database).await.expect("sqlite store"))
-            }
-        };
         let composition = Composition {
             host: HostName::new(daemon_config.host_name.as_deref().expect("a host name")),
             clock: clock.unwrap_or_else(|| Arc::new(SystemClock)),
-            backend,
+            backend: ResourceBackend::new(InMemoryBackend::default()),
+            resync,
         };
         let relay = Arc::new(RestartRelay::default());
         let mut discovery = fake_discovery_with_host_directories(dir.path());
@@ -157,11 +149,11 @@ fn daemon_toml(settings: &str, agent: &str, environment: &str, change_request: &
 }
 
 /// Short cadences, so scenarios observe seeded kinds and changes promptly.
-fn harness_options() -> RuntimeOptions {
+fn harness_options(resync: Duration) -> RuntimeOptions {
     RuntimeOptions {
         namespace: NAMESPACE.into(),
         heartbeat_interval: Duration::from_secs(5),
-        controller_resync_interval: Duration::from_millis(200),
+        controller_resync_interval: resync,
         // The dummy kinds are seeded after startup; observe them on the next pass.
         fulfilment_probe_interval: Duration::from_millis(200),
         ..RuntimeOptions::default()
@@ -185,7 +177,8 @@ async fn compose(
     )
     .await;
     relay.connect(&daemon);
-    let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, harness_options()).await.expect("runtime");
+    let runtime =
+        DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, harness_options(composition.resync)).await.expect("runtime");
     (daemon, runtime)
 }
 
@@ -249,9 +242,11 @@ impl TestDaemon {
         }
     }
 
-    /// Every `T`, as `flotilla get` lists them.
+    /// Every `T`, as `flotilla get` lists them: with the replicas of every
+    /// peer's.
     pub async fn list<T: Resource>(&self) -> Vec<ResourceObject<T>> {
-        let request = ResourceListRequest::builder().kind(T::API_PATHS.kind.into()).namespace(NAMESPACE.into()).build();
+        let request =
+            ResourceListRequest::builder().kind(T::API_PATHS.kind.into()).namespace(NAMESPACE.into()).include_replicas(true).build();
         let read = self.operator.resources.list(request).await.unwrap_or_else(|message| panic!("list {}: {message}", T::API_PATHS.kind));
         read.records.into_iter().filter_map(|record| record.object).map(decode).collect()
     }
@@ -292,6 +287,48 @@ impl TestDaemon {
             }
             tokio::time::sleep(POLL).await;
         })
+    }
+
+    /// Wait until the client query `query` has a result set that satisfies
+    /// `done`, subscribing to it as a client does. The wait fails with the
+    /// last result set.
+    pub fn wait_query<'a>(&'a self, query: QueryId, done: impl Fn(&ResultSet) -> bool + 'a) -> Wait<'a, ResultSet> {
+        Wait::new(WAIT, async move |deadline| {
+            let mut events = self.operator.client.subscribe();
+            let cursors = [QueryCursor { query: query.clone(), since: None }];
+            let current = self.operator.client.subscribe_queries(uuid::Uuid::new_v4(), &cursors).await.expect("subscribe");
+            let mut last = None;
+            for event in current {
+                if let DaemonEvent::ResultSet(result) = event {
+                    if result.query() == query {
+                        last = Some(*result);
+                    }
+                }
+            }
+            loop {
+                if let Some(result) = last.take_if(|result| done(result)) {
+                    return result;
+                }
+                let next = match tokio::time::timeout_at(deadline, events.recv()).await {
+                    Ok(next) => next,
+                    Err(_) => panic!("no {query:?} result set satisfied the wait; last: {}", shown(&last)),
+                };
+                match next {
+                    Ok(DaemonEvent::ResultSet(result)) if result.query() == query => last = Some(*result),
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => panic!("the daemon closed while waiting on {query:?}"),
+                }
+            }
+        })
+    }
+
+    /// Connect `a` and `b` as the daemon's peer runtime connects two hosts.
+    /// Dropping the [`Peering`] disconnects them.
+    pub async fn peer(a: &TestDaemon, b: &TestDaemon) -> Peering {
+        let topology = super::server::spawn_in_memory_request_topology_stateful(Arc::clone(&a.daemon), Arc::clone(&b.daemon))
+            .await
+            .expect("peer runtimes");
+        Peering { _topology: topology }
     }
 
     /// The environment vendors: what a test does as the vendor is all the
@@ -344,6 +381,11 @@ impl TestDaemon {
         };
         self.wait("the dummy kind's harness", probed).within(SEED_WAIT).await;
     }
+}
+
+/// Two peered daemons; dropping it disconnects them.
+pub struct Peering {
+    _topology: super::server::InMemoryRequestTopology,
 }
 
 fn shown(value: &impl serde::Serialize) -> String {
