@@ -193,11 +193,6 @@ impl QueryFeed {
         &self.incarnation
     }
 
-    /// The aggregator subscriber id, which also owns the connection's wait subscriptions.
-    pub(crate) fn subscriber(&self) -> uuid::Uuid {
-        self.shared.subscriber
-    }
-
     pub(crate) fn daemon(&self) -> &Arc<InProcessDaemon> {
         &self.shared.daemon
     }

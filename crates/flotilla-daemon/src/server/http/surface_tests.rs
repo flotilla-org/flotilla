@@ -614,3 +614,27 @@ async fn commands_started_over_http_report_progress_on_the_socket() {
     }
     assert_eq!(outcome["state"], "finished");
 }
+
+// Review of #4298: a request's id is free again once it ends, so a connection issuing many short
+// requests never accumulates them; at most `OPEN_LIMIT` requests are open at once, and one more is
+// refused with `too_many_requests` while the connection stays up.
+#[tokio::test]
+async fn ended_requests_free_their_ids_and_open_requests_are_bounded() {
+    let router = router(ResourceBackend::new(InMemoryBackend::default()));
+    let mut client = user(&router, surface::CBOR).await;
+    let query = QueryId::Convoys { scope: None };
+    for round in 0..surface::OPEN_LIMIT + 8 {
+        let id = if round % 2 == 0 { "reused".to_owned() } else { format!("fresh-{round}") };
+        client.send(json!({"type": "fetch_more", "id": id, "query": query})).await;
+        assert_eq!(client.next().await["code"], "unavailable", "round {round}");
+    }
+    for index in 0..surface::OPEN_LIMIT {
+        client.send(subscribe(&format!("s{index}"))).await;
+    }
+    client.send(subscribe("one-more")).await;
+    let refused = client.until(|message| message["id"] == "one-more").await.pop().unwrap();
+    assert_eq!(refused["code"], "too_many_requests");
+    client.send(json!({"type": "cancel", "id": "s0"})).await;
+    client.send(subscribe("one-more")).await;
+    client.until(|message| message["id"] == "one-more" && message["type"] == "synced").await;
+}

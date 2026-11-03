@@ -40,6 +40,8 @@ const SNAPSHOT_LIMIT: &str = "10000";
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 /// A connection silent this long, pongs included, is closed.
 const IDLE_LIMIT: Duration = Duration::from_secs(60);
+/// Requests one connection may hold open at once.
+pub(super) const OPEN_LIMIT: usize = 256;
 /// The server's own message types, beside the table messages.
 #[cfg(test)]
 pub(super) const SERVER_TYPES: &[&str] = &["hello", "error", "command_step", "command_outcome", "wait_fired"];
@@ -273,7 +275,7 @@ fn failure(failure: Failure, id: &Id) -> Value {
 enum Event {
     Inbound(Option<Result<Frame, SocketError>>),
     Outbound(Value),
-    Finished(String),
+    Finished((String, u64)),
     Overflow,
     Ping,
 }
@@ -307,13 +309,15 @@ struct Connection {
     feed: Option<Arc<QueryFeed>>,
     /// Open requests by id: subscriptions, command observations, wait subscriptions and
     /// in-flight fetches. Each ends when its task does, or when it is cancelled.
-    open: HashMap<String, JoinHandle<()>>,
+    open: HashMap<String, (u64, JoinHandle<()>)>,
+    /// Numbers each started request, so a late end of one does not remove its id's successor.
+    started: u64,
 }
 
 impl Connection {
     fn new(state: Arc<HttpRouter>, caller: CallerAuth, encoding: Encoding) -> Self {
         let feed = state.daemon.as_ref().map(|daemon| QueryFeed::new(Arc::clone(daemon), state.incarnation.clone()));
-        Self { state, caller, encoding, feed, open: HashMap::new() }
+        Self { state, caller, encoding, feed, open: HashMap::new(), started: 0 }
     }
 
     async fn run(mut self, mut socket: Socket) {
@@ -325,7 +329,7 @@ impl Connection {
         });
         let (queue, mut outbound) = mpsc::channel(SEND_QUEUE);
         let (overflow, mut overflowed) = mpsc::channel(1);
-        let (finished, mut ended) = mpsc::unbounded_channel::<String>();
+        let (finished, mut ended) = mpsc::unbounded_channel::<(String, u64)>();
         let outbox = Outbox { queue, overflow };
         let mut ping = tokio::time::interval_at(Instant::now() + PING_INTERVAL, PING_INTERVAL);
         let mut heard = Instant::now();
@@ -370,8 +374,8 @@ impl Connection {
                             break;
                         }
                     }
-                    Event::Finished(id) => {
-                        if self.open.get(&id).is_some_and(JoinHandle::is_finished) {
+                    Event::Finished((id, number)) => {
+                        if self.open.get(&id).is_some_and(|(open, _)| *open == number) {
                             self.open.remove(&id);
                         }
                     }
@@ -380,6 +384,12 @@ impl Connection {
                             close = Some((1001, "idle"));
                             break;
                         }
+                        if let CallerAuth::Session(session) = &self.caller {
+                            if !self.state.logins.is_live(*session) {
+                                close = Some((1008, "session ended"));
+                                break;
+                            }
+                        }
                         if socket.send(Frame::Ping(Default::default())).await.is_err() {
                             break;
                         }
@@ -387,7 +397,7 @@ impl Connection {
                 }
             }
         }
-        for (_, task) in self.open.drain() {
+        for (_, (_, task)) in self.open.drain() {
             task.abort();
         }
         if let Some((code, reason)) = close {
@@ -395,7 +405,6 @@ impl Connection {
         }
         if let Some(feed) = &self.feed {
             feed.close().await;
-            feed.daemon().unsubscribe_waits(feed.subscriber()).await;
         }
     }
 
@@ -415,7 +424,7 @@ impl Connection {
     }
 
     /// Handles one client frame; work that waits runs as an open request of its own.
-    fn receive(&mut self, bytes: &[u8], outbox: &Outbox, finished: &mpsc::UnboundedSender<String>) {
+    fn receive(&mut self, bytes: &[u8], outbox: &Outbox, finished: &mpsc::UnboundedSender<(String, u64)>) {
         let map = match decode(self.encoding, bytes) {
             Ok(map) => map,
             Err(reason) => {
@@ -438,7 +447,7 @@ impl Connection {
         };
         match message {
             ClientMessage::Unsubscribe { id } | ClientMessage::Cancel { id } => match self.open.remove(&key(&id)) {
-                Some(task) => task.abort(),
+                Some((_, task)) => task.abort(),
                 None => {
                     outbox.send(error("not_found", "no open request has this id", Some(&id)));
                 }
@@ -470,13 +479,22 @@ impl Connection {
         id: Id,
         work: futures::future::BoxFuture<'static, Result<BoxStream<'static, Value>, Failure>>,
         outbox: &Outbox,
-        finished: &mpsc::UnboundedSender<String>,
+        finished: &mpsc::UnboundedSender<(String, u64)>,
     ) {
         let name = key(&id);
-        if self.open.get(&name).is_some_and(|task| !task.is_finished()) {
+        if self.open.get(&name).is_some_and(|(_, task)| !task.is_finished()) {
             outbox.send(error("duplicate_id", "a request with this id is open", Some(&id)));
             return;
         }
+        if self.open.len() >= OPEN_LIMIT {
+            self.open.retain(|_, (_, task)| !task.is_finished());
+        }
+        if self.open.len() >= OPEN_LIMIT && !self.open.contains_key(&name) {
+            outbox.send(error("too_many_requests", format!("a connection holds at most {OPEN_LIMIT} open requests"), Some(&id)));
+            return;
+        }
+        self.started += 1;
+        let number = self.started;
         let (outbox, finished) = (outbox.clone(), finished.clone());
         let task = tokio::spawn(async move {
             match work.await {
@@ -491,9 +509,9 @@ impl Connection {
                     outbox.send(failure(reason, &id));
                 }
             }
-            let _ = finished.send(key(&id));
+            let _ = finished.send((key(&id), number));
         });
-        self.open.insert(name, task);
+        self.open.insert(name, (number, task));
     }
 
     fn subscribe(&self, subscribe: Subscribe) -> futures::future::BoxFuture<'static, Result<BoxStream<'static, Value>, Failure>> {
@@ -540,19 +558,26 @@ impl Connection {
         Box::pin(async move {
             let feed = feed.ok_or_else(|| Failure::new("unavailable", "wait subscriptions need the daemon"))?;
             let daemon = Arc::clone(feed.daemon());
-            let watcher = feed.subscriber();
+            // Each wait is a watcher of its own, so ending the request releases just it.
+            let watcher = uuid::Uuid::new_v4();
             // Listen before subscribing, so a leaf already true fires into this stream.
             let events = daemon.subscribe();
             let subscription_id = daemon.subscribe_wait(watcher, subscription).await.map_err(|reason| Failure::new("wait", reason))?;
-            let fires = futures::stream::unfold(events, move |mut events| async move {
+            let release = WaitRelease { daemon, watcher };
+            let fires = futures::stream::unfold(Some((events, release)), move |state| async move {
+                let (mut events, release) = state?;
                 loop {
                     match events.recv().await {
                         Ok(DaemonEvent::LeafFired(fire)) if fire.watcher_id == watcher && fire.subscription_id == subscription_id => {
                             let mut body = serde_json::to_value(&fire).expect("leaf fires serialize");
                             body["type"] = json!("wait_fired");
-                            return Some((body, events));
+                            return Some((body, Some((events, release))));
                         }
-                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Ok(_) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let lost = error("wait_lagged", "fires may have been missed; subscribe again", None);
+                            return Some((lost, None));
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                     }
                 }
@@ -578,5 +603,20 @@ impl Connection {
             })?;
             Ok(progress.map(|progress| serde_json::to_value(progress).expect("command progress serializes")).boxed())
         })
+    }
+}
+
+/// Releases one wait subscription when its request ends, by cancel or by connection close.
+struct WaitRelease {
+    daemon: Arc<flotilla_core::in_process::InProcessDaemon>,
+    watcher: uuid::Uuid,
+}
+
+impl Drop for WaitRelease {
+    fn drop(&mut self) {
+        let (daemon, watcher) = (Arc::clone(&self.daemon), self.watcher);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move { daemon.unsubscribe_waits(watcher).await });
+        }
     }
 }
