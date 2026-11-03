@@ -7,7 +7,7 @@ mod schema_support;
 use flotilla_engine_store::ImportTarget;
 use flotilla_provisioning::{
     engine::{
-        access_delivery_import::{import_access_deliveries, rehearse_access_deliveries, AccessDeliveryCopy},
+        access_delivery_import::{import_access_deliveries, AccessDeliveryCopy},
         import::ImportReport,
     },
     stored,
@@ -157,18 +157,9 @@ fn a_deleted_copy_is_dropped_and_a_name_in_two_namespaces_is_refused() {
     deleted.object.metadata.deletion_timestamp = Some(chrono::Utc::now());
     let copies = [deleted, copy("one", "twice", "alpha", delivered()), copy("two", "twice", "alpha", failed())];
     let mut report = ImportReport::default();
-    rehearse_access_deliveries(&copies, &mut report);
+    let mut target = flotilla_engine_store::Import::in_memory("alpha", access_delivery::registry().expect("registry")).expect("target");
+    import_access_deliveries(&copies, &mut target, &mut report);
     assert_eq!(report.dropped.get(&("AccessDelivery", "deleted")), Some(&1));
     assert!(report.imported.is_empty());
     assert_eq!(report.refused.iter().map(|refusal| refusal.record.as_str()).collect::<Vec<_>>(), ["twice", "twice"]);
-}
-
-// Behaviour: a rehearsal of the same records over a store of its own imports them all.
-#[test]
-fn a_rehearsal_imports_every_record() {
-    let copies = [copy("flotilla", "access-a", "alpha", delivered()), copy("flotilla", "access-b", "alpha", failed())];
-    let mut report = ImportReport::default();
-    rehearse_access_deliveries(&copies, &mut report);
-    assert!(report.refused.is_empty(), "{:?}", report.refused);
-    assert_eq!(report.imported.values().sum::<usize>(), 2);
 }

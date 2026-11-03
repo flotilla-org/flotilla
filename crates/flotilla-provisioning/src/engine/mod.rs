@@ -46,6 +46,7 @@ pub mod manifest_root;
 pub mod manifest_root_import;
 pub mod observations;
 pub mod placement_import;
+pub mod plain_records;
 pub mod project_import;
 pub mod projects;
 pub(crate) mod provenance;

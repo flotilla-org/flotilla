@@ -25,17 +25,6 @@ pub struct AccessDeliveryCopy {
     pub home: String,
 }
 
-/// [`import_access_deliveries`] into a temporary store of their own.
-pub fn rehearse_access_deliveries(copies: &[AccessDeliveryCopy], report: &mut ImportReport) {
-    match flotilla_resources::access_delivery::registry()
-        .map_err(|error| format!("registry: {error:?}"))
-        .and_then(flotilla_engine_store::Rehearsal::open)
-    {
-        Ok(mut rehearsal) => import_access_deliveries(copies, &mut rehearsal, report),
-        Err(reason) => report.refused.push(ImportRefusal { kind: KIND, record: "<all>".to_owned(), reason }),
-    }
-}
-
 /// Writes every copy at a home `target` imports, each at its copy's creation time; drops are
 /// counted and refusals named in `report`.
 pub fn import_access_deliveries(copies: &[AccessDeliveryCopy], target: &mut impl ImportTarget, report: &mut ImportReport) {
