@@ -2,32 +2,32 @@
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct LabReach {
-    pub hostname: String,
-    pub port: u16,
-}
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Integration {
-    #[serde(default)]
-    provider: BTreeMap<String, Provider>,
+    #[serde(default, rename = "provider")]
+    _provider: BTreeMap<String, Provider>,
 }
+/// ADR 0047: `[flotilla.provider.<instance>.lab_reach]` is retired (#4299): what
+/// a vessel reaches is its composed reach set, not a per-instance setting. The
+/// table is accepted and dropped for one roll; remove this record, and the
+/// `flotilla` table with it, one roll after #4299.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Provider {
-    lab_reach: Option<LabReach>,
+    #[serde(default, rename = "lab_reach")]
+    _retired_lab_reach: Option<serde::de::IgnoredAny>,
 }
 
-pub fn split_configuration(text: &str) -> Result<(String, BTreeMap<String, LabReach>), String> {
+/// Drydock's provider configuration, with Flotilla's own settings removed.
+pub fn split_configuration(text: &str) -> Result<String, String> {
     let mut document: toml::Table = toml::from_str(text).map_err(|error| format!("invalid drydock TOML configuration: {error}"))?;
     #[derive(Deserialize)]
     struct Settings {
-        #[serde(default)]
-        flotilla: Integration,
+        #[serde(default, rename = "flotilla")]
+        _flotilla: Integration,
     }
-    let integration = toml::from_str::<Settings>(text).map_err(|error| format!("invalid Flotilla Drydock settings: {error}"))?.flotilla;
+    toml::from_str::<Settings>(text).map_err(|error| format!("invalid Flotilla Drydock settings: {error}"))?;
     document.remove("flotilla");
     // Drydock's table was `provider` before its configuration document became
     // `providers` (drydock#129). Accept the old name for one roll; remove after it.
@@ -37,16 +37,7 @@ pub fn split_configuration(text: &str) -> Result<(String, BTreeMap<String, LabRe
         }
         document.insert("providers".into(), providers);
     }
-    let mut reach = BTreeMap::new();
-    for (name, provider) in integration.provider {
-        if let Some(lab) = provider.lab_reach {
-            if lab.hostname.is_empty() || lab.hostname.contains(['\n', '\r', ' ', '\t']) || lab.port == 0 {
-                return Err("lab reach requires a hostname and nonzero port".into());
-            }
-            reach.insert(name, lab);
-        }
-    }
-    Ok((toml::to_string(&document).map_err(|_| "invalid drydock configuration")?, reach))
+    toml::to_string(&document).map_err(|_| "invalid drydock configuration".into())
 }
 
 #[cfg(test)]
@@ -55,28 +46,24 @@ mod tests {
     use hegel::generators as gs;
     #[test]
     fn errors_preserve_source_location() {
-        for text in ["[provider\n", "[flotilla.provider.daytona.lab_reach]\nhostname='host'\nport='wrong'\n"] {
+        for text in ["[provider\n", "[flotilla.provider.daytona.unknown]\nhostname='host'\n"] {
             let error = split_configuration(text).unwrap_err();
             assert!(error.contains("line ") && error.contains("column "), "{error}");
         }
     }
 
-    // #3765 B2: controller reach is host-local and never becomes provider or
-    // guest settings. Generated ports cover invalid zero and the valid range.
-    // The provider table's earlier name is read as drydock's current one.
+    // #4299: the retired per-instance lab reach is accepted and dropped, never
+    // becoming provider or guest settings, whatever it held. The provider
+    // table's earlier name is read as drydock's current one.
     #[hegel::test]
-    fn lab_reach_is_split_from_provider_settings(tc: hegel::TestCase) {
-        let port = tc.draw(hegel::generators::integers::<u16>());
+    fn the_retired_lab_reach_is_accepted_and_dropped(tc: hegel::TestCase) {
+        let port = tc.draw(gs::integers::<u16>());
         let table = tc.draw(gs::sampled_from(vec!["provider", "providers"]));
-        let text = format!("[{table}.daytona]\nmodule='daytona'\n[flotilla.provider.daytona.lab_reach]\nhostname='forgejo.lab.flotilla.work'\nport={port}\n");
-        let result = split_configuration(&text);
-        if port == 0 {
-            assert!(result.is_err());
-        } else {
-            let (provider, reach) = result.unwrap();
-            assert!(!provider.contains("flotilla"));
-            assert!(provider.contains("[providers.daytona]"), "{provider}");
-            assert_eq!(reach["daytona"].port, port);
-        }
+        let text = format!(
+            "[{table}.daytona]\nmodule='daytona'\n[flotilla.provider.daytona.lab_reach]\nhostname='forgejo.lab.example'\nport={port}\n"
+        );
+        let provider = split_configuration(&text).unwrap();
+        assert!(!provider.contains("flotilla") && !provider.contains("lab"), "{provider}");
+        assert!(provider.contains("[providers.daytona]"), "{provider}");
     }
 }

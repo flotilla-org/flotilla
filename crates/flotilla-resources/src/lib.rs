@@ -90,6 +90,7 @@ mod principal_attention;
 mod project;
 pub mod provider_placement;
 mod provisioning_identity;
+pub mod reach;
 pub mod realisation_settings;
 mod replica;
 #[doc(hidden)]

@@ -29,7 +29,10 @@ use flotilla_resources::{
     CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION,
     CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND, VESSEL_REF_LABEL,
 };
-use flotilla_resources::{realisation_settings, BRIEF_ARTIFACTS_ANNOTATION};
+use flotilla_resources::{
+    reach::{ReachDestination, ReachMeans, ReachRoute},
+    realisation_settings, BRIEF_ARTIFACTS_ANNOTATION,
+};
 use flotilla_store::{
     controller::{delete_lifecycle_owned_matching, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
     ReplicaReadResolver, ResourceBackend, TypedResolver,
@@ -496,6 +499,7 @@ enum PlannedPatch {
         terminal_session_refs: Vec<String>,
         requested_stance: Stance,
         effective_stance: Stance,
+        reach: Vec<ReachRoute>,
     },
     Interrupted {
         roles: BTreeSet<String>,
@@ -805,7 +809,7 @@ impl VesselReconciler {
                             .filter(|need| need.requires_guest_probe())
                             .cloned()
                             .collect();
-                        let spec = match cloud_environment_spec(&placement, image, probe_needs, &required_adapters) {
+                        let spec = match cloud_environment_spec(&placement, image, probe_needs, &required_adapters, &requirement.reach) {
                             Ok(spec) => spec,
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         };
@@ -1530,8 +1534,9 @@ impl VesselReconciler {
             }
         }
 
-        let mut configured_limits =
-            self.environments.get(&resolved_environment_ref).await?.status.and_then(|status| status.configured_limits);
+        let environment = self.environments.get(&resolved_environment_ref).await?;
+        let reach = vessel_reach(&environment, &requirement.reach);
+        let mut configured_limits = environment.status.and_then(|status| status.configured_limits);
         for terminal_ref in &terminal_refs {
             if let Some(limits) = self.terminal_sessions.get(terminal_ref).await?.status.and_then(|status| status.configured_limits) {
                 // Only host-direct launches record terminal limits today. Merge
@@ -1551,6 +1556,7 @@ impl VesselReconciler {
                 terminal_session_refs: terminal_refs,
                 requested_stance: effective_stance,
                 effective_stance,
+                reach,
             },
             actuations,
         })
@@ -1620,7 +1626,9 @@ impl Reconciler for VesselReconciler {
                     terminal_session_refs,
                     requested_stance,
                     effective_stance,
+                    reach,
                 } => Some(VesselStatusPatch::MarkReady {
+                    reach: reach.clone(),
                     configured_limits: configured_limits.clone(),
                     placement_decision: placement_decision.clone(),
                     environment_ref: Some(environment_ref.clone()),
@@ -1830,6 +1838,7 @@ fn cloud_environment_spec(
     image: &Option<PlacementImageSource>,
     probe_needs: BTreeSet<flotilla_resources::CapabilityNeed>,
     required_adapters: &BTreeSet<String>,
+    reach: &BTreeSet<ReachDestination>,
 ) -> Result<EnvironmentSpec, String> {
     let instance = placement
         .instance
@@ -1846,6 +1855,7 @@ fn cloud_environment_spec(
     Ok(EnvironmentSpec {
         provider_address: Some(address),
         cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+            reach: reach.clone(),
             image,
             image_build_ref,
             size,
@@ -1855,6 +1865,21 @@ fn cloud_environment_spec(
         }),
         ..EnvironmentSpec::default()
     })
+}
+
+/// How the vessel's environment meets each destination of its reach set: a
+/// cloud sandbox reports its routes once ready; Docker and host-direct
+/// environments share the controlling host's network view, so all are native.
+fn vessel_reach(environment: &ResourceObject<Environment>, reach: &BTreeSet<ReachDestination>) -> Vec<ReachRoute> {
+    if environment.spec.cloud_sandbox.is_some() {
+        return environment
+            .status
+            .as_ref()
+            .and_then(|status| status.provider_descriptor.as_ref())
+            .map(|d| d.reach.clone())
+            .unwrap_or_default();
+    }
+    reach.iter().map(|destination| ReachRoute { destination: destination.clone(), met: ReachMeans::Native }).collect()
 }
 
 /// The directory a vessel's recorded checkouts sit side by side in, when they
@@ -2366,12 +2391,13 @@ mod tests {
         .unwrap();
         let needs: BTreeSet<flotilla_resources::CapabilityNeed> = ["toolchain:rust".parse().unwrap()].into_iter().collect();
         let unfrozen = Placement { kind: kind.clone(), instance: None };
-        assert!(cloud_environment_spec(&unfrozen, &Some("image@sha256:digest".into()), needs.clone(), &BTreeSet::new())
+        assert!(cloud_environment_spec(&unfrozen, &Some("image@sha256:digest".into()), needs.clone(), &BTreeSet::new(), &BTreeSet::new())
             .unwrap_err()
             .contains("names no provider instance"));
         let placement = Placement { kind, instance: Some("daytona".into()) };
         let spec =
-            cloud_environment_spec(&placement, &Some("image@sha256:digest".into()), needs.clone(), &BTreeSet::new()).expect("a typed spec");
+            cloud_environment_spec(&placement, &Some("image@sha256:digest".into()), needs.clone(), &BTreeSet::new(), &BTreeSet::new())
+                .expect("a typed spec");
         assert!(spec.docker.is_none() && spec.host_direct.is_none());
         assert_eq!(spec.provider_address.unwrap().to_string(), "account:daytona/provider:daytona");
         assert_eq!(
@@ -2388,8 +2414,8 @@ mod tests {
         sized_kind.spec.realisation =
             FulfilmentRealisation::CloudSandboxPerVessel { image: Some("image@sha256:digest".into()), size: Some(policy_size.clone()) };
         let sized = Placement { kind: sized_kind, instance: Some("daytona".into()) };
-        let spec =
-            cloud_environment_spec(&sized, &Some("image@sha256:digest".into()), needs.clone(), &BTreeSet::new()).expect("a typed spec");
+        let spec = cloud_environment_spec(&sized, &Some("image@sha256:digest".into()), needs.clone(), &BTreeSet::new(), &BTreeSet::new())
+            .expect("a typed spec");
         let cloud = spec.cloud_sandbox.unwrap();
         assert_eq!(cloud.size, policy_size);
         assert_eq!((cloud.image.as_str(), cloud.image_build_ref), ("image@sha256:digest", None), "a literal resolves now");
@@ -2416,10 +2442,13 @@ mod tests {
         }))
         .unwrap();
         let placement = Placement { kind, instance: Some("daytona".into()) };
-        let cloud = cloud_environment_spec(&placement, &Some(built), BTreeSet::new(), &BTreeSet::new()).unwrap().cloud_sandbox.unwrap();
+        let cloud = cloud_environment_spec(&placement, &Some(built), BTreeSet::new(), &BTreeSet::new(), &BTreeSet::new())
+            .unwrap()
+            .cloud_sandbox
+            .unwrap();
         assert_eq!((cloud.image.as_str(), cloud.image_build_ref.as_deref()), ("", Some("image-identity-amd64-registry")));
         assert_eq!(composed_image(&placement, None).map(|image| image.identity), Some("identity".to_string()));
-        assert!(cloud_environment_spec(&placement, &None, BTreeSet::new(), &BTreeSet::new())
+        assert!(cloud_environment_spec(&placement, &None, BTreeSet::new(), &BTreeSet::new(), &BTreeSet::new())
             .unwrap_err()
             .contains("not frozen at admission"));
     }
@@ -2444,7 +2473,7 @@ mod tests {
         let placement = Placement { kind, instance: Some("daytona".into()) };
         let env = |adapters: &[&str]| {
             let adapters = adapters.iter().map(|adapter| adapter.to_string()).collect();
-            cloud_environment_spec(&placement, &Some("image@sha256:digest".into()), BTreeSet::new(), &adapters)
+            cloud_environment_spec(&placement, &Some("image@sha256:digest".into()), BTreeSet::new(), &adapters, &BTreeSet::new())
                 .unwrap()
                 .cloud_sandbox
                 .unwrap()

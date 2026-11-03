@@ -100,6 +100,11 @@ pub struct ProviderCapabilities {
     /// at a container's fixed locations.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub host_filesystem: bool,
+    /// How the vessels meet a destination that resolves privately on the
+    /// controlling host (#4299). Placement refuses a candidate that cannot.
+    /// Undeclared is not written, so earlier records keep their shape.
+    #[serde(skip_serializing_if = "crate::reach::PrivateReach::is_undeclared")]
+    pub private_reach: crate::reach::PrivateReach,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

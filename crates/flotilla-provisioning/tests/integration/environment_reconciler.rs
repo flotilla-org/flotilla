@@ -668,6 +668,7 @@ impl EnvironmentRuntime for CloudRuntime {
             backing_id: "opaque-cloud-backing".into(),
             image_ref: spec.cloud_sandbox.as_ref().unwrap().image.clone(),
             provider_descriptor: Box::new(flotilla_resources::EnvironmentProviderDescriptor {
+                reach: Default::default(),
                 instance: "daytona".into(),
                 kind: flotilla_protocol::provider::ProviderKind::new(
                     flotilla_protocol::provider::EnvironmentClass::CloudSandbox,
@@ -698,6 +699,7 @@ async fn cloud_ready_and_finalization_use_generic_backing() {
             &EnvironmentSpec {
                 provider_address: Some("account:daytona/provider:daytona".parse().unwrap()),
                 cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+                    reach: Default::default(),
                     probe_needs: Default::default(),
                     image: "image@sha256:digest".into(),
                     image_build_ref: None,
@@ -744,6 +746,7 @@ async fn composed_cloud_environment_provisions_the_registry_digest(#[case] deliv
             &EnvironmentSpec {
                 provider_address: Some("account:daytona/provider:daytona".parse().unwrap()),
                 cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+                    reach: Default::default(),
                     probe_needs: Default::default(),
                     image: String::new(),
                     image_build_ref: Some(name.clone()),

@@ -848,6 +848,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     VesselStatus { phase: VesselPhase::Ready, started_at: Some(ts(10)), ready_at: Some(ts(20)), ..VesselStatus::default() };
                 let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };
                 let patch = VesselStatusPatch::MarkReady {
+                    reach: Default::default(),
                     image: None,
                     configured_limits: None,
                     placement_decision: None,

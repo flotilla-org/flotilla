@@ -3577,6 +3577,12 @@ impl InProcessDaemon {
         self.admission.set_account_random(random);
     }
 
+    /// Resolve reach destinations for placement with `resolver` (#4299). The
+    /// daemon server sets the system resolver; until then nothing is looked up.
+    pub fn set_reach_resolver(&self, resolver: Arc<dyn flotilla_environment::reach::ReachResolver>) {
+        self.admission.set_reach_resolver(resolver);
+    }
+
     /// The home pass over one convoy's account bindings (#3907).
     pub async fn reconcile_convoy_accounts(
         &self,

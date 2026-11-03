@@ -128,7 +128,12 @@ impl DummyDaemon {
             .definitions::<flotilla_resources::FleetDesignation>(NAMESPACE)
             .create(
                 &InputMeta::builder().name(flotilla_resources::FLEET_DESIGNATION_NAME.to_string()).build(),
-                &flotilla_resources::FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
+                &flotilla_resources::FleetDesignationSpec {
+                    reach: Default::default(),
+                    fleet: Some("lab".into()),
+                    project: "fleet".into(),
+                    image_cache: None,
+                },
             )
             .await
             .expect("fleet designation");

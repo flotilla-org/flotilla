@@ -170,6 +170,9 @@ pub struct CloudSandboxEnvironmentSpec {
     pub lifetime_cap_seconds: Option<u64>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// The vessel's composed reach set (#4299), which the provider meets.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub reach: BTreeSet<crate::reach::ReachDestination>,
 }
 
 impl<'de> Deserialize<'de> for CloudSandboxEnvironmentSpec {
@@ -185,6 +188,9 @@ impl<'de> Deserialize<'de> for CloudSandboxEnvironmentSpec {
             #[serde(default)]
             env: BTreeMap<String, String>,
             probe_needs: Option<BTreeSet<crate::CapabilityNeed>>,
+            // Previous-generation specs omit reach (ADR 0047).
+            #[serde(default)]
+            reach: BTreeSet<crate::reach::ReachDestination>,
         }
         let mut stored = Stored::deserialize(deserializer)?;
         // ADR 0047: remove one fleet roll after #3765. Lift preceding-generation
@@ -214,6 +220,7 @@ impl<'de> Deserialize<'de> for CloudSandboxEnvironmentSpec {
             lifetime_cap_seconds: stored.lifetime_cap_seconds,
             env: stored.env,
             probe_needs,
+            reach: stored.reach,
         })
     }
 }
@@ -239,6 +246,10 @@ pub struct EnvironmentProviderDescriptor {
     /// before it was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_connection: Option<flotilla_protocol::provider::AgentConnectionReport>,
+    /// How the provider met each destination in the vessel's reach set
+    /// (#4299). Shown, never decided on; empty in earlier records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reach: Vec<crate::reach::ReachRoute>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -708,6 +719,7 @@ mod cloud_schema_tests {
         let spec = EnvironmentSpec {
             provider_address: Some("account:test/provider:daytona".parse().unwrap()),
             cloud_sandbox: Some(CloudSandboxEnvironmentSpec {
+                reach: Default::default(),
                 probe_needs: Default::default(),
                 image: "registry/image@sha256:digest".into(),
                 image_build_ref,

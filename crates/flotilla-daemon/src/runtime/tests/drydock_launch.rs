@@ -407,6 +407,7 @@ async fn stand_in_with(declared_path: Option<&str>, harness_in_image: bool, host
     let spec = EnvironmentSpec {
         provider_address: Some(address.clone()),
         cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+            reach: Default::default(),
             probe_needs: Default::default(),
             image: format!("example.test/crew@sha256:{}", "a".repeat(64)),
             image_build_ref: None,

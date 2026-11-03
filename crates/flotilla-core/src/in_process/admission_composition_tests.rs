@@ -167,7 +167,7 @@ async fn admission_cascade_precedence_and_dispatch_are_frozen() {
         .definitions::<FleetDesignation>("flotilla")
         .apply(
             &InputMeta::builder().name("fleet".into()).build(),
-            &FleetDesignationSpec { fleet: None, project: "fleet".into(), image_cache: None },
+            &FleetDesignationSpec { reach: Default::default(), fleet: None, project: "fleet".into(), image_cache: None },
         )
         .await
         .expect("designation");

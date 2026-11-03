@@ -40,7 +40,7 @@ async fn primitives_at(dir: &tempfile::TempDir, clock: Arc<dyn flotilla_resource
         .definitions::<FleetDesignation>(NAMESPACE)
         .create(
             &InputMeta::builder().name(FLEET_DESIGNATION_NAME.to_string()).build(),
-            &FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
+            &FleetDesignationSpec { reach: Default::default(), fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
         )
         .await
         .expect("designation");

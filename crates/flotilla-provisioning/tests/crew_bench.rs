@@ -237,6 +237,7 @@ fn pinned_life(n: usize) -> [VesselStatusPatch; 3] {
             image: None,
         },
         VesselStatusPatch::MarkReady {
+            reach: Default::default(),
             configured_limits: None,
             placement_decision: None,
             environment_ref: Some(format!("env-{n}")),

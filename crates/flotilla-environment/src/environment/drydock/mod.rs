@@ -22,24 +22,25 @@ pub use api::ProviderApi;
 use api::{self as wire, ApiError};
 pub use connector::installed_agent_build;
 use flotilla_protocol::provider::AgentConnectionReport;
+use flotilla_protocol::reach::{PrivateReach, ReachDestination, ReachRoute};
 use flotilla_resources::HostImageAction;
-use std::{collections::BTreeMap, sync::RwLock, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::RwLock,
+    time::Duration,
+};
 
-/// Where the guest's agent and lab service are.
+/// Where the guest's agent is.
 struct GuestLayout {
     /// The agent's socket.
     agent: PathBuf,
-    /// The port the lab service's name answers on.
-    lab_port: u16,
 }
 
 impl Default for GuestLayout {
     fn default() -> Self {
-        Self { agent: "/run/drydock/agent.sock".into(), lab_port: 443 }
+        Self { agent: "/run/drydock/agent.sock".into() }
     }
 }
-/// The lab service's name inside the guest.
-const LAB_HOSTNAME: &str = "forgejo.lab.flotilla.work";
 /// How long one agent connection may take, the vessel's boot included.
 const AGENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -48,7 +49,8 @@ pub struct DrydockEnvironmentProvider {
     link: Arc<dyn AgentLink>,
     instance: String,
     module: String,
-    lab_reach: Option<(String, u16)>,
+    /// Resolves reach destinations on this, the controlling, host.
+    resolver: Arc<dyn crate::reach::ReachResolver>,
     guest: GuestLayout,
     agent_timeout: Duration,
     owner: Arc<()>,
@@ -67,7 +69,7 @@ impl DrydockEnvironmentProvider {
             link,
             instance,
             module,
-            lab_reach: None,
+            resolver: Arc::new(crate::reach::SystemResolver),
             guest: GuestLayout::default(),
             agent_timeout: AGENT_CONNECT_TIMEOUT,
             owner: Arc::new(()),
@@ -92,19 +94,15 @@ impl DrydockEnvironmentProvider {
         self.guest.agent = socket;
         self
     }
-    /// The port the lab service's name answers on in the guest, for a
-    /// stand-in vessel that is not a drydock guest.
-    pub fn with_guest_lab_port(mut self, port: u16) -> Self {
-        self.guest.lab_port = port;
-        self
-    }
     /// How long one agent connection may take, the vessel's boot included.
     pub fn with_agent_timeout(mut self, timeout: Duration) -> Self {
         self.agent_timeout = timeout;
         self
     }
-    pub fn with_lab_reach(mut self, reach: Option<(String, u16)>) -> Self {
-        self.lab_reach = reach;
+    /// How reach destinations resolve on the controlling host, for tests
+    /// whose destinations are not in this host's DNS.
+    pub fn with_reach_resolver(mut self, resolver: Arc<dyn crate::reach::ReachResolver>) -> Self {
+        self.resolver = resolver;
         self
     }
     /// The instance as drydock declares it. A daemon reports an instance its
@@ -172,6 +170,7 @@ impl DrydockEnvironmentProvider {
                     module_version: versions.1.clone(),
                     capabilities: self.capabilities(),
                     agent_connection: None,
+                    reach: Vec::new(),
                 }
             },
             watch: self
@@ -186,34 +185,44 @@ impl DrydockEnvironmentProvider {
             created_for_setup: std::sync::atomic::AtomicBool::new(false),
             agent,
             report,
+            reach: RwLock::new(Vec::new()),
         }))
     }
 
     /// Bring the vessel to what this provision asks: its environment, through
-    /// the agent, and the lab service reachable. Each step is idempotent, so
-    /// re-adoption runs it again; a lab exposure already standing is left as
+    /// the agent, and its reach set met. Each step is idempotent, so
+    /// re-adoption runs it again; an exposure already standing is left as
     /// drydock keeps it. Tools and sockets are the vessel layer's.
-    async fn set_up(&self, handle: &DrydockEnvironment) -> Result<(), String> {
+    async fn set_up(&self, handle: &DrydockEnvironment, reach: &BTreeSet<ReachDestination>) -> Result<(), String> {
         let agent = handle.agent.as_ref().ok_or("inventory handle has no vessel agent")?;
         let environment = handle.env.read().expect("environment").clone();
         agent.configure_environment(environment).await?;
-        if let Some((hostname, port)) = &self.lab_reach {
-            handle.exposures.outward("lab", lab_request(hostname, *port, self.guest.lab_port)?).await?;
+        let routes = crate::reach::routes(&*self.resolver, reach, PrivateReach::Exposure).await?;
+        for planned in &routes {
+            if let Some(address) = planned.carried_to {
+                let destination = &planned.route.destination;
+                handle.exposures.outward(&reach_exposure_name(destination), reach_request(destination, address)).await?;
+            }
         }
+        *handle.reach.write().expect("reach routes") = routes.into_iter().map(|planned| planned.route).collect();
         ensure_directory(agent, &handle.capabilities.workspace_root).await
     }
 }
 
-/// The lab service, reached from drydock's machine, at its own name inside the
-/// guest. TLS stays end to end; the guest receives no reach credential.
-fn lab_request(hostname: &str, port: u16, guest_port: u16) -> Result<wire::OutwardRequest, String> {
-    if guest_port == 0 {
-        return Err("lab service guest port must be nonzero".into());
+/// A private destination, reached from drydock's machine at the address this
+/// host resolved it to, at its own name and port inside the guest. TLS stays
+/// end to end; the guest receives no reach credential. A provision after the
+/// name moves sets the exposure again.
+fn reach_request(destination: &ReachDestination, address: std::net::IpAddr) -> wire::OutwardRequest {
+    wire::OutwardRequest {
+        guest: wire::Guest::Name { name: destination.host.clone(), port: destination.port },
+        destination: wire::OutwardDestination::Tcp(std::net::SocketAddr::new(address, destination.port).to_string()),
     }
-    Ok(wire::OutwardRequest {
-        guest: wire::Guest::Name { name: LAB_HOSTNAME.into(), port: guest_port },
-        destination: wire::OutwardDestination::Tcp(format!("{hostname}:{port}")),
-    })
+}
+
+/// Exposure names are drydock file names: a destination is named by its digest.
+fn reach_exposure_name(destination: &ReachDestination) -> String {
+    exposures::path_name("reach", Path::new(&destination.to_string()))
 }
 
 /// `mkdir -p`: a missing directory is created 0755; an existing one keeps its mode.
@@ -352,14 +361,14 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
                 handle.created_for_setup.store(false, std::sync::atomic::Ordering::Release);
                 // Re-adoption must apply rotated tokens.
                 *handle.env.write().expect("environment") = env;
-                self.set_up(&handle).await.map_err(EnvironmentProvisionError::RetryAdoption)?;
+                self.set_up(&handle, &prepared.spec.reach).await.map_err(EnvironmentProvisionError::RetryAdoption)?;
                 return Ok(handle);
             }
         }
         let handle = self.handle(environment, prepared.spec.image.clone(), env, true)?;
         handle.created_for_setup.store(created, std::sync::atomic::Ordering::Release);
         let setup = async {
-            self.set_up(&handle).await?;
+            self.set_up(&handle, &prepared.spec.reach).await?;
             Ok::<_, String>(())
         }
         .await;
@@ -449,6 +458,8 @@ fn capabilities(c: &wire::Capabilities) -> ProviderCapabilities {
         receives_host_tools: true,
         per_vessel: true,
         host_filesystem: c.host_filesystem,
+        // Each private destination is a named outward exposure (drydock#135).
+        private_reach: PrivateReach::Exposure,
     }
 }
 /// The pipeline defaults drydock-agent sets on every process it starts, over
@@ -472,6 +483,8 @@ struct DrydockEnvironment {
     agent: Option<Arc<AgentRunner>>,
     /// Where the agent's latest connection went: recorded and shown, never decided on.
     report: Arc<std::sync::Mutex<Option<AgentConnectionReport>>>,
+    /// How set-up met the vessel's reach set: recorded and shown.
+    reach: RwLock<Vec<ReachRoute>>,
     watch: observations::Watch,
 }
 #[async_trait]
@@ -503,7 +516,8 @@ impl ProvisionedEnvironment for DrydockEnvironment {
     }
     fn provider_descriptor(&self) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
         let agent_connection = self.report.lock().expect("agent report").clone();
-        Some(flotilla_resources::EnvironmentProviderDescriptor { agent_connection, ..self.descriptor.clone() })
+        let reach = self.reach.read().expect("reach routes").clone();
+        Some(flotilla_resources::EnvironmentProviderDescriptor { agent_connection, reach, ..self.descriptor.clone() })
     }
 
     async fn observe(&self) -> ProviderObservation {

@@ -33,8 +33,14 @@ use crate::{
 
 mod conformance_adapter;
 
-/// The lab service's name inside the guest.
-const LAB_HOSTNAME: &str = "forgejo.lab.flotilla.work";
+/// This host resolves every reach destination to its loopback address.
+struct LoopbackResolver;
+#[async_trait]
+impl flotilla_environment::reach::ReachResolver for LoopbackResolver {
+    async fn resolve(&self, _: &flotilla_resources::reach::ReachDestination) -> flotilla_environment::reach::Resolution {
+        flotilla_environment::reach::Resolution::Private(std::net::Ipv4Addr::LOCALHOST.into())
+    }
+}
 
 /// The agent build the stand-in vessel runs, and drydock and the provider push.
 const BUILD: &[u8] = b"flotilla drydock test agent";
@@ -235,6 +241,7 @@ impl HostFixture {
 pub(super) fn spec() -> flotilla_resources::EnvironmentSpec {
     flotilla_resources::EnvironmentSpec {
         cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+            reach: Default::default(),
             probe_needs: Default::default(),
             image: format!("example.test/crew@sha256:{}", "a".repeat(64)),
             image_build_ref: None,
@@ -637,8 +644,9 @@ async fn crew_talks_back_through_an_outward_exposure() {
     handle.destroy().await.unwrap();
 }
 
-// drydock#132 case 3, lab service: the lab's name in the guest is an outward
-// exposure drydock gives an address and a hosts line, reaching the lab from
+// drydock#132 case 3, #4299: a reach destination that resolves privately on
+// the controlling host is an outward exposure drydock gives an address and a
+// hosts line under the destination's own name and port, reaching it from
 // drydock's machine. Re-adoption leaves the standing exposure as it is.
 //
 // Linux only: drydock gives each guest name its own 127.x.y.z address, and the
@@ -647,24 +655,27 @@ async fn crew_talks_back_through_an_outward_exposure() {
 // guests are Linux, so the exposure itself is unaffected.
 #[cfg_attr(not(target_os = "linux"), ignore = "needs 127/8 on loopback; macOS lo0 has only 127.0.0.1")]
 #[tokio::test]
-async fn the_lab_service_is_a_named_outward_exposure() {
+async fn a_private_reach_destination_is_a_named_outward_exposure() {
     let host = HostFixture::start().await;
     host.ready().await;
-    let lab = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let guest_port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let provider =
-        host.provider().with_lab_reach(Some(("127.0.0.1".into(), lab.local_addr().unwrap().port()))).with_guest_lab_port(guest_port);
-    let prepared = fixture_prepared(&host, &provider).await;
-    let handle = provider.provision(EnvironmentId::new("lab"), &prepared, host.opts()).await.unwrap();
+    let service = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let destination = flotilla_resources::reach::ReachDestination::new("forge.reach.test", service.local_addr().unwrap().port()).unwrap();
+    let provider = host.provider().with_reach_resolver(Arc::new(LoopbackResolver));
+    let mut input = spec();
+    input.cloud_sandbox.as_mut().unwrap().reach = [destination.clone()].into();
+    let prepared = fixture_prepared_spec(&provider, input).await;
+    let handle = provider.provision(EnvironmentId::new("reach"), &prepared, host.opts()).await.unwrap();
     let names = tokio::fs::read_to_string(host.root.join("hosts")).await.unwrap();
-    let line = names.lines().find(|line| line.contains(LAB_HOSTNAME)).unwrap_or_else(|| panic!("{names}"));
+    let line = names.lines().find(|line| line.contains(" forge.reach.test")).unwrap_or_else(|| panic!("{names}"));
     let address: std::net::IpAddr = line.split_whitespace().next().unwrap().parse().unwrap();
-    round_trip(tokio::net::TcpStream::connect((address, guest_port)).await.unwrap(), async { lab.accept().await.unwrap().0 }).await;
+    round_trip(tokio::net::TcpStream::connect((address, destination.port)).await.unwrap(), async { service.accept().await.unwrap().0 })
+        .await;
     let mut events = ProviderApi::observe(&*host.daemon(), None).await.unwrap();
-    provider.provision(EnvironmentId::new("lab"), &prepared, host.opts()).await.unwrap();
-    assert!(!announced(&mut events, Duration::from_millis(500)).await.contains(&"lab".to_owned()), "re-adoption sets no lab exposure");
+    provider.provision(EnvironmentId::new("reach"), &prepared, host.opts()).await.unwrap();
+    let announced = announced(&mut events, Duration::from_millis(500)).await;
+    assert!(!announced.iter().any(|name| name.starts_with("reach-")), "re-adoption sets no reach exposure: {announced:?}");
     let names = tokio::fs::read_to_string(host.root.join("hosts")).await.unwrap();
-    assert_eq!(names.matches(LAB_HOSTNAME).count(), 1, "{names}");
+    assert_eq!(names.lines().filter(|line| line.contains(" forge.reach.test")).count(), 1, "{names}");
     handle.destroy().await.unwrap();
 }
 

@@ -107,6 +107,10 @@ pub struct VesselStatus {
     pub credential_delivery_retry: Option<ControllerRetry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_refresh_retry: Option<ControllerRetry>,
+    /// The vessel's reach set and how its environment meets each entry
+    /// (#4299), recorded when it becomes Ready. Earlier records omit it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reach: Vec<crate::reach::ReachRoute>,
 }
 
 /// A vessel's frozen image: the composed identity, then the built digest once
@@ -170,6 +174,8 @@ pub enum VesselStatusPatch {
         /// The composed image and digest the Ready Environment runs; replaces
         /// any earlier record.
         image: Option<VesselImage>,
+        /// How the Ready Environment meets each destination in the reach set.
+        reach: Vec<crate::reach::ReachRoute>,
     },
     MarkInterrupted {
         roles: BTreeSet<String>,
@@ -260,6 +266,7 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
                 effective_stance,
                 ready_at,
                 image,
+                reach,
             } => {
                 // Ready records the image the Environment actually runs.
                 if let Some(image) = image {
@@ -280,6 +287,7 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
                 status.requested_stance = Some(*requested_stance);
                 status.effective_stance = Some(*effective_stance);
                 status.ready_at.get_or_insert(*ready_at);
+                status.reach = reach.clone();
                 status.message = None;
             }
             Self::MarkInterrupted { roles, message } => {
@@ -333,6 +341,7 @@ mod image_tests {
     #[test]
     fn ready_records_the_latest_image() {
         let ready = |identity: &str, digest: &str| VesselStatusPatch::MarkReady {
+            reach: Default::default(),
             configured_limits: None,
             placement_decision: None,
             environment_ref: Some("env".into()),

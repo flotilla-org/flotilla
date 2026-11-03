@@ -389,6 +389,12 @@ pub struct VesselRequirement {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub needs: BTreeSet<crate::CapabilityNeed>,
+    /// Destinations this vessel must reach (#4299). A template may declare
+    /// some; admission freezes the composed set here: these, those derived
+    /// from what the vessel is given, and the fleet's and project's.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub reach: BTreeSet<crate::reach::ReachDestination>,
 }
 
 /// The accepted stored form of a [`VesselRequirement`]. Unknown fields are
@@ -413,6 +419,9 @@ struct VesselRequirementRecord {
     crew: Vec<CrewSpec>,
     #[serde(default)]
     needs: BTreeSet<crate::CapabilityNeed>,
+    // Previous-generation requirements omit reach (ADR 0047).
+    #[serde(default)]
+    reach: BTreeSet<crate::reach::ReachDestination>,
     #[serde(default, rename = "stance")]
     _legacy_stance: Option<serde::de::IgnoredAny>,
 }
@@ -428,6 +437,7 @@ impl From<VesselRequirementRecord> for VesselRequirement {
             credential_permissions: record.credential_permissions,
             crew: record.crew,
             needs: record.needs,
+            reach: record.reach,
         }
     }
 }

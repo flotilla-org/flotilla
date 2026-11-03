@@ -395,6 +395,45 @@ measurement from silently disabling admission.
 Set the floor to `0` only when an external system provides an equivalent
 capacity guard.
 
+### Vessel reach
+
+Each vessel has a reach set: the destinations it must reach, composed at
+admission and frozen into its requirement (#4299). The set is the union of:
+
+- what the vessel is given: the hosts of its repositories' remotes, the
+  servers its credentials name (Git HTTP and Forgejo forges, GitHub, Docker
+  registries, the review-bundle object store) and the fleet image cache's
+  registry;
+- what is declared for anything not derivable: the fleet's
+  `FleetDesignation.spec.reach` and the project's `reach:` in `project.yaml`
+  (or its Project's `spec.reach`), and a workflow vessel's own `reach`.
+
+A declared entry names a host and a port:
+
+```yaml
+reach:
+  - host: artifacts.lab.example
+    port: 443
+```
+
+How each destination is met is the environment's business. One that resolves,
+on the vessel's controlling host, only to public addresses is met natively. One
+that resolves to a private, shared (CGNAT, tailnet), loopback or link-local
+address is carried from the controlling host: a drydock vessel gets an outward
+exposure under the destination's own name and port, so TLS stays end to end,
+reaching the address the controlling host resolved. Docker and host-direct
+vessels share the host's network and meet it natively. A private destination
+named only by an address cannot be carried under a name, and is refused.
+
+Placement refuses a candidate whose provider cannot carry a private
+destination, naming it. Destinations resolve on the admitting daemon; one that
+does not resolve there is left to provisioning, which fails naming it if the
+controlling host cannot resolve it either. A Ready vessel's status lists its
+reach set and how each entry is met (`native` or `exposure`).
+
+The earlier `[flotilla.provider.<instance>.lab_reach]` table in `drydock.toml`
+is retired: it is accepted and ignored for one roll, then refused.
+
 ## Forced checkout archives
 
 Forced checkout removal saves a Git bundle and patch under `.flotilla-archives/`

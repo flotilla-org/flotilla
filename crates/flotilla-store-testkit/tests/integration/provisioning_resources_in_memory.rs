@@ -76,6 +76,7 @@ async fn vessel_metadata_and_status_roundtrip() {
             "convoy-fix-bug-123-implement",
             &created.metadata.resource_version,
             &VesselStatus {
+                reach: Default::default(),
                 image: None,
                 degraded: Default::default(),
                 configured_limits: None,

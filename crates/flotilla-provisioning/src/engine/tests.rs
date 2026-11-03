@@ -399,6 +399,7 @@ fn a_cloud_sandbox_environment_stays_on_the_old_path() {
     let mut cloud = environment_object(false);
     cloud.spec.host_direct = None;
     cloud.spec.cloud_sandbox = Some(CloudSandboxEnvironmentSpec {
+        reach: Default::default(),
         probe_needs: Default::default(),
         image: "registry/flotilla@sha256:00".into(),
         image_build_ref: None,
@@ -957,6 +958,7 @@ fn provisioning(host: Option<&str>) -> flotilla_resources::VesselStatusPatch {
 
 fn vessel_ready(environment: &str) -> flotilla_resources::VesselStatusPatch {
     flotilla_resources::VesselStatusPatch::MarkReady {
+        reach: Default::default(),
         configured_limits: None,
         placement_decision: None,
         environment_ref: Some(environment.into()),

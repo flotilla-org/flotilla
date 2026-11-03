@@ -1817,6 +1817,7 @@ async fn tracking_repo_does_not_widen_project_name_or_overwrite_custom_project()
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let projects = backend.clone().using::<Project>("flotilla");
     let custom_spec = flotilla_resources::ProjectSpec {
+        reach: Default::default(),
         image: None,
         charter: None,
         role_definitions: BTreeMap::new(),
@@ -1855,6 +1856,7 @@ async fn tracking_repo_does_not_use_naming_cascade_when_slug_candidates_collide(
             .create(
                 &InputMeta::builder().name(name.to_string()).build(),
                 &flotilla_resources::ProjectSpec {
+                    reach: Default::default(),
                     image: None,
                     charter: None,
                     role_definitions: BTreeMap::new(),

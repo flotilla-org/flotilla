@@ -1009,6 +1009,7 @@ fn vessel_object_with_local_image_id(
             adopted_checkout_refs: Default::default(),
         },
         status: Some(VesselStatus {
+            reach: Default::default(),
             image: None,
             degraded: Default::default(),
             configured_limits: None,
@@ -1062,6 +1063,7 @@ fn bootstrap_from_valid_template_returns_bootstrap_patch() {
             .vessels
             .iter()
             .map(|task| flotilla_resources::VesselRequirement {
+                reach: Default::default(),
                 needs: Default::default(),
                 name: task.name.clone(),
                 repository_refs: task.repository_refs.clone(),
@@ -1258,6 +1260,7 @@ fn fan_out_advances_all_newly_ready_tasks() {
         turn_delivery: Default::default(),
         vessels: vec![
             flotilla_resources::VesselRequirement {
+                reach: Default::default(),
                 needs: Default::default(),
                 name: "a".to_string(),
                 repository_refs: None,
@@ -1268,6 +1271,7 @@ fn fan_out_advances_all_newly_ready_tasks() {
                 crew: Vec::new(),
             },
             flotilla_resources::VesselRequirement {
+                reach: Default::default(),
                 needs: Default::default(),
                 name: "b".to_string(),
                 repository_refs: None,
@@ -1278,6 +1282,7 @@ fn fan_out_advances_all_newly_ready_tasks() {
                 crew: Vec::new(),
             },
             flotilla_resources::VesselRequirement {
+                reach: Default::default(),
                 needs: Default::default(),
                 name: "c".to_string(),
                 repository_refs: None,
@@ -1318,6 +1323,7 @@ fn fan_in_waits_until_all_dependencies_complete() {
         turn_delivery: Default::default(),
         vessels: vec![
             flotilla_resources::VesselRequirement {
+                reach: Default::default(),
                 needs: Default::default(),
                 name: "implement".to_string(),
                 repository_refs: None,
@@ -1328,6 +1334,7 @@ fn fan_in_waits_until_all_dependencies_complete() {
                 crew: Vec::new(),
             },
             flotilla_resources::VesselRequirement {
+                reach: Default::default(),
                 needs: Default::default(),
                 name: "verify".to_string(),
                 repository_refs: None,
@@ -1338,6 +1345,7 @@ fn fan_in_waits_until_all_dependencies_complete() {
                 crew: Vec::new(),
             },
             flotilla_resources::VesselRequirement {
+                reach: Default::default(),
                 needs: Default::default(),
                 name: "review".to_string(),
                 repository_refs: None,
@@ -2486,6 +2494,7 @@ fn advancing_ready_tasks_emits_task_phase_change_events() {
         turn_delivery: Default::default(),
         vessels: vec![
             flotilla_resources::VesselRequirement {
+                reach: Default::default(),
                 needs: Default::default(),
                 name: "a".to_string(),
                 repository_refs: None,
@@ -2496,6 +2505,7 @@ fn advancing_ready_tasks_emits_task_phase_change_events() {
                 crew: Vec::new(),
             },
             flotilla_resources::VesselRequirement {
+                reach: Default::default(),
                 needs: Default::default(),
                 name: "b".to_string(),
                 repository_refs: None,
@@ -2506,6 +2516,7 @@ fn advancing_ready_tasks_emits_task_phase_change_events() {
                 crew: Vec::new(),
             },
             flotilla_resources::VesselRequirement {
+                reach: Default::default(),
                 needs: Default::default(),
                 name: "c".to_string(),
                 repository_refs: None,

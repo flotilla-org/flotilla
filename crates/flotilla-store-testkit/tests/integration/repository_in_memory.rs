@@ -60,6 +60,7 @@ async fn declared_issue_source_does_not_hide_an_unavailable_member_repository() 
     let repositories = backend.including_replicas::<Repository>("flotilla");
     let override_source = IssueSource { service: "linear".into(), scope: "WIDGET".into() };
     let project = ProjectSpec {
+        reach: Default::default(),
         image: None,
         charter: None,
         role_definitions: BTreeMap::new(),
@@ -99,6 +100,7 @@ async fn project_issue_bindings_add_exclude_and_filter_derived_sources() {
     let github_source = IssueSource { service: "https://github.com".into(), scope: "acme/app".into() };
     let forgejo_source = IssueSource { service: "https://forgejo.lab.flotilla.work".into(), scope: "fork-issues/zellij".into() };
     let project = ProjectSpec {
+        reach: Default::default(),
         image: None,
         charter: None,
         role_definitions: BTreeMap::new(),
@@ -148,6 +150,7 @@ fn creatable_issue_binding_must_create_values_matching_its_filter() {
         .creatable(true)
         .build();
     let spec = ProjectSpec {
+        reach: Default::default(),
         image: None,
         charter: None,
         role_definitions: BTreeMap::new(),
@@ -172,6 +175,7 @@ fn creatable_issue_binding_must_create_values_matching_its_filter() {
 #[test]
 fn issue_bindings_reject_state_as_band_semantics() {
     let spec = ProjectSpec {
+        reach: Default::default(),
         image: None,
         charter: None,
         role_definitions: BTreeMap::new(),
@@ -205,6 +209,7 @@ async fn project_issue_sources_are_the_deduplicated_union_of_repository_forges()
     }
     let repositories = backend.including_replicas::<Repository>("flotilla");
     let project = ProjectSpec {
+        reach: Default::default(),
         image: None,
         charter: None,
         role_definitions: BTreeMap::new(),
@@ -276,6 +281,7 @@ async fn project_issue_source_uses_canonical_service_for_a_live_remote_alias() {
     repository_writer.create(&InputMeta::builder().name(key.to_string()).build(), &repository).await.expect("repository should create");
     let repositories = backend.including_replicas::<Repository>("flotilla");
     let project = ProjectSpec {
+        reach: Default::default(),
         image: None,
         charter: None,
         role_definitions: BTreeMap::new(),
@@ -308,6 +314,7 @@ async fn project_issue_source_resolution_reports_typed_unavailability() {
     repository_writer.create(&InputMeta::builder().name(local.key().to_string()).build(), &local).await.expect("repository should create");
     let repositories = backend.including_replicas::<Repository>("flotilla");
     let local_only = ProjectSpec {
+        reach: Default::default(),
         image: None,
         charter: None,
         role_definitions: BTreeMap::new(),
@@ -519,6 +526,7 @@ fn project_normalization_sorts_entries_omits_whole_repo_subpath_and_rejects_dupl
     let repo_a = RepositoryKey("a".to_string());
     let repo_b = RepositoryKey("b".to_string());
     let normalized = normalize_project_spec(ProjectSpec {
+        reach: Default::default(),
         image: None,
         charter: None,
         role_definitions: BTreeMap::new(),
@@ -560,6 +568,7 @@ fn project_normalization_sorts_entries_omits_whole_repo_subpath_and_rejects_dupl
     assert_eq!(normalized.repositories[1].subpath.as_deref(), Some("apps/api"));
 
     let duplicate = ProjectSpec {
+        reach: Default::default(),
         image: None,
         charter: None,
         role_definitions: BTreeMap::new(),
@@ -603,6 +612,7 @@ fn project_normalization_sorts_entries_omits_whole_repo_subpath_and_rejects_dupl
 fn project_subpaths_reject_absolute_and_parent_traversal() {
     for subpath in ["/tmp/app", "apps/../../secret", "."] {
         let spec = ProjectSpec {
+            reach: Default::default(),
             image: None,
             charter: None,
             role_definitions: BTreeMap::new(),

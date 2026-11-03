@@ -276,6 +276,7 @@ async fn controller_loop_advances_task_via_vessel_secondary_watch() {
             "convoy-stage4a-implement",
             &workspace.metadata.resource_version,
             &VesselStatus {
+                reach: Default::default(),
                 image: None,
                 degraded: Default::default(),
                 configured_limits: None,

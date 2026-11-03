@@ -4,6 +4,7 @@
 use super::{memory::MemoryApi, *};
 use crate::environment::agent::memory::{MemoryAgent, MemoryLink, TOOLS_IMAGE};
 use crate::environment::registry_auth::{RegistryAuthMaterial, RegistryConfig};
+use flotilla_protocol::reach::ReachMeans;
 use hegel::generators as gs;
 
 struct Fixture {
@@ -31,6 +32,7 @@ impl Fixture {
 fn spec() -> flotilla_resources::EnvironmentSpec {
     flotilla_resources::EnvironmentSpec {
         cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+            reach: Default::default(),
             probe_needs: Default::default(),
             image: format!("example.test/crew@sha256:{}", "a".repeat(64)),
             image_build_ref: None,
@@ -231,23 +233,87 @@ async fn stale_snapshot_absence_is_confirmed_by_inspect() {
     assert_eq!(adopted.observe().await.state, ObservationState::Gone { cause: GoneCause::MissingOnList });
 }
 
-// The lab service is a named outward exposure at its own name in the guest;
-// re-adoption leaves a standing one as it is.
+/// Resolutions on the controlling host, by name; any other name does not resolve.
+struct Resolutions(BTreeMap<&'static str, crate::reach::Resolution>);
+
+#[async_trait]
+impl crate::reach::ReachResolver for Resolutions {
+    async fn resolve(&self, destination: &ReachDestination) -> crate::reach::Resolution {
+        self.0.get(destination.host.as_str()).cloned().unwrap_or_else(|| crate::reach::Resolution::Unresolved("unknown name".into()))
+    }
+}
+
+fn reaching(destinations: &[(&str, u16)]) -> flotilla_resources::EnvironmentSpec {
+    let mut spec = spec();
+    spec.cloud_sandbox.as_mut().unwrap().reach =
+        destinations.iter().map(|(host, port)| ReachDestination::new(*host, *port).unwrap()).collect();
+    spec
+}
+
+// #4299: a destination that resolves privately on the controlling host is an
+// outward exposure at its own name and port in the guest, so TLS stays end to
+// end; a public one is met natively, with no exposure. The descriptor reports
+// how each is met, and re-adoption leaves a standing exposure as it is.
 #[tokio::test]
-async fn the_lab_service_is_a_named_outward_exposure() {
+async fn a_private_destination_is_an_exposure_and_a_public_one_is_native() {
+    use crate::reach::Resolution::{Private, Public};
     let fixture = Fixture::new();
-    let provider = fixture.provider().with_lab_reach(Some(("lab.internal".into(), 3000))).with_guest_lab_port(8443);
-    let prepared = provider.prepare(&spec(), &Default::default()).await.unwrap();
-    let handle = provider.provision(EnvironmentId::new("lab"), &prepared, Default::default()).await.unwrap();
-    let lab = fixture.api.outward("memory", handle.backing_id(), "lab").await.unwrap();
-    assert_eq!(lab.guest, wire::Guest::Name { name: LAB_HOSTNAME.into(), port: 8443 });
-    assert_eq!(lab.destination, wire::OutwardDestination::Tcp("lab.internal:3000".into()));
+    let resolutions = Resolutions(BTreeMap::from([("forge.lab.test", Private("100.64.0.7".parse().unwrap())), ("github.com", Public)]));
+    let provider = fixture.provider().with_reach_resolver(Arc::new(resolutions));
+    let prepared = provider.prepare(&reaching(&[("forge.lab.test", 443), ("github.com", 443)]), &Default::default()).await.unwrap();
+    let handle = provider.provision(EnvironmentId::new("reach"), &prepared, Default::default()).await.unwrap();
+    let outwards = fixture.api.outwards.lock().unwrap().clone();
+    let reach =
+        outwards.iter().filter(|((backing, name), _)| backing == handle.backing_id() && name.starts_with("reach-")).collect::<Vec<_>>();
+    assert_eq!(reach.len(), 1, "only the private destination is carried: {outwards:?}");
+    let (key, exposure) = reach[0];
+    assert_eq!(exposure.guest, wire::Guest::Name { name: "forge.lab.test".into(), port: 443 });
+    assert_eq!(exposure.destination, wire::OutwardDestination::Tcp("100.64.0.7:443".into()));
+    let routes = handle.provider_descriptor().unwrap().reach;
+    let met = routes.iter().map(|route| (route.destination.to_string(), route.met)).collect::<Vec<_>>();
+    assert_eq!(met, vec![("forge.lab.test:443".into(), ReachMeans::Exposure), ("github.com:443".into(), ReachMeans::Native)]);
     // A marker no put would keep: re-adoption leaves the standing exposure alone.
     let marker = wire::ExposureError { code: wire::ExposureErrorCode::Refused, reason: "standing".into() };
-    let key = (handle.backing_id().to_owned(), "lab".to_owned());
-    fixture.api.outwards.lock().unwrap().get_mut(&key).unwrap().error = Some(marker.clone());
-    provider.provision(EnvironmentId::new("lab"), &prepared, Default::default()).await.unwrap();
-    assert_eq!(fixture.api.outwards.lock().unwrap()[&key].error, Some(marker));
+    fixture.api.outwards.lock().unwrap().get_mut(key).unwrap().error = Some(marker.clone());
+    provider.provision(EnvironmentId::new("reach"), &prepared, Default::default()).await.unwrap();
+    assert_eq!(fixture.api.outwards.lock().unwrap()[key].error, Some(marker));
+}
+
+// The reach set is frozen per vessel, so an exposure is only ever moved, never
+// orphaned: when a carried name resolves elsewhere on the controlling host, the
+// next provision points the same exposure at the new address.
+#[tokio::test]
+async fn a_carried_name_that_moves_is_carried_to_its_new_address() {
+    struct Moving(std::sync::Mutex<std::net::IpAddr>);
+    #[async_trait]
+    impl crate::reach::ReachResolver for Moving {
+        async fn resolve(&self, _destination: &ReachDestination) -> crate::reach::Resolution {
+            crate::reach::Resolution::Private(*self.0.lock().unwrap())
+        }
+    }
+    let fixture = Fixture::new();
+    let resolver = Arc::new(Moving(std::sync::Mutex::new("100.64.0.7".parse().unwrap())));
+    let provider = fixture.provider().with_reach_resolver(resolver.clone());
+    let prepared = provider.prepare(&reaching(&[("forge.lab.test", 443)]), &Default::default()).await.unwrap();
+    let handle = provider.provision(EnvironmentId::new("moving"), &prepared, Default::default()).await.unwrap();
+    *resolver.0.lock().unwrap() = "100.64.0.9".parse().unwrap();
+    provider.provision(EnvironmentId::new("moving"), &prepared, Default::default()).await.unwrap();
+    let outwards = fixture.api.outwards.lock().unwrap().clone();
+    let reach =
+        outwards.iter().filter(|((backing, name), _)| backing == handle.backing_id() && name.starts_with("reach-")).collect::<Vec<_>>();
+    assert_eq!(reach.len(), 1, "{outwards:?}");
+    assert_eq!(reach[0].1.destination, wire::OutwardDestination::Tcp("100.64.0.9:443".into()));
+}
+
+// A destination that does not resolve on the controlling host fails the
+// provision, naming it, rather than timing out inside a clone.
+#[tokio::test]
+async fn an_unresolvable_destination_fails_the_provision_naming_it() {
+    let fixture = Fixture::new();
+    let provider = fixture.provider().with_reach_resolver(Arc::new(Resolutions(BTreeMap::new())));
+    let prepared = provider.prepare(&reaching(&[("nowhere.test", 8443)]), &Default::default()).await.unwrap();
+    let failure = provider.provision(EnvironmentId::new("unreached"), &prepared, Default::default()).await.err().expect("refused");
+    assert!(failure.to_string().contains("nowhere.test:8443"), "{failure}");
 }
 
 // Every terminal provider cause maps to Gone; a lifetime cap must never look

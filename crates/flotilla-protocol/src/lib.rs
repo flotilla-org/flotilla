@@ -23,6 +23,7 @@ pub mod provider_data;
 mod provisioning_target;
 pub mod qualified_path;
 pub mod query;
+pub mod reach;
 mod repository;
 pub mod resource_ref;
 pub mod result_set;

@@ -251,6 +251,7 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
                     exit: None,
                     turn_delivery: Default::default(),
                     vessels: vec![VesselRequirement {
+                        reach: Default::default(),
                         needs: Default::default(),
                         name: "work".to_string(),
                         depends_on: Vec::new(),
@@ -373,6 +374,7 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-shared", "implement", REPO_URL, GIT_REF).await;
     let mut status = convoy.status.clone().expect("convoy status");
     status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels.push(VesselRequirement {
+        reach: Default::default(),
         needs: Default::default(),
         name: "review".to_string(),
         depends_on: vec!["implement".to_string()],
@@ -662,6 +664,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
                     exit: None,
                     turn_delivery: Default::default(),
                     vessels: vec![VesselRequirement {
+                        reach: Default::default(),
                         needs: Default::default(),
                         name: "implement".to_string(),
                         depends_on: Vec::new(),
@@ -873,6 +876,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
                     exit: None,
                     turn_delivery: Default::default(),
                     vessels: vec![VesselRequirement {
+                        reach: Default::default(),
                         needs: Default::default(),
                         name: "implement".to_string(),
                         depends_on: Vec::new(),
@@ -1187,6 +1191,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
                     exit: None,
                     turn_delivery: Default::default(),
                     vessels: vec![VesselRequirement {
+                        reach: Default::default(),
                         needs: Default::default(),
                         name: "implement".to_string(),
                         depends_on: Vec::new(),
@@ -1465,6 +1470,7 @@ async fn a_cloud_vessel_clones_below_the_workspace_root_and_crews_run_at_the_rec
             &meta("env-workspace-cloud"),
             &EnvironmentSpec {
                 cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+                    reach: Default::default(),
                     image: image.clone(),
                     image_build_ref: None,
                     size: flotilla_resources::realisation_settings::CLOUD_SANDBOX_SIZE,
@@ -3090,6 +3096,7 @@ async fn create_convoy_with_labeled_processes(
                     turn_delivery: Default::default(),
                     vessels: vec![
                         VesselRequirement {
+                            reach: Default::default(),
                             needs: Default::default(),
                             name: "implement".to_string(),
                             depends_on: Vec::new(),
@@ -3103,6 +3110,7 @@ async fn create_convoy_with_labeled_processes(
                                 .build()],
                         },
                         VesselRequirement {
+                            reach: Default::default(),
                             needs: Default::default(),
                             name: "review".to_string(),
                             depends_on: vec!["implement".to_string()],

@@ -522,6 +522,8 @@ impl DaemonServer {
         )
         .await;
         daemon.set_primitives_switch(primitives_on);
+        // Placement resolves each vessel's reach destinations on this host (#4299).
+        daemon.set_reach_resolver(Arc::new(flotilla_environment::reach::SystemResolver));
         let peer_manager = build_peer_manager(&daemon, &config, &socket_path)?;
         phase("sync_peer_query_state", sync_peer_query_state(&peer_manager, &daemon)).await;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
