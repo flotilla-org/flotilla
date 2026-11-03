@@ -843,12 +843,13 @@ where
         self.validation_backoff.lock().expect("validation backoff lock").remove(&obj.metadata.name);
         if let Some(reason) = self.backing_gone_reason(obj).await? {
             // Nothing is left to remove or archive: record what went with the backing and release.
-            self.finalizers.lock().await.remove(&obj.metadata.name);
             let path = obj.status.as_ref().and_then(|status| status.path.as_deref()).or(obj.spec.target_path()).unwrap_or("<unknown path>");
             let message = format!("checkout {path} is unrecoverable: its environment's backing is gone ({reason})");
             EventRecorder::new(self.backend.clone())
                 .record(ObjectEvent::for_object(obj, "CheckoutWorkLost", message.clone()), self.clock.now())
                 .await?;
+            // Forget any removal task only once the record is durable, so a failed record retries whole.
+            self.finalizers.lock().await.remove(&obj.metadata.name);
             warn!(checkout = %obj.metadata.name, %message, "released checkout whose environment backing is gone");
             return Ok(());
         }

@@ -92,12 +92,10 @@ fn vessel_ending_reason(
     })
 }
 
-/// How the daemon begins the message of a backing its provider confirmed gone (#4304).
-const LOST_UNRECOVERABLE: &str = "lost, unrecoverable";
-
-/// A lost vessel cannot resume; only one whose backing may still exist is recoverable.
-fn lost_vessel_refusal(vessel: &str, reason: &str) -> String {
-    if reason.starts_with(LOST_UNRECOVERABLE) {
+/// A lost vessel cannot resume; only one whose backing may still exist is
+/// recoverable. `backing_gone` is the Environment's recorded fact (#4304).
+fn lost_vessel_refusal(vessel: &str, reason: &str, backing_gone: bool) -> String {
+    if backing_gone {
         format!("vessel `{vessel}` is {reason}; it cannot be resumed")
     } else {
         format!("vessel `{vessel}` is lost, recoverable: {reason}; rehydration is not available yet (#2872)")
@@ -1030,12 +1028,14 @@ impl CrewService {
         let loss_reason =
             match self.resource_backend.including_replicas::<flotilla_resources::Vessel>(&context.namespace).get(&context.vessel_ref).await
             {
-                Ok(vessel) => vessel_ending_reason(
+                Ok(vessel) => match vessel_ending_reason(
                     self.lifecycle_reads.as_ref(),
                     &vessel,
                     "environment disappeared; rehydration is not available yet (#2872)",
-                )?
-                .map(|(_, reason)| reason),
+                )? {
+                    Some((_, reason)) => Some((reason, self.vessel_backing_gone(&context.namespace, &vessel).await?)),
+                    None => None,
+                },
                 Err(ResourceError::NotFound { .. }) => None,
                 Err(error) => return Err(error.to_string()),
             };
@@ -1068,8 +1068,8 @@ impl CrewService {
                     .role(process.role.clone())
                     .kind(if matches!(process.source, CrewSource::Agent { .. }) { "agent" } else { "tool" }.to_string())
                     .state(state.to_string())
-                    .maybe_reason(member_loss.map(|reason| {
-                        if reason.starts_with("lost, recoverable") || reason.starts_with(LOST_UNRECOVERABLE) {
+                    .maybe_reason(member_loss.map(|(reason, backing_gone)| {
+                        if *backing_gone || reason.starts_with("lost, recoverable") {
                             reason.clone()
                         } else {
                             format!("lost, recoverable: {reason}")
@@ -3057,6 +3057,18 @@ impl CrewService {
         Ok(CrewTurnAdmission { message, new_turn, rung: TurnDeliveryRung::WarmSession })
     }
 
+    /// Whether the vessel's Environment records its backing confirmed gone (#4304).
+    async fn vessel_backing_gone(&self, namespace: &str, vessel: &flotilla_resources::ReadResourceObject<Vessel>) -> Result<bool, String> {
+        let Some(environment_ref) = vessel.object.status.as_ref().and_then(|status| status.environment_ref.as_ref()) else {
+            return Ok(false);
+        };
+        match self.resource_backend.including_replicas::<Environment>(namespace).get(environment_ref).await {
+            Ok(environment) => Ok(environment.object.status.as_ref().is_some_and(|status| status.backing_gone_reason().is_some())),
+            Err(ResourceError::NotFound { .. }) => Ok(false),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     async fn ensure_vessel_backing_available(&self, namespace: &str, convoy: &str, vessel: &str) -> Result<(), String> {
         let vessel_ref = flotilla_resources::vessel_resource_name(convoy, vessel);
         match self.resource_backend.including_replicas::<flotilla_resources::Vessel>(namespace).get(&vessel_ref).await {
@@ -3065,7 +3077,7 @@ impl CrewService {
                     if !matches!(ending, flotilla_protocol::LifecycleReading::Lost) {
                         return Err(format!("vessel `{vessel}` lease ended: {reason}; it cannot be resumed"));
                     }
-                    return Err(lost_vessel_refusal(vessel, &reason));
+                    return Err(lost_vessel_refusal(vessel, &reason, self.vessel_backing_gone(namespace, &resource).await?));
                 }
                 if let Some(environment_ref) = resource.object.status.as_ref().and_then(|status| status.environment_ref.as_ref()) {
                     match self.resource_backend.including_replicas::<Environment>(namespace).get(environment_ref).await {
@@ -3098,7 +3110,7 @@ impl CrewService {
                                         match status.phase {
                                             EnvironmentPhase::Lost => {
                                                 let reason = status.message.as_deref().unwrap_or("environment disappeared");
-                                                return Err(lost_vessel_refusal(vessel, reason));
+                                                return Err(lost_vessel_refusal(vessel, reason, status.backing_gone_reason().is_some()));
                                             }
                                             EnvironmentPhase::Failed => {
                                                 let reason = status.message.as_deref().unwrap_or("environment provisioning failed");

@@ -407,6 +407,7 @@ impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
                 status.local_image_id = image_ref.rsplit_once('@').map(|(_, digest)| digest.to_owned());
                 status.registry_digest = Some(image_ref.clone());
                 status.provider_descriptor = Some((**provider_descriptor).clone());
+                status.backing_gone = false;
                 status.message = None;
             }
             Self::ObserveRuntime { observation } => {
@@ -428,16 +429,21 @@ impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
                 status.image_ref = image_ref.clone();
                 status.local_image_id = local_image_id.clone();
                 status.registry_digest = registry_digest.clone();
+                status.backing_gone = false;
                 status.message = None;
             }
             Self::WaitForImageBuild { message } => {
                 status.phase = EnvironmentPhase::Provisioning;
                 status.ready = false;
+                status.backing_gone = false;
                 status.message = Some(message.clone());
             }
+            // Only the provider's word that the backing is gone sets the flag; every
+            // other phase change clears it, so a later loss is never read as confirmed.
             Self::MarkLost { message } => {
                 status.phase = EnvironmentPhase::Lost;
                 status.ready = false;
+                status.backing_gone = false;
                 status.message = Some(message.clone());
             }
             Self::MarkBackingGone { message } => {
@@ -449,6 +455,7 @@ impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
             Self::MarkFailed { message } => {
                 status.phase = EnvironmentPhase::Failed;
                 status.ready = false;
+                status.backing_gone = false;
                 status.message = Some(message.clone());
             }
         }
@@ -753,5 +760,69 @@ mod cloud_schema_tests {
             serde_json::from_value(serde_json::json!({"phase":"Ready","docker_container_id":"previous-backing"})).unwrap();
         assert_eq!(old_status.docker_container_id.as_deref(), Some("previous-backing"));
         assert!(old_status.backing_id.is_none() && old_status.provider_descriptor.is_none());
+    }
+}
+
+#[cfg(test)]
+mod backing_gone_tests {
+    use super::*;
+
+    // #4304: a backing reads as confirmed gone only while its latest phase change
+    // was the provider's word that it is gone. Any other phase change clears the
+    // fact, so a later loss (a stopped backing, whose disk survives) is never read
+    // as gone. Every sequence of up to three patches, over every patch kind, is
+    // checked after each step.
+    #[test]
+    fn backing_reads_gone_only_while_its_latest_phase_change_confirmed_it() {
+        let patches = [
+            EnvironmentStatusPatch::MarkCloudReady {
+                backing_id: "sandbox".into(),
+                image_ref: "image@sha256:digest".into(),
+                provider_descriptor: Box::new(EnvironmentProviderDescriptor {
+                    instance: "daytona".into(),
+                    kind: flotilla_protocol::provider::ProviderKind::new(
+                        flotilla_protocol::provider::EnvironmentClass::CloudSandbox,
+                        "daytona",
+                    ),
+                    image_digest: "sha256:digest".into(),
+                    host_version: "1".into(),
+                    module_version: "1".into(),
+                    capabilities: Default::default(),
+                    agent_connection: None,
+                }),
+            },
+            EnvironmentStatusPatch::MarkReady {
+                configured_limits: None,
+                docker_container_id: Some("container".into()),
+                image_ref: None,
+                local_image_id: None,
+                registry_digest: None,
+            },
+            EnvironmentStatusPatch::WaitForImageBuild { message: "waiting".into() },
+            EnvironmentStatusPatch::MarkLost { message: "stopped".into() },
+            EnvironmentStatusPatch::MarkBackingGone { message: "gone".into() },
+            EnvironmentStatusPatch::MarkFailed { message: "failed".into() },
+            EnvironmentStatusPatch::ObserveRuntime { observation: Default::default() },
+            EnvironmentStatusPatch::CredentialDelivery { retry: None },
+        ];
+        let phase_change = |patch: &EnvironmentStatusPatch| {
+            !matches!(patch, EnvironmentStatusPatch::ObserveRuntime { .. } | EnvironmentStatusPatch::CredentialDelivery { .. })
+        };
+        let mut sequences: Vec<Vec<usize>> = vec![vec![]];
+        for _ in 0..3 {
+            let longer = sequences.iter().flat_map(|prefix| (0..patches.len()).map(move |next| [prefix.clone(), vec![next]].concat()));
+            sequences = sequences.iter().cloned().chain(longer.collect::<Vec<_>>()).collect();
+        }
+        for sequence in sequences {
+            let mut status = EnvironmentStatus::default();
+            let mut confirmed = false;
+            for &index in &sequence {
+                patches[index].apply(&mut status);
+                if phase_change(&patches[index]) {
+                    confirmed = matches!(patches[index], EnvironmentStatusPatch::MarkBackingGone { .. });
+                }
+                assert_eq!(status.backing_gone_reason().is_some(), confirmed, "{sequence:?}");
+            }
+        }
     }
 }
