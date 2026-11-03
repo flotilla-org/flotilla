@@ -677,19 +677,34 @@ async fn resource_controller_restart_budget_exhaustion_recovers() {
     assert!(runtime_health.conditions().await.is_empty(), "healthy run clears alarm");
 }
 
-#[tokio::test]
-async fn bounded_operation_releases_the_loop_after_a_blocked_pass() {
+// #4310: an overrunning standing convoy pass is reported, but never cut short: a pass dropped
+// between admitting a generation and recording it would lose that generation's failure.
+#[tokio::test(start_paused = true)]
+async fn an_overrunning_pass_is_reported_and_still_runs_to_completion() {
     let timed_out = Arc::new(AtomicBool::new(false));
-    let first = run_bounded_operation(Duration::from_millis(20), std::future::pending::<()>(), {
-        let timed_out = Arc::clone(&timed_out);
-        move || timed_out.store(true, Ordering::SeqCst)
-    })
+    let finished = Arc::new(AtomicBool::new(false));
+    let output = run_watched_operation(
+        Duration::from_millis(20),
+        {
+            let (timed_out, finished) = (Arc::clone(&timed_out), Arc::clone(&finished));
+            async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert!(timed_out.load(Ordering::SeqCst), "the overrun is reported while the pass still runs");
+                finished.store(true, Ordering::SeqCst);
+                42
+            }
+        },
+        {
+            let timed_out = Arc::clone(&timed_out);
+            move || timed_out.store(true, Ordering::SeqCst)
+        },
+    )
     .await;
-    assert!(first.is_none());
-    assert!(timed_out.load(Ordering::SeqCst));
+    assert_eq!(output, 42);
+    assert!(finished.load(Ordering::SeqCst), "the overrunning pass ran to its end");
 
-    let second = run_bounded_operation(Duration::from_millis(20), async { 42 }, || panic!("completed pass must not time out")).await;
-    assert_eq!(second, Some(42), "a subsequent pass must run after the blocked pass times out");
+    let prompt = run_watched_operation(Duration::from_millis(20), async { 7 }, || panic!("a prompt pass is not reported")).await;
+    assert_eq!(prompt, 7);
 }
 
 #[tokio::test]

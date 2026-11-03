@@ -564,7 +564,14 @@ impl MessagePrimitives {
             taken => return Err(format!("message `{record}` was already taken: {taken:?}")),
         }
         self.inbox.receive(&person, &id, Transport::Turn).await.map_err(|error| error.to_string())?;
-        self.inbox.deliver(&id, Deliver { receiver: person, transport: Transport::Turn }).await.map_err(|error| error.to_string())?;
+        if let Err(error) = self.inbox.deliver(&id, Deliver { receiver: person.clone(), transport: Transport::Turn }).await {
+            // The sweep delivers a committed receipt too (#4310); one that won the race to this
+            // receipt has taken the message for the person already.
+            let taken = self.inbox.get_async(&id).await.map_err(|error| error.to_string())?;
+            if !taken.is_some_and(|message| delivered_to(message.state(), &person)) {
+                return Err(error.to_string());
+            }
+        }
         let _ = self.attention_changes.send(());
         let _ = self.acknowledgements.send(());
         self.inbox.get_async(&id).await.map_err(|error| error.to_string())?.ok_or_else(|| format!("message `{record}` is gone"))
@@ -1425,6 +1432,35 @@ impl ViewLookups for OldStoreRecords {
     }
 }
 
+/// Whether `state` is a message delivered to `receiver`: awaiting or settled with it as receiver.
+/// A receipt alone leaves a message pending with no receiver, and one dropped is not delivered.
+fn delivered_to(state: &MessageState, receiver: &Receiver) -> bool {
+    matches!(state, MessageState::Awaiting { receiver: delivered } | MessageState::Settled { receiver: Some(delivered) } if delivered == receiver)
+}
+
 /// The composition root's slot for the new path: set once, at startup,
 /// when `[primitives]` is on; empty otherwise, and nothing changes.
 pub type MessagePath = Arc<std::sync::OnceLock<Arc<MessagePrimitives>>>;
+
+#[cfg(test)]
+mod tests {
+    use flotilla_state_machines::machines::{consumer::ConsumerKind, message::DropReason};
+
+    use super::*;
+
+    // #4310: an acknowledgement whose own deliver was refused is taken only when the message was
+    // delivered to the person; any other refusal stays an error.
+    #[test]
+    fn only_a_message_delivered_to_the_person_counts_as_taken() {
+        let person = Receiver { kind: ConsumerKind::Person, id: "person".into(), host: "home".into() };
+        let other = Receiver { kind: ConsumerKind::AgentSession, id: "session".into(), host: "home".into() };
+        let by: Address = "project:standing/role:operator".parse().expect("address");
+        assert!(delivered_to(&MessageState::Settled { receiver: Some(person.clone()) }, &person));
+        assert!(delivered_to(&MessageState::Awaiting { receiver: person.clone() }, &person));
+        assert!(!delivered_to(&MessageState::Pending, &person), "a receipt alone delivers nothing");
+        assert!(!delivered_to(&MessageState::Settled { receiver: Some(other.clone()) }, &person));
+        assert!(!delivered_to(&MessageState::Settled { receiver: None }, &person));
+        let withdrawn = DropReason::Withdrawn { by: by.clone(), authority: by };
+        assert!(!delivered_to(&MessageState::Dropped { reason: withdrawn, receiver: Some(person.clone()), watermark: None }, &person));
+    }
+}
