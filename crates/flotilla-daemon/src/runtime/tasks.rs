@@ -952,7 +952,8 @@ where
 /// Runs `operation` to completion, calling `on_timeout` once it is still running after `timeout`.
 /// The operation is never dropped part-way: a standing convoy pass admits a generation and records
 /// it in separate writes, and a pass cut between them leaves the generation unrecorded, so its end
-/// is never counted against the role's restart budget (#4310).
+/// is never counted against the role's restart budget (#4310). The cost is liveness: a pass that
+/// never returns holds the loop, with its timeout condition raised, until shutdown aborts the task.
 pub(super) async fn run_watched_operation<Output, OperationFuture, OnTimeout>(
     timeout: Duration,
     operation: OperationFuture,

@@ -1912,12 +1912,9 @@ async fn on_the_engine_acknowledging_a_standing_convoys_hold_admits_its_next_gen
     let item = loop {
         let CommandValue::PersonInbox(listing) = fleet.execute_as_operator(inbox.clone()).await else { panic!("a person inbox") };
         // The standing role may also report config drift on a generation; the hold is the one
-        // that says its generations failed.
-        if let Some(item) = listing
-            .items
-            .into_iter()
-            .find(|item| item.sender == "fleet:lab/role:standing" && item.body.contains("consecutive generations failed"))
-        {
+        // that gives the restart limit's reason.
+        let reason = flotilla_admission::reconcilers::convoy_ensure::restart_limit_reason(3);
+        if let Some(item) = listing.items.into_iter().find(|item| item.sender == "fleet:lab/role:standing" && item.body == reason) {
             break item;
         }
         assert!(tokio::time::Instant::now() < deadline, "the hold never reached a person");

@@ -40,6 +40,12 @@ struct EnsureAdmissionRetry {
     retry: ControllerRetry,
 }
 
+/// The reason a standing role's restart-limit hold gives its person: `failures` consecutive
+/// generations of it failed.
+pub fn restart_limit_reason(failures: u32) -> String {
+    format!("ensured convoy entered a terminal failure phase; {failures} consecutive generations failed")
+}
+
 fn ensure_retry_delay(restart_count: u32) -> ChronoDuration {
     ChronoDuration::from_std(flotilla_resources::PROVISIONING_RETRY_BACKOFF.delay(restart_count.saturating_add(1)))
         .expect("ensure retry delay fits chrono")
@@ -652,7 +658,7 @@ impl EnsurePass<'_> {
         let latest = generations.last();
         if !resolved_escalation && !released && !force_now && consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES {
             let latest = latest.expect("a positive failure count requires a generation");
-            let failure = format!("ensured convoy entered a terminal failure phase; {consecutive_failures} consecutive generations failed");
+            let failure = restart_limit_reason(consecutive_failures);
             self.raise_ensure_attention(ensure, latest, &failure, latest.metadata.creation_timestamp).await?;
             return Ok(Some(format!("ConvoyEnsure/{} exhausted restart budget", ensure.metadata.name)));
         }
@@ -901,7 +907,7 @@ impl EnsurePass<'_> {
         if status.retry_at.is_none() && !force_now {
             let failure = "ensured convoy entered a terminal failure phase";
             if status.restart_count.saturating_add(1) >= ENSURE_MAX_CONSECUTIVE_FAILURES {
-                let failure = format!("{failure}; {} consecutive generations failed", ENSURE_MAX_CONSECUTIVE_FAILURES);
+                let failure = restart_limit_reason(ENSURE_MAX_CONSECUTIVE_FAILURES);
                 // Raised once, as the hold begins; one on its backing earlier is another episode.
                 self.raise_ensure_attention(ensure, &convoy, &failure, now).await?;
                 self.patch_convoy_ensure(
@@ -1172,15 +1178,19 @@ impl EnsurePass<'_> {
             Ok(name) => Ok(name),
             // A commit that fails after creating its convoy has still admitted a generation; the
             // caller records it, or its end would never count against the restart budget (#4310).
-            Err(error) => match latest(self.ensured_convoy_generations(namespace, &ensure.metadata.name).await?)
-                .filter(|convoy| before.is_none_or(|before| convoy.spec.generation > before))
-            {
-                Some(admitted) => {
-                    let (ensure, convoy) = (&ensure.metadata.name, &admitted.metadata.name);
-                    warn!(%ensure, %convoy, %error, "standing convoy admitted, though its commit failed after");
-                    Ok(admitted.metadata.name)
-                }
-                None => Err(error),
+            // A generation newer than `before` is this commit's: each reconciliation pass holds the ensure
+            // reconciliation lock, so no other pass admits for this ensure meanwhile.
+            Err(error) => match self.ensured_convoy_generations(namespace, &ensure.metadata.name).await {
+                // The listing failing too says nothing of the commit; its own error is the one to report.
+                Err(listing) => Err(format!("{error}; and the generations could not be listed after it: {listing}")),
+                Ok(generations) => match latest(generations).filter(|convoy| before.is_none_or(|before| convoy.spec.generation > before)) {
+                    Some(admitted) => {
+                        let (ensure, convoy) = (&ensure.metadata.name, &admitted.metadata.name);
+                        warn!(%ensure, %convoy, %error, "standing convoy admitted, though its commit failed after");
+                        Ok(admitted.metadata.name)
+                    }
+                    None => Err(error),
+                },
             },
         }
     }
