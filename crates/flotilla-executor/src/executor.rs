@@ -437,7 +437,7 @@ pub struct ExecutorStepResolver {
     pub config_base: DaemonHostPath,
     pub daemon_socket_path: Option<DaemonHostPath>,
     pub local_host: HostName,
-    pub environment_manager: Arc<dyn EnvironmentLifecycle>,
+    pub environment_lifecycle: Arc<dyn EnvironmentLifecycle>,
     pub vcs_resolver: Arc<dyn flotilla_vcs::vcs::CheckoutVcsResolver>,
 }
 
@@ -458,13 +458,15 @@ impl StepResolver for ExecutorStepResolver {
                 (self.registry.clone(), self.runner.clone(), self.repo.root.clone(), self.providers_data.clone())
             }
             StepExecutionContext::Environment(_, env_id) => {
-                self.environment_manager.ensure_provisioned_environment_providers(env_id, &self.config_base).await?;
+                self.environment_lifecycle.ensure_provisioned_environment_providers(env_id, &self.config_base).await?;
                 let registry = self
-                    .environment_manager
+                    .environment_lifecycle
                     .environment_registry(env_id)
                     .ok_or_else(|| format!("environment registry not found: {env_id}"))?;
-                let runner =
-                    self.environment_manager.environment_runner(env_id).ok_or_else(|| format!("environment handle not found: {env_id}"))?;
+                let runner = self
+                    .environment_lifecycle
+                    .environment_runner(env_id)
+                    .ok_or_else(|| format!("environment handle not found: {env_id}"))?;
                 // Interior repo root from prior CreateCheckout outcome, or /workspace
                 let repo_root = prior
                     .iter()
@@ -500,7 +502,7 @@ impl StepResolver for ExecutorStepResolver {
                     providers_data: effective_providers_data.as_ref(),
                     local_host: &self.local_host,
                     new_checkout_qualifier: context_environment_id.as_ref().map_or_else(
-                        || PathQualifier::Host(self.environment_manager.local_host_id().clone()),
+                        || PathQualifier::Host(self.environment_lifecycle.local_host_id().clone()),
                         |env_id| PathQualifier::Environment(env_id.clone()),
                     ),
                     is_environment: context_environment_id.is_some(),
@@ -635,7 +637,7 @@ impl StepResolver for ExecutorStepResolver {
                 let reference_repo = self.resolve_reference_repo().await;
                 let daemon_socket =
                     self.daemon_socket_path.clone().ok_or_else(|| "daemon socket path required for environment creation".to_string())?;
-                self.environment_manager
+                self.environment_lifecycle
                     .create_provisioned_environment(CreateProvisionedEnvironmentRequest {
                         env_id: env_id.clone(),
                         provider: &provider,
@@ -650,7 +652,7 @@ impl StepResolver for ExecutorStepResolver {
                 Ok(StepOutcome::Completed)
             }
             StepAction::DestroyEnvironment { env_id } => {
-                self.environment_manager.destroy_provisioned_environment(&env_id).await?;
+                self.environment_lifecycle.destroy_provisioned_environment(&env_id).await?;
                 Ok(StepOutcome::Completed)
             }
 

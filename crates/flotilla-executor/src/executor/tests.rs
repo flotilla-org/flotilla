@@ -1197,7 +1197,7 @@ async fn run_build_plan_to_completion_with(
                 daemon_socket_path: None,
 
                 local_host: local_host.clone(),
-                environment_manager: empty_environment_manager().await,
+                environment_lifecycle: empty_environment_manager().await,
             };
             run_step_plan(step_plan, 1, local_node_id(), repo_identity(), repo_root(), cancel, tx, &resolver).await
         }
@@ -1789,7 +1789,7 @@ async fn executor_step_resolver_create_environment() {
         config_base: config_base.clone(),
         daemon_socket_path: Some(DaemonHostPath::new("/tmp/flotilla.sock")),
         local_host: local_host(),
-        environment_manager: empty_environment_manager().await,
+        environment_lifecycle: empty_environment_manager().await,
     };
 
     let spec = EnvironmentSpec {
@@ -1803,7 +1803,7 @@ async fn executor_step_resolver_create_environment() {
     assert!(matches!(outcome, Ok(StepOutcome::Completed)));
 
     assert!(
-        resolver.environment_manager.environment_runner(&env_id).is_some(),
+        resolver.environment_lifecycle.environment_runner(&env_id).is_some(),
         "environment manager should expose the created environment runner"
     );
     let seen_create_opts = provider.seen_create_opts.lock().await;
@@ -1825,7 +1825,7 @@ async fn executor_step_resolver_create_environment_errors_without_spec_outcome()
         config_base: config_base.clone(),
         daemon_socket_path: Some(DaemonHostPath::new("/tmp/flotilla.sock")),
         local_host: local_host(),
-        environment_manager: empty_environment_manager().await,
+        environment_lifecycle: empty_environment_manager().await,
     };
 
     let action = StepAction::CreateEnvironment { env_id, provider: "docker".into() };
@@ -1857,7 +1857,7 @@ async fn executor_step_resolver_destroy_environment() {
         config_base: config_base.clone(),
         daemon_socket_path: None,
         local_host: local_host(),
-        environment_manager,
+        environment_lifecycle: environment_manager,
     };
 
     let action = StepAction::DestroyEnvironment { env_id: env_id.clone() };
@@ -1866,7 +1866,7 @@ async fn executor_step_resolver_destroy_environment() {
     assert!(matches!(outcome, Ok(StepOutcome::Completed)), "destroy should complete: {outcome:?}");
 
     assert!(
-        resolver.environment_manager.environment_runner(&env_id).is_none(),
+        resolver.environment_lifecycle.environment_runner(&env_id).is_none(),
         "environment manager should remove the destroyed environment"
     );
 }
@@ -1884,7 +1884,7 @@ async fn executor_step_resolver_destroy_environment_not_found() {
         config_base: config_base.clone(),
         daemon_socket_path: None,
         local_host: local_host(),
-        environment_manager: empty_environment_manager().await,
+        environment_lifecycle: empty_environment_manager().await,
     };
 
     let action = StepAction::DestroyEnvironment { env_id: EnvironmentId::new("nonexistent") };

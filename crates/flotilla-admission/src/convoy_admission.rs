@@ -115,7 +115,7 @@ pub struct ConvoyAdmission {
     observed_checkout_reconciliation: Arc<Mutex<()>>,
     config: Arc<ConfigStore>,
     discovery: Arc<DiscoveryRuntime>,
-    environment_manager: Arc<dyn Environments>,
+    environments: Arc<dyn Environments>,
     local_environment_id: EnvironmentId,
     provisioning_namespace: Arc<std::sync::RwLock<String>>,
     repository_change_requests: Arc<RwLock<HashMap<RepositoryKey, RepositoryChangeRequestProvider>>>,
@@ -158,7 +158,7 @@ struct AdmissionRuntime<'a> {
     lifecycle_reads: &'a Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
     config: &'a ConfigStore,
     discovery: &'a DiscoveryRuntime,
-    environment_manager: &'a dyn Environments,
+    environments: &'a dyn Environments,
     local_environment_id: &'a EnvironmentId,
     local_host: Option<CanonicalHostId>,
     namespace: String,
@@ -204,7 +204,7 @@ impl ConvoyAdmission {
                 lifecycle_reads: &self.lifecycle_reads,
                 config: &self.config,
                 discovery: &self.discovery,
-                environment_manager: self.environment_manager.as_ref(),
+                environments: self.environments.as_ref(),
                 local_environment_id: &self.local_environment_id,
                 local_host: self.canonical_local_host_id(),
                 namespace: self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone(),
@@ -236,9 +236,7 @@ impl ConvoyAdmission {
     }
 
     fn canonical_local_host_id(&self) -> Option<CanonicalHostId> {
-        self.environment_manager
-            .host_id_for_environment(&self.local_environment_id)
-            .map(|host_id| CanonicalHostId::resolved(host_id.as_str()))
+        self.environments.host_id_for_environment(&self.local_environment_id).map(|host_id| CanonicalHostId::resolved(host_id.as_str()))
     }
 
     pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
@@ -962,7 +960,7 @@ impl ConvoyAdmission {
             .query_declared::<Repository>(namespace, &StoreQuery::names(repository_names.clone(), false))
             .await
             .map_err(|error| error.to_string())?;
-        let local_host = self.environment_manager.local_host_id().as_str();
+        let local_host = self.environments.local_host_id().as_str();
         let local_environment_query = host_direct_environment_query(local_host)?;
         let environments = self
             .backend
@@ -1166,7 +1164,7 @@ impl ConvoyAdmission {
             &reads,
             &observed,
             namespace,
-            self.environment_manager.local_host_id().as_str(),
+            self.environments.local_host_id().as_str(),
             self.lifecycle_reads.as_ref(),
         )
         .await?;
@@ -1881,8 +1879,8 @@ impl AdmissionRuntime<'_> {
     }
 
     async fn admission_ai_utility(&self) -> Result<ProbedNamingUtility, String> {
-        let environment = self.environment_manager.environment_bag(self.local_environment_id);
-        let runner = self.environment_manager.environment_runner(self.local_environment_id);
+        let environment = self.environments.environment_bag(self.local_environment_id);
+        let runner = self.environments.environment_runner(self.local_environment_id);
         let probe_root = ExecutionEnvironmentPath::new(self.config.base_path().as_ref());
         probe_admission_ai_utility(&self.discovery.factories.ai_utilities, environment.as_ref(), self.config, &probe_root, runner).await
     }
@@ -4888,7 +4886,7 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
     let config = Arc::new(ConfigStore::with_base(temp.path()));
     let discovery = Arc::new(fake_discovery(false));
     let local_environment_id = EnvironmentId::new("local");
-    let environment_manager: Arc<dyn Environments> = Arc::new(FixtureEnvironment {
+    let environments: Arc<dyn Environments> = Arc::new(FixtureEnvironment {
         host: flotilla_protocol::qualified_path::HostId::new("host"),
         runner: discovery.runner.clone(),
         bag: flotilla_discovery::run_host_detectors(&discovery.host_detectors, &*discovery.runner, &*discovery.env).await,
@@ -4912,7 +4910,7 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
         .observed_checkout_reconciliation(Arc::clone(&observed_checkout_reconciliation))
         .config(Arc::clone(&config))
         .discovery(Arc::clone(&discovery))
-        .environment_manager(Arc::clone(&environment_manager))
+        .environments(Arc::clone(&environments))
         .local_environment_id(local_environment_id.clone())
         .provisioning_namespace(Arc::clone(&provisioning_namespace))
         .repository_change_requests(Arc::clone(&repository_change_requests))
