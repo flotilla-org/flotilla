@@ -409,6 +409,23 @@ impl DummyDaemon {
                 &flotilla_engine_store::plain::PendingChange::new(flotilla_schema::NewChange::new("transport", at)),
             )
             .expect("provision record");
+        // Kept by the status controller: the daemon's own place, and a key naming no convoy.
+        flotilla_engine_store::plain::PlainLog::new(service.store())
+            .create(
+                "transport-access",
+                &flotilla_resources::AccessDeliverySpec {
+                    access: "transport-access".into(),
+                    place: flotilla_resources::host_direct_environment_name(
+                        &self.daemon.local_host_id().expect("local host id").to_string(),
+                    ),
+                    harness: "claude-code".into(),
+                    home: "/transport".into(),
+                    needs: Default::default(),
+                    retry: None,
+                },
+                &flotilla_engine_store::plain::PendingChange::new(flotilla_schema::NewChange::new("transport", at)),
+            )
+            .expect("access delivery record");
         // #3824 layer 2c: a ManifestRoot, declared with no records yet.
         let mut roots =
             Home::<flotilla_provisioning::stored::manifest_root::ManifestRoot, _>::with_log(home, StoreLog::new(service.store()))
@@ -626,6 +643,7 @@ impl DummyDaemon {
                 collect!(stored flotilla_provisioning::stored::project::ProjectDefinition);
                 collect!(stored flotilla_provisioning::stored::project::ProjectOpsRecord);
                 collect!(stored flotilla_provisioning::stored::artifact::ArtifactRecord);
+                collect!(stored flotilla_resources::AccessDeliverySpec);
                 collect!(stored flotilla_provisioning::stored::forge_observation::ChangeRequestRecord);
                 collect!(stored flotilla_provisioning::stored::forge_observation::IssueRecord);
                 collect!(stored flotilla_provisioning::stored::forge_observation::ForgeReadRecord);

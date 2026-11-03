@@ -98,6 +98,7 @@ pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     forge_observation::register(registry)?;
     placement::register(registry)?;
     host::register(registry)?;
+    registry.register::<flotilla_resources::AccessDeliverySpec>()?;
     Ok(())
 }
 

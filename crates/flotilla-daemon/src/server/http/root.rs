@@ -75,7 +75,7 @@ fn link_prefix(configured: Option<&str>, fleet: Option<&str>) -> Option<String> 
 
 /// A table is linked only when this daemon serves it.
 fn serves_table(state: &HttpRouter, name: &str) -> bool {
-    TableSource::open(name.to_owned(), state.backend.clone(), super::table_api::store(state), &state.derived).is_ok()
+    TableSource::open(name.to_owned(), &state.catalog(None)).is_ok()
 }
 
 fn links(state: &HttpRouter) -> Vec<Link> {

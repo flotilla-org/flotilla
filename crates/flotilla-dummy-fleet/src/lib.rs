@@ -39,7 +39,7 @@ use flotilla_environment::{environment::dummy::DummyEnvironmentBehaviour, factor
 pub use adapter::{DummyAgentAdapter, DUMMY_AGENT_ADAPTER, DUMMY_SCRIPT_ENV};
 pub use crew::{CrewScript, LAST_TURN_MARKER, SCRIPT_LINE_PREFIX};
 pub use fleet::{CrewCommandPort, DaemonCommandPort, DummyFleet, DummyFleetSnapshot, DummyVendor};
-pub use flotilla_environment::environment::dummy::{DUMMY_CLOUD_ENVIRONMENT_INSTANCE, DUMMY_ENVIRONMENT_INSTANCE, DUMMY_FLEET_ENV};
+pub use flotilla_environment::environment::dummy::{DUMMY_ENVIRONMENT_INSTANCE, DUMMY_FLEET_ENV};
 pub use forge::DummyChangeRequestTracker;
 pub use terminal::{DummyTerminalPool, DUMMY_TERMINAL_POOL};
 pub use vcs::DummyVcs;

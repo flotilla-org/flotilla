@@ -77,7 +77,7 @@ pub(super) async fn list(
     if let Some((status, message)) = caller.user_refusal() {
         return encoding.error_code(status, "unauthorized", message);
     }
-    match TableSource::list(store(&state), &state.derived).await {
+    match TableSource::list(&state.catalog(None)).await {
         Ok(value) => encoding.render(StatusCode::OK, value),
         Err(error) => failure(error, encoding),
     }
@@ -116,7 +116,8 @@ async fn respond(
     if let Some((status, message)) = caller.user_refusal() {
         return encoding.error_code(status, "unauthorized", message);
     }
-    let source = match TableSource::open(name, state.backend.clone(), store(&state), &state.derived) {
+    let named = params.iter().find(|(key, _)| key == "query").map(|(_, value)| value.as_str());
+    let source = match TableSource::open(name, &state.catalog(None)).and_then(|source| source.with_query(named)) {
         Ok(source) => source,
         Err(error) => return failure(error, encoding),
     };
@@ -148,11 +149,18 @@ async fn respond(
         Ok(query) => query,
         Err(error) => return failure(error, encoding),
     };
-    let messages = match source.messages(description, query).await {
+    let hold = match source.hold().await {
+        Ok(hold) => hold,
+        Err(error) => return failure(error, encoding),
+    };
+    let messages = match source.messages(description, query, None).await {
         Ok(messages) => messages,
         Err(error) => return failure(error, encoding),
     };
-    let stream = messages.map(move |message| encoding.encode_item(&message).map_err(std::io::Error::other));
+    let stream = messages.map(move |message| {
+        let _held = &hold;
+        encoding.encode_item(&message).map_err(std::io::Error::other)
+    });
     wire::vary_accept(
         (
             [
