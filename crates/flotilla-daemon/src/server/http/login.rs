@@ -116,6 +116,12 @@ impl LoginStore {
         state.sessions.get(&digest(value)).filter(|(_, expiry)| *expiry > now).map(|(id, _)| *id)
     }
 
+    /// Whether `session` has neither ended nor expired.
+    pub(in crate::server) fn is_live(&self, session: SessionId) -> bool {
+        let now = self.clock.now();
+        self.state().sessions.values().any(|(id, expiry)| *id == session && *expiry > now)
+    }
+
     /// End a session; its cookie authenticates nothing afterwards.
     pub(in crate::server) fn end(&self, session: SessionId) {
         self.state().sessions.retain(|_, (id, _)| *id != session);
