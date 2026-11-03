@@ -4,12 +4,13 @@
 //! - [`catalog`]: the declarations joined with their presentation entries, checked at load.
 //! - [`invoke`]: one invocation: request checks, per-subject checks and runs, and the
 //!   `verb.invocation` span that records the intent.
-//! - [`when`]: applicability conditions over a subject's row.
 //! - [`convoy`]: convoy subjects and `convoy.explain`.
+//!
+//! A verb's `when` speaks the condition language of a table read's `where`, parsed and kept per
+//! row by `tables::filter`.
 pub(crate) mod catalog;
 pub(crate) mod convoy;
 pub(crate) mod invoke;
-pub(crate) mod when;
 
 use std::sync::Arc;
 
@@ -17,11 +18,11 @@ use flotilla_core::in_process::InProcessDaemon;
 use flotilla_store::ResourceBackend;
 
 use crate::server::tables::DerivedSet;
-use catalog::{Catalog, NativeVerb, Picks, Presentation};
+use catalog::{Catalog, Handler, Picks, Presentation};
 pub(crate) use invoke::{Refusal, Verbs};
 
 /// The built-in native verbs.
-fn natives(daemon: Option<Arc<InProcessDaemon>>) -> Vec<Arc<dyn NativeVerb>> {
+fn natives(daemon: Option<Arc<InProcessDaemon>>) -> Vec<Arc<dyn Handler>> {
     vec![Arc::new(convoy::ExplainConvoy { daemon })]
 }
 
@@ -38,7 +39,7 @@ fn presentations() -> Vec<Presentation> {
 
 /// The verb route over the daemon's resources, or over a bare backend in resource-handler tests.
 pub(crate) fn builtin(backend: ResourceBackend, daemon: Option<Arc<InProcessDaemon>>) -> Verbs {
-    let subjects = Arc::new(convoy::ResourceSubjects::new(backend, daemon.clone()));
+    let subjects = Arc::new(convoy::ResourceSubjects::new(backend));
     Verbs { catalog: Catalog::new(natives(daemon), presentations(), subjects.as_ref()), subjects, policy: invoke::allow_all }
 }
 

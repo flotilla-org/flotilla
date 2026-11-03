@@ -1,17 +1,50 @@
 //! How a listener authenticated the caller. Each listener attaches one [`CallerAuth`] to the
 //! request before routing; routes read it and never inspect the transport (ADR 0065).
 
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::{collections::HashMap, sync::Arc};
+
 use axum::{
     extract::FromRequestParts,
-    http::{request::Parts, StatusCode},
+    http::{request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
-use flotilla_protocol::{AgentHookTerminalRef, EnvironmentId};
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_protocol::{AgentHookTerminalRef, CommandCaller, EnvironmentId, PrincipalRef};
 use rigging_http_wire::Encoding;
 
-use super::login::SessionId;
-use crate::server::caller::PeerCredential;
+use super::{login::SessionId, RouterState};
+use crate::server::{
+    caller::{self, CallerResolution, PeerCredential},
+    environment_connection,
+};
+
+/// Test double only for the kernel/procfs evidence boundary; resolution remains real. A test
+/// puts it in the request's extensions in place of the peer's own, and the test router's
+/// [`inject_evidence`] layer hands it to the main-socket resolution.
+#[cfg(test)]
+pub(super) struct PeerEvidence {
+    pub caller: CommandCaller,
+    pub claims: HashMap<String, String>,
+    pub mounts: Option<caller::PeerMounts>,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static INJECTED_EVIDENCE: Arc<PeerEvidence>;
+}
+
+/// The test router's layer: runs the request with the peer evidence its extensions carry, if any,
+/// in place of the kernel's.
+#[cfg(test)]
+pub(super) async fn inject_evidence(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    match request.extensions().get::<Arc<PeerEvidence>>().cloned() {
+        Some(evidence) => INJECTED_EVIDENCE.scope(evidence, next.run(request)).await,
+        None => next.run(request).await,
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::server) enum CallerAuth {
@@ -47,22 +80,6 @@ impl CallerAuth {
             .map(|(status, message)| if status == StatusCode::UNAUTHORIZED { unauthenticated() } else { refusal(status, message) })
     }
 
-    /// Who the caller is, as the `verb.invocation` span names it (#4182 ruling 6): the main socket's
-    /// user by uid, the bearer-token holder, a browser session, an environment or a hook's
-    /// terminal. Every holder of the daemon's one bearer token is the same `bearer`,
-    /// until per-caller policy (ruling 6) needs finer identities.
-    pub(super) fn principal(&self) -> String {
-        match self {
-            Self::Socket(Some(peer)) => format!("socket:uid={}", peer.uid()),
-            Self::Socket(None) => "socket".into(),
-            Self::Environment { environment, .. } => format!("environment:{environment}"),
-            Self::Bearer => "bearer".into(),
-            Self::Session(session) => format!("session:{}", session.number()),
-            Self::Hook { .. } => "hook".into(),
-            Self::Anonymous => "anonymous".into(),
-        }
-    }
-
     /// The refusal for an anonymous caller, or a hook token outside the hook routes.
     pub(super) fn refusal_unless_authenticated(&self) -> Option<Response> {
         match self {
@@ -84,11 +101,115 @@ impl<S: Send + Sync> FromRequestParts<S> for UserCaller {
         let caller = parts.extensions.get::<CallerAuth>().cloned().unwrap_or(CallerAuth::Anonymous);
         match caller.user_refusal() {
             None => Ok(Self(caller)),
-            Some((status, message)) => {
-                let encoding = Encoding::negotiate(&parts.headers).unwrap_or_else(|_| Encoding::for_errors(&parts.headers));
-                Err(encoding.error_code(status, "unauthorized", message))
-            }
+            Some((status, message)) => Err(refusal_encoding(&parts.headers).error_code(status, "unauthorized", message)),
         }
+    }
+}
+
+/// The negotiated encoding for a refusal, or the error encoding when negotiation fails.
+fn refusal_encoding(headers: &HeaderMap) -> Encoding {
+    Encoding::negotiate(headers).unwrap_or_else(|_| Encoding::for_errors(headers))
+}
+
+/// A caller acting as the user, resolved as [`command_caller`] resolves it, with the provisioning
+/// namespace it was resolved in. Any other caller is refused in the negotiated error encoding,
+/// before a later extractor such as `Wire` reads the body.
+pub(super) struct UserCommandCaller {
+    pub caller: CommandCaller,
+    pub namespace: String,
+}
+
+impl FromRequestParts<RouterState> for UserCommandCaller {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &RouterState) -> Result<Self, Self::Rejection> {
+        let UserCaller(caller) = UserCaller::from_request_parts(parts, state).await?;
+        let refuse = |status, message: &str| refusal_encoding(&parts.headers).error_code(status, "unauthorized", message);
+        let RouterState(router) = state;
+        let Some(daemon) = router.daemon.as_ref() else {
+            return Err(refuse(StatusCode::SERVICE_UNAVAILABLE, "the daemon is unavailable"));
+        };
+        let namespace = daemon.provisioning_namespace().await;
+        let socket_path = router.commands.as_ref().map(|commands| commands.socket_path());
+        match command_caller(daemon, &namespace, socket_path, &caller).await {
+            Ok(resolved) => Ok(Self { caller: resolved.caller, namespace }),
+            Err((status, message)) => Err(refuse(status, &message)),
+        }
+    }
+}
+
+/// Who an authenticated caller is to the command and verb routes: a crew when its evidence names
+/// one, else the user of `namespace`, the provisioning namespace; `Err` carries the refusal's
+/// status and message. An environment's crew is transport-bound, as is a contained crew on the
+/// main socket.
+pub(super) async fn command_caller(
+    daemon: &InProcessDaemon,
+    namespace: &str,
+    socket_path: Option<&Path>,
+    authenticated: &CallerAuth,
+) -> Result<CallerResolution, (StatusCode, String)> {
+    match authenticated {
+        CallerAuth::Socket(Some(peer)) => main_socket_caller(daemon, namespace, *peer, socket_path.map(Path::to_path_buf)).await,
+        CallerAuth::Socket(None) => Err((StatusCode::FORBIDDEN, "CallerIdentityUnavailable: socket peer credentials unavailable".into())),
+        CallerAuth::Environment { environment, peer } => {
+            let crews =
+                environment_connection::environment_crews(daemon, environment).await.map_err(|error| (StatusCode::FORBIDDEN, error))?;
+            let peer = *peer;
+            let claims = tokio::task::spawn_blocking(move || caller::claims_from_peer(peer))
+                .await
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+            let crew = caller::check_claims(crews, &claims).map_err(|error| (StatusCode::FORBIDDEN, error))?;
+            let principal_ref = PrincipalRef::implicit_for_namespace(&crew.namespace);
+            Ok(CallerResolution { caller: CommandCaller { principal_ref, process: None, crew: Some(crew) }, transport_bound: true })
+        }
+        CallerAuth::Bearer | CallerAuth::Session(_) => {
+            let principal_ref = PrincipalRef::implicit_for_namespace(namespace);
+            Ok(CallerResolution { caller: CommandCaller { principal_ref, process: None, crew: None }, transport_bound: false })
+        }
+        CallerAuth::Hook { .. } => Err((StatusCode::FORBIDDEN, "a hook token reaches only the hook routes".into())),
+        CallerAuth::Anonymous => Err((StatusCode::UNAUTHORIZED, "authentication required".into())),
+    }
+}
+
+/// The caller on the main socket, from its peer's kernel and process evidence.
+async fn main_socket_caller(
+    daemon: &InProcessDaemon,
+    namespace: &str,
+    peer: PeerCredential,
+    socket_path: Option<PathBuf>,
+) -> Result<CallerResolution, (StatusCode, String)> {
+    #[cfg(test)]
+    let injected_evidence = INJECTED_EVIDENCE.try_with(Arc::clone).ok();
+    let namespace = namespace.to_owned();
+    let evidence = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(evidence) = injected_evidence {
+            return Ok((
+                evidence.caller.clone(),
+                evidence.claims.clone(),
+                evidence
+                    .mounts
+                    .as_ref()
+                    .map(|m| caller::PeerMounts { mountinfo: m.mountinfo.clone(), legacy_main_directory: m.legacy_main_directory }),
+            ));
+        }
+        let claims = caller::claims_from_peer(Some(peer));
+        let caller = caller::caller_from_peer(Some(peer), &namespace)?;
+        let mounts = caller
+            .process
+            .as_ref()
+            .filter(|p| p.container.is_some())
+            .map(|p| caller::peer_mounts(p.pid, socket_path.as_deref()))
+            .transpose()?;
+        Ok::<_, String>((caller, claims, mounts))
+    })
+    .await;
+    match evidence {
+        Ok(Ok((caller, claims, mounts))) => {
+            caller::resolve_main_caller(daemon, caller, &claims, mounts.as_ref()).await.map_err(|error| (StatusCode::FORBIDDEN, error))
+        }
+        Ok(Err(error)) => Err((StatusCode::FORBIDDEN, error)),
+        Err(error) => Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string())),
     }
 }
 

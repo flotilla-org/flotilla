@@ -1,0 +1,14 @@
+error[E0277]: `#[param(subject = ...)]` is for Address fields
+ --> tests/ui_verb/subject_on_a_string.rs:7:9
+  |
+7 |     to: String,
+  |         ^^^^^^ the trait `SubjectParam` is not implemented for `String`
+  |
+help: the following other types implement trait `SubjectParam`
+ --> src/verb.rs
+  |
+  | impl SubjectParam for crate::Address {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `flotilla_schema::Address`
+  |
+  | impl SubjectParam for Option<crate::Address> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Option<flotilla_schema::Address>`

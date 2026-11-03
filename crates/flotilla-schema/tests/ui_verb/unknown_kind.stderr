@@ -1,0 +1,15 @@
+error[E0080]: evaluation panicked: not an ADR 0066 address kind
+ --> tests/ui_verb/unknown_kind.rs:4:40
+  |
+4 | #[verb(name = "galaxy.spin", subject = "galaxy", effect = "write")]
+  |                                        ^^^^^^^^ evaluation of `_` failed inside this call
+  |
+note: inside `flotilla_schema::address_kind`
+ --> $RUST/core/src/panic.rs
+  |
+  = note: the failure occurred here
+  |
+ ::: src/verb.rs
+  |
+  |     panic!("not an ADR 0066 address kind");
+  |     -------------------------------------- in this macro invocation

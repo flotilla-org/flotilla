@@ -7,10 +7,10 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use flotilla_address::Address;
 use flotilla_protocol::verbs::{Invocation, Invoked, Outcome};
-use flotilla_schema::{ParamDeclaration, ParamType};
+use flotilla_schema::ParamType;
 use serde_json::{Map, Value};
 
-use super::catalog::{Catalog, Entry, Picks, Subject, Subjects};
+use super::catalog::{Catalog, Entry, Params, Picks, Subject, Subjects};
 use tracing::Instrument;
 
 /// Why an invocation was refused as a whole, before any subject ran.
@@ -40,6 +40,9 @@ pub(crate) const FIELD_LIMIT: usize = 4096;
 /// The longest invocation id the route takes; a client id (a UUID is 36 bytes) needs no more.
 pub(crate) const INVOCATION_LIMIT: usize = 256;
 
+/// The most subjects one invocation names.
+pub(crate) const SUBJECT_LIMIT: usize = 1024;
+
 /// The verb route over a catalog, the subjects' rows and the policy.
 pub(crate) struct Verbs {
     pub catalog: Catalog,
@@ -53,8 +56,8 @@ impl Verbs {
     /// outcome or the request's refusal. The verb's own spans nest under it. A `done` outcome's
     /// `result` is the verb's answer to the caller, not part of the record, so the span leaves it
     /// out; every field taken from the request is bounded to [`FIELD_LIMIT`], since a request
-    /// refused for its size is still traced.
-    pub(crate) async fn invoke(&self, caller: &str, name: &str, request: Invocation) -> Result<Invoked, Refusal> {
+    /// refused for its size is still traced. Subjects are read in `namespace`.
+    pub(crate) async fn invoke(&self, caller: &str, namespace: &str, name: &str, request: Invocation) -> Result<Invoked, Refusal> {
         let subjects = bounded(serde_json::to_string(&request.subjects).unwrap_or_default());
         let params = bounded(serde_json::to_string(&request.params).unwrap_or_default());
         let (name_field, id_field) = (bounded(name.to_owned()), bounded(request.invocation.clone()));
@@ -68,7 +71,7 @@ impl Verbs {
             verb.outcomes = tracing::field::Empty,
             verb.refusal = tracing::field::Empty,
         );
-        let invoked = self.invoke_inner(caller, name, request).instrument(span.clone()).await;
+        let invoked = self.invoke_inner(caller, namespace, name, request).instrument(span.clone()).await;
         span.in_scope(|| match &invoked {
             Ok(invoked) => {
                 let outcomes: Vec<_> = invoked.outcomes.iter().map(|outcome| Outcome { result: None, ..outcome.clone() }).collect();
@@ -84,19 +87,19 @@ impl Verbs {
         invoked
     }
 
-    async fn invoke_inner(&self, caller: &str, name: &str, request: Invocation) -> Result<Invoked, Refusal> {
+    async fn invoke_inner(&self, caller: &str, namespace: &str, name: &str, request: Invocation) -> Result<Invoked, Refusal> {
         let entry = self.catalog.get(name).ok_or_else(|| Refusal::UnknownVerb(name.to_owned()))?;
         if let Some(broken) = &entry.broken {
             return Err(Refusal::Conflict(format!("verb `{name}` is broken: {broken}")));
         }
         let addresses = self.addresses(entry, &request)?;
-        let params = checked_params(&entry.declaration.params, &request.params)?;
-        let outcomes = self.run(caller, entry, &addresses, &params, &request.invocation).await;
+        let params = params(entry, request.params)?;
+        let outcomes = self.run(caller, namespace, entry, &addresses, &params, &request.invocation).await;
         Ok(Invoked { invocation: request.invocation, outcomes })
     }
 
-    /// The subjects' addresses: at least one, exactly one for `picks: one`, each of the verb's
-    /// subject kind.
+    /// The subjects' addresses: at least one and at most [`SUBJECT_LIMIT`], exactly one for
+    /// `picks: one`, each of the verb's subject kind and none repeated.
     fn addresses(&self, entry: &Entry, request: &Invocation) -> Result<Vec<Address>, Refusal> {
         if request.invocation.is_empty() {
             return Err(Refusal::Invalid("an invocation id is required".into()));
@@ -107,13 +110,16 @@ impl Verbs {
         if request.subjects.is_empty() {
             return Err(Refusal::Invalid("at least one subject is required".into()));
         }
+        if request.subjects.len() > SUBJECT_LIMIT {
+            return Err(Refusal::Invalid(format!("an invocation names at most {SUBJECT_LIMIT} subjects")));
+        }
         if entry.picks() == Picks::One && request.subjects.len() > 1 {
             return Err(Refusal::Invalid(format!("verb `{}` takes one subject", entry.declaration.name)));
         }
         let mut addresses: Vec<Address> = Vec::new();
         for subject in &request.subjects {
             let address: Address = subject.parse().map_err(|error| Refusal::Invalid(format!("subject `{subject}`: {error}")))?;
-            if address.kind().as_str() != entry.declaration.subject {
+            if address.kind() != entry.declaration.subject {
                 return Err(Refusal::Invalid(format!("subject `{subject}` is not a {}", entry.declaration.subject)));
             }
             if addresses.contains(&address) {
@@ -124,11 +130,19 @@ impl Verbs {
         Ok(addresses)
     }
 
-    async fn run(&self, caller: &str, entry: &Entry, addresses: &[Address], params: &Map<String, Value>, invocation: &str) -> Vec<Outcome> {
+    async fn run(
+        &self,
+        caller: &str,
+        namespace: &str,
+        entry: &Entry,
+        addresses: &[Address],
+        params: &Params,
+        invocation: &str,
+    ) -> Vec<Outcome> {
         let mut ready = Vec::new();
         let mut outcomes = BTreeMap::new();
         for address in addresses {
-            match self.check(caller, entry, address).await {
+            match self.check(caller, namespace, entry, address).await {
                 Ok(subject) => ready.push(subject),
                 Err(outcome) => {
                     outcomes.insert(address.to_string(), *outcome);
@@ -138,7 +152,7 @@ impl Verbs {
         if entry.picks() == Picks::Set {
             if outcomes.is_empty() {
                 // `ready` is not empty: the request names at least one subject, and none failed.
-                let ran = entry.handler.run(&ready, &bound(params, entry, &ready[0]), invocation).await;
+                let ran = entry.handler.run(&ready, params, invocation).await;
                 for subject in &ready {
                     outcomes.insert(subject.address.to_string(), outcome(subject, ran.clone()));
                 }
@@ -150,7 +164,7 @@ impl Verbs {
             }
         } else {
             for subject in ready {
-                let ran = entry.handler.run(std::slice::from_ref(&subject), &bound(params, entry, &subject), invocation).await;
+                let ran = entry.handler.run(std::slice::from_ref(&subject), params, invocation).await;
                 outcomes.insert(subject.address.to_string(), outcome(&subject, ran));
             }
         }
@@ -158,16 +172,16 @@ impl Verbs {
     }
 
     /// The subject's current row, once it exists, policy allows the caller and `when` holds.
-    async fn check(&self, caller: &str, entry: &Entry, address: &Address) -> Result<Subject, Box<Outcome>> {
+    async fn check(&self, caller: &str, namespace: &str, entry: &Entry, address: &Address) -> Result<Subject, Box<Outcome>> {
         let subject = address.to_string();
-        let row = match self.subjects.row(address).await {
+        let row = match self.subjects.row(namespace, address).await {
             Ok(Some(row)) => row,
             Ok(None) => return Err(Box::new(Outcome::failed(subject, format!("no {} at `{address}`", entry.declaration.subject)))),
             Err(error) => return Err(Box::new(Outcome::failed(subject, error))),
         };
         (self.policy)(caller, entry, address).map_err(|reason| Box::new(Outcome::refused(subject.clone(), reason)))?;
-        if let Some(failing) = entry.when.iter().find(|condition| !condition.holds(&row)) {
-            return Err(Box::new(Outcome::not_applicable(subject, failing.text.clone())));
+        if let Some(failing) = entry.failing(&row) {
+            return Err(Box::new(Outcome::not_applicable(subject, failing.text.to_owned())));
         }
         Ok(Subject { address: address.clone(), row })
     }
@@ -193,79 +207,31 @@ fn outcome(subject: &Subject, ran: Result<Option<Value>, String>) -> Outcome {
     }
 }
 
-/// The parameters checked against the declaration: no undeclared name, every required one
-/// present unless it has a default, and each value of its declared type. Literal defaults are
-/// filled in here; `$row.<column>` defaults are bound per subject.
-fn checked_params(declared: &[ParamDeclaration], given: &Map<String, Value>) -> Result<Map<String, Value>, Refusal> {
-    if let Some(unknown) = given.keys().find(|name| !declared.iter().any(|param| param.name == name.as_str())) {
-        return Err(Refusal::Invalid(format!("no parameter `{unknown}`")));
-    }
-    let mut params = Map::new();
-    for param in declared {
-        match given.get(param.name).filter(|value| !value.is_null()) {
-            Some(value) => {
-                check_type(param, value).map_err(|error| Refusal::Invalid(format!("parameter `{}`: {error}", param.name)))?;
-                params.insert(param.name.into(), value.clone());
+/// The request's parameters as the verb's own type. A null value is unset, and a literal default
+/// fills an unset parameter; deserialization refuses a missing required parameter or a value of
+/// the wrong type. The route checks what the type cannot: that every name is declared, that an
+/// enum's value is one of its options, and that a subject parameter names its kind.
+fn params(entry: &Entry, given: Map<String, Value>) -> Result<Params, Refusal> {
+    let declared = &entry.declaration.params;
+    let mut params = entry.defaults.clone();
+    for (name, value) in given {
+        let Some(param) = declared.iter().find(|param| param.name == name) else {
+            return Err(Refusal::Invalid(format!("no parameter `{name}`")));
+        };
+        match (param.ty, &value) {
+            (_, Value::Null) => continue,
+            (ParamType::Enum, Value::String(text)) if !param.options.contains(&text.as_str()) => {
+                return Err(Refusal::Invalid(format!("parameter `{name}`: `{text}` is not one of {}", param.options.join(", "))));
             }
-            None => match param.default {
-                Some(default) if default.starts_with("$row.") => {}
-                Some(default) => {
-                    // The load check refused a verb whose literal default does not fit.
-                    let value =
-                        literal(param, default).map_err(|error| Refusal::Conflict(format!("parameter `{}`: {error}", param.name)))?;
-                    params.insert(param.name.into(), value);
-                }
-                None if param.required => return Err(Refusal::Invalid(format!("parameter `{}` is required", param.name))),
-                None => {}
-            },
-        }
-    }
-    Ok(params)
-}
-
-fn check_type(param: &ParamDeclaration, value: &Value) -> Result<(), String> {
-    let fits = match param.ty {
-        ParamType::Str | ParamType::Text => value.is_string(),
-        ParamType::Enum => value.as_str().is_some_and(|value| param.options.contains(&value)),
-        ParamType::Integer => value.is_i64() || value.is_u64(),
-        ParamType::Number => value.is_number(),
-        ParamType::Bool => value.is_boolean(),
-        ParamType::Subject(kind) => {
-            let address = value.as_str().ok_or("expected an address")?.parse::<Address>().map_err(|error| error.to_string())?;
-            address.kind().as_str() == kind
-        }
-    };
-    if fits {
-        Ok(())
-    } else {
-        Err(format!("expected {}", param.ty.as_str()))
-    }
-}
-
-/// A literal default as its parameter's JSON value, once it fits the parameter's type. The load
-/// check runs this for every literal default, so a verb with one that does not fit is broken.
-pub(super) fn literal(param: &ParamDeclaration, default: &str) -> Result<Value, String> {
-    let value = match param.ty {
-        ParamType::Integer | ParamType::Number | ParamType::Bool => {
-            serde_json::from_str(default).map_err(|_| format!("default `{default}` does not parse as {}", param.ty.as_str()))?
-        }
-        _ => Value::from(default),
-    };
-    check_type(param, &value).map_err(|error| format!("default `{default}`: {error}"))?;
-    Ok(value)
-}
-
-/// `params` with each unset `$row.<column>` default bound from `subject`'s row.
-fn bound(params: &Map<String, Value>, entry: &Entry, subject: &Subject) -> Map<String, Value> {
-    let mut bound = params.clone();
-    for param in &entry.declaration.params {
-        if let Some(column) = param.default.and_then(|default| default.strip_prefix("$row.")) {
-            if !bound.contains_key(param.name) {
-                if let Some(value) = subject.row.get(column).filter(|value| !value.is_null()) {
-                    bound.insert(param.name.into(), value.clone());
+            (ParamType::Subject(kind), Value::String(text)) => {
+                let address: Address = text.parse().map_err(|error| Refusal::Invalid(format!("parameter `{name}`: {error}")))?;
+                if address.kind() != kind {
+                    return Err(Refusal::Invalid(format!("parameter `{name}`: `{text}` is not a {kind}")));
                 }
             }
+            _ => {}
         }
+        params.insert(name, value);
     }
-    bound
+    entry.handler.params(params).map_err(|error| Refusal::Invalid(format!("parameters: {error}")))
 }

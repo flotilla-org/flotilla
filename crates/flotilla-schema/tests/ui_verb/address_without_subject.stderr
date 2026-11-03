@@ -1,0 +1,17 @@
+error[E0277]: `flotilla_schema::Address` is not a verb parameter type
+ --> tests/ui_verb/address_without_subject.rs:6:9
+  |
+6 |     to: Address,
+  |         ^^^^^^^ the trait `Param` is not implemented for `flotilla_schema::Address`
+  |
+  = note: parameters are String, bool, integers, floats, or an Address with #[param(subject = "kind")], each optionally in an Option
+  = help: the following other types implement trait `Param`:
+            Option<T>
+            String
+            bool
+            f32
+            f64
+            i16
+            i32
+            i64
+          and $N others

@@ -184,7 +184,7 @@ impl HttpRouter {
     pub(in crate::server) fn into_router(mut self) -> Router {
         let verbs = self.verbs.take().unwrap_or_else(|| Arc::new(verbs::builtin(self.backend.clone(), self.daemon.clone())));
         self.derived = vec![Arc::new(verbs.tables())];
-        Router::new()
+        let router = Router::new()
             .route("/", get(root::handle))
             .route("/metrics", get(metrics::handle))
             .route(HELLO_PATH, get(hello))
@@ -209,7 +209,11 @@ impl HttpRouter {
             .route("/v1/shutdown", axum::routing::any(commands::handle))
             .fallback(resource_api)
             .with_state(RouterState(Arc::new(self)))
-            .layer(middleware::from_fn(caller_from_listener))
+            .layer(middleware::from_fn(caller_from_listener));
+        // Tests stand in for the kernel's peer evidence on the main socket.
+        #[cfg(test)]
+        let router = router.layer(middleware::from_fn(auth::inject_evidence));
+        router
     }
 }
 
