@@ -564,7 +564,14 @@ impl MessagePrimitives {
             taken => return Err(format!("message `{record}` was already taken: {taken:?}")),
         }
         self.inbox.receive(&person, &id, Transport::Turn).await.map_err(|error| error.to_string())?;
-        self.inbox.deliver(&id, Deliver { receiver: person, transport: Transport::Turn }).await.map_err(|error| error.to_string())?;
+        if let Err(error) = self.inbox.deliver(&id, Deliver { receiver: person.clone(), transport: Transport::Turn }).await {
+            // The sweep delivers a committed receipt too (#4310); one that won the race to this
+            // receipt has taken the message for the person already.
+            let taken = self.inbox.get_async(&id).await.map_err(|error| error.to_string())?;
+            if taken.is_none_or(|message| message.state().receiver() != Some(&person)) {
+                return Err(error.to_string());
+            }
+        }
         let _ = self.attention_changes.send(());
         let _ = self.acknowledgements.send(());
         self.inbox.get_async(&id).await.map_err(|error| error.to_string())?.ok_or_else(|| format!("message `{record}` is gone"))

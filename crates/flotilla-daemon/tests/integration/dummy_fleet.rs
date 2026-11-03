@@ -1911,7 +1911,13 @@ async fn on_the_engine_acknowledging_a_standing_convoys_hold_admits_its_next_gen
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let item = loop {
         let CommandValue::PersonInbox(listing) = fleet.execute_as_operator(inbox.clone()).await else { panic!("a person inbox") };
-        if let Some(item) = listing.items.into_iter().find(|item| item.sender == "fleet:lab/role:standing") {
+        // The standing role may also report config drift on a generation; the hold is the one
+        // that says its generations failed.
+        if let Some(item) = listing
+            .items
+            .into_iter()
+            .find(|item| item.sender == "fleet:lab/role:standing" && item.body.contains("consecutive generations failed"))
+        {
             break item;
         }
         assert!(tokio::time::Instant::now() < deadline, "the hold never reached a person");

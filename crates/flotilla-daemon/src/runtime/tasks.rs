@@ -891,21 +891,19 @@ pub(super) fn spawn_convoy_ensure_reconciler_task(
                 // after overflow so subsequent changes still wake admission.
                 dependency_events = convoy_ensure_dependency_watches(&backend, &namespace).await;
             }
-            let result = run_bounded_operation(
+            let result = run_watched_operation(
                 interval,
                 state.daemon.reconcile_convoy_ensures_once_with_backing_inspector(&namespace, &*state),
                 || {
                     runtime_health.report_convoy_ensure_timeout(interval);
-                    warn!(timeout_secs = interval.as_secs(), "standing convoy ensure reconciliation pass timed out");
+                    warn!(timeout_secs = interval.as_secs(), "standing convoy ensure reconciliation pass overran its interval");
                 },
             )
             .await;
-            if let Some(result) = result {
-                runtime_health.clear_convoy_ensure_timeout();
-                match result {
-                    Ok(changes) => info!(changes = changes.len(), "standing convoy ensure reconciler alive"),
-                    Err(error) => warn!(%error, "standing convoy ensure reconciliation pass failed"),
-                }
+            runtime_health.clear_convoy_ensure_timeout();
+            match result {
+                Ok(changes) => info!(changes = changes.len(), "standing convoy ensure reconciler alive"),
+                Err(error) => warn!(%error, "standing convoy ensure reconciliation pass failed"),
             }
         }
     })
@@ -951,20 +949,25 @@ where
     })
 }
 
-pub(super) async fn run_bounded_operation<Output, OperationFuture, OnTimeout>(
+/// Runs `operation` to completion, calling `on_timeout` once it is still running after `timeout`.
+/// The operation is never dropped part-way: a standing convoy pass admits a generation and records
+/// it in separate writes, and a pass cut between them leaves the generation unrecorded, so its end
+/// is never counted against the role's restart budget (#4310).
+pub(super) async fn run_watched_operation<Output, OperationFuture, OnTimeout>(
     timeout: Duration,
     operation: OperationFuture,
     on_timeout: OnTimeout,
-) -> Option<Output>
+) -> Output
 where
     OperationFuture: Future<Output = Output>,
     OnTimeout: FnOnce(),
 {
-    match tokio::time::timeout(timeout, operation).await {
-        Ok(output) => Some(output),
+    let mut operation = std::pin::pin!(operation);
+    match tokio::time::timeout(timeout, &mut operation).await {
+        Ok(output) => output,
         Err(_) => {
             on_timeout();
-            None
+            operation.await
         }
     }
 }
