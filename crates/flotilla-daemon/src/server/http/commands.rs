@@ -16,6 +16,7 @@ use axum::{
     response::Response,
     Extension,
 };
+use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
     CommandCaller, CommandValue, DaemonEvent, DispatcherErrorClass, Message, PrincipalRef, Request as RpcRequest, Response as RpcResponse,
@@ -139,6 +140,9 @@ struct CommandState {
     observation_error: Option<String>,
     #[serde(skip)]
     progress_bytes: usize,
+    /// Steps ever pushed, so an observer sends each once though history is bounded.
+    #[serde(skip)]
+    pushed: u64,
     #[serde(skip)]
     eviction_order: Option<u64>,
     #[serde(skip)]
@@ -277,72 +281,17 @@ pub(super) async fn handle(
         Ok(body) => body,
         Err(refused) => return refuse(encoding, refused.status(), refused.message()),
     };
-    let namespace = daemon.provisioning_namespace().await;
-    let mut transport_bound = false;
-    let caller = match &authenticated {
-        CallerAuth::Socket(Some(peer)) => {
-            let peer = *peer;
-            let socket_path = commands.socket_path.clone();
-            let evidence = tokio::task::spawn_blocking(move || {
-                #[cfg(test)]
-                if let Some(evidence) = injected_evidence {
-                    return Ok((
-                        evidence.caller.clone(),
-                        evidence.claims.clone(),
-                        evidence
-                            .mounts
-                            .as_ref()
-                            .map(|m| caller::PeerMounts { mountinfo: m.mountinfo.clone(), legacy_main_directory: m.legacy_main_directory }),
-                    ));
-                }
-                let claims = caller::claims_from_peer(Some(peer));
-                let caller = caller::caller_from_peer(Some(peer), &namespace)?;
-                let mounts = caller
-                    .process
-                    .as_ref()
-                    .filter(|p| p.container.is_some())
-                    .map(|p| caller::peer_mounts(p.pid, Some(&socket_path)))
-                    .transpose()?;
-                Ok::<_, String>((caller, claims, mounts))
-            })
-            .await;
-            match evidence {
-                Ok(Ok((caller, claims, mounts))) => match caller::resolve_main_caller(daemon, caller, &claims, mounts.as_ref()).await {
-                    Ok(resolved) => {
-                        transport_bound = resolved.transport_bound;
-                        resolved.caller
-                    }
-                    Err(error) => return refuse(encoding, StatusCode::FORBIDDEN, error),
-                },
-                Ok(Err(error)) => return refuse(encoding, StatusCode::FORBIDDEN, error),
-                Err(error) => return refuse(encoding, StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-            }
-        }
-        CallerAuth::Environment { environment, peer } => {
-            let crews = match environment_connection::environment_crews(daemon, environment).await {
-                Ok(c) => c,
-                Err(e) => return refuse(encoding, StatusCode::FORBIDDEN, e),
-            };
-            let peer = *peer;
-            let claims = match tokio::task::spawn_blocking(move || caller::claims_from_peer(peer)).await {
-                Ok(c) => c,
-                Err(e) => return refuse(encoding, StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-            };
-            let crew = match caller::check_claims(crews, &claims) {
-                Ok(c) => c,
-                Err(e) => return refuse(encoding, StatusCode::FORBIDDEN, e),
-            };
-            transport_bound = true;
-            CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace(&crew.namespace), process: None, crew: Some(crew) }
-        }
-        CallerAuth::Bearer | CallerAuth::Session(_) => {
-            CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace(&namespace), process: None, crew: None }
-        }
-        CallerAuth::Socket(None) => {
-            return refuse(encoding, StatusCode::FORBIDDEN, "CallerIdentityUnavailable: socket peer credentials unavailable")
-        }
-        CallerAuth::Hook { .. } => return refuse(encoding, StatusCode::FORBIDDEN, "a hook token reaches only the hook routes"),
-        CallerAuth::Anonymous => return refuse(encoding, StatusCode::UNAUTHORIZED, "authentication required"),
+    let (caller, transport_bound) = match resolve_caller(
+        daemon,
+        commands,
+        &authenticated,
+        #[cfg(test)]
+        injected_evidence,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err((status, message)) => return refuse(encoding, status, message),
     };
     if transport_bound && method == Method::DELETE && command_resource.is_some() {
         return refuse(encoding, StatusCode::FORBIDDEN, "EnvironmentCommandDenied: cancellation is outside supervisor authority");
@@ -514,6 +463,149 @@ pub(super) async fn handle(
     )
 }
 
+/// The command caller an authenticated request acts as, and whether its transport binds it to a
+/// crew.
+async fn resolve_caller(
+    daemon: &Arc<InProcessDaemon>,
+    commands: &Commands,
+    authenticated: &CallerAuth,
+    #[cfg(test)] injected_evidence: Option<Arc<PeerEvidence>>,
+) -> Result<(CommandCaller, bool), (StatusCode, String)> {
+    let namespace = daemon.provisioning_namespace().await;
+    let mut transport_bound = false;
+    let caller = match authenticated {
+        CallerAuth::Socket(Some(peer)) => {
+            let peer = *peer;
+            let socket_path = commands.socket_path.clone();
+            let evidence = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                if let Some(evidence) = injected_evidence {
+                    return Ok((
+                        evidence.caller.clone(),
+                        evidence.claims.clone(),
+                        evidence
+                            .mounts
+                            .as_ref()
+                            .map(|m| caller::PeerMounts { mountinfo: m.mountinfo.clone(), legacy_main_directory: m.legacy_main_directory }),
+                    ));
+                }
+                let claims = caller::claims_from_peer(Some(peer));
+                let caller = caller::caller_from_peer(Some(peer), &namespace)?;
+                let mounts = caller
+                    .process
+                    .as_ref()
+                    .filter(|p| p.container.is_some())
+                    .map(|p| caller::peer_mounts(p.pid, Some(&socket_path)))
+                    .transpose()?;
+                Ok::<_, String>((caller, claims, mounts))
+            })
+            .await;
+            match evidence {
+                Ok(Ok((caller, claims, mounts))) => match caller::resolve_main_caller(daemon, caller, &claims, mounts.as_ref()).await {
+                    Ok(resolved) => {
+                        transport_bound = resolved.transport_bound;
+                        resolved.caller
+                    }
+                    Err(error) => return Err((StatusCode::FORBIDDEN, error)),
+                },
+                Ok(Err(error)) => return Err((StatusCode::FORBIDDEN, error)),
+                Err(error) => return Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string())),
+            }
+        }
+        CallerAuth::Environment { environment, peer } => {
+            let crews = match environment_connection::environment_crews(daemon, environment).await {
+                Ok(c) => c,
+                Err(e) => return Err((StatusCode::FORBIDDEN, e)),
+            };
+            let peer = *peer;
+            let claims = match tokio::task::spawn_blocking(move || caller::claims_from_peer(peer)).await {
+                Ok(c) => c,
+                Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+            };
+            let crew = match caller::check_claims(crews, &claims) {
+                Ok(c) => c,
+                Err(e) => return Err((StatusCode::FORBIDDEN, e)),
+            };
+            transport_bound = true;
+            CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace(&crew.namespace), process: None, crew: Some(crew) }
+        }
+        CallerAuth::Bearer | CallerAuth::Session(_) => {
+            CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace(&namespace), process: None, crew: None }
+        }
+        CallerAuth::Socket(None) => {
+            return Err((StatusCode::FORBIDDEN, "CallerIdentityUnavailable: socket peer credentials unavailable".into()))
+        }
+        CallerAuth::Hook { .. } => return Err((StatusCode::FORBIDDEN, "a hook token reaches only the hook routes".into())),
+        CallerAuth::Anonymous => return Err((StatusCode::UNAUTHORIZED, "authentication required".into())),
+    };
+    Ok((caller, transport_bound))
+}
+
+/// What an observer of a command record receives: each step once, then its outcome.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(super) enum CommandProgress {
+    CommandStep { step: DaemonEvent },
+    CommandOutcome { state: &'static str, outcome: Option<CommandValue>, progress_truncated: bool, observation_error: Option<String> },
+}
+
+impl Commands {
+    /// Observes command record `id` for an authenticated user, under the same owner rule as
+    /// `GET /v1/commands/{id}`.
+    pub(super) async fn observe(
+        &self,
+        daemon: &Arc<InProcessDaemon>,
+        authenticated: &CallerAuth,
+        id: &str,
+    ) -> Result<futures::stream::BoxStream<'static, CommandProgress>, (StatusCode, String)> {
+        let (caller, transport_bound) = resolve_caller(
+            daemon,
+            self,
+            authenticated,
+            #[cfg(test)]
+            None,
+        )
+        .await?;
+        let id = Uuid::parse_str(id).map_err(|_| (StatusCode::BAD_REQUEST, "invalid command id".to_owned()))?;
+        let records = self.records.lock().await;
+        let record = records.get(&id).ok_or((StatusCode::NOT_FOUND, "command not found".to_owned()))?;
+        if record.owner.crew != caller.crew || transport_bound {
+            return Err((StatusCode::FORBIDDEN, "command belongs to another caller".to_owned()));
+        }
+        Ok(progress(record.state.clone()))
+    }
+}
+
+fn progress(receiver: watch::Receiver<CommandState>) -> futures::stream::BoxStream<'static, CommandProgress> {
+    use futures::StreamExt;
+    futures::stream::unfold((Some(receiver), 0u64, VecDeque::new()), |(mut receiver, mut sent, mut pending)| async move {
+        loop {
+            if let Some(progress) = pending.pop_front() {
+                return Some((progress, (receiver, sent, pending)));
+            }
+            let current = receiver.as_mut()?;
+            let state = current.borrow_and_update().clone();
+            let fresh = usize::try_from(state.pushed - sent).unwrap_or(usize::MAX).min(state.steps.len());
+            sent = state.pushed;
+            pending.extend(
+                state.steps.iter().skip(state.steps.len() - fresh).map(|step| CommandProgress::CommandStep { step: step.event.clone() }),
+            );
+            if state.outcome.is_some() || state.collector_closed {
+                pending.push_back(CommandProgress::CommandOutcome {
+                    state: state.state,
+                    outcome: state.outcome,
+                    progress_truncated: state.progress_truncated,
+                    observation_error: state.observation_error,
+                });
+                receiver = None;
+            } else if pending.is_empty() && current.changed().await.is_err() {
+                receiver = None;
+            }
+        }
+    })
+    .boxed()
+}
+
 impl CommandState {
     fn new(id: Uuid, outcome: Option<CommandValue>, order: &AtomicU64) -> Self {
         let outcome_is_terminal = outcome.is_some();
@@ -526,6 +618,7 @@ impl CommandState {
             progress_truncated: false,
             observation_error: None,
             progress_bytes: 0,
+            pushed: 0,
             unknown_since: None,
             collector_closed: outcome_is_terminal,
             completion_scope: CompletionScope::default(),
@@ -564,6 +657,7 @@ impl CommandState {
             self.progress_truncated = true;
         }
         self.progress_bytes += size;
+        self.pushed += 1;
         self.steps.push_back(RetainedStep { event, encoded_bytes: size });
     }
 }

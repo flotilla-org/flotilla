@@ -39,17 +39,55 @@ fn field(field: &syn::Field, prefix: TokenStream, fallback: &str) -> syn::Result
     })
 }
 
+/// Writes one field's cells or child rows; `value` is a reference to the field.
+fn encode(field: &syn::Field, value: TokenStream, prefix: TokenStream, fallback: &str) -> syn::Result<TokenStream> {
+    let name = field.ident.as_ref().map(|ident| ident.unraw().to_string()).unwrap_or_else(|| fallback.into());
+    let name = quote!(&::flotilla_schema::Layout::join(#prefix, #name));
+    let attrs = shape(field)?;
+    if attrs.key.is_some() {
+        return Ok(quote!(rows.key(|rows| ::flotilla_schema::Describe::encode(#value, rows, #name));));
+    }
+    Ok(match attrs.shape {
+        Some(crate::attrs::FieldAttr::Child) => quote!(::flotilla_schema::DescribeChild::encode_child(#value, rows, #name);),
+        Some(crate::attrs::FieldAttr::Intern) => {
+            let text = quote!(::flotilla_schema::__private::json!(::flotilla_schema::Intern::as_str(value)));
+            if crate::shape::option_inner(&field.ty).is_some() {
+                quote!(if let ::core::option::Option::Some(value) = #value { rows.cell(#name, #text); })
+            } else {
+                quote!({ let value = #value; rows.cell(#name, #text); })
+            }
+        }
+        _ => quote!(::flotilla_schema::Describe::encode(#value, rows, #name);),
+    })
+}
+
 pub(crate) fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
     if let Some(attr) = input.attrs.iter().find(|attr| attr.path().is_ident("store")) {
         return Err(syn::Error::new_spanned(attr, "Describe accepts shape attributes only"));
     }
-    let body = match &input.data {
+    let (body, encode_body) = match &input.data {
         Data::Struct(data) => {
             if matches!(&data.fields, Fields::Unnamed(fields) if fields.unnamed.len() != 1) {
                 return Err(syn::Error::new_spanned(&data.fields, "use named fields or a single-field newtype"));
             }
-            let fields = data.fields.iter().map(|f| field(f, quote!(name), "")).collect::<syn::Result<Vec<_>>>()?;
-            quote!(#(#fields)*)
+            // A row's key comes first, so child tables declared before it still inherit it.
+            let mut ordered: Vec<(usize, &syn::Field)> = data.fields.iter().enumerate().collect();
+            ordered.sort_by_key(|(_, f)| shape(f).map(|attrs| attrs.key.is_none()).unwrap_or(true));
+            let fields = ordered.iter().map(|(_, f)| field(f, quote!(name), "")).collect::<syn::Result<Vec<_>>>()?;
+            let encodes = ordered
+                .iter()
+                .map(|(index, f)| {
+                    let access = match &f.ident {
+                        Some(ident) => quote!(&self.#ident),
+                        None => {
+                            let index = syn::Index::from(*index);
+                            quote!(&self.#index)
+                        }
+                    };
+                    encode(f, access, quote!(name), "")
+                })
+                .collect::<syn::Result<Vec<_>>>()?;
+            (quote!(#(#fields)*), quote!(#(#encodes)*))
         }
         Data::Enum(data) => {
             if data.variants.is_empty() {
@@ -60,6 +98,7 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
             let mut seen = std::collections::BTreeSet::new();
             let mut datums: Vec<(String, syn::Field, String)> = Vec::new();
             let mut carried = Vec::new();
+            let mut arms = Vec::new();
             for variant in &data.variants {
                 let label = variant.ident.unraw().to_string();
                 let value =
@@ -89,6 +128,25 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
                     return Err(syn::Error::new_spanned(variant, "use named fields or a single-field variant"));
                 }
                 categories.push(quote!((#value.into(), #label.into())));
+                let ident = &variant.ident;
+                let mut bindings = Vec::new();
+                let mut writes = Vec::new();
+                for (position, datum) in variant.fields.iter().enumerate() {
+                    let binding = quote::format_ident!("__datum{}", position);
+                    let member = match &datum.ident {
+                        Some(ident) => quote!(#ident),
+                        None => {
+                            let index = syn::Index::from(position);
+                            quote!(#index)
+                        }
+                    };
+                    bindings.push(quote!(#member: #binding));
+                    writes.push(encode(datum, quote!(#binding), quote!(name), &snake_case(&label))?);
+                }
+                arms.push(quote!(Self::#ident { #(#bindings),* } => {
+                    rows.cell(tag, ::flotilla_schema::__private::json!(#value));
+                    #(#writes)*
+                }));
                 let mut variant_datums = Vec::new();
                 for datum in &variant.fields {
                     let fallback = snake_case(&label);
@@ -141,13 +199,19 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
                 let indexes = carried.iter().map(|(index, required)| quote!((#index, #required)));
                 quote!(layout.tag_guard(&tag, #value, &datums, &[#(#indexes),*]);)
             });
-            quote! {
-                let tag = if #has_data && name.is_empty() { "tag" } else { name };
-                layout.categories(tag, vec![#(#categories),*], required);
-                let datums = vec![#(#layouts),*];
-                #(#guards)*
-                if !datums.is_empty() { layout.expansion(tag, &datums); }
-            }
+            (
+                quote! {
+                    let tag = if #has_data && name.is_empty() { "tag" } else { name };
+                    layout.categories(tag, vec![#(#categories),*], required);
+                    let datums = vec![#(#layouts),*];
+                    #(#guards)*
+                    if !datums.is_empty() { layout.expansion(tag, &datums); }
+                },
+                quote! {
+                    let tag = if #has_data && name.is_empty() { "tag" } else { name };
+                    match self { #(#arms)* }
+                },
+            )
         }
         Data::Union(data) => return Err(syn::Error::new_spanned(data.union_token, "unions have no table description")),
     };
@@ -163,6 +227,10 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
         impl #imp ::flotilla_schema::Describe for #ident #ty #clause {
             fn describe(layout: &mut ::flotilla_schema::Layout, name: &str, required: bool) {
                 #body
+            }
+            fn encode(&self, rows: &mut ::flotilla_schema::RowWriter, name: &str) {
+                let _ = (&rows, name);
+                #encode_body
             }
             fn table_set() -> ::flotilla_schema::TableSet {
                 let mut layout = ::flotilla_schema::Layout::description(stringify!(#ident));

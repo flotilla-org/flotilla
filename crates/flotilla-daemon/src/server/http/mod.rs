@@ -14,6 +14,9 @@ mod login;
 pub(in crate::server) mod metrics;
 mod resource_api;
 mod root;
+mod surface;
+#[cfg(test)]
+mod surface_tests;
 mod table_api;
 #[cfg(test)]
 mod table_tests;
@@ -47,7 +50,7 @@ use resource_api::Reply;
 use rigging_http_serve::Caller;
 
 use crate::server::{
-    tables::DerivedSet,
+    tables::{Catalog, DerivedSet, QueryFeed},
     verbs::{self, Verbs},
 };
 
@@ -89,6 +92,9 @@ pub(in crate::server) struct HttpRouter {
     /// Tables derived from code (`verbs`), filled in when the router is built.
     #[builder(skip)]
     derived: Vec<Arc<DerivedSet>>,
+    /// This daemon run: a named query's sequence numbers restart with it.
+    #[builder(skip = uuid::Uuid::new_v4().to_string())]
+    incarnation: String,
 }
 
 /// The TCP listener's origin, known only once it binds (its port may be chosen then). The
@@ -133,6 +139,18 @@ impl HttpRouter {
             link_prefix: None,
             verbs: None,
             derived: Vec::new(),
+            incarnation: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+
+    /// The tables this router serves; named queries are read through `queries`, or a feed of
+    /// their own when it is `None`.
+    pub(in crate::server) fn catalog(&self, queries: Option<Arc<QueryFeed>>) -> Catalog {
+        Catalog {
+            backend: self.backend.clone(),
+            service: table_api::store(self),
+            derived: self.derived.clone(),
+            queries: queries.or_else(|| self.daemon.as_ref().map(|daemon| QueryFeed::new(Arc::clone(daemon), self.incarnation.clone()))),
         }
     }
 
@@ -172,6 +190,7 @@ impl HttpRouter {
             .route("/tables", get(table_api::list))
             .route("/tables/{table}", get(table_api::describe))
             .route("/tables/{table}/rows", get(table_api::rows))
+            .route(surface::PATH, get(surface::upgrade))
             .route("/verbs/{name}", post(verb_api::invoke).layer(Extension(verbs)))
             .route(LOGIN_CODES_PATH, post(mint_login_code))
             .route(LOGIN_PATH, get(login))

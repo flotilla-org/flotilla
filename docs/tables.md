@@ -60,6 +60,7 @@ Parameters apply to the rows route. Each is validated against the table's descri
 - `count=exact|estimate`: adds a `count` message.
 - `namespace` (default `default`): the scope read. Flotilla's own records live in the `flotilla` namespace, so a client that omits `namespace` gets empty tables and no error; pass `namespace=flotilla`. For engine kinds, a namespace other than `default` names the home.
 - `watch` (bare, or `true`): keep the stream open and send changes.
+- `query`: on a named query's tables only, the query to read, as the JSON of its framed-protocol query id (`{"convoys":{"scope":{"namespace":"flotilla","name":"demo"}}}`). It must be of the table's family. Absent, a table reads its family's fleet-wide query; `issue_row` tables need one, and answer `invalid_request` without it.
 
 `.log` tables accept no `watch`, `cursor`, `offset`, `count` or custom `sort`; they return a bounded snapshot in `home, sequence` order.
 
@@ -225,6 +226,7 @@ whereOperators
 `GET /tables` is the authority. The tables are:
 
 - Resource kinds: one table each, named by the kind's plural, with the shared columns `metadata.*`, `status.phase`, `status.conditions`, `spec` and `status`.
+- Named queries: a root table per query family (`convoy_row`, `independent_row`, `issue_row`, `checkout_row`, `awareness_node`, `standing_role_row`, `project_repositories_row`, `dispatch_queue_row`) and a child table per nested list, described by the row type. A child row carries its parent's key ahead of its own (`pos` for a list, `key` for a map). The listing entry names the family in `query`. The rows are the aggregator's result set, the same content the framed protocol's `SubscribeQueries` delivers; `sequence` is the result set's sequence and `incarnation` the daemon run's. Listed only when the daemon serves them.
 - Engine kinds: a root table per kind, a table per nested collection, and `<root>.log`, the kind's event log projection with the columns `home`, `sequence`, `name`, `cause`, `edge`, `from`, `to`, `at`. `cause` (`Create`, `Edit`, `Edge`, `Delete`, `Expunge`), `edge` (the kind's edge names) and `from` and `to` (its state's labels) are enum columns.
 
 The columns are not listed here; `?format=markdown` on a table describes its own.
@@ -241,6 +243,50 @@ The rendering is the `flotilla-table` sibling binary (#4249), which ships beside
 
 A table's built-in view is a binnacle Layout document (`version: 2`) under `views/`, named `<kind>.<name>.json`; `views/convoy.default.json` is the first. `flotilla-table` includes these files, and a table without one shows binnacle's default view: the nested columns hidden and the key and state columns first.
 
+## WebSocket
+
+`GET /v1/surface` upgrades to a WebSocket on every listener. It carries the messages above, in the same order and with the same fields, for any number of subscriptions on one ordered channel, so a change never overtakes the snapshot it applies to. Access is the table routes': users only (socket, bearer or session); anonymous callers get `401`, environment and hook tokens `403`, before the upgrade.
+
+The client offers a subprotocol: `flotilla.surface.v1+cbor` (binary frames, chosen when both are offered) or `flotilla.surface.v1+json` (text frames, for debugging). A client offering neither gets `406` `unsupported_format` and no upgrade. One message travels per frame, a map with a `type` field: CBOR through the profile's safe reader, which refuses duplicate keys, tags and trailing bytes, or JSON, which refuses duplicate keys and writes integers beyond ±2^53 as `{"u64":"…"}` or `{"i64":"…"}`. A client frame is at most 64 KiB; the reader refuses a larger one before reading it and closes the connection with code 1009. Readers ignore unknown keys. A frame that does not decode gets an `error`, and so does an unknown `type`, naming it; the connection stays open.
+
+```list surface-messages
+hello
+subscribe
+unsubscribe
+cancel
+fetch_more
+observe_focus
+wait_subscribe
+command
+error
+command_step
+command_outcome
+wait_fired
+```
+
+| `type` | From | Fields |
+|---|---|---|
+| `hello` | server, first frame | `build`, `fingerprint`, `incarnation` (this daemon run) |
+| `subscribe` | client | `id`, `table` or `query` (or both, to pick a named query's child table), the row parameters `where` (one condition or a list), `sort`, `columns` (comma-separated text or a list), `namespace`, `count`, and `cursor` `{incarnation, sequence}` to resume |
+| `unsubscribe` | client | `id` of the subscribe |
+| `cancel` | client | `id` of any open request |
+| `fetch_more` | client | `id`, `query`: extend a demand-backed query this connection subscribes to; the rows arrive on its subscriptions |
+| `observe_focus` | client | `id`, `targets` |
+| `wait_subscribe` | client | `id`, `subscription` (namespace, leaves, freshness demand, as the framed `SubscribeWait`) |
+| `command` | client | `id`, `command`: the id `POST /v1/commands` returned |
+| `error` | server | `code`, `message`, and `id` when it answers a request |
+| `command_step` | server | `id`, `step`: one element of the record's `steps` |
+| `command_outcome` | server | `id`, `state`, `outcome`, `progress_truncated`, `observation_error`, as the record has them once it finishes |
+| `wait_fired` | server | `id`, `subscription_id`, `leaf`, `value` |
+
+Every message about a subscription is a message above plus the subscription's `id`. A subscription is a watch of its whole table (up to 10,000 rows in the snapshot), with `progress` at least every 15 seconds. A `cursor` whose `incarnation` and `sequence` are those of the table's current snapshot resumes with `synced` alone (after `count` when requested); any other cursor, including one from another incarnation whose sequence looks current, gets `resync`, then `table`, `rows`, `synced`. Named-query sequences restart with the daemon, so their tables carry its incarnation.
+
+`unsubscribe` and `cancel` end a request; nothing more is sent for it, and an id that names no open request gets `error` `not_found`. An id may be reused once its request has ended; while it is open, reuse gets `duplicate_id`. Wait subscriptions, focus and the named queries a connection reads are its own and end when it closes. Commands are started over `/v1/commands`; `command` follows one under the same owner rule as `GET /v1/commands/{id}`.
+
+The server pings every 20 seconds and closes a connection silent for 60. It queues at most 1,024 frames for a connection; a consumer that falls further behind is closed with code 1013 and resumes by cursor.
+
+Errors carry the table codes above, plus `invalid_message`, `unknown_type`, `duplicate_id`, `not_found`, `unavailable` (a request that needs the daemon), and `command`, `fetch_more` and `wait` when the daemon refuses that request.
+
 ## Not built yet
 
-Named queries as tables and a WebSocket carrier (#3249), parent keys on child tables (#3600) and view subscriptions (#3447).
+View subscriptions (#3447).
