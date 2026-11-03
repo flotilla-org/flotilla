@@ -432,7 +432,10 @@ controlling host cannot resolve it either. A Ready vessel's status lists its
 reach set and how each entry is met (`native` or `exposure`).
 
 The earlier `[flotilla.provider.<instance>.lab_reach]` table in `drydock.toml`
-is retired: it is accepted and ignored for one roll, then refused.
+is retired: it is accepted and ignored for one roll, then refused. Its
+destination is no longer reached implicitly. A destination that is neither a
+repository remote nor a credential's server must be declared in the fleet's or
+project's `reach`, or provisioning a drydock vessel fails naming it.
 
 ## Forced checkout archives
 

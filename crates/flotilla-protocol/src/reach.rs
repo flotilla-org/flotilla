@@ -105,7 +105,8 @@ pub enum PrivateReach {
     /// The advertisement does not say: an earlier generation's record, or one
     /// rebuilt from a store that keeps only some capabilities. Placement
     /// refuses nothing on it; provisioning meets the set or fails naming the
-    /// destination.
+    /// destination. Fail-open until the engine's stored Host provider row
+    /// carries this capability (#4308).
     #[default]
     Undeclared,
 }

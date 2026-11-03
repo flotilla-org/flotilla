@@ -80,6 +80,8 @@ pub fn classify(addresses: impl IntoIterator<Item = IpAddr>) -> Resolution {
 /// Whether `address` is reachable from the public internet. Conservative: an
 /// address in a range that is not plainly global unicast counts as private, so
 /// a misjudgement costs an unneeded exposure rather than a guest that times out.
+/// Not exhaustive: rare special-purpose ranges inside 2000::/3 (ORCHID,
+/// benchmarking 2001:2::/48) still count as public.
 pub fn is_global(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(v4) => {
@@ -138,9 +140,11 @@ pub async fn routes(
     reach: &BTreeSet<ReachDestination>,
     private: PrivateReach,
 ) -> Result<Vec<PlannedRoute>, String> {
+    // Lookups run together, so the slowest bounds the wait, not their sum.
+    let resolutions = futures::future::join_all(reach.iter().map(|destination| resolver.resolve(destination))).await;
     let mut routes = Vec::with_capacity(reach.len());
-    for destination in reach {
-        let (met, carried_to) = match resolver.resolve(destination).await {
+    for (destination, resolution) in reach.iter().zip(resolutions) {
+        let (met, carried_to) = match resolution {
             Resolution::Public => (ReachMeans::Native, None),
             Resolution::Private(address) => match private.means() {
                 // An exposure stands at the destination's own name: an address names none.
@@ -150,6 +154,11 @@ pub async fn routes(
                 Some(means) => (means, (means == ReachMeans::Exposure).then_some(address)),
                 None => return Err(format!("reach destination {destination} resolves to a private address this environment cannot carry")),
             },
+            // A vessel on the host's own network meets it however it resolves.
+            Resolution::Unresolved(_) if private == PrivateReach::Native => (ReachMeans::Native, None),
+            // Deliberately fail fast: a carrier cannot tell whether an
+            // unresolved name needs carrying, and a provision that fails naming
+            // the destination beats a crew timing out inside a clone.
             Resolution::Unresolved(reason) => {
                 return Err(format!("reach destination {destination} does not resolve on the controlling host: {reason}"))
             }
@@ -242,6 +251,10 @@ mod tests {
         assert!(address.contains("10.0.0.5:443"), "{address}");
         let unresolved = routes(&resolver, &BTreeSet::from([at("elsewhere.test")]), PrivateReach::Exposure).await.unwrap_err();
         assert!(unresolved.contains("elsewhere.test:443") && unresolved.contains("unknown"), "{unresolved}");
+        // A vessel on the host's own network meets an unresolved name natively.
+        let on_host = routes(&resolver, &BTreeSet::from([at("elsewhere.test"), at("github.com")]), PrivateReach::Native).await.unwrap();
+        let met = on_host.iter().map(|planned| (planned.route.destination.host.as_str(), planned.route.met)).collect::<Vec<_>>();
+        assert_eq!(met, vec![("elsewhere.test", ReachMeans::Native), ("github.com", ReachMeans::Native)]);
         assert_eq!(NoLookup.resolve(&at("github.com")).await, Resolution::Unresolved("not looked up on this host".into()));
     }
 }
