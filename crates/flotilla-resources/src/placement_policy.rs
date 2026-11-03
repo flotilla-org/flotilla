@@ -3,21 +3,37 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    field_ownership::serialized_spec_field_value, resource::define_resource, status_patch::NoStatusPatch, FieldOwnedResource,
-    FieldOwnership, OwnershipEnforcement, ReplicationClass, ResourceError, WriterRole, HOST_DIRECT_NAME_PREFIX,
+    field_ownership::serialized_spec_field_value, status_patch::NoStatusPatch, FieldOwnedResource, FieldOwnership, OwnershipEnforcement,
+    ReplicationClass, ResourceError, WriterRole, HOST_DIRECT_NAME_PREFIX,
 };
 
 /// Reserved namespace shared by Docker policy seeding and field ownership.
 pub const DOCKER_POLICY_NAME_PREFIX: &str = "docker-on-";
 
-define_resource!(
-    PlacementPolicy,
-    "placementpolicies",
-    PlacementPolicySpec,
-    (),
-    NoStatusPatch,
-    replication = ReplicationClass::HomeBoundRuntime
-);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlacementPolicy;
+
+impl crate::Resource for PlacementPolicy {
+    type Spec = PlacementPolicySpec;
+    type Status = ();
+    type StatusPatch = NoStatusPatch;
+    const QUERYABLE_FIELDS: &'static [&'static str] = &["metadata.name"];
+    const API_PATHS: crate::ApiPaths =
+        crate::ApiPaths { group: "flotilla.work", version: "v1", plural: "placementpolicies", kind: "PlacementPolicy" };
+    const REPLICATION_CLASS: ReplicationClass = ReplicationClass::HomeBoundRuntime;
+
+    fn validate_spec(_meta: &crate::InputMeta, spec: &Self::Spec) -> Result<(), ResourceError> {
+        if let Some(cloud) = &spec.cloud_sandbox_per_vessel {
+            let crate::CloudSandboxSize { cpus, memory_bytes, disk_bytes } = cloud.size;
+            for (field, value) in [("cpus", u64::from(cpus)), ("memory_bytes", memory_bytes), ("disk_bytes", disk_bytes)] {
+                if value == 0 {
+                    return Err(ResourceError::invalid(format!("cloud_sandbox_per_vessel.size.{field} must be greater than zero")));
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Complete PlacementPolicy ownership declaration.
 ///
@@ -391,4 +407,37 @@ pub struct ProviderRequirements {
     pub material_modes: Vec<flotilla_protocol::provider::MaterialMode>,
     pub checkout_strategy: Option<flotilla_protocol::provider::CheckoutStrategy>,
     pub egress_enforcement: Option<flotilla_protocol::provider::EgressEnforcement>,
+}
+
+#[cfg(test)]
+mod size_validation_tests {
+    use super::*;
+    use crate::{CloudSandboxSize, InputMeta, Resource};
+
+    fn spec(size: CloudSandboxSize) -> PlacementPolicySpec {
+        PlacementPolicySpec::builder()
+            .pool("cloud".into())
+            .cloud_sandbox_per_vessel(CloudSandboxPerVesselPlacementPolicySpec {
+                image: None,
+                size,
+                checkout: CloudSandboxCheckout::CloneInVessel,
+                env: BTreeMap::new(),
+            })
+            .build()
+    }
+
+    #[test]
+    fn zero_size_dimensions_are_rejected() {
+        let meta = InputMeta { name: "cloud".into(), ..Default::default() };
+        let ok = CloudSandboxSize { cpus: 2, memory_bytes: 1 << 30, disk_bytes: 1 << 30 };
+        assert!(PlacementPolicy::validate_spec(&meta, &spec(ok.clone())).is_ok());
+        for (field, bad) in [
+            ("cpus", CloudSandboxSize { cpus: 0, ..ok.clone() }),
+            ("memory_bytes", CloudSandboxSize { memory_bytes: 0, ..ok.clone() }),
+            ("disk_bytes", CloudSandboxSize { disk_bytes: 0, ..ok.clone() }),
+        ] {
+            let error = PlacementPolicy::validate_spec(&meta, &spec(bad)).expect_err("zero rejected").to_string();
+            assert!(error.contains(field), "{error}");
+        }
+    }
 }
