@@ -191,7 +191,7 @@ fn refuse_kind<K: PlainKind>(kind: &str) -> Result<(), String> {
     if kind == K::KIND {
         Ok(())
     } else {
-        Err(format!("{kind} is not served by the artifact records"))
+        Err(format!("{kind} is not served by the {} records", K::KIND))
     }
 }
 
@@ -220,7 +220,7 @@ impl<K: PlainKind> EngineRecords for PlainRecords<K> {
         Ok(names
             .into_iter()
             .filter_map(|name| resolve(&resident.records, &self.home, name))
-            .filter_map(|held| held.map_err(|error| tracing::warn!(%error, "skipping an artifact record that does not encode")).ok())
+            .filter_map(|held| held.map_err(|error| tracing::warn!(%error, kind = K::KIND, "skipping a record that does not encode")).ok())
             .collect())
     }
 
@@ -231,7 +231,7 @@ impl<K: PlainKind> EngineRecords for PlainRecords<K> {
             .records
             .values()
             .filter_map(|held| {
-                held.clone().map_err(|error| tracing::warn!(%error, "skipping an artifact record that does not encode")).ok()
+                held.clone().map_err(|error| tracing::warn!(%error, kind = K::KIND, "skipping a record that does not encode")).ok()
             })
             .collect())
     }
@@ -274,7 +274,7 @@ impl<K: PlainKind> EngineRecords for PlainRecords<K> {
                 match service.with_store(|store| Ok(!follower.pass(&mut store.read()?, &homes)?.is_empty())) {
                     Ok(true) => return Some(((), (service, follower))),
                     Ok(false) => {}
-                    Err(error) => tracing::warn!(%error, "artifact change stream could not read the log; retrying"),
+                    Err(error) => tracing::warn!(%error, kind = K::KIND, "change stream could not read the log; retrying"),
                 }
             }
         });
