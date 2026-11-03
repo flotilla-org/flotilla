@@ -3,7 +3,7 @@
 #![allow(clippy::double_must_use)]
 
 use flotilla_resources::*;
-use flotilla_resources::{error, field_ownership, host, labels, resource, retention};
+use flotilla_resources::{error, host, labels, resource, retention};
 
 mod account_records;
 mod attentions;

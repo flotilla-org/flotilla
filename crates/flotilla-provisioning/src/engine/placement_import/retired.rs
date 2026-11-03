@@ -85,9 +85,6 @@ pub struct DockerPerVessel {
     pub image: Option<PlacementImageSource>,
     #[serde(default)]
     pub pull_policy: DockerImagePullPolicy,
-    /// The memory share, which is dropped.
-    #[serde(default)]
-    pub memory_policy: Option<Value>,
     #[serde(default)]
     pub agent_adapters: BTreeSet<String>,
     #[serde(default)]
@@ -113,8 +110,6 @@ pub struct CloudSandboxPerVessel {
     pub image: Option<PlacementImageSource>,
     pub size: CloudSandboxSize,
     pub checkout: CloudSandboxCheckout,
-    #[serde(default)]
-    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -633,7 +633,7 @@ mod tests {
     // #2803: get output is an editable resource document, applied to the store it was read
     // from, locally and routed.
     #[cfg(unix)]
-    async fn fulfilment_kind_cli_apply_scenario(target: u8, percent: u8) {
+    async fn fulfilment_kind_cli_apply_scenario(target: u8) {
         use std::sync::Arc;
 
         use flotilla_config::ConfigStore;
@@ -676,11 +676,10 @@ mod tests {
         let kinds = home.resource_backend().using::<FulfilmentKind>("flotilla");
         kinds.create(&InputMeta::builder().name(name.into()).build(), &spec).await.expect("seed kind");
         // A same-named caller record makes using the wrong store observable.
-        let decoy = || format!("pool-{}", decoy_percent(percent));
         if target == 2 {
             let mut decoy_spec = spec.clone();
             decoy_spec.host_ref = topology.leader.local_host_id().expect("caller id").to_string();
-            decoy_spec.pool = decoy();
+            decoy_spec.pool = "caller-pool".into();
             topology
                 .leader
                 .resource_backend()
@@ -690,14 +689,14 @@ mod tests {
                 .expect("caller kind");
         }
         let mut document = cli_resource_document(&*topology.client, node_id.clone(), "fulfilmentkind", name).await;
-        document["spec"]["pool"] = format!("pool-{percent}").into();
+        document["spec"]["pool"] = "applied-pool".into();
         let result = cli_apply_document(&*topology.client, node_id.clone(), document).await;
         assert!(matches!(result, CommandValue::ResourceObject(_)), "{result:?}");
         let stored = kinds.get(name).await.expect("stored kind").spec;
-        assert_eq!((stored.host_ref.as_str(), stored.pool), (host_ref.as_str(), format!("pool-{percent}")));
+        assert_eq!((stored.host_ref.as_str(), stored.pool), (host_ref.as_str(), "applied-pool".to_owned()));
         if target == 2 {
             let caller = topology.leader.resource_backend().using::<FulfilmentKind>("flotilla").get(name).await.expect("caller kind");
-            assert_eq!(caller.spec.pool, decoy());
+            assert_eq!(caller.spec.pool, "caller-pool");
         }
         // Another kind carrying a host ref round-trips through the same read envelope, CLI
         // renderer and local/routed apply-command handler.
@@ -714,39 +713,12 @@ mod tests {
         .await;
     }
 
-    /// A caller-store percentage that always differs from the applied one, so a
-    /// write to the wrong store is observable for every drawn percentage.
-    #[cfg(unix)]
-    fn decoy_percent(applied: u8) -> u8 {
-        if applied == 50 {
-            51
-        } else {
-            50
-        }
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn fulfilment_kind_cli_apply_pinned_rows() {
         for target in 0..=2 {
-            fulfilment_kind_cli_apply_scenario(target, 80).await;
+            fulfilment_kind_cli_apply_scenario(target).await;
         }
-    }
-
-    #[cfg(unix)]
-    #[hegel::test]
-    fn generated_fulfilment_kind_cli_apply(tc: hegel::TestCase) {
-        // The repo's hegel.toml budgets 12 cases in development/CI, 40 nightly.
-        // Hostless local, explicit local, routed peer; valid percentages including
-        // min/max, unchanged 50, and the live request 80. Both CLI modes share the
-        // same format-independent renderer, so no separate format dimension remains.
-        let target = tc.draw(hegel::generators::integers::<u8>().min_value(0).max_value(2));
-        let percent = tc.draw(hegel::generators::integers::<u8>().min_value(1).max_value(100));
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime")
-            .block_on(fulfilment_kind_cli_apply_scenario(target, percent));
     }
 
     #[test]

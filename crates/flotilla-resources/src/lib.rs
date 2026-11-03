@@ -165,7 +165,7 @@ pub use environment::{
 };
 pub use error::{FinalizerWaitReason, ResourceError};
 pub use event::{Event, EventRegarding, EventSpec, ObjectEvent, DEFAULT_EVENT_TTL_SECONDS};
-pub use field_ownership::{FieldOwnedResource, FieldOwnership, FieldOwnershipViolation, OwnershipEnforcement, WriterIdentity, WriterRole};
+pub use field_ownership::{FieldOwnershipViolation, WriterIdentity, WriterRole};
 pub use fleet_designation::{FleetDesignation, FleetDesignationSpec, FLEET_DESIGNATION_NAME};
 pub use flotilla_protocol::{PrincipalRef, ResourceRef};
 pub use forge::{Forge, ForgeKind, ForgeSpec};
