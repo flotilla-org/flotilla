@@ -281,7 +281,7 @@ Every message about a subscription is a message above plus the subscription's `i
 
 `unsubscribe` and `cancel` end a request; nothing more is sent for it, and an id that names no open request gets `error` `not_found`. An id may be reused once its request has ended; while it is open, reuse gets `duplicate_id`. A connection holds at most 256 open requests; one more gets `too_many_requests`. Wait subscriptions and the named queries a connection reads are its own: a wait's request ends after its one `wait_fired`, a wait ends with its request, and all of them end when the connection closes. A wait whose fires may have been missed ends with `error` `wait_lagged`; subscribe again. Commands are started over `/v1/commands`; `command` follows one under the same owner rule as `GET /v1/commands/{id}`.
 
-The server pings every 20 seconds and closes a connection silent for 60, and one whose browser session has ended or expired (code 1008). It queues at most 1,024 frames for a connection; a consumer that falls further behind is closed with code 1013 and resumes by cursor.
+The server pings every 20 seconds and closes a connection silent for 60. At each ping it also closes a connection whose browser session has ended or expired (code 1008), so a revoked session stays connected for at most 20 seconds. It queues at most 1,024 frames for a connection; a consumer that falls further behind is closed with code 1013 and resumes by cursor.
 
 Errors carry the table codes above, plus `invalid_message`, `unknown_type`, `duplicate_id`, `too_many_requests`, `wait_lagged`, `not_found`, `unavailable` (a request that needs the daemon), and `command`, `fetch_more` and `wait` when the daemon refuses that request.
 

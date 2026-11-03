@@ -50,13 +50,26 @@ struct Client {
 }
 
 async fn connect(router: &Router, caller: CallerAuth, protocols: &[&str]) -> Result<Client, tungstenite::Error> {
+    connect_from(router, caller, false, None, protocols).await
+}
+
+/// As [`connect`], authenticated by cookie or not, with an `Origin` header or none.
+async fn connect_from(
+    router: &Router,
+    caller: CallerAuth,
+    uses_cookie: bool,
+    origin: Option<&str>,
+    protocols: &[&str],
+) -> Result<Client, tungstenite::Error> {
     let (client, server) = tokio::io::duplex(1 << 16);
-    let policy =
-        TcpPolicy::new([HOST.to_owned()], move |_| Some(Authentication { caller: Caller::Custom(caller.clone()), uses_cookie: false }));
+    let policy = TcpPolicy::new([HOST.to_owned()], move |_| Some(Authentication { caller: Caller::Custom(caller.clone()), uses_cookie }));
     tokio::spawn(policy.serve_connection(server, router.clone(), std::future::pending()));
     let mut request = format!("ws://{HOST}{}", surface::PATH).into_client_request()?;
     if !protocols.is_empty() {
         request.headers_mut().insert(header::SEC_WEBSOCKET_PROTOCOL, protocols.join(", ").parse().unwrap());
+    }
+    if let Some(origin) = origin {
+        request.headers_mut().insert(header::ORIGIN, origin.parse().unwrap());
     }
     let (socket, response) = tokio_tungstenite::client_async(request, client).await?;
     let selected = response.headers().get(header::SEC_WEBSOCKET_PROTOCOL).and_then(|value| value.to_str().ok()).map(str::to_owned);
@@ -330,6 +343,31 @@ async fn the_upgrade_admits_users_offering_a_surface_subprotocol() {
     }
     let client = connect(&router, CallerAuth::Bearer, &[surface::JSON, surface::CBOR]).await.unwrap();
     assert!(client.cbor);
+}
+
+// Review of #4298: browsers exempt WebSocket upgrades from CORS, so the TCP listener's Origin
+// policy guards `/v1/surface` before the upgrade: a foreign `Origin` is refused, and so is a
+// cookie-authenticated upgrade with no `Origin`; a same-origin one is admitted.
+#[tokio::test]
+async fn the_upgrade_refuses_foreign_and_missing_origins() {
+    let router = router(ResourceBackend::new(InMemoryBackend::default()));
+    let logins = LoginStore::new(Arc::new(flotilla_resources::SystemClock));
+    let (session, _) = logins.redeem(&logins.mint_code().unwrap().code).unwrap().unwrap();
+    let session = CallerAuth::Session(session);
+    let same = format!("http://{HOST}");
+    for (caller, cookie, origin, expected) in [
+        (CallerAuth::Bearer, false, Some("http://elsewhere.test"), StatusCode::FORBIDDEN),
+        (session.clone(), true, Some("http://elsewhere.test"), StatusCode::FORBIDDEN),
+        (session.clone(), true, None, StatusCode::FORBIDDEN),
+        (session, true, Some(same.as_str()), StatusCode::SWITCHING_PROTOCOLS),
+    ] {
+        let status = match connect_from(&router, caller, cookie, origin, &[surface::CBOR]).await {
+            Err(tungstenite::Error::Http(response)) => response.status(),
+            Err(other) => panic!("{other}"),
+            Ok(_) => StatusCode::SWITCHING_PROTOCOLS,
+        };
+        assert_eq!(status, expected, "cookie {cookie}, origin {origin:?}");
+    }
 }
 
 // #3249: frames are refused, not decoded, past the reader's limits. The CBOR profile's safe reader
