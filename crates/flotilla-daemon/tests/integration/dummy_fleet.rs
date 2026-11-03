@@ -379,23 +379,15 @@ async fn on_the_engine_a_standing_ensure_readmits_after_abandon() {
     let first = fleet.wait("a first generation", |ensure| generation(ensure).is_some()).await;
     let first = generation(&first).expect("first generation");
     let open = |status: &ConvoyStatus| !status.phase.is_terminal();
-    fleet.wait("the first generation admitted", convoy(&first, open)).await;
-    let abandon = CommandAction::ConvoyAbandon {
-        namespace: Some(NAMESPACE.into()),
-        name: first.clone(),
-        reason: "exercise standing re-admission".into(),
-    };
-    // A convoy still moving through admission refuses the abandon and asks
-    // the operator to send it again, as `flotilla convoy abandon` would be.
-    let mut abandoned = fleet.execute(abandon.clone()).await;
-    for _ in 0..5 {
-        let CommandValue::Error { message } = &abandoned else { break };
-        if !message.ends_with("retry the command") {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        abandoned = fleet.execute(abandon.clone()).await;
-    }
+    // Abandon refuses a convoy still moving out of Pending.
+    fleet.wait("the first generation Active", in_phase(&first, ConvoyPhase::Active)).await;
+    let abandoned = fleet
+        .execute(CommandAction::ConvoyAbandon {
+            namespace: Some(NAMESPACE.into()),
+            name: first.clone(),
+            reason: "exercise standing re-admission".into(),
+        })
+        .await;
     assert!(!matches!(abandoned, CommandValue::Error { .. }), "{abandoned:?}");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let second = loop {
