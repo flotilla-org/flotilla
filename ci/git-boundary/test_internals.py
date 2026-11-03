@@ -7,7 +7,9 @@ counts, per file, the test code that rebuilds the daemon's own layers instead:
 - the controller runtime's internals, `ControllerRuntimeState` and
   `DockerControllerRuntime`, named anywhere;
 - direct calls to reconcile functions: any call whose callee is named
-  `reconcile` or starts with `reconcile_`.
+  `reconcile` or starts with `reconcile_`, outside crates that cannot reach a
+  controller (`NO_CONTROLLERS`, where `reconcile` means something else, such
+  as the TUI's table state).
 
 Test code is what check.py exempts from the production boundary: Cargo
 integration-test directories, testkits, `cfg(test)` items and out-of-line test
@@ -25,6 +27,8 @@ import check
 
 
 INTERNAL_TYPES = {"ControllerRuntimeState", "DockerControllerRuntime"}
+# Crates that reach no controller; their `reconcile` calls are their own.
+NO_CONTROLLERS = ("crates/flotilla-tui/",)
 ALLOWLIST = Path(__file__).with_name("test_internals_allowlist.toml")
 GROWN = ("test reaches daemon internals ({found} uses, {allowed} allowed): start the daemon with "
          "flotilla_daemon_testkit::daemon::TestDaemon and drive it through commands, its vendors and restarts")
@@ -45,21 +49,21 @@ def callee_name(call):
     return None
 
 
-def internal_use(node):
+def internal_use(node, path):
     if node.kind() in {"identifier", "type_identifier"}:
         return node.text().removeprefix("r#") in INTERNAL_TYPES
-    if node.kind() == "call_expression":
+    if node.kind() == "call_expression" and not path.startswith(NO_CONTROLLERS):
         name = callee_name(node)
         return name is not None and (name == "reconcile" or name.startswith("reconcile_"))
     return False
 
 
-def uses(node, inside_test):
+def uses(node, path, inside_test):
     """Internal uses within test code below `node`; cfg(test) items open test code."""
     found = []
 
     def visit(node, inside_test):
-        if inside_test and internal_use(node):
+        if inside_test and internal_use(node, path):
             found.append(node.range().start.line + 1)
         test_item = False
         for child in node.children():
@@ -94,7 +98,7 @@ def file_uses(sources):
     result = {}
     for path, source in sources.items():
         whole_file = path not in scanned or (check.integration_test_path(path) and not scanned[path])
-        lines = uses(SgRoot(source, "rust").root(), whole_file)
+        lines = uses(SgRoot(source, "rust").root(), path, whole_file)
         if lines:
             result[path] = lines
     return result
@@ -128,23 +132,3 @@ def report(found, allowed):
 def scan(sources, allowlist_text=None):
     allowed = load_allowlist(ALLOWLIST.read_text() if allowlist_text is None else allowlist_text)
     return report(file_uses(sources), allowed)
-
-
-def render_allowlist(sources):
-    """The allowlist that admits exactly today's uses."""
-    header = ("# Test files that still rebuild the daemon's own layers, and how many uses each holds (#4321).\n"
-              "# The ratchet in test_internals.py fails a file whose count rises or falls without this list\n"
-              "# changing to match. Only lower or remove entries: new tests use TestDaemon.\n")
-    entries = "".join(f'\n[[allow]]\npath = "{path}"\ncount = {len(lines)}\n' for path, lines in sorted(file_uses(sources).items()))
-    return header + entries
-
-
-if __name__ == "__main__":
-    import argparse
-    import subprocess
-
-    parser = argparse.ArgumentParser(description="Print the test internals allowlist for today's tree.")
-    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
-    args = parser.parse_args()
-    files = subprocess.check_output(["git", "ls-files", "-z", "--", "*.rs"], cwd=args.root).decode().split("\0")
-    print(render_allowlist({file: (args.root / file).read_text() for file in filter(None, files) if (args.root / file).exists()}), end="")

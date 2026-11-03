@@ -108,7 +108,8 @@ layers instead of starting it through
 
 - `ControllerRuntimeState` and `DockerControllerRuntime`, named anywhere;
 - direct calls to reconcile functions: any call whose callee is `reconcile` or
-  starts with `reconcile_`.
+  starts with `reconcile_`, except in crates that reach no controller
+  (`NO_CONTROLLERS`: the TUI, whose table state has its own `reconcile`).
 
 Test code is what the boundary checks exempt: Cargo integration-test
 directories, testkits, `cfg(test)` items and out-of-line test modules.
@@ -118,7 +119,6 @@ write the scenario against `TestDaemon`, driving the daemon through commands,
 its vendors and restarts. A lower count fails until the entry is lowered or
 removed, so the allowlist only shrinks. Never add an entry or raise a count.
 
-`python ci/git-boundary/test_internals.py` prints the allowlist that admits the
-current tree; use it only to lower counts after removing uses. Like the other
-rules this is syntax, not name resolution: aliases and helpers that wrap the
+A stale entry's failure prints the count to lower it to. Like the other rules
+this is syntax, not name resolution: aliases and helpers that wrap the
 internals are outside its scope.

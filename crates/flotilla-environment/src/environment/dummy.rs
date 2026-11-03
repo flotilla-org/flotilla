@@ -60,7 +60,7 @@ pub const DUMMY_CLOUD_ENVIRONMENT_INSTANCE: &str = "dummy-cloud";
 
 /// The vendor class a dummy instance stands in for.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum DummyEnvironmentClass {
+enum DummyEnvironmentClass {
     /// Per-vessel environments on the daemon's host, as Docker realises them.
     #[default]
     Container,
@@ -134,10 +134,6 @@ impl DummyEnvironmentProvider {
     pub fn with_cleanup(mut self, cleanup: DummyEnvironmentCleanup) -> Self {
         self.cleanup = Some(cleanup);
         self
-    }
-
-    pub fn class(&self) -> DummyEnvironmentClass {
-        self.class
     }
 
     fn handles(&self) -> std::sync::MutexGuard<'_, HashMap<EnvironmentId, Arc<DummyEnvironment>>> {

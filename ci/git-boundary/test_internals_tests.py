@@ -75,17 +75,18 @@ class TestInternalsTests(unittest.TestCase):
         self.assertEqual(scan(two, entry(INTEGRATION, 3)), [f"{INTEGRATION}: " + test_internals.SHRUNK.format(found=2, allowed=3)])
         self.assertEqual(scan({}, entry(INTEGRATION, 1)), [f"{INTEGRATION}: " + test_internals.SHRUNK.format(found=0, allowed=1)])
 
+    # Crates that reach no controller keep their own `reconcile` calls; the
+    # controller runtime's types are still counted there.
+    def test_reconcile_calls_count_only_where_controllers_are_reachable(self):
+        tui = "crates/flotilla-tui/src/table_view.rs"
+        self.assertEqual(scan({tui: f"#[cfg(test)]\nfn f() {{ {USES[4]} {USES[3]} }}"}), [])
+        self.assertEqual(len(scan({tui: f"#[cfg(test)]\nfn f() {{ {USES[0]} }}"})), 1)
+
     def test_malformed_allowlists_are_refused(self):
         for text in ['[[allow]]\npath = "a.rs"\n', '[[allow]]\npath = "a.rs"\ncount = 0\n', entry("a.rs", 1) + entry("a.rs", 2)]:
             with self.subTest(text=text):
                 with self.assertRaises(ValueError):
                     test_internals.load_allowlist(text)
-
-    # The committed allowlist is what the generator prints for these sources.
-    def test_the_generator_admits_todays_uses(self):
-        sources = {INTEGRATION: f"fn f() {{ {USES[0]} {USES[4]} }}", "crates/a/src/lib.rs": f"fn f() {{ {USES[0]} }}"}
-        self.assertEqual(scan(sources, test_internals.render_allowlist(sources)), [])
-        self.assertIn(entry(INTEGRATION, 2), test_internals.render_allowlist(sources))
 
 
 if __name__ == "__main__":

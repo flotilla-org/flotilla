@@ -306,10 +306,3 @@ count = 4
 path = "crates/flotilla-store-testkit/tests/integration/k8s_integration.rs"
 count = 5
 
-[[allow]]
-path = "crates/flotilla-tui/src/table_view.rs"
-count = 6
-
-[[allow]]
-path = "crates/flotilla-tui/src/widgets/project_page.rs"
-count = 2

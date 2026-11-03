@@ -640,11 +640,6 @@ impl TestClient {
         Self { client, _shutdown: shutdown, session }
     }
 
-    /// The client as any frontend holds it.
-    pub fn handle(&self) -> Arc<dyn DaemonHandle> {
-        Arc::clone(&self.client) as Arc<dyn DaemonHandle>
-    }
-
     /// Send `action` and return its value, as `flotilla` does for each command.
     pub async fn execute(&self, action: CommandAction) -> CommandValue {
         let command = flotilla_protocol::Command::builder().action(action).build();
