@@ -445,7 +445,7 @@ async fn reconcile_cloud_environment(
                 Ok(())
             }
             ObservationState::Gone { cause } => {
-                mark_unavailable_environment(state, namespace, &id, BackingDisposition::Gone, &format!("cloud sandbox gone: {cause:?}"))
+                mark_unavailable_environment(state, namespace, &id, BackingDisposition::Lost, &format!("cloud sandbox gone: {cause:?}"))
                     .await
             }
             ObservationState::Stopped { cause } => {
@@ -469,7 +469,7 @@ async fn reconcile_cloud_environment(
                 state,
                 namespace,
                 &id,
-                BackingDisposition::Gone,
+                BackingDisposition::Lost,
                 "cloud sandbox missing from authoritative provider inventory",
             )
             .await
@@ -477,10 +477,11 @@ async fn reconcile_cloud_environment(
     }
 }
 
-/// A cloud sandbox lost before its provider's word was recorded, as by a
-/// generation that recorded only `Lost`: ask again, so teardown can release
-/// work the provider confirms gone (#4304). A stopped sandbox keeps its disk,
-/// and an unknown one may return, so either stays held as it is.
+/// A lost cloud sandbox, asked again on a later pass: only a second, independent
+/// report that it is gone or absent records the backing gone, so one transient
+/// or partial inventory never discards work (#4304). This also covers a sandbox
+/// a previous generation recorded only as `Lost`. A stopped sandbox keeps its
+/// disk, and an unknown one may return, so either stays held as it is.
 async fn confirm_lost_cloud_backing(
     state: &Arc<ControllerRuntimeState>,
     namespace: &str,

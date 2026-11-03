@@ -845,6 +845,7 @@ where
             // Nothing is left to remove or archive: record what went with the backing and release.
             let path = obj.status.as_ref().and_then(|status| status.path.as_deref()).or(obj.spec.target_path()).unwrap_or("<unknown path>");
             let message = format!("checkout {path} is unrecoverable: its environment's backing is gone ({reason})");
+            // A retry after a later release failure records this event again; a repeat is harmless.
             EventRecorder::new(self.backend.clone())
                 .record(ObjectEvent::for_object(obj, "CheckoutWorkLost", message.clone()), self.clock.now())
                 .await?;

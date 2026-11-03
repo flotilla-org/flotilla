@@ -2016,11 +2016,17 @@ impl CrewService {
         namespace: &str,
         spec: &flotilla_resources::CheckoutSpec,
     ) -> Result<Option<String>, String> {
-        let Some(env_ref) = spec.env_ref().filter(|env_ref| !env_ref.is_empty()) else {
-            return Ok(None);
-        };
-        match self.resource_backend.clone().using::<Environment>(namespace).get(env_ref).await {
-            Ok(environment) => Ok(environment.status.as_ref().and_then(|status| status.backing_gone_reason()).map(str::to_owned)),
+        match spec.env_ref().filter(|env_ref| !env_ref.is_empty()) {
+            Some(env_ref) => self.environment_backing_gone_reason(namespace, env_ref).await,
+            None => Ok(None),
+        }
+    }
+
+    /// The one store read behind every crew-side "backing gone" judgement: a
+    /// missing Environment leaves the existing behaviour.
+    async fn environment_backing_gone_reason(&self, namespace: &str, environment_ref: &str) -> Result<Option<String>, String> {
+        match self.resource_backend.including_replicas::<Environment>(namespace).get(environment_ref).await {
+            Ok(environment) => Ok(environment.object.status.as_ref().and_then(|status| status.backing_gone_reason()).map(str::to_owned)),
             Err(ResourceError::NotFound { .. }) => Ok(None),
             Err(error) => Err(error.to_string()),
         }
@@ -3059,13 +3065,9 @@ impl CrewService {
 
     /// Whether the vessel's Environment records its backing confirmed gone (#4304).
     async fn vessel_backing_gone(&self, namespace: &str, vessel: &flotilla_resources::ReadResourceObject<Vessel>) -> Result<bool, String> {
-        let Some(environment_ref) = vessel.object.status.as_ref().and_then(|status| status.environment_ref.as_ref()) else {
-            return Ok(false);
-        };
-        match self.resource_backend.including_replicas::<Environment>(namespace).get(environment_ref).await {
-            Ok(environment) => Ok(environment.object.status.as_ref().is_some_and(|status| status.backing_gone_reason().is_some())),
-            Err(ResourceError::NotFound { .. }) => Ok(false),
-            Err(error) => Err(error.to_string()),
+        match vessel.object.status.as_ref().and_then(|status| status.environment_ref.as_ref()) {
+            Some(environment_ref) => Ok(self.environment_backing_gone_reason(namespace, environment_ref).await?.is_some()),
+            None => Ok(false),
         }
     }
 

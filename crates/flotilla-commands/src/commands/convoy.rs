@@ -63,7 +63,9 @@ pub struct ConvoyExplainArgs {
 pub struct ConvoyDeleteArgs {
     /// Convoy role or role@project address
     pub name: String,
-    /// Skip integration safety checks
+    /// Skip integration safety checks. The delete is always issued; the command
+    /// fails only to name teardown it could not release (#4304), so retrying it
+    /// re-reports rather than re-deletes.
     #[arg(long, default_value_t = false)]
     pub force: bool,
 }
