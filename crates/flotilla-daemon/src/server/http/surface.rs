@@ -256,11 +256,16 @@ impl<'de> Deserialize<'de> for Strict {
 
 /// A server message: `body`'s fields, plus the `id` it answers.
 fn tagged(body: impl serde::Serialize, id: Option<&Id>) -> Value {
-    let mut value = serde_json::to_value(body).expect("server messages serialize");
+    let mut value = body_of(body);
     if let (Some(id), Value::Object(map)) = (id, &mut value) {
         map.insert("id".into(), id.clone());
     }
     value
+}
+
+/// A server message body; one that cannot be represented becomes an `encoding` error.
+fn body_of(body: impl serde::Serialize) -> Value {
+    serde_json::to_value(body).unwrap_or_else(|reason| error("encoding", reason.to_string(), None))
 }
 
 fn error(code: &str, message: impl Into<String>, id: Option<&Id>) -> Value {
@@ -534,7 +539,7 @@ impl Connection {
             let query = Query::parse(&params, &description.table)?;
             let resume = subscribe.cursor.map(|cursor| Resume { incarnation: cursor.incarnation, sequence: cursor.sequence });
             let messages = source.messages(description, query, resume).await?;
-            Ok(messages.map(|message| serde_json::to_value(message).expect("table messages serialize")).boxed())
+            Ok(messages.map(body_of).boxed())
         })
     }
 
@@ -569,8 +574,10 @@ impl Connection {
                 loop {
                     match events.recv().await {
                         Ok(DaemonEvent::LeafFired(fire)) if fire.watcher_id == watcher && fire.subscription_id == subscription_id => {
-                            let mut body = serde_json::to_value(&fire).expect("leaf fires serialize");
-                            body["type"] = json!("wait_fired");
+                            let mut body = body_of(&fire);
+                            if body["type"] != "error" {
+                                body["type"] = json!("wait_fired");
+                            }
                             return Some((body, Some((events, release))));
                         }
                         Ok(_) => continue,
@@ -601,7 +608,7 @@ impl Connection {
                 };
                 Failure::new(code, message)
             })?;
-            Ok(progress.map(|progress| serde_json::to_value(progress).expect("command progress serializes")).boxed())
+            Ok(progress.map(body_of).boxed())
         })
     }
 }
