@@ -2,64 +2,18 @@ name: Claude Code Review
 on:
   pull_request:
     types: [opened, synchronize]
-    # Optional: Only run on specific file changes
-    # paths:
-    #   - "src/**/*.ts"
-    #   - "src/**/*.tsx"
-    #   - "src/**/*.js"
-    #   - "src/**/*.jsx"
 jobs:
-  claude-review:
-    if: ${{ !contains(github.event.pull_request.labels.*.name, 'in-vessel-review') }}
-    timeout-minutes: 15
-    # Optional: Filter by PR author
-    # if: |
-    #   github.event.pull_request.user.login == 'external-contributor' ||
-    #   github.event.pull_request.user.login == 'new-developer' ||
-    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
-    runs-on: ubuntu-latest
+  review:
+    # The shared reviewer (flotilla-org/flotilla#2754, #3709). Crew convoys that
+    # review in the vessel opt out with the in-vessel-review label.
+    uses: flotilla-org/.github/.github/workflows/claude-review.yml@v1-canary
     permissions:
       contents: read
       pull-requests: read
       issues: read
       id-token: write
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 1
-      - name: Run Claude Code Review
-        id: claude-review
-        uses: anthropics/claude-code-action@v1
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # Crew convoys open PRs as the flotilla-crew GitHub App; the action's
-          # human-actor guard would otherwise refuse to review them.
-          allowed_bots: "flotilla-crew"
-          prompt: |
-            REPO: ${{ github.repository }}
-            PR NUMBER: ${{ github.event.pull_request.number }}
-
-            Please review this pull request and provide feedback on:
-            - Code quality and best practices
-            - Potential bugs or issues
-            - Performance considerations
-            - Security concerns
-            - Test coverage
-
-            Read the repository's CLAUDE.md and CODING_STANDARDS.md for guidance on style and conventions. Be constructive and helpful in your feedback.
-
-            You are a STATIC reviewer by design: you review the diff and repository source only.
-            Dedicated CI jobs run cargo fmt/clippy/test on this PR and their results are visible
-            as checks - do NOT attempt to run builds, tests, or linters, and do NOT disclaim or
-            apologize for not running them. A static review is the complete job, not a degraded one.
-
-            AFTER reviewing, 
-              * CHECK your findings against the existing comments and replies on the PR. e.g if followup issues are filed or the implementor pushed back, make sure that is 
-              correct: drop issues that are already addressed, repeat issues that still need to be dealt with with an explanation.
-              * ALWAYS Use `gh pr comment` with your Bash tool to leave your review as a SINGLE comment on the PR, properly formatted as markdown, even if just to say that you found no issues.
-
-          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
-          # or https://docs.claude.com/en/docs/claude-code/cli-reference for available options
-          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
-
+    with:
+      guidance: "the repository's CLAUDE.md and CODING_STANDARDS.md"
+      skip_label: in-vessel-review
+      model: claude-opus-5-5
+    secrets: inherit
