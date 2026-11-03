@@ -388,6 +388,8 @@ async fn malformed_frames_get_errors_and_oversized_frames_close() {
     }
     client.send_raw(Frame::Text("{}".into())).await;
     assert_eq!(client.next().await["code"], "invalid_message");
+    client.send(json!({"type": "cancel", "id": ["x"]})).await;
+    assert_eq!(client.next().await["code"], "invalid_message");
     client.send(json!({"type": "teleport", "id": 7})).await;
     let unknown = client.next().await;
     assert_eq!((unknown["code"].as_str(), unknown["id"].as_u64()), (Some("unknown_type"), Some(7)));
@@ -708,6 +710,25 @@ async fn a_consumer_that_falls_behind_is_closed_with_1013() {
         create(&backend, &format!("c{index}")).await;
     }
     assert_eq!(client.close_code().await, Some(CloseCode::Again));
+}
+
+// Review of #4298: a client that stops reading cannot hold the connection open. A frame that
+// cannot be written within the write limit closes it, releasing what it holds; under paused time.
+#[tokio::test(start_paused = true)]
+async fn a_client_that_never_reads_is_dropped() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let router = router(backend.clone());
+    // Few, large frames: the socket's buffer fills long before the send queue would overflow.
+    for index in 0..300 {
+        create(&backend, &format!("c{index}")).await;
+    }
+    let mut client = user(&router, surface::CBOR).await;
+    for index in 0..10 {
+        client.send(json!({"type": "subscribe", "id": format!("s{index}"), "table": "convoys", "namespace": "test"})).await;
+    }
+    tokio::time::sleep(surface::WRITE_LIMIT * 2).await;
+    let probe = client.socket.send(Frame::Text("{}".into())).await;
+    assert!(probe.is_err(), "the server still reads from a client that never reads");
 }
 
 // #3249: a subscription with nothing to report still hears from the server at least every 15

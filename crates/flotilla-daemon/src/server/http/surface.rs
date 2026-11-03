@@ -42,6 +42,8 @@ const SEND_QUEUE: usize = 1024;
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 /// A connection silent this long, pongs included, is closed.
 const IDLE_LIMIT: Duration = Duration::from_secs(60);
+/// The longest one frame may take to reach a client; a client that stops reading is closed.
+pub(super) const WRITE_LIMIT: Duration = Duration::from_secs(10);
 /// Requests one connection may hold open at once.
 pub(super) const OPEN_LIMIT: usize = 256;
 /// The server's own message types, beside the table messages.
@@ -194,6 +196,11 @@ fn error(code: &str, message: impl Into<String>, id: Option<&Id>) -> Value {
 
 fn failure(failure: Failure, id: &Id) -> Value {
     error(&failure.code, failure.message, Some(id))
+}
+
+/// Sends one frame within [`WRITE_LIMIT`]; false when it failed or the client stopped reading.
+async fn send(socket: &mut Socket, frame: Frame) -> bool {
+    matches!(tokio::time::timeout(WRITE_LIMIT, socket.send(frame)).await, Ok(Ok(())))
 }
 
 /// What the connection loop does next.
@@ -356,7 +363,7 @@ impl Connection {
                                 break;
                             }
                         }
-                        if socket.send(Frame::Ping(Default::default())).await.is_err() {
+                        if !send(&mut socket, Frame::Ping(Default::default())).await {
                             break;
                         }
                     }
@@ -368,7 +375,7 @@ impl Connection {
             self.end(&id).await;
         }
         if let Some((code, reason)) = close {
-            let _ = socket.send(Frame::Close(Some(CloseFrame { code: CloseCode::from(code), reason: reason.into() }))).await;
+            send(&mut socket, Frame::Close(Some(CloseFrame { code: CloseCode::from(code), reason: reason.into() }))).await;
         }
         if let Some(feed) = &self.feed {
             feed.close().await;
@@ -387,7 +394,7 @@ impl Connection {
             Encoding::Cbor => Frame::Binary(bytes.into()),
             Encoding::Json => Frame::Text(String::from_utf8(bytes).expect("JSON is UTF-8").into()),
         };
-        socket.send(frame).await.is_ok()
+        send(socket, frame).await
     }
 
     /// Ends open request `id`, releasing the named query or wait it holds.
@@ -414,6 +421,10 @@ impl Connection {
             }
         };
         let id = map.get("id").cloned();
+        if id.as_ref().is_some_and(|id| !id.is_string() && !id.is_i64() && !id.is_u64()) {
+            outbox.send(error("invalid_message", "an id is a string or an integer", None));
+            return;
+        }
         let kind = map.get("type").and_then(Value::as_str).unwrap_or_default().to_owned();
         if !CLIENT_TYPES.contains(&kind.as_str()) {
             outbox.send(error("unknown_type", format!("unknown message type `{kind}`"), id.as_ref()));
