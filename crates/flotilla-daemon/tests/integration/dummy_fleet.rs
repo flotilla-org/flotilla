@@ -1250,6 +1250,23 @@ impl DummyDaemon {
                 &flotilla_engine_store::plain::PendingChange::new(flotilla_schema::NewChange::new("transport", at)),
             )
             .expect("provision record");
+        // Kept by the status controller: the daemon's own place, and a key naming no convoy.
+        flotilla_engine_store::plain::PlainLog::new(service.store())
+            .create(
+                "transport-access",
+                &flotilla_resources::AccessDeliverySpec {
+                    access: "transport-access".into(),
+                    place: flotilla_resources::host_direct_environment_name(
+                        &self.daemon.local_host_id().expect("local host id").to_string(),
+                    ),
+                    harness: "claude-code".into(),
+                    home: "/transport".into(),
+                    needs: Default::default(),
+                    retry: None,
+                },
+                &flotilla_engine_store::plain::PendingChange::new(flotilla_schema::NewChange::new("transport", at)),
+            )
+            .expect("access delivery record");
         // #3824 layer 2c: a ManifestRoot, declared with no records yet.
         let mut roots =
             Home::<flotilla_provisioning::stored::manifest_root::ManifestRoot, _>::with_log(home, StoreLog::new(service.store()))
@@ -1320,15 +1337,6 @@ impl DummyDaemon {
             .build();
         let record = flotilla_provisioning::stored::artifact::ArtifactRecord::from_spec(&artifact).expect("artifact");
         log.create("transport-artifact", &record, &change).expect("artifact record");
-        let delivery = flotilla_resources::AccessDeliverySpec {
-            access: flotilla_resources::access_delivery::access_key("transport", "transport-convoy", "implement", "coder"),
-            place: "transport-env".into(),
-            harness: "claude-code".into(),
-            home: "/home/crew".into(),
-            needs: Default::default(),
-            retry: None,
-        };
-        log.create("transport-access", &delivery, &change).expect("access delivery record");
         // One record of each forge observation.
         use flotilla_provisioning::stored::forge_observation::{ChangeRequestRecord, ForgeReadRecord, IssueRecord, IssueState, ReadValue};
         let change_request = ChangeRequestRecord {
