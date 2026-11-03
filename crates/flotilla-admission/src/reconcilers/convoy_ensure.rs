@@ -1173,6 +1173,7 @@ impl EnsurePass<'_> {
     async fn start_ensured_convoy(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<String, String> {
         let (ensure, admission) = self.admission.prepare(namespace, ensure).await?;
         let latest = |generations: Vec<ResourceObject<ResourceConvoy>>| generations.into_iter().max_by_key(|convoy| convoy.spec.generation);
+        // A listing that fails here aborts the start before anything is admitted; the next pass retries.
         let before = latest(self.ensured_convoy_generations(namespace, &ensure.metadata.name).await?).map(|convoy| convoy.spec.generation);
         match self.commit_ensured_convoy(namespace, &ensure, admission).await {
             Ok(name) => Ok(name),
