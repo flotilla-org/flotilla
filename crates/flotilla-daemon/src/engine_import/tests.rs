@@ -412,7 +412,7 @@ async fn the_rehearsal_reports_what_the_import_writes() {
 }
 
 #[test]
-fn rows_of_kinds_no_importer_reads_are_dropped_kept_or_refused_here_only() {
+fn rows_of_kinds_no_importer_reads_are_dropped_or_refused_here_only() {
     let row = |plural: &str, home: &str, name: &str| Row {
         namespace: NS.into(),
         plural: plural.into(),
@@ -435,11 +435,7 @@ fn rows_of_kinds_no_importer_reads_are_dropped_kept_or_refused_here_only() {
     assert_eq!(summary.kinds["Usage"].dropped, 1);
     assert_eq!(summary.kinds["Event"].dropped, 1);
     assert_eq!(summary.kinds["Regard"].dropped, 1, "only this home's row is dropped here");
-    assert_eq!(
-        summary.staying.get("FulfilmentKind"),
-        Some(&("the layer that serves FulfilmentKind from the engine", 1)),
-        "a kind still moving stays on the old store"
-    );
+    assert!(summary.staying.is_empty(), "an imported kind's rows are its step's: {:?}", summary.staying);
     assert_eq!(
         summary.refusals,
         vec![Refusal { kind: "widgets".into(), name: "widget".into(), reason: "no import plan for its kind".into() }]
