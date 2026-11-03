@@ -11,6 +11,7 @@ spec.loader.exec_module(check)
 # The store-read guard rail lives in its own module; importing its cases here
 # keeps the existing `-p test_check.py` CI discovery command running them.
 from store_reads_tests import StoreReadTests  # noqa: E402,F401
+from test_internals_tests import TestInternalsTests  # noqa: E402,F401
 
 
 class GitBoundaryTests(unittest.TestCase):

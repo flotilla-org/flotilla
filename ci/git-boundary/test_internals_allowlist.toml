@@ -1,0 +1,315 @@
+# Test files that still rebuild the daemon's own layers, and how many uses each holds (#4321).
+# The ratchet in test_internals.py fails a file whose count rises or falls without this list
+# changing to match. Only lower or remove entries: new tests use TestDaemon.
+
+[[allow]]
+path = "crates/flotilla-admission/src/project_image_layers.rs"
+count = 21
+
+[[allow]]
+path = "crates/flotilla-admission/src/project_ops.rs"
+count = 7
+
+[[allow]]
+path = "crates/flotilla-admission/src/project_ops/registration_race.rs"
+count = 1
+
+[[allow]]
+path = "crates/flotilla-admission/src/reconcilers/convoy_ensure.rs"
+count = 11
+
+[[allow]]
+path = "crates/flotilla-admission/tests/integration/convoy_ensure.rs"
+count = 4
+
+[[allow]]
+path = "crates/flotilla-controllers/tests/integration/convoy_reconcile.rs"
+count = 103
+
+[[allow]]
+path = "crates/flotilla-controllers/tests/integration/in_process_daemon.rs"
+count = 10
+
+[[allow]]
+path = "crates/flotilla-controllers/tests/integration/liveness_contract.rs"
+count = 2
+
+[[allow]]
+path = "crates/flotilla-controllers/tests/integration/provisioning_in_memory.rs"
+count = 2
+
+[[allow]]
+path = "crates/flotilla-core/src/in_process/tests/crew_lifecycle.rs"
+count = 4
+
+[[allow]]
+path = "crates/flotilla-core/src/in_process/tests/host_admission.rs"
+count = 3
+
+[[allow]]
+path = "crates/flotilla-core/src/in_process/tests/resume.rs"
+count = 1
+
+[[allow]]
+path = "crates/flotilla-core/src/in_process/tests/supervision.rs"
+count = 1
+
+[[allow]]
+path = "crates/flotilla-core/src/in_process/tests/turn_delivery.rs"
+count = 4
+
+[[allow]]
+path = "crates/flotilla-credentials/src/credential.rs"
+count = 11
+
+[[allow]]
+path = "crates/flotilla-crew/src/charter_notifications.rs"
+count = 1
+
+[[allow]]
+path = "crates/flotilla-crew/src/crew_ops/tests/awaiting.rs"
+count = 1
+
+[[allow]]
+path = "crates/flotilla-crew/src/crew_ops/tests/capabilities.rs"
+count = 3
+
+[[allow]]
+path = "crates/flotilla-crew/src/crew_ops/tests/message_admission.rs"
+count = 4
+
+[[allow]]
+path = "crates/flotilla-crew/src/crew_ops/tests/supervision.rs"
+count = 3
+
+[[allow]]
+path = "crates/flotilla-crew/src/leaf_engine/tests/stalls_supervision.rs"
+count = 2
+
+[[allow]]
+path = "crates/flotilla-crew/src/reconcilers/vessel.rs"
+count = 1
+
+[[allow]]
+path = "crates/flotilla-crew/tests/integration/convoy_engine_path.rs"
+count = 4
+
+[[allow]]
+path = "crates/flotilla-crew/tests/integration/convoy_in_memory.rs"
+count = 5
+
+[[allow]]
+path = "crates/flotilla-crew/tests/integration/placement_tiebreak_capacity_wait.rs"
+count = 3
+
+[[allow]]
+path = "crates/flotilla-crew/tests/integration/terminal_lifecycle.rs"
+count = 2
+
+[[allow]]
+path = "crates/flotilla-crew/tests/integration/terminal_session_reconciler.rs"
+count = 51
+
+[[allow]]
+path = "crates/flotilla-crew/tests/integration/vessel_finalization.rs"
+count = 2
+
+[[allow]]
+path = "crates/flotilla-crew/tests/integration/vessel_reconciler.rs"
+count = 50
+
+[[allow]]
+path = "crates/flotilla-daemon/src/dispatch_reconciler.rs"
+count = 33
+
+[[allow]]
+path = "crates/flotilla-daemon/src/resource_manifest.rs"
+count = 76
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/account_access.rs"
+count = 2
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/tests/adopted_checkouts.rs"
+count = 3
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/tests/clone_credentials.rs"
+count = 1
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/tests/clone_reads.rs"
+count = 1
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/tests/convoy_lifecycle.rs"
+count = 5
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/tests/credential_delivery.rs"
+count = 27
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/tests/discovery.rs"
+count = 2
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/tests/docker.rs"
+count = 20
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/tests/drydock_launch.rs"
+count = 6
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/tests/environments.rs"
+count = 17
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/tests/launch_support.rs"
+count = 1
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/tests/lifecycle_support.rs"
+count = 1
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/tests/memory_tests.rs"
+count = 8
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/tests/message.rs"
+count = 20
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/tests/placement_support.rs"
+count = 2
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/tests/recovery_scenario.rs"
+count = 2
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/tests/ssh_host_harness.rs"
+count = 8
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/tests/terminal.rs"
+count = 8
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/tests/terminal_support.rs"
+count = 6
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/tests/work_credentials.rs"
+count = 13
+
+[[allow]]
+path = "crates/flotilla-daemon/src/server/tests.rs"
+count = 1
+
+[[allow]]
+path = "crates/flotilla-daemon/tests/daemon_allocations.rs"
+count = 2
+
+[[allow]]
+path = "crates/flotilla-daemon/tests/integration/aggregator.rs"
+count = 1
+
+[[allow]]
+path = "crates/flotilla-daemon/tests/integration/dummy_fleet.rs"
+count = 1
+
+[[allow]]
+path = "crates/flotilla-daemon/tests/integration/project_cli.rs"
+count = 1
+
+[[allow]]
+path = "crates/flotilla-daemon/tests/integration/reconciled_remote_turn.rs"
+count = 2
+
+[[allow]]
+path = "crates/flotilla-daemon/tests/request_session_pair/main.rs"
+count = 3
+
+[[allow]]
+path = "crates/flotilla-messaging/tests/message.rs"
+count = 91
+
+[[allow]]
+path = "crates/flotilla-observation/src/change_request_observer.rs"
+count = 4
+
+[[allow]]
+path = "crates/flotilla-observation/src/observed_resources.rs"
+count = 2
+
+[[allow]]
+path = "crates/flotilla-orchestration-testkit/src/ensure_scenarios/addressing.rs"
+count = 1
+
+[[allow]]
+path = "crates/flotilla-orchestration-testkit/src/ensure_scenarios/admission.rs"
+count = 32
+
+[[allow]]
+path = "crates/flotilla-orchestration-testkit/src/ensure_scenarios/retry.rs"
+count = 26
+
+[[allow]]
+path = "crates/flotilla-orchestration-testkit/src/ensure_scenarios/teardown.rs"
+count = 15
+
+[[allow]]
+path = "crates/flotilla-orchestration-testkit/src/lib.rs"
+count = 3
+
+[[allow]]
+path = "crates/flotilla-projections/src/issue_materializer.rs"
+count = 25
+
+[[allow]]
+path = "crates/flotilla-provisioning/src/engine/tests.rs"
+count = 18
+
+[[allow]]
+path = "crates/flotilla-provisioning/tests/integration/checkout_reconciler.rs"
+count = 12
+
+[[allow]]
+path = "crates/flotilla-provisioning/tests/integration/clone_reconciler.rs"
+count = 6
+
+[[allow]]
+path = "crates/flotilla-provisioning/tests/integration/environment_reconciler.rs"
+count = 10
+
+[[allow]]
+path = "crates/flotilla-provisioning/tests/integration/image_build.rs"
+count = 3
+
+[[allow]]
+path = "crates/flotilla-replication/src/replicator.rs"
+count = 2
+
+[[allow]]
+path = "crates/flotilla-store-testkit/src/support/liveness.rs"
+count = 2
+
+[[allow]]
+path = "crates/flotilla-store-testkit/tests/integration/field_ownership.rs"
+count = 4
+
+[[allow]]
+path = "crates/flotilla-store-testkit/tests/integration/k8s_integration.rs"
+count = 5
+
+[[allow]]
+path = "crates/flotilla-tui/src/table_view.rs"
+count = 6
+
+[[allow]]
+path = "crates/flotilla-tui/src/widgets/project_page.rs"
+count = 2

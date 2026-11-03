@@ -12,7 +12,7 @@ use std::{
 use async_trait::async_trait;
 use flotilla_config::dummy_fleet::DummyFleetConfig;
 use flotilla_daemon_api::daemon::DaemonHandle;
-use flotilla_environment::factories::dummy::DummyEnvironmentFactory;
+use flotilla_environment::{environment::dummy::DummyEnvironmentCounts, factories::dummy::DummyEnvironmentFactory};
 use flotilla_protocol::{commands::CommandValue, Command, CommandAction, DaemonEvent};
 use flotilla_provider_runtime::{HttpClient, ReqwestHttpClient};
 use tokio::sync::{broadcast::error::RecvError, oneshot};
@@ -41,7 +41,9 @@ pub struct DummyFleet {
     /// Where coders open change requests instead of `forge`, when configured.
     pub(crate) shared_forge: Option<Arc<SharedForge>>,
     pub(crate) sessions: DummySessions,
-    pub(crate) environment_factory: OnceLock<DummyEnvironmentFactory>,
+    /// The container and cloud-sandbox vendors, created on first install and
+    /// kept across daemon restarts, as a vendor's backings outlive a daemon.
+    pub(crate) environment_factories: OnceLock<[DummyEnvironmentFactory; 2]>,
     pub(crate) checkouts: DummyCheckouts,
     port: OnceLock<Arc<dyn CrewCommandPort>>,
     counters: Counters,
@@ -73,7 +75,7 @@ impl DummyFleet {
             forge: DummyForge::new(&config),
             shared_forge,
             sessions: DummySessions::default(),
-            environment_factory: OnceLock::new(),
+            environment_factories: OnceLock::new(),
             checkouts: DummyCheckouts::default(),
             config,
             port: OnceLock::new(),
@@ -147,9 +149,47 @@ impl DummyFleet {
         self.command_error_samples.lock().expect("command errors").clone()
     }
 
+    fn vendors(&self) -> impl Iterator<Item = &DummyEnvironmentFactory> {
+        self.environment_factories.get().into_iter().flatten()
+    }
+
+    /// Act as the environment vendor: delete `environment`'s backing, by
+    /// Environment name or backing ID. Its crews' processes end with it.
+    /// False when no vendor holds it.
+    pub fn vanish_environment(&self, environment: &str) -> bool {
+        self.vendors().any(|vendor| vendor.vanish(environment))
+    }
+
+    /// Act as the environment vendor: stop `environment`'s backing.
+    pub fn stop_environment(&self, environment: &str) -> bool {
+        self.vendors().any(|vendor| vendor.stop(environment))
+    }
+
+    /// Act as the environment vendor: resume a backing it stopped.
+    pub fn resume_environment(&self, environment: &str) -> bool {
+        self.vendors().any(|vendor| vendor.resume(environment))
+    }
+
+    /// Act as the environment vendor: while set, refuse every new backing.
+    pub fn refuse_provisioning(&self, refuse: bool) {
+        self.vendors().for_each(|vendor| vendor.refuse_provisioning(refuse));
+    }
+
     pub fn snapshot(&self) -> DummyFleetSnapshot {
         let read = |counter| self.counters.get(counter).load(Ordering::Relaxed);
+        let environments = self.vendors().map(DummyEnvironmentFactory::counts).fold(DummyEnvironmentCounts::default(), |sum, counts| {
+            DummyEnvironmentCounts {
+                provisioned: sum.provisioned + counts.provisioned,
+                destroyed: sum.destroyed + counts.destroyed,
+                vanished: sum.vanished + counts.vanished,
+                live: sum.live + counts.live,
+            }
+        });
         DummyFleetSnapshot {
+            environments_provisioned: environments.provisioned,
+            environments_destroyed: environments.destroyed,
+            environments_vanished: environments.vanished,
+            live_environments: environments.live,
             sessions_launched: read(Counter::SessionsLaunched),
             turns_received: read(Counter::TurnsReceived),
             crews_completed: read(Counter::CrewsCompleted),
@@ -193,6 +233,14 @@ pub struct DummyFleetSnapshot {
     pub change_requests_opened: u64,
     pub command_errors: u64,
     pub live_sessions: u64,
+    /// Backings the environment vendors realised.
+    pub environments_provisioned: u64,
+    /// Backings destroyed on the daemon's request.
+    pub environments_destroyed: u64,
+    /// Backings a vendor deleted of its own accord.
+    pub environments_vanished: u64,
+    /// Backings the vendors hold now.
+    pub live_environments: u64,
 }
 
 /// Results unclaimed for this long belong to other callers and are dropped.

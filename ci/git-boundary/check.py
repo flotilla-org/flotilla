@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enforce the VCS and environment runtime boundaries and the store-read guard rail."""
+"""Enforce the VCS and environment runtime boundaries, the store-read guard rail and the test-internals ratchet."""
 import argparse
 import os
 from pathlib import Path
@@ -388,6 +388,16 @@ def main():
         print(error)
         return 1
     for failure in store_failures:
+        print(failure)
+        failed = True
+    # Imported here like store_reads: the ratchet shares this module's traversal.
+    import test_internals
+    try:
+        internal_failures = test_internals.scan(sources)
+    except ValueError as error:
+        print(error)
+        return 1
+    for failure in internal_failures:
         print(failure)
         failed = True
     return int(failed)

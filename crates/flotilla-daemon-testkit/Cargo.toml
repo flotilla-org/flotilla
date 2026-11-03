@@ -6,7 +6,13 @@ license.workspace = true
 publish = false
 
 [dependencies]
+flotilla-config = { path = "../flotilla-config" }
 flotilla-daemon-api = { path = "../flotilla-daemon-api" }
+flotilla-discovery = { path = "../flotilla-discovery" }
+flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
+flotilla-dummy-fleet = { path = "../flotilla-dummy-fleet" }
+flotilla-store-memory = { path = "../flotilla-store-memory" }
+flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
 flotilla-client = { path = "../flotilla-client" }
 flotilla-agent = { path = "../flotilla-agent" }
 flotilla-core = { path = "../flotilla-core" }
@@ -17,6 +23,8 @@ flotilla-store = { path = "../flotilla-store" }
 flotilla-transport = { path = "../flotilla-transport" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+bon = { workspace = true }
+tempfile = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
 flotilla-daemon = { path = "../flotilla-daemon" }

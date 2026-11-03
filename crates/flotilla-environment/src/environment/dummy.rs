@@ -12,13 +12,21 @@
 //!
 //! The provider is selected like any other instance: placement freezes
 //! [`DUMMY_ENVIRONMENT_INSTANCE`] for a Docker kind on a host where it is the
-//! only per-vessel provider.
+//! only per-vessel provider. A cloud-sandbox-class instance,
+//! [`DUMMY_CLOUD_ENVIRONMENT_INSTANCE`], stands in for a sandbox vendor: it
+//! realises cloud-sandbox kinds and reports a provider descriptor for each
+//! backing, as every cloud backing must.
+//!
+//! Tests act as the vendor through [`DummyEnvironmentProvider::vanish`],
+//! [`DummyEnvironmentProvider::stop`], [`DummyEnvironmentProvider::resume`]
+//! and [`DummyEnvironmentProvider::refuse_provisioning`]: what the provider
+//! then reports is what the daemon observes, with no stored record touched.
 
 use std::{
     collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -47,6 +55,37 @@ const EXIT_RECEIPT_BATCH: &str = "flotilla-agent-exits";
 /// Registry key of the dummy provider instance.
 pub const DUMMY_ENVIRONMENT_INSTANCE: &str = "dummy";
 
+/// Registry key of the dummy cloud-sandbox provider instance.
+pub const DUMMY_CLOUD_ENVIRONMENT_INSTANCE: &str = "dummy-cloud";
+
+/// The vendor class a dummy instance stands in for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DummyEnvironmentClass {
+    /// Per-vessel environments on the daemon's host, as Docker realises them.
+    #[default]
+    Container,
+    /// Per-vessel sandboxes a cloud vendor realises, reached through an account.
+    CloudSandbox,
+}
+
+/// What the vendor holds, by environment, since the provider was created.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DummyEnvironmentCounts {
+    /// Backings the vendor realised.
+    pub provisioned: u64,
+    /// Backings destroyed on the daemon's request.
+    pub destroyed: u64,
+    /// Backings the vendor deleted of its own accord.
+    pub vanished: u64,
+    /// Backings the vendor holds now, running or stopped.
+    pub live: u64,
+}
+
+// A backing's vendor-side state, beside its requested destruction.
+const RUNNING: u8 = 0;
+const STOPPED: u8 = 1;
+const VANISHED: u8 = 2;
+
 /// Realisation behaviour, taken from the daemon's `[dummy_fleet]` settings.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DummyEnvironmentBehaviour {
@@ -60,14 +99,36 @@ pub type DummyEnvironmentCleanup = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct DummyEnvironmentProvider {
     behaviour: DummyEnvironmentBehaviour,
+    class: DummyEnvironmentClass,
+    instance: String,
     cleanup: Option<DummyEnvironmentCleanup>,
     owner: Arc<()>,
     handles: Mutex<HashMap<EnvironmentId, Arc<DummyEnvironment>>>,
+    refusing: AtomicBool,
+    provisioned: AtomicU64,
+    destroyed_counter: Arc<AtomicU64>,
+    vanished: AtomicU64,
 }
 
 impl DummyEnvironmentProvider {
     pub fn new(behaviour: DummyEnvironmentBehaviour) -> Self {
-        Self { behaviour, cleanup: None, owner: Arc::new(()), handles: Mutex::new(HashMap::new()) }
+        Self {
+            behaviour,
+            class: DummyEnvironmentClass::Container,
+            instance: DUMMY_ENVIRONMENT_INSTANCE.into(),
+            cleanup: None,
+            owner: Arc::new(()),
+            handles: Mutex::new(HashMap::new()),
+            refusing: AtomicBool::new(false),
+            provisioned: AtomicU64::new(0),
+            destroyed_counter: Arc::default(),
+            vanished: AtomicU64::new(0),
+        }
+    }
+
+    /// A cloud-sandbox-class instance registered as `instance`.
+    pub fn cloud(behaviour: DummyEnvironmentBehaviour, instance: &str) -> Self {
+        Self { class: DummyEnvironmentClass::CloudSandbox, instance: instance.into(), ..Self::new(behaviour) }
     }
 
     pub fn with_cleanup(mut self, cleanup: DummyEnvironmentCleanup) -> Self {
@@ -75,8 +136,74 @@ impl DummyEnvironmentProvider {
         self
     }
 
+    pub fn class(&self) -> DummyEnvironmentClass {
+        self.class
+    }
+
     fn handles(&self) -> std::sync::MutexGuard<'_, HashMap<EnvironmentId, Arc<DummyEnvironment>>> {
         self.handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The backing for `environment`, by environment ID or backing name.
+    fn backing(&self, environment: &str) -> Option<Arc<DummyEnvironment>> {
+        self.handles()
+            .iter()
+            .find(|(id, handle)| (id.as_str() == environment || handle.container_name == environment) && handle.held())
+            .map(|(_, handle)| Arc::clone(handle))
+    }
+
+    /// The vendor deletes `environment`'s backing, as a sandbox vendor evicts
+    /// one: it leaves the inventory, its handles report it gone, and the
+    /// processes inside it end. False when the vendor holds no such backing.
+    pub fn vanish(&self, environment: &str) -> bool {
+        let Some(handle) = self.backing(environment) else { return false };
+        if handle.vendor.swap(VANISHED, Ordering::AcqRel) == VANISHED {
+            return false;
+        }
+        self.vanished.fetch_add(1, Ordering::Relaxed);
+        self.handles().retain(|_, current| !Arc::ptr_eq(current, &handle));
+        if let Some(cleanup) = &self.cleanup {
+            cleanup(handle.id.as_str());
+        }
+        true
+    }
+
+    /// The vendor stops `environment`'s backing; it stays in the inventory.
+    pub fn stop(&self, environment: &str) -> bool {
+        self.backing(environment)
+            .is_some_and(|handle| handle.vendor.compare_exchange(RUNNING, STOPPED, Ordering::AcqRel, Ordering::Acquire).is_ok())
+    }
+
+    /// The vendor resumes a backing it stopped.
+    pub fn resume(&self, environment: &str) -> bool {
+        self.backing(environment)
+            .is_some_and(|handle| handle.vendor.compare_exchange(STOPPED, RUNNING, Ordering::AcqRel, Ordering::Acquire).is_ok())
+    }
+
+    /// While set, the vendor refuses to realise any new backing.
+    pub fn refuse_provisioning(&self, refuse: bool) {
+        self.refusing.store(refuse, Ordering::Release);
+    }
+
+    pub fn counts(&self) -> DummyEnvironmentCounts {
+        DummyEnvironmentCounts {
+            provisioned: self.provisioned.load(Ordering::Relaxed),
+            destroyed: self.destroyed_counter.load(Ordering::Relaxed),
+            vanished: self.vanished.load(Ordering::Relaxed),
+            live: self.handles().values().filter(|handle| handle.held()).count() as u64,
+        }
+    }
+
+    fn descriptor(&self, image: &str) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
+        (self.class == DummyEnvironmentClass::CloudSandbox).then(|| flotilla_resources::EnvironmentProviderDescriptor {
+            instance: self.instance.clone(),
+            kind: self.kind(),
+            image_digest: dummy_image_id(image),
+            host_version: "dummy".into(),
+            module_version: "dummy".into(),
+            capabilities: self.capabilities(),
+            agent_connection: None,
+        })
     }
 }
 
@@ -105,18 +232,22 @@ impl EnvironmentProvider for DummyEnvironmentProvider {
         super::ProviderReadiness::Ready
     }
     fn kind(&self) -> super::ProviderKind {
-        super::ProviderKind::new(super::EnvironmentClass::Dummy, "dummy")
+        let class = match self.class {
+            DummyEnvironmentClass::Container => super::EnvironmentClass::Dummy,
+            DummyEnvironmentClass::CloudSandbox => super::EnvironmentClass::CloudSandbox,
+        };
+        super::ProviderKind::new(class, "dummy")
     }
     fn capabilities(&self) -> super::ProviderCapabilities {
-        Self::capability_declaration()
+        Self::capability_declaration(self.class)
     }
 
     fn legacy_input(&self) -> Option<EnvironmentInput> {
-        Some(EnvironmentInput::Docker)
+        (self.class == DummyEnvironmentClass::Container).then_some(EnvironmentInput::Docker)
     }
 
     fn local_image_cache(&self) -> Option<&dyn LocalImageCache> {
-        Some(self)
+        (self.class == DummyEnvironmentClass::Container).then_some(self as &dyn LocalImageCache)
     }
 
     fn detection(&self) -> Option<&dyn super::EnvironmentDetection> {
@@ -124,8 +255,15 @@ impl EnvironmentProvider for DummyEnvironmentProvider {
     }
 
     async fn prepare(&self, spec: &flotilla_resources::EnvironmentSpec, _opts: &PrepareOpts) -> Result<PreparedEnvironment, String> {
-        let docker = spec.docker.as_ref().filter(|_| spec.host_direct.is_none()).ok_or("dummy provider requires legacy image inputs")?;
-        Ok(PreparedEnvironment::new(&self.owner, docker.image.clone()))
+        let image = match self.class {
+            DummyEnvironmentClass::Container => {
+                &spec.docker.as_ref().filter(|_| spec.host_direct.is_none()).ok_or("dummy provider requires legacy image inputs")?.image
+            }
+            DummyEnvironmentClass::CloudSandbox => {
+                &spec.cloud_sandbox.as_ref().ok_or("dummy cloud provider requires cloud sandbox inputs")?.image
+            }
+        };
+        Ok(PreparedEnvironment::new(&self.owner, image.clone()))
     }
 
     async fn provision(
@@ -135,12 +273,15 @@ impl EnvironmentProvider for DummyEnvironmentProvider {
         opts: ProvisionOpts,
     ) -> Result<EnvironmentHandle, super::EnvironmentProvisionError> {
         let image = prepared.get::<String>(&self.owner)?.clone();
-        self.handles().retain(|_, handle| !handle.destroyed.load(Ordering::Acquire));
+        self.handles().retain(|_, handle| handle.held());
         if let Some(existing) = self.handles().get(&id) {
             return Ok(Arc::clone(existing) as EnvironmentHandle);
         }
         if !self.behaviour.realise_delay.is_zero() {
             tokio::time::sleep(self.behaviour.realise_delay).await;
+        }
+        if self.refusing.load(Ordering::Acquire) {
+            return Err(format!("dummy vendor refuses to provision {id}").into());
         }
         if dummy_draw(self.behaviour.seed, "environment-failure", id.as_str()) < self.behaviour.failure_rate {
             return Err(format!("dummy environment {id} failed to realise (configured failure rate)").into());
@@ -151,24 +292,28 @@ impl EnvironmentProvider for DummyEnvironmentProvider {
         let handle = Arc::new(DummyEnvironment {
             container_name: format!("flotilla-dummy-{id}"),
             local_image_id: dummy_image_id(&image),
+            descriptor: self.descriptor(&image),
+            capabilities: self.capabilities(),
             image: ImageId::new(image),
             mounts: opts.provisioned_mounts,
             environment,
             runner: Arc::new(DummyCommandRunner::default()),
             id: id.clone(),
             destroyed: AtomicBool::new(false),
+            vendor: AtomicU8::new(RUNNING),
             cleanup: self.cleanup.clone(),
+            destroyed_count: Arc::clone(&self.destroyed_counter),
         });
-        Ok(Arc::clone(self.handles().entry(id).or_insert(handle)) as EnvironmentHandle)
+        let mut handles = self.handles();
+        let held = handles.entry(id).or_insert_with(|| {
+            self.provisioned.fetch_add(1, Ordering::Relaxed);
+            handle
+        });
+        Ok(Arc::clone(held) as EnvironmentHandle)
     }
 
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
-        Ok(self
-            .handles()
-            .values()
-            .filter(|handle| !handle.destroyed.load(Ordering::Acquire))
-            .map(|handle| Arc::clone(handle) as EnvironmentHandle)
-            .collect())
+        Ok(self.handles().values().filter(|handle| handle.held()).map(|handle| Arc::clone(handle) as EnvironmentHandle).collect())
     }
 
     async fn destroy(&self, container_id: &str) -> Result<(), String> {
@@ -221,7 +366,12 @@ impl LocalImageCache for DummyEnvironmentProvider {
 
 struct DummyEnvironment {
     destroyed: AtomicBool,
+    /// The vendor's view of the backing: running, stopped or vanished.
+    vendor: AtomicU8,
     cleanup: Option<DummyEnvironmentCleanup>,
+    destroyed_count: Arc<AtomicU64>,
+    descriptor: Option<flotilla_resources::EnvironmentProviderDescriptor>,
+    capabilities: super::ProviderCapabilities,
     id: EnvironmentId,
     image: ImageId,
     local_image_id: String,
@@ -231,13 +381,20 @@ struct DummyEnvironment {
     runner: Arc<DummyCommandRunner>,
 }
 
+impl DummyEnvironment {
+    /// Whether the vendor still holds this backing.
+    fn held(&self) -> bool {
+        !self.destroyed.load(Ordering::Acquire) && self.vendor.load(Ordering::Acquire) != VANISHED
+    }
+}
+
 #[async_trait]
 impl ProvisionedEnvironment for DummyEnvironment {
     fn provider_descriptor(&self) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
-        None
+        self.descriptor.clone()
     }
     fn capabilities(&self) -> super::ProviderCapabilities {
-        DummyEnvironmentProvider::capability_declaration()
+        self.capabilities.clone()
     }
     fn backing_id(&self) -> &str {
         &self.container_name
@@ -262,8 +419,16 @@ impl ProvisionedEnvironment for DummyEnvironment {
         super::ProviderObservation::new(if self.destroyed.load(Ordering::Acquire) {
             super::ObservationState::Gone { cause: super::GoneCause::DestroyedByRequest }
         } else {
-            super::ObservationState::Running
+            match self.vendor.load(Ordering::Acquire) {
+                VANISHED => super::ObservationState::Gone { cause: super::GoneCause::EvictedByProvider },
+                STOPPED => super::ObservationState::Stopped { cause: super::StoppedCause::PausedByProvider },
+                _ => super::ObservationState::Running,
+            }
         })
+    }
+
+    async fn detect_readiness(&self) -> super::ProviderReadiness {
+        super::ProviderReadiness::Ready
     }
 
     async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
@@ -277,7 +442,8 @@ impl ProvisionedEnvironment for DummyEnvironment {
         Arc::new(super::vessel_ops::RunnerVesselAgent(self.runner()))
     }
     async fn destroy(&self) -> Result<(), String> {
-        if !self.destroyed.swap(true, Ordering::AcqRel) {
+        if !self.destroyed.swap(true, Ordering::AcqRel) && self.vendor.load(Ordering::Acquire) != VANISHED {
+            self.destroyed_count.fetch_add(1, Ordering::Relaxed);
             if let Some(cleanup) = &self.cleanup {
                 cleanup(self.id.as_str());
             }
@@ -486,14 +652,20 @@ impl super::EnvironmentDetection for DummyEnvironmentProvider {
 }
 
 impl DummyEnvironmentProvider {
-    fn capability_declaration() -> super::ProviderCapabilities {
+    fn capability_declaration(class: DummyEnvironmentClass) -> super::ProviderCapabilities {
+        // A sandbox vendor's guest shares nothing with the daemon's host.
+        let (material_modes, checkout_strategies) = match class {
+            DummyEnvironmentClass::Container => (
+                vec![super::MaterialMode::Frozen, super::MaterialMode::Pushed, super::MaterialMode::Shared],
+                vec![super::CheckoutStrategy::HostWorktree, super::CheckoutStrategy::HostClone, super::CheckoutStrategy::CloneInVessel],
+            ),
+            DummyEnvironmentClass::CloudSandbox => {
+                (vec![super::MaterialMode::Frozen, super::MaterialMode::Pushed], vec![super::CheckoutStrategy::CloneInVessel])
+            }
+        };
         super::ProviderCapabilities {
-            material_modes: vec![super::MaterialMode::Frozen, super::MaterialMode::Pushed, super::MaterialMode::Shared],
-            checkout_strategies: vec![
-                super::CheckoutStrategy::HostWorktree,
-                super::CheckoutStrategy::HostClone,
-                super::CheckoutStrategy::CloneInVessel,
-            ],
+            material_modes,
+            checkout_strategies,
             workspace_root: "/workspace".into(),
             reference_root: Some("/ref/repo".into()),
             fallback_runner: true,
@@ -557,6 +729,71 @@ mod tests {
         provider.destroy("one").await.expect("idempotent destroy");
         assert_eq!(*removed.lock().expect("removed"), vec!["one"]);
         assert_eq!(provider.list().await.expect("surviving environments").len(), 1);
+    }
+
+    // Behaviour: a test acting as the vendor changes only what the provider
+    // reports. A vanished backing leaves the inventory, reports eviction and
+    // ends its children; a stopped one stays listed until resumed; a refusing
+    // vendor realises nothing new; the counts follow each.
+    #[tokio::test]
+    async fn the_vendor_vanishes_stops_resumes_and_refuses_backings() {
+        let removed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&removed);
+        let provider = DummyEnvironmentProvider::new(DummyEnvironmentBehaviour::default())
+            .with_cleanup(Arc::new(move |id| captured.lock().expect("removed").push(id.to_string())));
+        let gone = provision(&provider, "gone").await.expect("gone");
+        let paused = provision(&provider, "paused").await.expect("paused");
+        assert!(provider.vanish("flotilla-dummy-gone"), "addressed by backing name");
+        assert!(!provider.vanish("gone"), "a vanished backing is no longer held");
+        assert_eq!(gone.observe().await.state, super::super::ObservationState::Gone { cause: super::super::GoneCause::EvictedByProvider });
+        assert!(EnvironmentProvider::inspect(&provider, &EnvironmentId::new("gone")).await.expect("inspect").is_none());
+        assert_eq!(*removed.lock().expect("removed"), vec!["gone"]);
+
+        assert!(provider.stop("paused"));
+        assert_eq!(
+            paused.observe().await.state,
+            super::super::ObservationState::Stopped { cause: super::super::StoppedCause::PausedByProvider }
+        );
+        assert_eq!(provider.list().await.expect("list").len(), 1, "a stopped backing stays in the inventory");
+        assert!(provider.resume("paused"));
+        assert!(!provider.resume("paused"), "only a stopped backing resumes");
+        assert_eq!(paused.observe().await.state, super::super::ObservationState::Running);
+
+        provider.refuse_provisioning(true);
+        assert!(provision(&provider, "refused").await.is_err());
+        assert!(provision(&provider, "paused").await.is_ok(), "a held backing is still adopted");
+        provider.refuse_provisioning(false);
+        provision(&provider, "accepted").await.expect("accepted");
+        paused.destroy().await.expect("destroy");
+        assert!(!provider.vanish("paused"), "a destroyed backing cannot vanish");
+        assert_eq!(provider.counts(), DummyEnvironmentCounts { provisioned: 3, destroyed: 1, vanished: 1, live: 1 });
+    }
+
+    // A cloud-class vendor takes cloud sandbox inputs, offers no local image
+    // cache or legacy input, and describes each backing.
+    #[tokio::test]
+    async fn a_cloud_vendor_realises_described_sandboxes() {
+        let provider = DummyEnvironmentProvider::cloud(DummyEnvironmentBehaviour::default(), DUMMY_CLOUD_ENVIRONMENT_INSTANCE);
+        assert!(provider.prepare(&docker_spec("dummy/crew:latest"), &PrepareOpts::default()).await.is_err());
+        let spec = EnvironmentSpec {
+            cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+                image: "dummy/crew:latest".into(),
+                image_build_ref: None,
+                size: flotilla_resources::CloudSandboxSize { cpus: 1, memory_bytes: 1, disk_bytes: 1 },
+                lifetime_cap_seconds: None,
+                probe_needs: Default::default(),
+                env: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let prepared = provider.prepare(&spec, &PrepareOpts::default()).await.expect("prepare");
+        let handle = provider.provision(EnvironmentId::new("env-cloud"), &prepared, Default::default()).await.expect("provision");
+        let descriptor = handle.provider_descriptor().expect("a cloud backing is described");
+        assert_eq!(descriptor.instance, DUMMY_CLOUD_ENVIRONMENT_INSTANCE);
+        assert_eq!(descriptor.kind.class, super::super::EnvironmentClass::CloudSandbox);
+        assert!(provider.legacy_input().is_none());
+        assert!(provider.local_image_cache().is_none());
+        assert_eq!(provider.capabilities().checkout_strategies, vec![super::super::CheckoutStrategy::CloneInVessel]);
     }
 
     #[test]
