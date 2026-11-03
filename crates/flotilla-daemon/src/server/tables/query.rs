@@ -52,7 +52,7 @@ pub(super) fn list() -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// One aggregator subscriber: a WebSocket connection's, or a GET read's, which holds no query.
+/// One aggregator subscriber: a WebSocket connection's, or a GET read's.
 pub(crate) struct QueryFeed {
     daemon: Arc<InProcessDaemon>,
     subscriber: uuid::Uuid,
@@ -215,32 +215,49 @@ impl Source {
         }
     }
 
-    /// A signal per change of the query, starting with one so a change since the snapshot is
-    /// read. A held query is signalled by its feed; a read holding none follows the daemon itself.
-    pub(super) fn events(&self) -> BoxStream<'static, Result<(), String>> {
-        let Ok(query) = self.query().cloned() else { return futures::stream::once(async { Err("table needs a query".into()) }).boxed() };
-        let first = futures::stream::once(async { Ok(()) });
-        if let Some((_, changed)) = self.feed.held().get(&query) {
-            let changes = futures::stream::unfold(changed.subscribe(), |mut changes| async move {
-                changes.changed().await.ok().map(|()| (Ok(()), changes))
-            });
-            return first.chain(changes).boxed();
-        }
-        let changes = futures::stream::unfold(self.feed.daemon.subscribe(), move |mut events| {
-            let query = query.clone();
-            async move {
-                loop {
-                    match events.recv().await {
-                        Ok(DaemonEvent::ResultSet(set)) if set.query() == query => break,
-                        Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == query => break,
-                        Ok(_) => continue,
-                        Err(RecvError::Lagged(_)) => break,
-                        Err(RecvError::Closed) => return None,
-                    }
+    /// Holds this table's query for one read, with the read's own daemon event receiver
+    /// signalling it, as a connection's loop does.
+    pub(super) async fn hold(&self) -> Result<Hold, Failure> {
+        let query = self.query()?.clone();
+        let mut events = self.feed.daemon.subscribe();
+        self.feed.join(query.clone()).await?;
+        let feed = Arc::clone(&self.feed);
+        let pump = tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(event) => feed.offer(Some(&event)),
+                    Err(RecvError::Lagged(_)) => feed.offer(None),
+                    Err(RecvError::Closed) => break,
                 }
-                Some((Ok(()), events))
             }
         });
-        first.chain(changes).boxed()
+        Ok(Hold { feed: Arc::clone(&self.feed), query, pump })
+    }
+
+    /// A signal per change of the held query, starting with one so a change since the snapshot
+    /// is read.
+    pub(super) fn events(&self) -> BoxStream<'static, Result<(), String>> {
+        let changed = self.query().ok().and_then(|query| Some(self.feed.held().get(query)?.1.subscribe()));
+        let Some(changed) = changed else { return futures::stream::once(async { Err("table query is not held".into()) }).boxed() };
+        let changes =
+            futures::stream::unfold(changed, |mut changes| async move { changes.changed().await.ok().map(|()| (Ok(()), changes)) });
+        futures::stream::once(async { Ok(()) }).chain(changes).boxed()
+    }
+}
+
+/// A read's hold on its query, released when the read is dropped.
+pub(crate) struct Hold {
+    feed: Arc<QueryFeed>,
+    query: QueryId,
+    pump: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        self.pump.abort();
+        let (feed, query) = (Arc::clone(&self.feed), self.query.clone());
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move { feed.leave(&query).await });
+        }
     }
 }

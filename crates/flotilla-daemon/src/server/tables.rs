@@ -473,6 +473,13 @@ impl TableSource {
         let query = query.map(serde_json::from_str).transpose().map_err(|error| bad("invalid_request", format!("query: {error}")))?;
         self.with_query_id(query)
     }
+    /// Holds a named query's demand for one read; other sources need none.
+    pub(crate) async fn hold(&self) -> Result<Option<query::Hold>, Failure> {
+        match self {
+            Self::Query(source) => source.hold().await.map(Some),
+            _ => Ok(None),
+        }
+    }
     pub(crate) fn with_query_id(self, query: Option<flotilla_protocol::QueryId>) -> Result<Self, Failure> {
         let Some(query) = query else { return Ok(self) };
         let Self::Query(source) = self else { return Err(bad("invalid_request", "only a named query's tables take a query")) };

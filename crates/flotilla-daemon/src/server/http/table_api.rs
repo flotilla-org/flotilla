@@ -149,11 +149,18 @@ async fn respond(
         Ok(query) => query,
         Err(error) => return failure(error, encoding),
     };
+    let hold = match source.hold().await {
+        Ok(hold) => hold,
+        Err(error) => return failure(error, encoding),
+    };
     let messages = match source.messages(description, query, None).await {
         Ok(messages) => messages,
         Err(error) => return failure(error, encoding),
     };
-    let stream = messages.map(move |message| encoding.encode_item(&message).map_err(std::io::Error::other));
+    let stream = messages.map(move |message| {
+        let _held = &hold;
+        encoding.encode_item(&message).map_err(std::io::Error::other)
+    });
     wire::vary_accept(
         (
             [

@@ -624,6 +624,32 @@ async fn closing_the_connection_releases_its_named_queries() {
     tokio::time::timeout(WAIT, demand.wait_for(|demand| !demand.contains_key(&query))).await.expect("released on close").unwrap();
 }
 
+// Review of #4298: a GET of an issues query returns its rows with no subscription holding it;
+// the read takes the query's demand and releases it when it ends.
+#[tokio::test]
+async fn a_get_reads_an_issues_query_no_subscription_holds() {
+    let daemon = Daemon::start().await;
+    let query = issues();
+    let encoded: String = serde_json::to_string(&query).unwrap().bytes().map(|byte| format!("%{byte:02X}")).collect();
+    let mut request = Request::builder()
+        .uri(format!("/tables/issue_row/rows?query={encoded}"))
+        .header(header::ACCEPT, "application/jsonl")
+        .body(Body::empty())
+        .unwrap();
+    request.extensions_mut().insert(CallerAuth::Bearer);
+    let response = daemon.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let messages: Vec<Value> =
+        body.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()).map(|line| serde_json::from_slice(line).unwrap()).collect();
+    assert_eq!(messages[0]["type"], "table");
+    let rows: usize =
+        messages.iter().filter(|message| message["type"] == "rows").map(|message| message["rows"].as_array().unwrap().len()).sum();
+    let mut demand = daemon.daemon.aggregator_projection_state().await.subscribe_demand();
+    tokio::time::timeout(WAIT, demand.wait_for(|demand| !demand.contains_key(&query))).await.expect("released after the read").unwrap();
+    assert_eq!(rows, daemon.framed(&query).await.rows.len());
+}
+
 // Review of #4298: a named-query cursor binds to the materialisation it was read from. A current
 // cursor resumes with `synced`. Once an issues query's last subscriber has left and it is
 // materialised again, its sequence restarts and its incarnation changes, so a cursor from the

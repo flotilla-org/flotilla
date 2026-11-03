@@ -122,7 +122,7 @@ impl RowWriter {
 }
 
 macro_rules! columns {
-    ($($ty:ty => |$this:ident| $cell:expr),* $(,)?) => {$(impl Describe for $ty {
+    ($($ty:ty),* => |$this:ident| $cell:expr) => {$(impl Describe for $ty {
         fn describe(layout: &mut Layout, name: &str, required: bool) {
             <$ty as Columns>::layout(layout, name, required);
         }
@@ -132,21 +132,10 @@ macro_rules! columns {
         }
     })*};
 }
-columns!(
-    String => |this| json!(this),
-    bool => |this| json!(this),
-    i8 => |this| json!(this),
-    i16 => |this| json!(this),
-    i32 => |this| json!(this),
-    i64 => |this| json!(this),
-    u8 => |this| json!(this),
-    u16 => |this| json!(this),
-    u32 => |this| json!(this),
-    u64 => |this| json!(this),
-    crate::Timestamp => |this| json!(this.to_datetime().map(|time| time.to_rfc3339())),
-    crate::Identity => |this| json!(this.name),
-    crate::Address => |this| json!(this.to_string()),
-);
+columns!(String, bool, i8, i16, i32, i64, u8, u16, u32, u64 => |this| json!(this));
+columns!(crate::Timestamp => |this| json!(this.to_datetime().map(|time| time.to_rfc3339())));
+columns!(crate::Identity => |this| json!(this.name));
+columns!(crate::Address => |this| json!(this.to_string()));
 
 impl<T: Describe> Describe for Option<T> {
     fn describe(layout: &mut Layout, name: &str, _required: bool) {
