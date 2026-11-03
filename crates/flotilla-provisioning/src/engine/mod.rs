@@ -26,6 +26,8 @@
 //!
 //! With the switch off nothing is wrapped, and nothing changes.
 
+pub mod access_deliveries;
+pub mod access_delivery_import;
 pub mod account;
 pub mod artifact_import;
 pub mod artifacts;

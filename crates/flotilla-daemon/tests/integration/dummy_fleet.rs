@@ -1320,6 +1320,15 @@ impl DummyDaemon {
             .build();
         let record = flotilla_provisioning::stored::artifact::ArtifactRecord::from_spec(&artifact).expect("artifact");
         log.create("transport-artifact", &record, &change).expect("artifact record");
+        let delivery = flotilla_resources::AccessDeliverySpec {
+            access: flotilla_resources::access_delivery::access_key("transport", "transport-convoy", "implement", "coder"),
+            place: "transport-env".into(),
+            harness: "claude-code".into(),
+            home: "/home/crew".into(),
+            needs: Default::default(),
+            retry: None,
+        };
+        log.create("transport-access", &delivery, &change).expect("access delivery record");
         // One record of each forge observation.
         use flotilla_provisioning::stored::forge_observation::{ChangeRequestRecord, ForgeReadRecord, IssueRecord, IssueState, ReadValue};
         let change_request = ChangeRequestRecord {
@@ -1467,6 +1476,7 @@ impl DummyDaemon {
                 collect!(stored flotilla_provisioning::stored::project::ProjectDefinition);
                 collect!(stored flotilla_provisioning::stored::project::ProjectOpsRecord);
                 collect!(stored flotilla_provisioning::stored::artifact::ArtifactRecord);
+                collect!(stored flotilla_resources::AccessDeliverySpec);
                 collect!(stored flotilla_provisioning::stored::forge_observation::ChangeRequestRecord);
                 collect!(stored flotilla_provisioning::stored::forge_observation::IssueRecord);
                 collect!(stored flotilla_provisioning::stored::forge_observation::ForgeReadRecord);
