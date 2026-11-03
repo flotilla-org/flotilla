@@ -405,7 +405,6 @@ async fn the_rehearsal_reports_what_the_import_writes() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _held = populated(dir.path()).await;
     let summary = rehearse(&Source::read(&dir.path().join(OLD_STORE), HERE).expect("source"), HERE);
-    assert!(summary.staying.is_empty(), "every kind the old store holds here is imported: {:?}", summary.staying);
     assert_eq!(summary.kinds["FulfilmentKind"].imported, 1);
     let written = report(&first_start(dir.path(), HERE, None).expect("imports").expect("a report"));
     assert_eq!(serde_json::to_value(&summary.kinds).expect("kinds"), written["kinds"]);
@@ -435,7 +434,7 @@ fn rows_of_kinds_no_importer_reads_are_dropped_or_refused_here_only() {
     assert_eq!(summary.kinds["Usage"].dropped, 1);
     assert_eq!(summary.kinds["Event"].dropped, 1);
     assert_eq!(summary.kinds["Regard"].dropped, 1, "only this home's row is dropped here");
-    assert!(summary.staying.is_empty(), "an imported kind's rows are its step's: {:?}", summary.staying);
+    assert!(!summary.kinds.contains_key("FulfilmentKind"), "an imported kind's rows are its step's");
     assert_eq!(
         summary.refusals,
         vec![Refusal { kind: "widgets".into(), name: "widget".into(), reason: "no import plan for its kind".into() }]
@@ -1059,7 +1058,6 @@ async fn placement_rows_import_as_kinds_and_none_stay_on_the_old_store() {
     let source = Source::read(&path, HERE).expect("source");
     let summary = rehearse(&source, HERE);
     assert!(summary.refusals.is_empty(), "{:?}", summary.refusals);
-    assert!(summary.staying.is_empty(), "nothing stays on the old store: {:?}", summary.staying);
     assert_eq!(summary.kinds["FulfilmentKind"].imported, 3, "the kind, and the two policies without one: {:?}", summary.kinds);
 
     first_start(dir.path(), HERE, None).expect("imports").expect("a report");

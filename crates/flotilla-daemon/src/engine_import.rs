@@ -234,8 +234,6 @@ pub struct Summary {
     pub refusals: Vec<Refusal>,
     /// Imported, but on an assumption worth reading, or kept in the old store by design.
     pub notes: Vec<String>,
-    /// Rows of kinds still on the old store, by kind: the layer that moves them, and the count.
-    pub staying: BTreeMap<&'static str, (&'static str, usize)>,
 }
 
 impl Summary {
@@ -263,13 +261,12 @@ impl Summary {
 }
 
 /// Counts the rows of kinds no importer reads, homed where `target` imports: a retired kind's are
-/// dropped, a moving kind's stay on the old store, and a kind with no plan refuses its rows.
+/// dropped, and a kind with no plan refuses its rows.
 fn plan_rows(source: &Source, target: &impl ImportTarget, summary: &mut Summary) {
     for row in source.rows.iter().filter(|row| target.imports(&row.home)) {
         match plan::plan(&row.plural) {
             Some((_, Plan::Imported(_))) => {}
             Some((kind, Plan::Retired(_))) => summary.kinds.entry(kind.to_owned()).or_default().dropped += 1,
-            Some((kind, Plan::Moving(layer))) => summary.staying.entry(kind).or_insert((layer, 0)).1 += 1,
             None => {
                 let unreadable =
                     row.document.get(UNREADABLE).and_then(Value::as_str).map(|error| format!("; its stored body is not JSON: {error}"));
@@ -368,9 +365,6 @@ fn write_report(state_dir: &Path, report: &Report) -> Result<PathBuf, String> {
 fn log_summary(summary: &Summary, report: &Path) {
     for (kind, counts) in &summary.kinds {
         tracing::info!(kind, imported = counts.imported, dropped = counts.dropped, refused = counts.refused, "engine import");
-    }
-    for (kind, (layer, rows)) in &summary.staying {
-        tracing::info!(kind, rows, layer, "engine import: not imported yet, stays on the old store");
     }
     for note in &summary.notes {
         tracing::info!(%note, "engine import note");

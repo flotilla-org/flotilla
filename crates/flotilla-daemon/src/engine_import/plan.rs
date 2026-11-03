@@ -1,7 +1,6 @@
 //! The importer's plan for every old-store kind (#3824 layer 0). Each kind the old store has held
-//! is imported by a named rehearsal, retired by a ruling (its rows dropped), or still moving in a
-//! later layer. A kind with no entry fails closed, so a new old-store kind cannot be left behind
-//! silently. Each layer of #3824 moves its kinds from [`Plan::Moving`] to [`Plan::Imported`].
+//! is imported by a named rehearsal or retired by a ruling (its rows dropped). A kind with no entry
+//! fails closed, so a new old-store kind cannot be left behind silently.
 
 use flotilla_store::{retired_resource_kind, REGISTERED_RESOURCE_KINDS};
 
@@ -12,8 +11,6 @@ pub enum Plan {
     Imported(&'static str),
     /// Retired by the named ruling; the import drops its rows.
     Retired(&'static str),
-    /// Moves to the engine in the named layer or ticket; not imported yet.
-    Moving(&'static str),
 }
 
 /// Every kind the old store has held, by kind name, with its plan. A retired kind the store no

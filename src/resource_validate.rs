@@ -395,14 +395,11 @@ async fn validate_daemon_with_preview(
     }
 }
 
-/// One line per kind, then the kinds still on the old store, each note and each refusal.
+/// One line per kind, then each note and each refusal.
 #[cfg(unix)]
 fn print_import(summary: &engine_import::Summary) {
     for (kind, counts) in &summary.kinds {
         println!("import rehearsal: {kind}: {} imported, {} dropped, {} refused", counts.imported, counts.dropped, counts.refused);
-    }
-    for (kind, (layer, rows)) in &summary.staying {
-        println!("import rehearsal: {kind}: {rows} not imported yet, stays on the old store ({layer})");
     }
     for note in &summary.notes {
         println!("import rehearsal: note: {note}");
