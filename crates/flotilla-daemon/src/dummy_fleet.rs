@@ -38,8 +38,15 @@ pub fn install_dummy_fleet(config: &DaemonConfig, discovery: &mut DiscoveryRunti
 /// their crew commands through its command path, and their attention reports
 /// through the same recording as harness hook events.
 pub fn attach_dummy_fleet(fleet: &DummyFleet, daemon: &Arc<InProcessDaemon>) -> Result<(), String> {
+    fleet.attach(daemon_crew_port(daemon))
+}
+
+/// The port [`attach_dummy_fleet`] attaches: `daemon`'s command path and its
+/// hook-attention recording. A harness that outlives one daemon, as a crew's
+/// process outlives a daemon restart, forwards to the current daemon's port.
+pub fn daemon_crew_port(daemon: &Arc<InProcessDaemon>) -> Arc<dyn CrewCommandPort> {
     let handle = Arc::clone(daemon) as Arc<dyn DaemonHandle>;
-    fleet.attach(Arc::new(DaemonCrewPort { commands: DaemonCommandPort::new(&handle), backend: daemon.resource_backend() }))
+    Arc::new(DaemonCrewPort { commands: DaemonCommandPort::new(&handle), backend: daemon.resource_backend() })
 }
 
 struct DaemonCrewPort {

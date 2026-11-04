@@ -161,6 +161,21 @@ fn providers() -> Vec<(Arc<dyn EnvironmentProvider>, flotilla_resources::Environ
         (Arc::new(docker_provider(Arc::new(DockerEngine::default()))), image_spec.clone()),
         (Arc::new(dummy::DummyEnvironmentProvider::new(Default::default())), image_spec),
         (
+            Arc::new(dummy::DummyEnvironmentProvider::cloud(Default::default())),
+            flotilla_resources::EnvironmentSpec {
+                provider_address: Some("account:dummy-cloud/provider:dummy-cloud".parse().unwrap()),
+                cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+                    image: DIGEST.into(),
+                    image_build_ref: None,
+                    size: flotilla_resources::CloudSandboxSize { cpus: 1, memory_bytes: 1 << 30, disk_bytes: 1 << 30 },
+                    lifetime_cap_seconds: None,
+                    probe_needs: Default::default(),
+                    env: Default::default(),
+                }),
+                ..Default::default()
+            },
+        ),
+        (
             Arc::new(host_direct::HostDirectEnvironmentProvider::new(Arc::new(DockerEngine::default()), Default::default())),
             flotilla_resources::EnvironmentSpec {
                 cloud_sandbox: None,
@@ -237,6 +252,24 @@ async fn provider_instances_and_declarations() {
         assert!(!declaration.workspace_root.as_os_str().is_empty());
     }
     assert!(providers().iter().any(|(provider, _)| provider.kind() == ProviderKind::new(EnvironmentClass::Dummy, "dummy")));
+    assert!(providers().iter().any(|(provider, _)| provider.kind() == ProviderKind::new(EnvironmentClass::CloudSandbox, "dummy")));
+}
+
+// Every cloud sandbox backing describes its provider, and keeps describing it
+// (#4163); other classes describe none.
+#[tokio::test]
+async fn cloud_backings_describe_their_provider() {
+    for (provider, spec) in providers() {
+        let prepared = provider.prepare(&spec, &Default::default()).await.unwrap();
+        let handle = provider.provision(EnvironmentId::new("env-0"), &prepared, Default::default()).await.unwrap();
+        let cloud = provider.kind().class == EnvironmentClass::CloudSandbox;
+        assert_eq!(handle.provider_descriptor().is_some(), cloud, "{:?}", provider.kind());
+        if let Some(descriptor) = handle.provider_descriptor() {
+            assert_eq!(descriptor.kind, provider.kind());
+            assert_eq!(descriptor.capabilities, provider.capabilities());
+        }
+        handle.destroy().await.unwrap();
+    }
 }
 
 // A provider error means Unknown, never Gone. The same handle recovers

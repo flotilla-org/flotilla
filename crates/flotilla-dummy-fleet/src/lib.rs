@@ -8,7 +8,9 @@
 //!
 //! - the dummy environment provider instance (in `flotilla-environment`)
 //!   realises the Docker-kind environments of a host whose only per-vessel
-//!   provider it is, and marks them as dummy environments;
+//!   provider it is, and marks them as dummy environments; a cloud-sandbox
+//!   instance realises cloud-sandbox kinds the same way, and tests act as
+//!   either vendor through [`DummyFleet::vendor`];
 //! - inside a dummy environment, discovery finds the dummy terminal pool, the
 //!   dummy agent adapter and the dummy VCS, and no real tools;
 //! - the dummy change-request tracker claims repositories on the dummy forge;
@@ -36,7 +38,7 @@ use flotilla_environment::{environment::dummy::DummyEnvironmentBehaviour, factor
 
 pub use adapter::{DummyAgentAdapter, DUMMY_AGENT_ADAPTER, DUMMY_SCRIPT_ENV};
 pub use crew::{CrewScript, LAST_TURN_MARKER, SCRIPT_LINE_PREFIX};
-pub use fleet::{CrewCommandPort, DaemonCommandPort, DummyFleet, DummyFleetSnapshot};
+pub use fleet::{CrewCommandPort, DaemonCommandPort, DummyFleet, DummyFleetSnapshot, DummyVendor};
 pub use flotilla_environment::environment::dummy::{DUMMY_ENVIRONMENT_INSTANCE, DUMMY_FLEET_ENV};
 pub use forge::DummyChangeRequestTracker;
 pub use terminal::{DummyTerminalPool, DUMMY_TERMINAL_POOL};
@@ -61,22 +63,23 @@ impl DummyFleet {
         let weak = Arc::downgrade(self);
         // Every install comes from this same fleet Arc. Retain its first weak
         // cleanup callback together with the surviving external environment world.
-        let factory = self.environment_factory.get_or_init(|| {
-            DummyEnvironmentFactory::new(
-                DummyEnvironmentBehaviour {
-                    seed: self.config.seed,
-                    realise_delay: Duration::from_millis(environment.realise_delay_ms),
-                    failure_rate: environment.failure_rate,
-                },
-                Arc::new(move |id| {
-                    if let Some(fleet) = weak.upgrade() {
-                        fleet.sessions.destroy_environment(id);
-                        fleet.checkouts.destroy_environment(id);
-                    }
-                }),
-            )
+        let vendors = self.vendor.factories.get_or_init(|| {
+            let behaviour = DummyEnvironmentBehaviour {
+                seed: self.config.seed,
+                realise_delay: Duration::from_millis(environment.realise_delay_ms),
+                failure_rate: environment.failure_rate,
+            };
+            let cleanup: flotilla_environment::environment::dummy::DummyEnvironmentCleanup = Arc::new(move |id| {
+                if let Some(fleet) = weak.upgrade() {
+                    fleet.sessions.destroy_environment(id);
+                    fleet.checkouts.destroy_environment(id);
+                }
+            });
+            [DummyEnvironmentFactory::new(behaviour.clone(), Arc::clone(&cleanup)), DummyEnvironmentFactory::cloud(behaviour, cleanup)]
         });
-        factories.environment_providers.push(Box::new(factory.clone()));
+        for vendor in vendors {
+            factories.environment_providers.push(Box::new(vendor.clone()));
+        }
         factories.change_requests.insert(0, Box::new(forge::DummyChangeRequestFactory { fleet: Arc::clone(self) }));
         factories.vcs.insert(0, Box::new(vcs::DummyVcsFactory { fleet: Arc::clone(self) }));
         factories.terminal_pools.push(Box::new(terminal::DummyTerminalPoolFactory { fleet: Arc::clone(self) }));
