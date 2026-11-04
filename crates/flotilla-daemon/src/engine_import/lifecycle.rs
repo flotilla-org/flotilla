@@ -9,9 +9,8 @@ use flotilla_engine_store::{Import, ImportTarget};
 use flotilla_provisioning::engine::{
     checkout::CheckoutBinding,
     clone::CloneBinding,
-    environment::EnvironmentBinding,
     image_build::ImageBuildBinding,
-    import::{import_records, import_vessels, ImportRefusal, ImportReport},
+    import::{import_environments, import_records, import_vessels, ImportRefusal, ImportReport},
     terminal_session::TerminalSessionBinding,
 };
 use flotilla_resources::{
@@ -57,7 +56,12 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, r
             import_records::<$binding>(&records, target, report);
         }};
     }
-    records!(Environment, "environments", "Environment", EnvironmentBinding);
+    let environments: Vec<_> = source
+        .owned::<Environment>("environments", namespace, "Environment", target, report)
+        .into_iter()
+        .map(|record| (record.object, record.home))
+        .collect();
+    import_environments(&environments, target, report);
     records!(ImageBuild, "imagebuilds", "ImageBuild", ImageBuildBinding);
     records!(CloneResource, "clones", "Clone", CloneBinding);
     records!(Checkout, "checkouts", "Checkout", CheckoutBinding);

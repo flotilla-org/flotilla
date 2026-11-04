@@ -687,9 +687,12 @@ impl EnvironmentRuntime for CloudRuntime {
     }
 }
 // #3620: cloud provisioning stores the opaque backing and descriptor without populating legacy Docker identity. Finalization uses that
-// same opaque identity through the reconciler's kind-neutral runtime port.
+// same opaque identity through the reconciler's kind-neutral runtime port. On the engine the sandbox is requested from its recipe,
+// realised under that backing, and released by its teardown.
 #[tokio::test]
 async fn cloud_ready_and_finalization_use_generic_backing() {
+    use flotilla_provisioning::engine::{environment::EnvironmentBinding, Engine, Lifecycles};
+    use flotilla_state_machines::machines::lifecycle::{Ending, LifecycleState};
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let environments = backend.using::<Environment>("flotilla");
     let environment = environments
@@ -711,7 +714,12 @@ async fn cloud_ready_and_finalization_use_generic_backing() {
         .await
         .unwrap();
     let runtime = Arc::new(CloudRuntime { destroyed: Default::default() });
-    let reconciler = EnvironmentReconciler::new(runtime.clone(), backend.clone(), "flotilla");
+    let fixture = flotilla_provisioning_testkit::LifecycleFixture::<EnvironmentBinding>::new(false);
+    let lifecycles: Arc<dyn Lifecycles<_>> = fixture.home.clone();
+    let reconciler = Engine::<_, EnvironmentBinding>::new(
+        EnvironmentReconciler::new(runtime.clone(), backend.clone(), "flotilla").with_lifecycle_reads(fixture.reads.clone()),
+        Some(lifecycles),
+    );
     let prepared = reconciler.prepare(&environment).await.unwrap();
     let outcome = reconciler.reconcile(&environment, &prepared, chrono::Utc::now());
     let mut status = EnvironmentStatus::default();
@@ -720,10 +728,13 @@ async fn cloud_ready_and_finalization_use_generic_backing() {
     assert_eq!(status.backing_id.as_deref(), Some("opaque-cloud-backing"));
     assert!(status.docker_container_id.is_none());
     assert_eq!(status.provider_descriptor.as_ref().unwrap().instance, "daytona");
-    environments.update_status(&environment.metadata.name, &environment.metadata.resource_version, &status).await.unwrap();
-    let ready = environments.get(&environment.metadata.name).await.unwrap();
+    let name = &environment.metadata.name;
+    assert_eq!(fixture.home.get(name).unwrap().state(), &LifecycleState::Realised { identity: "opaque-cloud-backing".into() });
+    environments.update_status(name, &environment.metadata.resource_version, &status).await.unwrap();
+    let ready = environments.get(name).await.unwrap();
     reconciler.run_finalizer(&ready).await.unwrap();
     assert_eq!(*runtime.destroyed.lock().unwrap(), vec!["opaque-cloud-backing"]);
+    assert_eq!(fixture.home.get(name).unwrap().state(), &LifecycleState::Gone { ending: Ending::Released });
 }
 
 // A composed cloud Environment waits for its ImageBuild like a Docker one, then provisions

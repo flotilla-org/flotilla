@@ -8,9 +8,10 @@
 //! | Kind | Old phase | Stored state |
 //! |---|---|---|
 //! | Environment | Pending, Provisioning | Requested |
-//! | | Ready | Realised (its container, or the host-direct root) |
+//! | | Ready | Realised (its container, cloud sandbox backing, or host-direct root) |
 //! | | Lost | Gone(Lost) |
 //! | | Failed | GaveUp |
+//! | Cloud sandbox Environment, deleted | Lost, Failed (its sandbox gone) | not stored: dropped |
 //! | ImageBuild | Queued, Building, Failed with a retry to come | Requested (its failed attempts tallied) |
 //! | | Built | Realised (its digest) |
 //! | | Failed, settled | GaveUp |
@@ -247,6 +248,28 @@ pub fn rehearse_vessels(records: &[(ResourceObject<OldVessel>, String)], report:
     }
 }
 
+/// Imports old Environment `records` into `target`. A deleted cloud sandbox whose sandbox is gone
+/// (Lost, or Failed) owes no teardown, and is dropped; every other record imports.
+pub fn import_environments(
+    records: &[(ResourceObject<OldEnvironment>, String)],
+    target: &mut impl ImportTarget,
+    report: &mut ImportReport,
+) {
+    let (dropped, kept): (Vec<_>, Vec<_>) =
+        records.iter().filter(|(_, home)| target.imports(home)).cloned().partition(|(environment, _)| {
+            environment.spec.cloud_sandbox.is_some()
+                && environment.metadata.deletion_timestamp.is_some()
+                && environment
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| matches!(status.phase, EnvironmentPhase::Lost | EnvironmentPhase::Failed))
+        });
+    if !dropped.is_empty() {
+        *report.dropped.entry(("Environment", "a deleted cloud sandbox, its sandbox gone")).or_default() += dropped.len();
+    }
+    import_records::<EnvironmentBinding>(&kept, target, report);
+}
+
 fn failed_by(detail: Option<&str>, fallback: &str) -> Cause {
     Cause::new(CauseCategory::External, detail.unwrap_or(fallback))
 }
@@ -262,9 +285,9 @@ impl Imported for EnvironmentBinding {
         Ok(match status.map(|status| status.phase).unwrap_or_default() {
             EnvironmentPhase::Pending | EnvironmentPhase::Provisioning => LifecycleState::requested(),
             EnvironmentPhase::Ready => {
-                let container = status.and_then(|status| status.docker_container_id.clone());
+                let backing = status.and_then(|status| status.docker_container_id.clone().or_else(|| status.backing_id.clone()));
                 let root = obj.spec.host_direct.as_ref().map(|host| host.repo_default_dir.clone());
-                realised(container.or(root), "container or root")?
+                realised(backing.or(root), "container, backing or root")?
             }
             EnvironmentPhase::Lost => LifecycleState::Gone { ending: Ending::Lost },
             EnvironmentPhase::Failed => LifecycleState::GaveUp { cause: failed_by(message, "the environment failed") },

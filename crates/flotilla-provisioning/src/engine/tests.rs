@@ -390,23 +390,82 @@ fn environment_object(docker: bool) -> ResourceObject<flotilla_resources::Enviro
     ResourceObject { metadata: meta("env-a"), spec, status: None }
 }
 
-// Behaviour (#3738 on main): a cloud sandbox has no stored recipe in the look-over's shape, so it is
-// no engine request and the old path keeps it.
-#[test]
-fn a_cloud_sandbox_environment_stays_on_the_old_path() {
-    use super::environment::EnvironmentBinding;
-    use flotilla_resources::{CloudSandboxEnvironmentSpec, CloudSandboxSize};
-    let mut cloud = environment_object(false);
-    cloud.spec.host_direct = None;
-    cloud.spec.cloud_sandbox = Some(CloudSandboxEnvironmentSpec {
-        probe_needs: Default::default(),
-        image: "registry/flotilla@sha256:00".into(),
-        image_build_ref: None,
-        size: CloudSandboxSize { cpus: 2, memory_bytes: 1 << 30, disk_bytes: 1 << 33 },
-        lifetime_cap_seconds: None,
-        env: Default::default(),
+// A cloud sandbox environment is an engine request whose recipe is its spec's fields, the image
+// built when a build is named and pinned otherwise, with nothing derived at launch stored; a pinned
+// image with a blank reference is refused. Once requested it is realised under its backing.
+// Generates built and pinned images (blank, whitespace and real references), env with and without
+// launch-derived keys, size and lifetime boundaries, and empty and mixed probe needs.
+#[hegel::test]
+fn a_cloud_sandbox_environment_is_requested_from_its_recipe(tc: hegel::TestCase) {
+    use flotilla_resources::{CapabilityNeed, CloudSandboxEnvironmentSpec, CloudSandboxSize, EnvironmentStatusPatch};
+    use hegel::generators as gs;
+
+    use super::{decide, environment::EnvironmentBinding};
+    use crate::stored::environment::CloudSandboxRecipe;
+    let pick = |tc: &hegel::TestCase, n: usize| tc.draw(gs::integers::<usize>().min_value(0).max_value(n - 1));
+    let built = tc.draw(gs::booleans());
+    let reference = ["", "  ", "registry/flotilla@sha256:00"][pick(&tc, 3)];
+    let bounds = [0, 1, u64::MAX];
+    let size =
+        CloudSandboxSize { cpus: [0, 1, u32::MAX][pick(&tc, 3)], memory_bytes: bounds[pick(&tc, 3)], disk_bytes: bounds[pick(&tc, 3)] };
+    let lifetime_cap_seconds = [None, Some(0), Some(u64::MAX)][pick(&tc, 3)];
+    let launch_derived = tc.draw(gs::booleans());
+    let mut env: BTreeMap<String, String> = [("A".to_owned(), "1".to_owned())].into();
+    if launch_derived {
+        env.insert(flotilla_resources::RESOLVED_SKILLS_ENV.to_owned(), "[]".to_owned());
+    }
+    let probe_needs: std::collections::BTreeSet<CapabilityNeed> = match pick(&tc, 3) {
+        0 => Default::default(),
+        1 => [CapabilityNeed::Gpu].into(),
+        _ => [CapabilityNeed::Platform("linux".into()), CapabilityNeed::Network("lab".into())].into(),
+    };
+    let mut obj = environment_object(false);
+    obj.spec.host_direct = None;
+    obj.spec.provider_address = Some("account:dummy-cloud/provider:dummy-cloud".parse().expect("provider"));
+    obj.spec.cloud_sandbox = Some(CloudSandboxEnvironmentSpec {
+        probe_needs: probe_needs.clone(),
+        image: reference.into(),
+        image_build_ref: built.then(|| "image-00-amd64".into()),
+        size: size.clone(),
+        lifetime_cap_seconds,
+        env,
     });
-    assert!(EnvironmentBinding::request(&cloud, HOME).expect_err("not held").contains("cloud sandbox"));
+    let request = EnvironmentBinding::request(&obj, HOME);
+    if !built && reference.trim().is_empty() {
+        assert!(request.is_err(), "a pinned image names its reference: {request:?}");
+        return;
+    }
+    let request = request.expect("a cloud sandbox is an engine request");
+    assert_eq!(
+        request.image_build.as_ref().map(|build| (build.name.as_str(), build.home.as_str())),
+        built.then_some(("image-00-amd64", HOME))
+    );
+    let expected = CloudSandboxRecipe {
+        image: if built { DockerImage::Built } else { DockerImage::Pinned { reference: reference.into() } },
+        size,
+        lifetime_cap_seconds,
+        env: [("A".to_owned(), "1".to_owned())].into(),
+        probe_needs,
+    };
+    assert_eq!(request.recipe.value().read::<CloudSandboxRecipe>().expect("the cloud sandbox recipe"), expected);
+
+    let home = lifecycles::<EnvironmentBinding>();
+    let ready = EnvironmentStatusPatch::MarkCloudReady {
+        backing_id: "sandbox-1".into(),
+        image_ref: "registry/flotilla@sha256:00".into(),
+        provider_descriptor: Box::new(flotilla_resources::EnvironmentProviderDescriptor {
+            instance: "dummy-cloud".into(),
+            kind: flotilla_protocol::provider::ProviderKind::new(flotilla_protocol::provider::EnvironmentClass::CloudSandbox, "dummy"),
+            image_digest: "sha256:00".into(),
+            host_version: "1".into(),
+            module_version: "1".into(),
+            capabilities: Default::default(),
+            agent_connection: None,
+        }),
+    };
+    let decision = decide::<EnvironmentBinding>(home.as_ref(), &obj, Some(ready.clone()), Utc::now());
+    assert_eq!(decision.patch, Some(ready));
+    assert_eq!(home.get("env-a").expect("held").state(), &LifecycleState::Realised { identity: "sandbox-1".into() });
 }
 
 // Behaviour: an environment is realised under its container, or the host-direct root; its recipe is
@@ -900,7 +959,64 @@ fn the_rehearsal_lists_records_with_no_mapping() {
     let listed: Vec<(&str, &str)> = report.refused.iter().map(|refusal| (refusal.kind, refusal.record.as_str())).collect();
     assert_eq!(listed, [("Checkout", "observed-a"), ("Environment", "env-a")]);
     assert!(report.refused[0].reason.contains("observed checkout"));
-    assert!(report.refused[1].reason.contains("no container or root"));
+    assert!(report.refused[1].reason.contains("no container, backing or root"));
+}
+
+fn cloud_environment_object() -> ResourceObject<flotilla_resources::Environment> {
+    let mut obj = environment_object(false);
+    obj.spec.host_direct = None;
+    obj.spec.provider_address = Some("account:dummy-cloud/provider:dummy-cloud".parse().expect("provider"));
+    obj.spec.cloud_sandbox = Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+        probe_needs: Default::default(),
+        image: "registry/flotilla@sha256:00".into(),
+        image_build_ref: None,
+        size: flotilla_resources::CloudSandboxSize { cpus: 2, memory_bytes: 1 << 30, disk_bytes: 1 << 33 },
+        lifetime_cap_seconds: Some(3600),
+        env: Default::default(),
+    });
+    obj
+}
+
+// The import maps every live cloud sandbox Environment, a Ready one realised under its backing. A
+// deleted one whose sandbox is gone (Lost or Failed) is dropped; a deleted one whose sandbox may
+// still run still owes its teardown, so it imports. Enumerates every old phase, live and deleted.
+#[test]
+fn the_import_maps_live_cloud_sandboxes_and_drops_deleted_gone_ones() {
+    use flotilla_resources::{EnvironmentPhase, EnvironmentStatus};
+
+    use super::import::{import_environments, rehearsal, ImportReport};
+    let phases = [
+        (EnvironmentPhase::Pending, "requested"),
+        (EnvironmentPhase::Provisioning, "requested"),
+        (EnvironmentPhase::Ready, "realised"),
+        (EnvironmentPhase::Lost, "gone"),
+        (EnvironmentPhase::Failed, "gave-up"),
+    ];
+    for deleted in [false, true] {
+        for (phase, label) in phases {
+            let mut obj = cloud_environment_object();
+            obj.status = Some(EnvironmentStatus { phase, backing_id: Some("sandbox-1".into()), ..Default::default() });
+            obj.metadata.deletion_timestamp = deleted.then(Utc::now);
+            let mut target = rehearsal().expect("rehearsal");
+            let mut report = ImportReport::default();
+            import_environments(&[(obj.clone(), HOME.to_owned())], &mut target, &mut report);
+            assert_eq!(report.refused, vec![], "{phase:?}");
+            let gone = deleted && matches!(phase, EnvironmentPhase::Lost | EnvironmentPhase::Failed);
+            let counted = |counts: &BTreeMap<(&'static str, &'static str), usize>| counts.values().sum::<usize>();
+            assert_eq!(
+                (counted(&report.imported), counted(&report.dropped)),
+                if gone { (0, 1) } else { (1, 0) },
+                "{phase:?} deleted {deleted}"
+            );
+            if !gone {
+                assert_eq!(report.imported.get(&("Environment", label)), Some(&1), "{phase:?}");
+            }
+            if phase == EnvironmentPhase::Ready {
+                let imported = super::import::import::<super::environment::EnvironmentBinding>(&obj, HOME).expect("imports");
+                assert_eq!(imported.resource.state(), &LifecycleState::Realised { identity: "sandbox-1".into() });
+            }
+        }
+    }
 }
 
 // Behaviour (#3747 review): the latest launch is found however many there are, and a launch key
