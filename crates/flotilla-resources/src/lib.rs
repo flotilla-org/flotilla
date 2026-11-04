@@ -50,6 +50,10 @@ pub mod delivery_hold;
 #[doc(hidden)]
 pub mod digest;
 pub use digest::{digest_bucket, DigestQuery, PartitionDigest, DIGEST_FANOUT};
+#[doc(hidden)]
+pub mod definition_provenance;
+pub mod definitions;
+pub mod engine_records;
 mod environment;
 #[doc(hidden)]
 pub mod error;
@@ -59,15 +63,6 @@ pub mod event;
 pub mod field_ownership;
 mod fleet_designation;
 mod forge;
-mod forge_read;
-pub use forge_read::{
-    forge_read_name, ForgeRead, ForgeReadHeartbeat, ForgeReadHeartbeatSpec, ForgeReadHeartbeatStatus, ForgeReadRequest, ForgeReadSpec,
-    ForgeReadStatus,
-};
-#[doc(hidden)]
-pub mod definition_provenance;
-pub mod definitions;
-pub mod engine_records;
 mod fulfilment_kind;
 #[doc(hidden)]
 pub mod host;
@@ -82,7 +77,7 @@ pub mod message;
 mod message_inbox;
 mod message_migration;
 #[doc(hidden)]
-pub mod placement_policy;
+pub mod placement;
 mod platform;
 #[doc(hidden)]
 pub mod prepared_snapshot;
@@ -166,7 +161,7 @@ pub use environment::{
 };
 pub use error::{FinalizerWaitReason, ResourceError};
 pub use event::{Event, EventRegarding, EventSpec, ObjectEvent, DEFAULT_EVENT_TTL_SECONDS};
-pub use field_ownership::{FieldOwnedResource, FieldOwnership, FieldOwnershipViolation, OwnershipEnforcement, WriterIdentity, WriterRole};
+pub use field_ownership::{FieldOwnershipViolation, WriterIdentity, WriterRole};
 pub use fleet_designation::{FleetDesignation, FleetDesignationSpec, FLEET_DESIGNATION_NAME};
 pub use flotilla_protocol::{PrincipalRef, ResourceRef};
 pub use forge::{Forge, ForgeKind, ForgeSpec};
@@ -193,11 +188,7 @@ pub use manifest_root::{
     DocumentKey, DocumentPhase, DocumentState, ManifestRoot, ManifestRootSpec, ManifestRootStatus, ManifestRootStatusPatch, Resolution,
     ResolutionAction, ResolutionOutcome,
 };
-pub use placement_policy::{
-    CloudSandboxCheckout, CloudSandboxPerVesselPlacementPolicySpec, DockerCheckoutStrategy, DockerImagePullPolicy,
-    DockerPerVesselPlacementPolicySpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, PlacementImageSource,
-    PlacementPolicy, PlacementPolicySpec, ProviderRequirements, DOCKER_POLICY_NAME_PREFIX,
-};
+pub use placement::{DockerImagePullPolicy, PlacementImageSource, DOCKER_POLICY_NAME_PREFIX};
 pub use platform::Platform;
 pub use prepared_snapshot::{content_hash, is_prepared_snapshot, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND};
 pub use principal_attention::{
@@ -277,12 +268,9 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::Environment>($($argument),*);
         $callback::<$crate::FleetDesignation>($($argument),*);
         $callback::<$crate::Forge>($($argument),*);
-        $callback::<$crate::ForgeRead>($($argument),*);
-        $callback::<$crate::ForgeReadHeartbeat>($($argument),*);
         $callback::<$crate::Event>($($argument),*);
         $callback::<$crate::Host>($($argument),*);
         $callback::<$crate::ManifestRoot>($($argument),*);
-        $callback::<$crate::PlacementPolicy>($($argument),*);
         $callback::<$crate::Project>($($argument),*);
         $callback::<$crate::Regard>($($argument),*);
         $callback::<$crate::Repository>($($argument),*);

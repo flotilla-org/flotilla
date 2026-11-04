@@ -1,9 +1,8 @@
-//! Source-scoped forge ownership and replicated reads (ADR 0057).
+//! Source-scoped forge ownership and per-host forge reads.
 use std::{
     collections::{btree_map::Entry, BTreeMap},
     future::Future,
     sync::Arc,
-    time::Duration as StdDuration,
 };
 
 use async_trait::async_trait;
@@ -12,27 +11,19 @@ use flotilla_change_request::{BoundObservations, ChangeRequestAdmission, ChangeR
 use flotilla_issue_tracker::IssueProvider;
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
-    Issue, IssueChangeset, IssueRef, IssueSource, NodeId,
+    ChangeRequest, Issue, IssueChangeset, IssueRef, IssueSource, NodeId,
 };
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
-    forge_read_name, normalize_issue_source, resolve_project_issue_sources_from_inventory, Clock, Forge, ForgeRead, ForgeReadHeartbeat,
-    ForgeReadHeartbeatSpec, ForgeReadHeartbeatStatus, ForgeReadRequest, ForgeReadSpec, ForgeReadStatus, ForgeSpec, Host, HostStatus,
-    InputMeta, IssueSourceResolution, Project, ProjectSpec, ReadWatchEvent, Repository, ResourceError, ResourceObject, ResourceProvenance,
-    SystemClock,
+    normalize_issue_source, resolve_project_issue_sources_from_inventory, Clock, Forge, ForgeSpec, Host, HostStatus, IssueSourceResolution,
+    Project, ProjectSpec, Repository, ResourceError, ResourceObject, ResourceProvenance, SystemClock,
 };
 use flotilla_store::ResourceBackend;
-use futures::StreamExt;
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::Mutex;
 
-use flotilla_protocol::ChangeRequest;
-
 pub const OWNER_LOCAL_INCREMENTAL_READ_ERROR: &str = "incremental forge reads are owner-local";
 
-// Leave three seconds for store/routing work inside the daemon's five-second
-// interactive request deadline (server/request_dispatch.rs).
-pub const REMOTE_READ_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 /// Stable diagnostic shared with the load harness when no observer qualifies.
 pub const NO_READY_FORGE_OBSERVER: &str = "no ready forge observer";
 
@@ -40,85 +31,31 @@ const HEARTBEAT_MAX_AGE: Duration = Duration::seconds(180);
 const UNKNOWN_OWNER_GRACE: Duration = Duration::seconds(180);
 const READ_FRESHNESS: Duration = Duration::seconds(60);
 pub const LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-pub(crate) const DEMAND_MAX_AGE: Duration = Duration::seconds(180);
-const DEMAND_RETENTION: Duration = Duration::seconds(3600);
-const STATUS_WRITE_ATTEMPTS: usize = 8;
-const READ_HEARTBEAT_INTERVAL: Duration = Duration::seconds(300);
-const READ_HEARTBEAT_MAX_AGE: Duration = Duration::seconds(900);
 
-type ReadLock = Arc<Mutex<Option<LocalRead>>>;
+/// One forge read, keyed with its source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum ForgeReadRequest {
+    Board,
+    Query { params: IssueQuery, page: u32, count: usize },
+    Issue { id: String },
+    Changes { since: String, count: usize },
+    Mission { id: String },
+    DispatchFacts { id: String },
+    Branch { branch: String },
+    ChangeRequests { limit: usize },
+    ChangeRequest { id: String },
+    MergedBranches { limit: usize },
+}
 
-struct LocalRead {
+type ReadLock = Arc<Mutex<Option<LastRead>>>;
+
+/// This host's latest completed read of one request.
+struct LastRead {
+    attempted_at: DateTime<Utc>,
+    /// The last successful result, kept through later failures.
+    value: Option<serde_json::Value>,
     error: Option<ObservationError>,
-    status: ForgeReadStatus,
-    content_at: DateTime<Utc>,
-}
-
-// Visit only known observation fields, never arbitrary user field maps.
-// Domain timestamps (as_of, updated_at, closed_at, merged_at) remain facts.
-fn observation_objects(
-    request: &ForgeReadRequest,
-    value: &mut serde_json::Value,
-    mut visit: impl FnMut(&mut serde_json::Map<String, serde_json::Value>),
-) {
-    let items = match request {
-        ForgeReadRequest::Query { .. } => value.get_mut("items"),
-        ForgeReadRequest::Changes { .. } => value.get_mut("updated"),
-        ForgeReadRequest::Board | ForgeReadRequest::Issue { .. } => {
-            if let Some(object) = value.as_object_mut() {
-                visit(object);
-            }
-            return;
-        }
-        _ => return,
-    };
-    if let Some(items) = items.and_then(serde_json::Value::as_array_mut) {
-        for item in items {
-            if let Some(object) = item.as_object_mut() {
-                visit(object);
-            }
-        }
-    }
-}
-fn comparable_value(request: &ForgeReadRequest, value: &Option<serde_json::Value>) -> Option<serde_json::Value> {
-    let mut value = value.clone();
-    if let Some(value) = value.as_mut() {
-        observation_objects(request, value, |object| {
-            object.remove("observed_at");
-            if matches!(request, ForgeReadRequest::Board) {
-                object.remove("age_seconds");
-            }
-        });
-    }
-    value
-}
-fn content_changed(request: &ForgeReadRequest, previous: Option<&ForgeReadStatus>, status: &ForgeReadStatus) -> bool {
-    previous.is_none_or(|previous| {
-        previous.authority != status.authority
-            || previous.error != status.error
-            || previous.retry_at != status.retry_at
-            || comparable_value(request, &previous.value) != comparable_value(request, &status.value)
-    })
-}
-fn expire_status(mut status: Option<ForgeReadStatus>, now: DateTime<Utc>) -> Option<ForgeReadStatus> {
-    if let Some(status) = status.as_mut() {
-        if now.signed_duration_since(status.attempted_at) >= READ_HEARTBEAT_MAX_AGE && status.error.is_none() {
-            status.error = Some("forge observation heartbeat stale".into());
-        }
-    }
-    status
-}
-fn local_status(previous: Option<ForgeReadStatus>, local: Option<&LocalRead>) -> Option<ForgeReadStatus> {
-    match (previous, local) {
-        (Some(previous), Some(local)) if previous.authority == local.status.authority && previous.attempted_at == local.content_at => {
-            Some(local.status.clone())
-        }
-        (previous, _) => previous,
-    }
-}
-
-fn latest_status(statuses: impl IntoIterator<Item = ForgeReadStatus>) -> Option<ForgeReadStatus> {
-    statuses.into_iter().max_by_key(|status| (status.attempted_at, status.authority.clone()))
 }
 
 fn unknown_health(declared_at: DateTime<Utc>, now: DateTime<Utc>) -> ObserverHealth {
@@ -297,14 +234,13 @@ pub(crate) async fn owns_source(backend: &ResourceBackend, namespace: &str, sour
 pub struct ForgeReads {
     pub backend: ResourceBackend,
     pub namespace: String,
-    pub touch_demand: bool,
     pub allow_stale: bool,
-    locks: Arc<Mutex<BTreeMap<String, ReadLock>>>,
+    reads: Arc<Mutex<BTreeMap<String, ReadLock>>>,
     clock: Arc<dyn Clock>,
 }
 impl ForgeReads {
     pub fn new(backend: ResourceBackend, namespace: String) -> Self {
-        Self { backend, namespace, touch_demand: true, allow_stale: false, locks: Default::default(), clock: Arc::new(SystemClock) }
+        Self { backend, namespace, allow_stale: false, reads: Default::default(), clock: Arc::new(SystemClock) }
     }
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
@@ -326,7 +262,7 @@ impl ForgeReads {
     {
         let source = canonical_source(source);
         // Incremental cursors change every poll and belong to the owner's
-        // materialization loop. Never persist or replicate one record per cursor.
+        // materialization loop. Never cache one result per cursor.
         if matches!(request, ForgeReadRequest::Changes { .. }) {
             if !owns_source(&self.backend, &self.namespace, &source).await? {
                 return Err(OWNER_LOCAL_INCREMENTAL_READ_ERROR.into());
@@ -337,243 +273,41 @@ impl ForgeReads {
             }
             return result;
         }
-        let name = forge_read_name(&source, &request);
-        let lock = self.locks.lock().await.entry(name.clone()).or_default().clone();
-        let mut local = lock.lock().await;
-        let records = self.backend.using::<ForgeRead>(&self.namespace);
+        let lock = self.lock(&source, &request).await;
+        let mut last = lock.lock().await;
         let now = self.clock.now();
-        let spec = ForgeReadSpec { source: source.clone(), request: request.clone(), demanded_at: now };
-        // This spec remains a migration fallback. Renewals live in the small
-        // companion so touching demand never rewrites a completed board.
-        let current = match records.get(&name).await {
-            Ok(current) => current,
-            Err(ResourceError::NotFound { .. }) => {
-                records.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.map_err(|e| e.to_string())?
-            }
-            Err(e) => return Err(e.to_string().into()),
-        };
-        self.touch_heartbeat(&name, current.spec.demanded_at, now).await?;
-        let published = self.published_status(&name).await?;
-        let previous = local_status(published.clone(), local.as_ref());
-        let previous = if local.as_ref().is_some_and(|local| {
-            published.as_ref().is_some_and(|status| status.attempted_at == local.content_at && status.authority == local.status.authority)
-        }) {
-            previous
-        } else {
-            self.with_heartbeat(&name, previous).await?
-        };
-        let owner = owns_source(&self.backend, &self.namespace, &source).await?;
-        let fresh = previous.as_ref().is_some_and(|status| {
-            now.signed_duration_since(status.attempted_at) < READ_FRESHNESS || status.retry_at.is_some_and(|at| at > now)
+        let fresh = last.as_ref().is_some_and(|last| {
+            now.signed_duration_since(last.attempted_at) < READ_FRESHNESS
+                || last.error.as_ref().and_then(ObservationError::retry_at).is_some_and(|at| at > now)
         });
-        if !owner || fresh {
-            let previous = if !owner && previous.is_none() {
-                tokio::time::timeout(REMOTE_READ_TIMEOUT, self.wait_for_status(&name)).await.unwrap_or(Ok(None))?
-            } else {
-                previous
-            };
-            let previous = if owner { previous } else { expire_status(previous, self.clock.now()) };
-            let status = previous.ok_or_else(|| ObservationError::from("forge observation pending at source owner"))?;
-            // Keep the adapter's full typed diagnostic on local cache hits. Replicated
-            // answers carry the existing diagnostic and retry fields, without a schema change.
-            if !self.allow_stale || status.value.is_none() {
-                if let Some(error) = local.as_ref().filter(|local| local.status == status).and_then(|local| local.error.clone()) {
-                    return Err(error);
-                }
-            }
-            return decode_typed(status, self.allow_stale, &request);
-        }
-        // The shared per-request lock coalesces local work. Do not persist a
-        // transient pending claim: cancellation or handoff must leave the last
-        // completed observation usable and must never delay the next owner.
-        let result = tokio::time::timeout(LOAD_TIMEOUT, load()).await.unwrap_or_else(|_| Err("forge observation timed out".into()));
-        // Handoff during a slow read cannot publish facts from the former owner.
-        if !owns_source(&self.backend, &self.namespace, &source).await? {
-            return Err("forge observer changed during read".into());
-        }
-        let completed_at = self.clock.now();
-        let (value, observed_at, error, retry_at) = match &result {
-            Ok(value) => (Some(serde_json::to_value(value).map_err(|e| e.to_string())?), Some(completed_at), None, None),
-            Err(error) => (
-                previous.as_ref().and_then(|s| s.value.clone()),
-                previous.as_ref().and_then(|s| s.observed_at),
-                Some(error.to_string()),
-                error.retry_at(),
-            ),
-        };
-        let status = ForgeReadStatus {
-            authority: self.backend.local_root().map_err(|e| e.to_string())?.to_string(),
-            attempted_at: completed_at,
-            value,
-            observed_at,
-            error,
-            retry_at,
-        };
-        let changed = content_changed(&request, published.as_ref(), &status);
-        let content_at = if changed {
-            self.publish_status(&name, current.metadata.resource_version, &status).await?;
-            status.attempted_at
-        } else {
-            published.expect("unchanged content has a published status").attempted_at
-        };
-        self.publish_heartbeat(&name, content_at, &status, changed).await?;
-        *local = Some(LocalRead { error: result.as_ref().err().cloned(), status: status.clone(), content_at });
-        match result {
-            Err(error) if !self.allow_stale || status.value.is_none() => Err(error),
-            _ => decode_typed(status, self.allow_stale, &request),
-        }
-    }
-    async fn wait_for_status(&self, name: &str) -> Result<Option<ForgeReadStatus>, String> {
-        // Subscribe before rechecking status. Answers published before the
-        // subscription are read below; later answers arrive on the watch.
-        let answers = self.backend.including_replicas::<ForgeRead>(&self.namespace).watch().await.map_err(|e| e.to_string())?;
-        self.wait_for_status_on(name, answers).await
-    }
-    async fn wait_for_status_on(
-        &self,
-        name: &str,
-        mut answers: futures::stream::BoxStream<'static, Result<ReadWatchEvent<ForgeRead>, ResourceError>>,
-    ) -> Result<Option<ForgeReadStatus>, String> {
-        if let Some(status) = self.published_status(name).await? {
-            return self.with_heartbeat(name, Some(status)).await;
-        }
-        while let Some(event) = answers.next().await {
-            match event.map_err(|e| e.to_string())? {
-                ReadWatchEvent::Added(record) | ReadWatchEvent::Modified(record) if record.object.metadata.name == name => {
-                    if let Some(status) = self.published_status(name).await? {
-                        return self.with_heartbeat(name, Some(status)).await;
-                    }
-                }
-                _ => {}
-            }
-        }
-        Err("ForgeRead answer watch closed".into())
-    }
-    async fn published_status(&self, name: &str) -> Result<Option<ForgeReadStatus>, String> {
-        let statuses = self.backend.including_replicas::<ForgeRead>(&self.namespace).get_all(name).await.map_err(|e| e.to_string())?;
-        Ok(latest_status(statuses.items.into_iter().filter_map(|record| record.object.status)))
-    }
-    async fn with_heartbeat(&self, name: &str, status: Option<ForgeReadStatus>) -> Result<Option<ForgeReadStatus>, String> {
-        let Some(mut status) = status else { return Ok(None) };
-        let pulses =
-            self.backend.including_replicas::<ForgeReadHeartbeat>(&self.namespace).get_all(name).await.map_err(|e| e.to_string())?;
-        let pulse = pulses
-            .items
-            .into_iter()
-            .filter_map(|record| record.object.status)
-            .filter(|pulse| pulse.authority == status.authority && pulse.content_at == status.attempted_at)
-            .max_by_key(|pulse| pulse.attempted_at);
-        if let Some(pulse) = pulse {
-            status.attempted_at = pulse.attempted_at;
-            status.observed_at = pulse.observed_at;
-        }
-        Ok(expire_status(Some(status), self.clock.now()))
-    }
-    pub async fn status(&self, name: &str) -> Result<Option<ForgeReadStatus>, String> {
-        let lock = self.locks.lock().await.entry(name.to_owned()).or_default().clone();
-        let local = lock.lock().await;
-        let published = self.published_status(name).await?;
-        if local.as_ref().is_some_and(|local| {
-            published.as_ref().is_some_and(|status| status.attempted_at == local.content_at && status.authority == local.status.authority)
-        }) {
-            Ok(expire_status(local_status(published, local.as_ref()), self.clock.now()))
-        } else {
-            self.with_heartbeat(name, published).await
-        }
-    }
-    async fn touch_heartbeat(&self, name: &str, legacy_demand: DateTime<Utc>, now: DateTime<Utc>) -> Result<(), String> {
-        let records = self.backend.using::<ForgeReadHeartbeat>(&self.namespace);
-        let spec = ForgeReadHeartbeatSpec { demanded_at: if self.touch_demand { now } else { legacy_demand } };
-        match records.get(name).await {
-            Ok(current) if self.touch_demand && now.signed_duration_since(current.spec.demanded_at) >= READ_FRESHNESS => {
-                records
-                    .update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-            Ok(_) => {}
-            Err(ResourceError::NotFound { .. }) => {
-                records.create(&InputMeta::builder().name(name.to_owned()).build(), &spec).await.map_err(|e| e.to_string())?;
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-        Ok(())
-    }
-    async fn publish_heartbeat(
-        &self,
-        name: &str,
-        content_at: DateTime<Utc>,
-        status: &ForgeReadStatus,
-        changed: bool,
-    ) -> Result<(), String> {
-        let records = self.backend.using::<ForgeReadHeartbeat>(&self.namespace);
-        for attempt in 0..STATUS_WRITE_ATTEMPTS {
-            let current = records.get(name).await.map_err(|e| e.to_string())?;
-            if !changed
-                && current.status.as_ref().is_some_and(|pulse| {
-                    pulse.authority == status.authority
-                        && pulse.content_at == content_at
-                        && status.attempted_at.signed_duration_since(pulse.attempted_at) < READ_HEARTBEAT_INTERVAL
-                })
-            {
-                return Ok(());
-            }
-            let pulse = ForgeReadHeartbeatStatus::builder()
-                .authority(status.authority.clone())
-                .content_at(content_at)
-                .attempted_at(status.attempted_at)
-                .maybe_observed_at(status.observed_at)
-                .build();
-            match records.update_status(name, &current.metadata.resource_version, &pulse).await {
-                Ok(_) => return Ok(()),
-                Err(ResourceError::Conflict { .. }) if attempt + 1 < STATUS_WRITE_ATTEMPTS => tokio::task::yield_now().await,
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-        unreachable!("heartbeat writes have a bounded nonempty retry loop")
-    }
-    async fn publish_status(&self, name: &str, mut version: String, status: &ForgeReadStatus) -> Result<(), String> {
-        let records = self.backend.using::<ForgeRead>(&self.namespace);
-        for attempt in 0..STATUS_WRITE_ATTEMPTS {
-            match records.update_status(name, &version, status).await {
-                Ok(_) => return Ok(()),
-                Err(ResourceError::Conflict { .. }) if attempt + 1 < STATUS_WRITE_ATTEMPTS => {
-                    version = records.get(name).await.map_err(|e| e.to_string())?.metadata.resource_version;
-                    tokio::task::yield_now().await;
-                }
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-        unreachable!("status writes have a bounded nonempty retry loop")
-    }
-}
-fn decode_typed<T: DeserializeOwned>(
-    status: ForgeReadStatus,
-    allow_stale: bool,
-    request: &ForgeReadRequest,
-) -> Result<T, ObservationError> {
-    let retry_at = status.retry_at;
-    decode(status, allow_stale, request).map_err(|detail| match retry_at {
-        Some(at) => ObservationError::RateLimited { budget: "forge read".into(), retry_at: Some(at), detail },
-        None => ObservationError::Failed(detail),
-    })
-}
-
-fn decode<T: DeserializeOwned>(status: ForgeReadStatus, allow_stale: bool, request: &ForgeReadRequest) -> Result<T, String> {
-    if !allow_stale {
-        if let Some(error) = &status.error {
-            return Err(error.clone());
-        }
-    }
-    if let Some(mut value) = status.value {
-        if let Some(observed_at) = status.observed_at {
-            observation_objects(request, &mut value, |object| {
-                object.insert("observed_at".into(), serde_json::json!(observed_at));
+        if !fresh {
+            let result = tokio::time::timeout(LOAD_TIMEOUT, load())
+                .await
+                .unwrap_or_else(|_| Err("forge observation timed out".into()))
+                .and_then(|value| serde_json::to_value(value).map_err(|error| ObservationError::from(error.to_string())));
+            let previous = last.take().and_then(|last| last.value);
+            let attempted_at = self.clock.now();
+            *last = Some(match result {
+                Ok(value) => LastRead { attempted_at, value: Some(value), error: None },
+                Err(error) => LastRead { attempted_at, value: previous, error: Some(error) },
             });
         }
-        serde_json::from_value(value).map_err(|e| e.to_string())
-    } else {
-        Err(status.error.unwrap_or_else(|| "forge observation pending".into()))
+        let last = last.as_ref().expect("a read completed under this lock");
+        if let Some(error) = last.error.as_ref().filter(|_| !self.allow_stale || last.value.is_none()) {
+            return Err(error.clone());
+        }
+        let value = last.value.clone().expect("a read without an error holds a value");
+        serde_json::from_value(value).map_err(|error| ObservationError::from(error.to_string()))
+    }
+    /// The error of this host's latest read of `request`, if it failed.
+    pub async fn last_error(&self, source: &IssueSource, request: &ForgeReadRequest) -> Option<String> {
+        let lock = self.lock(&canonical_source(source), request).await;
+        let last = lock.lock().await;
+        last.as_ref().and_then(|last| last.error.as_ref()).map(ToString::to_string)
+    }
+    async fn lock(&self, source: &IssueSource, request: &ForgeReadRequest) -> ReadLock {
+        let key = serde_json::json!([source, request]).to_string();
+        self.reads.lock().await.entry(key).or_default().clone()
     }
 }
 
@@ -583,11 +317,6 @@ pub struct ObservedIssueProvider {
 }
 #[async_trait]
 impl IssueProvider for ObservedIssueProvider {
-    fn for_background_refresh(&self) -> Option<Arc<dyn IssueProvider>> {
-        let mut reads = self.reads.clone();
-        reads.touch_demand = false;
-        Some(Arc::new(Self { inner: self.inner.clone(), reads }))
-    }
     fn supports(&self, source: &IssueSource) -> bool {
         self.inner.supports(source)
     }
@@ -604,12 +333,7 @@ impl IssueProvider for ObservedIssueProvider {
         reads.allow_stale = true;
         let mut board: flotilla_protocol::DispatchBoardRepository =
             reads.read(source, ForgeReadRequest::Board, || self.inner.dispatch_board(source)).await?;
-        if let Some(status) = self.reads.status(&forge_read_name(&canonical_source(source), &ForgeReadRequest::Board)).await? {
-            if let Some(at) = status.observed_at {
-                board.observed_at = at;
-            }
-            board.refresh_error = status.error;
-        }
+        board.refresh_error = reads.last_error(source, &ForgeReadRequest::Board).await;
         Ok(board)
     }
     fn board_includes_mission_fields(&self) -> bool {
@@ -635,40 +359,6 @@ impl IssueProvider for ObservedIssueProvider {
     }
 }
 
-// Take a fresh lease snapshot after servicing potentially slow reads. Retire
-// each local kind independently: deleting a whole read must not orphan its
-// companion forever, and renewal at any origin keeps both kinds alive.
-pub(crate) async fn retire_idle_reads(backend: &ResourceBackend, namespace: &str, now: DateTime<Utc>) -> Result<(), String> {
-    let mut demands = BTreeMap::new();
-    for record in backend.including_replicas::<ForgeRead>(namespace).list().await.map_err(|e| e.to_string())?.items {
-        let demand = demands.entry(record.object.metadata.name).or_insert(record.object.spec.demanded_at);
-        *demand = (*demand).max(record.object.spec.demanded_at);
-    }
-    for record in backend.including_replicas::<ForgeReadHeartbeat>(namespace).list().await.map_err(|e| e.to_string())?.items {
-        let demand = demands.entry(record.object.metadata.name).or_insert(record.object.spec.demanded_at);
-        *demand = (*demand).max(record.object.spec.demanded_at);
-    }
-    let reads = backend.using::<ForgeRead>(namespace);
-    for record in reads.list().await.map_err(|e| e.to_string())?.items {
-        let demand = demands.get(&record.metadata.name).copied().unwrap_or(record.spec.demanded_at);
-        if now.signed_duration_since(demand) >= DEMAND_RETENTION {
-            if let Err(error) = reads.delete(&record.metadata.name).await {
-                tracing::debug!(name = %record.metadata.name, %error, "idle forge demand cleanup failed");
-            }
-        }
-    }
-    let pulses = backend.using::<ForgeReadHeartbeat>(namespace);
-    for record in pulses.list().await.map_err(|e| e.to_string())?.items {
-        let demand = demands.get(&record.metadata.name).copied().unwrap_or(record.spec.demanded_at);
-        if now.signed_duration_since(demand) >= DEMAND_RETENTION {
-            if let Err(error) = pulses.delete(&record.metadata.name).await {
-                tracing::debug!(name = %record.metadata.name, %error, "idle forge heartbeat cleanup failed");
-            }
-        }
-    }
-    Ok(())
-}
-
 pub struct ObservedChangeRequestTracker {
     pub inner: Arc<dyn ChangeRequestTracker>,
     pub reads: ForgeReads,
@@ -676,11 +366,6 @@ pub struct ObservedChangeRequestTracker {
 }
 #[async_trait]
 impl ChangeRequestTracker for ObservedChangeRequestTracker {
-    fn for_background_refresh(&self) -> Option<Arc<dyn ChangeRequestTracker>> {
-        let mut reads = self.reads.clone();
-        reads.touch_demand = false;
-        Some(Arc::new(Self { inner: self.inner.clone(), reads, source: self.source.clone() }))
-    }
     async fn observe_bound(&self, numbers: &[u64], logins: &CrewGithubLoginsByRequest) -> Result<BoundObservations, ObservationError> {
         if !owns_source(&self.reads.backend, &self.reads.namespace, &self.source).await? {
             return Err("bound PR observation belongs to another source owner".into());
@@ -725,8 +410,11 @@ impl ChangeRequestTracker for ObservedChangeRequestTracker {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_resources::{HostSpec, HostStatus, IssueSourceBindingSpec, ProjectSpec, Resource};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use flotilla_resources::{HostSpec, HostStatus, InputMeta, IssueSourceBindingSpec, ProjectSpec, Resource};
     use flotilla_store_memory::InMemoryBackend;
+    use flotilla_store_testkit::VirtualClock;
 
     use super::*;
 
@@ -743,429 +431,128 @@ mod tests {
         let list = from.using::<T>("flotilla").list().await.unwrap();
         to.replica_writer::<T>(from.local_root().unwrap(), "flotilla").replace(&list, Utc::now()).await.unwrap();
     }
-
-    fn clocked_reads(root: &str) -> (ForgeReads, Arc<flotilla_store_testkit::VirtualClock>) {
-        let clock = Arc::new(flotilla_store_testkit::VirtualClock::new(Utc::now()));
-        let mut reads = ForgeReads::new(backend(root), "flotilla".into());
-        reads.clock = clock.clone();
-        (reads, clock)
-    }
-
-    // An unreachable owner returns the existing pending error at the bound.
-    // Unrelated demands must not add store reads while waiting (no polling).
-    #[tokio::test(start_paused = true)]
-    async fn remote_wait_is_bounded_without_scanning_demands() {
-        use flotilla_store_testkit::ReadCountsBackendExt;
-        let owner = backend("owner");
-        let counted = InMemoryBackend::default().with_read_counts();
-        let peer = ResourceBackend::new(counted.clone()).with_local_root(NodeId::new("peer"));
-        owner
-            .using::<Project>("flotilla")
-            .create(
-                &meta("shared"),
-                &ProjectSpec::builder()
-                    .display_name("Shared".into())
-                    .issue_source_bindings(vec![IssueSourceBindingSpec::builder().source(source()).alias("shared".into()).build()])
-                    .build(),
-            )
-            .await
-            .expect("owner declaration");
-        replicate::<Project>(&owner, &peer).await;
-        for index in 0..200 {
-            let name = format!("unrelated-{index}");
-            peer.using::<ForgeRead>("flotilla")
-                .create(
-                    &meta(&name),
-                    &ForgeReadSpec {
-                        source: source(),
-                        request: ForgeReadRequest::Issue { id: index.to_string() },
-                        demanded_at: Utc::now(),
-                    },
-                )
-                .await
-                .expect("unrelated demand");
-            peer.using::<ForgeReadHeartbeat>("flotilla")
-                .create(&meta(&name), &ForgeReadHeartbeatSpec { demanded_at: Utc::now() })
-                .await
-                .expect("unrelated pulse");
-        }
-        let before = counted.read_snapshot();
-        let reads = ForgeReads::new(peer, "flotilla".into());
-        let started = tokio::time::Instant::now();
-        // Model the daemon's outer interactive deadline: the observation must
-        // return its pending error before request dispatch cancels it as busy.
-        let error = tokio::time::timeout(
-            StdDuration::from_secs(5),
-            reads.read::<u64, _, _>(&source(), ForgeReadRequest::Board, || async { panic!("peer loader") }),
-        )
-        .await
-        .expect("pending before the daemon interactive deadline")
-        .expect_err("unreachable owner");
-        assert_eq!(error, "forge observation pending at source owner");
-        assert_eq!(started.elapsed(), REMOTE_READ_TIMEOUT);
-        // Empty named reads return no counted records. The parent is returned
-        // exactly once by the initial status lookup and once by the recheck.
-        let decoded = counted.read_snapshot().since(&before).objects_by_kind();
-        for (kind, expected) in [(ForgeRead::API_PATHS.kind, 2), (ForgeReadHeartbeat::API_PATHS.kind, 0)] {
-            assert_eq!(decoded.get(kind).copied().unwrap_or_default(), expected, "waiting reads only the named demand pair");
-        }
-    }
-
-    // A lost answer channel is a transport error, not a premature pending result.
-    #[tokio::test]
-    async fn remote_wait_reports_closed_answer_watch() {
-        let reads = ForgeReads::new(backend("peer"), "flotilla".into());
-        let error = reads.wait_for_status_on("missing", futures::stream::empty().boxed()).await.unwrap_err();
-        assert_eq!(error, "ForgeRead answer watch closed");
-    }
-
-    // Waiting peers receive a published owner error immediately; a failed forge
-    // request must not leave the interactive read waiting for a value forever.
-    #[tokio::test(start_paused = true)]
-    async fn remote_wait_returns_published_owner_error() {
-        let owner = backend("owner");
-        let peer = backend("peer");
-        owner
-            .using::<Project>("flotilla")
-            .create(
-                &meta("shared"),
-                &ProjectSpec::builder()
-                    .display_name("Shared".into())
-                    .issue_source_bindings(vec![IssueSourceBindingSpec::builder().source(source()).alias("shared".into()).build()])
-                    .build(),
-            )
-            .await
-            .expect("owner declaration");
-        replicate::<Project>(&owner, &peer).await;
-        let owner_reads = ForgeReads::new(owner.clone(), "flotilla".into());
-        let peer_reads = ForgeReads::new(peer.clone(), "flotilla".into());
-        let source = source();
-        let started = tokio::time::Instant::now();
-        let read = peer_reads.read::<u64, _, _>(&source, ForgeReadRequest::Board, || async { panic!("peer loader") });
-        let publish = async {
-            // The loader stands in for the failing external forge boundary.
-            owner_reads
-                .read::<u64, _, _>(&source, ForgeReadRequest::Board, || async { Err("owner forge unavailable".into()) })
-                .await
-                .expect_err("forge error");
-            replicate::<ForgeRead>(&owner, &peer).await;
-        };
-        let (result, ()) = tokio::join!(read, publish);
-        assert_eq!(result.expect_err("owner error"), "owner forge unavailable");
-        assert!(started.elapsed() < REMOTE_READ_TIMEOUT);
-    }
-
-    // Incremental cursors are owner-local: any sequence of cursors, limits and
-    // successful/error responses creates zero durable demand/result records.
-    #[hegel::test]
-    fn incremental_reads_do_not_accumulate_records(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let polls = tc.draw(gs::integers::<usize>().min_value(1).max_value(12));
-        let steps = (0..polls)
-            .map(|_| {
-                (
-                    tc.draw(gs::integers::<u32>().min_value(0).max_value(3)),
-                    tc.draw(gs::integers::<usize>().min_value(0).max_value(100)),
-                    tc.draw(gs::booleans()),
-                )
-            })
-            .collect::<Vec<_>>();
-        tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-            let reads = ForgeReads::new(backend("owner"), "flotilla".into());
-            for (cursor, count, fail) in steps {
-                let expected = if fail { Err("provider failed".to_string()) } else { Ok(cursor) };
-                let result = reads
-                    .read(&source(), ForgeReadRequest::Changes { since: cursor.to_string(), count }, || async { expected.clone() })
-                    .await;
-                assert_eq!(result, expected);
-                assert!(reads.backend.using::<ForgeRead>("flotilla").list().await.expect("list records").items.is_empty());
-                assert!(reads.backend.using::<ForgeReadHeartbeat>("flotilla").list().await.expect("list records").items.is_empty());
-            }
-        });
-    }
-
-    // A nonowner never runs the incremental loader or authors a cursor demand.
-    #[tokio::test]
-    async fn nonowner_incremental_read_is_refused_without_records() {
-        let owner = backend("owner");
-        let peer = backend("peer");
-        owner
-            .using::<Project>("flotilla")
-            .create(
-                &meta("shared"),
-                &ProjectSpec::builder()
-                    .display_name("Shared".into())
-                    .issue_source_bindings(vec![IssueSourceBindingSpec::builder().source(source()).alias("shared".into()).build()])
-                    .build(),
-            )
-            .await
-            .expect("owner declaration");
-        replicate::<Project>(&owner, &peer).await;
-        let reads = ForgeReads::new(peer, "flotilla".into());
-        assert_eq!(
-            reads
-                .read::<u32, _, _>(&source(), ForgeReadRequest::Changes { since: "cursor".into(), count: 50 }, || async {
-                    panic!("nonowner incremental loader")
-                })
-                .await
-                .expect_err("nonowner refusal"),
-            OWNER_LOCAL_INCREMENTAL_READ_ERROR
-        );
-        assert!(reads.backend.using::<ForgeRead>("flotilla").list().await.expect("list records").items.is_empty());
-        assert!(reads.backend.using::<ForgeReadHeartbeat>("flotilla").list().await.expect("list records").items.is_empty());
-    }
-
-    // An externally removed parent leaves a live demand companion until its
-    // lease expires; at the retention boundary even an orphan is tombstoned.
-    // A new read afterwards recreates the pair and resumes normally.
-    #[tokio::test]
-    async fn orphan_heartbeat_retires_at_retention_and_can_be_recreated() {
-        let (reads, clock) = clocked_reads("owner");
-        let source = source();
-        let name = forge_read_name(&source, &ForgeReadRequest::Board);
-        reads.read(&source, ForgeReadRequest::Board, || async { Ok(42_u64) }).await.unwrap();
-        reads.backend.using::<ForgeRead>("flotilla").delete(&name).await.unwrap();
-        clock.advance(DEMAND_RETENTION - Duration::seconds(1));
-        retire_idle_reads(&reads.backend, "flotilla", clock.now()).await.unwrap();
-        assert!(reads.backend.using::<ForgeReadHeartbeat>("flotilla").get(&name).await.is_ok());
-        clock.advance(Duration::seconds(1));
-        retire_idle_reads(&reads.backend, "flotilla", clock.now()).await.unwrap();
-        assert!(matches!(reads.backend.using::<ForgeReadHeartbeat>("flotilla").get(&name).await, Err(ResourceError::NotFound { .. })));
-        assert_eq!(reads.read(&source, ForgeReadRequest::Board, || async { Ok(43_u64) }).await.unwrap(), 43);
-    }
-
-    // Fresh demand arriving from another origin protects an old local pair.
-    // Expiration deletes only local records, never the replicated demand.
-    #[tokio::test]
-    async fn replicated_demand_renews_retention_for_both_kinds() {
-        let (reads, clock) = clocked_reads("owner");
-        let source = source();
-        let name = forge_read_name(&source, &ForgeReadRequest::Board);
-        reads.read(&source, ForgeReadRequest::Board, || async { Ok(42_u64) }).await.unwrap();
-        clock.advance(DEMAND_RETENTION);
-        let peer = backend("peer");
-        peer.using::<ForgeReadHeartbeat>("flotilla")
-            .create(&meta(&name), &ForgeReadHeartbeatSpec { demanded_at: clock.now() })
-            .await
-            .unwrap();
-        replicate::<ForgeReadHeartbeat>(&peer, &reads.backend).await;
-        retire_idle_reads(&reads.backend, "flotilla", clock.now()).await.unwrap();
-        assert!(reads.backend.using::<ForgeRead>("flotilla").get(&name).await.is_ok());
-        assert!(reads.backend.using::<ForgeReadHeartbeat>("flotilla").get(&name).await.is_ok());
-        clock.advance(DEMAND_RETENTION);
-        retire_idle_reads(&reads.backend, "flotilla", clock.now()).await.unwrap();
-        assert!(matches!(reads.backend.using::<ForgeRead>("flotilla").get(&name).await, Err(ResourceError::NotFound { .. })));
-        assert!(matches!(reads.backend.using::<ForgeReadHeartbeat>("flotilla").get(&name).await, Err(ResourceError::NotFound { .. })));
-        assert!(peer.using::<ForgeReadHeartbeat>("flotilla").get(&name).await.is_ok());
-    }
-
-    // Fallback mission fields use the same per-source/ticket 60s cache as other
-    // ForgeReads. Repeated board users share a read until the freshness edge.
-    #[tokio::test]
-    async fn fallback_mission_fields_share_the_per_ticket_freshness_cache() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let (reads, clock) = clocked_reads("owner");
-        let calls = AtomicUsize::new(0);
-        let source = source();
-        let expected = flotilla_protocol::MissionFields { priority: Some(flotilla_protocol::Priority::High), ..Default::default() };
-        for (id, elapsed, count) in [("1", 0, 1), ("1", 0, 1), ("2", 0, 2), ("1", 59, 2), ("1", 1, 3)] {
-            clock.advance(Duration::seconds(elapsed));
-            let actual = reads
-                .read(&source, ForgeReadRequest::Mission { id: id.into() }, || async {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(expected.clone())
-                })
-                .await
-                .expect("field observation");
-            assert_eq!(actual, expected);
-            assert_eq!(calls.load(Ordering::SeqCst), count);
-        }
-    }
-
-    // Minute refreshes retain one whole-board publication, while demand renews
-    // in its small companion and observation heartbeats publish every 5 minutes.
-    // Generate elapsed poll counts across heartbeat edges and domain changes.
-    #[hegel::test]
-    fn unchanged_boards_publish_only_low_rate_heartbeats(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let polls = tc.draw(gs::integers::<u32>().min_value(1).max_value(12));
-        let changed_field = tc.draw(gs::integers::<u8>().min_value(0).max_value(2));
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (reads, clock) = clocked_reads("owner");
-            let source = source();
-            let name = forge_read_name(&source, &ForgeReadRequest::Board);
-            let initial = clock.now();
-            let mut value = serde_json::json!({"observed_at": initial, "age_seconds": 0,
-                "issues": (0..400).map(|id| serde_json::json!({"id":id,"title":"open","updated_at":initial})).collect::<Vec<_>>()});
-            reads.read(&source, ForgeReadRequest::Board, || async { Ok(value.clone()) }).await.unwrap();
-            let records = reads.backend.using::<ForgeRead>("flotilla");
-            let first = records.get(&name).await.unwrap();
-            let pulses = reads.backend.using::<ForgeReadHeartbeat>("flotilla");
-            let mut pulse = pulses.get(&name).await.unwrap().status.unwrap();
-            for poll in 1..=polls {
-                let now = clock.advance(READ_FRESHNESS);
-                value["observed_at"] = serde_json::json!(now);
-                value["age_seconds"] = serde_json::json!(poll);
-                let returned = reads.read(&source, ForgeReadRequest::Board, || async { Ok(value.clone()) }).await.unwrap();
-                assert_eq!(returned, value);
-                let current = records.get(&name).await.unwrap();
-                assert_eq!(
-                    current.metadata.resource_version, first.metadata.resource_version,
-                    "unchanged board must not replicate in full"
-                );
-                assert_eq!(current.status, first.status);
-                let heartbeat = pulses.get(&name).await.unwrap();
-                assert_eq!(heartbeat.spec.demanded_at, now);
-                let next = heartbeat.status.unwrap();
-                if poll % 5 == 0 {
-                    assert_eq!(next.attempted_at, now);
-                    assert_eq!(next.observed_at, Some(now));
-                } else {
-                    assert_eq!(next, pulse);
-                }
-                pulse = next;
-                assert_eq!(reads.status(&name).await.unwrap().unwrap().observed_at, Some(now));
-                // Coalescing uses completed local observations, rather than
-                // the old whole-board publication timestamp.
-                let _: serde_json::Value =
-                    reads.read(&source, ForgeReadRequest::Board, || async { panic!("fresh local read must coalesce") }).await.unwrap();
-            }
-            clock.advance(READ_FRESHNESS);
-            match changed_field {
-                0 => value["issues"][0]["title"] = serde_json::json!("changed"),
-                1 => value["issues"][0]["updated_at"] = serde_json::json!(clock.now()),
-                _ => value["issues"] = serde_json::json!([]),
-            }
-            reads.read(&source, ForgeReadRequest::Board, || async { Ok(value) }).await.unwrap();
-            assert_ne!(records.get(&name).await.unwrap().metadata.resource_version, first.metadata.resource_version);
-        });
-    }
-
-    // Other whole reads carry Issue observation timestamps too. Their freshness
-    // must not republish unchanged facts, and similarly named user fields and
-    // as_of revision timestamps must remain semantic. Generate both replicated issue shapes; owner-local Changes never publish.
-    #[hegel::test]
-    fn issue_read_publication_preserves_user_fields_and_revision_time(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let shape = tc.draw(gs::integers::<u8>().min_value(0).max_value(1));
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (reads, clock) = clocked_reads("owner");
-            let request = match shape {
-                0 => ForgeReadRequest::Issue { id: "7".into() },
-                _ => ForgeReadRequest::Query { params: IssueQuery::default(), page: 1, count: 1 },
-            };
-            let wrap = |item: serde_json::Value| match shape {
-                0 => item,
-                _ => serde_json::json!({"items":[item]}),
-            };
-            let source = source();
-            let name = forge_read_name(&source, &request);
-            let mut item = serde_json::json!({"observed_at":clock.now(),"as_of":clock.now(),"fields":{"observed_at":"user fact"}});
-            reads.read(&source, request.clone(), || async { Ok(wrap(item.clone())) }).await.unwrap();
-            let records = reads.backend.using::<ForgeRead>("flotilla");
-            let first = records.get(&name).await.unwrap();
-            clock.advance(READ_FRESHNESS);
-            item["observed_at"] = serde_json::json!(clock.now());
-            let expected = wrap(item.clone());
-            assert_eq!(reads.read(&source, request.clone(), || async { Ok(expected.clone()) }).await.unwrap(), expected);
-            assert_eq!(records.get(&name).await.unwrap().metadata.resource_version, first.metadata.resource_version);
-            clock.advance(READ_FRESHNESS);
-            item["fields"]["observed_at"] = serde_json::json!("changed user fact");
-            reads.read(&source, request.clone(), || async { Ok(wrap(item.clone())) }).await.unwrap();
-            let changed = records.get(&name).await.unwrap();
-            assert_ne!(changed.metadata.resource_version, first.metadata.resource_version);
-            clock.advance(READ_FRESHNESS);
-            item["as_of"] = serde_json::json!(clock.now());
-            reads.read(&source, request, || async { Ok(wrap(item)) }).await.unwrap();
-            assert_ne!(records.get(&name).await.unwrap().metadata.resource_version, changed.metadata.resource_version);
-        });
-    }
-
-    // Repeated identical errors do not resend the last good board. Error
-    // transitions and recovery publish immediately even with identical facts.
-    #[tokio::test]
-    async fn error_transitions_publish_once_and_background_does_not_renew_demand() {
-        let (mut reads, clock) = clocked_reads("owner");
-        let source = source();
-        let name = forge_read_name(&source, &ForgeReadRequest::Board);
-        reads.allow_stale = true;
-        reads.read(&source, ForgeReadRequest::Board, || async { Ok(42_u64) }).await.unwrap();
-        let records = reads.backend.using::<ForgeRead>("flotilla");
-        let first = records.get(&name).await.unwrap();
-        reads.touch_demand = false;
-        clock.advance(READ_FRESHNESS);
-        assert_eq!(reads.read(&source, ForgeReadRequest::Board, || async { Err::<u64, _>("outage".into()) }).await.unwrap(), 42);
-        let failed = records.get(&name).await.unwrap();
-        assert_ne!(first.metadata.resource_version, failed.metadata.resource_version);
-        assert_eq!(failed.status.as_ref().unwrap().error.as_deref(), Some("outage"));
-        clock.advance(READ_FRESHNESS);
-        reads.read(&source, ForgeReadRequest::Board, || async { Err::<u64, _>("outage".into()) }).await.unwrap();
-        assert_eq!(failed.metadata.resource_version, records.get(&name).await.unwrap().metadata.resource_version);
-        let demand = reads.backend.using::<ForgeReadHeartbeat>("flotilla").get(&name).await.unwrap();
-        assert_eq!(demand.spec.demanded_at, first.spec.demanded_at);
-        clock.advance(READ_FRESHNESS);
-        reads.read(&source, ForgeReadRequest::Board, || async { Ok(42_u64) }).await.unwrap();
-        let recovered = records.get(&name).await.unwrap();
-        assert_ne!(recovered.metadata.resource_version, failed.metadata.resource_version);
-        assert!(recovered.status.unwrap().error.is_none());
-    }
-
-    // Replicated peers use the small owner's heartbeat, never call the forge,
-    // and reject expired or mismatched-content heartbeats. A new owner can
-    // publish equal facts immediately with its new authority (handoff test).
-    #[tokio::test]
-    async fn peer_freshness_comes_from_matching_heartbeat_and_expires() {
-        let (owner, clock) = clocked_reads("owner");
-        let source = source();
+    async fn declare_at(owner: &ResourceBackend) {
         let spec = ProjectSpec::builder()
             .display_name("Shared".into())
-            .issue_source_bindings(vec![IssueSourceBindingSpec::builder().source(source.clone()).alias("shared".into()).build()])
+            .issue_source_bindings(vec![IssueSourceBindingSpec::builder().source(source()).alias("shared".into()).build()])
             .build();
-        owner.backend.using::<Project>("flotilla").create(&meta("shared"), &spec).await.unwrap();
-        let mut peer = ForgeReads::new(backend("peer"), "flotilla".into());
-        peer.clock = clock.clone();
-        replicate::<Project>(&owner.backend, &peer.backend).await;
-        owner.read(&source, ForgeReadRequest::Board, || async { Ok(42_u64) }).await.unwrap();
-        let name = forge_read_name(&source, &ForgeReadRequest::Board);
-        let first = owner.backend.using::<ForgeRead>("flotilla").get(&name).await.unwrap();
-        replicate::<ForgeRead>(&owner.backend, &peer.backend).await;
-        replicate::<ForgeReadHeartbeat>(&owner.backend, &peer.backend).await;
-        clock.advance(READ_HEARTBEAT_INTERVAL);
-        owner.read(&source, ForgeReadRequest::Board, || async { Ok(42_u64) }).await.unwrap();
-        assert_eq!(
-            first.metadata.resource_version,
-            owner.backend.using::<ForgeRead>("flotilla").get(&name).await.unwrap().metadata.resource_version
-        );
-        replicate::<ForgeReadHeartbeat>(&owner.backend, &peer.backend).await;
-        assert_eq!(
-            peer.read::<u64, _, _>(&source, ForgeReadRequest::Board, || async { panic!("peer must never load") }).await.unwrap(),
-            42_u64
-        );
-        assert_eq!(peer.status(&name).await.unwrap().unwrap().observed_at, Some(clock.now()));
-        clock.advance(READ_HEARTBEAT_MAX_AGE);
-        let error =
-            peer.read::<u64, _, _>(&source, ForgeReadRequest::Board, || async { panic!("peer must never load") }).await.unwrap_err();
-        assert_eq!(error, "forge observation heartbeat stale");
-        peer.allow_stale = true;
-        assert_eq!(
-            peer.read::<u64, _, _>(&source, ForgeReadRequest::Board, || async { panic!("peer must never load") }).await.unwrap(),
-            42_u64
-        );
-        let pulses = owner.backend.using::<ForgeReadHeartbeat>("flotilla");
-        let record = pulses.get(&name).await.unwrap();
-        let mut wrong = record.status.unwrap();
-        wrong.attempted_at = clock.now();
-        wrong.content_at = clock.now();
-        pulses.update_status(&name, &record.metadata.resource_version, &wrong).await.unwrap();
-        replicate::<ForgeReadHeartbeat>(&owner.backend, &peer.backend).await;
-        assert_eq!(peer.status(&name).await.unwrap().unwrap().error.as_deref(), Some("forge observation heartbeat stale"));
+        owner.using::<Project>("flotilla").create(&meta("shared"), &spec).await.expect("owner declaration");
+    }
+    fn clocked_reads(root: &str) -> (ForgeReads, Arc<VirtualClock>) {
+        let clock = Arc::new(VirtualClock::new(Utc::now()));
+        (ForgeReads::new(backend(root), "flotilla".into()).with_clock(clock.clone()), clock)
     }
 
-    // Cancellation must release local coalescing and leave no replicated claim
-    // that prevents the very next caller from obtaining a completed result.
+    /// A forge that answers each call with its current response and counts the calls.
+    struct CountingForge {
+        calls: AtomicUsize,
+        response: std::sync::Mutex<Result<u64, ObservationError>>,
+    }
+    impl CountingForge {
+        fn new(response: Result<u64, ObservationError>) -> Self {
+            Self { calls: AtomicUsize::new(0), response: std::sync::Mutex::new(response) }
+        }
+        fn respond(&self, response: Result<u64, ObservationError>) {
+            *self.response.lock().unwrap() = response;
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+        async fn board(&self, reads: &ForgeReads) -> Result<u64, ObservationError> {
+            reads
+                .read_typed(&source(), ForgeReadRequest::Board, || async {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    self.response.lock().unwrap().clone()
+                })
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_reads_of_one_request_make_one_forge_call() {
+        let (reads, _) = clocked_reads("host");
+        let forge = CountingForge::new(Ok(7));
+        let (first, second) = tokio::join!(forge.board(&reads), forge.board(&reads));
+        assert_eq!((first.unwrap(), second.unwrap()), (7, 7));
+        assert_eq!(forge.calls(), 1);
+    }
+
+    #[hegel::test]
+    fn a_read_calls_the_forge_only_once_its_last_result_is_stale(tc: hegel::TestCase) {
+        let elapsed = tc.draw(hegel::generators::integers::<i64>().min_value(0).max_value(3 * READ_FRESHNESS.num_seconds()));
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let (reads, clock) = clocked_reads("host");
+            let forge = CountingForge::new(Ok(1));
+            assert_eq!(forge.board(&reads).await.unwrap(), 1);
+            forge.respond(Ok(2));
+            clock.advance(Duration::seconds(elapsed));
+            let stale = Duration::seconds(elapsed) >= READ_FRESHNESS;
+            assert_eq!(forge.board(&reads).await.unwrap(), if stale { 2 } else { 1 });
+            assert_eq!(forge.calls(), 1 + usize::from(stale));
+        });
+    }
+
+    #[hegel::test]
+    fn a_failed_read_returns_the_last_good_value_only_when_stale_is_allowed(tc: hegel::TestCase) {
+        let allow_stale = tc.draw(hegel::generators::booleans());
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let (mut reads, clock) = clocked_reads("host");
+            reads.allow_stale = allow_stale;
+            let forge = CountingForge::new(Ok(1));
+            forge.board(&reads).await.unwrap();
+            forge.respond(Err("outage".into()));
+            clock.advance(READ_FRESHNESS);
+            let result = forge.board(&reads).await;
+            assert_eq!(forge.calls(), 2);
+            if allow_stale {
+                assert_eq!(result.unwrap(), 1);
+            } else {
+                assert_eq!(result.unwrap_err().to_string(), "outage");
+            }
+            assert_eq!(reads.last_error(&source(), &ForgeReadRequest::Board).await.as_deref(), Some("outage"));
+        });
+    }
+
+    #[hegel::test]
+    fn a_future_retry_time_suppresses_the_forge_call(tc: hegel::TestCase) {
+        let wait = tc.draw(hegel::generators::integers::<i64>().min_value(READ_FRESHNESS.num_seconds()).max_value(3600));
+        let elapsed = tc.draw(hegel::generators::integers::<i64>().min_value(0).max_value(wait + 60));
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let (reads, clock) = clocked_reads("host");
+            let retry_at = clock.now() + Duration::seconds(wait);
+            let limited = ObservationError::RateLimited { budget: "forge".into(), retry_at: Some(retry_at), detail: "quota".into() };
+            let forge = CountingForge::new(Err(limited.clone()));
+            assert_eq!(forge.board(&reads).await.unwrap_err(), limited);
+            forge.respond(Ok(1));
+            clock.advance(Duration::seconds(elapsed));
+            let suppressed = clock.now() < retry_at;
+            let result = forge.board(&reads).await;
+            assert_eq!(forge.calls(), 1 + usize::from(!suppressed));
+            if suppressed {
+                assert_eq!(result.unwrap_err(), limited);
+            } else {
+                assert_eq!(result.unwrap(), 1);
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn a_host_that_does_not_own_the_source_reads_from_its_own_call() {
+        let owner = backend("owner");
+        let peer = backend("peer");
+        declare_at(&owner).await;
+        replicate::<Project>(&owner, &peer).await;
+        assert_eq!(source_owner(&peer, "flotilla", &source()).await.unwrap(), Some(NodeId::new("owner")));
+        let reads = ForgeReads::new(peer, "flotilla".into());
+        let forge = CountingForge::new(Ok(42));
+        assert_eq!(forge.board(&reads).await.unwrap(), 42);
+        assert_eq!(forge.calls(), 1);
+    }
+
     #[tokio::test]
     async fn cancelled_read_does_not_delay_next_read() {
-        let reads = ForgeReads::new(backend("owner"), "flotilla".into());
+        let reads = ForgeReads::new(backend("host"), "flotilla".into());
         let source = source();
         let (entered, mut started) = tokio::sync::oneshot::channel();
         let mut first = Box::pin(reads.read(&source, ForgeReadRequest::Board, || async {
@@ -1180,122 +567,40 @@ mod tests {
         assert_eq!(reads.read(&source, ForgeReadRequest::Board, || async { Ok(42_u64) }).await.unwrap(), 42);
     }
 
-    // A concurrent demand touch may conflict with the final status write.
-    // Retrying must preserve the loaded value and stamp its completion time.
-    #[tokio::test]
-    async fn demand_touch_during_load_keeps_completed_result() {
-        let reads = ForgeReads::new(backend("owner"), "flotilla".into());
-        let source = source();
-        let name = forge_read_name(&source, &ForgeReadRequest::Board);
-        let completed = Arc::new(Mutex::new(None));
-        let result = reads
-            .read(&source, ForgeReadRequest::Board, || async {
-                let records = reads.backend.using::<ForgeRead>("flotilla");
-                let record = records.get(&name).await.unwrap();
-                let mut spec = record.spec;
-                spec.demanded_at = Utc::now();
-                records.update(&InputMeta::from(&record.metadata), &record.metadata.resource_version, &spec).await.unwrap();
-                *completed.lock().await = Some(Utc::now());
-                Ok(42_u64)
-            })
-            .await
-            .unwrap();
-        assert_eq!(result, 42);
-        let status = reads.backend.using::<ForgeRead>("flotilla").get(&name).await.unwrap().status.unwrap();
-        assert_eq!(status.value, Some(serde_json::json!(42)));
-        assert!(status.observed_at.unwrap() >= completed.lock().await.unwrap());
-        assert!(status.observed_at.unwrap() >= status.attempted_at);
-    }
-
-    // A former owner must not publish its in-flight result. After handoff the
-    // new owner can read immediately, without inheriting a five-minute claim.
-    #[tokio::test]
-    async fn handoff_during_load_leaves_new_owner_free_to_read() {
-        let first = backend("first");
-        let second = backend("second");
-        let source = source();
-        let spec = ProjectSpec::builder()
-            .display_name("Shared".into())
-            .issue_source_bindings(vec![IssueSourceBindingSpec::builder().source(source.clone()).alias("shared".into()).build()])
-            .build();
-        first.using::<Project>("flotilla").create(&meta("shared"), &spec).await.unwrap();
-        replicate::<Project>(&first, &second).await;
-        for backend in [&first, &second] {
-            let hosts = backend.using::<Host>("flotilla");
-            let host = hosts.create(&meta("host"), &HostSpec::default()).await.unwrap();
-            hosts
-                .update_status(
-                    "host",
-                    &host.metadata.resource_version,
-                    &HostStatus { ready: true, heartbeat_at: Some(Utc::now()), ..Default::default() },
-                )
-                .await
-                .unwrap();
-        }
-        replicate::<Host>(&second, &first).await;
-        let reads = ForgeReads::new(first.clone(), "flotilla".into());
-        let result = reads
-            .read(&source, ForgeReadRequest::Board, || async {
-                let hosts = first.using::<Host>("flotilla");
-                let host = hosts.get("host").await.unwrap();
-                hosts
-                    .update_status(
-                        "host",
-                        &host.metadata.resource_version,
-                        &HostStatus {
-                            ready: true,
-                            heartbeat_at: Some(Utc::now()),
-                            conditions: vec![flotilla_resources::HostCondition::builder()
-                                .condition_type("ForgeObservation")
-                                .reason("Withdrawn")
-                                .message("deliberate handover during a read")
-                                .observed_at(Utc::now())
-                                .value(flotilla_resources::ConditionValue::False)
-                                .blocks_readiness(false)
-                                // Explicit withdrawal must work independently of placement readiness.
-                                .blocks_forge_observation(true)
-                                .build()],
-                            ..Default::default()
-                        },
-                    )
+    #[hegel::test]
+    fn owner_incremental_reads_call_the_forge_every_time(tc: hegel::TestCase) {
+        let polls = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(6));
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let reads = ForgeReads::new(backend("owner"), "flotilla".into());
+            let calls = AtomicUsize::new(0);
+            for _ in 0..polls {
+                reads
+                    .read(&source(), ForgeReadRequest::Changes { since: "cursor".into(), count: 50 }, || async {
+                        Ok(calls.fetch_add(1, Ordering::SeqCst))
+                    })
                     .await
                     .unwrap();
-                Ok(1_u64)
-            })
-            .await;
-        assert_eq!(result.unwrap_err(), "forge observer changed during read");
-        replicate::<Host>(&first, &second).await;
-        replicate::<ForgeRead>(&first, &second).await;
-        let new_reads = ForgeReads::new(second, "flotilla".into());
-        assert_eq!(new_reads.read(&source, ForgeReadRequest::Board, || async { Ok(2_u64) }).await.unwrap(), 2);
-        assert!(first
-            .using::<ForgeRead>("flotilla")
-            .get(&forge_read_name(&source, &ForgeReadRequest::Board))
-            .await
-            .unwrap()
-            .status
-            .is_none());
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), polls);
+        });
     }
 
-    // Replication arrival order cannot change the selected status, including
-    // exact timestamp ties. Generate distinct authorities and duplicate rows.
-    #[hegel::test]
-    fn status_selection_is_independent_of_arrival_order(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let index = tc.draw(gs::integers::<u32>().min_value(0).max_value(1000));
-        let now = Utc::now();
-        let status = |authority: String| ForgeReadStatus {
-            authority,
-            attempted_at: now,
-            observed_at: Some(now),
-            value: Some(serde_json::json!(index)),
-            error: None,
-            retry_at: None,
-        };
-        let lower = status(format!("a-{index}"));
-        let higher = status(format!("b-{index}"));
-        assert_eq!(latest_status([lower.clone(), higher.clone(), lower.clone()]), Some(higher.clone()));
-        assert_eq!(latest_status([higher.clone(), lower.clone(), lower]), Some(higher));
+    #[tokio::test]
+    async fn nonowner_incremental_read_is_refused() {
+        let owner = backend("owner");
+        let peer = backend("peer");
+        declare_at(&owner).await;
+        replicate::<Project>(&owner, &peer).await;
+        let reads = ForgeReads::new(peer, "flotilla".into());
+        assert_eq!(
+            reads
+                .read::<u32, _, _>(&source(), ForgeReadRequest::Changes { since: "cursor".into(), count: 50 }, || async {
+                    panic!("nonowner incremental loader")
+                })
+                .await
+                .expect_err("nonowner refusal"),
+            OWNER_LOCAL_INCREMENTAL_READ_ERROR
+        );
     }
 
     // A preferred origin that never publishes a Host must eventually yield to
@@ -1424,7 +729,7 @@ mod forgejo_tests {
 
     // #3300: Forgejo's typed quota deadline is recorded just like any other provider's,
     // survives a cache hit, and suppresses further HTTP reads until that deadline.
-    // One example suffices for this adapter-to-store glue; cooldown boundaries have property coverage.
+    // One example suffices for this adapter-to-cache glue; cooldown boundaries have property coverage.
     #[tokio::test]
     async fn forgejo_rate_limit_records_retry_time_without_github_parsing() {
         let clock = Arc::new(ManualClock::new("2026-10-16T12:00:00Z".parse().expect("time")));
@@ -1447,9 +752,7 @@ mod forgejo_tests {
         let error = reads.read_typed(&source, request.clone(), || provider.find_change_request_by_branch("work")).await.expect_err("quota");
         let expected = DateTime::from_timestamp(1893456000, 0).expect("deadline");
         assert_eq!(error.retry_at(), Some(expected));
-        let status = reads.status(&forge_read_name(&source, &request)).await.expect("read status").expect("published");
-        assert_eq!(status.retry_at, Some(expected));
-        assert_eq!(status.error.as_deref(), Some(error.to_string().as_str()));
+        assert_eq!(reads.last_error(&source, &request).await, Some(error.to_string()));
         let cached = reads
             .read_typed::<Option<(String, ChangeRequest)>, _, _>(&source, request, || async { panic!("quota must suppress HTTP") })
             .await

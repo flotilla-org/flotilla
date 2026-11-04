@@ -23,11 +23,11 @@ use flotilla_resources::{
     repository_workspace_slugs, Artifact, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy,
     CrewSource, CrewWorkPhase, DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase,
     EnvironmentSpec, FreshCloneCheckoutSpec, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, InputMeta, LifecycleAuthority,
-    OwnerReference, PlacementImageSource, PlacementPolicy, Repository, RepositoryKey, RepositorySpec, Resource, ResourceError,
-    ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec,
-    Vessel, VesselImage, VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
-    CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION,
-    CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND, VESSEL_REF_LABEL,
+    OwnerReference, PlacementImageSource, Repository, RepositoryKey, RepositorySpec, Resource, ResourceError, ResourceObject,
+    ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, Vessel, VesselImage,
+    VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL,
+    CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
+    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND, VESSEL_REF_LABEL,
 };
 use flotilla_resources::{
     reach::{ReachDestination, ReachMeans, ReachRoute},
@@ -92,7 +92,6 @@ pub struct VesselReconciler {
     convoys: TypedResolver<Convoy>,
     repositories: TypedResolver<Repository>,
     kinds: TypedResolver<FulfilmentKind>,
-    policies: TypedResolver<PlacementPolicy>,
     environments: TypedResolver<Environment>,
     clones: TypedResolver<Clone>,
     checkouts: TypedResolver<Checkout>,
@@ -100,7 +99,6 @@ pub struct VesselReconciler {
     artifacts: ReplicaReadResolver<Artifact>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
     federated_kinds: Option<ReplicaReadResolver<FulfilmentKind>>,
-    federated_policies: Option<ReplicaReadResolver<PlacementPolicy>>,
     local_host_ref: Option<CanonicalHostId>,
     additional_host_refs: std::collections::BTreeSet<CanonicalHostId>,
     namespace: String,
@@ -132,7 +130,6 @@ impl VesselReconciler {
             convoys: backend.clone().using::<Convoy>(namespace),
             repositories: backend.clone().using::<Repository>(namespace),
             kinds: backend.clone().using::<FulfilmentKind>(namespace),
-            policies: backend.clone().using::<PlacementPolicy>(namespace),
             environments: backend.clone().using::<Environment>(namespace),
             clones: backend.clone().using::<Clone>(namespace),
             checkouts: backend.clone().using::<Checkout>(namespace),
@@ -140,7 +137,6 @@ impl VesselReconciler {
             artifacts: backend.including_replicas::<Artifact>(namespace),
             federated_convoys: None,
             federated_kinds: None,
-            federated_policies: None,
             local_host_ref: None,
             additional_host_refs: Default::default(),
             namespace: namespace.to_string(),
@@ -305,7 +301,6 @@ impl VesselReconciler {
     pub fn with_federated_dependencies(mut self, backend: &ResourceBackend, local_host_ref: CanonicalHostId) -> Self {
         self.federated_convoys = Some(backend.including_replicas::<Convoy>(&self.namespace));
         self.federated_kinds = Some(backend.including_replicas::<FulfilmentKind>(&self.namespace));
-        self.federated_policies = Some(backend.including_replicas::<PlacementPolicy>(&self.namespace));
         self.local_host_ref = Some(local_host_ref);
         self
     }
@@ -381,23 +376,11 @@ impl VesselReconciler {
         decision: Option<&PlacementDecision>,
     ) -> Result<Result<Placement, String>, ResourceError> {
         let frozen = decision.and_then(|decision| decision.provider_instance.clone());
-        match Self::snapshot_dependency(&self.kinds, self.federated_kinds.as_ref(), vessel, name).await {
-            Ok(kind) => match frozen {
-                Some(instance) => Ok(Ok(Placement { kind, instance: Some(instance) })),
-                None if kind.spec.realisation == FulfilmentRealisation::HostDirect => Ok(Ok(Placement { kind, instance: None })),
-                None => Ok(self.unfrozen_instance(&kind).await?.map(|instance| Placement { kind, instance })),
-            },
-            // ADR 0047: a convoy admitted before kinds froze its placement as a PlacementPolicy.
-            // Remove one roll after this ships, with PlacementPolicy.
-            Err(ResourceError::NotFound { .. }) => {
-                let policy = Self::snapshot_dependency(&self.policies, self.federated_policies.as_ref(), vessel, name).await?;
-                let instance = frozen
-                    .or_else(|| policy.metadata.labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).cloned())
-                    .or_else(|| policy.spec.provider_requirements.as_ref().and_then(|requirements| requirements.instance.clone()));
-                Ok(FulfilmentKindSpec::from_policy(&policy.spec, "linux")
-                    .map(|spec| Placement { kind: ResourceObject { metadata: policy.metadata, spec, status: None }, instance }))
-            }
-            Err(error) => Err(error),
+        let kind = Self::snapshot_dependency(&self.kinds, self.federated_kinds.as_ref(), vessel, name).await?;
+        match frozen {
+            Some(instance) => Ok(Ok(Placement { kind, instance: Some(instance) })),
+            None if kind.spec.realisation == FulfilmentRealisation::HostDirect => Ok(Ok(Placement { kind, instance: None })),
+            None => Ok(self.unfrozen_instance(&kind).await?.map(|instance| Placement { kind, instance })),
         }
     }
 
@@ -1989,8 +1972,7 @@ mod tests {
 
     use flotilla_protocol::{NodeId, PlacementDecision, PlacementTargetHost};
     use flotilla_resources::{
-        Convoy, ConvoySpec, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HostDirectPlacementPolicyCheckout,
-        HostDirectPlacementPolicySpec, InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceError, Vessel, VesselSpec,
+        Convoy, ConvoySpec, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, InputMeta, ResourceError, Vessel, VesselSpec,
         ACTUATOR_SOURCE_ROOT_ANNOTATION, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL,
     };
     use flotilla_store::ResourceBackend;
@@ -2146,37 +2128,24 @@ mod tests {
         }
     }
 
-    // A vessel reads its placement snapshot from whichever origin froze it, as a kind, or for
-    // one roll as the PlacementPolicy a convoy admitted before kinds froze. Only snapshots are
-    // read from another origin. The provider instance is the decision's, else the old snapshot's.
+    // A vessel reads its placement snapshot from whichever origin froze it. Only snapshots are
+    // read from another origin. The provider instance is the decision's.
     #[tokio::test]
     async fn vessel_resolves_prepared_placement_snapshot_from_a_third_origin() {
         let author = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("author"));
         let driver = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("driver"));
         let kind_snapshot = "placement-snapshot-012345abcdef";
-        let policy_snapshot = "placement-snapshot-fedcba543210";
         let kind = |pool: &str| {
             FulfilmentKindSpec::builder().host_ref("h".into()).pool(pool.into()).realisation(FulfilmentRealisation::HostDirect).build()
         };
         let kinds = author.using::<FulfilmentKind>("flotilla");
         kinds.create(&snapshot_meta(kind_snapshot), &kind("passthrough")).await.expect("author kind snapshot");
         kinds.create(&InputMeta::builder().name("ordinary-kind".into()).build(), &kind("cleat")).await.expect("author ordinary kind");
-        let policy = PlacementPolicySpec::builder()
-            .pool("zellij".to_string())
-            .host_direct(HostDirectPlacementPolicySpec { host_ref: "h".into(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
-            .provider_requirements(flotilla_resources::ProviderRequirements { instance: Some("frozen".into()), ..Default::default() })
-            .build();
-        author.using::<PlacementPolicy>("flotilla").create(&snapshot_meta(policy_snapshot), &policy).await.expect("author policy snapshot");
         driver
             .replica_writer::<FulfilmentKind>(NodeId::new("author"), "flotilla")
             .replace(&kinds.list().await.expect("author kinds"), chrono::Utc::now())
             .await
             .expect("replicate kinds");
-        driver
-            .replica_writer::<PlacementPolicy>(NodeId::new("author"), "flotilla")
-            .replace(&author.using::<PlacementPolicy>("flotilla").list().await.expect("author policies"), chrono::Utc::now())
-            .await
-            .expect("replicate policies");
         let reconciler = VesselReconciler::new(driver.clone(), "flotilla")
             .with_federated_dependencies(&driver, flotilla_protocol::CanonicalHostId::resolved("driver-host"));
         for (name, origin) in [("local-vessel", None), ("remote-vessel", Some("convoy-origin"))] {
@@ -2203,11 +2172,6 @@ mod tests {
             };
             let placement = resolve(kind_snapshot, Some(decision(Some("decided")))).await.expect("kind snapshot").expect("a kind");
             assert_eq!((placement.kind.spec.pool.as_str(), placement.instance.as_deref()), ("passthrough", Some("decided")));
-            let placement = resolve(policy_snapshot, None).await.expect("policy snapshot").expect("its kind");
-            assert_eq!((placement.kind.spec.pool.as_str(), placement.instance.as_deref()), ("zellij", Some("frozen")));
-            assert_eq!(placement.kind.spec.realisation, FulfilmentRealisation::HostDirect);
-            let placement = resolve(policy_snapshot, Some(decision(Some("decided")))).await.expect("policy snapshot").expect("its kind");
-            assert_eq!(placement.instance.as_deref(), Some("decided"));
             assert!(matches!(resolve("ordinary-kind", None).await, Err(ResourceError::NotFound { .. })));
         }
     }

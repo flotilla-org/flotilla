@@ -2,11 +2,7 @@ use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_sqlite::SqliteBackend;
 use std::collections::BTreeSet;
 
-use flotilla_resources::{
-    DockerCheckoutStrategy, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, FulfilmentCostClass, FulfilmentGrant,
-    FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta,
-    PlacementPolicySpec,
-};
+use flotilla_resources::{FulfilmentCostClass, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, InputMeta};
 use flotilla_store::ResourceBackend;
 
 async fn contract(backend: ResourceBackend) {
@@ -35,39 +31,6 @@ async fn sqlite_contract() {
     let dir = tempfile::tempdir().expect("temp directory");
     let backend = SqliteBackend::open(dir.path().join("resources.db")).expect("sqlite backend");
     contract(ResourceBackend::new(backend)).await;
-}
-
-#[test]
-fn live_policy_set_migrates_to_kinds() {
-    let docker = PlacementPolicySpec::builder()
-        .pool("cleat".to_string())
-        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-            memory_policy: Default::default(),
-            host_ref: "feta".to_string(),
-            image: Some("crew:v1".into()),
-            pull_policy: DockerImagePullPolicy::Always,
-            agent_adapters: BTreeSet::new(),
-            default_cwd: None,
-            env: Default::default(),
-            checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
-        })
-        .build();
-    let direct = PlacementPolicySpec::builder()
-        .pool("cleat".to_string())
-        .host_direct(HostDirectPlacementPolicySpec { host_ref: "kiwi".to_string(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
-        .build();
-    for name in ["docker-crew-image-feta", "docker-on-feta"] {
-        let kind = FulfilmentKindSpec::from_policy(&docker, "macos").expect(name);
-        assert_eq!(kind.realisation, FulfilmentRealisation::DockerPerVessel { image: Some("crew:v1".into()) });
-        assert!(kind.grants.contains(&FulfilmentGrant::platform("linux".to_string())));
-        assert!(kind.grants.contains(&FulfilmentGrant::network("scoped".to_string())));
-    }
-    let kind = FulfilmentKindSpec::from_policy(&direct, "macos").expect("host-direct-kiwi");
-    assert_eq!(kind.realisation, FulfilmentRealisation::HostDirect);
-    assert!(kind.grants.contains(&FulfilmentGrant::host_account_reach()));
-    assert!(kind.grants.contains(&FulfilmentGrant::platform("macos".to_string())));
-    // #4002: a GUI session is granted only once the host's probe observes one.
-    assert!(!kind.grants.contains(&FulfilmentGrant::gui_session()));
 }
 
 #[test]

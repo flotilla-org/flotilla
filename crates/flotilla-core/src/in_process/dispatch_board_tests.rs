@@ -44,19 +44,19 @@ pub(super) mod tests {
       // racing both 300s deadlines and replacing it with a tracker timeout.
     #[tokio::test(start_paused = true)]
     async fn layered_deadlines_preserve_observation_timeout_and_recover() {
-        use flotilla_observation::forge_observation::ForgeReads;
+        use flotilla_observation::forge_observation::{ForgeReadRequest, ForgeReads};
         use flotilla_resources::Clock;
         use flotilla_store::ResourceBackend;
         use flotilla_store_memory::InMemoryBackend;
         use flotilla_store_testkit::VirtualClock;
         let cache = DispatchBoardCache::default();
         let source = source("org/shared");
-        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(flotilla_protocol::NodeId::new("owner"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(flotilla_protocol::NodeId::new("host"));
         let clock = Arc::new(VirtualClock::new(Utc::now()));
         let mut reads = ForgeReads::new(backend, "flotilla".into()).with_clock(clock.clone());
         reads.allow_stale = true;
         let snapshot = board(&source, 1);
-        reads.read(&source, flotilla_resources::ForgeReadRequest::Board, || async { Ok(snapshot.clone()) }).await.unwrap();
+        reads.read(&source, ForgeReadRequest::Board, || async { Ok(snapshot.clone()) }).await.unwrap();
         clock.advance(chrono::Duration::seconds(60));
         let slow_reads = reads.clone();
         let slow_source = source.clone();
@@ -67,16 +67,13 @@ pub(super) mod tests {
                 // Equal layered deadlines cannot tolerate this small overhead.
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let result = slow_reads
-                    .read(&slow_source, flotilla_resources::ForgeReadRequest::Board, || async {
+                    .read(&slow_source, ForgeReadRequest::Board, || async {
                         entered.send(()).unwrap();
                         std::future::pending::<Result<DispatchBoardRepository, String>>().await
                     })
                     .await;
                 let mut board = result?;
-                board.refresh_error = slow_reads
-                    .status(&flotilla_resources::forge_read_name(&slow_source, &flotilla_resources::ForgeReadRequest::Board))
-                    .await?
-                    .and_then(|status| status.error);
+                board.refresh_error = slow_reads.last_error(&slow_source, &ForgeReadRequest::Board).await;
                 Ok(board)
             })
             .await
@@ -98,9 +95,7 @@ pub(super) mod tests {
         let recovered = snapshot.clone();
         let refresh_source = source.clone();
         cache
-            .read(&source, move || async move {
-                reads.read(&refresh_source, flotilla_resources::ForgeReadRequest::Board, || async { Ok(recovered) }).await
-            })
+            .read(&source, move || async move { reads.read(&refresh_source, ForgeReadRequest::Board, || async { Ok(recovered) }).await })
             .await
             .unwrap();
         for _ in 0..1000 {

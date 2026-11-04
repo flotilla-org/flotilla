@@ -47,7 +47,7 @@ auto_attach = false
 ## Docker crew memory
 
 A host can bound its Docker crews together under one systemd slice, giving each
-crew a memory ceiling in place of the placement policy's share. In
+crew a memory ceiling in place of the host's memory share. In
 `~/.config/flotilla/daemon.toml`:
 
 ```toml
@@ -58,7 +58,7 @@ memory_ceiling_gib = 20          # most one crew may use; memory = memory-swap
 
 Both keys are required. A missing or unknown key, or a name that is not a
 systemd slice, leaves the host without its Docker provider until it is fixed.
-Without the table, crews keep the placement policy's share. With it, a crew is
+Without the table, crews keep the host's memory share. With it, a crew is
 provisioned only when Docker uses the systemd cgroup driver and the slice is
 loaded with a finite `MemoryMax`, and neither that limit nor the host's RAM is
 below the ceiling. The ceiling bounds one crew and the slice bounds them all,
@@ -140,7 +140,7 @@ The `user` is the SSH login account and the account in which the crew runs.
 The remote account needs a writable `HOME`, a `XDG_RUNTIME_DIR` in its SSH
 login, Git, and the selected agent adapter. SSH access must work in batch
 mode. The owning daemon probes the host, publishes its stable Host identity and
-a `host-direct-<host-id>` PlacementPolicy, and provisions the checkout through
+a `host-direct-<host-id>` FulfilmentKind, and provisions the checkout through
 its SSH connection. SSH hosts are excluded from the daemon peer mesh and
 from contained placement. No container image is built or pulled.
 

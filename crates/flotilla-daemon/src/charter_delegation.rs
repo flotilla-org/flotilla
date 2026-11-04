@@ -901,7 +901,7 @@ mod tests {
         assert!(error.contains("delegated scope `flotilla/app`"), "{error}");
     }
 
-    // #2721: scoped sources cannot author fleet credentials, placement policies,
+    // #2721: scoped sources cannot author fleet credentials, fulfilment kinds,
     // another Project's governor, foreign repository targets, or cross-namespace records.
     #[hegel::test]
     fn generated_out_of_scope_documents_name_the_scope(tc: hegel::TestCase) {
@@ -913,7 +913,7 @@ mod tests {
                 escaped["kind"] = json!("CredentialSpec");
             }
             1 => {
-                escaped["kind"] = json!("PlacementPolicy");
+                escaped["kind"] = json!("FulfilmentKind");
             }
             2 => {
                 escaped = ensure("other");
@@ -931,7 +931,7 @@ mod tests {
                 escaped["kind"] = json!("CrewDefaults");
             }
             7 => {
-                escaped["kind"] = json!("placement-policy");
+                escaped["kind"] = json!("fulfilment-kind");
             }
             _ => {
                 escaped["kind"] = json!("credential-spec");

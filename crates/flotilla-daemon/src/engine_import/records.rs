@@ -1,20 +1,24 @@
 //! The importers of the kinds whose records map one to one: ManifestRoot, Repository, Host,
-//! Artifact and the account kinds.
+//! Artifact, AccessDelivery, FulfilmentKind (with each PlacementPolicy as a kind of its name) and the
+//! account kinds.
 
 use flotilla_engine_store::Import;
 use flotilla_provisioning::engine::{
+    access_delivery_import::{import_access_deliveries, AccessDeliveryCopy},
     account::import_accounts,
     artifact_import::{import_artifacts, ArtifactCopy},
     host_import::{import_hosts, HostCopies, HostCopy},
     import::ImportReport,
     manifest_root_import::import_roots,
+    placement_import::{retired::RetiredPolicy, write_placement, PlacementCopies, PlacementCopy},
     repository_import::{import_repositories, RepositoryCopy},
 };
-use flotilla_resources::{AccountBinding, AccountProvision, Artifact, Host, ManifestRoot, Repository};
+use flotilla_resources::{AccessDelivery, AccountBinding, AccountProvision, Artifact, FulfilmentKind, Host, ManifestRoot, Repository};
 
 use super::{Carried, Source};
 
 pub(super) const ACCOUNT_KINDS: [&str; 2] = ["accountbindings", "accountprovisions"];
+pub(super) const PLACEMENT_KINDS: [&str; 2] = ["fulfilmentkinds", "placementpolicies"];
 
 pub(super) fn manifest_roots(source: &Source, target: &mut Import, _: &mut Carried, report: &mut ImportReport) {
     for namespace in source.namespaces(&["manifestroots"]) {
@@ -52,6 +56,22 @@ pub(super) fn hosts(source: &Source, target: &mut Import, _: &mut Carried, repor
     import_hosts(&HostCopies { copies, homes }, target, report);
 }
 
+/// Every namespace's at once: the engine has no namespaces. Every home's copies are read, as a
+/// snapshot takes its platform from its host's kind wherever that is homed.
+pub(super) fn placement(source: &Source, target: &mut Import, _: &mut Carried, report: &mut ImportReport) {
+    let kinds = source
+        .owned::<FulfilmentKind>("fulfilmentkinds", None, "FulfilmentKind", target, report)
+        .into_iter()
+        .map(|copy| PlacementCopy { namespace: copy.namespace, object: copy.object, home: copy.home })
+        .collect();
+    let policies = source
+        .owned_as("placementpolicies", None, "PlacementPolicy", target, report, RetiredPolicy::decode)
+        .into_iter()
+        .map(|(namespace, object, home)| PlacementCopy { namespace, object, home })
+        .collect();
+    write_placement(&PlacementCopies { kinds, policies }, target, report);
+}
+
 /// Every namespace's at once: the engine has no namespaces.
 pub(super) fn artifacts(source: &Source, target: &mut Import, _: &mut Carried, report: &mut ImportReport) {
     let copies: Vec<_> = source
@@ -76,4 +96,14 @@ pub(super) fn accounts(source: &Source, target: &mut Import, _: &mut Carried, re
             .collect();
         import_accounts(&bindings, &provisions, target, report);
     }
+}
+
+/// Every namespace's at once: the engine has no namespaces.
+pub(super) fn access_deliveries(source: &Source, target: &mut Import, _: &mut Carried, report: &mut ImportReport) {
+    let copies: Vec<_> = source
+        .owned::<AccessDelivery>("accessdeliveries", None, "AccessDelivery", target, report)
+        .into_iter()
+        .map(|copy| AccessDeliveryCopy { namespace: copy.namespace, object: copy.object, home: copy.home })
+        .collect();
+    import_access_deliveries(&copies, target, report);
 }

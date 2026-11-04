@@ -630,10 +630,10 @@ mod tests {
         );
     }
 
-    // #2803: get output is an editable resource document. Changing only memory
-    // policy must retain canonical host_ref and its loop owner, locally and routed.
+    // #2803: get output is an editable resource document, applied to the store it was read
+    // from, locally and routed.
     #[cfg(unix)]
-    async fn placement_policy_cli_apply_scenario(target: u8, percent: u8) {
+    async fn fulfilment_kind_cli_apply_scenario(target: u8) {
         use std::sync::Arc;
 
         use flotilla_config::ConfigStore;
@@ -641,7 +641,7 @@ mod tests {
         use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful;
         use flotilla_discovery_testkit::fake_discovery;
         use flotilla_resources::{
-            Environment, EnvironmentSpec, FulfilmentKind, HostDirectEnvironmentSpec, InputMeta, PlacementPolicy, PlacementPolicySpec,
+            Environment, EnvironmentSpec, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HostDirectEnvironmentSpec, InputMeta,
         };
         let leader_temp = tempfile::tempdir().expect("leader config");
         let follower_temp = tempfile::tempdir().expect("follower config");
@@ -668,73 +668,42 @@ mod tests {
         let node_id = (target != 0).then(|| home.node_id().clone());
         let host_ref = home.local_host_id().expect("host id").to_string();
         let name = "docker-crew-image-feta";
-        let spec: PlacementPolicySpec = serde_json::from_value(serde_json::json!({
-            "pool": "cleat", "docker_per_vessel": {
-                "host_ref": host_ref, "image": "crew:latest", "agent_adapters": ["codex"],
-                "checkout": { "worktree_on_host_and_mount": { "mount_path": "/workspace" } }
-            }
-        }))
-        .expect("policy");
-        let policies = home.resource_backend().using::<PlacementPolicy>("flotilla");
-        policies.create(&InputMeta::builder().name(name.into()).build(), &spec).await.expect("seed policy");
+        let spec = FulfilmentKindSpec::builder()
+            .host_ref(host_ref.clone())
+            .pool("cleat".into())
+            .realisation(FulfilmentRealisation::DockerPerVessel { image: Some("crew:latest".into()) })
+            .build();
+        let kinds = home.resource_backend().using::<FulfilmentKind>("flotilla");
+        kinds.create(&InputMeta::builder().name(name.into()).build(), &spec).await.expect("seed kind");
         // A same-named caller record makes using the wrong store observable.
         if target == 2 {
-            let mut decoy = spec.clone();
-            let decoy_docker = decoy.docker_per_vessel.as_mut().expect("docker");
-            decoy_docker.host_ref = topology.leader.local_host_id().expect("caller id").to_string();
-            decoy_docker.memory_policy.host_memory_percent = decoy_percent(percent);
+            let mut decoy_spec = spec.clone();
+            decoy_spec.host_ref = topology.leader.local_host_id().expect("caller id").to_string();
+            decoy_spec.pool = "caller-pool".into();
             topology
                 .leader
                 .resource_backend()
-                .using::<PlacementPolicy>("flotilla")
-                .create(&InputMeta::builder().name(name.into()).build(), &decoy)
+                .using::<FulfilmentKind>("flotilla")
+                .create(&InputMeta::builder().name(name.into()).build(), &decoy_spec)
                 .await
-                .expect("caller policy");
+                .expect("caller kind");
         }
-        let mut document = cli_resource_document(&*topology.client, node_id.clone(), "placementpolicy", name).await;
-        document["spec"]["docker_per_vessel"]["memory_policy"]["host_memory_percent"] = percent.into();
-        for change_host in [false, true] {
-            let mut attempted = document.clone();
-            if change_host {
-                attempted["spec"]["docker_per_vessel"]["host_ref"] = "other-host".into();
-            }
-            let result = cli_apply_document(&*topology.client, node_id.clone(), attempted).await;
-            if change_host {
-                assert!(
-                    matches!(result, CommandValue::Error { ref message }
-                    if message.contains("spec.docker_per_vessel.host_ref") && message.contains("ReconcileLoop")),
-                    "{result:?}"
-                );
-            } else {
-                assert!(matches!(result, CommandValue::ResourceObject(_)), "unchanged host_ref must be accepted: {result:?}");
-            }
-            let stored = policies.get(name).await.expect("stored policy").spec.docker_per_vessel.expect("docker");
-            assert_eq!(stored.host_ref, host_ref);
-            assert_eq!(stored.memory_policy.host_memory_percent, percent);
-            if target == 2 {
-                assert_eq!(
-                    topology
-                        .leader
-                        .resource_backend()
-                        .using::<PlacementPolicy>("flotilla")
-                        .get(name)
-                        .await
-                        .expect("caller policy")
-                        .spec
-                        .docker_per_vessel
-                        .expect("docker")
-                        .memory_policy
-                        .host_memory_percent,
-                    decoy_percent(percent)
-                );
-            }
+        let mut document = cli_resource_document(&*topology.client, node_id.clone(), "fulfilmentkind", name).await;
+        document["spec"]["pool"] = "applied-pool".into();
+        let result = cli_apply_document(&*topology.client, node_id.clone(), document).await;
+        assert!(matches!(result, CommandValue::ResourceObject(_)), "{result:?}");
+        let stored = kinds.get(name).await.expect("stored kind").spec;
+        assert_eq!((stored.host_ref.as_str(), stored.pool), (host_ref.as_str(), "applied-pool".to_owned()));
+        if target == 2 {
+            let caller = topology.leader.resource_backend().using::<FulfilmentKind>("flotilla").get(name).await.expect("caller kind");
+            assert_eq!(caller.spec.pool, "caller-pool");
         }
-        // Other kinds carrying host refs must also round-trip through the same
-        // read envelope, CLI renderer and local/routed apply-command handler.
+        // Another kind carrying a host ref round-trips through the same read envelope, CLI
+        // renderer and local/routed apply-command handler.
         cli_round_trip_host_reference::<Environment>(
             &home.resource_backend(),
             &*topology.client,
-            node_id.clone(),
+            node_id,
             &EnvironmentSpec {
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_ref.clone(), repo_default_dir: "/workspace".into() }),
                 docker: None,
@@ -742,48 +711,14 @@ mod tests {
             },
         )
         .await;
-        cli_round_trip_host_reference::<FulfilmentKind>(
-            &home.resource_backend(),
-            &*topology.client,
-            node_id,
-            &flotilla_resources::FulfilmentKindSpec::from_policy(&spec, "linux").expect("fulfilment kind"),
-        )
-        .await;
-    }
-
-    /// A caller-store percentage that always differs from the applied one, so a
-    /// write to the wrong store is observable for every drawn percentage.
-    #[cfg(unix)]
-    fn decoy_percent(applied: u8) -> u8 {
-        if applied == 50 {
-            51
-        } else {
-            50
-        }
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn placement_policy_cli_apply_pinned_rows() {
+    async fn fulfilment_kind_cli_apply_pinned_rows() {
         for target in 0..=2 {
-            placement_policy_cli_apply_scenario(target, 80).await;
+            fulfilment_kind_cli_apply_scenario(target).await;
         }
-    }
-
-    #[cfg(unix)]
-    #[hegel::test]
-    fn generated_placement_policy_cli_apply(tc: hegel::TestCase) {
-        // The repo's hegel.toml budgets 12 cases in development/CI, 40 nightly.
-        // Hostless local, explicit local, routed peer; valid percentages including
-        // min/max, unchanged 50, and the live request 80. Both CLI modes share the
-        // same format-independent renderer, so no separate format dimension remains.
-        let target = tc.draw(hegel::generators::integers::<u8>().min_value(0).max_value(2));
-        let percent = tc.draw(hegel::generators::integers::<u8>().min_value(1).max_value(100));
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime")
-            .block_on(placement_policy_cli_apply_scenario(target, percent));
     }
 
     #[test]

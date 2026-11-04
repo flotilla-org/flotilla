@@ -1,7 +1,6 @@
 //! The importer's plan for every old-store kind (#3824 layer 0). Each kind the old store has held
-//! is imported by a named rehearsal, retired by a ruling (its rows dropped), or still moving in a
-//! later layer. A kind with no entry fails closed, so a new old-store kind cannot be left behind
-//! silently. Each layer of #3824 moves its kinds from [`Plan::Moving`] to [`Plan::Imported`].
+//! is imported by a named rehearsal or retired by a ruling (its rows dropped). A kind with no entry
+//! fails closed, so a new old-store kind cannot be left behind silently.
 
 use flotilla_store::{retired_resource_kind, REGISTERED_RESOURCE_KINDS};
 
@@ -12,13 +11,12 @@ pub enum Plan {
     Imported(&'static str),
     /// Retired by the named ruling; the import drops its rows.
     Retired(&'static str),
-    /// Moves to the engine in the named layer or ticket; not imported yet.
-    Moving(&'static str),
 }
 
 /// Every kind the old store has held, by kind name, with its plan. A retired kind the store no
 /// longer registers is still listed by a previous-generation daemon; while it is in
-/// `RETIRED_RESOURCE_KINDS` (one generation, ADR 0047) its rows are counted as dropped.
+/// `RETIRED_RESOURCE_KINDS` (one generation, ADR 0047) its rows are counted as dropped, or
+/// converted by an importer that keeps a decoder of its own.
 pub const PLAN: &[(&str, Plan)] = &[
     ("Message", Plan::Imported("Message import (#3317)")),
     ("Environment", Plan::Imported("lifecycle import (#3629)")),
@@ -49,20 +47,17 @@ pub const PLAN: &[(&str, Plan)] = &[
     ("WorkflowTemplate", Plan::Imported("definitions import (#3824 layer 2b)")),
     ("Project", Plan::Imported("definitions import (#3824 layer 3b)")),
     ("Repository", Plan::Imported("Repository import (#3824 layer 3a)")),
-    // Mapped by the placement import (#3824 layer 4a), but the engine store holds no FulfilmentKind until
-    // a layer serves it from there.
-    ("FulfilmentKind", Plan::Moving("the layer that serves FulfilmentKind from the engine")),
+    ("FulfilmentKind", Plan::Imported("placement import (#3824 layer 4b-iv)")),
     ("Host", Plan::Imported("hosts")),
-    // Each policy becomes a FulfilmentKind of its name.
-    ("PlacementPolicy", Plan::Moving("the layer that serves FulfilmentKind from the engine")),
+    // Retired; each policy without a kind of its name becomes one.
+    ("PlacementPolicy", Plan::Imported("placement import (#3824 layer 4b-iv)")),
     ("ChangeRequest", Plan::Imported("forge observations import (#3824 layer 5)")),
     ("Issue", Plan::Imported("forge observations import (#3824 layer 5)")),
-    ("ForgeRead", Plan::Imported("forge observations import (#3824 layer 5)")),
+    ("ForgeRead", Plan::Retired("#4333: forge reads are a per-host cache until 5c")),
     ("Artifact", Plan::Imported("Artifact import (#3824 layer 7)")),
     ("Demand", Plan::Imported("attention import (#3824 layer 8)")),
     ("Regard", Plan::Retired("#3824 layer 8, 2026-11-01: dropped with its salience boost")),
-    // A plain record beside AccountProvision; its type already derives `Stored` (#3964).
-    ("AccessDelivery", Plan::Moving("#3824, plain like AccountProvision")),
+    ("AccessDelivery", Plan::Imported("access delivery import (#3824)")),
 ];
 
 /// The plan for the kind listed under `plural`, if it has one.
@@ -98,12 +93,19 @@ mod tests {
         kinds.dedup();
         assert_eq!(kinds.len(), PLAN.len(), "a kind is planned twice");
         for retired in RETIRED_RESOURCE_KINDS {
-            assert!(matches!(plan(retired.plural), Some((_, Plan::Retired(_)))), "{} keeps a drop decoder, so it is retired", retired.kind);
+            assert!(
+                matches!(plan(retired.plural), Some((_, Plan::Retired(_) | Plan::Imported(_)))),
+                "{} keeps a drop decoder, so it is retired or its importer keeps a decoder of its own",
+                retired.kind
+            );
         }
         for (kind, plan) in PLAN {
-            if !REGISTERED_RESOURCE_KINDS.iter().any(|entry| entry.kind == *kind) {
-                assert!(matches!(plan, Plan::Retired(_)), "{kind} is not registered, so only a retired kind may be");
-            }
+            let registered = REGISTERED_RESOURCE_KINDS.iter().any(|entry| entry.kind == *kind);
+            let decoded = RETIRED_RESOURCE_KINDS.iter().any(|retired| retired.kind == *kind);
+            assert!(
+                registered || matches!(plan, Plan::Retired(_)) || (decoded && matches!(plan, Plan::Imported(_))),
+                "{kind} is not registered, so it is retired or imported by a decoder of its own"
+            );
         }
     }
 

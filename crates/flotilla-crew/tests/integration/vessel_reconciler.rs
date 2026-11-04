@@ -20,14 +20,13 @@ use flotilla_resources::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_resources::{
     canonicalize_repo_url, clone_key, interactive_single_workflow_spec, Artifact, ArtifactSpec, BoundChangeRequest, Checkout,
     CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, ClaimExit, Convoy, ConvoyIssue, ConvoyPhase, ConvoyRepositorySpec,
-    ConvoySpec, ConvoyStatus, ConvoyTeardownRuntime, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, DockerCheckoutStrategy,
-    DockerEnvironmentSpec, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ExitDeclaration,
-    FulfilmentKindSpec, FulfilmentRealisation, HostDirectEnvironmentSpec, InnerCommandStatus, InputMeta, IssueSnapshot, LifecycleAuthority,
-    ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Repository, RepositorySpec, ResourceError, Selector, Stance, StatusPatch,
-    TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
-    TerminalSessionStatus, Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowSnapshot,
-    WorkflowTemplate, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_SCOPES_ANNOTATION, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL,
-    VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    ConvoySpec, ConvoyStatus, ConvoyTeardownRuntime, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, DockerEnvironmentSpec,
+    DockerImagePullPolicy, Environment, EnvironmentSpec, ExitDeclaration, FulfilmentKindSpec, FulfilmentRealisation,
+    HostDirectEnvironmentSpec, InnerCommandStatus, InputMeta, IssueSnapshot, LifecycleAuthority, ObservedCheckoutSpec, Repository,
+    RepositorySpec, ResourceError, Selector, Stance, StatusPatch, TerminalBrief, TerminalCrewContext, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselPhase, VesselRequirement,
+    VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
+    CREDENTIAL_SCOPES_ANNOTATION, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 use flotilla_store::{
     controller::{ControllerLoop, Reconciler},
@@ -1591,55 +1590,6 @@ async fn docker_environment_enables_the_adapters_its_crew_requires(#[case] adapt
         .unwrap_or_else(|| panic!("docker environment should be created: {:?}", outcome.patch));
     assert_eq!(docker.required_agent_adapters, BTreeSet::from([adapter.to_string()]));
     assert_eq!(docker.env.get("FLOTILLA_FLEET_CANARY").map(String::as_str), enabled);
-}
-
-// ADR 0047: for one roll a vessel whose convoy froze a PlacementPolicy snapshot
-// still provisions; the policy's instance label pins the environment and its
-// stored settings give way to the realisation constants.
-#[tokio::test]
-async fn vessel_naming_a_frozen_placement_policy_still_provisions() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_convoy_with_single_task(&backend, NAMESPACE, "convoy-policy", "implement", REPO_URL, GIT_REF).await;
-    let instance_key = flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
-    backend
-        .clone()
-        .using::<PlacementPolicy>(NAMESPACE)
-        .create(
-            &labeled_meta("placement-snapshot-0123456789ab", [(instance_key.to_string(), "rootless".to_string())]),
-            &PlacementPolicySpec::builder()
-                .pool("cleat".to_string())
-                .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                    memory_policy: flotilla_resources::EnvironmentMemoryPolicy {
-                        host_memory_percent: 30,
-                        expected_concurrent_crews: 3,
-                        swap_bytes: 0,
-                    },
-                    host_ref: HOST_REF.to_string(),
-                    image: Some("flotilla-dev-env:latest".into()),
-                    pull_policy: DockerImagePullPolicy::Never,
-                    agent_adapters: Default::default(),
-                    default_cwd: None,
-                    env: Default::default(),
-                    checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
-                })
-                .build(),
-        )
-        .await
-        .expect("policy snapshot create should succeed");
-    create_ready_host_worktree(&backend, "convoy-policy", "workspace-policy").await;
-    let vessel = create_workspace(
-        &backend,
-        NAMESPACE,
-        "workspace-policy",
-        "convoy-policy",
-        "implement",
-        "placement-snapshot-0123456789ab",
-        REPO_URL,
-    )
-    .await;
-
-    let environment = created_docker_environment(&backend, &vessel).await;
-    assert_eq!(environment, ("rootless".to_string(), "flotilla-dev-env:latest".to_string(), DockerImagePullPolicy::Always));
 }
 
 async fn created_docker_environment(

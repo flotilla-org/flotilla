@@ -11,15 +11,13 @@ use serde_json::{json, Value};
 
 use crate::{
     api_version,
-    field_ownership::merge_owned_spec,
     host::HostStatus,
     replica::{LAST_SYNCED_AT_ANNOTATION, ORIGIN_ROOT_ANNOTATION},
     AccessDelivery, AccountBinding, AccountProvision, Artifact, ChangeRequest, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure,
-    CredentialGrant, CredentialSpec, CrewDefaults, Demand, Environment, Event, FieldOwnedResource, FleetDesignation, Forge, ForgeRead,
-    ForgeReadHeartbeat, FulfilmentKind, Host, ImageBuild, ImageLayer, InputMeta, Issue, ManifestRoot, Message, ObjectMeta, OwnerReference,
-    PlacementPolicy, Project, ReadResourceList, ReadWatchEvent, Regard, ReplicaCursor, ReplicationClass, Repository, Resource,
-    ResourceBackend, ResourceError, ResourceList, ResourceObject, ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart,
-    WorkflowTemplate, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    CredentialGrant, CredentialSpec, CrewDefaults, Demand, Environment, Event, FleetDesignation, Forge, FulfilmentKind, Host, ImageBuild,
+    ImageLayer, InputMeta, Issue, ManifestRoot, Message, ObjectMeta, OwnerReference, Project, ReadResourceList, ReadWatchEvent, Regard,
+    ReplicaCursor, ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject,
+    ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
 
 pub const MANIFEST_WRITER_SOURCE: &str = "resource-manifest";
@@ -55,13 +53,10 @@ enum RegisteredResource {
     Event,
     FleetDesignation,
     Forge,
-    ForgeRead,
-    ForgeReadHeartbeat,
     FulfilmentKind,
     Host,
     ManifestRoot,
     Message,
-    PlacementPolicy,
     Project,
     Regard,
     Repository,
@@ -116,8 +111,6 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
     kind::<Artifact>(RegisteredResource::Artifact, &[]),
     kind::<ChangeRequest>(RegisteredResource::ChangeRequest, &["cr", "change_request", "change-request"]),
     kind::<Issue>(RegisteredResource::Issue, &[]),
-    kind::<ForgeRead>(RegisteredResource::ForgeRead, &[]),
-    kind::<ForgeReadHeartbeat>(RegisteredResource::ForgeReadHeartbeat, &[]),
     kind::<Checkout>(RegisteredResource::Checkout, &[]),
     kind::<CloneResource>(RegisteredResource::Clone, &[]),
     kind::<Convoy>(RegisteredResource::Convoy, &[]),
@@ -147,10 +140,6 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
     ),
     kind::<Host>(RegisteredResource::Host, &[]),
     kind::<ManifestRoot>(RegisteredResource::ManifestRoot, &["manifest-root", "manifest_root"]),
-    kind::<PlacementPolicy>(
-        RegisteredResource::PlacementPolicy,
-        &["placementpolicy", "placement_policy", "placement_policies", "placement-policy", "placement-policies"],
-    ),
     kind::<Message>(RegisteredResource::Message, &[]),
     kind::<Project>(RegisteredResource::Project, &[]),
     kind::<Regard>(RegisteredResource::Regard, &[]),
@@ -168,7 +157,8 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
 
 /// A kind retired from [`REGISTERED_RESOURCE_KINDS`] whose rows a previous generation may still
 /// hold. For one generation (ADR 0047) the stored decoder accepts and drops them, so a host still
-/// holding rows validates, and the import reports them as retired and dropped, not as an unknown kind.
+/// holding rows validates, and the import drops them, or converts them where its plan says so,
+/// rather than refusing an unknown kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetiredResourceKind {
     pub kind: &'static str,
@@ -186,6 +176,11 @@ pub const RETIRED_RESOURCE_KINDS: &[RetiredResourceKind] = &[
     RetiredResourceKind { kind: "DispatchObservation", plural: "dispatchobservations", api_version: "flotilla.work/v1" },
     RetiredResourceKind { kind: "DispatchHold", plural: "dispatchholds", api_version: "flotilla.work/v1" },
     RetiredResourceKind { kind: "DispatchDeployment", plural: "dispatchdeployments", api_version: "flotilla.work/v1" },
+    // The cut-over import converts its rows into FulfilmentKinds; remove one roll after this generation ships.
+    RetiredResourceKind { kind: "PlacementPolicy", plural: "placementpolicies", api_version: "flotilla.work/v1" },
+    // Remove one roll after this generation ships, once the corpus is refreshed.
+    RetiredResourceKind { kind: "ForgeRead", plural: "forgereads", api_version: "flotilla.work/v1" },
+    RetiredResourceKind { kind: "ForgeReadHeartbeat", plural: "forgereadheartbeats", api_version: "flotilla.work/v1" },
 ];
 
 /// What a stored document decoded as.
@@ -245,11 +240,8 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::ImageBuild => poll_typed_resource!($body::<ImageBuild>($($arg),*)),
             RegisteredResource::ImageLayer => poll_typed_resource!($body::<ImageLayer>($($arg),*)),
             RegisteredResource::Issue => poll_typed_resource!($body::<Issue>($($arg),*)),
-            RegisteredResource::ForgeRead => poll_typed_resource!($body::<ForgeRead>($($arg),*)),
-            RegisteredResource::ForgeReadHeartbeat => poll_typed_resource!($body::<ForgeReadHeartbeat>($($arg),*)),
             RegisteredResource::ManifestRoot => poll_typed_resource!($body::<ManifestRoot>($($arg),*)),
             RegisteredResource::Message => poll_typed_resource!($body::<Message>($($arg),*)),
-            RegisteredResource::PlacementPolicy => poll_typed_resource!($body::<PlacementPolicy>($($arg),*)),
             RegisteredResource::Project => poll_typed_resource!($body::<Project>($($arg),*)),
             RegisteredResource::Regard => poll_typed_resource!($body::<Regard>($($arg),*)),
             RegisteredResource::Repository => poll_typed_resource!($body::<Repository>($($arg),*)),
@@ -282,11 +274,8 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::ImageBuild => $body::<ImageBuild>(),
             RegisteredResource::ImageLayer => $body::<ImageLayer>(),
             RegisteredResource::Issue => $body::<Issue>(),
-            RegisteredResource::ForgeRead => $body::<ForgeRead>(),
-            RegisteredResource::ForgeReadHeartbeat => $body::<ForgeReadHeartbeat>(),
             RegisteredResource::ManifestRoot => $body::<ManifestRoot>(),
             RegisteredResource::Message => $body::<Message>(),
-            RegisteredResource::PlacementPolicy => $body::<PlacementPolicy>(),
             RegisteredResource::Project => $body::<Project>(),
             RegisteredResource::Regard => $body::<Regard>(),
             RegisteredResource::Repository => $body::<Repository>(),
@@ -319,11 +308,8 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::ImageBuild => $body::<ImageBuild>($($arg),*),
             RegisteredResource::ImageLayer => $body::<ImageLayer>($($arg),*),
             RegisteredResource::Issue => $body::<Issue>($($arg),*),
-            RegisteredResource::ForgeRead => $body::<ForgeRead>($($arg),*),
-            RegisteredResource::ForgeReadHeartbeat => $body::<ForgeReadHeartbeat>($($arg),*),
             RegisteredResource::ManifestRoot => $body::<ManifestRoot>($($arg),*),
             RegisteredResource::Message => $body::<Message>($($arg),*),
-            RegisteredResource::PlacementPolicy => $body::<PlacementPolicy>($($arg),*),
             RegisteredResource::Project => $body::<Project>($($arg),*),
             RegisteredResource::Regard => $body::<Regard>($($arg),*),
             RegisteredResource::Repository => $body::<Repository>($($arg),*),
@@ -339,33 +325,19 @@ pub async fn registered_resource_namespaces(backend: &ResourceBackend) -> Result
     backend.namespace_inventory().await
 }
 
-/// Dynamic apply uses the ownership-aware path for enrolled kinds. Enrolling
-/// another resource changes one dispatch arm rather than adding a one-off
-/// apply function or branch.
+/// Dynamic apply writes as `$writer`.
 macro_rules! dispatch_apply_resource_kind {
     ($resource:expr, $backend:expr, $namespace:expr, $metadata:expr, $spec:expr, $writer:expr) => {
-        match $resource {
-            RegisteredResource::PlacementPolicy => apply_owned_typed::<PlacementPolicy>($backend, $namespace, $metadata, $spec).await,
-            resource => dispatch_resource_kind!(resource, apply_typed($backend, $namespace, $metadata, $spec, $writer).await),
-        }
+        dispatch_resource_kind!($resource, apply_typed($backend, $namespace, $metadata, $spec, $writer).await)
     };
 }
 
-/// Manifest reconciliation is authoritative for both operator-authored input
-/// and loop-derived topology. Enrolled resources project the same desired spec
-/// through each role instead of bypassing the single ownership-aware write path.
+/// Manifest reconciliation writes as the reconcile loop, sourced from the manifest.
 macro_rules! dispatch_manifest_apply_resource_kind {
-    ($resource:expr, $backend:expr, $namespace:expr, $metadata:expr, $spec:expr) => {
-        match $resource {
-            RegisteredResource::PlacementPolicy => {
-                apply_manifest_owned_typed::<PlacementPolicy>($backend, $namespace, $metadata, $spec).await
-            }
-            resource => {
-                let writer = WriterIdentity::reconcile_loop().with_source(MANIFEST_WRITER_SOURCE);
-                dispatch_resource_kind!(resource, apply_typed($backend, $namespace, $metadata, $spec, &writer).await)
-            }
-        }
-    };
+    ($resource:expr, $backend:expr, $namespace:expr, $metadata:expr, $spec:expr) => {{
+        let writer = WriterIdentity::reconcile_loop().with_source(MANIFEST_WRITER_SOURCE);
+        dispatch_resource_kind!($resource, apply_typed($backend, $namespace, $metadata, $spec, &writer).await)
+    }};
 }
 
 /// Drives a typed read of every kind in the embedded durable store.
@@ -438,11 +410,8 @@ pub fn declared_resource_kinds() -> Vec<crate::ResourceKind> {
             RegisteredResource::ImageBuild => crate::ResourceKind::of::<ImageBuild>(),
             RegisteredResource::ImageLayer => crate::ResourceKind::of::<ImageLayer>(),
             RegisteredResource::Issue => crate::ResourceKind::of::<Issue>(),
-            RegisteredResource::ForgeRead => crate::ResourceKind::of::<ForgeRead>(),
-            RegisteredResource::ForgeReadHeartbeat => crate::ResourceKind::of::<ForgeReadHeartbeat>(),
             RegisteredResource::ManifestRoot => crate::ResourceKind::of::<ManifestRoot>(),
             RegisteredResource::Message => crate::ResourceKind::of::<Message>(),
-            RegisteredResource::PlacementPolicy => crate::ResourceKind::of::<PlacementPolicy>(),
             RegisteredResource::Project => crate::ResourceKind::of::<Project>(),
             RegisteredResource::Regard => crate::ResourceKind::of::<Regard>(),
             RegisteredResource::Repository => crate::ResourceKind::of::<Repository>(),
@@ -1494,71 +1463,6 @@ async fn apply_typed<T: Resource>(
             resolver.update(&meta, &existing.metadata.resource_version, &spec).await?
         }
         Err(ResourceError::NotFound { .. }) => resolver.create(&metadata.input_meta_for_create(), &spec).await?,
-        Err(error) => return Err(error),
-    };
-    Ok(DynamicResourceObject {
-        kind: T::API_PATHS.kind.to_string(),
-        plural: T::API_PATHS.plural.to_string(),
-        namespace: namespace.to_string(),
-        value: object_value(&object)?,
-    })
-}
-
-async fn apply_owned_typed<T: FieldOwnedResource>(
-    backend: &ResourceBackend,
-    namespace: &str,
-    metadata: DynamicApplyMetadata,
-    spec: Value,
-) -> Result<DynamicResourceObject, ResourceError> {
-    let spec =
-        serde_json::from_value(spec).map_err(|error| ResourceError::decode(format!("decode {} spec: {error}", T::API_PATHS.kind)))?;
-    let resolver = backend.using::<T>(namespace);
-    let object = match resolver.get(&metadata.name).await {
-        Ok(existing) => {
-            let meta = metadata.input_meta_for_update(&existing.metadata);
-            resolver.write_spec_rejecting_violations(&WriterIdentity::operator(), &meta, &existing.metadata.resource_version, &spec).await?
-        }
-        Err(ResourceError::NotFound { .. }) => resolver.create(&metadata.input_meta_for_create(), &spec).await?,
-        Err(error) => return Err(error),
-    };
-    Ok(DynamicResourceObject {
-        kind: T::API_PATHS.kind.to_string(),
-        plural: T::API_PATHS.plural.to_string(),
-        namespace: namespace.to_string(),
-        value: object_value(&object)?,
-    })
-}
-
-async fn apply_manifest_owned_typed<T: FieldOwnedResource>(
-    backend: &ResourceBackend,
-    namespace: &str,
-    metadata: DynamicApplyMetadata,
-    spec: Value,
-) -> Result<DynamicResourceObject, ResourceError> {
-    let desired =
-        serde_json::from_value(spec).map_err(|error| ResourceError::decode(format!("decode {} spec: {error}", T::API_PATHS.kind)))?;
-    let resolver = backend.using::<T>(namespace);
-    let object = match resolver.get(&metadata.name).await {
-        Ok(existing) => {
-            let operator = WriterIdentity::operator();
-            let (operator_spec, _) = merge_owned_spec::<T>(&existing.spec, &desired, &operator, namespace, &metadata.name)?;
-            let meta = metadata.input_meta_for_update(&existing.metadata);
-            let operator_written = resolver.write_spec(&operator, &meta, &existing.metadata.resource_version, &operator_spec).await?;
-
-            let reconcile_loop = WriterIdentity::reconcile_loop();
-            let (loop_spec, _) = merge_owned_spec::<T>(&operator_written.spec, &desired, &reconcile_loop, namespace, &metadata.name)?;
-            let current_value = serde_json::to_value(&operator_written.spec)
-                .map_err(|error| ResourceError::decode(format!("encode current {} spec: {error}", T::API_PATHS.kind)))?;
-            let loop_value = serde_json::to_value(&loop_spec)
-                .map_err(|error| ResourceError::decode(format!("encode projected {} spec: {error}", T::API_PATHS.kind)))?;
-            if current_value == loop_value {
-                operator_written
-            } else {
-                let meta = metadata.input_meta_for_update(&operator_written.metadata);
-                resolver.write_spec(&reconcile_loop, &meta, &operator_written.metadata.resource_version, &loop_spec).await?
-            }
-        }
-        Err(ResourceError::NotFound { .. }) => resolver.create(&metadata.input_meta_for_create(), &desired).await?,
         Err(error) => return Err(error),
     };
     Ok(DynamicResourceObject {

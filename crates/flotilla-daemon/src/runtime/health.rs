@@ -29,7 +29,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, warn};
 
 use super::discovery::LocalProvisioningProfile;
-use super::seed::{ensure_host_exists, migrate_live_placement_policies};
+use super::seed::{canonicalize_kind_hosts, ensure_host_exists};
 use super::tasks::{spawn_periodic_task, PeriodicTaskStart, AGGREGATOR_CONTROLLER, CONVOY_ENSURE_CONDITION_TYPE};
 use crate::{
     blob_store::TieredBlobStore, resource_limits::file_descriptor_pressure_condition, resource_manifest::manifest_root_name,
@@ -521,7 +521,7 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
         Err(error) => (None, Some(error)),
     };
     let admission_free_space_floor_bytes = daemon.admission_free_space_floor_bytes()?;
-    migrate_live_placement_policies(&backend, namespace, &profile.host_id, std::env::consts::OS).await?;
+    canonicalize_kind_hosts(&backend, namespace, &profile.host_id).await?;
     let mut conditions = runtime_health.conditions().await;
     conditions.extend(daemon.project_image_layer_conditions().await);
     conditions.extend(daemon.observation_credential_conditions().await);
@@ -781,14 +781,12 @@ pub(super) fn resource_decode_quarantine_condition(
         return None;
     }
     // Extend this list when source_owner gains another stored election input
-    // or ForgeReads gains another demand/result kind; keep its scope test aligned.
+    // or forge observation gains another stored kind; keep its scope test aligned.
     let forge_kinds = [
         Host::API_PATHS.kind,
         Forge::API_PATHS.kind,
         flotilla_resources::Project::API_PATHS.kind,
         flotilla_resources::Repository::API_PATHS.kind,
-        flotilla_resources::ForgeRead::API_PATHS.kind,
-        flotilla_resources::ForgeReadHeartbeat::API_PATHS.kind,
         flotilla_resources::Issue::API_PATHS.kind,
         flotilla_resources::ChangeRequest::API_PATHS.kind,
     ];

@@ -92,9 +92,9 @@ use crate::{
 };
 pub(crate) use tasks::manifest_reconciler_enabled;
 pub use tasks::spawn_pending_supervisor_turn_task;
+pub use tasks::spawn_pending_supervisor_turn_task_with_watches;
 #[cfg(test)]
 pub(crate) use tasks::wait_for_listening;
-pub use tasks::{spawn_forge_read_demand_task, spawn_pending_supervisor_turn_task_with_watches};
 
 #[derive(Debug, Clone, bon::Builder)]
 pub struct RuntimeOptions {
@@ -670,8 +670,6 @@ impl StartupRestoration {
             options.namespace.clone(),
             options.controller_resync_interval,
         ))];
-        let (forge_demands, _) = spawn_forge_read_demand_task(Arc::clone(daemon), options.namespace.clone());
-        controller_tasks.push(AbortOnDropHandle::new(forge_demands));
         let observation_daemon = Arc::clone(daemon);
         let observation_namespace = options.namespace.clone();
         controller_tasks.push(AbortOnDropHandle::new(tokio::spawn(async move {
@@ -1342,6 +1340,13 @@ async fn open_provisioning_lifecycles(
         .await
         .map_err(|error| error.to_string())??;
     daemon.resource_backend().install_engine_records(Arc::new(artifacts));
+    let service = daemon.decided_store()?;
+    let clock = daemon.clock_for_scenarios();
+    let access_deliveries =
+        tokio::task::spawn_blocking(move || flotilla_provisioning::engine::access_deliveries::EngineAccessDeliveries::open(service, clock))
+            .await
+            .map_err(|error| error.to_string())??;
+    daemon.resource_backend().install_engine_records(Arc::new(access_deliveries));
     // ChangeRequest and Issue: written by their source's observer, read at every home.
     let service = daemon.decided_store()?;
     let clock = daemon.clock_for_scenarios();

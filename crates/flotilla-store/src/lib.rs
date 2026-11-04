@@ -3,7 +3,7 @@
 #![allow(clippy::double_must_use)]
 
 use flotilla_resources::*;
-use flotilla_resources::{error, field_ownership, host, labels, resource, retention};
+use flotilla_resources::{error, host, labels, resource, retention};
 
 mod account_records;
 mod attentions;
@@ -33,8 +33,8 @@ pub mod message_query;
 pub use message_query::*;
 mod owner_gc;
 pub use owner_gc::*;
-mod placement_policy;
-pub use placement_policy::*;
+mod placement_image;
+pub use placement_image::*;
 mod prepared_snapshot;
 pub use prepared_snapshot::*;
 mod project;

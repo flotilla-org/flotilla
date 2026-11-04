@@ -18,8 +18,13 @@ pub const DUMMY_FORGE_ID: &str = "dummy-forge";
 pub const DUMMY_REPOSITORY: &str = "dummy/fleet";
 /// FulfilmentKind name selecting dummy environments.
 pub const DUMMY_FULFILMENT_KIND: &str = "dummy-crews";
+/// FulfilmentKind name selecting dummy cloud sandboxes.
+pub const DUMMY_CLOUD_FULFILMENT_KIND: &str = "dummy-cloud-crews";
 /// Image named by dummy environments; nothing pulls it.
 pub const DUMMY_IMAGE: &str = "dummy/crew:latest";
+/// Image named by dummy cloud sandboxes: a cloud backing records the digest
+/// its image reference pins.
+pub const DUMMY_CLOUD_IMAGE: &str = "dummy/crew@sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 /// The crew compositions a load mix draws from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -149,6 +154,21 @@ pub fn fulfilment_kind(host_ref: &str) -> FulfilmentKindSpec {
         .pool(DUMMY_TERMINAL_POOL.to_string())
         .grants([FulfilmentGrant::platform(Platform::Linux.to_string()), FulfilmentGrant::network("scoped".into())].into())
         .realisation(FulfilmentRealisation::DockerPerVessel { image: Some(PlacementImageSource::Literal(DUMMY_IMAGE.into())) })
+        .build()
+}
+
+/// Per-vessel dummy cloud sandboxes, crews in the dummy pool. The controller
+/// advertising the sandbox vendor realises them; `host_ref` names that host
+/// for the readiness admission reads.
+pub fn cloud_fulfilment_kind(host_ref: &str) -> FulfilmentKindSpec {
+    FulfilmentKindSpec::builder()
+        .host_ref(host_ref.into())
+        .pool(DUMMY_TERMINAL_POOL.to_string())
+        .grants([FulfilmentGrant::platform(Platform::Linux.to_string()), FulfilmentGrant::network("scoped".into())].into())
+        .realisation(FulfilmentRealisation::CloudSandboxPerVessel {
+            image: Some(PlacementImageSource::Literal(DUMMY_CLOUD_IMAGE.into())),
+            size: None,
+        })
         .build()
 }
 

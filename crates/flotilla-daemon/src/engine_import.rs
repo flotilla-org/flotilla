@@ -73,9 +73,6 @@ fn record_name(document: &Value) -> String {
 const UNREADABLE: &str = "flotilla.work/unreadable-body";
 
 fn decode<R: Resource>(document: &Value) -> Result<ResourceObject<R>, String> {
-    if let Some(error) = document.get(UNREADABLE).and_then(Value::as_str) {
-        return Err(format!("its stored body is not JSON: {error}"));
-    }
     let object = K8sResourceObject::<R>::deserialize(document).map_err(|error| error.to_string())?;
     ResourceObject::from_k8s_object(object).map_err(|error| error.to_string())
 }
@@ -134,10 +131,30 @@ impl Source {
         target: &impl ImportTarget,
         report: &mut ImportReport,
     ) -> Vec<Decoded<R>> {
+        self.owned_as(plural, namespace, kind, target, report, decode::<R>)
+            .into_iter()
+            .map(|(namespace, object, home)| Decoded { namespace, object, home })
+            .collect()
+    }
+
+    /// [`Self::owned`], each row decoded by `decode`: a retired kind's, by the type its importer keeps.
+    fn owned_as<T>(
+        &self,
+        plural: &str,
+        namespace: Option<&str>,
+        kind: &'static str,
+        target: &impl ImportTarget,
+        report: &mut ImportReport,
+        decode: impl Fn(&Value) -> Result<T, String>,
+    ) -> Vec<(String, T, String)> {
         let mut decoded = Vec::new();
         for row in self.of(plural, namespace) {
-            match decode::<R>(&row.document) {
-                Ok(object) => decoded.push(Decoded { namespace: row.namespace.clone(), object, home: row.home.clone() }),
+            let object = match row.document.get(UNREADABLE).and_then(Value::as_str) {
+                Some(error) => Err(format!("its stored body is not JSON: {error}")),
+                None => decode(&row.document),
+            };
+            match object {
+                Ok(object) => decoded.push((row.namespace.clone(), object, row.home.clone())),
                 Err(error) if target.imports(&row.home) => report.refused.push(flotilla_provisioning::engine::import::ImportRefusal {
                     kind,
                     record: record_name(&row.document),
@@ -183,8 +200,10 @@ pub const STEPS: &[Step] = &[
     Step { name: "definitions", kinds: &definitions::KINDS, run: definitions::definitions },
     Step { name: "repositories", kinds: &["repositories"], run: records::repositories },
     Step { name: "hosts", kinds: &["hosts"], run: records::hosts },
+    Step { name: "fulfilment kinds", kinds: &records::PLACEMENT_KINDS, run: records::placement },
     Step { name: "artifacts", kinds: &["artifacts"], run: records::artifacts },
     Step { name: "forge observations", kinds: &observations::KINDS, run: observations::observations },
+    Step { name: "access deliveries", kinds: &["accessdeliveries"], run: records::access_deliveries },
     Step { name: "accounts", kinds: &records::ACCOUNT_KINDS, run: records::accounts },
     Step { name: "messages", kinds: &["messages"], run: messages::messages },
     Step { name: "attentions", kinds: &["demands"], run: attentions::attentions },
@@ -215,8 +234,6 @@ pub struct Summary {
     pub refusals: Vec<Refusal>,
     /// Imported, but on an assumption worth reading, or kept in the old store by design.
     pub notes: Vec<String>,
-    /// Rows of kinds still on the old store, by kind: the layer that moves them, and the count.
-    pub staying: BTreeMap<&'static str, (&'static str, usize)>,
 }
 
 impl Summary {
@@ -244,13 +261,12 @@ impl Summary {
 }
 
 /// Counts the rows of kinds no importer reads, homed where `target` imports: a retired kind's are
-/// dropped, a moving kind's stay on the old store, and a kind with no plan refuses its rows.
+/// dropped, and a kind with no plan refuses its rows.
 fn plan_rows(source: &Source, target: &impl ImportTarget, summary: &mut Summary) {
     for row in source.rows.iter().filter(|row| target.imports(&row.home)) {
         match plan::plan(&row.plural) {
             Some((_, Plan::Imported(_))) => {}
             Some((kind, Plan::Retired(_))) => summary.kinds.entry(kind.to_owned()).or_default().dropped += 1,
-            Some((kind, Plan::Moving(layer))) => summary.staying.entry(kind).or_insert((layer, 0)).1 += 1,
             None => {
                 let unreadable =
                     row.document.get(UNREADABLE).and_then(Value::as_str).map(|error| format!("; its stored body is not JSON: {error}"));
@@ -349,9 +365,6 @@ fn write_report(state_dir: &Path, report: &Report) -> Result<PathBuf, String> {
 fn log_summary(summary: &Summary, report: &Path) {
     for (kind, counts) in &summary.kinds {
         tracing::info!(kind, imported = counts.imported, dropped = counts.dropped, refused = counts.refused, "engine import");
-    }
-    for (kind, (layer, rows)) in &summary.staying {
-        tracing::info!(kind, rows, layer, "engine import: not imported yet, stays on the old store");
     }
     for note in &summary.notes {
         tracing::info!(%note, "engine import note");

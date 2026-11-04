@@ -1,17 +1,12 @@
 use chrono::Utc;
 use flotilla_resources::{
-    Checkout, CheckoutSpec, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec,
-    Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentSpec, FreshCloneCheckoutSpec, Host, HostDirectEnvironmentSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, PlacementPolicy, PlacementPolicySpec, Selector, TerminalBrief,
-    TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselPhase, VesselSpec, VesselStatus,
+    Checkout, CheckoutSpec, DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentSpec,
+    FreshCloneCheckoutSpec, Host, HostDirectEnvironmentSpec, Selector, TerminalBrief, TerminalCrewContext, TerminalSession,
+    TerminalSessionSource, TerminalSessionSpec, Vessel, VesselPhase, VesselSpec, VesselStatus,
 };
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_testkit::fixtures::{owner_reference, resource_meta};
-
-fn placement_meta(name: &str) -> flotilla_resources::InputMeta {
-    resource_meta().name(name).call()
-}
 
 fn vessel_meta(name: &str) -> flotilla_resources::InputMeta {
     resource_meta()
@@ -37,28 +32,6 @@ fn docker_environment_meta(name: &str) -> flotilla_resources::InputMeta {
         .owner_references(vec![owner_reference("convoy-fix-bug-123-implement", "Vessel")])
         .finalizers(vec!["flotilla.work/environment-teardown".to_string()])
         .call()
-}
-
-#[tokio::test]
-async fn placement_policy_roundtrips_without_status() {
-    let resolver = ResourceBackend::new(InMemoryBackend::default()).using::<PlacementPolicy>("flotilla");
-    let spec = PlacementPolicySpec::builder()
-        .pool("cleat".to_string())
-        .priority(100)
-        .host_direct(HostDirectPlacementPolicySpec {
-            host_ref: "01HXYZ".to_string(),
-            checkout: HostDirectPlacementPolicyCheckout::Worktree,
-        })
-        .build();
-
-    let created = resolver.create(&placement_meta("host-direct-01HXYZ"), &spec).await.expect("create should succeed");
-    let fetched = resolver.get("host-direct-01HXYZ").await.expect("get should succeed");
-
-    assert_eq!(created.metadata.name, "host-direct-01HXYZ");
-    assert_eq!(created.status, None);
-    assert_eq!(fetched.spec.pool, "cleat");
-    assert_eq!(fetched.spec.priority, 100);
-    assert!(fetched.spec.host_direct.is_some());
 }
 
 #[tokio::test]
@@ -192,39 +165,6 @@ async fn agent_terminal_session_preserves_structured_launch_and_canonical_brief(
     assert_eq!(created.spec.source, spec.source);
     // #2706: the declared session environment persists independently of host facts.
     assert_eq!(created.spec.env, spec.env);
-}
-
-#[test]
-fn docker_per_vessel_policy_uses_vessel_spelling_in_serialized_resources() {
-    let spec = PlacementPolicySpec::builder()
-        .pool("docker".to_string())
-        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-            memory_policy: Default::default(),
-            host_ref: "01HXYZ".to_string(),
-            image: Some("ghcr.io/flotilla/dev:latest".into()),
-            pull_policy: DockerImagePullPolicy::Never,
-            agent_adapters: Default::default(),
-            default_cwd: Some("/workspace".to_string()),
-            env: [("FOO".to_string(), "bar".to_string())].into_iter().collect(),
-            checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
-        })
-        .build();
-
-    assert_eq!(
-        serde_json::to_value(spec).expect("placement policy should serialize"),
-        serde_json::json!({
-            "pool": "docker",
-            "docker_per_vessel": {
-                "host_ref": "01HXYZ",
-                "image": "ghcr.io/flotilla/dev:latest",
-                "pull_policy": "never",
-                "memory_policy": {"host_memory_percent": 80, "expected_concurrent_crews": 4, "swap_bytes": 0},
-                "default_cwd": "/workspace",
-                "env": {"FOO": "bar"},
-                "checkout": {"fresh_clone_in_container": {"clone_path": "/workspace"}}
-            }
-        })
-    );
 }
 
 // #2706 / ADR 0047: previous-generation terminal specs without an environment

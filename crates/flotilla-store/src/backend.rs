@@ -15,11 +15,9 @@ use futures::{stream, StreamExt};
 use crate::{
     definition::DefinitionResolver,
     error::ResourceError,
-    field_ownership::merge_owned_spec,
     replica::StoredReplicaEventKind,
     resource::{InputMeta, Resource, ResourceObject},
     retention::ResourceStoreDiagnostics,
-    FieldOwnedResource, FieldOwnershipViolation, OwnershipEnforcement, WriterIdentity,
 };
 
 macro_rules! dispatch_backend {
@@ -213,9 +211,6 @@ impl ResourceBackend {
     }
     pub(crate) async fn delete_decode_quarantine<T: Resource>(&self, namespace: &str, name: &str) -> Result<bool, ResourceError> {
         self.store.delete_decode_quarantine_typed::<T>(namespace, name).await
-    }
-    async fn record_field_ownership_violation(&self, violation: FieldOwnershipViolation) -> Result<(), ResourceError> {
-        self.store.record_field_ownership_violation(violation).await
     }
 }
 
@@ -920,67 +915,6 @@ impl<T: Resource> TypedResolver<T> {
             return Ok(WatchStream::new(None, events.boxed()));
         }
         dispatch_backend!(self, watch_typed, start)
-    }
-}
-
-impl<T: FieldOwnedResource> TypedResolver<T> {
-    /// The only update path for an enrolled resource kind.
-    ///
-    /// Observe mode records attempted ownership violations and applies the
-    /// writer's owned fields while preserving protected stored values. Enforce
-    /// mode records the same event and refuses the complete write.
-    pub async fn write_spec(
-        &self,
-        writer: &WriterIdentity,
-        meta: &InputMeta,
-        resource_version: &str,
-        requested: &T::Spec,
-    ) -> Result<ResourceObject<T>, ResourceError> {
-        self.write_spec_with_enforcement(writer, meta, resource_version, requested, T::OWNERSHIP_ENFORCEMENT).await
-    }
-
-    pub(crate) async fn write_spec_rejecting_violations(
-        &self,
-        writer: &WriterIdentity,
-        meta: &InputMeta,
-        resource_version: &str,
-        requested: &T::Spec,
-    ) -> Result<ResourceObject<T>, ResourceError> {
-        self.write_spec_with_enforcement(writer, meta, resource_version, requested, OwnershipEnforcement::Enforce).await
-    }
-
-    async fn write_spec_with_enforcement(
-        &self,
-        writer: &WriterIdentity,
-        meta: &InputMeta,
-        resource_version: &str,
-        requested: &T::Spec,
-        enforcement: OwnershipEnforcement,
-    ) -> Result<ResourceObject<T>, ResourceError> {
-        let current = self.get(&meta.name).await?;
-        let (merged, violations) = merge_owned_spec::<T>(&current.spec, requested, writer, &self.namespace, &meta.name)?;
-        self.record_field_ownership_violations(&violations).await?;
-        if !violations.is_empty() && enforcement == OwnershipEnforcement::Enforce {
-            return Err(ResourceError::FieldOwnership { violations });
-        }
-        self.update(meta, resource_version, &merged).await
-    }
-
-    pub(crate) async fn record_field_ownership_violations(&self, violations: &[FieldOwnershipViolation]) -> Result<(), ResourceError> {
-        for violation in violations {
-            tracing::warn!(
-                kind = %violation.kind,
-                namespace = %violation.namespace,
-                name = %violation.name,
-                writer_role = ?violation.writer.role,
-                field = %violation.field,
-                attempted_value = %violation.attempted_value,
-                rule = %violation.rule,
-                "resource field ownership violation"
-            );
-            self.backend.record_field_ownership_violation(violation.clone()).await?;
-        }
-        Ok(())
     }
 }
 

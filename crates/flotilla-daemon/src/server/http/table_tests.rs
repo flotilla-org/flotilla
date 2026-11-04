@@ -785,6 +785,22 @@ fn tables_doc_lists_the_message_kinds_of_the_code() {
     assert_eq!(sorted(samples.iter().map(kind).collect()), sorted(documented("messages")));
 }
 
+// #3249: the WebSocket section lists every message type the surface channel reads and writes.
+#[test]
+fn tables_doc_lists_the_surface_messages_of_the_code() {
+    let commands = [
+        super::commands::CommandProgress::CommandStep {
+            step: flotilla_protocol::DaemonEvent::HostRemoved { environment_id: flotilla_protocol::EnvironmentId::new("e"), seq: 0 },
+        },
+        super::commands::CommandProgress::CommandOutcome { state: "", outcome: None, progress_truncated: false, observation_error: None },
+    ];
+    let commands: Vec<String> =
+        commands.iter().map(|sample| serde_json::to_value(sample).unwrap()["type"].as_str().unwrap().to_owned()).collect();
+    assert!(commands.iter().all(|name| super::surface::SERVER_TYPES.contains(&name.as_str())));
+    let code = super::surface::CLIENT_TYPES.iter().chain(super::surface::SERVER_TYPES).copied().collect();
+    assert_eq!(sorted(code), sorted(documented("surface-messages")));
+}
+
 #[test]
 fn tables_doc_lists_the_column_types_of_the_code() {
     use flotilla_schema::ColumnType;

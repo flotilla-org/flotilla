@@ -158,52 +158,6 @@ async fn home_bound_authorship_collision_is_advisory_and_clears_after_removal() 
 }
 
 #[tokio::test]
-async fn field_ownership_violation_is_exposed_in_fleet_diagnosis() {
-    let temp = TempDir::new().expect("tempdir");
-    fs::write(temp.path().join("daemon.toml"), "machine_id = \"field-ownership-violation-test\"\n").expect("daemon config");
-    let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
-    let host_id = daemon.local_host_id().expect("local host id").to_string();
-    let profile = manual_profile(&host_id, false);
-    register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("register resources");
-
-    let policies = daemon.resource_backend().using::<PlacementPolicy>(NAMESPACE);
-    let policy = policies
-        .create(
-            &empty_meta(&profile.host_direct_policy_name()),
-            &PlacementPolicySpec::builder()
-                .pool(profile.host_direct_pool.clone())
-                .host_direct(HostDirectPlacementPolicySpec {
-                    host_ref: host_id.clone(),
-                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                })
-                .build(),
-        )
-        .await
-        .expect("policy under a seeded name");
-    policies
-        .write_spec(
-            &flotilla_resources::WriterIdentity::operator(),
-            &InputMeta::from(&policy.metadata),
-            &policy.metadata.resource_version,
-            &PlacementPolicySpec::builder()
-                .pool("operator-attempt".to_string())
-                .priority(8)
-                .host_direct(policy.spec.host_direct.clone().expect("host-direct policy"))
-                .build(),
-        )
-        .await
-        .expect("observe-mode operator write");
-
-    apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("publish heartbeat");
-    let fleet = daemon.fleet_health_internal().await.expect("fleet diagnosis");
-    let local = fleet.hosts.iter().find(|host| host.is_local).expect("local host");
-    let diagnosis = local.degraded_conditions.join("; ");
-    assert!(diagnosis.contains("ResourceStore/FieldOwnership"), "{diagnosis}");
-    assert!(diagnosis.contains("spec.pool"), "{diagnosis}");
-    assert!(diagnosis.contains("Operator"), "{diagnosis}");
-}
-
-#[tokio::test]
 async fn clone_controller_failure_is_visible_in_convoy_explain() {
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
@@ -677,19 +631,34 @@ async fn resource_controller_restart_budget_exhaustion_recovers() {
     assert!(runtime_health.conditions().await.is_empty(), "healthy run clears alarm");
 }
 
-#[tokio::test]
-async fn bounded_operation_releases_the_loop_after_a_blocked_pass() {
+// #4310: an overrunning standing convoy pass is reported, but never cut short: a pass dropped
+// between admitting a generation and recording it would lose that generation's failure.
+#[tokio::test(start_paused = true)]
+async fn an_overrunning_pass_is_reported_and_still_runs_to_completion() {
     let timed_out = Arc::new(AtomicBool::new(false));
-    let first = run_bounded_operation(Duration::from_millis(20), std::future::pending::<()>(), {
-        let timed_out = Arc::clone(&timed_out);
-        move || timed_out.store(true, Ordering::SeqCst)
-    })
+    let finished = Arc::new(AtomicBool::new(false));
+    let output = run_watched_operation(
+        Duration::from_millis(20),
+        {
+            let (timed_out, finished) = (Arc::clone(&timed_out), Arc::clone(&finished));
+            async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert!(timed_out.load(Ordering::SeqCst), "the overrun is reported while the pass still runs");
+                finished.store(true, Ordering::SeqCst);
+                42
+            }
+        },
+        {
+            let timed_out = Arc::clone(&timed_out);
+            move || timed_out.store(true, Ordering::SeqCst)
+        },
+    )
     .await;
-    assert!(first.is_none());
-    assert!(timed_out.load(Ordering::SeqCst));
+    assert_eq!(output, 42);
+    assert!(finished.load(Ordering::SeqCst), "the overrunning pass ran to its end");
 
-    let second = run_bounded_operation(Duration::from_millis(20), async { 42 }, || panic!("completed pass must not time out")).await;
-    assert_eq!(second, Some(42), "a subsequent pass must run after the blocked pass times out");
+    let prompt = run_watched_operation(Duration::from_millis(20), async { 7 }, || panic!("a prompt pass is not reported")).await;
+    assert_eq!(prompt, 7);
 }
 
 #[tokio::test]
@@ -975,9 +944,9 @@ async fn capability_regression_keeps_live_forge_observer() {
 // inputs/results withdraw the forge reader. Exercise objects and event records.
 #[hegel::test]
 fn quarantine_withdraws_only_for_observation_records(tc: hegel::TestCase) {
-    let kind = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(8));
+    let kind = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(6));
     let event = tc.draw(hegel::generators::booleans());
-    let kinds = ["Convoy", "Host", "Forge", "Project", "Repository", "ForgeRead", "ForgeReadHeartbeat", "Issue", "ChangeRequest"];
+    let kinds = ["Convoy", "Host", "Forge", "Project", "Repository", "Issue", "ChangeRequest"];
     let mut diagnostics = flotilla_resources::ResourceStoreDiagnostics::default();
     if event {
         diagnostics.event_decode_quarantines.push(
