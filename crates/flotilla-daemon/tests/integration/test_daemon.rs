@@ -77,16 +77,14 @@ async fn a_restarted_daemon_adopts_its_running_cloud_sandboxes() {
     daemon.wait("a launched coder", |_: &ResourceObject<Convoy>| daemon.counts().sessions_launched == 1).await;
     let daemon = daemon.restart().await;
     let name = environment.metadata.name;
-    // Sample the sandbox until its crew has finished: it is Ready on every read.
-    let watched = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-        while daemon.counts().crews_completed == 0 {
-            let status = daemon.get::<Environment>(&name).await.and_then(|current| current.status);
-            let ready = status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Ready && status.ready);
-            assert!(ready, "the adopted sandbox stays Ready while its crew works: {status:?}");
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-    });
-    watched.await.unwrap_or_else(|_| panic!("the crew never completed after the restart: {:?}", daemon.counts()));
+    // A refused adoption marks the sandbox not ready on every pass, so it is
+    // Ready once its crew completes only if the restarted daemon adopted it.
+    let adopted = |current: &ResourceObject<Environment>| {
+        current.metadata.name == name
+            && current.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Ready && status.ready)
+            && daemon.counts().crews_completed == 1
+    };
+    daemon.wait("Ready once its crew completes", adopted).await;
     daemon.wait("Landed", in_phase(&convoy, ConvoyPhase::Landed)).await;
     let counts = daemon.counts();
     assert_eq!((counts.sessions_launched, counts.environments_provisioned, counts.command_errors), (1, 1, 0), "{counts:?}");
