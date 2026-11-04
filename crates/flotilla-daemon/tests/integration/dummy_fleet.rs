@@ -952,7 +952,6 @@ replication_kinds!(
     Issue,
     ManifestRoot,
     Message,
-    PlacementPolicy,
     Project,
     Repository,
     TerminalSession,
@@ -966,7 +965,7 @@ async fn apply_transport_fixtures(fleet: &TestDaemon, host: &str) {
     use flotilla_resources::{
         account_access::{requester_address, AccessName, BindingState, CredentialName, ProvisionPlan, Selection, UpdateMode},
         AccessDelivery, AccessDeliverySpec, AccountBinding, AccountBindingSpec, AccountProvision, AccountProvisionSpec, ChangeRequest,
-        ConvoyEnsure, CredentialGrant, CredentialSpec, CrewDefaults, ImageBuild, ImageLayer, Issue, ManifestRoot, PlacementPolicy,
+        ConvoyEnsure, CredentialGrant, CredentialSpec, CrewDefaults, ImageBuild, ImageLayer, Issue, ManifestRoot,
     };
     let local = fleet.list::<Host>().await.into_iter().next().expect("local host").metadata.name;
     let place = flotilla_resources::host_direct_environment_name(&local);
@@ -1028,7 +1027,6 @@ async fn apply_transport_fixtures(fleet: &TestDaemon, host: &str) {
     apply_json::<Issue>(fleet, &format!("{host}-issue"), observed(2)).await;
     let root = serde_json::json!({"host": local, "path": "/transport/manifests", "source": "transport"});
     apply_json::<ManifestRoot>(fleet, &format!("manifest-{host}"), root).await;
-    apply_json::<PlacementPolicy>(fleet, &format!("{host}-policy"), serde_json::json!({"pool": "transport"})).await;
     let ensure = serde_json::json!({"project_ref": "fleet", "role": format!("{host}-standing"), "workflow_ref": CrewMix::Coder.workflow_name(), "repositories": []});
     apply_json::<ConvoyEnsure>(fleet, &format!("{host}-ensure"), ensure).await;
     let layers: Vec<flotilla_resources::ImageLayerSpec> = vec![serde_json::from_value(layer).expect("a current layer")];
