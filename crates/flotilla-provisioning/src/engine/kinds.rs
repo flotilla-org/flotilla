@@ -70,7 +70,7 @@ fn is_snapshot(labels: &BTreeMap<String, String>) -> bool {
 }
 
 /// The change a writer stamping `labels` and `annotations` makes at `home`.
-fn change_of(
+pub(crate) fn change_of(
     labels: &BTreeMap<String, String>,
     annotations: &BTreeMap<String, String>,
     home: &str,

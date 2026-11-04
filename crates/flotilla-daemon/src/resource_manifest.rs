@@ -1217,7 +1217,10 @@ mod tests {
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use flotilla_protocol::{HostName, NodeId};
     use flotilla_provider_runtime::ProcessCommandRunner;
-    use flotilla_resources::{InputMeta, PlacementPolicy, PlacementPolicySpec, Project, Resolution, WatchStart, WorkflowTemplate};
+    use flotilla_resources::{
+        FulfilmentCostClass, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, InputMeta, Project, Resolution, WatchStart,
+        WorkflowTemplate,
+    };
     use flotilla_store::{patch_resource_annotation, ResourceBackend, MANIFEST_WRITER_SOURCE};
     use flotilla_vcs::factory::GitVcsFactory;
     use futures::StreamExt;
@@ -1262,7 +1265,7 @@ mod tests {
         reconciler.reconcile_once().await.expect("apply merged head");
         let merged = test_root(&backend).await.status.expect("status").applied_revision.expect("merged revision");
         assert_ne!(first, merged);
-        let live = backend.using::<PlacementPolicy>(NAMESPACE).get("versioned").await.expect("policy");
+        let live = backend.using::<FulfilmentKind>(NAMESPACE).get("versioned").await.expect("policy");
         assert_eq!(live.spec.pool, "merged");
         assert_eq!(live.metadata.annotations[MANIFEST_REVISION_ANNOTATION], merged);
         git(repo.path(), &["restore", "charters/policy.yaml"]);
@@ -1276,7 +1279,7 @@ mod tests {
         assert_eq!(status.applied_revision.as_deref(), Some(merged.as_str()));
         assert!(status.source_error.as_deref().expect("parse reason").contains("z-bad.yaml"));
         assert!(status.stalled.is_some());
-        assert_eq!(backend.using::<PlacementPolicy>(NAMESPACE).get("versioned").await.expect("live policy").spec, live.spec);
+        assert_eq!(backend.using::<FulfilmentKind>(NAMESPACE).get("versioned").await.expect("live policy").spec, live.spec);
         git(repo.path(), &["rm", "charters/z-bad.yaml"]);
         git(repo.path(), &["commit", "-m", "repair"]);
         reconciler.reconcile_once().await.expect("recover");
@@ -1333,7 +1336,7 @@ mod tests {
         reconciler.reconcile_once_for_test().await.expect("apply directory");
         let first = test_root(&backend).await.status.expect("status").applied_revision.expect("revision");
         assert!(first.starts_with("local:"));
-        let live = backend.using::<PlacementPolicy>(NAMESPACE).get("laptop").await.expect("policy");
+        let live = backend.using::<FulfilmentKind>(NAMESPACE).get("laptop").await.expect("policy");
         assert_eq!(live.metadata.annotations[MANIFEST_REVISION_ANNOTATION], first);
         write(&dir.path().join("policy.yaml"), "broken: [");
         assert!(reconciler.reconcile_once().await.is_err());
@@ -1365,7 +1368,7 @@ mod tests {
             reconciler = reconciler.with_binding(Some(binding));
             reconciler.reconcile_once_for_test().await.expect("apply source");
             let applied = test_root(&backend).await.status.expect("status").applied_revision.expect("revision");
-            let live = backend.using::<PlacementPolicy>(NAMESPACE).get("versioned").await.expect("policy");
+            let live = backend.using::<FulfilmentKind>(NAMESPACE).get("versioned").await.expect("policy");
 
             let limit = flotilla_charter::charter_store::SOURCE_LIMITS.max_file_bytes as usize;
             write(&repo.path().join("policy.yaml"), &manifest("versioned", "must-not-apply"));
@@ -1378,7 +1381,7 @@ mod tests {
             assert_eq!(status.applied_revision.as_deref(), Some(applied.as_str()));
             assert_eq!(status.source_error.as_deref(), Some(error.as_str()));
             assert!(status.stalled.is_some());
-            let kept = backend.using::<PlacementPolicy>(NAMESPACE).get("versioned").await.expect("kept policy");
+            let kept = backend.using::<FulfilmentKind>(NAMESPACE).get("versioned").await.expect("kept policy");
             assert_eq!((kept.spec, kept.metadata.annotations), (live.spec, live.metadata.annotations));
 
             git(repo.path(), &["rm", "-q", "large.yaml"]);
@@ -1386,7 +1389,7 @@ mod tests {
             reconciler.reconcile_once().await.expect("recovered source");
             let status = test_root(&backend).await.status.expect("recovered status");
             assert!(status.source_error.is_none() && status.applied_revision.as_deref() != Some(applied.as_str()));
-            assert_eq!(backend.using::<PlacementPolicy>(NAMESPACE).get("versioned").await.expect("policy").spec.pool, "must-not-apply");
+            assert_eq!(backend.using::<FulfilmentKind>(NAMESPACE).get("versioned").await.expect("policy").spec.pool, "must-not-apply");
         }
     }
 
@@ -1469,7 +1472,7 @@ mod tests {
     }
 
     fn key(name: &str) -> DocumentKey {
-        DocumentKey { path: "policy.yaml".into(), kind: "PlacementPolicy".into(), namespace: NAMESPACE.into(), name: name.into() }
+        DocumentKey { path: "policy.yaml".into(), kind: "FulfilmentKind".into(), namespace: NAMESPACE.into(), name: name.into() }
     }
 
     async fn set_resolution(backend: &ResourceBackend, key: DocumentKey, action: ResolutionAction, token: &str) {
@@ -1524,13 +1527,17 @@ mod tests {
     }
 
     fn manifest(name: &str, pool: &str) -> String {
-        format!("apiVersion: flotilla.work/v1\nkind: PlacementPolicy\nmetadata:\n  name: {name}\nspec:\n  pool: {pool}\n")
+        format!(
+            "apiVersion: flotilla.work/v1\nkind: FulfilmentKind\nmetadata:\n  name: {name}\nspec:\n  host_ref: host\n  pool: {pool}\n  realisation: host_direct\n"
+        )
     }
 
-    fn manifest_with_priority(name: &str, pool: &str, priority: i32) -> String {
-        format!(
-            "apiVersion: flotilla.work/v1\nkind: PlacementPolicy\nmetadata:\n  name: {name}\nspec:\n  pool: {pool}\n  priority: {priority}\n"
-        )
+    fn manifest_with_cost(name: &str, pool: &str, cost_class: &str) -> String {
+        format!("{}  cost_class: {cost_class}\n", manifest(name, pool))
+    }
+
+    fn kind_spec(pool: &str) -> FulfilmentKindSpec {
+        FulfilmentKindSpec::builder().host_ref("host".into()).pool(pool.into()).realisation(FulfilmentRealisation::HostDirect).build()
     }
 
     fn project_manifest(workflow: &str, detailed_repository: bool) -> String {
@@ -1552,7 +1559,7 @@ mod tests {
         write(&nested.join("policies.yaml"), &format!("{}---\n{}", manifest("alpha", "one"), manifest("gamma", "three")));
         write(
             &dir.path().join("beta.json"),
-            r#"{"apiVersion":"flotilla.work/v1","kind":"PlacementPolicy","metadata":{"name":"beta"},"spec":{"pool":"two","priority":100}}"#,
+            r#"{"apiVersion":"flotilla.work/v1","kind":"FulfilmentKind","metadata":{"name":"beta"},"spec":{"host_ref":"host","pool":"two","cost_class":"metered","realisation":"host_direct"}}"#,
         );
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
@@ -1562,7 +1569,7 @@ mod tests {
         assert_eq!(report.created, 3);
         let expected_root = manifest_root_name("local", dir.path(), "local");
         for (name, source) in [("alpha", "nested/policies.yaml"), ("gamma", "nested/policies.yaml"), ("beta", "beta.json")] {
-            let object = backend.using::<PlacementPolicy>(NAMESPACE).get(name).await.expect("manifest object");
+            let object = backend.using::<FulfilmentKind>(NAMESPACE).get(name).await.expect("manifest object");
             assert_eq!(object.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some(MANIFEST_MANAGED_BY_VALUE));
             assert_eq!(object.metadata.annotations.get(MANIFEST_SOURCE_ANNOTATION).map(String::as_str), Some("local"));
             assert_eq!(object.metadata.annotations.get(MANIFEST_PATH_ANNOTATION).map(String::as_str), Some(source));
@@ -1579,7 +1586,10 @@ mod tests {
                 )
             );
         }
-        assert_eq!(backend.using::<PlacementPolicy>(NAMESPACE).get("beta").await.expect("beta policy").spec.priority, 100);
+        assert_eq!(
+            backend.using::<FulfilmentKind>(NAMESPACE).get("beta").await.expect("beta kind").spec.cost_class,
+            FulfilmentCostClass::Metered
+        );
     }
 
     #[tokio::test]
@@ -1599,7 +1609,7 @@ mod tests {
         assert!(!super::super::runtime::manifest_reconciler_enabled("kiwi", "feta"));
         // The false eligibility result means runtime never constructs or runs
         // a reconciler against feta_dir, regardless of its stale contents.
-        let object = backend.using::<PlacementPolicy>(NAMESPACE).get("shared").await.expect("replicated manifest object");
+        let object = backend.using::<FulfilmentKind>(NAMESPACE).get("shared").await.expect("replicated manifest object");
         assert_eq!(object.spec.pool, "current");
         let expected_root = manifest_root_name("kiwi", kiwi_dir.path(), "project-map");
         assert_eq!(object.metadata.annotations.get(MANIFEST_RECONCILER_ROOT_ANNOTATION).map(String::as_str), Some(expected_root.as_str()));
@@ -1613,7 +1623,7 @@ mod tests {
         let mut reconciler = versioned_reconciler(dir.path(), backend.clone()).await;
 
         reconciler.reconcile_once_for_test().await.expect("clean revision");
-        let applied = backend.using::<PlacementPolicy>(NAMESPACE).get("versioned").await.expect("applied manifest");
+        let applied = backend.using::<FulfilmentKind>(NAMESPACE).get("versioned").await.expect("applied manifest");
         let revision = git(dir.path(), &["rev-parse", "HEAD"]);
         assert_eq!(applied.metadata.annotations.get(MANIFEST_REVISION_ANNOTATION).map(String::as_str), Some(revision.as_str()));
     }
@@ -1663,12 +1673,12 @@ mod tests {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut first = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
         first.reconcile_once_for_test().await.expect("initial pass");
-        let before = backend.using::<PlacementPolicy>(NAMESPACE).get("steady").await.expect("policy");
+        let before = backend.using::<FulfilmentKind>(NAMESPACE).get("steady").await.expect("policy");
 
-        let mut events = backend.using::<PlacementPolicy>(NAMESPACE).watch(WatchStart::Now).await.expect("watch");
+        let mut events = backend.using::<FulfilmentKind>(NAMESPACE).watch(WatchStart::Now).await.expect("watch");
         let mut restarted = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
         let report = restarted.reconcile_once_for_test().await.expect("restart pass");
-        let after = backend.using::<PlacementPolicy>(NAMESPACE).get("steady").await.expect("policy");
+        let after = backend.using::<FulfilmentKind>(NAMESPACE).get("steady").await.expect("policy");
 
         assert_eq!(report.unchanged, 1);
         assert_eq!(before.metadata.resource_version, after.metadata.resource_version);
@@ -1684,11 +1694,11 @@ mod tests {
             .with_declared_source("project-map", "kiwi")
             .with_revision("revision-one");
         reconciler.reconcile_once_for_test().await.expect("initial pass");
-        let before = backend.using::<PlacementPolicy>(NAMESPACE).get("steady-revision").await.expect("policy");
+        let before = backend.using::<FulfilmentKind>(NAMESPACE).get("steady-revision").await.expect("policy");
 
         reconciler.fixed_revision = Some("revision-two".to_string());
         let report = reconciler.reconcile_once_for_test().await.expect("unrelated revision pass");
-        let after = backend.using::<PlacementPolicy>(NAMESPACE).get("steady-revision").await.expect("policy");
+        let after = backend.using::<FulfilmentKind>(NAMESPACE).get("steady-revision").await.expect("policy");
 
         assert_eq!(report.unchanged, 1);
         assert_eq!(report.updated, 0);
@@ -1711,7 +1721,7 @@ mod tests {
         write(&root.join("policy.yaml"), &manifest("late", "one"));
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if backend.using::<PlacementPolicy>(NAMESPACE).get("late").await.is_ok() {
+                if backend.using::<FulfilmentKind>(NAMESPACE).get("late").await.is_ok() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1731,19 +1741,19 @@ mod tests {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
-        let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
+        let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
         let applied = resolver.get("moving").await.expect("policy");
         let mut live_meta = InputMeta::from(&applied.metadata);
         live_meta.labels.insert("another-controller/observation".to_string(), "kept".to_string());
         resolver.update(&live_meta, &applied.metadata.resource_version, &applied.spec).await.expect("add external metadata");
 
-        write(&path, &manifest_with_priority("moving", "two", 100));
+        write(&path, &manifest_with_cost("moving", "two", "metered"));
         let report = reconciler.reconcile_once_for_test().await.expect("fast-forward pass");
         let object = resolver.get("moving").await.expect("policy");
 
         assert_eq!(report.updated, 1);
         assert_eq!(object.spec.pool, "two");
-        assert_eq!(object.spec.priority, 100);
+        assert_eq!(object.spec.cost_class, FulfilmentCostClass::Metered);
         assert_eq!(object.metadata.labels.get("another-controller/observation").map(String::as_str), Some("kept"));
         assert_eq!(
             object.metadata.annotations.get(LAST_APPLIED_HASH_ANNOTATION),
@@ -1807,12 +1817,9 @@ mod tests {
         )
         .await;
         let backend = daemon.resource_backend();
-        let policies = backend.using::<PlacementPolicy>(NAMESPACE);
+        let policies = backend.using::<FulfilmentKind>(NAMESPACE);
         let unmanaged = policies
-            .create(
-                &InputMeta::builder().name("colliding".to_string()).build(),
-                &PlacementPolicySpec::builder().pool("live".to_string()).build(),
-            )
+            .create(&InputMeta::builder().name("colliding".to_string()).build(), &kind_spec("live"))
             .await
             .expect("create unmanaged object");
         let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
@@ -1834,14 +1841,10 @@ mod tests {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
-        let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
+        let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
         let applied = resolver.get("drifted").await.expect("policy");
         resolver
-            .update(
-                &InputMeta::from(&applied.metadata),
-                &applied.metadata.resource_version,
-                &PlacementPolicySpec::builder().pool("live-edit".to_string()).build(),
-            )
+            .update(&InputMeta::from(&applied.metadata), &applied.metadata.resource_version, &kind_spec("live-edit"))
             .await
             .expect("edit live spec");
 
@@ -1864,16 +1867,12 @@ mod tests {
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("atomic-refusal", "one"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
+        let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
         let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
         let applied = resolver.get("atomic-refusal").await.expect("policy");
         let edited = resolver
-            .update(
-                &InputMeta::from(&applied.metadata),
-                &applied.metadata.resource_version,
-                &PlacementPolicySpec::builder().pool("live-edit".to_string()).build(),
-            )
+            .update(&InputMeta::from(&applied.metadata), &applied.metadata.resource_version, &kind_spec("live-edit"))
             .await
             .expect("edit live spec");
         write(&path, &manifest("atomic-refusal", "manifest-edit"));
@@ -1890,12 +1889,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("convergent", "same"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
+        let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
         resolver
-            .create(
-                &InputMeta::builder().name("convergent".to_string()).build(),
-                &PlacementPolicySpec::builder().pool("same".to_string()).build(),
-            )
+            .create(&InputMeta::builder().name("convergent".to_string()).build(), &kind_spec("same"))
             .await
             .expect("unmanaged but convergent policy");
         let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
@@ -1920,7 +1916,7 @@ mod tests {
 
         assert_eq!(reconciler.reconcile_once_for_test().await.expect("creation pass").created, 1);
         let next = reconciler.reconcile_once_for_test().await.expect("verification pass");
-        let object = backend.using::<PlacementPolicy>(NAMESPACE).get("fresh-baseline").await.expect("policy");
+        let object = backend.using::<FulfilmentKind>(NAMESPACE).get("fresh-baseline").await.expect("policy");
         let digest = resource_document_spec_hash(&serde_json::to_value(object.to_k8s_object()).expect("document")).expect("digest");
 
         assert_eq!(next.unchanged, 1);
@@ -1934,17 +1930,13 @@ mod tests {
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("suspended", "manifest"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
+        let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
         let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("creation");
         let applied = resolver.get("suspended").await.expect("policy");
         set_suspended(&reconciler.backend, key("suspended"), true).await;
         resolver
-            .update(
-                &InputMeta::from(&applied.metadata),
-                &applied.metadata.resource_version,
-                &PlacementPolicySpec::builder().pool("hotfix".to_string()).build(),
-            )
+            .update(&InputMeta::from(&applied.metadata), &applied.metadata.resource_version, &kind_spec("hotfix"))
             .await
             .expect("hotfix");
         write(&path, &manifest("suspended", "new-manifest"));
@@ -1966,16 +1958,12 @@ mod tests {
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("sync-me", "manifest"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
+        let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
         let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("creation");
         let applied = resolver.get("sync-me").await.expect("policy");
         resolver
-            .update(
-                &InputMeta::from(&applied.metadata),
-                &applied.metadata.resource_version,
-                &PlacementPolicySpec::builder().pool("live".to_string()).build(),
-            )
+            .update(&InputMeta::from(&applied.metadata), &applied.metadata.resource_version, &kind_spec("live"))
             .await
             .expect("live edit");
         reconciler.reconcile_once_for_test().await.expect("refusal");
@@ -1994,11 +1982,7 @@ mod tests {
         assert_eq!(reconciler.reconcile_once_for_test().await.expect("same token pass").unchanged, 1);
         let edited = resolver.get("sync-me").await.expect("policy");
         resolver
-            .update(
-                &InputMeta::from(&edited.metadata),
-                &edited.metadata.resource_version,
-                &PlacementPolicySpec::builder().pool("second-live-edit".to_string()).build(),
-            )
+            .update(&InputMeta::from(&edited.metadata), &edited.metadata.resource_version, &kind_spec("second-live-edit"))
             .await
             .expect("second live edit");
         assert_eq!(reconciler.reconcile_once_for_test().await.expect("same token cannot resolve again").drifted, 1);
@@ -2025,7 +2009,7 @@ mod tests {
         let roots: Arc<dyn ManifestRoots> =
             Arc::new(EngineManifestRoots::open(service, Arc::new(flotilla_resources::SystemClock)).expect("engine roots"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
+        let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
         let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path()).with_roots(Arc::clone(&roots));
         reconciler.reconcile_once_for_test().await.expect("creation");
         let name = reconciler.root_name();
@@ -2049,14 +2033,7 @@ mod tests {
 
         // A live edit, with the annotations gone again: drift is judged from the root's record.
         let current = resolver.get("sync-me").await.expect("policy");
-        resolver
-            .update(
-                &strip(&current.metadata),
-                &current.metadata.resource_version,
-                &PlacementPolicySpec::builder().pool("live".to_string()).build(),
-            )
-            .await
-            .expect("live edit");
+        resolver.update(&strip(&current.metadata), &current.metadata.resource_version, &kind_spec("live")).await.expect("live edit");
         assert_eq!(reconciler.reconcile_once_for_test().await.expect("drift pass").drifted, 1);
         assert_eq!(resolver.get("sync-me").await.expect("policy").spec.pool, "live", "drift is left untouched");
 
@@ -2136,16 +2113,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("interrupted", "manifest"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
+        let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
         let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("creation");
         let applied = resolver.get("interrupted").await.expect("policy");
         resolver
-            .update(
-                &InputMeta::from(&applied.metadata),
-                &applied.metadata.resource_version,
-                &PlacementPolicySpec::builder().pool("live".to_string()).build(),
-            )
+            .update(&InputMeta::from(&applied.metadata), &applied.metadata.resource_version, &kind_spec("live"))
             .await
             .expect("live edit");
         reconciler.reconcile_once_for_test().await.expect("drift pass");
@@ -2250,16 +2223,12 @@ mod tests {
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("adopt-me", "manifest"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
+        let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
         let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("creation");
         let applied = resolver.get("adopt-me").await.expect("policy");
         resolver
-            .update(
-                &InputMeta::from(&applied.metadata),
-                &applied.metadata.resource_version,
-                &PlacementPolicySpec::builder().pool("live".to_string()).build(),
-            )
+            .update(&InputMeta::from(&applied.metadata), &applied.metadata.resource_version, &kind_spec("live"))
             .await
             .expect("live edit");
         reconciler.reconcile_once_for_test().await.expect("refusal");
@@ -2278,17 +2247,14 @@ mod tests {
         write(&dir.path().join("policy.yaml"), &manifest("unmanaged", "manifest"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
         backend
-            .using::<PlacementPolicy>(NAMESPACE)
-            .create(
-                &InputMeta::builder().name("unmanaged".to_string()).build(),
-                &PlacementPolicySpec::builder().pool("live".to_string()).build(),
-            )
+            .using::<FulfilmentKind>(NAMESPACE)
+            .create(&InputMeta::builder().name("unmanaged".to_string()).build(), &kind_spec("live"))
             .await
             .expect("unmanaged policy");
         let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
 
         let report = reconciler.reconcile_once_for_test().await.expect("manifest pass");
-        let object = backend.using::<PlacementPolicy>(NAMESPACE).get("unmanaged").await.expect("policy");
+        let object = backend.using::<FulfilmentKind>(NAMESPACE).get("unmanaged").await.expect("policy");
 
         assert_eq!(report.unmanaged, 1);
         assert_eq!(object.spec.pool, "live");
@@ -2300,7 +2266,7 @@ mod tests {
 
         set_resolution(&backend, key("unmanaged"), ResolutionAction::Sync, "token-1").await;
         let report = reconciler.reconcile_once_for_test().await.expect("unmanaged sync pass");
-        let still_unmanaged = backend.using::<PlacementPolicy>(NAMESPACE).get("unmanaged").await.expect("policy");
+        let still_unmanaged = backend.using::<FulfilmentKind>(NAMESPACE).get("unmanaged").await.expect("policy");
         let root = test_root(&backend).await;
         let status = root.status.expect("status");
         let state = &status.documents[&key("unmanaged")];
@@ -2316,17 +2282,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("unmanaged", "manifest"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
-        resolver
-            .create(
-                &InputMeta::builder().name("unmanaged".to_string()).build(),
-                &PlacementPolicySpec::builder().pool("live".to_string()).build(),
-            )
-            .await
-            .expect("unmanaged policy");
+        let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
+        resolver.create(&InputMeta::builder().name("unmanaged".to_string()).build(), &kind_spec("live")).await.expect("unmanaged policy");
         let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
         let identity =
-            ObjectIdentity { kind: "PlacementPolicy".to_string(), namespace: NAMESPACE.to_string(), name: "unmanaged".to_string() };
+            ObjectIdentity { kind: "FulfilmentKind".to_string(), namespace: NAMESPACE.to_string(), name: "unmanaged".to_string() };
 
         reconciler.reconcile_once_for_test().await.expect("initial unmanaged pass");
         assert!(reconciler.warned_unmanaged.contains(&identity));
@@ -2362,7 +2322,7 @@ mod tests {
         assert_eq!(report.errors.len(), 1);
         assert_eq!(report.errors[0].path, PathBuf::from("broken.yaml"));
         assert!(report.errors[0].reason.contains("parse YAML"));
-        backend.using::<PlacementPolicy>(NAMESPACE).get("valid").await.expect("valid policy");
+        backend.using::<FulfilmentKind>(NAMESPACE).get("valid").await.expect("valid policy");
         let status = test_root(&backend).await.status.expect("status");
         let broken = DocumentKey { path: "broken.yaml".into(), kind: String::new(), namespace: String::new(), name: String::new() };
         assert_eq!(status.documents[&broken].phase, DocumentPhase::Refused);
@@ -2379,7 +2339,7 @@ mod tests {
 
         let root = test_root(&backend).await;
         backend.using::<ManifestRoot>(NAMESPACE).delete(&root.metadata.name).await.expect("remove declared root");
-        backend.using::<PlacementPolicy>(NAMESPACE).get("retained").await.expect("root deletion must not prune object");
+        backend.using::<FulfilmentKind>(NAMESPACE).get("retained").await.expect("root deletion must not prune object");
     }
 
     fn forge_manifest(host: &str) -> String {
@@ -2491,7 +2451,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("remove the source");
 
         reconciler.reconcile_once_for_test().await.expect_err("the source does not load");
-        backend.using::<PlacementPolicy>(NAMESPACE).get("kept").await.expect("nothing is pruned");
+        backend.using::<FulfilmentKind>(NAMESPACE).get("kept").await.expect("nothing is pruned");
         assert_eq!(test_root(&backend).await.status.expect("status").documents[&key("kept")].phase, DocumentPhase::Applied);
     }
 
@@ -2505,7 +2465,7 @@ mod tests {
 
         let report = reconciler.reconcile_once_for_test().await.expect("refusal pass");
         assert_eq!((report.deleted, report.orphaned), (0, 0), "{report:?}");
-        backend.using::<PlacementPolicy>(NAMESPACE).get("kept").await.expect("nothing is pruned");
+        backend.using::<FulfilmentKind>(NAMESPACE).get("kept").await.expect("nothing is pruned");
         let status = test_root(&backend).await.status.expect("status");
         assert!(status.documents[&key("kept")].baseline_hash.is_some(), "its baseline stands");
     }
@@ -2516,9 +2476,9 @@ mod tests {
     async fn a_moved_document_is_not_pruned() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (backend, mut reconciler) = applied_policy(dir.path(), "moved").await;
-        let policies = backend.using::<PlacementPolicy>(NAMESPACE);
+        let policies = backend.using::<FulfilmentKind>(NAMESPACE);
         let current = policies.get("moved").await.expect("applied");
-        let live = PlacementPolicySpec::builder().pool("live".to_string()).build();
+        let live = kind_spec("live");
         policies.update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &live).await.expect("live edit");
         std::fs::rename(dir.path().join("policy.yaml"), dir.path().join("moved.yaml")).expect("move document");
 
@@ -2540,14 +2500,14 @@ mod tests {
         let mut reconciler = reconciler.with_revision("r2");
 
         assert_eq!(reconciler.reconcile_once_for_test().await.expect("suspended pass").orphaned, 1);
-        backend.using::<PlacementPolicy>(NAMESPACE).get("paused").await.expect("kept while suspended");
+        backend.using::<FulfilmentKind>(NAMESPACE).get("paused").await.expect("kept while suspended");
         let state = test_root(&backend).await.status.expect("status").documents[&key("paused")].clone();
         assert_eq!(state.phase, DocumentPhase::Orphaned);
         assert!(state.reason.as_deref().is_some_and(|reason| reason.starts_with("suspended")), "{state:?}");
 
         set_suspended(&backend, key("paused"), false).await;
         assert_eq!(reconciler.reconcile_once_for_test().await.expect("resumed pass").deleted, 1);
-        assert!(matches!(backend.using::<PlacementPolicy>(NAMESPACE).get("paused").await, Err(ResourceError::NotFound { .. })));
+        assert!(matches!(backend.using::<FulfilmentKind>(NAMESPACE).get("paused").await, Err(ResourceError::NotFound { .. })));
         let state = &test_root(&backend).await.status.expect("status").documents[&key("paused")];
         assert_eq!((state.phase, state.removed_in.as_deref()), (DocumentPhase::Deleted, Some("r2")));
     }
@@ -2557,7 +2517,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("legacy", "one"));
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
+        let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
         let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
         let object = resolver.get("legacy").await.expect("policy");
@@ -2585,7 +2545,7 @@ mod registered_charter_tests {
     use flotilla_discovery_testkit::fake_discovery;
     use flotilla_protocol::HostName;
     use flotilla_resources::{
-        CharterPointer, PlacementPolicy, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, RepositoryKey,
+        CharterPointer, FulfilmentKind, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, RepositoryKey,
         ResourceProvenance,
     };
     use flotilla_resources::{InputMeta, ManifestRoot};
@@ -2623,12 +2583,12 @@ mod registered_charter_tests {
         let initial_project = backend.using::<Project>("flotilla").get("app").await.expect("project");
         let mut bad = good.clone();
         bad["spec"]["display_name"] = serde_json::json!("Must not apply");
-        bad["spec"]["charter"]["documents"] = serde_json::json!([{"apiVersion": "flotilla.work/v1", "kind": "PlacementPolicy", "metadata": {"name": "escape"}, "spec": {"pool": "other"}}]);
+        bad["spec"]["charter"]["documents"] = serde_json::json!([{"apiVersion": "flotilla.work/v1", "kind": "FulfilmentKind", "metadata": {"name": "escape"}, "spec": {"host_ref": "host", "pool": "other", "realisation": "host_direct"}}]);
         std::fs::write(directory.path().join("project.json"), serde_json::to_string(&bad).expect("encode")).expect("write refused head");
         let error = reconciler.reconcile_once().await.expect_err("refuse whole candidate");
         assert!(error.contains("delegated scope `flotilla/app`"), "{error}");
         assert_eq!(backend.using::<Project>("flotilla").get("app").await.expect("project").spec, initial_project.spec);
-        assert!(backend.using::<PlacementPolicy>("flotilla").list().await.expect("policies").items.is_empty());
+        assert!(backend.using::<FulfilmentKind>("flotilla").list().await.expect("policies").items.is_empty());
         let refused =
             backend.using::<ManifestRoot>("flotilla").get(&reconciler.root_name()).await.expect("refused root").status.expect("status");
         assert_eq!(refused.applied_revision, initial_root.status.expect("initial status").applied_revision);
@@ -2780,36 +2740,33 @@ mod registered_charter_tests {
         )
         .await;
         let host_ref = host.local_host_summary().await.environment_id.host_id().expect("host ID").to_string();
-        let spec = flotilla_resources::PlacementPolicySpec::builder()
+        let spec = flotilla_resources::FulfilmentKindSpec::builder()
+            .host_ref(host_ref)
             .pool("passthrough".into())
-            .host_direct(flotilla_resources::HostDirectPlacementPolicySpec {
-                host_ref,
-                checkout: flotilla_resources::HostDirectPlacementPolicyCheckout::Worktree,
-            })
-            .priority(40)
+            .realisation(flotilla_resources::FulfilmentRealisation::HostDirect)
             .build();
         host_backend
-            .using::<PlacementPolicy>("flotilla")
+            .using::<FulfilmentKind>("flotilla")
             .create(&InputMeta::builder().name("legacy-local".into()).build(), &spec)
             .await
             .expect("legacy local policy");
         let path = input.join("placement.json");
-        let mut document = serde_json::json!({"apiVersion": "flotilla.work/v1", "kind": "PlacementPolicy", "metadata": {"name": "fleet-target-host"}, "spec": spec});
+        let mut document = serde_json::json!({"apiVersion": "flotilla.work/v1", "kind": "FulfilmentKind", "metadata": {"name": "fleet-target-host"}, "spec": spec});
         std::fs::write(&path, serde_json::to_string(&document).expect("encode")).expect("fleet policy");
         let mut reconciler = ResourceManifestReconciler::new(fleet_backend.clone(), "flotilla", &input)
             .with_binding(Some(CharterSource::LocalDirectory { directory: input.to_string_lossy().into_owned() }));
         reconciler.reconcile_once_for_test().await.expect("apply fleet policy");
         let topology = spawn_in_memory_request_topology(fleet, host).await.expect("connect daemon stores");
-        for priority in [40, 75] {
-            if priority == 75 {
-                document["spec"]["priority"] = serde_json::json!(priority);
+        for cost_class in [flotilla_resources::FulfilmentCostClass::OwnedIdle, flotilla_resources::FulfilmentCostClass::Metered] {
+            if cost_class == flotilla_resources::FulfilmentCostClass::Metered {
+                document["spec"]["cost_class"] = serde_json::json!(cost_class);
                 std::fs::write(&path, serde_json::to_string(&document).expect("encode")).expect("update fleet policy");
                 reconciler.reconcile_once().await.expect("apply policy update");
             }
             let replicated = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    if let Ok(policy) = host_backend.including_replicas::<PlacementPolicy>("flotilla").get("fleet-target-host").await {
-                        if policy.object.spec.priority == priority {
+                    if let Ok(policy) = host_backend.including_replicas::<FulfilmentKind>("flotilla").get("fleet-target-host").await {
+                        if policy.object.spec.cost_class == cost_class {
                             break policy;
                         }
                     }
@@ -2819,12 +2776,9 @@ mod registered_charter_tests {
             .await
             .expect("policy federates to target host");
             assert!(matches!(replicated.provenance, ResourceProvenance::Replica { .. }));
+            assert_eq!(replicated.object.spec.host_ref, spec.host_ref);
             assert_eq!(
-                replicated.object.spec.host_direct.as_ref().expect("host strategy").host_ref,
-                spec.host_direct.as_ref().expect("host strategy").host_ref
-            );
-            assert_eq!(
-                host_backend.using::<PlacementPolicy>("flotilla").get("legacy-local").await.expect("local policy preserved").spec,
+                host_backend.using::<FulfilmentKind>("flotilla").get("legacy-local").await.expect("local policy preserved").spec,
                 spec
             );
         }

@@ -10,7 +10,7 @@ use flotilla_store_sqlite::SqliteBackend;
 async fn contract(backend: ResourceBackend) {
     let roots = backend.using::<ManifestRoot>("flotilla");
     let key =
-        DocumentKey { path: "sub/policy.yaml".into(), kind: "PlacementPolicy".into(), namespace: "flotilla".into(), name: "demo".into() };
+        DocumentKey { path: "sub/policy.yaml".into(), kind: "FulfilmentKind".into(), namespace: "flotilla".into(), name: "demo".into() };
     let spec = ManifestRootSpec::builder().host("host-a".into()).path("/tmp/manifests".into()).source("source".into()).build();
     let root = roots.create(&InputMeta::builder().name("host-a".into()).build(), &spec).await.expect("create root");
     let mut requested = root.spec.clone();
