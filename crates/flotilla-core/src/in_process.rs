@@ -170,7 +170,6 @@ use flotilla_vcs::checkout_integration::{
 
 struct ProviderChangeRequestQueryPort {
     forge_reads: flotilla_observation::forge_observation::ForgeReads,
-    resource_backend: ResourceBackend,
     config: Arc<ConfigStore>,
     discovery: Arc<DiscoveryRuntime>,
     environment_manager: Arc<EnvironmentManager>,
@@ -334,7 +333,6 @@ impl ChangeRequestQueryPort for ProviderChangeRequestQueryPort {
     ) -> Result<Arc<dyn ChangeRequestTracker>, String> {
         discover_repository_change_request_with(
             &self.forge_reads,
-            &self.resource_backend,
             &self.config,
             &self.discovery,
             &self.environment_manager,
@@ -1237,7 +1235,6 @@ impl InProcessDaemon {
             flotilla_observation::forge_observation::ForgeReads::new(resource_backend.clone(), DEFAULT_PROVISIONING_NAMESPACE.into());
         let query_port: Arc<dyn ChangeRequestQueryPort> = Arc::new(ProviderChangeRequestQueryPort {
             forge_reads: forge_reads.clone(),
-            resource_backend: resource_backend.clone(),
             config: Arc::clone(&config),
             discovery: Arc::clone(&discovery),
             environment_manager: Arc::clone(&environment_manager),
