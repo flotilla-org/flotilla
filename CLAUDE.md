@@ -95,17 +95,10 @@ subscribers. Keep tests that require process-wide state (such as a global alloca
 
 ## Testing Philosophy
 
-- Outbound HTTP code must be tested against an in-process stand-in that enforces the remote service's documented request requirements, or against a recorded replay fixture. Mock-only coverage that accepts arbitrary requests is insufficient. Document justified exceptions beside the affected tests. Use test identities and signing keys for credential contracts; never record live token mints.
-
-- Prefer behavior tests that run through injected collaborators over tests that depend on real filesystem state, subprocess orchestration, sockets, or live multi-host setup.
 - When a subsystem has multiple storage or transport implementations, specify the behavior once and run the same contract tests against each implementation.
-- Use in-memory implementations for most logical scenario tests when they make setup clearer and failures easier to reason about.
-- Keep real-backed implementations covered too, but verify them against the same behavioral contract instead of forcing all behavior tests through the real backing store.
 - Favor reusable test harnesses over ad hoc setup. The goal is to make new multi-step scenarios cheap to express and debug.
 - Behaviour tests of the daemon start it with `flotilla_daemon_testkit::daemon::TestDaemon`, one builder call that composes it as `flotillad` does, with fakes only at the vendor seams `daemon.toml`'s `[dummy_fleet]` selects (environment vendor, forge, VCS, terminal pool, agent). Drive it only as an operator (`execute`, or `execute_in(repository, ..)` with the CLI's `context_repo`, `dispatch`, `get`/`list`/`apply`/`wait`/`wait_gone`, and `wait_query` for a client's query subscription, all through the request dispatcher the CLI uses), as the environment vendor (`vendor()`: `vanish`, `stop`, `refuse_provisioning`), by `restart()` over the same store and by `TestDaemon::peer(a, b)` as the peer runtime connects two hosts; `.resync(..)` sets the controllers' resync interval, and `.forges(ForgeTransport { http, commands })` installs the real GitHub and Forgejo providers behind a test's transports. Read what the fakes did with `counts()`. Do not add to that API to make a test pass; a test that cannot be written on it says what it needs.
-- For multi-host orchestration logic, prefer `InProcessDaemon`-level tests unless the bug specifically depends on real process or transport boundaries.
 - Test multi-host command routing at the router and request-dispatch level over in-memory transport sessions; `InProcessDaemon` tests do not exercise routing. Add a scenario row when routing, admission, or command targeting changes.
-- Test multi-host routing, homing, and teardown through the router-level scenario engine; targeting changes add a pinned row and pass the generated CI profile.
 - **The `insta` snapshots in `crates/flotilla-tui/src/widgets/table.rs` are a signal, not a formality.** Never run `cargo insta accept` or update those snapshots just because a test failed. A failing snapshot means the rendered output changed — investigate *why* it changed. If the change is an intended consequence of the current work, accept it with a clear justification. If the change is unintended, it's a bug — fix the code, don't update the snapshot.
 
 ## Claude Code Web (changedirection/flotilla fork)
