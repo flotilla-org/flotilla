@@ -83,9 +83,13 @@ pub(super) async fn provision(
             }
         },
     };
-    if provider.receives_host_tools() {
+    // Every cloud vessel is probed and registered, as the Docker path registers
+    // every container, whether or not its provider takes the vessel layer.
+    if provider.receives_host_tools() || spec.cloud_sandbox.is_some() {
         let delivered = async {
-            deliver_vessel_layer(state, &id, spec, &handle).await?;
+            if provider.receives_host_tools() {
+                deliver_vessel_layer(state, &id, spec, &handle).await?;
+            }
             let image = spec.cloud_sandbox.as_ref().map(|cloud| (&cloud.probe_needs, cloud.image.as_str()));
             probe_and_register(state, &id, &handle, image).await
         }
@@ -134,9 +138,9 @@ pub(super) async fn adopt(state: &Arc<ControllerRuntimeState>, name: &str, spec:
     let handle = provider.adopt(&id, image).await?.ok_or_else(|| format!("provider holds no backing for environment {name}"))?;
     if provider.receives_host_tools() {
         deliver_vessel_layer(state, &id, spec, &handle).await?;
-        // The image was checked against its needs when it was provisioned.
-        probe_and_register(state, &id, &handle, None).await?;
     }
+    // The image was checked against its needs when it was provisioned.
+    probe_and_register(state, &id, &handle, None).await?;
     state.provisioned_environments.lock().await.insert(handle.backing_id().to_string(), ActiveProvisionedEnvironment { handle });
     Ok(())
 }

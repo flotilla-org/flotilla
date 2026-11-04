@@ -849,13 +849,17 @@ impl flotilla_environment::environment::EnvironmentProvider for CountingProvider
     }
 }
 
-// #4300 acceptance: a cloud vessel with a composed image stores an empty image
-// and its ImageBuild. After a flotillad restart, one adoption pass reconnects
-// to the live vessel without preparing or provisioning it again (the empty
-// image could not be prepared): the handle is registered, the crew socket in
-// the vessel reaches the new process again, the environment its provider
-// configured is kept, the unchanged tools layer is not uploaded again, and the
-// crew's work credentials are delivered through the adopted vessel.
+// #4300 acceptance, on drydock's own path: a cloud vessel with a composed image
+// stores an empty image and its ImageBuild. After a flotillad restart, one
+// adoption pass reconnects to the live vessel without preparing or
+// provisioning it again (drydock refuses to prepare the empty image): the crew
+// socket in the vessel reaches the new process again, the environment its
+// provider configured is kept, the unchanged tools layer is not uploaded
+// again, and the crew's work credentials are delivered through the adopted
+// vessel. The generic restart (the backing kept, the Environment Ready, the
+// crew finishing) is TestDaemon's `a_restarted_daemon_adopts_its_running_cloud_sandboxes`;
+// these facts need the real drydock daemon, its reference module and agent,
+// which the dummy cloud vendor stands in for.
 #[tokio::test]
 async fn a_composed_image_cloud_vessel_is_adopted_after_a_restart() {
     use flotilla_environment::environment::DAEMON_SOCKET_ENV;
@@ -941,11 +945,7 @@ async fn a_composed_image_cloud_vessel_is_adopted_after_a_restart() {
 
     assert_eq!((prepares.load(Ordering::SeqCst), provisions.load(Ordering::SeqCst)), (0, 0), "adoption never prepares or provisions");
     let id = EnvironmentId::new(&name);
-    assert!(state.daemon.environment_registry_for_environment(&id).is_some(), "the adopted handle is registered");
     let handle = stand_in.handle().await.expect("adopted handle");
-    assert_eq!(handle.backing_id(), facts.backing_id, "the vessel provisioned before the restart");
-    let message = environments.get(&name).await.expect("environment").status.and_then(|status| status.message);
-    assert!(!message.as_deref().is_some_and(|message| message.contains("adoption failed")), "{message:?}");
 
     let commands = handle.agent().commands();
     let shell = |script: String| {
