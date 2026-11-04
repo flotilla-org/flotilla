@@ -11,6 +11,8 @@
 //!   socket client uses ([`TestDaemon::execute`], [`TestDaemon::get`],
 //!   [`TestDaemon::apply`] and the waits);
 //! - the environment vendor, through [`TestDaemon::vendor`];
+//! - real forges, when `.forges(..)` installs the GitHub and Forgejo
+//!   providers behind a test's transports;
 //! - the daemon process, through [`TestDaemon::restart`] over the same store,
 //!   while vendor backings and running crews survive;
 //! - another daemon, through [`TestDaemon::peer`], as the daemon's own peer
@@ -38,17 +40,22 @@ use flotilla_daemon::{
     server::{build_remote_command_router, PeerConnectionEvent},
 };
 use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_discovery_api::detectors::{parse_first_dotted_version, CommandDetector};
 use flotilla_discovery_testkit::fake_discovery_with_host_directories;
 use flotilla_dummy_fleet::{
     catalog::{self, CrewMix, DUMMY_CLOUD_FULFILMENT_KIND, DUMMY_FULFILMENT_KIND},
     CrewCommandPort, DummyFleet, DummyFleetSnapshot, DummyVendor, DUMMY_AGENT_ADAPTER,
 };
+use flotilla_forgejo_providers::factories::{change_request::ForgejoChangeRequestFactory, issue_tracker::ForgejoIssueProviderFactory};
+use flotilla_github_providers::factories::{change_request::GitHubChangeRequestFactory, issue_tracker::GitHubIssueProviderFactory};
 use flotilla_protocol::{
-    commands::CommandValue, CommandAction, CommandCaller, DaemonEvent, HostName, PrincipalRef, QueryCursor, QueryId, ResultSet,
+    commands::CommandValue, CommandAction, CommandCaller, DaemonEvent, HostName, PrincipalRef, QueryCursor, QueryId, RepoSelector,
+    ResultSet,
 };
+use flotilla_provider_runtime::{CommandRunner, HttpClient};
 use flotilla_resources::{
     Clock, Convoy, FleetDesignation, FleetDesignationSpec, Forge, FulfilmentKind, Host, K8sResourceObject, Project, ProjectSpec,
-    Repository, Resource, ResourceObject, SystemClock, WorkflowTemplate, FLEET_DESIGNATION_NAME,
+    Repository, RepositoryKey, Resource, ResourceObject, SystemClock, WorkflowTemplate, FLEET_DESIGNATION_NAME,
 };
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
@@ -69,6 +76,15 @@ struct Composition {
     clock: Arc<dyn Clock>,
     backend: ResourceBackend,
     resync: Duration,
+    forges: Option<ForgeTransport>,
+}
+
+/// The transports the real forge providers reach their forges through:
+/// Forgejo's HTTP requests and the host's `gh` and `git` commands.
+#[derive(Clone)]
+pub struct ForgeTransport {
+    pub http: Arc<dyn HttpClient>,
+    pub commands: Arc<dyn CommandRunner>,
 }
 
 pub struct TestDaemon {
@@ -105,6 +121,10 @@ impl TestDaemon {
         /// scenarios observe seeded kinds and changes promptly.
         #[builder(default = HARNESS_RESYNC)]
         resync: Duration,
+        /// Install the GitHub and Forgejo providers behind these transports,
+        /// as on a host with `gh` and forge credentials. The dummy fleet makes
+        /// them read-only, as it does on such a host.
+        forges: Option<ForgeTransport>,
     ) -> Self {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let config_dir = dir.path().join("config");
@@ -117,9 +137,10 @@ impl TestDaemon {
             clock: clock.unwrap_or_else(|| Arc::new(SystemClock)),
             backend: ResourceBackend::new(InMemoryBackend::default()),
             resync,
+            forges,
         };
         let relay = Arc::new(RestartRelay::default());
-        let mut discovery = fake_discovery_with_host_directories(dir.path());
+        let mut discovery = discovery(&dir, composition.forges.as_ref());
         let fleet = install_dummy_fleet(&daemon_config, &mut discovery).expect("dummy fleet configured");
         fleet.attach(Arc::clone(&relay) as Arc<dyn CrewCommandPort>).expect("attach the crews' command relay");
         let (daemon, runtime) = compose(&composition, config, discovery, &relay).await;
@@ -160,6 +181,23 @@ fn harness_options(resync: Duration) -> RuntimeOptions {
     }
 }
 
+/// The host's discovery: its directories under `dir`, and the real forge
+/// providers behind `forges`.
+fn discovery(dir: &tempfile::TempDir, forges: Option<&ForgeTransport>) -> flotilla_discovery::DiscoveryRuntime {
+    let mut discovery = fake_discovery_with_host_directories(dir.path());
+    let Some(forges) = forges else { return discovery };
+    discovery.runner = Arc::clone(&forges.commands);
+    discovery.http = Arc::clone(&forges.http);
+    let detectors = Arc::get_mut(&mut discovery.host_detectors).expect("unshared detectors");
+    detectors.push(Box::new(CommandDetector::new("gh", &["--version"], parse_first_dotted_version)));
+    let factories = &mut discovery.factories;
+    factories.change_requests =
+        vec![Box::new(GitHubChangeRequestFactory), Box::new(ForgejoChangeRequestFactory::new(Arc::clone(&forges.http)))];
+    factories.issue_trackers =
+        vec![Box::new(GitHubIssueProviderFactory), Box::new(ForgejoIssueProviderFactory::new(Arc::clone(&forges.http)))];
+    discovery
+}
+
 async fn compose(
     composition: &Composition,
     config: Arc<ConfigStore>,
@@ -196,7 +234,7 @@ impl TestDaemon {
         drop(daemon);
         tokio::task::yield_now().await;
         let config = Arc::new(ConfigStore::with_base(dir.path().join("config")));
-        let mut discovery = fake_discovery_with_host_directories(dir.path());
+        let mut discovery = discovery(&dir, composition.forges.as_ref());
         fleet.install(&mut discovery);
         let (daemon, runtime) = compose(&composition, config, discovery, &relay).await;
         assert_eq!(daemon.node_id(), &node, "restart preserves the daemon's identity");
@@ -207,7 +245,13 @@ impl TestDaemon {
     /// Execute `action` as an operator: through the request dispatcher, as the
     /// CLI's commands do. A refusal or failure is a [`CommandValue::Error`].
     pub async fn execute(&self, action: CommandAction) -> CommandValue {
-        self.operator.execute(action).await
+        self.operator.execute(action, None).await
+    }
+
+    /// [`TestDaemon::execute`] in `repository`, as the CLI sends a command
+    /// with its `context_repo`.
+    pub async fn execute_in(&self, repository: &RepositoryKey, action: CommandAction) -> CommandValue {
+        self.operator.execute(action, Some(RepoSelector::Repository(repository.clone()))).await
     }
 
     /// Dispatch a convoy of `mix` onto the fulfilment kind `kind`, and return
@@ -480,8 +524,8 @@ impl Operator {
     }
 
     /// Send `action` and return its value, as `flotilla` does for each command.
-    async fn execute(&self, action: CommandAction) -> CommandValue {
-        let command = flotilla_protocol::Command::builder().action(action).build();
+    async fn execute(&self, action: CommandAction, repository: Option<RepoSelector>) -> CommandValue {
+        let command = flotilla_protocol::Command::builder().action(action).maybe_context_repo(repository).build();
         if command.action.is_query() {
             return self
                 .client
