@@ -69,7 +69,8 @@ fn retired_corpus_kinds_decode_as_dropped_and_purged_ones_refuse() {
     }
     let usage: Value = serde_json::from_str(include_str!("../fixtures/retired-usage.json")).unwrap();
     let dispatch: Vec<Value> = serde_json::from_str(include_str!("../fixtures/retired-dispatch.json")).unwrap();
-    let fixed = || std::iter::once(usage.clone()).chain(dispatch.iter().cloned());
+    let forge_reads: Vec<Value> = serde_json::from_str(include_str!("../fixtures/retired-forge-read.json")).unwrap();
+    let fixed = || std::iter::once(usage.clone()).chain(dispatch.iter().cloned()).chain(forge_reads.iter().cloned());
     for retired in RETIRED_RESOURCE_KINDS {
         assert!(!REGISTERED_RESOURCE_KINDS.iter().any(|registered| registered.kind == retired.kind), "{} is retired", retired.kind);
         let recorded = if AFTER_R355_KINDS.contains(&retired.kind) { Vec::new() } else { recorded(retired.kind) };

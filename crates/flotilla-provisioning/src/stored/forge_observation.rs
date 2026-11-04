@@ -1,4 +1,4 @@
-//! Forge observations on the engine: ChangeRequest, Issue and ForgeRead, plain records (a spec and
+//! Forge observations on the engine: ChangeRequest and Issue, plain records (a spec and
 //! no machine) written by the host that observes their source, at its own home, only when an
 //! observed value changes.
 //!
@@ -8,10 +8,9 @@
 //! stored. ChangeRequest's convoy history is not stored either: the convoys hold those links.
 
 use chrono::{DateTime, Utc};
-use flotilla_protocol::IssueSource;
 use flotilla_resources::{
-    ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, ForgeReadRequest, ForgeReadStatus, IssueSpec, IssueStatus,
-    Observation, ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision,
+    ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, IssueSpec, IssueStatus, Observation,
+    ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision,
 };
 use flotilla_schema::{KindRegistry, RegistryError, Stored, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -327,53 +326,10 @@ impl IssueRecord {
     }
 }
 
-/// A forge read's successful result, read whole; `value` is null when the read found nothing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReadValue {
-    pub value: serde_json::Value,
-}
-
-/// The observing home's latest result of one forge read: kind code `fr`, named by the read's
-/// `forge_read_name`.
-#[derive(Clone, Debug, PartialEq, Eq, Stored)]
-#[store(kind = "ForgeRead", code = "fr")]
-pub struct ForgeReadRecord {
-    /// The read's canonical source.
-    pub service: String,
-    pub scope: String,
-    /// The operation and its parameters, read whole.
-    #[store(cbor)]
-    pub request: ForgeReadRequest,
-    /// The last successful result; none until a read succeeds.
-    #[store(cbor)]
-    pub value: Option<ReadValue>,
-    pub error: Option<String>,
-    pub retry_at: Option<Timestamp>,
-}
-
-impl ForgeReadRecord {
-    /// The record of an old read's source, request and latest status.
-    pub fn from_old(source: &IssueSource, request: &ForgeReadRequest, status: &ForgeReadStatus) -> Self {
-        Self {
-            service: source.service.clone(),
-            scope: source.scope.clone(),
-            request: request.clone(),
-            value: status.value.clone().map(|value| ReadValue { value }),
-            error: status.error.clone(),
-            retry_at: status.retry_at.as_ref().map(Timestamp::from_datetime),
-        }
-    }
-
-    pub fn source(&self) -> IssueSource {
-        IssueSource { service: self.service.clone(), scope: self.scope.clone() }
-    }
-}
-
-/// Registers the three kinds into `registry` under their codes, `cq`, `iu` and `fr`: plain kinds.
+/// Registers the two kinds into `registry` under their codes, `cq` and `iu`: plain kinds.
 pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     registry.register::<ChangeRequestRecord>()?;
-    registry.register::<IssueRecord>()?;
-    registry.register::<ForgeReadRecord>()
+    registry.register::<IssueRecord>()
 }
 
 /// The forge observation kinds alone, for their DDL snapshot.

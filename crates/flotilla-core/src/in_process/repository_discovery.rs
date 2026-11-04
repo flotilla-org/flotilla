@@ -2,8 +2,10 @@
 use super::*;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_forge_forgejo::FORGEJO_AUTH_PROVIDER;
+use flotilla_observation::forge_observation::ForgeReads;
 use flotilla_vcs::providers::detection::remote_assertion;
 pub(super) async fn discover_repository_change_request_with(
+    forge_reads: &ForgeReads,
     resource_backend: &ResourceBackend,
     config: &ConfigStore,
     discovery: &DiscoveryRuntime,
@@ -22,7 +24,11 @@ pub(super) async fn discover_repository_change_request_with(
             Ok(provider) => {
                 return Ok(Arc::new(flotilla_observation::forge_observation::ObservedChangeRequestTracker {
                     inner: provider,
-                    reads: flotilla_observation::forge_observation::ForgeReads::new(resource_backend.clone(), namespace.into()),
+                    reads: {
+                        let mut reads = forge_reads.clone();
+                        reads.namespace = namespace.into();
+                        reads
+                    },
                     source: flotilla_protocol::IssueSource { service: identity.service_url.clone(), scope: identity.repository.clone() },
                 }))
             }

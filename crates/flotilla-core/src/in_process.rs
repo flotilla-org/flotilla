@@ -169,6 +169,7 @@ use flotilla_vcs::checkout_integration::{
 };
 
 struct ProviderChangeRequestQueryPort {
+    forge_reads: flotilla_observation::forge_observation::ForgeReads,
     resource_backend: ResourceBackend,
     config: Arc<ConfigStore>,
     discovery: Arc<DiscoveryRuntime>,
@@ -332,6 +333,7 @@ impl ChangeRequestQueryPort for ProviderChangeRequestQueryPort {
         repository: &RepositorySpec,
     ) -> Result<Arc<dyn ChangeRequestTracker>, String> {
         discover_repository_change_request_with(
+            &self.forge_reads,
             &self.resource_backend,
             &self.config,
             &self.discovery,
@@ -761,10 +763,8 @@ pub struct InProcessDaemon {
     /// Discovery dependencies and configuration used for all daemon-side
     /// provider detection, both at startup and for later repo additions.
     discovery: Arc<DiscoveryRuntime>,
-    change_request_query_port: Arc<dyn ChangeRequestQueryPort>,
     issue_query_port: Arc<dyn IssueQueryPort>,
     forge_budgets: flotilla_forge_github::forge_budget::ForgeBudgets,
-    pub(crate) forge_demand_refresh: Mutex<()>,
     dispatch_board_cache: dispatch_board::DispatchBoardCache,
     /// VCS capabilities are selected once for each checkout in its execution environment.
     checkout_providers: Arc<CheckoutProviders>,
@@ -1232,7 +1232,11 @@ impl InProcessDaemon {
 
         let repos = Arc::new(RwLock::new(repos));
         let provisioning_namespace = Arc::new(std::sync::RwLock::new(DEFAULT_PROVISIONING_NAMESPACE.to_string()));
+        // One per host: every provider this daemon builds shares its forge read cache.
+        let forge_reads =
+            flotilla_observation::forge_observation::ForgeReads::new(resource_backend.clone(), DEFAULT_PROVISIONING_NAMESPACE.into());
         let query_port: Arc<dyn ChangeRequestQueryPort> = Arc::new(ProviderChangeRequestQueryPort {
+            forge_reads: forge_reads.clone(),
             resource_backend: resource_backend.clone(),
             config: Arc::clone(&config),
             discovery: Arc::clone(&discovery),
@@ -1251,10 +1255,7 @@ impl InProcessDaemon {
             tracing::warn!(%error, "garbage collect orphaned change request observations at startup failed");
         }
         let issue_query_port: Arc<dyn IssueQueryPort> = Arc::new(ProviderIssueQueryPort {
-            forge_reads: flotilla_observation::forge_observation::ForgeReads::new(
-                resource_backend.clone(),
-                DEFAULT_PROVISIONING_NAMESPACE.into(),
-            ),
+            forge_reads,
             host_providers: Mutex::new(HashMap::new()),
             backend: resource_backend.clone(),
             config: Arc::clone(&config),
@@ -1356,10 +1357,8 @@ impl InProcessDaemon {
             pool_turnovers: flotilla_discovery::factories::generation_turnovers(),
             environment_adoption: tokio::sync::watch::channel(true).0,
             discovery: Arc::clone(&discovery),
-            change_request_query_port: Arc::clone(&query_port),
             issue_query_port: Arc::clone(&issue_query_port),
             forge_budgets,
-            forge_demand_refresh: Mutex::new(()),
             checkout_providers: Arc::clone(&checkout_providers),
             checkout_namespace_changes: tokio::sync::watch::channel(()).0,
             repository_providers: Mutex::new(HashMap::new()),
@@ -4329,19 +4328,7 @@ impl InProcessDaemon {
         self.read_projections().list_hosts(&self.local_host_counts().await).await
     }
 
-    pub(crate) async fn provisioning_namespace_for_forge(&self) -> String {
-        self.provisioning_namespace().await
-    }
-
     pub async fn refresh_dispatch_boards_internal(&self) -> Result<(), String> {
-        let daemon = self.self_weak.clone();
-        tokio::spawn(async move {
-            if let Some(daemon) = daemon.upgrade() {
-                if let Err(error) = daemon.refresh_forge_read_demands().await {
-                    tracing::debug!(%error, "forge demand refresh unavailable");
-                }
-            }
-        });
         self.dispatch_board_repositories_internal(None).await.map(|_| ())
     }
 
@@ -6001,7 +5988,6 @@ impl InProcessDaemon {
         &self.environment_manager
     }
 }
-mod forge_demands;
 mod person_inbox;
 
 #[async_trait]
