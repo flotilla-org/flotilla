@@ -81,7 +81,6 @@ struct Composition {
 
 /// The transports the real forge providers reach their forges through:
 /// Forgejo's HTTP requests and the host's `gh` and `git` commands.
-#[derive(Clone)]
 pub struct ForgeTransport {
     pub http: Arc<dyn HttpClient>,
     pub commands: Arc<dyn CommandRunner>,
