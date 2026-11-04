@@ -303,9 +303,7 @@ struct RawRemoteHostConfig {
     expected_node_id: Option<NodeId>,
     user: Option<String>,
     ssh_multiplex: Option<bool>,
-    // ADR 0047: remove the agentless_ssh alias one fleet roll after #4001,
-    // once udder's hosts.toml says `ssh_host`.
-    #[serde(default, alias = "agentless_ssh")]
+    #[serde(default)]
     ssh_host: bool,
     #[serde(default)]
     supplies: Vec<HostSupply>,
