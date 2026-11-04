@@ -102,15 +102,13 @@ use flotilla_resources::{
     controller_patches as convoy_controller_patches, implement_review_workflow_spec, single_agent_shepherd_workflow_spec,
     single_agent_workflow_spec, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     Convoy as ResourceConvoy, ConvoyPhase, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec,
-    CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, DockerCheckoutStrategy,
-    DockerPerVesselPlacementPolicySpec, FulfilmentFacts, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation,
-    HarnessFacts, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta,
-    LifecycleAuthority, ModelFact, ModelFactSource, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
-    ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositoryRelation, RepositorySpec, ResourceError, Stance,
-    TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, WatchEvent, WatchStart, WorkPhase, WorkState, WorkflowSnapshot,
-    WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, HELD_CREDENTIALS_CAPABILITY, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL,
-    VESSEL_LABEL,
+    CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, FulfilmentFacts,
+    FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, Host as ResourceHost, HostSpec, HostStatus,
+    InputMeta, LifecycleAuthority, ModelFact, ModelFactSource, ObservedCheckoutSpec, Project, ProjectRepositorySpec, ProjectSpec,
+    Repository, RepositoryKey, RepositoryRelation, RepositorySpec, ResourceError, Stance, TerminalAttention, TerminalAttentionSource,
+    TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
+    TerminalSessionStatusPatch, WatchEvent, WatchStart, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
+    AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, HELD_CREDENTIALS_CAPABILITY, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::{apply_status_patch, ResourceBackend, TypedResolver};
 use flotilla_terminal::TerminalPool;
@@ -1803,12 +1801,14 @@ async fn manifest_resolution_command_persists_a_root_spec_token() {
         )
         .await
         .expect("create root");
-    let policies = daemon.resource_backend().using::<PlacementPolicy>("flotilla");
+    let kinds = daemon.resource_backend().using::<FulfilmentKind>("flotilla");
     let mut meta = InputMeta::builder().name("resolve-me".to_string()).build();
     meta.annotations.insert("flotilla.work/manifest-path".into(), "policy.yaml".into());
     meta.annotations.insert("flotilla.work/manifest-source".into(), "test".into());
     meta.annotations.insert("flotilla.work/manifest-reconciler-root".into(), "local".into());
-    policies.create(&meta, &PlacementPolicySpec::builder().pool("live".to_string()).build()).await.expect("create policy");
+    let spec =
+        FulfilmentKindSpec::builder().host_ref("host".into()).pool("live".into()).realisation(FulfilmentRealisation::HostDirect).build();
+    kinds.create(&meta, &spec).await.expect("create kind");
     let mut events = daemon.subscribe();
 
     let command_id = daemon
@@ -1816,7 +1816,7 @@ async fn manifest_resolution_command_persists_a_root_spec_token() {
             Command::builder()
                 .action(CommandAction::ResourceManifestResolve {
                     namespace: "flotilla".to_string(),
-                    kind: "PlacementPolicy".to_string(),
+                    kind: "FulfilmentKind".to_string(),
                     name: "resolve-me".to_string(),
                     resolution: ManifestResolution::Sync,
                     requested_by: "flotilla/implicit".to_string(),
@@ -1826,11 +1826,11 @@ async fn manifest_resolution_command_persists_a_root_spec_token() {
         .await
         .expect("request manifest sync");
     let result = recv_command_finished(&mut events, command_id).await;
-    let stored = policies.get("resolve-me").await.expect("policy");
+    let stored = kinds.get("resolve-me").await.expect("kind");
     let root = roots.get("manifest-test").await.expect("root");
     let key = flotilla_resources::DocumentKey {
         path: "policy.yaml".into(),
-        kind: "PlacementPolicy".into(),
+        kind: "FulfilmentKind".into(),
         namespace: "flotilla".into(),
         name: "resolve-me".into(),
     };

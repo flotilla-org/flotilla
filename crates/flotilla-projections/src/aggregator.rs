@@ -33,8 +33,8 @@ use flotilla_resources::attentions::{Attentions, OpenAttention, Sender, Subject 
 use flotilla_resources::{
     api_version, convoy_subject_rows, repository_display_labels, subject_relationship_conflicts, Checkout, CheckoutSpec,
     Clone as CloneResource, Convoy, ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource,
-    Demand, Environment, FulfilmentKind, FulfilmentRealisation, PlacementPolicy, Project, ReadResourceObject, ReadWatchEvent, Repository,
-    Resource, ResourceError, ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalAttention, TerminalAttentionState,
+    Demand, Environment, FulfilmentKind, FulfilmentRealisation, Project, ReadResourceObject, ReadWatchEvent, Repository, Resource,
+    ResourceError, ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalAttention, TerminalAttentionState,
     TerminalSession, TerminalSessionPhase, Vessel, VesselPhase, VesselRequirement, WatchEvent, WatchStream, WorkPhase as ResourceWorkPhase,
     WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
@@ -81,7 +81,6 @@ pub struct AggregatorResolvers {
     durable_demands: TypedResolver<Demand>,
     durable_environments: TypedResolver<Environment>,
     durable_fulfilment_kinds: Option<ReplicaReadResolver<FulfilmentKind>>,
-    durable_placement_policies: Option<ReplicaReadResolver<PlacementPolicy>>,
     durable_sessions: ReplicaReadResolver<TerminalSession>,
     durable_projects: ReplicaReadResolver<Project>,
     durable_fleet_designation: Option<ReplicaReadResolver<flotilla_resources::FleetDesignation>>,
@@ -103,7 +102,6 @@ struct AggregatorSourceRefs<'a> {
     durable_demands: &'a dyn AggregatorWatchSource<Demand>,
     durable_environments: &'a dyn AggregatorWatchSource<Environment>,
     durable_fulfilment_kinds: Option<&'a dyn AggregatorReplicaWatchSource<FulfilmentKind>>,
-    durable_placement_policies: Option<&'a dyn AggregatorReplicaWatchSource<PlacementPolicy>>,
     durable_sessions: &'a dyn AggregatorReplicaWatchSource<TerminalSession>,
     durable_projects: &'a dyn AggregatorReplicaWatchSource<Project>,
     durable_fleet_designation: Option<&'a dyn AggregatorReplicaWatchSource<flotilla_resources::FleetDesignation>>,
@@ -229,8 +227,6 @@ pub struct Aggregator {
     hosts: BTreeMap<String, ResourceObject<flotilla_resources::Host>>,
     #[builder(skip)]
     fulfilment_kinds: BTreeMap<RepositorySourceKey, ReadResourceObject<FulfilmentKind>>,
-    #[builder(skip)]
-    placement_policies: BTreeMap<RepositorySourceKey, ReadResourceObject<PlacementPolicy>>,
     #[builder(skip)]
     readiness_checkouts: BTreeMap<RepositorySourceKey, ReadResourceObject<Checkout>>,
     #[builder(skip)]
@@ -364,7 +360,6 @@ impl Aggregator {
             observed_checkouts: HashMap::new(),
             readiness_vessels: BTreeMap::new(),
             fulfilment_kinds: BTreeMap::new(),
-            placement_policies: BTreeMap::new(),
             hosts: BTreeMap::new(),
             readiness_checkouts: BTreeMap::new(),
             readiness_clones: BTreeMap::new(),
@@ -460,7 +455,6 @@ impl Aggregator {
             durable_demands,
             durable_environments,
             durable_fulfilment_kinds,
-            durable_placement_policies,
             durable_sessions,
             durable_projects,
             durable_fleet_designation,
@@ -481,9 +475,6 @@ impl Aggregator {
             .durable_environments(&durable_environments)
             .maybe_durable_fulfilment_kinds(
                 durable_fulfilment_kinds.as_ref().map(|source| source as &dyn AggregatorReplicaWatchSource<FulfilmentKind>),
-            )
-            .maybe_durable_placement_policies(
-                durable_placement_policies.as_ref().map(|source| source as &dyn AggregatorReplicaWatchSource<PlacementPolicy>),
             )
             .durable_sessions(&durable_sessions)
             .durable_projects(&durable_projects)
@@ -512,7 +503,6 @@ impl Aggregator {
             durable_demands,
             durable_environments,
             durable_fulfilment_kinds,
-            durable_placement_policies,
             durable_sessions,
             durable_projects,
             durable_fleet_designation,
@@ -553,14 +543,6 @@ impl Aggregator {
                 watch
             }
             None => Box::pin(futures::stream::pending()) as BoxStream<'static, Result<ReadWatchEvent<FulfilmentKind>, ResourceError>>,
-        };
-        let mut placement_policy_stream = match durable_placement_policies {
-            Some(source) => {
-                let (items, watch) = Self::recover_replica_watch(source).await?;
-                self.placement_policies = readiness_resources(items);
-                watch
-            }
-            None => Box::pin(futures::stream::pending()) as BoxStream<'static, Result<ReadWatchEvent<PlacementPolicy>, ResourceError>>,
         };
         let mut durable_convoy_stream = self.recover_replica_convoy_watch(durable_convoys).await?;
         let mut durable_demand_stream = self.recover_demand_watch(durable_demands).await?;
@@ -760,21 +742,6 @@ impl Aggregator {
                         }
                         Some(Err(error)) => return Err(error),
                         None => return Err(ResourceError::other("aggregator fulfilment kind watch ended")),
-                    }
-                    self.rebuild_local_projection().await;
-                }
-                event = placement_policy_stream.next() => {
-                    match event {
-                        Some(Ok(event)) => apply_readiness_event(&mut self.placement_policies, event),
-                        Some(Err(ResourceError::WatchExpired { .. })) => {
-                            if let Some(source) = durable_placement_policies {
-                                let (items, watch) = Self::recover_replica_watch(source).await?;
-                                self.placement_policies = readiness_resources(items);
-                                placement_policy_stream = watch;
-                            }
-                        }
-                        Some(Err(error)) => return Err(error),
-                        None => return Err(ResourceError::other("aggregator placement policy watch ended")),
                     }
                     self.rebuild_local_projection().await;
                 }
@@ -2874,25 +2841,11 @@ impl Aggregator {
             .as_ref()
             .and_then(|status| status.observed_kind_ref.as_ref())
             .unwrap_or(&vessel.object.spec.fulfilment_kind_ref);
-        let (version, kind) = match placement_record(&self.fulfilment_kinds, &convoy.namespace, kind_ref, &vessel.provenance) {
-            Some(kind) => (
-                &kind.object.metadata.resource_version,
-                match kind.object.spec.realisation {
-                    FulfilmentRealisation::HostDirect => EnvironmentKind::Direct,
-                    _ => EnvironmentKind::Provisioned,
-                },
-            ),
-            // ADR 0047: a placement frozen as a PlacementPolicy before kinds; remove with PlacementPolicy.
-            None => {
-                let policy = placement_record(&self.placement_policies, &convoy.namespace, kind_ref, &vessel.provenance)?;
-                let spec = &policy.object.spec;
-                let kind = match (&spec.host_direct, &spec.docker_per_vessel, &spec.cloud_sandbox_per_vessel) {
-                    (Some(_), None, None) => EnvironmentKind::Direct,
-                    (None, Some(_), None) | (None, None, Some(_)) => EnvironmentKind::Provisioned,
-                    _ => return None,
-                };
-                (&policy.object.metadata.resource_version, kind)
-            }
+        let placed = placement_record(&self.fulfilment_kinds, &convoy.namespace, kind_ref, &vessel.provenance)?;
+        let version = &placed.object.metadata.resource_version;
+        let kind = match placed.object.spec.realisation {
+            FulfilmentRealisation::HostDirect => EnvironmentKind::Direct,
+            _ => EnvironmentKind::Provisioned,
         };
         if vessel
             .object
@@ -6611,23 +6564,6 @@ mod tests {
                 .build();
             let kind = create_placement_record::<FulfilmentKind>(spec).await;
             assert_vessel_environment_kind_follows(kind, expected, |aggregator| &mut aggregator.fulfilment_kinds).await;
-        }
-    }
-
-    // ADR 0047: a vessel placed before kinds names a PlacementPolicy; remove with PlacementPolicy.
-    #[tokio::test]
-    async fn vessel_environment_kind_falls_back_to_observed_placement_policy() {
-        for (variant, expected) in [
-            (serde_json::json!({"host_direct": {"host_ref": "local", "checkout": "worktree"}}), EnvironmentKind::Direct),
-            (
-                serde_json::json!({"docker_per_vessel": {"host_ref": "local", "checkout": {"fresh_clone_in_container": {"clone_path": "/repo"}}}}),
-                EnvironmentKind::Provisioned,
-            ),
-        ] {
-            let mut spec = variant;
-            spec["pool"] = serde_json::json!("arbitrary-instance");
-            let policy = create_placement_record::<PlacementPolicy>(serde_json::from_value(spec).expect("policy spec")).await;
-            assert_vessel_environment_kind_follows(policy, expected, |aggregator| &mut aggregator.placement_policies).await;
         }
     }
 

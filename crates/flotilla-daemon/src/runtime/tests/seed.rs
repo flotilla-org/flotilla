@@ -4,7 +4,7 @@ use flotilla_resources::{definition_provenance::SEEDING_MANAGER, FulfilmentGrant
 use flotilla_store_sqlite::SqliteBackend;
 
 #[tokio::test]
-async fn migrates_display_name_host_ref_to_canonical_host_id() {
+async fn canonicalizes_display_name_kind_host_refs_to_the_host_id() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let host_id = "b2aac222-host-id";
     backend
@@ -24,35 +24,15 @@ async fn migrates_display_name_host_ref_to_canonical_host_id() {
             .await
             .expect("seed ambiguous host");
     }
-    let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
-    let ambiguous_policy = PlacementPolicySpec::builder()
-        .pool("cleat".to_string())
-        .host_direct(HostDirectPlacementPolicySpec {
-            host_ref: "collision".to_string(),
-            checkout: HostDirectPlacementPolicyCheckout::Worktree,
-        })
-        .build();
-    policies.create(&empty_meta("a-collision"), &ambiguous_policy).await.expect("seed ambiguous policy");
-    let spec = PlacementPolicySpec::builder()
-        .pool("cleat".to_string())
-        .host_direct(HostDirectPlacementPolicySpec { host_ref: "udder".to_string(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
-        .build();
-    policies.create(&empty_meta("direct-udder"), &spec).await.expect("seed legacy policy");
-    let docker_spec = PlacementPolicySpec::builder()
-        .pool("cleat".to_string())
-        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-            memory_policy: Default::default(),
-            host_ref: "udder".to_string(),
-            image: Some("crew:test".into()),
-            pull_policy: Default::default(),
-            agent_adapters: BTreeSet::new(),
-            default_cwd: None,
-            env: BTreeMap::new(),
-            checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
-        })
-        .build();
-    policies.create(&empty_meta("docker-udder"), &docker_spec).await.expect("seed legacy docker policy");
-    let legacy_kind = FulfilmentKindSpec::from_policy(&spec, "linux").expect("valid legacy policy");
+    let host_direct = |host_ref: &str| {
+        FulfilmentKindSpec::builder()
+            .host_ref(host_ref.into())
+            .pool("cleat".into())
+            .grants(BTreeSet::from([FulfilmentGrant::platform("linux".into())]))
+            .realisation(FulfilmentRealisation::HostDirect)
+            .build()
+    };
+    let legacy_kind = host_direct("udder");
     backend.clone().using::<FulfilmentKind>(NAMESPACE).create(&empty_meta("direct-udder"), &legacy_kind).await.expect("seed legacy kind");
     backend
         .clone()
@@ -63,7 +43,7 @@ async fn migrates_display_name_host_ref_to_canonical_host_id() {
     backend
         .clone()
         .using::<FulfilmentKind>(NAMESPACE)
-        .create(&empty_meta("a-collision"), &FulfilmentKindSpec::from_policy(&ambiguous_policy, "linux").expect("valid ambiguous policy"))
+        .create(&empty_meta("a-collision"), &host_direct("collision"))
         .await
         .expect("seed ambiguous kind");
     let previous =
@@ -91,165 +71,12 @@ async fn migrates_display_name_host_ref_to_canonical_host_id() {
     assert!(facts.contains_key("direct-udder"), "display-name kind must receive host facts");
     assert!(!facts.contains_key("a-collision"), "ambiguous kind must not block healthy facts");
 
-    migrate_live_placement_policies(&backend, NAMESPACE, host_id, "linux").await.expect("migrate policy");
+    canonicalize_kind_hosts(&backend, NAMESPACE, host_id).await.expect("canonicalize kinds");
 
-    let policy = policies.get("direct-udder").await.expect("policy remains");
-    assert_eq!(policy.spec.host_direct.expect("direct policy").host_ref, host_id);
-    let kind = backend.clone().using::<FulfilmentKind>(NAMESPACE).get("direct-udder").await.expect("kind exists");
-    assert_eq!(kind.spec.host_ref, host_id);
-    let orphan = backend.clone().using::<FulfilmentKind>(NAMESPACE).get("orphan-udder").await.expect("orphan kind exists");
-    assert_eq!(orphan.spec.host_ref, host_id);
-    let docker = policies.get("docker-udder").await.expect("docker policy remains");
-    assert_eq!(docker.spec.docker_per_vessel.expect("docker policy").host_ref, host_id);
-    assert_eq!(backend.clone().using::<FulfilmentKind>(NAMESPACE).get("docker-udder").await.expect("docker kind").spec.host_ref, host_id);
-    assert_eq!(
-        policies.get("a-collision").await.expect("ambiguous policy remains").spec.host_direct.expect("direct").host_ref,
-        "collision"
-    );
-}
-
-#[tokio::test]
-async fn conflicting_policy_does_not_block_other_host_ref_migrations() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let host_id = "host-id";
-    let hosts = backend.clone().using::<Host>(NAMESPACE);
-    hosts.create(&empty_meta(host_id), &HostSpec { display_name: "kiwi".into(), ..HostSpec::default() }).await.expect("seed host");
-    let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
-    let spec = PlacementPolicySpec::builder()
-        .pool("cleat".to_string())
-        .host_direct(HostDirectPlacementPolicySpec { host_ref: "kiwi".to_string(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
-        .build();
-    for name in ["a-conflicting", "b-healthy"] {
-        policies.create(&empty_meta(name), &spec).await.expect("seed policy");
-    }
-    let listed_hosts = hosts.list().await.expect("list hosts");
-    let listed_policies = policies.list().await.expect("list policies");
-    let conflicting = policies.get("a-conflicting").await.expect("read conflicting policy");
-    let mut edited_spec = conflicting.spec.clone();
-    edited_spec.priority = 1;
-    policies
-        .update(&InputMeta::from(&conflicting.metadata), &conflicting.metadata.resource_version, &edited_spec)
-        .await
-        .expect("concurrent policy write");
-
-    migrate_listed_placement_policies(&backend, NAMESPACE, host_id, "linux", &listed_hosts.items, listed_policies.items)
-        .await
-        .expect("healthy policy still migrates");
-
-    assert_eq!(policies.get("a-conflicting").await.expect("conflicting policy").spec.host_direct.expect("direct").host_ref, "kiwi");
-    assert_eq!(policies.get("b-healthy").await.expect("healthy policy").spec.host_direct.expect("direct").host_ref, host_id);
-    backend.clone().using::<FulfilmentKind>(NAMESPACE).get("b-healthy").await.expect("healthy kind created");
-}
-
-#[tokio::test]
-async fn migrates_live_policy_names_to_fulfilment_kinds() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
-    for host in ["feta", "kiwi", "udder"] {
-        let name = format!("docker-crew-image-{host}");
-        let spec = PlacementPolicySpec::builder()
-            .pool("cleat".to_string())
-            .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                memory_policy: Default::default(),
-                host_ref: host.to_string(),
-                image: Some("crew:test".into()),
-                pull_policy: Default::default(),
-                agent_adapters: BTreeSet::new(),
-                default_cwd: None,
-                env: BTreeMap::new(),
-                checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
-            })
-            .build();
-        policies.create(&empty_meta(&name), &spec).await.expect("seed crew image policy");
-    }
-    for (name, host, docker) in [("docker-on-kiwi", "kiwi", true), ("host-direct-kiwi", "kiwi", false)] {
-        let mut spec = PlacementPolicySpec::builder().pool("cleat".to_string()).build();
-        if docker {
-            spec.docker_per_vessel = Some(DockerPerVesselPlacementPolicySpec {
-                memory_policy: Default::default(),
-                host_ref: host.to_string(),
-                image: Some("ubuntu:24.04".into()),
-                pull_policy: Default::default(),
-                agent_adapters: BTreeSet::new(),
-                default_cwd: None,
-                env: BTreeMap::new(),
-                checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
-            });
-        } else {
-            spec.host_direct =
-                Some(HostDirectPlacementPolicySpec { host_ref: host.to_string(), checkout: HostDirectPlacementPolicyCheckout::Worktree });
-        }
-        policies.create(&empty_meta(name), &spec).await.expect("seed local policy");
-    }
-    let snapshot_name = "placement-snapshot-012345abcdef";
-    let snapshot_spec = PlacementPolicySpec::builder()
-        .pool("cleat".to_string())
-        .host_direct(HostDirectPlacementPolicySpec { host_ref: "kiwi".to_string(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
-        .build();
-    policies
-        .create(
-            &InputMeta::builder()
-                .name(snapshot_name.to_string())
-                .labels(BTreeMap::from([(
-                    flotilla_resources::PREPARED_SNAPSHOT_LABEL.to_string(),
-                    flotilla_resources::PLACEMENT_SNAPSHOT_KIND.to_string(),
-                )]))
-                .build(),
-            &snapshot_spec,
-        )
-        .await
-        .expect("seed frozen placement snapshot");
     let kinds = backend.clone().using::<FulfilmentKind>(NAMESPACE);
-    let frozen_kind = kinds
-        .create(
-            &InputMeta::builder()
-                .name(snapshot_name.to_string())
-                .labels(BTreeMap::from([(
-                    flotilla_resources::PREPARED_SNAPSHOT_LABEL.to_string(),
-                    flotilla_resources::PLACEMENT_SNAPSHOT_KIND.to_string(),
-                )]))
-                .build(),
-            &FulfilmentKindSpec::from_policy(&snapshot_spec, "linux").expect("valid frozen policy"),
-        )
-        .await
-        .expect("seed admission's snapshot kind");
-    let legacy_snapshot = "old-convoy-remote-placement-012345abcdef";
-    policies.create(&empty_meta(legacy_snapshot), &snapshot_spec).await.expect("seed legacy snapshot without label");
-    let mut invalid = PlacementPolicySpec::builder().pool("cleat".to_string()).build();
-    invalid.host_direct =
-        Some(HostDirectPlacementPolicySpec { host_ref: "kiwi".to_string(), checkout: HostDirectPlacementPolicyCheckout::Worktree });
-    invalid.docker_per_vessel = Some(DockerPerVesselPlacementPolicySpec {
-        memory_policy: Default::default(),
-        host_ref: "kiwi".to_string(),
-        image: Some("crew:test".into()),
-        pull_policy: Default::default(),
-        agent_adapters: BTreeSet::new(),
-        default_cwd: None,
-        env: BTreeMap::new(),
-        checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
-    });
-    policies.create(&empty_meta("invalid-both-realisations"), &invalid).await.expect("seed invalid policy");
-    for host in ["feta", "kiwi", "udder"] {
-        migrate_live_placement_policies(&backend, NAMESPACE, host, "linux").await.expect("migrate host policies");
-    }
-    let snapshot_kind = kinds.get(snapshot_name).await.expect("admission's snapshot kind is left alone");
-    assert_eq!(snapshot_kind.metadata.resource_version, frozen_kind.metadata.resource_version);
-    let kinds = kinds.list().await.expect("list kinds").items;
-    let names: BTreeSet<_> = kinds.iter().map(|kind| kind.metadata.name.as_str()).collect();
-    assert_eq!(
-        names,
-        BTreeSet::from(["docker-crew-image-feta", "docker-crew-image-kiwi", "docker-crew-image-udder", snapshot_name]),
-        "snapshots, seeded names and invalid policies do not migrate"
-    );
-    for kind in kinds {
-        assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::platform("linux".to_string())));
-        if kind.metadata.name.starts_with("docker-") {
-            assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::network("scoped".to_string())));
-        } else {
-            assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::host_account_reach()));
-        }
-    }
-    assert_eq!(policies.list().await.expect("policies and snapshots stay for A1 admission").items.len(), 8);
+    assert_eq!(kinds.get("direct-udder").await.expect("kind exists").spec.host_ref, host_id);
+    assert_eq!(kinds.get("orphan-udder").await.expect("orphan kind exists").spec.host_ref, host_id);
+    assert_eq!(kinds.get("a-collision").await.expect("ambiguous kind").spec.host_ref, "collision");
 }
 
 #[tokio::test]
@@ -275,13 +102,11 @@ async fn startup_registration_is_idempotent_and_discovers_existing_clone() {
     let hosts = backend.clone().using::<Host>(NAMESPACE);
     let environments = backend.clone().using::<Environment>(NAMESPACE);
     let kinds = backend.clone().using::<FulfilmentKind>(NAMESPACE);
-    let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
     let clones = backend.using::<Clone>(NAMESPACE);
 
     assert!(hosts.get(&host_id).await.is_ok(), "host resource should exist");
     assert!(environments.get(&format!("host-direct-{host_id}")).await.is_ok(), "host-direct environment should exist");
     assert!(kinds.get(&format!("host-direct-{host_id}")).await.is_ok(), "host-direct kind should exist");
-    assert!(policies.list().await.expect("list policies").items.is_empty(), "startup seeds no placement policy");
 
     let clone_name = format!(
         "clone-{}",
@@ -323,7 +148,7 @@ fn seeded_labels() -> BTreeMap<String, String> {
     BTreeMap::from([(MANAGED_BY_LABEL.to_string(), SEEDING_MANAGER.to_string())])
 }
 
-// Seeding writes this host's kinds directly, labelled as seeding's, and seeds no PlacementPolicy.
+// Seeding writes this host's kinds directly, labelled as seeding's.
 #[tokio::test]
 async fn seeding_writes_host_direct_and_docker_kinds() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
@@ -339,7 +164,6 @@ async fn seeding_writes_host_direct_and_docker_kinds() {
     assert_eq!(profile.docker_policy_name(), "docker-on-host-test");
     assert_eq!(docker.spec, docker_kind_spec(&profile));
     assert_eq!(docker.metadata.labels, seeded_labels());
-    assert!(backend.using::<PlacementPolicy>(NAMESPACE).list().await.expect("list policies").items.is_empty());
 }
 
 #[tokio::test]
@@ -484,54 +308,6 @@ async fn startup_registration_skips_repos_without_origin_and_gates_docker_kind()
     assert!(kinds2.get(&format!("docker-on-{host_id2}")).await.is_ok(), "docker kind should be created when docker capability is true");
 }
 
-// #3765 S6: a cloud policy migrates only on its uniquely advertised controller;
-// its fulfilment kind retains the cloud realisation and resolved host identity.
-#[tokio::test]
-async fn cloud_policy_migration_uses_unique_controller() {
-    use flotilla_protocol::provider::{EnvironmentClass, ProviderAdvertisement, ProviderKind, ProviderReadiness};
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let hosts = backend.using::<Host>(NAMESPACE);
-    let host = hosts
-        .create(&empty_meta("cloud-controller"), &flotilla_resources::HostSpec { display_name: "controller".into(), ..Default::default() })
-        .await
-        .unwrap();
-    hosts
-        .update_status(
-            &host.metadata.name,
-            &host.metadata.resource_version,
-            &flotilla_resources::HostStatus {
-                capabilities: [(
-                    flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
-                    serde_json::to_value(vec![ProviderAdvertisement {
-                        instance: "daytona".into(),
-                        kind: Some(ProviderKind::new(EnvironmentClass::CloudSandbox, "daytona")),
-                        readiness: ProviderReadiness::Ready,
-                        ..Default::default()
-                    }])
-                    .unwrap(),
-                )]
-                .into_iter()
-                .collect(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    let spec: flotilla_resources::PlacementPolicySpec = serde_json::from_value(serde_json::json!({
-        "pool": "cleat", "provider_requirements": {"instance":"daytona", "class":"cloud_sandbox"},
-        "cloud_sandbox_per_vessel": {"image":"image@sha256:digest", "size":{"cpus":1,"memory_bytes":1024,"disk_bytes":2048}, "checkout":"clone_in_vessel", "env":{}}
-    })).unwrap();
-    backend.using::<PlacementPolicy>(NAMESPACE).create(&empty_meta("cloud"), &spec).await.unwrap();
-    let listed_hosts = hosts.list().await.unwrap().items;
-    let policies = backend.using::<PlacementPolicy>(NAMESPACE).list().await.unwrap().items;
-    migrate_listed_placement_policies(&backend, NAMESPACE, "other-host", "linux", &listed_hosts, policies.clone()).await.unwrap();
-    assert!(backend.using::<FulfilmentKind>(NAMESPACE).get("cloud").await.is_err());
-    migrate_listed_placement_policies(&backend, NAMESPACE, "cloud-controller", "linux", &listed_hosts, policies).await.unwrap();
-    let kind = backend.using::<FulfilmentKind>(NAMESPACE).get("cloud").await.unwrap();
-    assert_eq!(kind.spec.host_ref, "cloud-controller");
-    assert!(matches!(kind.spec.realisation, flotilla_resources::FulfilmentRealisation::CloudSandboxPerVessel { .. }));
-}
-
 // A read-deadline storm lasting longer than five minutes must not terminate startup.
 // The real runtime exercises refusals at the memory store boundary.
 #[tokio::test(start_paused = true)]
@@ -562,65 +338,4 @@ async fn runtime_starts_after_store_read_deadlines_clear() {
     assert!(refusals.load(Ordering::Relaxed) > 0, "startup exercised the deadline refusal");
     assert!(!daemon.resource_backend().using::<Host>(NAMESPACE).list().await.unwrap().items.is_empty());
     runtime.shutdown();
-}
-
-// A cloud policy's provider instance selects between two cloud providers on one
-// controller, both for a kind it creates and for one migrated before it carried the instance.
-#[tokio::test]
-async fn cloud_policy_instance_selects_among_controller_providers() {
-    use flotilla_protocol::provider::{
-        CheckoutStrategy, EnvironmentClass, ProviderAdvertisement, ProviderCapabilities, ProviderKind, ProviderReadiness,
-    };
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let hosts = backend.using::<Host>(NAMESPACE);
-    let host = hosts
-        .create(&empty_meta("cloud-controller"), &flotilla_resources::HostSpec { display_name: "controller".into(), ..Default::default() })
-        .await
-        .unwrap();
-    let advertisement = |instance: &str| ProviderAdvertisement {
-        instance: instance.into(),
-        kind: Some(ProviderKind::new(EnvironmentClass::CloudSandbox, instance)),
-        capabilities: ProviderCapabilities {
-            checkout_strategies: vec![CheckoutStrategy::CloneInVessel],
-            workspace_root: "/workspace".into(),
-            per_vessel: true,
-            ..Default::default()
-        },
-        readiness: ProviderReadiness::Ready,
-    };
-    hosts
-        .update_status(
-            &host.metadata.name,
-            &host.metadata.resource_version,
-            &flotilla_resources::HostStatus {
-                capabilities: [(
-                    flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
-                    serde_json::to_value(vec![advertisement("daytona"), advertisement("namespace")]).unwrap(),
-                )]
-                .into_iter()
-                .collect(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    let spec: flotilla_resources::PlacementPolicySpec = serde_json::from_value(serde_json::json!({
-        "pool": "cleat", "provider_requirements": {"instance":"namespace", "class":"cloud_sandbox"},
-        "cloud_sandbox_per_vessel": {"image":"image@sha256:digest", "size":{"cpus":1,"memory_bytes":1024,"disk_bytes":2048}, "checkout":"clone_in_vessel", "env":{}}
-    }))
-    .unwrap();
-    let policies = backend.using::<PlacementPolicy>(NAMESPACE);
-    policies.create(&empty_meta("created"), &spec).await.unwrap();
-    policies.create(&empty_meta("migrated"), &spec).await.unwrap();
-    let mut unlabelled = FulfilmentKindSpec::from_policy(&spec, "linux").unwrap();
-    unlabelled.host_ref = "cloud-controller".into();
-    backend.using::<FulfilmentKind>(NAMESPACE).create(&empty_meta("migrated"), &unlabelled).await.unwrap();
-
-    migrate_live_placement_policies(&backend, NAMESPACE, "cloud-controller", "linux").await.unwrap();
-
-    for name in ["created", "migrated"] {
-        let mut kind = backend.using::<FulfilmentKind>(NAMESPACE).get(name).await.unwrap();
-        flotilla_admission::support::resolve_placement_provider(&backend, NAMESPACE, &mut kind).await.unwrap();
-        assert_eq!(flotilla_admission::support::provider_instance(&kind), Some("namespace"), "{name}");
-    }
 }

@@ -4,10 +4,15 @@ use std::collections::BTreeMap;
 use chrono::Utc;
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
-    Convoy, ConvoySpec, InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceError, WorkflowTemplate, WorkflowTemplateSpec,
-    PLACEMENT_SNAPSHOT_ANNOTATION, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_KIND,
+    Convoy, ConvoySpec, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, InputMeta, ResourceError, WorkflowTemplate,
+    WorkflowTemplateSpec, PLACEMENT_SNAPSHOT_ANNOTATION, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION,
+    WORKFLOW_SNAPSHOT_KIND,
 };
 use flotilla_store::{PreparedSnapshotGarbageCollector, ResourceBackend};
+
+fn placement() -> FulfilmentKindSpec {
+    FulfilmentKindSpec::builder().host_ref("remote".into()).pool("remote".into()).realisation(FulfilmentRealisation::HostDirect).build()
+}
 
 fn prepared_meta(name: &str, kind: &str) -> InputMeta {
     InputMeta::builder().name(name.to_string()).labels(BTreeMap::from([(PREPARED_SNAPSHOT_LABEL.to_string(), kind.to_string())])).build()
@@ -49,8 +54,8 @@ async fn shared_snapshots_are_collected_only_after_the_last_convoy_releases_them
         .expect("create prepared workflow");
     backend
         .clone()
-        .using::<PlacementPolicy>("flotilla")
-        .create(&prepared_meta(placement_name, PLACEMENT_SNAPSHOT_KIND), &PlacementPolicySpec::builder().pool("remote".to_string()).build())
+        .using::<FulfilmentKind>("flotilla")
+        .create(&prepared_meta(placement_name, PLACEMENT_SNAPSHOT_KIND), &placement())
         .await
         .expect("create prepared placement");
     create_convoy(&backend, "first", workflow_name, placement_name).await.expect("create first convoy");
@@ -67,7 +72,7 @@ async fn shared_snapshots_are_collected_only_after_the_last_convoy_releases_them
         backend.clone().definitions::<WorkflowTemplate>("flotilla").get(workflow_name).await,
         Err(ResourceError::NotFound { .. })
     ));
-    assert!(matches!(backend.using::<PlacementPolicy>("flotilla").get(placement_name).await, Err(ResourceError::NotFound { .. })));
+    assert!(matches!(backend.using::<FulfilmentKind>("flotilla").get(placement_name).await, Err(ResourceError::NotFound { .. })));
 }
 
 #[tokio::test]
@@ -82,8 +87,8 @@ async fn replicated_convoy_keeps_an_authored_snapshot_alive() {
         .await
         .expect("author workflow snapshot");
     author
-        .using::<PlacementPolicy>("flotilla")
-        .create(&prepared_meta(placement_name, PLACEMENT_SNAPSHOT_KIND), &PlacementPolicySpec::builder().pool("remote".to_string()).build())
+        .using::<FulfilmentKind>("flotilla")
+        .create(&prepared_meta(placement_name, PLACEMENT_SNAPSHOT_KIND), &placement())
         .await
         .expect("author placement snapshot");
     create_convoy(&remote, "remote-convoy", workflow_name, placement_name).await.expect("remote convoy");
@@ -125,11 +130,8 @@ async fn sweep_removes_unreferenced_legacy_snapshots() {
         .expect("create legacy workflow");
     backend
         .clone()
-        .using::<PlacementPolicy>("flotilla")
-        .create(
-            &InputMeta::builder().name(legacy_placement.to_string()).build(),
-            &PlacementPolicySpec::builder().pool("remote".to_string()).build(),
-        )
+        .using::<FulfilmentKind>("flotilla")
+        .create(&InputMeta::builder().name(legacy_placement.to_string()).build(), &placement())
         .await
         .expect("create legacy placement");
 
