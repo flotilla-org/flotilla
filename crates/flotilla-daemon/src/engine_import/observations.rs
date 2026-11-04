@@ -1,22 +1,21 @@
-//! The importer of the forge observations: ChangeRequest, Issue and ForgeRead. Hosts' old stores
+//! The importer of the forge observations: ChangeRequest and Issue. Hosts' old stores
 //! hold different copies of one subject, so each is written only at the home its source's
 //! declarations name as observer, which every host's import reads the same.
 
 use std::collections::BTreeMap;
 
-use chrono::Utc;
 use flotilla_engine_store::Import;
 use flotilla_observation::forge_observation::Declarations;
 use flotilla_protocol::IssueSource;
 use flotilla_provisioning::engine::{
-    forge_observation_import::{import_change_requests, import_forge_reads, import_issues, Demands, ObservationCopy},
+    forge_observation_import::{import_change_requests, import_issues, ObservationCopy},
     import::ImportReport,
 };
-use flotilla_resources::{ChangeRequest, Forge, ForgeRead, ForgeReadHeartbeat, Issue, Project, Repository, Resource};
+use flotilla_resources::{ChangeRequest, Forge, Issue, Project, Repository, Resource};
 
 use super::{Carried, Source};
 
-pub(super) const KINDS: [&str; 3] = ["changerequests", "issues", "forgereads"];
+pub(super) const KINDS: [&str; 2] = ["changerequests", "issues"];
 
 /// The declarations every home's import reads alike: each Project at its earliest declaration, and
 /// the forges and repositories the Projects resolve through.
@@ -61,11 +60,4 @@ pub(super) fn observations(source: &Source, target: &mut Import, _: &mut Carried
     import_change_requests(&change_requests, &observer_of, target, report);
     let issues = copies::<Issue>(source, "issues", target, report);
     import_issues(&issues, &observer_of, target, report);
-    let mut renewed = Demands::new();
-    for heartbeat in source.context::<ForgeReadHeartbeat>("forgereadheartbeats", None) {
-        let at = renewed.entry(heartbeat.object.metadata.name.clone()).or_insert(heartbeat.object.spec.demanded_at);
-        *at = (*at).max(heartbeat.object.spec.demanded_at);
-    }
-    let reads = copies::<ForgeRead>(source, "forgereads", target, report);
-    import_forge_reads(&reads, &renewed, &observer_of, Utc::now(), target, report);
 }

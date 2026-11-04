@@ -14,11 +14,10 @@ use crate::{
     host::HostStatus,
     replica::{LAST_SYNCED_AT_ANNOTATION, ORIGIN_ROOT_ANNOTATION},
     AccessDelivery, AccountBinding, AccountProvision, Artifact, ChangeRequest, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure,
-    CredentialGrant, CredentialSpec, CrewDefaults, Demand, Environment, Event, FleetDesignation, Forge, ForgeRead, ForgeReadHeartbeat,
-    FulfilmentKind, Host, ImageBuild, ImageLayer, InputMeta, Issue, ManifestRoot, Message, ObjectMeta, OwnerReference, Project,
-    ReadResourceList, ReadWatchEvent, Regard, ReplicaCursor, ReplicationClass, Repository, Resource, ResourceBackend, ResourceError,
-    ResourceList, ResourceObject, ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    CredentialGrant, CredentialSpec, CrewDefaults, Demand, Environment, Event, FleetDesignation, Forge, FulfilmentKind, Host, ImageBuild,
+    ImageLayer, InputMeta, Issue, ManifestRoot, Message, ObjectMeta, OwnerReference, Project, ReadResourceList, ReadWatchEvent, Regard,
+    ReplicaCursor, ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject,
+    ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
 
 pub const MANIFEST_WRITER_SOURCE: &str = "resource-manifest";
@@ -54,8 +53,6 @@ enum RegisteredResource {
     Event,
     FleetDesignation,
     Forge,
-    ForgeRead,
-    ForgeReadHeartbeat,
     FulfilmentKind,
     Host,
     ManifestRoot,
@@ -114,8 +111,6 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
     kind::<Artifact>(RegisteredResource::Artifact, &[]),
     kind::<ChangeRequest>(RegisteredResource::ChangeRequest, &["cr", "change_request", "change-request"]),
     kind::<Issue>(RegisteredResource::Issue, &[]),
-    kind::<ForgeRead>(RegisteredResource::ForgeRead, &[]),
-    kind::<ForgeReadHeartbeat>(RegisteredResource::ForgeReadHeartbeat, &[]),
     kind::<Checkout>(RegisteredResource::Checkout, &[]),
     kind::<CloneResource>(RegisteredResource::Clone, &[]),
     kind::<Convoy>(RegisteredResource::Convoy, &[]),
@@ -183,6 +178,9 @@ pub const RETIRED_RESOURCE_KINDS: &[RetiredResourceKind] = &[
     RetiredResourceKind { kind: "DispatchDeployment", plural: "dispatchdeployments", api_version: "flotilla.work/v1" },
     // The cut-over import converts its rows into FulfilmentKinds; remove one roll after this generation ships.
     RetiredResourceKind { kind: "PlacementPolicy", plural: "placementpolicies", api_version: "flotilla.work/v1" },
+    // Remove one roll after this generation ships, once the corpus is refreshed.
+    RetiredResourceKind { kind: "ForgeRead", plural: "forgereads", api_version: "flotilla.work/v1" },
+    RetiredResourceKind { kind: "ForgeReadHeartbeat", plural: "forgereadheartbeats", api_version: "flotilla.work/v1" },
 ];
 
 /// What a stored document decoded as.
@@ -242,8 +240,6 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::ImageBuild => poll_typed_resource!($body::<ImageBuild>($($arg),*)),
             RegisteredResource::ImageLayer => poll_typed_resource!($body::<ImageLayer>($($arg),*)),
             RegisteredResource::Issue => poll_typed_resource!($body::<Issue>($($arg),*)),
-            RegisteredResource::ForgeRead => poll_typed_resource!($body::<ForgeRead>($($arg),*)),
-            RegisteredResource::ForgeReadHeartbeat => poll_typed_resource!($body::<ForgeReadHeartbeat>($($arg),*)),
             RegisteredResource::ManifestRoot => poll_typed_resource!($body::<ManifestRoot>($($arg),*)),
             RegisteredResource::Message => poll_typed_resource!($body::<Message>($($arg),*)),
             RegisteredResource::Project => poll_typed_resource!($body::<Project>($($arg),*)),
@@ -278,8 +274,6 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::ImageBuild => $body::<ImageBuild>(),
             RegisteredResource::ImageLayer => $body::<ImageLayer>(),
             RegisteredResource::Issue => $body::<Issue>(),
-            RegisteredResource::ForgeRead => $body::<ForgeRead>(),
-            RegisteredResource::ForgeReadHeartbeat => $body::<ForgeReadHeartbeat>(),
             RegisteredResource::ManifestRoot => $body::<ManifestRoot>(),
             RegisteredResource::Message => $body::<Message>(),
             RegisteredResource::Project => $body::<Project>(),
@@ -314,8 +308,6 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::ImageBuild => $body::<ImageBuild>($($arg),*),
             RegisteredResource::ImageLayer => $body::<ImageLayer>($($arg),*),
             RegisteredResource::Issue => $body::<Issue>($($arg),*),
-            RegisteredResource::ForgeRead => $body::<ForgeRead>($($arg),*),
-            RegisteredResource::ForgeReadHeartbeat => $body::<ForgeReadHeartbeat>($($arg),*),
             RegisteredResource::ManifestRoot => $body::<ManifestRoot>($($arg),*),
             RegisteredResource::Message => $body::<Message>($($arg),*),
             RegisteredResource::Project => $body::<Project>($($arg),*),
@@ -418,8 +410,6 @@ pub fn declared_resource_kinds() -> Vec<crate::ResourceKind> {
             RegisteredResource::ImageBuild => crate::ResourceKind::of::<ImageBuild>(),
             RegisteredResource::ImageLayer => crate::ResourceKind::of::<ImageLayer>(),
             RegisteredResource::Issue => crate::ResourceKind::of::<Issue>(),
-            RegisteredResource::ForgeRead => crate::ResourceKind::of::<ForgeRead>(),
-            RegisteredResource::ForgeReadHeartbeat => crate::ResourceKind::of::<ForgeReadHeartbeat>(),
             RegisteredResource::ManifestRoot => crate::ResourceKind::of::<ManifestRoot>(),
             RegisteredResource::Message => crate::ResourceKind::of::<Message>(),
             RegisteredResource::Project => crate::ResourceKind::of::<Project>(),

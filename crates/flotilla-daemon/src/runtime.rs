@@ -92,9 +92,9 @@ use crate::{
 };
 pub(crate) use tasks::manifest_reconciler_enabled;
 pub use tasks::spawn_pending_supervisor_turn_task;
+pub use tasks::spawn_pending_supervisor_turn_task_with_watches;
 #[cfg(test)]
 pub(crate) use tasks::wait_for_listening;
-pub use tasks::{spawn_forge_read_demand_task, spawn_pending_supervisor_turn_task_with_watches};
 
 #[derive(Debug, Clone, bon::Builder)]
 pub struct RuntimeOptions {
@@ -670,8 +670,6 @@ impl StartupRestoration {
             options.namespace.clone(),
             options.controller_resync_interval,
         ))];
-        let (forge_demands, _) = spawn_forge_read_demand_task(Arc::clone(daemon), options.namespace.clone());
-        controller_tasks.push(AbortOnDropHandle::new(forge_demands));
         let observation_daemon = Arc::clone(daemon);
         let observation_namespace = options.namespace.clone();
         controller_tasks.push(AbortOnDropHandle::new(tokio::spawn(async move {

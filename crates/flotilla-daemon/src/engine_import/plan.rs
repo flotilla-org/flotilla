@@ -53,7 +53,7 @@ pub const PLAN: &[(&str, Plan)] = &[
     ("PlacementPolicy", Plan::Imported("placement import (#3824 layer 4b-iv)")),
     ("ChangeRequest", Plan::Imported("forge observations import (#3824 layer 5)")),
     ("Issue", Plan::Imported("forge observations import (#3824 layer 5)")),
-    ("ForgeRead", Plan::Imported("forge observations import (#3824 layer 5)")),
+    ("ForgeRead", Plan::Retired("#4333: forge reads are a per-host cache until 5c")),
     ("Artifact", Plan::Imported("Artifact import (#3824 layer 7)")),
     ("Demand", Plan::Imported("attention import (#3824 layer 8)")),
     ("Regard", Plan::Retired("#3824 layer 8, 2026-11-01: dropped with its salience boost")),

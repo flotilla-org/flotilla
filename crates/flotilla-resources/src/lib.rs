@@ -50,6 +50,10 @@ pub mod delivery_hold;
 #[doc(hidden)]
 pub mod digest;
 pub use digest::{digest_bucket, DigestQuery, PartitionDigest, DIGEST_FANOUT};
+#[doc(hidden)]
+pub mod definition_provenance;
+pub mod definitions;
+pub mod engine_records;
 mod environment;
 #[doc(hidden)]
 pub mod error;
@@ -59,15 +63,6 @@ pub mod event;
 pub mod field_ownership;
 mod fleet_designation;
 mod forge;
-mod forge_read;
-pub use forge_read::{
-    forge_read_name, ForgeRead, ForgeReadHeartbeat, ForgeReadHeartbeatSpec, ForgeReadHeartbeatStatus, ForgeReadRequest, ForgeReadSpec,
-    ForgeReadStatus,
-};
-#[doc(hidden)]
-pub mod definition_provenance;
-pub mod definitions;
-pub mod engine_records;
 mod fulfilment_kind;
 #[doc(hidden)]
 pub mod host;
@@ -272,8 +267,6 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::Environment>($($argument),*);
         $callback::<$crate::FleetDesignation>($($argument),*);
         $callback::<$crate::Forge>($($argument),*);
-        $callback::<$crate::ForgeRead>($($argument),*);
-        $callback::<$crate::ForgeReadHeartbeat>($($argument),*);
         $callback::<$crate::Event>($($argument),*);
         $callback::<$crate::Host>($($argument),*);
         $callback::<$crate::ManifestRoot>($($argument),*);

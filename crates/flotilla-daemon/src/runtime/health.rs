@@ -781,14 +781,12 @@ pub(super) fn resource_decode_quarantine_condition(
         return None;
     }
     // Extend this list when source_owner gains another stored election input
-    // or ForgeReads gains another demand/result kind; keep its scope test aligned.
+    // or forge observation gains another stored kind; keep its scope test aligned.
     let forge_kinds = [
         Host::API_PATHS.kind,
         Forge::API_PATHS.kind,
         flotilla_resources::Project::API_PATHS.kind,
         flotilla_resources::Repository::API_PATHS.kind,
-        flotilla_resources::ForgeRead::API_PATHS.kind,
-        flotilla_resources::ForgeReadHeartbeat::API_PATHS.kind,
         flotilla_resources::Issue::API_PATHS.kind,
         flotilla_resources::ChangeRequest::API_PATHS.kind,
     ];
