@@ -4,10 +4,11 @@
 //! `invocation`, `idempotent` and `result = "kind"`; each
 //! named field is a parameter, typed by its Rust type through `Param`, and refined by
 //! `#[param(text)]`, `#[param(options("a", "b"))]`, `#[param(subject = "kind")]` and
-//! `#[param(default = "...")]`.
+//! `#[param(default = "...")]`. A kind names its `flotilla_address::Kind` variant in snake case,
+//! so a kind that is none does not compile.
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{ext::IdentExt, Data, DeriveInput, Fields, LitStr};
+use syn::{ext::IdentExt, Data, DeriveInput, Fields, Ident, LitStr};
 
 struct VerbAttrs {
     name: LitStr,
@@ -96,12 +97,18 @@ fn param(field: &syn::Field) -> syn::Result<TokenStream> {
             ::flotilla_schema::ParamType::Enum
         })
     } else if let Some(kind) = &subject {
-        quote!({
-            const _: () = assert!(matches!(#declared, ::flotilla_schema::ParamType::Subject(_)), "#[param(subject = ...)] is for Address fields");
-            ::flotilla_schema::ParamType::Subject(#kind)
-        })
+        let kind = kind_path(kind);
+        quote!(::flotilla_schema::ParamType::Subject(#kind))
     } else {
         declared
+    };
+    // An address is no `Param`: a subject parameter is required unless it is an `Option`.
+    let required = match &subject {
+        Some(_) => {
+            let required = !matches!(ty, syn::Type::Path(path) if path.path.segments.last().is_some_and(|last| last.ident == "Option"));
+            quote!(#required)
+        }
+        None => quote!(<#ty as ::flotilla_schema::Param>::REQUIRED),
     };
     let default = match &default {
         Some(default) => quote!(::core::option::Option::Some(#default)),
@@ -110,7 +117,7 @@ fn param(field: &syn::Field) -> syn::Result<TokenStream> {
     Ok(quote!(::flotilla_schema::ParamDeclaration {
         name: #name,
         ty: #ty_tokens,
-        required: <#ty as ::flotilla_schema::Param>::REQUIRED,
+        required: #required,
         default: #default,
         options: ::std::vec![#(#options),*],
     }))
@@ -129,8 +136,12 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
     let ident = &input.ident;
     let (implementation, ty, clause) = input.generics.split_for_impl();
     let VerbAttrs { name, subject, effect, invocation, idempotent, result } = attrs;
+    let subject = kind_path(&subject);
     let result = match result {
-        Some(kind) => quote!(::core::option::Option::Some(#kind)),
+        Some(kind) => {
+            let kind = kind_path(&kind);
+            quote!(::core::option::Option::Some(#kind))
+        }
         None => quote!(::core::option::Option::None),
     };
     Ok(quote! {
@@ -148,4 +159,18 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
             }
         }
     })
+}
+
+/// `::flotilla_address::Kind::<Variant>` for a kind written in snake case.
+fn kind_path(kind: &LitStr) -> TokenStream {
+    let variant: String = kind
+        .value()
+        .split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map(|first| first.to_ascii_uppercase().to_string() + chars.as_str()).unwrap_or_default()
+        })
+        .collect();
+    let variant = Ident::new(&variant, kind.span());
+    quote!(::flotilla_address::Kind::#variant)
 }
