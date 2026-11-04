@@ -127,7 +127,7 @@ async fn fixture() -> Fixture {
         verb: "convoy.touch",
         label: Some("Touch convoy"),
         picks: Picks::Each,
-        when: vec![r#"status.phase != "Landed""#],
+        when: vec![".status.phase != Landed"],
         ..Presentation::default()
     };
     let catalog = Catalog::new(
@@ -230,7 +230,7 @@ async fn the_verbs_table_lists_native_verbs_and_their_parameters() {
     assert_eq!(verb["label"], "Touch convoy");
     assert_eq!(verb["effect"], "write");
     assert_eq!(verb["picks"], "each");
-    assert_eq!(verb["when"], json!([r#"status.phase != "Landed""#]));
+    assert_eq!(verb["when"], json!([".status.phase != Landed"]));
     assert_eq!(verb["reads"], json!(["status.phase"]));
     assert_eq!(verb["source"], "builtin");
     assert_eq!(verb["broken"], Value::Null);
@@ -361,7 +361,7 @@ async fn a_failing_when_answers_not_applicable_with_the_condition() {
     let Fixture { router, runs, .. } = fixture().await;
     let (status, body) = invoke(&router, CallerAuth::Bearer, "convoy.touch", json!({"invocation": "n", "subjects": [LANDED]})).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["outcomes"], json!([{"subject": LANDED, "status": "not_applicable", "condition": r#"status.phase != "Landed""#}]));
+    assert_eq!(body["outcomes"], json!([{"subject": LANDED, "status": "not_applicable", "condition": ".status.phase != Landed"}]));
     assert_eq!(runs.load(Ordering::SeqCst), 0);
 }
 
@@ -472,39 +472,29 @@ async fn requests_that_do_not_fit_the_verb_are_refused_whole() {
 }
 
 // Behaviour (#4197 operator check, #4234): the built-in catalog lists `convoy.explain`, unbroken,
-// and it runs through the route over the daemon's own convoy, named by its role: under its
-// project for a project's convoy, and at the root for a projectless one. The role under another
-// project, and the record name, name nothing.
+// and it runs through the route over the daemon's own convoy, named by its record name or by
+// its role under its project, as the CLI's `convoy explain` names it. The role under another
+// project names nothing.
 #[tokio::test]
-async fn convoy_explain_finds_a_convoy_by_its_role() {
+async fn convoy_explain_finds_a_convoy_by_its_record_name_or_role() {
     let (_dir, daemon) = super::super::tests::empty_daemon().await;
     let namespace = daemon.provisioning_namespace().await;
     let convoys = daemon.resource_backend().using::<Convoy>(&namespace);
-    for (record, project) in [("convoy-0123", Some("flotilla")), ("convoy-0456", None)] {
-        let mut labels = BTreeMap::from([(ROLE_LABEL.to_owned(), "fix-3774".to_owned())]);
-        labels.extend(project.map(|project| (PROJECT_LABEL.to_owned(), project.to_owned())));
-        let spec = ConvoySpec::builder()
-            .workflow_ref("workflow".into())
-            .maybe_project_ref(project.map(str::to_owned))
-            .role("fix-3774".into())
-            .build();
-        convoys.create(&InputMeta::builder().name(record.into()).labels(labels).build(), &spec).await.unwrap();
-    }
+    let labels = BTreeMap::from([(ROLE_LABEL.to_owned(), "fix-3774".to_owned()), (PROJECT_LABEL.to_owned(), "flotilla".to_owned())]);
+    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).role("fix-3774".into()).build();
+    convoys.create(&InputMeta::builder().name("convoy-0123".into()).labels(labels).build(), &spec).await.unwrap();
     let router =
         HttpRouter::for_daemon(Arc::clone(&daemon), Arc::new(LoginStore::new(daemon.clock_for_scenarios())), ListenerOrigin::default())
             .into_router();
     let verbs = rows(&router, "/tables/verbs/rows").await;
     let explain = verbs.iter().find(|verb| verb["name"] == "convoy.explain").expect("listed");
     assert_eq!((&explain["effect"], &explain["picks"], &explain["broken"]), (&json!("read"), &json!("each"), &Value::Null));
-    let subjects =
-        ["project:flotilla/convoy:fix-3774", "convoy:fix-3774", "project:other/convoy:fix-3774", "project:flotilla/convoy:convoy-0123"];
+    let subjects = ["convoy:convoy-0123", "project:flotilla/convoy:fix-3774", "project:other/convoy:fix-3774"];
     let (status, body) = invoke(&router, CallerAuth::Bearer, "convoy.explain", json!({"invocation": "r", "subjects": subjects})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     for outcome in &body["outcomes"].as_array().unwrap()[..2] {
         assert_eq!(outcome["status"], "done", "{body}");
         assert!(outcome["result"].is_object(), "{body}");
     }
-    for (index, subject) in subjects.iter().enumerate().skip(2) {
-        assert_eq!(body["outcomes"][index], json!({"subject": subject, "status": "failed", "error": format!("no convoy at `{subject}`")}));
-    }
+    assert_eq!(body["outcomes"][2], json!({"subject": subjects[2], "status": "failed", "error": "no convoy matches `fix-3774@other`"}));
 }

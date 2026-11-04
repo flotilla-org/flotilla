@@ -6,8 +6,8 @@ use flotilla_address::{Address, Kind};
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_protocol::table::Row;
 use flotilla_schema::{Table, Verb};
-use flotilla_store::{query_convoy_by_role, ResourceBackend};
-use serde_json::{json, Value};
+use flotilla_store::{query_resource_kind, resolve_local_convoy_name, ResourceBackend, StoreQuery};
+use serde_json::Value;
 
 use super::catalog::{NativeVerb, Subject, Subjects};
 use crate::server::tables;
@@ -29,14 +29,19 @@ impl Subjects for ResourceSubjects {
         (kind == Kind::Convoy).then(|| tables::descriptor("convoys"))
     }
 
-    /// Under an ADR 0066 address a convoy is named by its role, within its project or, at the
-    /// root, among the projectless convoys; its record name (`convoy-<uuid>`, `ensure-<hash>`)
-    /// is not an address. One indexed read by the role and project labels finds it.
+    /// A convoy address names a record (`convoy:convoy-<uuid>`) or a role, within a project
+    /// (`project:<p>/convoy:<role>`) or in any project; it resolves as the CLI's `convoy explain`
+    /// resolves `<role>@<project>`, and the row is read by the resolved record name.
     async fn row(&self, namespace: &str, address: &Address) -> Result<Option<Row>, String> {
         let Some(table) = self.table(address.kind()) else { return Err(format!("no table serves `{}` subjects", address.kind())) };
-        let project = address.get(Kind::Project).unwrap_or_default();
-        let Some(convoy) = query_convoy_by_role(&self.backend, namespace, address.name(), project).await? else { return Ok(None) };
-        Ok(tables::resource_rows(&json!({ "items": [convoy] }), &table)?.into_iter().next())
+        let reference = match address.get(Kind::Project) {
+            Some(project) => format!("{}@{project}", address.name()),
+            None => address.name().to_owned(),
+        };
+        let name = resolve_local_convoy_name(&self.backend, namespace, &reference).await?;
+        let query = StoreQuery::names([name], false);
+        let document = query_resource_kind(&self.backend, namespace, "convoys", &query).await.map_err(|error| error.to_string())?;
+        Ok(tables::resource_rows(&document, &table)?.into_iter().next())
     }
 }
 

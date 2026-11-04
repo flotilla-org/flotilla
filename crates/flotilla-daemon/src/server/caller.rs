@@ -506,16 +506,6 @@ mod tests {
     }
 
     // Unavailable kernel evidence must refuse, never downgrade a container to host.
-    // #4234: a route that knows no main socket path (the verb route on a router built without
-    // the command service) passes none, and a contained peer then never gains legacy authority.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn mounts_without_a_main_socket_path_grant_no_legacy_authority() {
-        let mounts = peer_mounts(std::process::id(), None).expect("own mount evidence");
-        assert!(!mounts.mountinfo.is_empty());
-        assert!(!mounts.legacy_main_directory);
-    }
-
     #[cfg(target_os = "linux")]
     #[test]
     fn missing_peer_cgroup_refuses_identity() {

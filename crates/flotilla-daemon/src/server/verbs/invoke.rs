@@ -180,8 +180,8 @@ impl Verbs {
             Err(error) => return Err(Box::new(Outcome::failed(subject, error))),
         };
         (self.policy)(caller, entry, address).map_err(|reason| Box::new(Outcome::refused(subject.clone(), reason)))?;
-        if let Some(failing) = entry.failing(&row) {
-            return Err(Box::new(Outcome::not_applicable(subject, failing.text.to_owned())));
+        if let Some(failing) = entry.when.iter().find(|condition| !condition.holds(&row)) {
+            return Err(Box::new(Outcome::not_applicable(subject, failing.text.clone())));
         }
         Ok(Subject { address: address.clone(), row })
     }

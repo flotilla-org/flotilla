@@ -11,14 +11,11 @@ use std::{
 use async_trait::async_trait;
 use flotilla_address::{Address, Kind};
 use flotilla_protocol::table::Row;
-use flotilla_schema::{
-    ColumnType, Filterable, Layout, ParamDeclaration, ParamType, Table, TableRole, TableSet, Verb, VerbDeclaration, VerbEffect,
-};
-use rigging_condition::{Checked, Condition};
+use flotilla_schema::{ColumnType, Layout, ParamDeclaration, ParamType, Table, TableRole, TableSet, Verb, VerbDeclaration, VerbEffect};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
 
-use crate::server::tables::filter;
+use super::when::Condition;
 
 /// How a verb takes the rows it is offered (#4182 ruling 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -119,21 +116,11 @@ pub(crate) trait Subjects: Send + Sync {
     async fn row(&self, namespace: &str, address: &Address) -> Result<Option<Row>, String>;
 }
 
-/// One condition of a verb's `when` (#4182 ruling 3), in the condition language a table read's
-/// `where` speaks, checked against the subject kind's table.
-pub(crate) struct When {
-    /// As written, for the `when` column and a `not_applicable` answer.
-    pub text: &'static str,
-    pub condition: Checked<Condition>,
-}
-
 /// One listed verb.
 pub(crate) struct Entry {
     pub declaration: VerbDeclaration,
     pub presentation: Presentation,
-    pub when: Vec<When>,
-    /// The subject kind's table as condition fields; none when no table serves the kind.
-    pub fields: Option<Filterable>,
+    pub when: Vec<Condition>,
     /// The literal defaults, as their parameters' JSON values.
     pub defaults: Map<String, Value>,
     pub handler: Arc<dyn Handler>,
@@ -152,15 +139,8 @@ impl Entry {
 
     /// The columns `when` reads.
     pub(crate) fn reads(&self) -> Vec<String> {
-        let Some(fields) = &self.fields else { return Vec::new() };
-        let reads: BTreeSet<String> = self.when.iter().flat_map(|when| filter::columns(&when.condition, fields)).collect();
+        let reads: BTreeSet<String> = self.when.iter().map(|condition| condition.column.clone()).collect();
         reads.into_iter().collect()
-    }
-
-    /// The first `when` condition `row` does not satisfy.
-    pub(crate) fn failing(&self, row: &Row) -> Option<&When> {
-        let fields = self.fields.as_ref()?;
-        self.when.iter().find(|when| !filter::keeps(&when.condition, fields, row))
     }
 }
 
@@ -188,20 +168,19 @@ impl Catalog {
             let presentation =
                 presentations.remove(declaration.name).unwrap_or(Presentation { verb: declaration.name, ..Presentation::default() });
             let mut problems = Vec::new();
-            let table = subjects.table(declaration.subject);
-            let fields = table.as_ref().map(filter::fields);
-            let mut when = Vec::new();
-            match (&table, &fields) {
-                (Some(table), Some(fields)) => {
-                    for &text in &presentation.when {
-                        match filter::parse(&[("where".into(), text.into())], table, fields) {
-                            Ok(Some(condition)) => when.push(When { text, condition }),
-                            Ok(None) => {}
-                            Err(failure) => problems.push(format!("condition `{text}`: {}", failure.message)),
-                        }
+            let when = presentation
+                .when
+                .iter()
+                .filter_map(|text| Condition::parse(text).map_err(|error| problems.push(error)).ok())
+                .collect::<Vec<_>>();
+            match subjects.table(declaration.subject) {
+                Some(table) => {
+                    let columns: BTreeSet<&str> = table.key.iter().chain(&table.columns).map(|column| column.name.as_str()).collect();
+                    for condition in when.iter().filter(|condition| !columns.contains(condition.column.as_str())) {
+                        problems.push(format!("`{}` is not a column of `{}`", condition.column, table.name));
                     }
                 }
-                _ => problems.push(format!("no table serves `{}` subjects", declaration.subject)),
+                None => problems.push(format!("no table serves `{}` subjects", declaration.subject)),
             }
             let mut defaults = Map::new();
             for param in &declaration.params {
@@ -213,7 +192,7 @@ impl Catalog {
                     Err(error) => problems.push(format!("parameter `{}`: {error}", param.name)),
                 }
             }
-            let entry = Entry { declaration, presentation, when, fields, defaults, handler, broken: None };
+            let entry = Entry { declaration, presentation, when, defaults, handler, broken: None };
             let broken = (!problems.is_empty()).then(|| problems.join("; "));
             entries.insert(entry.declaration.name, Entry { broken, ..entry });
         }

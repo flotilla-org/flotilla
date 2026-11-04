@@ -4,13 +4,12 @@
 //! - [`catalog`]: the declarations joined with their presentation entries, checked at load.
 //! - [`invoke`]: one invocation: request checks, per-subject checks and runs, and the
 //!   `verb.invocation` span that records the intent.
+//! - [`when`]: applicability conditions over a subject's row.
 //! - [`convoy`]: convoy subjects and `convoy.explain`.
-//!
-//! A verb's `when` speaks the condition language of a table read's `where`, parsed and kept per
-//! row by `tables::filter`.
 pub(crate) mod catalog;
 pub(crate) mod convoy;
 pub(crate) mod invoke;
+pub(crate) mod when;
 
 use std::sync::Arc;
 

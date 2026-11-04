@@ -149,37 +149,3 @@ impl<T: Param> Param for Option<T> {
     const TYPE: ParamType = T::TYPE;
     const REQUIRED: bool = false;
 }
-
-/// An `Address` parameter, whose kind `#[param(subject = "kind")]` names.
-#[diagnostic::on_unimplemented(message = "`#[param(subject = ...)]` is for Address fields")]
-pub trait SubjectParam {
-    const REQUIRED: bool = true;
-}
-
-impl SubjectParam for crate::Address {}
-
-impl SubjectParam for Option<crate::Address> {
-    const REQUIRED: bool = false;
-}
-
-/// The address kind `token` names, for `#[derive(Verb)]`: evaluated at compile time, so a
-/// declaration naming no kind does not build.
-#[doc(hidden)]
-pub const fn address_kind(token: &str) -> Kind {
-    let mut index = 0;
-    while index < Kind::ALL.len() {
-        let kind = Kind::ALL[index];
-        let (name, wanted) = (kind.as_str().as_bytes(), token.as_bytes());
-        if name.len() == wanted.len() {
-            let mut at = 0;
-            while at < name.len() && name[at] == wanted[at] {
-                at += 1;
-            }
-            if at == name.len() {
-                return kind;
-            }
-        }
-        index += 1;
-    }
-    panic!("not an ADR 0066 address kind");
-}

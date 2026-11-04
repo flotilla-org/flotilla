@@ -70,7 +70,7 @@ impl Kind {
     ];
 
     /// The segment token, as printed before `:`.
-    pub const fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Kind::Host => "host",
             Kind::Provider => "provider",

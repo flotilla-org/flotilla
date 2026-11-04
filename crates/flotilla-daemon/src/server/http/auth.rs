@@ -124,16 +124,20 @@ impl FromRequestParts<RouterState> for UserCommandCaller {
 
     async fn from_request_parts(parts: &mut Parts, state: &RouterState) -> Result<Self, Self::Rejection> {
         let UserCaller(caller) = UserCaller::from_request_parts(parts, state).await?;
-        let refuse = |status, message: &str| refusal_encoding(&parts.headers).error_code(status, "unauthorized", message);
+        let encoding = refusal_encoding(&parts.headers);
         let RouterState(router) = state;
         let Some(daemon) = router.daemon.as_ref() else {
-            return Err(refuse(StatusCode::SERVICE_UNAVAILABLE, "the daemon is unavailable"));
+            return Err(encoding.error(StatusCode::SERVICE_UNAVAILABLE, "the daemon is unavailable"));
         };
         let namespace = daemon.provisioning_namespace().await;
         let socket_path = router.commands.as_ref().map(|commands| commands.socket_path());
         match command_caller(daemon, &namespace, socket_path, &caller).await {
             Ok(resolved) => Ok(Self { caller: resolved.caller, namespace }),
-            Err((status, message)) => Err(refuse(status, &message)),
+            // Only an authentication refusal is `unauthorized`; a failed blocking task is the daemon's.
+            Err((status @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN), message)) => {
+                Err(encoding.error_code(status, "unauthorized", message))
+            }
+            Err((status, message)) => Err(encoding.error(status, message)),
         }
     }
 }
