@@ -7,7 +7,7 @@
 //! rather than leaving a crew to time out in a clone.
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_environment::reach::{PlannedRoute, ReachAnswer};
+use flotilla_environment::reach::{is_global, PlannedRoute, ReachAnswer};
 use flotilla_resources::{
     reach::{self, ReachDestination, ReachMeans, ReachRoute, ReachWay},
     ConvoyRepositorySpec, CredentialConsumer, CredentialSpec, FleetDesignation, Forge, Project, Repository, ResourceError,
@@ -135,17 +135,41 @@ impl ReachAnswers for flotilla_discovery::registry::ProviderRegistry {
 }
 
 /// The answers a candidate's advertised ways give without looking anything
-/// up: every destination on the host's network when that is its preferred
-/// way, and none otherwise.
+/// up, for a candidate no live instance here answers for: the interim answer
+/// until placement asks candidates on another daemon directly (#4299).
+///
+/// - A candidate preferring the host's network meets every destination there.
+/// - A destination named by an address is classified as it stands: a public
+///   one is met by egress, a private one only on the host's network, since an
+///   outward exposure stands at a name.
+/// - A named destination is met by the first advertised way, which carries it
+///   if it proves private, or by egress when none is advertised. Whether the
+///   candidate's host can resolve and reach it is checked when it provisions,
+///   which fails naming the destination.
 pub fn advertised_answers(ways: &[ReachWay], reach: &BTreeSet<ReachDestination>) -> Vec<ReachAnswer> {
-    if ways.first() != Some(&ReachWay::HostNetwork) {
-        return Vec::new();
-    }
-    let met = |destination: &ReachDestination| PlannedRoute {
-        route: ReachRoute { destination: destination.clone(), met: ReachMeans::HostNetwork },
+    let met = |destination: &ReachDestination, met: ReachMeans| PlannedRoute {
+        route: ReachRoute { destination: destination.clone(), met },
         carried_to: None,
     };
-    reach.iter().map(|destination| (destination.clone(), Ok(met(destination)))).collect()
+    let preferred = match ways.first() {
+        Some(ReachWay::HostNetwork) => ReachMeans::HostNetwork,
+        Some(ReachWay::OutwardExposure) => ReachMeans::OutwardExposure,
+        None => ReachMeans::Egress,
+    };
+    reach
+        .iter()
+        .map(|destination| {
+            let address = destination.host.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().ok();
+            let answer = match address {
+                _ if preferred == ReachMeans::HostNetwork => Ok(met(destination, ReachMeans::HostNetwork)),
+                Some(address) if is_global(address) => Ok(met(destination, ReachMeans::Egress)),
+                Some(_) if ways.contains(&ReachWay::HostNetwork) => Ok(met(destination, ReachMeans::HostNetwork)),
+                Some(_) => Err(format!("{destination} is a private address and no advertised way reaches it")),
+                None => Ok(met(destination, preferred)),
+            };
+            (destination.clone(), answer)
+        })
+        .collect()
 }
 
 /// Why a candidate that gave `answers` cannot meet the reach set, naming the
@@ -169,8 +193,7 @@ mod tests {
 
     // #4299: a candidate is refused at the first destination it cannot meet,
     // in its own words, or gives no answer for; one that meets every
-    // destination, however it meets each, is not. A candidate that prefers the
-    // host's network answers from its advertisement alone.
+    // destination, however it meets each, is not.
     #[test]
     fn a_candidate_is_refused_at_a_destination_it_cannot_meet_or_does_not_answer() {
         let met = |host: &str, met| (at(host), Ok(PlannedRoute { route: ReachRoute { destination: at(host), met }, carried_to: None }));
@@ -182,10 +205,40 @@ mod tests {
         let unanswered = unmet_reach(&reach, &answers[..1]).expect("refused");
         assert!(unanswered.contains("no answer") && unanswered.contains("forgejo.lab.test:443"), "{unanswered}");
         assert_eq!(unmet_reach(&BTreeSet::new(), &[]), None);
-        // A candidate preferring the host's network answers from its advertisement.
-        assert_eq!(unmet_reach(&reach, &advertised_answers(&[ReachWay::HostNetwork, ReachWay::OutwardExposure], &reach)), None);
-        assert!(advertised_answers(&[ReachWay::OutwardExposure, ReachWay::HostNetwork], &reach).is_empty());
-        assert!(advertised_answers(&[], &reach).is_empty());
+    }
+
+    // #4299, interim: a candidate no live instance here answers for answers
+    // from the ways it advertises, looking nothing up. Its host's network
+    // meets everything; an exposure carries a name; an address is classified
+    // as it stands; with no ways a name is left to its egress, and its host
+    // checks when it provisions.
+    #[test]
+    fn a_candidate_on_another_daemon_answers_from_its_advertised_ways() {
+        let reach = BTreeSet::from([at("forgejo.lab.test"), at("100.64.0.7"), at("140.82.112.3")]);
+        let means = |ways: &[ReachWay]| {
+            advertised_answers(ways, &reach)
+                .into_iter()
+                .map(|(destination, answer)| {
+                    (destination.host, answer.map(|planned| planned.route.met).map_err(|reason| reason.contains("100.64.0.7:443")))
+                })
+                .collect::<Vec<_>>()
+        };
+        use ReachMeans::{Egress, HostNetwork, OutwardExposure};
+        let host = |met| ("100.64.0.7".to_string(), met);
+        let public = ("140.82.112.3".to_string(), Ok(Egress));
+        let forge = |met| ("forgejo.lab.test".to_string(), Ok(met));
+        assert_eq!(
+            means(&[ReachWay::HostNetwork]),
+            vec![host(Ok(HostNetwork)), ("140.82.112.3".into(), Ok(HostNetwork)), forge(HostNetwork)]
+        );
+        assert_eq!(means(&[ReachWay::OutwardExposure]), vec![host(Err(true)), public.clone(), forge(OutwardExposure)]);
+        assert_eq!(
+            means(&[ReachWay::OutwardExposure, ReachWay::HostNetwork]),
+            vec![host(Ok(HostNetwork)), public.clone(), forge(OutwardExposure)]
+        );
+        assert_eq!(means(&[]), vec![host(Err(true)), public, forge(Egress)]);
+        let refused = unmet_reach(&reach, &advertised_answers(&[ReachWay::OutwardExposure], &reach)).expect("refused");
+        assert!(refused.contains("100.64.0.7:443") && refused.contains("no advertised way"), "{refused}");
     }
 
     // #4299: a vessel's credentials name the servers it must reach, and only

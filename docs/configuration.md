@@ -440,6 +440,13 @@ destination the candidate cannot meet, or gives no answer for, refuses it, and
 the refusal names the destination. A cloud sandbox's environment reports how it
 met each destination.
 
+A candidate acted for from another daemon answers, for now, from the ways it
+advertises, looking nothing up: `host_network` meets what its host reaches,
+`outward_exposure` carries a named destination, and an address is classified
+as it stands. Its host then checks each destination when it provisions, and the
+provision fails naming any it cannot meet. Placement will ask that daemon
+directly later.
+
 The earlier `[flotilla.provider.<instance>.lab_reach]` table in `drydock.toml`
 is retired: it is accepted and ignored for one roll, then refused. Its
 destination is no longer reached implicitly. A destination that is neither a

@@ -1902,10 +1902,9 @@ impl AdmissionRuntime<'_> {
 impl AdmissionReadContext<'_> {
     /// A candidate's own answers for the reach set (#4299). A provider
     /// instance this host acts for answers here, resolving names on this host.
-    /// One whose preferred way is the controlling host's network meets every
-    /// destination there however it resolves, so its advertisement is its
-    /// answer wherever it runs. Any other candidate acted for from another
-    /// daemon answers nothing here, so any destination refuses it.
+    /// A candidate acted for from another daemon answers from the ways it
+    /// advertises, and its host checks what it resolves when it provisions:
+    /// the interim answer until placement asks that daemon directly.
     async fn candidate_reach_answers(
         &self,
         namespace: &str,
