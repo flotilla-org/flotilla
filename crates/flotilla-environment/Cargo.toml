@@ -14,6 +14,7 @@ flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-discovery-api = { path = "../flotilla-discovery-api" }
 async-trait.workspace = true
 bon.workspace = true
+futures.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -29,7 +30,6 @@ rigging-tls = { workspace = true }
 clap = { version = "4", features = ["derive", "string"] }
 data-encoding = "2"
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
-futures.workspace = true
 rigging-stream.workspace = true
 http.workspace = true
 tempfile.workspace = true
