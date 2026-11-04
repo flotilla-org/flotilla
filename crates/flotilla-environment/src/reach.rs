@@ -1,12 +1,13 @@
-//! How a destination in a vessel's reach set is met (#4299). The rule: a
-//! destination that resolves, on the controlling host, only to globally
-//! routable addresses is met natively; one that resolves to any private,
-//! shared (CGNAT, tailnet), loopback or link-local address must be carried
-//! from the controlling host, by whatever means the environment offers.
+//! How a provider instance would meet each destination in a vessel's reach set
+//! (#4299). The instance answers on its own controlling host, from the ways
+//! its module declares. Its default rule: a destination that resolves there
+//! only to globally routable addresses is met by the guest's own egress; one
+//! that resolves to any private, shared (CGNAT, tailnet), loopback or
+//! link-local address is met by the first declared way that can carry it.
 use std::{collections::BTreeSet, net::IpAddr, time::Duration};
 
 use async_trait::async_trait;
-use flotilla_protocol::reach::{PrivateReach, ReachDestination, ReachMeans, ReachRoute};
+use flotilla_protocol::reach::{ReachDestination, ReachMeans, ReachRoute, ReachWay};
 
 /// How long one destination's name lookup may take.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -22,24 +23,11 @@ pub enum Resolution {
     Unresolved(String),
 }
 
-/// Resolves destinations on this host. A seam for tests: the system resolver
-/// is the only production one.
+/// Resolves destinations on the host a provider instance runs on. A seam for
+/// tests and fake vendors: the system resolver is the only production one.
 #[async_trait]
 pub trait ReachResolver: Send + Sync {
     async fn resolve(&self, destination: &ReachDestination) -> Resolution;
-}
-
-/// Looks nothing up: every destination is unresolved here, so placement
-/// refuses none and provisioning resolves each where it is carried. The
-/// admission default until the daemon sets [`SystemResolver`].
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoLookup;
-
-#[async_trait]
-impl ReachResolver for NoLookup {
-    async fn resolve(&self, _destination: &ReachDestination) -> Resolution {
-        Resolution::Unresolved("not looked up on this host".into())
-    }
 }
 
 /// The host's own name resolution.
@@ -132,40 +120,68 @@ pub struct PlannedRoute {
     pub carried_to: Option<IpAddr>,
 }
 
-/// How an environment whose private destinations are met by `private` meets
-/// each destination: public ones natively, private ones by `private`. The
-/// first destination it cannot meet is named in the error.
+/// One destination and how a candidate would meet it, or why it cannot.
+pub type ReachAnswer = (ReachDestination, Result<PlannedRoute, String>);
+
+/// How an instance whose module declares `ways` would meet each destination.
+/// A vessel on the host's own network, when that is the preferred way, meets
+/// every destination there, so nothing is looked up.
+pub async fn answer(resolver: &dyn ReachResolver, reach: &BTreeSet<ReachDestination>, ways: &[ReachWay]) -> Vec<ReachAnswer> {
+    let met = |destination: &ReachDestination, met: ReachMeans, carried_to: Option<IpAddr>| PlannedRoute {
+        route: ReachRoute { destination: destination.clone(), met },
+        carried_to,
+    };
+    if ways.first() == Some(&ReachWay::HostNetwork) {
+        return reach.iter().map(|destination| (destination.clone(), Ok(met(destination, ReachMeans::HostNetwork, None)))).collect();
+    }
+    // Lookups run together, so the slowest bounds the wait, not their sum.
+    let resolutions = futures::future::join_all(reach.iter().map(|destination| resolver.resolve(destination))).await;
+    reach
+        .iter()
+        .zip(resolutions)
+        .map(|(destination, resolution)| {
+            let answer = match resolution {
+                Resolution::Public => Ok(met(destination, ReachMeans::Egress, None)),
+                Resolution::Private(address) => ways
+                    .iter()
+                    .find_map(|way| match way {
+                        ReachWay::HostNetwork => Some(met(destination, ReachMeans::HostNetwork, None)),
+                        // An exposure stands at the destination's own name: an address names none.
+                        ReachWay::OutwardExposure => {
+                            (!is_address(destination)).then(|| met(destination, ReachMeans::OutwardExposure, Some(address)))
+                        }
+                    })
+                    .ok_or_else(|| {
+                        if ways.contains(&ReachWay::OutwardExposure) {
+                            format!("{destination} is a private address; an outward exposure carries only a named destination")
+                        } else {
+                            format!("{destination} resolves to a private address and no declared way reaches it")
+                        }
+                    }),
+                // A vessel on the host's own network resolves it as the host does.
+                Resolution::Unresolved(_) if ways.contains(&ReachWay::HostNetwork) => Ok(met(destination, ReachMeans::HostNetwork, None)),
+                // A carrier cannot tell whether an unresolved name needs
+                // carrying; refusing it names the destination rather than
+                // leaving a crew to time out inside a clone.
+                Resolution::Unresolved(reason) => Err(format!("{destination} does not resolve on the controlling host: {reason}")),
+            };
+            (destination.clone(), answer)
+        })
+        .collect()
+}
+
+/// Each destination's route, or the first destination the instance cannot
+/// meet, named.
 pub async fn routes(
     resolver: &dyn ReachResolver,
     reach: &BTreeSet<ReachDestination>,
-    private: PrivateReach,
+    ways: &[ReachWay],
 ) -> Result<Vec<PlannedRoute>, String> {
-    // Lookups run together, so the slowest bounds the wait, not their sum.
-    let resolutions = futures::future::join_all(reach.iter().map(|destination| resolver.resolve(destination))).await;
-    let mut routes = Vec::with_capacity(reach.len());
-    for (destination, resolution) in reach.iter().zip(resolutions) {
-        let (met, carried_to) = match resolution {
-            Resolution::Public => (ReachMeans::Native, None),
-            Resolution::Private(address) => match private.means() {
-                // An exposure stands at the destination's own name: an address names none.
-                Some(ReachMeans::Exposure) if is_address(destination) => {
-                    return Err(format!("reach destination {destination} is a private address; only a named destination can be carried"))
-                }
-                Some(means) => (means, (means == ReachMeans::Exposure).then_some(address)),
-                None => return Err(format!("reach destination {destination} resolves to a private address this environment cannot carry")),
-            },
-            // A vessel on the host's own network meets it however it resolves.
-            Resolution::Unresolved(_) if private == PrivateReach::Native => (ReachMeans::Native, None),
-            // Deliberately fail fast: a carrier cannot tell whether an
-            // unresolved name needs carrying, and a provision that fails naming
-            // the destination beats a crew timing out inside a clone.
-            Resolution::Unresolved(reason) => {
-                return Err(format!("reach destination {destination} does not resolve on the controlling host: {reason}"))
-            }
-        };
-        routes.push(PlannedRoute { route: ReachRoute { destination: destination.clone(), met }, carried_to });
-    }
-    Ok(routes)
+    answer(resolver, reach, ways)
+        .await
+        .into_iter()
+        .map(|(_, answer)| answer.map_err(|reason| format!("reach destination {reason}")))
+        .collect()
 }
 
 #[cfg(test)]
@@ -218,13 +234,13 @@ mod tests {
         ReachDestination::new(host, 443).unwrap()
     }
 
-    // #4299: public destinations are met natively; private ones by the
-    // environment's means, an exposure carried to the address that was
-    // classified; a private address cannot stand under a name, and a
-    // destination that does not resolve, or that the environment cannot
-    // carry, fails naming it.
+    // #4299: a candidate answers per destination from its declared ways. Public
+    // destinations are met by the guest's egress; private ones by the first
+    // way that can carry them, an exposure to the address that was classified.
+    // A private address cannot stand under a name, and a destination that
+    // does not resolve, or that no declared way reaches, is answered with why.
     #[tokio::test]
-    async fn routes_meet_public_natively_and_private_by_the_environment() {
+    async fn a_candidate_answers_each_destination_from_its_declared_ways() {
         let private: IpAddr = "10.0.0.5".parse().unwrap();
         let resolver = Fixed(BTreeMap::from([
             ("github.com", Resolution::Public),
@@ -232,29 +248,48 @@ mod tests {
             ("10.0.0.5", Resolution::Private(private)),
         ]));
         let reach = BTreeSet::from([at("github.com"), at("forgejo.lab.test")]);
-        let exposed = routes(&resolver, &reach, PrivateReach::Exposure).await.unwrap();
+        let exposed = routes(&resolver, &reach, &[ReachWay::OutwardExposure]).await.unwrap();
         assert_eq!(
             exposed,
             vec![
                 PlannedRoute {
-                    route: ReachRoute { destination: at("forgejo.lab.test"), met: ReachMeans::Exposure },
+                    route: ReachRoute { destination: at("forgejo.lab.test"), met: ReachMeans::OutwardExposure },
                     carried_to: Some(private)
                 },
-                PlannedRoute { route: ReachRoute { destination: at("github.com"), met: ReachMeans::Native }, carried_to: None },
+                PlannedRoute { route: ReachRoute { destination: at("github.com"), met: ReachMeans::Egress }, carried_to: None },
             ]
         );
-        let native = routes(&resolver, &reach, PrivateReach::Native).await.unwrap();
-        assert!(native.iter().all(|planned| planned.route.met == ReachMeans::Native && planned.carried_to.is_none()));
-        let unmet = routes(&resolver, &reach, PrivateReach::Unmet).await.unwrap_err();
-        assert!(unmet.contains("forgejo.lab.test:443"), "{unmet}");
-        let address = routes(&resolver, &BTreeSet::from([at("10.0.0.5")]), PrivateReach::Exposure).await.unwrap_err();
-        assert!(address.contains("10.0.0.5:443"), "{address}");
-        let unresolved = routes(&resolver, &BTreeSet::from([at("elsewhere.test")]), PrivateReach::Exposure).await.unwrap_err();
-        assert!(unresolved.contains("elsewhere.test:443") && unresolved.contains("unknown"), "{unresolved}");
-        // A vessel on the host's own network meets an unresolved name natively.
-        let on_host = routes(&resolver, &BTreeSet::from([at("elsewhere.test"), at("github.com")]), PrivateReach::Native).await.unwrap();
-        let met = on_host.iter().map(|planned| (planned.route.destination.host.as_str(), planned.route.met)).collect::<Vec<_>>();
-        assert_eq!(met, vec![("elsewhere.test", ReachMeans::Native), ("github.com", ReachMeans::Native)]);
-        assert_eq!(NoLookup.resolve(&at("github.com")).await, Resolution::Unresolved("not looked up on this host".into()));
+        let met = |answers: Vec<ReachAnswer>| {
+            answers.into_iter().map(|(destination, answer)| (destination.host, answer.map(|planned| planned.route.met))).collect::<Vec<_>>()
+        };
+        // A module that prefers an exposure but shares the host network carries
+        // a private address there.
+        let both = BTreeSet::from([at("10.0.0.5"), at("elsewhere.test"), at("forgejo.lab.test")]);
+        assert_eq!(
+            met(answer(&resolver, &both, &[ReachWay::OutwardExposure, ReachWay::HostNetwork]).await),
+            vec![
+                ("10.0.0.5".into(), Ok(ReachMeans::HostNetwork)),
+                ("elsewhere.test".into(), Ok(ReachMeans::HostNetwork)),
+                ("forgejo.lab.test".into(), Ok(ReachMeans::OutwardExposure)),
+            ]
+        );
+        // With no ways, only what the guest's egress reaches is met.
+        let none = met(answer(&resolver, &both, &[]).await);
+        assert!(none.iter().all(|(host, answer)| answer.as_ref().is_err_and(|reason| reason.contains(host.as_str()))), "{none:?}");
+        assert!(matches!(&none[1].1, Err(reason) if reason.contains("unknown")), "{none:?}");
+        let address = routes(&resolver, &BTreeSet::from([at("10.0.0.5")]), &[ReachWay::OutwardExposure]).await.unwrap_err();
+        assert!(address.contains("10.0.0.5:443") && address.contains("named"), "{address}");
+        // Preferring the host network, nothing is looked up.
+        let on_host = met(answer(&NoAnswers, &both, &[ReachWay::HostNetwork]).await);
+        assert!(on_host.iter().all(|(_, answer)| *answer == Ok(ReachMeans::HostNetwork)), "{on_host:?}");
+    }
+
+    struct NoAnswers;
+
+    #[async_trait]
+    impl ReachResolver for NoAnswers {
+        async fn resolve(&self, destination: &ReachDestination) -> Resolution {
+            panic!("{destination} looked up")
+        }
     }
 }

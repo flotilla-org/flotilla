@@ -22,7 +22,7 @@ pub use api::ProviderApi;
 use api::{self as wire, ApiError};
 pub use connector::installed_agent_build;
 use flotilla_protocol::provider::AgentConnectionReport;
-use flotilla_protocol::reach::{PrivateReach, ReachDestination, ReachRoute};
+use flotilla_protocol::reach::{ReachDestination, ReachRoute};
 use flotilla_resources::HostImageAction;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -197,7 +197,7 @@ impl DrydockEnvironmentProvider {
         let agent = handle.agent.as_ref().ok_or("inventory handle has no vessel agent")?;
         let environment = handle.env.read().expect("environment").clone();
         agent.configure_environment(environment).await?;
-        let routes = crate::reach::routes(&*self.resolver, reach, PrivateReach::Exposure).await?;
+        let routes = crate::reach::routes(&*self.resolver, reach, &handle.capabilities.reach_ways).await?;
         for planned in &routes {
             if let Some(address) = planned.carried_to {
                 let destination = &planned.route.destination;
@@ -244,6 +244,9 @@ impl EnvironmentProvider for DrydockEnvironmentProvider {
     }
     fn capabilities(&self) -> ProviderCapabilities {
         self.declaration.read().expect("declaration lock").as_ref().map(|p| capabilities(&p.capabilities)).unwrap_or_default()
+    }
+    async fn answer_reach(&self, reach: &BTreeSet<ReachDestination>) -> Vec<crate::reach::ReachAnswer> {
+        crate::reach::answer(&*self.resolver, reach, &self.capabilities().reach_ways).await
     }
     async fn detect_readiness(&self) -> ProviderReadiness {
         match self.declaration().await {
@@ -458,8 +461,11 @@ fn capabilities(c: &wire::Capabilities) -> ProviderCapabilities {
         receives_host_tools: true,
         per_vessel: true,
         host_filesystem: c.host_filesystem,
-        // Each private destination is a named outward exposure (drydock#135).
-        private_reach: PrivateReach::Exposure,
+        // OPEN (flotilla-org/drydock#262): the module declares its ways in
+        // `Capabilities`, and this reads them once the drydock pin carries the
+        // field. Until then the instance declares none, so its vessels meet
+        // only what their egress reaches.
+        reach_ways: Vec::new(),
     }
 }
 /// The pipeline defaults drydock-agent sets on every process it starts, over

@@ -400,13 +400,14 @@ capacity guard.
 Each vessel has a reach set: the destinations it must reach, composed at
 admission and frozen into its requirement (#4299). The set is the union of:
 
-- what the vessel is given: the hosts of its repositories' remotes, the
+- what the vessel is given: the hosts of its repositories' remotes and the
   servers its credentials name (Git HTTP and Forgejo forges, GitHub, Docker
-  registries, the review-bundle object store) and the fleet image cache's
-  registry;
+  registries, the review-bundle object store);
 - what is declared for anything not derivable: the fleet's
   `FleetDesignation.spec.reach` and the project's `reach:` in `project.yaml`
   (or its Project's `spec.reach`), and a workflow vessel's own `reach`.
+
+The fleet's image cache is not in the set: the guest does not pull from it.
 
 A declared entry names a host and a port:
 
@@ -416,26 +417,31 @@ reach:
     port: 443
 ```
 
-How each destination is met is the environment's business. One that resolves,
-on the vessel's controlling host, only to public addresses is met natively. One
-that resolves to a private, shared (CGNAT, tailnet), loopback or link-local
-address is carried from the controlling host: a drydock vessel gets an outward
-exposure under the destination's own name and port, so TLS stays end to end,
-reaching the address the controlling host resolved. Docker and host-direct
-vessels share the host's network and meet it natively. A private destination
-named only by an address cannot be carried under a name, and is refused.
+Each environment provider instance declares the ways its vessels can reach a
+destination beyond their own egress, preferred first:
 
-Placement refuses a candidate whose provider cannot carry a private
-destination, naming it. Destinations resolve on the admitting daemon; one that
-does not resolve there is left to provisioning, which fails naming it if the
-controlling host cannot resolve it either. A Ready vessel's status lists its
-reach set and how each entry is met (`native` or `exposure`).
+- `host_network`: the vessel shares the controlling host's network. Docker and
+  host-direct instances declare it.
+- `outward_exposure`: the controlling host carries the connection under the
+  destination's own name and port, so TLS stays end to end. A drydock module
+  declares it in its capabilities when it runs the agent (drydock#262).
+
+At placement each candidate answers, for every destination, how it would meet
+it or that it cannot, resolving names on its own controlling host. Admission
+looks nothing up. The candidate's default rule: a destination that resolves only
+to public addresses is met by the guest's egress; one that resolves to a
+private, shared (CGNAT, tailnet), loopback or link-local address is met by the
+first declared way that can carry it. An outward exposure stands at a name, so
+a private destination named only by an address needs `host_network`. A
+destination the candidate cannot meet, or gives no answer for, refuses it, and
+the refusal names the destination. A cloud sandbox's environment reports how it
+met each destination.
 
 The earlier `[flotilla.provider.<instance>.lab_reach]` table in `drydock.toml`
 is retired: it is accepted and ignored for one roll, then refused. Its
 destination is no longer reached implicitly. A destination that is neither a
 repository remote nor a credential's server must be declared in the fleet's or
-project's `reach`, or provisioning a drydock vessel fails naming it.
+project's `reach`.
 
 ## Forced checkout archives
 

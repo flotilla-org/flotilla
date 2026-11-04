@@ -958,7 +958,6 @@ fn provisioning(host: Option<&str>) -> flotilla_resources::VesselStatusPatch {
 
 fn vessel_ready(environment: &str) -> flotilla_resources::VesselStatusPatch {
     flotilla_resources::VesselStatusPatch::MarkReady {
-        reach: Default::default(),
         configured_limits: None,
         placement_decision: None,
         environment_ref: Some(environment.into()),

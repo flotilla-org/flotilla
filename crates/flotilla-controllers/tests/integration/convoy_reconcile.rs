@@ -1009,7 +1009,6 @@ fn vessel_object_with_local_image_id(
             adopted_checkout_refs: Default::default(),
         },
         status: Some(VesselStatus {
-            reach: Default::default(),
             image: None,
             degraded: Default::default(),
             configured_limits: None,

@@ -29,10 +29,7 @@ use flotilla_resources::{
     CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
     CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND, VESSEL_REF_LABEL,
 };
-use flotilla_resources::{
-    reach::{ReachDestination, ReachMeans, ReachRoute},
-    realisation_settings, BRIEF_ARTIFACTS_ANNOTATION,
-};
+use flotilla_resources::{reach::ReachDestination, realisation_settings, BRIEF_ARTIFACTS_ANNOTATION};
 use flotilla_store::{
     controller::{delete_lifecycle_owned_matching, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
     ReplicaReadResolver, ResourceBackend, TypedResolver,
@@ -482,7 +479,6 @@ enum PlannedPatch {
         terminal_session_refs: Vec<String>,
         requested_stance: Stance,
         effective_stance: Stance,
-        reach: Vec<ReachRoute>,
     },
     Interrupted {
         roles: BTreeSet<String>,
@@ -1517,9 +1513,8 @@ impl VesselReconciler {
             }
         }
 
-        let environment = self.environments.get(&resolved_environment_ref).await?;
-        let reach = vessel_reach(&environment, &requirement.reach);
-        let mut configured_limits = environment.status.and_then(|status| status.configured_limits);
+        let mut configured_limits =
+            self.environments.get(&resolved_environment_ref).await?.status.and_then(|status| status.configured_limits);
         for terminal_ref in &terminal_refs {
             if let Some(limits) = self.terminal_sessions.get(terminal_ref).await?.status.and_then(|status| status.configured_limits) {
                 // Only host-direct launches record terminal limits today. Merge
@@ -1539,7 +1534,6 @@ impl VesselReconciler {
                 terminal_session_refs: terminal_refs,
                 requested_stance: effective_stance,
                 effective_stance,
-                reach,
             },
             actuations,
         })
@@ -1609,9 +1603,7 @@ impl Reconciler for VesselReconciler {
                     terminal_session_refs,
                     requested_stance,
                     effective_stance,
-                    reach,
                 } => Some(VesselStatusPatch::MarkReady {
-                    reach: reach.clone(),
                     configured_limits: configured_limits.clone(),
                     placement_decision: placement_decision.clone(),
                     environment_ref: Some(environment_ref.clone()),
@@ -1848,21 +1840,6 @@ fn cloud_environment_spec(
         }),
         ..EnvironmentSpec::default()
     })
-}
-
-/// How the vessel's environment meets each destination of its reach set: a
-/// cloud sandbox reports its routes once ready; Docker and host-direct
-/// environments share the controlling host's network view, so all are native.
-fn vessel_reach(environment: &ResourceObject<Environment>, reach: &BTreeSet<ReachDestination>) -> Vec<ReachRoute> {
-    if environment.spec.cloud_sandbox.is_some() {
-        return environment
-            .status
-            .as_ref()
-            .and_then(|status| status.provider_descriptor.as_ref())
-            .map(|d| d.reach.clone())
-            .unwrap_or_default();
-    }
-    reach.iter().map(|destination| ReachRoute { destination: destination.clone(), met: ReachMeans::Native }).collect()
 }
 
 /// The directory a vessel's recorded checkouts sit side by side in, when they

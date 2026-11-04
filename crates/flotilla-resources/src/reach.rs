@@ -4,9 +4,9 @@
 //! allowlist is later built from.
 use std::collections::BTreeSet;
 
-pub use flotilla_protocol::reach::{PrivateReach, ReachDestination, ReachMeans, ReachRoute};
+pub use flotilla_protocol::reach::{ReachDestination, ReachMeans, ReachRoute, ReachWay};
 
-use crate::{CredentialConsumer, ImageCacheBinding};
+use crate::CredentialConsumer;
 
 /// The destination a URL names, with its scheme's default port: `https`,
 /// `http`, `ssh` and `git` URLs, and scp-like `user@host:path` remotes.
@@ -73,13 +73,6 @@ pub fn credential_destinations(consumer: &CredentialConsumer, forge_url: Option<
     }
 }
 
-impl ImageCacheBinding {
-    /// The registry that serves the cache: the repository's first segment.
-    pub fn registry_destination(&self) -> Option<ReachDestination> {
-        url_destination(&format!("https://{}", self.repository.split('/').next()?))
-    }
-}
-
 /// Every declared entry valid, or the first that is not.
 pub fn validate_declared(reach: &[ReachDestination]) -> Result<(), String> {
     reach.iter().try_for_each(ReachDestination::validate)
@@ -101,8 +94,8 @@ mod tests {
         ReachDestination::new(host, port).unwrap()
     }
 
-    // #4299: a remote, a delivered credential's server and the fleet's image
-    // cache each name the destination the vessel must reach.
+    // #4299: a remote and a delivered credential's server each name the
+    // destination the vessel must reach.
     #[test]
     fn destinations_are_derived_from_what_the_vessel_is_given() {
         for (url, expected) in [
@@ -134,18 +127,12 @@ mod tests {
         };
         assert_eq!(credential_destinations(&store, None), vec![at("objects.lab.example", 9000)]);
         assert!(credential_destinations(&CredentialConsumer::Claude, None).is_empty());
-        let cache = ImageCacheBinding {
-            repository: "registry.lab.example:5000/cache".into(),
-            pull_credential: "pull".into(),
-            push_credential: "push".into(),
-        };
-        assert_eq!(cache.registry_destination(), Some(at("registry.lab.example", 5000)));
     }
 
     // ADR 0047: records written before #4299 carry no reach and decode with an
     // empty set; an empty set is not written, so the stored shape is unchanged
-    // until a vessel has a destination. An advertisement that does not say how
-    // it carries a private destination decodes as undeclared.
+    // until a vessel has a destination. An advertisement that declares no ways
+    // decodes with none and writes none.
     #[test]
     fn previous_generation_records_decode_without_reach() {
         fn without_reach<T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug>(value: T) {
@@ -154,10 +141,10 @@ mod tests {
             assert_eq!(serde_json::from_value::<T>(json).unwrap(), value);
         }
         without_reach(crate::VesselRequirement::builder().name("work".into()).crew(Vec::new()).build());
-        without_reach(crate::VesselStatus::default());
         without_reach(crate::ProjectSpec::builder().display_name("app".into()).build());
         without_reach(crate::FleetDesignationSpec { fleet: None, project: "app".into(), image_cache: None, reach: Vec::new() });
         let capabilities: flotilla_protocol::provider::ProviderCapabilities = serde_json::from_str("{}").unwrap();
-        assert_eq!(capabilities.private_reach, PrivateReach::Undeclared);
+        assert!(capabilities.reach_ways.is_empty());
+        assert!(serde_json::to_value(&capabilities).unwrap().get("reach_ways").is_none());
     }
 }

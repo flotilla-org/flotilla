@@ -654,6 +654,7 @@ async fn crew_talks_back_through_an_outward_exposure() {
 // 127.0.0.1 on lo0 until an alias is added, so the bind fails there. Real
 // guests are Linux, so the exposure itself is unaffected.
 #[cfg_attr(not(target_os = "linux"), ignore = "needs 127/8 on loopback; macOS lo0 has only 127.0.0.1")]
+#[ignore = "OPEN flotilla-org/drydock#262: the instance declares outward_exposure once it reads the module's ways"]
 #[tokio::test]
 async fn a_private_reach_destination_is_a_named_outward_exposure() {
     let host = HostFixture::start().await;

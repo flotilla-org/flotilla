@@ -62,22 +62,47 @@ impl fmt::Display for ReachDestination {
     }
 }
 
-/// How an environment meets one destination.
+/// A way a provider instance's vessels can reach a destination beyond the
+/// guest's own egress, declared per instance by its module (#4299,
+/// flotilla-org/drydock#262), preferred first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReachWay {
+    /// The vessel shares the controlling host's network: whatever the host
+    /// reaches, the vessel reaches.
+    HostNetwork,
+    /// The controlling host carries the connection by an outward exposure
+    /// under the destination's own name and port, so TLS stays end to end.
+    OutwardExposure,
+}
+
+/// How a vessel meets one destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReachMeans {
-    /// The vessel's own network reaches it, subject to its egress policy.
-    Native,
-    /// Carried from the controlling host by an outward exposure under the
-    /// destination's own name and port, so TLS stays end to end.
-    Exposure,
+    /// The guest's own egress, subject to its egress policy.
+    Egress,
+    /// The controlling host's network, which the vessel shares.
+    HostNetwork,
+    /// An outward exposure carried from the controlling host.
+    OutwardExposure,
+}
+
+impl From<ReachWay> for ReachMeans {
+    fn from(way: ReachWay) -> Self {
+        match way {
+            ReachWay::HostNetwork => Self::HostNetwork,
+            ReachWay::OutwardExposure => Self::OutwardExposure,
+        }
+    }
 }
 
 impl fmt::Display for ReachMeans {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Native => "native",
-            Self::Exposure => "exposure",
+            Self::Egress => "egress",
+            Self::HostNetwork => "host network",
+            Self::OutwardExposure => "outward exposure",
         })
     }
 }
@@ -88,42 +113,6 @@ pub struct ReachRoute {
     #[serde(flatten)]
     pub destination: ReachDestination,
     pub met: ReachMeans,
-}
-
-/// How a provider's vessels meet a destination that resolves, on the
-/// controlling host, to a private address.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PrivateReach {
-    /// The vessel shares the controlling host's network view.
-    Native,
-    /// The provider carries it from the controlling host by an exposure.
-    Exposure,
-    /// The provider cannot carry it (agentless SSH hosts await #3617).
-    /// Placement refuses such a candidate, naming the destination.
-    Unmet,
-    /// The advertisement does not say: an earlier generation's record, or one
-    /// rebuilt from a store that keeps only some capabilities. Placement
-    /// refuses nothing on it; provisioning meets the set or fails naming the
-    /// destination. Fail-open until the engine's stored Host provider row
-    /// carries this capability (#4308).
-    #[default]
-    Undeclared,
-}
-
-impl PrivateReach {
-    pub fn is_undeclared(&self) -> bool {
-        *self == Self::Undeclared
-    }
-
-    /// How a private destination is met, or `None` when it cannot be.
-    pub fn means(self) -> Option<ReachMeans> {
-        match self {
-            Self::Native => Some(ReachMeans::Native),
-            Self::Exposure => Some(ReachMeans::Exposure),
-            Self::Unmet | Self::Undeclared => None,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -142,9 +131,13 @@ mod tests {
         for refused in [r#"{"host":"","port":443}"#, r#"{"host":"host","port":0}"#, r#"{"host":"host","port":443,"extra":1}"#] {
             assert!(serde_json::from_str::<ReachDestination>(refused).is_err(), "{refused}");
         }
-        let route = ReachRoute { destination: decoded, met: ReachMeans::Exposure };
+        let route = ReachRoute { destination: decoded, met: ReachMeans::OutwardExposure };
         let text = serde_json::to_string(&route).unwrap();
-        assert_eq!(text, r#"{"host":"forgejo.lab.example","port":443,"met":"exposure"}"#);
+        assert_eq!(text, r#"{"host":"forgejo.lab.example","port":443,"met":"outward_exposure"}"#);
         assert_eq!(serde_json::from_str::<ReachRoute>(&text).unwrap(), route);
+        assert_eq!(
+            serde_json::to_string(&[ReachWay::OutwardExposure, ReachWay::HostNetwork]).unwrap(),
+            r#"["outward_exposure","host_network"]"#
+        );
     }
 }

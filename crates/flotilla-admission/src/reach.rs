@@ -1,19 +1,21 @@
 //! Vessel reach at admission (#4299): each vessel's reach set is composed from
-//! what it is given (its repositories' remotes, its credentials' servers and
-//! the fleet services it uses) and what the fleet and project declare, then
-//! frozen into its requirement. Placement refuses a candidate that cannot meet
-//! a destination, naming it, rather than leaving a crew to time out in a clone.
+//! what it is given (its repositories' remotes and its credentials' servers)
+//! and what the fleet and project declare, then frozen into its requirement.
+//! At placement each candidate answers, per destination, how it would meet it
+//! or that it cannot; admission looks nothing up. A destination a candidate
+//! cannot meet, or gives no answer for, refuses it, naming the destination,
+//! rather than leaving a crew to time out in a clone.
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_environment::reach::{is_address, ReachResolver, Resolution};
+use flotilla_environment::reach::{PlannedRoute, ReachAnswer};
 use flotilla_resources::{
-    reach::{self, PrivateReach, ReachDestination},
+    reach::{self, ReachDestination, ReachMeans, ReachRoute, ReachWay},
     ConvoyRepositorySpec, CredentialConsumer, CredentialSpec, FleetDesignation, Forge, Project, Repository, ResourceError,
     VesselRequirement, WorkflowTemplateSpec, FLEET_DESIGNATION_NAME,
 };
 use flotilla_store::ResourceBackend;
 
-/// The declared levels and fleet services every vessel of a convoy shares.
+/// The declared levels every vessel of a convoy shares.
 struct SharedReach {
     fleet: Vec<ReachDestination>,
     project: Vec<ReachDestination>,
@@ -22,10 +24,7 @@ struct SharedReach {
 async fn shared_reach(backend: &ResourceBackend, namespace: &str, project_ref: Option<&str>) -> Result<SharedReach, String> {
     let mut fleet = Vec::new();
     match backend.definitions::<FleetDesignation>(namespace).get(FLEET_DESIGNATION_NAME).await {
-        Ok(designation) => {
-            fleet.extend(designation.spec.image_cache.as_ref().and_then(|cache| cache.registry_destination()));
-            fleet.extend(designation.spec.reach);
-        }
+        Ok(designation) => fleet.extend(designation.spec.reach),
         Err(ResourceError::NotFound { .. }) => {}
         Err(error) => return Err(format!("read fleet designation for reach: {error}")),
     }
@@ -109,31 +108,54 @@ pub async fn freeze_workflow_reach(
     Ok(())
 }
 
-/// Where each destination resolves on this, the admitting, host.
-pub async fn classify(resolver: &dyn ReachResolver, reach: &BTreeSet<ReachDestination>) -> Vec<(ReachDestination, Resolution)> {
-    let mut classified = Vec::with_capacity(reach.len());
-    for destination in reach {
-        classified.push((destination.clone(), resolver.resolve(destination).await));
-    }
-    classified
+/// A host's provider instances answering, on that host, how each one's
+/// vessels would meet a reach set (#4299).
+#[async_trait::async_trait]
+pub trait ReachAnswers: Send + Sync {
+    /// The instance's answers, or `None` when it does not run here.
+    async fn answer(&self, instance: &str, reach: &BTreeSet<ReachDestination>) -> Option<Vec<ReachAnswer>>;
 }
 
-/// Why a candidate whose private destinations are met by `private` cannot meet
-/// the reach set, naming the first destination it cannot; `None` when it can.
-///
-/// Resolution happens on the admitting host, which may not be the candidate's
-/// controlling host. A destination that does not resolve here is left to
-/// provisioning, which resolves it where it is carried and names it if it fails.
-pub fn unmet_reach(classified: &[(ReachDestination, Resolution)], private: PrivateReach) -> Option<String> {
-    classified.iter().find_map(|(destination, resolution)| match resolution {
-        Resolution::Private(_) => match private {
-            PrivateReach::Unmet => Some(format!("cannot reach {destination}: it resolves to a private address the provider cannot carry")),
-            PrivateReach::Exposure if is_address(destination) => {
-                Some(format!("cannot reach {destination}: a private address is carried only under a name"))
-            }
-            PrivateReach::Exposure | PrivateReach::Native | PrivateReach::Undeclared => None,
-        },
-        Resolution::Public | Resolution::Unresolved(_) => None,
+/// Answers for no instance.
+pub struct NoReachAnswers;
+
+#[async_trait::async_trait]
+impl ReachAnswers for NoReachAnswers {
+    async fn answer(&self, _instance: &str, _reach: &BTreeSet<ReachDestination>) -> Option<Vec<ReachAnswer>> {
+        None
+    }
+}
+
+#[async_trait::async_trait]
+impl ReachAnswers for flotilla_discovery::registry::ProviderRegistry {
+    async fn answer(&self, instance: &str, reach: &BTreeSet<ReachDestination>) -> Option<Vec<ReachAnswer>> {
+        let (_, provider) = self.environment_providers.select(instance)?;
+        Some(provider.answer_reach(reach).await)
+    }
+}
+
+/// The answers a candidate's advertised ways give without looking anything
+/// up: every destination on the host's network when that is its preferred
+/// way, and none otherwise.
+pub fn advertised_answers(ways: &[ReachWay], reach: &BTreeSet<ReachDestination>) -> Vec<ReachAnswer> {
+    if ways.first() != Some(&ReachWay::HostNetwork) {
+        return Vec::new();
+    }
+    let met = |destination: &ReachDestination| PlannedRoute {
+        route: ReachRoute { destination: destination.clone(), met: ReachMeans::HostNetwork },
+        carried_to: None,
+    };
+    reach.iter().map(|destination| (destination.clone(), Ok(met(destination)))).collect()
+}
+
+/// Why a candidate that gave `answers` cannot meet the reach set, naming the
+/// first destination it cannot meet or gave no answer for; `None` when it
+/// meets every one.
+pub fn unmet_reach(reach: &BTreeSet<ReachDestination>, answers: &[ReachAnswer]) -> Option<String> {
+    reach.iter().find_map(|destination| match answers.iter().find(|(answered, _)| answered == destination) {
+        Some((_, Ok(_))) => None,
+        Some((_, Err(reason))) => Some(format!("reach destination {reason}")),
+        None => Some(format!("gives no answer for reach destination {destination}")),
     })
 }
 
@@ -145,62 +167,41 @@ mod tests {
         ReachDestination::new(host, 443).unwrap()
     }
 
-    // #4299: a candidate that cannot carry a private destination is refused
-    // with that destination named; one that carries it by exposure, or shares
-    // the controlling host's network, is not. Public destinations and those
-    // the admitting host cannot resolve never refuse a candidate.
+    // #4299: a candidate is refused at the first destination it cannot meet,
+    // in its own words, or gives no answer for; one that meets every
+    // destination, however it meets each, is not. A candidate that prefers the
+    // host's network answers from its advertisement alone.
     #[test]
-    fn a_candidate_that_cannot_meet_a_private_destination_is_refused_naming_it() {
-        let private = Resolution::Private("10.0.0.5".parse().unwrap());
-        let classified = vec![
-            (at("github.com"), Resolution::Public),
-            (at("elsewhere.test"), Resolution::Unresolved("unknown".into())),
-            (at("forgejo.lab.test"), private.clone()),
-        ];
-        let refusal = unmet_reach(&classified, PrivateReach::Unmet).expect("refused");
-        assert!(refusal.contains("forgejo.lab.test:443"), "{refusal}");
-        assert_eq!(unmet_reach(&classified, PrivateReach::Exposure), None);
-        assert_eq!(unmet_reach(&classified, PrivateReach::Native), None);
-        assert_eq!(unmet_reach(&classified, PrivateReach::Undeclared), None, "an advertisement that does not say is left to provisioning");
-        assert_eq!(unmet_reach(&classified[..2], PrivateReach::Unmet), None);
-        let address = [(at("10.0.0.5"), private)];
-        assert!(unmet_reach(&address, PrivateReach::Exposure).is_some_and(|refusal| refusal.contains("10.0.0.5:443")));
-        assert_eq!(unmet_reach(&address, PrivateReach::Native), None);
+    fn a_candidate_is_refused_at_a_destination_it_cannot_meet_or_does_not_answer() {
+        let met = |host: &str, met| (at(host), Ok(PlannedRoute { route: ReachRoute { destination: at(host), met }, carried_to: None }));
+        let reach = BTreeSet::from([at("forgejo.lab.test"), at("github.com")]);
+        let answers = vec![met("github.com", ReachMeans::Egress), met("forgejo.lab.test", ReachMeans::OutwardExposure)];
+        assert_eq!(unmet_reach(&reach, &answers), None);
+        let cannot = vec![met("github.com", ReachMeans::Egress), (at("forgejo.lab.test"), Err("forgejo.lab.test:443 is private".into()))];
+        assert_eq!(unmet_reach(&reach, &cannot).as_deref(), Some("reach destination forgejo.lab.test:443 is private"));
+        let unanswered = unmet_reach(&reach, &answers[..1]).expect("refused");
+        assert!(unanswered.contains("no answer") && unanswered.contains("forgejo.lab.test:443"), "{unanswered}");
+        assert_eq!(unmet_reach(&BTreeSet::new(), &[]), None);
+        // A candidate preferring the host's network answers from its advertisement.
+        assert_eq!(unmet_reach(&reach, &advertised_answers(&[ReachWay::HostNetwork, ReachWay::OutwardExposure], &reach)), None);
+        assert!(advertised_answers(&[ReachWay::OutwardExposure, ReachWay::HostNetwork], &reach).is_empty());
+        assert!(advertised_answers(&[], &reach).is_empty());
     }
 
-    // #4299: a vessel's frozen reach set is the union of what it declares, its
-    // repositories' remotes, its credentials' servers, the fleet's image cache
-    // registry and the fleet's and project's declarations. A vessel scoped to
-    // other repositories, with no credentials, keeps only the shared levels.
+    // #4299: a vessel's credentials name the servers it must reach, and only
+    // the repositories it is scoped to add their remotes; freezing again, as
+    // each admission check does, changes nothing. Composition with the fleet's
+    // and project's declarations is a daemon scenario (`vessel_reach`); this
+    // one stays here because a host holds credentials only through its own
+    // store, which a scenario cannot reach.
     #[tokio::test]
-    async fn fleet_and_project_declarations_compose_with_what_the_vessel_is_given() {
+    async fn credentials_name_their_servers_and_only_scoped_repositories_add_remotes() {
         use flotilla_resources::{
-            CredentialLifecycle, CredentialSource, CredentialSpecSpec, FleetDesignationSpec, ForgeKind, ForgeSpec, ImageCacheBinding,
-            InputMeta, ProjectSpec, RepositorySpec,
+            CredentialLifecycle, CredentialSource, CredentialSpecSpec, ForgeKind, ForgeSpec, InputMeta, RepositorySpec,
         };
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let meta = |name: &str| InputMeta::builder().name(name.into()).build();
         let destination = |host: &str, port| ReachDestination::new(host, port).unwrap();
-        let mut project = ProjectSpec::builder().display_name("app".into()).build();
-        project.reach = vec![destination("objects.lab.test", 9000)];
-        backend.using::<Project>("flotilla").create(&meta("app"), &project).await.unwrap();
-        backend
-            .definitions::<FleetDesignation>("flotilla")
-            .create(
-                &meta(FLEET_DESIGNATION_NAME),
-                &FleetDesignationSpec {
-                    fleet: Some("fleet".into()),
-                    project: "app".into(),
-                    image_cache: Some(ImageCacheBinding {
-                        repository: "registry.lab.test:5000/cache".into(),
-                        pull_credential: "pull".into(),
-                        push_credential: "push".into(),
-                    }),
-                    reach: vec![destination("artifacts.lab.test", 443)],
-                },
-            )
-            .await
-            .unwrap();
         let repository = RepositorySpec::remote("https://forgejo.lab.test/lab/app").unwrap();
         backend.using::<Repository>("flotilla").create(&meta(&repository.key().to_string()), &repository).await.unwrap();
         backend
@@ -211,7 +212,7 @@ mod tests {
                     forge_id: "lab".into(),
                     kind: ForgeKind::Forgejo,
                     hosts: ["forgejo.lab.test".to_string()].into(),
-                    https_url: "https://forgejo.lab.test".into(),
+                    https_url: "https://forgejo.lab.test:3000".into(),
                     git_ssh_host: "forgejo.lab.test".into(),
                 },
             )
@@ -239,29 +240,21 @@ mod tests {
         let given = VesselRequirement::builder()
             .name("work".into())
             .crew(Vec::new())
-            .credential_refs(["github".to_string(), "forgejo".to_string()].into())
-            .reach([destination("Declared.Test", 8443)].into())
+            .credential_refs(["github".to_string(), "forgejo".to_string(), "undeclared".to_string()].into())
             .build();
         let bare = VesselRequirement::builder().name("bare".into()).crew(Vec::new()).repository_refs(Vec::new()).build();
         let mut workflow = WorkflowTemplateSpec::builder().vessels(vec![given, bare]).build();
-        freeze_workflow_reach(&backend, "flotilla", Some("app"), &repositories, &mut workflow).await.unwrap();
-        let shared =
-            [destination("artifacts.lab.test", 443), destination("objects.lab.test", 9000), destination("registry.lab.test", 5000)];
-        let expected: BTreeSet<_> = shared
-            .iter()
-            .cloned()
-            .chain([
-                destination("declared.test", 8443),
-                destination("github.com", 443),
-                destination("api.github.com", 443),
-                destination("forgejo.lab.test", 443),
-            ])
-            .collect();
+        freeze_workflow_reach(&backend, "flotilla", None, &repositories, &mut workflow).await.unwrap();
+        let expected = BTreeSet::from([
+            destination("github.com", 443),
+            destination("api.github.com", 443),
+            destination("forgejo.lab.test", 443),
+            destination("forgejo.lab.test", 3000),
+        ]);
         assert_eq!(workflow.vessels[0].reach, expected);
-        assert_eq!(workflow.vessels[1].reach, shared.into_iter().collect());
-        // Freezing again, as each admission check does, changes nothing.
+        assert!(workflow.vessels[1].reach.is_empty(), "{:?}", workflow.vessels[1].reach);
         let frozen = workflow.clone();
-        freeze_workflow_reach(&backend, "flotilla", Some("app"), &repositories, &mut workflow).await.unwrap();
+        freeze_workflow_reach(&backend, "flotilla", None, &repositories, &mut workflow).await.unwrap();
         assert_eq!(workflow, frozen);
     }
 }

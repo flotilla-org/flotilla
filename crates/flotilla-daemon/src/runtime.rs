@@ -217,6 +217,8 @@ impl DaemonRuntime {
             }
         }
         let local_registry = retry_phase("probe_local_provider_registry", || probe_local_provider_registry(&daemon, &config)).await?;
+        // Placement asks this host's provider instances how they would meet a reach set (#4299).
+        daemon.set_reach_answers(Arc::clone(&local_registry) as Arc<dyn flotilla_admission::reach::ReachAnswers>);
         let mut profile = retry_phase("build_local_profile", || build_local_profile(&daemon, &local_registry)).await?;
         profile.max_vessels = daemon_config.max_vessels;
         let host_direct_environment_name = host_direct_environment_name(&profile.host_id);

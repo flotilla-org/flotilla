@@ -132,11 +132,11 @@ pub struct ConvoyAdmission {
     #[builder(default = std::sync::RwLock::new(Arc::new(crate::random::SeededRandom::from_entropy())))]
     random: std::sync::RwLock<Arc<dyn crate::random::RandomSource>>,
     fulfilment_decider: Arc<dyn FulfilmentDecider>,
-    /// Resolves reach destinations for placement (#4299). It looks nothing up
-    /// until the daemon's composition root sets the system resolver, so tests
-    /// never touch DNS unless they fix the answers.
-    #[builder(default = std::sync::RwLock::new(Arc::new(flotilla_environment::reach::NoLookup)))]
-    reach_resolver: std::sync::RwLock<Arc<dyn flotilla_environment::reach::ReachResolver>>,
+    /// The provider instances this host acts for, answering for a reach set
+    /// at placement (#4299). None answer until the daemon's runtime gives
+    /// admission its providers.
+    #[builder(default = std::sync::RwLock::new(Arc::new(crate::reach::NoReachAnswers)))]
+    reach_answers: std::sync::RwLock<Arc<dyn crate::reach::ReachAnswers>>,
     /// Serializes the identity selector check with Convoy creation on the owner host.
     #[builder(default)]
     guard: Mutex<()>,
@@ -172,7 +172,7 @@ struct AdmissionRuntime<'a> {
     issue_port: &'a dyn IssueQueryPort,
     clock: &'a dyn Clock,
     fulfilment_decider: &'a dyn FulfilmentDecider,
-    reach_resolver: Arc<dyn flotilla_environment::reach::ReachResolver>,
+    reach_answers: Arc<dyn crate::reach::ReachAnswers>,
     builds: PlacementBuildJoiner<'a>,
 }
 
@@ -219,7 +219,7 @@ impl ConvoyAdmission {
                 issue_port: self.issue_port.as_ref(),
                 clock: self.clock.as_ref(),
                 fulfilment_decider: self.fulfilment_decider.as_ref(),
-                reach_resolver: Arc::clone(&self.reach_resolver.read().unwrap_or_else(|poisoned| poisoned.into_inner())),
+                reach_answers: Arc::clone(&self.reach_answers.read().unwrap_or_else(|poisoned| poisoned.into_inner())),
                 builds: PlacementBuildJoiner { backend: &self.backend },
             },
         }
@@ -1634,10 +1634,10 @@ impl ConvoyAdmission {
         *self.random.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = random;
     }
 
-    /// Resolve reach destinations for placement with `resolver` (#4299): the
-    /// daemon sets the system resolver; tests fix the answers.
-    pub fn set_reach_resolver(&self, resolver: Arc<dyn flotilla_environment::reach::ReachResolver>) {
-        *self.reach_resolver.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = resolver;
+    /// Answer reach sets at placement with the provider instances this host
+    /// acts for (#4299).
+    pub fn set_reach_answers(&self, answers: Arc<dyn crate::reach::ReachAnswers>) {
+        *self.reach_answers.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = answers;
     }
 
     /// The home pass over one convoy's account bindings (#3882 lifecycle). Only binding a
@@ -1900,6 +1900,31 @@ impl AdmissionRuntime<'_> {
 }
 
 impl AdmissionReadContext<'_> {
+    /// A candidate's own answers for the reach set (#4299). A provider
+    /// instance this host acts for answers here, resolving names on this host.
+    /// One whose preferred way is the controlling host's network meets every
+    /// destination there however it resolves, so its advertisement is its
+    /// answer wherever it runs. Any other candidate acted for from another
+    /// daemon answers nothing here, so any destination refuses it.
+    async fn candidate_reach_answers(
+        &self,
+        namespace: &str,
+        candidate: &ResourceObject<FulfilmentKind>,
+        provider: &flotilla_protocol::provider::ProviderAdvertisement,
+        reach: &BTreeSet<flotilla_resources::reach::ReachDestination>,
+    ) -> Result<Vec<flotilla_environment::reach::ReachAnswer>, String> {
+        if reach.is_empty() {
+            return Ok(Vec::new());
+        }
+        let target = placement_target_host(&self.backend, namespace, candidate).await?;
+        if self.runtime.local_host.as_ref() == Some(&placement_actuator_host_ref(&self.backend, namespace, &target).await?) {
+            if let Some(answers) = self.runtime.reach_answers.answer(&provider.instance, reach).await {
+                return Ok(answers);
+            }
+        }
+        Ok(crate::reach::advertised_answers(&provider.capabilities.reach_ways, reach))
+    }
+
     async fn check_remote_placement_free_space_floor(&self, namespace: &str, placement: Option<&PlacementDecision>) -> Result<(), String> {
         let Some(placement) = placement else {
             return Ok(());
@@ -2663,8 +2688,8 @@ impl AdmissionReadContext<'_> {
                 return Err(format!("fulfilment kind `{pin}` does not exist"));
             }
         }
-        // Each destination the vessels must reach, as this host resolves it (#4299).
-        let reach = match purpose {
+        // Each destination the vessels must reach (#4299); each candidate answers for them.
+        let reach: BTreeSet<_> = match purpose {
             PlacementPurpose::Admission => {
                 // A credential that does not resolve is refused, in its own
                 // words, by the validation that follows placement; until then
@@ -2674,13 +2699,11 @@ impl AdmissionReadContext<'_> {
                     resolved = workflow.clone();
                 }
                 crate::reach::freeze_workflow_reach(&self.backend, namespace, project_ref, repositories, &mut resolved).await?;
-                let destinations = resolved.vessels.into_iter().flat_map(|vessel| vessel.reach).collect();
-                crate::reach::classify(self.runtime.reach_resolver.as_ref(), &destinations).await
+                resolved.vessels.into_iter().flat_map(|vessel| vessel.reach).collect()
             }
-            // Routing only picks the host that admits; that host resolves the
-            // reach set and refuses there, so routing neither reads credentials
-            // nor looks names up.
-            PlacementPurpose::Routing => Vec::new(),
+            // Routing only picks the host that admits; there the candidates
+            // answer and refuse, so routing reads no credentials.
+            PlacementPurpose::Routing => BTreeSet::new(),
         };
         let mut candidates = Vec::new();
         let mut rejected = Vec::new();
@@ -2816,7 +2839,8 @@ impl AdmissionReadContext<'_> {
             if purpose == PlacementPurpose::Admission {
                 let checked = async {
                     let provider = resolve_placement_advertisement(&self.backend, namespace, &mut selected).await?.1;
-                    if let Some(reason) = crate::reach::unmet_reach(&reach, provider.capabilities.private_reach) {
+                    let answers = self.candidate_reach_answers(namespace, &selected, &provider, &reach).await?;
+                    if let Some(reason) = crate::reach::unmet_reach(&reach, &answers) {
                         return Err(format!("provider {}: {reason}", provider.instance));
                     }
                     // A literal image is checked now; composed images freeze per vessel once the
@@ -4992,6 +5016,7 @@ pub async fn register_host_direct_kind(backend: &ResourceBackend, host: &str) {
         capabilities: ProviderCapabilities {
             material_modes: vec![MaterialMode::Shared],
             checkout_strategies: vec![CheckoutStrategy::HostWorktree],
+            reach_ways: vec![flotilla_protocol::reach::ReachWay::HostNetwork],
             ..Default::default()
         },
     }];
@@ -5544,55 +5569,6 @@ mod tests {
                     let error = placement.expect_err("refused");
                     assert!(error.contains("docker-on-host") && error.contains(reason), "{error}");
                 }
-            }
-        }
-    }
-
-    // #4299: placement refuses a candidate whose provider cannot carry a
-    // destination that resolves privately, naming the destination; a provider
-    // that meets it natively, or whose advertisement does not say, places.
-    #[tokio::test]
-    async fn placement_refuses_a_candidate_that_cannot_meet_a_reach_destination() {
-        use flotilla_environment::reach::{ReachResolver, Resolution};
-        use flotilla_protocol::provider::ProviderAdvertisement;
-        use flotilla_resources::reach::{PrivateReach, ReachDestination};
-        struct Lab;
-        #[async_trait::async_trait]
-        impl ReachResolver for Lab {
-            async fn resolve(&self, destination: &ReachDestination) -> Resolution {
-                match destination.host.as_str() {
-                    "forge.lab.test" => Resolution::Private("100.64.0.7".parse().unwrap()),
-                    _ => Resolution::Public,
-                }
-            }
-        }
-        let fixture = handler_contract_fixture().await;
-        fixture.owner.set_reach_resolver(Arc::new(Lab));
-        register_host_direct_kind(&fixture.backend, "host").await;
-        let workflow = WorkflowTemplateSpec::builder()
-            .vessels(vec![VesselRequirement::builder()
-                .name("work".into())
-                .crew(vec![CrewSpec::builder().role("tool".into()).source(CrewSource::Tool { command: "true".into() }).build()])
-                .reach([ReachDestination::new("forge.lab.test", 443).unwrap(), ReachDestination::new("github.com", 443).unwrap()].into())
-                .build()])
-            .build();
-        let hosts = fixture.backend.using::<ResourceHost>("flotilla");
-        for private_reach in [PrivateReach::Unmet, PrivateReach::Native, PrivateReach::Undeclared] {
-            let host = hosts.get("host").await.unwrap();
-            let mut status = host.status.clone().unwrap();
-            let capability = &status.capabilities[flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY];
-            let mut providers: Vec<ProviderAdvertisement> = serde_json::from_value(capability.clone()).unwrap();
-            providers[0].capabilities.private_reach = private_reach;
-            status.capabilities.insert(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::json!(providers));
-            hosts.update_status("host", &host.metadata.resource_version, &status).await.unwrap();
-            let placement = fixture.owner.resolve_created_convoy_placement("flotilla", None, &[], &workflow, None).await;
-            if private_reach == PrivateReach::Unmet {
-                let error = placement.expect_err("refused");
-                assert!(error.contains("host-direct-host") && error.contains("cannot reach forge.lab.test:443"), "{error}");
-                assert!(!error.contains("github.com"), "a public destination never refuses: {error}");
-            } else {
-                let placement = placement.unwrap_or_else(|error| panic!("{private_reach:?} places: {error}"));
-                assert_eq!(placement.selected.as_ref().map(|kind| kind.metadata.name.as_str()), Some("host-direct-host"));
             }
         }
     }
