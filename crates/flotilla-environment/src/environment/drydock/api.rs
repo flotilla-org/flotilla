@@ -108,6 +108,16 @@ pub struct Capabilities {
     /// The vessels share the host's filesystem (drydock's `local` module).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub host_filesystem: bool,
+    /// The ways beyond the guest's own egress that a vessel reaches a
+    /// destination, preferred first (drydock#262).
+    #[serde(default)]
+    pub reach_ways: Vec<ReachWay>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReachWay {
+    OutwardExposure,
+    HostNetwork,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

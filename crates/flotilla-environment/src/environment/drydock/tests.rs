@@ -254,7 +254,6 @@ fn reaching(destinations: &[(&str, u16)]) -> flotilla_resources::EnvironmentSpec
 // outward exposure at its own name and port in the guest, so TLS stays end to
 // end; a public one is met by the guest's egress, with no exposure. The descriptor reports
 // how each is met, and re-adoption leaves a standing exposure as it is.
-#[ignore = "OPEN flotilla-org/drydock#262: the instance declares outward_exposure once it reads the module's ways"]
 #[tokio::test]
 async fn a_private_destination_is_an_exposure_and_a_public_one_is_egress() {
     use crate::reach::Resolution::{Private, Public};
@@ -283,7 +282,6 @@ async fn a_private_destination_is_an_exposure_and_a_public_one_is_egress() {
 // The reach set is frozen per vessel, so an exposure is only ever moved, never
 // orphaned: when a carried name resolves elsewhere on the controlling host, the
 // next provision points the same exposure at the new address.
-#[ignore = "OPEN flotilla-org/drydock#262: the instance declares outward_exposure once it reads the module's ways"]
 #[tokio::test]
 async fn a_carried_name_that_moves_is_carried_to_its_new_address() {
     struct Moving(std::sync::Mutex<std::net::IpAddr>);

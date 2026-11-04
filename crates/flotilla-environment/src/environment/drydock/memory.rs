@@ -37,6 +37,7 @@ impl MemoryApi {
                     workspace_root: "/workspace".into(),
                     fallback_runner: false,
                     host_filesystem: false,
+                    reach_ways: vec![ReachWay::OutwardExposure],
                 },
                 readiness: Readiness::Ready,
             }),

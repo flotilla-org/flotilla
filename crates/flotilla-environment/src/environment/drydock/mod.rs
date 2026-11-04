@@ -22,7 +22,7 @@ pub use api::ProviderApi;
 use api::{self as wire, ApiError};
 pub use connector::installed_agent_build;
 use flotilla_protocol::provider::AgentConnectionReport;
-use flotilla_protocol::reach::{ReachDestination, ReachRoute};
+use flotilla_protocol::reach::{ReachDestination, ReachRoute, ReachWay};
 use flotilla_resources::HostImageAction;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -461,11 +461,14 @@ fn capabilities(c: &wire::Capabilities) -> ProviderCapabilities {
         receives_host_tools: true,
         per_vessel: true,
         host_filesystem: c.host_filesystem,
-        // OPEN (flotilla-org/drydock#262): the module declares its ways in
-        // `Capabilities`, and this reads them once the drydock pin carries the
-        // field. Until then the instance declares none, so its vessels meet
-        // only what their egress reaches.
-        reach_ways: Vec::new(),
+        reach_ways: c
+            .reach_ways
+            .iter()
+            .map(|way| match way {
+                wire::ReachWay::HostNetwork => ReachWay::HostNetwork,
+                wire::ReachWay::OutwardExposure => ReachWay::OutwardExposure,
+            })
+            .collect(),
     }
 }
 /// The pipeline defaults drydock-agent sets on every process it starts, over

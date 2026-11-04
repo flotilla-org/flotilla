@@ -423,8 +423,11 @@ destination beyond their own egress, preferred first:
 - `host_network`: the vessel shares the controlling host's network. Docker and
   host-direct instances declare it.
 - `outward_exposure`: the controlling host carries the connection under the
-  destination's own name and port, so TLS stays end to end. A drydock module
-  declares it in its capabilities when it runs the agent (drydock#262).
+  destination's own name and port, so TLS stays end to end.
+
+A drydock instance takes its ways from its module's declared capabilities: a
+module that runs the agent declares `outward_exposure`, and drydock's `local`
+module also declares `host_network` first.
 
 At placement each candidate answers, for every destination, how it would meet
 it or that it cannot, resolving names on its own controlling host. Admission
