@@ -246,7 +246,7 @@ mod tests {
     fn manifest_status_warns_that_failed_adoption_may_have_written_source() {
         let row = serde_json::json!({
             "root": "manifest-123",
-            "document": {"path": "policy.yaml", "kind": "PlacementPolicy", "namespace": "flotilla", "name": "adopt-me"},
+            "document": {"path": "policy.yaml", "kind": "FulfilmentKind", "namespace": "flotilla", "name": "adopt-me"},
             "state": {
                 "phase": "refused",
                 "reason": "live spec changed while adopting",
@@ -258,7 +258,7 @@ mod tests {
 
         assert_eq!(
             super::format_manifest_status_row(&row, Some(flotilla_resources::ResolutionAction::Adopt)),
-            "manifest-123\tpolicy.yaml\tPlacementPolicy/flotilla/adopt-me\trefused\t\tlive spec changed while adopting; adoption may have rewritten the source file; inspect it before retrying with a new token"
+            "manifest-123\tpolicy.yaml\tFulfilmentKind/flotilla/adopt-me\trefused\t\tlive spec changed while adopting; adoption may have rewritten the source file; inspect it before retrying with a new token"
         );
     }
 
@@ -288,7 +288,7 @@ mod tests {
     fn manifest_status_does_not_warn_for_failed_sync() {
         let row = serde_json::json!({
             "root": "manifest-123",
-            "document": {"path": "policy.yaml", "kind": "PlacementPolicy", "namespace": "flotilla", "name": "adopt-me"},
+            "document": {"path": "policy.yaml", "kind": "FulfilmentKind", "namespace": "flotilla", "name": "adopt-me"},
             "state": {
                 "phase": "refused",
                 "reason": "live spec changed while syncing",
@@ -299,7 +299,7 @@ mod tests {
 
         assert_eq!(
             super::format_manifest_status_row(&row, Some(flotilla_resources::ResolutionAction::Sync)),
-            "manifest-123\tpolicy.yaml\tPlacementPolicy/flotilla/adopt-me\trefused\t\tlive spec changed while syncing"
+            "manifest-123\tpolicy.yaml\tFulfilmentKind/flotilla/adopt-me\trefused\t\tlive spec changed while syncing"
         );
     }
 }

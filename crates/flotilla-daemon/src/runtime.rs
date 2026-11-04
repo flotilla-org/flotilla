@@ -1342,6 +1342,13 @@ async fn open_provisioning_lifecycles(
         .await
         .map_err(|error| error.to_string())??;
     daemon.resource_backend().install_engine_records(Arc::new(artifacts));
+    let service = daemon.decided_store()?;
+    let clock = daemon.clock_for_scenarios();
+    let access_deliveries =
+        tokio::task::spawn_blocking(move || flotilla_provisioning::engine::access_deliveries::EngineAccessDeliveries::open(service, clock))
+            .await
+            .map_err(|error| error.to_string())??;
+    daemon.resource_backend().install_engine_records(Arc::new(access_deliveries));
     // ChangeRequest and Issue: written by their source's observer, read at every home.
     let service = daemon.decided_store()?;
     let clock = daemon.clock_for_scenarios();

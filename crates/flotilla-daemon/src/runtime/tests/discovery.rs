@@ -198,7 +198,6 @@ async fn ssh_host_provisions_clone_and_worktree_through_its_runner() {
     let kinds = daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE);
     let kind = kinds.get("host-direct-ssh-test-host").await.expect("SSH kind");
     assert_eq!(kind.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some("seeding"));
-    assert!(daemon.resource_backend().using::<PlacementPolicy>(NAMESPACE).get("host-direct-ssh-test-host").await.is_err());
     let mut changed = kind.spec.clone();
     changed.grants.insert(flotilla_resources::FulfilmentGrant::toolchain("rust".to_string()));
     kinds

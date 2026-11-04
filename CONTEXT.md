@@ -331,11 +331,10 @@ requirements with unique names — never a field on the requirement *(amended
 by any orchestrator: a workflow template, an **orchestrating agent** (tool
 call), or a human (CLI pins / the picker). Templates carry abstract
 requirements only; launch-time **pins** (host=X, reuse hull Y, adopt this
-checkout) and fleet-level **PlacementPolicy** preferences merge at resolution
-(pins > requirements > policy preferences; unsatisfiable = loud failure, no
-silent fallback). Since ADR 0046, admission's allocation stage authors
-requirements from role **Capability Needs**, and **Fulfilment Kinds** replace
-PlacementPolicy preferences.
+checkout) and the **Fulfilment Kinds** that can realise them merge at resolution
+(pins > requirements > kinds; unsatisfiable = loud failure, no silent
+fallback). Since ADR 0046, admission's allocation stage authors requirements
+from role **Capability Needs**.
 _Avoid_: placement (the act, not the declaration), recipe, target.
 
 **Vessel**:
@@ -454,8 +453,9 @@ declares a **Grant Set**, which hosts complete with live facts (harness
 versions, models, toolchains, GUI session, capacity). Placement picks the
 *minimal* covering fulfilment kinds (least privilege, a partial order on
 grant sets), and cost and availability break ties. Choosing a non-minimal
-one is a recorded escalation (ADR 0046). This replaces per-host placement
-policies.
+one is a recorded escalation (ADR 0046). A kind holds its host, pool, cost
+class, **Grant Set** and realisation (the provider kind and image); how a
+realisation checks out, pulls and sizes memory is fixed in code, not per kind.
 _Avoid_: Placement policy (the retired form), backend.
 
 **Grant Set**:
@@ -1139,7 +1139,7 @@ _Avoid_: baseline, curated image.
 **Image Selection**:
 The base and shared layers a **Project** names in its `image:` block, or the
 installation default (the cascaded `CrewDefaults` `image:`) when it names
-none. Placement policies never select layers: a policy omits `image` to run the
+none. **Fulfilment Kinds** never select layers: a kind omits `image` to run the
 composed image, or names a literal image.
 _Avoid_: composition selection.
 

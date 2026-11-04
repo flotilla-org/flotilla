@@ -4,7 +4,6 @@ mod controller_loop;
 mod convoy_status_patch;
 mod decode_once;
 mod digest;
-mod field_ownership;
 mod forge_identity;
 mod fulfilment_kind;
 mod host_status_coalescing;

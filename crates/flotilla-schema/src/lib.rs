@@ -58,11 +58,15 @@ extern crate self as flotilla_schema;
 
 #[doc(hidden)]
 pub mod adapt;
+#[doc(hidden)]
+pub mod __private {
+    pub use serde_json::json;
+}
 mod code;
 mod codec;
 mod describe;
 mod descriptor;
-pub use describe::{Describe, DescribeChild, DescribeElement};
+pub use describe::{Describe, DescribeChild, DescribeElement, DescribedRow, RowWriter};
 mod edge;
 mod event;
 mod filter;
@@ -101,7 +105,7 @@ pub use frozen::{Freezable, Frozen};
 pub use history::{EdgeEvent, Labelled};
 pub use inline::{Cbor, INLINE_LIMITS};
 pub use layout::{snake_case, DatumColumns, Layout};
-pub use query::{element_values, interned_value, key_value, IndexQuery};
+pub use query::{interned_value, key_value, IndexQuery};
 pub use records::{Position, RecordRow, Records, RecordsFull};
 pub use reference::Ref;
 pub use registry::{KindRegistry, RegistryError};

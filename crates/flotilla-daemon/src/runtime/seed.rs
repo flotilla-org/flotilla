@@ -7,12 +7,10 @@ use std::{
 
 use flotilla_core::in_process::InProcessDaemon;
 
-use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_resources::{
     canonical_host_id, definition_provenance::SEEDING_MANAGER, descriptive_repo_slug, is_prepared_snapshot, Clone, CloneSpec, Environment,
     EnvironmentSpec, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostDirectEnvironmentSpec, HostSpec,
-    InputMeta, PlacementImageSource, PlacementPolicy, Platform, Repository, ResourceError, ResourceObject, DOCKER_POLICY_NAME_PREFIX,
-    HOST_DIRECT_NAME_PREFIX, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND,
+    InputMeta, PlacementImageSource, Platform, Repository, ResourceError, ResourceObject, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND,
 };
 use flotilla_store::ResourceBackend;
 use tracing::warn;
@@ -229,7 +227,7 @@ pub(super) async fn ensure_default_kinds(
         };
         seed_kind(backend, namespace, &profile.docker_policy_name(), docker).await?;
     }
-    migrate_live_placement_policies(backend, namespace, &profile.host_id, platform).await
+    canonicalize_kind_hosts(backend, namespace, &profile.host_id).await
 }
 
 async fn seed_kind(backend: &ResourceBackend, namespace: &str, name: &str, desired: FulfilmentKindSpec) -> Result<(), String> {
@@ -265,20 +263,6 @@ async fn seed_kind(backend: &ResourceBackend, namespace: &str, name: &str, desir
     }
 }
 
-/// Each live policy an operator or a manifest still holds becomes the kind of its name, until
-/// PlacementPolicy retires. Seeded names are seeding's own kinds.
-pub(super) async fn migrate_live_placement_policies(
-    backend: &ResourceBackend,
-    namespace: &str,
-    host_ref: &str,
-    platform: &str,
-) -> Result<(), String> {
-    let hosts = backend.clone().using::<Host>(namespace).list().await.map_err(|error| error.to_string())?;
-    let policies =
-        backend.clone().using::<flotilla_resources::PlacementPolicy>(namespace).list().await.map_err(|error| error.to_string())?;
-    migrate_listed_placement_policies(backend, namespace, host_ref, platform, &hosts.items, policies.items).await
-}
-
 pub(super) fn kind_belongs_to_host(
     hosts: &[ResourceObject<Host>],
     kind: &ResourceObject<FulfilmentKind>,
@@ -297,129 +281,11 @@ pub(super) fn kind_belongs_to_host(
     }
 }
 
-pub(super) async fn migrate_listed_placement_policies(
-    backend: &ResourceBackend,
-    namespace: &str,
-    host_ref: &str,
-    platform: &str,
-    hosts: &[ResourceObject<Host>],
-    policies: Vec<ResourceObject<PlacementPolicy>>,
-) -> Result<(), String> {
+/// Repairs this host's kinds whose host ref names it other than by its Host's name.
+pub(super) async fn canonicalize_kind_hosts(backend: &ResourceBackend, namespace: &str, host_ref: &str) -> Result<(), String> {
+    let hosts = backend.clone().using::<Host>(namespace).list().await.map_err(|error| error.to_string())?.items;
     let kinds = backend.clone().using::<FulfilmentKind>(namespace);
-    for policy in policies {
-        // Admission reads the operator's provider instance from the kind's label.
-        let instance = policy.spec.provider_requirements.as_ref().and_then(|requirements| requirements.instance.clone());
-        let cloud_controller = if policy.spec.cloud_sandbox_per_vessel.is_some() {
-            let Ok(spec) = FulfilmentKindSpec::from_policy(&policy.spec, platform) else { continue };
-            let mut kind = ResourceObject::<FulfilmentKind> { metadata: policy.metadata.clone(), spec, status: None };
-            if let Some(instance) = instance.clone() {
-                kind.metadata.labels.insert(ENVIRONMENT_PROVIDER_INSTANCE_LABEL.to_owned(), instance);
-            }
-            match flotilla_admission::support::placement_target_host(backend, namespace, &kind).await {
-                Ok(host) => Some(host.reference.to_string()),
-                Err(_) => continue,
-            }
-        } else {
-            None
-        };
-        let policy_host = policy
-            .spec
-            .host_direct
-            .as_ref()
-            .map(|strategy| strategy.host_ref.as_str())
-            .or_else(|| policy.spec.docker_per_vessel.as_ref().map(|strategy| strategy.host_ref.as_str()))
-            .or(cloud_controller.as_deref());
-        let Some(policy_host) = policy_host else { continue };
-        let canonical = match canonical_host_id(hosts, policy_host) {
-            Ok(id) => id.map(|id| id.to_string()).unwrap_or_else(|| policy_host.to_string()),
-            Err(error) => {
-                warn!(policy = %policy.metadata.name, %policy_host, %error, "skipping ambiguous placement policy host");
-                continue;
-            }
-        };
-        if canonical != host_ref {
-            continue;
-        }
-        if is_prepared_snapshot(&policy.metadata.name, &policy.metadata.labels, PLACEMENT_SNAPSHOT_KIND)
-            || policy.metadata.name.starts_with(DOCKER_POLICY_NAME_PREFIX)
-            || policy.metadata.name.starts_with(HOST_DIRECT_NAME_PREFIX)
-        {
-            continue;
-        }
-        if policy.metadata.deletion_timestamp.is_some() {
-            continue;
-        }
-        let mut policy_spec = policy.spec.clone();
-        if policy_host != host_ref {
-            // One-time repair of display-name refs written before host IDs
-            // became the stored PlacementPolicy/FulfilmentKind identity.
-            if let Some(direct) = policy_spec.host_direct.as_mut() {
-                direct.host_ref = host_ref.to_string();
-            }
-            if let Some(docker) = policy_spec.docker_per_vessel.as_mut() {
-                docker.host_ref = host_ref.to_string();
-            }
-        }
-        let name = &policy.metadata.name;
-        let mut spec = match FulfilmentKindSpec::from_policy(&policy_spec, platform) {
-            Ok(spec) => spec,
-            Err(error) => {
-                warn!(policy = %name, %error, "skipping invalid placement policy during fulfilment migration");
-                continue;
-            }
-        };
-        if cloud_controller.is_some() {
-            spec.host_ref = host_ref.to_owned();
-        }
-        if policy_spec != policy.spec {
-            match backend
-                .clone()
-                .using::<flotilla_resources::PlacementPolicy>(namespace)
-                .update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &policy_spec)
-                .await
-            {
-                Ok(_) => {}
-                Err(ResourceError::Conflict { .. }) => {
-                    warn!(policy = %name, "placement policy changed during host-ref canonicalization; retrying next pass");
-                    continue;
-                }
-                Err(error) => return Err(format!("canonicalize placement policy {name}: {error}")),
-            }
-        }
-        match kinds.get(name).await {
-            Ok(existing) if existing.metadata.deletion_timestamp.is_some() => {}
-            Ok(existing) => {
-                let mut updated = spec.clone();
-                updated.grants = existing.spec.grants.clone();
-                updated.cost_class = existing.spec.cost_class;
-                // Platform is a host fact. Correct an initial local-OS
-                // registration when an SSH host reports its own OS.
-                updated.grants.retain(|grant| !grant.0.starts_with("platform:"));
-                updated.grants.extend(spec.grants.iter().filter(|grant| grant.0.starts_with("platform:")).cloned());
-                let mut labels = existing.metadata.labels.clone();
-                if let Some(instance) = instance.clone() {
-                    labels.insert(ENVIRONMENT_PROVIDER_INSTANCE_LABEL.to_owned(), instance);
-                }
-                if updated != existing.spec || labels != existing.metadata.labels {
-                    kinds
-                        .update(&meta_from_existing(&existing, labels), &existing.metadata.resource_version, &updated)
-                        .await
-                        .map_err(|error| format!("update fulfilment kind {name}: {error}"))?;
-                }
-            }
-            Err(ResourceError::NotFound { .. }) => {
-                let labels = instance.map(|instance| (ENVIRONMENT_PROVIDER_INSTANCE_LABEL.to_owned(), instance)).into_iter().collect();
-                kinds
-                    .create(&empty_meta_with_labels(name, labels), &spec)
-                    .await
-                    .map_err(|error| format!("create fulfilment kind {name}: {error}"))?;
-            }
-            Err(error) => return Err(format!("inspect fulfilment kind {name}: {error}")),
-        }
-    }
-    // Also repair kinds that were authored directly and have no live policy.
-    // This is idempotent; after the first successful pass the stored ref is
-    // already the canonical Host resource name.
+    // Idempotent: after the first successful pass the stored ref is the Host's name.
     for kind in kinds.list().await.map_err(|error| error.to_string())?.items {
         if kind.metadata.deletion_timestamp.is_some()
             || kind.spec.host_ref == host_ref
@@ -427,7 +293,7 @@ pub(super) async fn migrate_listed_placement_policies(
         {
             continue;
         }
-        if kind_belongs_to_host(hosts, &kind, host_ref, "kind canonicalization") {
+        if kind_belongs_to_host(&hosts, &kind, host_ref, "kind canonicalization") {
             let mut spec = kind.spec.clone();
             spec.host_ref = host_ref.to_string();
             kinds

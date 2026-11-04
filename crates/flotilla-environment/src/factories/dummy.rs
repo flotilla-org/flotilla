@@ -12,7 +12,8 @@ use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
 
 use crate::environment::dummy::{
-    DummyEnvironmentBehaviour, DummyEnvironmentCleanup, DummyEnvironmentProvider, DUMMY_ENVIRONMENT_INSTANCE, DUMMY_FLEET_ENV,
+    DummyEnvironmentBehaviour, DummyEnvironmentCleanup, DummyEnvironmentCounts, DummyEnvironmentProvider, DUMMY_CLOUD_ENVIRONMENT_INSTANCE,
+    DUMMY_ENVIRONMENT_INSTANCE, DUMMY_FLEET_ENV,
 };
 use crate::environment::EnvironmentProvider;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
@@ -20,13 +21,39 @@ use flotilla_provider_runtime::CommandRunner;
 
 #[derive(Clone)]
 pub struct DummyEnvironmentFactory {
+    instance: &'static str,
     provider: Arc<DummyEnvironmentProvider>,
 }
 
 impl DummyEnvironmentFactory {
     /// Clones share the external backing inventory across daemon restarts.
     pub fn new(behaviour: DummyEnvironmentBehaviour, cleanup: DummyEnvironmentCleanup) -> Self {
-        Self { provider: Arc::new(DummyEnvironmentProvider::new(behaviour).with_cleanup(cleanup)) }
+        Self { instance: DUMMY_ENVIRONMENT_INSTANCE, provider: Arc::new(DummyEnvironmentProvider::new(behaviour).with_cleanup(cleanup)) }
+    }
+
+    /// The cloud-sandbox vendor, registered as [`DUMMY_CLOUD_ENVIRONMENT_INSTANCE`].
+    pub fn cloud(behaviour: DummyEnvironmentBehaviour, cleanup: DummyEnvironmentCleanup) -> Self {
+        let provider = DummyEnvironmentProvider::cloud(behaviour).with_cleanup(cleanup);
+        Self { instance: DUMMY_CLOUD_ENVIRONMENT_INSTANCE, provider: Arc::new(provider) }
+    }
+
+    /// Act as the vendor: see [`DummyEnvironmentProvider::vanish`].
+    pub fn vanish(&self, environment: &str) -> bool {
+        self.provider.vanish(environment)
+    }
+
+    /// Act as the vendor: see [`DummyEnvironmentProvider::stop`].
+    pub fn stop(&self, environment: &str) -> bool {
+        self.provider.stop(environment)
+    }
+
+    /// Act as the vendor: see [`DummyEnvironmentProvider::refuse_provisioning`].
+    pub fn refuse_provisioning(&self, refuse: bool) {
+        self.provider.refuse_provisioning(refuse);
+    }
+
+    pub fn counts(&self) -> DummyEnvironmentCounts {
+        self.provider.counts()
     }
 }
 
@@ -36,7 +63,7 @@ impl Factory for DummyEnvironmentFactory {
     type Output = dyn EnvironmentProvider;
 
     fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, DUMMY_ENVIRONMENT_INSTANCE)
+        ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, self.instance)
     }
 
     async fn probe(

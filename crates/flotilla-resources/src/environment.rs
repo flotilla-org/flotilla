@@ -6,9 +6,7 @@ use std::{
 use flotilla_protocol::ConfiguredResourceLimits;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    placement_policy::DockerImagePullPolicy, resource::define_resource, status_patch::StatusPatch, ControllerRetry, ResourceError,
-};
+use crate::{placement::DockerImagePullPolicy, resource::define_resource, status_patch::StatusPatch, ControllerRetry, ResourceError};
 
 define_resource!(
     Environment,

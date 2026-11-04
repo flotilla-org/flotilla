@@ -5,10 +5,10 @@ use flotilla_engine_store::ImportTarget;
 use flotilla_protocol::{IssueSource, NodeId};
 use flotilla_provisioning::stored::forge_observation::{ChangeRequestRecord, ForgeReadRecord, IssueRecord};
 use flotilla_resources::{
-    forge_read_name, Artifact, ChangeRequestReviewObservation, ChangeRequestStatus, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure,
-    CredentialSpec, FleetDesignation, Forge, ForgeReadRequest, FulfilmentKind, InputMeta, IssueStatus, Message, Observation,
-    ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision, Project, Repository,
-    RepositorySpec, Resource, TerminalSession, Vessel,
+    forge_read_name, AccessDelivery, Artifact, ChangeRequestReviewObservation, ChangeRequestStatus, Checkout, Clone as CloneResource,
+    Convoy, ConvoyEnsure, CredentialSpec, FleetDesignation, Forge, ForgeReadRequest, FulfilmentKind, InputMeta, IssueStatus, Message,
+    Observation, ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision, Project,
+    Repository, RepositorySpec, Resource, TerminalSession, Vessel,
 };
 use flotilla_schema::{Kind, Timestamp};
 use flotilla_store::{replica::StoredReplicaEventKind, ResourceKind};
@@ -50,6 +50,27 @@ fn artifact(name: &str) -> Value {
         name,
         json!({"convoy": "demo", "producer": "coder", "kind": "brief", "subject": "demo", "summary": {"charter_commit": "abc"},
             "digest": "ef37", "size": 1, "media_type": "text/markdown", "expires_at": "2026-11-19T00:00:00Z"}),
+        Value::Null,
+    )
+}
+
+/// An access delivery as r974's access layer wrote it: the digest-named record, two needs, and for
+/// a failed delivery a permanent retry.
+fn access_delivery(name: &str, failed: bool) -> Value {
+    let retry = if failed {
+        json!({"need": "account", "attempts": 3, "error": "permanent, not retried: authority refused", "next_at": i64::MAX})
+    } else {
+        Value::Null
+    };
+    document(
+        "AccessDelivery",
+        name,
+        json!({"access": "flotilla/demo/implement/coder", "place": "env-a", "harness": "claude-code", "home": "/home/crew/.claude",
+            "needs": {
+                "home": {"mechanism": "agent-push", "digest": "ab12", "at": 1_790_000_000_000_000_i64},
+                "skills": {"mechanism": "host-path-read-only-live", "digest": "cd34", "at": 1_790_000_001_000_000_i64},
+            },
+            "retry": retry}),
         Value::Null,
     )
 }
@@ -102,6 +123,8 @@ async fn populated(dir: &Path) -> SqliteBackend {
     own::<Message>(&backend, message("waiting")).await;
     own::<Artifact>(&backend, artifact("ours")).await;
     own::<CloneResource>(&backend, clone("clone-a")).await;
+    own::<AccessDelivery>(&backend, access_delivery("access-delivered", false)).await;
+    own::<AccessDelivery>(&backend, access_delivery("access-failed", true)).await;
     own::<Checkout>(
         &backend,
         document(
@@ -192,6 +215,7 @@ async fn populated(dir: &Path) -> SqliteBackend {
     )
     .await;
     replica::<Artifact>(&backend, THERE, artifact("theirs")).await;
+    replica::<AccessDelivery>(&backend, THERE, access_delivery("access-theirs", false)).await;
     replica::<CloneResource>(&backend, THERE, clone("clone-b")).await;
     replica::<Forge>(&backend, THERE, forge()).await;
     backend
@@ -267,6 +291,7 @@ async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
     ] {
         assert_eq!(kinds[kind]["imported"], 1, "{kind}: {report:#}");
     }
+    assert_eq!(kinds["AccessDelivery"], json!({"imported": 2, "dropped": 0, "refused": 0}), "{report:#}");
     assert_eq!(kinds["Checkout"], json!({"imported": 0, "dropped": 1, "refused": 0}), "an observed checkout is no request");
     assert_eq!(kinds["Convoy"], json!({"imported": 0, "dropped": 1, "refused": 0}), "an unbootstrapped convoy stays old");
     assert!(kinds.get("Forge").is_none(), "another host's records are not this host's to count: {report:#}");
@@ -274,7 +299,11 @@ async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
     let mut store = engine(dir.path());
     assert!(holds::<flotilla_provisioning::stored::artifact::ArtifactRecord>(&mut store, "ours", HERE));
     assert!(holds::<flotilla_state_machines::Resource<flotilla_provisioning::stored::clone::Clone>>(&mut store, "clone-a", HERE));
+    for name in ["access-delivered", "access-failed"] {
+        assert!(holds::<flotilla_resources::AccessDeliverySpec>(&mut store, name, HERE), "{name}");
+    }
     for home in [HERE, THERE] {
+        assert!(!holds::<flotilla_resources::AccessDeliverySpec>(&mut store, "access-theirs", home), "{home}");
         assert!(!holds::<flotilla_provisioning::stored::artifact::ArtifactRecord>(&mut store, "theirs", home), "{home}");
         assert!(!holds::<flotilla_state_machines::Resource<flotilla_provisioning::stored::clone::Clone>>(&mut store, "clone-b", home));
         assert!(!holds::<flotilla_provisioning::stored::definition::ForgeDefinition>(&mut store, "lab", home), "{home}");
@@ -376,13 +405,13 @@ async fn the_rehearsal_reports_what_the_import_writes() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _held = populated(dir.path()).await;
     let summary = rehearse(&Source::read(&dir.path().join(OLD_STORE), HERE).expect("source"), HERE);
-    assert_eq!(summary.staying.get("FulfilmentKind").map(|(_, rows)| *rows), Some(1), "not in the engine store at this build");
+    assert_eq!(summary.kinds["FulfilmentKind"].imported, 1);
     let written = report(&first_start(dir.path(), HERE, None).expect("imports").expect("a report"));
     assert_eq!(serde_json::to_value(&summary.kinds).expect("kinds"), written["kinds"]);
 }
 
 #[test]
-fn rows_of_kinds_no_importer_reads_are_dropped_kept_or_refused_here_only() {
+fn rows_of_kinds_no_importer_reads_are_dropped_or_refused_here_only() {
     let row = |plural: &str, home: &str, name: &str| Row {
         namespace: NS.into(),
         plural: plural.into(),
@@ -396,7 +425,7 @@ fn rows_of_kinds_no_importer_reads_are_dropped_kept_or_refused_here_only() {
         row("widgets", HERE, "widget"),
         row("widgets", THERE, "their-widget"),
         row("regards", THERE, "their-regard"),
-        row("accessdeliveries", HERE, "delivery"),
+        row("fulfilmentkinds", HERE, "docker"),
     ]);
     let target = Import::in_memory(HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
     assert!(target.imports(HERE) && !target.imports(THERE));
@@ -405,11 +434,7 @@ fn rows_of_kinds_no_importer_reads_are_dropped_kept_or_refused_here_only() {
     assert_eq!(summary.kinds["Usage"].dropped, 1);
     assert_eq!(summary.kinds["Event"].dropped, 1);
     assert_eq!(summary.kinds["Regard"].dropped, 1, "only this home's row is dropped here");
-    assert_eq!(
-        summary.staying.get("AccessDelivery"),
-        Some(&("#3824, plain like AccountProvision", 1)),
-        "a kind still moving stays on the old store"
-    );
+    assert!(!summary.kinds.contains_key("FulfilmentKind"), "an imported kind's rows are its step's");
     assert_eq!(
         summary.refusals,
         vec![Refusal { kind: "widgets".into(), name: "widget".into(), reason: "no import plan for its kind".into() }]
@@ -419,7 +444,10 @@ fn rows_of_kinds_no_importer_reads_are_dropped_kept_or_refused_here_only() {
 #[test]
 fn every_imported_kind_has_one_importer() {
     for (kind, plan) in plan::PLAN {
-        let plural = REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.kind == *kind).map(|entry| entry.plural);
+        let plural =
+            REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.kind == *kind).map(|entry| entry.plural).or_else(|| {
+                flotilla_store::RETIRED_RESOURCE_KINDS.iter().find(|retired| retired.kind == *kind).map(|retired| retired.plural)
+            });
         let importers = STEPS.iter().filter(|step| plural.is_some_and(|plural| step.kinds.contains(&plural))).count();
         match plan {
             Plan::Imported(_) => assert_eq!(importers, 1, "{kind} is imported, so one step imports it"),
@@ -987,4 +1015,54 @@ fn the_hosts_this_daemon_describes_import_here() {
 
     let summary = rehearse(&rows(documents()), HERE);
     assert_eq!(refused(&summary), [("Host", "kiwi"), ("Host", "b1"), ("Host", "feta")], "{summary:?}");
+}
+
+// Every FulfilmentKind and PlacementPolicy row an old store holds is imported: none stays behind
+// for the cut-over to delete. A policy, which this generation no longer registers, is read as the
+// row a previous generation stored and becomes the kind of its name.
+#[tokio::test]
+async fn placement_rows_import_as_kinds_and_none_stay_on_the_old_store() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(OLD_STORE);
+    let backend = SqliteBackend::open(&path).expect("old store");
+    own::<FulfilmentKind>(
+        &backend,
+        document(
+            "FulfilmentKind",
+            "host-direct-feta",
+            json!({"grants": ["platform:linux", "account:host", "network:host"], "host_ref": "feta", "pool": "cleat",
+                "realisation": "host_direct"}),
+            Value::Null,
+        ),
+    )
+    .await;
+    drop(backend);
+    let policy = |name: &str, spec: Value| document("PlacementPolicy", name, spec, Value::Null).to_string();
+    let docker = json!({"pool": "cleat", "docker_per_vessel": {"host_ref": "feta", "pull_policy": "always", "default_cwd": "/workspace",
+        "env": {}, "checkout": {"worktree_on_host_and_mount": {"mount_path": "/workspace"}}}});
+    let connection = rusqlite::Connection::open(&path).expect("raw");
+    for (name, spec) in [
+        ("docker-crew-image-feta", docker.clone()),
+        ("placement-snapshot-0123456789ab", json!({"pool": "cleat", "host_direct": {"host_ref": "feta", "checkout": "worktree"}})),
+        ("host-direct-feta", json!({"pool": "cleat", "host_direct": {"host_ref": "feta", "checkout": "worktree"}})),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO resource_objects (group_name, version, kind, namespace, name, resource_version, body_json) VALUES ('flotilla.work', 'v1', 'PlacementPolicy', ?1, ?2, 1, ?3)",
+                rusqlite::params![NS, name, policy(name, spec.clone())],
+            )
+            .expect("policy row");
+    }
+    drop(connection);
+
+    let source = Source::read(&path, HERE).expect("source");
+    let summary = rehearse(&source, HERE);
+    assert!(summary.refusals.is_empty(), "{:?}", summary.refusals);
+    assert_eq!(summary.kinds["FulfilmentKind"].imported, 3, "the kind, and the two policies without one: {:?}", summary.kinds);
+
+    first_start(dir.path(), HERE, None).expect("imports").expect("a report");
+    let mut store = engine(dir.path());
+    for name in ["host-direct-feta", "docker-crew-image-feta", "placement-snapshot-0123456789ab"] {
+        assert!(holds::<flotilla_provisioning::stored::placement::FulfilmentKindDefinition>(&mut store, name, HERE), "{name}");
+    }
 }

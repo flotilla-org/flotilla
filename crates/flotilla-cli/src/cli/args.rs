@@ -643,7 +643,7 @@ pub enum ResourceSubCommand {
     Delete(ResourceDeleteArgs),
     /// Remove a declared transport remote from a Repository
     RemoveRemote(ResourceRemoveRemoteArgs),
-    /// Remove standing multi-authored Host and PlacementPolicy records from non-home roots
+    /// Remove standing multi-authored Host records from non-home roots
     DedupSweep(ResourceDedupSweepArgs),
     /// Watch resources of a kind
     Watch(ResourceWatchArgs),
