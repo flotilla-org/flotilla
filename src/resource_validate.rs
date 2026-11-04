@@ -52,6 +52,35 @@ pub(crate) struct ValidationOptions {
     pub credential_tokens: BTreeMap<String, PathBuf>,
 }
 
+#[cfg(unix)]
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The running daemon's own host id, as its host list names it; none when the daemon does not report one.
+#[cfg(unix)]
+async fn daemon_host_id(client: &reqwest::Client, base: &str) -> Option<String> {
+    let command = flotilla_protocol::Command::builder().action(flotilla_protocol::CommandAction::QueryHostList {}).build();
+    let accepted: Value = client
+        .post(format!("{base}/v1/commands"))
+        .timeout(READ_TIMEOUT)
+        .json(&command)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    let url = accepted.get("url")?.as_str()?;
+    let finished: Value =
+        client.get(format!("{base}{url}?wait=5")).timeout(READ_TIMEOUT).send().await.ok()?.error_for_status().ok()?.json().await.ok()?;
+    let flotilla_protocol::CommandValue::HostList(hosts) = serde_json::from_value(finished.get("outcome")?.clone()).ok()? else {
+        return None;
+    };
+    let local = hosts.hosts.iter().find(|host| host.is_local)?;
+    Some(local.environment_id.as_ref()?.host_id()?.to_string())
+}
+
 // Candidate validation, including import enforcement, requires the Unix resource
 // socket; non-Unix callers receive this unsupported-operation error.
 #[cfg(not(unix))]
@@ -263,7 +292,8 @@ async fn validate_daemon_with_preview(
     }
     // Rehearse before every roll, as this host's first start with `[primitives]` imports; the
     // candidate host configuration controls enforcement.
-    let summary = engine_import::rehearse(&engine_import::Source::new(import_rows), LOCAL_HOME);
+    let own_host = if import_rows.iter().any(|row| row.plural == "hosts") { daemon_host_id(&client, base).await } else { None };
+    let summary = engine_import::rehearse(&engine_import::Source::new(import_rows).with_own_host(own_host), LOCAL_HOME);
     failed |= probes.require_import && summary.refused();
     print_import(&summary);
     if !retirement_inventory_failed {
@@ -793,6 +823,7 @@ mod tests {
     async fn serve_import_inventory(
         socket: &std::path::Path,
         inventory: BTreeMap<String, Vec<Value>>,
+        host_id: Option<&str>,
     ) -> (tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
         use tokio::{
             io::{AsyncReadExt, AsyncWriteExt},
@@ -807,6 +838,22 @@ mod tests {
         for (kind, items) in inventory {
             responses.insert(format!("/apis/flotilla.work/v1/namespaces/flotilla/{kind}"), serde_json::json!({"items":items}));
         }
+        let merged_hosts = responses.get("/apis/flotilla.work/v1/namespaces/flotilla/hosts").cloned();
+        let host_list = host_id.map(|host_id| {
+            let entry = flotilla_protocol::HostListEntry {
+                environment_id: Some(flotilla_protocol::EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new(host_id))),
+                host_name: flotilla_protocol::HostName::new("local"),
+                node: None,
+                is_local: true,
+                configured: false,
+                connection_status: flotilla_protocol::PeerConnectionState::Disconnected,
+                reconnect: None,
+                has_summary: true,
+                repo_count: 0,
+            };
+            let outcome = flotilla_protocol::CommandValue::HostList(Box::new(flotilla_protocol::HostListResponse { hosts: vec![entry] }));
+            serde_json::json!({"state":"finished","outcome":outcome})
+        });
         let task = tokio::spawn(async move {
             loop {
                 let (mut stream, _) = tokio::select! {
@@ -824,14 +871,26 @@ mod tests {
                     request.extend_from_slice(&buffer[..count]);
                 }
                 let request = String::from_utf8(request).unwrap();
-                assert!(request.starts_with("GET "));
                 let path = request.split_whitespace().nth(1).unwrap().split('?').next().unwrap();
-                let body = responses.remove(path).unwrap_or_else(|| panic!("unexpected or duplicate request {path}"));
+                let (status, body) = match (request.starts_with("POST "), path, &host_list) {
+                    (true, "/v1/commands", Some(_)) => ("202 Accepted", serde_json::json!({"url":"/v1/commands/host-list"})),
+                    (false, "/v1/commands/host-list", Some(host_list)) => ("200 OK", host_list.clone()),
+                    (_, path, _) if path.starts_with("/v1/commands") => ("404 Not Found", Value::Null),
+                    _ => {
+                        assert!(request.starts_with("GET "));
+                        let target = request.split_whitespace().nth(1).unwrap();
+                        if let Some(merged) = merged_hosts.as_ref().filter(|_| target.ends_with("/hosts?includeReplicas=true")) {
+                            ("200 OK", merged.clone())
+                        } else {
+                            ("200 OK", responses.remove(path).unwrap_or_else(|| panic!("unexpected or duplicate request {path}")))
+                        }
+                    }
+                };
                 let body = body.to_string();
                 stream
                     .write_all(
                         format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
                         )
                         .as_bytes(),
@@ -869,7 +928,7 @@ mod tests {
                 let config = ConfigStore::with_base(config_dir.path().to_path_buf()).load_daemon_config().unwrap();
                 let socket_dir = TestSocketDir::new();
                 let socket = socket_dir.socket_path("import-gate.sock");
-                let (stop, server) = serve_import_inventory(&socket, import_gate_inventory(case)).await;
+                let (stop, server) = serve_import_inventory(&socket, import_gate_inventory(case), None).await;
                 let probes = super::ValidationOptions { require_import: config.primitives.is_some(), ..Default::default() };
                 let result = super::validate_daemon_with_options(&socket, Some(&[]), None, &probes).await;
                 let _ = stop.send(());
@@ -880,6 +939,33 @@ mod tests {
                     "enabled={enabled}, case={case}: {result:?}"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn rehearsal_reads_the_daemons_own_host_id() {
+        rigging_tls::install_default_provider();
+        let host = |name: &str, spec: flotilla_resources::HostSpec| {
+            serde_json::json!({
+                "apiVersion":"flotilla.work/v1", "kind":"Host",
+                "metadata":{"name":name,"namespace":"flotilla","resourceVersion":"1","creationTimestamp":"2026-10-19T00:00:00Z"},
+                "spec":spec,"status":{"daemon_generation":"g7"}
+            })
+        };
+        let ssh = flotilla_resources::HostSpec {
+            connection: flotilla_resources::HostConnection::SshHost { owning_daemon: "kiwi".into(), destination: "crew@b1".into() },
+            ..Default::default()
+        };
+        for (reported, refused) in [(Some("kiwi"), false), (None, true)] {
+            let socket_dir = TestSocketDir::new();
+            let socket = socket_dir.socket_path("own-host.sock");
+            let inventory = BTreeMap::from([("hosts".to_string(), vec![host("kiwi", Default::default()), host("b1", ssh.clone())])]);
+            let (stop, server) = serve_import_inventory(&socket, inventory, reported).await;
+            let probes = super::ValidationOptions { require_import: true, ..Default::default() };
+            let result = super::validate_daemon_with_options(&socket, Some(&[]), None, &probes).await;
+            let _ = stop.send(());
+            tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+            assert_eq!(result.is_err(), refused, "reported={reported:?}: {result:?}");
         }
     }
 
