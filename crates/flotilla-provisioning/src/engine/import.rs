@@ -11,7 +11,7 @@
 //! | | Ready | Realised (its container, cloud sandbox backing, or host-direct root) |
 //! | | Lost | Gone(Lost) |
 //! | | Failed | GaveUp |
-//! | Cloud sandbox Environment, deleted | Lost, Failed (its sandbox gone) | not stored: dropped |
+//! | Cloud sandbox Environment, deleted | Lost (its sandbox gone) | not stored: dropped |
 //! | ImageBuild | Queued, Building, Failed with a retry to come | Requested (its failed attempts tallied) |
 //! | | Built | Realised (its digest) |
 //! | | Failed, settled | GaveUp |
@@ -248,8 +248,9 @@ pub fn rehearse_vessels(records: &[(ResourceObject<OldVessel>, String)], report:
     }
 }
 
-/// Imports old Environment `records` into `target`. A deleted cloud sandbox whose sandbox is gone
-/// (Lost, or Failed) owes no teardown, and is dropped; every other record imports.
+/// Imports old Environment `records` into `target`. A deleted cloud sandbox that is Lost (absent
+/// from its provider) owes no teardown, and is dropped; every other record imports. A Failed one
+/// may still run (a failed teardown or provision), so its teardown is still owed.
 pub fn import_environments(
     records: &[(ResourceObject<OldEnvironment>, String)],
     target: &mut impl ImportTarget,
@@ -259,10 +260,7 @@ pub fn import_environments(
         records.iter().filter(|(_, home)| target.imports(home)).cloned().partition(|(environment, _)| {
             environment.spec.cloud_sandbox.is_some()
                 && environment.metadata.deletion_timestamp.is_some()
-                && environment
-                    .status
-                    .as_ref()
-                    .is_some_and(|status| matches!(status.phase, EnvironmentPhase::Lost | EnvironmentPhase::Failed))
+                && environment.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Lost)
         });
     if !dropped.is_empty() {
         *report.dropped.entry(("Environment", "a deleted cloud sandbox, its sandbox gone")).or_default() += dropped.len();

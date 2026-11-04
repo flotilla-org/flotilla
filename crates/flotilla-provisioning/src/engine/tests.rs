@@ -978,8 +978,8 @@ fn cloud_environment_object() -> ResourceObject<flotilla_resources::Environment>
 }
 
 // The import maps every live cloud sandbox Environment, a Ready one realised under its backing. A
-// deleted one whose sandbox is gone (Lost or Failed) is dropped; a deleted one whose sandbox may
-// still run still owes its teardown, so it imports. Enumerates every old phase, live and deleted.
+// deleted one whose sandbox is gone (Lost) is dropped; a deleted one whose sandbox may still run,
+// Failed included, still owes its teardown, so it imports. Enumerates every old phase, live and deleted.
 #[test]
 fn the_import_maps_live_cloud_sandboxes_and_drops_deleted_gone_ones() {
     use flotilla_resources::{EnvironmentPhase, EnvironmentStatus};
@@ -1001,7 +1001,7 @@ fn the_import_maps_live_cloud_sandboxes_and_drops_deleted_gone_ones() {
             let mut report = ImportReport::default();
             import_environments(&[(obj.clone(), HOME.to_owned())], &mut target, &mut report);
             assert_eq!(report.refused, vec![], "{phase:?}");
-            let gone = deleted && matches!(phase, EnvironmentPhase::Lost | EnvironmentPhase::Failed);
+            let gone = deleted && phase == EnvironmentPhase::Lost;
             let counted = |counts: &BTreeMap<(&'static str, &'static str), usize>| counts.values().sum::<usize>();
             assert_eq!(
                 (counted(&report.imported), counted(&report.dropped)),
