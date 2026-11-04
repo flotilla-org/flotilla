@@ -7,12 +7,9 @@
 //! state here, never on the Environment's status.
 //!
 //! The access is an opaque key: the crew's Role Address (`project/convoy/vessel/role`)
-//! until the #3108 cut-over. Delivery never parses it. It is not an ADR 0066 address,
-//! whose grammar puts a role under its convoy and has no vessel segment there.
-//!
-//! Like the account access kinds, the record derives serde, for the resource store's
-//! kind, and `Stored`, for the generated tables the engine store takes on at the
-//! cut-over. Nothing registers, reads or writes the kind until the owner's schema review.
+//! until the #3108 cut-over. Delivery reads only its convoy segment, [`convoy_of_access`].
+//! It is not an ADR 0066 address, whose grammar puts a role under its convoy and has no
+//! vessel segment there.
 
 use std::collections::BTreeMap;
 
@@ -118,9 +115,34 @@ define_resource!(
     queryable = &["metadata.name", "spec.access", "spec.place"]
 );
 
+/// The access key of a crew's role, `project/convoy/vessel/role`.
+pub fn access_key(project: &str, convoy: &str, vessel: &str, role: &str) -> String {
+    format!("{project}/{convoy}/{vessel}/{role}")
+}
+
+/// The convoy an access key names, if it has the four segments [`access_key`] composes.
+pub fn convoy_of_access(access: &str) -> Option<&str> {
+    let mut segments = access.split('/');
+    let (_, convoy, _, _, rest) = (segments.next()?, segments.next()?, segments.next()?, segments.next()?, segments.next());
+    rest.is_none().then_some(convoy).filter(|convoy| !convoy.is_empty())
+}
+
 /// The generated-table kinds of the access layer's status.
 pub fn registry() -> Result<KindRegistry, RegistryError> {
     let mut registry = KindRegistry::new();
     registry.register::<AccessDeliverySpec>()?;
     Ok(registry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_convoy_is_the_second_segment_of_a_four_segment_key() {
+        assert_eq!(convoy_of_access(&access_key("flotilla", "demo-4", "implement", "coder")), Some("demo-4"));
+        for key in ["", "demo", "a/b/c", "a/b/c/d/e", "a//c/d"] {
+            assert_eq!(convoy_of_access(key), None, "{key:?}");
+        }
+    }
 }

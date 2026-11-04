@@ -15,10 +15,10 @@ included, and checked to be gone, also when interrupted.
 
 --provider-config is a drydock.toml as an operator writes it, with any number
 of `[providers.NAME]` tables; --provider names the trial's instance when there
-is more than one. Placement is set up as an operator does: a PlacementPolicy
-naming that instance and the image, which the daemon turns into the trial's
-FulfilmentKind. Without a config, drydock's `local` module runs the vessel as a
-child process on this machine. This script names no other module.
+is more than one. Placement is set up as an operator does: a FulfilmentKind
+on this host naming that instance and the image. Without a config, drydock's
+`local` module runs the vessel as a child process on this machine. This script
+names no other module.
 
 Issues, pull requests and git come from the fake forge on this machine,
 which a cloud vessel cannot reach. --forge FILE runs the trial against a real
@@ -756,16 +756,14 @@ class Trial:
             'fragment': 'FROM ${BASE}\n', 'provides': [f'harness:{SCRIPTED_ADAPTER}'], 'probe': 'command -v bash\n'})
 
     def place(self):
-        # Placement as an operator gives it: a policy naming the provider instance,
-        # which the daemon turns into the FulfilmentKind of its name. Without an
-        # image the vessel runs its composed one.
+        # Placement as an operator gives it: a kind on this host naming the provider
+        # instance. Without an image the vessel runs its composed one.
         if self.cache is not None:
             self.declare_image_cache()
-        cloud = {'size': CLOUD_SIZE, 'checkout': 'clone_in_vessel', 'env': {}, **({'image': self.image} if self.image else {})}
-        self.apply('PlacementPolicy', 'trial', {
-            'pool': 'cleat', 'provider_requirements': {'instance': self.instance}, 'cloud_sandbox_per_vessel': cloud})
-        self.wait('fulfilment kind from the placement policy', lambda: [item for item in self.objects('fulfilmentkinds')
-                                                                        if item['metadata']['name'] == 'trial'], timeout=120)
+        self.apply('FulfilmentKind', 'trial', {
+            'host_ref': self.host, 'pool': 'cleat', 'grants': ['platform:linux', 'network:open'],
+            'realisation': 'cloud_sandbox_per_vessel', 'size': CLOUD_SIZE, **({'image': self.image} if self.image else {})},
+            labels={'flotilla.work/environment-provider-instance': self.instance})
         self.apply('WorkflowTemplate', 'trial', workflow_spec(self.args.until))
 
     def start_convoy(self):

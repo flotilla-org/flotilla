@@ -30,7 +30,7 @@ use flotilla_resources::{
 use flotilla_store::{apply_status_patch as apply_resource_status_patch, EventRecorder, ResourceBackend, StoreQuery};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, warn};
 const ENSURE_BACKOFF_RESET_AFTER: ChronoDuration = ChronoDuration::minutes(10);
 const ENSURE_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 #[derive(Debug, Clone)]
@@ -38,6 +38,12 @@ struct EnsureAdmissionRetry {
     config_hash: String,
     dependency_hash: String,
     retry: ControllerRetry,
+}
+
+/// The reason a standing role's restart-limit hold gives its person: `failures` consecutive
+/// generations of it failed.
+pub fn restart_limit_reason(failures: u32) -> String {
+    format!("ensured convoy entered a terminal failure phase; {failures} consecutive generations failed")
 }
 
 fn ensure_retry_delay(restart_count: u32) -> ChronoDuration {
@@ -652,7 +658,7 @@ impl EnsurePass<'_> {
         let latest = generations.last();
         if !resolved_escalation && !released && !force_now && consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES {
             let latest = latest.expect("a positive failure count requires a generation");
-            let failure = format!("ensured convoy entered a terminal failure phase; {consecutive_failures} consecutive generations failed");
+            let failure = restart_limit_reason(consecutive_failures);
             self.raise_ensure_attention(ensure, latest, &failure, latest.metadata.creation_timestamp).await?;
             return Ok(Some(format!("ConvoyEnsure/{} exhausted restart budget", ensure.metadata.name)));
         }
@@ -901,7 +907,7 @@ impl EnsurePass<'_> {
         if status.retry_at.is_none() && !force_now {
             let failure = "ensured convoy entered a terminal failure phase";
             if status.restart_count.saturating_add(1) >= ENSURE_MAX_CONSECUTIVE_FAILURES {
-                let failure = format!("{failure}; {} consecutive generations failed", ENSURE_MAX_CONSECUTIVE_FAILURES);
+                let failure = restart_limit_reason(ENSURE_MAX_CONSECUTIVE_FAILURES);
                 // Raised once, as the hold begins; one on its backing earlier is another episode.
                 self.raise_ensure_attention(ensure, &convoy, &failure, now).await?;
                 self.patch_convoy_ensure(
@@ -1166,7 +1172,28 @@ impl EnsurePass<'_> {
 
     async fn start_ensured_convoy(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<String, String> {
         let (ensure, admission) = self.admission.prepare(namespace, ensure).await?;
-        self.commit_ensured_convoy(namespace, &ensure, admission).await
+        let latest = |generations: Vec<ResourceObject<ResourceConvoy>>| generations.into_iter().max_by_key(|convoy| convoy.spec.generation);
+        // A listing that fails here aborts the start before anything is admitted; the next pass retries.
+        let before = latest(self.ensured_convoy_generations(namespace, &ensure.metadata.name).await?).map(|convoy| convoy.spec.generation);
+        match self.commit_ensured_convoy(namespace, &ensure, admission).await {
+            Ok(name) => Ok(name),
+            // A commit that fails after creating its convoy has still admitted a generation; the
+            // caller records it, or its end would never count against the restart budget (#4310).
+            // A generation newer than `before` is this commit's: each reconciliation pass holds the ensure
+            // reconciliation lock, so no other pass admits for this ensure meanwhile.
+            Err(error) => match self.ensured_convoy_generations(namespace, &ensure.metadata.name).await {
+                // The listing failing too says nothing of the commit; its own error is the one to report.
+                Err(listing) => Err(format!("{error}; and the generations could not be listed after it: {listing}")),
+                Ok(generations) => match latest(generations).filter(|convoy| before.is_none_or(|before| convoy.spec.generation > before)) {
+                    Some(admitted) => {
+                        let (ensure, convoy) = (&ensure.metadata.name, &admitted.metadata.name);
+                        warn!(%ensure, %convoy, %error, "standing convoy admitted, though its commit failed after");
+                        Ok(admitted.metadata.name)
+                    }
+                    None => Err(error),
+                },
+            },
+        }
     }
 
     async fn commit_ensured_convoy(
@@ -1252,6 +1279,8 @@ mod tests {
         #[builder(skip)]
         refused: Arc<AtomicBool>,
         #[builder(skip)]
+        fails_after_create: Arc<AtomicBool>,
+        #[builder(skip)]
         prepares: Arc<AtomicU32>,
         #[builder(skip)]
         commits: Arc<AtomicU32>,
@@ -1313,6 +1342,9 @@ mod tests {
                 )
                 .await
                 .map_err(|e| e.to_string())?;
+            if self.fails_after_create.load(Ordering::SeqCst) {
+                return Err("status patch retry budget exhausted".into());
+            }
             Ok(name)
         }
     }
@@ -1566,6 +1598,24 @@ mod tests {
             .is_empty());
         assert_eq!(admission.commits.load(Ordering::SeqCst), 3);
         assert!(demands.get("ensure-attention-standing").await.is_ok(), "the restart limit holds it for a person");
+    }
+
+    // #4310: a commit that fails after creating its convoy has admitted a generation all the same;
+    // that generation's failure counts against the restart budget, and no other is admitted for it.
+    #[tokio::test]
+    async fn a_generation_whose_commit_failed_after_creation_still_counts() {
+        let (controller, admission, clock) = fixture().await;
+        admission.fails_after_create.store(true, Ordering::SeqCst);
+        controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.expect("admitted");
+        admission.fails_after_create.store(false, Ordering::SeqCst);
+        fail_current(&admission).await;
+        controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.expect("failure counted");
+        let status =
+            admission.backend.using::<ConvoyEnsure>("test").get("standing").await.expect("ensure fixture").status.expect("resource status");
+        assert_eq!(status.restart_count, 1, "the generation's failure is a strike");
+        clock.advance(ChronoDuration::minutes(3));
+        controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.expect("restarted");
+        assert_eq!(admission.commits.load(Ordering::SeqCst), 2, "one successor, after the backoff");
     }
 
     // #2220: reaping is idempotent for absence and refuses another ensure's

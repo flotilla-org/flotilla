@@ -2,10 +2,7 @@ use std::{collections::BTreeSet, fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    resource::define_resource, DockerPerVesselPlacementPolicySpec, HostDirectPlacementPolicySpec, NoStatusPatch, PlacementPolicySpec,
-    Platform, ReplicationClass,
-};
+use crate::{resource::define_resource, NoStatusPatch, Platform, ReplicationClass};
 
 // Kinds are authored at their home and replicated read-only; admission's
 // placement snapshots are kinds too.
@@ -329,55 +326,20 @@ pub enum FulfilmentRealisation {
         /// `None` is the vessel's composed image. A stored plain string decodes as a literal.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         image: Option<crate::PlacementImageSource>,
-        /// The policy's size; `None` provisions at `realisation_settings::CLOUD_SANDBOX_SIZE`.
+        /// The sandbox's size; `None` provisions at `realisation_settings::CLOUD_SANDBOX_SIZE`.
         /// Kinds stored before the size was carried decode with `None`; remove this default one roll later.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         size: Option<crate::CloudSandboxSize>,
     },
     DockerPerVessel {
         /// `None` is the vessel's composed image.
-        #[serde(
-            default,
-            deserialize_with = "crate::placement_policy::decode_optional_image_source",
-            skip_serializing_if = "Option::is_none"
-        )]
+        #[serde(default, deserialize_with = "crate::placement::decode_optional_image_source", skip_serializing_if = "Option::is_none")]
         image: Option<crate::PlacementImageSource>,
     },
     HostDirect,
 }
 
 impl FulfilmentKindSpec {
-    /// The kind a live policy's topology describes, with the grants its realisation implies.
-    /// Operator-authored grants may subsequently refine this initial set.
-    pub fn from_policy(policy: &PlacementPolicySpec, host_platform: &str) -> Result<Self, String> {
-        let (host_ref, realisation, grants) = match (&policy.docker_per_vessel, &policy.host_direct, &policy.cloud_sandbox_per_vessel) {
-            (Some(DockerPerVesselPlacementPolicySpec { host_ref, image, .. }), None, None) => {
-                let grants = BTreeSet::from([
-                    FulfilmentGrant::platform(Platform::Linux.to_string()),
-                    FulfilmentGrant::network("scoped".to_string()),
-                ]);
-                (host_ref.clone(), FulfilmentRealisation::DockerPerVessel { image: image.clone() }, grants)
-            }
-            // A GUI session is granted only once the host's probe observes
-            // one (#4002); a headless host never claims it.
-            (None, Some(HostDirectPlacementPolicySpec { host_ref, .. }), None) => {
-                let grants = BTreeSet::from([
-                    FulfilmentGrant::platform(host_platform.to_string()),
-                    FulfilmentGrant::host_account_reach(),
-                    FulfilmentGrant::network("host".to_string()),
-                ]);
-                (host_ref.clone(), FulfilmentRealisation::HostDirect, grants)
-            }
-            (None, None, Some(cloud)) => (
-                String::new(),
-                FulfilmentRealisation::CloudSandboxPerVessel { image: cloud.image.clone(), size: Some(cloud.size.clone()) },
-                BTreeSet::from([FulfilmentGrant::platform(Platform::Linux.to_string()), FulfilmentGrant::network("open".into())]),
-            ),
-            _ => return Err("placement policy must define exactly one realisation".to_string()),
-        };
-        Ok(Self { host_ref, pool: policy.pool.clone(), cost_class: FulfilmentCostClass::default(), grants, realisation })
-    }
-
     /// Bring the observation-derived grants in line with the host's latest
     /// facts: a host-direct kind holds `display:gui-session` exactly while
     /// its probe observes a usable GUI session (#4002). Returns whether the
@@ -403,24 +365,5 @@ mod size_tests {
         let legacy: FulfilmentRealisation =
             serde_json::from_value(serde_json::json!({"realisation": "cloud_sandbox_per_vessel", "image": "i@sha256:d"})).unwrap();
         assert_eq!(legacy, FulfilmentRealisation::CloudSandboxPerVessel { image: Some("i@sha256:d".into()), size: None });
-    }
-
-    // A cloud policy that omits its image derives a kind that composes one; a literal keeps
-    // its stored string shape.
-    #[test]
-    fn cloud_policy_image_is_optional_and_a_literal_keeps_its_shape() {
-        let policy = |image: Option<&str>| {
-            let mut cloud = serde_json::json!({"size": {"cpus": 1, "memory_bytes": 1, "disk_bytes": 1}, "checkout": "clone_in_vessel"});
-            if let Some(image) = image {
-                cloud["image"] = image.into();
-            }
-            serde_json::from_value::<crate::PlacementPolicySpec>(serde_json::json!({"pool": "cleat", "cloud_sandbox_per_vessel": cloud}))
-                .expect("policy")
-        };
-        let composed = crate::FulfilmentKindSpec::from_policy(&policy(None), "linux").expect("kind");
-        assert!(matches!(composed.realisation, FulfilmentRealisation::CloudSandboxPerVessel { image: None, .. }));
-        assert!(serde_json::to_value(&composed.realisation).expect("encode").get("image").is_none());
-        let literal = crate::FulfilmentKindSpec::from_policy(&policy(Some("i@sha256:d")), "linux").expect("kind");
-        assert_eq!(serde_json::to_value(&literal.realisation).expect("encode")["image"], "i@sha256:d");
     }
 }

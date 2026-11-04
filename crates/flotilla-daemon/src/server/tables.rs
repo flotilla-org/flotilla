@@ -2,14 +2,17 @@
 //! have one implementation shared by every carrier and both storage adapters.
 mod decided;
 mod filter;
+mod query;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use flotilla_protocol::table::{Message, Row};
 use flotilla_resources::WatchStart;
 use flotilla_schema::{ColumnType, Filterable, Layout, Table, TableSet};
 use flotilla_store::{query_resource_kind, watch_resource_kind_from, ResourceBackend, REGISTERED_RESOURCE_KINDS};
 use futures::{stream::BoxStream, StreamExt};
+pub(crate) use query::QueryFeed;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -17,7 +20,9 @@ use std::{
     time::Duration,
 };
 const LIMIT: usize = 200;
-const MAX_LIMIT: usize = 10_000;
+pub(crate) const MAX_LIMIT: usize = 10_000;
+/// The longest a watch goes without a message.
+const PROGRESS: Duration = Duration::from_secs(15);
 const KEY: &str = "metadata.name";
 #[derive(Debug, Clone)]
 pub(crate) struct Failure {
@@ -404,11 +409,31 @@ impl DerivedSet {
     }
 }
 
+/// Where tables come from: resource kinds, the engine's store, tables derived from code, and
+/// named queries read through a feed.
+#[derive(Clone)]
+pub(crate) struct Catalog {
+    pub backend: ResourceBackend,
+    pub service: Option<Arc<flotilla_schema_sqlite::stream::Service>>,
+    pub derived: Vec<Arc<DerivedSet>>,
+    pub queries: Option<Arc<QueryFeed>>,
+    /// The daemon run, the incarnation of tables whose sequences restart with it.
+    pub incarnation: String,
+}
+
+/// A watch's resume point: the `incarnation` and `sequence` of the last message a client applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Resume {
+    pub incarnation: String,
+    pub sequence: u64,
+}
+
 #[derive(Clone)]
 pub(crate) enum TableSource {
     Resource { backend: ResourceBackend, name: String },
     Decided { service: Arc<flotilla_schema_sqlite::stream::Service>, name: String },
-    Derived { derived: Arc<DerivedSet>, name: String },
+    Derived { derived: Arc<DerivedSet>, name: String, incarnation: String },
+    Query(query::Source),
 }
 pub(crate) struct Description {
     pub table: Table,
@@ -416,38 +441,54 @@ pub(crate) struct Description {
     pub markdown: String,
 }
 impl TableSource {
-    pub(crate) async fn list(
-        service: Option<Arc<flotilla_schema_sqlite::stream::Service>>,
-        derived: &[Arc<DerivedSet>],
-    ) -> Result<Value, Failure> {
+    pub(crate) async fn list(catalog: &Catalog) -> Result<Value, Failure> {
         let mut kinds: Vec<_> =
             REGISTERED_RESOURCE_KINDS.iter().map(|kind| json!({"kind":kind.kind,"root":kind.plural,"tables":[kind.plural]})).collect();
-        kinds.extend(derived.iter().map(|derived| {
+        kinds.extend(catalog.derived.iter().map(|derived| {
             let names: Vec<_> = derived.set.tables.iter().map(|table| table.name.clone()).collect();
             json!({"kind":derived.set.kind,"root":names[0],"tables":names})
         }));
-        if let Some(service) = service {
-            kinds.extend(decided::list(&service).await?);
+        if catalog.queries.is_some() {
+            kinds.extend(query::list());
+        }
+        if let Some(service) = &catalog.service {
+            kinds.extend(decided::list(service).await?);
         }
         Ok(json!({"kinds":kinds}))
     }
-    pub(crate) fn open(
-        name: String,
-        backend: ResourceBackend,
-        service: Option<Arc<flotilla_schema_sqlite::stream::Service>>,
-        derived: &[Arc<DerivedSet>],
-    ) -> Result<Self, Failure> {
+    pub(crate) fn open(name: String, catalog: &Catalog) -> Result<Self, Failure> {
         if REGISTERED_RESOURCE_KINDS.iter().any(|kind| kind.plural == name) {
-            return Ok(Self::Resource { backend, name });
+            return Ok(Self::Resource { backend: catalog.backend.clone(), name });
         }
-        if let Some(derived) = derived.iter().find(|derived| derived.table(&name).is_some()) {
-            return Ok(Self::Derived { derived: Arc::clone(derived), name });
+        if let Some(derived) = catalog.derived.iter().find(|derived| derived.table(&name).is_some()) {
+            return Ok(Self::Derived { derived: Arc::clone(derived), name, incarnation: catalog.incarnation.clone() });
         }
-        service.map(|service| Self::Decided { service, name }).ok_or_else(|| bad("not_found", "unknown table"))
+        if let Some(source) = query::Source::open(&name, catalog.queries.as_ref()) {
+            return Ok(Self::Query(source));
+        }
+        catalog.service.clone().map(|service| Self::Decided { service, name }).ok_or_else(|| bad("not_found", "unknown table"))
+    }
+    /// Reads the named query `query` (JSON text of a query id) instead of the table's default.
+    pub(crate) fn with_query(self, query: Option<&str>) -> Result<Self, Failure> {
+        let query = query.map(serde_json::from_str).transpose().map_err(|error| bad("invalid_request", format!("query: {error}")))?;
+        self.with_query_id(query)
+    }
+    /// Holds a named query's demand for one read; other sources need none.
+    pub(crate) async fn hold(&self) -> Result<Option<query::Hold>, Failure> {
+        match self {
+            Self::Query(source) => source.hold().await.map(Some),
+            _ => Ok(None),
+        }
+    }
+    pub(crate) fn with_query_id(self, query: Option<flotilla_protocol::QueryId>) -> Result<Self, Failure> {
+        let Some(query) = query else { return Ok(self) };
+        let Self::Query(source) = self else { return Err(bad("invalid_request", "only a named query's tables take a query")) };
+        source.with_query(query).map(Self::Query)
     }
     pub(crate) fn name(&self) -> &str {
         match self {
             Self::Resource { name, .. } | Self::Decided { name, .. } | Self::Derived { name, .. } => name,
+            Self::Query(source) => source.name(),
         }
     }
     pub(crate) async fn describe(&self) -> Result<Description, Failure> {
@@ -490,7 +531,7 @@ impl TableSource {
                 filter::describe_operators(&mut table);
                 Ok(Description { schema: set.frictionless(&table), table, markdown })
             }
-            Self::Derived { derived, name } => {
+            Self::Derived { derived, name, .. } => {
                 let mut table = derived.set.tables[derived.table(name).expect("opened table")].clone();
                 for column in table.key.iter_mut().chain(&mut table.columns) {
                     let scalar = !matches!(column.ty, ColumnType::Blob | ColumnType::Cbor | ColumnType::Frozen);
@@ -498,6 +539,16 @@ impl TableSource {
                 }
                 filter::describe_operators(&mut table);
                 Ok(Description { schema: derived.set.frictionless(&table), markdown: flotilla_schema::render_view([&derived.set]), table })
+            }
+            Self::Query(source) => {
+                let set = source.set();
+                let mut table = set.tables.iter().find(|table| table.name == source.name()).expect("opened table").clone();
+                for column in table.key.iter_mut().chain(&mut table.columns) {
+                    let scalar = !matches!(column.ty, ColumnType::Blob | ColumnType::Cbor | ColumnType::Frozen);
+                    column.properties.insert("sortable".into(), json!(scalar));
+                }
+                filter::describe_operators(&mut table);
+                Ok(Description { schema: set.frictionless(&table), markdown: flotilla_schema::render_view([set]), table })
             }
         }
     }
@@ -530,7 +581,22 @@ impl TableSource {
         }
         Ok(diagram)
     }
+    /// A snapshot whose incarnation also names the subscription's parameters, so a cursor
+    /// resumes only the subscription it came from.
     async fn snapshot(&self, table: &Table, query: &Query) -> Result<Snapshot, Failure> {
+        let mut snapshot = self.read(table, query).await?;
+        let named = match self {
+            Self::Query(source) => Some(source.query()?),
+            _ => None,
+        };
+        let parameters = serde_json::to_vec(&(self.name(), named, &query.namespace, query.filter_text(), &query.sort, &query.columns))
+            .map_err(|error| Failure::from(error.to_string()))?;
+        let digest = Sha256::digest(parameters);
+        snapshot.incarnation =
+            format!("{}~{}", snapshot.incarnation, digest[..8].iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+        Ok(snapshot)
+    }
+    async fn read(&self, table: &Table, query: &Query) -> Result<Snapshot, Failure> {
         match self {
             Self::Resource { backend, name } => {
                 let declared = flotilla_store::declared_resource_kinds().into_iter().find(|entry| entry.paths.plural == *name);
@@ -554,12 +620,21 @@ impl TableSource {
                 let (sequence, _, rows) = decided::read(service, name, query).await?;
                 Ok(Snapshot { rows, sequence, incarnation: "durable".into(), start: WatchStart::Now })
             }
-            Self::Derived { derived, name } => {
+            Self::Derived { derived, name, incarnation } => {
                 let rows =
                     derived.rows[derived.table(name).expect("opened table")].iter().filter(|row| query.keeps(row)).cloned().collect();
                 // Derived rows change only with the daemon, so one snapshot serves its life. A catalog
                 // that reloads (verbs from `verbs/*.yaml`, #4198) needs events here.
-                Ok(Snapshot { rows, sequence: 1, incarnation: "derived".into(), start: WatchStart::Now })
+                Ok(Snapshot { rows, sequence: 1, incarnation: incarnation.clone(), start: WatchStart::Now })
+            }
+            Self::Query(source) => {
+                let (rows, sequence, incarnation) = source.rows().await?;
+                Ok(Snapshot {
+                    rows: rows.into_iter().filter(|row| query.keeps(row)).collect(),
+                    sequence,
+                    incarnation,
+                    start: WatchStart::Now,
+                })
             }
         }
     }
@@ -597,9 +672,17 @@ impl TableSource {
                 .boxed()
             }
             Self::Derived { .. } => futures::stream::pending().boxed(),
+            Self::Query(source) => source.events(),
         }
     }
-    pub(crate) async fn messages(self, description: Description, query: Query) -> Result<BoxStream<'static, Message>, Failure> {
+    /// The row messages of `query`. A `resume` naming the snapshot's incarnation and sequence
+    /// continues from it with `synced` alone; any other gets `resync` and a fresh snapshot.
+    pub(crate) async fn messages(
+        self,
+        description: Description,
+        query: Query,
+        resume: Option<Resume>,
+    ) -> Result<BoxStream<'static, Message>, Failure> {
         if self.name().ends_with(".log") {
             if query.watch {
                 return Err(bad("unsupported_watch", "log watches require an incremental log port"));
@@ -613,12 +696,30 @@ impl TableSource {
             }
         }
         let snapshot = self.snapshot(&description.table, &query).await?;
-        let initial = page(self.name(), description.schema.clone(), &query, &snapshot)?;
+        let resumed =
+            resume.as_ref().is_some_and(|resume| resume.incarnation == snapshot.incarnation && resume.sequence == snapshot.sequence);
+        let initial = match resume {
+            Some(_) if resumed => {
+                let count = query.count.as_ref().map(|mode| Message::Count {
+                    count: snapshot.rows.len() as u64,
+                    estimate: mode == "estimate",
+                    sequence: snapshot.sequence,
+                });
+                count.into_iter().chain([Message::Synced { sequence: snapshot.sequence }]).collect()
+            }
+            Some(_) => {
+                let mut messages = vec![Message::Resync { reason: "stale cursor".into() }];
+                messages.extend(page(self.name(), description.schema.clone(), &query, &snapshot)?);
+                messages
+            }
+            None => page(self.name(), description.schema.clone(), &query, &snapshot)?,
+        };
         if !query.watch {
             return Ok(futures::stream::iter(initial).boxed());
         }
         let events = self.events(&query, &snapshot);
-        let state = Live { source: self, description, query, snapshot, events, pending: initial.into(), failures: 0, done: false };
+        let quiet = tokio::time::Instant::now() + PROGRESS;
+        let state = Live { source: self, description, query, snapshot, events, pending: initial.into(), failures: 0, done: false, quiet };
         Ok(live(state))
     }
 }
@@ -627,6 +728,7 @@ fn live(state: Live) -> BoxStream<'static, Message> {
     futures::stream::unfold(state, |mut state| async move {
         loop {
             if let Some(message) = state.pending.pop_front() {
+                state.quiet = tokio::time::Instant::now() + PROGRESS;
                 return Some((message, state));
             }
             if state.done {
@@ -634,7 +736,10 @@ fn live(state: Live) -> BoxStream<'static, Message> {
             }
             let event = tokio::select! {
                 event=state.events.next()=>event.unwrap_or_else(||Err("table change feed ended".into())),
-                _=tokio::time::sleep(Duration::from_secs(15))=>return Some((Message::Progress{sequence:state.snapshot.sequence},state)),
+                _=tokio::time::sleep_until(state.quiet)=>{
+                    state.pending.push_back(Message::Progress{sequence:state.snapshot.sequence});
+                    continue;
+                }
             };
             let next = match event {
                 Ok(()) => state.source.snapshot(&state.description.table, &state.query).await,
@@ -713,6 +818,8 @@ struct Live {
     pending: VecDeque<Message>,
     failures: u8,
     done: bool,
+    /// When a silent subscription next sends `progress`.
+    quiet: tokio::time::Instant,
 }
 fn source_failure(error: flotilla_resources::ResourceError) -> Failure {
     use flotilla_resources::ResourceError;
@@ -1106,6 +1213,7 @@ mod source_contract_tests {
                 pending: VecDeque::new(),
                 failures: 0,
                 done: false,
+                quiet: tokio::time::Instant::now() + PROGRESS,
             });
             assert!(matches!(messages.next().await, Some(Message::Resync { .. })));
             assert!(matches!(messages.next().await, Some(Message::Table { .. })));

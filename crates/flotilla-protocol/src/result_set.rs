@@ -95,6 +95,21 @@ impl QueryId {
         QueryId::DispatchReady { scope: None },
     ];
 
+    /// The description of this query's rows.
+    pub fn table_set(&self) -> flotilla_schema::TableSet {
+        use flotilla_schema::Describe;
+        match self {
+            Self::Convoys { .. } => ConvoyRow::table_set(),
+            Self::Independents { .. } => IndependentRow::table_set(),
+            Self::Issues { .. } => IssueRow::table_set(),
+            Self::Checkouts { .. } => CheckoutRow::table_set(),
+            Self::Awareness { .. } => AwarenessNode::table_set(),
+            Self::StandingRoles { .. } => StandingRoleRow::table_set(),
+            Self::DispatchReady { .. } => crate::DispatchQueueRow::table_set(),
+            Self::ProjectRepositories { .. } => ProjectRepositoriesRow::table_set(),
+        }
+    }
+
     pub fn family(&self) -> &'static str {
         match self {
             Self::Convoys { .. } => "convoys",
@@ -426,20 +441,24 @@ pub enum Rows {
 }
 
 impl Rows {
-    /// The description of this named query, independent of its current rows or scope.
-    /// This exhaustive match makes a new query require a self-describing row type.
-    pub fn table_set(&self) -> flotilla_schema::TableSet {
-        use flotilla_schema::Describe;
+    /// This result's rows, shredded into the tables of [`Rows::table_set`] whose root is `root`.
+    pub fn tables(&self, root: &str) -> BTreeMap<String, Vec<flotilla_schema::DescribedRow>> {
+        use flotilla_schema::RowWriter;
         match self {
-            Self::Convoys { .. } => ConvoyRow::table_set(),
-            Self::Independents { .. } => IndependentRow::table_set(),
-            Self::Issues { .. } => IssueRow::table_set(),
-            Self::Checkouts { .. } => CheckoutRow::table_set(),
-            Self::Awareness { .. } => AwarenessNode::table_set(),
-            Self::StandingRoles { .. } => StandingRoleRow::table_set(),
-            Self::DispatchReady { .. } => crate::DispatchQueueRow::table_set(),
-            Self::ProjectRepositories { .. } => ProjectRepositoriesRow::table_set(),
+            Self::Convoys { rows, .. } => RowWriter::rows(root, rows),
+            Self::Independents { rows, .. } => RowWriter::rows(root, rows),
+            Self::Issues { rows, .. } => RowWriter::rows(root, rows),
+            Self::Checkouts { rows, .. } => RowWriter::rows(root, rows),
+            Self::Awareness { rows, .. } => RowWriter::rows(root, rows),
+            Self::StandingRoles { rows, .. } => RowWriter::rows(root, rows),
+            Self::DispatchReady { rows, .. } => RowWriter::rows(root, rows),
+            Self::ProjectRepositories { rows, .. } => RowWriter::rows(root, rows),
         }
+    }
+
+    /// The description of this named query, independent of its current rows or scope.
+    pub fn table_set(&self) -> flotilla_schema::TableSet {
+        self.query().table_set()
     }
 
     pub fn query(&self) -> QueryId {
