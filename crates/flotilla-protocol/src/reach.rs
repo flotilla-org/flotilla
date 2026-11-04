@@ -88,25 +88,6 @@ pub enum ReachMeans {
     OutwardExposure,
 }
 
-impl From<ReachWay> for ReachMeans {
-    fn from(way: ReachWay) -> Self {
-        match way {
-            ReachWay::HostNetwork => Self::HostNetwork,
-            ReachWay::OutwardExposure => Self::OutwardExposure,
-        }
-    }
-}
-
-impl fmt::Display for ReachMeans {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Egress => "egress",
-            Self::HostNetwork => "host network",
-            Self::OutwardExposure => "outward exposure",
-        })
-    }
-}
-
 /// A destination and how the vessel's environment meets it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ReachRoute {
