@@ -161,3 +161,23 @@ fn every_kind_survives_a_reopened_home() {
     reopened::<CheckoutBinding>(&store, checkout, ready, "/work/feature");
     reopened::<CloneBinding>(&store, clone_object(), CloneStatusPatch::MarkReady { default_branch: None }, "/clones/repo");
 }
+
+// Behaviour (ADR 0047, look-over B): a clone stored before `discovered` existed opens as not
+// discovered, its column added in place, so a clone the previous generation cloned is never
+// treated as found.
+#[test]
+fn a_clone_stored_before_discovered_reads_as_not_discovered() {
+    let store = store();
+    let home = clones(&store);
+    decide::<CloneBinding>(home.as_ref(), &clone_object(), Some(CloneStatusPatch::MarkReady { default_branch: None }), Utc::now());
+    drop(home);
+    let connection = Arc::try_unwrap(store).unwrap_or_else(|_| panic!("store still held")).into_inner().expect("lock").into_connection();
+    // The previous generation's table: no `discovered` column.
+    connection.execute_batch("DROP VIEW clone_view; ALTER TABLE clone DROP COLUMN discovered;").expect("predate discovered");
+    let mut registry = KindRegistry::new();
+    stored::register(&mut registry).expect("registry");
+    let reopened = Arc::new(Mutex::new(Store::open(connection, HOME, registry).expect("the old shape opens")));
+    let restored = clones(&reopened).get("clone-a").expect("restored");
+    assert!(!restored.spec().discovered);
+    assert_eq!(restored.state(), &LifecycleState::Realised { identity: "/clones/repo".into() });
+}

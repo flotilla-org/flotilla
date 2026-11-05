@@ -7,6 +7,10 @@ use std::{
 
 use flotilla_core::in_process::InProcessDaemon;
 
+use flotilla_provisioning::{
+    engine::Lifecycles,
+    stored::clone::{CloneKind, CloneRequest},
+};
 use flotilla_resources::{
     canonical_host_id, definition_provenance::SEEDING_MANAGER, descriptive_repo_slug, is_prepared_snapshot, Clone, CloneSpec, Environment,
     EnvironmentSpec, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostDirectEnvironmentSpec, HostSpec,
@@ -21,6 +25,7 @@ pub(super) async fn register_startup_resources(
     daemon: &Arc<InProcessDaemon>,
     namespace: &str,
     profile: &LocalProvisioningProfile,
+    clones: &Arc<dyn Lifecycles<CloneKind>>,
 ) -> Result<(), String> {
     let backend = daemon.resource_backend();
     ensure_host_exists(&backend, namespace, &profile.host_id, &profile.display_name, profile.max_vessels)
@@ -29,7 +34,7 @@ pub(super) async fn register_startup_resources(
     ensure_host_direct_environment_exists(&backend, namespace, profile)
         .await
         .map_err(|error| format!("ensure_host_direct_environment_exists: {error}"))?;
-    discover_local_clones(daemon, &backend, namespace, profile).await.map_err(|error| format!("discover_local_clones: {error}"))?;
+    discover_local_clones(daemon, &backend, namespace, profile, clones).await.map_err(|error| format!("discover_local_clones: {error}"))?;
     ensure_default_kinds(&backend, namespace, profile, std::env::consts::OS)
         .await
         .map_err(|error| format!("ensure_default_kinds: {error}"))?;
@@ -122,6 +127,7 @@ pub(super) async fn discover_local_clones(
     backend: &ResourceBackend,
     namespace: &str,
     profile: &LocalProvisioningProfile,
+    engine: &Arc<dyn Lifecycles<CloneKind>>,
 ) -> Result<(), String> {
     let clones = backend.clone().using::<Clone>(namespace);
     let host_direct_env_ref = profile.host_direct_environment_name();
@@ -162,8 +168,21 @@ pub(super) async fn discover_local_clones(
             env_ref: host_direct_env_ref.clone(),
             path: repo_path.display().to_string(),
         };
+        // The engine's request says the clone was found here, not cloned, before the old resource
+        // that drives its reconciler exists.
+        request_discovered_clone(
+            engine,
+            &name,
+            CloneRequest {
+                repository: repo_key_value.clone(),
+                url: expected_spec.url.clone(),
+                environment: flotilla_schema::Ref::new(host_direct_env_ref.clone(), engine.home()),
+                path: expected_spec.path.clone(),
+                discovered: true,
+            },
+        )
+        .await?;
         let expected_labels = BTreeMap::from([
-            ("flotilla.work/discovered".to_string(), "true".to_string()),
             ("flotilla.work/repo-key".to_string(), repo_key_value),
             ("flotilla.work/env".to_string(), host_direct_env_ref.clone()),
             ("flotilla.work/repo".to_string(), descriptive_repo_slug(&canonical_url)),
@@ -195,6 +214,27 @@ pub(super) async fn discover_local_clones(
     }
 
     Ok(())
+}
+
+/// Requests the engine's Clone `name` as discovered, unless it is already held. A request is
+/// fixed once written: a held clone, discovered or cloned, is left as it is.
+async fn request_discovered_clone(engine: &Arc<dyn Lifecycles<CloneKind>>, name: &str, request: CloneRequest) -> Result<(), String> {
+    let (engine, name) = (Arc::clone(engine), name.to_owned());
+    // Home reads and writes may wait for another write, so they run off the async workers.
+    tokio::task::spawn_blocking(move || {
+        if let Some(held) = engine.get(&name) {
+            if held.spec() != &request {
+                warn!(clone = %name, "leaving the engine's clone as requested; discovery found it differently");
+            }
+            return Ok(());
+        }
+        engine
+            .request(&name, request, flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now()))
+            .map(|_| ())
+            .map_err(|error| format!("request discovered clone {name}: {error}"))
+    })
+    .await
+    .map_err(|error| format!("request discovered clone: {error}"))?
 }
 
 /// Seed this host's kinds: host-direct always, and Docker when it is available. Seeding owns

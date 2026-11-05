@@ -215,6 +215,7 @@ fn each_kind_survives_the_codec() {
             url: "https://example/repo".into(),
             environment: environment("feta"),
             path: "/c".into(),
+            discovered: true,
         };
         round_trip::<CloneKind>(spec, state);
     }
@@ -363,7 +364,8 @@ fn policies_give_up_as_the_old_retries_did() {
         Home, Outcome,
     };
     assert_eq!(failures_before_give_up::<ImageBuildKind>(image_build_request()), Some(flotilla_resources::IMAGE_BUILD_MAX_ATTEMPTS));
-    let clone = || CloneRequest { repository: "r".into(), url: "u".into(), environment: environment("feta"), path: "/c".into() };
+    let clone =
+        || CloneRequest { repository: "r".into(), url: "u".into(), environment: environment("feta"), path: "/c".into(), discovered: false };
     assert_eq!(failures_before_give_up::<CloneKind>(clone()), None);
     assert_eq!(failures_before_give_up::<EnvironmentKind>(environment_request()), Some(3));
     let checkout = CheckoutRequest {

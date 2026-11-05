@@ -156,7 +156,7 @@ async fn convoy_holds_and_recovers_when_terminal_pool_is_transiently_unavailable
     let initial = daemon_with_transient_terminal_pool(Arc::clone(&config), backend.clone(), Arc::clone(&pool)).await;
     let registry = probe_local_provider_registry(&initial, &config).await.expect("initial provider registry");
     let profile = build_local_profile(&initial, &registry).await.expect("initial profile");
-    register_startup_resources(&initial, NAMESPACE, &profile).await.expect("initial startup resources");
+    register_startup(&initial, NAMESPACE, &profile).await.expect("initial startup resources");
 
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let convoy = convoys

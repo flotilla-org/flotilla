@@ -256,3 +256,75 @@ pub(super) async fn assert_clone_lifecycle(old_phase: flotilla_resources::CloneP
     fixture.poison();
     assert!(reconciler.prepare(&obj).await.err().expect("read error").to_string().contains("poisoned"));
 }
+
+/// Inspects in place; a clone over the found repository is a failure.
+struct InspectOnlyRuntime;
+
+#[async_trait]
+impl CloneRuntime for InspectOnlyRuntime {
+    async fn clone_and_inspect(&self, _repo_url: &str, _target_path: &str) -> Result<Option<String>, String> {
+        Err("a discovered clone must not be cloned over".to_string())
+    }
+
+    async fn inspect_existing(&self, _target_path: &str) -> Result<Option<String>, String> {
+        Ok(Some("main".to_string()))
+    }
+}
+
+// Behaviour (look-over B): the engine's request, not a label, says a clone was found in place by
+// startup discovery; its reconcile inspects the repository there and never clones over it, while
+// a clone the engine holds as not discovered is cloned.
+#[tokio::test]
+async fn a_discovered_clone_is_inspected_in_place_not_cloned() {
+    use flotilla_engine_store::{open_home, StoreLog};
+    use flotilla_provisioning::{
+        engine::{LifecycleHome, Lifecycles},
+        stored::{
+            self,
+            clone::{CloneKind, CloneRequest},
+        },
+    };
+    use std::sync::Mutex;
+
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
+    let repository_key = repository_spec.key();
+    flotilla_store::ensure_repository(&backend.clone().using::<Repository>("flotilla"), &repository_key, &repository_spec)
+        .await
+        .expect("repository create should succeed");
+    let clones = backend.clone().using::<flotilla_resources::Clone>("flotilla");
+    let mut registry = flotilla_schema::KindRegistry::new();
+    stored::register(&mut registry).expect("registry");
+    let store = Arc::new(Mutex::new(
+        flotilla_schema_sqlite::Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", registry).expect("store"),
+    ));
+    let engine: Arc<dyn Lifecycles<CloneKind>> =
+        Arc::new(LifecycleHome::new("home", open_home(StoreLog::new(Arc::clone(&store))).expect("clone home")));
+    let reconciler =
+        CloneReconciler::new(Arc::new(InspectOnlyRuntime), backend.clone().using("flotilla")).with_clones(Some(Arc::clone(&engine)));
+
+    for (env_ref, discovered) in [("host-direct-found", true), ("host-direct-cloned", false)] {
+        let name = format!("clone-{}", clone_key("https://github.com/flotilla-org/flotilla", env_ref));
+        let spec = CloneSpec {
+            repo_ref: repository_key.clone(),
+            url: "git@github.com:flotilla-org/flotilla.git".to_string(),
+            env_ref: env_ref.to_string(),
+            path: "/Users/alice/dev/flotilla".to_string(),
+        };
+        let clone = clones.create(&meta(&name), &spec).await.expect("clone");
+        let request = CloneRequest {
+            repository: repository_key.to_string(),
+            url: spec.url.clone(),
+            environment: flotilla_schema::Ref::new(env_ref, "home"),
+            path: spec.path.clone(),
+            discovered,
+        };
+        engine.request(&name, request, flotilla_schema::Timestamp(1)).expect("engine request");
+        let deps = reconciler.prepare(&clone).await.expect("deps should load");
+        let patch = reconciler.reconcile(&clone, &deps, chrono::Utc::now()).patch;
+        match discovered {
+            true => assert!(matches!(patch, Some(flotilla_resources::CloneStatusPatch::MarkReady { .. })), "{patch:?}"),
+            false => assert!(matches!(patch, Some(flotilla_resources::CloneStatusPatch::MarkRetrying { .. })), "{patch:?}"),
+        }
+    }
+}

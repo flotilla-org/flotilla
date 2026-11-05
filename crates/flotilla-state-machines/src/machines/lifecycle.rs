@@ -33,6 +33,8 @@ pub trait LifecycleKind: 'static {
     const NAME: &'static str;
     /// What a caller asks for; the resource's immutable spec. Opaque here.
     type Request: Clone;
+    /// The kind's ADR 0047 additive column defaults, as [`Machine::STORED_DEFAULTS`].
+    const STORED_DEFAULTS: &'static [(&'static str, &'static str, i64)] = &[];
     /// The policy `give_up` judges the attempts against.
     fn policy() -> AttemptPolicy {
         DEFAULT_POLICY
@@ -253,6 +255,7 @@ impl Source<Absence> for MemoryLifecycleWorld {
 
 impl<K: LifecycleKind> Machine for Lifecycle<K> {
     const NAME: &'static str = K::NAME;
+    const STORED_DEFAULTS: &'static [(&'static str, &'static str, i64)] = K::STORED_DEFAULTS;
     type Request = K::Request;
     type Spec = K::Request;
     type State = LifecycleState;

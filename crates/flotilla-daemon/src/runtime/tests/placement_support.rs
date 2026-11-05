@@ -61,8 +61,8 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
     };
     fs::create_dir_all(&kiwi_profile.repo_default_dir).expect("kiwi repo root");
     fs::create_dir_all(&feta_profile.repo_default_dir).expect("feta repo root");
-    register_startup_resources(&kiwi, NAMESPACE, &kiwi_profile).await.expect("register kiwi resources");
-    register_startup_resources(&feta, NAMESPACE, &feta_profile).await.expect("register feta resources");
+    register_startup(&kiwi, NAMESPACE, &kiwi_profile).await.expect("register kiwi resources");
+    register_startup(&feta, NAMESPACE, &feta_profile).await.expect("register feta resources");
     assert!(
         feta.resource_backend()
             .replica_writer::<Convoy>(kiwi.node_id().clone(), NAMESPACE)

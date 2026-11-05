@@ -232,6 +232,7 @@ fn seed(homes: &mut Homes, home: &str, convoys: impl Iterator<Item = usize>) {
             url: format!("https://example/{}", repository(n)),
             environment: StoredRef::new(format!("env-{n}"), home),
             path: format!("/clones/{}", repository(n)),
+            discovered: false,
         };
         realised(&mut homes.clones, &format!("clone-{n}"), clone);
         for which in ["a", "b"] {

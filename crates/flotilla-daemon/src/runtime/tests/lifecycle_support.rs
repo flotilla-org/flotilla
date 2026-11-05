@@ -89,7 +89,7 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
     let profile = LocalProvisioningProfile { repo_default_dir: repo_default_dir.display().to_string(), ..manual_profile(&host_id, false) };
     let backend = daemon.resource_backend();
 
-    register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("startup registration should succeed");
+    register_startup(&daemon, NAMESPACE, &profile).await.expect("startup registration should succeed");
     apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("host heartbeat should succeed");
 
     let state = Arc::new(ControllerRuntimeState::new(

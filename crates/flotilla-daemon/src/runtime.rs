@@ -180,7 +180,10 @@ impl DaemonRuntime {
         let daemon_config = config.load_daemon_config()?;
         // ADR 0064 (#3108): Message and the provisioning lifecycles run on the decided store.
         result_phase("open_message_primitives", open_message_primitives(&daemon)).await?;
-        let provisioning_lifecycles = Some(open_provisioning_lifecycles(&daemon).await?);
+        let provisioning = open_provisioning_lifecycles(&daemon).await?;
+        let startup_clones: Arc<dyn flotilla_provisioning::engine::Lifecycles<flotilla_provisioning::stored::clone::CloneKind>> =
+            Arc::clone(&provisioning.clones);
+        let provisioning_lifecycles = Some(provisioning);
         daemon.require_lifecycle_reads_installed()?;
         let manifests = daemon_config.manifests;
         let relay = daemon_config.relay;
@@ -272,7 +275,8 @@ impl DaemonRuntime {
         })
         .await
         .map_err(|error| format!("scan stored resources for decode quarantine: {error}"))?;
-        retry_phase("register_startup_resources", || register_startup_resources(&daemon, &options.namespace, &profile)).await?;
+        retry_phase("register_startup_resources", || register_startup_resources(&daemon, &options.namespace, &profile, &startup_clones))
+            .await?;
         let registered_image_caches = local_registry
             .environment_providers
             .iter()
@@ -924,7 +928,8 @@ fn spawn_controller_loops(
                             Arc::new(RoutingCloneRuntime { state: Arc::clone(&state) }),
                             backend.using::<Repository>(&namespace_string),
                         )
-                        .with_lifecycle_reads(state.daemon.lifecycle_reads()),
+                        .with_lifecycle_reads(state.daemon.lifecycle_reads())
+                        .with_clones(state.provisioning.as_ref().map(|engine| Arc::clone(&engine.clones))),
                         state.provisioning.as_ref().map(|engine| Arc::clone(&engine.clones)),
                     ),
                 )

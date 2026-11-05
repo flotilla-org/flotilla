@@ -24,7 +24,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
     let backend = daemon.resource_backend();
 
-    register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("startup resources");
+    register_startup(&daemon, NAMESPACE, &profile).await.expect("startup resources");
     apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("host heartbeat");
     let mut state = ControllerRuntimeState::new(
         Arc::clone(&daemon),

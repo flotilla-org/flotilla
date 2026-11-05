@@ -13,6 +13,9 @@ pub struct CloneKind;
 
 impl LifecycleKind for CloneKind {
     const NAME: &'static str = "Clone";
+    // ADR 0047 N→N+1: a clone stored before `discovered` reads as not discovered. Remove one
+    // roll after the column lands.
+    const STORED_DEFAULTS: &'static [(&'static str, &'static str, i64)] = &[("", "discovered", 0)];
     type Request = CloneRequest;
     /// The old clone's: transient failures are retried for as long as the
     /// clone is wanted, 30 s doubling to two minutes apart, and a failure that
@@ -45,4 +48,7 @@ pub struct CloneRequest {
     pub url: String,
     pub environment: Ref<Resource<Environment>>,
     pub path: String,
+    /// Found already at `path` on this host by startup discovery, not cloned there: realising it
+    /// inspects the existing repository and never clones over it.
+    pub discovered: bool,
 }

@@ -11,6 +11,8 @@ use flotilla_store::{
     TypedResolver,
 };
 
+use crate::{engine::Lifecycles, stored::clone::CloneKind};
+
 const CLONE_BACKOFF: flotilla_resources::RetryBackoff =
     flotilla_resources::RetryBackoff { initial: Duration::from_secs(30), maximum: Duration::from_secs(120) };
 
@@ -31,11 +33,29 @@ pub struct CloneReconciler<R> {
     runtime: Arc<R>,
     repositories: TypedResolver<Repository>,
     lifecycle_reads: Arc<dyn LifecycleReads>,
+    /// The engine's clones, whose requests say which were discovered rather than cloned.
+    clones: Option<Arc<dyn Lifecycles<CloneKind>>>,
 }
 
 impl<R> CloneReconciler<R> {
     pub fn new(runtime: Arc<R>, repositories: TypedResolver<Repository>) -> Self {
-        Self { runtime, repositories, lifecycle_reads: Arc::new(NoLifecycleReads) }
+        Self { runtime, repositories, lifecycle_reads: Arc::new(NoLifecycleReads), clones: None }
+    }
+
+    /// Reads each clone's engine request: a discovered one is inspected, never cloned.
+    pub fn with_clones(mut self, clones: Option<Arc<dyn Lifecycles<CloneKind>>>) -> Self {
+        self.clones = clones;
+        self
+    }
+
+    /// Whether the engine's request for `name` is a discovered clone. Home reads may wait for a
+    /// write, so the read runs off the async workers.
+    async fn discovered(&self, name: &str) -> Result<bool, ResourceError> {
+        let Some(clones) = &self.clones else { return Ok(false) };
+        let (clones, name) = (Arc::clone(clones), name.to_owned());
+        tokio::task::spawn_blocking(move || clones.get(&name).is_some_and(|clone| clone.spec().discovered))
+            .await
+            .map_err(|error| ResourceError::other(format!("engine read: {error}")))
     }
 
     pub fn with_lifecycle_reads(mut self, reads: Arc<dyn LifecycleReads>) -> Self {
@@ -90,7 +110,7 @@ where
             return Ok(ClonePrepared::None);
         }
 
-        let result = if obj.metadata.labels.get("flotilla.work/discovered").map(String::as_str) == Some("true") {
+        let result = if self.discovered(&obj.metadata.name).await? {
             self.runtime.inspect_existing_in(&obj.spec.env_ref, &obj.spec.path).await
         } else {
             self.runtime.clone_and_inspect_in(&obj.spec.env_ref, &obj.spec.url, &obj.spec.path).await

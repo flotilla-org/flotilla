@@ -327,7 +327,7 @@ fn projection_parity_sequential_admissions(tc: hegel::TestCase) {
         let host_id = daemon.local_host_id().expect("host identity").to_string();
         let profile = LocalProvisioningProfile { repo_default_dir: temp.path().display().to_string(), ..manual_profile(&host_id, false) };
         let backend = daemon.resource_backend();
-        register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("register placement");
+        register_startup(&daemon, NAMESPACE, &profile).await.expect("register placement");
         backend
             .using::<WorkflowTemplate>(NAMESPACE)
             .create(

@@ -58,7 +58,13 @@ fn environment(key: &str) -> EnvironmentRequest {
 }
 
 fn clone_request() -> CloneRequest {
-    CloneRequest { repository: "repo".into(), url: "https://example/repo".into(), environment: Ref::new("env", HOME), path: "/c".into() }
+    CloneRequest {
+        repository: "repo".into(),
+        url: "https://example/repo".into(),
+        environment: Ref::new("env", HOME),
+        path: "/c".into(),
+        discovered: false,
+    }
 }
 
 fn state_of(read: &mut Read<'_>, name: &str) -> Result<Option<LifecycleState>, StoreError> {

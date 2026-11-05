@@ -18,7 +18,7 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
     let profile = LocalProvisioningProfile { repo_default_dir: repo_default_dir.display().to_string(), ..manual_profile(&host_id, false) };
     let backend = daemon.resource_backend();
 
-    register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("startup registration should succeed");
+    register_startup(&daemon, NAMESPACE, &profile).await.expect("startup registration should succeed");
     apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("host heartbeat should succeed");
 
     let state = Arc::new(ControllerRuntimeState::new(

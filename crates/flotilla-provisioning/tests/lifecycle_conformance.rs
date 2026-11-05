@@ -110,6 +110,7 @@ impl Sample for CloneKind {
             url: "https://example/repo".into(),
             environment: StoredRef::new("env", HOME),
             path: "/c".into(),
+            discovered: false,
         }
     }
 }

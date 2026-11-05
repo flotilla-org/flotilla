@@ -20,6 +20,9 @@ impl Binding for CloneBinding {
             url: spec.url.clone(),
             environment: Ref::new(spec.env_ref.clone(), home),
             path: spec.path.clone(),
+            // Only startup discovery requests a discovered clone, and it writes the engine's
+            // request itself before the old resource exists.
+            discovered: false,
         })
     }
 

@@ -380,3 +380,23 @@ fn cr_name(service: &str, scope: &str, number: u64) -> String {
     )
     .expect("record name")
 }
+
+/// The engine's Clone home over `daemon`'s decided store, restored with what it holds, as the
+/// runtime opens it before startup seeding.
+pub(super) fn startup_clones(
+    daemon: &Arc<InProcessDaemon>,
+) -> Arc<dyn flotilla_provisioning::engine::Lifecycles<flotilla_provisioning::stored::clone::CloneKind>> {
+    let store = daemon.decided_store().expect("decided store").store();
+    let log = flotilla_engine_store::StoreLog::new(store);
+    let home = log.home().to_owned();
+    Arc::new(flotilla_provisioning::engine::LifecycleHome::new(&home, flotilla_engine_store::open_home(log).expect("clone home")))
+}
+
+/// Startup seeding as the runtime runs it, over a freshly opened engine Clone home.
+pub(super) async fn register_startup(
+    daemon: &Arc<InProcessDaemon>,
+    namespace: &str,
+    profile: &LocalProvisioningProfile,
+) -> Result<(), String> {
+    register_startup_resources(daemon, namespace, profile, &startup_clones(daemon)).await
+}

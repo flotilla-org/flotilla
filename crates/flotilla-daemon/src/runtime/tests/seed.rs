@@ -95,8 +95,8 @@ async fn startup_registration_is_idempotent_and_discovers_existing_clone() {
     let host_id = daemon.local_host_id().expect("local host id").to_string();
     let profile = manual_profile(&host_id, false);
 
-    register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("first startup registration should succeed");
-    register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("second startup registration should succeed");
+    register_startup(&daemon, NAMESPACE, &profile).await.expect("first startup registration should succeed");
+    register_startup(&daemon, NAMESPACE, &profile).await.expect("second startup registration should succeed");
 
     let backend = daemon.resource_backend();
     let hosts = backend.clone().using::<Host>(NAMESPACE);
@@ -117,7 +117,11 @@ async fn startup_registration_is_idempotent_and_discovers_existing_clone() {
     );
     let clone = clones.get(&clone_name).await.expect("discovered clone should exist");
     assert_eq!(clone.spec.url, "git@github.com:flotilla-org/flotilla.git");
-    assert_eq!(clone.metadata.labels.get("flotilla.work/discovered").map(String::as_str), Some("true"));
+    // The engine's request records the discovery, not the old resource's labels.
+    assert!(!clone.metadata.labels.contains_key("flotilla.work/discovered"));
+    let held = startup_clones(&daemon).get(&clone_name).expect("the engine holds the discovered clone");
+    assert!(held.spec().discovered, "startup discovery requests the clone as discovered");
+    assert_eq!(held.spec().path, clone.spec.path);
 }
 
 fn host_direct_kind_spec(profile: &LocalProvisioningProfile, platform: &str) -> FulfilmentKindSpec {
@@ -286,7 +290,7 @@ async fn startup_registration_skips_repos_without_origin_and_gates_docker_kind()
     let daemon = in_memory_daemon(vec![repo.clone()], Arc::clone(&config)).await;
     let host_id = daemon.local_host_id().expect("local host id").to_string();
 
-    register_startup_resources(&daemon, NAMESPACE, &manual_profile(&host_id, false)).await.expect("startup registration should succeed");
+    register_startup(&daemon, NAMESPACE, &manual_profile(&host_id, false)).await.expect("startup registration should succeed");
 
     let backend = daemon.resource_backend();
     let clones = backend.clone().using::<Clone>(NAMESPACE);
@@ -301,7 +305,7 @@ async fn startup_registration_skips_repos_without_origin_and_gates_docker_kind()
     let config2 = Arc::new(ConfigStore::with_base(config2_base));
     let daemon2 = in_memory_daemon(Vec::new(), Arc::clone(&config2)).await;
     let host_id2 = daemon2.local_host_id().expect("local host id").to_string();
-    register_startup_resources(&daemon2, NAMESPACE, &manual_profile(&host_id2, true))
+    register_startup(&daemon2, NAMESPACE, &manual_profile(&host_id2, true))
         .await
         .expect("startup registration with docker capability should succeed");
     let kinds2 = daemon2.resource_backend().using::<FulfilmentKind>(NAMESPACE);
