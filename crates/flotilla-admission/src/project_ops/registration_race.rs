@@ -1,4 +1,5 @@
-// Storage boundary: interleave the startup Repository controller before registration commits its spec update.
+// Storage boundary: interleave the startup Repository controller before registration commits a
+// Repository spec edit.
 use std::{
     collections::BTreeMap,
     sync::{
@@ -144,10 +145,7 @@ impl Store for RacingStore {
         resource_version: &str,
         spec: &Value,
     ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
-        if resource_kind.paths.kind == "Repository"
-            && meta.annotations.contains_key(flotilla_charter::project_declaration::BOOTSTRAP_COMMIT_ANNOTATION)
-            && self.armed.swap(false, Ordering::SeqCst)
-        {
+        if resource_kind.paths.kind == "Repository" && self.armed.swap(false, Ordering::SeqCst) {
             use flotilla_store::controller::Reconciler;
             let backend = ResourceBackend::from_arc(Arc::clone(&self.inner));
             let repositories = backend.using::<Repository>(namespace);
@@ -158,10 +156,7 @@ impl Store for RacingStore {
             apply_status_patch(&repositories, &meta.name, &outcome.patch.expect("repository status patch")).await?;
         }
         // Persistent refusal models a storage writer winning every spec CAS.
-        if resource_kind.paths.kind == "Repository"
-            && meta.annotations.contains_key(flotilla_charter::project_declaration::BOOTSTRAP_COMMIT_ANNOTATION)
-            && matches!(self.contention, Contention::Persistent)
-        {
+        if resource_kind.paths.kind == "Repository" && matches!(self.contention, Contention::Persistent) {
             return Err(ResourceError::conflict(&meta.name, "stale resourceVersion"));
         }
         self.inner.update_raw(resource_kind, namespace, meta, resource_version, spec).await

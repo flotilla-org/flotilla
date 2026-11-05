@@ -508,14 +508,13 @@ impl ProjectService<'_> {
             let live_remote = declared_spec.live_remote().expect("remote RepositorySpec has a live remote");
             let mut backoff = std::time::Duration::from_millis(10);
             let mut attempts = 0;
+            // A member Repository carries no bootstrap stamp: the declaration's provenance is the
+            // Project's, read there.
             loop {
                 attempts += 1;
                 let updated_spec = repository.spec.clone().update_remotes(live_remote)?;
-                let mut repository_meta = InputMeta::from(&repository.metadata);
-                repository_meta.annotations.extend(provenance.clone());
-                if repository_stamped_alike(&repository.metadata.annotations, &repository_meta.annotations)
-                    && updated_spec == repository.spec
-                {
+                let repository_meta = InputMeta::from(&repository.metadata);
+                if updated_spec == repository.spec {
                     break;
                 }
                 // Status and spec share a version. Rebase this narrow declaration
@@ -1905,6 +1904,16 @@ mod tests {
             observed: observed.clone(),
             contention,
         });
+        // The Repository was first seen through a transport alias, so registering its declared
+        // remote is a real spec edit: the declared remote goes first.
+        backend
+            .using::<Repository>(test_namespace)
+            .create(
+                &InputMeta::builder().name(repository_spec.key().to_string()).build(),
+                &repository_spec.clone().update_remotes("https://github-alias.example/example/app").expect("alias remote"),
+            )
+            .await
+            .expect("repository seen through its alias");
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new(test_namespace.to_string());
         let roots = flotilla_store::OldStoreManifestRoots::new(backend.clone());
@@ -1957,7 +1966,10 @@ mod tests {
         assert!(!armed.load(Ordering::SeqCst), "startup reconciler must have raced registration");
         let repository = backend.using::<Repository>("flotilla").get(&repository_spec.key().to_string()).await.expect("repository");
         assert_eq!(repository.status.expect("controller status must survive registration").default_branch.as_deref(), Some("main"));
-        assert_eq!(repository.metadata.annotations[BOOTSTRAP_COMMIT_ANNOTATION], "abc123");
+        assert!(
+            !repository.metadata.annotations.contains_key(BOOTSTRAP_COMMIT_ANNOTATION),
+            "the declaration's provenance is the Project's, not its member Repository's"
+        );
         assert_eq!(operations.identity_resolutions.load(Ordering::SeqCst), 1);
         let project = backend.definitions::<Project>("flotilla").get("app").await.expect("registered project");
         assert_eq!(project.spec.repositories[0].repo, repository_spec.key());
