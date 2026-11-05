@@ -126,7 +126,8 @@ async fn table_carriers_share_paging_filter_count_and_resync_contract() {
             if let Message::Rows { rows, cursor, partial, .. } = message {
                 assert!(*partial);
                 assert_eq!(rows[0]["metadata.name"], "b");
-                assert_eq!(rows[0].len(), 2);
+                // The projected `spec`, the key, and the subject's address (#4199).
+                assert_eq!(rows[0].len(), 3);
                 cursor.clone()
             } else {
                 None
@@ -969,6 +970,51 @@ async fn messages_filter_under_a_convoy_address() {
     let resumed = messages(&router, &format!("/tables/message/rows?where={under}&cursor={former}"), false).await;
     assert!(matches!(resumed[0], Message::Resync { .. }), "{resumed:?}");
     assert_eq!(inbox_of(&resumed).len(), 2, "a fresh first page follows the resync");
+}
+
+// #4199: `/tables/convoys` names its subject: each row is a convoy, whose canonical address is
+// the derived `address` field, under its project when it has one. The field is an address column,
+// always projected, and filterable with `under`; each row's address resolves to that convoy.
+#[tokio::test]
+async fn convoy_rows_name_their_subject_by_address() {
+    use crate::server::verbs::{catalog::Subjects, convoy::ResourceSubjects};
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let convoys = backend.using::<Convoy>("test");
+    for (name, project) in [("convoy-1", Some("flotilla")), ("convoy-2", Some("flotilla2")), ("convoy-3", None)] {
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).maybe_project_ref(project.map(str::to_owned)).build();
+        convoys.create(&InputMeta::builder().name(name.into()).build(), &spec).await.unwrap();
+    }
+    let router = router(backend.clone());
+    let schema = json(&router, "/tables/convoys").await;
+    assert_eq!(schema["subject"], json!({"kind": "convoy", "field": "address"}));
+    let field = schema["fields"].as_array().unwrap().iter().find(|field| field["name"] == "address").unwrap().clone();
+    assert_eq!((&field["type"], &field["constraints"]["required"]), (&json!("address"), &json!(true)));
+    assert_eq!(field["whereOperators"], json!(["==", "!=", "in", "under", "has"]));
+
+    let rows = |messages: Vec<Message>| -> Vec<flotilla_protocol::table::Row> {
+        messages.into_iter().flat_map(|message| if let Message::Rows { rows, .. } = message { rows } else { vec![] }).collect()
+    };
+    let all = rows(messages(&router, "/tables/convoys/rows?namespace=test&columns=status.phase", false).await);
+    let addresses: Vec<_> = all.iter().map(|row| (row["metadata.name"].clone(), row["address"].clone())).collect();
+    assert_eq!(
+        addresses,
+        [
+            (json!("convoy-1"), json!("project:flotilla/convoy:convoy-1")),
+            (json!("convoy-2"), json!("project:flotilla2/convoy:convoy-2")),
+            (json!("convoy-3"), json!("convoy:convoy-3")),
+        ]
+    );
+    let subjects = ResourceSubjects::new(backend);
+    for row in &all {
+        let address: flotilla_schema::Address = row["address"].as_str().unwrap().parse().unwrap();
+        let resolved = subjects.row("test", &address).await.unwrap().expect("the row's address names a convoy");
+        assert_eq!(resolved["metadata.name"], row["metadata.name"], "{address}");
+        assert_eq!(resolved["address"], row["address"]);
+    }
+
+    let under = condition(r#"address.under("project:flotilla")"#);
+    let selected = rows(messages(&router, &format!("/tables/convoys/rows?namespace=test&where={under}"), false).await);
+    assert_eq!(selected.iter().map(|row| row["metadata.name"].clone()).collect::<Vec<_>>(), [json!("convoy-1")]);
 }
 
 #[test]

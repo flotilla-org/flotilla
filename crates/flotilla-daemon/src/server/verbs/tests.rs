@@ -298,7 +298,8 @@ async fn parameter_values_must_fit_their_declared_types() {
 
 // Behaviour (#4234): a convoy address resolves as the CLI's `convoy explain` resolves it: a
 // record name names its convoy, and a role names the convoy holding it, within a project or in
-// any project.
+// any project. A row's own address (#4199) names its record under its project, and the same
+// record under another project names nothing.
 #[tokio::test]
 async fn a_convoy_address_names_a_record_or_a_role() {
     let backend = flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
@@ -319,6 +320,8 @@ async fn a_convoy_address_names_a_record_or_a_role() {
     let subjects = ResourceSubjects::new(backend);
     for (address, record) in [
         ("convoy:convoy-0123", "convoy-0123"),
+        ("project:flotilla/convoy:convoy-0123", "convoy-0123"),
+        ("convoy:convoy-0456", "convoy-0456"),
         ("project:flotilla/convoy:reviewer", "convoy-0123"),
         ("convoy:reviewer", "convoy-0123"),
         ("convoy:lander", "convoy-0456"),
@@ -328,4 +331,6 @@ async fn a_convoy_address_names_a_record_or_a_role() {
     }
     let missing = subjects.row("ns", &"project:other/convoy:reviewer".parse::<Address>().unwrap()).await;
     assert_eq!(missing.unwrap_err(), "no convoy matches `reviewer@other`");
+    let elsewhere = subjects.row("ns", &"project:other/convoy:convoy-0123".parse::<Address>().unwrap()).await;
+    assert_eq!(elsewhere.unwrap_err(), "no convoy matches `convoy-0123@other`");
 }

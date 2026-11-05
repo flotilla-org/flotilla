@@ -27,6 +27,9 @@ pub enum Kind {
     Artifact,
     /// A message, under the inbox (role) that receives it.
     Message,
+    /// An agent session, under the role it acts for; attaching is how a
+    /// terminal client opens it.
+    Session,
     /// A forge, named by its `forge_id`.
     Forge,
     /// A repository on a forge: one value holding `owner/repo`.
@@ -48,7 +51,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 18] = [
+    pub const ALL: [Kind; 19] = [
         Kind::Host,
         Kind::Provider,
         Kind::Project,
@@ -58,6 +61,7 @@ impl Kind {
         Kind::Role,
         Kind::Artifact,
         Kind::Message,
+        Kind::Session,
         Kind::Forge,
         Kind::Repo,
         Kind::ChangeRequest,
@@ -81,6 +85,7 @@ impl Kind {
             Kind::Role => "role",
             Kind::Artifact => "artifact",
             Kind::Message => "message",
+            Kind::Session => "session",
             Kind::Forge => "forge",
             Kind::Repo => "repo",
             Kind::ChangeRequest => "cr",
@@ -106,6 +111,8 @@ impl Kind {
             Kind::Artifact => parent == Some(Kind::Role),
             // A message sits under its inbox, which is always a role.
             Kind::Message => parent == Some(Kind::Role),
+            // A session acts for a role: `…/convoy:fix-3774/role:coder/session:<id>`.
+            Kind::Session => parent == Some(Kind::Role),
             Kind::Repo => parent == Some(Kind::Forge),
             Kind::ChangeRequest | Kind::Issue | Kind::Comment | Kind::Commit | Kind::Ref => parent == Some(Kind::Repo),
             Kind::Account => matches!(parent, None | Some(Kind::Usage)),
