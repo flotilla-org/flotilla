@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use flotilla_schema::{
     Cbor, ChangeItem, Event, Identity, Kind, KindRegistry, KindSpec, Labelled, NewChange, RegistryError, StateData, Timestamp,
 };
-use flotilla_schema_sqlite::{AboutCursor, Read, Stamp, Store, StoreError};
+use flotilla_schema_sqlite::{AboutCursor, ChangeId, Read, Stamp, Store, StoreError, Write};
 use flotilla_state_machines::{
     machines::{
         agent_session::AgentSession,
@@ -165,9 +165,21 @@ where
     Resource<M>: Kind,
     StoreLog: Log<M>,
 {
-    let home = log.home().to_owned();
+    let store = log.clone();
+    open_home_with(&store, log)
+}
+
+/// [`open_home`] writing through `log`, a log built over `store` for a kind whose writes take
+/// more than the store log's (an Environment's Realise and its launch's facts).
+pub fn open_home_with<M, L>(store: &StoreLog, log: L) -> Result<flotilla_state_machines::Home<M, L>, String>
+where
+    M: Machine,
+    Resource<M>: Kind,
+    L: Log<M>,
+{
+    let home = store.home().to_owned();
     let stored = {
-        let mut store = lock_store(log.store());
+        let mut store = lock_store(store.store());
         let mut read = store.read().map_err(|error| error.to_string())?;
         let mut stored = Vec::new();
         let mut after = None;
@@ -452,6 +464,32 @@ where
         event: &EdgeEventOf<M>,
         writes: &[M::Write],
     ) -> Result<Version, LogError> {
+        self.edge_and(writer, previous, next, event, writes, |_, _| Ok(()))
+    }
+}
+
+impl StoreLog {
+    /// [`Log::edge_with_writes`], with `also` writing other records in the edge's own
+    /// transaction and change: they commit with the edge or not at all. A log for a kind whose
+    /// edge creates a record beside it (an Environment's Realise and its launch's facts) is built
+    /// on this.
+    pub fn edge_and<M>(
+        &mut self,
+        writer: &str,
+        previous: &StoredState<M>,
+        next: &Resource<M>,
+        event: &EdgeEventOf<M>,
+        writes: &[M::Write],
+        also: impl FnOnce(&mut Write<'_>, ChangeId) -> Result<(), StoreError>,
+    ) -> Result<Version, LogError>
+    where
+        M: Machine,
+        M::Spec: KindSpec<State = M::State>,
+        M::State: StateData + Labelled<Label = Label<M>>,
+        M::Write: StoredWrite<Resource<M>>,
+        EdgePayload<M::Edge>: Cbor,
+        M::Edge: Cbor,
+    {
         // An edge's master is a Message homed beside its consumer (ADR 0064).
         let master = |name: &str| Identity { kind: Resource::<Message>::CODE, name: name.to_owned(), home: self.home.clone() };
         let edge = next.stored_edge_about(previous, event, master).map_err(refused)?;
@@ -462,6 +500,7 @@ where
             write.resolve(Resource::<M>::CODE, next.name(), &self.home).map_err(refused)?.ok_or_else(|| LogError::new("not stored"))?;
         let change = write.open_change(&self.change(writer, event.at, &event.arguments.reads)).map_err(refused)?;
         let stamp = write.apply_edge(Stamp { id, version: next.version().0 }, edge, change).map_err(refused)?;
+        also(&mut write, change).map_err(refused)?;
         write.commit().map_err(refused)?;
         Ok(Version(stamp.version))
     }

@@ -6,6 +6,7 @@ Kind tables only; the shared tables are in `provisioning.sql`.
 |---|---|--:|---|---|---|
 | `checkout` | root | 23 | 4: `source` 2, `ending` 2 | – | `by_environment` (environment), `by_clone` (clone), `by_holder` (holder) |
 | `clone` | root | 19 | 2: `ending` 2 | – | `by_environment` (environment, repository) |
+| `environment_launch_facts` | root | 10 | – | – | – |
 | `environment` | root | 18 | 2: `ending` 2 | – | `live_by_provider` (provider), `by_image_build` (image_build), `by_holder` (holder) |
 | `image_build` | root | 21 | 4: `delivery` 2, `ending` 2 | – | `by_composition` (composition) |
 

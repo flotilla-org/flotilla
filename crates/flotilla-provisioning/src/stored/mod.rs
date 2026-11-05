@@ -38,6 +38,7 @@ pub mod environment;
 pub mod forge_observation;
 pub mod host;
 pub mod image_build;
+pub mod launch_facts;
 pub mod manifest_root;
 pub mod placement;
 pub mod project;
@@ -104,6 +105,7 @@ pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
 
 fn register_provisioning(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     registry.register::<Resource<environment::Environment>>()?;
+    registry.register::<launch_facts::EnvironmentLaunchFacts>()?;
     registry.register::<Resource<image_build::ImageBuild>>()?;
     registry.register::<Resource<clone::Clone>>()?;
     registry.register::<Resource<checkout::Checkout>>()?;

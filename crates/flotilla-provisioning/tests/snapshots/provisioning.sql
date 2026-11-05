@@ -333,6 +333,30 @@ CREATE VIEW "clone_view" AS SELECT
   (SELECT "name" FROM "codes" WHERE "kind" = 'cl' AND "field" = 'cause_category' AND "code" = "clone"."cause_category") AS "cause_category",
   "clone"."cause_detail"
 FROM "clone";
+CREATE TABLE "environment_launch_facts" (
+  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+  "version" INTEGER NOT NULL,
+  "image_ref" TEXT,
+  "local_image_id" TEXT,
+  "registry_digest" TEXT,
+  "configured_limits_cpus" INTEGER,
+  "configured_limits_cpu_shares" INTEGER,
+  "configured_limits_build_jobs" INTEGER,
+  "configured_limits_linker_threads" INTEGER,
+  "provider_descriptor" BLOB REFERENCES "objects" ("hash")
+) STRICT;
+CREATE VIEW "environment_launch_facts_view" AS SELECT
+  "environment_launch_facts"."id",
+  "environment_launch_facts"."version",
+  "environment_launch_facts"."image_ref",
+  "environment_launch_facts"."local_image_id",
+  "environment_launch_facts"."registry_digest",
+  "environment_launch_facts"."configured_limits_cpus",
+  "environment_launch_facts"."configured_limits_cpu_shares",
+  "environment_launch_facts"."configured_limits_build_jobs",
+  "environment_launch_facts"."configured_limits_linker_threads",
+  "environment_launch_facts"."provider_descriptor"
+FROM "environment_launch_facts";
 CREATE TABLE "environment" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,

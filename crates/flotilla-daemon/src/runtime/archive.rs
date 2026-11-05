@@ -67,7 +67,7 @@ impl ArchiveTarget for S3BlobStore {
 pub(crate) fn archive_kinds() -> ArchiveKinds {
     use flotilla_provisioning::stored::{
         account::AccountBinding, checkout::Checkout, clone::Clone, environment::Environment, image_build::ImageBuild,
-        manifest_root::ManifestRoot, terminal_session::TerminalSession,
+        launch_facts::EnvironmentLaunchFacts, manifest_root::ManifestRoot, terminal_session::TerminalSession,
     };
     use flotilla_state_machines::machines::{
         agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, ensure::Ensure, message::Message, person::Person,
@@ -79,6 +79,8 @@ pub(crate) fn archive_kinds() -> ArchiveKinds {
         .with::<Convoy>()
         .with::<AwaitingReply>()
         .with::<Environment>()
+        // A launch's facts end with the launch.
+        .companion::<Environment, EnvironmentLaunchFacts>()
         .with::<ImageBuild>()
         .with::<Clone>()
         .with::<Checkout>()
@@ -232,15 +234,18 @@ impl ArchiveShipper {
     async fn ship(&self, identity: &Identity, now: Timestamp) -> Result<bool, ShipError> {
         let target = identity.clone();
         let prepared = self.blocking(move |archiver, store| archiver.prepare(store, &target)).await.map_err(ShipError::Local)?;
-        let Prepared::Ready { bundle, version } = prepared else { return Ok(false) };
-        let bytes = bundle.encode().map_err(|error| ShipError::Local(error.to_string()))?;
-        let key = bundle_key(identity);
-        let digest = Sha256::digest(&bytes);
-        for store in &self.targets {
-            store.put(&key, &bytes).await.map_err(|error| ShipError::Store(format!("{}: upload: {error}", store.location())))?;
-            let held = store.get(&key).await.map_err(|error| ShipError::Store(format!("{}: confirm: {error}", store.location())))?;
-            if held.map(|held| Sha256::digest(&held)) != Some(digest) {
-                return Err(ShipError::Store(format!("{}: confirm: the store does not hold the uploaded bundle", store.location())));
+        let Prepared::Ready { bundle, version, companions } = prepared else { return Ok(false) };
+        // The resource's bundle and each companion's, every one confirmed before anything is deleted.
+        for bundle in std::iter::once(bundle.as_ref()).chain(&companions) {
+            let bytes = bundle.encode().map_err(|error| ShipError::Local(error.to_string()))?;
+            let key = bundle_key(&bundle.identity());
+            let digest = Sha256::digest(&bytes);
+            for store in &self.targets {
+                store.put(&key, &bytes).await.map_err(|error| ShipError::Store(format!("{}: upload: {error}", store.location())))?;
+                let held = store.get(&key).await.map_err(|error| ShipError::Store(format!("{}: confirm: {error}", store.location())))?;
+                if held.map(|held| Sha256::digest(&held)) != Some(digest) {
+                    return Err(ShipError::Store(format!("{}: confirm: the store does not hold the uploaded bundle", store.location())));
+                }
             }
         }
         let target = identity.clone();

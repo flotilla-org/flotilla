@@ -104,7 +104,7 @@ fn a_dropped_message_ships_a_week_later_and_leaves_in_two_writes() {
     assert!(archiver.due(Timestamp(due.0 - 1), GRACE).is_empty(), "not before a week");
     assert_eq!(archiver.due(due, GRACE), [Due::Ship(identity(&dropped))]);
 
-    let Prepared::Ready { bundle, version } = archiver.prepare(&mut store, &identity(&dropped)).expect("prepare") else {
+    let Prepared::Ready { bundle, version, .. } = archiver.prepare(&mut store, &identity(&dropped)).expect("prepare") else {
         panic!("an ended message is ready")
     };
     let stored = {

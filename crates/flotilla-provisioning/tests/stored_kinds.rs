@@ -48,6 +48,7 @@ fn provisioning_kind_codes_are_pinned() {
     let registry = stored::production_kinds().expect("no code is held twice");
     let held = |kind: &str| registry.iter().find(|set| set.kind == kind).map(|set| set.code);
     assert_eq!(held("Environment"), Some(KindCode::new("ev")));
+    assert_eq!(held("EnvironmentLaunchFacts"), Some(KindCode::new("el")));
     assert_eq!(held("ImageBuild"), Some(KindCode::new("ib")));
     assert_eq!(held("Clone"), Some(KindCode::new("cl")));
     assert_eq!(held("Checkout"), Some(KindCode::new("ck")));
@@ -66,7 +67,7 @@ fn provisioning_kind_codes_are_pinned() {
     assert_eq!(held("Host"), Some(KindCode::new("ho")));
     assert_eq!(held("HostObservation"), Some(KindCode::new("ob")));
     assert_eq!(held("AccessDelivery"), Some(KindCode::new("ad")));
-    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 25);
+    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 26);
     // The definition kinds (#3824 layer 2b), in the decided store with their writers (2b-ii).
     for (kind, code) in [
         ("Forge", "fo"),
