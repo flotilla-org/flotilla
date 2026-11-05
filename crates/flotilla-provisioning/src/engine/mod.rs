@@ -37,6 +37,8 @@ pub mod controller;
 pub mod definition_import;
 pub mod definitions;
 pub mod environment;
+pub mod environment_actuator;
+pub mod environments;
 pub mod forge_observation_import;
 pub mod host_import;
 pub mod hosts;
@@ -87,6 +89,8 @@ use crate::stored::{
 #[derive(Clone)]
 pub struct ProvisioningLifecycles {
     pub environments: Arc<dyn Lifecycles<EnvironmentKind>>,
+    /// The facts the Environment controller stages for each launch's Realise edge.
+    pub environment_facts: launch_log::StagedFacts,
     pub image_builds: Arc<dyn Lifecycles<ImageBuildKind>>,
     pub clones: Arc<dyn Lifecycles<CloneKind>>,
     pub checkouts: Arc<dyn Lifecycles<CheckoutKind>>,

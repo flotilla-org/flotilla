@@ -55,6 +55,7 @@ pub mod definition_provenance;
 pub mod definitions;
 pub mod engine_records;
 mod environment;
+pub mod environment_records;
 #[doc(hidden)]
 pub mod error;
 #[doc(hidden)]

@@ -1,0 +1,281 @@
+//! Environments on the engine (#3108): the request a provider's spec makes, the spec a stored
+//! request shows its readers and providers, and the [`EnvironmentRecords`] port over the decided
+//! store.
+
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
+
+use flotilla_protocol::ConfiguredResourceLimits;
+use flotilla_resources::{
+    environment_records::{EnvironmentRecord, EnvironmentRecords, LaunchFacts},
+    CloudSandboxEnvironmentSpec, DockerEnvironmentSpec, EnvironmentSpec, HostDirectEnvironmentSpec,
+};
+use flotilla_schema::{Frozen, Kind, Ref, Timestamp};
+use flotilla_schema_sqlite::{Read, Store};
+use flotilla_state_machines::Resource;
+
+use super::{
+    reads::{indexed, keyed, view, ReadError, StoreReads, View},
+    Lifecycles,
+};
+use crate::stored::{
+    environment::{
+        CloudSandboxRecipe, DockerImage, DockerRecipe, Environment, EnvironmentKind, EnvironmentRequest, HostDirectRecipe, Recipe,
+        LAUNCH_DERIVED_ENV,
+    },
+    launch_facts::{EnvironmentLaunchFacts, LaunchLimits},
+    Holder,
+};
+
+/// A provider's recipe, decoded by its shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecipeOf {
+    Docker(DockerRecipe),
+    HostDirect(HostDirectRecipe),
+    Cloud(CloudSandboxRecipe),
+}
+
+impl RecipeOf {
+    /// The recipe `recipe` holds. Each provider's recipe has fields the others lack (a
+    /// host-direct root, Docker's adapters and pull policy, a cloud size), so its shape names it.
+    pub fn of(recipe: &Recipe) -> Result<Self, String> {
+        recipe
+            .read::<HostDirectRecipe>()
+            .map(Self::HostDirect)
+            .or_else(|_| recipe.read::<DockerRecipe>().map(Self::Docker))
+            .or_else(|_| recipe.read::<CloudSandboxRecipe>().map(Self::Cloud))
+            .map_err(|_| "the recipe is none of the Docker, host-direct and cloud sandbox recipes".to_owned())
+    }
+}
+
+/// The request `spec` makes at `home`, held for `vessel`. Env entries derived at launch are left
+/// out: they are composed again at each launch, never stored (look-over ruling 5).
+pub fn request_of(spec: &EnvironmentSpec, vessel: Option<&str>, home: &str) -> Result<EnvironmentRequest, String> {
+    let provider = spec.resolved_provider_address(None)?.ok_or("an environment names no provider or host")?;
+    // The build is homed at its builder; the environment names it as replicated here.
+    let built = |name: &Option<String>| name.as_ref().map(|name| Ref::new(name.clone(), home));
+    // A composed image names its build, whose realised digest is read at creation.
+    let image = |image_build: &Option<_>, reference: &str| match image_build {
+        Some(_) => DockerImage::Built,
+        None => DockerImage::Pinned { reference: reference.to_owned() },
+    };
+    let stored_env = |env: &BTreeMap<String, String>| {
+        env.iter().filter(|(key, _)| !LAUNCH_DERIVED_ENV.contains(&key.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+    let (recipe, image_build) = match (&spec.docker, &spec.host_direct, &spec.cloud_sandbox) {
+        (Some(docker), None, None) => {
+            let image_build = built(&docker.image_build_ref);
+            let recipe = DockerRecipe {
+                image: image(&image_build, &docker.image),
+                declared_adapters: docker.declared_agent_adapters.clone(),
+                required_adapters: docker.required_agent_adapters.clone(),
+                pull_policy: docker.pull_policy,
+                mounts: docker.mounts.clone(),
+                env: stored_env(&docker.env),
+            };
+            recipe.validate(image_build.as_ref())?;
+            (Recipe::of(&recipe)?, image_build)
+        }
+        (None, Some(host), None) => {
+            let recipe = HostDirectRecipe { repo_default_dir: host.repo_default_dir.clone() };
+            recipe.validate()?;
+            (Recipe::of(&recipe)?, None)
+        }
+        (None, None, Some(cloud)) => {
+            let image_build = built(&cloud.image_build_ref);
+            let recipe = CloudSandboxRecipe {
+                image: image(&image_build, &cloud.image),
+                size: cloud.size.clone(),
+                lifetime_cap_seconds: cloud.lifetime_cap_seconds,
+                env: stored_env(&cloud.env),
+                probe_needs: cloud.probe_needs.clone(),
+            };
+            recipe.validate(image_build.as_ref())?;
+            (Recipe::of(&recipe)?, image_build)
+        }
+        _ => return Err("an environment is backed by exactly one of docker, host_direct and cloud_sandbox".into()),
+    };
+    let recipe = Frozen::new(recipe).map_err(|error| format!("freeze the provider's recipe: {error}"))?;
+    Ok(EnvironmentRequest { provider, image_build, recipe, holder: vessel.map(Holder::vessel) })
+}
+
+/// The spec `request` shows its readers and providers. A built image's reference is empty: its
+/// digest is the build's, read at launch.
+pub fn spec_of(request: &EnvironmentRequest) -> Result<EnvironmentSpec, String> {
+    let image_build_ref = request.image_build.as_ref().map(|build| build.name.clone());
+    let reference = |image: &DockerImage| match image {
+        DockerImage::Pinned { reference } => reference.clone(),
+        DockerImage::Built => String::new(),
+    };
+    let mut spec =
+        EnvironmentSpec { provider_address: Some(request.provider.clone()), host_direct: None, docker: None, cloud_sandbox: None };
+    // The provider's host, when it is a host's provider; an account's cloud sandbox has none.
+    let host = spec.host_ref().unwrap_or_default().to_owned();
+    match RecipeOf::of(&request.recipe)? {
+        RecipeOf::HostDirect(recipe) => {
+            spec.host_direct = Some(HostDirectEnvironmentSpec { host_ref: host, repo_default_dir: recipe.repo_default_dir });
+        }
+        RecipeOf::Docker(recipe) => {
+            spec.docker = Some(DockerEnvironmentSpec {
+                host_ref: host,
+                image: reference(&recipe.image),
+                image_build_ref,
+                declared_agent_adapters: recipe.declared_adapters,
+                required_agent_adapters: recipe.required_adapters,
+                pull_policy: recipe.pull_policy,
+                mounts: recipe.mounts,
+                env: recipe.env,
+            });
+        }
+        RecipeOf::Cloud(recipe) => {
+            spec.cloud_sandbox = Some(CloudSandboxEnvironmentSpec {
+                probe_needs: recipe.probe_needs,
+                image: reference(&recipe.image),
+                image_build_ref,
+                size: recipe.size,
+                lifetime_cap_seconds: recipe.lifetime_cap_seconds,
+                env: recipe.env,
+            });
+        }
+    }
+    Ok(spec)
+}
+
+/// The stored facts of a launch, from what its provider reported.
+pub fn launch_facts(facts: &LaunchFacts) -> Result<EnvironmentLaunchFacts, String> {
+    let limit = |value: Option<usize>| value.map(|value| value as u64);
+    let limits = facts.configured_limits.clone().unwrap_or_default();
+    Ok(EnvironmentLaunchFacts {
+        image_ref: facts.image_ref.clone(),
+        local_image_id: facts.local_image_id.clone(),
+        registry_digest: facts.registry_digest.clone(),
+        configured_limits: LaunchLimits {
+            cpus: limit(limits.cpus),
+            cpu_shares: limit(limits.cpu_shares),
+            build_jobs: limit(limits.build_jobs),
+            linker_threads: limit(limits.linker_threads),
+        },
+        provider_descriptor: facts
+            .provider_descriptor
+            .clone()
+            .map(Frozen::new)
+            .transpose()
+            .map_err(|error| format!("freeze the provider descriptor: {error}"))?,
+    })
+}
+
+/// A launch's facts as its readers see them. No configured limit known is no limits.
+pub fn facts_of(facts: &EnvironmentLaunchFacts) -> LaunchFacts {
+    let limits = &facts.configured_limits;
+    let limit = |value: Option<u64>| value.map(|value| value as usize);
+    let configured = ConfiguredResourceLimits {
+        cpus: limit(limits.cpus),
+        cpu_shares: limit(limits.cpu_shares),
+        build_jobs: limit(limits.build_jobs),
+        linker_threads: limit(limits.linker_threads),
+    };
+    LaunchFacts {
+        image_ref: facts.image_ref.clone(),
+        local_image_id: facts.local_image_id.clone(),
+        registry_digest: facts.registry_digest.clone(),
+        configured_limits: (configured != ConfiguredResourceLimits::default()).then_some(configured),
+        provider_descriptor: facts.provider_descriptor.as_ref().map(|descriptor| (**descriptor).clone()),
+    }
+}
+
+/// The facts of launch `name` at `home`, if it was realised.
+fn stored_facts(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<LaunchFacts>, ReadError> {
+    let Some(id) = read.resolve(EnvironmentLaunchFacts::CODE, name, home)? else { return Ok(None) };
+    Ok(read.load::<EnvironmentLaunchFacts>(id)?.map(|loaded| facts_of(&loaded.value)))
+}
+
+/// `view` as a reader sees it, with its launch's facts.
+fn record(read: &mut Read<'_>, view: View<EnvironmentKind>) -> Result<EnvironmentRecord, ReadError> {
+    let launch = stored_facts(read, &view.name, &view.home)?;
+    let spec = spec_of(&view.request).map_err(ReadError)?;
+    let vessel = view.request.holder.as_ref().and_then(|holder| holder.0.strip_prefix("vessel:")).map(str::to_owned);
+    Ok(EnvironmentRecord { reading: view.judgement.reading(), name: view.name, home: view.home, spec, vessel, launch })
+}
+
+/// The [`EnvironmentRecords`] port over one decided store: this home's environments through its
+/// Environment home, and every home's through keyed and indexed reads.
+pub struct EngineEnvironments {
+    lifecycles: Arc<dyn Lifecycles<EnvironmentKind>>,
+    reads: StoreReads,
+}
+
+impl EngineEnvironments {
+    pub fn new(lifecycles: Arc<dyn Lifecycles<EnvironmentKind>>, store: Arc<Mutex<Store>>) -> Self {
+        Self { lifecycles, reads: StoreReads::new(store) }
+    }
+
+    fn home(&self) -> &str {
+        self.lifecycles.home()
+    }
+}
+
+impl EnvironmentRecords for EngineEnvironments {
+    fn get(&self, name: &str, home: Option<&str>) -> Result<Option<EnvironmentRecord>, String> {
+        let home = home.unwrap_or(self.home()).to_owned();
+        self.reads
+            .read(|read| keyed::<EnvironmentKind>(read, name, &home)?.map(|view| record(read, view)).transpose())
+            .map_err(|error| format!("engine Environment/{name}: {error}"))
+    }
+
+    fn find(&self, name: &str) -> Result<Option<EnvironmentRecord>, String> {
+        let local = self.home().to_owned();
+        self.reads
+            .read(|read| {
+                let mut found = None;
+                for id in read.resolve_named(Resource::<Environment>::CODE, name)? {
+                    let Some(view) = view::<EnvironmentKind>(read, id)? else { continue };
+                    let here = view.home == local;
+                    if found.is_none() || here {
+                        found = Some(view);
+                    }
+                    if here {
+                        break;
+                    }
+                }
+                found.map(|view| record(read, view)).transpose()
+            })
+            .map_err(|error| format!("engine Environment/{name}: {error}"))
+    }
+
+    fn live(&self) -> Result<Vec<EnvironmentRecord>, String> {
+        let names = self.lifecycles.live().into_iter().map(|resource| resource.name().to_owned()).collect::<Vec<_>>();
+        let home = self.home().to_owned();
+        self.reads
+            .read(|read| {
+                let mut records = Vec::new();
+                for name in &names {
+                    if let Some(view) = keyed::<EnvironmentKind>(read, name, &home)? {
+                        records.push(record(read, view)?);
+                    }
+                }
+                Ok(records)
+            })
+            .map_err(|error| format!("engine live environments: {error}"))
+    }
+
+    fn held(&self, vessel: &str) -> Result<Vec<EnvironmentRecord>, String> {
+        let holder = Holder::vessel(vessel);
+        self.reads
+            .read(|read| {
+                let views = indexed::<EnvironmentKind, _>(read, &EnvironmentRequest::by_holder(&holder))?;
+                views.into_iter().map(|view| record(read, view)).collect()
+            })
+            .map_err(|error| format!("engine environments held for vessel {vessel}: {error}"))
+    }
+
+    fn request(&self, name: &str, spec: &EnvironmentSpec, vessel: Option<&str>) -> Result<bool, String> {
+        if self.lifecycles.get(name).is_some() {
+            return Ok(false);
+        }
+        let request = request_of(spec, vessel, self.home())?;
+        let at = Timestamp::from_datetime(&chrono::Utc::now());
+        self.lifecycles.request(name, request, at).map(|_| true).map_err(|error| format!("request environment {name}: {error}"))
+    }
+}

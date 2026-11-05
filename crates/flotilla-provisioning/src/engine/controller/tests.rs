@@ -3,7 +3,8 @@
 //!
 //! The scripted actuator keys each environment by its host-direct root. Its records live as
 //! Clone lifecycles at the same home: `input-<key>` is an input, `holder-<key>` ends the holder
-//! once Gone, and `fact-<key>` reports the provider usable while Realised.
+//! once Gone, `fact-<key>` reports the provider usable while Realised, and a live `served-<key>`
+//! holds its release back.
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -127,14 +128,20 @@ impl Actuator<EnvironmentKind> for Scripted {
         Ok(state_of(read, &format!("holder-{}", key(request)))?.is_some_and(|state| state.gone()))
     }
 
-    fn usability(&self, read: &mut Read<'_>, request: &EnvironmentRequest) -> Result<Option<Usability>, StoreError> {
+    fn usability(&self, read: &mut Read<'_>, request: &EnvironmentRequest) -> Result<Vec<Usability>, StoreError> {
         let key = key(request);
         if !self.script().with_fact.contains(&key) {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let name = format!("fact-{key}");
         let usable = state_of(read, &name)?.is_some_and(|state| state.realised());
-        Ok(Some(Usability { fact: record(&name), usable }))
+        Ok(vec![Usability { fact: record(&name), usable }])
+    }
+
+    fn release_blockers(&self, read: &mut Read<'_>, _: &str, request: &EnvironmentRequest) -> Result<Vec<Identity>, StoreError> {
+        let name = format!("served-{}", key(request));
+        let live = state_of(read, &name)?.is_some_and(|state| state.live());
+        Ok(if live { vec![record(&name)] } else { Vec::new() })
     }
 }
 
@@ -328,6 +335,28 @@ async fn a_holder_ending_releases_the_resource() {
     assert_eq!(world.actuator.script().released, [("a".to_owned(), Some("id-a".to_owned()))]);
 }
 
+// A holder's ending waits for the records the resource still serves: the release runs when the
+// last of them ends, and not before.
+#[tokio::test]
+async fn a_release_waits_for_what_the_resource_serves() {
+    let mut world = World::open();
+    world.clone_record("holder-a");
+    world.clone_record("served-a");
+    world.start();
+    world.request("a");
+    world.until("a realised", |world| world.state("a").realised()).await;
+    world.clone_step("holder-a", Step::Released);
+    // Another resource realised after the holder ended: the controller has passed a.
+    world.request("b");
+    world.until("b realised", |world| world.state("b").realised()).await;
+    assert!(world.state("a").realised(), "a is held while it serves a live record");
+    assert!(world.actuator.script().released.is_empty());
+    world.clone_step("served-a", Step::Realised { identity: "served".into() });
+    world.clone_step("served-a", Step::Released);
+    world.until("a released once what it serves ended", |world| world.state("a").gone()).await;
+    assert_eq!(world.actuator.script().released, [("a".to_owned(), Some("id-a".to_owned()))]);
+}
+
 // At start each live resource is observed: a backing already there is adopted, and a realised
 // resource whose backing is gone is lost.
 #[tokio::test]
@@ -352,6 +381,20 @@ async fn a_pushed_absence_loses_the_resource() {
     world.until("a realised", |world| world.state("a").realised()).await;
     world.backing.as_ref().expect("started").send(BackingEvent { name: "a".into(), observed: Backing::Absent }).await.expect("send");
     world.until("a lost", |world| world.state("a").gone()).await;
+}
+
+// A pushed broken backing ends the resource as failed, with the reason the provider gave.
+#[tokio::test]
+async fn a_pushed_failure_ends_the_resource_as_failed() {
+    let mut world = World::open();
+    world.start();
+    world.request("a");
+    world.until("a realised", |world| world.state("a").realised()).await;
+    let observed = Backing::Failed { reason: "adoption failed".into() };
+    world.backing.as_ref().expect("started").send(BackingEvent { name: "a".into(), observed }).await.expect("send");
+    world.until("a failed", |world| world.state("a").gone()).await;
+    let LifecycleState::Gone { ending } = world.state("a") else { unreachable!() };
+    assert_eq!(ending, flotilla_state_machines::machines::lifecycle::Ending::Failed { reason: "adoption failed".into() });
 }
 
 // A successor launch's request ends its predecessor, written by the controller.

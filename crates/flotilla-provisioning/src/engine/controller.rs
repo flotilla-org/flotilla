@@ -9,8 +9,10 @@
 //! - a commit of a resource of its kind here: a new request is realised;
 //! - a commit of a record a resource depends on ([`Actuator::dependencies`]): an input becoming
 //!   ready re-runs a failed attempt, and a holder ending releases the resource;
-//! - the host's facts reporting the provider usable again ([`Actuator::usability`]), which
-//!   re-runs a failed attempt;
+//! - the facts a request waits on reporting it usable again ([`Actuator::usability`]): its
+//!   provider's readiness, an input's realisation;
+//! - a record blocking a release changing ([`Actuator::release_blockers`]), such as a checkout
+//!   made in an environment ending;
 //! - one of its own flights (realise, release, observe) finishing;
 //! - a [`BackingEvent`] its provider pushes, such as a container's death.
 //!
@@ -52,6 +54,8 @@ pub enum Backing {
     Present { identity: String },
     /// It has no backing.
     Absent,
+    /// Its backing is there but broken for good, as `reason` says: it ends as failed.
+    Failed { reason: String },
 }
 
 /// Why one try at provider work failed.
@@ -88,15 +92,22 @@ pub trait Actuator<K: LifecycleKind>: Send + Sync + 'static {
     /// Tears `name`'s backing down; an absent backing is done. `identity` is the one it was
     /// realised under, if it was.
     async fn release(&self, name: &str, request: &K::Request, identity: Option<&str>) -> Result<(), ProviderFailure>;
-    /// The kinds of the records [`Actuator::dependencies`] and [`Actuator::usability`] name.
+    /// The kinds of the records [`Actuator::dependencies`], [`Actuator::usability`] and
+    /// [`Actuator::release_blockers`] name.
     fn followed(&self) -> Vec<KindCode>;
     /// The records whose change could change an attempt's outcome, or end the resource: its
     /// inputs and its holder.
     fn dependencies(&self, request: &K::Request) -> Vec<Identity>;
     /// Whether `request`'s holder has ended. A request with no holder is never released here.
     fn holder_ended(&self, read: &mut Read<'_>, request: &K::Request) -> Result<bool, StoreError>;
-    /// Whether the provider `request` needs is usable; None when no fact reports it.
-    fn usability(&self, read: &mut Read<'_>, request: &K::Request) -> Result<Option<Usability>, StoreError>;
+    /// The facts that say whether `request` can be realised now: its provider's readiness, an
+    /// input's realisation. It is tried only while every one is usable; none means nothing waits.
+    fn usability(&self, read: &mut Read<'_>, request: &K::Request) -> Result<Vec<Usability>, StoreError>;
+    /// The live records that must end before `name` is released, such as the checkouts made in an
+    /// environment; each one's change looks at `name` again.
+    fn release_blockers(&self, _read: &mut Read<'_>, _name: &str, _request: &K::Request) -> Result<Vec<Identity>, StoreError> {
+        Ok(Vec::new())
+    }
 }
 
 /// Why a resource is looked at.
@@ -135,14 +146,30 @@ enum Done {
 /// What a read found for one resource.
 struct Found {
     holder_ended: bool,
-    usability: Option<Usability>,
+    usability: Vec<Usability>,
+    /// The records its release waits on, read only once its holder has ended.
+    blockers: Vec<Identity>,
+}
+
+impl Found {
+    fn usable(&self) -> bool {
+        self.usability.iter().all(|usability| usability.usable)
+    }
+
+    /// Its holder ended and nothing holds its release back.
+    fn release(&self) -> bool {
+        self.holder_ended && self.blockers.is_empty()
+    }
 }
 
 /// The decision for one resource, from its state and what was read for it.
 fn act(state: &LifecycleState, judgement: &Judgement, found: &Found, trigger: Trigger, usable_again: bool) -> Action {
-    let usable = found.usability.as_ref().is_none_or(|usability| usability.usable);
+    let usable = found.usable();
     match state {
-        LifecycleState::Requested { .. } if found.holder_ended => Action::Release { identity: None },
+        LifecycleState::Requested { .. } if found.release() => Action::Release { identity: None },
+        LifecycleState::Realised { identity } if found.release() => Action::Release { identity: Some(identity.clone()) },
+        // Its holder ended, but a record it serves is still live: it waits for that one.
+        _ if found.holder_ended => Action::Nothing,
         LifecycleState::Requested { .. } if trigger == Trigger::Start => Action::Observe,
         LifecycleState::Requested { last_failure, .. } => match judgement {
             Judgement::Exhausted { last } => {
@@ -152,7 +179,6 @@ fn act(state: &LifecycleState, judgement: &Judgement, found: &Found, trigger: Tr
             Judgement::Retrying { .. } if usable && (trigger == Trigger::Dependency || usable_again) => Action::Realise,
             _ => Action::Nothing,
         },
-        LifecycleState::Realised { identity } if found.holder_ended => Action::Release { identity: Some(identity.clone()) },
         LifecycleState::Realised { .. } if trigger == Trigger::Start => Action::Observe,
         _ => Action::Nothing,
     }
@@ -294,14 +320,16 @@ where
             return;
         }
         let actuator = Arc::clone(&self.actuator);
-        let requests: Vec<K::Request> = held.iter().map(|(_, _, resource)| resource.spec().clone()).collect();
+        let requests: Vec<(String, K::Request)> = held.iter().map(|(name, _, resource)| (name.clone(), resource.spec().clone())).collect();
         let found = self
             .watch
             .read(move |read| {
                 requests
                     .iter()
-                    .map(|request| {
-                        Ok(Found { holder_ended: actuator.holder_ended(read, request)?, usability: actuator.usability(read, request)? })
+                    .map(|(name, request)| {
+                        let holder_ended = actuator.holder_ended(read, request)?;
+                        let blockers = if holder_ended { actuator.release_blockers(read, name, request)? } else { Vec::new() };
+                        Ok(Found { holder_ended, usability: actuator.usability(read, request)?, blockers })
                     })
                     .collect::<Result<Vec<_>, StoreError>>()
             })
@@ -315,8 +343,8 @@ where
             }
         };
         for ((name, trigger, resource), found) in held.into_iter().zip(found) {
-            self.remember(&name, resource.spec(), found.usability.as_ref());
-            let usable_now = found.usability.as_ref().is_none_or(|usability| usability.usable);
+            self.remember(&name, resource.spec(), &found);
+            let usable_now = found.usable();
             let usable_again = self.usable.insert(name.clone(), usable_now) == Some(false) && usable_now;
             if self.in_flight.contains(&name) {
                 continue;
@@ -411,6 +439,9 @@ where
             (Done::Observed(Ok(Backing::Absent)), LifecycleState::Realised { .. }) => {
                 self.write(name, Step::Vanished { cause: VanishCause::Lost }).await;
             }
+            (Done::Observed(Ok(Backing::Failed { reason })), LifecycleState::Realised { .. }) => {
+                self.write(name, Step::Vanished { cause: VanishCause::Failed { reason } }).await;
+            }
             (Done::Observed(Err(cause)), _) => warn!(kind = K::NAME, name, ?cause, "observation failed"),
             _ => {}
         }
@@ -430,9 +461,10 @@ where
         Some(error)
     }
 
-    fn remember(&mut self, name: &str, request: &K::Request, usability: Option<&Usability>) {
+    fn remember(&mut self, name: &str, request: &K::Request, found: &Found) {
         let mut depends = self.actuator.dependencies(request);
-        depends.extend(usability.map(|usability| usability.fact.clone()));
+        depends.extend(found.usability.iter().map(|usability| usability.fact.clone()));
+        depends.extend(found.blockers.iter().cloned());
         if self.depends.get(name) == Some(&depends) {
             return;
         }

@@ -1291,6 +1291,7 @@ async fn open_provisioning_lifecycles(
         }));
         Ok(ProvisioningLifecycles {
             environments: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
+            environment_facts: Default::default(),
             image_builds: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
             clones: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
             checkouts: Arc::new(LifecycleHome::new(&home, open_home(log())?)),

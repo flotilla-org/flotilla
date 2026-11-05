@@ -46,6 +46,12 @@ pub trait LifecycleReads: Send + Sync {
         }
     }
 
+    /// The engine's environments (#3108): every environment reader and requester goes through
+    /// them. Unavailable where no engine is installed.
+    fn environments(&self) -> Result<&dyn crate::environment_records::EnvironmentRecords, String> {
+        Err("environment records are not served without the engine".into())
+    }
+
     /// The reading of `name` homed at `origin` (a replica's origin root; `None` for this home), or
     /// `None` when the engine holds no such resource: the switch is off, or it was written before.
     ///
@@ -102,6 +108,10 @@ impl LifecycleReads for LateLifecycleReads {
 
     fn try_terminal_launch(&self, name: &str, origin: Option<&str>) -> Result<Option<crate::terminal_launches::TerminalLaunch>, String> {
         self.installed.get().map_or(Ok(None), |reads| reads.try_terminal_launch(name, origin))
+    }
+
+    fn environments(&self) -> Result<&dyn crate::environment_records::EnvironmentRecords, String> {
+        self.installed.get().ok_or_else(|| "provisioning lifecycle reads are not installed".to_owned())?.environments()
     }
 
     fn try_reading(

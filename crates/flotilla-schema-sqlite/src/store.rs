@@ -29,11 +29,11 @@ use crate::{
     shared::{
         check_kind_codes, check_kind_columns, has_string_domain, log_predates_changes, schema_ddl, sync_views, CHANGE_APPEND,
         CHANGE_EXISTS, CHANGE_GET, CHANGE_ITEMS, CHANGE_ITEM_APPEND, CHANGE_NAMED, CHANGE_NAMING, CHANGE_SEQS, FLOOR_GET, FLOOR_RAISE,
-        HOME_IDS_RESET, HOME_LOG_CLEAR, HOME_MARK_RESET, HOME_SEQ_RESET, IDENTITIES_PAGE, IDENTITY_DELETE, IDENTITY_INSERT, IDENTITY_OF,
-        IDENTITY_RESOLVE, IDENTITY_SEQ, IDENTITY_SET_SEQ, LOG_ABOUT_AFTER, LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE,
-        LOG_CAUSE, LOG_EXPUNGE, LOG_EXPUNGED_AFTER, LOG_LAST_CHANGE, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, REMOVED_MAX, SEQUENCE_LAST,
-        SEQUENCE_NEXT, SEQUENCE_RAISE, SHARED_STATEMENTS, SNAPSHOT_CAUSE_DELETE, SNAPSHOT_CAUSE_GET, SNAPSHOT_CAUSE_PUT, STRING_ID,
-        STRING_INSERT, WATERMARK_PUT,
+        HOME_IDS_RESET, HOME_LOG_CLEAR, HOME_MARK_RESET, HOME_SEQ_RESET, IDENTITIES_PAGE, IDENTITY_DELETE, IDENTITY_INSERT, IDENTITY_NAMED,
+        IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_SEQ, IDENTITY_SET_SEQ, LOG_ABOUT_AFTER, LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME,
+        LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE, LOG_EXPUNGED_AFTER, LOG_LAST_CHANGE, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, REMOVED_MAX,
+        SEQUENCE_LAST, SEQUENCE_NEXT, SEQUENCE_RAISE, SHARED_STATEMENTS, SNAPSHOT_CAUSE_DELETE, SNAPSHOT_CAUSE_GET, SNAPSHOT_CAUSE_PUT,
+        STRING_ID, STRING_INSERT, WATERMARK_PUT,
     },
     sql::{KindSql, TableSql},
 };
@@ -366,6 +366,12 @@ impl Read<'_> {
     // need rewinding alone, and the whole overlay is dropped if the transaction rolls back.
     pub fn resolve(&mut self, kind: KindCode, name: &str, home: &str) -> Result<Option<ResourceId>, StoreError> {
         self.ctx().resolve(&Identity { kind, name: name.to_owned(), home: home.to_owned() })
+    }
+
+    /// The identities of `kind` named `name` at every home this store holds, deleted ones
+    /// included: one keyed read of the (kind, name, home) key's prefix.
+    pub fn resolve_named(&mut self, kind: KindCode, name: &str) -> Result<Vec<ResourceId>, StoreError> {
+        self.ctx().resolve_named(kind, name)
     }
 
     pub fn load<K: Kind>(&mut self, id: ResourceId) -> Result<Option<Loaded<K>>, StoreError> {
@@ -1103,6 +1109,13 @@ impl Ctx<'_> {
             self.remember_identity(identity, id);
         }
         Ok(id)
+    }
+
+    pub(crate) fn resolve_named(&mut self, kind: KindCode, name: &str) -> Result<Vec<ResourceId>, StoreError> {
+        let Some(name) = self.string_id(RESOURCE_NAME_DOMAIN, name)? else { return Ok(Vec::new()) };
+        let mut statement = self.conn.prepare_cached(IDENTITY_NAMED)?;
+        let ids = statement.query_map(params![kind.as_str(), name], |row| row.get::<_, i64>(0).map(ResourceId))?;
+        Ok(ids.collect::<Result<_, _>>()?)
     }
 
     fn ensure_identity(&mut self, identity: &Identity) -> Result<ResourceId, StoreError> {

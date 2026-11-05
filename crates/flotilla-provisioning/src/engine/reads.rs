@@ -149,15 +149,26 @@ pub struct StoreReads {
 pub struct LifecycleReadPort {
     reads: StoreReads,
     home: String,
+    environments: Option<Arc<dyn flotilla_resources::environment_records::EnvironmentRecords>>,
 }
 
 impl LifecycleReadPort {
     pub fn new(reads: StoreReads, home: String) -> Self {
-        Self { reads, home }
+        Self { reads, home, environments: None }
+    }
+
+    /// Serves `environments` as the engine's environments.
+    pub fn with_environments(mut self, environments: Arc<dyn flotilla_resources::environment_records::EnvironmentRecords>) -> Self {
+        self.environments = Some(environments);
+        self
     }
 }
 
 impl flotilla_resources::lifecycle_reads::LifecycleReads for LifecycleReadPort {
+    fn environments(&self) -> Result<&dyn flotilla_resources::environment_records::EnvironmentRecords, String> {
+        self.environments.as_deref().ok_or_else(|| "this read port serves no environments".to_owned())
+    }
+
     fn try_terminal_launch(
         &self,
         name: &str,
@@ -205,14 +216,14 @@ impl StoreReads {
         Self { store }
     }
 
-    fn read<T>(&self, read: impl FnOnce(&mut Read<'_>) -> Result<T, ReadError>) -> Result<T, ReadError> {
+    pub(crate) fn read<T>(&self, read: impl FnOnce(&mut Read<'_>) -> Result<T, ReadError>) -> Result<T, ReadError> {
         let mut store = self.store.lock().map_err(|_| ReadError("decided store lock poisoned".into()))?;
         let mut reader = store.read()?;
         read(&mut reader)
     }
 }
 
-fn view<K>(read: &mut Read<'_>, id: ResourceId) -> Result<Option<View<K>>, ReadError>
+pub(crate) fn view<K>(read: &mut Read<'_>, id: ResourceId) -> Result<Option<View<K>>, ReadError>
 where
     K: LifecycleKind,
     Resource<Lifecycle<K>>: Kind,
@@ -230,7 +241,7 @@ where
     }))
 }
 
-fn keyed<K>(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<View<K>>, ReadError>
+pub(crate) fn keyed<K>(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<View<K>>, ReadError>
 where
     K: LifecycleKind,
     Resource<Lifecycle<K>>: Kind,
@@ -241,7 +252,7 @@ where
     }
 }
 
-fn indexed<K, Q>(read: &mut Read<'_>, query: &IndexQuery<Q>) -> Result<Vec<View<K>>, ReadError>
+pub(crate) fn indexed<K, Q>(read: &mut Read<'_>, query: &IndexQuery<Q>) -> Result<Vec<View<K>>, ReadError>
 where
     K: LifecycleKind,
     Resource<Lifecycle<K>>: Kind,

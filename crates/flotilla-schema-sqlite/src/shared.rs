@@ -186,6 +186,7 @@ pub(crate) const SHARED_STATEMENTS: &[(&str, &str)] = &[
     ("string_id", STRING_ID),
     ("string_insert", STRING_INSERT),
     ("identity_resolve", IDENTITY_RESOLVE),
+    ("identity_named", IDENTITY_NAMED),
     ("identity_insert", IDENTITY_INSERT),
     ("identity_of", IDENTITY_OF),
     ("identity_delete", IDENTITY_DELETE),
@@ -260,6 +261,8 @@ pub(crate) const LOG_EXPUNGED_AFTER: &str = "SELECT effect FROM log WHERE home =
 pub(crate) const STRING_ID: &str = "SELECT id FROM strings WHERE domain = ?1 AND s = ?2";
 pub(crate) const STRING_INSERT: &str = "INSERT INTO strings (domain, s) VALUES (?1, ?2)";
 pub(crate) const IDENTITY_RESOLVE: &str = "SELECT id FROM resource_identity WHERE kind = ?1 AND name = ?2 AND home = ?3";
+/// Every home's identity of one kind and name, by home, through the (kind, name, home) key.
+pub(crate) const IDENTITY_NAMED: &str = "SELECT id FROM resource_identity WHERE kind = ?1 AND name = ?2 ORDER BY home";
 pub(crate) const IDENTITY_INSERT: &str = "INSERT INTO resource_identity (kind, name, home) VALUES (?1, ?2, ?3)";
 pub(crate) const IDENTITY_OF: &str =
     "SELECT i.kind, n.s, h.s FROM resource_identity i JOIN strings n ON n.id = i.name JOIN strings h ON h.id = i.home WHERE i.id = ?1";
