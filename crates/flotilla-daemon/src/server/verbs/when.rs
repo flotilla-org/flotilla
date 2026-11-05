@@ -39,11 +39,6 @@ impl Condition {
     }
 }
 
-/// The columns a `confirm` text substitutes: each `{column}`.
-pub(crate) fn confirm_columns(confirm: &str) -> Vec<String> {
-    confirm.split('{').skip(1).filter_map(|part| part.split_once('}').map(|(column, _)| column.to_owned())).collect()
-}
-
 /// Whether `cell` compares as `operator` with `literal`: numerically when both are numbers, by
 /// text otherwise. A null cell, or one
 /// with no order for the operator, satisfies only `!=`.
@@ -102,11 +97,5 @@ mod tests {
         assert!(!holds(&json!(true), Operator::LessThan, "true"));
         assert!(Condition::parse("status.phase != Landed").is_err(), "a column path starts with `.`");
         assert!(Condition::parse(". == x").is_err());
-    }
-
-    #[test]
-    fn confirm_substitutions_name_their_columns() {
-        assert_eq!(confirm_columns("Abandon {metadata.name} in {status.phase}?"), ["metadata.name", "status.phase"]);
-        assert!(confirm_columns("Abandon it?").is_empty());
     }
 }

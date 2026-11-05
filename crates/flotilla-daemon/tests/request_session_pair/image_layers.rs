@@ -136,14 +136,6 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
             .unwrap();
     }
     let mesh = spawn_in_memory_request_mesh(hosts).await.expect("mesh");
-    // Run the production demand service on either possible source owner; the
-    // paused-clock scenarios must not wait on an absent refresher.
-    let mut forge_services = Vec::new();
-    for host in &mesh.hosts {
-        let (service, ready) = flotilla_daemon::runtime::spawn_forge_read_demand_task(host.clone(), "flotilla".into());
-        forge_services.push(tokio_util::task::AbortOnDropHandle::new(service));
-        ready.await.expect("forge demand watches ready");
-    }
     eventually(Duration::from_secs(5), Duration::from_millis(10), "image catalogue and placement replicate", || async {
         let issuer = mesh.hosts[issuer].resource_backend();
         let mut replicated = issuer.including_replicas::<Host>("flotilla").get(&host_id).await.is_ok()

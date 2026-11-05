@@ -71,10 +71,6 @@ impl ReadOnlyChangeRequests {
 
 #[async_trait]
 impl ChangeRequestTracker for ReadOnlyChangeRequests {
-    fn for_background_refresh(&self) -> Option<Arc<dyn ChangeRequestTracker>> {
-        self.0.for_background_refresh().map(Self::guard)
-    }
-
     async fn observe_bound(&self, numbers: &[u64], crew_logins: &CrewGithubLoginsByRequest) -> Result<BoundObservations, ObservationError> {
         self.0.observe_bound(numbers, crew_logins).await
     }

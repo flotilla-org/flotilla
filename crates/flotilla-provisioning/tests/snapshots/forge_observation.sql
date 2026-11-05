@@ -99,26 +99,6 @@ CREATE VIEW "change_request_view" AS SELECT
   (SELECT "name" FROM "codes" WHERE "kind" = 'cq' AND "field" = 'mergeable' AND "code" = "change_request"."mergeable") AS "mergeable",
   "change_request"."failing_since"
 FROM "change_request";
-CREATE TABLE "forge_read" (
-  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
-  "version" INTEGER NOT NULL,
-  "service" TEXT NOT NULL,
-  "scope" TEXT NOT NULL,
-  "request" BLOB NOT NULL,
-  "value" BLOB NOT NULL,
-  "error" TEXT,
-  "retry_at" INTEGER
-) STRICT;
-CREATE VIEW "forge_read_view" AS SELECT
-  "forge_read"."id",
-  "forge_read"."version",
-  "forge_read"."service",
-  "forge_read"."scope",
-  "forge_read"."request",
-  "forge_read"."value",
-  "forge_read"."error",
-  "forge_read"."retry_at"
-FROM "forge_read";
 CREATE TABLE "issue" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,

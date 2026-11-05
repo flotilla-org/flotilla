@@ -944,9 +944,9 @@ async fn capability_regression_keeps_live_forge_observer() {
 // inputs/results withdraw the forge reader. Exercise objects and event records.
 #[hegel::test]
 fn quarantine_withdraws_only_for_observation_records(tc: hegel::TestCase) {
-    let kind = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(8));
+    let kind = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(6));
     let event = tc.draw(hegel::generators::booleans());
-    let kinds = ["Convoy", "Host", "Forge", "Project", "Repository", "ForgeRead", "ForgeReadHeartbeat", "Issue", "ChangeRequest"];
+    let kinds = ["Convoy", "Host", "Forge", "Project", "Repository", "Issue", "ChangeRequest"];
     let mut diagnostics = flotilla_resources::ResourceStoreDiagnostics::default();
     if event {
         diagnostics.event_decode_quarantines.push(

@@ -2,13 +2,13 @@ use std::path::Path;
 
 use chrono::Utc;
 use flotilla_engine_store::ImportTarget;
-use flotilla_protocol::{IssueSource, NodeId};
-use flotilla_provisioning::stored::forge_observation::{ChangeRequestRecord, ForgeReadRecord, IssueRecord};
+use flotilla_protocol::NodeId;
+use flotilla_provisioning::stored::forge_observation::{ChangeRequestRecord, IssueRecord};
 use flotilla_resources::{
-    forge_read_name, AccessDelivery, Artifact, ChangeRequestReviewObservation, ChangeRequestStatus, Checkout, Clone as CloneResource,
-    Convoy, ConvoyEnsure, CredentialSpec, FleetDesignation, Forge, ForgeReadRequest, FulfilmentKind, InputMeta, IssueStatus, Message,
-    Observation, ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision, Project,
-    Repository, RepositorySpec, Resource, TerminalSession, Vessel,
+    AccessDelivery, Artifact, ChangeRequestReviewObservation, ChangeRequestStatus, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure,
+    CredentialSpec, FleetDesignation, Forge, FulfilmentKind, InputMeta, IssueStatus, Message, Observation, ObservedChangeRequestState,
+    ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision, Project, Repository, RepositorySpec, Resource,
+    TerminalSession, Vessel,
 };
 use flotilla_schema::{Kind, Timestamp};
 use flotilla_store::{replica::StoredReplicaEventKind, ResourceKind};
@@ -467,7 +467,14 @@ fn rows(documents: Vec<Value>) -> Source {
             .into_iter()
             .map(|document| {
                 let kind = document["kind"].as_str().unwrap_or("Message");
-                let plural = REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.kind == kind).expect("registered").plural;
+                let plural = REGISTERED_RESOURCE_KINDS
+                    .iter()
+                    .find(|entry| entry.kind == kind)
+                    .map(|entry| entry.plural)
+                    .or_else(|| {
+                        flotilla_store::RETIRED_RESOURCE_KINDS.iter().find(|retired| retired.kind == kind).map(|retired| retired.plural)
+                    })
+                    .expect("registered or retired");
                 let home = document.pointer("/metadata/annotations/flotilla.work~1origin-root").and_then(Value::as_str).unwrap_or(HERE);
                 Row { namespace: NS.into(), plural: plural.into(), home: home.into(), document }
             })
@@ -726,12 +733,10 @@ fn issue(number: u64) -> Value {
 }
 
 fn forge_read() -> Value {
-    let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
-    let request = ForgeReadRequest::Board;
     document(
         "ForgeRead",
-        &forge_read_name(&source, &request),
-        json!({"source": source, "request": request, "demanded_at": Utc::now()}),
+        "forge-read-board",
+        json!({"source": {"service": "https://github.com", "scope": "flotilla-org/flotilla"}, "request": {"operation": "board"}, "demanded_at": Utc::now()}),
         json!({"authority": HERE, "attempted_at": Utc::now(), "observed_at": Utc::now(), "value": {"repositories": []}, "error": null, "retry_at": null}),
     )
 }
@@ -799,21 +804,17 @@ fn hosts_importing_together_write_each_observation_once_at_its_observer() {
         let mut target = Import::in_memory(home, crate::runtime::decided_registry().expect("registry")).expect("store");
         let summary = import(&source, &mut target);
         assert!(summary.refusals.is_empty(), "{home}: {:?}", summary.refusals);
+        assert_eq!(summary.kinds.get("ForgeRead").map(|counts| counts.dropped), (home == HERE).then_some(1), "{home}");
         let mut read = target.store().read().expect("read");
         let held = [
             ("ChangeRequest", read.scan::<ChangeRequestRecord>(home, None, 64).expect("scan").ids.len()),
             ("Issue", read.scan::<IssueRecord>(home, None, 64).expect("scan").ids.len()),
-            ("ForgeRead", read.scan::<ForgeReadRecord>(home, None, 64).expect("scan").ids.len()),
         ];
         for (kind, count) in held {
             written.entry(kind.to_owned()).or_default().extend(std::iter::repeat_n(home.to_owned(), count));
         }
     }
-    let expected = BTreeMap::from([
-        ("ChangeRequest".to_owned(), vec![THERE.to_owned()]),
-        ("ForgeRead".to_owned(), vec![THERE.to_owned()]),
-        ("Issue".to_owned(), vec![ELSEWHERE.to_owned()]),
-    ]);
+    let expected = BTreeMap::from([("ChangeRequest".to_owned(), vec![THERE.to_owned()]), ("Issue".to_owned(), vec![ELSEWHERE.to_owned()])]);
     assert_eq!(written, expected);
 }
 

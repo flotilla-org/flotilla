@@ -21,7 +21,7 @@ use tracing::Instrument;
 static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-// ForgeReads owns the 300s load deadline and publishes its timeout/last-good
+// ForgeReads owns the 300s load deadline and keeps its timeout/last-good
 // result. This outer watchdog must allow that completion, rather than racing
 // the inner deadline and discarding its result. It also bounds bare providers.
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(300).saturating_add(Duration::from_secs(30));

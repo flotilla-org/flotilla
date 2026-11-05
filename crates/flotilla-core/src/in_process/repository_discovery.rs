@@ -2,9 +2,10 @@
 use super::*;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_forge_forgejo::FORGEJO_AUTH_PROVIDER;
+use flotilla_observation::forge_observation::ForgeReads;
 use flotilla_vcs::providers::detection::remote_assertion;
 pub(super) async fn discover_repository_change_request_with(
-    resource_backend: &ResourceBackend,
+    forge_reads: &ForgeReads,
     config: &ConfigStore,
     discovery: &DiscoveryRuntime,
     environment_manager: &EnvironmentManager,
@@ -13,7 +14,8 @@ pub(super) async fn discover_repository_change_request_with(
     repository: &RepositorySpec,
 ) -> Result<Arc<dyn ChangeRequestTracker>, String> {
     let identity = repository.forge().ok_or("no forge identity")?;
-    let bag = repository_provider_bag(resource_backend, config, environment_manager, local_environment_id, namespace, repository).await?;
+    let bag =
+        repository_provider_bag(&forge_reads.backend, config, environment_manager, local_environment_id, namespace, repository).await?;
     discovery.observation_credentials.require_for_bag(discovery.runner.as_ref(), &bag).await?;
     let probe_root = ExecutionEnvironmentPath::new(config.base_path().as_ref());
     let mut unmet = Vec::new();
@@ -22,7 +24,11 @@ pub(super) async fn discover_repository_change_request_with(
             Ok(provider) => {
                 return Ok(Arc::new(flotilla_observation::forge_observation::ObservedChangeRequestTracker {
                     inner: provider,
-                    reads: flotilla_observation::forge_observation::ForgeReads::new(resource_backend.clone(), namespace.into()),
+                    reads: {
+                        let mut reads = forge_reads.clone();
+                        reads.namespace = namespace.into();
+                        reads
+                    },
                     source: flotilla_protocol::IssueSource { service: identity.service_url.clone(), scope: identity.repository.clone() },
                 }))
             }

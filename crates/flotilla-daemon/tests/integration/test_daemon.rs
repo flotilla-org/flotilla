@@ -14,6 +14,8 @@ use flotilla_resources::{
     Checkout, Convoy, ConvoyPhase, Environment, EnvironmentPhase, EnvironmentStatus, Event, ResourceObject, VESSEL_REF_LABEL,
 };
 
+const PRIMITIVES: &str = "[primitives]\n";
+
 /// An environment of one of `convoy`'s vessels, in `phase`.
 fn of_convoy(convoy: &str, phase: EnvironmentPhase) -> impl Fn(&ResourceObject<Environment>) -> bool + '_ {
     move |environment| {
@@ -79,8 +81,8 @@ async fn working_cloud_convoy(daemon: &TestDaemon) -> (String, String, String) {
 }
 
 /// Liveness passes come every resync, so a loss is confirmed promptly.
-async fn cloud_daemon() -> TestDaemon {
-    TestDaemon::builder().agent("turn_delay_ms = 60000").resync(Duration::from_millis(100)).start().await
+async fn cloud_daemon(settings: &str) -> TestDaemon {
+    TestDaemon::builder().settings(settings).agent("turn_delay_ms = 60000").resync(Duration::from_millis(100)).start().await
 }
 
 // A cloud sandbox the vendor deletes is Lost: the daemon learns it only from
@@ -92,7 +94,18 @@ async fn cloud_daemon() -> TestDaemon {
 // forced delete then completes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn abandoning_a_convoy_whose_sandbox_the_vendor_deleted_releases_its_teardown() {
-    let daemon = cloud_daemon().await;
+    deleted_sandbox_releases_teardown("").await;
+}
+
+// On the engine, where the Lost status is written only as the engine's answer,
+// the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn on_the_engine_abandoning_a_convoy_whose_sandbox_the_vendor_deleted_releases_its_teardown() {
+    deleted_sandbox_releases_teardown(PRIMITIVES).await;
+}
+
+async fn deleted_sandbox_releases_teardown(settings: &str) {
+    let daemon = cloud_daemon(settings).await;
     let (convoy, environment, checkout) = working_cloud_convoy(&daemon).await;
     assert!(daemon.vendor().vanish(&environment));
     daemon.wait("Lost", environment_named(&environment, |status| status.phase == EnvironmentPhase::Lost)).await;
@@ -125,7 +138,7 @@ async fn abandoning_a_convoy_whose_sandbox_the_vendor_deleted_releases_its_teard
 // holds teardown and says what holds it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_convoy_whose_sandbox_the_vendor_stopped_holds_its_teardown() {
-    let daemon = cloud_daemon().await;
+    let daemon = cloud_daemon("").await;
     let (convoy, environment, checkout) = working_cloud_convoy(&daemon).await;
     assert!(daemon.vendor().stop(&environment));
     daemon.wait("Lost", environment_named(&environment, |status| status.phase == EnvironmentPhase::Lost)).await;

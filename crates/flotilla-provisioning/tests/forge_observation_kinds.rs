@@ -6,20 +6,20 @@ mod schema_support;
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use flotilla_engine_store::Import;
-use flotilla_protocol::{issue_query::IssueQuery, IssueSource};
+use flotilla_protocol::IssueSource;
 use flotilla_provisioning::{
     engine::{
-        forge_observation_import::{import_change_requests, import_forge_reads, import_issues, Demands, ObservationCopy},
+        forge_observation_import::{import_change_requests, import_issues, ObservationCopy},
         import::ImportReport,
     },
-    stored::forge_observation::{self as stored, ChangeRequestRecord, ForgeReadRecord, IssueRecord, ReadValue},
+    stored::forge_observation::{self as stored, ChangeRequestRecord, IssueRecord},
 };
 use flotilla_resources::{
-    ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, ChangeRequestSubjectHistory, ForgeRead,
-    ForgeReadRequest, ForgeReadSpec, ForgeReadStatus, Issue, IssueSpec, IssueStatus, ObjectMeta, Observation, ObservedChangeRequestState,
-    ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision, Resource, ResourceObject,
+    ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, ChangeRequestSubjectHistory, Issue, IssueSpec,
+    IssueStatus, ObjectMeta, Observation, ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability,
+    ObservedReviewDecision, Resource, ResourceObject,
 };
 use flotilla_schema::{render_view, Kind, Timestamp};
 use flotilla_schema_sqlite::{schema_ddl, DdlMode, Store};
@@ -126,25 +126,6 @@ fn issue_status(state: ObservedIssueState, at: DateTime<Utc>) -> IssueStatus {
         labels: known(Some(vec![]), at),
         updated_at: known(Some(at), at),
     }
-}
-
-fn source() -> IssueSource {
-    IssueSource { service: "https://github.com".into(), scope: SCOPE.into() }
-}
-
-fn read_status(value: Option<serde_json::Value>, error: Option<&str>, at: DateTime<Utc>, authority: &str) -> ForgeReadStatus {
-    ForgeReadStatus {
-        authority: authority.into(),
-        attempted_at: at,
-        observed_at: Some(at),
-        value,
-        error: error.map(str::to_owned),
-        retry_at: error.map(|_| at + Duration::seconds(60)),
-    }
-}
-
-fn read(name: &str, request: ForgeReadRequest, demanded_at: DateTime<Utc>, status: Option<ForgeReadStatus>) -> ResourceObject<ForgeRead> {
-    object(name, ForgeReadSpec { source: source(), request, demanded_at }, status)
 }
 
 fn observed_at_alpha(_: &IssueSource) -> Option<String> {
@@ -258,51 +239,6 @@ fn every_observed_issue_imports_with_its_values(tc: hegel::TestCase) {
     assert_eq!(record.failing_since, None);
 }
 
-fn json(tc: &hegel::TestCase) -> serde_json::Value {
-    match tc.draw(gs::integers::<u8>().min_value(0).max_value(5)) {
-        0 => serde_json::Value::Null,
-        1 => serde_json::Value::String(tc.draw(gs::text().max_size(8))),
-        2 => serde_json::Value::from(tc.draw(gs::integers::<i64>())),
-        3 => serde_json::json!({"items": [{"id": tc.draw(gs::text().max_size(4)), "open": tc.draw(gs::booleans())}], "page": 1}),
-        4 => serde_json::json!([tc.draw(gs::integers::<u64>()), null, "x"]),
-        _ => serde_json::Value::Bool(tc.draw(gs::booleans())),
-    }
-}
-
-// Behaviour (ADR 0047): a forge read's latest result imports as its value, error and retry time,
-// a successful read that found nothing (null) staying distinct from one that never succeeded.
-#[hegel::test]
-fn every_forge_read_result_imports_with_its_value(tc: hegel::TestCase) {
-    let now = epoch(1_800_000_000);
-    let value = maybe(&tc, json(&tc));
-    let error = if value.is_none() || tc.draw(gs::booleans()) { Some("rate limited") } else { None };
-    let request = tc.draw(
-        gs::sampled_from(vec![
-            ForgeReadRequest::Board,
-            ForgeReadRequest::Query {
-                params: IssueQuery { search: Some("layer".into()), label: None, match_fields: BTreeMap::new() },
-                page: 2,
-                count: 30,
-            },
-            ForgeReadRequest::Branch { branch: "main".into() },
-            ForgeReadRequest::MergedBranches { limit: 50 },
-        ])
-        .print_as_debug(),
-    );
-    let status = read_status(value.clone(), error, now - Duration::seconds(30), "alpha");
-    let old = read("forge-read-1", request.clone(), now - Duration::seconds(60), Some(status));
-    let mut target = import_at("alpha");
-    let mut report = ImportReport::default();
-    import_forge_reads(&[copy(old, "alpha")], &Demands::new(), &observed_at_alpha, now, &mut target, &mut report);
-    assert!(report.refused.is_empty(), "{report:?}");
-    let record: ForgeReadRecord = load(&mut target, "forge-read-1", "alpha").expect("imported");
-    assert_eq!(record.request, request);
-    assert_eq!(record.source(), source());
-    assert_eq!(record.value, value.map(|value| ReadValue { value }));
-    assert_eq!(record.error.as_deref(), error);
-    assert_eq!(record.retry_at, error.map(|_| Timestamp::from_datetime(&(now + Duration::seconds(30)))));
-}
-
 // Behaviour (ADR 0047; one import per subject): among every home's copies of one
 // subject, the observer imports the one readers pick today; deleted, never-observed and
 // undeclared copies are dropped, counted where they are homed, and convoy history is dropped.
@@ -347,52 +283,6 @@ fn the_observer_imports_the_copy_readers_pick_and_counts_the_rest() {
     assert!(names::<ChangeRequestRecord>(&mut beta, "beta").is_empty());
     let dropped: Vec<_> = report.dropped.iter().map(|((_, reason), count)| (*reason, *count)).collect();
     assert_eq!(dropped, [("imported at its observer", 1)]);
-}
-
-// Behaviour (ADR 0047): a forge read imports its latest attempt; one nothing has demanded within
-// the retention, an incremental one, and one that never succeeded or failed are dropped. A
-// heartbeat's renewal counts as demand.
-#[test]
-fn forge_reads_import_their_latest_result_while_demanded() {
-    let now = epoch(1_800_000_000);
-    let hour = Duration::seconds(3600);
-    let older = read(
-        "forge-read-a",
-        ForgeReadRequest::Board,
-        now - hour * 3,
-        Some(read_status(Some(serde_json::json!(1)), None, now - hour * 3, "beta")),
-    );
-    let newer = read(
-        "forge-read-a",
-        ForgeReadRequest::Board,
-        now - hour * 3,
-        Some(read_status(Some(serde_json::json!(2)), None, now - hour * 2, "alpha")),
-    );
-    let idle = read(
-        "forge-read-b",
-        ForgeReadRequest::Branch { branch: "x".into() },
-        now - hour * 2,
-        Some(read_status(None, Some("gone"), now - hour * 2, "alpha")),
-    );
-    let incremental = read(
-        "forge-read-c",
-        ForgeReadRequest::Changes { since: "c1".into(), count: 10 },
-        now,
-        Some(read_status(Some(serde_json::json!([])), None, now, "alpha")),
-    );
-    let unread = read("forge-read-d", ForgeReadRequest::Mission { id: "7".into() }, now, Some(read_status(None, None, now, "alpha")));
-    let renewed = Demands::from([("forge-read-a".to_owned(), now - Duration::seconds(30))]);
-    let copies = [copy(older, "beta"), copy(newer, "alpha"), copy(idle, "alpha"), copy(incremental, "alpha"), copy(unread, "alpha")];
-
-    let mut alpha = import_at("alpha");
-    let mut report = ImportReport::default();
-    import_forge_reads(&copies, &renewed, &observed_at_alpha, now, &mut alpha, &mut report);
-    assert!(report.refused.is_empty(), "{report:?}");
-    assert_eq!(names::<ForgeReadRecord>(&mut alpha, "alpha"), ["forge-read-a"]);
-    let record: ForgeReadRecord = load(&mut alpha, "forge-read-a", "alpha").expect("imported");
-    assert_eq!(record.value, Some(ReadValue { value: serde_json::json!(2) }));
-    let dropped: Vec<_> = report.dropped.iter().map(|((_, reason), count)| (*reason, *count)).collect();
-    assert_eq!(dropped, [("idle", 1), ("incremental", 1), ("never read", 1)]);
 }
 
 // Behaviour (one import per subject): hosts holding different copies, each importing
@@ -449,38 +339,4 @@ fn an_issue_imports_its_freshest_copy_at_its_observer() {
         let record: Option<IssueRecord> = load(&mut target, "issue-7", home);
         assert_eq!(record.map(|record| record.state), (home == "alpha").then_some(Some(stored::IssueState::Closed)), "{home}");
     }
-}
-
-// Behaviour (ADR 0047): a read that succeeded and found nothing keeps its null result, distinct from
-// a read that never succeeded.
-#[test]
-fn a_forge_read_that_found_nothing_keeps_its_null_result() {
-    let now = epoch(1_800_000_000);
-    let found_nothing = read(
-        "forge-read-null",
-        ForgeReadRequest::Branch { branch: "gone".into() },
-        now,
-        Some(read_status(Some(serde_json::Value::Null), None, now, "alpha")),
-    );
-    let failed = read(
-        "forge-read-none",
-        ForgeReadRequest::Branch { branch: "x".into() },
-        now,
-        Some(read_status(None, Some("forbidden"), now, "alpha")),
-    );
-    let mut target = import_at("alpha");
-    let mut report = ImportReport::default();
-    import_forge_reads(
-        &[copy(found_nothing, "alpha"), copy(failed, "alpha")],
-        &Demands::new(),
-        &observed_at_alpha,
-        now,
-        &mut target,
-        &mut report,
-    );
-    assert!(report.refused.is_empty(), "{report:?}");
-    let found_nothing: ForgeReadRecord = load(&mut target, "forge-read-null", "alpha").expect("imported");
-    let failed: ForgeReadRecord = load(&mut target, "forge-read-none", "alpha").expect("imported");
-    assert_eq!(found_nothing.value, Some(ReadValue { value: serde_json::Value::Null }));
-    assert_eq!(failed.value, None);
 }

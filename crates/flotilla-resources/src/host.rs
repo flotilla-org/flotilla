@@ -36,9 +36,6 @@ pub const CREDENTIAL_EXPIRY_CAPABILITY: &str = "credential_expiry";
 pub const AMBIENT_CLAUDE_CREDENTIAL_SCOPE: &str = "ambient:claude";
 pub const TERMINAL_POOLS_CAPABILITY: &str = "terminal_pools";
 pub const SSH_HOST_CAPABILITY: &str = "ssh_host";
-/// The capability key SSH hosts published before #4001.
-// ADR 0047: remove the agentless capability alias one fleet roll after #4001.
-const LEGACY_SSH_HOST_CAPABILITY: &str = "agentless";
 pub const TRANSPORT_CAPABILITY: &str = "transport";
 pub const PLACEMENT_CAPABILITY: &str = "placement";
 pub const OWNING_DAEMON_CAPABILITY: &str = "owning_daemon";
@@ -144,9 +141,10 @@ impl HostSpec {
 pub enum HostConnection {
     #[default]
     Daemon,
-    // ADR 0047: remove the agentless_ssh alias one fleet roll after #4001.
-    #[serde(alias = "agentless_ssh")]
-    SshHost { owning_daemon: String, destination: String },
+    SshHost {
+        owning_daemon: String,
+        destination: String,
+    },
 }
 
 impl HostConnection {
@@ -344,9 +342,7 @@ impl HostStatus {
     }
 
     pub fn is_ssh_host(&self) -> bool {
-        [SSH_HOST_CAPABILITY, LEGACY_SSH_HOST_CAPABILITY]
-            .iter()
-            .any(|key| self.capabilities.get(*key) == Some(&serde_json::Value::Bool(true)))
+        self.capabilities.get(SSH_HOST_CAPABILITY) == Some(&serde_json::Value::Bool(true))
             && self.capabilities.get(TRANSPORT_CAPABILITY).and_then(serde_json::Value::as_str) == Some("ssh")
             && self.capabilities.get(PLACEMENT_CAPABILITY).and_then(serde_json::Value::as_str) == Some("host_direct_only")
     }
@@ -773,27 +769,6 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // #4001, ADR 0047: Host records stored before the rename name the SSH host
-    // connection and capability by their retired names for one roll.
-    #[test]
-    fn previous_generation_ssh_host_decodes_and_new_writes_use_the_new_names() {
-        let connection: HostConnection =
-            serde_json::from_value(serde_json::json!({ "kind": "agentless_ssh", "owning_daemon": "udder", "destination": "crew@b1" }))
-                .expect("previous connection");
-        assert_eq!(connection, HostConnection::SshHost { owning_daemon: "udder".into(), destination: "crew@b1".into() });
-        assert_eq!(serde_json::to_value(&connection).expect("new connection")["kind"], "ssh_host");
-        let status = HostStatus {
-            capabilities: BTreeMap::from([
-                ("agentless".to_string(), serde_json::json!(true)),
-                (TRANSPORT_CAPABILITY.to_string(), serde_json::json!("ssh")),
-                (PLACEMENT_CAPABILITY.to_string(), serde_json::json!("host_direct_only")),
-                (OWNING_DAEMON_CAPABILITY.to_string(), serde_json::json!("udder")),
-            ]),
-            ..Default::default()
-        };
-        assert_eq!(status.ssh_host_owner(), Some("udder"));
-    }
 
     // Stored N records lack the new decision. Decode conservatively, while
     // every newly serialized record writes its explicit classification.

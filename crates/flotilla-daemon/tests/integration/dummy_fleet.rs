@@ -944,7 +944,6 @@ replication_kinds!(
     Environment,
     FleetDesignation,
     Forge,
-    ForgeRead,
     FulfilmentKind,
     Host,
     ImageBuild,

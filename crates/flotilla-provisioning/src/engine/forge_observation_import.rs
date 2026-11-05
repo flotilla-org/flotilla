@@ -1,13 +1,12 @@
-//! The import of ChangeRequest, Issue and ForgeRead onto the engine (ADR 0047).
+//! The import of ChangeRequest and Issue onto the engine (ADR 0047).
 //!
 //! | Old copy | Imported |
 //! |---|---|
-//! | Every home's copies of one subject or read | one record, at the home that observes its source, from the copy readers pick today |
+//! | Every home's copies of one subject | one record, at the home that observes its source, from the copy readers pick today |
 //! | Each observed value | its column; its `observed_at` is dropped (a judgement) |
-//! | `observing_authority`, ForgeRead's `authority`, `attempted_at`, `observed_at`, `demanded_at` | dropped: the home is the observer |
+//! | `observing_authority` | dropped: the home is the observer |
 //! | ChangeRequest `subject_of` | dropped and counted: the convoys hold their links |
 //! | A copy with no status | dropped: it never observed anything |
-//! | A ForgeRead idle past its retention, or of incremental changes | dropped |
 //! | Deleted copies; labels, annotations and namespaces (#3212) | dropped |
 //!
 //! Hosts' old stores hold different copies of one subject, so a subject is written only at its
@@ -17,17 +16,13 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Duration, Utc};
 use flotilla_engine_store::ImportTarget;
 use flotilla_protocol::IssueSource;
-use flotilla_resources::{select_change_request_sources, ChangeRequest, ForgeRead, ForgeReadRequest, Issue, Resource, ResourceObject};
+use flotilla_resources::{select_change_request_sources, ChangeRequest, Issue, Resource, ResourceObject};
 use flotilla_schema::Kind;
 
 use super::import::{created, ImportRefusal, ImportReport};
-use crate::stored::forge_observation::{ChangeRequestRecord, ForgeReadRecord, IssueRecord};
-
-/// How long a forge read with no demand is kept: the observer retires it after this.
-pub const READ_RETENTION: Duration = Duration::seconds(3600);
+use crate::stored::forge_observation::{ChangeRequestRecord, IssueRecord};
 
 /// One home's old copy of an observation: the object, and the home that wrote it.
 pub struct ObservationCopy<R: Resource> {
@@ -182,53 +177,5 @@ pub fn import_issues(
         let Some(status) = &object.status else { continue };
         let name = object.metadata.name.clone();
         write(KIND, target, &home, &name, object, &IssueRecord::from_old(&object.spec, status), report);
-    }
-}
-
-/// The last time anything demanded each forge read, by name: its creation's demand, or a later
-/// heartbeat's renewal.
-pub type Demands = BTreeMap<String, DateTime<Utc>>;
-
-/// Imports every forge read whose source's observer `target` imports, one record per name, from the
-/// latest result among every home's (its attempt time, then its authority). A read no one has
-/// demanded within [`READ_RETENTION`] of `now`, and an incremental read, are dropped.
-pub fn import_forge_reads(
-    copies: &[ObservationCopy<ForgeRead>],
-    renewed: &Demands,
-    observer_of: &ObserverOf<'_>,
-    now: DateTime<Utc>,
-    target: &mut impl ImportTarget,
-    report: &mut ImportReport,
-) {
-    const KIND: &str = "ForgeRead";
-    let mut demanded = renewed.clone();
-    for copy in copies {
-        let at = demanded.entry(copy.object.metadata.name.clone()).or_insert(copy.object.spec.demanded_at);
-        *at = (*at).max(copy.object.spec.demanded_at);
-    }
-    let rank = |object: &ResourceObject<ForgeRead>| object.status.as_ref().map(|status| (status.attempted_at, status.authority.clone()));
-    let mut selected = BTreeMap::<String, (&ResourceObject<ForgeRead>, String)>::new();
-    for copy in copies {
-        let name = &copy.object.metadata.name;
-        let unusable = if matches!(copy.object.spec.request, ForgeReadRequest::Changes { .. }) {
-            Some("incremental")
-        } else if demanded.get(name).is_some_and(|at| now.signed_duration_since(*at) > READ_RETENTION) {
-            Some("idle")
-        } else if !copy.object.status.as_ref().is_some_and(|status| status.value.is_some() || status.error.is_some()) {
-            Some("never read")
-        } else {
-            None
-        };
-        let Some(home) = candidate(KIND, copy, &copy.object.spec.source, unusable, observer_of, target, report) else { continue };
-        match selected.get(name) {
-            Some((prior, _)) if rank(prior) >= rank(&copy.object) => {}
-            _ => {
-                selected.insert(name.clone(), (&copy.object, home));
-            }
-        }
-    }
-    for (name, (object, home)) in selected {
-        let Some(status) = &object.status else { continue };
-        write(KIND, target, &home, &name, object, &ForgeReadRecord::from_old(&object.spec.source, &object.spec.request, status), report);
     }
 }

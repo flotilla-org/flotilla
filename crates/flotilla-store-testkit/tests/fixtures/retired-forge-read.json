@@ -1,0 +1,32 @@
+[
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "ForgeRead",
+    "metadata": { "name": "forge-read-5f1c", "namespace": "flotilla", "resourceVersion": "3", "creationTimestamp": "2026-11-01T00:00:00Z" },
+    "spec": {
+      "source": { "service": "https://github.com", "scope": "acme/widgets" },
+      "request": { "operation": "board" },
+      "demanded_at": "2026-11-01T00:00:00Z"
+    },
+    "status": {
+      "authority": "host-a",
+      "attempted_at": "2026-11-01T00:00:05Z",
+      "observed_at": "2026-11-01T00:00:05Z",
+      "value": { "issues": [], "pull_requests": [] },
+      "error": null,
+      "retry_at": null
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "ForgeReadHeartbeat",
+    "metadata": { "name": "forge-read-5f1c", "namespace": "flotilla", "resourceVersion": "4", "creationTimestamp": "2026-11-01T00:00:00Z" },
+    "spec": { "demanded_at": "2026-11-01T00:05:00Z" },
+    "status": {
+      "authority": "host-a",
+      "content_at": "2026-11-01T00:00:05Z",
+      "attempted_at": "2026-11-01T00:05:05Z",
+      "observed_at": "2026-11-01T00:05:05Z"
+    }
+  }
+]
