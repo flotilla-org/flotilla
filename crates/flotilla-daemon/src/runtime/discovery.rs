@@ -352,7 +352,7 @@ pub(super) async fn apply_ssh_host_observation(
     // The owning daemon is the only placer here, so it alone counts the
     // vessels held against the host's cap (#3793).
     if let Some(cap) = profile.max_vessels {
-        let occupancy = flotilla_admission::support::host_occupancy(&daemon.resource_backend(), namespace, &profile.host_id).await?;
+        let occupancy = flotilla_store::occupancy::host_occupancy(&daemon.resource_backend(), namespace, &profile.host_id).await?;
         let probed = ssh.fulfilment_facts.read().await;
         for (kind, facts) in fulfilment_facts.iter_mut() {
             // A probe that found the kind's terminal pool missing keeps it full.
@@ -602,7 +602,7 @@ pub(super) async fn observe_fulfilment_facts(
     let host_spec =
         hosts.items.iter().find(|host| host.metadata.name == host_ref).map(|host| &host.spec).filter(|host| host.connection.is_daemon());
     let occupancy = match host_spec.and_then(|host| host.max_vessels) {
-        Some(_) => Some(flotilla_admission::support::host_occupancy(backend, namespace, host_ref).await?),
+        Some(_) => Some(flotilla_store::occupancy::host_occupancy(backend, namespace, host_ref).await?),
         None => None,
     };
     let mut facts = BTreeMap::new();

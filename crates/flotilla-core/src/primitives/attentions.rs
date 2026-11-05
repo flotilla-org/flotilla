@@ -82,7 +82,9 @@ impl MessagePrimitives {
     /// Every attention message in this replica: from an attention's sender to a person role,
     /// about one subject.
     async fn held(&self, namespace: &str) -> Result<Vec<Held>, String> {
-        let roles = self.roles(namespace).await?;
+        // Raising an attention names its sender's fleet role, so an undesignated fleet holds
+        // none: clearing one then has nothing to clear, rather than failing the caller.
+        let Ok(roles) = self.roles_or_wait(namespace).await? else { return Ok(Vec::new()) };
         let people = self.person_inboxes(namespace).await?;
         let messages = self.messages()?;
         Ok(messages

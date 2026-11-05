@@ -8,9 +8,9 @@ use std::{
     collections::BTreeMap,
     marker::PhantomData,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
-    time::Duration,
 };
 
+use super::log_watch::LogWatch;
 use flotilla_engine_store::{
     follow::{Followed, Follower},
     plain::{PendingChange, PlainError, PlainLog},
@@ -20,9 +20,6 @@ use flotilla_schema::{Kind, NewChange, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use futures::stream::BoxStream;
 use serde_json::Value;
-
-/// How often a change stream looks for new entries in the log, as the account port's does.
-const POLL: Duration = Duration::from_millis(500);
 
 /// How often a write that loses a race to another writer of its name reads and tries again.
 const WRITE_ATTEMPTS: usize = 3;
@@ -263,16 +260,12 @@ impl<K: PlainKind> EngineRecords for PlainRecords<K> {
     }
 
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
-        let service = Arc::clone(&self.service);
-        let mut follower = Follower::new([K::CODE]);
-        let homes = service.homes();
-        service.with_store(|store| follower.start(&mut store.read()?, &homes)).map_err(|error| error.to_string())?;
-        let stream = futures::stream::unfold((service, follower), |(service, mut follower)| async move {
+        let watch = LogWatch::start(Arc::clone(&self.service), [K::CODE]).map_err(|error| error.to_string())?;
+        let stream = futures::stream::unfold(watch, |mut watch| async move {
             loop {
-                tokio::time::sleep(POLL).await;
-                let homes = service.homes();
-                match service.with_store(|store| Ok(!follower.pass(&mut store.read()?, &homes)?.is_empty())) {
-                    Ok(true) => return Some(((), (service, follower))),
+                // A pass that fails is tried again at the next commit; the watcher sees no tick.
+                match watch.next(|_, followed| Ok(!followed.is_empty())).await {
+                    Ok(true) => return Some(((), watch)),
                     Ok(false) => {}
                     Err(error) => tracing::warn!(%error, kind = K::KIND, "change stream could not read the log; retrying"),
                 }

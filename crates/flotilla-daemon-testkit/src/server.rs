@@ -179,6 +179,13 @@ pub async fn spawn_in_memory_request_mesh_with_replication_metrics(
     spawn_request_mesh_with_metrics(hosts, None, Arc::new(Some), None, replication_metrics).await
 }
 
+/// Hosts linked in a line, each only to the next: the first and last are not directly connected,
+/// so what crosses between them is passed on by the hosts between.
+pub async fn spawn_in_memory_request_line(hosts: Vec<Arc<InProcessDaemon>>) -> Result<InMemoryRequestMesh, String> {
+    let replication_metrics = hosts.iter().map(|_| Arc::default()).collect();
+    spawn_request_graph(hosts, None, Arc::new(Some), None, replication_metrics, |left, right| right == left + 1).await
+}
+
 async fn spawn_request_mesh(
     hosts: Vec<Arc<InProcessDaemon>>,
     replication_kinds: Option<&'static [&'static str]>,
@@ -196,6 +203,18 @@ async fn spawn_request_mesh_with_metrics(
     digest_driver: Option<DigestDriver>,
     replication_metrics: Vec<Arc<flotilla_store::load_metrics::ReplicationLoadMetrics>>,
 ) -> Result<InMemoryRequestMesh, String> {
+    spawn_request_graph(hosts, replication_kinds, filter, digest_driver, replication_metrics, |_, _| true).await
+}
+
+/// Hosts linked wherever `linked(left, right)` holds, for `left < right`.
+async fn spawn_request_graph(
+    hosts: Vec<Arc<InProcessDaemon>>,
+    replication_kinds: Option<&'static [&'static str]>,
+    filter: EnvelopeFilter,
+    digest_driver: Option<DigestDriver>,
+    replication_metrics: Vec<Arc<flotilla_store::load_metrics::ReplicationLoadMetrics>>,
+    linked: fn(usize, usize) -> bool,
+) -> Result<InMemoryRequestMesh, String> {
     if hosts.is_empty() {
         return Err("request mesh needs at least one host".into());
     }
@@ -209,6 +228,9 @@ async fn spawn_request_mesh_with_metrics(
     }
     for left in 0..hosts.len() {
         for right in (left + 1)..hosts.len() {
+            if !linked(left, right) {
+                continue;
+            }
             let (left_transport, right_transport) = channel_transport_pair_with_nodes(
                 NodeInfo::new(hosts[left].node_id().clone(), hosts[left].host_name().to_string()),
                 NodeInfo::new(hosts[right].node_id().clone(), hosts[right].host_name().to_string()),
@@ -281,9 +303,10 @@ async fn spawn_request_mesh_with_metrics(
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let mut ready = true;
-            for host in &hosts {
+            for (index, host) in hosts.iter().enumerate() {
                 let topology = host.get_topology().await.map_err(|error| error.to_string())?;
-                ready &= topology.routes.iter().filter(|route| route.connected).count() == hosts.len() - 1;
+                let links = (0..hosts.len()).filter(|other| *other != index && linked(index.min(*other), index.max(*other))).count();
+                ready &= topology.routes.iter().filter(|route| route.connected).count() >= links;
             }
             if ready {
                 return Ok::<(), String>(());

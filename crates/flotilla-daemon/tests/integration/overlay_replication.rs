@@ -1711,3 +1711,250 @@ async fn attach_routes_by_session_host_when_convoy_is_homed_elsewhere() {
     assert!(kiwi.resolve_attach_command_on_host_internal("coder@flotilla", Some(&HostName::new("kiwi"))).await.is_err());
     drop(topology);
 }
+
+// Governor relay contract (moved from server::replication::relay_tests, #3108): a workflow
+// template authored at feta reaches udder through kiwi with feta as its origin, and admission
+// freezes what was relayed. Only feta--kiwi and kiwi--udder are linked.
+mod governor_relay {
+    use std::collections::BTreeSet;
+
+    use flotilla_daemon_api::daemon::DaemonHandle;
+    use flotilla_protocol::{Command, CommandAction, CommandValue, ConvoyAutoAttach, ConvoyStartIntent, DaemonEvent};
+    use flotilla_resources::{
+        single_agent_workflow_spec, CrewSource, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, ResourceObject,
+        WorkflowTemplate, WorkflowTemplateSpec, ENVIRONMENT_PROVIDERS_CAPABILITY, WORKFLOW_SNAPSHOT_ANNOTATION,
+    };
+
+    use super::*;
+
+    async fn await_template(daemon: &InProcessDaemon, name: &str, expected: &WorkflowTemplateSpec) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if daemon
+                    .resource_backend()
+                    .definitions::<WorkflowTemplate>("flotilla")
+                    .get(name)
+                    .await
+                    .is_ok_and(|object| object.spec == *expected)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("feta template must converge through kiwi to udder within seconds");
+    }
+
+    async fn admit_governor(daemon: &InProcessDaemon) -> CommandValue {
+        let mut events = daemon.subscribe();
+        let command_id = daemon
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyStart {
+                        intent: Box::new(
+                            ConvoyStartIntent::builder()
+                                .project_ref("andamento".to_string())
+                                .name("governor".to_string())
+                                .branch("governor".to_string())
+                                .workflow_ref("governor".to_string())
+                                .auto_attach(ConvoyAutoAttach::Never)
+                                .build(),
+                        ),
+                    })
+                    .build(),
+            )
+            .await
+            .expect("submit governor admission");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let DaemonEvent::CommandFinished { command_id: id, result, .. } = events.recv().await.expect("admission event") {
+                    if id == command_id {
+                        return result;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("admission completes")
+    }
+
+    async fn governor_snapshot(daemon: &InProcessDaemon) -> (ResourceObject<Convoy>, WorkflowTemplateSpec) {
+        let backend = daemon.resource_backend();
+        let convoys = backend.using::<Convoy>("flotilla").list().await.expect("list admitted convoys");
+        assert_eq!(convoys.items.len(), 1);
+        let convoy = convoys.items.into_iter().next().expect("admitted governor");
+        let snapshot = backend
+            .definitions::<WorkflowTemplate>("flotilla")
+            .get(&convoy.metadata.annotations[WORKFLOW_SNAPSHOT_ANNOTATION])
+            .await
+            .expect("admission's immutable workflow snapshot");
+        (convoy, snapshot.spec)
+    }
+
+    async fn register_host_direct_kind(daemon: &InProcessDaemon) {
+        let backend = daemon.resource_backend();
+        let host_id = daemon.local_host_id().expect("local host id").to_string();
+        let hosts = backend.using::<Host>("flotilla");
+        let host = hosts.create(&InputMeta::builder().name(host_id.clone()).build(), &HostSpec::default()).await.expect("admission host");
+        hosts
+            .update_status(
+                &host_id,
+                &host.metadata.resource_version,
+                &HostStatus {
+                    capabilities: BTreeMap::from([(
+                        ENVIRONMENT_PROVIDERS_CAPABILITY.to_string(),
+                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                    )]),
+                    heartbeat_at: Some(chrono::Utc::now()),
+                    ready: true,
+                    disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
+                    admission_free_space_floor_bytes: Some(0),
+                    ..HostStatus::default()
+                },
+            )
+            .await
+            .expect("ready admission host");
+        backend
+            .using::<FulfilmentKind>("flotilla")
+            .create(
+                &InputMeta::builder().name(format!("host-direct-{host_id}")).build(),
+                &FulfilmentKindSpec::builder()
+                    .host_ref(host_id)
+                    .pool("cleat".to_string())
+                    .grants(BTreeSet::from([FulfilmentGrant::platform("linux".to_string()), FulfilmentGrant::host_account_reach()]))
+                    .realisation(FulfilmentRealisation::HostDirect)
+                    .build(),
+            )
+            .await
+            .expect("admission fulfilment kind");
+    }
+
+    #[tokio::test]
+    async fn in_memory_http_relays_governor_template_across_three_roots() {
+        governor_relay_contract(TestBackend::InMemory).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_http_relays_governor_template_across_three_roots() {
+        governor_relay_contract(TestBackend::Sqlite).await;
+    }
+
+    enum TestBackend {
+        InMemory,
+        Sqlite,
+    }
+
+    async fn governor_relay_contract(storage: TestBackend) {
+        let temp = tempfile::tempdir().expect("temporary stores");
+        let mut roots = Vec::new();
+        for host in ["feta", "kiwi", "udder"] {
+            let config_path = temp.path().join(host);
+            std::fs::create_dir_all(&config_path).expect("config directory");
+            std::fs::write(config_path.join("daemon.toml"), format!("machine_id = \"{host}\"\n[admission]\nfree_space_floor_gib = 0\n"))
+                .expect("machine identity");
+            let config = Arc::new(ConfigStore::with_base(config_path));
+            let backend = match storage {
+                TestBackend::Sqlite => {
+                    ResourceBackend::new(SqliteBackend::open(temp.path().join(format!("{host}.sqlite"))).expect("open store"))
+                }
+                TestBackend::InMemory => ResourceBackend::new(InMemoryBackend::default()),
+            };
+            let daemon = InProcessDaemon::new_with_resource_backend(
+                vec![],
+                config,
+                fake_discovery(false),
+                HostName::new(host),
+                backend,
+                std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+            )
+            .await;
+            roots.push((daemon, ()));
+        }
+        let feta = &roots[0].0;
+        let kiwi = &roots[1].0;
+        let udder = &roots[2].0;
+        udder
+            .resource_backend()
+            .definitions::<Project>("flotilla")
+            .apply(
+                &InputMeta::builder().name("andamento".to_string()).build(),
+                &ProjectSpec::builder().display_name("Andamento".to_string()).default_workflow_ref("governor".to_string()).build(),
+            )
+            .await
+            .expect("create admission project");
+        assert!(matches!(admit_governor(udder).await, CommandValue::Error { message } if message.contains("workflow template governor")));
+        register_host_direct_kind(udder).await;
+
+        let mut workflow = single_agent_workflow_spec();
+        workflow.exit = None;
+        // No processes are launched: this tests admission independently of adapters.
+        workflow.vessels[0].crew[0].source = CrewSource::Tool { command: "true".to_string() };
+        workflow.turn_delivery.clear();
+        let templates = feta.resource_backend().definitions::<WorkflowTemplate>("flotilla");
+        let metadata = InputMeta::builder().name("governor".to_string()).build();
+        templates.apply(&metadata, &workflow).await.expect("author feta governor");
+
+        // Copied manifests can retain read-view annotations. A local source must
+        // not poison the relay stream for unrelated third-origin definitions.
+        kiwi.resource_backend()
+            .definitions::<WorkflowTemplate>("flotilla")
+            .apply(
+                &InputMeta::builder()
+                    .name("a-local-template".to_string())
+                    .annotations(BTreeMap::from([("flotilla.work/origin-root".to_string(), "old-root".to_string())]))
+                    .build(),
+                &workflow,
+            )
+            .await
+            .expect("author local template with retained annotation");
+
+        // Only A--B and B--C exist: feta's records reach udder only as kiwi passes them on.
+        let _line = flotilla_daemon_testkit::server::spawn_in_memory_request_line(vec![
+            Arc::clone(&roots[0].0),
+            Arc::clone(&roots[1].0),
+            Arc::clone(&roots[2].0),
+        ])
+        .await
+        .expect("connect feta--kiwi--udder");
+        for root in [kiwi, udder] {
+            await_template(root, "governor", &workflow).await;
+            let backend = root.resource_backend();
+            assert!(backend.using::<WorkflowTemplate>("flotilla").get("governor").await.is_err(), "relay must not author locally");
+            let sources = backend.including_replicas::<WorkflowTemplate>("flotilla").list_replica_sources().await.expect("raw sources");
+            let source = sources.items.iter().find(|source| source.object.metadata.name == "governor").expect("governor replica");
+            assert!(matches!(&source.provenance, ResourceProvenance::Replica { origin_root, .. } if origin_root == feta.node_id()));
+        }
+        let admitted = admit_governor(udder).await;
+        assert!(matches!(admitted, CommandValue::ConvoyStarted { .. }), "{admitted:?}");
+        let (first_convoy, first_snapshot) = governor_snapshot(udder).await;
+        assert_eq!(first_snapshot.allocation.len(), 1);
+        let mut expected_snapshot = workflow.clone();
+        expected_snapshot.allocation = first_snapshot.allocation.clone();
+        // Admission freezes local cascade inputs alongside the relayed workflow.
+        let cascade = first_snapshot.cascade.as_ref().expect("frozen cascade");
+        assert_eq!(cascade.project_chain, ["andamento"]);
+        assert_eq!(cascade.settings["workflow"].value, "governor");
+        assert_eq!(cascade.settings["workflow"].layer, "dispatch");
+        expected_snapshot.cascade = first_snapshot.cascade.clone();
+        assert_eq!(first_snapshot, expected_snapshot);
+
+        workflow.vessels[0].crew[0].source = CrewSource::Tool { command: "echo revised-governor".to_string() };
+        templates.apply(&metadata, &workflow).await.expect("revise feta template during live watches");
+        for root in [kiwi, udder] {
+            await_template(root, "governor", &workflow).await;
+        }
+        assert_eq!(governor_snapshot(udder).await.1, first_snapshot, "relay must not rewrite an admitted snapshot");
+        udder.resource_backend().using::<Convoy>("flotilla").delete(&first_convoy.metadata.name).await.expect("retire first admission");
+        let result = admit_governor(udder).await;
+        assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "re-admission failed: {result:?}");
+        expected_snapshot = workflow.clone();
+        expected_snapshot.cascade = first_snapshot.cascade.clone();
+        expected_snapshot.allocation = first_snapshot.allocation;
+        assert_eq!(governor_snapshot(udder).await.1, expected_snapshot, "re-admission must capture the newly relayed merge view");
+
+        // Also cover a record first authored after all watches are already live.
+        templates.apply(&InputMeta::builder().name("late-governor".to_string()).build(), &workflow).await.expect("author late template");
+        await_template(udder, "late-governor", &workflow).await;
+    }
+}

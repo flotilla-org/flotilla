@@ -11,7 +11,8 @@ use flotilla_schema_sqlite::{
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 
-const CADENCE: Duration = Duration::from_secs(5);
+/// Rounds failing one after another before a follower gives the home up until its link reconnects.
+const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 const IO_DEADLINE: Duration = Duration::from_secs(15);
 // The producer waits 15 seconds for a frame. Allow another five seconds for the
 // routed request and response so its specific failure reaches the follower.
@@ -36,7 +37,7 @@ pub(super) fn body(
         if done {
             return Ok(None);
         }
-        let value = match daemon.next_change_stream_frame(&peer, None, Some(session.clone())).await {
+        let value = match daemon.next_change_stream_frame(&peer, None, None, Some(session.clone())).await {
             Ok(value) => value,
             Err(message) => {
                 let frame = Frame::Failure { message }.encode().map_err(std::io::Error::other)?;
@@ -163,24 +164,36 @@ impl flotilla_core::primitives::ports::HomeReads for DecidedHomeReads {
     }
 }
 
-/// One round selects the socket transport when available, otherwise command routing.
+/// The homes a round's keepalive says its server holds.
+type Homes = Vec<String>;
+
+/// The stream query for one round of `home`'s log through `peer`: the peer's own log, or another
+/// home's the peer passes on.
+fn stream_query(peer: &str, home: &str, after: Option<u64>, session: Option<String>) -> flotilla_protocol::Command {
+    use flotilla_protocol::{Command, CommandAction, NodeId};
+    let home = (home != peer).then(|| home.to_owned());
+    Command::builder().node_id(NodeId::new(peer)).action(CommandAction::QueryChangeStream { home, after, session }).build()
+}
+
+/// One round of `home`'s log through `peer`, which is `home` itself or a peer passing it on.
+/// It selects the socket transport when available, otherwise command routing.
 pub(super) async fn follow_round(
     service: Arc<Service>,
+    peer: &str,
     home: &str,
     client: Option<&reqwest::Client>,
     router: &super::remote_commands::RemoteCommandRouter,
-) -> Result<(), String> {
+) -> Result<Homes, String> {
     match client {
         Some(client) => {
-            use flotilla_protocol::{Command, CommandAction, CommandValue, NodeId};
+            use flotilla_protocol::CommandValue;
             let after = service
                 .has_watermark(home)
                 .then(|| service.watermark(home))
                 .transpose()
                 .map_err(|e| e.to_string())?
                 .map(|mark| mark.home_seq);
-            let command =
-                Command::builder().node_id(NodeId::new(home)).action(CommandAction::QueryChangeStream { after, session: None }).build();
+            let command = stream_query(peer, home, after, None);
             let value = tokio::time::timeout(ROUTED_PULL_DEADLINE, router.dispatch_replication_query(command))
                 .await
                 .map_err(|_| "routed stream timed out")??;
@@ -188,26 +201,31 @@ pub(super) async fn follow_round(
                 return Err(format!("unexpected routed stream response: {value:?}"));
             };
             match follow_connection(Arc::clone(&service), home, client, &session, &frame).await {
-                Ok(()) => Ok(()),
+                Ok(homes) => Ok(homes),
                 Err(HttpRoundError::RouteUnavailable(error)) => {
-                    tracing::debug!(%home, %error, "home socket unavailable; using peer route for this round");
-                    routed_round(service, home, router).await
+                    tracing::debug!(%peer, %home, %error, "peer socket unavailable; using peer route for this round");
+                    routed_round(service, peer, home, router).await
                 }
                 Err(HttpRoundError::Failed(error)) => Err(error),
             }
         }
-        None => routed_round(service, home, router).await,
+        None => routed_round(service, peer, home, router).await,
     }
 }
 
-async fn routed_round(service: Arc<Service>, home: &str, router: &super::remote_commands::RemoteCommandRouter) -> Result<(), String> {
-    use flotilla_protocol::{Command, CommandAction, CommandValue, NodeId};
+async fn routed_round(
+    service: Arc<Service>,
+    peer: &str,
+    home: &str,
+    router: &super::remote_commands::RemoteCommandRouter,
+) -> Result<Homes, String> {
+    use flotilla_protocol::CommandValue;
     let after =
         service.has_watermark(home).then(|| service.watermark(home)).transpose().map_err(|e| e.to_string())?.map(|mark| mark.home_seq);
     let mut session = None;
     let mut spool = tokio::fs::File::from_std(tempfile::tempfile().map_err(|e| e.to_string())?);
     loop {
-        let command = Command::builder().node_id(NodeId::new(home)).action(CommandAction::QueryChangeStream { after, session }).build();
+        let command = stream_query(peer, home, after, session);
         let value = tokio::time::timeout(ROUTED_PULL_DEADLINE, router.dispatch_replication_query(command))
             .await
             .map_err(|_| "routed stream timed out")??;
@@ -249,30 +267,71 @@ pub(super) fn follow(
                 return;
             }
         };
-        let mut failures: u64 = 0;
+        let mut failures: u32 = 0;
+        // The other homes this peer passes on, each followed through it while its link lasts:
+        // the set ends with this task.
+        let own = service.home().to_owned();
+        let mut relayed = std::collections::BTreeSet::new();
+        let mut relays = tokio::task::JoinSet::new();
         loop {
-            let result = follow_round(Arc::clone(&service), &home, client.as_ref(), &router).await;
+            let result = follow_round(Arc::clone(&service), &home, &home, client.as_ref(), &router).await;
             let watermark = service.watermark(&home).expect("cached watermark").home_seq;
             match &result {
-                Ok(()) => daemon.report_change_stream(&peer, ChangeStreamUpdate::Healthy(watermark)),
+                Ok(_) => daemon.report_change_stream(&peer, ChangeStreamUpdate::Healthy(watermark)),
                 Err(error) => {
                     daemon.report_change_stream(&peer, ChangeStreamUpdate::Failure { watermark: Some(watermark), message: error.clone() })
                 }
             }
-            if result.is_ok() {
-                failures = 0;
-            }
-            if let Err(error) = result {
-                failures = failures.saturating_add(1);
-                if failures == 3 || failures.is_multiple_of(12) {
-                    tracing::warn!(%home, %error, failures, "decided stream repeatedly disconnected; resuming");
-                } else {
+            // The home holds each round open until its log advances, so the next round starts at
+            // once. A failed round is retried at once from the committed prefix; a home that fails
+            // every round in a row is given up until its link reconnects, which starts a new
+            // follower.
+            match result {
+                Ok(homes) => {
+                    failures = 0;
+                    for other in homes {
+                        if other != own && other != home && relayed.insert(other.clone()) {
+                            relays.spawn(relay(Arc::clone(&service), home.clone(), other, client.clone(), router.clone()));
+                        }
+                    }
+                }
+                Err(error) => {
+                    failures += 1;
+                    if failures >= MAX_CONSECUTIVE_FAILURES {
+                        tracing::warn!(%home, %error, failures, "decided stream keeps failing; following again when the link reconnects");
+                        return;
+                    }
                     tracing::debug!(%home, %error, "decided stream disconnected; resuming");
                 }
             }
-            tokio::time::sleep(CADENCE).await;
         }
     })
+}
+
+/// Follows `home`'s log through `peer`, which passes it on, until the peer's link ends (the
+/// caller drops this task) or every round fails in a row. Applying another home's entries is
+/// idempotent, so the same home followed through two peers converges.
+async fn relay(
+    service: Arc<Service>,
+    peer: String,
+    home: String,
+    client: Option<reqwest::Client>,
+    router: super::remote_commands::RemoteCommandRouter,
+) {
+    let mut failures: u32 = 0;
+    loop {
+        match follow_round(Arc::clone(&service), &peer, &home, client.as_ref(), &router).await {
+            Ok(_) => failures = 0,
+            Err(error) => {
+                failures += 1;
+                if failures >= MAX_CONSECUTIVE_FAILURES {
+                    tracing::warn!(%peer, %home, %error, failures, "relayed stream keeps failing; following again when the link reconnects");
+                    return;
+                }
+                tracing::debug!(%peer, %home, %error, "relayed stream disconnected; resuming");
+            }
+        }
+    }
 }
 
 fn http_client(socket: &std::path::Path) -> Result<reqwest::Client, String> {
@@ -302,7 +361,7 @@ async fn follow_connection(
     client: &reqwest::Client,
     session: &str,
     first: &[u8],
-) -> Result<(), HttpRoundError> {
+) -> Result<Homes, HttpRoundError> {
     // The peer-issued session fixes the cursor; HTTP only continues that round.
     let target = format!("http://flotilla.local{}", stream::PATH);
     let mut spool = tokio::fs::File::from_std(tempfile::tempfile().map_err(|e| e.to_string())?);
@@ -369,11 +428,13 @@ async fn follow_connection(
     install_spool(service, home, spool.into_std().await).await.map_err(Into::into)
 }
 
-async fn install_spool(service: Arc<Service>, home: &str, mut spool: std::fs::File) -> Result<(), String> {
+/// Installs a staged round; the homes its keepalive says the server holds.
+async fn install_spool(service: Arc<Service>, home: &str, mut spool: std::fs::File) -> Result<Homes, String> {
     let home = home.to_owned();
     tokio::task::spawn_blocking(move || {
         use std::io::{Read, Seek};
         spool.rewind().map_err(transport)?;
+        let mut held = Vec::new();
         service.with_store(|store| {
             Follower::new(store).receive(&home, |sink| loop {
                 let mut header = [0; HEADER_LEN];
@@ -382,13 +443,20 @@ async fn install_spool(service: Arc<Service>, home: &str, mut spool: std::fs::Fi
                 let mut frame = header.to_vec();
                 frame.resize(HEADER_LEN + length, 0);
                 spool.read_exact(&mut frame[HEADER_LEN..]).map_err(transport)?;
-                let end = matches!(Frame::decode(&frame)?, Frame::Keepalive { .. });
+                let end = match Frame::decode(&frame)? {
+                    Frame::Keepalive { homes, .. } => {
+                        held = homes;
+                        true
+                    }
+                    _ => false,
+                };
                 sink(&frame)?;
                 if end {
                     return Ok(());
                 }
             })
-        })
+        })?;
+        Ok::<_, StoreError>(held)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -420,8 +488,9 @@ mod tests {
             if known {
                 service
                     .with_store(|store| {
-                        Follower::new(store)
-                            .receive("home", |sink| sink(&Frame::Keepalive { home: "home".into(), watermark: Watermark::ZERO }.encode()?))
+                        Follower::new(store).receive("home", |sink| {
+                            sink(&Frame::Keepalive { home: "home".into(), watermark: Watermark::ZERO, homes: Vec::new() }.encode()?)
+                        })
                     })
                     .expect("baseline");
             }
@@ -444,7 +513,11 @@ mod tests {
                 } else {
                     vec![
                         Frame::End { home: "home".into(), home_seq: 0 },
-                        Frame::Keepalive { home: "home".into(), watermark: Watermark { home_seq: 0, applied_through: Timestamp(7) } },
+                        Frame::Keepalive {
+                            home: "home".into(),
+                            watermark: Watermark { home_seq: 0, applied_through: Timestamp(7) },
+                            homes: Vec::new(),
+                        },
                     ]
                 };
                 let bytes: Vec<u8> = frames.iter().flat_map(|frame| frame.encode().expect("encode")).collect();
@@ -503,7 +576,11 @@ mod tests {
             }
             let rest: Vec<u8> = [
                 Frame::End { home: "home".into(), home_seq: 0 },
-                Frame::Keepalive { home: "home".into(), watermark: Watermark { home_seq: 0, applied_through: Timestamp(7) } },
+                Frame::Keepalive {
+                    home: "home".into(),
+                    watermark: Watermark { home_seq: 0, applied_through: Timestamp(7) },
+                    homes: Vec::new(),
+                },
             ]
             .iter()
             .flat_map(|frame| frame.encode().expect("frame"))
@@ -536,8 +613,12 @@ mod tests {
             other.with_store(|store| {
                 Follower::new(store).receive("other", |sink| {
                     sink(
-                        &Frame::Keepalive { home: "other".into(), watermark: Watermark { home_seq: 0, applied_through: Timestamp(3) } }
-                            .encode()?,
+                        &Frame::Keepalive {
+                            home: "other".into(),
+                            watermark: Watermark { home_seq: 0, applied_through: Timestamp(3) },
+                            homes: Vec::new(),
+                        }
+                        .encode()?,
                     )
                 })
             })?;

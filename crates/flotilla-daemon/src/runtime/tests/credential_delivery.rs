@@ -352,19 +352,10 @@ async fn daemon_forgejo_credential_mapping_waits_for_forge_replication() {
         )
         .await;
     daemon.publish_peer_connection_status(&peer, PeerConnectionState::Connected).await;
-    let backend = daemon.resource_backend();
-    let authority = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    backend
-        .replica_writer::<Host>(peer_id.clone(), NAMESPACE)
-        .replace(&authority.using::<Host>(NAMESPACE).list().await.expect("host snapshot"), Utc::now())
-        .await
-        .expect("unrelated replication");
     assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("pending Forge replication").is_none());
-    let writer = backend.replica_writer::<Forge>(peer_id, NAMESPACE);
-    writer
-        .replace(&authority.using::<Forge>(NAMESPACE).list().await.expect("empty Forge snapshot"), Utc::now())
-        .await
-        .expect("empty Forge replication settled");
+    // The authority's decided log arrives, holding no Forge: its absence is settled.
+    let target = daemon.decided_store().expect("decided store");
+    flotilla_provisioning_testkit::other_home_for(&target, peer_id.as_str()).replicate_to(&target);
     assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("settled absence").is_some());
     // The declaration itself is a decided record: it arrives as the authority's log does.
     declare_mapping_forge_at_home(&daemon, "forge-authority").await;

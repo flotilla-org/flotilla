@@ -15,7 +15,6 @@
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
-    time::Duration,
 };
 
 use flotilla_engine_store::{
@@ -32,6 +31,7 @@ use flotilla_schema_sqlite::{stream::Service, Read, ResourceId, StoreError};
 use futures::stream::BoxStream;
 use serde_json::Value;
 
+use super::log_watch::LogWatch;
 use super::provenance;
 use crate::stored::manifest_root::ManifestRoot;
 use crate::stored::project::{ProjectDefinition, ProjectOpsRecord};
@@ -42,9 +42,6 @@ const OPS: KindCode = <ProjectOpsRecord as Kind>::CODE;
 /// The ManifestRoot's code: a root's baselines hold the paths its Projects read with, so a root's
 /// change re-reads its home's Projects.
 const ROOT: KindCode = <flotilla_state_machines::Resource<ManifestRoot> as Kind>::CODE;
-
-/// How often a change stream looks for new entries in the log, as the account port's does.
-const POLL: Duration = Duration::from_millis(500);
 
 /// How often a write that loses a race to another writer of its name reads and tries again.
 const WRITE_ATTEMPTS: usize = 3;
@@ -495,27 +492,28 @@ impl EngineRecords for EngineProjects {
     }
 
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
-        let service = Arc::clone(&self.service);
-        let mut follower = Follower::new([PROJECT, OPS, ROOT]);
-        let homes = service.homes();
-        service.with_store(|store| follower.start(&mut store.read()?, &homes)).map_err(|error| error.to_string())?;
+        let watch = LogWatch::start(Arc::clone(&self.service), [PROJECT, OPS, ROOT]).map_err(|error| error.to_string())?;
         let mut judged = self.judged_changes.subscribe();
         judged.mark_unchanged();
-        let stream = futures::stream::unfold((service, follower, judged), |(service, mut follower, mut judged)| async move {
+        // The port is gone once its sender is; the log alone ticks from then on.
+        let stream = futures::stream::unfold((watch, Some(judged)), |(mut watch, mut judged)| async move {
             loop {
-                tokio::select! {
-                    changed = judged.changed() => {
-                        // The port is gone once its sender is; the log alone ticks from then on.
-                        if changed.is_ok() {
-                            return Some(((), (service, follower, judged)));
+                match judged.as_mut() {
+                    Some(receiver) => tokio::select! {
+                        changed = receiver.changed() => {
+                            if changed.is_ok() {
+                                return Some(((), (watch, judged)));
+                            }
+                            judged = None;
+                            continue;
                         }
-                        tokio::time::sleep(POLL).await;
-                    }
-                    () = tokio::time::sleep(POLL) => {}
+                        () = watch.woken() => {}
+                    },
+                    None => watch.woken().await,
                 }
-                let homes = service.homes();
-                match service.with_store(|store| Ok(!follower.pass(&mut store.read()?, &homes)?.is_empty())) {
-                    Ok(true) => return Some(((), (service, follower, judged))),
+                // A pass that fails is tried again at the next commit.
+                match watch.pass(|_, followed| Ok(!followed.is_empty())).await {
+                    Ok(true) => return Some(((), (watch, judged))),
                     Ok(false) => {}
                     Err(error) => tracing::warn!(%error, "project change stream could not read the log; retrying"),
                 }

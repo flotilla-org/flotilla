@@ -6950,7 +6950,7 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     });
     // A missing forwarded socket must use the working peer route immediately.
     let missing = rigging_tls::client_builder().unix_socket(dir.path().join("missing.sock")).build().unwrap();
-    super::change_stream::follow_round(Arc::clone(&target), "home", Some(&missing), &router).await.unwrap();
+    super::change_stream::follow_round(Arc::clone(&target), "home", "home", Some(&missing), &router).await.unwrap();
     // Twenty writes, each a change and its entry (#4024).
     assert_eq!(target.watermark("home").unwrap().home_seq, 40);
     // The stand-in replaces only HTTP: one unavailable route, then a damaged
@@ -6978,14 +6978,14 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
         }
     });
     seed("tail");
-    super::change_stream::follow_round(Arc::clone(&target), "home", Some(&http), &router).await.unwrap();
+    super::change_stream::follow_round(Arc::clone(&target), "home", "home", Some(&http), &router).await.unwrap();
     assert_eq!(target.watermark("home").unwrap().home_seq, 42);
     seed("partial");
-    let error = super::change_stream::follow_round(Arc::clone(&target), "home", Some(&http), &router).await.unwrap_err();
+    let error = super::change_stream::follow_round(Arc::clone(&target), "home", "home", Some(&http), &router).await.unwrap_err();
     assert_eq!(error, "truncated home stream", "a mid-body failure must not fall back");
     assert_eq!(target.watermark("home").unwrap().home_seq, 42);
     serving.await.unwrap();
-    super::change_stream::follow_round(Arc::clone(&target), "home", None, &router).await.unwrap();
+    super::change_stream::follow_round(Arc::clone(&target), "home", "home", None, &router).await.unwrap();
     assert_eq!(target.watermark("home").unwrap().home_seq, 44);
     for index in 0..=21 {
         let name = match index {
@@ -7036,7 +7036,7 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     tokio::time::pause();
     let round = tokio::spawn({
         let (target, router) = (Arc::clone(&target), router.clone());
-        async move { super::change_stream::follow_round(target, "home", None, &router).await }
+        async move { super::change_stream::follow_round(target, "home", "home", None, &router).await }
     });
     let error = loop {
         for _ in 0..64 {
@@ -7110,7 +7110,7 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     assert!(failure.message.unwrap().contains("home/rs/large"));
     assert!(!fresh.has_watermark("home"));
 
-    super::change_stream::follow_round(Arc::clone(&target), "home", None, &router).await.unwrap();
+    super::change_stream::follow_round(Arc::clone(&target), "home", "home", None, &router).await.unwrap();
     assert_eq!(target.watermark("home").unwrap().home_seq, 176);
     let hosts = home.list_hosts_internal().await.unwrap();
     let environment = &hosts.hosts.iter().find(|host| host.is_local).unwrap().environment_id.clone().unwrap();
@@ -7121,7 +7121,7 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
 
     // HTTP must carry the producer's reason as a frame, rather than replacing it
     // with a generic truncated-body error; the receiver rolls back that failure.
-    let first = home.next_change_stream_frame("http-health", None, None).await.unwrap();
+    let first = home.next_change_stream_frame("http-health", None, None, None).await.unwrap();
     let CommandValue::ChangeStreamFrame { session, .. } = first else { panic!("first frame") };
     let frames = super::change_stream::body(Arc::clone(&home), "http-health".into(), session);
     tokio::pin!(frames);
@@ -7200,7 +7200,7 @@ async fn routed_change_stream_origin_admission_rows() {
                 1,
                 NodeId::new("local"),
                 NodeId::new("local"),
-                Command::builder().action(CommandAction::QueryChangeStream { after: None, session: None }).build(),
+                Command::builder().action(CommandAction::QueryChangeStream { home: None, after: None, session: None }).build(),
                 caller,
                 session,
             )
@@ -7242,7 +7242,7 @@ async fn dropped_replication_dispatch_releases_pending_entry() {
             .dispatch_replication_query(
                 Command::builder()
                     .node_id(NodeId::new("home"))
-                    .action(CommandAction::QueryChangeStream { after: None, session: None })
+                    .action(CommandAction::QueryChangeStream { home: None, after: None, session: None })
                     .build(),
             )
             .await

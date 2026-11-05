@@ -1262,9 +1262,12 @@ pub enum CommandAction {
         name: String,
     },
     /// Peer-only pull of a whole-home stream frame; interactive query dispatch refuses it.
-    /// `after` selects a new round's cut. With `session`, the saved cut takes precedence
-    /// and `after` is ignored. Idle consumers lose the session.
+    /// `home` names the log: the target's own when absent, or another home the target holds
+    /// and passes on (relay). `after` selects a new round's cut. With `session`, the saved cut
+    /// takes precedence and `after` is ignored. Idle consumers lose the session.
     QueryChangeStream {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        home: Option<String>,
         after: Option<u64>,
         session: Option<String>,
     },
@@ -1830,8 +1833,10 @@ mod tests {
     #[test]
     fn command_roundtrip_covers_all_variants() {
         let cases = vec![
-            Command::builder().action(CommandAction::QueryChangeStream { after: None, session: None }).build(),
-            Command::builder().action(CommandAction::QueryChangeStream { after: Some(7), session: Some("round".into()) }).build(),
+            Command::builder().action(CommandAction::QueryChangeStream { home: None, after: None, session: None }).build(),
+            Command::builder()
+                .action(CommandAction::QueryChangeStream { home: Some("relayed".into()), after: Some(7), session: Some("round".into()) })
+                .build(),
             Command::builder()
                 .action(CommandAction::Refresh { repo: Some(RepoSelector::Query("flotilla".into())) })
                 .node_id(NodeId::new("feta"))

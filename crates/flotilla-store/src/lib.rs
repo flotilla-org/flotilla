@@ -14,6 +14,7 @@ pub use backend::*;
 pub mod controller;
 mod convoy;
 pub mod load_metrics;
+pub mod occupancy;
 pub use convoy::*;
 mod decoded;
 pub use decoded::*;

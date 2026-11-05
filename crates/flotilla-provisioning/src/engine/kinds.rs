@@ -12,7 +12,6 @@
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
-    time::Duration,
 };
 
 use flotilla_engine_store::{
@@ -30,6 +29,7 @@ use flotilla_schema_sqlite::{stream::Service, Read, ResourceId, StoreError};
 use futures::stream::BoxStream;
 use serde_json::Value;
 
+use super::log_watch::LogWatch;
 use super::provenance;
 use crate::stored::{manifest_root::ManifestRoot, placement::FulfilmentKindDefinition};
 
@@ -40,9 +40,6 @@ const CONVOY: KindCode = <flotilla_state_machines::Resource<flotilla_state_machi
 const ROOT: KindCode = <flotilla_state_machines::Resource<ManifestRoot> as Kind>::CODE;
 
 const SEEDING: &str = "seeding";
-
-/// How often a change stream looks for new entries in the log, as the account port's does.
-const POLL: Duration = Duration::from_millis(500);
 
 /// How often a write that loses a race to another writer of its name reads and tries again.
 const WRITE_ATTEMPTS: usize = 3;
@@ -357,16 +354,12 @@ impl EngineRecords for EngineKinds {
     }
 
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
-        let service = Arc::clone(&self.service);
-        let mut follower = Follower::new([CODE]);
-        let homes = service.homes();
-        service.with_store(|store| follower.start(&mut store.read()?, &homes)).map_err(|error| error.to_string())?;
-        let stream = futures::stream::unfold((service, follower), |(service, mut follower)| async move {
+        let watch = LogWatch::start(Arc::clone(&self.service), [CODE]).map_err(|error| error.to_string())?;
+        let stream = futures::stream::unfold(watch, |mut watch| async move {
             loop {
-                tokio::time::sleep(POLL).await;
-                let homes = service.homes();
-                match service.with_store(|store| Ok(!follower.pass(&mut store.read()?, &homes)?.is_empty())) {
-                    Ok(true) => return Some(((), (service, follower))),
+                // A pass that fails is tried again at the next commit; the watcher sees no tick.
+                match watch.next(|_, followed| Ok(!followed.is_empty())).await {
+                    Ok(true) => return Some(((), watch)),
                     Ok(false) => {}
                     Err(error) => tracing::warn!(%error, "fulfilment kind change stream could not read the log; retrying"),
                 }

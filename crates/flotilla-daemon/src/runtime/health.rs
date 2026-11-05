@@ -359,7 +359,12 @@ pub(super) fn assess_agent_adapter_capabilities(
             }
         },
     };
-    let same_daemon = previous.daemon_generation == health.generation && previous.daemon_started_at == Some(health.started_at);
+    // The observed store's generation is minted per daemon process, so it alone tells a restart
+    // from this daemon's own earlier heartbeat; the decided store keeps no start time.
+    let same_daemon = match (&previous.daemon_generation, &health.generation) {
+        (Some(previous), Some(current)) => previous == current,
+        _ => previous.daemon_started_at == Some(health.started_at),
+    };
     if same_daemon {
         return AgentAdapterCapabilityAssessment { baseline, regression: None };
     }
@@ -642,18 +647,16 @@ pub(super) async fn resolve_daemon_forgejo_credential_condition(
             _ => return Ok(None),
         }
     }
-    // A cursor for some other kind does not establish that Forge definitions
-    // have arrived. Wait for each connected peer's Forge snapshot bookmark.
+    // Forge definitions arrive with each connected peer's decided log: wait until this store has
+    // committed a first round of every one of them.
+    let decided = daemon.decided_store()?;
     for peer in daemon.connected_peer_node_ids().await {
-        if backend.replica_writer::<Forge>(peer, namespace).cursor().await.map_err(|error| error.to_string())?.is_none() {
+        if !decided.has_watermark(peer.as_str()) {
             return Ok(None);
         }
     }
-    // The host-local map applies to source-addressed requests in any namespace.
-    // A declaration outside the runtime namespace is still a valid use of a key.
-    let mut namespaces =
-        backend.stored_namespaces::<Forge>().await.map_err(|error| error.to_string())?.into_iter().collect::<BTreeSet<_>>();
-    namespaces.insert(namespace.to_string());
+    // The decided store holds definitions without namespaces.
+    let namespaces = BTreeSet::from([namespace.to_string()]);
     let mut declared = BTreeSet::new();
     for declared_namespace in &namespaces {
         let forges = backend.definitions::<Forge>(declared_namespace).list().await.map_err(|error| error.to_string())?;

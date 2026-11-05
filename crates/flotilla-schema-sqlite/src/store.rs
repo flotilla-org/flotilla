@@ -150,6 +150,7 @@ struct Runtime {
     change_page_bytes: usize,
     watermarks: crate::stream::Watermarks,
     applied: crate::stream::AppliedListeners,
+    commits: crate::stream::Commits,
     home: String,
     kinds: KindRegistry,
     sql: BTreeMap<KindCode, KindSql>,
@@ -240,6 +241,7 @@ impl Store {
         let runtime = Runtime {
             watermarks: std::sync::Arc::new(std::sync::RwLock::new(watermarks)),
             applied: Default::default(),
+            commits: Default::default(),
             home: home.to_owned(),
             kinds,
             sql,
@@ -265,6 +267,10 @@ impl Store {
 
     pub(crate) fn applied_listeners(&self) -> crate::stream::AppliedListeners {
         std::sync::Arc::clone(&self.runtime.applied)
+    }
+
+    pub(crate) fn commits(&self) -> crate::stream::Commits {
+        std::sync::Arc::clone(&self.runtime.commits)
     }
 
     /// Committed local gate input, independent of the store transaction lock.
@@ -876,6 +882,8 @@ impl Write<'_> {
         for (id, identity) in ids {
             self.runtime.ids.insert(id, identity);
         }
+        // Last, so a woken reader sees the new watermarks and interned names.
+        self.runtime.commits.committed();
         Ok(())
     }
 }

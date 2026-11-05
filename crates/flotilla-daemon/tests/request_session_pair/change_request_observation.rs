@@ -95,6 +95,18 @@ async fn remote_change_request_scenario(existing: ExistingRecord, late_watcher: 
         )
         .await
         .unwrap();
+    // Only a host that has sent a heartbeat is a candidate observer: the owner has.
+    let owner_host = owner.local_host_id().expect("owner host identity").to_string();
+    let hosts = owner.resource_backend().using::<Host>("flotilla");
+    let host = hosts.create(&InputMeta::builder().name(owner_host.clone()).build(), &HostSpec::default()).await.expect("owner host");
+    hosts
+        .update_status(
+            &owner_host,
+            &host.metadata.resource_version,
+            &HostStatus { ready: true, heartbeat_at: Some(Utc::now()), ..HostStatus::default() },
+        )
+        .await
+        .expect("owner heartbeat");
     let mesh = spawn_in_memory_request_mesh_with_replication_kinds(
         vec![owner.clone(), requester.clone()],
         Some(&[Project::API_PATHS.kind, Host::API_PATHS.kind, Convoy::API_PATHS.kind, ChangeRequest::API_PATHS.kind]),

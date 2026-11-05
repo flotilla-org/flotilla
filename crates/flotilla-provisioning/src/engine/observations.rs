@@ -10,7 +10,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
-    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -27,15 +26,13 @@ use flotilla_schema_sqlite::{stream::Service, Read, ResourceId, StoreError};
 use futures::stream::BoxStream;
 use serde_json::Value;
 
+use super::log_watch::LogWatch;
 use crate::stored::forge_observation::{ChangeRequestRecord, IssueRecord};
 
 const CHANGE_REQUEST: &str = "ChangeRequest";
 const ISSUE: &str = "Issue";
 const CHANGE_REQUEST_CODE: KindCode = <ChangeRequestRecord as Kind>::CODE;
 const ISSUE_CODE: KindCode = <IssueRecord as Kind>::CODE;
-
-/// How often a change stream looks for new entries in the log, as the other ports' do.
-const POLL: Duration = Duration::from_millis(500);
 
 /// The writer the plain-kind port records for the observer's writes.
 const WRITER: &str = "forge-observer";
@@ -452,16 +449,12 @@ impl EngineRecords for EngineObservations {
     }
 
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
-        let service = Arc::clone(&self.service);
-        let mut follower = Follower::new([CHANGE_REQUEST_CODE, ISSUE_CODE]);
-        let homes = service.homes();
-        service.with_store(|store| follower.start(&mut store.read()?, &homes)).map_err(|error| error.to_string())?;
-        let stream = futures::stream::unfold((service, follower), |(service, mut follower)| async move {
+        let watch = LogWatch::start(Arc::clone(&self.service), [CHANGE_REQUEST_CODE, ISSUE_CODE]).map_err(|error| error.to_string())?;
+        let stream = futures::stream::unfold(watch, |mut watch| async move {
             loop {
-                tokio::time::sleep(POLL).await;
-                let homes = service.homes();
-                match service.with_store(|store| Ok(!follower.pass(&mut store.read()?, &homes)?.is_empty())) {
-                    Ok(true) => return Some(((), (service, follower))),
+                // A pass that fails is tried again at the next commit; the watcher sees no tick.
+                match watch.next(|_, followed| Ok(!followed.is_empty())).await {
+                    Ok(true) => return Some(((), watch)),
                     Ok(false) => {}
                     Err(error) => tracing::warn!(%error, "observation change stream could not read the log; retrying"),
                 }

@@ -544,8 +544,11 @@ impl RemoteCommandRouter {
 
         if target_node_id == *self.daemon.node_id() {
             if command.action.is_query() {
-                if let CommandAction::QueryChangeStream { after, session } = &command.action {
-                    return self.daemon.next_change_stream_frame(self.daemon.node_id().as_str(), *after, session.clone()).await;
+                if let CommandAction::QueryChangeStream { home, after, session } = &command.action {
+                    return self
+                        .daemon
+                        .next_change_stream_frame(self.daemon.node_id().as_str(), home.clone(), *after, session.clone())
+                        .await;
                 }
                 return self.execute_projected_query(command, session_id.unwrap_or(uuid::Uuid::nil())).await;
             }
@@ -978,11 +981,11 @@ impl RemoteCommandRouter {
         // result back directly without subscribing to the event stream.
         if command.action.is_query() {
             let query_session = origin.session_id.unwrap_or(uuid::Uuid::nil());
-            let query = if let CommandAction::QueryChangeStream { after, session } = &command.action {
+            let query = if let CommandAction::QueryChangeStream { home, after, session } = &command.action {
                 if origin.caller.is_some() || origin.session_id.is_some() {
                     Err("change-stream queries require peer replication transport".into())
                 } else {
-                    self.daemon.next_change_stream_frame(requester_node_id.as_str(), *after, session.clone()).await
+                    self.daemon.next_change_stream_frame(requester_node_id.as_str(), home.clone(), *after, session.clone()).await
                 }
             } else {
                 self.execute_projected_query(command, query_session).await

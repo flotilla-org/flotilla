@@ -13,7 +13,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
-    time::Duration,
 };
 
 use flotilla_engine_store::{
@@ -31,12 +30,10 @@ use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use flotilla_state_machines::{Home, Resource, WriteError};
 use futures::stream::BoxStream;
 
+use super::log_watch::LogWatch;
 use crate::stored::account::{
     self as stored, AccountBinding, BindingEdge, BindingSpec, BindingState, Close, ObserveEpoch, ProvisionSpec, Regrant, Revoke,
 };
-
-/// How often a change stream looks for new entries in the log.
-const POLL: Duration = Duration::from_millis(500);
 
 /// The writer recorded on this home's account writes.
 const WRITER: &str = "account-records";
@@ -500,37 +497,30 @@ impl AccountRecords for EngineAccounts {
     }
 
     async fn changes(&self, _namespace: &str) -> Result<BoxStream<'static, Result<AccountChange, String>>, String> {
-        let service = Arc::clone(&self.service);
-        let mut follower = Follower::new([BINDING, PROVISION]);
-        let homes = service.homes();
-        service.with_store(|store| follower.start(&mut store.read()?, &homes)).map_err(store_error)?;
-        let stream = futures::stream::unfold(
-            (service, follower, std::collections::VecDeque::new()),
-            |(service, mut follower, mut queue)| async move {
-                loop {
-                    if let Some(change) = queue.pop_front() {
-                        return Some((Ok(change), (service, follower, queue)));
-                    }
-                    tokio::time::sleep(POLL).await;
-                    let homes = service.homes();
-                    let found = service.with_store(|store| {
-                        let mut read = store.read()?;
+        let watch = LogWatch::start(Arc::clone(&self.service), [BINDING, PROVISION]).map_err(store_error)?;
+        let stream = futures::stream::unfold((watch, std::collections::VecDeque::new()), |(mut watch, mut queue)| async move {
+            loop {
+                if let Some(change) = queue.pop_front() {
+                    return Some((Ok(change), (watch, queue)));
+                }
+                let found = watch
+                    .next(|read, followed| {
                         let mut changes = Vec::new();
-                        for followed in follower.pass(&mut read, &homes)? {
+                        for followed in followed {
                             match followed {
-                                Followed::Changed(identity) => changes.extend(change(&mut read, &identity)?),
-                                Followed::Rescan(home) => changes.extend(rescanned(&mut read, &home)?),
+                                Followed::Changed(identity) => changes.extend(change(read, &identity)?),
+                                Followed::Rescan(home) => changes.extend(rescanned(read, &home)?),
                             }
                         }
                         Ok(changes)
-                    });
-                    match found {
-                        Ok(changes) => queue.extend(changes),
-                        Err(error) => return Some((Err(error.to_string()), (service, follower, queue))),
-                    }
+                    })
+                    .await;
+                match found {
+                    Ok(changes) => queue.extend(changes),
+                    Err(error) => return Some((Err(error.to_string()), (watch, queue))),
                 }
-            },
-        );
+            }
+        });
         Ok(Box::pin(stream))
     }
 }

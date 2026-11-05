@@ -59,6 +59,36 @@ pub fn validate_project_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether a materialised definition already carries the stamps an operational entry gives it. The
+/// entry's path is read with the entry and named in its refusals; the stored record's change does
+/// not hold it, so it is left out of the comparison and a refresh that changes nothing writes
+/// nothing.
+fn stamped_alike(stored: &BTreeMap<String, String>, desired: &BTreeMap<String, String>) -> bool {
+    let kept = |(key, _): &(&String, &String)| key.as_str() != SOURCE_ENTRY_PATH_ANNOTATION;
+    stored.iter().filter(kept).eq(desired.iter().filter(kept))
+}
+
+/// Whether a member Repository already carries the annotations a refresh gives it. The stored
+/// record keeps the verification commands' provenance as typed fields, not the JSON text written,
+/// so it reads back with its fields in another order: that annotation is compared as JSON.
+fn repository_stamped_alike(stored: &BTreeMap<String, String>, desired: &BTreeMap<String, String>) -> bool {
+    let kept = |annotations: &BTreeMap<String, String>| {
+        annotations
+            .iter()
+            .map(|(key, value)| {
+                let value = match key.as_str() {
+                    VERIFICATION_PROVENANCE_ANNOTATION => {
+                        serde_json::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.clone()))
+                    }
+                    _ => serde_json::Value::String(value.clone()),
+                };
+                (key.clone(), value)
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    kept(stored) == kept(desired)
+}
+
 fn normalize_project_name(name: &str) -> Result<String, String> {
     let normalized = name
         .trim()
@@ -483,7 +513,9 @@ impl ProjectService<'_> {
                 let updated_spec = repository.spec.clone().update_remotes(live_remote)?;
                 let mut repository_meta = InputMeta::from(&repository.metadata);
                 repository_meta.annotations.extend(provenance.clone());
-                if repository_meta.annotations == repository.metadata.annotations && updated_spec == repository.spec {
+                if repository_stamped_alike(&repository.metadata.annotations, &repository_meta.annotations)
+                    && updated_spec == repository.spec
+                {
                     break;
                 }
                 // Status and spec share a version. Rebase this narrow declaration
@@ -860,7 +892,10 @@ impl ProjectService<'_> {
                     None => return Err(format!("WorkflowTemplate `{name}` already exists and is not materialized by a project")),
                 }
             }
-            if current.as_ref().is_none_or(|current| current.spec != *spec || current.metadata.annotations != meta.annotations) {
+            if current
+                .as_ref()
+                .is_none_or(|current| current.spec != *spec || !stamped_alike(&current.metadata.annotations, &meta.annotations))
+            {
                 templates.apply(&stored_meta, spec).await.map_err(|error| error.to_string())?;
                 changes.push(format!("WorkflowTemplate/{name}"));
             }
@@ -932,7 +967,10 @@ impl ProjectService<'_> {
                     None => return Err(format!("ConvoyEnsure `{name}` already exists and is not materialized by a project")),
                 }
             }
-            if current.as_ref().is_none_or(|current| current.spec != *spec || current.metadata.annotations != meta.annotations) {
+            if current
+                .as_ref()
+                .is_none_or(|current| current.spec != *spec || !stamped_alike(&current.metadata.annotations, &meta.annotations))
+            {
                 convoy_ensures.apply(meta, spec).await.map_err(|error| error.to_string())?;
                 changes.push(format!("ConvoyEnsure/{name}"));
             }
@@ -1014,7 +1052,7 @@ impl ProjectService<'_> {
                     meta.annotations.remove(VERIFICATION_PROVENANCE_ANNOTATION);
                 }
             }
-            if current.spec != desired_spec || current.metadata.annotations != meta.annotations {
+            if current.spec != desired_spec || !repository_stamped_alike(&current.metadata.annotations, &meta.annotations) {
                 repositories.update(&meta, &current.metadata.resource_version, &desired_spec).await.map_err(|error| error.to_string())?;
                 changes.push(format!("Repository/{} verification commands", member.repo));
             }

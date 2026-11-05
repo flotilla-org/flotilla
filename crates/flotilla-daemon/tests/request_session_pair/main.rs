@@ -4934,7 +4934,10 @@ async fn router_change_stream_admission_scenario_rows() {
         let error = topology
             .client
             .execute_query(
-                Command::builder().node_id(target.clone()).action(CommandAction::QueryChangeStream { after: None, session: None }).build(),
+                Command::builder()
+                    .node_id(target.clone())
+                    .action(CommandAction::QueryChangeStream { home: None, after: None, session: None })
+                    .build(),
                 uuid::Uuid::nil(),
             )
             .await

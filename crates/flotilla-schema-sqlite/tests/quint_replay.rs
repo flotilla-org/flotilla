@@ -50,6 +50,7 @@ fn replay_quint_streams() {
                     vec![Frame::Keepalive {
                         home: "home".into(),
                         watermark: Watermark { home_seq: sequence, applied_through: moment(row.at) },
+                        homes: vec!["home".into()],
                     }]
                 } else {
                     let mut write = source.write().unwrap();

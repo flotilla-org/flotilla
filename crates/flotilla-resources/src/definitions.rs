@@ -125,7 +125,9 @@ pub fn origin(labels: &BTreeMap<String, String>, annotations: &BTreeMap<String, 
             project: annotation(MATERIALIZED_PROJECT_ANNOTATION)?,
             repository: annotation(SOURCE_REPOSITORY_ANNOTATION)?,
             commit: annotation(SOURCE_COMMIT_ANNOTATION)?,
-            entry_path: Some(annotation(SOURCE_ENTRY_PATH_ANNOTATION)?),
+            // The entry is named when it was read; a record rebuilt from the engine's change holds
+            // no path, so its stamps name none.
+            entry_path: annotations.get(SOURCE_ENTRY_PATH_ANNOTATION).cloned(),
         });
     }
     // A declaration-backed Project stays the declaration's even when a whole-repository label
@@ -219,7 +221,12 @@ mod tests {
                 charter: tc.draw(gs::booleans()).then(|| CharterOrigin { source: Some(text(&tc)), revision: text(&tc), scope: text(&tc) }),
                 materialized_project: tc.draw(gs::booleans()).then(|| text(&tc)),
             },
-            2 => DefinitionOrigin::ProjectOps { project: text(&tc), repository: text(&tc), commit: text(&tc), entry_path: Some(text(&tc)) },
+            2 => DefinitionOrigin::ProjectOps {
+                project: text(&tc),
+                repository: text(&tc),
+                commit: text(&tc),
+                entry_path: tc.draw(gs::booleans()).then(|| text(&tc)),
+            },
             3 => DefinitionOrigin::ProjectImage { project: text(&tc), commit: text(&tc) },
             4 => DefinitionOrigin::ProjectDeclaration { repository: text(&tc), commit: text(&tc) },
             5 => DefinitionOrigin::WholeRepository,

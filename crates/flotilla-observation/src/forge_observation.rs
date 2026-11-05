@@ -28,7 +28,6 @@ pub const OWNER_LOCAL_INCREMENTAL_READ_ERROR: &str = "incremental forge reads ar
 pub const NO_READY_FORGE_OBSERVER: &str = "no ready forge observer";
 
 const HEARTBEAT_MAX_AGE: Duration = Duration::seconds(180);
-const UNKNOWN_OWNER_GRACE: Duration = Duration::seconds(180);
 const READ_FRESHNESS: Duration = Duration::seconds(60);
 pub const LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
@@ -58,14 +57,6 @@ struct LastRead {
     error: Option<ObservationError>,
 }
 
-fn unknown_health(declared_at: DateTime<Utc>, now: DateTime<Utc>) -> ObserverHealth {
-    if now.signed_duration_since(declared_at) < UNKNOWN_OWNER_GRACE {
-        ObserverHealth::Unknown
-    } else {
-        ObserverHealth::Unready
-    }
-}
-
 fn canonical_source(source: &IssueSource) -> IssueSource {
     let mut source = normalize_issue_source(source);
     if source.service == "github" {
@@ -93,7 +84,6 @@ pub async fn project_home(backend: &ResourceBackend, namespace: &str, name: &str
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ObserverHealth {
     Ready,
-    Unknown,
     Unready,
 }
 
@@ -177,54 +167,57 @@ async fn declarations(backend: &ResourceBackend, namespace: &str) -> Result<Decl
     Ok(Declarations { forges, projects, repositories })
 }
 
-/// Shared sources elect once, regardless of how many Projects bind them.
-/// Unknown host health preserves the preferred owner; only observer-unready or
-/// stale evidence, or a preferred home that never wrote a Host by the end of
-/// its declaration's startup grace, permits fallback. A Host is written only
-/// by its own daemon, so one without a first heartbeat is unknown, not unready:
-/// its home is running and has yet to report. This daemon never judges itself
-/// unready for want of evidence. Admission readiness never withdraws forge
-/// observation.
+/// Shared sources elect once, regardless of how many Projects bind them. Only a host that has
+/// sent a heartbeat is a candidate: a Host with none yet is not counted at all, neither as unknown
+/// nor as blocking the others, so a home that dies before its first heartbeat leaves its sources
+/// to the hosts that are running. A candidate whose heartbeat is stale, or whose status carries a
+/// forge-blocking condition, is not ready. The preferred observer (the home of the earliest
+/// declaration) keeps the source while it is a ready candidate; otherwise the lowest ready home
+/// takes it. There is no grace window: two hosts may both observe briefly at startup, which
+/// idempotent per-item observation records absorb. This daemon never judges itself unready for
+/// want of evidence. Admission readiness never withdraws forge observation.
 pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &IssueSource) -> Result<Option<NodeId>, String> {
     let now = Utc::now();
-    let preferred = declarations(backend, namespace).await?.preferred_observer(source);
+    let preferred = declarations(backend, namespace).await?.preferred_observer(source).map(|(_, home)| home);
     let local = backend.local_root().map_err(|e| e.to_string())?;
-    let mut ready = BTreeMap::new();
+    let mut candidates = BTreeMap::new();
+    let mut hosts = false;
     for host in backend.including_replicas::<Host>(namespace).list_replica_sources().await.map_err(|e| e.to_string())?.items {
         if !matches!(host.object.spec.connection, flotilla_resources::HostConnection::Daemon) {
             continue;
         }
+        hosts = true;
         let root = origin(backend, &host.provenance)?;
-        let heartbeat = host.object.status.as_ref().and_then(|status| status.heartbeat_at);
-        let health = match host.object.status.as_ref() {
-            None => ObserverHealth::Unknown,
-            Some(status) if !observer_ready(status) => ObserverHealth::Unready,
-            Some(_) => match heartbeat {
-                Some(at) if now.signed_duration_since(at) < HEARTBEAT_MAX_AGE => ObserverHealth::Ready,
-                Some(_) => ObserverHealth::Unready,
-                None => ObserverHealth::Unknown,
-            },
+        let status = host.object.status.as_ref();
+        let health = match status.and_then(|status| status.heartbeat_at) {
+            Some(at) if status.is_some_and(observer_ready) && now.signed_duration_since(at) < HEARTBEAT_MAX_AGE => ObserverHealth::Ready,
+            Some(_) => ObserverHealth::Unready,
+            // No first heartbeat: not a candidate, unless it is this daemon's own Host.
+            None if root == local && status.is_none_or(observer_ready) => ObserverHealth::Ready,
+            None if root == local => ObserverHealth::Unready,
+            None => continue,
         };
         // Newer heartbeat evidence wins. For equal timestamps, positive
         // Unready evidence wins conservatively; a duplicate Ready row must
         // not resurrect an explicitly unready origin (ADR 0057).
-        let candidate = (heartbeat, health);
-        let entry = ready.entry(root).or_insert(candidate);
+        let candidate = (status.and_then(|status| status.heartbeat_at), health);
+        let entry = candidates.entry(root).or_insert(candidate);
         if candidate > *entry {
             *entry = candidate;
         }
     }
-    if let Some((declared_at, preferred)) = preferred {
-        let absent = || if preferred == local { ObserverHealth::Unknown } else { unknown_health(declared_at, now) };
-        if ready.get(&preferred).map_or_else(absent, |(_, health)| *health) != ObserverHealth::Unready {
-            return Ok(Some(preferred));
-        }
-    } else if ready.is_empty() {
+    // This daemon is a candidate before its own Host is written.
+    candidates.entry(local).or_insert((None, ObserverHealth::Ready));
+    let ready = |home: &NodeId| candidates.get(home).is_some_and(|(_, health)| *health == ObserverHealth::Ready);
+    if let Some(preferred) = preferred.as_ref().filter(|home| ready(home)) {
+        return Ok(Some(preferred.clone()));
+    }
+    if preferred.is_none() && !hosts {
         return Ok(None);
     }
-    ready
-        .into_iter()
-        .find_map(|(root, (_, health))| (health == ObserverHealth::Ready).then_some(root))
+    candidates
+        .iter()
+        .find_map(|(root, (_, health))| (*health == ObserverHealth::Ready).then(|| root.clone()))
         .map(Some)
         .ok_or_else(|| NO_READY_FORGE_OBSERVER.into())
 }
@@ -548,7 +541,10 @@ mod tests {
         let owner = backend("owner");
         let peer = backend("peer");
         declare_at(&owner).await;
+        // Only a host that has sent a heartbeat is a candidate (Q3): the owner has.
+        host_at(&owner, "owner-host", true).await;
         replicate::<Project>(&owner, &peer).await;
+        replicate::<Host>(&owner, &peer).await;
         assert_eq!(source_owner(&peer, "flotilla", &source()).await.unwrap(), Some(NodeId::new("owner")));
         let reads = ForgeReads::new(peer, "flotilla".into());
         let forge = CountingForge::new(Ok(42));
@@ -596,7 +592,10 @@ mod tests {
         let owner = backend("owner");
         let peer = backend("peer");
         declare_at(&owner).await;
+        // Only a host that has sent a heartbeat is a candidate (Q3): the owner has.
+        host_at(&owner, "owner-host", true).await;
         replicate::<Project>(&owner, &peer).await;
+        replicate::<Host>(&owner, &peer).await;
         let reads = ForgeReads::new(peer, "flotilla".into());
         assert_eq!(
             reads
@@ -609,42 +608,70 @@ mod tests {
         );
     }
 
-    // A preferred origin that never publishes a Host must eventually yield to
-    // a ready replica. Exercise expiry through real replicated declarations.
-    #[tokio::test]
-    async fn never_reporting_owner_yields_after_startup_grace() {
-        let missing = backend("missing");
-        let ready = backend("ready");
-        let source = source();
-        let spec = ProjectSpec::builder()
+    /// Writes Host `name` on `home`, with a heartbeat now when `heartbeat` says so.
+    async fn host_at(home: &ResourceBackend, name: &str, heartbeat: bool) {
+        let hosts = home.using::<Host>("flotilla");
+        let host = hosts.create(&meta(name), &HostSpec::default()).await.unwrap();
+        if heartbeat {
+            let status = HostStatus { ready: true, heartbeat_at: Some(Utc::now()), ..Default::default() };
+            hosts.update_status(name, &host.metadata.resource_version, &status).await.unwrap();
+        }
+    }
+
+    fn shared_project(source: &IssueSource) -> ProjectSpec {
+        ProjectSpec::builder()
             .display_name("Shared".into())
             .issue_source_bindings(vec![IssueSourceBindingSpec::builder().source(source.clone()).alias("shared".into()).build()])
-            .build();
-        missing.using::<Project>("flotilla").create(&meta("shared"), &spec).await.unwrap();
-        replicate::<Project>(&missing, &ready).await;
-        let hosts = ready.using::<Host>("flotilla");
-        let host = hosts.create(&meta("host"), &HostSpec::default()).await.unwrap();
-        hosts
-            .update_status(
-                "host",
-                &host.metadata.resource_version,
-                &HostStatus { ready: true, heartbeat_at: Some(Utc::now()), ..Default::default() },
-            )
-            .await
-            .unwrap();
-        assert_eq!(source_owner(&ready, "flotilla", &source).await.unwrap(), Some(missing.local_root().unwrap()));
-        // The replica boundary supplies aged declarations without wall-clock sleeps.
-        let mut projects = missing.using::<Project>("flotilla").list().await.unwrap();
-        projects.items[0].metadata.creation_timestamp -= UNKNOWN_OWNER_GRACE + Duration::seconds(1);
-        ready.replica_writer::<Project>(missing.local_root().unwrap(), "flotilla").replace(&projects, Utc::now()).await.unwrap();
-        assert_eq!(source_owner(&ready, "flotilla", &source).await.unwrap(), Some(ready.local_root().unwrap()));
-        // A Host its home wrote but has not yet reported on is that home running: unknown, so the
-        // preferred owner keeps its source however long ago the Host was written.
-        missing.using::<Host>("flotilla").create(&meta("silent"), &HostSpec::default()).await.unwrap();
-        let mut silent = missing.using::<Host>("flotilla").list().await.unwrap();
-        silent.items[0].metadata.creation_timestamp -= UNKNOWN_OWNER_GRACE + Duration::seconds(1);
-        ready.replica_writer::<Host>(missing.local_root().unwrap(), "flotilla").replace(&silent, Utc::now()).await.unwrap();
-        assert_eq!(source_owner(&ready, "flotilla", &source).await.unwrap(), Some(missing.local_root().unwrap()));
+            .build()
+    }
+
+    // Behaviour (owner ruling, Q3): only a host that has sent a heartbeat is a candidate. A home
+    // that declares a source and dies before its first heartbeat is not counted at all: with no
+    // grace window, the source is observed at once by a host that is running.
+    #[tokio::test]
+    async fn a_home_that_dies_before_its_first_heartbeat_leaves_its_source_observed() {
+        let dead = backend("dead");
+        let running = backend("running");
+        let source = source();
+        dead.using::<Project>("flotilla").create(&meta("shared"), &shared_project(&source)).await.unwrap();
+        host_at(&dead, "dead-host", false).await;
+        replicate::<Project>(&dead, &running).await;
+        replicate::<Host>(&dead, &running).await;
+        host_at(&running, "running-host", true).await;
+        assert_eq!(source_owner(&running, "flotilla", &source).await.unwrap(), Some(running.local_root().unwrap()));
+        // The declaring home, had it lived, never judges itself unready for want of a heartbeat:
+        // both observe briefly, which idempotent per-item records absorb.
+        assert_eq!(source_owner(&dead, "flotilla", &source).await.unwrap(), Some(dead.local_root().unwrap()));
+    }
+
+    // Behaviour (owner ruling, Q3): the preferred home keeps its source once it has a heartbeat.
+    #[tokio::test]
+    async fn a_preferred_home_with_a_heartbeat_keeps_its_source() {
+        let preferred = backend("preferred");
+        let other = backend("other");
+        let source = source();
+        preferred.using::<Project>("flotilla").create(&meta("shared"), &shared_project(&source)).await.unwrap();
+        host_at(&preferred, "preferred-host", true).await;
+        replicate::<Project>(&preferred, &other).await;
+        replicate::<Host>(&preferred, &other).await;
+        host_at(&other, "other-host", true).await;
+        assert_eq!(source_owner(&other, "flotilla", &source).await.unwrap(), Some(preferred.local_root().unwrap()));
+    }
+
+    // Behaviour (owner ruling, Q3): two ready candidates with no preference between them go to the
+    // lowest home, whichever of them asks.
+    #[tokio::test]
+    async fn tied_candidates_go_to_the_lowest_home() {
+        let alpha = backend("alpha");
+        let beta = backend("beta");
+        let source = source();
+        host_at(&alpha, "alpha-host", true).await;
+        host_at(&beta, "beta-host", true).await;
+        replicate::<Host>(&alpha, &beta).await;
+        replicate::<Host>(&beta, &alpha).await;
+        for asker in [&alpha, &beta] {
+            assert_eq!(source_owner(asker, "flotilla", &source).await.unwrap(), Some(alpha.local_root().unwrap()));
+        }
     }
 
     // Admission readiness and condition names never affect observer eligibility.
@@ -696,17 +723,6 @@ mod tests {
         let unready = (heartbeat, ObserverHealth::Unready);
         assert!(ready.max(unready).1 == ObserverHealth::Unready);
         assert!(unready.max(ready).1 == ObserverHealth::Unready);
-    }
-
-    // Unknown ownership lasts only through its startup grace, even if no first
-    // heartbeat ever arrives. Generate ages on both sides and at the boundary.
-    #[hegel::test]
-    fn unknown_owner_grace_is_bounded(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let age = tc.draw(gs::integers::<i64>().min_value(0).max_value(360));
-        let now = Utc::now();
-        assert_eq!(unknown_health(now - Duration::seconds(age), now) == ObserverHealth::Unknown, age < UNKNOWN_OWNER_GRACE.num_seconds());
-        assert!(unknown_health(now - UNKNOWN_OWNER_GRACE, now) == ObserverHealth::Unready);
     }
 }
 

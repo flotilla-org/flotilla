@@ -26,9 +26,6 @@ use flotilla_store::{
     DefinitionResolver, PreparedSnapshotGarbageCollector, ReplicaReadResolver, TypedResolver,
 };
 use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
-// Convoy secondary watches cover work/checkouts, not arbitrary PR or artifact
-// records. A bounded retry also handles observation freshness without an event.
-const PROMISE_OBSERVATION_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
 /// How soon a crew's Done held on its undelivered turn is rechecked (#3894):
 /// the engine delivery adapter's pace. The hold itself lasts at most one
 /// delivery hold (`DELIVERY_HOLD_FOR`), after which an untyped turn no longer
@@ -283,7 +280,67 @@ impl ConvoyReconciler {
                 resolver: backend.including_replicas::<Checkout>(namespace),
                 _marker: PhantomData,
             }),
+            Box::new(EvidenceWake {
+                evidence: backend.including_replicas::<ChangeRequest>(namespace),
+                convoys: backend.including_replicas::<Convoy>(namespace),
+            }),
+            Box::new(EvidenceWake {
+                evidence: backend.including_replicas::<Artifact>(namespace),
+                convoys: backend.including_replicas::<Convoy>(namespace),
+            }),
         ]
+    }
+}
+
+/// Wakes every open convoy when a record its promises are observed from changes: a ChangeRequest
+/// (a submission, its landing) or an Artifact (a decision ledger). Neither names its convoy, so
+/// each open convoy is reconciled again and reads the evidence it waits on; one waiting on none
+/// finds nothing to do. Freshness rides on the same events: an observer that sees the record
+/// again writes it again.
+pub struct EvidenceWake<W: Resource> {
+    pub evidence: ReplicaReadResolver<W>,
+    pub convoys: ReplicaReadResolver<Convoy>,
+}
+
+impl<W: Resource> std::clone::Clone for EvidenceWake<W> {
+    fn clone(&self) -> Self {
+        Self { evidence: self.evidence.clone(), convoys: self.convoys.clone() }
+    }
+}
+
+impl<W: Resource> SecondaryWatch for EvidenceWake<W> {
+    type Primary = Convoy;
+
+    fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: flotilla_store::ResourceBackend,
+        _namespace: String,
+        sender: flotilla_store::controller::WorkQueueSender,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async move {
+            // What is already held was read by the convoys' own first pass; only changes wake.
+            let mut watch = self.evidence.watch().await?;
+            while let Some(event) = futures::StreamExt::next(&mut watch).await {
+                if let Err(error) = event {
+                    tracing::warn!(%error, kind = W::API_PATHS.kind, "a convoy evidence watch failed");
+                    return Err(error);
+                }
+                for convoy in self.convoys.list().await?.items {
+                    let convoy = convoy.object;
+                    if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+                        continue;
+                    }
+                    if sender.send(convoy.metadata.name).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 }
 
@@ -868,22 +925,7 @@ impl Reconciler for ConvoyReconciler {
                 .turn_hold
                 .then_some(TURN_HOLD_RETRY)
                 .or(provisioning_requeue)
-                .or_else(|| reclaim_refused.then_some(self.landing_evidence_stale_after))
-                .or_else(|| {
-                    obj.status.as_ref().filter(|status| !status.phase.is_terminal()).and_then(|status| {
-                        status
-                            .promises
-                            .values()
-                            .flat_map(BTreeMap::values)
-                            .flatten()
-                            .any(|p| {
-                                p.state == flotilla_resources::convoy::promises::PromiseState::Submitted
-                                    || (p.kind == flotilla_resources::convoy::promises::PromiseKind::DecisionLedger
-                                        && p.state == flotilla_resources::convoy::promises::PromiseState::Open)
-                            })
-                            .then_some(PROMISE_OBSERVATION_RETRY)
-                    })
-                }),
+                .or_else(|| reclaim_refused.then_some(self.landing_evidence_stale_after)),
         }
     }
 

@@ -58,10 +58,10 @@ use tracing::warn;
 use crate::project_ops;
 use crate::support::{
     authoritative_placement_host, check_placement_capacity, ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot,
-    home_copy_wins_by_name, host_generation, host_occupancies, host_occupancy, is_ssh_host, placement_actuator_host_ref,
-    placement_host_not_ready_reason, placement_target_host, prepared_snapshot_name, resolve_placement_provider, unready_placement_refusal,
-    SSH_HOST_PIN_ONLY,
+    home_copy_wins_by_name, host_generation, is_ssh_host, placement_actuator_host_ref, placement_host_not_ready_reason,
+    placement_target_host, prepared_snapshot_name, resolve_placement_provider, unready_placement_refusal, SSH_HOST_PIN_ONLY,
 };
+use flotilla_store::occupancy::{host_occupancies, host_occupancy};
 
 /// Routing uses replicated observations as hints; only admission may refuse on
 /// destination-owned facts, credentials, or the installed skill catalog.

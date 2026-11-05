@@ -2377,9 +2377,18 @@ impl InProcessDaemon {
 
     /// Peer replication entry point; the router supplies the originating node from
     /// the trusted peer transport envelope.
-    pub async fn next_change_stream_frame(&self, peer: &str, after: Option<u64>, session: Option<String>) -> Result<CommandValue, String> {
+    pub async fn next_change_stream_frame(
+        &self,
+        peer: &str,
+        home: Option<String>,
+        after: Option<u64>,
+        session: Option<String>,
+    ) -> Result<CommandValue, String> {
         self.change_stream_rounds
-            .next(peer, self.decided_store()?, after, session, flotilla_schema::Timestamp::from_datetime(&self.clock.now()))
+            .next(peer, home, self.decided_store()?, after, session, {
+                let clock = Arc::clone(&self.clock);
+                Arc::new(move || flotilla_schema::Timestamp::from_datetime(&clock.now()))
+            })
             .await
     }
 

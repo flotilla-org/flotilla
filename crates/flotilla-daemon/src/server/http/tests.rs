@@ -655,7 +655,7 @@ async fn http_change_stream_requires_peer_session() {
     let mut bodies = Vec::new();
     for index in 0..16 {
         let CommandValue::ChangeStreamFrame { session, .. } =
-            daemon.next_change_stream_frame(&format!("peer-{index}"), None, None).await.expect("peer-issued cursor")
+            daemon.next_change_stream_frame(&format!("peer-{index}"), None, None, None).await.expect("peer-issued cursor")
         else {
             panic!("frame")
         };
@@ -666,7 +666,7 @@ async fn http_change_stream_requires_peer_session() {
         assert_eq!(response.status(), StatusCode::OK);
         bodies.push(response.into_body());
     }
-    assert!(daemon.next_change_stream_frame("peer-17", None, None).await.expect_err("global cap").contains("too many"));
+    assert!(daemon.next_change_stream_frame("peer-17", None, None, None).await.expect_err("global cap").contains("too many"));
     let read = tokio::task::spawn_blocking(move || service.with_store(|store| store.read()?.last_sequence("home")));
     assert_eq!(
         tokio::time::timeout(std::time::Duration::from_secs(2), read)

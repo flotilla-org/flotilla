@@ -2420,6 +2420,16 @@ mod tests {
             .replace(&projects.list().await.expect("remote projects"), Utc::now())
             .await
             .expect("project replica");
+        // Only a host that has sent a heartbeat is a candidate observer (Q3): `remote` has.
+        let hosts = remote.using::<flotilla_resources::Host>("ops");
+        let host = hosts.create(&InputMeta::builder().name("remote-host".into()).build(), &Default::default()).await.expect("remote host");
+        let status = flotilla_resources::HostStatus { ready: true, heartbeat_at: Some(Utc::now()), ..Default::default() };
+        hosts.update_status("remote-host", &host.metadata.resource_version, &status).await.expect("remote heartbeat");
+        backend
+            .replica_writer::<flotilla_resources::Host>(NodeId::new("remote"), "ops")
+            .replace(&hosts.list().await.expect("remote hosts"), Utc::now())
+            .await
+            .expect("host replica");
         let unheld = ChangeRequestKey::new(
             "ops",
             flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 43, &[]).expect("address"),

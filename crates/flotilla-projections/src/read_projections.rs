@@ -356,6 +356,17 @@ impl ReadProjections<'_> {
             .query_declared::<FulfilmentKind>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
             .await
             .map_err(|error| error.to_string())?;
+        // Free slots are judged, not stored: a capped host's cap less what it holds, as admission
+        // counts it.
+        let capped = kinds
+            .items
+            .iter()
+            .filter(|kind| {
+                host_specs.get(&kind.object.spec.host_ref).is_some_and(|host| host.vessel_cap(&kind.object.spec.realisation).is_some())
+            })
+            .map(|kind| kind.object.spec.host_ref.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let occupancies = flotilla_store::occupancy::host_occupancies(self.backend, namespace, &capped).await?;
         let mut rows = BTreeMap::new();
         for kind in kinds.items {
             let kind = kind.object;
@@ -363,6 +374,11 @@ impl ReadProjections<'_> {
                 continue;
             }
             let facts = facts_by_host.get(&kind.spec.host_ref).and_then(|status| status.fulfilment_facts.get(&kind.metadata.name));
+            let max_vessels = host_specs.get(&kind.spec.host_ref).and_then(|host| host.vessel_cap(&kind.spec.realisation));
+            let free_vessel_slots = match max_vessels {
+                Some(cap) => Some(occupancies.get(&kind.spec.host_ref).map_or(cap, |occupancy| occupancy.free_slots(cap))),
+                None => facts.and_then(|facts| facts.free_vessel_slots),
+            };
             let grants = kind.spec.grants.iter().map(|grant| grant.0.clone()).collect();
             let harnesses = facts
                 .map(|facts| {
@@ -409,8 +425,8 @@ impl ReadProjections<'_> {
                 harnesses,
                 toolchains: facts.map(|facts| facts.toolchains.clone()).unwrap_or_default(),
                 gui_session_logged_in: facts.map(|facts| facts.gui_session_logged_in),
-                free_vessel_slots: facts.and_then(|facts| facts.free_vessel_slots),
-                max_vessels: host_specs.get(&kind.spec.host_ref).and_then(|host| host.vessel_cap(&kind.spec.realisation)),
+                free_vessel_slots,
+                max_vessels,
                 image: facts.and_then(|facts| facts.image.as_ref().map(|image| image.image_ref.clone())),
             };
             rows.insert((row.host_ref.clone(), row.name.clone()), row);

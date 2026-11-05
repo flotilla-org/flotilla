@@ -17,7 +17,6 @@
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
-    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -43,14 +42,12 @@ use futures::stream::BoxStream;
 use serde_json::{json, Value};
 
 use super::host_import;
+use super::log_watch::LogWatch;
 use crate::stored::host::{Class, Condition, HostObservation, HostRecord, Readiness};
 
 const KIND: &str = <HostRecord as Kind>::KIND;
 const HOST: KindCode = <HostRecord as Kind>::CODE;
 const OBSERVATION: KindCode = <HostObservation as Kind>::CODE;
-
-/// How often a change stream looks for new entries in the log, as the other ports' do.
-const POLL: Duration = Duration::from_millis(500);
 
 /// How often a write that loses a race to another writer of its name reads and tries again.
 const WRITE_ATTEMPTS: usize = 3;
@@ -181,7 +178,9 @@ pub fn status(
     // The summary carries only the architecture, which image builds and their placement read.
     let description = observation.architecture.as_ref().map(|arch| HostSummary {
         environment_id: EnvironmentId::host(HostId::new(name)),
-        host_name: None,
+        // A daemon names its own Host with its host name, so the display name is the host name
+        // every view keys the host by.
+        host_name: Some(flotilla_protocol::HostName::new(spec.display_name.clone())),
         node: NodeInfo::new(NodeId::new(home), spec.display_name.clone()),
         system: SystemInfo { arch: Some(arch.clone()), ..SystemInfo::default() },
         inventory: Default::default(),
@@ -560,16 +559,12 @@ impl EngineRecords for EngineHosts {
     }
 
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
-        let service = Arc::clone(&self.service);
-        let mut follower = Follower::new([HOST, OBSERVATION]);
-        let homes = service.homes();
-        service.with_store(|store| follower.start(&mut store.read()?, &homes)).map_err(|error| error.to_string())?;
-        let stream = futures::stream::unfold((service, follower), |(service, mut follower)| async move {
+        let watch = LogWatch::start(Arc::clone(&self.service), [HOST, OBSERVATION]).map_err(|error| error.to_string())?;
+        let stream = futures::stream::unfold(watch, |mut watch| async move {
             loop {
-                tokio::time::sleep(POLL).await;
-                let homes = service.homes();
-                match service.with_store(|store| Ok(!follower.pass(&mut store.read()?, &homes)?.is_empty())) {
-                    Ok(true) => return Some(((), (service, follower))),
+                // A pass that fails is tried again at the next commit; the watcher sees no tick.
+                match watch.next(|_, followed| Ok(!followed.is_empty())).await {
+                    Ok(true) => return Some(((), watch)),
                     Ok(false) => {}
                     Err(error) => tracing::warn!(%error, "host change stream could not read the log; retrying"),
                 }
