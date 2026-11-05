@@ -533,7 +533,10 @@ async fn served_tables_type_addresses_and_carry_enum_names() {
                 "{table}.{name} whereOperators: {field}"
             );
             if field["type"] == "address" {
-                assert_eq!(column.map(|column| &column.ty), Some(&ColumnType::Interned(ADDRESS_DOMAIN)), "{table}.{name}");
+                // A stored address is interned; a resource row's subject address is derived (#4199).
+                if stored.is_some() {
+                    assert_eq!(column.map(|column| &column.ty), Some(&ColumnType::Interned(ADDRESS_DOMAIN)), "{table}.{name}");
+                }
                 addresses.push(format!("{table}.{name}"));
             }
             match column.map(|column| (&column.ty, &column.categories)) {
@@ -563,6 +566,7 @@ async fn served_tables_type_addresses_and_carry_enum_names() {
     for column in ["inbox", "sender", "reason_by", "reason_authority"] {
         assert!(addresses.contains(&format!("message.{column}")), "message.{column} in {addresses:?}");
     }
+    assert!(addresses.contains(&"convoys.address".to_owned()), "{addresses:?}");
     assert!(!addresses.iter().any(|address| address.ends_with("_condition")), "{addresses:?}");
     let rows = |messages: Vec<Message>| -> Vec<flotilla_protocol::table::Row> {
         messages.into_iter().flat_map(|message| if let Message::Rows { rows, .. } = message { rows } else { vec![] }).collect()
