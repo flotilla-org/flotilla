@@ -4,18 +4,12 @@
 use color_eyre::{eyre::eyre, Result};
 use flotilla_cli::cli::args::{Cli, SubCommand, TuiArgs, ViewArgs};
 use flotilla_client::{
-    build_id,
+    binary_version, build_id,
     reconnect::{incompatible_daemon_reexec_failure, reexec_current_process, should_reexec_for_incompatible_daemon, REEXEC_BUILD_ENV},
     sibling::{check_parent_build, PARENT_BUILD_ENV},
 };
 
 mod dashboard;
-
-/// The version `flotilla --version` reports, naming the build, so a release can check this sibling.
-fn binary_version() -> &'static str {
-    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    VERSION.get_or_init(|| format!("{} (wire={}, proto={})", env!("CARGO_PKG_VERSION"), build_id(), flotilla_protocol::PROTOCOL_VERSION))
-}
 
 fn main() -> Result<()> {
     flotilla_daemon_api::build_info::initialize_build_id(env!("FLOTILLA_BUILD_ID"));
@@ -25,10 +19,11 @@ fn main() -> Result<()> {
     check_parent_build("flotilla-tui", parent.as_deref(), env!("FLOTILLA_BUILD_ID")).map_err(|error| eyre!(error))?;
     // Checked once: a re-exec into a newer build below runs it on its own.
     std::env::remove_var(PARENT_BUILD_ENV);
-    let mut cli = Cli::try_parse_with_version(env!("CARGO_PKG_VERSION"), binary_version()).unwrap_or_else(|error| error.exit());
+    let mut cli = Cli::try_parse_with_version(env!("CARGO_PKG_VERSION"), binary_version(env!("CARGO_PKG_VERSION")))
+        .unwrap_or_else(|error| error.exit());
     let scoped_view = match cli.command.take() {
         Some(SubCommand::Tui(TuiArgs { args })) if asks_for_version(&args) => {
-            println!("flotilla-tui {}", binary_version());
+            println!("flotilla-tui {}", binary_version(env!("CARGO_PKG_VERSION")));
             return Ok(());
         }
         command => scoped_view(command)?,

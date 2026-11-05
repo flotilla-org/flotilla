@@ -1,12 +1,10 @@
-use std::sync::OnceLock;
-
 use color_eyre::Result;
 use flotilla_cli::cli::args::{
     attach_mode, AttachArgs, Cli, CompleteArgs, CompletionsArgs, DaemonArgs, DaemonSubCommand, DomainCommand, EventsArgs, FleetSubCommand,
     HookArgs, LogsArgs, LsArgs, ResourceListArgs, ResourceSubCommand, SubCommand, TopologyArgs, ViewArgs, WaitArgs,
 };
 use flotilla_client::{
-    build_id,
+    binary_version, build_id,
     reconnect::{incompatible_daemon_reexec_failure, reexec_current_process, should_reexec_for_incompatible_daemon, REEXEC_BUILD_ENV},
 };
 use flotilla_protocol::{commands::CommandValue, output::OutputFormat, Command, CommandAction};
@@ -22,11 +20,6 @@ use cli::{
     run_table_command, run_topology_command, run_tui, run_wait, run_watch, run_web_command,
 };
 
-fn binary_version() -> &'static str {
-    static VERSION: OnceLock<String> = OnceLock::new();
-    VERSION.get_or_init(|| format!("{} (wire={}, proto={})", env!("CARGO_PKG_VERSION"), build_id(), flotilla_protocol::PROTOCOL_VERSION))
-}
-
 // Parsing and dispatch run in sequence rather than nested: clap's derived
 // builders and the dispatch future both need large frames in unoptimised
 // builds, and stacking them overflowed Windows' 1 MiB main thread (#2588).
@@ -41,8 +34,8 @@ fn main() -> Result<()> {
     flotilla_daemon_api::build_info::initialize_build_id(env!("FLOTILLA_BUILD_ID"));
     rigging_tls::install_default_provider();
     color_eyre::install()?;
-    let mut cli =
-        Cli::try_parse_with_version(env!("CARGO_PKG_VERSION"), binary_version()).unwrap_or_else(|error| exit_cli_parse_error(error));
+    let mut cli = Cli::try_parse_with_version(env!("CARGO_PKG_VERSION"), binary_version(env!("CARGO_PKG_VERSION")))
+        .unwrap_or_else(|error| exit_cli_parse_error(error));
     let format = OutputFormat::from_json_flag(cli.json);
     let remote_daemon_selected = cli.remote_daemon().is_ok_and(|endpoint| endpoint.is_some());
     let command = cli.command.take();
