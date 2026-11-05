@@ -1039,6 +1039,16 @@ async fn handle_client_session(
     .await;
 }
 
+/// Serve one HTTP connection on `stream` as the main socket serves the operator's own process
+/// (`curl --unix-socket`): the same router, the caller trusted as the user. For harnesses that
+/// read the daemon's tables as an operator does.
+pub async fn serve_local_http(mut stream: tokio::net::UnixStream, daemon: Arc<InProcessDaemon>) -> std::io::Result<()> {
+    let Some(first_byte) = read_preface(&mut stream).await else { return Ok(()) };
+    let logins = Arc::new(http::LoginStore::new(daemon.clock_for_scenarios()));
+    let router = http::HttpRouter::for_daemon(daemon, logins, http::ListenerOrigin::default()).into_router();
+    http::serve_sniffed(stream, first_byte, router, |peer| http::CallerAuth::Socket(Some(peer)), std::future::pending()).await
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_client_session_with_caller(
     session: MessageSession,

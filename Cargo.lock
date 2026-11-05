@@ -2614,6 +2614,7 @@ dependencies = [
  "flotilla-store",
  "flotilla-store-memory",
  "flotilla-transport",
+ "futures",
  "serde",
  "serde_json",
  "tempfile",

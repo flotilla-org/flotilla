@@ -16,7 +16,15 @@
 //! - the daemon process, through [`TestDaemon::restart`] over the same store,
 //!   while vendor backings and running crews survive;
 //! - another daemon, through [`TestDaemon::peer`], as the daemon's own peer
-//!   runtime connects to one.
+//!   runtime connects to one;
+//! - the engine's tables, through [`TestDaemon::rows`], as an operator reads
+//!   them over the main socket.
+//!
+//! `.old_store(OldStoreMode::Unavailable)` composes the daemon with no old
+//! resource store ([`super::old_store`]): every access to it is refused and
+//! recorded, and the scenario fails at its next step with where each access came
+//! from. `OldStoreMode::Recording` serves the accesses and only records them, so
+//! one run lists what a scenario still reads and writes there.
 
 use std::{
     sync::{
@@ -49,8 +57,9 @@ use flotilla_dummy_fleet::{
 use flotilla_forgejo_providers::factories::{change_request::ForgejoChangeRequestFactory, issue_tracker::ForgejoIssueProviderFactory};
 use flotilla_github_providers::factories::{change_request::GitHubChangeRequestFactory, issue_tracker::GitHubIssueProviderFactory};
 use flotilla_protocol::{
-    commands::CommandValue, CommandAction, CommandCaller, DaemonEvent, HostName, PrincipalRef, QueryCursor, QueryId, RepoSelector,
-    ResultSet,
+    commands::CommandValue,
+    table::{Message as TableMessage, Row},
+    CommandAction, CommandCaller, DaemonEvent, HostName, PrincipalRef, QueryCursor, QueryId, RepoSelector, ResultSet,
 };
 use flotilla_provider_runtime::{CommandRunner, HttpClient};
 use flotilla_resources::{
@@ -60,6 +69,9 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
 use tokio::sync::{mpsc, watch, Notify};
+
+pub use super::old_store::OldStoreMode;
+use super::old_store::{OldStore, OldStoreAccesses};
 
 /// The namespace every test daemon provisions in.
 pub const NAMESPACE: &str = "flotilla";
@@ -75,6 +87,10 @@ struct Composition {
     host: HostName,
     clock: Arc<dyn Clock>,
     backend: ResourceBackend,
+    /// The old store's accesses, when they are recorded.
+    old_store: Option<Arc<OldStoreAccesses>>,
+    /// Whether an access fails the scenario.
+    old_store_refused: bool,
     resync: Duration,
     forges: Option<ForgeTransport>,
 }
@@ -124,6 +140,10 @@ impl TestDaemon {
         /// as on a host with `gh` and forge credentials. The dummy fleet makes
         /// them read-only, as it does on such a host.
         forges: Option<ForgeTransport>,
+        /// The old resource store: available (the default), or unavailable or
+        /// recording, which need `[primitives]` in `settings`.
+        #[builder(default)]
+        old_store: OldStoreMode,
     ) -> Self {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let config_dir = dir.path().join("config");
@@ -131,10 +151,23 @@ impl TestDaemon {
         std::fs::write(config_dir.join("daemon.toml"), daemon_toml(settings, agent, environment, change_request)).expect("daemon.toml");
         let config = Arc::new(ConfigStore::with_base(config_dir));
         let daemon_config: DaemonConfig = config.load_daemon_config().expect("daemon config");
+        let mode = old_store;
+        assert!(mode == OldStoreMode::Available || daemon_config.primitives.is_some(), "{mode:?} needs [primitives]");
+        let old_store = (mode != OldStoreMode::Available).then(|| Arc::new(OldStoreAccesses::default()));
+        let backend = match (&old_store, mode) {
+            (Some(accesses), OldStoreMode::Unavailable) => ResourceBackend::from_arc(Arc::new(OldStore::unavailable(Arc::clone(accesses)))),
+            (Some(accesses), _) => ResourceBackend::from_arc(Arc::new(OldStore::recording(
+                Arc::clone(accesses),
+                Arc::new(InMemoryBackend::default()) as Arc<dyn flotilla_store::Store>,
+            ))),
+            (None, _) => ResourceBackend::new(InMemoryBackend::default()),
+        };
         let composition = Composition {
             host: HostName::new(daemon_config.host_name.as_deref().expect("a host name")),
             clock: clock.unwrap_or_else(|| Arc::new(SystemClock)),
-            backend: ResourceBackend::new(InMemoryBackend::default()),
+            backend,
+            old_store,
+            old_store_refused: mode == OldStoreMode::Unavailable,
             resync,
             forges,
         };
@@ -142,7 +175,7 @@ impl TestDaemon {
         let mut discovery = discovery(&dir, composition.forges.as_ref());
         let fleet = install_dummy_fleet(&daemon_config, &mut discovery).expect("dummy fleet configured");
         fleet.attach(Arc::clone(&relay) as Arc<dyn CrewCommandPort>).expect("attach the crews' command relay");
-        let (daemon, runtime) = compose(&composition, config, discovery, &relay).await;
+        let (daemon, runtime) = untouched(composition.refused(), compose(&composition, config, discovery, &relay)).await;
         let operator = Operator::connect(&daemon).await;
         let started = Self { daemon, fleet, runtime: Some(runtime), relay, operator, composition, dispatched: AtomicU64::new(0), dir };
         started.seed(daemon_config.primitives.is_some()).await;
@@ -235,7 +268,7 @@ impl TestDaemon {
         let config = Arc::new(ConfigStore::with_base(dir.path().join("config")));
         let mut discovery = discovery(&dir, composition.forges.as_ref());
         fleet.install(&mut discovery);
-        let (daemon, runtime) = compose(&composition, config, discovery, &relay).await;
+        let (daemon, runtime) = untouched(composition.refused(), compose(&composition, config, discovery, &relay)).await;
         assert_eq!(daemon.node_id(), &node, "restart preserves the daemon's identity");
         let operator = Operator::connect(&daemon).await;
         Self { daemon, fleet, runtime: Some(runtime), relay, operator, composition, dispatched, dir }
@@ -244,7 +277,9 @@ impl TestDaemon {
     /// Execute `action` as an operator: through the request dispatcher, as the
     /// CLI's commands do. A refusal or failure is a [`CommandValue::Error`].
     pub async fn execute(&self, action: CommandAction) -> CommandValue {
-        self.operator.execute(action, None).await
+        let value = self.operator.execute(action, None).await;
+        self.assert_old_store_untouched();
+        value
     }
 
     /// [`TestDaemon::execute`] in `repository`, as the CLI sends a command
@@ -256,6 +291,14 @@ impl TestDaemon {
     /// Dispatch a convoy of `mix` onto the fulfilment kind `kind`, and return
     /// the convoy's resource name.
     pub async fn dispatch(&self, mix: CrewMix, kind: &str) -> String {
+        let role = self.request_convoy(mix, kind).await;
+        let convoys = self.list::<Convoy>().await;
+        convoys.into_iter().find(|convoy| convoy.spec.role == role).unwrap_or_else(|| panic!("no convoy {role}")).metadata.name
+    }
+
+    /// Request a convoy of `mix` onto the fulfilment kind `kind`, as `flotilla
+    /// convoy create` does, and return its role.
+    pub async fn request_convoy(&self, mix: CrewMix, kind: &str) -> String {
         let role = format!("{}-{}", mix.workflow_name(), self.dispatched.fetch_add(1, Ordering::Relaxed));
         let forge = catalog::forge(&self.fleet.config().forge_service_url);
         let created = self
@@ -271,14 +314,15 @@ impl TestDaemon {
             })
             .await;
         assert!(matches!(created, CommandValue::ConvoyCreated { .. }), "dispatch {role}: {created:?}");
-        let convoys = self.list::<Convoy>().await;
-        convoys.into_iter().find(|convoy| convoy.spec.role == role).unwrap_or_else(|| panic!("no convoy {role}")).metadata.name
+        role
     }
 
     /// The `T` named `name`, as `flotilla get` reads it.
     pub async fn get<T: Resource>(&self, name: &str) -> Option<ResourceObject<T>> {
         let request = ResourceGetRequest::builder().kind(T::API_PATHS.kind.into()).name(name.into()).namespace(NAMESPACE.into()).build();
-        match self.operator.resources.get(request).await {
+        let read = self.operator.resources.get(request).await;
+        self.assert_old_store_untouched();
+        match read {
             Ok(read) => read.records.into_iter().find_map(|record| record.object).map(decode),
             Err(message) if message.contains("not found") => None,
             Err(message) => panic!("get {} {name}: {message}", T::API_PATHS.kind),
@@ -290,7 +334,9 @@ impl TestDaemon {
     pub async fn list<T: Resource>(&self) -> Vec<ResourceObject<T>> {
         let request =
             ResourceListRequest::builder().kind(T::API_PATHS.kind.into()).namespace(NAMESPACE.into()).include_replicas(true).build();
-        let read = self.operator.resources.list(request).await.unwrap_or_else(|message| panic!("list {}: {message}", T::API_PATHS.kind));
+        let read = self.operator.resources.list(request).await;
+        self.assert_old_store_untouched();
+        let read = read.unwrap_or_else(|message| panic!("list {}: {message}", T::API_PATHS.kind));
         read.records.into_iter().filter_map(|record| record.object).map(decode).collect()
     }
 
@@ -372,6 +418,73 @@ impl TestDaemon {
             .await
             .expect("peer runtimes");
         Peering { _topology: topology }
+    }
+
+    /// The rows of the table `table` that satisfy `condition` (the tables
+    /// API's `where`, none when empty), as an operator reads them with `curl
+    /// --unix-socket` from `/tables/{table}/rows`: this home's, for an engine
+    /// kind.
+    pub async fn rows(&self, table: &str, condition: &str) -> Vec<Row> {
+        let mut target = format!("/tables/{table}/rows?limit=10000");
+        if !condition.is_empty() {
+            target.push_str("&where=");
+            target.extend(condition.bytes().map(|byte| match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => char::from(byte).to_string(),
+                _ => format!("%{byte:02X}"),
+            }));
+        }
+        let (status, body) = local_get(&self.daemon, &target).await;
+        self.assert_old_store_untouched();
+        assert_eq!(status, 200, "GET {target}: {}", String::from_utf8_lossy(&body));
+        let mut rows = Vec::new();
+        for line in body.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
+            match serde_json::from_slice::<TableMessage>(line).unwrap_or_else(|error| panic!("GET {target}: {error}")) {
+                TableMessage::Rows { rows: page, partial, .. } => {
+                    assert!(!partial, "GET {target}: more than one page");
+                    rows.extend(page);
+                }
+                TableMessage::Resync { reason } => panic!("GET {target}: resync: {reason}"),
+                _ => {}
+            }
+        }
+        rows
+    }
+
+    /// Wait until some row of `table` satisfying `condition` also satisfies
+    /// `done`, and return it. The wait fails with the table's last rows.
+    pub fn wait_row<'a>(&'a self, what: &'a str, table: &'a str, condition: &'a str, done: impl Fn(&Row) -> bool + 'a) -> Wait<'a, Row> {
+        Wait::new(WAIT, async move |deadline| loop {
+            let mut rows = self.rows(table, condition).await;
+            if let Some(found) = rows.iter().position(&done) {
+                return rows.swap_remove(found);
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("no {table} row reached {what}; last rows where {condition:?}: {}; fleet: {:?}", shown(&rows), self.counts());
+            }
+            tokio::time::sleep(POLL).await;
+        })
+    }
+
+    /// Fails with every access, when the old store is unavailable and
+    /// something reached it.
+    pub fn assert_old_store_untouched(&self) {
+        if let Some(accesses) = self.composition.refused() {
+            if !accesses.accesses().is_empty() {
+                panic!("{}", accesses.report());
+            }
+        }
+    }
+
+    /// Names the scenario's stage, which each later old-store access records.
+    pub fn stage(&self, stage: &str) {
+        if let Some(accesses) = &self.composition.old_store {
+            accesses.stage(stage);
+        }
+    }
+
+    /// The old store's accesses so far, when they are recorded.
+    pub fn old_store_report(&self) -> Option<String> {
+        self.composition.old_store.as_ref().map(|accesses| accesses.report())
     }
 
     /// The environment vendors: what a test does as the vendor is all the
@@ -590,4 +703,61 @@ impl CrewCommandPort for RestartRelay {
     async fn report_attention(&self, namespace: &str, session: &str, working: bool) -> Result<(), String> {
         self.port().await.report_attention(namespace, session, working).await
     }
+}
+
+impl Composition {
+    /// The accesses that fail the scenario: the old store's, when it is unavailable.
+    fn refused(&self) -> Option<&OldStoreAccesses> {
+        self.old_store.as_deref().filter(|_| self.old_store_refused)
+    }
+}
+
+/// Runs `step`, failing with the old store's accesses as soon as there is one.
+async fn untouched<T>(old_store: Option<&OldStoreAccesses>, step: impl std::future::Future<Output = T>) -> T {
+    let Some(accesses) = old_store else { return step.await };
+    tokio::select! {
+        biased;
+        () = accesses.first_access() => panic!("{}", accesses.report()),
+        done = step => {
+            if !accesses.accesses().is_empty() {
+                panic!("{}", accesses.report());
+            }
+            done
+        }
+    }
+}
+
+/// One GET over a connection the daemon serves as its main socket serves the
+/// operator's process: the status and the de-chunked body.
+async fn local_get(daemon: &Arc<InProcessDaemon>, target: &str) -> (u16, Vec<u8>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut client, server) = tokio::net::UnixStream::pair().expect("socket pair");
+    let serving = tokio::spawn(flotilla_daemon::server::serve_local_http(server, Arc::clone(daemon)));
+    let request = format!("GET {target} HTTP/1.1\r\nHost: flotilla.local\r\nAccept: application/x-ndjson\r\nConnection: close\r\n\r\n");
+    client.write_all(request.as_bytes()).await.expect("send request");
+    let mut response = Vec::new();
+    tokio::time::timeout(WAIT, client.read_to_end(&mut response)).await.expect("response in time").expect("read response");
+    serving.abort();
+    let split = response.windows(4).position(|window| window == b"\r\n\r\n").expect("response head");
+    let head = String::from_utf8_lossy(&response[..split]).to_ascii_lowercase();
+    let mut body = response[split + 4..].to_vec();
+    let status = head.split_whitespace().nth(1).and_then(|code| code.parse().ok()).expect("status code");
+    if head.lines().any(|line| line.starts_with("transfer-encoding:") && line.contains("chunked")) {
+        let mut chunked = body.as_slice();
+        let mut plain = Vec::new();
+        loop {
+            let end = chunked.windows(2).position(|window| window == b"\r\n").expect("chunk size");
+            let size =
+                String::from_utf8_lossy(&chunked[..end]).split(';').next().map(str::trim).map(|size| usize::from_str_radix(size, 16));
+            let size = size.expect("chunk size").expect("chunk size");
+            chunked = &chunked[end + 2..];
+            if size == 0 {
+                break;
+            }
+            plain.extend_from_slice(&chunked[..size]);
+            chunked = &chunked[size + 2..];
+        }
+        body = plain;
+    }
+    (status, body)
 }
