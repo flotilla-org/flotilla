@@ -884,6 +884,31 @@ async fn daemon_startup_reaps_retained_landed_convoy_orphan() {
         )
         .await
         .expect("running orphan");
+    // It was launched before this start: the engine holds its launch realised under its pool
+    // session, as a reconciler's MarkRunning report records it (or the cut-over import does).
+    {
+        use flotilla_engine_store::{open_home, StoreLog};
+        use flotilla_provisioning::{
+            engine::{launch, terminal_session::TerminalSessionBinding, Binding, LifecycleHome, Lifecycles, Step},
+            stored::terminal_session::TerminalSessionKind,
+        };
+        let store = initial.decided_store().expect("decided store").store();
+        let session = sessions.get("old-orphan").await.expect("orphan");
+        tokio::task::spawn_blocking(move || {
+            let log = StoreLog::new(store);
+            let home = log.home().to_owned();
+            let lifecycles: LifecycleHome<TerminalSessionKind, StoreLog> =
+                LifecycleHome::new(&home, open_home(log).expect("terminal session home"));
+            let name = launch("old-orphan", 1);
+            let at = flotilla_schema::Timestamp::from_datetime(&Utc::now());
+            let request = TerminalSessionBinding::request(&session, &home).expect("launch request");
+            lifecycles.request(&name, request, at).expect("launch requested");
+            lifecycles.finish_launch_request(&name, at).expect("launch request finished");
+            lifecycles.step(&name, &Step::Realised { identity: "old-process".into() }, at).expect("launch realised");
+        })
+        .await
+        .expect("realise the orphan's launch");
+    }
     drop(initial);
     let (restarted, pool) = crew_daemon_with_backend(Arc::clone(&config), backend.clone()).await;
     pool.add_sessions(vec![ProviderTerminalSession::builder()
