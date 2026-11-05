@@ -33,6 +33,14 @@ pub mod sibling;
 pub mod systemd;
 pub use flotilla_daemon_api::build_info::build_id;
 
+/// The `--version` of `flotilla` and its siblings: `package_version (wire=<build>, proto=<protocol>)`.
+/// A release checks each sibling by its `wire=`, so they all report this one form. A process is one
+/// binary, so the first call's `package_version` is the one kept.
+pub fn binary_version(package_version: &str) -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| format!("{package_version} (wire={}, proto={})", build_id(), flotilla_protocol::PROTOCOL_VERSION))
+}
+
 /// Std RwLock for local seq tracking — the critical sections are single HashMap
 /// operations (no async work while holding the lock), and using a sync lock
 /// avoids the race where a spawned seq update hasn't run before the next delta

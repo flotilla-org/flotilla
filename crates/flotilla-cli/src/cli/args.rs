@@ -71,6 +71,10 @@ pub enum SubCommand {
     /// open-view set is untouched. This is the deep-link entry Presentation
     /// Manager recipes embed (ADR 0013).
     View(ViewArgs),
+    /// The dashboard, as `flotilla` with no subcommand: the command its flotilla-tui sibling
+    /// serves, which a release checks with `flotilla tui --version` (#4263).
+    #[command(hide = true, disable_help_flag = true)]
+    Tui(TuiArgs),
     /// Print repo list and state
     Status,
     /// Stream daemon events to stdout
@@ -231,6 +235,13 @@ pub struct LsArgs {
 pub struct TableArgs {
     /// A table name (omit to list the tables), then flotilla-table's flags: --view, --where,
     /// --format, --columns, --sort, --namespace and the rest
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub args: Vec<std::ffi::OsString>,
+}
+
+/// `flotilla tui`'s arguments, handed to the flotilla-tui sibling, which reads only `--version`.
+#[derive(clap::Args, Debug, Default, PartialEq, Eq)]
+pub struct TuiArgs {
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<std::ffi::OsString>,
 }

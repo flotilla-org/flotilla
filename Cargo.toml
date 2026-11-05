@@ -145,8 +145,6 @@ edition = "2021"
 license.workspace = true
 
 [features]
-default = ["tui"]
-tui = ["dep:flotilla-tui", "dep:ratatui"]
 aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-daemon/aws-lc-provider"]
 
 # New external crates also belong in clippy.toml's absolute-paths-allowed-crates.
@@ -171,9 +169,7 @@ flotilla-provisioning = { path = "crates/flotilla-provisioning" }
 flotilla-manifest = { path = "crates/flotilla-manifest" }
 flotilla-protocol = { path = "crates/flotilla-protocol" }
 flotilla-resources = { path = "crates/flotilla-resources" }
-flotilla-tui = { path = "crates/flotilla-tui", optional = true }
 flotilla-cli = { path = "crates/flotilla-cli" }
-ratatui = { version = "0.30", optional = true }
 tokio = { workspace = true }
 color-eyre = { workspace = true }
 clap = { version = "4", features = ["derive", "string"] }
@@ -201,11 +197,6 @@ flotilla-core = { path = "crates/flotilla-core" }
 flotilla-test-support = { path = "crates/flotilla-test-support" }
 hegeltest = { workspace = true }
 tempfile = { workspace = true }
-
-[[example]]
-name = "glyph_showcase"
-test = false
-required-features = ["tui"]
 
 [workspace.lints.clippy]
 absolute_paths = "warn"

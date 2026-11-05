@@ -7,15 +7,8 @@ use std::{
 use color_eyre::Result;
 use flotilla_client::{DaemonEndpoint, SshEndpoint};
 use flotilla_daemon_api::daemon::DaemonHandle;
-#[cfg(not(feature = "tui"))]
-use flotilla_protocol::ViewAddress;
 
 use flotilla_cli::cli::args::{Cli, CliPaths, DevModeSubCommand};
-
-#[cfg(feature = "tui")]
-mod dashboard;
-#[cfg(feature = "tui")]
-pub(crate) use dashboard::run_tui;
 
 pub(super) fn host_daemon_socket_required(contained_marker: Option<&std::ffi::OsStr>) -> bool {
     contained_marker.is_some()
@@ -215,11 +208,6 @@ pub(super) async fn connect_daemon(cli: &Cli) -> Result<Arc<dyn DaemonHandle>> {
     .await
     .map_err(|e| color_eyre::eyre::eyre!(e))?;
     Ok(daemon as Arc<dyn DaemonHandle>)
-}
-
-#[cfg(not(feature = "tui"))]
-pub(crate) async fn run_tui(_cli: Cli, _scoped_view: Option<ViewAddress>) -> Result<()> {
-    Err(color_eyre::eyre::eyre!("this binary was built without the TUI; use an operator build with the tui feature"))
 }
 
 #[cfg(test)]
