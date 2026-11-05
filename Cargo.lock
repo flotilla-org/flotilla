@@ -4043,7 +4043,6 @@ dependencies = [
  "chrono",
  "clap",
  "color-eyre",
- "comfy-table",
  "crokey",
  "crossterm",
  "dirs",

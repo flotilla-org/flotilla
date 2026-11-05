@@ -45,7 +45,6 @@ crokey = "1.4"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 time = { version = "0.3.47", features = ["local-offset"] }
 futures = "0.3"
-comfy-table = { version = "7.2.2", default-features = false }
 clap = { version = "4", features = ["derive"] }
 uuid = { workspace = true, features = ["v4"] }
 indexmap = { workspace = true }
