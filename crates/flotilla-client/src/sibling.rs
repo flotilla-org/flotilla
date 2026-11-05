@@ -21,9 +21,6 @@ pub enum Sibling {
 }
 
 impl Sibling {
-    /// Every sibling, in allowlist order.
-    pub const ALL: &[Sibling] = &[Sibling::Table];
-
     /// The `flotilla` command it serves.
     pub fn command(self) -> &'static str {
         match self {
@@ -118,8 +115,9 @@ mod tests {
             .lines()
             .filter_map(|line| line.trim().strip_prefix("Sibling::")?.split_once(" => \"")?.1.strip_suffix("\","))
             .collect();
-        let commands: Vec<&str> = Sibling::ALL.iter().map(|sibling| sibling.command()).collect();
-        // `command` matches exhaustively, so a variant missing from `ALL` still has an arm here.
+        // `command` matches exhaustively, so a new variant has an arm here and fails this until
+        // it is listed too, which checks that the packaging parse reads its arm.
+        let commands: Vec<&str> = [Sibling::Table].iter().map(|sibling| sibling.command()).collect();
         assert_eq!(arms, commands);
     }
 
