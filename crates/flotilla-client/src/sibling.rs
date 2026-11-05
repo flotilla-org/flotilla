@@ -12,7 +12,9 @@ use std::{
 pub const PARENT_BUILD_ENV: &str = "FLOTILLA_PARENT_BUILD";
 
 /// The siblings `flotilla` hands commands to; adding one is a code change. `mcp` (#4201) and
-/// `tui` (#4263) join as they land.
+/// `tui` (#4263) join as they land. This is the allowlist the release ships too: the candidate
+/// build reads the `Sibling::<Name> => "<command>"` arms of [`Sibling::command`] from this file
+/// (`generation_validation.py siblings`), so keep each arm on one line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sibling {
     Table,
@@ -103,6 +105,20 @@ mod tests {
         let sibling = dir.path().join(Sibling::Table.file_name());
         std::fs::write(&sibling, b"").expect("write sibling");
         assert_eq!(locate(Sibling::Table, &binary).expect("found"), sibling);
+    }
+
+    // The release packages the siblings named by the `command` arms in this file's text; every
+    // sibling has its arm there, and nothing else in the file reads as one.
+    #[test]
+    fn the_packaged_allowlist_reads_every_sibling_from_this_file() {
+        let arms: Vec<&str> = include_str!("sibling.rs")
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("Sibling::")?.split_once(" => \"")?.1.strip_suffix("\","))
+            .collect();
+        // `command` matches exhaustively, so a new variant has an arm here and fails this until
+        // it is listed too, which checks that the packaging parse reads its arm.
+        let commands: Vec<&str> = [Sibling::Table].iter().map(|sibling| sibling.command()).collect();
+        assert_eq!(arms, commands);
     }
 
     #[test]

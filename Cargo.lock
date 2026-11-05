@@ -2824,6 +2824,7 @@ dependencies = [
  "flotilla-build-features-http-server",
  "flotilla-build-features-logging",
  "flotilla-build-features-types",
+ "flotilla-client",
  "flotilla-discovery-api",
  "flotilla-discovery-testkit",
  "flotilla-paths",

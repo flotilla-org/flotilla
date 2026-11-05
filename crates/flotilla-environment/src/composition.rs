@@ -17,6 +17,8 @@ pub mod role {
     /// Bootstrapped separately into each vessel; never published in the layer.
     pub const AGENT: &str = "agent";
     pub const CLI: &str = "cli";
+    /// The `flotilla-table` sibling (#4249), published beside the CLI where its lookup finds it.
+    pub const TABLE: &str = "table";
     pub const CLEAT: &str = "cleat";
     pub const CLEAT_LIBRARY: &str = "cleat-library";
 }
@@ -419,10 +421,23 @@ mod tests {
     #[test]
     fn stdlib_tools_declaration_names_every_typed_role() {
         let tools = flotilla_tools();
-        for typed in [role::AGENT, role::CLI, role::CLEAT, role::CLEAT_LIBRARY] {
+        for typed in [role::AGENT, role::CLI, role::TABLE, role::CLEAT, role::CLEAT_LIBRARY] {
             assert!(matches!(tools.member(typed).map(|member| &member.source), Some(Source::File(_))), "{typed}");
         }
         assert!(tools.member(role::AGENT).is_some_and(|agent| agent.install.is_none()));
+    }
+
+    // A vessel's `flotilla` runs its siblings from its own directory, so the table installs
+    // beside the CLI under the name the lookup expects; the TUI is never delivered (#4249 ruling 4).
+    #[test]
+    fn the_table_sibling_is_published_beside_the_cli_and_the_tui_is_not() {
+        let tools = flotilla_tools();
+        let install = |role| Path::new(tools.member(role).and_then(|member| member.install.as_deref()).expect("published"));
+        let (cli, table) = (install(role::CLI), install(role::TABLE));
+        assert_eq!(cli.file_name(), Some("flotilla".as_ref()));
+        assert_eq!(table.parent(), cli.parent());
+        assert_eq!(table.file_name(), Some(flotilla_client::sibling::Sibling::Table.file_name().as_ref()));
+        assert!(tools.published().all(|(_, install)| !install.contains("flotilla-tui")), "no TUI in vessels");
     }
 
     // Static declaration rules refuse each broken composition with its reason.
