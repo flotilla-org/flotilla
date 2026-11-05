@@ -19,11 +19,19 @@ pub struct ConvoyAddressIdentity<'a> {
     pub project: Option<&'a str>,
     pub terminal: bool,
 }
+/// Resolves a convoy address to candidate records. A record name, alone or qualified by its
+/// project (`<record>@<project>`, a convoy row's own address), names that record exactly;
+/// otherwise the address names a role, within a project or in any project.
 pub fn resolve_convoy_candidate_indices(identities: &[ConvoyAddressIdentity<'_>], address: &str) -> Result<Vec<usize>, String> {
+    let qualified = address.split_once('@').filter(|(_, project)| !project.is_empty());
     let exact = identities
         .iter()
         .enumerate()
-        .filter_map(|(index, identity)| (identity.record_name == address).then_some(index))
+        .filter_map(|(index, identity)| {
+            let named = identity.record_name == address
+                || qualified.is_some_and(|(record, project)| identity.record_name == record && identity.project == Some(project));
+            named.then_some(index)
+        })
         .collect::<Vec<_>>();
     if !exact.is_empty() {
         return Ok(exact);
@@ -120,6 +128,22 @@ mod naming_tests {
         for value in ["governor", "@andamento", "governor@", "governor@andamento@extra"] {
             assert!(RoleAddress::from_str(value).is_err(), "{value} must not produce a qualified address");
         }
+    }
+
+    // #4199: a record name qualified by its own project names that record, ahead of any role of
+    // the same name; qualified by another project, or by none, it falls through to role matching.
+    #[test]
+    fn a_record_qualified_by_its_project_names_it_exactly() {
+        let identity = |record_name, role, project| ConvoyAddressIdentity { record_name, role: Some(role), project, terminal: false };
+        let identities = [
+            identity("convoy-1", "coder", Some("flotilla")),
+            identity("convoy-2", "convoy-1", Some("flotilla")),
+            identity("convoy-3", "lander", Some("")),
+        ];
+        assert_eq!(resolve_convoy_candidate_indices(&identities, "convoy-1@flotilla"), Ok(vec![0]));
+        assert_eq!(resolve_convoy_candidate_indices(&identities, "convoy-1@other"), Ok(vec![]));
+        assert_eq!(resolve_convoy_candidate_indices(&identities, "convoy-3@"), Ok(vec![]));
+        assert_eq!(resolve_convoy_candidate_indices(&identities, "convoy-3"), Ok(vec![2]));
     }
 
     // Naming retains the projectless spelling independently of disambiguation spelling.

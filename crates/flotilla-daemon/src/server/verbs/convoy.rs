@@ -31,27 +31,18 @@ impl Subjects for ResourceSubjects {
 
     /// A convoy address is a row's own `address` (`project:<p>/convoy:convoy-<uuid>`, or
     /// `convoy:convoy-<uuid>` without a project), which names its record; or it names a role,
-    /// within a project (`project:<p>/convoy:<role>`) or in any project, and resolves as the
-    /// CLI's `convoy explain` resolves `<role>@<project>`. The row is read by record name.
+    /// within a project (`project:<p>/convoy:<role>`) or in any project. Both resolve as the CLI's
+    /// `convoy explain` resolves `<name>@<project>`, and the row is read by the resolved record name.
     async fn row(&self, namespace: &str, address: &Address) -> Result<Option<Row>, String> {
         let Some(table) = self.table(address.kind()) else { return Err(format!("no table serves `{}` subjects", address.kind())) };
-        let read = |name: String| {
-            let table = &table;
-            async move {
-                let query = StoreQuery::names([name], false);
-                let document = query_resource_kind(&self.backend, namespace, "convoys", &query).await.map_err(|error| error.to_string())?;
-                Ok::<_, String>(tables::resource_rows(&document, table)?.into_iter().next())
-            }
-        };
-        let own = |row: &Row| row.get(tables::ADDRESS).and_then(Value::as_str) == Some(address.as_str());
-        if let Some(row) = read(address.name().to_owned()).await?.filter(own) {
-            return Ok(Some(row));
-        }
         let reference = match address.get(Kind::Project) {
             Some(project) => format!("{}@{project}", address.name()),
             None => address.name().to_owned(),
         };
-        read(resolve_local_convoy_name(&self.backend, namespace, &reference).await?).await
+        let name = resolve_local_convoy_name(&self.backend, namespace, &reference).await?;
+        let query = StoreQuery::names([name], false);
+        let document = query_resource_kind(&self.backend, namespace, "convoys", &query).await.map_err(|error| error.to_string())?;
+        Ok(tables::resource_rows(&document, &table)?.into_iter().next())
     }
 }
 

@@ -152,7 +152,7 @@ Each field has:
 
 `subject`, when present, says what each row is about: `kind` is the ADR 0066 address kind of the row's subject, and `field` names the field holding its canonical address. A client opens a row (Enter) by opening that address. A table whose rows are no one kind's subjects has no `subject`.
 
-- A resource table's subject is derived from its key. `convoys` rows are convoys: their `address` field is `project:<project>/convoy:<record name>`, or `convoy:<record name>` for a convoy without a project, the convoy its roles' inboxes sit under. Each row's address names that convoy wherever a convoy address is taken. Other resource kinds have no subject yet.
+- A resource table's subject is derived from its key. `convoys` rows are convoys: their `address` field is `project:<project>/convoy:<record name>`, or `convoy:<record name>` for a convoy without a project, the convoy its roles' inboxes sit under, taking the project from the convoy's `flotilla.work/project` label. Each row's address names that convoy wherever a convoy address is taken. Other resource kinds have no subject yet.
 - A described table declares its subject with `Layout::subject`, naming one of its address fields.
 - The subject field is always returned, as key columns are, whatever `columns` asks for.
 

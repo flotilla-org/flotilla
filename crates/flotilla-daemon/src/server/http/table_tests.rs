@@ -980,9 +980,11 @@ async fn convoy_rows_name_their_subject_by_address() {
     use crate::server::verbs::{catalog::Subjects, convoy::ResourceSubjects};
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoys = backend.using::<Convoy>("test");
+    // As admission labels them: a convoy without a project carries an empty project label.
     for (name, project) in [("convoy-1", Some("flotilla")), ("convoy-2", Some("flotilla2")), ("convoy-3", None)] {
         let spec = ConvoySpec::builder().workflow_ref("workflow".into()).maybe_project_ref(project.map(str::to_owned)).build();
-        convoys.create(&InputMeta::builder().name(name.into()).build(), &spec).await.unwrap();
+        let labels = BTreeMap::from([(flotilla_resources::PROJECT_LABEL.to_owned(), project.unwrap_or_default().to_owned())]);
+        convoys.create(&InputMeta::builder().name(name.into()).labels(labels).build(), &spec).await.unwrap();
     }
     let router = router(backend.clone());
     let schema = json(&router, "/tables/convoys").await;
