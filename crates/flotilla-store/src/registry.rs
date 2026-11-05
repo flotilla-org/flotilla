@@ -322,7 +322,7 @@ macro_rules! dispatch_resource_kind {
 
 /// Inventory every namespace with an authored or replicated record, by kind.
 pub async fn registered_resource_namespaces(backend: &ResourceBackend) -> Result<BTreeMap<String, Vec<String>>, ResourceError> {
-    backend.namespace_inventory().await
+    backend.stored_namespace_inventory().await
 }
 
 /// Dynamic apply writes as `$writer`.

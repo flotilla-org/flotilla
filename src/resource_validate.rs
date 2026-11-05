@@ -182,6 +182,12 @@ async fn validate_daemon_with_preview(
             }
             let retirement_collection =
                 store_base == base && has_templates && matches!(kind.as_str(), "workflowtemplates" | "projects" | "fleetdesignations");
+            // The engine holds manifest roots, which the kind's listing does not serve: a namespace
+            // discovery names for them is asked for its bound charter inputs, and answers empty
+            // when none is bound.
+            if store_base == base && kind == "manifestroots" {
+                charter_namespaces.insert(namespace.clone());
+            }
             let label = format!("{store_base}/{namespace}/{kind}");
             let url = format!("{store_base}/apis/flotilla.work/v1/namespaces/{namespace}/{kind}{query}");
             let response = client.get(url).send().await.map_err(|error| eyre!("list {label}: {error}"))?;
@@ -209,9 +215,6 @@ async fn validate_daemon_with_preview(
             for item in items {
                 count += 1;
                 let name = item.pointer("/metadata/name").and_then(Value::as_str).unwrap_or("<unnamed>");
-                if store_base == base && kind == "manifestroots" && item["spec"].get("binding").is_some_and(|binding| !binding.is_null()) {
-                    charter_namespaces.insert(namespace.clone());
-                }
                 if store_base == base && kind == "projects" {
                     match serde_json::from_value::<K8sResourceObject<Project>>(item.clone())
                         .map_err(|error| error.to_string())
@@ -1342,15 +1345,15 @@ mod tests {
             )
             .await
             .expect("create project outside default namespace");
-        for namespace in ["flotilla", "replicas"] {
-            backend
-                .clone()
-                .definitions::<flotilla_resources::WorkflowTemplate>(namespace)
-                .apply(&InputMeta::builder().name("default".into()).build(), &flotilla_resources::WorkflowTemplateSpec::builder().build())
-                .await
-                .expect("satisfiable pending workflow");
-        }
-        let replicas = backend.using::<Convoy>("replicas");
+        // The engine holds definitions in the daemon's one namespace, so a replicated convoy that
+        // names one is in that namespace too.
+        backend
+            .clone()
+            .definitions::<flotilla_resources::WorkflowTemplate>("flotilla")
+            .apply(&InputMeta::builder().name("default".into()).build(), &flotilla_resources::WorkflowTemplateSpec::builder().build())
+            .await
+            .expect("satisfiable pending workflow");
+        let replicas = backend.using::<Convoy>("flotilla");
         replicas
             .create(
                 &InputMeta::builder().name("replica-only".to_string()).build(),
@@ -1358,9 +1361,10 @@ mod tests {
             )
             .await
             .expect("create replica source");
-        let source = replicas.list().await.expect("list replica source");
+        let mut source = replicas.list().await.expect("list replica source");
+        source.items.retain(|convoy| convoy.metadata.name == "replica-only");
         backend
-            .replica_writer::<Convoy>(NodeId::new("other-root"), "replicas")
+            .replica_writer::<Convoy>(NodeId::new("other-root"), "flotilla")
             .replace(&source, chrono::Utc::now())
             .await
             .expect("write replica source");
@@ -1370,18 +1374,21 @@ mod tests {
         let charter_text =
             "apiVersion: flotilla.work/v1\nkind: FulfilmentKind\nmetadata:\n  name: candidate-kind\nspec:\n  host_ref: host\n  pool: default\n  realisation: host_direct\n";
         std::fs::write(&charter_file, charter_text).expect("charter document");
-        backend
-            .using::<flotilla_resources::ManifestRoot>("flotilla")
-            .create(
-                &InputMeta::builder().name("candidate-charter".to_string()).build(),
-                &flotilla_resources::ManifestRootSpec::builder()
-                    .host(server.daemon().local_host_id().expect("host identity").to_string())
-                    .path(charter_dir.path().to_string_lossy().into_owned())
-                    .source("local".into())
-                    .binding(flotilla_resources::CharterSource::LocalDirectory {
+        server
+            .daemon()
+            .manifest_roots()
+            .declare(
+                "flotilla",
+                "candidate-charter",
+                flotilla_resources::manifest_roots::RootDeclaration {
+                    host: server.daemon().local_host_id().expect("host identity").to_string(),
+                    path: charter_dir.path().to_string_lossy().into_owned(),
+                    source: "local".into(),
+                    binding: Some(flotilla_resources::CharterSource::LocalDirectory {
                         directory: charter_dir.path().to_string_lossy().into_owned(),
-                    })
-                    .build(),
+                    }),
+                    ops: false,
+                },
             )
             .await
             .expect("bound root");

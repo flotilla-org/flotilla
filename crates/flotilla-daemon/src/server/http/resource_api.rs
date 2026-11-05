@@ -4,7 +4,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use flotilla_core::in_process::InProcessDaemon;
-use flotilla_resources::{ResourceError, WatchStart};
+use flotilla_resources::{ManifestRoot, Resource, ResourceError, WatchStart};
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_store::{
     get_resource_kind, get_resource_kind_all_provenances, get_resource_kind_including_replicas, list_resource_kind,
@@ -106,10 +106,25 @@ pub(in crate::server) async fn respond(
         (path, backend)
     };
     if path == "/apis/flotilla.work/v1" {
-        let namespaces = match registered_resource_namespaces(&backend).await {
+        let mut namespaces = match registered_resource_namespaces(&backend).await {
             Ok(namespaces) => namespaces,
             Err(error) => return Reply::resource_error(error),
         };
+        // The engine holds manifest roots in the provisioning namespace; it is named when any is
+        // held, so a candidate asks it for their bound charter inputs.
+        if let Some(daemon) = daemon.filter(|_| !observed_path) {
+            let namespace = daemon.provisioning_namespace().await;
+            match daemon.manifest_roots().roots(&namespace).await {
+                Ok(roots) if !roots.is_empty() => {
+                    let held = namespaces.entry(ManifestRoot::API_PATHS.plural.to_owned()).or_default();
+                    if !held.contains(&namespace) {
+                        held.push(namespace);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => return Reply::error(500, &error),
+            }
+        }
         return Reply::json(
             200,
             serde_json::json!({"kinds": REGISTERED_RESOURCE_KINDS.iter().map(|kind| kind.plural).collect::<Vec<_>>(), "namespaces": namespaces, "stores": additional_stores }),

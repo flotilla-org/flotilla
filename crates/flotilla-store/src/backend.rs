@@ -215,12 +215,32 @@ impl ResourceBackend {
         records: &dyn flotilla_resources::engine_records::EngineRecords,
         local: bool,
     ) -> Result<Vec<String>, ResourceError> {
+        self.engine_kind_namespaces(T::API_PATHS.kind, records, local).await
+    }
+
+    async fn engine_kind_namespaces(
+        &self,
+        kind: &str,
+        records: &dyn flotilla_resources::engine_records::EngineRecords,
+        local: bool,
+    ) -> Result<Vec<String>, ResourceError> {
         let namespace = self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).namespace.clone();
-        let namespace =
-            namespace.ok_or_else(|| ResourceError::other(format!("{} is served by the engine in no namespace", T::API_PATHS.kind)))?;
+        let namespace = namespace.ok_or_else(|| ResourceError::other(format!("{kind} is served by the engine in no namespace")))?;
         let home = records.home();
-        let sources = records.sources(T::API_PATHS.kind).await.map_err(ResourceError::other)?;
+        let sources = records.sources(kind).await.map_err(ResourceError::other)?;
         Ok(if sources.iter().any(|record| !local || record.home == home) { vec![namespace] } else { Vec::new() })
+    }
+
+    /// Every namespace with an authored or replicated record, by kind plural: a kind the engine
+    /// serves answers from the engine, every other from the store.
+    pub async fn stored_namespace_inventory(&self) -> Result<std::collections::BTreeMap<String, Vec<String>>, ResourceError> {
+        let mut inventory = self.store.namespace_inventory().await?;
+        for kind in crate::declared_resource_kinds() {
+            if let Some(records) = self.engine_records(kind.paths.kind) {
+                inventory.insert(kind.paths.plural.to_string(), self.engine_kind_namespaces(kind.paths.kind, &*records, false).await?);
+            }
+        }
+        Ok(inventory)
     }
 
     pub fn definitions<T: Resource>(&self, namespace: &str) -> DefinitionResolver<T> {
