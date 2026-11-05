@@ -107,6 +107,17 @@ pub struct Table {
     /// Earlier names of columns, as `(old, current)`: a renamed field's columns keep their
     /// names under the field's alias, so a log entry written under one still decodes.
     pub aliases: Vec<(String, String)>,
+    /// What each row is about, when its rows are subjects of one address kind (#4199).
+    pub subject: Option<Subject>,
+}
+
+/// The subject of a table's rows (#4182 ruling 1): the ADR 0066 address kind of each row's
+/// subject, and the field holding the subject's canonical address. A client opens a row by
+/// opening that address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subject {
+    pub kind: flotilla_address::Kind,
+    pub field: String,
 }
 
 /// One column-shaped field of a row: a range of [`Table::columns`].

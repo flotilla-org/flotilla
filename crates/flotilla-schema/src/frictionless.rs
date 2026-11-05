@@ -100,7 +100,12 @@ impl Table {
                 })
             })
             .collect();
-        json!({"fields":fields,"primaryKey":this.key.iter().map(|column| &column.name).collect::<Vec<_>>(),"foreignKeys":foreign_keys})
+        let mut schema =
+            json!({"fields":fields,"primaryKey":this.key.iter().map(|column| &column.name).collect::<Vec<_>>(),"foreignKeys":foreign_keys});
+        if let Some(subject) = &this.subject {
+            schema["subject"] = json!({"kind": subject.kind.as_str(), "field": subject.field});
+        }
+        schema
     }
 }
 
@@ -171,6 +176,24 @@ mod tests {
         assert_eq!(schema["foreignKeys"][0]["fields"], json!(["state.home", "state"]));
         assert_eq!(field["roles"], json!(["key", "sequence"]));
         assert_eq!(field["title"], "State");
+    }
+    // #4199: a table that declares a subject names its kind and address field; one that
+    // declares none has no `subject`, and only an address column can be the subject field.
+    #[test]
+    fn a_declared_subject_names_its_kind_and_address_field() {
+        let sample = |subject: Option<&str>| {
+            let mut layout = Layout::description("sample");
+            layout.key(|layout| layout.column("name", ColumnType::Text, true));
+            layout.column("address", ColumnType::Text, true);
+            layout.address();
+            if let Some(field) = subject {
+                layout.subject(flotilla_address::Kind::Session, field);
+            }
+            layout.finish().tables.remove(0).frictionless()
+        };
+        assert_eq!(sample(Some("address"))["subject"], json!({"kind": "session", "field": "address"}));
+        assert!(sample(None).get("subject").is_none());
+        assert!(std::panic::catch_unwind(|| sample(Some("name"))).is_err(), "a text key is no address");
     }
     // ADR 0067: field types come from the descriptor, independent of source. Generate
     // every native type and both nullabilities; semantic extensions survive rendering.

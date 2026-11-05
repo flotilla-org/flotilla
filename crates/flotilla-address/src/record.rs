@@ -55,6 +55,7 @@ pub fn record_name(address: &Address) -> Option<String> {
         | Kind::Vessel
         | Kind::Role
         | Kind::Message
+        | Kind::Session
         | Kind::Forge
         | Kind::Repo
         | Kind::Comment

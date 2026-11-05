@@ -103,6 +103,42 @@ fn address_print_then_parse_is_identity(tc: hegel::TestCase) {
     assert_eq!(resolve(&text, &BuiltinForges).as_ref(), Ok(&address));
 }
 
+// #4199: an agent session is a subject of its own, under the role it acts for
+// (a fleet, project or convoy role). Its canonical text is the role's followed
+// by `/session:<id>`, it parses back exactly, and a session under anything but
+// a role is refused.
+#[hegel::test(test_cases = 300)]
+fn session_print_then_parse_is_identity(tc: hegel::TestCase) {
+    let owners = [Kind::Fleet, Kind::Project, Kind::Convoy];
+    let owner = owners[draw_index(&tc, owners.len())];
+    let mut role = Address::root(owner, &value(&tc, 1)).expect("owner");
+    if owner == Kind::Project && tc.draw(gs::booleans()) {
+        role = role.child(Kind::Convoy, &value(&tc, 1)).expect("convoy");
+    }
+    let role = role.child(Kind::Role, &value(&tc, 1)).expect("role");
+    let id = value(&tc, 1);
+    let session = role.child(Kind::Session, &id).expect("a session follows a role");
+    let text = session.to_string();
+    assert!(text.starts_with(&format!("{role}/session:")), "{text}");
+    let parsed: Address = text.parse().unwrap_or_else(|error| panic!("{text} must parse: {error}"));
+    assert_eq!(parsed, session);
+    assert_eq!((parsed.kind(), parsed.name(), parsed.parent()), (Kind::Session, id.as_str(), Some(role.clone())));
+    assert_eq!(resolve(&text, &BuiltinForges).as_ref(), Ok(&session));
+    let elsewhere = role.parent().expect("a role has a parent");
+    assert!(elsewhere.child(Kind::Session, &id).is_err(), "a session under {elsewhere} is refused");
+    assert!(format!("{elsewhere}/session:x").parse::<Address>().is_err());
+    assert!(Address::root(Kind::Session, &id).is_err() && "session:x".parse::<Address>().is_err());
+}
+
+#[test]
+fn session_spelling_is_the_owner_approved_shape() {
+    let text = "project:flotilla/convoy:fix-3774/role:coder/session:9f2c";
+    let session: Address = text.parse().expect("session address");
+    assert_eq!((session.kind(), session.name(), session.get(Kind::Role)), (Kind::Session, "9f2c", Some("coder")));
+    assert_eq!(session.as_str(), text);
+    assert_eq!("session".parse::<Kind>(), Ok(Kind::Session));
+}
+
 // ADR 0066 §4: one address has exactly one spelling. Lowercasing an escape or
 // escaping a bare character yields text the strict parser refuses.
 #[hegel::test(test_cases = 200)]

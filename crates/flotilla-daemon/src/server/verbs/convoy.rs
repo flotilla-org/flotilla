@@ -29,9 +29,10 @@ impl Subjects for ResourceSubjects {
         (kind == Kind::Convoy).then(|| tables::descriptor("convoys"))
     }
 
-    /// A convoy address names a record (`convoy:convoy-<uuid>`) or a role, within a project
-    /// (`project:<p>/convoy:<role>`) or in any project; it resolves as the CLI's `convoy explain`
-    /// resolves `<role>@<project>`, and the row is read by the resolved record name.
+    /// A convoy address is a row's own `address` (`project:<p>/convoy:convoy-<uuid>`, or
+    /// `convoy:convoy-<uuid>` without a project), which names its record; or it names a role,
+    /// within a project (`project:<p>/convoy:<role>`) or in any project. Both resolve as the CLI's
+    /// `convoy explain` resolves `<name>@<project>`, and the row is read by the resolved record name.
     async fn row(&self, namespace: &str, address: &Address) -> Result<Option<Row>, String> {
         let Some(table) = self.table(address.kind()) else { return Err(format!("no table serves `{}` subjects", address.kind())) };
         let reference = match address.get(Kind::Project) {

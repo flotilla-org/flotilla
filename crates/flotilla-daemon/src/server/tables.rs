@@ -4,8 +4,9 @@ mod decided;
 mod filter;
 mod query;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use flotilla_address::{Address, Kind};
 use flotilla_protocol::table::{Message, Row};
-use flotilla_resources::WatchStart;
+use flotilla_resources::{WatchStart, PROJECT_LABEL};
 use flotilla_schema::{ColumnType, Filterable, Layout, Table, TableSet};
 use flotilla_store::{query_resource_kind, watch_resource_kind_from, ResourceBackend, REGISTERED_RESOURCE_KINDS};
 use futures::{stream::BoxStream, StreamExt};
@@ -24,6 +25,30 @@ pub(crate) const MAX_LIMIT: usize = 10_000;
 /// The longest a watch goes without a message.
 const PROGRESS: Duration = Duration::from_secs(15);
 const KEY: &str = "metadata.name";
+/// The derived field holding a resource row's subject address (#4199).
+pub(crate) const ADDRESS: &str = "address";
+
+/// The address kind of a resource kind's rows, for the resource kinds that are subjects.
+fn resource_subject(plural: &str) -> Option<Kind> {
+    match plural {
+        "convoys" => Some(Kind::Convoy),
+        _ => None,
+    }
+}
+
+/// The canonical address of a resource document's subject, derived from its key: a convoy is
+/// `convoy:<record name>`, under `project:<project>` when it has one, as its roles' inboxes are.
+/// The project is the convoy's project label, which convoy addresses resolve by.
+fn resource_address(kind: Kind, document: &Value) -> Option<Address> {
+    let name = document.pointer("/metadata/name")?.as_str()?;
+    match kind {
+        Kind::Convoy => match document["metadata"]["labels"][PROJECT_LABEL].as_str().filter(|project| !project.is_empty()) {
+            Some(project) => Address::project(project).and_then(|project| project.child(Kind::Convoy, name)).ok(),
+            None => Address::convoy(name).ok(),
+        },
+        _ => None,
+    }
+}
 #[derive(Debug, Clone)]
 pub(crate) struct Failure {
     pub code: String,
@@ -77,6 +102,11 @@ pub(crate) fn descriptor(kind: &str) -> Table {
     let label_values = json!({"type":"string","sortable":false});
     let mut layout = Layout::description(kind);
     layout.key(|layout| layout.column(KEY, ColumnType::Text, true));
+    if let Some(subject) = resource_subject(kind) {
+        layout.column(ADDRESS, ColumnType::Text, true);
+        layout.address();
+        layout.subject(subject, ADDRESS);
+    }
     for (name, ty, required) in [
         ("metadata.namespace", ColumnType::Text, true),
         ("metadata.resourceVersion", ColumnType::Text, true),
@@ -106,6 +136,10 @@ pub(crate) fn descriptor(kind: &str) -> Table {
     {
         let column = table.key.iter_mut().chain(&mut table.columns).find(|column| column.name == field).expect("declared column");
         column.properties.insert("sortable".into(), json!(field != "metadata.resourceVersion"));
+    }
+    if let Some(column) = table.columns.iter_mut().find(|column| column.name == ADDRESS) {
+        column.properties.insert("sortable".into(), json!(true));
+        column.properties.insert("title".into(), json!("Address"));
     }
     for column in table.key.iter_mut().chain(&mut table.columns) {
         column.properties.entry("sortable".into()).or_insert(json!(false));
@@ -203,9 +237,9 @@ impl Query {
         if columns.iter().any(|name| !fields.contains(name.as_str())) {
             return Err(bad("unknown_column", "unknown projected column"));
         }
-        for key in &table.key {
-            if !columns.contains(&key.name) {
-                columns.push(key.name.clone());
+        for key in table.key.iter().map(|key| &key.name).chain(table.subject.as_ref().map(|subject| &subject.field)) {
+            if !columns.contains(key) {
+                columns.push(key.clone());
             }
         }
         for column in table.key.iter().chain(&table.columns).filter(|column| column.reference.is_some()) {
@@ -369,7 +403,7 @@ fn compare(a: &Value, b: &Value) -> Ordering {
     }
 }
 fn row(value: &Value, table: &Table) -> Row {
-    table
+    let mut row: Row = table
         .key
         .iter()
         .chain(&table.columns)
@@ -377,7 +411,12 @@ fn row(value: &Value, table: &Table) -> Row {
             let pointer = format!("/{}", column.name.replace('.', "/"));
             (column.name.clone(), value.pointer(&pointer).cloned().unwrap_or(Value::Null))
         })
-        .collect()
+        .collect();
+    if let Some(subject) = &table.subject {
+        let address = resource_address(subject.kind, value).map_or(Value::Null, |address| Value::String(address.as_str().to_owned()));
+        row.insert(subject.field.clone(), address);
+    }
+    row
 }
 fn snapshot_sequence(document: &Value) -> Result<u64, String> {
     document
