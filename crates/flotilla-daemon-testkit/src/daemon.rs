@@ -44,7 +44,7 @@ use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon::{
     dummy_fleet::{daemon_crew_port, install_dummy_fleet},
     peer::PeerManager,
-    runtime::{DaemonRuntime, RuntimeOptions},
+    runtime::{engine_opener, DaemonRuntime, RuntimeOptions},
     server::{build_remote_command_router, PeerConnectionEvent},
 };
 use flotilla_daemon_api::daemon::DaemonHandle;
@@ -236,7 +236,8 @@ async fn compose(
     discovery: flotilla_discovery::DiscoveryRuntime,
     relay: &RestartRelay,
 ) -> (Arc<InProcessDaemon>, DaemonRuntime) {
-    let daemon = InProcessDaemon::new_with_resource_backend_and_clock(
+    let engine = engine_opener(&config).expect("daemon config");
+    let daemon = InProcessDaemon::new_composed(
         vec![],
         Arc::clone(&config),
         discovery,
@@ -244,11 +245,19 @@ async fn compose(
         composition.backend.clone(),
         Arc::clone(&composition.clock),
         Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+        engine,
     )
-    .await;
+    .await
+    .expect("compose the daemon");
     relay.connect(&daemon);
-    let runtime =
-        DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, harness_options(composition.resync)).await.expect("runtime");
+    let runtime = match DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, harness_options(composition.resync)).await {
+        Ok(runtime) => runtime,
+        // A start refused by the unavailable old store reports where each access came from.
+        Err(error) => match composition.refused().filter(|accesses| !accesses.accesses().is_empty()) {
+            Some(accesses) => panic!("{}\nruntime: {error}", accesses.report()),
+            None => panic!("runtime: {error:?}"),
+        },
+    };
     (daemon, runtime)
 }
 

@@ -182,7 +182,7 @@ impl DaemonRuntime {
         // engine and its store; refused without `[dummy_fleet]`. Absent, nothing changes.
         let mut provisioning_lifecycles = None;
         if daemon_config.primitives()?.is_some() {
-            result_phase("open_message_primitives", open_message_primitives(&daemon, &config)).await?;
+            result_phase("open_message_primitives", open_message_primitives(&daemon)).await?;
             provisioning_lifecycles = Some(open_provisioning_lifecycles(&daemon).await?);
             daemon.require_lifecycle_reads_installed()?;
         }
@@ -1221,27 +1221,78 @@ mod decided_kinds_tests {
     }
 }
 
-/// Opens the engine path behind `[primitives]` (#3317): the decided store, filled from the old
-/// store at its first start ([`crate::engine_import::first_start`]),
-/// with the [`decided_registry`] kinds, homed at this daemon's node id, and the
-/// Message path over it. Installed before peer tasks start, so every peer's
-/// log is followed from the first connection.
-async fn open_message_primitives(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Result<(), String> {
+/// The decided store's opener behind `[primitives]` (#3108, #3317), for the composition root to
+/// pass to [`InProcessDaemon::new_composed`]; none without the switch. Once the daemon's identity
+/// is resolved it fills the store from the old one at its first start
+/// ([`crate::engine_import::first_start`]), opens it with the [`decided_registry`] kinds, homed at
+/// this daemon's node id, and opens the ports serving those kinds, so nothing the daemon composes
+/// reads them anywhere else.
+pub fn engine_opener(config: &ConfigStore) -> Result<Option<flotilla_core::in_process::EngineOpener>, String> {
+    if config.load_daemon_config()?.primitives()?.is_none() {
+        return Ok(None);
+    }
     let state_dir = config.state_dir().as_path().to_path_buf();
-    let path = state_dir.join(crate::engine_import::ENGINE_STORE);
-    let home = daemon.node_id().as_str().to_owned();
+    Ok(Some(Box::new(move |identity: flotilla_core::in_process::EngineIdentity| {
+        Box::pin(
+            async move { tokio::task::spawn_blocking(move || open_engine(&state_dir, identity)).await.map_err(|error| error.to_string())? },
+        ) as futures::future::BoxFuture<'static, _>
+    })))
+}
+
+fn open_engine(
+    state_dir: &std::path::Path,
+    identity: flotilla_core::in_process::EngineIdentity,
+) -> Result<flotilla_core::in_process::ComposedEngine, String> {
+    use flotilla_provisioning::engine::{
+        access_deliveries::EngineAccessDeliveries, artifacts::EngineArtifacts, definitions::EngineDefinitions, hosts::EngineHosts,
+        kinds::EngineKinds, observations::EngineObservations, projects::EngineProjects, repositories::EngineRepositories,
+    };
+    use flotilla_resources::engine_records::EngineRecords;
+    let home = identity.node_id.as_str().to_owned();
+    let own_host = identity.host_id.to_string();
     // Before this daemon serves or connects to a peer, so an importing host neither sends nor receives records.
-    let importing = home.clone();
-    let own_host = daemon.local_host_id().map(|host| host.to_string());
-    tokio::task::spawn_blocking(move || crate::engine_import::first_start(&state_dir, &importing, own_host.as_deref()))
-        .await
-        .map_err(|error| error.to_string())??;
+    crate::engine_import::first_start(state_dir, &home, Some(&own_host))?;
     let registry = decided_registry().map_err(|error| format!("decided store registry: {error:?}"))?;
+    let path = state_dir.join(crate::engine_import::ENGINE_STORE);
     let service = Arc::new(
         flotilla_schema_sqlite::stream::Service::open(&path, &home, registry)
             .map_err(|error| format!("open decided store {}: {error}", path.display()))?,
     );
-    daemon.install_decided_store(Arc::clone(&service))?;
+    let clock = || Arc::clone(&identity.clock);
+    let records: Vec<Arc<dyn EngineRecords>> = vec![
+        // #3824 layer 2b-ii: the definition kinds.
+        Arc::new(EngineDefinitions::open(Arc::clone(&service), clock())?),
+        // #3824 layer 3a and 3b: Repository, and Project with its operations' record.
+        Arc::new(EngineRepositories::open(Arc::clone(&service), clock())?),
+        Arc::new(EngineProjects::open(Arc::clone(&service), clock())?),
+        Arc::new(EngineArtifacts::open(Arc::clone(&service), clock())?),
+        Arc::new(EngineAccessDeliveries::open(Arc::clone(&service), clock())?),
+        // FulfilmentKind, which admission and the vessel reconciler read and admission's snapshots write.
+        Arc::new(EngineKinds::open(Arc::clone(&service), clock())?),
+        // Host, which every placement reads and this daemon's observers write only on change.
+        Arc::new(EngineHosts::open(Arc::clone(&service), own_host, clock())?),
+    ];
+    // ChangeRequest and Issue: written by their source's observer, read at every home.
+    let observations = Arc::new(EngineObservations::open(Arc::clone(&service), clock())?);
+    // #3824 layers 1 and 2c: the account kinds and ManifestRoot.
+    let accounts = Arc::new(flotilla_provisioning::engine::account::EngineAccounts::open(Arc::clone(&service), clock())?);
+    let manifest_roots = Arc::new(flotilla_provisioning::engine::manifest_root::EngineManifestRoots::open(Arc::clone(&service), clock())?);
+    Ok(flotilla_core::in_process::ComposedEngine {
+        service,
+        records,
+        observations: observations.clone(),
+        observation_failures: observations,
+        accounts,
+        manifest_roots,
+    })
+}
+
+/// Opens the Message path over the decided store composed with the daemon (#3317). Installed
+/// before peer tasks start, so every peer's log is followed from the first connection.
+async fn open_message_primitives(daemon: &Arc<InProcessDaemon>) -> Result<(), String> {
+    let service =
+        daemon.decided_store().map_err(|error| format!("[primitives] needs the decided store composed with the daemon: {error}"))?;
+    let home = daemon.node_id().as_str().to_owned();
     let primitives = retry_phase("restore_message_primitives", || async {
         let backend = daemon.resource_backend();
         let clock = daemon.clock_for_scenarios();
@@ -1295,82 +1346,6 @@ async fn open_provisioning_lifecycles(
         reads: StoreReads::new(Arc::clone(&store)),
         backend: daemon.resource_backend(),
     }))?;
-    // #3824 layer 1: the account kinds on the engine, installed before their controllers start.
-    let service = daemon.decided_store()?;
-    let clock = daemon.clock_for_scenarios();
-    let accounts = tokio::task::spawn_blocking(move || flotilla_provisioning::engine::account::EngineAccounts::open(service, clock))
-        .await
-        .map_err(|error| error.to_string())??;
-    daemon.install_account_records(Arc::new(accounts))?;
-    // #3824 layer 2c: ManifestRoot on the engine, installed before the manifest reconciler starts.
-    let service = daemon.decided_store()?;
-    let clock = daemon.clock_for_scenarios();
-    let roots =
-        tokio::task::spawn_blocking(move || flotilla_provisioning::engine::manifest_root::EngineManifestRoots::open(service, clock))
-            .await
-            .map_err(|error| error.to_string())??;
-    daemon.install_manifest_roots(Arc::new(roots))?;
-    // #3824 layer 2b-ii: the definition kinds on the engine, installed on the daemon's backend so
-    // every definition read and write reaches them.
-    let service = daemon.decided_store()?;
-    let clock = daemon.clock_for_scenarios();
-    let definitions =
-        tokio::task::spawn_blocking(move || flotilla_provisioning::engine::definitions::EngineDefinitions::open(service, clock))
-            .await
-            .map_err(|error| error.to_string())??;
-    daemon.resource_backend().install_engine_records(Arc::new(definitions));
-    // #3824 layer 3a: Repository likewise.
-    let service = daemon.decided_store()?;
-    let clock = daemon.clock_for_scenarios();
-    let repositories =
-        tokio::task::spawn_blocking(move || flotilla_provisioning::engine::repositories::EngineRepositories::open(service, clock))
-            .await
-            .map_err(|error| error.to_string())??;
-    daemon.resource_backend().install_engine_records(Arc::new(repositories));
-    // #3824 layer 3b: Project, with project operations' record and the dispatch queue's judgement.
-    let service = daemon.decided_store()?;
-    let clock = daemon.clock_for_scenarios();
-    let projects = tokio::task::spawn_blocking(move || flotilla_provisioning::engine::projects::EngineProjects::open(service, clock))
-        .await
-        .map_err(|error| error.to_string())??;
-    daemon.resource_backend().install_engine_records(Arc::new(projects));
-    let service = daemon.decided_store()?;
-    let clock = daemon.clock_for_scenarios();
-    let artifacts = tokio::task::spawn_blocking(move || flotilla_provisioning::engine::artifacts::EngineArtifacts::open(service, clock))
-        .await
-        .map_err(|error| error.to_string())??;
-    daemon.resource_backend().install_engine_records(Arc::new(artifacts));
-    let service = daemon.decided_store()?;
-    let clock = daemon.clock_for_scenarios();
-    let access_deliveries =
-        tokio::task::spawn_blocking(move || flotilla_provisioning::engine::access_deliveries::EngineAccessDeliveries::open(service, clock))
-            .await
-            .map_err(|error| error.to_string())??;
-    daemon.resource_backend().install_engine_records(Arc::new(access_deliveries));
-    // ChangeRequest and Issue: written by their source's observer, read at every home.
-    let service = daemon.decided_store()?;
-    let clock = daemon.clock_for_scenarios();
-    let observations =
-        tokio::task::spawn_blocking(move || flotilla_provisioning::engine::observations::EngineObservations::open(service, clock))
-            .await
-            .map_err(|error| error.to_string())??;
-    let observations = Arc::new(observations);
-    daemon.install_observation_records(observations.clone(), observations)?;
-    // FulfilmentKind, which admission and the vessel reconciler read and admission's snapshots write.
-    let service = daemon.decided_store()?;
-    let clock = daemon.clock_for_scenarios();
-    let kinds = tokio::task::spawn_blocking(move || flotilla_provisioning::engine::kinds::EngineKinds::open(service, clock))
-        .await
-        .map_err(|error| error.to_string())??;
-    daemon.resource_backend().install_engine_records(Arc::new(kinds));
-    // Host, which every placement reads and this daemon's observers write only on change.
-    let service = daemon.decided_store()?;
-    let clock = daemon.clock_for_scenarios();
-    let own_host = daemon.local_host_id().ok_or("the engine's Hosts need this daemon's host id")?.to_string();
-    let hosts = tokio::task::spawn_blocking(move || flotilla_provisioning::engine::hosts::EngineHosts::open(service, own_host, clock))
-        .await
-        .map_err(|error| error.to_string())??;
-    daemon.resource_backend().install_engine_records(Arc::new(hosts));
     let backend = daemon.resource_backend();
     tokio::task::spawn_blocking(move || {
         let home = StoreLog::new(Arc::clone(&store)).home().to_owned();

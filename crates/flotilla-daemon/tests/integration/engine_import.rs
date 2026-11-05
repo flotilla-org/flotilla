@@ -9,7 +9,7 @@ use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon::{
     dummy_fleet::{attach_dummy_fleet, install_dummy_fleet},
     engine_import::{ENGINE_STORE, IMPORTING, OLD_STORE},
-    runtime::{DaemonRuntime, RuntimeOptions},
+    runtime::{engine_opener, DaemonRuntime, RuntimeOptions},
 };
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{HostName, NodeId};
@@ -23,9 +23,12 @@ use serde_json::{json, Value};
 
 const NS: &str = "flotilla";
 
-/// A host's daemon before its runtime starts, over its old store in its state directory.
+/// A host before its daemon starts, over its old store in its state directory: the daemon is
+/// composed at its start, importing the old store into its engine store first.
 struct Host {
-    daemon: Arc<InProcessDaemon>,
+    name: String,
+    node: NodeId,
+    daemon: std::sync::OnceLock<Arc<InProcessDaemon>>,
     config: Arc<ConfigStore>,
     backend: SqliteBackend,
     dir: tempfile::TempDir,
@@ -37,25 +40,20 @@ impl Host {
         std::fs::write(dir.path().join("daemon.toml"), format!("machine_id = \"{name}\"\n\n[primitives]\n[dummy_fleet]\n"))
             .expect("config");
         let config = Arc::new(ConfigStore::with_base(dir.path().to_path_buf()));
-        let daemon_config: DaemonConfig = config.load_daemon_config().expect("daemon config");
-        let mut discovery = fake_discovery(false);
-        let fleet = install_dummy_fleet(&daemon_config, &mut discovery).expect("dummy fleet");
+        let node =
+            flotilla_core::host_identity::resolve_local_node_id(config.base_path().as_path(), Some(name), &*fake_discovery(false).runner)
+                .await
+                .expect("node id");
         let backend = SqliteBackend::open(dir.path().join(OLD_STORE)).expect("old store");
-        let daemon = InProcessDaemon::new_with_resource_backend(
-            vec![],
-            Arc::clone(&config),
-            discovery,
-            HostName::new(name),
-            ResourceBackend::new(backend.clone()),
-            Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-        )
-        .await;
-        attach_dummy_fleet(&fleet, &daemon).expect("attach fleet");
-        Self { daemon, config, backend, dir }
+        Self { name: name.to_owned(), node, daemon: std::sync::OnceLock::new(), config, backend, dir }
     }
 
     fn home(&self) -> String {
-        self.daemon.node_id().as_str().to_owned()
+        self.node.as_str().to_owned()
+    }
+
+    fn daemon(&self) -> &Arc<InProcessDaemon> {
+        self.daemon.get().expect("the host has started")
     }
 
     async fn own<R: Resource>(&self, name: &str, spec: Value, status: Value) -> Value {
@@ -88,12 +86,29 @@ impl Host {
     }
 
     async fn start(&self) -> Result<DaemonRuntime, String> {
+        let daemon_config: DaemonConfig = self.config.load_daemon_config().expect("daemon config");
+        let mut discovery = fake_discovery(false);
+        let fleet = install_dummy_fleet(&daemon_config, &mut discovery).expect("dummy fleet");
+        let daemon = InProcessDaemon::new_composed(
+            vec![],
+            Arc::clone(&self.config),
+            discovery,
+            HostName::new(&self.name),
+            ResourceBackend::new(self.backend.clone()),
+            Arc::new(flotilla_resources::SystemClock),
+            Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+            engine_opener(&self.config)?,
+        )
+        .await?;
+        assert_eq!(daemon.node_id(), &self.node, "the daemon is homed where its host's records are");
+        attach_dummy_fleet(&fleet, &daemon).expect("attach fleet");
+        let daemon = self.daemon.get_or_init(|| daemon);
         let options = RuntimeOptions { namespace: NS.into(), ..RuntimeOptions::default() };
-        DaemonRuntime::start_with_options(Arc::clone(&self.daemon), Arc::clone(&self.config), None, options).await
+        DaemonRuntime::start_with_options(Arc::clone(daemon), Arc::clone(&self.config), None, options).await
     }
 
     fn snapshot<K: Kind>(&self, name: &str, home: &str) -> Option<Snapshot> {
-        self.daemon
+        self.daemon()
             .decided_store()
             .expect("engine store")
             .with_store(|store| {
@@ -181,7 +196,7 @@ async fn hosts_importing_together_end_with_every_homes_records_written_by_their_
     for host in &hosts {
         assert!(host.dir.path().join(ENGINE_STORE).exists());
     }
-    let _mesh = flotilla_daemon_testkit::server::spawn_in_memory_request_mesh(hosts.iter().map(|host| Arc::clone(&host.daemon)).collect())
+    let _mesh = flotilla_daemon_testkit::server::spawn_in_memory_request_mesh(hosts.iter().map(|host| Arc::clone(host.daemon())).collect())
         .await
         .expect("mesh");
     converged(&hosts).await;
@@ -195,7 +210,7 @@ async fn hosts_importing_one_after_another_end_with_every_homes_records_written_
         runtimes.push(host.start().await.expect("runtime"));
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    let _mesh = flotilla_daemon_testkit::server::spawn_in_memory_request_mesh(hosts.iter().map(|host| Arc::clone(&host.daemon)).collect())
+    let _mesh = flotilla_daemon_testkit::server::spawn_in_memory_request_mesh(hosts.iter().map(|host| Arc::clone(host.daemon())).collect())
         .await
         .expect("mesh");
     converged(&hosts).await;
@@ -214,5 +229,5 @@ async fn a_refused_import_fails_the_start() {
     assert!(error.contains("engine import refused 1 records"), "{error}");
     assert!(!host.dir.path().join(ENGINE_STORE).exists());
     assert!(host.dir.path().join(IMPORTING).exists());
-    assert!(host.daemon.decided_store().is_err(), "nothing serves an engine store");
+    assert!(host.daemon.get().is_none(), "no daemon is composed over a refused import");
 }

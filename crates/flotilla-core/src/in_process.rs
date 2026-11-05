@@ -826,6 +826,30 @@ pub struct InProcessDaemon {
 /// the daemon directly hit the same namespace the runtime uses.
 pub const DEFAULT_PROVISIONING_NAMESPACE: &str = "flotilla";
 
+/// What the decided store is opened against during composition: the identity its records are
+/// homed at, known only once the daemon has resolved it.
+pub struct EngineIdentity {
+    pub node_id: NodeId,
+    pub host_id: flotilla_protocol::qualified_path::HostId,
+    pub clock: Arc<dyn Clock>,
+}
+
+/// The decided store behind `[primitives]`, opened before anything reads a resource (#3108): the
+/// store, the ports serving its kinds through the backend, and the forge observations' failures.
+pub struct ComposedEngine {
+    pub service: Arc<flotilla_schema_sqlite::stream::Service>,
+    /// Installed on the backend before the daemon composes anything that reads.
+    pub records: Vec<Arc<dyn flotilla_resources::engine_records::EngineRecords>>,
+    /// ChangeRequest and Issue, which the forge observers write only on change.
+    pub observations: Arc<dyn flotilla_resources::engine_records::EngineRecords>,
+    pub observation_failures: Arc<dyn flotilla_resources::engine_records::ObservationFailures>,
+    pub accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,
+    pub manifest_roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
+}
+
+/// Opens the decided store once the daemon's identity is resolved; the composition root supplies it.
+pub type EngineOpener = Box<dyn FnOnce(EngineIdentity) -> futures::future::BoxFuture<'static, Result<ComposedEngine, String>> + Send>;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RepositoryRefreshFailurePolicy {
     BestEffort,
@@ -1015,6 +1039,25 @@ impl InProcessDaemon {
         clock: Arc<dyn Clock>,
         peer_overlay: Arc<dyn flotilla_projections::host_registry::PeerOverlay>,
     ) -> Arc<Self> {
+        Self::new_composed(repo_paths, config, discovery, host_name, resource_backend, clock, peer_overlay, None)
+            .await
+            .expect("a daemon composed with no engine")
+    }
+
+    /// Composes the daemon, opening the decided store through `engine` (behind `[primitives]`) as
+    /// soon as the daemon's identity is resolved, so its kinds are served from it before anything
+    /// reads them. Fails when the decided store cannot be opened or filled.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_composed(
+        repo_paths: Vec<PathBuf>,
+        config: Arc<ConfigStore>,
+        discovery: DiscoveryRuntime,
+        host_name: HostName,
+        resource_backend: ResourceBackend,
+        clock: Arc<dyn Clock>,
+        peer_overlay: Arc<dyn flotilla_projections::host_registry::PeerOverlay>,
+        engine: Option<EngineOpener>,
+    ) -> Result<Arc<Self>, String> {
         use flotilla_discovery::DiscoveryResult;
 
         let mut discovery = discovery;
@@ -1052,6 +1095,19 @@ impl InProcessDaemon {
         let local_host_id = resolve_local_host_id(config.state_dir().as_path(), config_machine_id, &*discovery.runner)
             .await
             .expect("failed to resolve local host id");
+        resource_backend.serve_engine_in(DEFAULT_PROVISIONING_NAMESPACE);
+        let engine = match engine {
+            Some(open) => {
+                let identity = EngineIdentity { node_id: local_node_id.clone(), host_id: local_host_id.clone(), clock: Arc::clone(&clock) };
+                let engine = open(identity).await?;
+                for records in &engine.records {
+                    resource_backend.install_engine_records(Arc::clone(records));
+                }
+                resource_backend.install_engine_records(Arc::clone(&engine.observations));
+                Some(engine)
+            }
+            None => None,
+        };
         let environment_manager =
             Arc::new(EnvironmentManager::new_local(&discovery, local_environment_id.clone(), local_host_id.clone()).await);
         register_static_ssh_direct_environments(&config, &discovery, &environment_manager).await;
@@ -1248,8 +1304,12 @@ impl InProcessDaemon {
             observation_source.clone(),
             flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
         );
-        if let Err(error) = change_request_refresher.garbage_collect_orphans().await {
-            tracing::warn!(%error, "garbage collect orphaned change request observations at startup failed");
+        // On the engine, observations outlive a restart and are swept once their demand has had a
+        // lease to return ([`Self::install_observation_records`]); the old store's are orphans now.
+        if engine.is_none() {
+            if let Err(error) = change_request_refresher.garbage_collect_orphans().await {
+                tracing::warn!(%error, "garbage collect orphaned change request observations at startup failed");
+            }
         }
         let issue_query_port: Arc<dyn IssueQueryPort> = Arc::new(ProviderIssueQueryPort {
             forge_reads,
@@ -1267,8 +1327,10 @@ impl InProcessDaemon {
             Arc::new(ProviderIssueObservationSource { backend: resource_backend.clone(), query_port: Arc::clone(&issue_query_port) }),
             flotilla_observation::issue_observer::IssueRefreshCadence::default(),
         );
-        if let Err(error) = issue_refresher.garbage_collect_orphans().await {
-            tracing::warn!(%error, "garbage collect orphaned issue observations at startup failed");
+        if engine.is_none() {
+            if let Err(error) = issue_refresher.garbage_collect_orphans().await {
+                tracing::warn!(%error, "garbage collect orphaned issue observations at startup failed");
+            }
         }
         let message_inboxes = Arc::new(Mutex::new(HashMap::new()));
         let message_path = crate::primitives::MessagePath::default();
@@ -1422,6 +1484,12 @@ impl InProcessDaemon {
             local_provider_statuses,
             local_placement_provider_statuses: RwLock::new(Vec::new()),
         });
+        if let Some(engine) = engine {
+            daemon.install_decided_store(engine.service)?;
+            daemon.install_observation_records(engine.observations, engine.observation_failures)?;
+            daemon.install_account_records(engine.accounts)?;
+            daemon.install_manifest_roots(engine.manifest_roots)?;
+        }
         crew.set_checkout_inspector(Arc::new(CheckoutInspector(Arc::downgrade(&daemon))));
         crew.set_turn_delivery_actuator(Arc::new(CrewTurnDeliveryActuator { crew: Arc::downgrade(&crew) })).await;
 
@@ -1492,7 +1560,7 @@ impl InProcessDaemon {
             }
         });
 
-        daemon
+        Ok(daemon)
     }
 
     /// Returns the host name for this daemon.
@@ -2175,6 +2243,7 @@ impl InProcessDaemon {
     /// (e.g. `ConvoyWorkForceComplete`). Called by the daemon runtime at startup with
     /// `RuntimeOptions::namespace`.
     pub async fn set_provisioning_namespace(&self, namespace: String) {
+        self.resource_backend.serve_engine_in(&namespace);
         *self.provisioning_namespace.write().expect("provisioning namespace lock poisoned") = namespace;
         self.checkout_namespace_changes.send_replace(());
     }

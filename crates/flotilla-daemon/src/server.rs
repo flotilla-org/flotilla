@@ -509,18 +509,21 @@ impl DaemonServer {
         let host_name = daemon_config.host_name.map(HostName::new).unwrap_or_else(HostName::local);
         let (resource_backend, store_metrics) = retry_phase("open_resource_backend", || build_embedded_resource_backend(&config)).await?;
         let load_metrics = Arc::new(http::metrics::LoadMetrics::new(store_metrics));
+        let engine = crate::runtime::engine_opener(&config)?;
         let daemon = phase(
             "initialize_in_process_daemon",
-            InProcessDaemon::new_with_resource_backend(
+            InProcessDaemon::new_composed(
                 repo_paths,
                 Arc::clone(&config),
                 discovery,
                 host_name.clone(),
                 resource_backend,
+                Arc::new(flotilla_resources::SystemClock),
                 std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+                engine,
             ),
         )
-        .await;
+        .await?;
         daemon.set_primitives_switch(primitives_on);
         let peer_manager = build_peer_manager(&daemon, &config, &socket_path)?;
         phase("sync_peer_query_state", sync_peer_query_state(&peer_manager, &daemon)).await;

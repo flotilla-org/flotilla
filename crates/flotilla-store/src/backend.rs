@@ -26,11 +26,18 @@ macro_rules! dispatch_backend {
     };
 }
 
-/// The engine ports installed behind `[primitives]`, by the resource kinds they serve: shared by
-/// every handle cloned or derived from one backend (#3824 layers 2b-ii and 3).
-type EngineSlot = std::sync::Arc<
-    std::sync::RwLock<std::collections::BTreeMap<&'static str, std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>>>,
->;
+/// The engine ports installed behind `[primitives]`, by the resource kinds they serve, and the
+/// namespace their records are served in: shared by every handle cloned or derived from one
+/// backend (#3824 layers 2b-ii and 3).
+type EngineSlot = std::sync::Arc<std::sync::RwLock<EngineSlots>>;
+
+#[derive(Debug, Default)]
+struct EngineSlots {
+    ports: std::collections::BTreeMap<&'static str, std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>>,
+    /// The engine keeps no namespaces: its records read in whichever namespace is asked, so a scan
+    /// for the namespaces holding a kind it serves answers with this daemon's one.
+    namespace: Option<String>,
+}
 
 #[derive(Default)]
 struct TerminalReadSlot(std::sync::RwLock<Option<std::sync::Arc<dyn LifecycleReads>>>);
@@ -77,12 +84,17 @@ impl ResourceBackend {
     pub fn install_engine_records(&self, records: std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>) {
         let mut engines = self.engines.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         for kind in records.kinds() {
-            engines.insert(kind, std::sync::Arc::clone(&records));
+            engines.ports.insert(kind, std::sync::Arc::clone(&records));
         }
+    }
+    /// The namespace the engine's records are served in, the daemon's provisioning namespace: a
+    /// namespace scan of a kind the engine serves answers with it.
+    pub fn serve_engine_in(&self, namespace: &str) {
+        self.engines.write().unwrap_or_else(std::sync::PoisonError::into_inner).namespace = Some(namespace.to_owned());
     }
     /// The engine port serving `kind`, when one is installed.
     pub(crate) fn engine_records(&self, kind: &str) -> Option<std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>> {
-        self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(kind).cloned()
+        self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).ports.get(kind).cloned()
     }
     pub fn install_terminal_readings(&self, reads: std::sync::Arc<dyn LifecycleReads>) {
         *self.terminal_reads.0.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reads);
@@ -182,12 +194,33 @@ impl ResourceBackend {
 
     /// Namespaces containing locally-authored objects of this kind.
     pub async fn local_namespaces<T: Resource>(&self) -> Result<Vec<String>, ResourceError> {
+        if let Some(records) = self.engine_records(T::API_PATHS.kind) {
+            return self.engine_namespaces::<T>(&*records, true).await;
+        }
         self.local_namespaces_typed::<T>().await
     }
 
     /// Namespaces containing a local or replicated source of this kind.
     pub async fn stored_namespaces<T: Resource>(&self) -> Result<Vec<String>, ResourceError> {
+        if let Some(records) = self.engine_records(T::API_PATHS.kind) {
+            return self.engine_namespaces::<T>(&*records, false).await;
+        }
         self.stored_namespaces_typed::<T>().await
+    }
+
+    /// For a kind the engine serves: its namespace when any home holds a record of the kind (this
+    /// home, when `local`), else none.
+    async fn engine_namespaces<T: Resource>(
+        &self,
+        records: &dyn flotilla_resources::engine_records::EngineRecords,
+        local: bool,
+    ) -> Result<Vec<String>, ResourceError> {
+        let namespace = self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).namespace.clone();
+        let namespace =
+            namespace.ok_or_else(|| ResourceError::other(format!("{} is served by the engine in no namespace", T::API_PATHS.kind)))?;
+        let home = records.home();
+        let sources = records.sources(T::API_PATHS.kind).await.map_err(ResourceError::other)?;
+        Ok(if sources.iter().any(|record| !local || record.home == home) { vec![namespace] } else { Vec::new() })
     }
 
     pub fn definitions<T: Resource>(&self, namespace: &str) -> DefinitionResolver<T> {

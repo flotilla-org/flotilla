@@ -69,8 +69,10 @@ impl Default for OldStoreAccesses {
 
 impl OldStoreAccesses {
     fn record(&self, operation: &'static str, kind: &'static str, target: String) -> ResourceError {
-        let new = self.seen.lock().expect("old store accesses").insert((operation, kind));
-        let backtrace = new.then(|| std::backtrace::Backtrace::force_capture().to_string());
+        // Held until the access is recorded, so an operation's first recorded access is the one
+        // whose caller was captured, even when another arrives while it is captured.
+        let mut seen = self.seen.lock().expect("old store accesses");
+        let backtrace = seen.insert((operation, kind)).then(|| std::backtrace::Backtrace::force_capture().to_string());
         let error = ResourceError::other(format!("{OLD_STORE_UNAVAILABLE}: {operation} {kind} {target}"));
         let stage = self.stage.lock().expect("old store stage").clone();
         let mut accesses = self.accesses.lock().expect("old store accesses");
