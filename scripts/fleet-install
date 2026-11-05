@@ -268,6 +268,27 @@ require_generation_manifest() {
   die "could not fetch requested generation $generation"
 }
 
+# Every sibling the selected generation ships (`bin/flotilla-<command>`, #4249) answers
+# `flotilla <command> --version` through the managed launcher: found beside the binary the
+# launcher runs (the generation on Linux, the stable copies on macOS) and of the generation's
+# build. A generation predating siblings ships none and passes.
+check_siblings() {
+  local release="$1" generation="$2" build commands command version
+  commands="$(python3 "$GENERATION_VALIDATOR" sibling-commands -- "$release")" \
+    || die "cannot list the siblings of generation $generation"
+  [[ -n "$commands" ]] || return 0
+  build="$(manifest_value "$release/.generation.json" sources.flotilla)" \
+    || die "cannot read the flotilla source of generation $generation"
+  build="${build:0:12}"
+  for command in $commands; do
+    version="$("$FLEET_BIN_DIR/flotilla" "$command" --version 2>&1)" \
+      || die "flotilla $command does not run its sibling in generation $generation: $version; generation $generation remains active; reinstall it"
+    [[ "$version" == *"wire=$build"* ]] \
+      || die "flotilla-$command in generation $generation reports another build ($version), not $build; generation $generation remains active; reinstall it"
+    printf 'fleet-install: flotilla %s runs flotilla-%s of build %s\n' "$command" "$command" "$build"
+  done
+}
+
 manifest_value() {
   local manifest="$1"
   local expression="$2"
@@ -326,6 +347,11 @@ verify_darwin_signatures() {
   requirement="=designated => anchor apple generic and certificate leaf[subject.OU] = \"$TRUSTED_APPLE_TEAM_ID\""
   codesign="$(codesign_program)"
   local targets=("$release"/lib/*.dylib "$release"/bin/flotilla "$release"/bin/flotillad "$release"/bin/drydock-host "$release"/bin/cleat)
+  local siblings sibling
+  siblings="$(python3 "$GENERATION_VALIDATOR" sibling-commands -- "$release")" || die "cannot list the release's siblings"
+  for sibling in $siblings; do
+    targets+=("$release/bin/flotilla-$sibling")
+  done
   local path relative verification details entitlements
   for path in "${targets[@]}"; do
     [[ -f "$path" ]] || continue
@@ -943,6 +969,7 @@ activate_staged_generation() {
       --diagnostics-dir "$FLEET_ROOT/diagnostics"; then
     die "post-install cleat drain failed or warned; installed generation $generation remains active; inspect diagnostics and retry (no rollback)"
   fi
+  check_siblings "$release" "$generation"
 }
 
 handoff_activation() {
@@ -1165,6 +1192,7 @@ rollback() {
   end_darwin_install_window
   record_roll "$previous" "$current" 'fleet-install rollback' \
     || printf 'fleet-install: could not record the roll in %s\n' "$ROLL_LOG" >&2
+  check_siblings "$RELEASES_DIR/$previous" "$previous"
 }
 
 # Selection and deletion share the install lock. Always delegate to the active

@@ -417,9 +417,14 @@ mod tests {
 
     /// A source tree laid out by the shipped declaration's generation paths.
     fn write_source(source: &Path, contents: &[u8]) {
-        for file in
-            ["bin/flotilla-vessel", "bin/cleat", "lib/libghostty-vt.so.0", "share/terminfo/x/xterm-ghostty", "share/terminfo/LICENSE"]
-        {
+        for file in [
+            "bin/flotilla-vessel",
+            "bin/flotilla-table",
+            "bin/cleat",
+            "lib/libghostty-vt.so.0",
+            "share/terminfo/x/xterm-ghostty",
+            "share/terminfo/LICENSE",
+        ] {
             fs::create_dir_all(source.join(file).parent().unwrap()).unwrap();
             fs::write(source.join(file), contents).unwrap();
         }
@@ -461,24 +466,24 @@ mod tests {
             copy_asset(input, output, hash, expected)
         };
         let first = publisher.publish_with(&root, assets.payload(), transfer).unwrap();
-        assert_eq!(transfers.get(), 5);
+        assert_eq!(transfers.get(), 6);
         let abandoned = root.join("tools/.staging-interrupted");
         fs::create_dir_all(&abandoned).unwrap();
         fs::write(abandoned.join("partial"), b"interrupted").unwrap();
         assert_eq!(publisher.publish_with(&root, assets.payload(), transfer).unwrap(), first);
         assert!(!abandoned.exists(), "cached publication still reclaims abandoned staging under the root lock");
-        assert_eq!(transfers.get(), 5, "unchanged preparation never rereads binary content");
+        assert_eq!(transfers.get(), 6, "unchanged preparation never rereads binary content");
         let replacement = source.join("replacement");
         fs::write(&replacement, b"new").unwrap();
         fs::rename(replacement, &assets.flotilla).unwrap();
         let updated = publisher.publish_with(&root, assets.payload(), transfer).unwrap();
         assert_ne!(first, updated);
         assert_eq!(fs::read(root.join("bin/flotilla")).unwrap(), b"new");
-        assert_eq!(transfers.get(), 10);
+        assert_eq!(transfers.get(), 12);
         fs::remove_file(root.join("bin/flotilla")).unwrap();
         assert_eq!(publisher.publish_with(&root, assets.payload(), transfer).unwrap(), updated);
         assert_eq!(fs::read(root.join("bin/flotilla")).unwrap(), b"new");
-        assert_eq!(transfers.get(), 15);
+        assert_eq!(transfers.get(), 18);
     }
 
     // #3874 acceptance: a tool and a companion tree added only to the

@@ -718,10 +718,11 @@ async fn pushes_complete_generations_and_retains_old_cleat_files(memory: Arc<dyn
     std::fs::create_dir(&sources).unwrap();
     let composition = flotilla_environment::composition::flotilla_tools();
     let cli = sources.join("bin/flotilla-vessel");
+    let table = sources.join("bin/flotilla-table");
     let cleat = sources.join("bin/cleat");
     let library = sources.join("lib/libghostty-vt.so.0");
     let terminfo = sources.join("share/terminfo");
-    for path in [&cli, &cleat, &library] {
+    for path in [&cli, &table, &cleat, &library] {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     }
     std::fs::create_dir_all(terminfo.join("x")).unwrap();
@@ -741,13 +742,20 @@ async fn pushes_complete_generations_and_retains_old_cleat_files(memory: Arc<dyn
     }
     let mut previous = None;
     for bytes in [b"generation one".as_slice(), b"generation two"] {
-        for path in [&cli, &cleat, &library] {
+        for path in [&cli, &table, &cleat, &library] {
             std::fs::write(path, bytes).unwrap();
         }
         let generation =
             flotilla_environment::tools::publish(&fleet, flotilla_environment::tools::Payload { composition, root: &sources }).unwrap();
         runner.push_tools(std::slice::from_ref(&tool)).await.unwrap();
         assert_eq!(std::fs::read(destination.join("bin/flotilla")).unwrap(), bytes);
+        // The vessel's `flotilla` finds its table sibling beside it, through the same `tools/current`.
+        assert_eq!(std::fs::read(destination.join("bin/flotilla-table")).unwrap(), bytes);
+        assert_eq!(
+            std::fs::canonicalize(destination.join("bin/flotilla-table")).unwrap().parent(),
+            std::fs::canonicalize(destination.join("bin/flotilla")).unwrap().parent()
+        );
+        assert!(!destination.join("bin/flotilla-tui").exists(), "no TUI in vessels");
         assert_eq!(std::fs::read(destination.join("bin/cleat")).unwrap(), bytes);
         assert_eq!(std::fs::read_link(destination.join("tools/current")).unwrap(), Path::new(generation.file_name().unwrap()));
         if let Some((old, bytes)) = previous {

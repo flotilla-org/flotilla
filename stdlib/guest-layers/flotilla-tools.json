@@ -17,7 +17,8 @@
       "tree": "share/terminfo",
       "install": "share/terminfo",
       "requires": [{"path": "x/xterm-ghostty", "format": "terminfo"}, {"path": "LICENSE"}]
-    }
+    },
+    {"role": "table", "file": "bin/flotilla-table", "install": "bin/flotilla-table", "format": "elf"}
   ],
   "environment": {
     "path": ["bin"],

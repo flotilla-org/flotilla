@@ -8,5 +8,6 @@ pub mod hooks;
 pub mod logs;
 pub mod manifest;
 pub mod resource;
+pub mod table;
 pub mod targets;
 pub use resource::dispatch;
