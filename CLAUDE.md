@@ -59,7 +59,7 @@ CI uses nextest plus doctests and `ci/affected/selection.py` for PR test selecti
 
 Desk and crew vessel builds keep Cargo incrementals enabled. CI builds set `CARGO_INCREMENTAL=0`. Each fleet host runs an mtime-based `cargo-sweep --time 3` daily, while `scripts/prune-target.sh` remains a size-cap backstop. See [docs/development.md](docs/development.md) for installation, scope, logs, and thresholds.
 
-**Stable toolchain:** `rust-toolchain.toml` is the single compiler pin (currently Rust 1.99.0). Rustup selects it automatically and installs rustfmt, Clippy, llvm-tools, and the Relay Workers WebAssembly target. CI installs that pin and runs `ci/toolchain/assert.sh` to reject a mismatched compiler. Coverage uses stable with line coverage only. Release candidates and the crew image read the same file.
+**Stable toolchain:** `rust-toolchain.toml` is the single compiler pin (currently Rust 1.99.0). Rustup selects it automatically and installs rustfmt, Clippy and llvm-tools. CI installs that pin and runs `ci/toolchain/assert.sh` to reject a mismatched compiler. Coverage uses stable with line coverage only. Release candidates and the crew image read the same file.
 
 **Formatting:** `cargo fmt` uses the same stable pin; no nightly toolchain is required.
 
@@ -78,8 +78,7 @@ Core and daemon unit tests compile shared adapter sources only under `cfg(test)`
 integration tests import the testkit crates directly. Native libraries share `flotilla-build-features`' feature-only dependency
 selections on stable Cargo; `ci/build-graph/check.py` checks build and test selections separately for every workspace package,
 rejects production testkit dependencies and production `test-util`, and runs in workspace CI. Keep its anchors aligned when
-adding dependencies. The build-graph check resolves the full Cargo graph to enforce the boundary on external Rigging crates; its first run may fetch the pinned Git sources. Optional TLS providers and sandbox skips remain opt-in. The Relay Workers WebAssembly target does not
-depend on the native feature selections.
+adding dependencies. The build-graph check resolves the full Cargo graph to enforce the boundary on external Rigging crates; its first run may fetch the pinned Git sources. Optional TLS providers and sandbox skips remain opt-in.
 Workspace tests require Python 3.9+ and Cargo on PATH (`python` on Windows, `python3` elsewhere) for this guard.
 
 `flotilla-store-testkit`, `flotilla-crew` and `flotilla-controllers` collect their integration tests in `tests/integration/main.rs`.

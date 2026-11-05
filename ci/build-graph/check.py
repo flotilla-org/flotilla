@@ -17,7 +17,7 @@ import tempfile
 # but must still reject SQLite or any other native storage dependency.
 C_FREE_BASE = frozenset({
     "flotilla-address", "flotilla-protocol", "flotilla-transport", "flotilla-paths",
-    "flotilla-daemon-api", "flotilla-relay-protocol",
+    "flotilla-daemon-api",
     "flotilla-resources", "flotilla-client", "flotilla-store", "flotilla-store-memory",
     "flotilla-config", "flotilla-messaging", "flotilla-schema", "flotilla-schema-derive",
     "flotilla-state-machines", "flotilla-agent-connector",

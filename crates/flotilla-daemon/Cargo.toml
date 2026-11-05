@@ -58,7 +58,7 @@ flotilla-charter = { path = "../flotilla-charter" }
 flotilla-credentials = { path = "../flotilla-credentials" }
 flotilla-capability-contract = { path = "../flotilla-capability-contract" }
 flotilla-protocol = { path = "../flotilla-protocol" }
-flotilla-relay-protocol = { path = "../flotilla-relay-protocol" }
+rigging-relay-protocol = { workspace = true }
 flotilla-replication = { path = "../flotilla-replication" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-transport = { path = "../flotilla-transport" }

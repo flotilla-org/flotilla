@@ -10,11 +10,11 @@ from check import (AGENT_CONNECTOR, AGENT_CONNECTOR_FORBIDDEN, CAPABILITY_CRATES
                    vessel_graph_violations, operator_graph_violations, feature_differences, is_testkit, layer, main, tree_features, violations)
 
 
-# Explicit finite generator: the eight names are fixed by the amended contract,
+# Explicit finite generator: the seven names are fixed by the amended contract,
 # independent of the implementation's policy set (which might regress).
 BASE_CRATES = (
     "flotilla-protocol", "flotilla-transport", "flotilla-paths",
-    "flotilla-daemon-api", "flotilla-relay-protocol",
+    "flotilla-daemon-api",
     "flotilla-resources", "flotilla-client", "flotilla-config",
 )
 

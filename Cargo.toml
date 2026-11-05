@@ -53,8 +53,6 @@ members = [
     "crates/flotilla-terminal",
     "crates/flotilla-protocol",
     "crates/flotilla-protocol-testkit",
-    "crates/flotilla-relay",
-    "crates/flotilla-relay-protocol",
     "crates/flotilla-replication",
     "crates/flotilla-replay-testkit",
     "crates/flotilla-resources",
@@ -103,6 +101,10 @@ rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", rev = "3
 rigging-http-wire = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
 # The condition language (#4108).
 rigging-condition = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
+# The webhook relay's wire types (flotilla-org/flotilla.work#1), at rigging main. The crate
+# depends on no other rigging crate; the pins above stay at drydock's rev so drydock and
+# flotilla share one copy of each, and all move to one rev when drydock next bumps rigging.
+rigging-relay-protocol = { git = "https://github.com/flotilla-org/rigging", rev = "61018dd937661525bcbba5dd7e57ee6a1c887443" }
 binnacle-cli = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d", features = ["described", "clap"] }
 binnacle-core = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d" }
 binnacle-described = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d" }
