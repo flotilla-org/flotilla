@@ -40,6 +40,10 @@ use rusqlite::{Connection, OptionalExtension};
 /// partial `log_expunges` a home's expunge entries, the tombstones `apply` checks an event for an
 /// unknown identity against, so that check visits expunges only, not every later entry.
 ///
+/// `snapshot_cause` holds, for a record this store installed from a snapshot, the change that
+/// snapshot carried as its cause: no entry here explains such a record until its next one
+/// arrives, which deletes the row; the next snapshot of its home replaces it.
+///
 /// No database created by an earlier generation of these tables exists: the first production
 /// generation is the baseline, and ADR 0047's N→N+1 rule applies from then.
 pub(crate) const SHARED_DDL: &str = "\
@@ -92,6 +96,11 @@ CREATE TABLE IF NOT EXISTS stream_watermark (
 CREATE TABLE IF NOT EXISTS stream_history (
   home INTEGER PRIMARY KEY REFERENCES strings(id), home_seq INTEGER NOT NULL CHECK (home_seq >= 0)
 ) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS snapshot_cause (
+  resource INTEGER PRIMARY KEY REFERENCES resource_identity(id) ON DELETE CASCADE,
+  home INTEGER NOT NULL REFERENCES strings(id),
+  change_seq INTEGER NOT NULL,
+  FOREIGN KEY (home, change_seq) REFERENCES change(home, seq)) STRICT, WITHOUT ROWID;
 ";
 
 /// The readable view of `log` (#3392 D4): each entry with its home and resource named by their
@@ -162,7 +171,11 @@ pub(crate) const SHARED_STATEMENTS: &[(&str, &str)] = &[
     ("change_exists", CHANGE_EXISTS),
     ("change_seqs", CHANGE_SEQS),
     ("change_naming", CHANGE_NAMING),
+    ("change_named", CHANGE_NAMED),
     ("log_last_change", LOG_LAST_CHANGE),
+    ("snapshot_cause_get", SNAPSHOT_CAUSE_GET),
+    ("snapshot_cause_put", SNAPSHOT_CAUSE_PUT),
+    ("snapshot_cause_delete", SNAPSHOT_CAUSE_DELETE),
     ("log_cause", LOG_CAUSE),
     ("log_by_resource", LOG_BY_RESOURCE),
     ("log_by_home", LOG_BY_HOME),
@@ -202,11 +215,20 @@ pub(crate) const CHANGE_EXISTS: &str = "SELECT 1 FROM change WHERE home = ?1 AND
 /// A home's changes between two of its sequences, in order: those a stream sends between entries.
 pub(crate) const CHANGE_SEQS: &str = "SELECT seq FROM change WHERE home = ?1 AND seq > ?2 AND seq < ?3 ORDER BY seq";
 /// The newest change at a home naming a record as an item, by `change_items_by_record`.
+/// Whether any held change names a record as an item, by `change_items_by_record`.
+pub(crate) const CHANGE_NAMED: &str = "SELECT 1 FROM change_items WHERE record = ?1 LIMIT 1";
 pub(crate) const CHANGE_NAMING: &str =
     "SELECT change_seq FROM change_items WHERE record = ?1 AND change_home = ?2 ORDER BY change_seq DESC LIMIT 1";
 /// A resource's newest entry's change, by `log_by_resource`: why it is as it is.
 pub(crate) const LOG_LAST_CHANGE: &str =
     "SELECT (SELECT s FROM strings WHERE id = home), change FROM log WHERE resource = ?1 ORDER BY home_seq DESC LIMIT 1";
+/// The change a record installed from a snapshot holds as its cause, while no entry here
+/// explains it: [`snapshot_cause`](SHARED_DDL)'s one row for the resource.
+pub(crate) const SNAPSHOT_CAUSE_GET: &str =
+    "SELECT (SELECT s FROM strings WHERE id = home), change_seq FROM snapshot_cause WHERE resource = ?1";
+pub(crate) const SNAPSHOT_CAUSE_PUT: &str = "INSERT INTO snapshot_cause (resource, home, change_seq) VALUES (?1, ?2, ?3) \
+     ON CONFLICT (resource) DO UPDATE SET home = excluded.home, change_seq = excluded.change_seq";
+pub(crate) const SNAPSHOT_CAUSE_DELETE: &str = "DELETE FROM snapshot_cause WHERE resource = ?1";
 pub(crate) const LOG_CAUSE: &str = "SELECT cause FROM log WHERE home = ?1 AND home_seq = ?2";
 /// The columns an entry is read back with, in `LogRow` order: its strings through `strings`' primary key.
 macro_rules! log_select {

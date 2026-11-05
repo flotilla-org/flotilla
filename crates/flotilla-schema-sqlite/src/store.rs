@@ -28,11 +28,12 @@ use crate::{
     query::{page_limit, Cursor, Page},
     shared::{
         check_kind_codes, check_kind_columns, has_string_domain, log_predates_changes, schema_ddl, sync_views, CHANGE_APPEND,
-        CHANGE_EXISTS, CHANGE_GET, CHANGE_ITEMS, CHANGE_ITEM_APPEND, CHANGE_NAMING, CHANGE_SEQS, FLOOR_GET, FLOOR_RAISE, HOME_IDS_RESET,
-        HOME_LOG_CLEAR, HOME_MARK_RESET, HOME_SEQ_RESET, IDENTITIES_PAGE, IDENTITY_DELETE, IDENTITY_INSERT, IDENTITY_OF, IDENTITY_RESOLVE,
-        IDENTITY_SEQ, IDENTITY_SET_SEQ, LOG_ABOUT_AFTER, LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE,
-        LOG_EXPUNGED_AFTER, LOG_LAST_CHANGE, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, REMOVED_MAX, SEQUENCE_LAST, SEQUENCE_NEXT,
-        SEQUENCE_RAISE, SHARED_STATEMENTS, STRING_ID, STRING_INSERT, WATERMARK_PUT,
+        CHANGE_EXISTS, CHANGE_GET, CHANGE_ITEMS, CHANGE_ITEM_APPEND, CHANGE_NAMED, CHANGE_NAMING, CHANGE_SEQS, FLOOR_GET, FLOOR_RAISE,
+        HOME_IDS_RESET, HOME_LOG_CLEAR, HOME_MARK_RESET, HOME_SEQ_RESET, IDENTITIES_PAGE, IDENTITY_DELETE, IDENTITY_INSERT, IDENTITY_OF,
+        IDENTITY_RESOLVE, IDENTITY_SEQ, IDENTITY_SET_SEQ, LOG_ABOUT_AFTER, LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE,
+        LOG_CAUSE, LOG_EXPUNGE, LOG_EXPUNGED_AFTER, LOG_LAST_CHANGE, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, REMOVED_MAX, SEQUENCE_LAST,
+        SEQUENCE_NEXT, SEQUENCE_RAISE, SHARED_STATEMENTS, SNAPSHOT_CAUSE_DELETE, SNAPSHOT_CAUSE_GET, SNAPSHOT_CAUSE_PUT, STRING_ID,
+        STRING_INSERT, WATERMARK_PUT,
     },
     sql::{KindSql, TableSql},
 };
@@ -105,6 +106,11 @@ pub struct Snapshot {
     pub version: u64,
     /// Rows per table in pre-order, each table sorted by key.
     pub rows: Rows,
+    /// Why the resource is as it is: its newest entry's change, or for a resource this store holds
+    /// from a snapshot, the cause that snapshot carried. A restore records it, so a record that
+    /// crosses hosts by snapshot keeps the reason it was written (#3108).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<ChangeHeader>,
 }
 
 impl Snapshot {
@@ -367,7 +373,7 @@ impl Read<'_> {
     }
 
     pub fn load_snapshot(&mut self, id: ResourceId) -> Result<Option<Snapshot>, StoreError> {
-        self.ctx().snapshot(id)
+        self.ctx().snapshot_with_cause(id)
     }
     /// Up to `limit` logged events of resource `id` after `after`, in sequence order: the tail that
     /// follows a snapshot at version `after`, and the resource's history from 0. A limit of 0 is
@@ -608,7 +614,9 @@ impl Write<'_> {
                 return Err(StoreError::OwnHome { home: home.into() });
             }
             // Identities that the replacement did not write remain at zero. Remove obsolete
-            // unreferenced identities too; retain referenced placeholders while other homes lag.
+            // unreferenced identities too; retain referenced placeholders while other homes lag,
+            // and those a held change names: removing one would drop the item from that change,
+            // which a snapshot's cause may be.
             let kinds: Vec<_> = ctx.runtime.kinds.iter().map(|set| set.code).collect();
             for kind in kinds {
                 let mut after = None;
@@ -619,7 +627,7 @@ impl Write<'_> {
                     }
                     after = ids.last().copied();
                     for id in ids {
-                        if ctx.identity_seq(id)? == 0 {
+                        if ctx.identity_seq(id)? == 0 && !ctx.change_named(id)? {
                             if let Some(identity) = ctx.identity_of(id)? {
                                 match ctx.remove_identity(id, &identity) {
                                     Err(StoreError::Referenced { .. }) => {}
@@ -673,7 +681,7 @@ impl Write<'_> {
     }
 
     pub fn load_snapshot(&mut self, id: ResourceId) -> Result<Option<Snapshot>, StoreError> {
-        self.ctx().snapshot(id)
+        self.ctx().snapshot_with_cause(id)
     }
 
     /// Up to `limit` logged events of resource `id` after `after`, in sequence order: the tail that
@@ -1553,6 +1561,10 @@ impl Ctx<'_> {
 
     /// Deletes an identity's log entries, then the identity: entries about it keep their rows,
     /// their `about` set to null. A row of another resource still referencing it is `Referenced`.
+    fn change_named(&mut self, id: ResourceId) -> Result<bool, StoreError> {
+        Ok(self.conn.prepare_cached(CHANGE_NAMED)?.query_row([id.0], |_| Ok(())).optional()?.is_some())
+    }
+
     fn remove_identity(&mut self, id: ResourceId, identity: &Identity) -> Result<(), StoreError> {
         let removed: Option<i64> = self.conn.prepare_cached(REMOVED_MAX)?.query_row([id.0], |row| row.get(0))?;
         if let Some(removed) = removed {
@@ -1692,6 +1704,8 @@ impl Ctx<'_> {
         if !self.record(event.kind, id, &event.home, header, event.prev_seq, (&event.effect, &bytes), sequence, stored)? {
             return Err(StoreError::NotFound { id });
         }
+        // The log explains the record again from its first entry here.
+        self.conn.prepare_cached(SNAPSHOT_CAUSE_DELETE)?.execute([id.0])?;
         let home = self.intern(HOME_DOMAIN, &event.home)?;
         self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
         Ok(Applied::Applied(Stamp { id, version: event.home_seq }))
@@ -1767,6 +1781,17 @@ impl Ctx<'_> {
         self.check_objects(&ops, &snapshot.rows.objects)?;
         self.execute(snapshot.kind, id, &ops, sequence, None)?;
         self.set_identity_seq(id, sequence)?;
+        if let Some(cause) = &snapshot.cause {
+            // A record's changes are its home's: a cause from elsewhere, or later than the
+            // snapshot's version, is not this record's.
+            if cause.home != snapshot.home || cause.seq > snapshot.version {
+                return Err(Malformed::ChangeMismatch { home: cause.home.clone(), seq: cause.seq }.into());
+            }
+            self.record_change(cause)?;
+            let home = self.intern(HOME_DOMAIN, &cause.home)?;
+            let seq = i64::try_from(cause.seq).map_err(|_| Malformed::Sequence { home_seq: cause.seq })?;
+            self.conn.prepare_cached(SNAPSHOT_CAUSE_PUT)?.execute(params![id.0, home, seq])?;
+        }
         let home = self.intern(HOME_DOMAIN, &snapshot.home)?;
         self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
         Ok(Stamp { id, version: snapshot.version })
@@ -2074,8 +2099,14 @@ impl Ctx<'_> {
 
     /// The change of resource `id`'s newest entry: why it is as it is.
     fn last_change(&mut self, id: ResourceId) -> Result<Option<ChangeHeader>, StoreError> {
-        let last: Option<(String, i64)> =
-            self.conn.prepare_cached(LOG_LAST_CHANGE)?.query_row([id.0], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+        // A record held from a snapshot has no entry here until its next one arrives: its
+        // snapshot's cause explains it until then.
+        let held: Option<(String, i64)> =
+            self.conn.prepare_cached(SNAPSHOT_CAUSE_GET)?.query_row([id.0], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+        let last = match held {
+            Some(held) => Some(held),
+            None => self.conn.prepare_cached(LOG_LAST_CHANGE)?.query_row([id.0], |row| Ok((row.get(0)?, row.get(1)?))).optional()?,
+        };
         let Some((home, seq)) = last else { return Ok(None) };
         let seq = u64::try_from(seq).map_err(|_| StoreError::Corrupt { table: "log".into(), column: "change".into() })?;
         self.change(&home, seq)
@@ -2132,8 +2163,12 @@ impl Ctx<'_> {
         if self.conn.prepare_cached(CHANGE_EXISTS)?.query_row(params![home, sequence], |_| Ok(())).optional()?.is_some() {
             // Recorded again, as a stream re-sends a change before an entry naming it: the same
             // change, or the sender's is not the home's.
+            // A home's reset keeps its change rows, so the sequence they took is raised again.
             return match self.change(&change.home, change.seq)? {
-                Some(held) if held == *change => Ok(()),
+                Some(held) if held == *change => {
+                    self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
+                    Ok(())
+                }
                 _ => Err(Malformed::ChangeMismatch { home: change.home.clone(), seq: change.seq }.into()),
             };
         }
@@ -2216,7 +2251,14 @@ impl Ctx<'_> {
             }
         }
         rows.sort();
-        Ok(Some(Snapshot { kind: identity.kind, name: identity.name, home: identity.home, version, rows }))
+        Ok(Some(Snapshot { kind: identity.kind, name: identity.name, home: identity.home, version, rows, cause: None }))
+    }
+
+    /// [`Self::snapshot`] with the resource's cause: what a snapshot sends, and what a restore records.
+    fn snapshot_with_cause(&mut self, id: ResourceId) -> Result<Option<Snapshot>, StoreError> {
+        let Some(mut snapshot) = self.snapshot(id)? else { return Ok(None) };
+        snapshot.cause = self.last_change(id)?;
+        Ok(Some(snapshot))
     }
 
     /// Maps stored values back to logical ones, collecting the objects the row names.

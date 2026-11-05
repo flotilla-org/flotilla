@@ -115,7 +115,7 @@ fn a_dropped_message_ships_a_week_later_and_leaves_in_two_writes() {
     assert_eq!((bundle.snapshot.clone(), bundle.identity(), version), (stored.clone(), identity(&dropped), stored.version));
     assert_eq!(bundle.entries.iter().map(|entry| entry.cause.name()).collect::<Vec<_>>(), ["create", "edge"]);
     let bytes = bundle.encode().expect("encode");
-    assert_eq!(Bundle::decode(&bytes).expect("decode"), bundle);
+    assert_eq!(Bundle::decode(&bytes).expect("decode"), *bundle);
     let mut elsewhere = self::store("gamma");
     assert_eq!(bundle.replay(&mut elsewhere).expect("replay"), Some(stored), "the entries rebuild the end state");
 

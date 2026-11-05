@@ -40,11 +40,8 @@ pub(crate) async fn run_resource_command(cli: &Cli, command: ResourceSubCommand,
                     local_roots.as_deref(),
                     skill_catalog.as_deref(),
                     &resource_validate::ValidationOptions {
-                        require_import: ConfigStore::new(DaemonHostPath::new(&paths.config_dir), DaemonHostPath::new(&paths.state_dir))
-                            .load_daemon_config()
-                            .map_err(|error| color_eyre::eyre::eyre!(error))?
-                            .primitives
-                            .is_some(),
+                        // Every daemon runs on the engine, so every validation rehearses the import.
+                        require_import: true,
                         sources: skill_sources.or_else(|| skill_catalog.as_ref().and_then(|path| path.parent().map(Path::to_path_buf))),
                         credential_tokens: resource_validate::frozen::load_tokens(skill_probe_tokens.as_deref())?,
                     },

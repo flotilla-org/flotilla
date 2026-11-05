@@ -55,7 +55,6 @@ fn daemon_hello(fingerprint: &str) -> Message {
         connection_role: None,
         surface: None,
         crew_claims: Default::default(),
-        primitives: false,
     }
 }
 

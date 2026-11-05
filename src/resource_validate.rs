@@ -923,13 +923,10 @@ mod tests {
                 "named-designation",
                 "unnamed-designation",
             ] {
-                let config_dir = tempfile::tempdir().unwrap();
-                std::fs::write(config_dir.path().join("daemon.toml"), if enabled { "[primitives]\n" } else { "" }).unwrap();
-                let config = ConfigStore::with_base(config_dir.path().to_path_buf()).load_daemon_config().unwrap();
                 let socket_dir = TestSocketDir::new();
                 let socket = socket_dir.socket_path("import-gate.sock");
                 let (stop, server) = serve_import_inventory(&socket, import_gate_inventory(case), None).await;
-                let probes = super::ValidationOptions { require_import: config.primitives.is_some(), ..Default::default() };
+                let probes = super::ValidationOptions { require_import: enabled, ..Default::default() };
                 let result = super::validate_daemon_with_options(&socket, Some(&[]), None, &probes).await;
                 let _ = stop.send(());
                 tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();

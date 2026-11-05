@@ -200,7 +200,7 @@ pub(super) async fn follow_round(
             let CommandValue::ChangeStreamFrame { session, frame } = value else {
                 return Err(format!("unexpected routed stream response: {value:?}"));
             };
-            match follow_connection(Arc::clone(&service), home, client, &session, &frame).await {
+            match follow_connection(Arc::clone(&service), home, peer != home, client, &session, &frame).await {
                 Ok(homes) => Ok(homes),
                 Err(HttpRoundError::RouteUnavailable(error)) => {
                     tracing::debug!(%peer, %home, %error, "peer socket unavailable; using peer route for this round");
@@ -240,7 +240,7 @@ async fn routed_round(
         session = Some(next);
     }
     spool.flush().await.map_err(|e| e.to_string())?;
-    install_spool(service, home, spool.into_std().await).await
+    install_spool(service, home, peer != home, spool.into_std().await).await
 }
 
 /// Every reachable home is followed over its socket or command route. Dropping the
@@ -358,6 +358,7 @@ impl From<String> for HttpRoundError {
 async fn follow_connection(
     service: Arc<Service>,
     home: &str,
+    relayed: bool,
     client: &reqwest::Client,
     session: &str,
     first: &[u8],
@@ -368,7 +369,7 @@ async fn follow_connection(
     spool.write_all(first).await.map_err(|e| e.to_string())?;
     if matches!(Frame::decode(first).map_err(|e| e.to_string())?, Frame::Keepalive { .. }) {
         spool.flush().await.map_err(|e| e.to_string())?;
-        return install_spool(service, home, spool.into_std().await).await.map_err(Into::into);
+        return install_spool(service, home, relayed, spool.into_std().await).await.map_err(Into::into);
     }
     let response = client
         .get(target)
@@ -425,18 +426,20 @@ async fn follow_connection(
         return Err("truncated home stream".to_owned().into());
     }
     spool.flush().await.map_err(|e| e.to_string())?;
-    install_spool(service, home, spool.into_std().await).await.map_err(Into::into)
+    install_spool(service, home, relayed, spool.into_std().await).await.map_err(Into::into)
 }
 
-/// Installs a staged round; the homes its keepalive says the server holds.
-async fn install_spool(service: Arc<Service>, home: &str, mut spool: std::fs::File) -> Result<Homes, String> {
+/// Installs a staged round, `relayed` when a peer passed it on; the homes its keepalive says the
+/// server holds.
+async fn install_spool(service: Arc<Service>, home: &str, relayed: bool, mut spool: std::fs::File) -> Result<Homes, String> {
     let home = home.to_owned();
     tokio::task::spawn_blocking(move || {
         use std::io::{Read, Seek};
         spool.rewind().map_err(transport)?;
         let mut held = Vec::new();
         service.with_store(|store| {
-            Follower::new(store).receive(&home, |sink| loop {
+            let mut follower = if relayed { Follower::relayed(store) } else { Follower::new(store) };
+            follower.receive(&home, |sink| loop {
                 let mut header = [0; HEADER_LEN];
                 spool.read_exact(&mut header).map_err(transport)?;
                 let length = FRAMING.body_len(&header).map_err(transport)?;
@@ -530,6 +533,7 @@ mod tests {
             let result = follow_connection(
                 Arc::clone(&service),
                 "home",
+                false,
                 &http_client(&socket).unwrap(),
                 "peer-session",
                 &Frame::Begin { home: "home".into(), home_seq: 0 }.encode().unwrap(),
@@ -598,6 +602,7 @@ mod tests {
             follow_connection(
                 target,
                 "home",
+                false,
                 &http_client(&socket).unwrap(),
                 "peer-session",
                 &Frame::Begin { home: "home".into(), home_seq: 0 }.encode().unwrap(),
@@ -684,6 +689,7 @@ mod tests {
                     tables: vec![vec![flotilla_schema::Row { key: vec![], values: vec![] }]],
                     ..Default::default()
                 },
+                cause: None,
             });
             let remote = value.clone();
             let peer = tokio::spawn(async move {

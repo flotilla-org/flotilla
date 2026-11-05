@@ -262,6 +262,7 @@ fn resource_chunks(snapshot: &Snapshot, send: &mut dyn FnMut(&[u8]) -> Result<()
                 home: snapshot.home.clone(),
                 version: snapshot.version,
                 rows: chunk,
+                cause: snapshot.cause.clone(),
             };
             let bytes = FRAMING.encode(&Frame::ResourceChunk { value, last: sent == total }).map_err(|error| {
                 if matches!(error.kind(), flotilla_cbor::ErrorKind::MessageLimit | flotilla_cbor::ErrorKind::ElementLimit) {
@@ -280,17 +281,27 @@ fn resource_chunks(snapshot: &Snapshot, send: &mut dyn FnMut(&[u8]) -> Result<()
 /// commits state and sequence together; only an applied keepalive moves the time watermark.
 pub struct Follower<'a> {
     store: &'a mut Store,
+    relayed: bool,
 }
 
 impl<'a> Follower<'a> {
+    /// Follows a home from the home itself.
     pub fn new(store: &'a mut Store) -> Self {
-        Self { store }
+        Self { store, relayed: false }
+    }
+
+    /// Follows a home through a peer that passes it on (relay). Such a round may race this store's
+    /// own round with the home, so a snapshot cut behind what this store holds is refused rather
+    /// than taking it back; a home's own snapshot behind the cursor is its reset, and installs.
+    pub fn relayed(store: &'a mut Store) -> Self {
+        Self { store, relayed: true }
     }
     pub fn receive(
         &mut self,
         home: &str,
         deliver: impl FnOnce(&mut dyn FnMut(&[u8]) -> Result<(), StoreError>) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
+        let relayed = self.relayed;
         let mut write = self.store.write()?;
         let mut snapshot = None;
         let mut chunks: Option<Snapshot> = None;
@@ -300,9 +311,9 @@ impl<'a> Follower<'a> {
             match Frame::decode(bytes)? {
                 Frame::Failure { message } => return Err(StoreError::Stream(message)),
                 Frame::Begin { home: from, home_seq } if from == home && snapshot.is_none() => {
-                    // A snapshot behind what this store holds would take it back; the follower
-                    // asks again from its cursor.
-                    if home_seq < cursor.home_seq {
+                    // A relayed snapshot behind what this store holds would take it back; the
+                    // follower asks again from its cursor.
+                    if relayed && home_seq < cursor.home_seq {
                         return Err(StoreError::Stream("snapshot cut is behind this store".into()));
                     }
                     write.reset_replica(home)?;
@@ -585,7 +596,7 @@ mod tests {
     fn snapshot(value: Value) -> Snapshot {
         let mut rows = Rows::with_tables(1);
         rows.tables[0].push(Row { key: Vec::new(), values: vec![value] });
-        Snapshot { kind: KindCode::new("test"), name: "resource".into(), home: "home".into(), version: 0, rows }
+        Snapshot { kind: KindCode::new("test"), name: "resource".into(), home: "home".into(), version: 0, rows, cause: None }
     }
 
     // Splitting rows cannot repair an invalid byte string. Refuse before sending even

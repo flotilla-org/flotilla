@@ -271,7 +271,7 @@ pub enum Due {
 #[derive(Debug)]
 pub enum Prepared {
     Ready {
-        bundle: Bundle,
+        bundle: Box<Bundle>,
         version: u64,
     },
     /// It is no longer stored, or no longer at an end.
@@ -431,7 +431,7 @@ impl Archiver {
             changes.push(read.change(&identity.home, seq)?.ok_or_else(|| ArchiveError::Missing(identity.clone()))?);
         }
         let version = snapshot.version;
-        Ok(Prepared::Ready { bundle: Bundle { format: BUNDLE_FORMAT, snapshot, entries, changes }, version })
+        Ok(Prepared::Ready { bundle: Box::new(Bundle { format: BUNDLE_FORMAT, snapshot, entries, changes }), version })
     }
 
     /// Deletes a shipped resource at the version its bundle holds; a resource that moved since is
