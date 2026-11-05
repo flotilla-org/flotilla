@@ -11,13 +11,15 @@ use std::{
 /// The variable a handoff sets to the parent's build id; the sibling refuses a different build.
 pub const PARENT_BUILD_ENV: &str = "FLOTILLA_PARENT_BUILD";
 
-/// The siblings `flotilla` hands commands to; adding one is a code change. `mcp` (#4201) and
-/// `tui` (#4263) join as they land. This is the allowlist the release ships too: the candidate
+/// The siblings `flotilla` hands commands to; adding one is a code change. `mcp` (#4201) joins
+/// as it lands. This is the allowlist the release ships too: the candidate
 /// build reads the `Sibling::<Name> => "<command>"` arms of [`Sibling::command`] from this file
 /// (`generation_validation.py siblings`), so keep each arm on one line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sibling {
     Table,
+    /// The old dashboard: `flotilla` with no subcommand, and `flotilla view` (#4263).
+    Tui,
 }
 
 impl Sibling {
@@ -25,6 +27,16 @@ impl Sibling {
     pub fn command(self) -> &'static str {
         match self {
             Sibling::Table => "table",
+            Sibling::Tui => "tui",
+        }
+    }
+
+    /// What a person ran to reach it, for the missing-sibling error. Its arms say `Self::`, so the
+    /// packaging reads only [`Sibling::command`]'s as the allowlist.
+    fn entry(self) -> &'static str {
+        match self {
+            Self::Table => "`flotilla table`",
+            Self::Tui => "the flotilla dashboard (`flotilla` with no subcommand, or `flotilla view`)",
         }
     }
 
@@ -48,9 +60,9 @@ pub fn locate(sibling: Sibling, binary: &Path) -> Result<PathBuf, String> {
         return Ok(path);
     }
     Err(format!(
-        "`flotilla {}` runs {}, which is not in {} beside {}; reinstall the flotilla release, which ships its siblings \
+        "{} runs {}, which is not in {} beside {}; reinstall the flotilla release, which ships its siblings \
          (in a source checkout: cargo build -p flotilla-{})",
-        sibling.command(),
+        sibling.entry(),
         sibling.file_name(),
         dir.display(),
         binary.display(),
@@ -95,16 +107,20 @@ mod tests {
 
     #[test]
     fn a_sibling_is_found_beside_the_binary_and_a_missing_one_names_the_fix() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let binary = dir.path().join("flotilla");
-        let missing = locate(Sibling::Table, &binary).unwrap_err();
-        assert!(missing.contains(&Sibling::Table.file_name()), "{missing}");
-        assert!(missing.contains(&dir.path().display().to_string()), "{missing}");
-        assert!(missing.contains("reinstall the flotilla release"), "{missing}");
+        for (sibling, entry) in [(Sibling::Table, "`flotilla table`"), (Sibling::Tui, "`flotilla` with no subcommand")] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let binary = dir.path().join("flotilla");
+            let missing = locate(sibling, &binary).unwrap_err();
+            assert!(missing.contains(entry), "{missing}");
+            assert!(missing.contains(&sibling.file_name()), "{missing}");
+            assert!(missing.contains(&dir.path().display().to_string()), "{missing}");
+            assert!(missing.contains("reinstall the flotilla release"), "{missing}");
+            assert!(missing.contains(&format!("cargo build -p flotilla-{}", sibling.command())), "{missing}");
 
-        let sibling = dir.path().join(Sibling::Table.file_name());
-        std::fs::write(&sibling, b"").expect("write sibling");
-        assert_eq!(locate(Sibling::Table, &binary).expect("found"), sibling);
+            let path = dir.path().join(sibling.file_name());
+            std::fs::write(&path, b"").expect("write sibling");
+            assert_eq!(locate(sibling, &binary).expect("found"), path);
+        }
     }
 
     // The release packages the siblings named by the `command` arms in this file's text; every
@@ -117,7 +133,7 @@ mod tests {
             .collect();
         // `command` matches exhaustively, so a new variant has an arm here and fails this until
         // it is listed too, which checks that the packaging parse reads its arm.
-        let commands: Vec<&str> = [Sibling::Table].iter().map(|sibling| sibling.command()).collect();
+        let commands: Vec<&str> = [Sibling::Table, Sibling::Tui].iter().map(|sibling| sibling.command()).collect();
         assert_eq!(arms, commands);
     }
 

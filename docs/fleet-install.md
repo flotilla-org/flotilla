@@ -16,7 +16,7 @@ allowlisted sibling whose crate has landed:
 | --- | --- | --- |
 | `flotilla-table` | `flotilla table` | shipped |
 | `flotilla-mcp` | `flotilla mcp` | joins the allowlist with #4201 |
-| `flotilla-tui` | `flotilla tui` | joins the allowlist with #4263 |
+| `flotilla-tui` | `flotilla` with no subcommand, `flotilla view` (and the hidden `flotilla tui` the checks below run) | shipped |
 
 The candidate build reads the allowlist from that file, builds the siblings with
 the generation's build id, and refuses a bundle whose siblings differ from it.

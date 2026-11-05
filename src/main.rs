@@ -7,7 +7,7 @@ use flotilla_cli::cli::args::{
 };
 use flotilla_client::{
     build_id,
-    reconnect::{should_reexec_for_incompatible_daemon, REEXEC_BUILD_ENV},
+    reconnect::{incompatible_daemon_reexec_failure, reexec_current_process, should_reexec_for_incompatible_daemon, REEXEC_BUILD_ENV},
 };
 use flotilla_protocol::{commands::CommandValue, output::OutputFormat, Command, CommandAction};
 use flotilla_provider_runtime::ProcessCommandRunner;
@@ -72,16 +72,13 @@ fn main() -> Result<()> {
 async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat) -> Result<()> {
     match command {
         Some(SubCommand::View(ViewArgs { address })) => {
-            // Parse before touching the terminal so a bad address in a
-            // recipe fails loudly at the shell (ADR 0013).
-            let address: flotilla_protocol::ViewAddress = match address.parse() {
-                Ok(address) => address,
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    std::process::exit(2);
-                }
-            };
-            run_tui(cli, Some(address)).await
+            // Parse before handing off so a bad address in a recipe fails
+            // loudly at the shell (ADR 0013).
+            if let Err(e) = address.parse::<flotilla_protocol::ViewAddress>() {
+                eprintln!("Error: {e}");
+                std::process::exit(2);
+            }
+            run_tui()
         }
         Some(SubCommand::Daemon(DaemonArgs { command: Some(DaemonSubCommand::Stop), .. })) => run_daemon_stop(&cli).await,
         Some(SubCommand::Daemon(DaemonArgs { command: Some(DaemonSubCommand::DevMode { command }), .. })) => {
@@ -162,6 +159,7 @@ async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat
         Some(SubCommand::Ensure { command }) => run_ensure_command(&cli, command, format).await,
         Some(SubCommand::Web { command }) => run_web_command(&cli, command).await,
         Some(SubCommand::Table(args)) => run_table_command(&cli, args).await,
+        Some(SubCommand::Tui(_)) => run_tui(),
         Some(SubCommand::Resource { command }) => run_resource_command(&cli, command, format).await,
         Some(SubCommand::Manifest { command }) => run_manifest_command(&cli, command, format).await,
         Some(SubCommand::Artifact { command }) => run_artifact_command(&cli, command, format).await,
@@ -194,28 +192,7 @@ async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat
             Ok(())
         }
 
-        None => run_tui(cli, None).await,
-    }
-}
-
-fn incompatible_daemon_reexec_failure(incompatibility: &str, reexec_error: &dyn std::fmt::Display) -> String {
-    format!("{incompatibility}; re-exec could not reach a matching build: {reexec_error}")
-}
-
-fn reexec_current_process() -> Result<()> {
-    let executable = std::env::current_exe()?;
-    let mut command = std::process::Command::new(executable);
-    command.args(std::env::args_os().skip(1));
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let error = command.exec();
-        Err(error.into())
-    }
-    #[cfg(not(unix))]
-    {
-        command.spawn()?;
-        std::process::exit(0);
+        None => run_tui(),
     }
 }
 
@@ -236,16 +213,6 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    #[test]
-    fn failed_incompatible_daemon_reexec_names_both_builds_and_protocols() {
-        let mismatch = "daemon protocol version mismatch: client built cli-old speaks proto 19; daemon built daemon-new speaks proto 20";
-
-        let message = incompatible_daemon_reexec_failure(mismatch, &std::io::Error::from_raw_os_error(libc::ENOENT));
-
-        assert!(message.contains("client built cli-old speaks proto 19"), "{message}");
-        assert!(message.contains("daemon built daemon-new speaks proto 20"), "{message}");
-        assert!(message.contains("re-exec could not reach a matching build"), "{message}");
-    }
     // Installer readiness and diagnostics must query the selected generation;
     // an incompatible wire generation must not cause either command to re-exec its CLI.
     #[test]

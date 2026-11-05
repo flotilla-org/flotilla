@@ -23,8 +23,8 @@ C_FREE_BASE = frozenset({
     "flotilla-state-machines", "flotilla-agent-connector",
 })
 # Shrink this explicit exemption list with the ADR 0060 step 3 store split.
-# Manifest uses TLS; TUI no longer reaches core or store, but still reaches TLS
-# through manifest and provider runtime; the executable still reaches store through core.
+# Manifest uses TLS; the flotilla-tui sibling no longer reaches core or store, but still reaches
+# TLS through manifest and provider runtime; the executable still reaches store through core.
 RESOURCE_EXEMPTIONS = frozenset({
     "flotilla-manifest", "flotilla-tui", "flotilla",
 })
@@ -104,6 +104,16 @@ VESSEL_UI_PACKAGES = frozenset({"flotilla-tui", "ratatui", "ratatui-core", "rata
 def vessel_graph_violations(tree):
     names = {package.split()[0] for package in tree}
     return [f"vessel CLI: must not depend on {name}" for name in sorted(names & (VESSEL_UI_PACKAGES | {"flotilla-core", "flotilla-daemon"}))]
+
+
+# #4249 rulings 1 and 3, #4263: the dashboard is the flotilla-tui sibling, so the operator CLI
+# selects no renderer or terminal-driver package, not even for its tests.
+OPERATOR_UI_PACKAGES = VESSEL_UI_PACKAGES | {"ratatui-crossterm", "crossterm"}
+
+
+def operator_graph_violations(tree):
+    names = {package.split()[0] for package in tree}
+    return [f"flotilla: must not depend on {name}; the dashboard is the flotilla-tui sibling" for name in sorted(names & OPERATOR_UI_PACKAGES)]
 
 
 def c_free_violations(name, tree):
@@ -359,7 +369,8 @@ def main(arguments=()):
     errors = violations(metadata)
     tree_arguments = ("tree", "--locked", "--prefix", "none", "--format", "{p}|{f}")
     members = [package for package in metadata["packages"] if package["id"] in metadata["workspace_members"]]
-    requests = [("vessel", (*tree_arguments, "-p", "flotilla-cli", "--edges", "normal,build", *target_arguments))]
+    requests = [("vessel", (*tree_arguments, "-p", "flotilla-cli", "--edges", "normal,build", *target_arguments)),
+                ("operator", (*tree_arguments, "-p", "flotilla", "--edges", "normal,build,dev", *target_arguments))]
     for group in ("base", "native"):
         selection = [argument for package in members if layer(package["name"]) == group
                      for argument in ("-p", package["name"])]
@@ -377,6 +388,7 @@ def main(arguments=()):
             requests.append((("package", package["name"], edges), (*tree_arguments, "-p", package["name"], "--edges", edges, *target_arguments)))
     trees = dict(zip((key for key, _ in requests), concurrent_trees(cargo, [arguments for _, arguments in requests])))
     errors.extend(vessel_graph_violations(trees["vessel"]))
+    errors.extend(operator_graph_violations(trees["operator"]))
     # Resolver 2 unifies dependency features within a command. Compare to
     # the union of consumers in the same layer, not the unrelated native stack.
     workspace = {key[1:]: tree for key, tree in trees.items() if key[0] == "layer"}
@@ -396,7 +408,7 @@ def main(arguments=()):
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
-    print(f"Workspace build graph ({options.target or 'host'}): C-free Windows base; production excludes testkits and test-util; layer-local build/test features reusable; vessel CLI excludes TUI")
+    print(f"Workspace build graph ({options.target or 'host'}): C-free Windows base; production excludes testkits and test-util; layer-local build/test features reusable; vessel and operator CLIs exclude TUI")
     return 0
 
 
