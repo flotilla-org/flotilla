@@ -15,7 +15,6 @@ flotilla-store = { path = "../flotilla-store" }
 flotilla-resources = { path = "../flotilla-resources" }
 rigging-tls = { workspace = true }
 flotilla-protocol = { path = "../flotilla-protocol" }
-flotilla-relay-protocol = { path = "../flotilla-relay-protocol" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true }

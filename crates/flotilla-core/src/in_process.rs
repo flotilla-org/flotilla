@@ -2390,8 +2390,7 @@ impl InProcessDaemon {
 
     pub async fn refresh_change_request_hint(&self, hint: &flotilla_address::Address) -> Result<(), String> {
         self.crew.refresh_change_request_hint(hint).await?;
-        let Some(hint_text) = flotilla_relay_protocol::hint_subject(hint).filter(|_| hint.kind() == flotilla_address::Kind::ChangeRequest)
-        else {
+        let Some(hint_text) = github_change_request_text(hint) else {
             return Ok(());
         };
         // Transitional (#3359): convoy subjects are still the protocol
@@ -3447,6 +3446,15 @@ impl InProcessDaemon {
 
 /// Non-trait methods that are called directly on the concrete `InProcessDaemon`
 /// type by the daemon server peer-overlay code and by the `execute()` implementation.
+/// The `cr/github.com/<owner>/<repo>/<number>` text of a public GitHub change request.
+fn github_change_request_text(address: &flotilla_address::Address) -> Option<String> {
+    use flotilla_address::Kind;
+    if address.kind() != Kind::ChangeRequest || address.get(Kind::Forge) != Some(flotilla_address::GITHUB_FORGE_ID) {
+        return None;
+    }
+    Some(format!("cr/github.com/{}/{}", address.get(Kind::Repo)?, address.number()?))
+}
+
 fn repository_identity_display(spec: &RepositorySpec) -> String {
     match spec.identity() {
         flotilla_resources::RepositoryIdentity::Forge { forge_ref, owner, repo_name } => format!("{forge_ref}/{owner}/{repo_name}"),

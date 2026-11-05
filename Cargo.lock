@@ -189,7 +189,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "itoa",
- "matchit 0.8.4",
+ "matchit",
  "memchr",
  "mime",
  "percent-encoding",
@@ -2278,7 +2278,6 @@ dependencies = [
  "flotilla-provider-runtime",
  "flotilla-provisioning",
  "flotilla-provisioning-testkit",
- "flotilla-relay-protocol",
  "flotilla-replay-testkit",
  "flotilla-resources",
  "flotilla-schema",
@@ -2515,7 +2514,6 @@ dependencies = [
  "flotilla-provider-runtime",
  "flotilla-provisioning",
  "flotilla-provisioning-testkit",
- "flotilla-relay-protocol",
  "flotilla-replay-testkit",
  "flotilla-replication",
  "flotilla-resources",
@@ -2550,6 +2548,7 @@ dependencies = [
  "rigging-http-serve",
  "rigging-http-wire",
  "rigging-process",
+ "rigging-relay-protocol",
  "rigging-replay-testkit",
  "rigging-tls",
  "rusqlite",
@@ -3245,7 +3244,6 @@ dependencies = [
  "flotilla-manifest",
  "flotilla-protocol",
  "flotilla-provider-runtime",
- "flotilla-relay-protocol",
  "flotilla-replay-testkit",
  "flotilla-resources",
  "flotilla-store",
@@ -3513,46 +3511,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flotilla-relay"
-version = "0.1.0"
-dependencies = [
- "flotilla-build-features",
- "flotilla-build-features-async",
- "flotilla-build-features-base",
- "flotilla-build-features-hmac",
- "flotilla-build-features-sqlite",
- "flotilla-relay-protocol",
- "futures",
- "getrandom 0.2.17",
- "hex",
- "js-sys",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "tokio",
- "worker",
-]
-
-[[package]]
-name = "flotilla-relay-protocol"
-version = "0.1.0"
-dependencies = [
- "flotilla-address",
- "flotilla-build-features",
- "flotilla-build-features-async",
- "flotilla-build-features-base",
- "flotilla-build-features-hmac",
- "hex",
- "hmac",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
-]
-
-[[package]]
 name = "flotilla-replay-testkit"
 version = "0.1.0"
 dependencies = [
@@ -3748,7 +3706,6 @@ dependencies = [
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
  "flotilla-protocol",
- "flotilla-relay-protocol",
  "flotilla-resources",
  "flotilla-store-testkit",
  "futures",
@@ -3788,7 +3745,6 @@ dependencies = [
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
  "flotilla-protocol",
- "flotilla-relay-protocol",
  "flotilla-resources",
  "flotilla-store",
  "flotilla-store-testkit",
@@ -3829,7 +3785,6 @@ dependencies = [
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
  "flotilla-protocol",
- "flotilla-relay-protocol",
  "flotilla-resources",
  "flotilla-store",
  "flotilla-store-testkit",
@@ -3868,7 +3823,6 @@ dependencies = [
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
  "flotilla-protocol",
- "flotilla-relay-protocol",
  "flotilla-replication",
  "flotilla-resources",
  "flotilla-store",
@@ -5127,12 +5081,6 @@ dependencies = [
 
 [[package]]
 name = "matchit"
-version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
-
-[[package]]
-name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
@@ -5710,26 +5658,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
 dependencies = [
  "siphasher",
-]
-
-[[package]]
-name = "pin-project"
-version = "1.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2466b2336ed02bcdca6b294417127b90ec92038d1d5c4fbeac971a922e0e0924"
-dependencies = [
- "pin-project-internal",
-]
-
-[[package]]
-name = "pin-project-internal"
-version = "1.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c96395f0a926bc13b1c17622aaddda1ecb55d49c8f1bf9777e4d877800a43f8b"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -6373,6 +6301,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rigging-relay-protocol"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/rigging?rev=eec34d59c4bfa03ae8f781519c02b906a5f8cb51#eec34d59c4bfa03ae8f781519c02b906a5f8cb51"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rigging-replay-testkit"
 version = "0.1.0"
 source = "git+https://github.com/flotilla-org/rigging?rev=3c60c7ae62a1b93f910b7049d90ae97bf8275837#3c60c7ae62a1b93f910b7049d90ae97bf8275837"
@@ -6710,17 +6647,6 @@ checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
  "serde_derive",
-]
-
-[[package]]
-name = "serde-wasm-bindgen"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8302e169f0eddcc139c70f139d19d6467353af16f9fce27e8c30158036a1e16b"
-dependencies = [
- "js-sys",
- "serde",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -8103,19 +8029,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wasm-streams"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94ce9bdac782bbca70d6ac48a3ba18b873c848a706d6dc3bd9a03c1b96f04693"
-dependencies = [
- "futures-util",
- "js-sys",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
 name = "wasmparser"
 version = "0.244.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8659,65 +8572,6 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
-]
-
-[[package]]
-name = "worker"
-version = "0.8.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4057bce8ec66c80b7e270d884c312e2a4ff60eb997fd02936656106c06a964e5"
-dependencies = [
- "async-trait",
- "bytes",
- "chrono",
- "futures-channel",
- "futures-util",
- "http",
- "http-body",
- "js-sys",
- "matchit 0.7.3",
- "pin-project",
- "serde",
- "serde-wasm-bindgen",
- "serde_json",
- "serde_urlencoded",
- "strum 0.28.0",
- "tokio",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-streams 0.7.0",
- "web-sys",
- "worker-macros",
- "worker-sys",
-]
-
-[[package]]
-name = "worker-macros"
-version = "0.8.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3d7389670b55aab89760be149007aeff773cdad7b650d807f7fb556d04bb304"
-dependencies = [
- "async-trait",
- "proc-macro2",
- "quote",
- "strum 0.28.0",
- "syn 3.0.6",
- "wasm-bindgen",
- "wasm-bindgen-macro-support",
- "worker-sys",
-]
-
-[[package]]
-name = "worker-sys"
-version = "0.8.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a440092e7ae7c5feb5507fbdc6aee0cc241d132757c83e1729766a24cddff82"
-dependencies = [
- "cfg-if",
- "js-sys",
- "wasm-bindgen",
- "web-sys",
 ]
 
 [[package]]

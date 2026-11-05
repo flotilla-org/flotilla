@@ -2230,7 +2230,8 @@ mod tests {
         }
         wait_for_calls(&calls, 2).await;
         let before = calls.load(Ordering::SeqCst);
-        let hint = flotilla_relay_protocol::parse_hint_subject("cr/github.com/flotilla-org/flotilla/2051").expect("hint");
+        let hint =
+            flotilla_address::Address::change_request(&flotilla_address::Forge::github(), "flotilla-org/flotilla", 2051).expect("hint");
         refresher.refresh_hint(&hint).await.expect("hint");
         assert_eq!(calls.load(Ordering::SeqCst), before + 2, "both namespaces refresh once");
 
@@ -2264,11 +2265,13 @@ mod tests {
         wait_for_calls(&calls, 1).await;
         let before = calls.load(Ordering::SeqCst);
 
-        let other = flotilla_relay_protocol::parse_hint_subject("cr/github.com/flotilla-org/flotilla/2054").expect("other hint");
+        let other = flotilla_address::Address::change_request(&flotilla_address::Forge::github(), "flotilla-org/flotilla", 2054)
+            .expect("other hint");
         refresher.refresh_hint(&other).await.expect("other hint");
         assert_eq!(calls.load(Ordering::SeqCst), before, "another change request's hint refreshes nothing");
 
-        let hint = flotilla_relay_protocol::parse_hint_subject("cr/github.com/flotilla-org/flotilla/2053").expect("hint");
+        let hint =
+            flotilla_address::Address::change_request(&flotilla_address::Forge::github(), "flotilla-org/flotilla", 2053).expect("hint");
         refresher.refresh_hint(&hint).await.expect("hint");
         assert_eq!(calls.load(Ordering::SeqCst), before + 1, "the host-spelled hint names the forge-id-spelled demand");
     }
