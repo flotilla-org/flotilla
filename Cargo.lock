@@ -6303,7 +6303,7 @@ dependencies = [
 [[package]]
 name = "rigging-relay-protocol"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=eec34d59c4bfa03ae8f781519c02b906a5f8cb51#eec34d59c4bfa03ae8f781519c02b906a5f8cb51"
+source = "git+https://github.com/flotilla-org/rigging?rev=6cb480672f9ec989e26a577dbcbdae9a7df2ab96#6cb480672f9ec989e26a577dbcbdae9a7df2ab96"
 dependencies = [
  "serde",
  "serde_json",

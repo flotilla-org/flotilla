@@ -105,7 +105,7 @@ rigging-condition = { git = "https://github.com/flotilla-org/rigging", rev = "3c
 # branch that adds the crate, which depends on no other rigging crate; the pins above stay
 # at drydock's rev so drydock and flotilla share one copy of each. All move to one rigging
 # main rev, with drydock's, once the crate merges.
-rigging-relay-protocol = { git = "https://github.com/flotilla-org/rigging", rev = "eec34d59c4bfa03ae8f781519c02b906a5f8cb51" }
+rigging-relay-protocol = { git = "https://github.com/flotilla-org/rigging", rev = "6cb480672f9ec989e26a577dbcbdae9a7df2ab96" }
 binnacle-cli = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d", features = ["described", "clap"] }
 binnacle-core = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d" }
 binnacle-described = { git = "https://github.com/flotilla-org/binnacle", rev = "cb1822f6afeffbbefbd460fbe06826668e3c467d" }
