@@ -94,18 +94,7 @@ async fn cloud_daemon(settings: &str) -> TestDaemon {
 // forced delete then completes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn abandoning_a_convoy_whose_sandbox_the_vendor_deleted_releases_its_teardown() {
-    deleted_sandbox_releases_teardown("").await;
-}
-
-// On the engine, where the Lost status is written only as the engine's answer,
-// the same.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn on_the_engine_abandoning_a_convoy_whose_sandbox_the_vendor_deleted_releases_its_teardown() {
-    deleted_sandbox_releases_teardown(PRIMITIVES).await;
-}
-
-async fn deleted_sandbox_releases_teardown(settings: &str) {
-    let daemon = cloud_daemon(settings).await;
+    let daemon = cloud_daemon("").await;
     let (convoy, environment, checkout) = working_cloud_convoy(&daemon).await;
     assert!(daemon.vendor().vanish(&environment));
     daemon.wait("Lost", environment_named(&environment, |status| status.phase == EnvironmentPhase::Lost)).await;
@@ -117,17 +106,35 @@ async fn deleted_sandbox_releases_teardown(settings: &str) {
         archives.iter().any(|archive| archive.checkout == checkout && archive.status == CheckoutArchiveStatus::Lost),
         "abandon names the checkout unrecoverable: {archives:?}"
     );
-    daemon.wait_gone::<Checkout>(&checkout).await;
+    released_with_nothing_asked_of_the_vendor(&daemon, &convoy, &environment, &checkout).await;
+}
+
+// On the engine, where the Lost status is written only as the engine's answer,
+// the lost vessel fails its convoy, so teardown begins without the operator:
+// the gone backing releases it all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn on_the_engine_a_convoy_whose_sandbox_the_vendor_deleted_releases_its_teardown() {
+    let daemon = cloud_daemon(PRIMITIVES).await;
+    let (convoy, environment, checkout) = working_cloud_convoy(&daemon).await;
+    assert!(daemon.vendor().vanish(&environment));
+    released_with_nothing_asked_of_the_vendor(&daemon, &convoy, &environment, &checkout).await;
+}
+
+/// The checkout and environment of a sandbox the vendor deleted are released,
+/// the checkout's lost work recorded, and a forced delete then completes, with
+/// no destroy asked of the vendor.
+async fn released_with_nothing_asked_of_the_vendor(daemon: &TestDaemon, convoy: &str, environment: &str, checkout: &str) {
+    daemon.wait_gone::<Checkout>(checkout).await;
     // The checkout's record leaves an event saying what went with the backing.
     daemon
         .wait("the lost work recorded", |event: &ResourceObject<Event>| {
             event.spec.reason == "CheckoutWorkLost" && event.spec.regarding.name == checkout
         })
         .await;
-    daemon.wait_gone::<Environment>(&environment).await;
-    let deleted = daemon.execute(CommandAction::ConvoyDelete { namespace: None, name: convoy.clone(), force: true }).await;
+    daemon.wait_gone::<Environment>(environment).await;
+    let deleted = daemon.execute(CommandAction::ConvoyDelete { namespace: None, name: convoy.into(), force: true }).await;
     assert!(!matches!(deleted, CommandValue::Error { .. }), "nothing holds the forced delete: {deleted:?}");
-    daemon.wait_gone::<Convoy>(&convoy).await;
+    daemon.wait_gone::<Convoy>(convoy).await;
     let counts = daemon.counts();
     assert_eq!((counts.environments_vanished, counts.environment_destroys_not_found, counts.live_environments), (1, 0, 0), "{counts:?}");
 }
