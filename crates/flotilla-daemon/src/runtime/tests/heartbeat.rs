@@ -1,7 +1,6 @@
 use super::*;
-use flotilla_resources::{Clock, FulfilmentGrant};
+use flotilla_resources::FulfilmentGrant;
 use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
 
 #[tokio::test(start_paused = true)]
 async fn controller_loop_watchdog_reports_and_clears_a_stale_heartbeat() {
@@ -230,18 +229,9 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
     let status = hosts.get(&host_id).await.expect("host").status.expect("status");
     assert_eq!(status.fulfilment_facts["host-direct-async-facts-test"].toolchains["rustc"], "rustc 1.94.1");
 
+    // The engine Host keeps no model probe state (`host_import.rs`); the probe's own count is
+    // what a later probe reads.
     let mut model_probes = ModelProbeState { total_requests: 2, ..ModelProbeState::default() };
-    flotilla_store::apply_status_patch(
-        &hosts,
-        &host_id,
-        &HostStatusPatch::FulfilmentFacts { facts: status.fulfilment_facts.clone(), model_probes: model_probes.clone() },
-    )
-    .await
-    .expect("publish model probe count");
-    apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &profile, None, &health, &runtime_health)
-        .await
-        .expect("heartbeat preserves model probe count");
-    assert_eq!(hosts.get(&host_id).await.expect("host").status.expect("status").model_probes.total_requests, 2);
 
     // Recently cached observations retain independent availability, but neither
     // old verdict from another account can be republished as model evidence.
@@ -322,40 +312,35 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
 
 // #1496: a replicated description must produce a HostSnapshot for live
 // surfaces without a query or peer-summary message, including while offline.
+// The engine Host carries only the description's architecture (`host_import.rs`), so that
+// is what the remote home changes.
 #[tokio::test]
 async fn host_description_watch_publishes_offline_replica_updates() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"host-watch-observer\"\n").expect("daemon config");
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
-    let remote = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("remote-root"));
-    let hosts = remote.using::<Host>(NAMESPACE);
-    let created = hosts.create(&empty_meta("remote-host"), &HostSpec::default()).await.expect("remote host");
-    let summary = HostSummary::builder()
-        .environment_id(EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("remote-host")))
-        .host_name(flotilla_protocol::HostName::new("remote"))
-        .node(flotilla_protocol::NodeInfo::new(NodeId::new("remote-node"), "remote"))
-        .system(flotilla_protocol::SystemInfo { os: Some("linux".into()), ..Default::default() })
-        .build();
-    hosts
-        .update_status(
-            "remote-host",
-            &created.metadata.resource_version,
-            &HostStatus { description: Some(summary.clone()), heartbeat_at: Some(Utc::now()), ..Default::default() },
-        )
-        .await
-        .expect("remote description");
+    let target = daemon.decided_store().expect("decided store");
+    let remote = flotilla_provisioning_testkit::other_home_for(&target, "remote-root");
+    let environment_id = EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("remote-host"));
+    let described = |arch: &str| HostStatus {
+        description: Some(
+            HostSummary::builder()
+                .environment_id(environment_id.clone())
+                .node(flotilla_protocol::NodeInfo::new(NodeId::new("remote-root"), "remote"))
+                .system(flotilla_protocol::SystemInfo { arch: Some(arch.into()), ..Default::default() })
+                .build(),
+        ),
+        heartbeat_at: Some(Utc::now()),
+        ..Default::default()
+    };
+    remote.host("remote-host", &HostSpec::default(), Some(&described("amd64"))).await;
     let mut events = daemon.subscribe();
     let projection = spawn_host_description_projection_task(Arc::clone(&daemon), NAMESPACE.to_string(), Duration::from_secs(3600));
-    daemon
-        .resource_backend()
-        .replica_writer::<Host>(NodeId::new("remote-root"), NAMESPACE)
-        .replace(&hosts.list().await.expect("remote list"), Utc::now())
-        .await
-        .expect("replicate");
+    remote.replicate_to(&target);
     let snapshot = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let flotilla_protocol::DaemonEvent::HostSnapshot(snapshot) = events.recv().await.expect("event") {
-                if snapshot.environment_id == summary.environment_id {
+                if snapshot.environment_id == environment_id {
                     break snapshot;
                 }
             }
@@ -363,29 +348,14 @@ async fn host_description_watch_publishes_offline_replica_updates() {
     })
     .await
     .expect("watch publishes replicated description");
-    assert_eq!(snapshot.summary, summary);
+    assert_eq!(snapshot.summary.system.arch.as_deref(), Some("amd64"));
     assert_eq!(snapshot.connection_status, flotilla_protocol::PeerConnectionState::Disconnected);
-    let current = hosts.get("remote-host").await.expect("current host");
-    let mut changed = summary.clone();
-    changed.system.cpu_count = Some(8);
-    hosts
-        .update_status(
-            "remote-host",
-            &current.metadata.resource_version,
-            &HostStatus { description: Some(changed.clone()), heartbeat_at: Some(Utc::now()), ..Default::default() },
-        )
-        .await
-        .expect("change remote description");
-    daemon
-        .resource_backend()
-        .replica_writer::<Host>(NodeId::new("remote-root"), NAMESPACE)
-        .replace(&hosts.list().await.expect("updated list"), Utc::now())
-        .await
-        .expect("replicate update");
+    remote.host("remote-host", &HostSpec::default(), Some(&described("arm64"))).await;
+    remote.replicate_to(&target);
     let updated = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let flotilla_protocol::DaemonEvent::HostSnapshot(snapshot) = events.recv().await.expect("event") {
-                if snapshot.environment_id == summary.environment_id && snapshot.summary == changed {
+                if snapshot.environment_id == environment_id && snapshot.summary.system.arch.as_deref() == Some("arm64") {
                     break snapshot;
                 }
             }
@@ -406,9 +376,11 @@ async fn heartbeat_task_updates_host_status_without_socket_server() {
     let config = Arc::new(ConfigStore::with_base(temp.path()));
     let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
     let host_id = daemon.local_host_id().expect("local host id").to_string();
-    let profile = manual_profile(&host_id, false);
+    let profile = own_host_profile(&daemon, false);
 
-    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi", None).await.expect("host registration should succeed");
+    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, &profile.display_name, None)
+        .await
+        .expect("host registration should succeed");
     let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
     flotilla_store::apply_status_patch(
         &hosts,
@@ -420,25 +392,19 @@ async fn heartbeat_task_updates_host_status_without_socket_server() {
     )
     .await
     .expect("seed sleep inhibition health");
-    let blob_store = Arc::new(TieredBlobStore::new(temp.path(), vec![("test-fleet".to_string(), Arc::new(MemoryBlobStore::default()))]));
-    blob_store.put(b"pending host status blob").await.expect("local blob put");
-    // Blob sync status is folded into the heartbeat's write rather than written on its own cadence.
+    // The engine Host keeps what decisions read: generation, adapters and the conditions that
+    // block readiness. Display fields and metrics (blob sync, memory, store figures, version,
+    // fingerprint, disk figures) are dropped (`host_import.rs`).
     let heartbeat = spawn_heartbeat_task_with_credentials(
         Arc::clone(&daemon),
         NAMESPACE.to_string(),
         profile,
         Arc::new(None),
         test_health_identity(),
-        RuntimeHealth::default().with_blob_store(Arc::clone(&blob_store)),
+        RuntimeHealth::default(),
         Duration::from_millis(20),
     );
 
-    wait_until_with_timeout(Duration::from_secs(30), || {
-        let hosts = hosts.clone();
-        let host_id = host_id.clone();
-        async move { hosts.get(&host_id).await.ok().and_then(|host| host.status).is_some_and(|status| status.heartbeat_at.is_some()) }
-    })
-    .await;
     wait_until_with_timeout(Duration::from_secs(30), || {
         let hosts = hosts.clone();
         let host_id = host_id.clone();
@@ -448,39 +414,19 @@ async fn heartbeat_task_updates_host_status_without_socket_server() {
                 .await
                 .ok()
                 .and_then(|host| host.status)
-                .and_then(|status| status.blob_sync)
-                .is_some_and(|sync| sync.pending_count == 1)
+                .is_some_and(|status| status.heartbeat_at.is_some() && status.daemon_generation.is_some())
         }
     })
     .await;
     let status = hosts.get(&host_id).await.expect("get host").status.expect("host status");
-    assert_eq!(status.blob_sync.as_ref().expect("blob sync status").pending_count, 1);
-    let local_environment_id = daemon.local_host_summary().await.environment_id;
-    let host_status = daemon.get_host_status_internal(&local_environment_id).await.expect("query host status");
-    assert_eq!(host_status.blob_sync.as_ref().expect("host query blob sync").pending_count, 1);
     assert!(!status.ready, "sleep inhibition failure should keep the host degraded");
     assert_eq!(status.agent_adapters().expect("valid agent adapter capability"), BTreeSet::new());
-    assert_eq!(status.capabilities.get("docker"), Some(&json!(false)));
-    assert_eq!(status.capabilities.get("terminal_pools"), Some(&json!(["passthrough"])));
     assert_eq!(status.daemon_generation.as_deref(), Some("test-generation"));
-    assert_eq!(status.daemon_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
-    // Publish the exact handshake fingerprint, independently of restart identity.
-    assert_eq!(status.protocol_fingerprint.as_deref(), Some(flotilla_protocol::PROTOCOL_FINGERPRINT));
-    assert!(status.daemon_started_at.is_some());
-    assert!(status.disk_free_bytes.is_some());
-    assert!(status.daemon_rss_bytes.is_some_and(|bytes| bytes > 0));
-    assert!(matches!(status.sleep_inhibition, flotilla_protocol::SleepInhibitionHealth::Failed { consecutive_failures: 3, .. }));
     assert_eq!(status.conditions.len(), 1);
     assert_eq!(status.conditions[0].condition_type, flotilla_resources::SLEEP_INHIBITION_CONDITION_TYPE);
     assert!(status.conditions[0].message.contains("polkit denied"));
-    assert!(
-        status.resource_store.expect("heartbeat should publish resource store diagnostics").event_log_within_retention(),
-        "heartbeat should report a bounded resource event log"
-    );
     let fleet = daemon.fleet_health_internal().await.expect("query fleet health");
     let local = fleet.hosts.iter().find(|host| host.is_local).expect("local fleet-health row");
-    assert_eq!(local.blob_sync.as_ref().expect("fleet list blob sync").pending_count, 1);
-    assert!(local.daemon_rss_bytes.is_some_and(|bytes| bytes > 0));
     assert!(
         local.degraded_conditions.iter().any(|condition| condition.contains("SleepInhibition") && condition.contains("polkit denied")),
         "fleet health should expose the sleep-inhibition condition: {:?}",
@@ -618,165 +564,6 @@ fn unresolved_fulfilment_provider_publishes_unknown(tc: hegel::TestCase) {
         assert_eq!(facts.free_vessel_slots, (!pool).then_some(0));
         assert_eq!(model_probes.total_requests, 0);
     });
-}
-
-/// The daemon clock on a paused tokio runtime: wall time advances only with
-/// `tokio::time::advance`, so heartbeat timestamps follow the test's intervals.
-struct PausedClock {
-    origin: chrono::DateTime<Utc>,
-    started: tokio::time::Instant,
-}
-
-impl Clock for PausedClock {
-    fn now(&self) -> chrono::DateTime<Utc> {
-        self.origin + chrono::Duration::from_std(self.started.elapsed()).expect("paused elapsed time fits")
-    }
-}
-
-/// Yield until `condition` holds. The paused clock cannot advance while the
-/// test waits (a blocking task inhibits auto-advance), so the bound is real time.
-async fn settle<F, Fut>(what: &str, mut condition: F)
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while !condition().await {
-        assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::task::yield_now().await;
-    }
-}
-
-// Behaviour (#3154, done-when): on the SQLite backend, the Host's periodic
-// writers commit its status at most once per heartbeat interval. Blob sync
-// status is folded into the heartbeat, and a 5 s fulfilment probe that only
-// refreshes `observed_at` (an unresolved provider re-stamps "unknown" every
-// pass) commits nothing. `heartbeat_at` advances every interval.
-#[tokio::test(start_paused = true)]
-async fn host_status_commits_at_most_once_per_heartbeat_interval_on_sqlite() {
-    const INTERVAL: Duration = Duration::from_secs(30);
-    // SQLite runs on its own threads; holding a blocking task stops the paused
-    // clock auto-advancing (and tripping the store's read deadline) while the
-    // test waits for them. Time then moves only through `advance`.
-    let (release, held) = std::sync::mpsc::channel::<()>();
-    let hold = tokio::task::spawn_blocking(move || held.recv().ok());
-
-    let temp = TempDir::new().expect("tempdir");
-    fs::write(temp.path().join("daemon.toml"), "machine_id = \"heartbeat-coalescing-test\"\n").expect("daemon config");
-    let config = Arc::new(ConfigStore::with_base(temp.path()));
-    std::fs::create_dir_all(config.state_dir()).expect("state dir");
-    let backend = ResourceBackend::new(SqliteBackend::open(config.state_dir().join("resources.sqlite")).expect("sqlite backend"));
-    let clock = Arc::new(PausedClock { origin: Utc::now(), started: tokio::time::Instant::now() });
-    let mut discovery = git_process_discovery(false);
-    discovery.runner = Arc::new(NoPrProcessRunner);
-    let daemon = InProcessDaemon::new_with_resource_backend_and_clock(
-        Vec::new(),
-        Arc::clone(&config),
-        discovery,
-        flotilla_protocol::HostName::new("test-host"),
-        backend,
-        clock.clone(),
-        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
-    )
-    .await;
-    let host_id = daemon.local_host_id().expect("local host id").to_string();
-    let profile = manual_profile(&host_id, false);
-    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi", None).await.expect("host registration");
-    daemon
-        .resource_backend()
-        .using::<FulfilmentKind>(NAMESPACE)
-        .create(
-            &empty_meta("unresolved-kind"),
-            &FulfilmentKindSpec::builder()
-                .host_ref(host_id.clone())
-                .pool("passthrough".to_string())
-                .realisation(FulfilmentRealisation::HostDirect)
-                .build(),
-        )
-        .await
-        .expect("fulfilment kind");
-    let blob_store = Arc::new(TieredBlobStore::new(temp.path(), vec![("test-fleet".to_string(), Arc::new(MemoryBlobStore::default()))]));
-    blob_store.put(b"pending host status blob").await.expect("local blob put");
-    let runtime_health = RuntimeHealth::default().with_blob_store(Arc::clone(&blob_store));
-    let observations = runtime_health.host_observations.clone();
-    let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
-    let tasks = [
-        spawn_heartbeat_task_with_credentials(
-            Arc::clone(&daemon),
-            NAMESPACE.to_string(),
-            profile.clone(),
-            Arc::new(None),
-            test_health_identity(),
-            runtime_health,
-            INTERVAL,
-        ),
-        // No environment provider: every pass observes a fresh "unknown".
-        spawn_local_fulfilment_probe_task(
-            Arc::clone(&daemon),
-            NAMESPACE.to_string(),
-            profile,
-            Arc::new(ProviderRegistry::new()),
-            temp.path().join("probe-cwd"),
-            observations.clone(),
-            FULFILMENT_CHANGE_CHECK_INTERVAL,
-        ),
-    ];
-    let probe_time = || {
-        let observations = observations.clone();
-        async move { observations.fulfilment_facts().await.and_then(|facts| facts.get("unresolved-kind").map(|facts| facts.observed_at)) }
-    };
-    let read = |hosts: flotilla_store::TypedResolver<Host>, host_id: String| async move {
-        let host = hosts.get(&host_id).await.expect("get host");
-        (host.metadata.resource_version.parse::<u64>().expect("numeric resource version"), host.status.unwrap_or_default())
-    };
-
-    // Startup: the first heartbeat and the first fulfilment pass publish.
-    settle("first heartbeat and probe", || {
-        let (hosts, host_id) = (hosts.clone(), host_id.clone());
-        async move {
-            let (_, status) = read(hosts, host_id).await;
-            status.heartbeat_at.is_some() && status.fulfilment_facts.contains_key("unresolved-kind") && probe_time().await.is_some()
-        }
-    })
-    .await;
-    let (mut version, status) = read(hosts.clone(), host_id.clone()).await;
-    assert_eq!(status.blob_sync.as_ref().expect("blob sync folded into the heartbeat").pending_count, 1);
-    let first_probe = status.fulfilment_facts["unresolved-kind"].observed_at;
-
-    for interval in 1..=10 {
-        for _ in 0..6 {
-            let previous_probe = probe_time().await;
-            tokio::time::advance(Duration::from_secs(5)).await;
-            settle("fulfilment pass", || async { probe_time().await != previous_probe }).await;
-        }
-        let expected_heartbeat = clock.now();
-        settle("heartbeat", || {
-            let (hosts, host_id) = (hosts.clone(), host_id.clone());
-            async move { read(hosts, host_id).await.1.heartbeat_at == Some(expected_heartbeat) }
-        })
-        .await;
-        let (current, status) = read(hosts.clone(), host_id.clone()).await;
-        assert_eq!(current - version, 1, "interval {interval}: exactly the heartbeat commits the Host status");
-        version = current;
-        // The heartbeat folds the probe's refreshed observation time into its write.
-        assert!(status.fulfilment_facts["unresolved-kind"].observed_at > first_probe, "interval {interval}");
-        assert!(status.heartbeat_is_fresh(clock.now()));
-    }
-
-    // A patch that changes nothing commits nothing.
-    let unchanged = HostStatusPatch::SleepInhibition {
-        health: read(hosts.clone(), host_id.clone()).await.1.sleep_inhibition,
-        observed_at: clock.now(),
-    };
-    flotilla_store::apply_status_patch(&hosts, &host_id, &unchanged).await.expect("unchanged patch");
-    assert_eq!(read(hosts.clone(), host_id.clone()).await.0, version, "an unchanged patch commits nothing");
-
-    for task in tasks {
-        task.abort();
-        let _ = task.await;
-    }
-    release.send(()).expect("release blocking hold");
-    hold.await.expect("blocking hold");
 }
 
 // #4002: grants come from observation. A host-direct kind stored with a GUI

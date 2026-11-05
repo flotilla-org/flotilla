@@ -170,7 +170,6 @@ pub(super) async fn serve(
             connection_role: Some(flotilla_protocol::ConnectionRole::Client),
             surface: None,
             crew_claims: Default::default(),
-            primitives: false,
         })
         .await
         .is_err()

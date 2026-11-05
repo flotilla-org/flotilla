@@ -615,11 +615,10 @@ struct HttpStreamSample {
 #[tokio::test]
 async fn http_change_stream_requires_peer_session() {
     use flotilla_protocol::CommandValue;
-    use flotilla_schema::{KindRegistry, NewChange, Timestamp};
+    use flotilla_schema::{NewChange, Timestamp};
     use flotilla_schema_sqlite::stream::Service;
-    let (_dir, daemon) = super::super::tests::empty_daemon().await;
     let files = tempfile::tempdir().expect("files");
-    let mut kinds = KindRegistry::new();
+    let mut kinds = super::super::tests::decided_kinds();
     kinds.register::<HttpStreamSample>().expect("kind");
     let service = Arc::new(Service::open(&files.path().join("home.db"), "home", kinds).expect("service"));
     service
@@ -635,7 +634,7 @@ async fn http_change_stream_requires_peer_session() {
             write.commit()
         })
         .expect("seed more frames than the producer queues");
-    daemon.install_decided_store(Arc::clone(&service)).expect("store");
+    let (_dir, daemon) = super::super::tests::daemon_with_decided_store("local", Arc::clone(&service)).await;
     let router =
         HttpRouter::for_daemon(Arc::clone(&daemon), Arc::new(LoginStore::new(daemon.clock_for_scenarios())), ListenerOrigin::default())
             .into_router();

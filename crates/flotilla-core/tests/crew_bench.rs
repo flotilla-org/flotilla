@@ -1,7 +1,7 @@
 //! Crew kinds load benchmark (#3629 layer 6): ignored by default.
 //!
 //! ```text
-//! cargo test -p flotilla-provisioning --release --locked --test crew_bench -- --ignored --nocapture
+//! cargo test -p flotilla-core --release --locked --test crew_bench -- --ignored --nocapture
 //! ```
 //!
 //! `CREW_BENCH_CONVOYS` sets the load (default 10,000), so a run can be staged upward under a

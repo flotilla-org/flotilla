@@ -4,7 +4,6 @@ mod clone_reconciler;
 mod common;
 mod environment_reconciler;
 mod image_build;
-mod image_check;
 mod lifecycle_read_contract;
 mod repository_reconciler;
 #[path = "../../../../tests/support/integration_modules.rs"]

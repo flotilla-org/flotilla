@@ -172,7 +172,12 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         )
         .await
         .expect("fulfilment kind");
-    replicate::<FulfilmentKind>(&home, &placement, home_daemon.node_id()).await;
+    // A FulfilmentKind is an engine record: it reaches the placement as its home's log does.
+    flotilla_provisioning_testkit::other_home::replicate_home(
+        &home_daemon.decided_store().expect("home decided store"),
+        home_daemon.node_id().as_str(),
+        &placement_daemon.decided_store().expect("placement decided store"),
+    );
     let environments = placement.clone().using::<Environment>("flotilla");
     let environment = environments
         .create(

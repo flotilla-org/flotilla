@@ -25,7 +25,7 @@ use flotilla_state_machines::{
 const NS: &str = "flotilla";
 
 /// The engine path at one daemon: its decided store homed at its node id.
-async fn engine(daemon: &Arc<InProcessDaemon>, dir: &tempfile::TempDir) -> (Arc<Service>, Arc<MessagePrimitives>) {
+async fn engine(daemon: &Arc<InProcessDaemon>) -> (Arc<Service>, Arc<MessagePrimitives>) {
     let backend = daemon.resource_backend();
     backend
         .clone()
@@ -48,11 +48,9 @@ async fn engine(daemon: &Arc<InProcessDaemon>, dir: &tempfile::TempDir) -> (Arc<
         )
         .await
         .expect("fleet designation");
+    // The daemon composes with its decided store; the Message path opens over it as its runtime does.
     let home = daemon.node_id().as_str().to_owned();
-    let service = Arc::new(
-        Service::open(&dir.path().join("decided.sqlite"), &home, flotilla_engine_store::registry().expect("registry")).expect("store"),
-    );
-    daemon.install_decided_store(Arc::clone(&service)).expect("decided store");
+    let service = daemon.decided_store().expect("decided store");
     let primitives =
         Arc::new(MessagePrimitives::open(&home, Arc::clone(&service), backend, Arc::new(SystemClock)).expect("message primitives"));
     daemon.install_message_primitives(Arc::clone(&primitives)).expect("message path");
@@ -149,17 +147,25 @@ pub(super) struct DropStep {
 // age; a reply to a fleet role is routed by subject.
 pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subject(operations: &[DropStep]) {
     // Both homes' Convoy and session replicas are written by hand below, so the
-    // router replicates only Host identity.
-    let topology = flotilla_daemon_testkit::server::spawn_in_memory_request_topology_with_replication_kinds(
-        super::empty_daemon_named("home-a").await,
-        super::empty_daemon_named("home-b").await,
-        &[Host::API_PATHS.kind],
+    // router replicates only Host identity. The decided stores' change streams are
+    // pumped by hand too: each home's request to follow the other is dropped.
+    let drop_change_streams: flotilla_daemon_testkit::server::EnvelopeFilter = Arc::new(|message| match &message {
+        flotilla_protocol::PeerWireMessage::Routed(flotilla_protocol::RoutedPeerMessage::CommandRequest { command, .. })
+            if matches!(command.action, flotilla_protocol::CommandAction::QueryChangeStream { .. }) =>
+        {
+            None
+        }
+        _ => Some(message),
+    });
+    let mesh = flotilla_daemon_testkit::server::spawn_in_memory_request_mesh_with_filter(
+        vec![super::empty_daemon_named("home-a").await, super::empty_daemon_named("home-b").await],
+        Some(&[Host::API_PATHS.kind]),
+        drop_change_streams,
     )
     .await
     .expect("two-home router");
-    let (a, b) = (&topology.leader, &topology.follower);
-    let (dir_a, dir_b) = (tempfile::tempdir().expect("dir"), tempfile::tempdir().expect("dir"));
-    let ((store_a, engine_a), (store_b, engine_b)) = (engine(a, &dir_a).await, engine(b, &dir_b).await);
+    let (a, b) = (&mesh.hosts[0], &mesh.hosts[1]);
+    let ((store_a, engine_a), (store_b, engine_b)) = (engine(a).await, engine(b).await);
     let (home_a, home_b) = (a.node_id().as_str().to_owned(), b.node_id().as_str().to_owned());
 
     // Convoy X, the subject, is homed at A; the crew it asks about lives at B.
@@ -298,7 +304,7 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
                 document: serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":name}, "spec":cancel}),
             })
             .build();
-        let id = topology.client.execute(command).await.expect("routed cancellable admission");
+        let id = mesh.clients[0].execute(command).await.expect("routed cancellable admission");
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if let flotilla_protocol::DaemonEvent::CommandFinished { command_id, node_id, result, .. } =

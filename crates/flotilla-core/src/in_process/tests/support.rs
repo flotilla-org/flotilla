@@ -395,64 +395,125 @@ pub(in crate::in_process) fn test_meta(name: &str) -> InputMeta {
 const PLACEMENT_DISK_FREE_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 const PLACEMENT_FREE_SPACE_FLOOR_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
-pub(super) async fn host_direct_kind(backend: &ResourceBackend, name: &str, host_ref: &str) -> ResourceObject<FulfilmentKind> {
-    backend
-        .using::<FulfilmentKind>("flotilla")
-        .create(
-            &test_meta(name),
-            &FulfilmentKindSpec::builder()
-                .host_ref(host_ref.to_string())
-                .pool("passthrough".to_string())
-                .grants(BTreeSet::from([
-                    FulfilmentGrant::platform("linux".to_string()),
-                    FulfilmentGrant::host_account_reach(),
-                    FulfilmentGrant::network("host".to_string()),
-                ]))
-                .realisation(FulfilmentRealisation::HostDirect)
-                .build(),
-        )
-        .await
-        .expect("host-direct kind")
+pub(super) fn host_direct_kind_spec(host_ref: &str) -> FulfilmentKindSpec {
+    FulfilmentKindSpec::builder()
+        .host_ref(host_ref.to_string())
+        .pool("passthrough".to_string())
+        .grants(BTreeSet::from([
+            FulfilmentGrant::platform("linux".to_string()),
+            FulfilmentGrant::host_account_reach(),
+            FulfilmentGrant::network("host".to_string()),
+        ]))
+        .realisation(FulfilmentRealisation::HostDirect)
+        .build()
 }
 
-pub(super) async fn create_host_direct_placement(
-    backend: &ResourceBackend,
+pub(super) async fn host_direct_kind(backend: &ResourceBackend, name: &str, host_ref: &str) -> ResourceObject<FulfilmentKind> {
+    backend.using::<FulfilmentKind>("flotilla").create(&test_meta(name), &host_direct_kind_spec(host_ref)).await.expect("host-direct kind")
+}
+
+/// Where a test writes Hosts: a plain store holds any, and a daemon's store only those homed at
+/// that daemon (ADR 0064); another host's are written at its own home and replicated in.
+#[derive(Clone, Copy)]
+pub(super) enum HostsAt<'a> {
+    Store(&'a ResourceBackend),
+    Daemon(&'a InProcessDaemon),
+}
+
+impl<'a> From<&'a ResourceBackend> for HostsAt<'a> {
+    fn from(backend: &'a ResourceBackend) -> Self {
+        Self::Store(backend)
+    }
+}
+
+impl<'a> From<&'a InProcessDaemon> for HostsAt<'a> {
+    fn from(daemon: &'a InProcessDaemon) -> Self {
+        Self::Daemon(daemon)
+    }
+}
+
+impl<'a> From<&'a Arc<InProcessDaemon>> for HostsAt<'a> {
+    fn from(daemon: &'a Arc<InProcessDaemon>) -> Self {
+        Self::Daemon(daemon)
+    }
+}
+
+impl HostsAt<'_> {
+    pub(super) fn backend(self) -> ResourceBackend {
+        match self {
+            Self::Store(backend) => backend.clone(),
+            Self::Daemon(daemon) => daemon.resource_backend(),
+        }
+    }
+
+    /// Whether Host `name` with `spec` is written through [`Self::backend`].
+    fn homes(self, name: &str, spec: &HostSpec) -> bool {
+        let Self::Daemon(daemon) = self else { return true };
+        let home_host = match &spec.connection {
+            flotilla_resources::HostConnection::Daemon => name,
+            flotilla_resources::HostConnection::SshHost { owning_daemon, .. } => owning_daemon.as_str(),
+        };
+        daemon.local_host_id().is_some_and(|own| own.to_string() == home_host)
+    }
+}
+
+/// Writes Host `name`, with `status` as its home observes it, where it is homed.
+pub(super) async fn put_host<'a>(at: impl Into<HostsAt<'a>>, name: &str, spec: &HostSpec, status: &HostStatus) {
+    let at = at.into();
+    if !at.homes(name, spec) {
+        let HostsAt::Daemon(daemon) = at else { unreachable!("a plain store homes every host") };
+        let target = daemon.decided_store().expect("decided store");
+        flotilla_provisioning_testkit::put_host_at_its_home(&target, name, spec, Some(status)).await;
+        return;
+    }
+    let hosts = at.backend().using::<ResourceHost>("flotilla");
+    let version = match hosts.get(name).await {
+        Ok(held) => held.metadata.resource_version,
+        Err(_) => hosts.create(&test_meta(name), spec).await.expect("host create").metadata.resource_version,
+    };
+    hosts.update_status(name, &version, status).await.expect("host status update");
+}
+
+/// Host `name` as read where it is held, from whichever home wrote it.
+pub(super) async fn read_host<'a>(at: impl Into<HostsAt<'a>>, name: &str) -> ResourceObject<ResourceHost> {
+    at.into().backend().including_replicas::<ResourceHost>("flotilla").get(name).await.expect("host").object
+}
+
+pub(super) async fn create_host_direct_placement<'a>(
+    at: impl Into<HostsAt<'a>>,
     kind_name: &str,
     host_ref: &str,
     agent_adapters: BTreeSet<String>,
 ) {
-    let hosts = backend.using::<ResourceHost>("flotilla");
-    let host = hosts
-        .create(
-            &test_meta(host_ref),
-            &HostSpec { display_name: host_ref.to_string(), connection: Default::default(), ..HostSpec::default() },
-        )
-        .await
-        .expect("host create");
-    hosts
-        .update_status(
-            &host.metadata.name,
-            &host.metadata.resource_version,
-            &HostStatus {
-                capabilities: [
-                    (
-                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
-                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
-                    ),
-                    (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(agent_adapters)),
-                ]
-                .into_iter()
-                .collect(),
-                heartbeat_at: Some(Utc::now()),
-                ready: true,
-                disk_free_bytes: Some(PLACEMENT_DISK_FREE_BYTES),
-                admission_free_space_floor_bytes: Some(PLACEMENT_FREE_SPACE_FLOOR_BYTES),
-                ..HostStatus::default()
-            },
-        )
-        .await
-        .expect("host status update");
-    host_direct_kind(backend, kind_name, host_ref).await;
+    let at = at.into();
+    create_host_direct_host(at, host_ref, agent_adapters).await;
+    host_direct_kind(&at.backend(), kind_name, host_ref).await;
+}
+
+/// A ready host for host-direct placements, offering `agent_adapters`.
+pub(super) async fn create_host_direct_host<'a>(at: impl Into<HostsAt<'a>>, host_ref: &str, agent_adapters: BTreeSet<String>) {
+    put_host(
+        at,
+        host_ref,
+        &HostSpec { display_name: host_ref.to_string(), connection: Default::default(), ..HostSpec::default() },
+        &HostStatus {
+            capabilities: [
+                (
+                    flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                    serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                ),
+                (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(agent_adapters)),
+            ]
+            .into_iter()
+            .collect(),
+            heartbeat_at: Some(Utc::now()),
+            ready: true,
+            disk_free_bytes: Some(PLACEMENT_DISK_FREE_BYTES),
+            admission_free_space_floor_bytes: Some(PLACEMENT_FREE_SPACE_FLOOR_BYTES),
+            ..HostStatus::default()
+        },
+    )
+    .await;
 }
 
 pub(super) fn trusted_codex_workflow() -> WorkflowTemplateSpec {
@@ -517,59 +578,50 @@ pub(in crate::in_process) async fn create_running_session(daemon: &InProcessDaem
 
 /// A ready Docker host and a literal-image Docker kind on it whose image the
 /// host probed for the Codex harness.
-pub(super) async fn create_docker_placement(
-    backend: &ResourceBackend,
+pub(super) async fn create_docker_placement<'a>(
+    at: impl Into<HostsAt<'a>>,
     kind_name: &str,
     host_ref: &str,
     held_credentials: BTreeSet<String>,
 ) {
-    let hosts = backend.clone().using::<ResourceHost>("flotilla");
-    let host = hosts
-        .create(
-            &test_meta(host_ref),
-            &HostSpec { display_name: host_ref.to_string(), connection: Default::default(), ..HostSpec::default() },
-        )
-        .await
-        .expect("host create");
-    hosts
-        .update_status(
-            &host.metadata.name,
-            &host.metadata.resource_version,
-            &HostStatus {
-                capabilities: [
-                    (flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(held_credentials)),
-                    (
-                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
-                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
-                    ),
-                    ("docker".to_string(), serde_json::json!(true)),
-                    ("os".to_string(), serde_json::json!("linux")),
-                ]
-                .into_iter()
-                .collect(),
-                heartbeat_at: Some(Utc::now()),
-                ready: true,
-                resource_store: None,
-                disk_free_bytes: Some(PLACEMENT_DISK_FREE_BYTES),
-                admission_free_space_floor_bytes: Some(PLACEMENT_FREE_SPACE_FLOOR_BYTES),
-                fulfilment_facts: BTreeMap::from([(
-                    kind_name.to_string(),
-                    FulfilmentFacts {
-                        harnesses: BTreeMap::from([(
-                            "codex".to_string(),
-                            HarnessFacts { version: "0.160.0".to_string(), models: BTreeMap::new() },
-                        )]),
-                        observed_at: Utc::now(),
-                        ..Default::default()
-                    },
-                )]),
-                ..HostStatus::default()
-            },
-        )
-        .await
-        .expect("host status update");
-    backend
-        .clone()
+    let at = at.into();
+    put_host(
+        at,
+        host_ref,
+        &HostSpec { display_name: host_ref.to_string(), connection: Default::default(), ..HostSpec::default() },
+        &HostStatus {
+            capabilities: [
+                (flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(held_credentials)),
+                (
+                    flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                    serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                ),
+                ("docker".to_string(), serde_json::json!(true)),
+                ("os".to_string(), serde_json::json!("linux")),
+            ]
+            .into_iter()
+            .collect(),
+            heartbeat_at: Some(Utc::now()),
+            ready: true,
+            resource_store: None,
+            disk_free_bytes: Some(PLACEMENT_DISK_FREE_BYTES),
+            admission_free_space_floor_bytes: Some(PLACEMENT_FREE_SPACE_FLOOR_BYTES),
+            fulfilment_facts: BTreeMap::from([(
+                kind_name.to_string(),
+                FulfilmentFacts {
+                    harnesses: BTreeMap::from([(
+                        "codex".to_string(),
+                        HarnessFacts { version: "0.160.0".to_string(), models: BTreeMap::new() },
+                    )]),
+                    observed_at: Utc::now(),
+                    ..Default::default()
+                },
+            )]),
+            ..HostStatus::default()
+        },
+    )
+    .await;
+    at.backend()
         .using::<FulfilmentKind>("flotilla")
         .create(
             &test_meta(kind_name),
@@ -586,12 +638,12 @@ pub(super) async fn create_docker_placement(
         .expect("Docker kind");
 }
 
-pub(super) async fn set_host_credential_expiry(backend: &ResourceBackend, host_ref: &str, expiry: BTreeMap<String, CredentialExpiry>) {
-    let hosts = backend.clone().using::<ResourceHost>("flotilla");
-    let host = hosts.get(host_ref).await.expect("host resource");
+pub(super) async fn set_host_credential_expiry<'a>(at: impl Into<HostsAt<'a>>, host_ref: &str, expiry: BTreeMap<String, CredentialExpiry>) {
+    let at = at.into();
+    let host = read_host(at, host_ref).await;
     let mut status = host.status.expect("host status");
     status.capabilities.insert(flotilla_resources::CREDENTIAL_EXPIRY_CAPABILITY.to_string(), serde_json::json!(expiry));
-    hosts.update_status(host_ref, &host.metadata.resource_version, &status).await.expect("update host status");
+    put_host(at, host_ref, &host.spec, &status).await;
 }
 
 pub(super) async fn stall_test_daemon() -> (Arc<InProcessDaemon>, ResourceBackend, tempfile::TempDir, tokio::task::JoinHandle<()>) {

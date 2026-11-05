@@ -237,9 +237,7 @@ fn build_peer_manager(
             daemon.session_id(),
             Arc::clone(&command_runner),
             SshTransportPaths { state_dir: config.state_dir().as_path(), daemon_socket: local_daemon_socket_path },
-        )
-        .map(|transport| transport.with_local_primitives(daemon.primitives_switch()))
-        {
+        ) {
             Ok(transport) => {
                 peer_manager.add_configured_target(ConfigLabel(name), expected_host_name, expected_node_id, Box::new(transport));
             }
@@ -505,11 +503,10 @@ impl DaemonServer {
         idle_timeout: Duration,
     ) -> Result<Self, String> {
         let daemon_config = config.load_daemon_config()?;
-        let primitives_on = daemon_config.primitives()?.is_some();
         let host_name = daemon_config.host_name.map(HostName::new).unwrap_or_else(HostName::local);
         let (resource_backend, store_metrics) = retry_phase("open_resource_backend", || build_embedded_resource_backend(&config)).await?;
         let load_metrics = Arc::new(http::metrics::LoadMetrics::new(store_metrics));
-        let engine = crate::runtime::engine_opener(&config)?;
+        let engine = crate::runtime::engine_opener(&config);
         let daemon = phase(
             "initialize_in_process_daemon",
             InProcessDaemon::new_composed(
@@ -524,7 +521,6 @@ impl DaemonServer {
             ),
         )
         .await?;
-        daemon.set_primitives_switch(primitives_on);
         let peer_manager = build_peer_manager(&daemon, &config, &socket_path)?;
         phase("sync_peer_query_state", sync_peer_query_state(&peer_manager, &daemon)).await;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1145,7 +1141,7 @@ async fn handle_client_session_with_identity(
     match first_msg {
         // The main socket derives identity from kernel peer evidence; in-band
         // claims are honoured only by environment sockets.
-        Message::Hello { protocol_version, node_id, display_name, session_id, connection_role, surface, crew_claims: _, primitives } => {
+        Message::Hello { protocol_version, node_id, display_name, session_id, connection_role, surface, crew_claims: _ } => {
             if environment_context.is_some() {
                 warn!("peer/client hello on per-environment socket is unsupported");
                 return;
@@ -1200,7 +1196,6 @@ async fn handle_client_session_with_identity(
                         connection_role: Some(ConnectionRole::Client),
                         surface: None,
                         crew_claims: Default::default(),
-                        primitives: false,
                     })
                     .await
                     .is_err()
@@ -1256,7 +1251,7 @@ async fn handle_client_session_with_identity(
             } else {
                 // Peer path (ConnectionRole::Peer or None) — existing behavior.
                 PeerConnection::new(daemon, shutdown_rx, inbound_peer_tx, peer_manager, peer_connected_tx, client_count, client_notify)
-                    .run(session, protocol_version, node_id, display_name, session_id, primitives)
+                    .run(session, protocol_version, node_id, display_name, session_id)
                     .await;
             }
         }

@@ -9,8 +9,6 @@ use flotilla_dummy_fleet::{
 };
 use flotilla_resources::{Convoy, ConvoyPhase, Environment, EnvironmentPhase, ResourceObject, VESSEL_REF_LABEL};
 
-const PRIMITIVES: &str = "[primitives]\n";
-
 /// An environment of one of `convoy`'s vessels, in `phase`.
 fn of_convoy(convoy: &str, phase: EnvironmentPhase) -> impl Fn(&ResourceObject<Environment>) -> bool + '_ {
     move |environment| {
@@ -25,26 +23,20 @@ fn in_phase(convoy: &str, phase: ConvoyPhase) -> impl Fn(&ResourceObject<Convoy>
 
 // A cloud sandbox the vendor deletes, or stops with no resume available, is
 // Lost: the daemon learns it only from what the vendor reports, and no stored
-// record is touched to make it so.
+// record is touched to make it so; the Lost status is written only as the
+// engine's answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cloud_sandbox_the_vendor_deletes_becomes_lost() {
-    cloud_sandbox_becomes_lost(DummyVendor::vanish, "").await;
+    cloud_sandbox_becomes_lost(DummyVendor::vanish).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cloud_sandbox_the_vendor_stops_becomes_lost() {
-    cloud_sandbox_becomes_lost(DummyVendor::stop, "").await;
+    cloud_sandbox_becomes_lost(DummyVendor::stop).await;
 }
 
-// On the engine, where the Lost status is written only as the engine's answer, a cloud sandbox
-// the vendor deletes is Lost too.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn on_the_engine_a_cloud_sandbox_the_vendor_deletes_becomes_lost() {
-    cloud_sandbox_becomes_lost(DummyVendor::vanish, PRIMITIVES).await;
-}
-
-async fn cloud_sandbox_becomes_lost(vendor: fn(&DummyVendor, &str) -> bool, settings: &str) {
-    let daemon = TestDaemon::builder().settings(settings).start().await;
+async fn cloud_sandbox_becomes_lost(vendor: fn(&DummyVendor, &str) -> bool) {
+    let daemon = TestDaemon::builder().start().await;
     let convoy = daemon.dispatch(CrewMix::Coder, DUMMY_CLOUD_FULFILMENT_KIND).await;
     let ready = daemon.wait("a Ready cloud sandbox", of_convoy(&convoy, EnvironmentPhase::Ready)).await;
     assert!(ready.spec.cloud_sandbox.is_some(), "{ready:?}");

@@ -74,15 +74,27 @@ pub(super) fn credential_mapping_config(path: &Path, key: Option<&str>) {
     fs::write(path.join("daemon.toml"), config).expect("write daemon config");
 }
 
-pub(super) async fn declare_mapping_forge(backend: &ResourceBackend, namespace: &str) {
-    let spec = ForgeSpec::builder()
+fn mapping_forge_spec() -> ForgeSpec {
+    ForgeSpec::builder()
         .forge_id("lab".to_string())
         .kind(flotilla_resources::ForgeKind::Forgejo)
         .hosts(BTreeSet::from(["lab.example".to_string()]))
         .https_url("https://lab.example".to_string())
         .git_ssh_host("lab.example".to_string())
-        .build();
-    backend.using::<Forge>(namespace).create(&empty_meta("lab"), &spec).await.expect("declare Forge");
+        .build()
+}
+
+pub(super) async fn declare_mapping_forge(backend: &ResourceBackend, namespace: &str) {
+    backend.using::<Forge>(namespace).create(&empty_meta("lab"), &mapping_forge_spec()).await.expect("declare Forge");
+}
+
+/// The mapping's Forge declared at another home, `home`, under a record name of its own (a
+/// name is held at one home), and replicated to `daemon` as that home's log arrives.
+pub(super) async fn declare_mapping_forge_at_home(daemon: &InProcessDaemon, home: &str) {
+    let target = daemon.decided_store().expect("decided store");
+    let other = flotilla_provisioning_testkit::other_home_for(&target, home);
+    other.definition("Forge", &format!("lab-{home}"), serde_json::to_value(mapping_forge_spec()).expect("Forge spec")).await;
+    other.replicate_to(&target);
 }
 
 #[derive(Clone)]
@@ -158,6 +170,13 @@ pub(super) fn manual_profile(host_id: &str, docker_available: bool) -> LocalProv
         docker_available,
         max_vessels: None,
     }
+}
+
+/// [`manual_profile`] for `daemon`'s own host, named as the daemon names itself, as discovery
+/// builds it: the engine Host's description names the host by that display name.
+pub(super) fn own_host_profile(daemon: &InProcessDaemon, docker_available: bool) -> LocalProvisioningProfile {
+    let host_id = daemon.local_host_id().expect("local host id").to_string();
+    LocalProvisioningProfile { display_name: daemon.host_name().to_string(), ..manual_profile(&host_id, docker_available) }
 }
 
 pub(super) async fn daemon_with_backend(

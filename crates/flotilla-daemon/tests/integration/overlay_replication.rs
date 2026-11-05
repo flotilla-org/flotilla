@@ -46,14 +46,36 @@ async fn daemon_with_backend(path: std::path::PathBuf, machine_id: &str, host: &
     .await
 }
 
+/// Waits until `at` holds `home`'s own Host, written at its home and replicated through the
+/// engine store's change stream, and returns it.
+async fn await_host_replica(at: &InProcessDaemon, home: &InProcessDaemon) -> flotilla_resources::ResourceObject<Host> {
+    let name = home.local_host_id().expect("home host id").to_string();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let hosts = at.resource_backend().including_replicas::<Host>("flotilla").list().await.expect("list host sources");
+            if let Some(host) = hosts.items.into_iter().find(|host| {
+                host.object.metadata.name == name
+                    && matches!(&host.provenance, ResourceProvenance::Replica { origin_root, .. } if origin_root == home.node_id())
+            }) {
+                break host.object;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} did not replicate its Host to {}", home.host_name(), at.host_name()))
+}
+
+// A host's self-report reaches its peers' fleet health. On the engine (ADR 0064) a Host keeps
+// what decisions read: its generation, and when its home was last heard as its heartbeat. Its
+// version, start time, free disk and memory are display figures and metrics, not recorded there.
 #[tokio::test]
 async fn sqlite_daemons_expose_remote_host_self_report_in_fleet_health() {
     let temp = tempfile::tempdir().expect("tempdir");
     let kiwi = sqlite_daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
     let feta = sqlite_daemon(temp.path().join("feta"), "feta-root", "feta").await;
     let feta_host_id = feta.local_host_summary().await.environment_id.host_id().expect("feta host id").to_string();
-    let started_at = chrono::Utc::now() - chrono::Duration::hours(2);
-    let heartbeat_at = chrono::Utc::now();
+    let reported_at = chrono::Utc::now();
     let feta_hosts = feta.resource_backend().using::<Host>("flotilla");
     let feta_host = feta_hosts
         .create(&InputMeta::builder().name(feta_host_id.clone()).build(), &HostSpec::default())
@@ -64,13 +86,9 @@ async fn sqlite_daemons_expose_remote_host_self_report_in_fleet_health() {
             &feta_host_id,
             &feta_host.metadata.resource_version,
             &HostStatus {
-                heartbeat_at: Some(heartbeat_at),
+                heartbeat_at: Some(reported_at),
                 ready: true,
                 daemon_generation: Some("feta-generation".to_string()),
-                daemon_version: Some("0.1.0".to_string()),
-                daemon_started_at: Some(started_at),
-                disk_free_bytes: Some(459_371_896_832),
-                daemon_rss_bytes: Some(123_456_789),
                 ..HostStatus::default()
             },
         )
@@ -78,36 +96,15 @@ async fn sqlite_daemons_expose_remote_host_self_report_in_fleet_health() {
         .expect("publish feta host self-report");
 
     let topology = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect sqlite daemons");
-
-    let replicated = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let hosts = kiwi.resource_backend().including_replicas::<Host>("flotilla").list().await.expect("list kiwi host sources");
-            if let Some(host) = hosts.items.into_iter().find(|host| {
-                matches!(host.provenance, ResourceProvenance::Replica { .. })
-                    && host.object.status.as_ref().and_then(|status| status.daemon_version.as_deref()) == Some("0.1.0")
-            }) {
-                break host;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("feta host self-report did not replicate to kiwi");
-    assert!(matches!(
-        replicated.provenance,
-        ResourceProvenance::Replica { ref origin_root, .. } if origin_root == feta.node_id()
-    ));
+    let replicated = await_host_replica(&kiwi, &feta).await;
+    assert_eq!(replicated.status.as_ref().and_then(|status| status.daemon_generation.as_deref()), Some("feta-generation"));
 
     let health = kiwi.fleet_health_internal().await.expect("query kiwi fleet health");
     let row = health.hosts.into_iter().find(|row| row.host == HostName::new("feta")).expect("feta fleet health row");
 
-    assert_eq!(row.daemon_version.as_deref(), Some("0.1.0"));
     assert_eq!(row.daemon_generation.as_deref(), Some("feta-generation"));
-    assert_eq!(row.heartbeat_at, Some(heartbeat_at));
+    assert!(row.heartbeat_at.is_some_and(|heard| heard >= reported_at), "the heartbeat is when feta was last heard: {row:?}");
     assert_eq!(row.link, PeerConnectionState::Connected);
-    assert_eq!(row.disk_free_bytes, Some(459_371_896_832));
-    assert_eq!(row.daemon_rss_bytes, Some(123_456_789));
-    assert!(row.daemon_uptime_seconds.is_some_and(|uptime| uptime >= 2 * 60 * 60));
     drop(topology);
 }
 
@@ -175,6 +172,8 @@ async fn fleet_list_and_health_include_replicated_remote_crew_without_snapshot_f
     })
     .await
     .expect("remote crew did not appear in fleet list");
+    // The Host travels the engine store's change stream, beside the old store's replication.
+    await_host_replica(&kiwi, &feta).await;
     let list = kiwi.fleet_list_internal().await.expect("fleet list");
     let row = list.rows.iter().find(|row| row.session.as_deref() == Some("feta-session")).expect("feta crew row");
     assert_eq!(row.host, HostName::new("feta"));
@@ -709,94 +708,6 @@ fn project_spec(display_name: &str, workflow: &str) -> ProjectSpec {
         .default_workflow_ref(workflow.to_string())
         .repositories(Vec::new())
         .build()
-}
-
-#[tokio::test]
-async fn connected_daemons_causally_merge_project_definitions() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let kiwi = daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
-    let feta = daemon(temp.path().join("feta"), "feta-root", "feta").await;
-    let meta = InputMeta::builder().name("widgets".to_string()).build();
-    kiwi.resource_backend()
-        .definitions::<Project>("flotilla")
-        .apply(&meta, &project_spec("Widgets", "default"))
-        .await
-        .expect("create Project on kiwi");
-
-    let topology = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect topology");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if feta
-                .resource_backend()
-                .definitions::<Project>("flotilla")
-                .get("widgets")
-                .await
-                .is_ok_and(|project| project.spec.display_name == "Widgets")
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("initial Project replication timed out");
-    drop(topology);
-
-    kiwi.resource_backend()
-        .definitions::<Project>("flotilla")
-        .apply(&meta, &project_spec("Kiwi Widgets", "default"))
-        .await
-        .expect("offline edit on kiwi");
-    feta.resource_backend()
-        .definitions::<Project>("flotilla")
-        .apply(&meta, &project_spec("Feta Widgets", "feta-flow"))
-        .await
-        .expect("offline edit on feta");
-
-    let reconnected = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("reconnect topology");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let kiwi_project = kiwi.resource_backend().definitions::<Project>("flotilla").get("widgets").await;
-            let feta_project = feta.resource_backend().definitions::<Project>("flotilla").get("widgets").await;
-            if let (Ok(kiwi_project), Ok(feta_project)) = (kiwi_project, feta_project) {
-                let kiwi_merge = kiwi_project.metadata.merge.as_ref().expect("kiwi merge metadata");
-                let feta_merge = feta_project.metadata.merge.as_ref().expect("feta merge metadata");
-                if kiwi_project.spec.default_workflow_ref == "feta-flow"
-                    && feta_project.spec.default_workflow_ref == "feta-flow"
-                    && kiwi_merge.conflicts.contains_key("spec.display_name")
-                    && feta_merge.conflicts.contains_key("spec.display_name")
-                {
-                    break;
-                }
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("concurrent Project replication timed out");
-    let listed = kiwi.list_projects_internal().await.expect("list conflicted Projects");
-    let widgets = listed.projects.iter().find(|project| project.name == "widgets").expect("widgets Project in list");
-    assert_eq!(widgets.conflicts, vec!["spec.display_name"], "Project list should expose a compact conflict badge");
-
-    kiwi.resource_backend()
-        .definitions::<Project>("flotilla")
-        .apply(&meta, &project_spec("Resolved Widgets", "feta-flow"))
-        .await
-        .expect("resolve Project conflict");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let resolved = feta.resource_backend().definitions::<Project>("flotilla").get("widgets").await;
-            if resolved.is_ok_and(|project| {
-                project.spec.display_name == "Resolved Widgets" && project.metadata.merge.is_some_and(|merge| merge.conflicts.is_empty())
-            }) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("Project conflict resolution replication timed out");
-    drop(reconnected);
 }
 
 #[tokio::test]

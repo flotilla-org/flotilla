@@ -156,3 +156,21 @@ pub fn production_kinds() -> Result<KindRegistry, RegistryError> {
     register(&mut registry)?;
     Ok(registry)
 }
+
+/// Every kind the daemon's decided store holds (ADR 0064, #3108): Message and AgentSession
+/// (#3317), the kinds registered by [`register`], and the engine's Vessel and Ensure (#3629),
+/// each under its production code.
+pub fn decided_registry() -> Result<KindRegistry, RegistryError> {
+    let mut registry = flotilla_engine_store::registry()?;
+    register(&mut registry)?;
+    flotilla_engine_store::register_crew(&mut registry)?;
+    Ok(registry)
+}
+
+/// The machine diagram of each kind in [`decided_registry`], by kind name.
+pub fn decided_diagrams() -> Result<BTreeMap<String, String>, RegistryError> {
+    let mut all = flotilla_engine_store::machine_registry()?.diagrams;
+    all.extend(diagrams());
+    all.extend(flotilla_engine_store::crew_diagrams());
+    Ok(all)
+}

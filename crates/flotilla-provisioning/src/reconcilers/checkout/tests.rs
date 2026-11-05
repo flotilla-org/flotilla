@@ -9,7 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE as NAMESPACE;
+const NAMESPACE: &str = "flotilla";
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;

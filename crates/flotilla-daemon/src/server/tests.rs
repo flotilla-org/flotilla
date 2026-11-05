@@ -733,7 +733,6 @@ fn current_client_hello() -> Message {
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
         crew_claims: Default::default(),
-        primitives: false,
     }
 }
 
@@ -868,6 +867,63 @@ async fn empty_daemon_named(host_name: &str) -> (tempfile::TempDir, Arc<InProces
     )
     .await;
     (tmp, daemon)
+}
+
+/// A daemon named `host_name` composed with `store` as its decided store, which the test opened
+/// with its own kinds beside the decided ones ([`decided_kinds`]).
+pub(super) async fn daemon_with_decided_store(
+    host_name: &str,
+    store: Arc<flotilla_schema_sqlite::stream::Service>,
+) -> (tempfile::TempDir, Arc<InProcessDaemon>) {
+    use flotilla_provisioning::engine::{
+        access_deliveries::EngineAccessDeliveries, account::EngineAccounts, artifacts::EngineArtifacts, definitions::EngineDefinitions,
+        hosts::EngineHosts, kinds::EngineKinds, manifest_root::EngineManifestRoots, observations::EngineObservations,
+        projects::EngineProjects, repositories::EngineRepositories,
+    };
+    use flotilla_resources::engine_records::EngineRecords;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = test_config_store(tmp.path().join("config"));
+    let engine: flotilla_core::in_process::EngineOpener = Box::new(move |identity: flotilla_core::in_process::EngineIdentity| {
+        Box::pin(async move {
+            let clock = || Arc::clone(&identity.clock);
+            let records: Vec<Arc<dyn EngineRecords>> = vec![
+                Arc::new(EngineDefinitions::open(Arc::clone(&store), clock())?),
+                Arc::new(EngineRepositories::open(Arc::clone(&store), clock())?),
+                Arc::new(EngineProjects::open(Arc::clone(&store), clock())?),
+                Arc::new(EngineArtifacts::open(Arc::clone(&store), clock())?),
+                Arc::new(EngineAccessDeliveries::open(Arc::clone(&store), clock())?),
+                Arc::new(EngineKinds::open(Arc::clone(&store), clock())?),
+                Arc::new(EngineHosts::open(Arc::clone(&store), identity.host_id.to_string(), clock())?),
+            ];
+            let observations = Arc::new(EngineObservations::open(Arc::clone(&store), clock())?);
+            Ok(flotilla_core::in_process::ComposedEngine {
+                accounts: Arc::new(EngineAccounts::open(Arc::clone(&store), clock())?),
+                manifest_roots: Arc::new(EngineManifestRoots::open(Arc::clone(&store), clock())?),
+                service: store,
+                records,
+                observations: observations.clone(),
+                observation_failures: observations,
+            })
+        }) as futures::future::BoxFuture<'static, _>
+    });
+    let daemon = InProcessDaemon::new_composed(
+        vec![],
+        config,
+        fake_discovery(false),
+        HostName::new(host_name),
+        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
+        Arc::new(flotilla_resources::SystemClock),
+        std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
+        engine,
+    )
+    .await
+    .expect("compose the daemon with the test's decided store");
+    (tmp, daemon)
+}
+
+/// The decided store's kinds, to which a test adds its own.
+pub(super) fn decided_kinds() -> flotilla_schema::KindRegistry {
+    flotilla_core::in_process::decided::registry().expect("decided registry")
 }
 
 fn test_config_store(config_dir: PathBuf) -> Arc<ConfigStore> {
@@ -2111,59 +2167,42 @@ fn host_direct_kind(host_ref: &str) -> FulfilmentKindSpec {
 async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option<flotilla_protocol::CommandCaller>) {
     let (_tmp, daemon) = empty_daemon().await;
     let (_remote_tmp, remote_daemon) = empty_daemon_named("feta").await;
+    // feta's Host and placement kind, written at its home and replicated to both daemons as its
+    // log arrives.
+    let target = daemon.decided_store().expect("decided store");
+    let feta = flotilla_provisioning_testkit::other_home_for(&target, "feta");
     let remote_host_id = "feta-host-id".to_string();
-    let remote_hosts = remote_daemon.resource_backend().using::<Host>("flotilla");
-    let remote_host = remote_hosts
-        .create(&InputMeta::builder().name(remote_host_id.clone()).build(), &HostSpec::default())
-        .await
-        .expect("create remote host resource");
-    remote_hosts
-        .update_status(
-            &remote_host_id,
-            &remote_host.metadata.resource_version,
-            &HostStatus {
-                capabilities: BTreeMap::from([
-                    (
-                        flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
-                        serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
-                    ),
-                    (flotilla_resources::AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"])),
-                ]),
-                fulfilment_facts: BTreeMap::from([(
-                    format!("host-direct-{remote_host_id}"),
-                    FulfilmentFacts {
-                        harnesses: BTreeMap::from([("codex".into(), HarnessFacts { version: "0.160.0".into(), models: BTreeMap::new() })]),
-                        ..Default::default()
-                    },
-                )]),
-                heartbeat_at: Some(chrono::Utc::now()),
-                daemon_generation: Some("feta-test".to_string()),
-                ready: true,
-                disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
-                admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
-                ..HostStatus::default()
-            },
-        )
-        .await
-        .expect("publish remote host capacity");
-    daemon
-        .resource_backend()
-        .replica_writer::<Host>(node("feta"), "flotilla")
-        .replace(&remote_hosts.list().await.expect("list remote host resources"), chrono::Utc::now())
-        .await
-        .expect("replicate remote host capacity");
+    feta.host(
+        &remote_host_id,
+        &HostSpec::default(),
+        Some(&HostStatus {
+            capabilities: BTreeMap::from([
+                (
+                    flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                    serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+                ),
+                (flotilla_resources::AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"])),
+            ]),
+            fulfilment_facts: BTreeMap::from([(
+                format!("host-direct-{remote_host_id}"),
+                FulfilmentFacts {
+                    harnesses: BTreeMap::from([("codex".into(), HarnessFacts { version: "0.160.0".into(), models: BTreeMap::new() })]),
+                    ..Default::default()
+                },
+            )]),
+            heartbeat_at: Some(chrono::Utc::now()),
+            daemon_generation: Some("feta-test".to_string()),
+            ready: true,
+            disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
+            admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
+            ..HostStatus::default()
+        }),
+    )
+    .await;
     let remote_policy_name = format!("host-direct-{remote_host_id}");
-    let remote_kinds = remote_daemon.resource_backend().using::<FulfilmentKind>("flotilla");
-    remote_kinds
-        .create(&InputMeta::builder().name(remote_policy_name.clone()).build(), &host_direct_kind(&remote_host_id))
-        .await
-        .expect("remote fulfilment kind at its home");
-    daemon
-        .resource_backend()
-        .replica_writer::<FulfilmentKind>(node("feta"), "flotilla")
-        .replace(&remote_kinds.list().await.expect("list remote fulfilment kinds"), chrono::Utc::now())
-        .await
-        .expect("replicate remote fulfilment kind");
+    feta.kind(&remote_policy_name, &host_direct_kind(&remote_host_id)).await;
+    feta.replicate_to(&target);
+    feta.replicate_to(&remote_daemon.decided_store().expect("remote decided store"));
     let remote_summary = HostSummary::builder()
         .environment_id(EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new(&remote_host_id)))
         .host_name(HostName::new("feta"))
@@ -2485,44 +2524,34 @@ async fn command_target_resolver_keeps_reads_local_and_routes_explicit_delivery(
 // refusal. A placement still needs a connected peer route for delivery.
 async fn dispatch_execute_requires_a_route_for_unready_or_statusless_placement() {
     let (_tmp, daemon) = empty_daemon().await;
-    let (_remote_tmp, remote_daemon) = empty_daemon_named("stopped").await;
-    let remote_backend = remote_daemon.resource_backend();
-    let hosts = remote_backend.using::<Host>("flotilla");
-    let host = hosts
-        .create(&InputMeta::builder().name("stopped-host-id".to_string()).build(), &HostSpec::default())
-        .await
-        .expect("create remote host");
-    hosts
-        .update_status(
-            &host.metadata.name,
-            &host.metadata.resource_version,
-            &HostStatus {
+    // The stopped daemon's records, written at its home and replicated here as its log arrives.
+    // Its Host is not ready: a blocking condition, as its daemon reports one.
+    let target = daemon.decided_store().expect("decided store");
+    let stopped = flotilla_provisioning_testkit::other_home_for(&target, "stopped");
+    let host_name = "stopped-host-id";
+    stopped
+        .host(
+            host_name,
+            &HostSpec::default(),
+            Some(&HostStatus {
                 daemon_generation: Some("stopped-generation".to_string()),
                 heartbeat_at: Some(chrono::Utc::now()),
                 ready: false,
+                conditions: vec![flotilla_resources::HostCondition::builder()
+                    .condition_type("Stopping")
+                    .value(flotilla_resources::ConditionValue::False)
+                    .reason("DaemonStopping")
+                    .message("the daemon is stopping")
+                    .observed_at(chrono::Utc::now())
+                    .blocks_forge_observation(false)
+                    .build()],
                 ..HostStatus::default()
-            },
+            }),
         )
-        .await
-        .expect("mark remote host not ready");
-    daemon
-        .resource_backend()
-        .replica_writer::<Host>(node("stopped"), "flotilla")
-        .replace(&hosts.list().await.expect("list remote host"), chrono::Utc::now())
-        .await
-        .expect("replicate not-ready host");
+        .await;
     let policy_name = "host-direct-stopped-host-id";
-    let kinds = remote_backend.using::<FulfilmentKind>("flotilla");
-    kinds
-        .create(&InputMeta::builder().name(policy_name.to_string()).build(), &host_direct_kind(&host.metadata.name))
-        .await
-        .expect("create remote fulfilment kind");
-    daemon
-        .resource_backend()
-        .replica_writer::<FulfilmentKind>(node("stopped"), "flotilla")
-        .replace(&kinds.list().await.expect("list remote fulfilment kinds"), chrono::Utc::now())
-        .await
-        .expect("replicate remote fulfilment kind");
+    stopped.kind(policy_name, &host_direct_kind(host_name)).await;
+    stopped.replicate_to(&target);
     let router = make_remote_command_router(
         &daemon,
         &Arc::new(Mutex::new(PeerManager::new(NodeId::new("local")))),
@@ -2551,27 +2580,11 @@ async fn dispatch_execute_requires_a_route_for_unready_or_statusless_placement()
         .expect_err("unreachable placement must be refused by peer routing");
     assert_eq!(error, "peer host stopped-host-id is not connected");
 
-    let statusless = hosts
-        .create(&InputMeta::builder().name("statusless-host-id".to_string()).build(), &HostSpec::default())
-        .await
-        .expect("create remote host without status");
-    daemon
-        .resource_backend()
-        .replica_writer::<Host>(node("stopped"), "flotilla")
-        .replace(&hosts.list().await.expect("list remote hosts"), chrono::Utc::now())
-        .await
-        .expect("replicate host without status");
+    let statusless = "statusless-host-id";
+    stopped.host(statusless, &HostSpec::default(), None).await;
     let statusless_policy = "host-direct-statusless-host-id";
-    kinds
-        .create(&InputMeta::builder().name(statusless_policy.to_string()).build(), &host_direct_kind(&statusless.metadata.name))
-        .await
-        .expect("create fulfilment kind without host status");
-    daemon
-        .resource_backend()
-        .replica_writer::<FulfilmentKind>(node("stopped"), "flotilla")
-        .replace(&kinds.list().await.expect("list remote fulfilment kinds"), chrono::Utc::now())
-        .await
-        .expect("replicate fulfilment kind without host status");
+    stopped.kind(statusless_policy, &host_direct_kind(statusless)).await;
+    stopped.replicate_to(&target);
     let error = router
         .dispatch_execute(
             Command::builder()
@@ -3862,7 +3875,6 @@ async fn handle_client_forwards_peer_link_state_and_registers_peer() {
         connection_role: None,
         surface: None,
         crew_claims: Default::default(),
-        primitives: false,
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
 
@@ -3933,7 +3945,6 @@ async fn silent_peer_session_is_reaped_at_idle_deadline() {
         connection_role: None,
         surface: None,
         crew_claims: Default::default(),
-        primitives: false,
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write peer hello");
     assert!(matches!(
@@ -4408,7 +4419,6 @@ async fn assert_client_hello_rejected(protocol_version: u32, display_name: Strin
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
         crew_claims: Default::default(),
-        primitives: false,
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
 
@@ -4452,7 +4462,6 @@ async fn wire_generation_mismatched_client_can_request_shutdown() {
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
         crew_claims: Default::default(),
-        primitives: false,
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write client hello");
     let hello = reader.next_line().await.expect("read hello").expect("hello payload");
@@ -4486,7 +4495,6 @@ async fn wire_generation_mismatched_client_cannot_request_rich_rpc() {
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
         surface: None,
         crew_claims: Default::default(),
-        primitives: false,
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write client hello");
     let _hello = reader.next_line().await.expect("read hello").expect("hello payload");
@@ -4978,7 +4986,6 @@ async fn handle_client_relays_outbound_peer_messages() {
         connection_role: None,
         surface: None,
         crew_claims: Default::default(),
-        primitives: false,
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
     let _ = reader.next_line().await.expect("read hello").expect("line");
@@ -5099,7 +5106,6 @@ async fn duplicate_inbound_peer_receives_goodbye_on_rejection() {
             connection_role: None,
             surface: None,
             crew_claims: Default::default(),
-            primitives: false,
         };
         flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
 
@@ -5832,7 +5838,6 @@ pub(super) async fn place_crew(daemon: &InProcessDaemon, environment: &str, plac
         .expect("crew identity");
 }
 
-mod primitives_peering;
 mod ssh_host_forward;
 
 // #3270: the transport's environment constrains every request, independently of
@@ -6879,16 +6884,20 @@ impl PeerSender for StreamCommandWire {
 // a damaged HTTP body and unreachable point-read homes retain explicit failures.
 #[tokio::test]
 async fn routed_only_change_stream_follows_snapshot_and_tail() {
-    use flotilla_schema::{Kind, KindRegistry, NewChange, Timestamp};
+    use flotilla_schema::{Kind, NewChange, Timestamp};
     use flotilla_schema_sqlite::stream::Service;
-    let (_local_dir, local) = empty_daemon().await;
-    let (_home_dir, home) = empty_daemon_named("home").await;
     let dir = tempfile::tempdir().unwrap();
-    let mut kinds = KindRegistry::new();
+    let mut kinds = decided_kinds();
     kinds.register::<RoutedStreamSample>().unwrap();
     let source = Arc::new(Service::open(&dir.path().join("source.db"), "home", kinds.clone()).unwrap());
     let target = Arc::new(Service::open(&dir.path().join("target.db"), "local", kinds.clone()).unwrap());
-    home.install_decided_store(Arc::clone(&source)).unwrap();
+    let fresh = Arc::new(Service::open(&dir.path().join("fresh.db"), "local", kinds).unwrap());
+    let (_local_dir, local) = daemon_with_decided_store("local", Arc::clone(&fresh)).await;
+    // The home's own tasks poll its decided store, which this test later holds locked from a
+    // writer while the follower waits out its frame deadline: they run on a runtime of their
+    // own, so they wait without stalling the test's current-thread runtime.
+    let home_runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let (_home_dir, home) = home_runtime.spawn(daemon_with_decided_store("home", Arc::clone(&source))).await.unwrap();
     let seed = |name: &str| {
         source
             .with_store(|store| {
@@ -7073,8 +7082,6 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
         current.version = stamp.version;
         current.value = next;
     }
-    let fresh = Arc::new(Service::open(&dir.path().join("fresh.db"), "local", kinds).unwrap());
-    local.install_decided_store(Arc::clone(&fresh)).unwrap();
     let following =
         tokio_util::task::AbortOnDropHandle::new(super::change_stream::follow(Arc::clone(&local), "home".into(), None, router.clone()));
     let failure = tokio::time::timeout(Duration::from_secs(15), async {
@@ -7165,19 +7172,15 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     assert_eq!(state.consecutive_failures, 0);
     assert!(state.last_error.is_none());
     remote.abort();
+    home_runtime.shutdown_background();
 }
 
 // Forwarded surface context must not acquire a whole-home replication cursor. Only the
 // peer-owned path (no caller or surface session) is admitted by the destination router.
 #[tokio::test]
 async fn routed_change_stream_origin_admission_rows() {
-    use flotilla_schema::KindRegistry;
-    use flotilla_schema_sqlite::stream::Service;
+    // The home serves the decided store it composed with.
     let (_dir, home) = empty_daemon_named("home").await;
-    let files = tempfile::tempdir().unwrap();
-    let mut kinds = KindRegistry::new();
-    kinds.register::<RoutedStreamSample>().unwrap();
-    home.install_decided_store(Arc::new(Service::open(&files.path().join("home.db"), "home", kinds).unwrap())).unwrap();
     let pm = Arc::new(Mutex::new(PeerManager::new(NodeId::new("home"))));
     let (tx, mut rx) = mpsc::channel(1);
     pm.lock().await.register_sender(NodeId::new("local"), Arc::new(StreamCommandWire(tx)));

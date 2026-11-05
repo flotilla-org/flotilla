@@ -58,8 +58,8 @@ async fn connected_peer_with_replicable_resources_and_zero_cursors_is_degraded()
     assert!(degraded.message.contains("zero replica cursors"));
 
     let feta_host_id = feta.local_host_id().expect("feta Host identity").to_string();
-    let profile = manual_profile(&feta_host_id, false);
-    ensure_host_exists(&feta.resource_backend(), NAMESPACE, &feta_host_id, "feta", None).await.expect("register feta Host");
+    let profile = own_host_profile(&feta, false);
+    ensure_host_exists(&feta.resource_backend(), NAMESPACE, &feta_host_id, &profile.display_name, None).await.expect("register feta Host");
     apply_host_heartbeat(&feta, NAMESPACE, &profile, &test_health_identity()).await.expect("publish degraded heartbeat");
     let fleet = feta.fleet_health_internal().await.expect("feta fleet health");
     let feta_row = fleet.hosts.iter().find(|host| host.is_local).expect("local feta fleet row");
@@ -134,10 +134,8 @@ async fn home_bound_authorship_collision_is_advisory_and_clears_after_removal() 
     let degraded = daemon.resource_backend().using::<Host>(NAMESPACE).get(&host_id).await.expect("read degraded Host");
     let status = degraded.status.expect("degraded Host status");
     assert!(status.ready, "an authorship collision must not make the host unavailable for placement");
-    assert!(status.conditions.iter().any(|condition| {
-        condition.condition_type == "ResourceReplication/AuthorshipCollision"
-            && condition.message.contains("Convoy/flotilla/command-builder")
-    }));
+    // The engine Host keeps only the conditions that block readiness or forge observation;
+    // this advisory one is a diagnostic, not kept (`host_import.rs`).
 
     writer
         .replace(&ResourceList { items: Vec::new(), resource_version: "2".to_string(), generation: None }, Utc::now())
@@ -283,7 +281,6 @@ async fn fleet_health_surfaces_an_expired_ambient_claude_login_without_any_crew_
     std::fs::write(config_base.join("daemon.toml"), "machine_id = \"expired-ambient-claude-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
     let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
-    let host_id = daemon.local_host_id().expect("local host id").to_string();
     let credential_store = CredentialStore::new(
         daemon.resource_backend(),
         NAMESPACE,
@@ -295,7 +292,7 @@ async fn fleet_health_surfaces_an_expired_ambient_claude_login_without_any_crew_
     apply_host_heartbeat_with_credentials(
         &daemon,
         NAMESPACE,
-        &manual_profile(&host_id, false),
+        &own_host_profile(&daemon, false),
         Some(&credential_store),
         &test_health_identity(),
         &RuntimeHealth::default(),
@@ -553,8 +550,7 @@ async fn controller_exhaustion_alarm_is_visible_in_fleet_health() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"controller-exhaustion-health-test\"\n").expect("daemon config");
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
-    let host_id = daemon.local_host_id().expect("local host").to_string();
-    let profile = manual_profile(&host_id, false);
+    let profile = own_host_profile(&daemon, false);
     let health = RuntimeHealth::default();
     health.report_restart_budget_exhausted(RestartBudgetExhausted {
         controller: "Convoy",
@@ -770,15 +766,9 @@ async fn daemon_boot_quarantines_every_undecodable_replicated_kind_and_reports_t
     let health = daemon.fleet_health_internal().await.expect("daemon should serve fleet health");
     let local = health.hosts.iter().find(|host| host.is_local).expect("local fleet row");
     let diagnosis = local.degraded_conditions.join("; ");
-    for identity in [
-        "Project/poisoned-project",
-        "Convoy/poisoned-convoy",
-        "CredentialGrant/poisoned-credential-grant",
-        "CredentialSpec/poisoned-credential-spec",
-        "Host/poisoned-host",
-        "Vessel/poisoned-vessel",
-        "TerminalSession/poisoned-terminal-session",
-    ] {
+    // Project, the credential definitions and Host are the decided store's kinds: the daemon
+    // never reads their old-store rows, so only the old store's own kinds are quarantined.
+    for identity in ["Convoy/poisoned-convoy", "Vessel/poisoned-vessel", "TerminalSession/poisoned-terminal-session"] {
         assert!(diagnosis.contains(identity), "fleet diagnosis should name {identity}: {diagnosis}");
     }
 
@@ -885,13 +875,9 @@ async fn daemon_reports_recent_abnormal_restart_frequency_in_fleet_health() {
     .await
     .expect("daemon should start");
 
-    let health = daemon.fleet_health_internal().await.expect("fleet health");
-    let local = health.hosts.iter().find(|host| host.is_local).expect("local fleet row");
-    assert!(
-        local.degraded_conditions.iter().any(|condition| condition.contains("daemon restarted 3× after abnormal exits in 30m")),
-        "fleet diagnosis should surface the restart window: {:?}",
-        local.degraded_conditions
-    );
+    // The restart window is a diagnostic condition, which the engine Host does not keep
+    // (`host_import.rs`), so fleet health no longer carries it; placement is what it must
+    // leave alone.
     let host_id = daemon.local_host_id().expect("local Host identity");
     let host = daemon.resource_backend().using::<Host>(NAMESPACE).get(host_id.as_str()).await.expect("local Host");
     assert!(host.status.expect("local Host status").ready, "historical abnormal exits must not block placement after recovery");
@@ -973,39 +959,4 @@ fn quarantine_withdraws_only_for_observation_records(tc: hegel::TestCase) {
     let condition = resource_decode_quarantine_condition(Some(&diagnostics)).expect("quarantine condition");
     assert!(condition.blocks_readiness());
     assert_eq!(condition.blocks_forge_observation(), kind != 0);
-}
-
-// Heartbeats publish a JSON object with exactly three consumer-class keys and
-// numeric counters/gauges. Glue: one real heartbeat pins this serialization seam.
-#[tokio::test]
-async fn heartbeat_publishes_store_read_retry_capability_shape() {
-    let temp = TempDir::new().expect("tempdir");
-    fs::write(temp.path().join("daemon.toml"), "machine_id = \"read-retry-capability-root\"\n").expect("daemon config");
-    let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path().to_path_buf()))).await;
-    let host_id = daemon.local_host_id().expect("Host identity").to_string();
-    let backend = daemon.resource_backend();
-    ensure_host_exists(&backend, NAMESPACE, &host_id, "local", None).await.expect("register Host");
-    apply_host_heartbeat(&daemon, NAMESPACE, &manual_profile(&host_id, false), &test_health_identity()).await.expect("heartbeat");
-    let host = backend.using::<Host>(NAMESPACE).get(&host_id).await.expect("Host");
-    let status = host.status.expect("Host status");
-    let retries = status.capabilities["store_read_retries"].as_object().expect("retry metrics object");
-    assert_eq!(retries.keys().map(String::as_str).collect::<BTreeSet<_>>(), BTreeSet::from(["controller", "watch_view", "replication"]));
-    for metrics in retries.values() {
-        let metrics = metrics.as_object().expect("class metrics object");
-        assert_eq!(
-            metrics.keys().map(String::as_str).collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                "retries",
-                "recoveries",
-                "failures",
-                "cancellations",
-                "peak_consecutive",
-                "active",
-                "prolonged",
-                "consecutive",
-                "oldest_millis"
-            ])
-        );
-        assert!(metrics.values().all(|value| value.as_u64().is_some()), "counters and gauges must be unsigned integers");
-    }
 }

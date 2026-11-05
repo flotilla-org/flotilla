@@ -15,16 +15,22 @@ pub(super) async fn replicate_local_kind<T: Resource>(source: &InProcessDaemon, 
         .unwrap_or_else(|error| panic!("replicate {} in test: {error}", T::API_PATHS.kind));
 }
 
+/// Sends everything `source`'s decided store holds of its own home to `target`'s, as its log
+/// arrives at a peer.
+pub(super) fn replicate_decided_store(source: &InProcessDaemon, target: &InProcessDaemon) {
+    let from = source.decided_store().expect("source decided store");
+    let to = target.decided_store().expect("target decided store");
+    flotilla_provisioning_testkit::replicate_home(&from, source.node_id().as_str(), &to);
+}
+
 pub(super) async fn bridge_runtime_resource_stores(first: &InProcessDaemon, second: &InProcessDaemon) {
     replicate_local_kind::<Convoy>(first, second).await;
     replicate_local_kind::<Vessel>(first, second).await;
-    replicate_local_kind::<FulfilmentKind>(first, second).await;
     replicate_local_kind::<ResourceCheckout>(first, second).await;
     replicate_local_kind::<TerminalSession>(first, second).await;
 
     replicate_local_kind::<Convoy>(second, first).await;
     replicate_local_kind::<Vessel>(second, first).await;
-    replicate_local_kind::<FulfilmentKind>(second, first).await;
     replicate_local_kind::<ResourceCheckout>(second, first).await;
     replicate_local_kind::<TerminalSession>(second, first).await;
 }
@@ -170,6 +176,8 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
         .create(&empty_meta(policy_name), &kind)
         .await
         .expect("create remote fulfilment kind");
+    // The kind is a decided record homed at kiwi: it reaches feta as kiwi's log does.
+    replicate_decided_store(&kiwi, &feta);
     let convoys = kiwi.resource_backend().using::<Convoy>(NAMESPACE);
     let convoy = convoys
         .create(

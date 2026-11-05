@@ -33,8 +33,8 @@ use serde_json::Value;
 
 use self::plan::Plan;
 
-/// The engine store a daemon with `[primitives]` on opens.
-pub const ENGINE_STORE: &str = "decided.sqlite";
+/// The engine store every daemon opens.
+pub use flotilla_core::in_process::decided::ENGINE_STORE;
 /// The old store the import reads.
 pub const OLD_STORE: &str = "resources.sqlite";
 /// The engine store while the import fills it.

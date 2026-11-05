@@ -1452,6 +1452,7 @@ mod tests {
         .await;
         let backend = daemon.resource_backend();
         let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, source.path())
+            .with_roots(daemon.manifest_roots())
             .with_declared_source("laptop-charter", daemon.local_host_id().expect("host").to_string())
             .with_binding(Some(CharterSource::LocalDirectory { directory: source.path().to_string_lossy().into_owned() }));
         write(&source.path().join("policy.yaml"), "bad: [");

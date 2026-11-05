@@ -347,14 +347,13 @@ async fn checkout_provider_watch_follows_namespace_changes() {
     .await;
     let spec = RepositorySpec::remote("https://github.com/example/namespace").expect("repository");
     let key = spec.key();
-    for namespace in ["flotilla", "other"] {
-        daemon
-            .resource_backend
-            .using::<Repository>(namespace)
-            .create(&InputMeta::builder().name(key.to_string()).build(), &spec)
-            .await
-            .expect("repository");
-    }
+    // The decided store has no namespaces: one Repository record reads in both.
+    daemon
+        .resource_backend
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(key.to_string()).build(), &spec)
+        .await
+        .expect("repository");
     observe(&daemon, &daemon.observed_resource_backend, "namespace", path, &key).await;
     let first = daemon.local_vcs_for_checkout(path).await.expect("first provider");
     let first_lifetime = Arc::downgrade(&first);

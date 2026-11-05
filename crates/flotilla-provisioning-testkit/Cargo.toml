@@ -14,9 +14,16 @@ flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
 flotilla-state-machines = { path = "../flotilla-state-machines" }
 flotilla-engine-store = { path = "../flotilla-engine-store" }
 flotilla-store-testkit = { path = "../flotilla-store-testkit" }
+flotilla-environment = { path = "../flotilla-environment" }
+flotilla-protocol = { path = "../flotilla-protocol" }
 rusqlite = { version = "0.37", features = ["bundled"] }
+async-trait = { workspace = true }
+reqwest = { workspace = true, features = ["charset", "http2", "json", "system-proxy"] }
+tokio = { workspace = true }
 
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

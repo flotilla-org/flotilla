@@ -126,7 +126,6 @@ pub struct SshTransport {
     task_handles: Vec<tokio::task::JoinHandle<()>>,
     /// Local daemon's session ID, included in outbound hello messages.
     local_session_id: uuid::Uuid,
-    local_primitives: bool,
     /// Session ID received from the remote peer during handshake.
     remote_session_id: Option<uuid::Uuid>,
     /// Remote node identity learned from the last successful hello handshake.
@@ -171,15 +170,9 @@ impl SshTransport {
             outbound_tx: None,
             task_handles: Vec::new(),
             local_session_id,
-            local_primitives: false,
             remote_session_id: None,
             remote_node_info: None,
         })
-    }
-
-    pub fn with_local_primitives(mut self, on: bool) -> Self {
-        self.local_primitives = on;
-        self
     }
 
     /// Spawn the SSH child process that forwards the remote socket locally.
@@ -346,7 +339,6 @@ impl SshTransport {
                 connection_role: None,
                 surface: None,
                 crew_claims: Default::default(),
-                primitives: self.local_primitives,
             },
         )
         .await?;
@@ -360,7 +352,7 @@ impl SshTransport {
             .ok_or_else(|| PRE_HELLO_CLOSE_ERROR.to_string())?;
         let hello = serde_json::from_str(&line).map_err(|e| format!("failed to parse peer hello: {e}"))?;
         let (remote_node_info, remote_session_id) =
-            Self::validate_remote_hello(&self.expected_host_name, self.expected_node_id.as_ref(), self.local_primitives, hello)?;
+            Self::validate_remote_hello(&self.expected_host_name, self.expected_node_id.as_ref(), hello)?;
         self.remote_node_info = Some(remote_node_info.clone());
         self.remote_session_id = Some(remote_session_id);
 
@@ -502,16 +494,12 @@ impl SshTransport {
     fn validate_remote_hello(
         expected_host_name: &HostName,
         expected_node_id: Option<&NodeId>,
-        local_primitives: bool,
         hello: Message,
     ) -> Result<(NodeInfo, uuid::Uuid), String> {
         match hello {
-            Message::Hello { protocol_version, node_id, display_name, session_id, primitives, .. } => {
+            Message::Hello { protocol_version, node_id, display_name, session_id, .. } => {
                 if protocol_version != PROTOCOL_VERSION {
                     return Err(format!("peer protocol version mismatch: expected {}, got {}", PROTOCOL_VERSION, protocol_version));
-                }
-                if let Some(reason) = flotilla_protocol::primitives_mismatch(&display_name, primitives, local_primitives) {
-                    return Err(reason);
                 }
                 match expected_node_id {
                     Some(expected_node_id) if &node_id != expected_node_id => {
@@ -1184,11 +1172,10 @@ mod tests {
             connection_role: None,
             surface: None,
             crew_claims: Default::default(),
-            primitives: false,
         };
 
         let (node, session_id) =
-            SshTransport::validate_remote_hello(&HostName::new("expected-host"), None, false, hello).expect("hello should be accepted");
+            SshTransport::validate_remote_hello(&HostName::new("expected-host"), None, hello).expect("hello should be accepted");
         assert_eq!(node, NodeInfo::new(NodeId::new("remote-node-1"), "remote-host"));
         assert_eq!(session_id, uuid::Uuid::nil());
     }
@@ -1203,10 +1190,9 @@ mod tests {
             connection_role: None,
             surface: None,
             crew_claims: Default::default(),
-            primitives: false,
         };
 
-        let err = SshTransport::validate_remote_hello(&HostName::new("expected-host"), None, false, hello)
+        let err = SshTransport::validate_remote_hello(&HostName::new("expected-host"), None, hello)
             .expect_err("unexpected protocol version should be rejected");
         assert!(err.contains("protocol"));
     }
@@ -1221,12 +1207,10 @@ mod tests {
             connection_role: None,
             surface: None,
             crew_claims: Default::default(),
-            primitives: false,
         };
 
-        let (node, _) =
-            SshTransport::validate_remote_hello(&HostName::new("expected-host"), Some(&NodeId::new("expected-node")), false, hello)
-                .expect("hello should be accepted");
+        let (node, _) = SshTransport::validate_remote_hello(&HostName::new("expected-host"), Some(&NodeId::new("expected-node")), hello)
+            .expect("hello should be accepted");
         assert_eq!(node, NodeInfo::new(NodeId::new("expected-node"), "different-display"));
     }
 
@@ -1240,10 +1224,9 @@ mod tests {
             connection_role: None,
             surface: None,
             crew_claims: Default::default(),
-            primitives: false,
         };
 
-        let err = SshTransport::validate_remote_hello(&HostName::new("expected-host"), Some(&NodeId::new("expected-node")), false, hello)
+        let err = SshTransport::validate_remote_hello(&HostName::new("expected-host"), Some(&NodeId::new("expected-node")), hello)
             .expect_err("mismatched expected node id should be rejected");
         assert!(err.contains("node id"));
     }
@@ -1258,11 +1241,10 @@ mod tests {
             connection_role: None,
             surface: None,
             crew_claims: Default::default(),
-            primitives: false,
         };
 
         let (node, _) =
-            SshTransport::validate_remote_hello(&HostName::new("expected-host"), None, false, hello).expect("hello should be accepted");
+            SshTransport::validate_remote_hello(&HostName::new("expected-host"), None, hello).expect("hello should be accepted");
         assert_eq!(node, NodeInfo::new(NodeId::new("someone-else"), "different-display"));
     }
 
@@ -1370,7 +1352,6 @@ mod tests {
                 connection_role: None,
                 surface: None,
                 crew_claims: Default::default(),
-                primitives: false,
             })
             .expect("serialize hello");
             let peer = serde_json::to_string(&Message::Peer(Box::new(PeerWireMessage::RouteAdvertisement {

@@ -1,4 +1,7 @@
 //! Real decided-store fixture shared by lifecycle reader contract tests.
+pub mod image_build;
+pub mod other_home;
+pub use other_home::{other_home_for, put_host_at_its_home, put_host_at_its_home_heard, replicate_home, replicate_home_at, OtherHome};
 use std::sync::{Arc, Mutex};
 
 use flotilla_engine_store::StoreLog;

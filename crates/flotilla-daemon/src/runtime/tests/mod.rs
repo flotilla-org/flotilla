@@ -108,7 +108,6 @@ use super::{
     test_git_repo::TestGitRepo, *,
 };
 use crate::{
-    blob_store::{BlobStore, MemoryBlobStore, TieredBlobStore},
     environment_tools::{
         tests::with_fourth_tool, EnvironmentToolProvisioner, CONTAINED_CARGO_SHIM_DIRECTORY, CONTAINED_CARGO_SHIM_PATH,
         CONTAINED_RUSTC_WRAPPER_PATH, ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH, ENVIRONMENT_CLEAT_LIBRARY_DIR, ENVIRONMENT_CLEAT_PATH,

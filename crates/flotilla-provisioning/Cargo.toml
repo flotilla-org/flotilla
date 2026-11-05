@@ -47,7 +47,6 @@ flotilla-store-testkit = { path = "../flotilla-store-testkit" }
 flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
 tokio = { workspace = true, features = ["test-util"] }
 serde = { workspace = true }
-flotilla-core = { path = "../flotilla-core" }
 hegeltest = "=0.48.1"
 tempfile = { workspace = true }
 

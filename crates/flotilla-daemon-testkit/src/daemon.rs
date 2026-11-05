@@ -128,7 +128,7 @@ impl TestDaemon {
         /// `[dummy_fleet.change_request]`.
         #[builder(default)]
         change_request: &str,
-        /// The rest of `daemon.toml`, such as `[primitives]` or `host_name`.
+        /// The rest of `daemon.toml`, such as `host_name`.
         #[builder(default)]
         settings: &str,
         clock: Option<Arc<dyn Clock>>,
@@ -141,7 +141,7 @@ impl TestDaemon {
         /// them read-only, as it does on such a host.
         forges: Option<ForgeTransport>,
         /// The old resource store: available (the default), or unavailable or
-        /// recording, which need `[primitives]` in `settings`.
+        /// recording.
         #[builder(default)]
         old_store: OldStoreMode,
     ) -> Self {
@@ -152,7 +152,6 @@ impl TestDaemon {
         let config = Arc::new(ConfigStore::with_base(config_dir));
         let daemon_config: DaemonConfig = config.load_daemon_config().expect("daemon config");
         let mode = old_store;
-        assert!(mode == OldStoreMode::Available || daemon_config.primitives.is_some(), "{mode:?} needs [primitives]");
         let old_store = (mode != OldStoreMode::Available).then(|| Arc::new(OldStoreAccesses::default()));
         let backend = match (&old_store, mode) {
             (Some(accesses), OldStoreMode::Unavailable) => ResourceBackend::from_arc(Arc::new(OldStore::unavailable(Arc::clone(accesses)))),
@@ -178,7 +177,7 @@ impl TestDaemon {
         let (daemon, runtime) = untouched(composition.refused(), compose(&composition, config, discovery, &relay)).await;
         let operator = Operator::connect(&daemon).await;
         let started = Self { daemon, fleet, runtime: Some(runtime), relay, operator, composition, dispatched: AtomicU64::new(0), dir };
-        started.seed(daemon_config.primitives.is_some()).await;
+        started.seed().await;
         started
     }
 }
@@ -236,7 +235,7 @@ async fn compose(
     discovery: flotilla_discovery::DiscoveryRuntime,
     relay: &RestartRelay,
 ) -> (Arc<InProcessDaemon>, DaemonRuntime) {
-    let engine = engine_opener(&config).expect("daemon config");
+    let engine = engine_opener(&config);
     let daemon = InProcessDaemon::new_composed(
         vec![],
         Arc::clone(&config),
@@ -509,18 +508,16 @@ impl TestDaemon {
 
     /// The dummy catalog, applied as an operator applies one: a Fleet project
     /// and its designation, the forge, repository, kinds and workflows.
-    async fn seed(&self, primitives: bool) {
-        if primitives {
-            // Fleet identity and charter Project are declared independently.
-            let fleet = ProjectSpec::builder()
-                .display_name("Fleet".to_string())
-                .default_workflow_ref(CrewMix::Coder.workflow_name().to_string())
-                .repositories(Vec::new())
-                .build();
-            self.apply::<Project>("fleet", fleet).await;
-            let designation = FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None };
-            self.apply::<FleetDesignation>(FLEET_DESIGNATION_NAME, designation).await;
-        }
+    async fn seed(&self) {
+        // Fleet identity and charter Project are declared independently.
+        let fleet = ProjectSpec::builder()
+            .display_name("Fleet".to_string())
+            .default_workflow_ref(CrewMix::Coder.workflow_name().to_string())
+            .repositories(Vec::new())
+            .build();
+        self.apply::<Project>("fleet", fleet).await;
+        let designation = FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None };
+        self.apply::<FleetDesignation>(FLEET_DESIGNATION_NAME, designation).await;
         let host = self.list::<Host>().await.into_iter().next().expect("local host").metadata.name;
         let forge = catalog::forge(&self.fleet.config().forge_service_url);
         self.apply::<Forge>(&forge.forge_id.clone(), forge.clone()).await;

@@ -13,7 +13,7 @@ use flotilla_resources::{
 };
 use flotilla_store::ResourceBackend;
 
-use super::support::{create_docker_placement, set_host_credential_expiry, test_meta};
+use super::support::{create_docker_placement, put_host, read_host, set_host_credential_expiry, test_meta};
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
 use flotilla_admission::account_access::validate_account_access;
@@ -33,8 +33,7 @@ async fn docker_placement_refuses_instance_readiness_before_selection() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    create_docker_placement(&backend, "docker-kiwi", "kiwi", BTreeSet::new()).await;
-    let hosts = backend.using::<ResourceHost>("flotilla");
+    create_docker_placement(&daemon, "docker-kiwi", "kiwi", BTreeSet::new()).await;
     let workflow = WorkflowTemplateSpec::builder()
         .vessels(vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()])
         .build();
@@ -42,14 +41,14 @@ async fn docker_placement_refuses_instance_readiness_before_selection() {
     // Both pinned and default admission use instance readiness rather than
     // host-wide Docker/OS booleans. Providers own prerequisite explanations.
     for missing in ["runtime unavailable", "Linux host required"] {
-        let host = hosts.get("kiwi").await.expect("host");
+        let host = read_host(&daemon, "kiwi").await;
         let mut status = host.status.expect("status");
         let mut providers = flotilla_discovery_testkit::environment::ready_placement_advertisements();
         providers[1].readiness = flotilla_protocol::provider::ProviderReadiness::MissingTool { reason: missing.into() };
         status.capabilities.insert(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::json!(providers));
         status.capabilities.insert("docker".into(), serde_json::json!(true));
         status.capabilities.insert("os".into(), serde_json::json!("linux"));
-        hosts.update_status("kiwi", &host.metadata.resource_version, &status).await.expect("update capability");
+        put_host(&daemon, "kiwi", &host.spec, &status).await;
 
         for policy in [Some("docker-kiwi"), None] {
             let error = daemon

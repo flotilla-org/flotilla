@@ -462,13 +462,23 @@ async fn stale_change_request_observation_stalls_landing_convoy() {
         )
         .await
         .expect("stale observation");
+    // The decided store keeps no observation times: the record's values age from when its
+    // observer's reads began failing.
+    let failures = flotilla_provisioning::engine::observations::EngineObservations::open(
+        daemon.decided_store().expect("decided store"),
+        clock.clone(),
+    )
+    .expect("observations");
+    flotilla_resources::engine_records::ObservationFailures::failing(&failures, "ChangeRequest", &record_name)
+        .await
+        .expect("observer reads failing");
     daemon.reconcile_crew_stalls_once("flotilla").await.expect("judge inside observer grace");
     assert!(convoys.get("stale-observation").await.expect("convoy").status.expect("status").stalled.is_none());
     clock.advance(chrono::Duration::hours(1));
     daemon.reconcile_crew_stalls_once("flotilla").await.expect("judge expired observer grace");
     let stalled = wait_for_stall(&backend, "stale-observation", true).await.stalled.expect("stalled");
     assert!(matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Observed { .. })));
-    assert!(stalled.evidence.contains("stale"));
+    assert!(stalled.evidence.contains("stale"), "{}", stalled.evidence);
     assert!(stalled.evidence.contains("observer behind scheduled refresh grace"));
     assert_eq!(stalled.source, flotilla_resources::StallEvidenceSource::Observation);
     watch.abort();

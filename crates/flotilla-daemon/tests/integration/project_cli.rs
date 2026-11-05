@@ -11,7 +11,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::Utc;
 use flotilla_admission::repository_inspection::LocalCheckoutInspection;
 use flotilla_admission::repository_inspection::ProjectDeclarationInspection;
 use flotilla_admission::repository_inspection::RepositoryInspection;
@@ -20,7 +19,6 @@ use flotilla_charter::ops_entry::materialized_workflow_name;
 use flotilla_charter::ops_entry::MATERIALIZED_PROJECT_ANNOTATION;
 use flotilla_charter::ops_entry::PRESENTS_AS_ANNOTATION;
 use flotilla_charter::ops_entry::SOURCE_COMMIT_ANNOTATION;
-use flotilla_charter::ops_entry::SOURCE_ENTRY_PATH_ANNOTATION;
 use flotilla_charter::ops_entry::SOURCE_REPOSITORY_ANNOTATION;
 use flotilla_charter::ops_entry::VERIFICATION_PROJECT_ANNOTATION;
 use flotilla_charter::project_declaration::BOOTSTRAP_COMMIT_ANNOTATION;
@@ -35,7 +33,7 @@ use flotilla_discovery_testkit::fake_discovery_on_host_os;
 use flotilla_discovery_testkit::git_process_discovery;
 use flotilla_discovery_testkit::init_git_repo_with_remote;
 use flotilla_protocol::{
-    commands::RepositoryIdentityChange, AgentOverride, Command, CommandAction, CommandValue, DaemonEvent, HostName, NodeId, RepoSelector,
+    commands::RepositoryIdentityChange, AgentOverride, Command, CommandAction, CommandValue, DaemonEvent, HostName, RepoSelector,
 };
 use flotilla_resources::{
     Checkout, CheckoutSpec, Convoy, ConvoyEnsure, InputMeta, IssueSource, ObservedCheckoutSpec, Project, ProjectRepositoryRole,
@@ -226,10 +224,6 @@ async fn track_repository(daemon: &Arc<InProcessDaemon>, tmp: &tempfile::TempDir
 async fn replicated_remote_declaration_resolution_preserves_existing_mirror_project_residue() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let kiwi_root = NodeId::new("kiwi-root");
-    let feta_root = NodeId::new("feta-root");
-    let kiwi = ResourceBackend::new(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
-    let feta = ResourceBackend::new(InMemoryBackend::default()).with_local_root(feta_root);
     let canonical = "https://github.com/flotilla-org/flotilla";
     let mirror = "https://forgejo.lab/lab/flotilla";
     let declared =
@@ -238,15 +232,20 @@ async fn replicated_remote_declaration_resolution_preserves_existing_mirror_proj
     let mirror_spec = RepositorySpec::remote(mirror).expect("provisional mirror repository");
     let mirror_key = mirror_spec.key();
 
-    kiwi.using::<Repository>("flotilla")
-        .create(&InputMeta::builder().name(canonical_key.to_string()).build(), &declared)
-        .await
-        .expect("author declaration on kiwi");
-    let kiwi_repositories = kiwi.using::<Repository>("flotilla").list().await.expect("list kiwi repositories");
-    feta.replica_writer::<Repository>(kiwi_root, "flotilla")
-        .replace(&kiwi_repositories, Utc::now())
-        .await
-        .expect("replicate declaration to feta");
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::new("feta"),
+        ResourceBackend::new(InMemoryBackend::default()),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    let feta = daemon.resource_backend();
+    // kiwi authors the declaration at its home; it reaches feta as kiwi's log does.
+    let kiwi = flotilla_provisioning_testkit::other_home::OtherHome::open("kiwi-root");
+    kiwi.repository(&canonical_key.to_string(), &declared).await;
+    kiwi.replicate_to(&daemon.decided_store().expect("decided store"));
 
     feta.using::<Repository>("flotilla")
         .create(&InputMeta::builder().name(mirror_key.to_string()).build(), &mirror_spec)
@@ -267,15 +266,6 @@ async fn replicated_remote_declaration_resolution_preserves_existing_mirror_proj
         .await
         .expect("seed retired mirror Project residue");
 
-    let daemon = InProcessDaemon::new_with_resource_backend(
-        vec![],
-        Arc::clone(&config),
-        fake_discovery(false),
-        HostName::new("feta"),
-        feta.clone(),
-        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-    )
-    .await;
     daemon.set_repository_inspector(Arc::new(FixedInspector { spec: mirror_spec, host_ref: "feta".to_string() })).await;
     let checkout_path = tmp.path().join("mirror-checkout");
     std::fs::create_dir(&checkout_path).expect("mirror checkout dir");
@@ -293,30 +283,26 @@ async fn replicated_remote_declaration_resolution_preserves_existing_mirror_proj
 async fn independently_observed_same_repository_remains_resolvable_after_replication() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let kiwi_root = NodeId::new("kiwi-root");
-    let feta_root = NodeId::new("feta-root");
-    let kiwi = ResourceBackend::new(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
-    let feta = ResourceBackend::new(InMemoryBackend::default()).with_local_root(feta_root);
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     let repository_key = repository_spec.key();
     let meta = InputMeta::builder().name(repository_key.to_string()).build();
-    kiwi.using::<Repository>("flotilla").create(&meta, &repository_spec).await.expect("observe repository on kiwi");
-    feta.using::<Repository>("flotilla").create(&meta, &repository_spec).await.expect("observe repository on feta");
-    let kiwi_repositories = kiwi.using::<Repository>("flotilla").list().await.expect("list kiwi repositories");
-    feta.replica_writer::<Repository>(kiwi_root, "flotilla")
-        .replace(&kiwi_repositories, Utc::now())
-        .await
-        .expect("replicate kiwi observation to feta");
 
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
         fake_discovery(false),
         HostName::new("feta"),
-        feta.clone(),
+        ResourceBackend::new(InMemoryBackend::default()),
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    let feta = daemon.resource_backend();
+    // kiwi observes the same repository at its home; it reaches feta as kiwi's log does.
+    let kiwi = flotilla_provisioning_testkit::other_home::OtherHome::open("kiwi-root");
+    kiwi.repository(&repository_key.to_string(), &repository_spec).await;
+    kiwi.replicate_to(&daemon.decided_store().expect("decided store"));
+    feta.using::<Repository>("flotilla").create(&meta, &repository_spec).await.expect("observe repository on feta");
+
     daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "feta".to_string() })).await;
     let checkout_path = tmp.path().join("canonical-checkout");
     std::fs::create_dir(&checkout_path).expect("canonical checkout dir");
@@ -431,15 +417,15 @@ async fn project_declarations_register_single_and_multi_member_projects_with_pro
         vec![Some("app"), Some("operations")]
     );
     for member in &split.spec.repositories {
+        // A Repository keeps no bootstrap stamps on the engine: nothing reads them from it.
         let repository = backend.using::<Repository>("flotilla").get(&member.repo.to_string()).await.expect("member repository");
-        assert_eq!(repository.metadata.annotations.get(BOOTSTRAP_COMMIT_ANNOTATION).map(String::as_str), Some("0123456789abcdef"));
         assert!(!repository.metadata.annotations.contains_key(BOOTSTRAP_PATH_ANNOTATION));
     }
 }
 
-// An upgraded Project may have portable bootstrap identity but no observed
-// bootstrap on this host. Never adopt a replicated legacy path; explain how to
-// establish the host-local observation explicitly.
+// An upgraded Project may have portable bootstrap identity (its declaring
+// repository at a commit) but no observed bootstrap on this host. Never adopt a
+// replicated legacy path; explain how to establish the host-local observation explicitly.
 #[tokio::test]
 async fn legacy_project_without_local_bootstrap_requires_reregistration() {
     let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
@@ -452,6 +438,7 @@ async fn legacy_project_without_local_bootstrap_requires_reregistration() {
                 .name("legacy".to_string())
                 .annotations(BTreeMap::from([
                     (BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(), key.to_string()),
+                    (BOOTSTRAP_COMMIT_ANNOTATION.to_string(), "legacy-commit".to_string()),
                     (BOOTSTRAP_PATH_ANNOTATION.to_string(), "/another-host/bootstrap".to_string()),
                 ]))
                 .build(),
@@ -774,11 +761,8 @@ async fn ops_entries_materialization_scenario() {
     assert_eq!(scoped.spec.repository_refs.as_deref(), Some(std::slice::from_ref(&app.repo)));
     assert!(scoped.spec.vessels.is_empty());
     assert_eq!(scoped.metadata.annotations.get(SOURCE_REPOSITORY_ANNOTATION), Some(&ops_spec.key().to_string()));
+    // Its change names the ops repository at its commit; the entry's path is not kept (#4024).
     assert_eq!(scoped.metadata.annotations.get(SOURCE_COMMIT_ANNOTATION).map(String::as_str), Some("ops-commit"));
-    assert_eq!(
-        scoped.metadata.annotations.get(SOURCE_ENTRY_PATH_ANNOTATION).map(String::as_str),
-        Some("verification-commands/this-is-a-workflow.md")
-    );
     let all_code = workflows.get(&all_code_name).await.expect("default-scoped workflow");
     assert_eq!(all_code.spec.vessels[0].repository_refs.as_deref(), Some([app.repo.clone(), docs.repo.clone()].as_slice()));
     let app_repository = backend.using::<Repository>("flotilla").get(&app.repo.to_string()).await.expect("app repository");
@@ -807,6 +791,16 @@ async fn ops_entries_materialization_scenario() {
             .await
             .expect("resolve repository default branch");
     }
+    // Message delivery reads the fleet roles from the FleetDesignation record.
+    backend
+        .clone()
+        .using::<flotilla_resources::FleetDesignation>("flotilla")
+        .create(
+            &InputMeta::builder().name(flotilla_resources::FLEET_DESIGNATION_NAME.to_string()).build(),
+            &flotilla_resources::FleetDesignationSpec { fleet: Some("lab".into()), project: "demo".into(), image_cache: None },
+        )
+        .await
+        .expect("designate the fleet");
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("start ensured standing convoy");
     let ensured_convoy_ref = ensures
         .get(&ensure_name)
@@ -970,47 +964,39 @@ async fn project_replica_does_not_materialize_operational_entries_on_refresh() {
     )
     .expect("write operational entry");
 
-    let authority = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("project-home"));
+    // The Project is written at its own home and arrives here as that home's log does.
+    let authority = flotilla_provisioning_testkit::other_home::OtherHome::open("project-home");
     let mut annotations = BTreeMap::new();
     annotations.insert(BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(), ops_spec.key().to_string());
     annotations.insert(BOOTSTRAP_COMMIT_ANNOTATION.to_string(), "replica-commit".to_string());
     annotations.insert(BOOTSTRAP_PATH_ANNOTATION.to_string(), tmp.path().to_string_lossy().into_owned());
     let app = RepositorySpec::remote("https://github.com/example/app").expect("app spec");
-    authority
-        .definitions::<Project>("flotilla")
-        .apply(
-            &InputMeta::builder().name("replicated".to_string()).annotations(annotations).build(),
-            &ProjectSpec::builder()
-                .display_name("replicated".to_string())
-                .default_workflow_ref("single-agent".to_string())
-                .repositories(vec![
-                    flotilla_resources::ProjectRepositorySpec {
-                        charter_store: None,
-                        repo: app.key(),
-                        alias: Some("app".to_string()),
-                        roles: [ProjectRepositoryRole::Code].into_iter().collect(),
-                        subpath: None,
-                        default_branch: None,
-                    },
-                    flotilla_resources::ProjectRepositorySpec {
-                        charter_store: None,
-                        repo: ops_spec.key(),
-                        alias: Some("operations".to_string()),
-                        roles: [ProjectRepositoryRole::Ops].into_iter().collect(),
-                        subpath: None,
-                        default_branch: None,
-                    },
-                ])
-                .build(),
-        )
-        .await
-        .expect("author Project at its home");
-    let snapshot = authority.using::<Project>("flotilla").list().await.expect("list home Project");
-    backend
-        .replica_writer::<Project>(NodeId::new("project-home"), "flotilla")
-        .replace(&snapshot, Utc::now())
-        .await
-        .expect("replicate Project");
+    let spec = ProjectSpec::builder()
+        .display_name("replicated".to_string())
+        .default_workflow_ref("single-agent".to_string())
+        .repositories(vec![
+            flotilla_resources::ProjectRepositorySpec {
+                charter_store: None,
+                repo: app.key(),
+                alias: Some("app".to_string()),
+                roles: [ProjectRepositoryRole::Code].into_iter().collect(),
+                subpath: None,
+                default_branch: None,
+            },
+            flotilla_resources::ProjectRepositorySpec {
+                charter_store: None,
+                repo: ops_spec.key(),
+                alias: Some("operations".to_string()),
+                roles: [ProjectRepositoryRole::Ops].into_iter().collect(),
+                subpath: None,
+                default_branch: None,
+            },
+        ])
+        .build();
+    // Its declaration names the ops repository at its commit, as its home holds it.
+    authority.repository(&ops_spec.key().to_string(), &ops_spec).await;
+    authority.project("replicated", &BTreeMap::new(), &annotations, &spec).await;
+    authority.replicate_to(&daemon.decided_store().expect("decided store"));
 
     let log_output = Arc::new(Mutex::new(Vec::new()));
     let writer = LogCaptureWriter(Arc::clone(&log_output));
@@ -1712,9 +1698,23 @@ async fn daemon_start_and_restart_do_not_backfill_projects() {
     let projects = backend.clone().using::<Project>("flotilla");
     assert!(projects.list().await.expect("project list").items.is_empty());
     drop(runtime);
+    drop(daemon);
 
-    let _restarted = DaemonRuntime::start_with_options(daemon, config, None, options).await.expect("runtime restart");
+    // A restart composes a new daemon over the same stores, as a restarted flotillad does.
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![tmp.path().join("backfilled")],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    let repository_spec = RepositorySpec::remote("https://github.com/org/backfilled.git").expect("repository spec");
+    daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "host-01".to_string() })).await;
+    let _restarted = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options).await.expect("runtime restart");
 
+    let projects = daemon.resource_backend().using::<Project>("flotilla");
     assert!(projects.list().await.expect("project list").items.is_empty());
 }
 
@@ -1773,10 +1773,25 @@ async fn daemon_restart_does_not_create_project_while_preserving_applied_project
     let remote_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("remote repository spec");
     let remote_key = remote_spec.key();
     *inspected_spec.write().expect("repository identity lock should not be poisoned") = remote_spec;
+    let host_ref = daemon.local_host_id().expect("local Host").to_string();
     drop(runtime);
+    drop(daemon);
 
-    let _restarted =
-        DaemonRuntime::start_with_options(daemon, config, None, options).await.expect("runtime should restart after project overlap");
+    // A restart composes a new daemon over the same stores, as a restarted flotillad does.
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![checkout_path],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec), host_ref })).await;
+    let _restarted = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options)
+        .await
+        .expect("runtime should restart after project overlap");
+    let projects = daemon.resource_backend().using::<Project>("flotilla");
 
     let presentation = projects.get("presentation").await.expect("overlapping applied project should survive restart");
     assert_eq!(
@@ -2215,9 +2230,8 @@ repositories:
     assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ProjectApplied { name: "labelled".into() });
     let project = projects.get("labelled").await.expect("Project should remain");
     assert_eq!(project.spec.display_name, "After");
+    // The writer's provenance is kept; other labels and annotations are not stamps a Project keeps.
     assert_eq!(project.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some("whole-repository-project"));
-    assert_eq!(project.metadata.labels.get("example.com/preserved").map(String::as_str), Some("true"));
-    assert_eq!(project.metadata.annotations.get("example.com/note").map(String::as_str), Some("keep"));
 }
 
 #[tokio::test]
@@ -2425,10 +2439,10 @@ async fn image_check_command_reads_the_ref_and_reports_its_build() {
     project.image = Some(flotilla_resources::ImageSelection { base: Some("base".into()), layers: Vec::new() });
     let meta = InputMeta::builder()
         .name("demo".into())
-        .annotations(BTreeMap::from([(
-            flotilla_resources::definition_provenance::BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(),
-            repository.key().to_string(),
-        )]))
+        .annotations(BTreeMap::from([
+            (flotilla_resources::definition_provenance::BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(), repository.key().to_string()),
+            (BOOTSTRAP_COMMIT_ANNOTATION.to_string(), "demo-commit".to_string()),
+        ]))
         .build();
     backend.using::<Project>("flotilla").create(&meta, &project).await.expect("project");
     let layer = |name: &str, tier: ImageLayerTier, provides: &[&str]| {

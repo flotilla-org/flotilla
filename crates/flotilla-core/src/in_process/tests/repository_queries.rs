@@ -24,9 +24,6 @@ async fn cli_lists_include_observed_checkouts_and_only_open_change_requests() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let repository = RepositorySpec::remote("https://github.com/team/repo.git").expect("repository");
-    let key = repository.key();
-    backend.using::<Repository>("flotilla").create(&test_meta(&key.to_string()), &repository).await.expect("repository record");
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -36,6 +33,9 @@ async fn cli_lists_include_observed_checkouts_and_only_open_change_requests() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    let repository = RepositorySpec::remote("https://github.com/team/repo.git").expect("repository");
+    let key = repository.key();
+    backend.using::<Repository>("flotilla").create(&test_meta(&key.to_string()), &repository).await.expect("repository record");
     daemon
         .observed_resource_backend()
         .using::<ResourceCheckout>("flotilla")

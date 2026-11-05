@@ -40,6 +40,7 @@ use flotilla_daemon_api::action_namespace;
 #[path = "attach.rs"]
 mod attach;
 mod checkout_providers;
+pub mod decided;
 use flotilla_executor::executor_actions;
 use flotilla_projections::projections_actions;
 
@@ -774,8 +775,6 @@ pub struct InProcessDaemon {
     convoy_ensure_reconciler: RwLock<Option<Arc<dyn ConvoyEnsureReconciler>>>,
     crew: Arc<CrewService>,
     leaf_subscription_diagnostics: projection_ports::LeafSubscriptionDiagnostics,
-    /// Whether `[primitives]` is on, as peers compare it at their handshake.
-    primitives_switch: std::sync::atomic::AtomicBool,
     /// The `[primitives]` Message path, installed once at composition.
     message_path: crate::primitives::MessagePath,
     /// The same path, as crew code reaches it: through its EngineMessages port.
@@ -1039,12 +1038,13 @@ impl InProcessDaemon {
         clock: Arc<dyn Clock>,
         peer_overlay: Arc<dyn flotilla_projections::host_registry::PeerOverlay>,
     ) -> Arc<Self> {
-        Self::new_composed(repo_paths, config, discovery, host_name, resource_backend, clock, peer_overlay, None)
+        let engine = decided::opener(config.state_dir().as_path());
+        Self::new_composed(repo_paths, config, discovery, host_name, resource_backend, clock, peer_overlay, engine)
             .await
-            .expect("a daemon composed with no engine")
+            .expect("compose the daemon with its decided store")
     }
 
-    /// Composes the daemon, opening the decided store through `engine` (behind `[primitives]`) as
+    /// Composes the daemon, opening the decided store through `engine` as
     /// soon as the daemon's identity is resolved, so its kinds are served from it before anything
     /// reads them. Fails when the decided store cannot be opened or filled.
     #[allow(clippy::too_many_arguments)]
@@ -1056,7 +1056,7 @@ impl InProcessDaemon {
         resource_backend: ResourceBackend,
         clock: Arc<dyn Clock>,
         peer_overlay: Arc<dyn flotilla_projections::host_registry::PeerOverlay>,
-        engine: Option<EngineOpener>,
+        engine: EngineOpener,
     ) -> Result<Arc<Self>, String> {
         use flotilla_discovery::DiscoveryResult;
 
@@ -1096,18 +1096,12 @@ impl InProcessDaemon {
             .await
             .expect("failed to resolve local host id");
         resource_backend.serve_engine_in(DEFAULT_PROVISIONING_NAMESPACE);
-        let engine = match engine {
-            Some(open) => {
-                let identity = EngineIdentity { node_id: local_node_id.clone(), host_id: local_host_id.clone(), clock: Arc::clone(&clock) };
-                let engine = open(identity).await?;
-                for records in &engine.records {
-                    resource_backend.install_engine_records(Arc::clone(records));
-                }
-                resource_backend.install_engine_records(Arc::clone(&engine.observations));
-                Some(engine)
-            }
-            None => None,
-        };
+        let identity = EngineIdentity { node_id: local_node_id.clone(), host_id: local_host_id.clone(), clock: Arc::clone(&clock) };
+        let engine = engine(identity).await?;
+        for records in &engine.records {
+            resource_backend.install_engine_records(Arc::clone(records));
+        }
+        resource_backend.install_engine_records(Arc::clone(&engine.observations));
         let environment_manager =
             Arc::new(EnvironmentManager::new_local(&discovery, local_environment_id.clone(), local_host_id.clone()).await);
         register_static_ssh_direct_environments(&config, &discovery, &environment_manager).await;
@@ -1304,13 +1298,6 @@ impl InProcessDaemon {
             observation_source.clone(),
             flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
         );
-        // On the engine, observations outlive a restart and are swept once their demand has had a
-        // lease to return ([`Self::install_observation_records`]); the old store's are orphans now.
-        if engine.is_none() {
-            if let Err(error) = change_request_refresher.garbage_collect_orphans().await {
-                tracing::warn!(%error, "garbage collect orphaned change request observations at startup failed");
-            }
-        }
         let issue_query_port: Arc<dyn IssueQueryPort> = Arc::new(ProviderIssueQueryPort {
             forge_reads,
             host_providers: Mutex::new(HashMap::new()),
@@ -1327,11 +1314,6 @@ impl InProcessDaemon {
             Arc::new(ProviderIssueObservationSource { backend: resource_backend.clone(), query_port: Arc::clone(&issue_query_port) }),
             flotilla_observation::issue_observer::IssueRefreshCadence::default(),
         );
-        if engine.is_none() {
-            if let Err(error) = issue_refresher.garbage_collect_orphans().await {
-                tracing::warn!(%error, "garbage collect orphaned issue observations at startup failed");
-            }
-        }
         let message_inboxes = Arc::new(Mutex::new(HashMap::new()));
         let message_path = crate::primitives::MessagePath::default();
         let crew_message_path = flotilla_crew::ports::MessagePath::default();
@@ -1449,7 +1431,6 @@ impl InProcessDaemon {
             crew: Arc::clone(&crew),
             leaf_subscription_diagnostics: projection_ports::LeafSubscriptionDiagnostics(leaf_subscriptions),
             message_receivers: projection_ports::MessageReceivers(Arc::clone(&message_path)),
-            primitives_switch: std::sync::atomic::AtomicBool::new(false),
             message_path,
             crew_message_path,
             convoy_engine_path,
@@ -1484,12 +1465,10 @@ impl InProcessDaemon {
             local_provider_statuses,
             local_placement_provider_statuses: RwLock::new(Vec::new()),
         });
-        if let Some(engine) = engine {
-            daemon.install_decided_store(engine.service)?;
-            daemon.install_observation_records(engine.observations, engine.observation_failures)?;
-            daemon.install_account_records(engine.accounts)?;
-            daemon.install_manifest_roots(engine.manifest_roots)?;
-        }
+        daemon.install_decided_store(engine.service)?;
+        daemon.install_observation_records(engine.observations, engine.observation_failures)?;
+        daemon.install_account_records(engine.accounts)?;
+        daemon.install_manifest_roots(engine.manifest_roots)?;
         crew.set_checkout_inspector(Arc::new(CheckoutInspector(Arc::downgrade(&daemon))));
         crew.set_turn_delivery_actuator(Arc::new(CrewTurnDeliveryActuator { crew: Arc::downgrade(&crew) })).await;
 
@@ -2389,15 +2368,6 @@ impl InProcessDaemon {
     /// The `[primitives]` Convoy path: empty until the switch's primitives are installed.
     pub fn convoy_engine_path(&self) -> flotilla_resources::convoy::engine::EngineConvoyPath {
         Arc::clone(&self.convoy_engine_path)
-    }
-
-    /// Set once at init, before peers are built; not a runtime toggle.
-    pub fn set_primitives_switch(&self, on: bool) {
-        self.primitives_switch.store(on, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn primitives_switch(&self) -> bool {
-        self.primitives_switch.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The `[primitives]` Message path, when the switch is on.

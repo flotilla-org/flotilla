@@ -45,6 +45,11 @@ impl<T: Resource> StoreViewSource<T> {
 #[async_trait]
 impl<T: Resource> ViewSource<T> for StoreViewSource<T> {
     async fn list_and_watch(&self) -> Result<(ReadResourceList<T>, Events<T>), ResourceError> {
+        // An engine-served kind's records, every home's, then each change to them.
+        if let Some(watch) = self.backend.definitions::<T>(&self.namespace).engine_watch().await {
+            let (items, events) = watch?;
+            return Ok((ReadResourceList { items }, events));
+        }
         let store = self.backend.store();
         let replicas = if T::REPLICATION_CLASS == ReplicationClass::None {
             futures::stream::pending().boxed()

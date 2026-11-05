@@ -7,16 +7,21 @@ pub(super) enum LaunchObservationRecord {
     MissingEnvironment,
 }
 
-/// Bind a requester's Claude subscription to `credential`, as admission does (#3907).
-pub(super) async fn bind_account(backend: &ResourceBackend, convoy: &str, role: &str, credential: &str, account: &str) {
+/// The binding of a requester's Claude subscription to `credential`, as admission opens it (#3907).
+pub(super) fn pending_binding(
+    convoy: &str,
+    role: &str,
+    credential: &str,
+    account: &str,
+    opened_at: flotilla_schema::Timestamp,
+) -> flotilla_resources::account_access::PendingBinding {
     use flotilla_resources::account_access::{
         binding_name, requester_address, AccessName, AccountBindingSpec, BindingState, CredentialName, EpochEntry, GrantName, GrantScope,
         Selection,
     };
     let access = AccessName(flotilla_agent::account_access::CLAUDE_SUBSCRIPTION.to_string());
-    let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
     let mut epochs = flotilla_schema::Records::new();
-    epochs.append(1, EpochEntry { epoch: "1".into(), observed_at: now }).expect("epoch");
+    epochs.append(1, EpochEntry { epoch: "1".into(), observed_at: opened_at }).expect("epoch");
     let spec = AccountBindingSpec {
         requester: requester_address(Some("flotilla"), convoy, role).expect("requester"),
         item: "claude-code".into(),
@@ -28,47 +33,42 @@ pub(super) async fn bind_account(backend: &ResourceBackend, convoy: &str, role: 
         exclusions: BTreeMap::new(),
         selection: Selection::Pin { pinned_by: "test".into() },
         epochs,
-        opened_at: now,
-        state: flotilla_schema::State::new(BindingState::Open, now),
+        opened_at,
+        state: flotilla_schema::State::new(BindingState::Open, opened_at),
     };
-    let binding = flotilla_resources::account_access::PendingBinding { name: binding_name(convoy, role, &access), spec };
-    flotilla_resources::account_access::AccountRecords::open(
-        &flotilla_store::OldStoreAccounts::new(backend.clone()),
-        NAMESPACE,
-        vec![binding],
-    )
-    .await
-    .expect("account binding");
+    flotilla_resources::account_access::PendingBinding { name: binding_name(convoy, role, &access), spec }
 }
 
-/// As [`bind_account`], but the binding is a replica from another home, opened `ahead` later on
-/// that home's clock than this host's.
+/// Bind a requester's Claude subscription to `credential` at this daemon, as admission does (#3907).
+pub(super) async fn bind_account(daemon: &InProcessDaemon, convoy: &str, role: &str, credential: &str, account: &str) {
+    let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
+    daemon.account_records().open(NAMESPACE, vec![pending_binding(convoy, role, credential, account, now)]).await.expect("account binding");
+}
+
+/// As [`bind_account`], but the binding is opened at another home, `ahead` later on that home's
+/// clock than this host's, and arrives here as that home's replica.
 pub(super) async fn bind_account_from_home(
-    backend: &ResourceBackend,
+    daemon: &InProcessDaemon,
     home: &str,
     convoy: &str,
     role: &str,
     credential: &str,
     ahead: chrono::Duration,
 ) {
-    let source = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    bind_account(&source, convoy, role, credential, "box-a@example.com").await;
-    let bindings = source.using::<flotilla_resources::AccountBinding>(NAMESPACE);
-    let mut binding = bindings.list().await.expect("bindings").items.remove(0);
-    binding.spec.opened_at = flotilla_schema::Timestamp::from_datetime(&(chrono::Utc::now() + ahead));
-    bindings
-        .update(
-            &InputMeta::builder().name(binding.metadata.name.clone()).labels(binding.metadata.labels.clone()).build(),
-            &binding.metadata.resource_version,
-            &binding.spec,
-        )
+    use flotilla_resources::account_access::AccountRecords;
+    let target = daemon.decided_store().expect("decided store");
+    let other = flotilla_provisioning_testkit::other_home_for(&target, home);
+    let accounts = flotilla_provisioning::engine::account::EngineAccounts::open(
+        Arc::clone(other.service()),
+        Arc::new(flotilla_resources::SystemClock),
+    )
+    .expect("other home accounts");
+    let opened_at = flotilla_schema::Timestamp::from_datetime(&(chrono::Utc::now() + ahead));
+    accounts
+        .open(NAMESPACE, vec![pending_binding(convoy, role, credential, "box-a@example.com", opened_at)])
         .await
-        .expect("skewed opening");
-    backend
-        .replica_writer::<flotilla_resources::AccountBinding>(flotilla_protocol::NodeId::new(home), NAMESPACE)
-        .replace(&bindings.list().await.expect("bindings"), chrono::Utc::now())
-        .await
-        .expect("replicate binding");
+        .expect("account binding at its home");
+    other.replicate_to(&target);
 }
 
 /// Freeze one crew aboard Vessel `vessel_ref` (within-convoy name `work`) in convoy
@@ -293,7 +293,7 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
     if matches!(observation, LaunchObservationRecord::Present) {
         backend.using::<TerminalSession>(NAMESPACE).create(&terminal_meta, &spec).await.expect("terminal context");
     }
-    bind_account(&backend, "demo", "coder", "claude-max", "test@example.com").await;
+    bind_account(&daemon, "demo", "coder", "claude-max", "test@example.com").await;
     let tags: [flotilla_terminal::TerminalSessionTag; 0] = [];
 
     let launched = TerminalControllerRuntime { state }

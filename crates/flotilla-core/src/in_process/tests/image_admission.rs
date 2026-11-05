@@ -17,7 +17,7 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
 
-use super::support::{create_docker_placement, test_meta};
+use super::support::{create_docker_placement, put_host, test_meta};
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
 use flotilla_admission::convoy_admission::PlacementResolution;
@@ -72,12 +72,12 @@ async fn fixture(layers: Vec<ImageLayerSpec>, image: Option<ImageSelection>) -> 
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    create_docker_placement(&backend, "crew-policy", "host-a", BTreeSet::new()).await;
+    create_docker_placement(&daemon, "crew-policy", "host-a", BTreeSet::new()).await;
     let kinds = backend.using::<FulfilmentKind>(NS);
     let mut kind = kinds.get("crew-policy").await.expect("kind");
     kind.spec.realisation = FulfilmentRealisation::DockerPerVessel { image: None };
     kinds.update(&test_meta("crew-policy"), &kind.metadata.resource_version, &kind.spec).await.expect("composed kind");
-    set_architecture(&backend, "host-a", "x86_64", None).await;
+    set_architecture(&daemon, "host-a", "x86_64", None).await;
     for spec in layers {
         backend.definitions::<ImageLayer>(NS).apply(&test_meta(&spec.resource_name()), &spec.into()).await.expect("layer");
     }
@@ -89,19 +89,15 @@ async fn fixture(layers: Vec<ImageLayerSpec>, image: Option<ImageSelection>) -> 
     Fixture { daemon, backend, _temp: temp }
 }
 
-async fn set_architecture(backend: &ResourceBackend, name: &str, arch: &str, capacity: Option<ImageBuildCapacity>) {
-    let hosts = backend.using::<Host>(NS);
-    let host = match hosts.get(name).await {
-        Ok(host) => host,
-        Err(_) => hosts.create(&test_meta(name), &flotilla_resources::HostSpec::default()).await.expect("host"),
-    };
+/// Host `name` as its home describes it: running `arch`, and building images when `capacity` is
+/// given.
+async fn set_architecture(daemon: &InProcessDaemon, name: &str, arch: &str, capacity: Option<ImageBuildCapacity>) {
+    let held = daemon.resource_backend().including_replicas::<Host>(NS).get(name).await.ok().map(|held| held.object);
+    let mut spec = held.as_ref().map(|host| host.spec.clone()).unwrap_or_default();
     if capacity.is_some() {
-        let mut spec = host.spec.clone();
         spec.image_build_capacity = capacity;
-        hosts.update(&test_meta(name), &host.metadata.resource_version, &spec).await.expect("capacity");
     }
-    let host = hosts.get(name).await.expect("host");
-    let mut status = host.status.clone().unwrap_or_default();
+    let mut status = held.and_then(|host| host.status).unwrap_or_default();
     status.description = Some(
         flotilla_protocol::HostSummary::builder()
             .environment_id(flotilla_protocol::EnvironmentId::new(name))
@@ -109,7 +105,7 @@ async fn set_architecture(backend: &ResourceBackend, name: &str, arch: &str, cap
             .system(flotilla_protocol::SystemInfo { arch: Some(arch.into()), ..Default::default() })
             .build(),
     );
-    hosts.update_status(name, &host.metadata.resource_version, &status).await.expect("architecture");
+    put_host(daemon, name, &spec, &status).await;
 }
 
 fn agent(role: &str, adapter: &str) -> CrewSpec {
@@ -298,9 +294,9 @@ async fn registry_delivery_uses_the_deterministic_builder() {
     let local = build_for(&fixture, &local).await;
     assert_eq!(local.spec.current().expect("current").delivery, ImageDelivery::Local);
     assert!(local.metadata.name.ends_with("-host-a"), "local builds carry their builder: {}", local.metadata.name);
-    set_architecture(&fixture.backend, "udder", "x86_64", builder(1)).await;
-    set_architecture(&fixture.backend, "feta", "x86_64", builder(2)).await;
-    set_architecture(&fixture.backend, "arm", "aarch64", None).await;
+    set_architecture(&fixture.daemon, "udder", "x86_64", builder(1)).await;
+    set_architecture(&fixture.daemon, "feta", "x86_64", builder(2)).await;
+    set_architecture(&fixture.daemon, "arm", "aarch64", None).await;
     fixture
         .backend
         .definitions::<FleetDesignation>(NS)
@@ -365,13 +361,13 @@ async fn declare_image_cache(backend: &ResourceBackend) {
 async fn cloud_composed_image_builds_for_amd64_through_the_image_cache() {
     let fixture = fixture(catalogue(), None).await;
     make_cloud(&fixture).await;
-    set_architecture(&fixture.backend, "host-a", "aarch64", None).await;
+    set_architecture(&fixture.daemon, "host-a", "aarch64", None).await;
     let amd64_builder = ImageBuildCapacity::Builder {
         architecture: "amd64".into(),
         slots: 1,
         reservation: ImageBuildReservation { cpu: 2, disk_bytes: 1 << 30 },
     };
-    set_architecture(&fixture.backend, "kiwi", "aarch64", Some(amd64_builder)).await;
+    set_architecture(&fixture.daemon, "kiwi", "aarch64", Some(amd64_builder)).await;
     declare_image_cache(&fixture.backend).await;
     let workflow = WorkflowTemplateSpec::builder().vessels(vec![vessel("work", vec![agent("coder", "codex")], &[])]).build();
     let (image, pins) = admit(&fixture, &workflow).await.expect("admit");

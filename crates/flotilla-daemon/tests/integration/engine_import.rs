@@ -1,5 +1,5 @@
 //! The cut-over import across hosts: each daemon fills its engine store from its own old store
-//! at its first start with `[primitives]`, writing only the records it is home to, and the
+//! at its first start, writing only the records it is home to, and the
 //! records reach every other host from their home through engine replication.
 
 use std::{sync::Arc, time::Duration};
@@ -37,8 +37,7 @@ struct Host {
 impl Host {
     async fn new(name: &str) -> Self {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        std::fs::write(dir.path().join("daemon.toml"), format!("machine_id = \"{name}\"\n\n[primitives]\n[dummy_fleet]\n"))
-            .expect("config");
+        std::fs::write(dir.path().join("daemon.toml"), format!("machine_id = \"{name}\"\n\n[dummy_fleet]\n")).expect("config");
         let config = Arc::new(ConfigStore::with_base(dir.path().to_path_buf()));
         let node =
             flotilla_core::host_identity::resolve_local_node_id(config.base_path().as_path(), Some(name), &*fake_discovery(false).runner)
@@ -97,7 +96,7 @@ impl Host {
             ResourceBackend::new(self.backend.clone()),
             Arc::new(flotilla_resources::SystemClock),
             Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-            engine_opener(&self.config)?,
+            engine_opener(&self.config),
         )
         .await?;
         assert_eq!(daemon.node_id(), &self.node, "the daemon is homed where its host's records are");

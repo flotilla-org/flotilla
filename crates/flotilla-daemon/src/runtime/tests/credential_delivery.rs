@@ -232,8 +232,10 @@ fn docker_environment_metadata_decodes_non_empty_credential_scopes() {
     assert_eq!(credential_scopes_from_environment(&spec).expect("decode credential scopes"), expected);
 }
 
-// #2577: misspelled mappings surface at host level, while a valid Forge
-// needs no checkout. Late declarations and config corrections clear them.
+// #2577: misspelled mappings are diagnosed, while a valid Forge needs no checkout. Late
+// declarations and config corrections clear them. The diagnosis is advisory: the heartbeat
+// makes it, but the engine Host keeps only conditions that block readiness or forge
+// observation (`host_import.rs`), so it is read where the heartbeat reads it.
 #[tokio::test]
 async fn daemon_forgejo_credential_mapping_heartbeat_lifecycle() {
     let temp = TempDir::new().expect("tempdir");
@@ -245,56 +247,25 @@ async fn daemon_forgejo_credential_mapping_heartbeat_lifecycle() {
     let profile = manual_profile(&host_id, false);
     apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("heartbeat");
     let status = backend.using::<Host>(NAMESPACE).get(&host_id).await.expect("host").status.expect("status");
-    let condition = status
-        .conditions
-        .iter()
-        .find(|condition| condition.condition_type == "DaemonForgejoCredentials")
-        .expect("misspelled mapping diagnosis");
+    assert!(status.ready, "an unresolved mapping must not block unrelated placement");
+    let condition = daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("misspelled mapping diagnosis");
+    assert_eq!(condition.condition_type, "DaemonForgejoCredentials");
     assert_eq!(condition.reason, "UnresolvedForgeMappings");
     assert!(condition.message.contains("`lba`"));
     assert!(condition.message.contains(&format!("namespaces `{NAMESPACE}`")));
     assert!(!condition.blocks_readiness());
-    assert!(status.ready, "an unresolved mapping must not block unrelated placement");
-    let fleet = daemon.fleet_health_internal().await.expect("fleet health");
-    assert!(fleet
-        .hosts
-        .iter()
-        .find(|host| host.is_local)
-        .expect("local host")
-        .degraded_conditions
-        .iter()
-        .any(|message| message.contains("`lba`")));
 
     credential_mapping_config(temp.path(), Some("lab"));
     apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("corrected heartbeat");
-    let status = backend.using::<Host>(NAMESPACE).get(&host_id).await.expect("host").status.expect("status");
-    assert!(status.conditions.iter().all(|condition| condition.condition_type != "DaemonForgejoCredentials"));
+    assert!(daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.is_none());
     assert!(backend.using::<Checkout>(NAMESPACE).list().await.expect("checkouts").items.is_empty());
 
     backend.using::<Forge>(NAMESPACE).delete("lab").await.expect("delete Forge");
     apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("unresolved heartbeat");
-    assert!(backend
-        .using::<Host>(NAMESPACE)
-        .get(&host_id)
-        .await
-        .expect("host")
-        .status
-        .expect("status")
-        .conditions
-        .iter()
-        .any(|condition| condition.condition_type == "DaemonForgejoCredentials"));
+    assert!(daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.is_some());
     declare_mapping_forge(&backend, NAMESPACE).await;
     apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("late declaration heartbeat");
-    assert!(backend
-        .using::<Host>(NAMESPACE)
-        .get(&host_id)
-        .await
-        .expect("host")
-        .status
-        .expect("status")
-        .conditions
-        .iter()
-        .all(|condition| condition.condition_type != "DaemonForgejoCredentials"));
+    assert!(daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.is_none());
 
     credential_mapping_config(temp.path(), Some("lba"));
     assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("diagnosis").is_some());
@@ -316,22 +287,16 @@ async fn daemon_forgejo_credential_mapping_errors_are_advisory_and_retry() {
     assert!(daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.is_some(), "later heartbeats retry the diagnosis");
 }
 
-// An unqualified host-local mapping can serve a source-addressed request
-// whose Forge is replicated into a namespace with no local checkout.
+// An unqualified host-local mapping can serve a source-addressed request whose Forge is
+// declared at another home, with no local checkout. The engine keeps no namespaces, so the
+// other home's declaration is the one outside this daemon's.
 #[tokio::test]
 async fn daemon_forgejo_credential_mapping_resolves_replica_in_another_namespace() {
     let temp = TempDir::new().expect("tempdir");
     credential_mapping_config(temp.path(), Some("lab"));
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
     assert!(daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.is_some());
-    let authority = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    declare_mapping_forge(&authority, "other").await;
-    daemon
-        .resource_backend()
-        .replica_writer::<Forge>(NodeId::new("forge-authority"), "other")
-        .replace(&authority.using::<Forge>("other").list().await.expect("Forge snapshot"), Utc::now())
-        .await
-        .expect("replicate Forge outside runtime namespace");
+    declare_mapping_forge_at_home(&daemon, "forge-authority").await;
     assert!(daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.is_none());
     assert!(daemon.resource_backend().using::<Checkout>("other").list().await.expect("checkouts").items.is_empty());
 }
@@ -401,16 +366,13 @@ async fn daemon_forgejo_credential_mapping_waits_for_forge_replication() {
         .await
         .expect("empty Forge replication settled");
     assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("settled absence").is_some());
-    declare_mapping_forge(&authority, NAMESPACE).await;
-    writer
-        .replace(&authority.using::<Forge>(NAMESPACE).list().await.expect("Forge snapshot"), Utc::now())
-        .await
-        .expect("late Forge replication");
+    // The declaration itself is a decided record: it arrives as the authority's log does.
+    declare_mapping_forge_at_home(&daemon, "forge-authority").await;
     assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("replicated declaration").is_none());
 }
 
-// #2577: source-addressed requests can use declarations outside the runtime
-// namespace. Exercise config removal/correction and declaration arrival/deletion
+// #2577: source-addressed requests can use declarations made at another home. Exercise
+// config removal/correction and declaration arrival/deletion
 // in generated order, checking the invariant after every step.
 #[hegel::test]
 fn daemon_forgejo_credential_mapping_sequences(tc: hegel::TestCase) {
@@ -433,7 +395,9 @@ fn daemon_forgejo_credential_mapping_sequences(tc: hegel::TestCase) {
                 0 => key = None,
                 1 => key = Some("lba"),
                 2 => key = Some("lab"),
-                3 if !declared => {
+                // One Forge owns an issue service across homes: a declaration here and one at
+                // another home are never both present.
+                3 if !declared && !other_declared => {
                     declare_mapping_forge(&backend, NAMESPACE).await;
                     declared = true;
                 }
@@ -441,8 +405,8 @@ fn daemon_forgejo_credential_mapping_sequences(tc: hegel::TestCase) {
                     backend.using::<Forge>(NAMESPACE).delete("lab").await.expect("delete Forge");
                     declared = false;
                 }
-                5 if !other_declared => {
-                    declare_mapping_forge(&backend, "other").await;
+                5 if !other_declared && !declared => {
+                    declare_mapping_forge_at_home(&daemon, "forge-authority").await;
                     other_declared = true;
                 }
                 _ => {}
@@ -523,7 +487,7 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_pushed_into(
         .expect("environment record");
     let source = LocalSkillSource::new(temp.path(), "research");
     freeze_crew(&backend, "demo", "demo-work", "coder", "claude-code", vec![source.selected.clone()]).await;
-    bind_account(&backend, "demo", "coder", "claude-max", "test@example.com").await;
+    bind_account(&daemon, "demo", "coder", "claude-max", "test@example.com").await;
 
     let home = PathBuf::from("/home/crew/flotilla/agent-homes/requesters/demo/coder/claude");
     let runner: Arc<dyn CommandRunner> =

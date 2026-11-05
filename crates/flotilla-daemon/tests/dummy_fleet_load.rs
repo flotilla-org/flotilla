@@ -23,11 +23,9 @@
 //! `FLOTILLA_LOAD_TRACE=1` records controller errors/restarts and slow Message
 //! receipt timestamps, including the durable submission instant, to stderr.
 //!
-//! `FLOTILLA_LOAD_PRIMITIVES=true` adds `[primitives]` to each home's
-//! `daemon.toml`, so Message runs on the ADR 0064 engine (#3317), and seeds the
-//! designated fleet project its roles live under. Turn delivery is then timed
-//! from each engine Message's creation entry to the AgentSession receipt edge
-//! about it, followed on the decided store's log.
+//! Each home seeds the designated fleet project its roles live under. Turn
+//! delivery is timed from each engine Message's creation entry to the
+//! AgentSession receipt edge about it, followed on the decided store's log.
 //!
 //! `FLOTILLA_LOAD_MAX_RESIDENT_GIB` stops admitting convoys once the process
 //! holds that much memory, so a plan the host cannot hold reports how far it
@@ -132,8 +130,7 @@ fn state_of(phase: ConvoyPhase) -> ConvoyState {
 async fn start_home(root: &std::path::Path, index: usize, dummy_fleet: &str, options: RuntimeOptions, admissions: Admissions) -> Home {
     let config_dir = root.join(format!("home-{index}"));
     std::fs::create_dir_all(&config_dir).expect("config dir");
-    let switch = if load_primitives() { "[primitives]\n" } else { "" };
-    std::fs::write(config_dir.join("daemon.toml"), format!("machine_id = \"load-{index}\"\n\n{switch}[dummy_fleet]\n{dummy_fleet}"))
+    std::fs::write(config_dir.join("daemon.toml"), format!("machine_id = \"load-{index}\"\n\n[dummy_fleet]\n{dummy_fleet}"))
         .expect("daemon.toml");
     let config = Arc::new(ConfigStore::with_base(config_dir.clone()));
     let daemon_config: DaemonConfig = config.load_daemon_config().expect("daemon config");
@@ -156,43 +153,40 @@ async fn start_home(root: &std::path::Path, index: usize, dummy_fleet: &str, opt
     let options = RuntimeOptions { namespace: NAMESPACE.into(), ..options };
     let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options).await.expect("runtime");
     let backend = daemon.resource_backend();
-    seed(&backend, fleet.config(), daemon.message_primitives().is_some()).await;
+    seed(&backend, fleet.config()).await;
     let view = Arc::new(HomeView::default());
     watch_convoys(&backend, Arc::clone(&view), admissions).await;
     watch_messages(&backend, Arc::clone(&view)).await;
-    if let Some(primitives) = daemon.message_primitives() {
-        watch_engine_messages(Arc::clone(primitives.service()), Arc::clone(&view));
-    }
+    let primitives = daemon.message_primitives().expect("the Message path is composed");
+    watch_engine_messages(Arc::clone(primitives.service()), Arc::clone(&view));
     let port = DaemonCommandPort::new(&(Arc::clone(&daemon) as Arc<dyn DaemonHandle>));
     Home { daemon, fleet, runtime, store, database, port, replication: Arc::default(), view }
 }
 
-async fn seed(backend: &ResourceBackend, config: &flotilla_config::dummy_fleet::DummyFleetConfig, primitives: bool) {
-    if primitives {
-        // The engine path resolves fleet roles from the replicated fleet identity.
-        backend
-            .clone()
-            .using::<Project>(NAMESPACE)
-            .create(
-                &InputMeta::builder().name("fleet".to_string()).build(),
-                &ProjectSpec::builder()
-                    .display_name("Fleet".to_string())
-                    .default_workflow_ref(CrewMix::Coder.workflow_name().to_string())
-                    .repositories(Vec::new())
-                    .build(),
-            )
-            .await
-            .expect("fleet project");
-        backend
-            .clone()
-            .definitions::<FleetDesignation>(NAMESPACE)
-            .create(
-                &InputMeta::builder().name(FLEET_DESIGNATION_NAME.to_string()).build(),
-                &FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
-            )
-            .await
-            .expect("fleet designation");
-    }
+async fn seed(backend: &ResourceBackend, config: &flotilla_config::dummy_fleet::DummyFleetConfig) {
+    // The engine path resolves fleet roles from the replicated fleet identity.
+    backend
+        .clone()
+        .using::<Project>(NAMESPACE)
+        .create(
+            &InputMeta::builder().name("fleet".to_string()).build(),
+            &ProjectSpec::builder()
+                .display_name("Fleet".to_string())
+                .default_workflow_ref(CrewMix::Coder.workflow_name().to_string())
+                .repositories(Vec::new())
+                .build(),
+        )
+        .await
+        .expect("fleet project");
+    backend
+        .clone()
+        .definitions::<FleetDesignation>(NAMESPACE)
+        .create(
+            &InputMeta::builder().name(FLEET_DESIGNATION_NAME.to_string()).build(),
+            &FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
+        )
+        .await
+        .expect("fleet designation");
     let host = backend.clone().using::<Host>(NAMESPACE).list().await.expect("hosts").items.into_iter().next().expect("local host");
     let forge = catalog::forge(&config.forge_service_url);
     backend
@@ -312,7 +306,7 @@ async fn watch_messages(backend: &ResourceBackend, view: Arc<HomeView>) {
     });
 }
 
-/// Time each engine Message (`[primitives]`) from its creation entry to the
+/// Time each engine Message from its creation entry to the
 /// AgentSession receipt edge about it, following the decided store's log as a
 /// peer does, so the measurement never lists the replica.
 fn watch_engine_messages(service: Arc<Service>, view: Arc<HomeView>) {
@@ -570,10 +564,6 @@ fn load_long_runner_turns() -> u32 {
     env_or("FLOTILLA_LOAD_LONG_RUNNER_TURNS", 5)
 }
 
-fn load_primitives() -> bool {
-    env_or("FLOTILLA_LOAD_PRIMITIVES", false)
-}
-
 fn catalog_forge_url() -> String {
     flotilla_config::dummy_fleet::DEFAULT_DUMMY_FORGE_SERVICE_URL.to_string()
 }
@@ -724,15 +714,9 @@ async fn load_baseline() {
     report.metadata.insert("source_status".into(), source_status);
     report.metadata.insert("source_diff".into(), source_diff);
     report.metadata.insert("dummy_fleet".into(), dummy_fleet_settings(load_long_runner_turns()));
-    report.metadata.insert("primitives".into(), load_primitives().to_string());
     report.metadata.insert(
         "turn_delivery_definition".into(),
-        if load_primitives() {
-            "engine Message creation entry -> AgentSession Receive edge about it (decided store log)"
-        } else {
-            "old-store Message creation_timestamp -> status.resolved_receiver.delivered_at"
-        }
-        .into(),
+        "engine Message creation entry -> AgentSession Receive edge about it (decided store log)".into(),
     );
     report.metadata.insert("effective_dummy_config".into(), format!("{:?}", fleet.homes[0].fleet.config()));
     report.metadata.insert("host_load_start".into(), load_start.trim().into());
@@ -754,10 +738,8 @@ async fn load_baseline() {
     assert_eq!(report.total.delivered, report.dispatch.admitted, "every admitted convoy delivers");
     assert_eq!(report.dispatch.errors, 0, "{:?}", report.dispatch);
     assert_eq!(report.total.failed + report.total.abandoned, 0, "all load scripts should deliver: {:?}", report.total);
-    if load_primitives() {
-        for home in &report.home_metrics {
-            assert!(home.turn_delivery.count > 0, "switch on, the engine log reader recorded no turn delivery");
-        }
+    for home in &report.home_metrics {
+        assert!(home.turn_delivery.count > 0, "the engine log reader recorded no turn delivery");
     }
     assert_eq!(observer_failures, 0, "load produced no-ready-forge-observer stall evidence; see observer_failure lines");
 }

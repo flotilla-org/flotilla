@@ -436,7 +436,7 @@ fn assert_holds_central_copy(host: &FakeHost, home: &str, access_token: &str) {
 async fn launch_ssh_host(host: SshHost, adapter: &str, grant_claude: bool) -> Result<LaunchedSession, String> {
     let runtime = ssh_host_runtime(host, adapter).await;
     if grant_claude {
-        bind_account(&runtime.daemon.resource_backend(), "demo", "coder", "claude-max", "crew@example.com").await;
+        bind_account(&runtime.daemon, "demo", "coder", "claude-max", "crew@example.com").await;
     }
     runtime.launch().await
 }
@@ -583,7 +583,7 @@ async fn launched_claude_crew() -> (SshHostRuntime, Arc<FakeHost>, flotilla_test
     let runtime_dir = flotilla_test_support::TestSocketDir::new();
     let host = Arc::new(FakeHost::with_files(HOST_HARNESS_FILES));
     let runtime = ssh_host_runtime(ssh_host(&host, &runtime_dir), "claude-code").await;
-    bind_account(&runtime.daemon.resource_backend(), "demo", "coder", "claude-max", "crew@example.com").await;
+    bind_account(&runtime.daemon, "demo", "coder", "claude-max", "crew@example.com").await;
     let launched = runtime.launch().await.expect("first launch");
     (runtime, host, runtime_dir, launched)
 }
@@ -1048,8 +1048,8 @@ async fn bound_ssh_host_crew_with(
         .await
         .expect("box account declaration");
     match skew {
-        None => bind_account(&backend, "demo", "coder", "claude-box-a", "box-a@example.com").await,
-        Some((home, ahead)) => bind_account_from_home(&backend, home, "demo", "coder", "claude-box-a", ahead).await,
+        None => bind_account(&runtime.daemon, "demo", "coder", "claude-box-a", "box-a@example.com").await,
+        Some((home, ahead)) => bind_account_from_home(&runtime.daemon, home, "demo", "coder", "claude-box-a", ahead).await,
     }
     backend.using::<TerminalSession>(NAMESPACE).create(&empty_meta("terminal-demo-work-coder"), &runtime.spec).await.expect("session");
     runtime.launch().await.expect("bound launch");
@@ -1058,15 +1058,30 @@ async fn bound_ssh_host_crew_with(
 
 /// Where the bound token lies: the requester's material directory on the runtime base.
 const BOUND_MATERIAL: &str = "/run/user/1000/flotilla/agent-material/requesters/demo/coder/claude";
-const BINDING: &str = "demo.coder.claude-subscription";
 
-async fn provision(backend: &ResourceBackend) -> Option<flotilla_resources::AccountProvisionSpec> {
-    backend
-        .using::<flotilla_resources::AccountProvision>(NAMESPACE)
-        .get(&format!("{BINDING}.{ENVIRONMENT}"))
-        .await
-        .ok()
-        .map(|record| record.spec)
+/// The requester's current binding, as the account port reads it.
+async fn binding(daemon: &InProcessDaemon) -> flotilla_resources::account_access::BindingRecord {
+    let access = flotilla_resources::account_access::AccessName(flotilla_agent::account_access::CLAUDE_SUBSCRIPTION.to_string());
+    daemon.account_records().requester_binding(NAMESPACE, "demo", "coder", &access).await.expect("read binding").expect("binding")
+}
+
+/// This place's provision record of the requester's binding.
+async fn provision_record(daemon: &InProcessDaemon) -> Option<flotilla_resources::account_access::ProvisionRecord> {
+    let provisions = daemon.account_records().local_provisions(NAMESPACE).await.expect("provisions");
+    provisions.into_iter().find(|record| record.spec.place == ENVIRONMENT)
+}
+
+async fn provision(daemon: &InProcessDaemon) -> Option<flotilla_resources::AccountProvisionSpec> {
+    provision_record(daemon).await.map(|record| record.spec)
+}
+
+/// Reopens the requester's binding a second later, as an explicit rebind does.
+async fn rebind(daemon: &InProcessDaemon) {
+    let current = binding(daemon).await;
+    let now = flotilla_schema::Timestamp::from_datetime(&(chrono::Utc::now() + chrono::Duration::seconds(1)));
+    let reopened = super::launch_support::pending_binding("demo", "coder", "claude-box-a", "box-a@example.com", now);
+    assert_eq!(reopened.spec.requester, current.spec.requester);
+    daemon.account_records().rebind(NAMESPACE, reopened, None, now).await.expect("rebind");
 }
 
 // Acceptance (#3907 sticky): a refresh is a new material generation of the same managed
@@ -1078,9 +1093,8 @@ async fn a_refreshed_token_is_pushed_into_the_bound_home_without_moving_the_bind
     let token = tokens.path().join("box-a");
     fs::write(&token, "generation-one\n").expect("token");
     let (runtime, host, _runtime_dir) = bound_ssh_host_crew(&token).await;
-    let backend = runtime.daemon.resource_backend();
-    let binding = backend.using::<flotilla_resources::AccountBinding>(NAMESPACE).get(BINDING).await.expect("binding").spec;
-    let delivered = provision(&backend).await.expect("provision recorded at launch");
+    let bound = binding(&runtime.daemon).await.spec;
+    let delivered = provision(&runtime.daemon).await.expect("provision recorded at launch");
     assert_eq!((delivered.place.as_str(), delivered.environment_kind.as_str()), (ENVIRONMENT, "ssh-host"));
     assert_eq!(delivered.home, BOUND_MATERIAL, "the provision records where the copy lies");
     assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), Some(HostEntry::File("generation-one".into())));
@@ -1089,12 +1103,12 @@ async fn a_refreshed_token_is_pushed_into_the_bound_home_without_moving_the_bind
     reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
 
     assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), Some(HostEntry::File("generation-two".into())));
-    let pushed = provision(&backend).await.expect("provision kept");
+    let pushed = provision(&runtime.daemon).await.expect("provision kept");
     let generation =
         |spec: &flotilla_resources::AccountProvisionSpec| spec.delivered.as_ref().map(|delivered| delivered.generation.clone());
     assert_ne!(generation(&pushed), generation(&delivered));
     assert_eq!(generation(&pushed), Some(flotilla_resources::account_access::material_generation("generation-two")));
-    assert_eq!(backend.using::<flotilla_resources::AccountBinding>(NAMESPACE).get(BINDING).await.expect("binding").spec, binding);
+    assert_eq!(binding(&runtime.daemon).await.spec, bound);
 }
 
 // Acceptance (#3907 grant withdrawal, at the place): once the binding is revoked, the place
@@ -1107,23 +1121,18 @@ async fn a_revoked_binding_stops_the_session_and_deletes_its_copy() {
     fs::write(&token, "box-a-token").expect("token");
     let (runtime, host, _runtime_dir) = bound_ssh_host_crew(&token).await;
     let backend = runtime.daemon.resource_backend();
-    let bindings = backend.using::<flotilla_resources::AccountBinding>(NAMESPACE);
-    let binding = bindings.get(BINDING).await.expect("binding");
-    let mut revoked = binding.spec.clone();
+    let bound = binding(&runtime.daemon).await;
     let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
-    revoked.state = flotilla_schema::State::new(
-        flotilla_resources::account_access::BindingState::Revoked {
-            reason: "binding revoked: no authorizing grant".into(),
-            delivered_until: Some(now),
-        },
-        now,
-    );
-    bindings.update(&empty_meta(BINDING), &binding.metadata.resource_version, &revoked).await.expect("revoke");
+    let revoked = flotilla_resources::account_access::BindingState::Revoked {
+        reason: "binding revoked: no authorizing grant".into(),
+        delivered_until: Some(now),
+    };
+    runtime.daemon.account_records().end(NAMESPACE, &bound, revoked, now).await.expect("revoke");
 
     reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
 
     assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), None, "the delivered copy is deleted");
-    assert!(provision(&backend).await.is_none(), "the provision record is removed");
+    assert!(provision(&runtime.daemon).await.is_none(), "the provision record is removed");
     assert!(
         matches!(backend.using::<TerminalSession>(NAMESPACE).get("terminal-demo-work-coder").await, Err(ResourceError::NotFound { .. })),
         "the harness session is stopped"
@@ -1141,18 +1150,14 @@ async fn a_rebound_requester_loses_its_old_copy_and_session() {
     fs::write(&token, "box-a-token").expect("token");
     let (runtime, host, _runtime_dir) = bound_ssh_host_crew(&token).await;
     let backend = runtime.daemon.resource_backend();
-    let bindings = backend.using::<flotilla_resources::AccountBinding>(NAMESPACE);
-    let binding = bindings.get(BINDING).await.expect("binding");
-    let mut reopened = binding.spec.clone();
-    reopened.opened_at = flotilla_schema::Timestamp::from_datetime(&(chrono::Utc::now() + chrono::Duration::seconds(1)));
-    bindings.update(&empty_meta(BINDING), &binding.metadata.resource_version, &reopened).await.expect("rebind");
+    rebind(&runtime.daemon).await;
 
     reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
 
     assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), None);
-    // #3929: the record is kept with its delivery cleared at the withdrawn version, so a
-    // relaunch that records a new delivery first is never lost.
-    assert_eq!(provision(&backend).await.expect("record kept").delivered, None);
+    // A rebind closes the old binding and opens a new one under its own name, so the old
+    // binding's provision goes with its copy; a relaunch records the new binding's afresh.
+    assert_eq!(provision(&runtime.daemon).await, None, "the closed binding's provision is removed");
     assert!(matches!(
         backend.using::<TerminalSession>(NAMESPACE).get("terminal-demo-work-coder").await,
         Err(ResourceError::NotFound { .. })
@@ -1168,23 +1173,20 @@ async fn a_restart_keeps_the_account_and_a_gone_place_is_swept() {
     let token = tokens.path().join("box-a");
     fs::write(&token, "box-a-token").expect("token");
     let (runtime, _host, _runtime_dir) = bound_ssh_host_crew(&token).await;
-    let backend = runtime.daemon.resource_backend();
-    let mut old_place = provision(&backend).await.expect("provision");
+    let mut old_place = provision(&runtime.daemon).await.expect("provision");
     old_place.place = "replaced-vessel-env".into();
-    backend
-        .using::<flotilla_resources::AccountProvision>(NAMESPACE)
-        .create(&empty_meta(&format!("{BINDING}.replaced-vessel-env")), &old_place)
-        .await
-        .expect("old place record");
+    let accounts = runtime.daemon.account_records();
+    let old_name = format!("{}.replaced-vessel-env", old_place.binding.name);
+    accounts.record_provision(NAMESPACE, &old_name, "demo", &old_place, false).await.expect("old place record");
 
     let restarted = runtime.launch().await.expect("restart");
     let token_file = restarted.env_vars.iter().find(|(name, _)| name == "FLOTILLA_CLAUDE_OAUTH_TOKEN_FILE").map(|(_, value)| value.clone());
     assert_eq!(token_file.as_deref(), Some(format!("{BOUND_MATERIAL}/.flotilla-oauth-token").as_str()));
     reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
 
-    let provisions = backend.using::<flotilla_resources::AccountProvision>(NAMESPACE).list().await.expect("provisions").items;
+    let provisions = accounts.local_provisions(NAMESPACE).await.expect("provisions");
     assert_eq!(provisions.iter().map(|record| record.spec.place.as_str()).collect::<Vec<_>>(), [ENVIRONMENT]);
-    let binding = backend.using::<flotilla_resources::AccountBinding>(NAMESPACE).get(BINDING).await.expect("binding").spec;
+    let binding = binding(&runtime.daemon).await.spec;
     assert_eq!(binding.credential.0, "claude-box-a");
 }
 
@@ -1197,20 +1199,18 @@ async fn a_relaunch_moves_a_copy_recorded_in_the_old_home() {
     let token = tokens.path().join("box-a");
     fs::write(&token, "box-a-token").expect("token");
     let (runtime, host, _runtime_dir) = bound_ssh_host_crew(&token).await;
-    let backend = runtime.daemon.resource_backend();
-    let provisions = backend.using::<flotilla_resources::AccountProvision>(NAMESPACE);
-    let name = format!("{BINDING}.{ENVIRONMENT}");
-    let recorded = provisions.get(&name).await.expect("provision");
+    let recorded = provision_record(&runtime.daemon).await.expect("provision");
     let old_home = format!("{RUNTIME_BASE}/agent-homes/requesters/demo/coder/claude");
     host.put(&Path::new(&old_home).join(".flotilla-oauth-token"), "box-a-token");
     let old = flotilla_resources::AccountProvisionSpec { home: old_home.clone(), ..recorded.spec.clone() };
-    provisions.update(&empty_meta(&name), &recorded.metadata.resource_version, &old).await.expect("pre-#4012 record");
+    let written = runtime.daemon.account_records().update_provision(NAMESPACE, &recorded, &old).await.expect("pre-#4012 record");
+    assert_eq!(written, flotilla_resources::account_access::ProvisionWrite::Written);
 
     runtime.launch().await.expect("relaunch");
 
     assert_eq!(host.entry(format!("{old_home}/.flotilla-oauth-token")), None, "the old copy is deleted");
     assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), Some(HostEntry::File("box-a-token".into())));
-    assert_eq!(provision(&backend).await.expect("provision").home, BOUND_MATERIAL);
+    assert_eq!(provision(&runtime.daemon).await.expect("provision").home, BOUND_MATERIAL);
 }
 
 // Review #3910: a binding homed on another daemon whose clock runs ahead of this place is still
@@ -1223,13 +1223,13 @@ async fn a_replica_binding_from_a_clock_ahead_keeps_its_fresh_copy() {
     fs::write(&token, "box-a-token").expect("token");
     let (runtime, host, _runtime_dir) = bound_ssh_host_crew_with(&token, Some(("udder-root", chrono::Duration::hours(1)))).await;
     let backend = runtime.daemon.resource_backend();
-    let delivered = provision(&backend).await.expect("provision recorded at launch");
+    let delivered = provision(&runtime.daemon).await.expect("provision recorded at launch");
     assert_eq!(delivered.binding.home, "udder-root", "the provision names the binding's home");
 
     reconcile_place_provisions(&runtime.state, NAMESPACE).await.expect("place pass");
 
     assert_eq!(host.entry(format!("{BOUND_MATERIAL}/.flotilla-oauth-token")), Some(HostEntry::File("box-a-token".into())));
-    assert_eq!(provision(&backend).await, Some(delivered));
+    assert_eq!(provision(&runtime.daemon).await, Some(delivered));
     assert!(backend.using::<TerminalSession>(NAMESPACE).get("terminal-demo-work-coder").await.is_ok(), "the session keeps running");
 }
 
@@ -1241,14 +1241,10 @@ async fn a_withdrawal_waits_for_a_delivery_in_progress() {
     let token = tokens.path().join("box-a");
     fs::write(&token, "box-a-token").expect("token");
     let (runtime, host, _runtime_dir) = bound_ssh_host_crew(&token).await;
-    let backend = runtime.daemon.resource_backend();
-    let bindings = backend.using::<flotilla_resources::AccountBinding>(NAMESPACE);
-    let binding = bindings.get(BINDING).await.expect("binding");
-    let mut reopened = binding.spec.clone();
-    reopened.opened_at = flotilla_schema::Timestamp::from_datetime(&(chrono::Utc::now() + chrono::Duration::seconds(1)));
-    bindings.update(&empty_meta(BINDING), &binding.metadata.resource_version, &reopened).await.expect("rebind");
+    let bound = binding(&runtime.daemon).await;
+    rebind(&runtime.daemon).await;
 
-    let lock = runtime.state.account_delivery_lock(BINDING);
+    let lock = runtime.state.account_delivery_lock(&bound.name);
     let delivering = lock.lock().await;
     let state = Arc::clone(&runtime.state);
     let withdrawal = tokio::spawn(async move { reconcile_place_provisions(&state, NAMESPACE).await });
@@ -1277,7 +1273,7 @@ async fn failed_delivery_waits_for_its_retry_and_is_cleared_once_delivered() {
     let failed = retry(runtime.deliveries().await).expect("the failure is recorded");
     assert_eq!((failed.need.as_str(), failed.attempts), ("account", 1));
 
-    bind_account(&runtime.daemon.resource_backend(), "demo", "coder", "claude-max", "crew@example.com").await;
+    bind_account(&runtime.daemon, "demo", "coder", "claude-max", "crew@example.com").await;
     runtime.launch().await.expect_err("the retry is not yet due");
     assert_eq!(retry(runtime.deliveries().await), Some(failed), "no attempt before the retry is due");
 

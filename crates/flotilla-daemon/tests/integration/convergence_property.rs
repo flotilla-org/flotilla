@@ -1,4 +1,8 @@
 //! Seed-replayable convergence schedules over the real resource overlay.
+//!
+//! The schedules run over Checkout, a kind the old store still holds and replicates: Host is
+//! an engine record now (ADR 0064), written only at its home, with no finalizers or replica
+//! collection for the overlay to converge.
 
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_sqlite::SqliteBackend;
@@ -10,11 +14,28 @@ use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_testkit::server::{spawn_in_memory_request_mesh, spawn_in_memory_request_topology, InMemoryRequestTopology};
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{HostName, NodeId};
-use flotilla_resources::{Host, HostSpec, HostStatus, InputMeta, ResourceError, ResourceProvenance, WatchEvent};
+use flotilla_resources::{
+    Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, InputMeta, ObservedCheckoutSpec, RepositorySpec, ResourceError,
+    ResourceProvenance, WatchEvent,
+};
 use flotilla_store::{collect_resource_replica_kind, delete_resource_kind, ResourceBackend};
 use futures::StreamExt;
 
 const NAMESPACE: &str = "flotilla";
+
+/// A checkout spec told apart by `label`.
+fn checkout_spec(label: impl Into<String>) -> CheckoutSpec {
+    let label = label.into();
+    CheckoutSpec::Observed(
+        ObservedCheckoutSpec::builder()
+            .r#ref(label.clone())
+            .path(format!("/work/{label}"))
+            .repo_ref(RepositorySpec::remote("https://github.com/widgets/api.git").expect("repository").key())
+            .host_ref("host".to_string())
+            .is_main(false)
+            .build(),
+    )
+}
 const CI_SEEDS: &[u64] = &[1, 7, 42, 1_471];
 const REQUIRED_PREFIX: &[Op] = &[
     Op::Create(0),
@@ -201,16 +222,14 @@ impl Harness {
 
     async fn seed_historical_shapes(&mut self) {
         // Missing newer fields: decoding an old status shape exercises serde defaults.
-        let old_status: HostStatus = serde_json::from_value(serde_json::json!({ "ready": true })).expect("decode pre-schema host status");
-        assert!(old_status.capabilities.is_empty() && old_status.disk_free_bytes.is_none());
+        let old_status: CheckoutStatus =
+            serde_json::from_value(serde_json::json!({ "phase": "Ready" })).expect("decode pre-schema checkout status");
+        assert!(old_status.degraded.is_none() && old_status.path.is_none());
 
         let stale_source = ResourceBackend::new(InMemoryBackend::default());
-        let stale = stale_source.using::<Host>(NAMESPACE);
+        let stale = stale_source.using::<Checkout>(NAMESPACE);
         let stale_object = stale
-            .create(
-                &InputMeta::builder().name("host-0".to_string()).build(),
-                &HostSpec { display_name: "stale-self-copy".into(), connection: Default::default(), ..HostSpec::default() },
-            )
+            .create(&InputMeta::builder().name("host-0".to_string()).build(), &checkout_spec("stale-self-copy"))
             .await
             .expect("create stale self-origin fixture");
         stale
@@ -219,27 +238,27 @@ impl Harness {
             .expect("write old-schema status");
         self.nodes[0]
             .backend
-            .replica_writer::<Host>(self.nodes[0].root.clone(), NAMESPACE)
+            .replica_writer::<Checkout>(self.nodes[0].root.clone(), NAMESPACE)
             .replace(&stale.list().await.expect("list stale fixture"), fixed_time(1))
             .await
             .expect("seed stale self-origin partition");
 
         // A prior-run tombstone with a stale add behind it must remain deleted.
         let prior = stale
-            .create(&InputMeta::builder().name("prior-run".to_string()).build(), &HostSpec::default())
+            .create(&InputMeta::builder().name("prior-run".to_string()).build(), &checkout_spec("prior-run"))
             .await
             .expect("create prior-run fixture");
-        let writer = self.nodes[1].backend.replica_writer::<Host>(NodeId::new("retired-root"), NAMESPACE);
+        let writer = self.nodes[1].backend.replica_writer::<Checkout>(NodeId::new("retired-root"), NAMESPACE);
         writer.apply(WatchEvent::Added(prior.clone()), fixed_time(2)).await.expect("seed prior-run add");
         writer.apply(WatchEvent::Deleted(prior), fixed_time(3)).await.expect("seed prior-run tombstone");
 
         // A finalizer must drain before raw deletion can propagate.
         self.nodes[2]
             .backend
-            .using::<Host>(NAMESPACE)
+            .using::<Checkout>(NAMESPACE)
             .create(
                 &InputMeta::builder().name("host-2".to_string()).finalizers(vec!["abandoned.example/finalizer".into()]).build(),
-                &HostSpec { display_name: "abandoned-finalizer".into(), connection: Default::default(), ..HostSpec::default() },
+                &checkout_spec("abandoned-finalizer"),
             )
             .await
             .expect("seed abandoned finalizer");
@@ -297,34 +316,23 @@ impl Harness {
                 if self.permanently_deleted.contains(&name) {
                     return Ok(());
                 }
-                let resolver = self.nodes[index].backend.using::<Host>(NAMESPACE);
+                let resolver = self.nodes[index].backend.using::<Checkout>(NAMESPACE);
                 if matches!(resolver.get(&name).await, Err(ResourceError::NotFound { .. })) {
                     resolver
-                        .create(
-                            &InputMeta::builder().name(name).build(),
-                            &HostSpec {
-                                display_name: format!("created-by-{}", self.seed),
-                                connection: Default::default(),
-                                ..HostSpec::default()
-                            },
-                        )
+                        .create(&InputMeta::builder().name(name).build(), &checkout_spec(format!("created-by-{}", self.seed)))
                         .await
                         .map_err(|error| error.to_string())?;
                 }
             }
             Op::SpecUpdate(index) => {
                 let name = format!("host-{index}");
-                let resolver = self.nodes[index].backend.using::<Host>(NAMESPACE);
+                let resolver = self.nodes[index].backend.using::<Checkout>(NAMESPACE);
                 if let Ok(current) = resolver.get(&name).await {
                     resolver
                         .update(
                             &InputMeta::builder().name(name).build(),
                             &current.metadata.resource_version,
-                            &HostSpec {
-                                display_name: format!("seed-{}-rv-{}", self.seed, current.metadata.resource_version),
-                                connection: Default::default(),
-                                ..HostSpec::default()
-                            },
+                            &checkout_spec(format!("seed-{}-rv-{}", self.seed, current.metadata.resource_version)),
                         )
                         .await
                         .map_err(|error| error.to_string())?;
@@ -332,13 +340,13 @@ impl Harness {
             }
             Op::StatusPatch(index) => {
                 let name = format!("host-{index}");
-                let resolver = self.nodes[index].backend.using::<Host>(NAMESPACE);
+                let resolver = self.nodes[index].backend.using::<Checkout>(NAMESPACE);
                 if let Ok(current) = resolver.get(&name).await {
                     resolver
                         .update_status(
                             &name,
                             &current.metadata.resource_version,
-                            &HostStatus { disk_free_bytes: Some(self.seed + index as u64), ..HostStatus::default() },
+                            &CheckoutStatus::builder().phase(CheckoutPhase::Ready).path(format!("seed-{}-{index}", self.seed)).build(),
                         )
                         .await
                         .map_err(|error| error.to_string())?;
@@ -346,7 +354,7 @@ impl Harness {
             }
             Op::LifecycleDelete(index) => {
                 let name = format!("host-{index}");
-                let resolver = self.nodes[index].backend.using::<Host>(NAMESPACE);
+                let resolver = self.nodes[index].backend.using::<Checkout>(NAMESPACE);
                 match resolver.delete(&name).await {
                     Ok(()) => {
                         if matches!(resolver.get(&name).await, Err(ResourceError::NotFound { .. })) {
@@ -359,9 +367,10 @@ impl Harness {
             }
             Op::RawDelete(index) => {
                 let name = format!("host-{index}");
-                let first =
-                    delete_resource_kind(&self.nodes[index].backend, NAMESPACE, "hosts", &name).await.map_err(|error| error.to_string())?;
-                let resolver = self.nodes[index].backend.using::<Host>(NAMESPACE);
+                let first = delete_resource_kind(&self.nodes[index].backend, NAMESPACE, "checkouts", &name)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let resolver = self.nodes[index].backend.using::<Checkout>(NAMESPACE);
                 if let Ok(pending) = resolver.get(&name).await {
                     if !pending.metadata.is_pending_finalization() {
                         return Err(format!("raw delete of {name} did not request finalization"));
@@ -370,10 +379,13 @@ impl Harness {
                     let mut meta = InputMeta::from(&pending.metadata);
                     meta.finalizers.clear();
                     resolver.update(&meta, &pending.metadata.resource_version, &pending.spec).await.map_err(|error| error.to_string())?;
-                    delete_resource_kind(&self.nodes[index].backend, NAMESPACE, "hosts", &name).await.map_err(|error| error.to_string())?;
+                    delete_resource_kind(&self.nodes[index].backend, NAMESPACE, "checkouts", &name)
+                        .await
+                        .map_err(|error| error.to_string())?;
                 }
-                let repeated =
-                    delete_resource_kind(&self.nodes[index].backend, NAMESPACE, "hosts", &name).await.map_err(|error| error.to_string())?;
+                let repeated = delete_resource_kind(&self.nodes[index].backend, NAMESPACE, "checkouts", &name)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 if first.already_deleted {
                     if !repeated.already_deleted {
                         return Err(format!("repeat raw delete of {name} was not already-deleted"));
@@ -386,7 +398,9 @@ impl Harness {
             Op::RawReplicaDelete(index) => {
                 let origin = (index + 1) % 3;
                 let name = format!("host-{origin}");
-                match collect_resource_replica_kind(&self.nodes[index].backend, NAMESPACE, "hosts", &name, &self.nodes[origin].root).await {
+                match collect_resource_replica_kind(&self.nodes[index].backend, NAMESPACE, "checkouts", &name, &self.nodes[origin].root)
+                    .await
+                {
                     Ok(_) | Err(ResourceError::NotFound { .. }) => {}
                     Err(error) => return Err(error.to_string()),
                 }
@@ -415,9 +429,9 @@ impl Harness {
         let mut rows = Vec::new();
         for authority in &self.nodes {
             let name = authority.host.to_string();
-            let expected = authority.backend.using::<Host>(NAMESPACE).get(&name).await.ok();
+            let expected = authority.backend.using::<Checkout>(NAMESPACE).get(&name).await.ok();
             for (index, node) in self.nodes.iter().enumerate() {
-                let actual = node.backend.including_replicas::<Host>(NAMESPACE).get(&name).await.ok();
+                let actual = node.backend.including_replicas::<Checkout>(NAMESPACE).get(&name).await.ok();
                 if objects_differ(actual.as_ref().map(|row| &row.object), expected.as_ref()).unwrap_or(true) {
                     rows.push(format!("store={index} name={name} expected={expected:?} actual={actual:?}"));
                 }
@@ -429,9 +443,9 @@ impl Harness {
     async fn views_match_authorities(&self) -> Result<bool, String> {
         for authority in &self.nodes {
             let name = authority.host.to_string();
-            let expected = authority.backend.using::<Host>(NAMESPACE).get(&name).await.ok();
+            let expected = authority.backend.using::<Checkout>(NAMESPACE).get(&name).await.ok();
             for node in &self.nodes {
-                let actual = node.backend.including_replicas::<Host>(NAMESPACE).get(&name).await.ok().map(|row| row.object);
+                let actual = node.backend.including_replicas::<Checkout>(NAMESPACE).get(&name).await.ok().map(|row| row.object);
                 if objects_differ(actual.as_ref(), expected.as_ref())? {
                     return Ok(false);
                 }
@@ -450,13 +464,13 @@ impl Harness {
     async fn assert_deletes_stay_deleted(&self) -> Result<(), String> {
         for name in &self.permanently_deleted {
             for node in &self.nodes {
-                if node.backend.including_replicas::<Host>(NAMESPACE).get(name).await.is_ok() {
+                if node.backend.including_replicas::<Checkout>(NAMESPACE).get(name).await.is_ok() {
                     return Err(format!("deleted record {name} resurrected after a later relay cycle"));
                 }
             }
         }
         for node in &self.nodes {
-            if node.backend.including_replicas::<Host>(NAMESPACE).get("prior-run").await.is_ok() {
+            if node.backend.including_replicas::<Checkout>(NAMESPACE).get("prior-run").await.is_ok() {
                 return Err("prior-run tombstone allowed a stale record to reappear".into());
             }
         }
@@ -466,12 +480,12 @@ impl Harness {
     async fn assert_shadow(&self, fault: bool) -> Result<(), String> {
         for node in &self.nodes {
             let name = node.host.to_string();
-            let local = match node.backend.using::<Host>(NAMESPACE).get(&name).await {
+            let local = match node.backend.using::<Checkout>(NAMESPACE).get(&name).await {
                 Ok(local) => local,
                 Err(ResourceError::NotFound { .. }) => continue,
                 Err(error) => return Err(error.to_string()),
             };
-            let mut resolver = node.backend.including_replicas::<Host>(NAMESPACE);
+            let mut resolver = node.backend.including_replicas::<Checkout>(NAMESPACE);
             if fault {
                 resolver = resolver.with_self_origin_suppression(false);
             }
@@ -493,7 +507,7 @@ impl Harness {
 
     async fn assert_shadow_watch(&self, fault: bool) -> Result<(), String> {
         let node = &self.nodes[0];
-        let mut resolver = node.backend.including_replicas::<Host>(NAMESPACE);
+        let mut resolver = node.backend.including_replicas::<Checkout>(NAMESPACE);
         if fault {
             resolver = resolver.with_self_origin_suppression(false);
         }
@@ -501,15 +515,12 @@ impl Harness {
         while tokio::time::timeout(Duration::from_millis(10), watch.next()).await.is_ok() {}
         let stale_source = ResourceBackend::new(InMemoryBackend::default());
         let stale = stale_source
-            .using::<Host>(NAMESPACE)
-            .create(
-                &InputMeta::builder().name("host-0".to_string()).build(),
-                &HostSpec { display_name: "watch-shadow".to_string(), connection: Default::default(), ..HostSpec::default() },
-            )
+            .using::<Checkout>(NAMESPACE)
+            .create(&InputMeta::builder().name("host-0".to_string()).build(), &checkout_spec("watch-shadow"))
             .await
             .map_err(|error| error.to_string())?;
         node.backend
-            .replica_writer::<Host>(node.root.clone(), NAMESPACE)
+            .replica_writer::<Checkout>(node.root.clone(), NAMESPACE)
             .apply(WatchEvent::Modified(stale), fixed_time(4))
             .await
             .map_err(|error| error.to_string())?;
@@ -541,8 +552,8 @@ impl Harness {
 }
 
 fn objects_differ(
-    left: Option<&flotilla_resources::ResourceObject<Host>>,
-    right: Option<&flotilla_resources::ResourceObject<Host>>,
+    left: Option<&flotilla_resources::ResourceObject<Checkout>>,
+    right: Option<&flotilla_resources::ResourceObject<Checkout>>,
 ) -> Result<bool, String> {
     match (left, right) {
         (Some(left), Some(right)) => Ok(serde_json::to_value(left).map_err(|error| error.to_string())?

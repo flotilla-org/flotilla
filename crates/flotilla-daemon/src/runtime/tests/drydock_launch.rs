@@ -419,7 +419,7 @@ async fn stand_in_with(declared_path: Option<&str>, harness_in_image: bool, host
     backend.using::<Environment>(NAMESPACE).create(&empty_meta(env_id.as_str()), &spec).await.expect("environment record");
     let source = LocalSkillSource::new(root, "research");
     freeze_crew(&backend, &convoy, "demo-work", "coder", "claude-code", vec![source.selected.clone()]).await;
-    bind_account(&backend, &convoy, "coder", "claude-max", "test@example.com").await;
+    bind_account(&daemon, &convoy, "coder", "claude-max", "test@example.com").await;
 
     let adapters: Arc<dyn CommandRunner> =
         Arc::new(CredentialInteriorRunner(DiscoveryMockRunner::builder().tool_exists("claude", true).build()));

@@ -14,7 +14,7 @@ use flotilla_resources::{
 };
 use flotilla_store::ResourceBackend;
 
-use super::support::{create_docker_placement, create_identity_convoy, host_direct_kind, test_meta};
+use super::support::{create_docker_placement, create_identity_convoy, host_direct_kind, put_host, read_host, test_meta};
 use crate::in_process::{placement_target_host, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;
 use flotilla_admission::convoy_admission::allocate_convoy_generation;
@@ -171,10 +171,8 @@ async fn capability_admission_resolves_display_name_kind_and_policy_host_refs() 
         .await
         .expect("host facts");
     for name in ["collision-a", "collision-b"] {
-        hosts
-            .create(&test_meta(name), &HostSpec { display_name: "collision".into(), connection: Default::default(), ..HostSpec::default() })
-            .await
-            .expect("ambiguous host");
+        let spec = HostSpec { display_name: "collision".into(), connection: Default::default(), ..HostSpec::default() };
+        put_host(&daemon, name, &spec, &HostStatus::default()).await;
     }
     backend
         .clone()
@@ -484,43 +482,34 @@ async fn capability_admission_places_on_ssh_hosts_only_when_pinned() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    let hosts = backend.clone().using::<ResourceHost>("flotilla");
-    let host = hosts
-        .create(
-            &test_meta("ssh-host"),
-            &HostSpec {
-                display_name: "beaufort".into(),
-                connection: flotilla_resources::HostConnection::SshHost {
-                    owning_daemon: "ssh-host-owner".into(),
-                    destination: "crew@beaufort.example".into(),
-                },
-                ..HostSpec::default()
+    put_host(
+        &daemon,
+        "ssh-host",
+        &HostSpec {
+            display_name: "beaufort".into(),
+            connection: flotilla_resources::HostConnection::SshHost {
+                owning_daemon: "ssh-host-owner".into(),
+                destination: "crew@beaufort.example".into(),
             },
-        )
-        .await
-        .expect("SSH host");
-    hosts
-        .update_status(
-            "ssh-host",
-            &host.metadata.resource_version,
-            &HostStatus {
-                capabilities: [(
-                    flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
-                    serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
-                )]
-                .into_iter()
-                .collect(),
-                heartbeat_at: Some(Utc::now()),
-                ready: true,
-                fulfilment_facts: BTreeMap::from([(
-                    "host-direct-ssh-host".into(),
-                    FulfilmentFacts { observed_at: Utc::now(), ..Default::default() },
-                )]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("SSH host facts");
+            ..HostSpec::default()
+        },
+        &HostStatus {
+            capabilities: [(
+                flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+            )]
+            .into_iter()
+            .collect(),
+            heartbeat_at: Some(Utc::now()),
+            ready: true,
+            fulfilment_facts: BTreeMap::from([(
+                "host-direct-ssh-host".into(),
+                FulfilmentFacts { observed_at: Utc::now(), ..Default::default() },
+            )]),
+            ..Default::default()
+        },
+    )
+    .await;
     backend
         .clone()
         .using::<FulfilmentKind>("flotilla")
@@ -745,45 +734,36 @@ async fn parallel_daemons_have_independent_free_space_probe_capacity() {
 
 /// An SSH host, owned by `ssh-host-owner`, with its policy and
 /// host-direct kind, optionally declaring a vessel cap (#3793).
-async fn ssh_host(backend: &ResourceBackend, name: &str, max_vessels: Option<u32>) {
-    let hosts = backend.clone().using::<ResourceHost>("flotilla");
+async fn ssh_host(daemon: &InProcessDaemon, name: &str, max_vessels: Option<u32>) {
     let kind = format!("host-direct-{name}");
-    let host = hosts
-        .create(
-            &test_meta(name),
-            &HostSpec {
-                display_name: name.into(),
-                connection: flotilla_resources::HostConnection::SshHost {
-                    owning_daemon: "ssh-host-owner".into(),
-                    destination: format!("crew@{name}.example"),
-                },
-                max_vessels,
-                ..HostSpec::default()
+    put_host(
+        daemon,
+        name,
+        &HostSpec {
+            display_name: name.into(),
+            connection: flotilla_resources::HostConnection::SshHost {
+                owning_daemon: "ssh-host-owner".into(),
+                destination: format!("crew@{name}.example"),
             },
-        )
-        .await
-        .expect("SSH host");
-    hosts
-        .update_status(
-            name,
-            &host.metadata.resource_version,
-            &HostStatus {
-                capabilities: [(
-                    flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
-                    serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
-                )]
-                .into_iter()
-                .collect(),
-                heartbeat_at: Some(Utc::now()),
-                ready: true,
-                fulfilment_facts: BTreeMap::from([(kind.clone(), FulfilmentFacts { observed_at: Utc::now(), ..Default::default() })]),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("SSH host facts");
-    backend
-        .clone()
+            max_vessels,
+            ..HostSpec::default()
+        },
+        &HostStatus {
+            capabilities: [(
+                flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
+                serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
+            )]
+            .into_iter()
+            .collect(),
+            heartbeat_at: Some(Utc::now()),
+            ready: true,
+            fulfilment_facts: BTreeMap::from([(kind.clone(), FulfilmentFacts { observed_at: Utc::now(), ..Default::default() })]),
+            ..Default::default()
+        },
+    )
+    .await;
+    daemon
+        .resource_backend()
         .using::<FulfilmentKind>("flotilla")
         .create(
             &test_meta(&kind),
@@ -820,7 +800,7 @@ async fn capped_ssh_hosts_spread_unpinned_convoys_and_queue_beyond_their_cap() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = ssh_host_owner(&backend, &temp).await;
     for name in ["b1", "b2", "b3"] {
-        ssh_host(&backend, name, Some(1)).await;
+        ssh_host(&daemon, name, Some(1)).await;
     }
     let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
     let unpinned = flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".to_string()).build();
@@ -949,8 +929,8 @@ async fn uncapped_ssh_host_still_refuses_unpinned_convoys() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = ssh_host_owner(&backend, &temp).await;
-    ssh_host(&backend, "b1", Some(1)).await;
-    ssh_host(&backend, "b9", None).await;
+    ssh_host(&daemon, "b1", Some(1)).await;
+    ssh_host(&daemon, "b9", None).await;
     let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
     let unpinned = flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".to_string()).build();
     let (placement, _) = daemon
@@ -969,8 +949,8 @@ async fn placement_prefers_the_capped_host_with_most_free_slots() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = ssh_host_owner(&backend, &temp).await;
-    ssh_host(&backend, "b1", Some(2)).await;
-    ssh_host(&backend, "b2", Some(2)).await;
+    ssh_host(&daemon, "b1", Some(2)).await;
+    ssh_host(&daemon, "b2", Some(2)).await;
     let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
     let unpinned = flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".to_string()).build();
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
@@ -1017,7 +997,7 @@ async fn capped_ssh_host_refuses_a_convoy_with_more_vessels_than_its_cap() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = ssh_host_owner(&backend, &temp).await;
-    ssh_host(&backend, "b1", Some(1)).await;
+    ssh_host(&daemon, "b1", Some(1)).await;
     let vessel = |name: &str| flotilla_resources::VesselRequirement::builder().name(name.to_string()).crew(Vec::new()).build();
     let workflow = WorkflowTemplateSpec::builder().vessels(vec![vessel("first"), vessel("second")]).build();
     let unpinned = flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".to_string()).build();
@@ -1037,7 +1017,7 @@ async fn concurrent_admissions_onto_one_free_slot_provision_in_admission_order()
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = ssh_host_owner(&backend, &temp).await;
-    ssh_host(&backend, "b1", Some(1)).await;
+    ssh_host(&daemon, "b1", Some(1)).await;
     let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
     let unpinned = flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".to_string()).build();
     // Both placements are decided before either convoy exists.
@@ -1095,32 +1075,22 @@ async fn concurrent_admissions_onto_one_free_slot_provision_in_admission_order()
 
 /// A daemon host holding its Docker crew image, with the Docker kind derived
 /// as feta's is, optionally declaring a Docker vessel cap (#4002).
-async fn docker_host(backend: &ResourceBackend, name: &str, max_vessels: Option<u32>) {
+async fn docker_host(daemon: &InProcessDaemon, name: &str, max_vessels: Option<u32>) {
     let kind = format!("docker-{name}");
-    create_docker_placement(backend, &kind, name, BTreeSet::new()).await;
-    let hosts = backend.clone().using::<ResourceHost>("flotilla");
-    let host = hosts.get(name).await.expect("Docker host");
-    hosts
-        .update(&InputMeta::from(&host.metadata), &host.metadata.resource_version, &HostSpec { max_vessels, ..host.spec.clone() })
-        .await
-        .expect("Docker host cap");
-    let host = hosts.get(name).await.expect("Docker host");
+    create_docker_placement(daemon, &kind, name, BTreeSet::new()).await;
+    let host = read_host(daemon, name).await;
     let mut status = host.status.expect("Docker host status");
     status.capabilities.insert(flotilla_resources::IMAGE_DIGESTS_CAPABILITY.into(), serde_json::json!({"fixture-1": ["crew:latest"]}));
-    hosts.update_status(name, &host.metadata.resource_version, &status).await.expect("held crew image");
+    put_host(daemon, name, &HostSpec { max_vessels, ..host.spec }, &status).await;
 }
 
 /// A capped SSH host box whose host-direct kind is derived as b1's is,
 /// with or without the single-tenant declaration (#4002).
-async fn dedicated_box(backend: &ResourceBackend, name: &str, max_vessels: u32, single_tenant: bool) {
-    ssh_host(backend, name, Some(max_vessels)).await;
-    let hosts = backend.clone().using::<ResourceHost>("flotilla");
-    let host = hosts.get(name).await.expect("box");
-    hosts
-        .update(&InputMeta::from(&host.metadata), &host.metadata.resource_version, &HostSpec { single_tenant, ..host.spec.clone() })
-        .await
-        .expect("box tenancy");
-    let kinds = backend.clone().using::<FulfilmentKind>("flotilla");
+async fn dedicated_box(daemon: &InProcessDaemon, name: &str, max_vessels: u32, single_tenant: bool) {
+    ssh_host(daemon, name, Some(max_vessels)).await;
+    let host = read_host(daemon, name).await;
+    put_host(daemon, name, &HostSpec { single_tenant, ..host.spec }, &host.status.expect("box status")).await;
+    let kinds = daemon.resource_backend().using::<FulfilmentKind>("flotilla");
     let kind = kinds.get(&format!("host-direct-{name}")).await.expect("box kind");
     kinds
         .update(
@@ -1189,9 +1159,9 @@ async fn declared_single_tenant_box_is_a_minimal_alternative_and_an_undeclared_o
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = ssh_host_owner(&backend, &temp).await;
-    docker_host(&backend, "feta", None).await;
-    dedicated_box(&backend, "b1", 1, true).await;
-    dedicated_box(&backend, "b2", 1, false).await;
+    docker_host(&daemon, "feta", None).await;
+    dedicated_box(&daemon, "b1", 1, true).await;
+    dedicated_box(&daemon, "b2", 1, false).await;
     let decision = admit(&daemon, &backend, "convoy", None).await;
     let feta = allocation_candidate(&decision, "docker-feta");
     let declared = allocation_candidate(&decision, "host-direct-b1");
@@ -1210,8 +1180,8 @@ async fn capped_docker_host_at_its_cap_overflows_to_a_box() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = ssh_host_owner(&backend, &temp).await;
-    docker_host(&backend, "feta", Some(1)).await;
-    dedicated_box(&backend, "b1", 1, true).await;
+    docker_host(&daemon, "feta", Some(1)).await;
+    dedicated_box(&daemon, "b1", 1, true).await;
     // The first convoy fills feta's one slot.
     admit(&daemon, &backend, "first", Some("docker-feta")).await;
     let second = admit(&daemon, &backend, "second", None).await;
@@ -1227,8 +1197,8 @@ async fn all_candidates_full_means_the_convoy_waits() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = ssh_host_owner(&backend, &temp).await;
-    docker_host(&backend, "feta", Some(1)).await;
-    dedicated_box(&backend, "b1", 1, true).await;
+    docker_host(&daemon, "feta", Some(1)).await;
+    dedicated_box(&daemon, "b1", 1, true).await;
     for (name, pin) in [("first", "docker-feta"), ("second", "host-direct-b1")] {
         admit(&daemon, &backend, name, Some(pin)).await;
     }

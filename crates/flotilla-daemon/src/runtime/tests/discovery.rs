@@ -188,11 +188,11 @@ async fn ssh_host_provisions_clone_and_worktree_through_its_runner() {
         .expect("write remote credential metadata");
     apply_ssh_host_observation(&daemon, NAMESPACE, &profile, None, None).await.expect("publish SSH observation");
     let host = daemon.resource_backend().using::<Host>(NAMESPACE).get(host_id).await.expect("SSH Host");
-    // #3793: the owning daemon declares the configured cap and publishes the
-    // free slots it counts for each of the host's kinds.
+    // #3793: the owning daemon declares the configured cap. Free slots are a judgement on the
+    // engine, counted afresh by admission, so the Host carries none (`host_import.rs`).
     assert_eq!(host.spec.max_vessels, Some(2));
     let status = host.status.expect("SSH status");
-    assert_eq!(status.fulfilment_facts.get("host-direct-ssh-test-host").and_then(|facts| facts.free_vessel_slots), Some(2));
+    assert!(status.fulfilment_facts.contains_key("host-direct-ssh-test-host"));
     assert!(status.ready);
     assert!(status.credential_expiry().expect("SSH credential expiry").contains_key(flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE));
     let kinds = daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE);

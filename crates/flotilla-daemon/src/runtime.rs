@@ -178,14 +178,10 @@ impl DaemonRuntime {
         phase("set_provisioning_namespace", daemon.set_provisioning_namespace(options.namespace.clone())).await;
         let aggregator_projection_state = phase("aggregator_projection_state", daemon.aggregator_projection_state()).await;
         let daemon_config = config.load_daemon_config()?;
-        // ADR 0064 switch-over (#3317): `[primitives]` moves Message onto the
-        // engine and its store; refused without `[dummy_fleet]`. Absent, nothing changes.
-        let mut provisioning_lifecycles = None;
-        if daemon_config.primitives()?.is_some() {
-            result_phase("open_message_primitives", open_message_primitives(&daemon)).await?;
-            provisioning_lifecycles = Some(open_provisioning_lifecycles(&daemon).await?);
-            daemon.require_lifecycle_reads_installed()?;
-        }
+        // ADR 0064 (#3108): Message and the provisioning lifecycles run on the decided store.
+        result_phase("open_message_primitives", open_message_primitives(&daemon)).await?;
+        let provisioning_lifecycles = Some(open_provisioning_lifecycles(&daemon).await?);
+        daemon.require_lifecycle_reads_installed()?;
         let manifests = daemon_config.manifests;
         let relay = daemon_config.relay;
         let forge_default_branches = crate::dummy_fleet::dummy_forge_default_branches(daemon_config.dummy_fleet.as_ref());
@@ -470,17 +466,14 @@ impl DaemonRuntime {
 
         let controller_metrics = Arc::new(flotilla_store::load_metrics::ControllerMetricsRegistry::default());
         let mut controller_state = None;
-        // Behind `[primitives]` the engine's Ensure decides standing-convoy status (#3629 layer 7).
-        let ensure_engine = match provisioning_lifecycles {
-            Some(_) => {
-                let store = daemon.decided_store()?.store();
-                let clock = daemon.clock_for_scenarios();
-                let path = tokio::task::spawn_blocking(move || flotilla_core::primitives::ensures::EngineEnsurePath::open(store, clock))
-                    .await
-                    .map_err(|error| error.to_string())??;
-                Some(Arc::new(path) as Arc<dyn flotilla_admission::convoy_ensure::EngineEnsures>)
-            }
-            None => None,
+        // The engine's Ensure decides standing-convoy status (#3629 layer 7).
+        let ensure_engine = {
+            let store = daemon.decided_store()?.store();
+            let clock = daemon.clock_for_scenarios();
+            let path = tokio::task::spawn_blocking(move || flotilla_core::primitives::ensures::EngineEnsurePath::open(store, clock))
+                .await
+                .map_err(|error| error.to_string())??;
+            Some(Arc::new(path) as Arc<dyn flotilla_admission::convoy_ensure::EngineEnsures>)
         };
         daemon
             .install_convoy_ensure_reconciler(Arc::new(
@@ -1180,23 +1173,14 @@ fn spawn_controller_loops(
     controllers
 }
 
-/// The decided store's kinds behind `[primitives]`: Message and AgentSession
-/// (#3317), the provisioning lifecycle kinds and TerminalSession, the account
-/// kinds (#3824 layer 1), and the engine's Vessel and Ensure (#3629), each
-/// under its production code.
+/// The decided store's kinds ([`flotilla_core::in_process::decided::registry`]).
 pub(crate) fn decided_registry() -> Result<flotilla_schema::KindRegistry, flotilla_schema::RegistryError> {
-    let mut registry = flotilla_engine_store::registry()?;
-    flotilla_provisioning::stored::register(&mut registry)?;
-    flotilla_engine_store::register_crew(&mut registry)?;
-    Ok(registry)
+    flotilla_core::in_process::decided::registry()
 }
 
 /// The machine diagram of each kind in [`decided_registry`], by kind name.
 pub(crate) fn decided_diagrams() -> Result<std::collections::BTreeMap<String, String>, flotilla_schema::RegistryError> {
-    let mut diagrams = flotilla_engine_store::machine_registry()?.diagrams;
-    diagrams.extend(flotilla_provisioning::stored::diagrams());
-    diagrams.extend(flotilla_engine_store::crew_diagrams());
-    Ok(diagrams)
+    flotilla_core::in_process::decided::diagrams()
 }
 
 #[cfg(test)]
@@ -1221,70 +1205,16 @@ mod decided_kinds_tests {
     }
 }
 
-/// The decided store's opener behind `[primitives]` (#3108, #3317), for the composition root to
-/// pass to [`InProcessDaemon::new_composed`]; none without the switch. Once the daemon's identity
-/// is resolved it fills the store from the old one at its first start
-/// ([`crate::engine_import::first_start`]), opens it with the [`decided_registry`] kinds, homed at
-/// this daemon's node id, and opens the ports serving those kinds, so nothing the daemon composes
-/// reads them anywhere else.
-pub fn engine_opener(config: &ConfigStore) -> Result<Option<flotilla_core::in_process::EngineOpener>, String> {
-    if config.load_daemon_config()?.primitives()?.is_none() {
-        return Ok(None);
-    }
-    let state_dir = config.state_dir().as_path().to_path_buf();
-    Ok(Some(Box::new(move |identity: flotilla_core::in_process::EngineIdentity| {
-        Box::pin(
-            async move { tokio::task::spawn_blocking(move || open_engine(&state_dir, identity)).await.map_err(|error| error.to_string())? },
-        ) as futures::future::BoxFuture<'static, _>
-    })))
-}
-
-fn open_engine(
-    state_dir: &std::path::Path,
-    identity: flotilla_core::in_process::EngineIdentity,
-) -> Result<flotilla_core::in_process::ComposedEngine, String> {
-    use flotilla_provisioning::engine::{
-        access_deliveries::EngineAccessDeliveries, artifacts::EngineArtifacts, definitions::EngineDefinitions, hosts::EngineHosts,
-        kinds::EngineKinds, observations::EngineObservations, projects::EngineProjects, repositories::EngineRepositories,
-    };
-    use flotilla_resources::engine_records::EngineRecords;
-    let home = identity.node_id.as_str().to_owned();
-    let own_host = identity.host_id.to_string();
-    // Before this daemon serves or connects to a peer, so an importing host neither sends nor receives records.
-    crate::engine_import::first_start(state_dir, &home, Some(&own_host))?;
-    let registry = decided_registry().map_err(|error| format!("decided store registry: {error:?}"))?;
-    let path = state_dir.join(crate::engine_import::ENGINE_STORE);
-    let service = Arc::new(
-        flotilla_schema_sqlite::stream::Service::open(&path, &home, registry)
-            .map_err(|error| format!("open decided store {}: {error}", path.display()))?,
-    );
-    let clock = || Arc::clone(&identity.clock);
-    let records: Vec<Arc<dyn EngineRecords>> = vec![
-        // #3824 layer 2b-ii: the definition kinds.
-        Arc::new(EngineDefinitions::open(Arc::clone(&service), clock())?),
-        // #3824 layer 3a and 3b: Repository, and Project with its operations' record.
-        Arc::new(EngineRepositories::open(Arc::clone(&service), clock())?),
-        Arc::new(EngineProjects::open(Arc::clone(&service), clock())?),
-        Arc::new(EngineArtifacts::open(Arc::clone(&service), clock())?),
-        Arc::new(EngineAccessDeliveries::open(Arc::clone(&service), clock())?),
-        // FulfilmentKind, which admission and the vessel reconciler read and admission's snapshots write.
-        Arc::new(EngineKinds::open(Arc::clone(&service), clock())?),
-        // Host, which every placement reads and this daemon's observers write only on change.
-        Arc::new(EngineHosts::open(Arc::clone(&service), own_host, clock())?),
-    ];
-    // ChangeRequest and Issue: written by their source's observer, read at every home.
-    let observations = Arc::new(EngineObservations::open(Arc::clone(&service), clock())?);
-    // #3824 layers 1 and 2c: the account kinds and ManifestRoot.
-    let accounts = Arc::new(flotilla_provisioning::engine::account::EngineAccounts::open(Arc::clone(&service), clock())?);
-    let manifest_roots = Arc::new(flotilla_provisioning::engine::manifest_root::EngineManifestRoots::open(Arc::clone(&service), clock())?);
-    Ok(flotilla_core::in_process::ComposedEngine {
-        service,
-        records,
-        observations: observations.clone(),
-        observation_failures: observations,
-        accounts,
-        manifest_roots,
-    })
+/// The decided store's opener (#3108), for the composition root to pass to
+/// [`InProcessDaemon::new_composed`]. Once the daemon's identity is resolved it fills the store
+/// from the old one at its first start ([`crate::engine_import::first_start`]), before this
+/// daemon serves or connects to a peer, so an importing host neither sends nor receives records;
+/// then it opens the store ([`flotilla_core::in_process::decided::open`]).
+pub fn engine_opener(config: &ConfigStore) -> flotilla_core::in_process::EngineOpener {
+    flotilla_core::in_process::decided::opener_with(
+        config.state_dir().as_path(),
+        Box::new(|state_dir, home, own_host| crate::engine_import::first_start(state_dir, home, Some(own_host)).map(|_| ())),
+    )
 }
 
 /// Opens the Message path over the decided store composed with the daemon (#3317). Installed

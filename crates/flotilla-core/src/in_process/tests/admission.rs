@@ -47,6 +47,31 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
     let token_path = temp.path().join("forgejo-token");
     std::fs::write(&token_path, "test-token").expect("token file");
     let backend = ResourceBackend::new(InMemoryBackend::default());
+    let provider = Arc::new(FakeChangeRequest::new());
+    provider
+        .add_change_requests(vec![(
+            "17".to_string(),
+            ChangeRequest {
+                title: "Fix ghostty".to_string(),
+                branch: "governor".to_string(),
+                status: flotilla_protocol::ChangeRequestStatus::Open,
+                body: None,
+                provider_name: "forgejo".to_string(),
+                provider_display_name: "Forgejo".to_string(),
+            },
+        )])
+        .await;
+    let mut discovery = fake_discovery(false);
+    discovery.factories.change_requests = vec![Box::new(ForgeAwareTestChangeRequestFactory(provider))];
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        discovery,
+        HostName::new("test-host"),
+        backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let forge = flotilla_resources::ForgeSpec::builder()
         .forge_id("lab".to_string())
         .kind(flotilla_resources::ForgeKind::Forgejo)
@@ -81,31 +106,6 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
         )
         .await
         .expect("credential");
-    let provider = Arc::new(FakeChangeRequest::new());
-    provider
-        .add_change_requests(vec![(
-            "17".to_string(),
-            ChangeRequest {
-                title: "Fix ghostty".to_string(),
-                branch: "governor".to_string(),
-                status: flotilla_protocol::ChangeRequestStatus::Open,
-                body: None,
-                provider_name: "forgejo".to_string(),
-                provider_display_name: "Forgejo".to_string(),
-            },
-        )])
-        .await;
-    let mut discovery = fake_discovery(false);
-    discovery.factories.change_requests = vec![Box::new(ForgeAwareTestChangeRequestFactory(provider))];
-    let daemon = InProcessDaemon::new_with_resource_backend(
-        Vec::new(),
-        Arc::new(ConfigStore::with_base(temp.path())),
-        discovery,
-        HostName::new("test-host"),
-        backend,
-        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-    )
-    .await;
     daemon.set_provisioning_namespace("flotilla".to_string()).await;
     let resolved =
         daemon.resolve_convoy_change_request(std::slice::from_ref(&repository_key), "governor", None).await.expect("resolve Forgejo PR");
@@ -755,6 +755,16 @@ async fn bound_change_request_resolution_uses_durable_observation_for_a_mirror_c
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"bound-pr-test\"\n").expect("daemon config");
     let backend = ResourceBackend::new(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("test-host"),
+        backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    daemon.set_provisioning_namespace("flotilla".to_string()).await;
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla")
         .expect("repository spec")
         .with_remotes(["https://github.com/flotilla-org/flotilla".to_string(), "https://forgejo.example/flotilla/flotilla".to_string()])
@@ -766,16 +776,6 @@ async fn bound_change_request_resolution_uses_durable_observation_for_a_mirror_c
         .create(&test_meta(&repository_key.to_string()), &repository_spec)
         .await
         .expect("repository");
-    let daemon = InProcessDaemon::new_with_resource_backend(
-        Vec::new(),
-        Arc::new(ConfigStore::with_base(temp.path())),
-        fake_discovery(false),
-        HostName::new("test-host"),
-        backend,
-        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-    )
-    .await;
-    daemon.set_provisioning_namespace("flotilla".to_string()).await;
     let change_requests = daemon.resource_backend().using::<ResourceChangeRequest>("flotilla");
     let change_request_name = cr_name("github.com", "flotilla-org/flotilla", 1696);
     let observation = change_requests
@@ -898,6 +898,17 @@ async fn rehearsal_binding_preserves_copied_forge_data() {
             ),
         ).expect("daemon config");
         let backend = ResourceBackend::new(InMemoryBackend::default());
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let discovery = fake_discovery(false);
+        let daemon = InProcessDaemon::new_with_resource_backend(
+            Vec::new(),
+            config.clone(),
+            discovery,
+            HostName::new("rehearsal"),
+            backend.clone(),
+            Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+        )
+        .await;
         let mut repository = RepositorySpec::remote(format!("{service}/team/repo")).expect("copied repository");
         if declared {
             let github = service == "https://github.com";
@@ -922,17 +933,6 @@ async fn rehearsal_binding_preserves_copied_forge_data() {
             .create(&test_meta(&repository.key().to_string()), &repository)
             .await
             .expect("copied record");
-        let config = Arc::new(ConfigStore::with_base(temp.path()));
-        let discovery = fake_discovery(false);
-        let daemon = InProcessDaemon::new_with_resource_backend(
-            Vec::new(),
-            config.clone(),
-            discovery,
-            HostName::new("rehearsal"),
-            backend.clone(),
-            Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-        )
-        .await;
         let bag = super::super::repository_discovery::repository_provider_bag(
             &backend,
             &config,

@@ -22,7 +22,6 @@ use flotilla_resources::{
 
 /// Long runners' turns in the harness's `[dummy_fleet.agent]`.
 const LONG_RUNNER_TURNS: u32 = 2;
-const PRIMITIVES: &str = "[primitives]\n";
 
 /// The convoy named `name`, once `done` holds for its status.
 fn convoy<'a>(name: &'a str, done: impl Fn(&ConvoyStatus) -> bool + 'a) -> impl Fn(&ResourceObject<Convoy>) -> bool + 'a {
@@ -46,6 +45,18 @@ fn stalled(name: &str) -> impl Fn(&ResourceObject<Convoy>) -> bool + '_ {
     })
 }
 
+/// The promises of `vessel`'s `role` in convoy `name`, as explain reads them: the engine's.
+async fn promises(fleet: &TestDaemon, name: &str, vessel: &str, role: &str) -> Vec<flotilla_resources::promises::Promise> {
+    let explain = CommandAction::QueryExplainConvoy { namespace: Some(NAMESPACE.into()), name: name.into() };
+    let CommandValue::ConvoyExplanation(explained) = fleet.execute(explain).await else { panic!("an explanation") };
+    explained
+        .promises
+        .into_iter()
+        .map(|promise| serde_json::from_value::<flotilla_resources::promises::Promise>(promise).expect("promise"))
+        .filter(|promise| promise.vessel == vessel && promise.role == role)
+        .collect()
+}
+
 /// Dispatch a convoy of `mix` onto the dummy kind and wait for it to land.
 async fn deliver(fleet: &TestDaemon, mix: CrewMix) -> (ResourceObject<Convoy>, DummyFleetSnapshot) {
     let name = fleet.dispatch(mix, DUMMY_FULFILMENT_KIND).await;
@@ -58,8 +69,8 @@ async fn a_lone_coder_keeps_its_change_request_promise_and_lands() {
     let fleet = TestDaemon::builder().start().await;
     let (convoy, snapshot) = deliver(&fleet, CrewMix::Coder).await;
     assert_eq!((snapshot.crews_completed, snapshot.change_requests_opened, snapshot.crews_failed), (1, 1, 0));
+    let promises = promises(&fleet, &convoy.metadata.name, "implement", "coder").await;
     let status = convoy.status.expect("status");
-    let promises = &status.promises["implement"]["coder"];
     let promise = promises.iter().find(|p| p.kind == flotilla_resources::promises::PromiseKind::Pr).expect("pr promise");
     assert_eq!(promise.state, flotilla_resources::promises::PromiseState::Kept);
     assert_eq!(promise.id, "template/pr");
@@ -75,11 +86,13 @@ async fn a_reviewed_coder_lands_after_its_reviewer_answers() {
     let (convoy, snapshot) = deliver(&fleet, CrewMix::CoderReviewer).await;
     assert_eq!(snapshot.crews_completed, 2, "{snapshot:?}");
     assert_eq!(snapshot.turns_received, 2, "the review request and its answer are delivered turns: {snapshot:?}");
+    let promises = promises(&fleet, &convoy.metadata.name, "implement", "coder").await;
     let status = convoy.status.unwrap();
-    let pr = status.promises["implement"]["coder"].iter().find(|p| p.kind == flotilla_resources::promises::PromiseKind::Pr).unwrap();
+    let pr = promises.iter().find(|p| p.kind == flotilla_resources::promises::PromiseKind::Pr).unwrap();
     assert_eq!(pr.id, "template/pr");
     assert_eq!(pr.state, flotilla_resources::promises::PromiseState::Kept);
     assert!(status.crew_work.values().flat_map(|crew| crew.values()).all(|work| work.phase == CrewWorkPhase::Done));
+    assert_no_old_messages(&fleet).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -88,6 +101,7 @@ async fn a_long_runner_exchanges_its_turns_before_landing() {
     let (_, snapshot) = deliver(&fleet, CrewMix::LongRunner).await;
     assert_eq!(snapshot.crews_completed, 2, "{snapshot:?}");
     assert_eq!(snapshot.turns_received, u64::from(2 * LONG_RUNNER_TURNS), "every task and reply is a delivered turn: {snapshot:?}");
+    assert_no_old_messages(&fleet).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -145,21 +159,11 @@ async fn a_stalled_crew_resumes_on_supervision_and_lands() {
 }
 
 // #3439: force the handoff-after-Done ordering without racing the scripts.
-// A zero-task long runner finishes first; its aide then hands back work.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_finished_long_runner_handles_a_late_handoff_and_lands() {
-    late_handoff_scenario("").await;
-}
-
-// A late handoff reopens the recipient on the engine path too; the recipient
-// delivers its convoy after handling that additional turn.
+// A zero-task long runner finishes first; its aide then hands back work, which
+// reopens the recipient; it delivers its convoy after handling that turn.
 #[tokio::test(start_paused = true)]
-async fn on_the_engine_a_finished_long_runner_handles_a_late_handoff() {
-    late_handoff_scenario(PRIMITIVES).await;
-}
-
-async fn late_handoff_scenario(settings: &str) {
-    let fleet = TestDaemon::builder().settings(settings).start().await;
+async fn a_finished_long_runner_handles_a_late_handoff_and_lands() {
+    let fleet = TestDaemon::builder().start().await;
     // Isolate the legacy same-vessel hand-back path. Normal peer tasks retain
     // their separate responsibilities on distinct vessels in the load catalog.
     let mut same_vessel = CrewMix::LongRunner.workflow(0);
@@ -210,9 +214,7 @@ async fn late_handoff_scenario(settings: &str) {
         landed.status.expect("status").crew_work["govern"]["governor"].completion_authority,
         flotilla_resources::WorkCompletionAuthority::Promises
     );
-    if !settings.is_empty() {
-        assert_no_old_messages(&fleet).await;
-    }
+    assert_no_old_messages(&fleet).await;
 }
 
 // The supervisor is eagerly launched with no claim, waits for a delivered
@@ -226,27 +228,6 @@ async fn an_eager_supervisor_waits_for_work_and_lands_after_answering() {
     assert_eq!(snapshot.crews_stalled, 0, "{snapshot:?}");
 }
 
-// Behaviour (#3317): with `[primitives]` on, crew turns run end to end on the
-// engine path, and the old store holds no Message at all.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn on_the_engine_a_reviewed_coder_lands_after_its_reviewer_answers() {
-    let fleet = TestDaemon::builder().settings(PRIMITIVES).start().await;
-    let (_, snapshot) = deliver(&fleet, CrewMix::CoderReviewer).await;
-    assert_eq!(snapshot.crews_completed, 2, "{snapshot:?}");
-    assert_eq!(snapshot.turns_received, 2, "the review request and its answer are delivered turns: {snapshot:?}");
-    assert_no_old_messages(&fleet).await;
-}
-
-// Behaviour (#3317): a long runner's turns all travel the engine path.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn on_the_engine_a_long_runner_exchanges_its_turns_before_landing() {
-    let fleet = TestDaemon::builder().settings(PRIMITIVES).start().await;
-    let (_, snapshot) = deliver(&fleet, CrewMix::LongRunner).await;
-    assert_eq!(snapshot.crews_completed, 2, "{snapshot:?}");
-    assert_eq!(snapshot.turns_received, u64::from(2 * LONG_RUNNER_TURNS), "every task and reply is a delivered turn: {snapshot:?}");
-    assert_no_old_messages(&fleet).await;
-}
-
 /// On the engine path every Message is the engine's; the old store holds none.
 async fn assert_no_old_messages(fleet: &TestDaemon) {
     let old = fleet.list::<flotilla_resources::Message>().await;
@@ -258,7 +239,7 @@ async fn assert_no_old_messages(fleet: &TestDaemon) {
 // Host keeps only conditions that can block, so health's diagnostic naming it is not recorded there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_missing_fleet_designation_waits_and_delivery_resumes_when_it_arrives() {
-    let fleet = TestDaemon::builder().settings(PRIMITIVES).start().await;
+    let fleet = TestDaemon::builder().start().await;
     let removed = fleet
         .execute(CommandAction::ResourceDelete {
             namespace: NAMESPACE.into(),
@@ -309,17 +290,17 @@ async fn host_conditions(fleet: &TestDaemon) -> Vec<flotilla_resources::HostCond
 // reaches a stalled crew first resumes it, and a later one may find its
 // session already ended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn on_the_engine_an_operators_message_reaches_the_crew_from_the_projects_operator() {
+async fn an_operators_message_reaches_the_crew_from_the_projects_operator() {
     operator_turn_scenario(true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn on_the_engine_an_operators_ruling_reaches_the_crew_from_the_projects_operator() {
+async fn an_operators_ruling_reaches_the_crew_from_the_projects_operator() {
     operator_turn_scenario(false).await;
 }
 
 async fn operator_turn_scenario(noted: bool) {
-    let fleet = TestDaemon::builder().agent("stall_rate = 1.0").settings(PRIMITIVES).start().await;
+    let fleet = TestDaemon::builder().agent("stall_rate = 1.0").start().await;
     let name = fleet.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
     fleet.wait("a supervisable stall", stalled(&name)).await;
     let turns = fleet.counts().turns_received;
@@ -346,11 +327,11 @@ async fn operator_turn_scenario(noted: bool) {
 // A standing Ensure binds an admitted convoy. Abandoning that convoy must let
 // the same Ensure admit a fresh generation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn on_the_engine_a_standing_ensure_readmits_after_abandon() {
+async fn a_standing_ensure_readmits_after_abandon() {
     use flotilla_resources::ConvoyEnsure;
 
     let clock = Arc::new(SkippingClock::default());
-    let fleet = TestDaemon::builder().settings(PRIMITIVES).clock(clock.clone() as Arc<dyn flotilla_resources::Clock>).start().await;
+    let fleet = TestDaemon::builder().clock(clock.clone() as Arc<dyn flotilla_resources::Clock>).start().await;
     let mut standing = CrewMix::Coder.workflow(LONG_RUNNER_TURNS);
     standing.exit = None;
     fleet.apply::<WorkflowTemplate>("engine-standing-workflow", standing).await;
@@ -453,13 +434,13 @@ async fn create_named(fleet: &TestDaemon, name: &str, workflow: &str) {
 
 // A real governor must resume a stalled coder and deliver its convoy.
 #[tokio::test(start_paused = true)]
-async fn on_the_engine_crew_supervision_resumes_a_stalled_coder() {
+async fn crew_supervision_resumes_a_stalled_coder() {
     supervised_coder_scenario(CrewSupervisionAction::Resume).await;
 }
 
 // A failing crew proposes failure; its named governor must fail it.
 #[tokio::test(start_paused = true)]
-async fn on_the_engine_crew_supervision_fails_a_failing_coder() {
+async fn crew_supervision_fails_a_failing_coder() {
     supervised_coder_scenario(CrewSupervisionAction::Fail).await;
 }
 
@@ -478,7 +459,7 @@ async fn supervised_coder_scenario(action: CrewSupervisionAction) {
                 && dummy_draw(0, domain, &format!("{name}/{name}-supervise/governor")) >= 0.5
         })
         .expect("seeded case");
-    let fleet = TestDaemon::builder().agent(agent).settings(PRIMITIVES).start().await;
+    let fleet = TestDaemon::builder().agent(agent).start().await;
     let mut workflow = CrewMix::CoderSupervisor.workflow(LONG_RUNNER_TURNS);
     workflow.supervision =
         Some(vec![SupervisionTarget::ConvoyCrew { vessel: "supervise".into(), role: "governor".into() }, SupervisionTarget::Operator]);
@@ -502,9 +483,8 @@ async fn supervised_coder_scenario(action: CrewSupervisionAction) {
 // Its next submissions deliver the convoy without re-admission or a duplicate
 // process launch.
 #[tokio::test(start_paused = true)]
-async fn on_the_engine_a_daemon_restart_restores_an_active_convoy_and_lands() {
-    let fleet =
-        TestDaemon::builder().agent("turn_delay_ms = 10000").settings("host_name = \"restart-proof\"\n[primitives]\n").start().await;
+async fn a_daemon_restart_restores_an_active_convoy_and_lands() {
+    let fleet = TestDaemon::builder().agent("turn_delay_ms = 10000").settings("host_name = \"restart-proof\"\n").start().await;
     let name = fleet.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
     let before = fleet
         .wait("a launched coder before its first submission", |found: &ResourceObject<Convoy>| {
@@ -534,12 +514,12 @@ impl flotilla_resources::Clock for SkippingClock {
     }
 }
 
-// Behaviour (#3824 layer 8b): with `[primitives]` on, a standing convoy whose
+// Behaviour (#3824 layer 8b): a standing convoy whose
 // generation ends three times is held, and the hold is an attention from the standing
 // role in its project's operator inbox. The person sees it in `message inbox`;
 // acknowledging it releases the hold, and the next generation is admitted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn on_the_engine_acknowledging_a_standing_convoys_hold_admits_its_next_generation() {
+async fn acknowledging_a_standing_convoys_hold_admits_its_next_generation() {
     use flotilla_charter::ops_entry::{
         ENSURED_FROM_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION,
         SOURCE_REPOSITORY_ANNOTATION,
@@ -549,7 +529,7 @@ async fn on_the_engine_acknowledging_a_standing_convoys_hold_admits_its_next_gen
     };
 
     let clock = Arc::new(SkippingClock::default());
-    let fleet = TestDaemon::builder().settings(PRIMITIVES).clock(clock.clone() as Arc<dyn flotilla_resources::Clock>).start().await;
+    let fleet = TestDaemon::builder().clock(clock.clone() as Arc<dyn flotilla_resources::Clock>).start().await;
     let forge = catalog::forge(&catalog_forge_url(&fleet).await);
     let repository = catalog::repository(&forge).expect("repository").key();
     // A standing role runs until it is stopped: its workflow declares no exit.
@@ -664,10 +644,10 @@ async fn on_the_engine_acknowledging_a_standing_convoys_hold_admits_its_next_gen
 // it settles the escalation, which expects nothing more.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "#4323: an escalation to principal:operator is lost while an operator client is connected"]
-async fn on_the_engine_a_stall_past_every_supervisor_reaches_the_projects_operator_and_the_person() {
+async fn a_stall_past_every_supervisor_reaches_the_projects_operator_and_the_person() {
     use flotilla_resources::SupervisionTarget;
 
-    let fleet = TestDaemon::builder().agent("stall_rate = 1.0").settings(PRIMITIVES).start().await;
+    let fleet = TestDaemon::builder().agent("stall_rate = 1.0").start().await;
     let mut workflow = CrewMix::Coder.workflow(LONG_RUNNER_TURNS);
     workflow.supervision = Some(vec![
         SupervisionTarget::ConvoyCrew { vessel: String::new(), role: "bosun".into() },
@@ -723,8 +703,8 @@ async fn on_the_engine_a_stall_past_every_supervisor_reaches_the_projects_operat
 // A lone coder delivers its convoy after the daemon runtime realises its
 // environment and launches its crew, and tears the environment down after.
 #[tokio::test(start_paused = true)]
-async fn on_the_engine_a_lone_coder_realises_its_resources_and_delivers() {
-    let fleet = TestDaemon::builder().settings(PRIMITIVES).start().await;
+async fn a_lone_coder_realises_its_resources_and_delivers() {
+    let fleet = TestDaemon::builder().start().await;
     let (_, landed) = deliver(&fleet, CrewMix::Coder).await;
     assert_eq!((landed.environments_provisioned, landed.sessions_launched, landed.crews_completed), (1, 1, 1), "{landed:?}");
     fleet.wait("the environment torn down", |_: &ResourceObject<Convoy>| fleet.counts().live_environments == 0).await;
@@ -733,8 +713,8 @@ async fn on_the_engine_a_lone_coder_realises_its_resources_and_delivers() {
 
 // An environment that cannot realise fails its convoy and launches no terminal session.
 #[tokio::test(start_paused = true)]
-async fn on_the_engine_an_unrealised_environment_records_failure_without_a_terminal() {
-    let fleet = TestDaemon::builder().environment("failure_rate = 1.0").settings(PRIMITIVES).start().await;
+async fn an_unrealised_environment_records_failure_without_a_terminal() {
+    let fleet = TestDaemon::builder().environment("failure_rate = 1.0").start().await;
     let name = fleet.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
     fleet.wait("Failed", in_phase(&name, ConvoyPhase::Failed)).await;
     assert!(fleet.list::<TerminalSession>().await.is_empty(), "no terminal launches");
@@ -771,16 +751,17 @@ where
 }
 
 // Behaviour (#3824 layer 8b): the input-needed and declaration-refused Demands are gone; their
-// facts are read from the records that hold them, with the switch off and on. A crew session that
+// facts are read from the records that hold them. A crew session that
 // needs input raises its vessel's salience, and a refused declaration is listed by `fleet list`.
-async fn judgements_scenario(settings: &str) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn input_needed_and_declaration_refusals_are_read_from_their_records() {
     use flotilla_protocol::{AwarenessGrouping, AwarenessKind, DeclarationAttentionKind, QueryId, ResultSet, Salience};
     use flotilla_resources::{
         DeclarationRefusedCondition, Project, ProjectSpec, ProjectStatusPatch, TerminalAttention, TerminalAttentionSource,
         TerminalAttentionState, TerminalSessionStatusPatch, CONVOY_LABEL,
     };
 
-    let fleet = TestDaemon::builder().agent("stall_rate = 1.0").settings(settings).start().await;
+    let fleet = TestDaemon::builder().agent("stall_rate = 1.0").start().await;
     let name = fleet.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
     fleet.wait("a stall", stalled(&name)).await;
     // The stalled crew's hook reports it idle; the person's input is asked after that.
@@ -834,16 +815,6 @@ async fn judgements_scenario(settings: &str) {
         "{:?}",
         listed.declaration_attention
     );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn input_needed_and_declaration_refusals_are_read_from_their_records() {
-    judgements_scenario("").await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn on_the_engine_input_needed_and_declaration_refusals_are_read_from_their_records() {
-    judgements_scenario(PRIMITIVES).await;
 }
 
 /// Each listed record's name and spec, with how many times it is listed.
@@ -1046,14 +1017,13 @@ async fn apply_transport_fixtures(fleet: &TestDaemon, host: &str) {
 // listed at the other, as `flotilla get` shows it there, and home-local kinds
 // stay home.
 #[tokio::test(start_paused = true)]
-async fn on_the_engine_two_daemons_replicate_every_kind() {
+async fn two_daemons_replicate_every_kind() {
     // Replication is under test, not missed events: the production resync
     // keeps the paused clock's controller passes, which cost real time, few.
     let resync = RuntimeOptions::default().controller_resync_interval;
-    let (settings_a, settings_b) = (format!("host_name = \"engine-a\"\n{PRIMITIVES}"), format!("host_name = \"engine-b\"\n{PRIMITIVES}"));
     let (a, b) = tokio::join!(
-        TestDaemon::builder().agent("stall_rate = 1.0").settings(&settings_a).resync(resync).start(),
-        TestDaemon::builder().agent("stall_rate = 1.0").settings(&settings_b).resync(resync).start()
+        TestDaemon::builder().agent("stall_rate = 1.0").settings("host_name = \"engine-a\"\n").resync(resync).start(),
+        TestDaemon::builder().agent("stall_rate = 1.0").settings("host_name = \"engine-b\"\n").resync(resync).start()
     );
     // A stalled crew keeps its vessel, environment, checkout, session and messages.
     let (stalled_a, stalled_b) =
@@ -1062,7 +1032,7 @@ async fn on_the_engine_two_daemons_replicate_every_kind() {
     apply_transport_fixtures(&a, "engine-a").await;
     apply_transport_fixtures(&b, "engine-b").await;
     let (before_a, before_b) = tokio::join!(inventories(&a), inventories(&b));
-    // Under `[primitives]` a Message lives only on the engine, which `get`
+    // A Message lives only on the engine, which `get`
     // does not read (see `assert_no_old_messages`), so there is none to compare.
     let unmade: Vec<_> = before_a.iter().filter(|(_, records)| records.is_empty()).map(|(kind, _)| *kind).collect();
     assert_eq!(unmade, ["Message"], "every other kind has a record to replicate");

@@ -26,7 +26,7 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 use flotilla_store_testkit::VirtualClock;
 
-use super::image_build::{builder, host, reconciler, settle, Behaviour, BuildService, Materials, HOST, NS};
+use flotilla_provisioning_testkit::image_build::{builder, host, reconciler, settle, Behaviour, BuildService, Materials, HOST, NS};
 
 const PROJECT: &str = "app";
 const REPO: &str = "https://github.com/example/app";

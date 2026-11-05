@@ -717,7 +717,7 @@ async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listen
             )
             .await
             .expect("Claude credential declaration");
-        bind_account(&daemon.resource_backend(), "demo", "coder", "claude-max", "test@example.com").await;
+        bind_account(&daemon, "demo", "coder", "claude-max", "test@example.com").await;
         let state_dir = temp.path().join("state");
         // The daemon's login has a runtime directory, as a Linux host's does.
         let runtime_dir = temp.path().join("runtime");

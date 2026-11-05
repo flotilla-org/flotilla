@@ -3452,7 +3452,6 @@ dependencies = [
  "flotilla-build-features-types",
  "flotilla-charter",
  "flotilla-config",
- "flotilla-core",
  "flotilla-discovery-testkit",
  "flotilla-engine-store",
  "flotilla-environment",
@@ -3489,8 +3488,11 @@ dependencies = [
 name = "flotilla-provisioning-testkit"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "flotilla-engine-store",
+ "flotilla-environment",
+ "flotilla-protocol",
  "flotilla-provisioning",
  "flotilla-resources",
  "flotilla-schema",
@@ -3498,7 +3500,10 @@ dependencies = [
  "flotilla-state-machines",
  "flotilla-store",
  "flotilla-store-testkit",
+ "reqwest 0.13.2",
  "rusqlite",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 

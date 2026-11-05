@@ -81,6 +81,41 @@ fn convoy_rows(result_set: &ResultSet) -> &[ConvoyRow] {
     result_set.rows.as_convoys().expect("convoy rows")
 }
 
+/// The next convoys-query event: its result set or delta, by sequence.
+async fn next_convoys_event(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, what: &str) -> DaemonEvent {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(DaemonEvent::ResultSet(result_set)) if result_set.query() == QueryId::Convoys { scope: None } => {
+                    return DaemonEvent::ResultSet(result_set);
+                }
+                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Convoys { scope: None } => {
+                    return DaemonEvent::ResultDelta(delta);
+                }
+                Ok(_) => continue,
+                Err(err) => panic!("broadcast receive error: {err}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+}
+
+/// The convoys result set a new subscriber is sent.
+async fn convoys_result_set(daemon: &InProcessDaemon) -> ResultSet {
+    let events = daemon
+        .subscribe_queries(uuid::Uuid::new_v4(), &[QueryCursor { query: QueryId::Convoys { scope: None }, since: None }])
+        .await
+        .expect("subscribe_queries");
+    events
+        .into_iter()
+        .find_map(|event| match event {
+            DaemonEvent::ResultSet(result_set) if result_set.query() == QueryId::Convoys { scope: None } => Some(*result_set),
+            _ => None,
+        })
+        .expect("a convoys result set")
+}
+
 fn independent_rows(result_set: &ResultSet) -> &[IndependentRow] {
     result_set.rows.as_independents().expect("independent rows")
 }
@@ -89,7 +124,17 @@ fn independent_rows(result_set: &ResultSet) -> &[IndependentRow] {
 async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::new("local"),
+        ResourceBackend::new(InMemoryBackend::default()),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    // Repository and Project are the daemon's engine records, written through its store.
+    let backend = daemon.resource_backend();
     let repository_spec = RepositorySpec::remote("https://github.com/widgets/api.git").expect("remote repository");
     let repository_key = repository_spec.key();
     backend
@@ -111,16 +156,6 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
         )
         .await
         .expect("create project");
-    let daemon = InProcessDaemon::new_with_resource_backend(
-        vec![],
-        Arc::clone(&config),
-        fake_discovery(false),
-        HostName::new("local"),
-        backend,
-        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-    )
-    .await;
-    let observed = daemon.observed_resource_backend();
     let options = RuntimeOptions {
         namespace: "flotilla".into(),
         heartbeat_interval: Duration::from_secs(300),
@@ -158,7 +193,9 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
     .expect("checkout scopes become available");
 
     let mut events = daemon.subscribe();
-    let checkouts = observed.using::<Checkout>("flotilla");
+    // An adopted Checkout is durable; the daemon projects it into the observed store,
+    // and removes an adopted projection whose durable source is gone.
+    let checkouts = backend.clone().using::<Checkout>("flotilla");
     let checkout = checkouts
         .create(
             &InputMeta::builder()
@@ -177,7 +214,8 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
             ),
         )
         .await
-        .expect("create observed checkout");
+        .expect("adopt checkout");
+    daemon.reconcile_adopted_checkouts("flotilla").await.expect("project adopted checkout");
 
     let mut additions = HashMap::new();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -201,6 +239,7 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
         assert_eq!(rows[0].for_convoy.as_deref(), Some("ship-it"));
     }
 
+    let checkout = checkouts.get(&checkout.metadata.name).await.expect("adopted checkout");
     let checkout = checkouts
         .update(
             &InputMeta::builder()
@@ -220,12 +259,16 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
             ),
         )
         .await
-        .expect("modify observed checkout");
+        .expect("modify adopted checkout");
+    daemon.reconcile_adopted_checkouts("flotilla").await.expect("project modified checkout");
     let mut modifications = HashMap::new();
     tokio::time::timeout(Duration::from_secs(5), async {
         while modifications.len() < 2 {
             if let DaemonEvent::ResultDelta(delta) = events.recv().await.expect("checkout event") {
-                if matches!(delta.query(), QueryId::Checkouts { .. }) && delta.changes.as_checkouts().is_some_and(|rows| !rows.is_empty()) {
+                // The adoption's status projection may still be arriving; wait for the revision.
+                if matches!(delta.query(), QueryId::Checkouts { .. })
+                    && delta.changes.as_checkouts().is_some_and(|rows| rows.iter().any(|row| row.branch == "feature/revised"))
+                {
                     modifications.insert(delta.query(), delta);
                 }
             }
@@ -271,7 +314,8 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
         .expect("subscribe with current checkout cursors");
     assert!(current_replay.is_empty());
 
-    checkouts.delete(&checkout.metadata.name).await.expect("delete observed checkout");
+    checkouts.delete(&checkout.metadata.name).await.expect("delete adopted checkout");
+    daemon.reconcile_adopted_checkouts("flotilla").await.expect("remove adopted projection");
     let mut removals = HashMap::new();
     tokio::time::timeout(Duration::from_secs(5), async {
         while removals.len() < 2 {
@@ -379,27 +423,6 @@ async fn project_issue_subscription_materializes_window_and_ephemeral_search() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let repository_spec = RepositorySpec::remote("https://github.com/widgets/api.git").expect("remote repository");
-    let repository_key = repository_spec.key();
-    backend
-        .clone()
-        .using::<Repository>("flotilla")
-        .create(&InputMeta::builder().name(repository_key.to_string()).build(), &repository_spec)
-        .await
-        .expect("create repository resource");
-    backend
-        .clone()
-        .using::<Project>("flotilla")
-        .create(
-            &InputMeta::builder().name("widgets".to_string()).build(),
-            &ProjectSpec::builder()
-                .display_name("Widgets".to_string())
-                .default_workflow_ref("single-agent".to_string())
-                .repositories(vec![ProjectRepositorySpec::builder().repo(repository_key).build()])
-                .build(),
-        )
-        .await
-        .expect("create project resource");
     let provider = Arc::new(FakeIssueProvider::new());
     provider
         .add_issues(
@@ -423,6 +446,28 @@ async fn project_issue_subscription_materializes_window_and_ephemeral_search() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // Repository and Project are the daemon's engine records, written through its store.
+    let repository_spec = RepositorySpec::remote("https://github.com/widgets/api.git").expect("remote repository");
+    let repository_key = repository_spec.key();
+    daemon
+        .resource_backend()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(repository_key.to_string()).build(), &repository_spec)
+        .await
+        .expect("create repository resource");
+    daemon
+        .resource_backend()
+        .using::<Project>("flotilla")
+        .create(
+            &InputMeta::builder().name("widgets".to_string()).build(),
+            &ProjectSpec::builder()
+                .display_name("Widgets".to_string())
+                .default_workflow_ref("single-agent".to_string())
+                .repositories(vec![ProjectRepositorySpec::builder().repo(repository_key).build()])
+                .build(),
+        )
+        .await
+        .expect("create project resource");
     let options = RuntimeOptions {
         namespace: "flotilla".into(),
         heartbeat_interval: Duration::from_secs(300),
@@ -518,29 +563,21 @@ async fn aggregator_emits_result_set_events() {
         ..RuntimeOptions::default()
     };
     let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("runtime start");
+    // The aggregator publishes its bootstrap result set once it has listed every source.
+    let DaemonEvent::ResultSet(bootstrap) = next_convoys_event(&mut rx, "the bootstrap result set").await else {
+        panic!("the convoys query starts with a result set")
+    };
+    assert!(convoy_rows(&bootstrap).is_empty());
 
     // Create a Convoy resource — the Aggregator should pick it up via the watch
-    // stream and emit a ResultSet for the convoys query.
+    // stream and emit a delta for the convoys query.
     let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
     let mut spec = convoy_spec("my-workflow");
     spec.project_ref = Some("my-project".to_string());
     convoys.create(&convoy_meta("test-convoy-1"), &spec).await.expect("create convoy");
+    let DaemonEvent::ResultDelta(_) = next_convoys_event(&mut rx, "the convoy's delta").await else { panic!("a delta follows") };
 
-    // Wait for the convoys result set.
-    let found = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match rx.recv().await {
-                Ok(DaemonEvent::ResultSet(result_set)) if result_set.query() == QueryId::Convoys { scope: None } => {
-                    return result_set;
-                }
-                Ok(_) => continue,
-                Err(err) => panic!("broadcast receive error: {err}"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for ResultSet for convoys query");
-
+    let found = convoys_result_set(&daemon).await;
     let rows = convoy_rows(&found);
     assert_eq!(rows.len(), 1, "expected exactly one convoy in the result set");
     assert_eq!(rows[0].name, "test-convoy-1");
@@ -552,27 +589,6 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git").expect("repository spec");
-    let repository_key = repository_spec.key();
-    backend
-        .clone()
-        .using::<Repository>("flotilla")
-        .create(&InputMeta::builder().name(repository_key.to_string()).build(), &repository_spec)
-        .await
-        .expect("create repository");
-    backend
-        .clone()
-        .using::<Project>("flotilla")
-        .create(
-            &InputMeta::builder().name("flotilla".to_string()).build(),
-            &ProjectSpec::builder()
-                .display_name("Flotilla".to_string())
-                .default_workflow_ref("single-agent".to_string())
-                .repositories(vec![ProjectRepositorySpec::builder().repo(repository_key.clone()).build()])
-                .build(),
-        )
-        .await
-        .expect("create project");
     let pool = Arc::new(FakeTerminalPool::new());
     pool.add_sessions(vec![
         PoolTerminalSession::builder().session_name("cleat-convoy-coder".to_string()).status(TerminalStatus::Disconnected).build(),
@@ -588,6 +604,28 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // Repository and Project are the daemon's engine records, written through its store.
+    let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git").expect("repository spec");
+    let repository_key = repository_spec.key();
+    daemon
+        .resource_backend()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(repository_key.to_string()).build(), &repository_spec)
+        .await
+        .expect("create repository");
+    daemon
+        .resource_backend()
+        .using::<Project>("flotilla")
+        .create(
+            &InputMeta::builder().name("flotilla".to_string()).build(),
+            &ProjectSpec::builder()
+                .display_name("Flotilla".to_string())
+                .default_workflow_ref("single-agent".to_string())
+                .repositories(vec![ProjectRepositorySpec::builder().repo(repository_key.clone()).build()])
+                .build(),
+        )
+        .await
+        .expect("create project");
     let mut rx = daemon.subscribe();
     let host_id = daemon.local_host_id().expect("local host id");
     let environment_name = format!("host-direct-{host_id}");
@@ -996,23 +1034,15 @@ async fn subscribe_queries_replays_result_set_after_seq() {
     let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("runtime start");
 
     let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
+    let DaemonEvent::ResultSet(_) = next_convoys_event(&mut rx, "the bootstrap result set").await else {
+        panic!("the convoys query starts with a result set")
+    };
 
-    // Step 1: Create convoy A and wait for the ResultSet.
+    // Step 1: Create convoy A and wait for its change.
     convoys.create(&convoy_meta("convoy-a"), &convoy_spec("wf-a")).await.expect("create convoy-a");
+    let DaemonEvent::ResultDelta(after_a) = next_convoys_event(&mut rx, "convoy-a's delta").await else { panic!("a delta follows") };
 
-    let result_set_after_a = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match rx.recv().await {
-                Ok(DaemonEvent::ResultSet(result_set)) if result_set.query() == QueryId::Convoys { scope: None } => return result_set,
-                Ok(_) => continue,
-                Err(err) => panic!("recv error waiting for result set: {err}"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for ResultSet after convoy-a");
-
-    let cursor_seq = result_set_after_a.seq;
+    let cursor_seq = after_a.seq;
     assert!(cursor_seq > 0, "result set seq must be positive");
 
     // Step 2: Create convoy B and wait for the ResultDelta.

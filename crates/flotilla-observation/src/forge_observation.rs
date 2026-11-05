@@ -178,12 +178,17 @@ async fn declarations(backend: &ResourceBackend, namespace: &str) -> Result<Decl
 }
 
 /// Shared sources elect once, regardless of how many Projects bind them.
-/// Unknown host health preserves the preferred owner during startup; only
-/// observer-unready/stale evidence or expiry of the startup grace permits
-/// fallback. Admission readiness never withdraws forge observation.
+/// Unknown host health preserves the preferred owner; only observer-unready or
+/// stale evidence, or a preferred home that never wrote a Host by the end of
+/// its declaration's startup grace, permits fallback. A Host is written only
+/// by its own daemon, so one without a first heartbeat is unknown, not unready:
+/// its home is running and has yet to report. This daemon never judges itself
+/// unready for want of evidence. Admission readiness never withdraws forge
+/// observation.
 pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &IssueSource) -> Result<Option<NodeId>, String> {
     let now = Utc::now();
     let preferred = declarations(backend, namespace).await?.preferred_observer(source);
+    let local = backend.local_root().map_err(|e| e.to_string())?;
     let mut ready = BTreeMap::new();
     for host in backend.including_replicas::<Host>(namespace).list_replica_sources().await.map_err(|e| e.to_string())?.items {
         if !matches!(host.object.spec.connection, flotilla_resources::HostConnection::Daemon) {
@@ -192,12 +197,12 @@ pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &I
         let root = origin(backend, &host.provenance)?;
         let heartbeat = host.object.status.as_ref().and_then(|status| status.heartbeat_at);
         let health = match host.object.status.as_ref() {
-            None => unknown_health(host.object.metadata.creation_timestamp, now),
+            None => ObserverHealth::Unknown,
             Some(status) if !observer_ready(status) => ObserverHealth::Unready,
             Some(_) => match heartbeat {
                 Some(at) if now.signed_duration_since(at) < HEARTBEAT_MAX_AGE => ObserverHealth::Ready,
                 Some(_) => ObserverHealth::Unready,
-                None => unknown_health(host.object.metadata.creation_timestamp, now),
+                None => ObserverHealth::Unknown,
             },
         };
         // Newer heartbeat evidence wins. For equal timestamps, positive
@@ -210,7 +215,8 @@ pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &I
         }
     }
     if let Some((declared_at, preferred)) = preferred {
-        if ready.get(&preferred).map_or_else(|| unknown_health(declared_at, now), |(_, health)| *health) != ObserverHealth::Unready {
+        let absent = || if preferred == local { ObserverHealth::Unknown } else { unknown_health(declared_at, now) };
+        if ready.get(&preferred).map_or_else(absent, |(_, health)| *health) != ObserverHealth::Unready {
             return Ok(Some(preferred));
         }
     } else if ready.is_empty() {
@@ -632,11 +638,13 @@ mod tests {
         projects.items[0].metadata.creation_timestamp -= UNKNOWN_OWNER_GRACE + Duration::seconds(1);
         ready.replica_writer::<Project>(missing.local_root().unwrap(), "flotilla").replace(&projects, Utc::now()).await.unwrap();
         assert_eq!(source_owner(&ready, "flotilla", &source).await.unwrap(), Some(ready.local_root().unwrap()));
+        // A Host its home wrote but has not yet reported on is that home running: unknown, so the
+        // preferred owner keeps its source however long ago the Host was written.
         missing.using::<Host>("flotilla").create(&meta("silent"), &HostSpec::default()).await.unwrap();
         let mut silent = missing.using::<Host>("flotilla").list().await.unwrap();
         silent.items[0].metadata.creation_timestamp -= UNKNOWN_OWNER_GRACE + Duration::seconds(1);
         ready.replica_writer::<Host>(missing.local_root().unwrap(), "flotilla").replace(&silent, Utc::now()).await.unwrap();
-        assert_eq!(source_owner(&ready, "flotilla", &source).await.unwrap(), Some(ready.local_root().unwrap()));
+        assert_eq!(source_owner(&ready, "flotilla", &source).await.unwrap(), Some(missing.local_root().unwrap()));
     }
 
     // Admission readiness and condition names never affect observer eligibility.

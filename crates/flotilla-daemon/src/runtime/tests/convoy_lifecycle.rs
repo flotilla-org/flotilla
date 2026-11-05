@@ -778,18 +778,34 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
         .replace(&checkouts.list().await.expect("list checkout authority resources"), chrono::Utc::now())
         .await
         .expect("replicate fresh evidence to convoy authority A");
-    authority
-        .replica_writer::<flotilla_resources::ChangeRequest>(flotilla_protocol::NodeId::new("checkout-root"), NAMESPACE)
-        .replace(
-            &checkout_host
-                .using::<flotilla_resources::ChangeRequest>(NAMESPACE)
-                .list()
-                .await
-                .expect("list checkout authority CR observations"),
-            chrono::Utc::now(),
+    // The CR observation is a decided record homed at the checkout authority: it reaches the
+    // convoy authority as that home's log does.
+    {
+        use flotilla_resources::engine_records::EngineRecords;
+        let target = authority_daemon.decided_store().expect("authority decided store");
+        let checkout_home = flotilla_provisioning_testkit::other_home_for(&target, "checkout-root");
+        let observations = flotilla_provisioning::engine::observations::EngineObservations::open(
+            Arc::clone(checkout_home.service()),
+            Arc::new(flotilla_resources::SystemClock),
         )
-        .await
-        .expect("replicate fresh CR evidence to convoy authority A");
+        .expect("checkout authority observations");
+        let observed = checkout_host
+            .using::<flotilla_resources::ChangeRequest>(NAMESPACE)
+            .list()
+            .await
+            .expect("list checkout authority CR observations");
+        for record in observed.items {
+            let name = &record.metadata.name;
+            let spec = serde_json::to_value(&record.spec).expect("CR spec");
+            observations
+                .apply("ChangeRequest", name, &record.metadata.labels, &record.metadata.annotations, spec)
+                .await
+                .expect("CR at its home");
+            let status = serde_json::to_value(record.status.expect("CR status")).expect("CR status value");
+            observations.set_status("ChangeRequest", name, status).await.expect("CR status at its home");
+        }
+        checkout_home.replicate_to(&target);
+    }
     let current = convoys.get("cross-host").await.expect("get Landing convoy");
     let reconciler = ConvoyReconciler::new(authority.definitions::<WorkflowTemplate>(NAMESPACE))
         .with_federated_checkouts(authority.including_replicas::<Checkout>(NAMESPACE))
@@ -877,6 +893,9 @@ async fn daemon_startup_reaps_retained_landed_convoy_orphan() {
         .working_directory(ExecutionEnvironmentPath::new("/workspace"))
         .build()])
         .await;
+    // A designated fleet, as every engine fleet is: the teardown finalizer withdraws the
+    // convoy session's delivery attention, and attentions are addressed to fleet roles.
+    designate_fleet(&restarted).await;
     let runtime = DaemonRuntime::start_with_options(
         Arc::clone(&restarted),
         config,
@@ -1087,3 +1106,21 @@ fn crew_provisioning_recovers_lost_session_after_in_process_daemon_restart_and_r
 }
 
 use flotilla_orchestration_testkit::InProcessDiscoveryExt;
+
+async fn designate_fleet(daemon: &InProcessDaemon) {
+    use flotilla_resources::{FleetDesignation, FleetDesignationSpec, Project, ProjectSpec, FLEET_DESIGNATION_NAME};
+    let backend = daemon.resource_backend();
+    backend
+        .definitions::<Project>(NAMESPACE)
+        .create(&InputMeta::builder().name("fleet".into()).build(), &ProjectSpec::builder().display_name("Fleet".into()).build())
+        .await
+        .expect("fleet project");
+    backend
+        .definitions::<FleetDesignation>(NAMESPACE)
+        .create(
+            &InputMeta::builder().name(FLEET_DESIGNATION_NAME.into()).build(),
+            &FleetDesignationSpec { fleet: None, project: "fleet".into(), image_cache: None },
+        )
+        .await
+        .expect("fleet designation");
+}

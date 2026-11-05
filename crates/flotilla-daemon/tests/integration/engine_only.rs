@@ -7,8 +7,6 @@ use flotilla_daemon_testkit::daemon::{OldStoreMode, TestDaemon};
 use flotilla_dummy_fleet::catalog::{CrewMix, DUMMY_FULFILMENT_KIND};
 use flotilla_protocol::table::Row;
 
-const PRIMITIVES: &str = "[primitives]\n";
-
 fn text<'a>(row: &'a Row, column: &str) -> &'a str {
     row.get(column).and_then(serde_json::Value::as_str).unwrap_or_default()
 }
@@ -32,7 +30,7 @@ fn names<'a>(column: &'a str, name: &'a str) -> impl Fn(&Row) -> bool + 'a {
 // its promise; the convoy is delivered, and everything held for it ends Gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn on_the_engine_alone_a_convoy_is_delivered_and_its_resources_end_gone() {
-    let daemon = TestDaemon::builder().settings(PRIMITIVES).old_store(OldStoreMode::Unavailable).start().await;
+    let daemon = TestDaemon::builder().old_store(OldStoreMode::Unavailable).start().await;
     delivered_convoy(&daemon).await;
     daemon.assert_old_store_untouched();
 }
@@ -42,7 +40,7 @@ async fn on_the_engine_alone_a_convoy_is_delivered_and_its_resources_end_gone() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "a census of the old store's remaining accesses, run by hand"]
 async fn census_of_old_store_accesses_on_the_way_to_delivery() {
-    let daemon = TestDaemon::builder().settings(PRIMITIVES).old_store(OldStoreMode::Recording).start().await;
+    let daemon = TestDaemon::builder().old_store(OldStoreMode::Recording).start().await;
     let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(delivered_convoy(&daemon))).await;
     println!("{}", daemon.old_store_report().expect("recorded"));
     if let Err(failure) = outcome {

@@ -2088,28 +2088,23 @@ mod tests {
         assert_eq!(loads.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
-    // A request shares even an empty snapshot across concurrent lookups, isolates
-    // namespaces, and releases the snapshot so the next request sees new Hosts.
+    // A request shares even an empty snapshot across concurrent lookups and releases
+    // it so the next request sees new Hosts.
     #[tokio::test]
-    async fn host_snapshot_is_request_scoped_and_namespace_isolated() {
-        let (_daemon, backend, _temp) = attach_fixture().await;
-        let backend = backend.with_read_counts();
+    async fn host_snapshot_is_request_scoped() {
+        let (daemon, backend, _temp) = attach_fixture().await;
         let reads = AttachReadContext::default();
         let (first, second) =
-            tokio::join!(reads.canonical_host(&backend, "empty", "new-host"), reads.canonical_host(&backend, "empty", "new-host"),);
+            tokio::join!(reads.canonical_host(&backend, "flotilla", "new-host"), reads.canonical_host(&backend, "flotilla", "new-host"),);
         assert!(first.expect("first lookup").is_none());
         assert!(second.expect("second lookup").is_none());
-        backend
-            .using::<ResourceHost>("empty")
-            .create(&test_meta("new-host"), &HostSpec { display_name: "new".into(), ..Default::default() })
-            .await
-            .expect("new host");
-        assert!(reads.canonical_host(&backend, "empty", "new-host").await.expect("cached absence").is_none());
-        assert!(reads.canonical_host(&backend, "other", "new-host").await.expect("other namespace").is_none());
+        // Another daemon's Host arrives from its own home.
+        let spec = HostSpec { display_name: "new".into(), ..Default::default() };
+        flotilla_provisioning_testkit::put_host_at_its_home(&daemon.decided_store().expect("decided store"), "new-host", &spec, None).await;
+        assert!(reads.canonical_host(&backend, "flotilla", "new-host").await.expect("cached absence").is_none());
         let fresh = AttachReadContext::default();
-        let host = fresh.canonical_host(&backend, "empty", "new-host").await.expect("fresh lookup").expect("new host visible");
+        let host = fresh.canonical_host(&backend, "flotilla", "new-host").await.expect("fresh lookup").expect("new host visible");
         assert_eq!(host.reference.as_str(), "new-host");
-        assert_eq!(backend.read_snapshot().calls_by_kind().get("Host"), Some(&6));
     }
 
     #[test]

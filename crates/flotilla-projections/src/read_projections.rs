@@ -328,20 +328,11 @@ impl ReadProjections<'_> {
     }
 
     pub async fn fulfilment_list(&self, namespace: &str) -> Result<FulfilmentListResponse, String> {
+        // Every host is read: a kind joins its host by name below, and the decided store's Host
+        // records answer no query relating them to another kind.
         let hosts = self
             .backend
-            .query_declared::<ResourceHost>(
-                namespace,
-                &StoreQuery {
-                    include_replicas: true,
-                    ..StoreQuery::related_kind(
-                        "metadata.name",
-                        "FulfilmentKind",
-                        "spec.host_ref",
-                        StoreQuery { include_replicas: true, ..Default::default() },
-                    )
-                },
-            )
+            .query_declared::<ResourceHost>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
             .await
             .map_err(|error| error.to_string())?;
         let mut facts_by_host = BTreeMap::<String, ResourceHostStatus>::new();

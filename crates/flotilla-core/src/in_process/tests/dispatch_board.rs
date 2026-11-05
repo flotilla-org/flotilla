@@ -27,6 +27,15 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
         issue_calls: AtomicUsize::new(0),
         release: tokio::sync::Semaphore::new(0),
     });
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::default().with_issue_tracker(provider.clone())),
+        HostName::new("test-host"),
+        backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
     let projects = backend.using::<Project>("flotilla");
     let mut binding = flotilla_resources::IssueSourceBindingSpec::from(source.clone());
     binding.alias = Some("large".into());
@@ -86,15 +95,6 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
             .await
             .expect("convoy");
     }
-    let daemon = InProcessDaemon::new_with_resource_backend(
-        Vec::new(),
-        Arc::new(ConfigStore::with_base(temp.path())),
-        fake_discovery_with_provider_set(FakeDiscoveryProviders::default().with_issue_tracker(provider.clone())),
-        HostName::new("test-host"),
-        backend.clone(),
-        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
-    )
-    .await;
     let cold = tokio::time::timeout(Duration::from_secs(1), daemon.dispatch_board_internal(Some("large")))
         .await
         .expect("interactive read must not wait for forge");
