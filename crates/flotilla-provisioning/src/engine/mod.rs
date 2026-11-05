@@ -33,6 +33,7 @@ pub mod artifact_import;
 pub mod artifacts;
 pub mod checkout;
 pub mod clone;
+pub mod controller;
 pub mod definition_import;
 pub mod definitions;
 pub mod environment;
@@ -42,7 +43,6 @@ pub mod hosts;
 pub mod image_build;
 pub mod import;
 pub mod kinds;
-pub(crate) mod log_watch;
 pub mod manifest_root;
 pub mod manifest_root_import;
 pub mod observations;
@@ -58,6 +58,7 @@ pub mod terminal_session;
 #[cfg(test)]
 mod tests;
 pub mod vessel;
+pub mod watch;
 
 use std::sync::{Arc, Mutex};
 
@@ -149,6 +150,9 @@ pub trait Lifecycles<K: LifecycleKind>: Send + Sync {
     /// The resource as the engine holds it.
     fn get(&self, name: &str) -> Option<Resource<Lifecycle<K>>>;
 
+    /// This home's live resources (Requested or Realised), as the engine holds them.
+    fn live(&self) -> Vec<Resource<Lifecycle<K>>>;
+
     /// Requests `name`; it starts Requested.
     fn request(&self, name: &str, request: K::Request, at: Timestamp) -> Result<Resource<Lifecycle<K>>, EngineError>;
 
@@ -234,6 +238,11 @@ where
 
     fn get(&self, name: &str) -> Option<Resource<Lifecycle<K>>> {
         self.home.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(name).cloned()
+    }
+
+    fn live(&self) -> Vec<Resource<Lifecycle<K>>> {
+        let home = self.home.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        home.resources().filter(|resource| resource.state().live()).cloned().collect()
     }
 
     fn request(&self, name: &str, request: K::Request, at: Timestamp) -> Result<Resource<Lifecycle<K>>, EngineError> {

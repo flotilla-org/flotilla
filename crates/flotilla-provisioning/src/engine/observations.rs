@@ -26,7 +26,7 @@ use flotilla_schema_sqlite::{stream::Service, Read, ResourceId, StoreError};
 use futures::stream::BoxStream;
 use serde_json::Value;
 
-use super::log_watch::LogWatch;
+use super::watch::EngineWatch;
 use crate::stored::forge_observation::{ChangeRequestRecord, IssueRecord};
 
 const CHANGE_REQUEST: &str = "ChangeRequest";
@@ -449,7 +449,7 @@ impl EngineRecords for EngineObservations {
     }
 
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
-        let watch = LogWatch::start(Arc::clone(&self.service), [CHANGE_REQUEST_CODE, ISSUE_CODE]).map_err(|error| error.to_string())?;
+        let watch = EngineWatch::start(Arc::clone(&self.service), [CHANGE_REQUEST_CODE, ISSUE_CODE]).map_err(|error| error.to_string())?;
         let stream = futures::stream::unfold(watch, |mut watch| async move {
             loop {
                 // A pass that fails is tried again at the next commit; the watcher sees no tick.

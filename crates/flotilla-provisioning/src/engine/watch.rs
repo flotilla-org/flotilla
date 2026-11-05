@@ -13,7 +13,7 @@ use flotilla_schema_sqlite::{
 use tokio::sync::Notify;
 
 /// A [`Follower`] of some kinds over every home's log, woken by the store's commits.
-pub(crate) struct LogWatch {
+pub struct EngineWatch {
     service: Arc<Service>,
     follower: Follower,
     wake: Arc<Notify>,
@@ -21,10 +21,10 @@ pub(crate) struct LogWatch {
     _listener: Arc<CommitListener>,
 }
 
-impl LogWatch {
+impl EngineWatch {
     /// Follows `kinds` from each home's current sequence. The listener is installed first, so a
     /// commit between it and the start still wakes the first pass.
-    pub(crate) fn start(service: Arc<Service>, kinds: impl IntoIterator<Item = KindCode>) -> Result<Self, StoreError> {
+    pub fn start(service: Arc<Service>, kinds: impl IntoIterator<Item = KindCode>) -> Result<Self, StoreError> {
         let wake = Arc::new(Notify::new());
         let listener: Arc<CommitListener> = {
             let wake = Arc::clone(&wake);
@@ -39,7 +39,7 @@ impl LogWatch {
 
     /// Waits for the next commit, then passes over the log and hands what it found to `read`,
     /// in the same read. A pass that fails is tried again at the next commit.
-    pub(crate) async fn next<T: Send + 'static>(
+    pub async fn next<T: Send + 'static>(
         &mut self,
         read: impl FnOnce(&mut Read<'_>, Vec<Followed>) -> Result<T, StoreError> + Send + 'static,
     ) -> Result<T, StoreError> {
@@ -49,12 +49,12 @@ impl LogWatch {
 
     /// Resolves once a commit has landed since the last wake. Safe to drop unresolved: the wake
     /// stays for the next call.
-    pub(crate) async fn woken(&self) {
+    pub async fn woken(&self) {
         self.wake.notified().await;
     }
 
     /// Passes over the log now. Dropped unresolved, it leaves the cursors where they were.
-    pub(crate) async fn pass<T: Send + 'static>(
+    pub async fn pass<T: Send + 'static>(
         &mut self,
         read: impl FnOnce(&mut Read<'_>, Vec<Followed>) -> Result<T, StoreError> + Send + 'static,
     ) -> Result<T, StoreError> {
@@ -75,5 +75,16 @@ impl LogWatch {
             self.follower = follower;
         }
         result
+    }
+
+    /// Reads the store now on a blocking thread, leaving the cursors where they are.
+    pub async fn read<T: Send + 'static>(
+        &self,
+        read: impl FnOnce(&mut Read<'_>) -> Result<T, StoreError> + Send + 'static,
+    ) -> Result<T, StoreError> {
+        let service = Arc::clone(&self.service);
+        tokio::task::spawn_blocking(move || service.with_store(|store| read(&mut store.read()?)))
+            .await
+            .map_err(|error| StoreError::Stream(format!("read did not finish: {error}")))?
     }
 }

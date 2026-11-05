@@ -26,7 +26,7 @@ use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use futures::stream::BoxStream;
 use serde_json::Value;
 
-use super::log_watch::LogWatch;
+use super::watch::EngineWatch;
 use crate::stored::repository::{RepositoryRecord, VerificationProvenance};
 
 const KIND: &str = "Repository";
@@ -315,7 +315,7 @@ impl EngineRecords for EngineRepositories {
     }
 
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
-        let watch = LogWatch::start(Arc::clone(&self.service), [CODE]).map_err(|error| error.to_string())?;
+        let watch = EngineWatch::start(Arc::clone(&self.service), [CODE]).map_err(|error| error.to_string())?;
         let stream = futures::stream::unfold(watch, |mut watch| async move {
             loop {
                 // A pass that fails is tried again at the next commit; the watcher sees no tick.

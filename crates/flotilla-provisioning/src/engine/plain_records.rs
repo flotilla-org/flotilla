@@ -10,7 +10,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
-use super::log_watch::LogWatch;
+use super::watch::EngineWatch;
 use flotilla_engine_store::{
     follow::{Followed, Follower},
     plain::{PendingChange, PlainError, PlainLog},
@@ -260,7 +260,7 @@ impl<K: PlainKind> EngineRecords for PlainRecords<K> {
     }
 
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
-        let watch = LogWatch::start(Arc::clone(&self.service), [K::CODE]).map_err(|error| error.to_string())?;
+        let watch = EngineWatch::start(Arc::clone(&self.service), [K::CODE]).map_err(|error| error.to_string())?;
         let stream = futures::stream::unfold(watch, |mut watch| async move {
             loop {
                 // A pass that fails is tried again at the next commit; the watcher sees no tick.

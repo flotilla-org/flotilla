@@ -30,7 +30,7 @@ use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use flotilla_state_machines::{Home, Resource, WriteError};
 use futures::stream::BoxStream;
 
-use super::log_watch::LogWatch;
+use super::watch::EngineWatch;
 use crate::stored::account::{
     self as stored, AccountBinding, BindingEdge, BindingSpec, BindingState, Close, ObserveEpoch, ProvisionSpec, Regrant, Revoke,
 };
@@ -497,7 +497,7 @@ impl AccountRecords for EngineAccounts {
     }
 
     async fn changes(&self, _namespace: &str) -> Result<BoxStream<'static, Result<AccountChange, String>>, String> {
-        let watch = LogWatch::start(Arc::clone(&self.service), [BINDING, PROVISION]).map_err(store_error)?;
+        let watch = EngineWatch::start(Arc::clone(&self.service), [BINDING, PROVISION]).map_err(store_error)?;
         let stream = futures::stream::unfold((watch, std::collections::VecDeque::new()), |(mut watch, mut queue)| async move {
             loop {
                 if let Some(change) = queue.pop_front() {

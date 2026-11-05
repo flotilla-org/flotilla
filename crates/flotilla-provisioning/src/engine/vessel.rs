@@ -203,6 +203,10 @@ where
         self.with_placements(|placements| placements.get(&VesselId::new(name)).cloned())
     }
 
+    fn live(&self) -> Vec<Resource<Lifecycle<VesselKind>>> {
+        self.with_placements(|placements| placements.home().resources().filter(|resource| resource.state().live()).cloned().collect())
+    }
+
     fn request(&self, name: &str, spec: VesselSpec, at: Timestamp) -> Result<Resource<Lifecycle<VesselKind>>, EngineError> {
         let id = VesselId::new(name);
         let lease = spec.lease();
