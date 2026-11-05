@@ -1603,6 +1603,7 @@ dependencies = [
  "sha2",
  "smallvec",
  "syn 2.0.117",
+ "typenum",
  "zeroize",
 ]
 
@@ -1780,6 +1781,7 @@ dependencies = [
  "futures-sink",
  "futures-util",
  "generic-array",
+ "getrandom 0.4.2",
  "libc",
  "memchr",
  "serde",
@@ -1788,6 +1790,7 @@ dependencies = [
  "sha2",
  "slab",
  "subtle",
+ "typenum",
  "zerocopy",
  "zeroize",
 ]
@@ -1801,6 +1804,7 @@ dependencies = [
  "generic-array",
  "hmac",
  "subtle",
+ "typenum",
  "zeroize",
 ]
 
@@ -1934,6 +1938,7 @@ dependencies = [
  "signature",
  "spki",
  "subtle",
+ "typenum",
  "zeroize",
 ]
 
@@ -4055,6 +4060,7 @@ dependencies = [
  "flotilla-build-features",
  "flotilla-build-features-async",
  "flotilla-build-features-os",
+ "getrandom 0.4.2",
  "tempfile",
  "tokio",
 ]
