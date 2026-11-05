@@ -373,14 +373,14 @@ fn a_host_imports_only_at_its_home() {
     assert_eq!(refused, ["kiwi"], "{report:?}");
 }
 
-// Behaviour (ADR 0047): an SSH host published under the pre-#4001 `agentless` key imports, its
-// markers dropped as the connection carries them; a previous generation's Host with no adapter
-// baseline takes its adapters as the baseline, as the health check compares against them.
+// Behaviour (ADR 0047): an SSH host's markers are dropped as the connection carries them; a
+// previous generation's Host with no adapter baseline takes its adapters as the baseline, as the
+// health check compares against them.
 #[test]
 fn a_previous_generations_ssh_host_and_missing_baseline_import() {
     let status = HostStatus {
         capabilities: serde_json::from_value(json!({
-            "agentless": true, "transport": "ssh", "placement": "host_direct_only", "owning_daemon": "udder",
+            "ssh_host": true, "transport": "ssh", "placement": "host_direct_only", "owning_daemon": "udder",
             "agent_adapters": ["claude-code"]
         }))
         .expect("capabilities"),

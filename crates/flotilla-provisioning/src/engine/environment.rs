@@ -1,12 +1,16 @@
 //! Environment's binding: the old Environment reconciler's patches as lifecycle steps.
 
+use std::collections::BTreeMap;
+
 use flotilla_resources::{Environment as OldEnvironment, EnvironmentPhase, EnvironmentStatusPatch, ResourceObject, VESSEL_REF_LABEL};
 use flotilla_schema::{Frozen, Ref};
 use flotilla_state_machines::{machines::lifecycle::LifecycleState, Cause, CauseCategory, Outcome};
 
 use super::{Binding, Step};
 use crate::stored::{
-    environment::{DockerImage, DockerRecipe, EnvironmentKind, EnvironmentRequest, HostDirectRecipe, Recipe, LAUNCH_DERIVED_ENV},
+    environment::{
+        CloudSandboxRecipe, DockerImage, DockerRecipe, EnvironmentKind, EnvironmentRequest, HostDirectRecipe, Recipe, LAUNCH_DERIVED_ENV,
+    },
     Holder,
 };
 
@@ -18,45 +22,53 @@ impl Binding for EnvironmentBinding {
 
     fn request(obj: &ResourceObject<OldEnvironment>, home: &str) -> Result<EnvironmentRequest, String> {
         let spec = &obj.spec;
-        // A cloud sandbox (#3738) has no stored recipe in the look-over's shape: the old path
-        // keeps it, as it keeps one written before the switch.
-        if spec.cloud_sandbox.is_some() {
-            return Err("a cloud sandbox environment has no stored recipe yet; the old path keeps it".into());
-        }
         let provider = spec.resolved_provider_address(None)?.ok_or("an environment names no provider or host")?;
         // The provider's own recipe; only the build it names is a column (look-over rulings 5-6).
-        let (recipe, image_build) = match (&spec.docker, &spec.host_direct) {
-            (Some(docker), None) => {
-                // The build is homed at its builder; the environment names it as replicated here.
-                let image_build = docker.image_build_ref.as_ref().map(|name| Ref::new(name.clone(), home));
+        // The build is homed at its builder; the environment names it as replicated here.
+        let built = |name: &Option<String>| name.as_ref().map(|name| Ref::new(name.clone(), home));
+        // A composed image names its build, whose realised digest is read at creation; the old
+        // spec's empty image is that placeholder.
+        let image = |image_build: &Option<_>, reference: &str| match image_build {
+            Some(_) => DockerImage::Built,
+            None => DockerImage::Pinned { reference: reference.to_owned() },
+        };
+        // Credential grants and skills are composed at launch, never stored.
+        let stored_env = |env: &BTreeMap<String, String>| {
+            env.iter().filter(|(key, _)| !LAUNCH_DERIVED_ENV.contains(&key.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        let (recipe, image_build) = match (&spec.docker, &spec.host_direct, &spec.cloud_sandbox) {
+            (Some(docker), None, None) => {
+                let image_build = built(&docker.image_build_ref);
                 let recipe = DockerRecipe {
-                    // A composed image names its build, whose realised digest is read at creation;
-                    // the old spec's empty image is that placeholder.
-                    image: match image_build {
-                        Some(_) => DockerImage::Built,
-                        None => DockerImage::Pinned { reference: docker.image.clone() },
-                    },
+                    image: image(&image_build, &docker.image),
                     declared_adapters: docker.declared_agent_adapters.clone(),
                     required_adapters: docker.required_agent_adapters.clone(),
                     pull_policy: docker.pull_policy,
                     mounts: docker.mounts.clone(),
-                    // Credential grants and skills are composed at launch, never stored.
-                    env: docker
-                        .env
-                        .iter()
-                        .filter(|(key, _)| !LAUNCH_DERIVED_ENV.contains(&key.as_str()))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
+                    env: stored_env(&docker.env),
                 };
                 recipe.validate(image_build.as_ref())?;
                 (Recipe::of(&recipe)?, image_build)
             }
-            (None, Some(host)) => {
+            (None, Some(host), None) => {
                 let recipe = HostDirectRecipe { repo_default_dir: host.repo_default_dir.clone() };
                 recipe.validate()?;
                 (Recipe::of(&recipe)?, None)
             }
-            _ => return Err("an environment is backed by exactly one of docker and host_direct".into()),
+            (None, None, Some(cloud)) => {
+                let image_build = built(&cloud.image_build_ref);
+                let recipe = CloudSandboxRecipe {
+                    image: image(&image_build, &cloud.image),
+                    size: cloud.size.clone(),
+                    lifetime_cap_seconds: cloud.lifetime_cap_seconds,
+                    env: stored_env(&cloud.env),
+                    probe_needs: cloud.probe_needs.clone(),
+                    reach: cloud.reach.clone(),
+                };
+                recipe.validate(image_build.as_ref())?;
+                (Recipe::of(&recipe)?, image_build)
+            }
+            _ => return Err("an environment is backed by exactly one of docker, host_direct and cloud_sandbox".into()),
         };
         let recipe = Frozen::new(recipe).map_err(|error| format!("freeze the provider's recipe: {error}"))?;
         // A crew's environment is held for its vessel, which the old environment names by label.
@@ -75,7 +87,7 @@ impl Binding for EnvironmentBinding {
             EnvironmentStatusPatch::MarkReady { docker_container_id, .. } => {
                 vec![Step::Realised { identity: identity(obj, docker_container_id.as_deref()) }]
             }
-            // A cloud sandbox is realised under its backing (never held while it has no recipe).
+            // A cloud sandbox is realised under its backing.
             EnvironmentStatusPatch::MarkCloudReady { backing_id, .. } => vec![Step::Realised { identity: backing_id.clone() }],
             // The provider refused it: the old environment never retried a failure.
             EnvironmentStatusPatch::MarkFailed { message } => {

@@ -304,15 +304,6 @@ fn parse_ssh_host_reuses_peer_ssh_destination_fields() {
     assert_eq!(ssh_destination(&host.hostname, host.user.as_deref()), "crew@beaufort.example");
 }
 
-// #4001, ADR 0047: hosts.toml files written before the rename still declare
-// SSH hosts with `agentless_ssh` for one roll.
-#[test]
-fn parse_ssh_host_from_the_retired_key() {
-    let config: HostsConfig =
-        toml::from_str("[hosts.b1]\nhostname = \"b1.example\"\nagentless_ssh = true\n").expect("hosts config with the retired key");
-    assert!(config.hosts["b1"].ssh_host);
-}
-
 // #3722: the supplies format agreed with drydock#55, exactly as declared.
 #[test]
 fn parse_ssh_host_supplies_in_declaration_order() {

@@ -57,7 +57,8 @@ pub struct EnvironmentRequest {
 
 /// A provider's own recipe for an environment: a document whose shape the
 /// provider owns and validates, opaque to the shared table. The Docker
-/// provider's is a [`DockerRecipe`] and host-direct's a [`HostDirectRecipe`].
+/// provider's is a [`DockerRecipe`], host-direct's a [`HostDirectRecipe`] and a
+/// cloud sandbox provider's a [`CloudSandboxRecipe`].
 /// A stored recipe is a stored document: renaming or retiring one of its
 /// fields takes the same one-generation alias or default shim as any stored
 /// shape (ADR 0047), and its content hash must stay stable.
@@ -96,7 +97,7 @@ pub struct DockerRecipe {
     pub env: std::collections::BTreeMap<String, String>,
 }
 
-/// A Docker environment's image: pinned, or built (owner's look-over ruling
+/// A Docker or cloud sandbox environment's image: pinned, or built (owner's look-over ruling
 /// 6). A built image names no reference here: its ImageBuild is the
 /// request's indexed `image_build` column, and the digest used is the build's
 /// realised identity, read at container creation and never copied in.
@@ -104,6 +105,29 @@ pub struct DockerRecipe {
 pub enum DockerImage {
     Pinned { reference: String },
     Built,
+}
+
+/// A cloud sandbox provider's recipe.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudSandboxRecipe {
+    pub image: DockerImage,
+    pub size: flotilla_resources::CloudSandboxSize,
+    pub lifetime_cap_seconds: Option<u64>,
+    /// As [`DockerRecipe::env`]: nothing derived at launch.
+    pub env: std::collections::BTreeMap<String, String>,
+    pub probe_needs: std::collections::BTreeSet<flotilla_resources::CapabilityNeed>,
+    /// What the vessel must reach, frozen at admission (#4299); omitted when
+    /// empty, so a recipe frozen before it decodes and serializes unchanged.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub reach: std::collections::BTreeSet<flotilla_resources::reach::ReachDestination>,
+}
+
+impl CloudSandboxRecipe {
+    /// The recipe's own rules beside the request's `image_build` column, as [`DockerRecipe::validate`].
+    pub fn validate(&self, image_build: Option<&Ref<Resource<ImageBuild>>>) -> Result<(), String> {
+        self.image.validate(image_build)?;
+        stored_env(&self.env)
+    }
 }
 
 /// The host-direct provider's recipe.
@@ -140,17 +164,25 @@ impl DockerRecipe {
     /// built image has its build there and a pinned one has none, a pinned
     /// reference is not empty, and the env holds nothing derived at launch.
     pub fn validate(&self, image_build: Option<&Ref<Resource<ImageBuild>>>) -> Result<(), String> {
-        match (&self.image, image_build) {
-            (DockerImage::Built, None) => return Err("a built image names its ImageBuild in the request".into()),
-            (DockerImage::Pinned { .. }, Some(_)) => return Err("a pinned image names no ImageBuild".into()),
-            (DockerImage::Pinned { reference }, None) if reference.trim().is_empty() => {
-                return Err("a pinned image names its reference".into())
-            }
-            _ => {}
+        self.image.validate(image_build)?;
+        stored_env(&self.env)
+    }
+}
+
+impl DockerImage {
+    fn validate(&self, image_build: Option<&Ref<Resource<ImageBuild>>>) -> Result<(), String> {
+        match (self, image_build) {
+            (DockerImage::Built, None) => Err("a built image names its ImageBuild in the request".into()),
+            (DockerImage::Pinned { .. }, Some(_)) => Err("a pinned image names no ImageBuild".into()),
+            (DockerImage::Pinned { reference }, None) if reference.trim().is_empty() => Err("a pinned image names its reference".into()),
+            _ => Ok(()),
         }
-        match LAUNCH_DERIVED_ENV.iter().find(|key| self.env.contains_key(**key)) {
-            Some(key) => Err(format!("{key} is composed at launch, never stored")),
-            None => Ok(()),
-        }
+    }
+}
+
+fn stored_env(env: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
+    match LAUNCH_DERIVED_ENV.iter().find(|key| env.contains_key(**key)) {
+        Some(key) => Err(format!("{key} is composed at launch, never stored")),
+        None => Ok(()),
     }
 }

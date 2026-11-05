@@ -41,7 +41,7 @@ const HOST: &str = <HostRecord as Kind>::KIND;
 const OBSERVATION: &str = <HostObservation as Kind>::KIND;
 
 /// The capability keys whose values are not carried, with the reason counted.
-const DROPPED_CAPABILITIES: [(&str, &str); 10] = [
+const DROPPED_CAPABILITIES: [(&str, &str); 9] = [
     (TERMINAL_POOLS_CAPABILITY, "terminal pools, read only for display"),
     ("docker", "the docker and os capabilities, which no decision reads"),
     ("os", "the docker and os capabilities, which no decision reads"),
@@ -49,8 +49,6 @@ const DROPPED_CAPABILITIES: [(&str, &str); 10] = [
     ("store_read_retries", "metrics"),
     ("forge_budgets", "metrics"),
     (SSH_HOST_CAPABILITY, "the SSH capability markers, which the connection carries"),
-    // The key SSH hosts published before #4001.
-    ("agentless", "the SSH capability markers, which the connection carries"),
     (TRANSPORT_CAPABILITY, "the SSH capability markers, which the connection carries"),
     (PLACEMENT_CAPABILITY, "the SSH capability markers, which the connection carries"),
 ];
