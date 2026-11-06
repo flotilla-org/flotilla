@@ -9,8 +9,8 @@ use std::{
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
     Checkout as OldCheckout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch, CheckoutWorktreeSpec, Clone as OldClone,
-    ClonePhase, CloneSpec, CloneStatus, CloneStatusPatch, ObjectMeta, RepositoryKey, Resource as OldResource, ResourceError,
-    ResourceObject, StatusPatch, CONVOY_LABEL,
+    ClonePhase, CloneSpec, CloneStatus, ObjectMeta, RepositoryKey, Resource as OldResource, ResourceError, ResourceObject, StatusPatch,
+    CONVOY_LABEL,
 };
 use flotilla_state_machines::{
     machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
@@ -18,7 +18,7 @@ use flotilla_state_machines::{
 };
 use flotilla_store::controller::{ReconcileOutcome, Reconciler};
 
-use super::{checkout::CheckoutBinding, clone::CloneBinding, Binding, Engine, LifecycleHome, Lifecycles, Step};
+use super::{checkout::CheckoutBinding, Binding, Engine, LifecycleHome, Lifecycles, Step};
 use crate::stored::{
     checkout::{CheckoutRequest, Source},
     environment::{DockerImage, DockerRecipe},
@@ -139,92 +139,42 @@ where
     outcome
 }
 
-// Behaviour (#3629 layer 3): a clone first reported Ready is requested and realised in the engine
-// under its path, and the old patch is written because the engine took it.
-#[tokio::test]
-async fn a_ready_clone_is_requested_and_realised_in_the_engine() {
-    let home = lifecycles::<CloneBinding>();
-    let engine = Engine::<_, CloneBinding>::new(
-        Scripted::<OldClone>::new([Some(CloneStatusPatch::MarkReady { default_branch: Some("main".into()) })]),
-        Some(home.clone()),
-    );
-    let mut obj = clone_object(None);
-    let outcome = reconcile(&engine, &mut obj).await;
-    assert_eq!(outcome.patch, Some(CloneStatusPatch::MarkReady { default_branch: Some("main".into()) }));
-    let stored = home.get("clone-a").expect("requested");
-    assert_eq!(stored.state(), &LifecycleState::Realised { identity: "/clones/repo".into() });
-    assert_eq!(stored.spec().environment.name, "env-a");
-    assert_eq!(stored.spec().environment.home, HOME);
-}
-
-// Behaviour: the engine decides when a clone gives up. Transient failures pass through as long as
-// the clone is wanted (Clone's policy has no cap); a failure that cannot succeed gives it up, the
-// requeue is dropped, and the old reconciler is never run on it again.
-#[tokio::test]
-async fn the_engine_gives_a_clone_up_and_never_reconciles_it_again() {
-    let home = lifecycles::<CloneBinding>();
-    let retrying = || Some(CloneStatusPatch::MarkRetrying { message: "network unreachable".into() });
-    let failed = CloneStatusPatch::MarkFailed { message: "repository not found".into(), failed_at: DateTime::UNIX_EPOCH };
-    let engine = Engine::<_, CloneBinding>::new(
-        Scripted::<OldClone>::new((0..20).map(|_| retrying()).chain([Some(failed.clone()), retrying()])),
-        Some(home.clone()),
-    );
-    let mut obj = clone_object(Some(ClonePhase::Pending));
-    for failure in 1..=20 {
-        let outcome = reconcile(&engine, &mut obj).await;
-        assert_eq!(outcome.patch, retrying(), "failure {failure} is retried");
-        assert!(matches!(home.get("clone-a").expect("held").state(), LifecycleState::Requested { failures, .. } if *failures == failure));
-    }
-    let outcome = reconcile(&engine, &mut obj).await;
-    assert_eq!(outcome.patch, Some(failed));
-    assert_eq!(outcome.requeue_after, None);
-    assert!(
-        matches!(home.get("clone-a").expect("held").state(), LifecycleState::GaveUp { cause } if cause.detail == "repository not found")
-    );
-    assert_eq!(obj.status.as_ref().map(|status| status.phase), Some(ClonePhase::Failed));
-
-    let prepared = engine.inner().prepared.load(Ordering::SeqCst);
-    let outcome = reconcile(&engine, &mut obj).await;
-    assert_eq!(outcome.patch, None, "ended clones emit no copy");
-    assert_eq!(engine.inner().prepared.load(Ordering::SeqCst), prepared, "an ended resource is not reconciled again");
-}
-
 // Behaviour: a resource written before the switch (past its initial phase, not held by the
 // engine) stays on the old path until the import: its patch passes and nothing is requested.
 #[tokio::test]
 async fn a_resource_the_engine_does_not_hold_stays_on_the_old_path() {
-    let home = lifecycles::<CloneBinding>();
-    let patch = CloneStatusPatch::MarkFailed { message: "gone".into(), failed_at: DateTime::UNIX_EPOCH };
-    let engine = Engine::<_, CloneBinding>::new(Scripted::<OldClone>::new([Some(patch.clone())]), Some(home.clone()));
-    let mut obj = clone_object(Some(ClonePhase::Ready));
+    let home = lifecycles::<CheckoutBinding>();
+    let patch = CheckoutStatusPatch::MarkFailed { message: "gone".into() };
+    let engine = Engine::<_, CheckoutBinding>::new(Scripted::<OldCheckout>::new([Some(patch.clone())]), Some(home.clone()));
+    let mut obj = worktree(Some("convoy-a"));
+    obj.status = Some(CheckoutStatus { phase: CheckoutPhase::Ready, path: Some("/work/feature".into()), ..CheckoutStatus::default() });
     assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(patch));
-    assert!(home.get("clone-a").is_none());
+    assert!(home.get("checkout-a").is_none());
 }
 
-// Behaviour: a patch with no lifecycle meaning (cloning, an observation) requests nothing.
+// Behaviour: a patch with no lifecycle meaning (an observation) requests nothing.
 #[tokio::test]
 async fn an_in_progress_patch_requests_nothing() {
-    let home = lifecycles::<CloneBinding>();
-    let engine = Engine::<_, CloneBinding>::new(Scripted::<OldClone>::new([Some(CloneStatusPatch::MarkCloning)]), Some(home.clone()));
-    let mut obj = clone_object(None);
-    assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(CloneStatusPatch::MarkCloning));
-    assert!(home.get("clone-a").is_none());
+    let home = lifecycles::<CheckoutBinding>();
+    let observed = CheckoutStatusPatch::ObserveDegradation { message: Some("slow disk".into()) };
+    let engine = Engine::<_, CheckoutBinding>::new(Scripted::<OldCheckout>::new([Some(observed.clone())]), Some(home.clone()));
+    let mut obj = worktree(Some("convoy-a"));
+    assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(observed));
+    assert!(home.get("checkout-a").is_none());
 }
 
 // Behaviour: a finished teardown releases the engine's resource.
 #[tokio::test]
 async fn a_finished_teardown_releases_the_resource() {
-    let home = lifecycles::<CloneBinding>();
-    let engine = Engine::<_, CloneBinding>::new(
-        Scripted::<OldClone>::new([Some(CloneStatusPatch::MarkReady { default_branch: None })]),
-        Some(home.clone()),
-    );
-    let mut obj = clone_object(None);
+    let home = lifecycles::<CheckoutBinding>();
+    let ready = CheckoutStatusPatch::MarkReady { path: "/work/feature".into(), commit: None, branch_provenance: Default::default() };
+    let engine = Engine::<_, CheckoutBinding>::new(Scripted::<OldCheckout>::new([Some(ready)]), Some(home.clone()));
+    let mut obj = worktree(Some("convoy-a"));
     reconcile(&engine, &mut obj).await;
     engine.run_finalizer(&obj).await.expect("teardown");
     assert_eq!(engine.inner().finalized.load(Ordering::SeqCst), 1);
     assert_eq!(
-        home.get("clone-a").expect("held").state(),
+        home.get("checkout-a").expect("held").state(),
         &LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released }
     );
 }
@@ -318,13 +268,15 @@ async fn a_checkout_held_for_no_one_is_the_engines() {
 // Behaviour: steps for each kind's patches.
 #[test]
 fn patches_read_as_lifecycle_steps() {
-    let obj = clone_object(None);
-    assert_eq!(CloneBinding::steps(&obj, &CloneStatusPatch::MarkCloning), vec![]);
-    assert_eq!(
-        CloneBinding::steps(&obj, &CloneStatusPatch::MarkReady { default_branch: None }),
-        vec![Step::Realised { identity: "/clones/repo".into() }]
-    );
     let checkout = worktree(Some("c"));
+    assert_eq!(CheckoutBinding::steps(&checkout, &CheckoutStatusPatch::ObserveDegradation { message: None }), vec![]);
+    assert_eq!(
+        CheckoutBinding::steps(
+            &checkout,
+            &CheckoutStatusPatch::MarkReady { path: "/work/feature".into(), commit: None, branch_provenance: Default::default() }
+        ),
+        vec![Step::Realised { identity: "/work/feature".into() }]
+    );
     assert_eq!(
         CheckoutBinding::steps(&checkout, &CheckoutStatusPatch::MarkGone),
         vec![Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost() }]
@@ -335,11 +287,11 @@ fn patches_read_as_lifecycle_steps() {
 // unchanged and nothing is requested.
 #[tokio::test]
 async fn without_lifecycles_the_old_reconciler_is_unchanged() {
-    let engine =
-        Engine::<_, CloneBinding>::new(Scripted::<OldClone>::new([Some(CloneStatusPatch::MarkRetrying { message: "x".into() })]), None);
-    let mut obj = clone_object(None);
+    let failed = CheckoutStatusPatch::MarkFailed { message: "x".into() };
+    let engine = Engine::<_, CheckoutBinding>::new(Scripted::<OldCheckout>::new([Some(failed.clone())]), None);
+    let mut obj = worktree(Some("convoy-a"));
     let outcome = reconcile(&engine, &mut obj).await;
-    assert_eq!(outcome.patch, Some(CloneStatusPatch::MarkRetrying { message: "x".into() }));
+    assert_eq!(outcome.patch, Some(failed));
     assert_eq!(outcome.requeue_after, Some(std::time::Duration::from_secs(30)));
 }
 
@@ -548,23 +500,6 @@ async fn image_build_failures_follow_the_build_policy() {
         assert!(home.step("image-a", &step, Timestamp(3)).is_err());
         assert_eq!(home.get("image-a").expect("held").state(), &LifecycleState::Realised { identity: "sha256:beef".into() });
     }
-}
-
-// When a status write fails after an engine step, the next report is a new attempt.
-// The engine counts each attempt once without relying on a copied status.
-#[tokio::test]
-async fn a_lost_status_write_leaves_the_engine_counting_each_try_once() {
-    let home = lifecycles::<CloneBinding>();
-    let retrying = || Some(CloneStatusPatch::MarkRetrying { message: "network unreachable".into() });
-    let engine = Engine::<_, CloneBinding>::new(Scripted::<OldClone>::new([retrying(), retrying()]), Some(home.clone()));
-    let obj = clone_object(Some(ClonePhase::Pending));
-    // Two reconciles whose patches are never written: the old status stays Pending.
-    for tries in 1..=2u32 {
-        let prepared = engine.prepare(&obj).await.expect("prepare");
-        assert_eq!(engine.reconcile(&obj, &prepared, Utc::now()).patch, retrying());
-        assert!(matches!(home.get("clone-a").expect("held").state(), LifecycleState::Requested { failures, .. } if *failures == tries));
-    }
-    assert_eq!(engine.inner().prepared.load(Ordering::SeqCst), 2, "each count is a try the old reconciler made");
 }
 
 fn session_object(phase: flotilla_resources::TerminalSessionPhase) -> ResourceObject<flotilla_resources::TerminalSession> {
@@ -838,7 +773,7 @@ fn every_old_phase_imports_and_rehearses() {
     ] {
         let mut obj = clone_object(Some(phase));
         obj.status.as_mut().expect("status").failure_policy = policy;
-        let imported = import::<CloneBinding>(&obj, HOME).expect("imports");
+        let imported = super::import::import_clone(&obj, HOME).expect("imports");
         assert_eq!(label(imported.resource.state()), expected, "{phase:?} {policy:?}");
         assert_eq!(rehearse(&[imported]), BTreeMap::new());
     }
@@ -1325,7 +1260,7 @@ fn a_lifecycle_finishes_a_durable_failed_attempt_after_log_errors(tc: hegel::Tes
     let mut lifecycles = LifecycleHome::new(HOME, new_home());
     let obj = clone_object(Some(ClonePhase::Ready));
     let name = &obj.metadata.name;
-    lifecycles.request(name, CloneBinding::request(&obj, HOME).expect("request"), Timestamp(1)).expect("requested");
+    lifecycles.request(name, super::clones::request_of(&obj.spec, false, HOME), Timestamp(1)).expect("requested");
     let step = Step::Attempted(flotilla_state_machines::Outcome::Failed {
         cause: flotilla_state_machines::Cause::new(flotilla_state_machines::CauseCategory::Refused, message),
         retryable: false,
@@ -1345,73 +1280,4 @@ fn a_lifecycle_finishes_a_durable_failed_attempt_after_log_errors(tc: hegel::Tes
             lifecycles = LifecycleHome::new(HOME, home);
         }
     }
-    let lifecycles = Arc::new(lifecycles);
-    tokio::runtime::Runtime::new().expect("runtime").block_on(async {
-        use crate::reconcilers::{CloneReconciler, CloneRuntime};
-        use flotilla_protocol::LifecycleReading;
-        use flotilla_resources::lifecycle_reads::{LifecycleReads, ProvisioningKind};
-        use flotilla_resources::{InputMeta, Repository};
-        use flotilla_store::{controller::ControllerLoop, ResourceBackend};
-
-        // The read adapter judges the durable home, including the restored exhausted attempt.
-        struct Reads(Arc<dyn Lifecycles<CloneKind>>);
-        impl LifecycleReads for Reads {
-            fn try_reading(&self, _: ProvisioningKind, name: &str, _: Option<&str>) -> Result<Option<LifecycleReading>, String> {
-                Ok(self.0.get(name).map(|resource| match super::reads::judge::<CloneKind>(resource.state()) {
-                    super::reads::Judgement::Exhausted { last } => LifecycleReading::Exhausted { cause: last.detail },
-                    super::reads::Judgement::GaveUp { cause } => LifecycleReading::GaveUp { cause: cause.detail },
-                    _ => panic!("only recovery states belong in this scenario"),
-                }))
-            }
-        }
-        // Provider process boundary: recovery must never request clone or inspection work.
-        struct NoProvider(AtomicUsize);
-        #[async_trait::async_trait]
-        impl CloneRuntime for NoProvider {
-            async fn clone_and_inspect(&self, _: &str, _: &str) -> Result<Option<String>, String> {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Err("provider must not be repeated".into())
-            }
-            async fn inspect_existing(&self, _: &str) -> Result<Option<String>, String> {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Err("provider must not be repeated".into())
-            }
-        }
-        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        let primary = backend.clone().using::<OldClone>("flotilla");
-        let mut metadata = InputMeta::builder().name(name.clone()).build();
-        metadata.finalizers = vec!["flotilla.work/clone-cleanup".into()];
-        let object = primary.create(&metadata, &obj.spec).await.expect("old resource");
-        let provider = Arc::new(NoProvider(AtomicUsize::new(0)));
-        let inner = CloneReconciler::new(provider.clone(), backend.clone().using::<Repository>("flotilla"))
-            .with_lifecycle_reads(Arc::new(Reads(lifecycles.clone())));
-        assert!(inner.retry_disposition(&object).is_none(), "Exhausted must reach engine prepare");
-        let engine = Engine::<_, CloneBinding>::new(inner, Some(lifecycles.clone()));
-        let controller = tokio::spawn(
-            ControllerLoop {
-                primary,
-                secondaries: vec![],
-                reconciler: engine,
-                resync_interval: std::time::Duration::from_secs(3600),
-                backend,
-            }
-            .run(),
-        );
-        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            loop {
-                if matches!(lifecycles.get(name).expect("held").state(), LifecycleState::GaveUp { .. }) {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
-        })
-        .await;
-        controller.abort();
-        let _ = controller.await;
-        result.expect("controller finishes GiveUp after split write, including restart");
-        assert_eq!(provider.0.load(Ordering::SeqCst), 0);
-    });
-    let ended = lifecycles.get(name).expect("controller completed GiveUp");
-    assert_eq!(ended.version().0, attempted_version.expect("durable attempt").0 + 1, "only GiveUp is appended");
-    assert!(matches!(ended.state(), LifecycleState::GaveUp { cause } if cause.detail == message));
 }

@@ -600,25 +600,6 @@ impl<R: Reconciler> ControllerLoop<R> {
                 let resolver = backend.using::<crate::Repository>(namespace);
                 crate::ensure_repository(&resolver, &key, &spec).await.map(|_| ())
             }
-            Actuation::CreateClone { meta, spec } => {
-                let resolver = backend.using::<crate::Clone>(namespace);
-                Self::create_if_missing(&resolver, meta, spec).await
-            }
-            Actuation::RetryClone { name, failed_at } => {
-                let resolver = backend.using::<crate::Clone>(namespace);
-                let clone =
-                    match crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || resolver.get(&name)).await {
-                        Ok(clone) => clone,
-                        Err(ResourceError::NotFound { .. }) => return Ok(()),
-                        Err(error) => return Err(error),
-                    };
-                let current_failed_at =
-                    clone.status.as_ref().and_then(|status| status.failed_at).unwrap_or(clone.metadata.creation_timestamp);
-                if clone.status.as_ref().map(|status| status.phase) != Some(crate::ClonePhase::Failed) || current_failed_at != failed_at {
-                    return Ok(());
-                }
-                crate::apply_status_patch(&resolver, &name, &crate::CloneStatusPatch::MarkCloning).await.map(|_| ())
-            }
             Actuation::CreateCheckout { meta, spec } => {
                 let resolver = backend.using::<crate::Checkout>(namespace);
                 Self::create_if_missing(&resolver, meta, spec).await

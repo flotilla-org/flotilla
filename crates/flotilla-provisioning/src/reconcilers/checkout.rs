@@ -11,8 +11,8 @@ use flotilla_protocol::LifecycleReading;
 use flotilla_resources::checkout_integration::{checkout_observation_lacks_convoy_association, convoy_change_request_id_for_checkout};
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::{
-    convoy_sanctions_checkout_reclaim, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
-    CheckoutStatus, CheckoutStatusPatch, Clock, Clone, CloneCredentials, CloneFailurePolicy, ClonePhase, Convoy, ConvoyPhase, Forge,
+    clone_records::CloneRecord, convoy_sanctions_checkout_reclaim, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus,
+    CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch, Clock, CloneCredentials, Convoy, ConvoyPhase, Forge,
     IntegrationCondition, LifecycleAuthority, ObjectEvent, Resource, ResourceError, ResourceObject, ResourceProvenance, SystemClock,
     ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, FORCE_TEARDOWN_ANNOTATION,
 };
@@ -168,7 +168,6 @@ pub trait CheckoutRuntime: Send + Sync {
 pub struct CheckoutReconciler<R> {
     runtime: Arc<R>,
     checkouts: TypedResolver<Checkout>,
-    clones: TypedResolver<Clone>,
     lifecycle_reads: Arc<dyn LifecycleReads>,
     convoys: TypedResolver<Convoy>,
     forges: flotilla_store::DefinitionResolver<Forge>,
@@ -197,7 +196,6 @@ impl<R> CheckoutReconciler<R> {
         Self {
             runtime,
             checkouts: backend.clone().using::<Checkout>(namespace),
-            clones: backend.clone().using::<Clone>(namespace),
             lifecycle_reads: Arc::new(NoLifecycleReads),
             convoys: backend.clone().using::<Convoy>(namespace),
             forges: backend.definitions::<Forge>(namespace),
@@ -220,38 +218,33 @@ impl<R> CheckoutReconciler<R> {
         self.lifecycle_reads.try_reading(ProvisioningKind::Checkout, &obj.metadata.name, None).map_err(ResourceError::other)
     }
 
+    /// The clone launch `name` names, at this home: a launch name (`<clone>#<n>`) reads that
+    /// launch, and a clone's name, from a checkout made before clones had launches, its latest.
+    /// The engine's reads take the store's lock, so they run off the async workers.
+    async fn clone_record(&self, name: &str) -> Result<Option<CloneRecord>, ResourceError> {
+        let (reads, name) = (Arc::clone(&self.lifecycle_reads), name.to_owned());
+        tokio::task::spawn_blocking(move || reads.clones().and_then(|clones| clones.get(&name, None)))
+            .await
+            .map_err(|error| ResourceError::other(format!("engine read: {error}")))?
+            .map_err(ResourceError::other)
+    }
+
+    /// What the checkout waits for, or why it fails, from the clone launch it is made from. A
+    /// launch that ended stays ended: a new request for the clone starts its next launch, and a
+    /// checkout made then names that one.
     async fn clone_dependency(
         &self,
         checkout: &ResourceObject<Checkout>,
-        clone: &ResourceObject<Clone>,
+        clone: &CloneRecord,
     ) -> Result<Option<CheckoutPrepared>, ResourceError> {
-        if let Some(reading) =
-            self.lifecycle_reads.try_reading(ProvisioningKind::Clone, &clone.metadata.name, None).map_err(ResourceError::other)?
-        {
-            // The engine owns the retry episode; an old controller retry must not survive it.
-            self.observe_clone_retry(checkout, None).await?;
-            return Ok(match reading {
-                LifecycleReading::Ready { .. } => None,
-                LifecycleReading::InProgress | LifecycleReading::Retrying { .. } => Some(CheckoutPrepared::Waiting),
-                other => Some(CheckoutPrepared::Failed(other.reason().unwrap_or_default())),
-            });
-        }
-        self.observe_clone_retry(checkout, clone.status.as_ref().and_then(|status| status.retry.clone())).await?;
-        let status = clone.status.as_ref();
-        Ok(match status.map(|status| status.phase) {
-            Some(ClonePhase::Ready) => None,
-            Some(ClonePhase::Failed) if status.and_then(|status| status.failure_policy) == Some(CloneFailurePolicy::Terminal) => {
-                Some(CheckoutPrepared::Failed(
-                    status
-                        .and_then(|status| status.message.clone())
-                        .unwrap_or_else(|| format!("clone {} failed validation", clone.metadata.name)),
-                ))
+        // The engine owns the retry episode; a retry an old controller recorded must not survive it.
+        self.observe_clone_retry(checkout, None).await?;
+        Ok(match &clone.reading {
+            LifecycleReading::Ready { .. } => None,
+            LifecycleReading::InProgress | LifecycleReading::Retrying { .. } | LifecycleReading::Exhausted { .. } => {
+                Some(CheckoutPrepared::Waiting)
             }
-            Some(ClonePhase::Failed) => Some(CheckoutPrepared::RetryClone {
-                clone_name: clone.metadata.name.clone(),
-                failed_at: status.and_then(|status| status.failed_at).unwrap_or(clone.metadata.creation_timestamp),
-            }),
-            _ => Some(CheckoutPrepared::Waiting),
+            other => Some(CheckoutPrepared::Failed(other.reason().unwrap_or_default())),
         })
     }
 
@@ -344,7 +337,6 @@ pub enum CheckoutPrepared {
     OwnerTerminal,
     Ready { prepared: PreparedCheckout },
     Integration { status: Box<CheckoutIntegrationStatus> },
-    RetryClone { clone_name: String, failed_at: DateTime<Utc> },
     Waiting,
     ValidationUnavailable(flotilla_provider_runtime::ObservationError),
     Failed(String),
@@ -442,10 +434,9 @@ where
             }
             if lifecycle_authority == Some(LifecycleAuthority::Managed) && phase == CheckoutPhase::Ready {
                 if let CheckoutSpec::Worktree(spec) = &obj.spec {
-                    let source = match self.clones.get(&spec.clone_ref).await {
-                        Ok(clone) => clone.spec.path,
-                        Err(ResourceError::NotFound { .. }) => spec.target_path.clone(),
-                        Err(error) => return Err(error),
+                    let source = match self.clone_record(&spec.clone_ref).await? {
+                        Some(clone) => clone.spec.path,
+                        None => spec.target_path.clone(),
                     };
                     let reason = checkout_registration_reason(obj, convoy.as_ref());
                     if let Err(error) = self.runtime.protect_worktree_in(&spec.env_ref, &source, &spec.target_path, &reason).await {
@@ -563,13 +554,9 @@ where
 
         match &obj.spec {
             CheckoutSpec::Worktree(spec) => {
-                let clone = match self.clones.get(&spec.clone_ref).await {
-                    Ok(clone) => clone,
-                    Err(ResourceError::NotFound { .. }) => {
-                        self.observe_clone_retry(obj, None).await?;
-                        return Ok(CheckoutPrepared::Waiting);
-                    }
-                    Err(err) => return Err(err),
+                let Some(clone) = self.clone_record(&spec.clone_ref).await? else {
+                    self.observe_clone_retry(obj, None).await?;
+                    return Ok(CheckoutPrepared::Waiting);
                 };
                 if let Some(waiting) = self.clone_dependency(obj, &clone).await? {
                     return Ok(waiting);
@@ -611,11 +598,7 @@ where
             }
             CheckoutSpec::FreshClone(spec) if spec.source_clone_ref.is_some() => {
                 let clone_name = spec.source_clone_ref.as_ref().expect("local clone source");
-                let clone = match self.clones.get(clone_name).await {
-                    Ok(clone) => clone,
-                    Err(ResourceError::NotFound { .. }) => return Ok(CheckoutPrepared::Waiting),
-                    Err(error) => return Err(error),
-                };
+                let Some(clone) = self.clone_record(clone_name).await? else { return Ok(CheckoutPrepared::Waiting) };
                 if let Some(waiting) = self.clone_dependency(obj, &clone).await? {
                     return Ok(waiting);
                 }
@@ -717,7 +700,6 @@ where
                 | CheckoutPrepared::OwnerTerminal
                 | CheckoutPrepared::Gone
                 | CheckoutPrepared::Reappeared => None,
-                CheckoutPrepared::RetryClone { .. } => None,
                 CheckoutPrepared::Failed(message) => Some(CheckoutStatusPatch::MarkFailed { message: message.clone() }),
                 CheckoutPrepared::ValidationUnavailable(error) => {
                     let message = error.to_string();
@@ -776,7 +758,6 @@ where
                 | CheckoutPrepared::OwnerTerminal
                 | CheckoutPrepared::Reappeared
                 | CheckoutPrepared::Ready { .. }
-                | CheckoutPrepared::RetryClone { .. }
                 | CheckoutPrepared::Waiting
                 | CheckoutPrepared::ValidationUnavailable(_) => None,
             }
@@ -786,9 +767,6 @@ where
 
         let actuations = match prepared {
             CheckoutPrepared::OwnerTerminal => vec![Actuation::DeleteCheckout { name: obj.metadata.name.clone() }],
-            CheckoutPrepared::RetryClone { clone_name, failed_at } if lifecycle.is_none() || phase == CheckoutPhase::Pending => {
-                vec![Actuation::RetryClone { name: clone_name.clone(), failed_at: *failed_at }]
-            }
             _ => Vec::new(),
         };
         let mut outcome = ReconcileOutcome::with_actuations(patch, actuations);
@@ -833,8 +811,8 @@ where
         });
         let landed = convoy.as_ref().is_some_and(|convoy| convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landed));
         let removal = match &obj.spec {
-            CheckoutSpec::Worktree(spec) => match self.clones.get(&spec.clone_ref).await {
-                Ok(clone) => {
+            CheckoutSpec::Worktree(spec) => match self.clone_record(&spec.clone_ref).await? {
+                Some(clone) => {
                     let clone_path = clone.spec.path;
                     let branch = spec.r#ref.clone();
                     let target_path = spec.target_path.clone();
@@ -846,8 +824,7 @@ where
                         CheckoutRemoval::Worktree { clone_path, branch, target_path }
                     }
                 }
-                Err(ResourceError::NotFound { .. }) => CheckoutRemoval::OrphanedWorktree { target_path: spec.target_path.clone() },
-                Err(err) => return Err(err),
+                None => CheckoutRemoval::OrphanedWorktree { target_path: spec.target_path.clone() },
             },
             CheckoutSpec::FreshClone(spec) if spec.source_clone_ref.is_some() => {
                 CheckoutRemoval::LocalClone { target_path: spec.target_path.clone() }

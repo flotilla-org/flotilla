@@ -66,8 +66,14 @@ impl ArchiveTarget for S3BlobStore {
 /// The decided store's kinds whose ended resources archive: every machine it holds.
 pub(crate) fn archive_kinds() -> ArchiveKinds {
     use flotilla_provisioning::stored::{
-        account::AccountBinding, checkout::Checkout, clone::Clone, environment::Environment, image_build::ImageBuild,
-        launch_facts::EnvironmentLaunchFacts, manifest_root::ManifestRoot, terminal_session::TerminalSession,
+        account::AccountBinding,
+        checkout::Checkout,
+        clone::{Clone, CloneFacts},
+        environment::Environment,
+        image_build::ImageBuild,
+        launch_facts::EnvironmentLaunchFacts,
+        manifest_root::ManifestRoot,
+        terminal_session::TerminalSession,
     };
     use flotilla_state_machines::machines::{
         agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, ensure::Ensure, message::Message, person::Person,
@@ -83,6 +89,8 @@ pub(crate) fn archive_kinds() -> ArchiveKinds {
         .companion::<Environment, EnvironmentLaunchFacts>()
         .with::<ImageBuild>()
         .with::<Clone>()
+        // The facts a clone launch found end with it.
+        .companion::<Clone, CloneFacts>()
         .with::<Checkout>()
         .with::<TerminalSession>()
         .with::<Vessel>()

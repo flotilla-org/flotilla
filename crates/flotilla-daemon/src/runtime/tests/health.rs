@@ -1,5 +1,6 @@
 use super::*;
 use crate::runtime::tasks::AGGREGATOR_CONTROLLER;
+use flotilla_resources::clone_records::CloneRecords as _;
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_sqlite::SqliteBackend;
 
@@ -155,6 +156,22 @@ async fn home_bound_authorship_collision_is_advisory_and_clears_after_removal() 
         .all(|condition| { condition.condition_type != "ResourceReplication/AuthorshipCollision" }));
 }
 
+/// Refuses every clone as a forge that has no such repository.
+struct MissingRepositoryCloneRuntime;
+
+#[async_trait]
+impl CloneRuntime for MissingRepositoryCloneRuntime {
+    async fn clone_and_inspect(&self, _: &str, _: &str) -> Result<Option<String>, String> {
+        Err("authentication failed: repository not found".into())
+    }
+
+    async fn inspect_existing(&self, _: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+}
+
+// Behaviour (#3108): a clone the Clone controller gives up on shows its cause in convoy explain,
+// on the checkout made from it, beside the convoy controller's own events.
 #[tokio::test]
 async fn clone_controller_failure_is_visible_in_convoy_explain() {
     let temp = TempDir::new().expect("tempdir");
@@ -163,6 +180,21 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
     fs::write(config_base.join("daemon.toml"), "machine_id = \"clone-failure-explain-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
     let daemon = in_memory_daemon(Vec::new(), config).await;
+    let engine = flotilla_provisioning_testkit::clones::RunningClones::start("local", Arc::new(MissingRepositoryCloneRuntime));
+    daemon.install_lifecycle_reads(engine.reads.clone()).expect("engine reads");
+    let clone_path = temp.path().join("clone").display().to_string();
+    engine.environments.put_ready(
+        "host-direct-test",
+        &EnvironmentSpec {
+            cloud_sandbox: None,
+            provider_address: None,
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: clone_path.clone() }),
+            docker: None,
+        },
+        None,
+        &clone_path,
+        Default::default(),
+    );
     let backend = daemon.resource_backend();
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git").expect("repository spec");
     let repository_key = repository_spec.key();
@@ -176,45 +208,44 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
                 .name("clone-failure-convoy".to_string())
                 .labels(BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), "clone-failure-convoy".to_string())]))
                 .build(),
-            &ConvoySpec::builder().workflow_ref("missing-workflow".to_string()).build(),
+            &ConvoySpec::builder()
+                .workflow_ref("missing-workflow".to_string())
+                .adopted_checkout_refs(BTreeMap::from([(repository_key.clone(), "clone-failure-checkout".to_string())]))
+                .build(),
         )
         .await
         .expect("convoy");
-    backend
-        .using::<Clone>(NAMESPACE)
-        .create(
-            &InputMeta::builder()
-                .name("incorrect-clone-name".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "clone-failure-convoy".to_string())]))
-                .build(),
+    let launch = engine
+        .clones
+        .request(
+            &repository_spec,
             &CloneSpec {
-                repo_ref: repository_key,
+                repo_ref: repository_key.clone(),
                 url: "https://github.com/flotilla-org/flotilla.git".to_string(),
                 env_ref: "host-direct-test".to_string(),
-                path: temp.path().join("clone").display().to_string(),
+                path: clone_path.clone(),
             },
+            false,
+        )
+        .expect("clone request");
+    backend
+        .using::<Checkout>(NAMESPACE)
+        .create(
+            &InputMeta::builder()
+                .name("clone-failure-checkout".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "clone-failure-convoy".to_string())]))
+                .build(),
+            &CheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
+                repo_ref: repository_key,
+                env_ref: "host-direct-test".to_string(),
+                r#ref: "main".to_string(),
+                base_ref: None,
+                target_path: temp.path().join("checkout").display().to_string(),
+                clone_ref: launch.clone(),
+            }),
         )
         .await
-        .expect("clone intent");
-
-    let controller = tokio::spawn(
-        ControllerLoop {
-            primary: backend.using::<Clone>(NAMESPACE),
-            secondaries: Vec::new(),
-            reconciler: CloneReconciler::new(
-                Arc::new(CloneControllerRuntime::new(
-                    Arc::new(ProcessCommandRunner),
-                    Some(test_controller_vcs(Arc::new(ProcessCommandRunner), &temp.path().join("clone").to_string_lossy())),
-                    Arc::new(CloneFlights::default()),
-                    vec![],
-                )),
-                backend.using::<Repository>(NAMESPACE),
-            ),
-            resync_interval: Duration::from_secs(60),
-            backend: backend.clone(),
-        }
-        .run(),
-    );
+        .expect("checkout");
     let convoy_controller = tokio::spawn(
         ControllerLoop {
             primary: backend.using::<Convoy>(NAMESPACE),
@@ -226,15 +257,17 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
         .run(),
     );
 
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
+            let gave_up = matches!(
+                engine.clones.get(&launch, None).ok().flatten().map(|clone| clone.reading),
+                Some(flotilla_protocol::LifecycleReading::GaveUp { .. })
+            );
             let events = backend.using::<flotilla_resources::Event>(NAMESPACE).list().await.expect("events").items;
-            if events.iter().any(|event| event.spec.reason == "CloneFailed")
-                && events.iter().any(|event| event.spec.reason == "WorkflowTemplateNotFound")
-            {
+            if gave_up && events.iter().any(|event| event.spec.reason == "WorkflowTemplateNotFound") {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -254,15 +287,18 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
     let CommandValue::ConvoyExplanation(explanation) = result else {
         panic!("explain should return a convoy explanation, got {result:?}");
     };
-    assert!(explanation
-        .recent_events
-        .iter()
-        .any(|event| { event.reason == "CloneFailed" && event.message.contains("clone name mismatch") }));
+    let checkout = explanation.checkouts.iter().find(|checkout| checkout.name == "clone-failure-checkout").expect("explained checkout");
+    let clone = checkout.clone.as_ref().expect("the checkout's clone is explained");
+    assert_eq!(clone.name, launch);
+    assert!(
+        matches!(&clone.reading, flotilla_protocol::LifecycleReading::GaveUp { cause } if cause.contains("repository not found")),
+        "explain shows the clone's cause: {:?}",
+        clone.reading
+    );
     assert!(explanation
         .recent_events
         .iter()
         .any(|event| { event.reason == "WorkflowTemplateNotFound" && event.message.contains("missing-workflow") }));
-    controller.abort();
     convoy_controller.abort();
 }
 

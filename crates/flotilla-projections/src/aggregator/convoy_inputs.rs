@@ -10,7 +10,6 @@ pub(super) struct ConvoyInputs {
     vessels: HashMap<Parent, Vec<RepositorySourceKey>>,
     checkouts: HashMap<Parent, Vec<RepositorySourceKey>>,
     named_checkouts: HashMap<Parent, Vec<RepositorySourceKey>>,
-    clones: HashMap<Parent, Vec<RepositorySourceKey>>,
 }
 impl Aggregator {
     pub(super) fn rebuild_convoy_inputs(&mut self) {
@@ -32,9 +31,6 @@ impl Aggregator {
                 index.checkouts.entry((item.object.metadata.namespace.clone(), parent.clone())).or_default().push(key.clone());
             }
             index.named_checkouts.entry((key.0.clone(), key.1.clone())).or_default().push(key.clone());
-        }
-        for key in self.readiness_clones.keys() {
-            index.clones.entry((key.0.clone(), key.1.clone())).or_default().push(key.clone());
         }
         self.convoy_inputs = index;
     }
@@ -97,19 +93,6 @@ impl Aggregator {
                 .into_iter()
                 .flatten()
                 .filter_map(|key| self.readiness_checkouts.get(key)),
-        )
-    }
-    pub(super) fn named_clones(&self, namespace: &str, name: &str) -> Box<dyn Iterator<Item = &ReadResourceObject<CloneResource>> + '_> {
-        if !self.convoy_inputs.ready {
-            return Box::new(self.readiness_clones.values());
-        }
-        Box::new(
-            self.convoy_inputs
-                .clones
-                .get(&(namespace.into(), name.into()))
-                .into_iter()
-                .flatten()
-                .filter_map(|key| self.readiness_clones.get(key)),
         )
     }
 }

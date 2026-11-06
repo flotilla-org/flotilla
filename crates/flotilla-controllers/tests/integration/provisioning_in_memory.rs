@@ -16,18 +16,19 @@ use common::{
 use flotilla_crew::reconcilers::terminal_session::{TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler};
 use flotilla_crew::reconcilers::vessel::VesselReconciler;
 use flotilla_protocol::ConfiguredResourceLimits;
+use flotilla_protocol::LifecycleReading;
 use flotilla_provisioning::reconcilers::{
-    checkout::CheckoutPrepared, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler,
-    CloneRuntime, PreparedCheckout,
+    checkout::CheckoutPrepared, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneRuntime,
+    PreparedCheckout,
 };
-use flotilla_provisioning_testkit::EnvironmentFixture;
+use flotilla_provisioning_testkit::{clones::RunningClones, CloneFixture, EnvironmentFixture};
+use flotilla_resources::clone_records::CloneRecords;
 use flotilla_resources::lifecycle_reads::LifecycleReads;
 use flotilla_resources::{
-    canonicalize_repo_url, clone_key, Actuation, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec,
-    Clone, ClonePhase, CloneSpec, CloneStatus, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, Host,
-    HostSpec, HostStatus, InputMeta, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec,
-    ResourceError, ResourceObject, TerminalSession, TerminalSessionPhase, TerminalSessionTarget, Vessel, VesselPhase, VesselRequirement,
-    VESSEL_REF_LABEL,
+    canonicalize_repo_url, Actuation, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, CloneSpec,
+    Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, Host, HostSpec, HostStatus, InputMeta, Project,
+    ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec, ResourceError, ResourceObject, TerminalSession,
+    TerminalSessionPhase, TerminalSessionTarget, Vessel, VesselPhase, VesselRequirement, VESSEL_REF_LABEL,
 };
 use flotilla_store::{
     controller::{ControllerLoop, ReconcileOutcome, Reconciler},
@@ -45,6 +46,27 @@ struct FakeCloneRuntime;
 impl CloneRuntime for FakeCloneRuntime {
     async fn clone_and_inspect(&self, _repo_url: &str, _target_path: &str) -> Result<Option<String>, String> {
         Ok(Some("main".to_string()))
+    }
+
+    async fn inspect_existing(&self, _target_path: &str) -> Result<Option<String>, String> {
+        Ok(Some("main".to_string()))
+    }
+}
+
+/// Refuses the first clone as the forge refused a stale credential, then clones as `FakeCloneRuntime`.
+#[derive(Default)]
+struct RefusingFirstCloneRuntime {
+    refused: AtomicBool,
+}
+
+#[async_trait]
+impl CloneRuntime for RefusingFirstCloneRuntime {
+    async fn clone_and_inspect(&self, _repo_url: &str, _target_path: &str) -> Result<Option<String>, String> {
+        if self.refused.swap(true, Ordering::SeqCst) {
+            Ok(Some("main".to_string()))
+        } else {
+            Err("authentication failed: repository access denied".to_string())
+        }
     }
 
     async fn inspect_existing(&self, _target_path: &str) -> Result<Option<String>, String> {
@@ -198,8 +220,9 @@ impl TerminalRuntime for FakeTerminalRuntime {
 async fn controller_loops_drive_host_direct_workspace_to_ready() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_host(&backend, "01HXYZ").await;
-    let environments = EnvironmentFixture::default();
-    create_ready_host_direct_environment(&environments, "01HXYZ", "/Users/alice/dev/flotilla-repos");
+    let engine = RunningClones::start("01HXYZ", Arc::new(FakeCloneRuntime));
+    let environments = &engine.environments;
+    create_ready_host_direct_environment(environments, "01HXYZ", "/Users/alice/dev/flotilla-repos");
     create_host_direct_kind(&backend, NAMESPACE, "kind-a", "01HXYZ", "cleat").await;
     let repository_url = "git@github.com:flotilla-org/flotilla.git";
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-a", "implement", repository_url, "feat/task-provisioning").await;
@@ -213,7 +236,7 @@ async fn controller_loops_drive_host_direct_workspace_to_ready() {
         .expect("destination should start without the convoy repository");
     create_workspace(&backend, NAMESPACE, "workspace-a", "convoy-a", "implement", "kind-a", repository_url).await;
 
-    let harness = full_controller_harness(backend.clone(), environments.reads.clone());
+    let harness = full_controller_harness(backend.clone(), engine.reads.clone());
 
     let workspaces = backend.clone().using::<Vessel>(NAMESPACE);
     harness
@@ -263,8 +286,9 @@ async fn controller_loops_drive_host_direct_workspace_to_ready() {
 async fn a_project_gaining_a_member_leaves_a_running_convoys_checkouts_unchanged() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_host(&backend, "01HXYZ").await;
-    let environments = EnvironmentFixture::default();
-    create_ready_host_direct_environment(&environments, "01HXYZ", "/Users/alice/dev/flotilla-repos");
+    let engine = RunningClones::start("01HXYZ", Arc::new(FakeCloneRuntime));
+    let environments = &engine.environments;
+    create_ready_host_direct_environment(environments, "01HXYZ", "/Users/alice/dev/flotilla-repos");
     create_host_direct_kind(&backend, NAMESPACE, "kind-a", "01HXYZ", "cleat").await;
     let repository_url = "https://github.com/flotilla-org/flotilla";
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-a", "implement", repository_url, "fix/members").await;
@@ -286,7 +310,7 @@ async fn a_project_gaining_a_member_leaves_a_running_convoys_checkouts_unchanged
         .expect("project create");
     create_workspace(&backend, NAMESPACE, "workspace-a", "convoy-a", "implement", "kind-a", repository_url).await;
 
-    let harness = full_controller_harness(backend.clone(), environments.reads.clone());
+    let harness = full_controller_harness(backend.clone(), engine.reads.clone());
     let vessels = backend.clone().using::<Vessel>(NAMESPACE);
     harness
         .wait_until(Duration::from_secs(3), || {
@@ -315,7 +339,7 @@ async fn a_project_gaining_a_member_leaves_a_running_convoys_checkouts_unchanged
     projects.update(&InputMeta::from(&project.metadata), &project.metadata.resource_version, &grown).await.expect("project gains a member");
 
     let vessel = vessels.get("workspace-a").await.expect("vessel");
-    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE).with_lifecycle_reads(environments.reads.clone());
+    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE).with_lifecycle_reads(engine.reads.clone());
     let outcome = reconciler.reconcile(&vessel, &reconciler.prepare(&vessel).await.expect("vessel dependencies"), Utc::now());
     assert!(outcome.actuations.iter().all(|actuation| !matches!(actuation, Actuation::CreateCheckout { .. })), "{:?}", outcome.actuations);
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -329,8 +353,9 @@ async fn a_project_gaining_a_member_leaves_a_running_convoys_checkouts_unchanged
 async fn controller_materializes_a_missing_repository_for_a_multi_repository_convoy() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_host(&backend, "01HXYZ").await;
-    let environments = EnvironmentFixture::default();
-    create_ready_host_direct_environment(&environments, "01HXYZ", "/Users/alice/dev/flotilla-repos");
+    let engine = RunningClones::start("01HXYZ", Arc::new(FakeCloneRuntime));
+    let environments = &engine.environments;
+    create_ready_host_direct_environment(environments, "01HXYZ", "/Users/alice/dev/flotilla-repos");
     create_host_direct_kind(&backend, NAMESPACE, "kind-multi", "01HXYZ", "cleat").await;
 
     let known = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("known repository");
@@ -422,7 +447,7 @@ async fn controller_materializes_a_missing_repository_for_a_multi_repository_con
     )
     .await;
 
-    let harness = full_controller_harness(backend.clone(), environments.reads.clone());
+    let harness = full_controller_harness(backend.clone(), engine.reads.clone());
     let vessels = backend.clone().using::<Vessel>(NAMESPACE);
     harness
         .wait_until(Duration::from_secs(3), || {
@@ -439,9 +464,9 @@ async fn controller_materializes_a_missing_repository_for_a_multi_repository_con
     let repositories = backend.clone().using::<Repository>(NAMESPACE);
     repositories.get(&known.key().to_string()).await.expect("known repository should remain registered");
     repositories.get(&missing.key().to_string()).await.expect("missing repository should be materialized");
-    let clones = backend.clone().using::<Clone>(NAMESPACE).list().await.expect("clones should list");
-    assert_eq!(clones.items.len(), 2);
-    assert!(clones.items.iter().all(|clone| clone.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Ready)));
+    let clones = engine.clones.here().expect("clones should read");
+    assert_eq!(clones.len(), 2);
+    assert!(clones.iter().all(|clone| clone.is_ready()), "{clones:?}");
 
     harness.shutdown().await;
 }
@@ -449,91 +474,69 @@ async fn controller_materializes_a_missing_repository_for_a_multi_repository_con
 #[tokio::test]
 async fn clone_controller_marks_clone_ready() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let environments = EnvironmentFixture::default();
-    create_ready_host_direct_environment(&environments, "01HXYZ", "/Users/alice/dev/flotilla-repos");
-    let repository_spec = flotilla_resources::RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
-    flotilla_store::ensure_repository(
-        &backend.clone().using::<flotilla_resources::Repository>(NAMESPACE),
-        &repository_spec.key(),
-        &repository_spec,
-    )
-    .await
-    .expect("repository create should succeed");
-
-    let clones = backend.clone().using::<Clone>(NAMESPACE);
-    let clone_name = format!("clone-{}", clone_key("https://github.com/flotilla-org/flotilla", "host-direct-01HXYZ"));
-    clones
-        .create(
-            &controller_meta().name(&clone_name).call(),
-            &CloneSpec {
-                repo_ref: flotilla_resources::RepositoryKey(flotilla_resources::repo_key("https://github.com/flotilla-org/flotilla")),
-                url: "git@github.com:flotilla-org/flotilla.git".to_string(),
-                env_ref: "host-direct-01HXYZ".to_string(),
-                path: "/Users/alice/dev/flotilla".to_string(),
-            },
-        )
-        .await
-        .expect("clone create should succeed");
-
-    let harness = clone_harness(backend.clone());
-    harness
-        .wait_until(Duration::from_secs(1), || {
-            let clones = clones.clone();
-            let clone_name = clone_name.clone();
-            async move {
-                matches!(
-                    clones.get(&clone_name).await.ok().and_then(|clone| clone.status).map(|status| status.phase),
-                    Some(ClonePhase::Ready)
-                )
-            }
-        })
-        .await;
-
-    let clone = clones.get(&clone_name).await.expect("clone get should succeed");
-    let status = clone.status.expect("clone status should be present");
-    assert_eq!(status.phase, flotilla_resources::ClonePhase::Ready);
-    assert_eq!(status.default_branch.as_deref(), Some("main"));
-
-    harness.shutdown().await;
-}
-
-#[tokio::test]
-async fn new_convoy_checkout_demand_redrives_a_clone_failed_on_old_auth() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let engine = RunningClones::start("01HXYZ", Arc::new(FakeCloneRuntime));
+    create_ready_host_direct_environment(&engine.environments, "01HXYZ", "/Users/alice/dev/flotilla-repos");
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
-    flotilla_store::ensure_repository(&backend.clone().using::<Repository>(NAMESPACE), &repository_spec.key(), &repository_spec)
-        .await
-        .expect("repository create should succeed");
-    let clone_name = format!("clone-{}", clone_key("https://github.com/flotilla-org/flotilla", "host-direct-01HXYZ"));
-    let clones = backend.clone().using::<Clone>(NAMESPACE);
-    let failed_clone = clones
-        .create(
-            &controller_meta().name(&clone_name).call(),
+    let launch = engine
+        .clones
+        .request(
+            &repository_spec,
             &CloneSpec {
                 repo_ref: repository_spec.key(),
                 url: "git@github.com:flotilla-org/flotilla.git".to_string(),
                 env_ref: "host-direct-01HXYZ".to_string(),
                 path: "/Users/alice/dev/flotilla".to_string(),
             },
+            false,
         )
-        .await
-        .expect("clone create should succeed");
-    clones
-        .update_status(
-            &clone_name,
-            &failed_clone.metadata.resource_version,
-            &CloneStatus {
-                phase: ClonePhase::Failed,
-                default_branch: None,
-                message: Some("authentication failed: repository access denied".to_string()),
-                failed_at: Some(Utc::now() - chrono::Duration::hours(15)),
-                failure_policy: None,
-                retry: None,
-            },
-        )
-        .await
-        .expect("legacy clone failure should apply");
+        .expect("clone request should succeed");
 
+    let harness = ControllerLoopHarness::new(backend);
+    harness
+        .wait_until(Duration::from_secs(1), || {
+            let ready = engine.clones.get(&launch, None).ok().flatten().is_some_and(|clone| clone.is_ready());
+            async move { ready }
+        })
+        .await;
+
+    let clone = engine.clones.get(&launch, None).expect("clone read should succeed").expect("clone held");
+    assert_eq!(clone.reading, LifecycleReading::Ready { identity: "/Users/alice/dev/flotilla".to_string() });
+    assert_eq!(clone.default_branch.as_deref(), Some("main"));
+
+    harness.shutdown().await;
+}
+
+// Behaviour (#3108): a clone the forge refused gives up; a new checkout's demand for it requests
+// its next launch, which clones again, and the checkout made from that launch becomes ready.
+#[tokio::test]
+async fn new_convoy_checkout_demand_redrives_a_clone_failed_on_old_auth() {
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let engine = RunningClones::start("01HXYZ", Arc::new(RefusingFirstCloneRuntime::default()));
+    create_ready_host_direct_environment(&engine.environments, "01HXYZ", "/Users/alice/dev/flotilla-repos");
+    let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
+    flotilla_store::ensure_repository(&backend.clone().using::<Repository>(NAMESPACE), &repository_spec.key(), &repository_spec)
+        .await
+        .expect("repository create should succeed");
+    let clone_spec = CloneSpec {
+        repo_ref: repository_spec.key(),
+        url: "git@github.com:flotilla-org/flotilla.git".to_string(),
+        env_ref: "host-direct-01HXYZ".to_string(),
+        path: "/Users/alice/dev/flotilla".to_string(),
+    };
+    let refused = engine.clones.request(&repository_spec, &clone_spec, false).expect("clone request should succeed");
+    let mut harness = ControllerLoopHarness::new(backend.clone());
+    harness
+        .wait_until(Duration::from_secs(3), || {
+            let gave_up = matches!(
+                engine.clones.get(&refused, None).ok().flatten().map(|clone| clone.reading),
+                Some(LifecycleReading::GaveUp { cause }) if cause.contains("authentication failed")
+            );
+            async move { gave_up }
+        })
+        .await;
+
+    let launch = engine.clones.request(&repository_spec, &clone_spec, false).expect("new demand should request the next launch");
+    assert_ne!(launch, refused, "an ended launch is never revived");
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     checkouts
         .create(
@@ -544,29 +547,18 @@ async fn new_convoy_checkout_demand_redrives_a_clone_failed_on_old_auth() {
                 r#ref: "fix/clone-failed-latch".to_string(),
                 base_ref: Some("main".to_string()),
                 target_path: "/Users/alice/dev/flotilla.fix-clone-failed-latch".to_string(),
-                clone_ref: clone_name.clone(),
+                clone_ref: launch.clone(),
             }),
         )
         .await
         .expect("checkout create should succeed");
-
-    let mut harness = ControllerLoopHarness::new(backend.clone());
-    harness.spawn(
-        ControllerLoop {
-            primary: clones.clone(),
-            secondaries: vec![],
-            reconciler: CloneReconciler::new(Arc::new(FakeCloneRuntime), backend.clone().using(NAMESPACE)),
-            resync_interval: Duration::from_secs(60),
-            backend: backend.clone(),
-        }
-        .run(),
-    );
     harness.spawn(
         ControllerLoop {
             primary: checkouts.clone(),
             secondaries: vec![],
-            reconciler: CheckoutReconciler::new(Arc::new(FakeCheckoutRuntime), backend.clone(), NAMESPACE),
-            resync_interval: Duration::from_secs(60),
+            reconciler: CheckoutReconciler::new(Arc::new(FakeCheckoutRuntime), backend.clone(), NAMESPACE)
+                .with_lifecycle_reads(engine.reads.clone()),
+            resync_interval: Duration::from_millis(50),
             backend,
         }
         .run(),
@@ -574,17 +566,14 @@ async fn new_convoy_checkout_demand_redrives_a_clone_failed_on_old_auth() {
 
     harness
         .wait_until(Duration::from_secs(3), || {
-            let clones = clones.clone();
+            let clone_ready = engine.clones.get(&launch, None).ok().flatten().is_some_and(|clone| clone.is_ready());
             let checkouts = checkouts.clone();
-            let clone_name = clone_name.clone();
             async move {
-                matches!(
-                    clones.get(&clone_name).await.ok().and_then(|clone| clone.status),
-                    Some(status) if status.phase == ClonePhase::Ready
-                ) && matches!(
-                    checkouts.get("checkout-new-demand").await.ok().and_then(|checkout| checkout.status),
-                    Some(status) if status.phase == CheckoutPhase::Ready
-                )
+                clone_ready
+                    && matches!(
+                        checkouts.get("checkout-new-demand").await.ok().and_then(|checkout| checkout.status),
+                        Some(status) if status.phase == CheckoutPhase::Ready
+                    )
             }
         })
         .await;
@@ -595,15 +584,8 @@ async fn new_convoy_checkout_demand_redrives_a_clone_failed_on_old_auth() {
 #[tokio::test]
 async fn checkout_controller_marks_worktree_checkout_ready() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_clone(
-        &backend,
-        NAMESPACE,
-        "clone-a",
-        "git@github.com:flotilla-org/flotilla.git",
-        "host-direct-01HXYZ",
-        "/Users/alice/dev/flotilla",
-    )
-    .await;
+    let clones = CloneFixture::default();
+    create_ready_clone(&clones, "clone-a", "git@github.com:flotilla-org/flotilla.git", "host-direct-01HXYZ", "/Users/alice/dev/flotilla");
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     checkouts
         .create(
@@ -620,7 +602,7 @@ async fn checkout_controller_marks_worktree_checkout_ready() {
         .await
         .expect("checkout create should succeed");
 
-    let harness = checkout_harness(backend.clone());
+    let harness = checkout_harness(backend.clone(), clones.reads.clone());
     harness
         .wait_until(Duration::from_secs(1), || {
             let checkouts = checkouts.clone();
@@ -642,15 +624,8 @@ async fn checkout_controller_marks_worktree_checkout_ready() {
 #[tokio::test]
 async fn checkout_controller_requeues_when_first_completion_is_dropped() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_clone(
-        &backend,
-        NAMESPACE,
-        "clone-a",
-        "git@github.com:flotilla-org/flotilla.git",
-        "host-direct-01HXYZ",
-        "/Users/alice/dev/flotilla",
-    )
-    .await;
+    let clones = CloneFixture::default();
+    create_ready_clone(&clones, "clone-a", "git@github.com:flotilla-org/flotilla.git", "host-direct-01HXYZ", "/Users/alice/dev/flotilla");
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     checkouts
         .create(
@@ -669,7 +644,7 @@ async fn checkout_controller_requeues_when_first_completion_is_dropped() {
 
     let runtime = Arc::new(CountingCheckoutRuntime::default());
     let reconciler = DropFirstCheckoutCompletion {
-        inner: CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE),
+        inner: CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE).with_lifecycle_reads(clones.reads.clone()),
         dropped: AtomicBool::new(false),
     };
     let mut harness = ControllerLoopHarness::new(backend.clone());
@@ -840,28 +815,13 @@ async fn vessel_controller_finalizer_deletes_vessel_owned_children_but_preserves
     harness.shutdown().await;
 }
 
-fn clone_harness(backend: ResourceBackend) -> ControllerLoopHarness {
-    let mut harness = ControllerLoopHarness::new(backend.clone());
-    harness.spawn(
-        ControllerLoop {
-            primary: backend.clone().using::<Clone>(NAMESPACE),
-            secondaries: vec![],
-            reconciler: CloneReconciler::new(Arc::new(FakeCloneRuntime), backend.clone().using(NAMESPACE)),
-            resync_interval: Duration::from_millis(50),
-            backend,
-        }
-        .run(),
-    );
-    harness
-}
-
-fn checkout_harness(backend: ResourceBackend) -> ControllerLoopHarness {
+fn checkout_harness(backend: ResourceBackend, reads: Arc<dyn LifecycleReads>) -> ControllerLoopHarness {
     let mut harness = ControllerLoopHarness::new(backend.clone());
     harness.spawn(
         ControllerLoop {
             primary: backend.clone().using::<Checkout>(NAMESPACE),
             secondaries: vec![],
-            reconciler: CheckoutReconciler::new(Arc::new(FakeCheckoutRuntime), backend.clone(), NAMESPACE),
+            reconciler: CheckoutReconciler::new(Arc::new(FakeCheckoutRuntime), backend.clone(), NAMESPACE).with_lifecycle_reads(reads),
             resync_interval: Duration::from_millis(50),
             backend,
         }
@@ -886,24 +846,16 @@ fn terminal_harness(backend: ResourceBackend, reads: Arc<dyn LifecycleReads>) ->
     harness
 }
 
-/// The old-store controllers over the engine's environments, which `reads` serve.
+/// The old-store controllers over the engine's environments and clones, which `reads` serve; the
+/// engine's Clone controller runs beside them.
 fn full_controller_harness(backend: ResourceBackend, reads: Arc<dyn LifecycleReads>) -> ControllerLoopHarness {
     let mut harness = ControllerLoopHarness::new(backend.clone());
     harness.spawn(
         ControllerLoop {
-            primary: backend.clone().using::<Clone>(NAMESPACE),
-            secondaries: vec![],
-            reconciler: CloneReconciler::new(Arc::new(FakeCloneRuntime), backend.clone().using(NAMESPACE)),
-            resync_interval: Duration::from_millis(50),
-            backend: backend.clone(),
-        }
-        .run(),
-    );
-    harness.spawn(
-        ControllerLoop {
             primary: backend.clone().using::<Checkout>(NAMESPACE),
             secondaries: vec![],
-            reconciler: CheckoutReconciler::new(Arc::new(FakeCheckoutRuntime), backend.clone(), NAMESPACE),
+            reconciler: CheckoutReconciler::new(Arc::new(FakeCheckoutRuntime), backend.clone(), NAMESPACE)
+                .with_lifecycle_reads(Arc::clone(&reads)),
             resync_interval: Duration::from_millis(50),
             backend: backend.clone(),
         }

@@ -107,6 +107,8 @@ pub(super) struct RuntimeHealth {
     pub(super) restart_history_dir: Option<Arc<PathBuf>>,
     pub(super) issue_polling: IssuePollingHealth,
     pub(super) host_observations: HostObservations,
+    /// Wakes the heartbeat to publish a condition straight away, before its next tick.
+    pub(super) heartbeat_now: Arc<tokio::sync::Notify>,
 }
 
 /// Latest periodic observations of the local Host, folded into the heartbeat's

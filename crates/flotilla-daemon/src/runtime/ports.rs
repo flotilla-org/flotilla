@@ -23,7 +23,7 @@ use flotilla_provisioning::reconcilers::{
 use flotilla_resources::attentions::{Attention, Fact, Sender, Subject};
 use flotilla_resources::checkout_path::checkout_path_from_status_and_spec;
 use flotilla_resources::{
-    canonicalize_repo_url, ChangeRequest, Checkout, CheckoutIntegrationStatus, CheckoutSpec, Clone, CloneCredentials, ClonePhase, Convoy,
+    canonicalize_repo_url, ChangeRequest, Checkout, CheckoutIntegrationStatus, CheckoutSpec, CloneCredentials, Convoy,
     ConvoyTeardownRuntime, Forge, ForgeIdentity, InputMeta, Resource, ResourceObject,
 };
 use flotilla_store::{ReplicaReadResolver, ResourceBackend};
@@ -91,21 +91,22 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
                 Ok(format!("Repository/{name} refreshed"))
             }
             "clone" | "clones" => {
-                let clones = self.state.daemon.resource_backend().using::<Clone>(namespace);
-                let clone = clones.get(name).await.map_err(|error| error.to_string())?;
-                let ready = match self.state.daemon.lifecycle_reads().try_reading(
-                    flotilla_resources::lifecycle_reads::ProvisioningKind::Clone, name, None,
-                )? {
-                    Some(reading) => matches!(reading, flotilla_protocol::LifecycleReading::Ready { .. }),
-                    None => clone.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Ready),
-                };
-                if ready {
-                    return Ok(format!("Clone/{name} is already ready"));
-                }
-                flotilla_store::apply_status_patch(&clones, name, &flotilla_resources::CloneStatusPatch::MarkCloning)
+                // An ended clone starts its next launch; a live one is tried again when what it
+                // waits on changes, so there is nothing to wake.
+                let reads = self.state.daemon.lifecycle_reads();
+                let clone = flotilla_resources::clone_records::launched(name).to_owned();
+                let renewal = tokio::task::spawn_blocking(move || reads.clones()?.renew(&clone))
                     .await
-                    .map_err(|error| error.to_string())?;
-                Ok(format!("Clone/{name} retry requested"))
+                    .map_err(|error| format!("renew clone: {error}"))??;
+                Ok(match renewal {
+                    flotilla_resources::clone_records::CloneRenewal::Started(launch) => format!("Clone/{name}: launch {launch} requested"),
+                    flotilla_resources::clone_records::CloneRenewal::Live(record) if record.is_ready() => {
+                        format!("Clone/{name} is already ready")
+                    }
+                    flotilla_resources::clone_records::CloneRenewal::Live(record) => {
+                        format!("Clone/{name} has not ended ({:?}); it is tried again when what it waits on changes", record.reading)
+                    }
+                })
             }
             "credentialdelivery" | "workcredential" | "workcredentials" => {
                 record_credential_delivery_retry(&self.state.daemon.resource_backend(), namespace, name, None, false).await?;
@@ -734,7 +735,9 @@ mod chained_default_branch_tests {
             .create(&InputMeta::builder().name(spec.key().to_string()).build(), &spec)
             .await
             .expect("repository");
+        // No clone holds a default branch, so the forge's answer decides.
         let reconciler = flotilla_provisioning::reconcilers::RepositoryReconciler::new(backend.clone(), backend, "ops")
+            .with_lifecycle_reads(flotilla_provisioning_testkit::CloneFixture::default().reads)
             .with_forge_default_branch_resolver(Arc::new(GhForgeDefaultBranchResolver::new(runner.clone())));
         (runner, reconciler, repository)
     }

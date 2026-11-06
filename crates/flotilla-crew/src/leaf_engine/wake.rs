@@ -8,14 +8,16 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{Leaf, LeafAddress, LeafOperator};
+use flotilla_protocol::{Leaf, LeafAddress, LeafOperator, LifecycleReading};
 use flotilla_resources::checkout_integration::remote_ref_for_branch;
 use flotilla_resources::{
     actor_obligation,
     address::{leaf_address, leaf_for, record_name, subject_address},
+    clone_records::{launched, CloneChange, CloneRecord},
     instantiate_exit, instantiate_turn_delivery, select_convoy_children, subject_relationship_conflicts, ChangeRequest, Checkout,
-    CheckoutSpec, ControllerRetry, Convoy, ConvoyPhase, CrewWorkPhase, Forge, InstantiatedExit, LeafMaker, ResourceError, ResourceObject,
-    RetryCeiling, StatusPatch, TerminalAttentionSource, TerminalSession, TurnDeliveryOutcome, Vessel, WorkPhase,
+    CheckoutSpec, ControllerRetry, ControllerRetryDisposition, Convoy, ConvoyPhase, CrewWorkPhase, Forge, InstantiatedExit, LeafMaker,
+    ResourceError, ResourceObject, RetryCeiling, StatusPatch, TerminalAttentionSource, TerminalSession, TurnDeliveryOutcome, Vessel,
+    WorkPhase,
 };
 use flotilla_store::{
     controller::{SecondaryWatch, WorkQueueSender},
@@ -326,6 +328,8 @@ impl ReconcilerWake {
         let mut change_request_watch = views.change_requests.subscribe_keys();
         let mut vessel_watch = views.vessels.subscribe_keys();
         let mut forge_watch = views.forges.subscribe();
+        // Clones are the engine's (#3108): where it serves none, no worktree's clone row is armed.
+        let mut clone_changes = self.subscriptions.inner.lifecycle_reads.clones().ok().map(|clones| clones.changes());
         let mut convoy_objects = views.local_convoys().await?.as_ref().clone();
         let mut wake_rx = self.subscriptions.inner.reconciler_tx.subscribe();
         self.sync_rows(&namespace, &convoy_objects).await?;
@@ -367,6 +371,25 @@ impl ReconcilerWake {
                 event = forge_watch.changed() => {
                     event.map_err(|_| "forge view stopped".to_string())?;
                     self.sync_rows(&namespace, &convoy_objects).await?;
+                }
+                change = async {
+                    match clone_changes.as_mut() {
+                        Some(changes) => changes.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let selected = match change {
+                        Ok(CloneChange::Changed(name)) => Some(
+                            views.row_dependencies.lock().await.by_record.get(&clone_dependency(launched(&name))).cloned().unwrap_or_default(),
+                        ),
+                        Ok(CloneChange::Rescanned) | Err(broadcast::error::RecvError::Lagged(_)) => None,
+                        // Where clones are not followed, their channel is closed: nothing wakes on them.
+                        Err(broadcast::error::RecvError::Closed) => {
+                            clone_changes = None;
+                            continue;
+                        }
+                    };
+                    self.sync_rows_selected(&namespace, &convoy_objects, selected.as_ref()).await?;
                 }
                 wake = wake_rx.recv() => match wake {
                     Ok(convoy) => sender.send(convoy).await.map_err(|_| "convoy controller queue closed".to_string())?,
@@ -462,6 +485,7 @@ impl ReconcilerWake {
         }
         let mut desired = Vec::<LeafSubscriptionRow>::new();
         let mut dependencies = HashMap::<String, HashSet<String>>::new();
+        let mut clone_readings = HashMap::<flotilla_resources::RepositoryKey, Vec<CloneRecord>>::new();
         let selected_convoys = match selected {
             Some(names) => names.iter().filter_map(|name| convoys.get(name)).collect::<Vec<_>>(),
             None => convoys.values().collect(),
@@ -526,12 +550,29 @@ impl ReconcilerWake {
             }
             let checkouts = select_convoy_children(convoy, &checkout_sources);
             inputs.extend(checkouts.keys().cloned());
+            // A worktree's clone stands as a controller row while the engine's reading of it is a
+            // failure (#3108): the leaf shows its cause, or that its attempts are spent.
             for checkout in checkouts.values() {
                 let CheckoutSpec::Worktree(spec) = &checkout.spec else { continue };
-                let Some(retry) = checkout.status.as_ref().and_then(|status| status.clone_retry.clone()) else { continue };
+                inputs.insert(clone_dependency(launched(&spec.clone_ref)));
                 if !controller_rows.insert(("Clone".into(), spec.clone_ref.clone())) {
                     continue;
                 }
+                if !clone_readings.contains_key(&spec.repo_ref) {
+                    let (reads, repository) = (Arc::clone(&self.subscriptions.inner.lifecycle_reads), spec.repo_ref.clone());
+                    let records = tokio::task::spawn_blocking(move || reads.clones()?.of_repository(&repository))
+                        .await
+                        .map_err(|error| format!("clone readings: {error}"))??;
+                    clone_readings.insert(spec.repo_ref.clone(), records);
+                }
+                let Some(retry) = clone_readings[&spec.repo_ref]
+                    .iter()
+                    .filter(|record| record.name == spec.clone_ref || record.clone_name() == spec.clone_ref)
+                    .max_by_key(|record| launch_number(&record.name))
+                    .and_then(|record| clone_retry(&record.reading, self.subscriptions.inner.clock.now()))
+                else {
+                    continue;
+                };
                 desired.push(LeafSubscriptionRow {
                     id: uuid::Uuid::nil(),
                     namespace: namespace.to_string(),
@@ -986,6 +1027,39 @@ impl ReconcilerWake {
         Ok(())
     }
 }
+/// The reverse-dependency key under which a convoy's rows depend on clone `clone`, kept apart from
+/// the stored records' names.
+fn clone_dependency(clone: &str) -> String {
+    format!("Clone/{clone}")
+}
+
+/// The launch number of `<clone>#<n>`; a name without one sorts first.
+fn launch_number(name: &str) -> u32 {
+    name.rsplit_once('#').and_then(|(_, n)| n.parse().ok()).unwrap_or(0)
+}
+
+/// A clone's engine reading as a controller row's retry, while it is a failure. The engine's own
+/// policy ends a clone's retries (it gives up with its cause), so a launch whose attempts are spent
+/// reads as retrying without progress until it does. A reading carries no first failure time, so
+/// its next try stands for it: a retrying clone stalls once it has not tried again within the
+/// ceiling's duration (it waits on a fact that has not come).
+fn clone_retry(reading: &LifecycleReading, now: DateTime<Utc>) -> Option<ControllerRetry> {
+    match reading {
+        LifecycleReading::Retrying { failures, next, .. } => Some(ControllerRetry {
+            attempts: *failures,
+            first_failure_at: *next,
+            disposition: ControllerRetryDisposition::Retryable { next_attempt_at: *next },
+        }),
+        LifecycleReading::Exhausted { .. } => Some(ControllerRetry {
+            attempts: RetryCeiling::default().attempts,
+            first_failure_at: now,
+            disposition: ControllerRetryDisposition::Retryable { next_attempt_at: now },
+        }),
+        LifecycleReading::GaveUp { cause } => Some(ControllerRetry::terminal(None, now, cause.clone())),
+        _ => None,
+    }
+}
+
 fn watcher_convoy(watcher: &LeafWatcher) -> Option<&str> {
     match watcher {
         LeafWatcher::ReconcilerWake { convoy } | LeafWatcher::TurnDelivery { convoy, .. } => Some(convoy),
@@ -1036,6 +1110,31 @@ pub(super) fn same_standing_maker(left: &LeafMaker, right: &LeafMaker) -> bool {
             LeafMaker::Controller { resource_kind: right_kind, name: right_name, ceiling: right_ceiling, .. },
         ) => left_kind == right_kind && left_name == right_name && left_ceiling == right_ceiling,
         _ => left == right,
+    }
+}
+
+#[cfg(test)]
+mod clone_retry_tests {
+    use super::*;
+
+    // Each clone reading's stall evidence: a fresh retry none, a retry that has not tried again
+    // within the ceiling's duration and a launch whose attempts are spent "retrying without
+    // progress", a launch that gave up its cause, and a ready clone no row.
+    #[test]
+    fn clone_readings_judge_as_controller_retries() {
+        let now = Utc::now();
+        let ceiling = RetryCeiling::default();
+        let stall = |reading: LifecycleReading| clone_retry(&reading, now).map(|retry| retry.stall_reason(now, ceiling));
+        assert_eq!(stall(LifecycleReading::Retrying { failures: 1, next: now, cause: "network".into() }), Some(None));
+        let long_ago = now - chrono::Duration::from_std(ceiling.total_duration).expect("duration");
+        assert_eq!(
+            stall(LifecycleReading::Retrying { failures: 1, next: long_ago, cause: "network".into() }),
+            Some(Some("retrying without progress".into()))
+        );
+        assert_eq!(stall(LifecycleReading::Exhausted { cause: "network".into() }), Some(Some("retrying without progress".into())));
+        assert_eq!(stall(LifecycleReading::GaveUp { cause: "repository not found".into() }), Some(Some("repository not found".into())));
+        assert_eq!(stall(LifecycleReading::Ready { identity: "/clone".into() }), None);
+        assert_eq!(stall(LifecycleReading::InProgress), None);
     }
 }
 

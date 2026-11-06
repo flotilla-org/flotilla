@@ -4,23 +4,12 @@ use flotilla_protocol::{
     result_set::{Readiness, ReadinessBlocker, ReadinessState},
     LifecycleReading,
 };
-use flotilla_resources::{CheckoutPhase, ClonePhase, CrewWorkPhase, CrewWorkState, VesselPhase};
+use flotilla_resources::{CheckoutPhase, CrewWorkPhase, CrewWorkState, VesselPhase};
 
 use super::*;
 use crate::ports::ProvisioningKind;
 
 impl Aggregator {
-    pub(super) async fn recover_clone_readiness_watch(
-        &mut self,
-        resolver: &dyn AggregatorWatchSource<CloneResource>,
-    ) -> Result<WatchStream<CloneResource>, ResourceError> {
-        let (listed, watch) = recover_local_view(resolver).await?;
-        self.readiness_clones = readiness_resources(
-            listed.items.into_iter().map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }).collect(),
-        );
-        Ok(watch)
-    }
-
     pub(super) fn vessel_readiness(
         &self,
         convoy: &ResourceRef,
@@ -159,52 +148,28 @@ impl Aggregator {
                     continue;
                 }
                 if let CheckoutSpec::Worktree(spec) = &source.object.spec {
-                    if let Some(clone) = self.named_clones(&convoy.namespace, &spec.clone_ref).find(|clone| {
-                        clone.object.metadata.namespace == convoy.namespace
-                            && clone.object.metadata.name == spec.clone_ref
-                            && self.read_host(&clone.provenance).as_ref() == Some(host)
-                    }) {
-                        let clone_ref = || {
-                            ResourceRef::new(
-                                api_version(CloneResource::API_PATHS),
-                                CloneResource::API_PATHS.kind,
-                                &convoy.namespace,
-                                &spec.clone_ref,
-                            )
-                            .on_host(host.clone())
-                        };
-                        let reading = self.lifecycle_reads.try_reading(
-                            ProvisioningKind::Clone,
+                    // The clone launch the checkout was made from, at the checkout's home (#3108).
+                    let clone_ref = || {
+                        ResourceRef::new(
+                            api_version(CloneResource::API_PATHS),
+                            CloneResource::API_PATHS.kind,
+                            &convoy.namespace,
                             &spec.clone_ref,
-                            engine_origin(&clone.provenance).as_deref(),
-                        );
-                        let reading = match reading {
-                            Ok(reading) => reading,
-                            Err(error) => {
-                                result.state = result.state.max(ReadinessState::Blocked);
-                                result.blockers.push(ReadinessBlocker { resource: clone_ref(), phase: "Unknown".into(), reason: error });
-                                continue;
-                            }
-                        };
-                        if let Some(reading) = reading {
-                            if let Some((state, phase, reason)) = reading_blocker(&reading, "clone is not ready") {
+                        )
+                        .on_host(host.clone())
+                    };
+                    match self.lifecycle_reads.clones().and_then(|clones| clones.get(&spec.clone_ref, origin.as_deref())) {
+                        Ok(Some(clone)) => {
+                            if let Some((state, phase, reason)) = reading_blocker(&clone.reading, "clone is not ready") {
                                 result.state = result.state.max(state);
                                 result.blockers.push(ReadinessBlocker { resource: clone_ref(), phase, reason });
                             }
-                        } else if let Some(status) = clone.object.status.as_ref().filter(|status| status.phase != ClonePhase::Ready) {
-                            let state = if status.phase == ClonePhase::Failed && status.failure_policy.is_some() {
-                                ReadinessState::Failed
-                            } else if status.retry.is_some() || status.phase == ClonePhase::Failed {
-                                ReadinessState::Blocked
-                            } else {
-                                ReadinessState::Provisioning
-                            };
-                            result.state = result.state.max(state);
-                            result.blockers.push(ReadinessBlocker {
-                                resource: clone_ref(),
-                                phase: format!("{:?}", status.phase),
-                                reason: status.message.clone().unwrap_or_else(|| "clone is not ready".into()),
-                            });
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            result.state = result.state.max(ReadinessState::Blocked);
+                            result.blockers.push(ReadinessBlocker { resource: clone_ref(), phase: "Unknown".into(), reason: error });
+                            continue;
                         }
                     }
                 }

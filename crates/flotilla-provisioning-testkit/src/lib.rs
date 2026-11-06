@@ -1,7 +1,9 @@
 //! Real decided-store fixture shared by lifecycle reader contract tests.
+pub mod clones;
 pub mod environments;
 pub mod image_build;
 pub mod other_home;
+pub use clones::CloneFixture;
 pub use environments::EnvironmentFixture;
 pub use other_home::{other_home_for, put_host_at_its_home, put_host_at_its_home_heard, replicate_home, replicate_home_at, OtherHome};
 use std::sync::{Arc, Mutex};
@@ -39,6 +41,8 @@ where
     pub store: Arc<Mutex<Store>>,
     /// The environments its readers find, homed at `home` on the same store.
     pub environments: EnvironmentFixture,
+    /// The clones its readers find, homed at `home` on the same store.
+    pub clones: CloneFixture,
 }
 
 impl<B: Binding> LifecycleFixture<B>
@@ -52,11 +56,13 @@ where
             Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", registry).expect("store")));
         let home = Arc::new(LifecycleHome::new("home", Home::with_log("home", StoreLog::new(Arc::clone(&store))).expect("home")));
         let environments = EnvironmentFixture::over("home", Arc::clone(&store));
+        let clones = CloneFixture::over("home", Arc::clone(&store));
         let reads = Arc::new(
             LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), if replica { "reader" } else { "home" }.into())
-                .with_environments(Arc::clone(&environments.environments) as Arc<dyn EnvironmentRecords>),
+                .with_environments(Arc::clone(&environments.environments) as Arc<dyn EnvironmentRecords>)
+                .with_clones(Arc::clone(&clones.clones) as Arc<dyn flotilla_resources::clone_records::CloneRecords>),
         );
-        Self { home, reads, store, environments }
+        Self { home, reads, store, environments, clones }
     }
 
     pub fn name(&self, obj: &ResourceObject<B::Old>) -> String {

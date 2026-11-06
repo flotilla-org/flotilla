@@ -49,6 +49,15 @@ pub const HEARTBEAT_READY_TTL_SECS: i64 = 60;
 /// stays inside [`HEARTBEAT_READY_TTL_SECS`] for any interval under 40 s.
 pub const HEARTBEAT_REFRESH_SECS: i64 = HEARTBEAT_READY_TTL_SECS / 3;
 pub const SLEEP_INHIBITION_CONDITION_TYPE: &str = "SleepInhibition";
+/// The prefix of a host's condition on whether it reaches a remote Git host:
+/// `Remote/<remote host>`. A clone's transport failure records it False at once, and the host's
+/// reachability probe records it True again; a clone of that remote waits while it is False.
+pub const REMOTE_CONDITION_PREFIX: &str = "Remote/";
+
+/// The condition type of whether this host reaches remote Git host `remote`.
+pub fn remote_condition_type(remote: &str) -> String {
+    format!("{REMOTE_CONDITION_PREFIX}{remote}")
+}
 
 /// Resolve a user-authored host resource name or display-name alias to the
 /// stable host resource identity used by comparison surfaces.

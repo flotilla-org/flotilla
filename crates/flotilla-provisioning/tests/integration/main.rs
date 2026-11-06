@@ -1,5 +1,4 @@
 mod checkout_reconciler;
-mod clone_reconciler;
 #[path = "../common/mod.rs"]
 mod common;
 mod image_build;

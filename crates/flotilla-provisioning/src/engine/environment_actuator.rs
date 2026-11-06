@@ -102,7 +102,7 @@ fn vessel_of(holder: &Option<Holder>) -> Option<&str> {
 }
 
 /// The host and instance of a host's provider; an account's provider has no host.
-fn host_provider(provider: &Address) -> Option<(&str, &str)> {
+pub(crate) fn host_provider(provider: &Address) -> Option<(&str, &str)> {
     match provider.segments() {
         [host, instance] if host.kind().as_str() == "host" && instance.kind().as_str() == "provider" => {
             Some((host.value(), instance.value()))
@@ -112,7 +112,7 @@ fn host_provider(provider: &Address) -> Option<(&str, &str)> {
 }
 
 /// The lifecycle state of the `K` resource `name` at `home`.
-fn state_of<K>(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<LifecycleState>, StoreError>
+pub(crate) fn state_of<K>(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<LifecycleState>, StoreError>
 where
     K: flotilla_state_machines::machines::lifecycle::LifecycleKind,
     Resource<Lifecycle<K>>: Kind,

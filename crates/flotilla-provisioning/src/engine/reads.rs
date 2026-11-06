@@ -21,7 +21,7 @@ use flotilla_state_machines::{
 
 use crate::stored::{
     checkout::{CheckoutKind, CheckoutRequest},
-    clone::{CloneKind, CloneRequest},
+    clone::CloneKind,
     environment::{EnvironmentKind, EnvironmentRequest},
     image_build::ImageBuildKind,
     terminal_session::{TerminalSessionKind, TerminalSessionRequest},
@@ -112,12 +112,11 @@ impl From<StoreError> for ReadError {
 pub trait ProvisioningReads: Send + Sync {
     fn environment(&self, name: &str, home: &str) -> Result<Option<View<EnvironmentKind>>, ReadError>;
     fn image_build(&self, name: &str, home: &str) -> Result<Option<View<ImageBuildKind>>, ReadError>;
+    /// A clone launch by its name, or a clone's latest launch by the clone's name.
     fn repository_clone(&self, name: &str, home: &str) -> Result<Option<View<CloneKind>>, ReadError>;
     fn checkout(&self, name: &str, home: &str) -> Result<Option<View<CheckoutKind>>, ReadError>;
     /// The checkouts made in an environment (`checkout.by_environment`).
     fn environment_checkouts(&self, environment: &str, home: &str) -> Result<Vec<View<CheckoutKind>>, ReadError>;
-    /// An environment's clone of a repository (`clone.by_environment`).
-    fn environment_clone(&self, environment: &str, home: &str, repository: &str) -> Result<Option<View<CloneKind>>, ReadError>;
     /// The terminal sessions held for `holder` (`terminal_session.by_holder`), every launch: a
     /// vessel finds the sessions that run in it so.
     fn held_sessions(&self, holder: &Holder) -> Result<Vec<View<TerminalSessionKind>>, ReadError>;
@@ -152,11 +151,18 @@ pub struct LifecycleReadPort {
     reads: StoreReads,
     home: String,
     environments: Option<Arc<dyn flotilla_resources::environment_records::EnvironmentRecords>>,
+    clones: Option<Arc<dyn flotilla_resources::clone_records::CloneRecords>>,
 }
 
 impl LifecycleReadPort {
     pub fn new(reads: StoreReads, home: String) -> Self {
-        Self { reads, home, environments: None }
+        Self { reads, home, environments: None, clones: None }
+    }
+
+    /// Serves `clones` as the engine's clones.
+    pub fn with_clones(mut self, clones: Arc<dyn flotilla_resources::clone_records::CloneRecords>) -> Self {
+        self.clones = Some(clones);
+        self
     }
 
     /// Serves `environments` as the engine's environments.
@@ -169,6 +175,10 @@ impl LifecycleReadPort {
 impl flotilla_resources::lifecycle_reads::LifecycleReads for LifecycleReadPort {
     fn environments(&self) -> Result<&dyn flotilla_resources::environment_records::EnvironmentRecords, String> {
         self.environments.as_deref().ok_or_else(|| "this read port serves no environments".to_owned())
+    }
+
+    fn clones(&self) -> Result<&dyn flotilla_resources::clone_records::CloneRecords, String> {
+        self.clones.as_deref().ok_or_else(|| "this read port serves no clones".to_owned())
     }
 
     fn try_terminal_launch(
@@ -283,6 +293,32 @@ where
     }
 }
 
+/// The latest launch (`<name>#<n>`) of `name` at `home`. Launches are numbered from 1 without
+/// gaps, so the latest is found by doubling past it and halving back, as the write path's
+/// `current` does: O(log launches) keyed reads.
+pub(crate) fn latest<K>(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<View<K>>, ReadError>
+where
+    K: LifecycleKind,
+    Resource<Lifecycle<K>>: Kind,
+{
+    let Some(first) = keyed(read, &super::launch(name, 1), home)? else { return Ok(None) };
+    let (mut held, mut probe) = ((1, first), 2u32);
+    let mut absent = loop {
+        match keyed(read, &super::launch(name, probe), home)? {
+            Some(view) => (held, probe) = ((probe, view), probe.saturating_mul(2)),
+            None => break probe,
+        }
+    };
+    while absent - held.0 > 1 {
+        let mid = held.0 + (absent - held.0) / 2;
+        match keyed(read, &super::launch(name, mid), home)? {
+            Some(view) => held = (mid, view),
+            None => absent = mid,
+        }
+    }
+    Ok(Some(held.1))
+}
+
 pub(crate) fn indexed<K, Q>(read: &mut Read<'_>, query: &IndexQuery<Q>) -> Result<Vec<View<K>>, ReadError>
 where
     K: LifecycleKind,
@@ -312,7 +348,11 @@ impl ProvisioningReads for StoreReads {
     }
 
     fn repository_clone(&self, name: &str, home: &str) -> Result<Option<View<CloneKind>>, ReadError> {
-        self.read(|read| keyed(read, name, home))
+        // A launch is read as itself; a clone, as its latest launch.
+        if flotilla_resources::clone_records::launched(name) != name {
+            return self.read(|read| keyed(read, name, home));
+        }
+        self.read(|read| latest(read, name, home))
     }
 
     fn checkout(&self, name: &str, home: &str) -> Result<Option<View<CheckoutKind>>, ReadError> {
@@ -321,11 +361,6 @@ impl ProvisioningReads for StoreReads {
 
     fn environment_checkouts(&self, environment: &str, home: &str) -> Result<Vec<View<CheckoutKind>>, ReadError> {
         self.read(|read| indexed(read, &CheckoutRequest::by_environment(&Ref::new(environment.to_owned(), home))))
-    }
-
-    fn environment_clone(&self, environment: &str, home: &str, repository: &str) -> Result<Option<View<CloneKind>>, ReadError> {
-        let query = CloneRequest::by_environment(&Ref::new(environment.to_owned(), home), &repository.to_owned());
-        self.read(|read| Ok(indexed(read, &query)?.into_iter().next()))
     }
 
     fn provider_environments(&self, provider: &Address) -> Result<Vec<View<EnvironmentKind>>, ReadError> {
@@ -337,26 +372,7 @@ impl ProvisioningReads for StoreReads {
     }
 
     fn terminal_session(&self, name: &str, home: &str) -> Result<Option<View<TerminalSessionKind>>, ReadError> {
-        // Launches are numbered from 1 without gaps, so the latest is found by doubling past it and
-        // halving back, as the write path's `current` does: O(log launches) keyed reads.
-        self.read(|read| {
-            let Some(first) = keyed(read, &super::launch(name, 1), home)? else { return Ok(None) };
-            let (mut held, mut probe) = ((1, first), 2u32);
-            let mut absent = loop {
-                match keyed(read, &super::launch(name, probe), home)? {
-                    Some(view) => (held, probe) = ((probe, view), probe.saturating_mul(2)),
-                    None => break probe,
-                }
-            };
-            while absent - held.0 > 1 {
-                let mid = held.0 + (absent - held.0) / 2;
-                match keyed(read, &super::launch(name, mid), home)? {
-                    Some(view) => held = (mid, view),
-                    None => absent = mid,
-                }
-            }
-            Ok(Some(held.1))
-        })
+        self.read(|read| latest(read, name, home))
     }
 
     fn held_checkouts(&self, holder: &Holder) -> Result<Vec<View<CheckoutKind>>, ReadError> {

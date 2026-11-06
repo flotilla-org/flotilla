@@ -9,13 +9,13 @@ use std::{
 use chrono::{DateTime, Utc};
 use flotilla_engine_store::{open_home, StoreLog};
 use flotilla_provisioning::{
-    engine::{clone::CloneBinding, decide, LifecycleHome, Lifecycles},
+    engine::{clones::request_of, decide, LifecycleHome, Lifecycles, Step},
     stored::{self, clone::CloneKind},
 };
-use flotilla_resources::{Clone as OldClone, CloneSpec, CloneStatusPatch, ObjectMeta, ResourceObject};
-use flotilla_schema::KindRegistry;
+use flotilla_resources::{Clone as OldClone, CloneSpec, ObjectMeta, ResourceObject};
+use flotilla_schema::{KindRegistry, Timestamp};
 use flotilla_schema_sqlite::Store;
-use flotilla_state_machines::machines::lifecycle::LifecycleState;
+use flotilla_state_machines::{machines::lifecycle::LifecycleState, Cause, CauseCategory, Outcome};
 
 const HOME: &str = "home";
 
@@ -54,18 +54,26 @@ fn clone_object() -> ResourceObject<OldClone> {
     }
 }
 
-// Behaviour (#3629 layer 3): a reconciler's failed attempt and its realisation are written to the
-// decided store through the engine; a home reopened over the store holds the realised clone, so a
-// restarted daemon keeps writing where it left off and refuses a second request of the name.
+/// Requests clone `clone-a` at `home` and realises it under its path, as the Clone controller
+/// does; with `failing`, after a failed try first.
+fn realise_clone(home: &dyn Lifecycles<CloneKind>, failing: bool) {
+    let obj = clone_object();
+    home.request("clone-a", request_of(&obj.spec, false, HOME), Timestamp(1)).expect("requested");
+    if failing {
+        let failed = Outcome::Failed { cause: Cause::new(CauseCategory::Transient, "network unreachable"), retryable: true };
+        home.step("clone-a", &Step::Attempted(failed), Timestamp(2)).expect("a failed try");
+    }
+    home.step("clone-a", &Step::Realised { identity: obj.spec.path.clone() }, Timestamp(3)).expect("realised");
+}
+
+// Behaviour (#3629 layer 3): a clone's failed try and its realisation are written to the decided
+// store; a home reopened over the store holds the realised clone, so a restarted daemon keeps
+// writing where it left off and refuses a second request of the name.
 #[test]
 fn engine_writes_survive_a_reopened_home() {
     let store = store();
     let home = clones(&store);
-    let obj = clone_object();
-    let retrying = CloneStatusPatch::MarkRetrying { message: "network unreachable".into() };
-    assert_eq!(decide::<CloneBinding>(home.as_ref(), &obj, Some(retrying.clone()), Utc::now()).patch, Some(retrying));
-    let ready = CloneStatusPatch::MarkReady { default_branch: Some("main".into()) };
-    assert_eq!(decide::<CloneBinding>(home.as_ref(), &obj, Some(ready.clone()), Utc::now()).patch, Some(ready));
+    realise_clone(home.as_ref(), true);
 
     let reopened = clones(&store);
     let restored = reopened.get("clone-a").expect("restored from the store");
@@ -153,7 +161,11 @@ fn every_kind_survives_a_reopened_home() {
     };
     let ready = CheckoutStatusPatch::MarkReady { path: "/work/feature".into(), commit: None, branch_provenance: Default::default() };
     reopened::<CheckoutBinding>(&store, checkout, ready, "/work/feature");
-    reopened::<CloneBinding>(&store, clone_object(), CloneStatusPatch::MarkReady { default_branch: None }, "/clones/repo");
+    let held = clones(&store);
+    realise_clone(held.as_ref(), false);
+    let restored = clones(&store).get("clone-a").expect("restored");
+    assert_eq!(restored.state(), &LifecycleState::Realised { identity: "/clones/repo".into() });
+    assert_eq!(restored.spec(), held.get("clone-a").expect("held").spec());
 }
 
 // Behaviour (ADR 0047, look-over B): a clone stored before `discovered` existed opens as not
@@ -163,7 +175,7 @@ fn every_kind_survives_a_reopened_home() {
 fn a_clone_stored_before_discovered_reads_as_not_discovered() {
     let store = store();
     let home = clones(&store);
-    decide::<CloneBinding>(home.as_ref(), &clone_object(), Some(CloneStatusPatch::MarkReady { default_branch: None }), Utc::now());
+    realise_clone(home.as_ref(), false);
     drop(home);
     let connection = Arc::try_unwrap(store).unwrap_or_else(|_| panic!("store still held")).into_inner().expect("lock").into_connection();
     // The previous generation's table: no `discovered` column.

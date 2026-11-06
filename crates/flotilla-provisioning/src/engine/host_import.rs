@@ -152,7 +152,9 @@ pub(crate) fn observation(
     let mut conditions = BTreeMap::new();
     for condition in &status.conditions {
         uncarried("each condition's observation time, a judgement");
-        if !condition.blocks_readiness && !condition.blocks_forge_observation {
+        // A remote's reachability blocks neither, but the clones that reach it wait on it.
+        let remote = condition.condition_type.starts_with(flotilla_resources::REMOTE_CONDITION_PREFIX);
+        if !condition.blocks_readiness && !condition.blocks_forge_observation && !remote {
             uncarried("diagnostic conditions, which belong in metrics");
             continue;
         }

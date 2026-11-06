@@ -51,6 +51,7 @@ fn provisioning_kind_codes_are_pinned() {
     assert_eq!(held("EnvironmentLaunchFacts"), Some(KindCode::new("el")));
     assert_eq!(held("ImageBuild"), Some(KindCode::new("ib")));
     assert_eq!(held("Clone"), Some(KindCode::new("cl")));
+    assert_eq!(held("CloneFacts"), Some(KindCode::new("cf")));
     assert_eq!(held("Checkout"), Some(KindCode::new("ck")));
     assert_eq!(held("TerminalSession"), Some(KindCode::new("ts")));
     assert_eq!(held("AccountBinding"), Some(KindCode::new("ab")));
@@ -67,7 +68,7 @@ fn provisioning_kind_codes_are_pinned() {
     assert_eq!(held("Host"), Some(KindCode::new("ho")));
     assert_eq!(held("HostObservation"), Some(KindCode::new("ob")));
     assert_eq!(held("AccessDelivery"), Some(KindCode::new("ad")));
-    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 26);
+    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 27);
     // The definition kinds (#3824 layer 2b), in the decided store with their writers (2b-ii).
     for (kind, code) in [
         ("Forge", "fo"),
@@ -355,8 +356,9 @@ fn image_build_request() -> ImageBuildRequest {
 
 // Behaviour (#3629 layer 2): each kind's policy keeps its old retry budget. An ImageBuild gives up
 // after five failed attempts (`IMAGE_BUILD_MAX_ATTEMPTS`) and at once on a recipe failure; a Clone
-// retries transient failures for as long as it is wanted and gives up at once on one that is not
-// retryable; Environment and Checkout take the engine's default three; and the backoff between
+// gives up after three tries and at once on one that is not retryable (#3108 ruling: what it waits
+// on, such as free space or a reachable remote, is a wait, not a try); Environment and Checkout
+// take the engine's default three; and the backoff between
 // ImageBuild attempts doubles from 30 s to 30 min.
 #[test]
 fn policies_give_up_as_the_old_retries_did() {
@@ -367,7 +369,7 @@ fn policies_give_up_as_the_old_retries_did() {
     assert_eq!(failures_before_give_up::<ImageBuildKind>(image_build_request()), Some(flotilla_resources::IMAGE_BUILD_MAX_ATTEMPTS));
     let clone =
         || CloneRequest { repository: "r".into(), url: "u".into(), environment: environment("feta"), path: "/c".into(), discovered: false };
-    assert_eq!(failures_before_give_up::<CloneKind>(clone()), None);
+    assert_eq!(failures_before_give_up::<CloneKind>(clone()), Some(3));
     assert_eq!(failures_before_give_up::<EnvironmentKind>(environment_request()), Some(3));
     let checkout = CheckoutRequest {
         repository: "r".into(),
@@ -397,7 +399,7 @@ fn policies_give_up_as_the_old_retries_did() {
         .expect("attempt");
     clones.apply("c", GiveUp { cause: wrong }, &world, Timestamp::from_micros(1)).expect("a clone that cannot succeed gives up at once");
     let policy = CloneKind::policy();
-    assert_eq!((policy.backoff(1), policy.backoff(2), policy.backoff(9)), (30_000_000, 60_000_000, 120_000_000));
+    assert_eq!((policy.backoff(1), policy.backoff(2)), (0, 0), "a clone tries again at once; what it waits on wakes it");
 
     let policy = ImageBuildKind::policy();
     let seconds = |failures| policy.backoff(failures) / 1_000_000;

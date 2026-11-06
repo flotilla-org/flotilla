@@ -7,7 +7,7 @@ pub mod repository;
 pub use checkout::{
     BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
 };
-pub use clone::{CloneReconciler, CloneRuntime};
+pub use clone::CloneRuntime;
 pub use environment::{CloudProvisioning, EnvironmentProvisioning, EnvironmentRuntime, LocalProvisioning};
 pub use image_build::{ImageBuildMaterials, ImageBuildReconciler};
 

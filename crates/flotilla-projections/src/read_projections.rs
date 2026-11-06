@@ -25,8 +25,8 @@ use flotilla_manifest::{
 use flotilla_protocol::{
     commands::{ExplainedSubjectFact, ExplainedSubjectObservation},
     ConvoyExplanation, DeclarationAttentionKind, DeclarationAttentionRow, DispatchQueueResponse, DispatchQueueRow, EnvironmentId,
-    ExplainedArtifact, ExplainedChangeRequest, ExplainedCheckout, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent,
-    ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
+    ExplainedArtifact, ExplainedChangeRequest, ExplainedCheckout, ExplainedClone, ExplainedCrewDelivery, ExplainedDecisionLedger,
+    ExplainedEvent, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
     FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetReplicaStatus, FleetStaleness,
     FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow, HostListResponse, HostName, HostProvidersResponse,
     HostStatusResponse, HostSummary, NodeId, PeerConnectionState, ProjectListEntry, ProjectListRepository, ProjectListResponse,
@@ -1335,17 +1335,24 @@ impl ReadProjections<'_> {
                 let source = selected_checkout_sources.get(checkout_name);
                 let selected = source.map(|source| &source.object);
                 let provenance = source.map(|source| explained_provenance(&source.provenance, self.node_id));
-                // One keyed engine read per checkout, at the checkout's home.
+                // One keyed engine read per checkout, and one for a worktree's clone, at the
+                // checkout's home (its environment's host, which also holds the clone).
+                let origin = source.and_then(|source| match &source.provenance {
+                    flotilla_resources::ResourceProvenance::Local => None,
+                    flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
+                });
                 let lifecycle = source
-                    .map(|source| {
-                        let origin = match &source.provenance {
-                            flotilla_resources::ResourceProvenance::Local => None,
-                            flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
-                        };
-                        self.lifecycles.try_reading(crate::ports::ProvisioningKind::Checkout, checkout_name, origin.as_deref())
-                    })
+                    .map(|_| self.lifecycles.try_reading(crate::ports::ProvisioningKind::Checkout, checkout_name, origin.as_deref()))
                     .transpose()?
                     .flatten();
+                let clone = match selected.map(|checkout| &checkout.spec) {
+                    Some(flotilla_resources::CheckoutSpec::Worktree(spec)) => self
+                        .lifecycles
+                        .clones()?
+                        .get(&spec.clone_ref, origin.as_deref())?
+                        .map(|clone| ExplainedClone { name: clone.name, reading: clone.reading }),
+                    _ => None,
+                };
                 let integration = selected.and_then(|checkout| checkout.status.as_ref()).map(|status| &status.integration);
                 Ok(ExplainedCheckout {
                     name: checkout_name.clone(),
@@ -1355,6 +1362,7 @@ impl ReadProjections<'_> {
                     pushed: integration.map(|status| explain_condition(&status.pushed, now, LANDING_EVIDENCE_TTL)),
                     landed: integration.map(|status| explain_condition(&status.landed, now, LANDING_EVIDENCE_TTL)),
                     lifecycle,
+                    clone,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;

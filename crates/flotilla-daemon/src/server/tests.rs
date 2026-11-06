@@ -1122,6 +1122,8 @@ async fn dispatch_add_list_remove_repo_round_trip() {
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has: discovery reads its clones.
+    engine_environments(&daemon);
     let repo_path = tmp.path().join("repo-a");
     init_git_repo_with_remote(&repo_path, "git@github.com:owner/repo-a.git");
 
@@ -5713,11 +5715,12 @@ async fn failed_connection_tasks_are_reaped() {
 }
 
 /// The engine's environments `daemon` reads (#3108), on its decided store, stepped as the
-/// Environment controller would step them.
+/// Environment controller would step them; its readings serve the engine's clones there too.
 pub(super) fn engine_environments(daemon: &InProcessDaemon) -> flotilla_provisioning_testkit::EnvironmentFixture {
     let store = daemon.decided_store().expect("decided store").store();
     let home = flotilla_engine_store::StoreLog::new(Arc::clone(&store)).home().to_owned();
-    let fixture = flotilla_provisioning_testkit::EnvironmentFixture::over(&home, store);
+    let clones = flotilla_provisioning_testkit::CloneFixture::over(&home, Arc::clone(&store));
+    let fixture = flotilla_provisioning_testkit::EnvironmentFixture::over(&home, store).serving_clones(clones.clones);
     daemon.install_lifecycle_reads(Arc::clone(&fixture.reads)).expect("install the engine's environments");
     fixture
 }

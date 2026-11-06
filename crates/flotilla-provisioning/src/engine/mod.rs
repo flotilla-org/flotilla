@@ -32,7 +32,8 @@ pub mod account;
 pub mod artifact_import;
 pub mod artifacts;
 pub mod checkout;
-pub mod clone;
+pub mod clone_actuator;
+pub mod clones;
 pub mod controller;
 pub mod definition_import;
 pub mod definitions;
@@ -80,7 +81,10 @@ use flotilla_state_machines::{
 use flotilla_store::controller::{ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler};
 
 use crate::stored::{
-    checkout::CheckoutKind, clone::CloneKind, environment::EnvironmentKind, image_build::ImageBuildKind,
+    checkout::CheckoutKind,
+    clone::{CloneFacts, CloneKind},
+    environment::EnvironmentKind,
+    image_build::ImageBuildKind,
     terminal_session::TerminalSessionKind,
 };
 
@@ -92,6 +96,8 @@ pub struct ProvisioningLifecycles {
     pub environment_facts: launch_log::StagedFacts,
     pub image_builds: Arc<dyn Lifecycles<ImageBuildKind>>,
     pub clones: Arc<dyn Lifecycles<CloneKind>>,
+    /// The facts the Clone controller stages for each launch's Realise edge.
+    pub clone_facts: launch_log::StagedFacts<CloneFacts>,
     pub checkouts: Arc<dyn Lifecycles<CheckoutKind>>,
     /// TerminalSession, each launch a resource (layer 7).
     pub terminal_sessions: Arc<dyn Lifecycles<TerminalSessionKind>>,
@@ -404,7 +410,7 @@ pub fn current<B: Binding>(
     latest_launch(name, |key| lifecycles.get(key))
 }
 
-fn latest_launch<K: LifecycleKind>(
+pub(crate) fn latest_launch<K: LifecycleKind>(
     name: &str,
     mut get: impl FnMut(&str) -> Option<Resource<Lifecycle<K>>>,
 ) -> (String, Option<Resource<Lifecycle<K>>>) {

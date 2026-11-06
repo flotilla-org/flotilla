@@ -15,8 +15,8 @@ use flotilla_protocol::{EnvironmentId, LifecycleReading};
 use flotilla_resources::checkout_path::checkout_path;
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::{
-    Checkout as ResourceCheckout, CheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Clone as ResourceClone, ReadResourceObject,
-    Repository, RepositoryKey, ResourceError, ResourceObject, ResourceProvenance, WatchEvent, WatchStart,
+    Checkout as ResourceCheckout, CheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, ReadResourceObject, Repository, RepositoryKey,
+    ResourceError, ResourceObject, ResourceProvenance, WatchEvent, WatchStart,
 };
 use flotilla_store::ResourceBackend;
 use futures::StreamExt;
@@ -131,11 +131,10 @@ impl CheckoutProviders {
         Ok(provider)
     }
 
-    /// The URL of this host's Clone at `path` in `env_id`, if one is recorded.
-    async fn clone_url(&self, namespace: &str, env_id: &EnvironmentId, path: &Path) -> Result<Option<String>, String> {
-        let clones = self.resource_backend.clone().using::<ResourceClone>(namespace).list().await.map_err(|error| error.to_string())?;
+    /// The URL of this host's clone at `path` in `env_id`, if one is recorded: the engine's (#3108).
+    async fn clone_url(&self, _namespace: &str, env_id: &EnvironmentId, path: &Path) -> Result<Option<String>, String> {
+        let clones = self.lifecycle_reads.clones()?.here()?;
         Ok(clones
-            .items
             .into_iter()
             .find(|clone| {
                 Path::new(&clone.spec.path) == path

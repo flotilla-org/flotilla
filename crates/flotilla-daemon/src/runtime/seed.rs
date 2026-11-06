@@ -7,14 +7,10 @@ use std::{
 
 use flotilla_core::in_process::InProcessDaemon;
 
-use flotilla_provisioning::{
-    engine::Lifecycles,
-    stored::clone::{CloneKind, CloneRequest},
-};
 use flotilla_resources::{
-    canonical_host_id, definition_provenance::SEEDING_MANAGER, descriptive_repo_slug, is_prepared_snapshot, Clone, CloneSpec,
-    EnvironmentSpec, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostDirectEnvironmentSpec, HostSpec,
-    InputMeta, PlacementImageSource, Platform, Repository, ResourceError, ResourceObject, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND,
+    canonical_host_id, definition_provenance::SEEDING_MANAGER, is_prepared_snapshot, CloneSpec, EnvironmentSpec, FulfilmentGrant,
+    FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostDirectEnvironmentSpec, HostSpec, InputMeta, PlacementImageSource,
+    Platform, Repository, ResourceError, ResourceObject, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND,
 };
 use flotilla_store::ResourceBackend;
 use tracing::warn;
@@ -25,7 +21,6 @@ pub(super) async fn register_startup_resources(
     daemon: &Arc<InProcessDaemon>,
     namespace: &str,
     profile: &LocalProvisioningProfile,
-    clones: &Arc<dyn Lifecycles<CloneKind>>,
 ) -> Result<(), String> {
     let backend = daemon.resource_backend();
     ensure_host_exists(&backend, namespace, &profile.host_id, &profile.display_name, profile.max_vessels)
@@ -34,7 +29,7 @@ pub(super) async fn register_startup_resources(
     ensure_host_direct_environment_exists(daemon.lifecycle_reads(), profile)
         .await
         .map_err(|error| format!("ensure_host_direct_environment_exists: {error}"))?;
-    discover_local_clones(daemon, &backend, namespace, profile, clones).await.map_err(|error| format!("discover_local_clones: {error}"))?;
+    discover_local_clones(daemon, &backend, namespace, profile).await.map_err(|error| format!("discover_local_clones: {error}"))?;
     ensure_default_kinds(&backend, namespace, profile, std::env::consts::OS)
         .await
         .map_err(|error| format!("ensure_default_kinds: {error}"))?;
@@ -116,9 +111,7 @@ pub(super) async fn discover_local_clones(
     backend: &ResourceBackend,
     namespace: &str,
     profile: &LocalProvisioningProfile,
-    engine: &Arc<dyn Lifecycles<CloneKind>>,
 ) -> Result<(), String> {
-    let clones = backend.clone().using::<Clone>(namespace);
     let host_direct_env_ref = profile.host_direct_environment_name();
 
     for repo_path in daemon.tracked_repo_paths().await {
@@ -145,8 +138,6 @@ pub(super) async fn discover_local_clones(
         flotilla_store::ensure_repository(&backend.clone().using::<Repository>(namespace), &repository_key, &repository_spec)
             .await
             .map_err(|error| error.to_string())?;
-        let repo_key_value = repository_key.to_string();
-        let name = format!("clone-{}", repository_spec.clone_key(&host_direct_env_ref)?);
         let expected_spec = CloneSpec {
             repo_ref: repository_key.clone(),
             url: if matches!(repository_spec.identity(), flotilla_resources::RepositoryIdentity::Forge { .. }) {
@@ -157,73 +148,18 @@ pub(super) async fn discover_local_clones(
             env_ref: host_direct_env_ref.clone(),
             path: repo_path.display().to_string(),
         };
-        // The engine's request says the clone was found here, not cloned, before the old resource
-        // that drives its reconciler exists.
-        request_discovered_clone(
-            engine,
-            &name,
-            CloneRequest {
-                repository: repo_key_value.clone(),
-                url: expected_spec.url.clone(),
-                environment: flotilla_schema::Ref::new(host_direct_env_ref.clone(), engine.home()),
-                path: expected_spec.path.clone(),
-                discovered: true,
-            },
-        )
-        .await?;
-        let expected_labels = BTreeMap::from([
-            ("flotilla.work/repo-key".to_string(), repo_key_value),
-            ("flotilla.work/env".to_string(), host_direct_env_ref.clone()),
-            ("flotilla.work/repo".to_string(), descriptive_repo_slug(&canonical_url)),
-        ]);
-
-        match clones.get(&name).await {
-            Ok(existing) => {
-                if existing.metadata.deletion_timestamp.is_some() {
-                    continue;
-                }
-                if existing.spec.repo_ref != repository_key || existing.spec.env_ref != host_direct_env_ref {
-                    warn!(clone = %name, "leaving discovered clone untouched because the existing resource does not match the expected repo/env tuple");
-                    continue;
-                }
-
-                let merged_labels = merged_labels(&existing.metadata.labels, &expected_labels);
-                if existing.spec != expected_spec || existing.metadata.labels != merged_labels {
-                    clones
-                        .update(&meta_from_existing(&existing, merged_labels), &existing.metadata.resource_version, &expected_spec)
-                        .await
-                        .map_err(|err| err.to_string())?;
-                }
-            }
-            Err(ResourceError::NotFound { .. }) => {
-                clones.create(&empty_meta_with_labels(&name, expected_labels), &expected_spec).await.map_err(|err| err.to_string())?;
-            }
-            Err(err) => return Err(err.to_string()),
+        // The engine's request says the clone was found here, not cloned. A clone already held
+        // is served as it is; one held for another repository or environment is left alone.
+        let reads = daemon.lifecycle_reads();
+        let requested = tokio::task::spawn_blocking(move || reads.clones()?.request(&repository_spec, &expected_spec, true))
+            .await
+            .map_err(|error| format!("request discovered clone: {error}"))?;
+        if let Err(error) = requested {
+            warn!(%error, path = %repo_path.display(), "leaving discovered clone as the engine holds it");
         }
     }
 
     Ok(())
-}
-
-/// Requests the engine's Clone `name` as discovered, unless it is already held. A request is
-/// fixed once written: a held clone, discovered or cloned, is left as it is.
-async fn request_discovered_clone(engine: &Arc<dyn Lifecycles<CloneKind>>, name: &str, request: CloneRequest) -> Result<(), String> {
-    let (engine, name) = (Arc::clone(engine), name.to_owned());
-    // Home reads and writes may wait for another write, so they run off the async workers.
-    tokio::task::spawn_blocking(move || {
-        if let Some(held) = engine.get(&name) {
-            if held.spec() != &request {
-                warn!(clone = %name, "leaving the engine's clone as requested; discovery found it differently");
-            }
-            return Ok(());
-        }
-        engine
-            .request(&name, request, flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now()))
-            .map(|_| ())
-            .map_err(|error| format!("request discovered clone {name}: {error}"))
-    })
-    .await
-    .map_err(|error| format!("request discovered clone: {error}"))?
 }
 
 /// Seed this host's kinds: host-direct always, and Docker when it is available. Seeding owns

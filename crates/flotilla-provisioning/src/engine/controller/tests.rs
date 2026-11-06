@@ -13,7 +13,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_engine_store::{open_home, StoreLog};
+use flotilla_engine_store::{open_home, open_home_with, StoreLog};
 use flotilla_resources::SystemClock;
 use flotilla_schema::{Frozen, Identity, Kind, KindCode, Ref, Timestamp};
 use flotilla_schema_sqlite::{
@@ -413,4 +413,69 @@ async fn a_successor_launch_ends_its_predecessor() {
     world.environments.request(&launch("s", 2), environment("s2"), World::now()).expect("successor");
     world.until("predecessor gone", |world| world.state(&launch("s", 1)).gone()).await;
     world.until("successor realised", |world| world.state(&launch("s", 2)).realised()).await;
+}
+
+/// The store's log, refusing every GiveUp: a failure whose giving up was never written, as when
+/// the write failed or the daemon stopped between the two.
+struct RefusingGiveUp(StoreLog);
+
+impl flotilla_state_machines::Log<Lifecycle<EnvironmentKind>> for RefusingGiveUp {
+    fn create(
+        &mut self,
+        writer: &str,
+        at: Timestamp,
+        resource: &Resource<Lifecycle<EnvironmentKind>>,
+        reads: &[flotilla_state_machines::InputRead],
+    ) -> Result<flotilla_state_machines::Version, flotilla_state_machines::LogError> {
+        self.0.create(writer, at, resource, reads)
+    }
+
+    fn create_resource(
+        &mut self,
+        writer: &str,
+        at: Timestamp,
+        resource: Resource<Lifecycle<EnvironmentKind>>,
+        reads: &[flotilla_state_machines::InputRead],
+    ) -> Result<Resource<Lifecycle<EnvironmentKind>>, flotilla_state_machines::LogError> {
+        self.0.create_resource(writer, at, resource, reads)
+    }
+
+    fn edge(
+        &mut self,
+        writer: &str,
+        previous: &flotilla_state_machines::StoredState<Lifecycle<EnvironmentKind>>,
+        next: &Resource<Lifecycle<EnvironmentKind>>,
+        event: &flotilla_state_machines::EdgeEventOf<Lifecycle<EnvironmentKind>>,
+    ) -> Result<flotilla_state_machines::Version, flotilla_state_machines::LogError> {
+        if matches!(next.state(), LifecycleState::GaveUp { .. }) {
+            return Err(flotilla_state_machines::LogError::new("the giving up was not written"));
+        }
+        self.0.edge(writer, previous, next, event)
+    }
+}
+
+// A final failure whose giving up was not written is given up when the controller next starts,
+// without the provider being tried again (#3108; the engine half of the old split-write test).
+#[tokio::test]
+async fn a_failure_whose_giving_up_was_not_written_gives_up_at_start_without_trying_again() {
+    let mut world = World::open();
+    {
+        let store = StoreLog::new(world.service.store());
+        let refusing = LifecycleHome::new(HOME, open_home_with(&store, RefusingGiveUp(store.clone())).expect("refusing home"));
+        refusing.request("a", environment("a"), World::now()).expect("request");
+        let failed = Step::Attempted(flotilla_state_machines::Outcome::Failed {
+            cause: Cause::new(CauseCategory::Refused, "image refused"),
+            retryable: false,
+        });
+        assert!(refusing.step("a", &failed, World::now()).is_err(), "the giving up is refused");
+    }
+    // The daemon restarts: its home is read back from the store, the failure recorded and not
+    // given up.
+    world.environments = Arc::new(LifecycleHome::new(HOME, open_home(StoreLog::new(world.service.store())).expect("environments")));
+    assert_eq!(failures(&world.state("a")), Some(1));
+    world.start();
+    world
+        .until("a gave up", |world| matches!(world.state("a"), LifecycleState::GaveUp { ref cause } if cause.detail == "image refused"))
+        .await;
+    assert!(world.actuator.script().realised.is_empty(), "the provider is not tried again");
 }

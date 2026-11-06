@@ -32,6 +32,7 @@ use tokio::sync::{Mutex, Semaphore};
 
 use super::discovery::SshHostProfile;
 use super::environments::{stage_remote_rustc_wrapper, ActiveProvisionedEnvironment};
+use super::remotes::RemoteProbe;
 use super::tasks::{load_checkout_archive_roots, CheckoutArchiveRoot};
 use super::terminal::PendingTerminalDelivery;
 #[cfg(test)]
@@ -91,6 +92,8 @@ pub(super) struct ControllerRuntimeState {
     /// controller: the sender the probes use, and the receiver its controller takes once.
     pub(super) environment_backings: tokio::sync::mpsc::Sender<BackingEvent>,
     pub(super) environment_backing_events: StdMutex<Option<tokio::sync::mpsc::Receiver<BackingEvent>>>,
+    /// The remotes this host's clones could not reach, published on its heartbeat (#3108).
+    pub(super) remote_reachability: Arc<RemoteProbe>,
 }
 
 impl ControllerRuntimeState {
@@ -326,7 +329,14 @@ impl ControllerRuntimeState {
             provisioning: None,
             environment_backings,
             environment_backing_events: StdMutex::new(Some(environment_backing_events)),
+            remote_reachability: Arc::new(RemoteProbe::new(super::health::RuntimeHealth::default())),
         }
+    }
+
+    /// Publishes the remotes this host's clones cannot reach on `health`'s heartbeat.
+    pub(super) fn with_runtime_health(mut self, health: super::health::RuntimeHealth) -> Self {
+        self.remote_reachability = Arc::new(RemoteProbe::new(health));
+        self
     }
 
     pub(super) fn with_provisioning_lifecycles(

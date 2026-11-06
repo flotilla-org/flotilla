@@ -6,7 +6,7 @@ use flotilla_state_machines::{
     AttemptPolicy, Resource,
 };
 
-use super::{environment::Environment, SECOND};
+use super::environment::Environment;
 
 /// Clones as a lifecycle kind.
 pub struct CloneKind;
@@ -17,13 +17,13 @@ impl LifecycleKind for CloneKind {
     // roll after the column lands.
     const STORED_DEFAULTS: &'static [(&'static str, &'static str, i64)] = &[("", "discovered", 0)];
     type Request = CloneRequest;
-    /// The old clone's: transient failures are retried for as long as the
-    /// clone is wanted, 30 s doubling to two minutes apart, and a failure that
-    /// is not retryable gives up at once. A clone's name is derived from its
-    /// repository and environment, so a given-up clone could not be requested
-    /// again under it: a long outage must not give one up.
+    /// Three tries, each as soon as what it waits on changes (owner's ruling, #3108): an
+    /// environment that is not ready is a wait, not a try; a transport failure waits for the
+    /// host's reachability probe to reach the remote again; a full disk waits for the host's
+    /// free-space fact; a misconfiguration gives up at once. Each launch has a name of its own
+    /// (`clone-<key>#<n>`), so a launch that gave up is followed by the next one on a new request.
     fn policy() -> AttemptPolicy {
-        AttemptPolicy { max_failures: u32::MAX, base: 30 * SECOND, factor: 2, cap: 120 * SECOND }
+        AttemptPolicy::immediate(3)
     }
 }
 
@@ -33,14 +33,20 @@ pub type Clone = Lifecycle<CloneKind>;
 /// What a Clone clones, and where. It declares the stored Clone (kind code
 /// `cl`), homed at the host of its environment.
 ///
-/// Its name is derived from the repository and environment
-/// (`forge_clone_key`), so the name, unique per kind and home, keeps one
-/// Clone per pair.
+/// Each launch is named `clone-<key>#<n>`, the key derived from the
+/// repository and environment (`forge_clone_key`), so one clone per pair is
+/// launched again under its own name, never revived.
 ///
 /// Realised under its path once the repository is observed there. The
-/// default branch it found is an observation.
+/// default branch it found is its [`CloneFacts`].
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
-#[store(kind = "Clone", code = "cl", state = LifecycleState, index(name = "by_environment", eq(environment, repository)))]
+#[store(
+    kind = "Clone",
+    code = "cl",
+    state = LifecycleState,
+    index(name = "by_environment", eq(environment, repository)),
+    index(name = "by_repository", eq(repository))
+)]
 pub struct CloneRequest {
     /// The Repository resource's key, interned (domain `rk`).
     #[store(intern = "rk")]
@@ -51,4 +57,14 @@ pub struct CloneRequest {
     /// Found already at `path` on this host by startup discovery, not cloned there: realising it
     /// inspects the existing repository and never clones over it.
     pub discovered: bool,
+}
+
+/// What a Clone found when it was realised: kind code `cf`, a plain record named and homed as
+/// the Clone it describes. The Clone controller writes it in the transaction of the Clone's
+/// Realise edge and nothing updates it; it archives and expunges with its Clone.
+#[derive(Clone, Debug, PartialEq, Eq, Stored)]
+#[store(kind = "CloneFacts", code = "cf")]
+pub struct CloneFacts {
+    /// The remote's default branch, from its symbolic HEAD; absent when the remote reported none.
+    pub default_branch: Option<String>,
 }

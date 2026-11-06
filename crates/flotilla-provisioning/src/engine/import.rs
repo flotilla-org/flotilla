@@ -2,7 +2,8 @@
 //!
 //! One function per kind maps an old record's status onto a stored lifecycle state; the request is
 //! the kind's [`Binding::request`], as the write path makes it (an Environment's is the request
-//! the environment port makes, [`super::environments::request_of`]). A record that cannot be mapped is
+//! the environment port makes, [`super::environments::request_of`], and a Clone's the clone port's,
+//! [`super::clones::request_of`]). A record that cannot be mapped is
 //! refused with the record named. [`import_records`] writes every mapped resource into an
 //! [`ImportTarget`], reads it back, and lists what it refused.
 //!
@@ -16,8 +17,8 @@
 //! | ImageBuild | Queued, Building, Failed with a retry to come | Requested (its failed attempts tallied) |
 //! | | Built | Realised (its digest) |
 //! | | Failed, settled | GaveUp |
-//! | Clone | Pending, Cloning, Failed from before the terminal policy | Requested |
-//! | | Ready | Realised (its path) |
+//! | Clone (as launch `#1`) | Pending, Cloning, Failed from before the terminal policy | Requested |
+//! | | Ready | Realised (its path), with the default branch it found |
 //! | | Failed, terminal | GaveUp |
 //! | Checkout | Pending | Requested |
 //! | | Ready | Realised (its path) |
@@ -54,10 +55,14 @@ use flotilla_state_machines::{
 };
 
 use super::{
-    checkout::CheckoutBinding, clone::CloneBinding, environments, image_build::ImageBuildBinding, launch,
-    terminal_session::TerminalSessionBinding, vessel::VesselBinding, Binding,
+    checkout::CheckoutBinding, clones, environments, image_build::ImageBuildBinding, launch, terminal_session::TerminalSessionBinding,
+    vessel::VesselBinding, Binding,
 };
-use crate::stored::{environment::EnvironmentKind, launch_facts::EnvironmentLaunchFacts};
+use crate::stored::{
+    clone::{CloneFacts, CloneKind},
+    environment::EnvironmentKind,
+    launch_facts::EnvironmentLaunchFacts,
+};
 
 /// A kind whose old records the import maps.
 pub trait Imported: Binding {
@@ -372,19 +377,51 @@ impl Imported for ImageBuildBinding {
     }
 }
 
-impl Imported for CloneBinding {
-    fn imported_state(obj: &ResourceObject<OldClone>) -> Result<LifecycleState, String> {
-        let status = obj.status.as_ref();
-        Ok(match status.map(|status| status.phase).unwrap_or_default() {
-            ClonePhase::Pending | ClonePhase::Cloning => LifecycleState::requested(),
-            ClonePhase::Ready => LifecycleState::Realised { identity: obj.spec.path.clone() },
-            // A failure from before the terminal policy is retried on renewed demand: still wanted.
-            ClonePhase::Failed if status.is_some_and(|status| status.failure_policy.is_none()) => LifecycleState::requested(),
-            ClonePhase::Failed => {
-                LifecycleState::GaveUp { cause: failed_by(status.and_then(|status| status.message.as_deref()), "the clone failed") }
+/// Imports old Clone `records` into `target`, each as its clone's first launch (`<name>#1`): the
+/// request the clone port makes, and for a Ready clone the default branch it found, written
+/// beside it as the launch's facts.
+pub fn import_clones(records: &[(ResourceObject<OldClone>, String)], target: &mut impl ImportTarget, report: &mut ImportReport) {
+    for (clone, home) in records {
+        if !target.imports(home) {
+            continue;
+        }
+        let refuse = |reason: String| ImportRefusal { kind: CloneKind::NAME, record: clone.metadata.name.clone(), reason };
+        let result = import_clone(clone, home).and_then(|imported| {
+            let change = NewChange::new(IMPORT_WRITER, imported.resource.since());
+            target.write(home, imported.resource.name(), &change, &imported.resource).map_err(refuse)?;
+            if matches!(imported.resource.state(), LifecycleState::Realised { .. }) {
+                let facts = CloneFacts { default_branch: clone.status.as_ref().and_then(|status| status.default_branch.clone()) };
+                target.write(home, imported.resource.name(), &change, &facts).map_err(refuse)?;
             }
-        })
+            Ok(imported)
+        });
+        report.record(&result);
     }
+}
+
+/// Maps old Clone `obj`, homed at `home`, onto its first launch.
+pub fn import_clone(obj: &ResourceObject<OldClone>, home: &str) -> Result<ImportedResource<CloneKind>, ImportRefusal> {
+    let status = obj.status.as_ref();
+    let state = match status.map(|status| status.phase).unwrap_or_default() {
+        ClonePhase::Pending | ClonePhase::Cloning => LifecycleState::requested(),
+        ClonePhase::Ready => LifecycleState::Realised { identity: obj.spec.path.clone() },
+        // A failure from before the terminal policy is retried on renewed demand: still wanted.
+        ClonePhase::Failed if status.is_some_and(|status| status.failure_policy.is_none()) => LifecycleState::requested(),
+        ClonePhase::Failed => {
+            LifecycleState::GaveUp { cause: failed_by(status.and_then(|status| status.message.as_deref()), "the clone failed") }
+        }
+    };
+    let since = Timestamp::from_datetime(&obj.metadata.creation_timestamp);
+    Ok(ImportedResource {
+        record: obj.metadata.name.clone(),
+        home: home.to_owned(),
+        resource: Resource::stored(
+            launch(&obj.metadata.name, 1),
+            clones::request_of(&obj.spec, false, home),
+            State::new(state, since),
+            Version(1),
+        ),
+    })
 }
 
 impl Imported for CheckoutBinding {

@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use common::meta;
+use flotilla_provisioning::engine::checkout::CheckoutBinding;
 use flotilla_provisioning::reconcilers::{ForgeDefaultBranchResolver, RepositoryReconciler};
 use flotilla_resources::{
-    Checkout, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, CloneStatus, EnvironmentSpec, ForgeIdentity,
-    FreshCloneCheckoutSpec, HostDirectEnvironmentSpec, LifecycleAuthority, ObservedCheckoutSpec, Repository, RepositoryCheckoutKind,
-    RepositorySpec,
+    Checkout, CheckoutSpec, CheckoutWorktreeSpec, CloneSpec, EnvironmentSpec, ForgeIdentity, FreshCloneCheckoutSpec,
+    HostDirectEnvironmentSpec, LifecycleAuthority, ObservedCheckoutSpec, Repository, RepositoryCheckoutKind, RepositorySpec,
 };
 use flotilla_store::{controller::Reconciler, ResourceBackend};
 
@@ -35,8 +35,8 @@ async fn repository_status_groups_typed_checkout_associations_by_explicit_host()
         .create(&meta(&repository_key.to_string()), &repository_spec)
         .await
         .expect("repository create");
-    let environments = flotilla_provisioning_testkit::EnvironmentFixture::default();
-    environments.request(
+    let lifecycles = flotilla_provisioning_testkit::LifecycleFixture::<CheckoutBinding>::new(false);
+    lifecycles.environments.request(
         "env-host-a",
         &EnvironmentSpec {
             host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host-a".to_string(), repo_default_dir: "/repos".to_string() }),
@@ -92,37 +92,19 @@ async fn repository_status_groups_typed_checkout_associations_by_explicit_host()
         )
         .await
         .expect("observed checkout create");
-    let clones = durable.clone().using::<Clone>(NAMESPACE);
-    let clone = clones
-        .create(
-            &meta("clone-a"),
-            &CloneSpec {
-                repo_ref: repository_key.clone(),
-                url: "https://github.com/org/repo.git".to_string(),
-                env_ref: "env-host-a".to_string(),
-                path: "/repos/repo".to_string(),
-            },
-        )
-        .await
-        .expect("clone create");
-    clones
-        .update_status(
-            "clone-a",
-            &clone.metadata.resource_version,
-            &CloneStatus {
-                phase: ClonePhase::Ready,
-                default_branch: Some("main".to_string()),
-                message: None,
-                failed_at: None,
-                failure_policy: None,
-                retry: None,
-            },
-        )
-        .await
-        .expect("clone status");
+    lifecycles.clones.put_named_ready(
+        "clone-a",
+        &CloneSpec {
+            repo_ref: repository_key.clone(),
+            url: "https://github.com/org/repo.git".to_string(),
+            env_ref: "env-host-a".to_string(),
+            path: "/repos/repo".to_string(),
+        },
+        Some("main"),
+    );
 
     let reconciler = RepositoryReconciler::new(durable, observed, NAMESPACE)
-        .with_lifecycle_reads(environments.reads.clone())
+        .with_lifecycle_reads(lifecycles.reads.clone())
         .with_forge_default_branch_resolver(Arc::new(FixedForgeDefaultBranch("stable")));
     let status = reconciler.prepare(&repository).await.expect("status projection");
 
@@ -143,7 +125,8 @@ async fn repository_with_no_checkouts_projects_empty_status_without_deletion() {
     let repository =
         durable.clone().using::<Repository>(NAMESPACE).create(&meta(&spec.key().to_string()), &spec).await.expect("repository create");
 
-    let reconciler = RepositoryReconciler::new(durable, observed, NAMESPACE);
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
+    let reconciler = RepositoryReconciler::new(durable, observed, NAMESPACE).with_lifecycle_reads(clones.reads.clone());
     let status = reconciler.prepare(&repository).await.expect("status projection");
 
     assert!(status.checkouts_by_host.is_empty());

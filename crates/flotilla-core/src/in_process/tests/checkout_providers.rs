@@ -97,7 +97,7 @@ impl flotilla_discovery_api::Factory for RemoteClaiming {
 }
 
 // A path not yet cloned has no remote to detect: discovery takes the remote from the
-// Clone recorded for that path on this host, and from nothing else.
+// engine's clone of that path on this host, and from nothing else.
 #[tokio::test]
 async fn checkout_vcs_discovery_names_the_repository_a_clone_is_for() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -118,20 +118,17 @@ async fn checkout_vcs_discovery_names_the_repository_a_clone_is_for() {
     )
     .await;
     let repository = RepositorySpec::remote("https://forge.example/team/repo").expect("repository");
-    daemon
-        .resource_backend
-        .using::<flotilla_resources::Clone>("flotilla")
-        .create(
-            &test_meta("clone"),
-            &flotilla_resources::CloneSpec {
-                repo_ref: repository.key(),
-                url: "https://forge.example/team/repo".into(),
-                env_ref: flotilla_resources::host_direct_environment_name(daemon.environment_manager.local_host_id().as_str()),
-                path: cloned.to_string_lossy().into(),
-            },
-        )
-        .await
-        .expect("clone");
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
+    daemon.install_lifecycle_reads(clones.reads.clone()).expect("engine reads");
+    clones.put_named(
+        "clone",
+        &flotilla_resources::CloneSpec {
+            repo_ref: repository.key(),
+            url: "https://forge.example/team/repo".into(),
+            env_ref: flotilla_resources::host_direct_environment_name(daemon.environment_manager.local_host_id().as_str()),
+            path: cloned.to_string_lossy().into(),
+        },
+    );
     assert!(daemon.local_vcs_for_checkout(&cloned).await.is_ok());
     let error = daemon.local_vcs_for_checkout(&unrecorded).await.err().expect("no remote");
     assert!(error.contains("forge.example"), "{error}");

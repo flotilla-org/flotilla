@@ -65,6 +65,16 @@ impl EnvironmentFixture {
         Self { home: home.to_owned(), store, lifecycles, environments, reads, staged }
     }
 
+    /// The same fixture whose [`Self::reads`] serve `clones` too, as a daemon's readings do.
+    pub fn serving_clones(mut self, clones: Arc<dyn flotilla_resources::clone_records::CloneRecords>) -> Self {
+        self.reads = Arc::new(
+            LifecycleReadPort::new(StoreReads::new(Arc::clone(&self.store)), self.home.clone())
+                .with_environments(Arc::clone(&self.environments) as Arc<dyn EnvironmentRecords>)
+                .with_clones(clones),
+        );
+        self
+    }
+
     /// Requests `name` with `spec`, held for `vessel`.
     pub fn request(&self, name: &str, spec: &EnvironmentSpec, vessel: Option<&str>) {
         self.environments.request(name, spec, vessel).expect("environment requested");

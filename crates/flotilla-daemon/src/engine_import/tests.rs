@@ -298,14 +298,17 @@ async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
 
     let mut store = engine(dir.path());
     assert!(holds::<flotilla_provisioning::stored::artifact::ArtifactRecord>(&mut store, "ours", HERE));
-    assert!(holds::<flotilla_state_machines::Resource<flotilla_provisioning::stored::clone::Clone>>(&mut store, "clone-a", HERE));
+    assert!(
+        holds::<flotilla_state_machines::Resource<flotilla_provisioning::stored::clone::Clone>>(&mut store, "clone-a#1", HERE),
+        "a clone is imported as its first launch"
+    );
     for name in ["access-delivered", "access-failed"] {
         assert!(holds::<flotilla_resources::AccessDeliverySpec>(&mut store, name, HERE), "{name}");
     }
     for home in [HERE, THERE] {
         assert!(!holds::<flotilla_resources::AccessDeliverySpec>(&mut store, "access-theirs", home), "{home}");
         assert!(!holds::<flotilla_provisioning::stored::artifact::ArtifactRecord>(&mut store, "theirs", home), "{home}");
-        assert!(!holds::<flotilla_state_machines::Resource<flotilla_provisioning::stored::clone::Clone>>(&mut store, "clone-b", home));
+        assert!(!holds::<flotilla_state_machines::Resource<flotilla_provisioning::stored::clone::Clone>>(&mut store, "clone-b#1", home));
         assert!(!holds::<flotilla_provisioning::stored::definition::ForgeDefinition>(&mut store, "lab", home), "{home}");
     }
     drop(store);

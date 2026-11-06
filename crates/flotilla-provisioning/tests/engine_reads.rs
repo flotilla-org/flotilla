@@ -102,7 +102,9 @@ fn judgements_follow_the_stored_state_and_the_policy() {
     assert!(matches!(judge::<CheckoutKind>(&failed(2, true)), Judgement::Retrying { failures: 2, .. }));
     assert_eq!(judge::<CheckoutKind>(&failed(3, true)), Judgement::Exhausted { last: cause.clone() });
     assert_eq!(judge::<CloneKind>(&failed(1, false)), Judgement::Exhausted { last: cause.clone() });
-    assert!(matches!(judge::<CloneKind>(&failed(50, true)), Judgement::Retrying { .. }), "a clone retries while wanted");
+    // A clone tries three times (#3108 ruling): a third retryable failure spends it.
+    assert!(matches!(judge::<CloneKind>(&failed(2, true)), Judgement::Retrying { failures: 2, .. }));
+    assert_eq!(judge::<CloneKind>(&failed(3, true)), Judgement::Exhausted { last: cause.clone() });
     assert_eq!(judge::<CheckoutKind>(&LifecycleState::GaveUp { cause: cause.clone() }), Judgement::GaveUp { cause });
 }
 

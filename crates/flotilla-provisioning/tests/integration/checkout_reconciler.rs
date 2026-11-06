@@ -25,11 +25,7 @@ use flotilla_resources::CheckoutPhase;
 use flotilla_resources::CheckoutSpec;
 use flotilla_resources::CheckoutStatus;
 use flotilla_resources::CheckoutWorktreeSpec;
-use flotilla_resources::Clone;
-use flotilla_resources::ClonePhase;
 use flotilla_resources::CloneSpec;
-use flotilla_resources::CloneStatus;
-use flotilla_resources::CloneStatusPatch;
 use flotilla_resources::ConditionValue;
 use flotilla_resources::Convoy;
 use flotilla_resources::ConvoyPhase;
@@ -274,8 +270,9 @@ async fn continued_fresh_clone_recovers_protection_through_controller_loop() {
 }
 
 async fn exercise_creation_protection_recovery(continuing_fresh: bool) {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_clone(&backend, NAMESPACE, "clone-recovery", REPO_URL, "host-direct-a", "/checkouts/repo").await;
+    create_ready_clone(&clones, "clone-recovery", REPO_URL, "host-direct-a", "/checkouts/repo");
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     let repo = RepositoryKey(repo_key(REPO_URL));
     let mut metadata = meta("checkout-recovery").with_lifecycle_authority(LifecycleAuthority::Managed);
@@ -311,7 +308,7 @@ async fn exercise_creation_protection_recovery(continuing_fresh: bool) {
         creation_protection_failures: AtomicUsize::new(7),
         ..Default::default()
     });
-    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE);
+    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE).with_lifecycle_reads(clones.reads.clone());
     assert!(reconciler.prepare(&checkout).await.is_err(), "protection failure must request controller retry");
     assert_eq!(checkouts.get("checkout-recovery").await.expect("checkout").status.unwrap_or_default().phase, CheckoutPhase::Pending);
     let controller = tokio::spawn(
@@ -360,6 +357,7 @@ async fn exercise_creation_protection_recovery(continuing_fresh: bool) {
 
 #[tokio::test]
 async fn missing_worktree_observed_on_its_host_becomes_gone() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     let checkout = checkouts
@@ -385,7 +383,7 @@ async fn missing_worktree_observed_on_its_host_becomes_gone() {
         .await
         .expect("ready checkout");
     let runtime = Arc::new(RecordingCheckoutRuntime { path_exists: Some(false), ..Default::default() });
-    let reconciler = CheckoutReconciler::new(runtime, backend.clone(), NAMESPACE);
+    let reconciler = CheckoutReconciler::new(runtime, backend.clone(), NAMESPACE).with_lifecycle_reads(clones.reads.clone());
     let prepared = reconciler.prepare(&checkout).await.expect("observe host path");
     let outcome = reconciler.reconcile(&checkout, &prepared, chrono::Utc::now());
     let mut status = checkout.status.expect("status");
@@ -395,7 +393,8 @@ async fn missing_worktree_observed_on_its_host_becomes_gone() {
     let current = checkouts.get("checkout-a").await.expect("checkout");
     let gone = checkouts.update_status("checkout-a", &current.metadata.resource_version, &status).await.expect("record Gone");
     let reappeared =
-        CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime { path_exists: Some(true), ..Default::default() }), backend, NAMESPACE);
+        CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime { path_exists: Some(true), ..Default::default() }), backend, NAMESPACE)
+            .with_lifecycle_reads(clones.reads.clone());
     let prepared = reappeared.prepare(&gone).await.expect("recheck host path");
     let outcome = reappeared.reconcile(&gone, &prepared, chrono::Utc::now());
     outcome.patch.expect("ready patch").apply(&mut status);
@@ -404,6 +403,7 @@ async fn missing_worktree_observed_on_its_host_becomes_gone() {
 
 #[tokio::test]
 async fn deleting_checkout_retries_finalizer_without_a_status_change() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     create_deleting_checkout(&backend, "retry-cleanup", "/checkouts/retry").await;
@@ -421,7 +421,7 @@ async fn deleting_checkout_retries_finalizer_without_a_status_change() {
         .await
         .expect("seed previously recorded finalizer error");
     let runtime = Arc::new(RecordingCheckoutRuntime { transient_removal_failures: AtomicUsize::new(1), ..Default::default() });
-    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE);
+    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE).with_lifecycle_reads(clones.reads.clone());
     let controller = tokio::spawn(
         ControllerLoop {
             primary: checkouts.clone(),
@@ -450,6 +450,7 @@ async fn deleting_checkout_retries_finalizer_without_a_status_change() {
 
 #[tokio::test(start_paused = true)]
 async fn finalizer_backoff_ignores_early_wakes_and_grows_until_cleanup_succeeds() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     create_deleting_checkout(&backend, "backoff-cleanup", "/checkouts/backoff").await;
@@ -460,7 +461,8 @@ async fn finalizer_backoff_ignores_early_wakes_and_grows_until_cleanup_succeeds(
         ControllerLoop {
             primary: checkouts.clone(),
             secondaries: Vec::new(),
-            reconciler: CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE),
+            reconciler: CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE)
+                .with_lifecycle_reads(clones.reads.clone()),
             resync_interval: Duration::from_secs(3600),
             backend: backend.clone(),
         }
@@ -496,6 +498,7 @@ async fn finalizer_backoff_ignores_early_wakes_and_grows_until_cleanup_succeeds(
 
 #[tokio::test]
 async fn finalizer_error_maps_to_failed_checkout_status() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let checkout = create_ready_checkout(
         &backend,
@@ -517,7 +520,8 @@ async fn finalizer_error_maps_to_failed_checkout_status() {
             .build(),
     )
     .await;
-    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend, NAMESPACE);
+    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend, NAMESPACE)
+        .with_lifecycle_reads(clones.reads.clone());
     let error = ResourceError::other("remove worktree: permission denied");
 
     let patch =
@@ -529,91 +533,9 @@ async fn finalizer_error_maps_to_failed_checkout_status() {
     assert_eq!(status.message.as_deref(), Some("checkout teardown failed: remove worktree: permission denied"));
 }
 
-#[tokio::test]
-async fn clone_failure_from_the_current_checkout_attempt_requests_another_clone_attempt() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let clones = backend.clone().using::<Clone>(NAMESPACE);
-    let clone = clones
-        .create(
-            &meta("clone-a"),
-            &CloneSpec {
-                repo_ref: RepositoryKey(repo_key(REPO_URL)),
-                url: REPO_URL.to_string(),
-                env_ref: "host-direct-a".to_string(),
-                path: "/clones/repo".to_string(),
-            },
-        )
-        .await
-        .expect("clone should create");
-    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
-    let checkout = checkouts
-        .create(
-            &meta("checkout-a"),
-            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
-                repo_ref: RepositoryKey(repo_key(REPO_URL)),
-                env_ref: "host-direct-a".to_string(),
-                r#ref: "fix/clone-failed-latch".to_string(),
-                base_ref: Some("main".to_string()),
-                target_path: "/checkouts/repo.fix-clone-failed-latch".to_string(),
-                clone_ref: "clone-a".to_string(),
-            }),
-        )
-        .await
-        .expect("checkout should create");
-    let failed_at = checkout.metadata.creation_timestamp + chrono::Duration::seconds(1);
-    clones
-        .update_status(
-            "clone-a",
-            &clone.metadata.resource_version,
-            &CloneStatus {
-                phase: ClonePhase::Failed,
-                default_branch: None,
-                message: Some("authentication failed".to_string()),
-                failed_at: Some(failed_at),
-                failure_policy: None,
-                retry: None,
-            },
-        )
-        .await
-        .expect("legacy clone failure should apply");
-    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend, NAMESPACE);
-
-    let deps = reconciler.prepare(&checkout).await.expect("dependencies should load");
-    let outcome = reconciler.reconcile(&checkout, &deps, failed_at);
-
-    assert!(outcome.patch.is_none());
-    assert!(matches!(
-        outcome.actuations.as_slice(),
-        [flotilla_resources::Actuation::RetryClone { name, failed_at: observed_failed_at }]
-            if name == "clone-a" && *observed_failed_at == failed_at
-    ));
-    assert!(outcome.requeue_after.is_some());
-}
-
-#[tokio::test]
-async fn structural_clone_failure_is_terminal_for_its_checkout() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let clones = backend.clone().using::<Clone>(NAMESPACE);
-    clones
-        .create(
-            &meta("clone-a"),
-            &CloneSpec {
-                repo_ref: RepositoryKey(repo_key(REPO_URL)),
-                url: REPO_URL.to_string(),
-                env_ref: "host-direct-a".to_string(),
-                path: "/clones/repo".to_string(),
-            },
-        )
-        .await
-        .expect("clone should create");
-    apply_status_patch(
-        &clones,
-        "clone-a",
-        &CloneStatusPatch::MarkFailed { message: "clone name mismatch".to_string(), failed_at: chrono::Utc::now() },
-    )
-    .await
-    .expect("structural clone failure should apply");
-    let checkout = backend
+/// A worktree checkout of `clone-a` in `host-direct-a`.
+async fn checkout_of_clone_a(backend: &ResourceBackend) -> ResourceObject<Checkout> {
+    backend
         .clone()
         .using::<Checkout>(NAMESPACE)
         .create(
@@ -628,14 +550,54 @@ async fn structural_clone_failure_is_terminal_for_its_checkout() {
             }),
         )
         .await
-        .expect("checkout should create");
-    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend, NAMESPACE);
+        .expect("checkout should create")
+}
+
+fn clone_a_spec() -> CloneSpec {
+    CloneSpec {
+        repo_ref: RepositoryKey(repo_key(REPO_URL)),
+        url: REPO_URL.to_string(),
+        env_ref: "host-direct-a".to_string(),
+        path: "/clones/repo".to_string(),
+    }
+}
+
+// Behaviour (#3108): while its clone is being retried, a checkout waits for it and asks for
+// nothing: the Clone controller tries again when what the clone waits on changes.
+#[tokio::test]
+async fn a_checkout_waits_while_its_clone_retries() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
+    let launch = clones.put_named("clone-a", &clone_a_spec());
+    clones.retry(&launch, "authentication failed");
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let checkout = checkout_of_clone_a(&backend).await;
+    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend, NAMESPACE)
+        .with_lifecycle_reads(clones.reads.clone());
+
+    let deps = reconciler.prepare(&checkout).await.expect("dependencies should load");
+    assert!(matches!(deps, CheckoutPrepared::Waiting));
+    let outcome = reconciler.reconcile(&checkout, &deps, chrono::Utc::now());
+    assert!(outcome.patch.is_none());
+    assert!(outcome.actuations.is_empty(), "the clone's retries are its controller's");
+    assert!(outcome.requeue_after.is_some());
+}
+
+// Behaviour: a clone that gave up fails its checkout, with the clone's cause.
+#[tokio::test]
+async fn structural_clone_failure_is_terminal_for_its_checkout() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
+    let launch = clones.put_named("clone-a", &clone_a_spec());
+    clones.finish(&launch, flotilla_provisioning_testkit::Ending::GaveUp("clone name mismatch"));
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let checkout = checkout_of_clone_a(&backend).await;
+    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend, NAMESPACE)
+        .with_lifecycle_reads(clones.reads.clone());
 
     let prepared = reconciler.prepare(&checkout).await.expect("dependencies should load");
     let outcome = reconciler.reconcile(&checkout, &prepared, chrono::Utc::now());
 
     assert!(
-        matches!(outcome.patch, Some(flotilla_resources::CheckoutStatusPatch::MarkFailed { message }) if message == "clone name mismatch")
+        matches!(outcome.patch, Some(flotilla_resources::CheckoutStatusPatch::MarkFailed { message }) if message.contains("clone name mismatch"))
     );
     assert!(outcome.actuations.is_empty());
     assert!(outcome.requeue_after.is_none());
@@ -684,6 +646,7 @@ async fn create_deleting_checkout(backend: &ResourceBackend, name: &str, target_
 
 #[tokio::test]
 async fn failed_checkout_teardown_marks_only_that_checkout_failed_and_controller_continues() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     create_deleting_checkout(&backend, "alpha-failing", "/checkouts/alpha").await;
@@ -692,7 +655,8 @@ async fn failed_checkout_teardown_marks_only_that_checkout_failed_and_controller
         Arc::new(RecordingCheckoutRuntime { failed_removal_target: Some("/checkouts/alpha".to_string()), ..Default::default() }),
         backend.clone(),
         NAMESPACE,
-    );
+    )
+    .with_lifecycle_reads(clones.reads.clone());
     let controller = tokio::spawn(
         ControllerLoop {
             primary: checkouts.clone(),
@@ -727,8 +691,9 @@ async fn failed_checkout_teardown_marks_only_that_checkout_failed_and_controller
 
 #[tokio::test]
 async fn worktree_finalizer_supplies_clone_branch_and_target_to_runtime() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_clone(&backend, NAMESPACE, "clone-a", REPO_URL, "host-direct-a", "/checkouts/repo").await;
+    create_ready_clone(&clones, "clone-a", REPO_URL, "host-direct-a", "/checkouts/repo");
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     let created = checkouts
         .create(
@@ -763,7 +728,7 @@ async fn worktree_finalizer_supplies_clone_branch_and_target_to_runtime() {
         .expect("checkout status update should succeed");
     let checkout = checkouts.get("checkout-a").await.expect("checkout should exist");
     let runtime = Arc::new(RecordingCheckoutRuntime::default());
-    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend, NAMESPACE);
+    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend, NAMESPACE).with_lifecycle_reads(clones.reads.clone());
 
     reconciler.run_finalizer(&checkout).await.expect("finalizer should succeed");
 
@@ -779,6 +744,7 @@ async fn worktree_finalizer_supplies_clone_branch_and_target_to_runtime() {
 
 #[tokio::test]
 async fn forced_convoy_deletion_directs_checkout_authority_to_archive_before_removal() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     convoys
@@ -791,7 +757,7 @@ async fn forced_convoy_deletion_directs_checkout_authority_to_archive_before_rem
         )
         .await
         .expect("create forced convoy");
-    create_ready_clone(&backend, NAMESPACE, "clone-a", REPO_URL, "host-direct-a", "/checkouts/repo").await;
+    create_ready_clone(&clones, "clone-a", REPO_URL, "host-direct-a", "/checkouts/repo");
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     let checkout = checkouts
         .create(
@@ -815,7 +781,7 @@ async fn forced_convoy_deletion_directs_checkout_authority_to_archive_before_rem
         preserved_branch: Some(("feature/cleanup".into(), BranchPreservationReason::CommitsPastBase)),
         ..Default::default()
     });
-    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE);
+    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE).with_lifecycle_reads(clones.reads.clone());
 
     timeout(Duration::from_secs(2), async {
         loop {
@@ -845,6 +811,7 @@ async fn forced_convoy_deletion_directs_checkout_authority_to_archive_before_rem
 
 #[tokio::test]
 async fn abandoned_convoy_directs_checkout_authority_to_archive_before_removal() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let convoy = convoys
@@ -862,7 +829,7 @@ async fn abandoned_convoy_directs_checkout_authority_to_archive_before_removal()
         )
         .await
         .expect("mark convoy Abandoned");
-    create_ready_clone(&backend, NAMESPACE, "clone-a", REPO_URL, "host-direct-a", "/checkouts/repo").await;
+    create_ready_clone(&clones, "clone-a", REPO_URL, "host-direct-a", "/checkouts/repo");
     let checkout = backend
         .clone()
         .using::<Checkout>(NAMESPACE)
@@ -883,7 +850,7 @@ async fn abandoned_convoy_directs_checkout_authority_to_archive_before_removal()
         .await
         .expect("create checkout");
     let runtime = Arc::new(RecordingCheckoutRuntime { archive_path: Some("/archives/work-123".to_string()), ..Default::default() });
-    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE);
+    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE).with_lifecycle_reads(clones.reads.clone());
 
     timeout(Duration::from_secs(2), async {
         loop {
@@ -904,6 +871,7 @@ async fn abandoned_convoy_directs_checkout_authority_to_archive_before_removal()
 
 #[tokio::test]
 async fn slow_forced_archive_does_not_stop_other_checkout_or_controller_heartbeat() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     convoys
@@ -916,7 +884,7 @@ async fn slow_forced_archive_does_not_stop_other_checkout_or_controller_heartbea
         )
         .await
         .expect("forced convoy");
-    create_ready_clone(&backend, NAMESPACE, "clone-a", REPO_URL, "host-direct-a", "/checkouts/repo").await;
+    create_ready_clone(&clones, "clone-a", REPO_URL, "host-direct-a", "/checkouts/repo");
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     for name in ["slow", "fast"] {
         checkouts
@@ -945,7 +913,8 @@ async fn slow_forced_archive_does_not_stop_other_checkout_or_controller_heartbea
         ControllerLoop {
             primary: checkouts.clone(),
             secondaries: Vec::new(),
-            reconciler: CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE),
+            reconciler: CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE)
+                .with_lifecycle_reads(clones.reads.clone()),
             resync_interval: Duration::from_secs(3600),
             backend,
         }
@@ -978,6 +947,7 @@ async fn slow_forced_archive_does_not_stop_other_checkout_or_controller_heartbea
 
 #[tokio::test]
 async fn worktree_finalizer_removes_checkout_when_clone_resource_is_already_gone() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     let created = checkouts
@@ -995,7 +965,7 @@ async fn worktree_finalizer_removes_checkout_when_clone_resource_is_already_gone
         .await
         .expect("checkout create should succeed");
     let runtime = Arc::new(RecordingCheckoutRuntime::default());
-    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend, NAMESPACE);
+    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend, NAMESPACE).with_lifecycle_reads(clones.reads.clone());
 
     reconciler.run_finalizer(&created).await.expect("missing clone must not wedge checkout deletion");
 
@@ -1007,8 +977,9 @@ async fn worktree_finalizer_removes_checkout_when_clone_resource_is_already_gone
 
 #[tokio::test]
 async fn ready_checkout_reconciler_patches_integration_conditions() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_clone(&backend, NAMESPACE, "clone-a", REPO_URL, "host-direct-a", "/checkouts/repo").await;
+    create_ready_clone(&clones, "clone-a", REPO_URL, "host-direct-a", "/checkouts/repo");
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     let created = checkouts
         .create(
@@ -1043,7 +1014,7 @@ async fn ready_checkout_reconciler_patches_integration_conditions() {
         .expect("checkout status update should succeed");
     let checkout = checkouts.get("checkout-a").await.expect("checkout should exist");
     let runtime = Arc::new(RecordingCheckoutRuntime::default());
-    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend, NAMESPACE);
+    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend, NAMESPACE).with_lifecycle_reads(clones.reads.clone());
     let deps = reconciler.prepare(&checkout).await.expect("fetch dependencies should succeed");
 
     let outcome = reconciler.reconcile(&checkout, &deps, chrono::Utc::now());
@@ -1060,8 +1031,9 @@ async fn ready_checkout_reconciler_patches_integration_conditions() {
 
 #[tokio::test]
 async fn ready_checkout_reconciler_retries_protection_errors_without_failing_fresh_checkouts() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_clone(&backend, NAMESPACE, "clone-a", REPO_URL, "host-direct-a", "/checkouts/repo").await;
+    create_ready_clone(&clones, "clone-a", REPO_URL, "host-direct-a", "/checkouts/repo");
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     let created = checkouts
         .create(
@@ -1105,7 +1077,7 @@ async fn ready_checkout_reconciler_retries_protection_errors_without_failing_fre
         .expect("checkout status update should succeed");
     let checkout = checkouts.get("checkout-a").await.expect("checkout should exist");
     let runtime = Arc::new(RecordingCheckoutRuntime::default());
-    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE);
+    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE).with_lifecycle_reads(clones.reads.clone());
 
     let deps = reconciler.prepare(&checkout).await.expect("fetch dependencies should succeed");
     let outcome = reconciler.reconcile(&checkout, &deps, chrono::Utc::now());
@@ -1126,7 +1098,7 @@ async fn ready_checkout_reconciler_retries_protection_errors_without_failing_fre
     );
     // Maintenance errors are retryable and leave the persisted Ready phase intact.
     let failing = Arc::new(RecordingCheckoutRuntime { protection_error: Some("environment unavailable".into()), ..Default::default() });
-    let retrying = CheckoutReconciler::new(failing, backend, NAMESPACE);
+    let retrying = CheckoutReconciler::new(failing, backend, NAMESPACE).with_lifecycle_reads(clones.reads.clone());
     assert!(retrying.prepare(&checkout).await.is_err());
     assert_eq!(checkouts.get("checkout-a").await.expect("checkout").status.expect("status").phase, CheckoutPhase::Ready);
 }
@@ -1249,6 +1221,7 @@ async fn assert_checkout_refresh_for_phases(phases: &[(ConvoyPhase, bool)]) {
 
 #[tokio::test]
 async fn checkout_authority_reclaims_managed_checkout_when_replicated_convoy_is_landed() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     let authority_root = NodeId::new("convoy-authority");
     let checkout_host = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("checkout-authority"));
     let authority = ResourceBackend::new(InMemoryBackend::default()).with_local_root(authority_root.clone());
@@ -1297,8 +1270,9 @@ async fn checkout_authority_reclaims_managed_checkout_when_replicated_convoy_is_
         .await
         .expect("create managed checkout");
     let runtime = Arc::new(RecordingCheckoutRuntime::default());
-    let reconciler =
-        CheckoutReconciler::new(Arc::clone(&runtime), checkout_host.clone(), NAMESPACE).with_federated_convoys(&checkout_host, NAMESPACE);
+    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), checkout_host.clone(), NAMESPACE)
+        .with_lifecycle_reads(clones.reads.clone())
+        .with_federated_convoys(&checkout_host, NAMESPACE);
 
     let deps = reconciler.prepare(&checkout).await.expect("resolve replicated Landed convoy");
     let outcome = reconciler.reconcile(&checkout, &deps, chrono::Utc::now());
@@ -1310,6 +1284,7 @@ async fn checkout_authority_reclaims_managed_checkout_when_replicated_convoy_is_
 
 #[tokio::test]
 async fn annotated_checkout_finds_its_local_deleting_convoy() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("local-root"));
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     convoys
@@ -1346,6 +1321,7 @@ async fn annotated_checkout_finds_its_local_deleting_convoy() {
         .await
         .expect("create checkout");
     let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend.clone(), NAMESPACE)
+        .with_lifecycle_reads(clones.reads.clone())
         .with_federated_convoys(&backend, NAMESPACE);
 
     assert!(matches!(reconciler.prepare(&checkout).await.expect("prepare checkout"), CheckoutPrepared::OwnerTerminal));
@@ -1353,6 +1329,7 @@ async fn annotated_checkout_finds_its_local_deleting_convoy() {
 
 #[tokio::test]
 async fn remote_convoy_deletion_queues_labeled_checkout_without_snapshot_reference() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     let authority_root = NodeId::new("convoy-authority");
     let authority = ResourceBackend::new(InMemoryBackend::default()).with_local_root(authority_root.clone());
     let checkout_host = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("checkout-authority"));
@@ -1403,6 +1380,7 @@ async fn remote_convoy_deletion_queues_labeled_checkout_without_snapshot_referen
             primary: checkouts.clone(),
             secondaries: CheckoutReconciler::<RecordingCheckoutRuntime>::federated_secondary_watches(&checkout_host, NAMESPACE),
             reconciler: CheckoutReconciler::new(Arc::clone(&runtime), checkout_host.clone(), NAMESPACE)
+                .with_lifecycle_reads(clones.reads.clone())
                 .with_federated_convoys(&checkout_host, NAMESPACE),
             resync_interval: Duration::from_secs(3600),
             backend: checkout_host.clone(),
@@ -1524,6 +1502,7 @@ async fn fresh_failed_change_request_lookup_waits_for_the_landing_ttl_before_ret
 // branch, including while that other checkout is still pending materialisation.
 #[tokio::test]
 async fn convoy_checkout_refuses_branch_held_by_checkout() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let checkouts = backend.using::<Checkout>(NAMESPACE);
     let spec = CheckoutSpec::Worktree(
@@ -1550,7 +1529,8 @@ async fn convoy_checkout_refuses_branch_held_by_checkout() {
         )
         .await
         .expect("new checkout");
-    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend.clone(), NAMESPACE);
+    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend.clone(), NAMESPACE)
+        .with_lifecycle_reads(clones.reads.clone());
     let prepared = reconciler.prepare(&checkout).await.expect("prepare");
     assert!(matches!(prepared, CheckoutPrepared::Failed(ref message) if message.contains("reused") && message.contains("old")));
     assert!(matches!(reconciler.prepare(&old).await.expect("oldest reservation"), CheckoutPrepared::Waiting));
@@ -1564,7 +1544,8 @@ async fn convoy_checkout_refuses_branch_held_by_checkout() {
         Arc::new(RecordingCheckoutRuntime { validation_failures: Mutex::new(2), ..Default::default() }),
         backend,
         NAMESPACE,
-    );
+    )
+    .with_lifecycle_reads(clones.reads.clone());
     let unavailable = retrying.prepare(&old).await.expect("transient lookup");
     assert!(matches!(unavailable, CheckoutPrepared::ValidationUnavailable(ref message) if message.to_string() == "forge rate limit"));
     let outcome = retrying.reconcile(&old, &unavailable, chrono::Utc::now());
@@ -1617,7 +1598,9 @@ async fn validation_fixture(
         .await
         .expect("checkout");
     let now = "2026-10-21T00:00:00Z".parse().expect("now");
-    let reconciler = CheckoutReconciler::with_clock(runtime.clone(), backend, NAMESPACE, Arc::new(VirtualClock::new(now)));
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
+    let reconciler = CheckoutReconciler::with_clock(runtime.clone(), backend, NAMESPACE, Arc::new(VirtualClock::new(now)))
+        .with_lifecycle_reads(clones.reads.clone());
     (runtime, reconciler, checkout)
 }
 
@@ -1660,6 +1643,7 @@ async fn validation_success_resets_backoff() {
 // after owner failure/deletion. Check the invariant after each lifecycle step.
 #[hegel::test]
 fn continued_checkout_reservation_follows_owner_lifecycle(tc: hegel::TestCase) {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     use hegel::generators as gs;
     // Generator covers every live/terminal convoy phase and repeated transitions.
     let phases = [
@@ -1684,7 +1668,7 @@ fn continued_checkout_reservation_follows_owner_lifecycle(tc: hegel::TestCase) {
             .create(&meta("new-owner"), &ConvoySpec::builder().workflow_ref("dev".into()).continuation(repo.clone()).build())
             .await
             .expect("continuing convoy");
-        create_ready_clone(&backend, NAMESPACE, "clone", REPO_URL, "host", "/clone").await;
+        create_ready_clone(&clones, "clone", REPO_URL, "host", "/clone");
         let checkouts = backend.using::<Checkout>(NAMESPACE);
         let new_spec = CheckoutSpec::Worktree(
             CheckoutWorktreeSpec::builder()
@@ -1729,7 +1713,8 @@ fn continued_checkout_reservation_follows_owner_lifecycle(tc: hegel::TestCase) {
             )
             .await
             .expect("new checkout");
-        let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend.clone(), NAMESPACE);
+        let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend.clone(), NAMESPACE)
+            .with_lifecycle_reads(clones.reads.clone());
         for phase in sequence {
             let old = convoys.get("old-owner").await.expect("old owner");
             convoys
@@ -1747,6 +1732,7 @@ fn continued_checkout_reservation_follows_owner_lifecycle(tc: hegel::TestCase) {
 // #4139: a terminal convoy's checkouts reserve no branch in member repos other than the continued PR's repo.
 #[tokio::test]
 async fn terminal_owner_reserves_no_branch_in_non_continued_member_repo() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let repo = RepositoryKey(repo_key(REPO_URL));
     let convoys = backend.using::<Convoy>(NAMESPACE);
@@ -1758,7 +1744,7 @@ async fn terminal_owner_reserves_no_branch_in_non_continued_member_repo() {
         )
         .await
         .expect("new convoy");
-    create_ready_clone(&backend, NAMESPACE, "clone", REPO_URL, "host", "/clone").await;
+    create_ready_clone(&clones, "clone", REPO_URL, "host", "/clone");
     let checkouts = backend.using::<Checkout>(NAMESPACE);
     let spec = |path: &str| {
         CheckoutSpec::Worktree(
@@ -1785,7 +1771,8 @@ async fn terminal_owner_reserves_no_branch_in_non_continued_member_repo() {
         .await
         .expect("ready old");
     let new = checkouts.create(&labelled("new-checkout", "new-owner"), &spec("/checkout/new")).await.expect("new");
-    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend.clone(), NAMESPACE);
+    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend.clone(), NAMESPACE)
+        .with_lifecycle_reads(clones.reads.clone());
     let live = reconciler.prepare(&new).await.expect("live");
     assert!(
         matches!(&live, CheckoutPrepared::Failed(message) if message.contains("conflicts with Checkout old-checkout")),
@@ -1806,17 +1793,14 @@ async fn terminal_owner_reserves_no_branch_in_non_continued_member_repo() {
 // preserves provenance and copy degradation, then uses clone removal at teardown.
 #[tokio::test]
 async fn local_clone_waits_for_source_and_records_host_materialisation_and_teardown() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let clones = backend.clone().using::<Clone>(NAMESPACE);
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     let key = RepositoryKey(repo_key(REPO_URL));
-    let source = clones
-        .create(
-            &meta("source"),
-            &CloneSpec { repo_ref: key.clone(), url: REPO_URL.into(), env_ref: "host".into(), path: "/host/repos/source".into() },
-        )
-        .await
-        .unwrap();
+    let source = clones.put_named(
+        "source",
+        &CloneSpec { repo_ref: key.clone(), url: REPO_URL.into(), env_ref: "host".into(), path: "/host/repos/source".into() },
+    );
     let checkout = checkouts
         .create(
             &meta("local"),
@@ -1833,13 +1817,10 @@ async fn local_clone_waits_for_source_and_records_host_materialisation_and_teard
         .await
         .unwrap();
     let runtime = Arc::new(RecordingCheckoutRuntime::default());
-    let reconciler = CheckoutReconciler::new(runtime.clone(), backend.clone(), NAMESPACE);
+    let reconciler = CheckoutReconciler::new(runtime.clone(), backend.clone(), NAMESPACE).with_lifecycle_reads(clones.reads.clone());
     assert!(matches!(reconciler.prepare(&checkout).await.unwrap(), CheckoutPrepared::Waiting));
     assert!(runtime.local_clone_calls.lock().unwrap().is_empty());
-    clones
-        .update_status("source", &source.metadata.resource_version, &CloneStatus { phase: ClonePhase::Ready, ..Default::default() })
-        .await
-        .unwrap();
+    clones.ready(&source, None);
     let prepared = reconciler.prepare(&checkout).await.unwrap();
     assert!(
         matches!(prepared, CheckoutPrepared::Ready { ref prepared } if prepared.branch_provenance == CheckoutBranchProvenance::CreatedForConvoy)
@@ -1861,11 +1842,12 @@ async fn local_clone_waits_for_source_and_records_host_materialisation_and_teard
 // that remote tip without being rejected as a new forge head; other convoys refuse.
 #[tokio::test]
 async fn ready_local_sibling_authorises_shared_branch_only_within_its_convoy() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     use flotilla_vcs::vcs::LocalCloneIntent;
     let backend = ResourceBackend::new(InMemoryBackend::default());
     common::create_convoy_with_single_task(&backend, NAMESPACE, "convoy-shared", "work", REPO_URL, "crew").await;
     common::create_convoy_with_single_task(&backend, NAMESPACE, "convoy-foreign", "work", REPO_URL, "crew").await;
-    create_ready_clone(&backend, NAMESPACE, "source", REPO_URL, "host", "/host/repos/source").await;
+    create_ready_clone(&clones, "source", REPO_URL, "host", "/host/repos/source");
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     let make_spec = |path: &str| {
         CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
@@ -1897,7 +1879,7 @@ async fn ready_local_sibling_authorises_shared_branch_only_within_its_convoy() {
     late_meta.labels.insert(CONVOY_LABEL.into(), "convoy-shared".into());
     let late = checkouts.create(&late_meta, &make_spec("/host/repos/convoy-shared/late")).await.expect("late");
     let runtime = Arc::new(RecordingCheckoutRuntime { validation_failures: Mutex::new(1), ..Default::default() });
-    let reconciler = CheckoutReconciler::new(runtime.clone(), backend.clone(), NAMESPACE);
+    let reconciler = CheckoutReconciler::new(runtime.clone(), backend.clone(), NAMESPACE).with_lifecycle_reads(clones.reads.clone());
     assert!(matches!(reconciler.prepare(&late).await.expect("late prepare"), CheckoutPrepared::Ready { .. }));
     assert_eq!(*runtime.local_clone_intents.lock().expect("intents"), vec![LocalCloneIntent::ShareConvoyBranch]);
     assert_eq!(
@@ -1918,6 +1900,7 @@ async fn ready_local_sibling_authorises_shared_branch_only_within_its_convoy() {
 // rather than keeping checkout deletion in a permanent error/retry loop.
 #[tokio::test]
 async fn orphaned_checkout_finalizer_records_preserved_path_and_finishes() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let path = "/checkouts/orphan";
     let checkout = backend
@@ -1937,27 +1920,25 @@ async fn orphaned_checkout_finalizer_records_preserved_path_and_finishes() {
         .await
         .expect("checkout");
     let runtime = Arc::new(RecordingCheckoutRuntime { orphaned_path: Some(path.into()), ..Default::default() });
-    let reconciler = CheckoutReconciler::new(runtime.clone(), backend.clone(), NAMESPACE);
+    let reconciler = CheckoutReconciler::new(runtime.clone(), backend.clone(), NAMESPACE).with_lifecycle_reads(clones.reads.clone());
     reconciler.run_finalizer(&checkout).await.expect("terminal preservation finishes finalization");
     let events = backend.using::<Event>(NAMESPACE).list().await.expect("events");
     assert!(events.items.iter().any(|event| event.spec.reason == "OrphanedCheckoutPreserved" && event.spec.message.contains(path)));
     assert!(matches!(runtime.removals.lock().expect("removals").as_slice(), [CheckoutRemoval::OrphanedWorktree { .. }]));
 }
 
-// Checkout dependencies follow the engine while old clone phases and messages stay stale.
-// All old phases are crossed with readiness, retries and each terminal judgement.
+// Behaviour (#3108): a checkout follows its clone's launch as the engine reads it: it waits while
+// the launch is requested, proceeds once it is ready, and fails with the cause once it is lost; a
+// read of a broken store is an error, never a guess.
 #[tokio::test]
-async fn checkout_reads_clone_dependencies_without_a_status_copy() {
-    use flotilla_provisioning::engine::clone::CloneBinding;
-    use flotilla_provisioning_testkit::{Ending, LifecycleFixture};
+async fn checkout_reads_clone_dependencies_from_the_engine() {
+    use flotilla_provisioning_testkit::{CloneFixture, Ending};
+    let clones = CloneFixture::default();
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    create_ready_clone(&backend, NAMESPACE, "source", REPO_URL, "env", "/repo").await;
-    let clones = backend.using::<Clone>(NAMESPACE);
-    let mut clone = clones.get("source").await.expect("clone");
-    let mut old = clone.status.clone().expect("status");
-    old.phase = ClonePhase::Failed;
-    old.message = Some("stale".into());
-    clone = clones.update_status("source", &clone.metadata.resource_version, &old).await.expect("stale status");
+    let launch = clones.put_named(
+        "source",
+        &CloneSpec { repo_ref: RepositoryKey(repo_key(REPO_URL)), url: REPO_URL.into(), env_ref: "env".into(), path: "/repo".into() },
+    );
     let checkout = backend
         .using::<Checkout>(NAMESPACE)
         .create(
@@ -1968,25 +1949,22 @@ async fn checkout_reads_clone_dependencies_without_a_status_copy() {
                 r#ref: "feature".into(),
                 base_ref: None,
                 target_path: "/work".into(),
-                clone_ref: "source".into(),
+                clone_ref: launch.clone(),
             }),
         )
         .await
         .expect("checkout");
-    let fixture = LifecycleFixture::<CloneBinding>::new(false);
-    fixture.request(&clone);
     let reconciler =
         CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime { allow_creation: true, ..Default::default() }), backend, NAMESPACE)
-            .with_lifecycle_reads(fixture.reads.clone());
+            .with_lifecycle_reads(clones.reads.clone());
     assert!(matches!(reconciler.prepare(&checkout).await.expect("requested"), CheckoutPrepared::Waiting));
-    fixture.finish(&clone, Ending::Ready("/repo"));
+    clones.finish(&launch, Ending::Ready("/repo"));
     assert!(matches!(reconciler.prepare(&checkout).await.expect("ready"), CheckoutPrepared::Ready { .. }));
-    fixture.finish(&clone, Ending::Lost("/repo"));
+    clones.finish(&launch, Ending::Lost("/repo"));
     assert!(
         matches!(reconciler.prepare(&checkout).await.expect("lost"), CheckoutPrepared::Failed(message) if message == "observed absent")
     );
-    assert_eq!(clones.get("source").await.expect("unchanged").status, Some(old));
-    fixture.poison();
+    clones.poison();
     assert!(reconciler.prepare(&checkout).await.err().expect("checked read").to_string().contains("poisoned"));
 }
 
@@ -1997,7 +1975,8 @@ pub(super) async fn assert_checkout_lifecycle(old_phase: CheckoutPhase, ending: 
     use flotilla_provisioning_testkit::{Ending, LifecycleFixture};
     use flotilla_resources::CheckoutStatusPatch;
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    create_ready_clone(&backend, NAMESPACE, "source", REPO_URL, "env", "/repo").await;
+    let fixture = LifecycleFixture::<CheckoutBinding>::new(false);
+    create_ready_clone(&fixture.clones, "source", REPO_URL, "env", "/repo");
     let mut obj = backend
         .using::<Checkout>(NAMESPACE)
         .create(
@@ -2014,7 +1993,6 @@ pub(super) async fn assert_checkout_lifecycle(old_phase: CheckoutPhase, ending: 
         .await
         .expect("checkout");
     obj.status = Some(CheckoutStatus { phase: old_phase, path: Some("/stale".into()), ..Default::default() });
-    let fixture = LifecycleFixture::<CheckoutBinding>::new(false);
     fixture.request(&obj);
     let runtime = Arc::new(RecordingCheckoutRuntime { allow_creation: true, path_exists: Some(true), ..Default::default() });
     let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend, NAMESPACE).with_lifecycle_reads(fixture.reads.clone());
@@ -2044,7 +2022,8 @@ async fn checkout_reserves_branches_from_sibling_engine_phases() {
     use flotilla_provisioning::engine::checkout::CheckoutBinding;
     use flotilla_provisioning_testkit::{Ending, LifecycleFixture};
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    create_ready_clone(&backend, NAMESPACE, "source", REPO_URL, "env", "/repo").await;
+    let fixture = LifecycleFixture::<CheckoutBinding>::new(false);
+    create_ready_clone(&fixture.clones, "source", REPO_URL, "env", "/repo");
     let records = backend.using::<Checkout>(NAMESPACE);
     let spec = CheckoutSpec::Worktree(CheckoutWorktreeSpec {
         repo_ref: RepositoryKey(repo_key(REPO_URL)),
@@ -2065,7 +2044,6 @@ async fn checkout_reserves_branches_from_sibling_engine_phases() {
         .await
         .expect("stale status");
     let checkout = records.create(&convoy_meta("checkout"), &spec).await.expect("checkout");
-    let fixture = LifecycleFixture::<CheckoutBinding>::new(false);
     fixture.request(&checkout);
     fixture.request(&sibling);
     let reconciler =
@@ -2086,6 +2064,7 @@ async fn checkout_reserves_branches_from_sibling_engine_phases() {
 // the checkout with the reason rather than cloning without them.
 #[tokio::test]
 async fn fresh_clone_with_undecodable_grant_annotations_fails_with_the_reason() {
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
     let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("local-root"));
     let checkout = backend
         .clone()
@@ -2108,7 +2087,8 @@ async fn fresh_clone_with_undecodable_grant_annotations_fails_with_the_reason() 
         )
         .await
         .expect("create cloud checkout");
-    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend, NAMESPACE);
+    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend, NAMESPACE)
+        .with_lifecycle_reads(clones.reads.clone());
 
     let deps = reconciler.prepare(&checkout).await.expect("prepare");
 

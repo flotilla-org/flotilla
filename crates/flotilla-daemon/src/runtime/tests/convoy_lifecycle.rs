@@ -54,37 +54,53 @@ fn live_github_scope_expands_only_project_grants_without_explicit_repositories()
     assert_eq!(pinned.fixed_repositories, repositories);
 }
 
+/// Clones nothing: the clone requested below waits for its environment, which is never ready.
+struct UnusedCloneRuntime;
+
+#[async_trait]
+impl CloneRuntime for UnusedCloneRuntime {
+    async fn clone_and_inspect(&self, _: &str, _: &str) -> Result<Option<String>, String> {
+        Err("no environment is ready, so nothing is cloned".into())
+    }
+
+    async fn inspect_existing(&self, _: &str) -> Result<Option<String>, String> {
+        Err("no environment is ready, so nothing is inspected".into())
+    }
+}
+
+// Behaviour (#3108): a clone requested of the engine (renewed demand for it) wakes standing
+// ensure admission through the engine's clone changes, not an old Clone watch.
+#[tokio::test]
+async fn a_requested_clone_wakes_standing_ensure_admission() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let engine = flotilla_provisioning_testkit::clones::RunningClones::start("home", Arc::new(UnusedCloneRuntime));
+    let mut wakes = super::super::tasks::convoy_ensure_dependency_watches(&backend, NAMESPACE, &engine.reads).await;
+    let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
+    flotilla_resources::clone_records::CloneRecords::request(
+        engine.clones.as_ref(),
+        &repository,
+        &CloneSpec {
+            repo_ref: repository.key(),
+            url: "https://github.com/flotilla-org/flotilla".to_string(),
+            env_ref: "host-direct".to_string(),
+            path: "/workspace".to_string(),
+        },
+        false,
+    )
+    .expect("request the clone");
+    tokio::time::timeout(Duration::from_secs(1), wakes.next())
+        .await
+        .expect("a clone request should wake promptly")
+        .expect("the wakes stay open")
+        .expect("a wake");
+}
+
 #[tokio::test]
 async fn standing_ensure_dependency_changes_emit_wakes() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    for kind in ["Clone", "Convoy", "ConvoyEnsure", "WorkflowTemplate"] {
-        let mut watch = if kind == "Clone" {
-            watch_resource_kind(&backend, NAMESPACE, kind).await
-        } else {
-            watch_resource_kind_including_replicas(&backend, NAMESPACE, kind).await
-        }
-        .expect("dependency watch")
-        .stream;
+    for kind in ["Convoy", "ConvoyEnsure", "WorkflowTemplate"] {
+        let mut watch = watch_resource_kind_including_replicas(&backend, NAMESPACE, kind).await.expect("dependency watch").stream;
         match kind {
-            "Clone" => {
-                let clones = backend.clone().using::<Clone>(NAMESPACE);
-                clones
-                    .create(
-                        &empty_meta("renewed-demand"),
-                        &CloneSpec {
-                            repo_ref: RepositoryKey("github.com/flotilla-org/flotilla".to_string()),
-                            url: "https://github.com/flotilla-org/flotilla".to_string(),
-                            env_ref: "host-direct".to_string(),
-                            path: "/workspace".to_string(),
-                        },
-                    )
-                    .await
-                    .expect("create renewed clone demand");
-                watch.next().await.expect("watch should remain open").expect("clone create event");
-                flotilla_store::apply_status_patch(&clones, "renewed-demand", &flotilla_resources::CloneStatusPatch::MarkCloning)
-                    .await
-                    .expect("renew clone demand");
-            }
             "Convoy" => {
                 let convoys = backend.clone().using::<Convoy>(NAMESPACE);
                 convoys
@@ -338,6 +354,8 @@ async fn checkout_removals_queue_across_environments_and_release_capacity() {
         fs::write(temp.path().join("daemon.toml"), "machine_id = \"removal-queue-test\"\n").expect("daemon config");
         let config = Arc::new(ConfigStore::with_base(temp.path()));
         let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+        // The engine's readings, which a running daemon always has: a removal reads its clones.
+        engine_environments(&daemon);
         let (started, mut observed) = tokio::sync::mpsc::unbounded_channel();
         let runner = Arc::new(GatedRemovalRunner { started, release: tokio::sync::Semaphore::new(0) });
         for env in ["teardown-a", "teardown-b"] {

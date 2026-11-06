@@ -1221,6 +1221,13 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
             ]);
         }
         let _ = writeln!(output, "{table}");
+        // A clone that is not ready is what its checkout waits on, or why it failed.
+        for checkout in &explanation.checkouts {
+            let Some(clone) = &checkout.clone else { continue };
+            if let Some(reason) = clone.reading.reason() {
+                let _ = writeln!(output, "  {} clone {}: {} ({reason})", checkout.name, clone.name, clone.reading.label());
+            }
+        }
     }
 
     output.push_str("\nSubjects:\n");

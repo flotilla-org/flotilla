@@ -381,26 +381,15 @@ fn cr_name(service: &str, scope: &str, number: u64) -> String {
     .expect("record name")
 }
 
-/// The engine's Clone home over `daemon`'s decided store, restored with what it holds, as the
-/// runtime opens it before startup seeding.
-pub(super) fn startup_clones(
-    daemon: &Arc<InProcessDaemon>,
-) -> Arc<dyn flotilla_provisioning::engine::Lifecycles<flotilla_provisioning::stored::clone::CloneKind>> {
-    let store = daemon.decided_store().expect("decided store").store();
-    let log = flotilla_engine_store::StoreLog::new(store);
-    let home = log.home().to_owned();
-    Arc::new(flotilla_provisioning::engine::LifecycleHome::new(&home, flotilla_engine_store::open_home(log).expect("clone home")))
-}
-
-/// Startup seeding as the runtime runs it, over a freshly opened engine Clone home and the
-/// daemon's [`engine_environments`], with its host-direct root realised.
+/// Startup seeding as the runtime runs it, over the daemon's [`engine_environments`] (whose
+/// readings serve its clones), with its host-direct root realised.
 pub(super) async fn register_startup(
     daemon: &Arc<InProcessDaemon>,
     namespace: &str,
     profile: &LocalProvisioningProfile,
 ) -> Result<(), String> {
     let environments = engine_environments(daemon);
-    register_startup_resources(daemon, namespace, profile, &startup_clones(daemon)).await?;
+    register_startup_resources(daemon, namespace, profile).await?;
     // No Environment controller runs here: the host-direct root is realised as it would realise it.
     let name = profile.host_direct_environment_name();
     if environments.environments.find(&name)?.is_some_and(|environment| !environment.is_ready() && !environment.ended()) {

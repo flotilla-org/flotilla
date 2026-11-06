@@ -6805,6 +6805,8 @@ async fn adopted_checkout_reconciliation_repairs_partial_durable_creation() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has: they hold no clone here.
+    daemon.install_lifecycle_reads(flotilla_provisioning_testkit::CloneFixture::default().reads).expect("engine reads");
     let durable = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
     let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
     let spec = ResourceCheckoutSpec::Observed(
@@ -7051,6 +7053,8 @@ async fn discovery_resolves_origin_forge_and_binds_both_forgejo_sources() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has: they hold no clone here.
+    daemon.install_lifecycle_reads(flotilla_provisioning_testkit::CloneFixture::default().reads).expect("engine reads");
     daemon
         .resource_backend()
         .definitions::<Forge>("flotilla")

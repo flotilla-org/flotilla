@@ -485,6 +485,8 @@ async fn selected_detached_ops_checkout_loads_without_rederiving_identity() {
         )
         .await,
     );
+    // The engine's readings, which a running daemon always has: they hold no clone here.
+    daemon.install_lifecycle_reads(flotilla_provisioning_testkit::CloneFixture::default().reads).expect("engine reads");
     git(&ops, &["remote", "add", "lab", "https://forgejo.example.org/example/ops"]);
     git(&ops, &["checkout", "--detach"]);
     let mut rx = daemon.subscribe();
@@ -1240,6 +1242,8 @@ async fn mirror_and_canonical_roots_preserve_the_existing_mirror_project() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has: they hold no clone here.
+    daemon.install_lifecycle_reads(flotilla_provisioning_testkit::CloneFixture::default().reads).expect("engine reads");
 
     let canonical = RepositorySpec::remote(mirror_url)
         .expect("mirror observation")

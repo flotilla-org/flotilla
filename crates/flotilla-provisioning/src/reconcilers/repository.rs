@@ -1,12 +1,13 @@
 use std::{marker::PhantomData, sync::Arc};
 
+use crate::engine::clones::CloneRepositoryWake;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
     lifecycle_reads::{LifecycleReads, NoLifecycleReads},
-    resolve_default_branch, Checkout, CheckoutSpec, Clone, DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity,
-    LifecycleAuthority, Repository, RepositoryCheckoutRef, RepositoryKey, RepositoryStatus, RepositoryStatusPatch, ResourceError,
-    ResourceObject, REPO_KEY_LABEL,
+    resolve_default_branch, Checkout, CheckoutSpec, DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity, LifecycleAuthority,
+    Repository, RepositoryCheckoutRef, RepositoryKey, RepositoryStatus, RepositoryStatusPatch, ResourceError, ResourceObject,
+    REPO_KEY_LABEL,
 };
 use flotilla_store::{
     controller::{LabelMappedWatch, ReconcileOutcome, Reconciler, ResolverLabelMappedWatch, SecondaryWatch},
@@ -20,8 +21,8 @@ pub trait ForgeDefaultBranchResolver: Send + Sync {
 
 pub struct RepositoryReconciler {
     checkout_sources: Vec<TypedResolver<Checkout>>,
-    clones: TypedResolver<Clone>,
-    /// The engine's environments, through its readings: a checkout's host is its environment's.
+    /// The engine's environments and clones, through its readings: a checkout's host is its
+    /// environment's, and each clone launch found the remote's default branch.
     lifecycle_reads: Arc<dyn LifecycleReads>,
     forge_default_branch_resolver: Option<Arc<dyn ForgeDefaultBranchResolver>>,
 }
@@ -29,8 +30,7 @@ pub struct RepositoryReconciler {
 impl RepositoryReconciler {
     pub fn new(durable: ResourceBackend, observed: ResourceBackend, namespace: &str) -> Self {
         Self {
-            checkout_sources: vec![durable.clone().using::<Checkout>(namespace), observed.using::<Checkout>(namespace)],
-            clones: durable.using::<Clone>(namespace),
+            checkout_sources: vec![durable.using::<Checkout>(namespace), observed.using::<Checkout>(namespace)],
             lifecycle_reads: Arc::new(NoLifecycleReads),
             forge_default_branch_resolver: None,
         }
@@ -46,16 +46,24 @@ impl RepositoryReconciler {
         self
     }
 
-    pub fn secondary_watches(observed: ResourceBackend, namespace: &str) -> Vec<Box<dyn SecondaryWatch<Primary = Repository>>> {
-        vec![
+    /// The kinds a repository follows: its checkouts, and with the engine's `service` its clones.
+    pub fn secondary_watches(
+        observed: ResourceBackend,
+        namespace: &str,
+        service: Option<Arc<flotilla_schema_sqlite::stream::Service>>,
+    ) -> Vec<Box<dyn SecondaryWatch<Primary = Repository>>> {
+        let mut watches: Vec<Box<dyn SecondaryWatch<Primary = Repository>>> = vec![
             Box::new(LabelMappedWatch::<Checkout, Repository> { label_key: REPO_KEY_LABEL, _marker: PhantomData }),
-            Box::new(LabelMappedWatch::<Clone, Repository> { label_key: REPO_KEY_LABEL, _marker: PhantomData }),
             Box::new(ResolverLabelMappedWatch::<Checkout, Repository> {
                 label_key: REPO_KEY_LABEL,
                 resolver: observed.using::<Checkout>(namespace),
                 _marker: PhantomData,
             }),
-        ]
+        ];
+        if let Some(service) = service {
+            watches.push(Box::new(CloneRepositoryWake::new(service)));
+        }
+        watches
     }
 
     async fn checkout_host(&self, checkout: &CheckoutSpec) -> Result<String, String> {
@@ -131,15 +139,18 @@ impl Reconciler for RepositoryReconciler {
             }
         }
 
-        for clone in self.clones.list().await?.items {
-            if clone.spec.repo_ref != repository_key {
-                continue;
-            }
-            if let Some(branch) = clone.status.and_then(|status| status.default_branch) {
-                status
-                    .default_branch_observations
-                    .push(DefaultBranchObservation { branch, provenance: DefaultBranchProvenance::RemoteSymbolicHead });
-            }
+        // Each clone launch found the remote's default branch when it was realised. The engine's
+        // reads take the store's lock, so they run off the async workers.
+        let reads = Arc::clone(&self.lifecycle_reads);
+        let key = repository_key.clone();
+        let clones = tokio::task::spawn_blocking(move || reads.clones().and_then(|clones| clones.of_repository(&key)))
+            .await
+            .map_err(|error| ResourceError::other(format!("engine read: {error}")))?
+            .map_err(ResourceError::other)?;
+        for branch in clones.into_iter().filter_map(|clone| clone.default_branch) {
+            status
+                .default_branch_observations
+                .push(DefaultBranchObservation { branch, provenance: DefaultBranchProvenance::RemoteSymbolicHead });
         }
 
         for checkouts in status.checkouts_by_host.values_mut() {

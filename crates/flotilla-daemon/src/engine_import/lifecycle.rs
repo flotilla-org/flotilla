@@ -8,9 +8,8 @@ use flotilla_core::primitives::ensures::import_ensures;
 use flotilla_engine_store::{Import, ImportTarget};
 use flotilla_provisioning::engine::{
     checkout::CheckoutBinding,
-    clone::CloneBinding,
     image_build::ImageBuildBinding,
-    import::{import_environments, import_records, import_vessels, ImportRefusal, ImportReport},
+    import::{import_clones, import_environments, import_records, import_vessels, ImportRefusal, ImportReport},
     terminal_session::TerminalSessionBinding,
 };
 use flotilla_resources::{
@@ -63,7 +62,12 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, r
         .collect();
     import_environments(&environments, target, report);
     records!(ImageBuild, "imagebuilds", "ImageBuild", ImageBuildBinding);
-    records!(CloneResource, "clones", "Clone", CloneBinding);
+    let clones: Vec<_> = source
+        .owned::<CloneResource>("clones", namespace, "Clone", target, report)
+        .into_iter()
+        .map(|record| (record.object, record.home))
+        .collect();
+    import_clones(&clones, target, report);
     records!(Checkout, "checkouts", "Checkout", CheckoutBinding);
     records!(TerminalSession, "terminalsessions", "TerminalSession", TerminalSessionBinding);
     let convoys = source.context::<Convoy>("convoys", namespace);

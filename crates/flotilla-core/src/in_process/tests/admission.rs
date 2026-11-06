@@ -427,6 +427,8 @@ async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has: they hold no clone here.
+    daemon.install_lifecycle_reads(flotilla_provisioning_testkit::CloneFixture::default().reads).expect("engine reads");
     let repository = RepositorySpec::remote("https://github.com/acme/archive").expect("repository spec").key();
     let checkouts = backend.using::<ResourceCheckout>("flotilla");
     let fresh = Utc::now().to_rfc3339();
@@ -566,6 +568,8 @@ async fn abandon_archive_pushes_only_checkout_with_commits_beyond_base() {
         Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has: they hold no clone here.
+    daemon.install_lifecycle_reads(flotilla_provisioning_testkit::CloneFixture::default().reads).expect("engine reads");
     let repository = RepositorySpec::remote("https://github.com/acme/archive").unwrap().key();
     for (name, advanced) in [("at-base", false), ("advanced", true)] {
         let path = temp.path().join(name);

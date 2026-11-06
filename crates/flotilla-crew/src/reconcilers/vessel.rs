@@ -21,16 +21,16 @@ use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, LifecycleReading, PlacementDecision};
 use flotilla_resources::{
     address::artifact_slot_record_name, canonicalize_repo_url, host_direct_environment_name, is_prepared_snapshot,
-    repository_workspace_slugs, Artifact, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy,
-    CrewSource, CrewWorkPhase, DockerEnvironmentSpec, EnvironmentMount, EnvironmentMountMode, EnvironmentSpec, FreshCloneCheckoutSpec,
-    FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, InputMeta, LifecycleAuthority, OwnerReference, PlacementImageSource,
-    Repository, RepositoryKey, RepositorySpec, Resource, ResourceError, ResourceObject, ResourceProvenance, Stance, TerminalSession,
+    repository_workspace_slugs, Artifact, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, CloneSpec, Convoy, CrewSource,
+    CrewWorkPhase, DockerEnvironmentSpec, EnvironmentMount, EnvironmentMountMode, EnvironmentSpec, FreshCloneCheckoutSpec, FulfilmentKind,
+    FulfilmentKindSpec, FulfilmentRealisation, InputMeta, LifecycleAuthority, OwnerReference, PlacementImageSource, Repository,
+    RepositoryKey, RepositorySpec, Resource, ResourceError, ResourceObject, ResourceProvenance, Stance, TerminalSession,
     TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, Vessel, VesselImage, VesselPhase, VesselStatusPatch, WorkPhase,
     ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
     CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
     CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND, VESSEL_REF_LABEL,
 };
-use flotilla_resources::{realisation_settings, BRIEF_ARTIFACTS_ANNOTATION};
+use flotilla_resources::{clone_records::CloneRecords, realisation_settings, BRIEF_ARTIFACTS_ANNOTATION};
 use flotilla_store::{
     controller::{delete_lifecycle_owned_matching, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
     ReplicaReadResolver, ResourceBackend, TypedResolver,
@@ -39,7 +39,6 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
-const REPO_LABEL: &str = "flotilla.work/repo";
 const ENV_LABEL: &str = "flotilla.work/env";
 const VESSEL_PROVISIONING_REQUEUE_AFTER: Duration = Duration::from_secs(5);
 const VESSEL_INTERRUPTED_REQUEUE_AFTER: Duration = Duration::from_millis(250);
@@ -90,7 +89,6 @@ pub struct VesselReconciler {
     convoys: TypedResolver<Convoy>,
     repositories: TypedResolver<Repository>,
     kinds: TypedResolver<FulfilmentKind>,
-    clones: TypedResolver<Clone>,
     checkouts: TypedResolver<Checkout>,
     terminal_sessions: TypedResolver<TerminalSession>,
     artifacts: ReplicaReadResolver<Artifact>,
@@ -126,7 +124,6 @@ impl VesselReconciler {
             convoys: backend.clone().using::<Convoy>(namespace),
             repositories: backend.clone().using::<Repository>(namespace),
             kinds: backend.clone().using::<FulfilmentKind>(namespace),
-            clones: backend.clone().using::<Clone>(namespace),
             checkouts: backend.clone().using::<Checkout>(namespace),
             terminal_sessions: backend.clone().using::<TerminalSession>(namespace),
             artifacts: backend.including_replicas::<Artifact>(namespace),
@@ -205,6 +202,11 @@ impl VesselReconciler {
         self.lifecycle_reads.environments().map_err(ResourceError::other)
     }
 
+    /// The engine's clones (#3108).
+    fn clones(&self) -> Result<&dyn CloneRecords, ResourceError> {
+        self.lifecycle_reads.clones().map_err(ResourceError::other)
+    }
+
     /// The environment `name`, at whichever home holds it: environment names are fleet-unique.
     fn environment(&self, name: &str) -> Result<Option<EnvironmentRecord>, ResourceError> {
         self.environments()?.find(name).map_err(ResourceError::other)
@@ -235,14 +237,10 @@ impl VesselReconciler {
             let clone_ref = clone_ref.as_ref().ok_or_else(|| {
                 ResourceError::invalid(format!("contained worktree placement requires checkout {checkout_name} to be a managed worktree"))
             })?;
-            match self.clones.get(clone_ref).await {
-                Ok(_) => {}
-                Err(ResourceError::NotFound { .. }) => {
-                    return Err(ResourceError::invalid(format!(
-                        "contained worktree checkout {checkout_name} refers to missing clone {clone_ref}"
-                    )))
-                }
-                Err(error) => return Err(error),
+            if self.clones()?.get(clone_ref, None).map_err(ResourceError::other)?.is_none() {
+                return Err(ResourceError::invalid(format!(
+                    "contained worktree checkout {checkout_name} refers to missing clone {clone_ref}"
+                )));
             }
             let checkout = self.checkouts.get(checkout_name).await?;
             let CheckoutSpec::Worktree(spec) = &checkout.spec else {
@@ -838,22 +836,24 @@ impl VesselReconciler {
                 return Ok(VesselPrepared::failed(message));
             }
             fork_stance |= repository_spec.is_fork();
-            let clone_identity = match repository_spec.clone_key(&clone_env_ref) {
-                Ok(key) => key,
+            let clone_name = match flotilla_resources::clone_records::clone_name(&repository_spec, &clone_env_ref) {
+                Ok(name) => name,
                 Err(error) => return Ok(VesselPrepared::failed(error)),
             };
             let repository_key = convoy_repository.repo_ref.clone();
             let repo_key = repository_key.to_string();
             let adopted_checkout_ref = obj.spec.adopted_checkout_refs.get(&repository_key).cloned();
-            let clone_name = if adopted_checkout_ref.is_none() && strategy.needs_shared_clone() {
-                let clone_name = format!("clone-{clone_identity}");
-                match self.clones.get(&clone_name).await {
-                    Ok(existing) => {
+            // The shared clone a worktree checkout is made from: its name and the spec a request
+            // for it makes. The checkout names the launch serving that request when it is made.
+            let shared_clone = if adopted_checkout_ref.is_none() && strategy.needs_shared_clone() {
+                let clone_path = match self.clones()?.get(&clone_name, None).map_err(ResourceError::other)? {
+                    Some(existing) => {
                         if existing.spec.repo_ref != repository_key || existing.spec.env_ref != clone_env_ref {
                             return Ok(VesselPrepared::failed(format!("clone {clone_name} does not match expected repo/env tuple")));
                         }
+                        existing.spec.path
                     }
-                    Err(ResourceError::NotFound { .. }) => {
+                    None => {
                         let repository_catalog = repository_catalog.get_or_try_init(|| self.repositories.list()).await?;
                         let keyed_repositories = repository_catalog
                             .items
@@ -865,31 +865,20 @@ impl VesselReconciler {
                         let clone_directory_slug = repository_workspace_slugs(keyed_repositories.iter().map(|(key, spec)| (key, *spec)))
                             .remove(&repository_key)
                             .expect("the current repository was included in slug allocation");
-                        let clone_path = format!(
+                        format!(
                             "{}/{}",
                             shared_clone_root.as_deref().expect("shared-clone placement has a root").trim_end_matches('/'),
                             clone_directory_slug
-                        );
-                        actuations.push(Actuation::CreateClone {
-                            meta: InputMeta::builder()
-                                .name(clone_name.clone())
-                                .labels(BTreeMap::from([
-                                    (REPO_KEY_LABEL.to_string(), repo_key.clone()),
-                                    (ENV_LABEL.to_string(), clone_env_ref.clone()),
-                                    (REPO_LABEL.to_string(), convoy_repository.workspace_slug.clone()),
-                                ]))
-                                .build(),
-                            spec: CloneSpec {
-                                repo_ref: repository_key.clone(),
-                                url: convoy_repository.url.clone(),
-                                env_ref: clone_env_ref.clone(),
-                                path: clone_path,
-                            },
-                        });
+                        )
                     }
-                    Err(err) => return Err(err),
-                }
-                Some(clone_name)
+                };
+                let spec = CloneSpec {
+                    repo_ref: repository_key.clone(),
+                    url: convoy_repository.url.clone(),
+                    env_ref: clone_env_ref.clone(),
+                    path: clone_path,
+                };
+                Some(spec)
             } else {
                 None
             };
@@ -991,13 +980,18 @@ impl VesselReconciler {
                     drop(recent);
                     let spec = match &strategy {
                         PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerHostCheckoutAndMount { .. } => {
+                            let clone_spec = shared_clone.expect("shared-clone strategy requires a clone");
+                            let clone_launch = match self.clones()?.request(&repository_spec, &clone_spec, false) {
+                                Ok(launch) => launch,
+                                Err(error) => return Ok(VesselPrepared::failed(error)),
+                            };
                             CheckoutSpec::Worktree(CheckoutWorktreeSpec {
                                 repo_ref: repository_key.clone(),
                                 env_ref: clone_env_ref.clone(),
                                 r#ref: git_ref.clone().expect("repository checkout requires a convoy ref"),
                                 base_ref: Some(convoy_repository.source_ref.clone()),
                                 target_path: checkout_target_path,
-                                clone_ref: clone_name.expect("shared-clone strategy requires clone name"),
+                                clone_ref: clone_launch,
                             })
                         }
                         PlacementStrategy::CloneInVessel { .. } => CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
@@ -1949,7 +1943,7 @@ mod tests {
     // refuse invalid/unavailable metadata instead of granting writable siblings.
     #[tokio::test]
     async fn contained_mounts_cover_empty_duplicate_and_invalid_metadata() {
-        use flotilla_resources::{Checkout, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, EnvironmentMountMode, RepositoryKey};
+        use flotilla_resources::{Checkout, CheckoutSpec, CheckoutWorktreeSpec, CloneSpec, EnvironmentMountMode, RepositoryKey};
         use flotilla_vcs::vcs::WorktreeMetadata;
         struct Metadata(Result<WorktreeMetadata, String>);
         // VCS process boundary fake; stores and mount planning are real.
@@ -1962,20 +1956,16 @@ mod tests {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let namespace = "test-mounts";
         let repo_ref = RepositoryKey("test-repo".into());
-        backend
-            .clone()
-            .using::<Clone>(namespace)
-            .create(
-                &InputMeta::builder().name("clone".to_string()).build(),
-                &CloneSpec {
-                    repo_ref: repo_ref.clone(),
-                    url: "https://example.com/repo".into(),
-                    env_ref: "host".into(),
-                    path: "/clone".into(),
-                },
-            )
-            .await
-            .expect("clone");
+        let clones = flotilla_provisioning_testkit::CloneFixture::default();
+        clones.put_named(
+            "clone",
+            &CloneSpec {
+                repo_ref: repo_ref.clone(),
+                url: "https://example.com/repo".into(),
+                env_ref: "host".into(),
+                path: "/clone".into(),
+            },
+        );
         backend
             .clone()
             .using::<Checkout>(namespace)
@@ -1993,7 +1983,9 @@ mod tests {
             .await
             .expect("checkout");
         let valid = WorktreeMetadata { common_dir: "/clone/.git".into(), admin_dir: "/clone/.git/worktrees/actual".into() };
-        let reconciler = VesselReconciler::new(backend.clone(), namespace).with_worktree_metadata(Arc::new(Metadata(Ok(valid.clone()))));
+        let reconciler = VesselReconciler::new(backend.clone(), namespace)
+            .with_lifecycle_reads(clones.reads.clone())
+            .with_worktree_metadata(Arc::new(Metadata(Ok(valid.clone()))));
         assert!(reconciler.contained_git_mounts(&[]).await.expect("empty").is_empty());
         let own = ("own".into(), Some("clone".into()));
         let one = reconciler.contained_git_mounts(std::slice::from_ref(&own)).await.expect("own mounts");
@@ -2011,10 +2003,12 @@ mod tests {
             Ok(WorktreeMetadata { admin_dir: "/sibling".into(), ..valid.clone() }),
             Ok(WorktreeMetadata { admin_dir: "/clone/.git/worktrees/own/nested".into(), ..valid.clone() }),
         ] {
-            let refusing = VesselReconciler::new(backend.clone(), namespace).with_worktree_metadata(Arc::new(Metadata(metadata)));
+            let refusing = VesselReconciler::new(backend.clone(), namespace)
+                .with_lifecycle_reads(clones.reads.clone())
+                .with_worktree_metadata(Arc::new(Metadata(metadata)));
             assert!(refusing.contained_git_mounts(std::slice::from_ref(&own)).await.is_err(), "invalid metadata must fail closed");
         }
-        let unavailable = VesselReconciler::new(backend, namespace);
+        let unavailable = VesselReconciler::new(backend, namespace).with_lifecycle_reads(clones.reads.clone());
         assert!(
             matches!(unavailable.contained_git_mounts(&[own]).await, Err(ResourceError::Other { .. })),
             "missing resolver must retry without guessing paths or failing the vessel"

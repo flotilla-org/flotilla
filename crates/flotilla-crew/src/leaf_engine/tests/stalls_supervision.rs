@@ -1178,7 +1178,11 @@ async fn credential_delivery_and_clone_controller_rows_judge_transient_terminal_
         Arc::new(UnavailableChangeRequests),
         flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
-    let wake = ReconcilerWake::new(LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher));
+    // The clones are the engine's (#3108): the worktree's clone row reads them.
+    let clones = flotilla_provisioning_testkit::CloneFixture::default();
+    let wake = ReconcilerWake::new(
+        LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher).with_lifecycle_reads(clones.reads.clone()),
+    );
     create_convoy(&backend, "delivery", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
     let vessels = backend.using::<Vessel>("flotilla");
     let vessel = vessels
@@ -1252,6 +1256,14 @@ async fn credential_delivery_and_clone_controller_rows_judge_transient_terminal_
     )
     .await
     .expect("clear credential retry");
+    let repository = flotilla_resources::RepositorySpec::remote("https://example.org/example/repo").expect("repository");
+    let clone_spec = flotilla_resources::CloneSpec {
+        repo_ref: repository.key(),
+        url: "https://example.org/example/repo".into(),
+        env_ref: "delivery-env".into(),
+        path: "/tmp/clone".into(),
+    };
+    let clone = flotilla_resources::clone_records::clone_name(&repository, "delivery-env").expect("clone name");
     let checkouts = backend.using::<Checkout>("flotilla");
     checkouts
         .create(
@@ -1260,42 +1272,42 @@ async fn credential_delivery_and_clone_controller_rows_judge_transient_terminal_
                 .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "delivery".to_string())]))
                 .build(),
             &CheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
-                repo_ref: RepositoryKey("repo".into()),
+                repo_ref: repository.key(),
                 env_ref: "delivery-env".into(),
                 r#ref: "main".into(),
                 base_ref: None,
                 target_path: "/tmp/checkout".into(),
-                clone_ref: "delivery-clone".into(),
+                // Named by its clone, the checkout reads the clone's latest launch.
+                clone_ref: clone.clone(),
             }),
         )
         .await
         .expect("worktree checkout");
-    for (retry, expected) in [
-        (ControllerRetry::retryable(None, now, backoff), None),
-        (ControllerRetry::terminal(None, now, "repository not found"), Some("repository not found")),
-        (
-            ControllerRetry {
-                attempts: RetryCeiling::default().attempts,
-                first_failure_at: now,
-                disposition: flotilla_resources::ControllerRetryDisposition::Retryable { next_attempt_at: now },
-            },
-            Some("retrying without progress"),
-        ),
-    ] {
-        flotilla_store::apply_status_patch(
-            &checkouts,
-            "delivery-checkout",
-            &flotilla_resources::CheckoutStatusPatch::ObserveCloneRetry { retry: Some(retry) },
-        )
-        .await
-        .expect("project clone retry");
+    let first = clones.request(&repository, &clone_spec, false);
+    let judge_clone = || async {
         let convoy = backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy");
         let objects = HashMap::from([("delivery".to_string(), convoy)]);
         wake.sync_rows("flotilla", &objects).await.expect("arm clone controller row");
         wake.judge_stalls("flotilla", &objects).await.expect("judge clone controller row");
-        let stalled = backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy").status.expect("status").stalled;
-        assert_eq!(stalled.as_ref().map(|stalled| stalled.evidence.as_str()), expected);
+        backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy").status.expect("status").stalled
+    };
+    // A transient failure retries without stalling.
+    clones.retry(&first, "network unreachable");
+    assert_eq!(judge_clone().await.as_ref().map(|stalled| stalled.evidence.as_str()), None);
+    // A clone that gives up stalls with its cause.
+    clones.finish(&first, flotilla_provisioning_testkit::Ending::GaveUp("repository not found"));
+    assert_eq!(judge_clone().await.as_ref().map(|stalled| stalled.evidence.as_str()), Some("repository not found"));
+    // Its next launch, its attempts spent, gives up in the same step (the Clone policy's three
+    // tries) and stalls with the last failure's cause. A launch read between spending its attempts
+    // and giving up stalls as retrying without progress (`wake::clone_retry_tests`).
+    let second = clones.request(&repository, &clone_spec, false);
+    assert_ne!(second, first, "a clone that gave up is requested again as its next launch");
+    for _ in 0..2 {
+        clones.retry(&second, "network unreachable");
+        assert_eq!(judge_clone().await.as_ref().map(|stalled| stalled.evidence.as_str()), None, "retries short of the policy");
     }
+    clones.retry(&second, "network unreachable");
+    assert_eq!(judge_clone().await.as_ref().map(|stalled| stalled.evidence.as_str()), Some("network unreachable"));
 }
 
 // #2499: Landing keeps its exit gates while the observed maker waits at a

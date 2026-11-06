@@ -12,6 +12,7 @@ mod message;
 mod ports;
 mod primitives;
 mod provider_path;
+mod remotes;
 mod seed;
 pub(crate) mod ssh_host_vessels;
 mod state;
@@ -37,14 +38,13 @@ use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::CanonicalHostId;
 use flotilla_provisioning::engine::{
-    checkout::CheckoutBinding, clone::CloneBinding, image_build::ImageBuildBinding, terminal_session::TerminalSessionBinding,
-    vessel::VesselBinding, Engine,
+    checkout::CheckoutBinding, image_build::ImageBuildBinding, terminal_session::TerminalSessionBinding, vessel::VesselBinding, Engine,
 };
-use flotilla_provisioning::reconcilers::{CheckoutReconciler, CloneReconciler, ForgeDefaultBranchResolver, RepositoryReconciler};
+use flotilla_provisioning::reconcilers::{CheckoutReconciler, ForgeDefaultBranchResolver, RepositoryReconciler};
 use flotilla_resources::LANDING_EVIDENCE_TTL;
 use flotilla_resources::{
-    host_direct_environment_name, ChangeRequest, Checkout, Clone, Convoy, Forge, Host, Repository, Resource, ResourceError,
-    TerminalSession, Vessel, WorkflowTemplate,
+    host_direct_environment_name, ChangeRequest, Checkout, Convoy, Forge, Host, Repository, Resource, ResourceError, TerminalSession,
+    Vessel, WorkflowTemplate,
 };
 use flotilla_store::{controller::ControllerLoop, ResourceBackend};
 use tokio::{sync::watch, task::JoinHandle};
@@ -178,9 +178,7 @@ impl DaemonRuntime {
         let daemon_config = config.load_daemon_config()?;
         // ADR 0064 (#3108): Message and the provisioning lifecycles run on the decided store.
         result_phase("open_message_primitives", open_message_primitives(&daemon)).await?;
-        let (provisioning, environment_changes) = open_provisioning_lifecycles(&daemon).await?;
-        let startup_clones: Arc<dyn flotilla_provisioning::engine::Lifecycles<flotilla_provisioning::stored::clone::CloneKind>> =
-            Arc::clone(&provisioning.clones);
+        let (provisioning, environment_changes, clone_changes) = open_provisioning_lifecycles(&daemon).await?;
         let provisioning_lifecycles = Some(provisioning);
         daemon.require_lifecycle_reads_installed()?;
         let manifests = daemon_config.manifests;
@@ -273,8 +271,7 @@ impl DaemonRuntime {
         })
         .await
         .map_err(|error| format!("scan stored resources for decode quarantine: {error}"))?;
-        retry_phase("register_startup_resources", || register_startup_resources(&daemon, &options.namespace, &profile, &startup_clones))
-            .await?;
+        retry_phase("register_startup_resources", || register_startup_resources(&daemon, &options.namespace, &profile)).await?;
         let registered_image_caches = local_registry
             .environment_providers
             .iter()
@@ -334,6 +331,7 @@ impl DaemonRuntime {
 
         let mut tasks = vec![
             environment_changes,
+            clone_changes,
             spawn_local_fulfilment_probe_task(
                 Arc::clone(&daemon),
                 options.namespace.clone(),
@@ -554,7 +552,8 @@ impl DaemonRuntime {
                 .with_image_build_service(image_build_service)
                 .with_forge_default_branches(forge_default_branches)
                 .with_controller_metrics(Arc::clone(&controller_metrics))
-                .with_provisioning_lifecycles(provisioning_lifecycles.clone()),
+                .with_provisioning_lifecycles(provisioning_lifecycles.clone())
+                .with_runtime_health(runtime_health.clone()),
             );
             if state.ssh_host_vessels.is_some() {
                 daemon.set_ssh_host_vessel_access(Arc::new(ssh_host_vessels::VesselSessions { state: Arc::downgrade(&state) }));
@@ -751,6 +750,7 @@ impl StartupRestoration {
             options.controller_resync_interval,
         )));
         controller_tasks.push(AbortOnDropHandle::new(spawn_environment_orphan_sweep_task(Arc::clone(state))));
+        controller_tasks.push(AbortOnDropHandle::new(remotes::spawn_remote_probe_task(Arc::clone(state), remotes::REMOTE_PROBE_INTERVAL)));
         controller_tasks.push(AbortOnDropHandle::new(spawn_codex_credential_redelivery_task(
             Arc::clone(state),
             options.namespace.clone(),
@@ -897,6 +897,8 @@ fn spawn_controller_loops(
             let lifecycle_reads = state.daemon.lifecycle_reads();
             let observed_backend = observed_backend.clone();
             let forge_default_branch_resolver = forge_default_branch_resolver.clone();
+            // A repository's clones wake it as their launches change.
+            let decided = state.daemon.decided_store().ok();
             move |backend: ResourceBackend, namespace_string: String| {
                 let observed_backend = observed_backend.clone();
                 let forge_default_branch_resolver = forge_default_branch_resolver.clone();
@@ -905,24 +907,7 @@ fn spawn_controller_loops(
                 if let Some(resolver) = forge_default_branch_resolver {
                     reconciler = reconciler.with_forge_default_branch_resolver(resolver);
                 }
-                (RepositoryReconciler::secondary_watches(observed_backend, &namespace_string), reconciler)
-            }
-        }),
-        controller!(Clone, {
-            let state = Arc::clone(&state);
-            move |backend: ResourceBackend, namespace_string: String| {
-                (
-                    vec![],
-                    Engine::<_, CloneBinding>::new(
-                        CloneReconciler::new(
-                            Arc::new(RoutingCloneRuntime { state: Arc::clone(&state) }),
-                            backend.using::<Repository>(&namespace_string),
-                        )
-                        .with_lifecycle_reads(state.daemon.lifecycle_reads())
-                        .with_clones(state.provisioning.as_ref().map(|engine| Arc::clone(&engine.clones))),
-                        state.provisioning.as_ref().map(|engine| Arc::clone(&engine.clones)),
-                    ),
-                )
+                (RepositoryReconciler::secondary_watches(observed_backend, &namespace_string, decided.clone()), reconciler)
             }
         }),
         controller!(Checkout, {
@@ -1041,6 +1026,7 @@ fn spawn_controller_loops(
         }),
     ];
     controllers.extend(spawn_environment_controller(&state));
+    controllers.extend(spawn_clone_controller(&state));
     if let Some(distributor) = &state.image_inventory {
         let distributor = Arc::clone(distributor);
         controllers.push(tokio::spawn(async move {
@@ -1290,6 +1276,40 @@ fn spawn_environment_controller(state: &Arc<ControllerRuntimeState>) -> Option<J
     }
 }
 
+/// The Clone controller (#3108): the single writer of this home's clone launches, cloning each
+/// repository once into its environment. A clone that cannot reach its remote waits for this
+/// host's probe (`remotes`) to reach it again.
+fn spawn_clone_controller(state: &Arc<ControllerRuntimeState>) -> Option<JoinHandle<()>> {
+    use flotilla_provisioning::engine::{clone_actuator::CloneActuator, controller::Controller, reads::StoreReads};
+    let engine = state.provisioning.as_ref()?;
+    let service = match state.daemon.decided_store() {
+        Ok(service) => service,
+        Err(error) => {
+            error!(%error, "the Clone controller has no decided store; clones will not launch");
+            return None;
+        }
+    };
+    let home = service.home().to_owned();
+    let actuator = CloneActuator::new(
+        Arc::new(RoutingCloneRuntime { state: Arc::clone(state) }),
+        StoreReads::new(service.store()),
+        home,
+        engine.clone_facts.clone(),
+        Arc::clone(&state.remote_reachability) as _,
+    );
+    match Controller::start(Arc::clone(&engine.clones), Arc::new(actuator), state.daemon.clock_for_scenarios(), service) {
+        Ok(controller) => Some(tokio::spawn(async move {
+            // No probe observes a clone's backing: what it waits on is in the log.
+            let (_unobserved, backings) = tokio::sync::mpsc::channel(1);
+            controller.run(backings).await
+        })),
+        Err(error) => {
+            error!(%error, "the Clone controller could not start; clones will not launch");
+            None
+        }
+    }
+}
+
 /// The env each vessel's environment is launched with beyond its stored recipe: its crews' skills
 /// and credential grants, from its convoy's frozen requirement.
 struct VesselLaunchEnvironment {
@@ -1309,9 +1329,10 @@ impl flotilla_provisioning::engine::environment_actuator::LaunchEnvironment for 
 /// aggregator) what changed among the environments, written here or replicated.
 async fn open_provisioning_lifecycles(
     daemon: &Arc<InProcessDaemon>,
-) -> Result<(flotilla_provisioning::engine::ProvisioningLifecycles, JoinHandle<()>), String> {
+) -> Result<(flotilla_provisioning::engine::ProvisioningLifecycles, JoinHandle<()>, JoinHandle<()>), String> {
     use flotilla_engine_store::{open_home, open_home_with, StoreLog};
     use flotilla_provisioning::engine::{
+        clones::EngineClones,
         environments::EngineEnvironments,
         launch_log::{LaunchLog, StagedFacts},
         reads::{LifecycleReadPort, StoreReads},
@@ -1332,6 +1353,8 @@ async fn open_provisioning_lifecycles(
         let log = || StoreLog::new(Arc::clone(&store));
         // An environment's launch facts are written in the transaction that realises it.
         let environment_facts = StagedFacts::default();
+        // A clone's facts (the remote's default branch) are written in the transaction that realises it.
+        let clone_facts = StagedFacts::default();
         let terminal_sessions = Arc::new(LifecycleHome::new(&home, open_home(log())?));
         backend.install_terminal_launches(Arc::new(flotilla_provisioning::engine::terminal_session::EngineTerminalLaunches {
             lifecycles: terminal_sessions.clone(),
@@ -1340,7 +1363,8 @@ async fn open_provisioning_lifecycles(
             environments: Arc::new(LifecycleHome::new(&home, open_home_with(&log(), LaunchLog::new(log(), environment_facts.clone()))?)),
             environment_facts,
             image_builds: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
-            clones: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
+            clones: Arc::new(LifecycleHome::new(&home, open_home_with(&log(), LaunchLog::new(log(), clone_facts.clone()))?)),
+            clone_facts,
             checkouts: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
             terminal_sessions,
             vessels: Arc::new(PlacementLifecycles::new(&home, open_home(log())?)?),
@@ -1351,11 +1375,15 @@ async fn open_provisioning_lifecycles(
     // Every environment reader and requester goes through the engine's environments.
     let environments = Arc::new(EngineEnvironments::new(Arc::clone(&lifecycles.environments), Arc::clone(&store)));
     let environment_changes = environments.follow(daemon.decided_store()?)?;
+    // Every clone reader and requester goes through the engine's clones.
+    let clones = Arc::new(EngineClones::new(Arc::clone(&lifecycles.clones) as _, Arc::clone(&store)));
+    let clone_changes = clones.follow(daemon.decided_store()?)?;
     daemon.install_lifecycle_reads(Arc::new(
         LifecycleReadPort::new(StoreReads::new(store), home)
-            .with_environments(environments as Arc<dyn flotilla_resources::environment_records::EnvironmentRecords>),
+            .with_environments(environments as Arc<dyn flotilla_resources::environment_records::EnvironmentRecords>)
+            .with_clones(clones as Arc<dyn flotilla_resources::clone_records::CloneRecords>),
     ))?;
-    Ok((lifecycles, environment_changes))
+    Ok((lifecycles, environment_changes, clone_changes))
 }
 
 /// Which seats a vessel serves (#3629 layer 8): its sessions by their vessel label, with each role

@@ -55,6 +55,16 @@ CREATE TABLE snapshot_cause (
 CREATE TABLE codes (
   kind TEXT NOT NULL, field TEXT NOT NULL, code TEXT NOT NULL, name TEXT NOT NULL,
   PRIMARY KEY (kind, field, code)) STRICT, WITHOUT ROWID;
+CREATE TABLE "clone_facts" (
+  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+  "version" INTEGER NOT NULL,
+  "default_branch" TEXT
+) STRICT;
+CREATE VIEW "clone_facts_view" AS SELECT
+  "clone_facts"."id",
+  "clone_facts"."version",
+  "clone_facts"."default_branch"
+FROM "clone_facts";
 CREATE TABLE "checkout" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
@@ -285,6 +295,7 @@ CREATE TABLE "clone" (
       END)
 ) STRICT;
 CREATE INDEX "clone_by_environment" ON "clone" ("environment", "repository");
+CREATE INDEX "clone_by_repository" ON "clone" ("repository");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cl', 'state', 'go', 'Gone'),
   ('cl', 'state', 'gu', 'GaveUp'),

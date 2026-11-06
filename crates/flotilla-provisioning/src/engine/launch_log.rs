@@ -1,73 +1,99 @@
-//! The Environment's log: a launch is realised together with its facts.
+//! A lifecycle kind's log whose launches are realised together with their facts.
 //!
-//! An Environment launch's [`EnvironmentLaunchFacts`] are written once, in the transaction of the
-//! launch's Realise edge, and never updated (owner's look-over, #3108). The Environment controller
-//! stages a launch's facts here when its provider work reports them, then steps the launch
-//! realised; this log writes the edge and inserts the staged facts under the launch's name in one
-//! change. A Realise with nothing staged is refused, so a realised launch always has its facts.
+//! A launch's facts are written once, in the transaction of the launch's Realise edge, and never
+//! updated (owner's look-overs, #3108): an Environment launch's [`EnvironmentLaunchFacts`], a
+//! Clone launch's [`CloneFacts`]. The kind's controller stages a launch's facts here when its
+//! provider work reports them, then steps the launch realised; this log writes the edge and
+//! inserts the staged facts under the launch's name in one change. A Realise with nothing staged
+//! is refused, so a realised launch always has its facts.
 
 use std::{
     collections::BTreeMap,
+    marker::PhantomData,
     sync::{Arc, Mutex},
 };
 
 use flotilla_engine_store::StoreLog;
-use flotilla_schema::Timestamp;
+use flotilla_schema::{Kind, Timestamp};
 use flotilla_state_machines::{
-    machines::lifecycle::{Lifecycle, LifecycleLabel},
+    machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleLabel},
     EdgeEventOf, InputRead, Log, LogError, Resource, StoredState, Version,
 };
 
-use crate::stored::{environment::EnvironmentKind, launch_facts::EnvironmentLaunchFacts};
-
-type Environment = Lifecycle<EnvironmentKind>;
+#[cfg(doc)]
+use crate::stored::clone::CloneFacts;
+use crate::stored::environment::EnvironmentKind;
+use crate::stored::launch_facts::EnvironmentLaunchFacts;
 
 /// Facts staged for launches about to be realised, by launch name: the provider work's
 /// report, waiting for the Realise edge that writes it.
-#[derive(Clone, Default)]
-pub struct StagedFacts(Arc<Mutex<BTreeMap<String, EnvironmentLaunchFacts>>>);
+pub struct StagedFacts<F = EnvironmentLaunchFacts>(Arc<Mutex<BTreeMap<String, F>>>);
 
-impl StagedFacts {
+impl<F> Clone for StagedFacts<F> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<F> Default for StagedFacts<F> {
+    fn default() -> Self {
+        Self(Arc::default())
+    }
+}
+
+impl<F> StagedFacts<F> {
     /// Stages `facts` for launch `name`'s Realise, replacing any staged before.
-    pub fn stage(&self, name: &str, facts: EnvironmentLaunchFacts) {
+    pub fn stage(&self, name: &str, facts: F) {
         self.lock().insert(name.to_owned(), facts);
     }
 
-    fn take(&self, name: &str) -> Option<EnvironmentLaunchFacts> {
+    fn take(&self, name: &str) -> Option<F> {
         self.lock().remove(name)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, EnvironmentLaunchFacts>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, F>> {
         // A poisoned map is still a map: staging is a plain insert or remove.
         self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
-/// The Environment kind's log over the store: [`StoreLog`]'s writes, with each Realise also
-/// inserting the launch's staged facts.
-#[derive(Clone)]
-pub struct LaunchLog {
+/// Kind `K`'s log over the store: [`StoreLog`]'s writes, with each Realise also inserting the
+/// launch's staged facts `F`.
+pub struct LaunchLog<K = EnvironmentKind, F = EnvironmentLaunchFacts> {
     inner: StoreLog,
-    staged: StagedFacts,
+    staged: StagedFacts<F>,
+    kind: PhantomData<fn() -> K>,
 }
 
-impl LaunchLog {
-    pub fn new(inner: StoreLog, staged: StagedFacts) -> Self {
-        Self { inner, staged }
+impl<K, F> Clone for LaunchLog<K, F> {
+    fn clone(&self) -> Self {
+        Self { inner: self.inner.clone(), staged: self.staged.clone(), kind: PhantomData }
     }
 }
 
-impl Log<Environment> for LaunchLog {
-    fn create(&mut self, writer: &str, at: Timestamp, resource: &Resource<Environment>, reads: &[InputRead]) -> Result<Version, LogError> {
+impl<K, F> LaunchLog<K, F> {
+    pub fn new(inner: StoreLog, staged: StagedFacts<F>) -> Self {
+        Self { inner, staged, kind: PhantomData }
+    }
+}
+
+impl<K, F> Log<Lifecycle<K>> for LaunchLog<K, F>
+where
+    K: LifecycleKind,
+    StoreLog: Log<Lifecycle<K>>,
+    K::Request: flotilla_schema::KindSpec<State = flotilla_state_machines::machines::lifecycle::LifecycleState>,
+    F: Kind,
+{
+    fn create(&mut self, writer: &str, at: Timestamp, resource: &Resource<Lifecycle<K>>, reads: &[InputRead]) -> Result<Version, LogError> {
         self.inner.create(writer, at, resource, reads)
     }
 
     fn edge(
         &mut self,
         writer: &str,
-        previous: &StoredState<Environment>,
-        next: &Resource<Environment>,
-        event: &EdgeEventOf<Environment>,
+        previous: &StoredState<Lifecycle<K>>,
+        next: &Resource<Lifecycle<K>>,
+        event: &EdgeEventOf<Lifecycle<K>>,
     ) -> Result<Version, LogError> {
         self.edge_with_writes(writer, previous, next, event, &[])
     }
@@ -75,10 +101,10 @@ impl Log<Environment> for LaunchLog {
     fn edge_with_writes(
         &mut self,
         writer: &str,
-        previous: &StoredState<Environment>,
-        next: &Resource<Environment>,
-        event: &EdgeEventOf<Environment>,
-        writes: &[<Environment as flotilla_state_machines::Machine>::Write],
+        previous: &StoredState<Lifecycle<K>>,
+        next: &Resource<Lifecycle<K>>,
+        event: &EdgeEventOf<Lifecycle<K>>,
+        writes: &[<Lifecycle<K> as flotilla_state_machines::Machine>::Write],
     ) -> Result<Version, LogError> {
         let name = next.name();
         if event.to != LifecycleLabel::Realised {

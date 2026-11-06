@@ -102,7 +102,6 @@ async fn startup_registration_is_idempotent_and_discovers_existing_clone() {
     let hosts = backend.clone().using::<Host>(NAMESPACE);
     let environments = engine_environments(&daemon);
     let kinds = backend.clone().using::<FulfilmentKind>(NAMESPACE);
-    let clones = backend.using::<Clone>(NAMESPACE);
 
     assert!(hosts.get(&host_id).await.is_ok(), "host resource should exist");
     assert!(
@@ -118,13 +117,11 @@ async fn startup_registration_is_idempotent_and_discovers_existing_clone() {
             &format!("host-direct-{host_id}")
         )
     );
-    let clone = clones.get(&clone_name).await.expect("discovered clone should exist");
-    assert_eq!(clone.spec.url, "git@github.com:flotilla-org/flotilla.git");
-    // The engine's request records the discovery, not the old resource's labels.
-    assert!(!clone.metadata.labels.contains_key("flotilla.work/discovered"));
-    let held = startup_clones(&daemon).get(&clone_name).expect("the engine holds the discovered clone");
-    assert!(held.spec().discovered, "startup discovery requests the clone as discovered");
-    assert_eq!(held.spec().path, clone.spec.path);
+    // Requested once, through the clone port, however often startup runs.
+    let held = environments.reads.clones().expect("clones").get(&clone_name, None).expect("read").expect("discovered clone held");
+    assert_eq!(held.name, flotilla_resources::clone_records::launch(&clone_name, 1));
+    assert_eq!(held.spec.url, "git@github.com:flotilla-org/flotilla.git");
+    assert!(held.discovered, "startup discovery requests the clone as discovered");
 }
 
 fn host_direct_kind_spec(profile: &LocalProvisioningProfile, platform: &str) -> FulfilmentKindSpec {

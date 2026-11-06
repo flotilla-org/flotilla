@@ -4,11 +4,11 @@ use std::{collections::BTreeMap, future::Future, time::Duration};
 
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
-    canonicalize_repo_url, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Clone, ClonePhase, CloneSpec, CloneStatus,
-    Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerEnvironmentSpec, EnvironmentSpec, FulfilmentKind,
-    FulfilmentKindSpec, FulfilmentRealisation, HostDirectEnvironmentSpec, InputMeta, Repository, RepositorySpec, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkCompletionAuthority,
-    WorkPhase, WorkState, WorkflowSnapshot,
+    canonicalize_repo_url, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CloneSpec, Convoy, ConvoyRepositorySpec,
+    ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerEnvironmentSpec, EnvironmentSpec, FulfilmentKind, FulfilmentKindSpec,
+    FulfilmentRealisation, HostDirectEnvironmentSpec, InputMeta, Repository, RepositorySpec, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkCompletionAuthority, WorkPhase, WorkState,
+    WorkflowSnapshot,
 };
 use flotilla_store::{ensure_repository, ResourceBackend};
 use tokio::{
@@ -254,45 +254,22 @@ pub fn create_ready_docker_environment(
         .expect("environment held")
 }
 
-pub async fn create_ready_clone(
-    backend: &ResourceBackend,
-    namespace: &str,
+/// Puts clone `name` ready in `clones`, as the engine holds it: launch 1, realised at `path`,
+/// having found `main`. Returns the launch.
+pub fn create_ready_clone(
+    clones: &flotilla_provisioning_testkit::CloneFixture,
     name: &str,
     repo_url: &str,
     env_ref: &str,
     path: &str,
-) -> flotilla_resources::ResourceObject<Clone> {
-    let clones = backend.clone().using::<Clone>(namespace);
-    let created = clones
-        .create(
-            &meta(name),
-            &CloneSpec {
-                repo_ref: flotilla_resources::RepositoryKey(repo_key(
-                    &canonicalize_repo_url(repo_url).expect("repo URL should canonicalize"),
-                )),
-                url: repo_url.to_string(),
-                env_ref: env_ref.to_string(),
-                path: path.to_string(),
-            },
-        )
-        .await
-        .expect("clone create should succeed");
-    clones
-        .update_status(
-            name,
-            &created.metadata.resource_version,
-            &CloneStatus {
-                phase: ClonePhase::Ready,
-                default_branch: Some("main".to_string()),
-                message: None,
-                failed_at: None,
-                failure_policy: None,
-                retry: None,
-            },
-        )
-        .await
-        .expect("clone status update should succeed");
-    clones.get(name).await.expect("clone get should succeed")
+) -> String {
+    let spec = CloneSpec {
+        repo_ref: flotilla_resources::RepositoryKey(repo_key(&canonicalize_repo_url(repo_url).expect("repo URL should canonicalize"))),
+        url: repo_url.to_string(),
+        env_ref: env_ref.to_string(),
+        path: path.to_string(),
+    };
+    clones.put_named_ready(name, &spec, Some("main"))
 }
 
 #[derive(bon::Builder)]

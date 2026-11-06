@@ -46,7 +46,7 @@ const HOST_REF: &str = "01HXYZ";
 
 // Process/VCS boundary fake: deliberately use a resolved admin name that is
 // different from the target basename; the controller must not guess Git names.
-struct TestWorktreeMetadata(ResourceBackend);
+struct TestWorktreeMetadata(ResourceBackend, Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>);
 #[async_trait]
 impl WorktreeMetadataResolver for TestWorktreeMetadata {
     async fn worktree_metadata(&self, env_ref: &str, target: &str) -> Result<WorktreeMetadata, String> {
@@ -62,7 +62,7 @@ impl WorktreeMetadataResolver for TestWorktreeMetadata {
             .find(|checkout| checkout.spec.target_path() == Some(target) && checkout.spec.env_ref() == Some(env_ref))
             .expect("fixture checkout");
         let CheckoutSpec::Worktree(spec) = checkout.spec else { panic!("worktree fixture") };
-        let clone = self.0.clone().using::<flotilla_resources::Clone>(NAMESPACE).get(&spec.clone_ref).await.map_err(|e| e.to_string())?;
+        let clone = self.1.clones()?.get(&spec.clone_ref, None)?.ok_or_else(|| format!("no clone {}", spec.clone_ref))?;
         let common_dir = std::path::PathBuf::from(clone.spec.path).join(".git");
         let name = std::path::Path::new(target).file_name().expect("target name").to_string_lossy();
         let admin_dir = common_dir.join("worktrees").join(format!("resolved-{name}"));
@@ -87,9 +87,14 @@ fn requested_docker(engine: &VesselFixture, vessel: &str) -> Option<DockerEnviro
     requested_environment(engine, vessel).and_then(|environment| environment.spec.docker)
 }
 
+/// The clones `engine` holds, each requested by a vessel or put there by the test.
+fn requested_clones(engine: &VesselFixture) -> Vec<flotilla_resources::clone_records::CloneRecord> {
+    flotilla_resources::clone_records::CloneRecords::here(engine.clones.clones.as_ref()).expect("clones read")
+}
+
 fn test_vessel_reconciler(backend: ResourceBackend, namespace: &str, engine: &VesselFixture) -> VesselReconciler {
     VesselReconciler::new(backend.clone(), namespace)
-        .with_worktree_metadata(Arc::new(TestWorktreeMetadata(backend)))
+        .with_worktree_metadata(Arc::new(TestWorktreeMetadata(backend, engine.reads.clone())))
         .with_lifecycle_reads(engine.reads.clone())
 }
 
@@ -312,10 +317,8 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
     let deps = reconciler.prepare(&vessel).await.expect("deps should load");
     let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
 
-    assert!(outcome
-        .actuations
-        .iter()
-        .all(|actuation| !matches!(actuation, Actuation::CreateClone { .. } | Actuation::CreateCheckout { .. })));
+    assert!(outcome.actuations.iter().all(|actuation| !matches!(actuation, Actuation::CreateCheckout { .. })));
+    assert!(requested_clones(lease_engine).is_empty(), "a repositoryless vessel requests no clone");
     assert!(outcome.actuations.iter().any(|actuation| {
         matches!(actuation, Actuation::CreateTerminalSession { spec, .. }
             if spec.cwd == "/Users/alice/dev/flotilla-repos" && spec.source == TerminalSessionSource::Tool { command: "bash".to_string() })
@@ -348,7 +351,7 @@ async fn ready_vessel_records_requested_and_effective_stance() {
     create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     let clone_name =
         format!("clone-{}", clone_key(&canonicalize_repo_url(REPO_URL).expect("repo canonicalization"), &host_direct_env_name()));
-    create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone").await;
+    create_ready_clone(&lease_engine.clones, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone");
     let checkout_path = "/Users/alice/dev/flotilla-repos/workspace-stance";
     create_ready_checkout(
         &backend,
@@ -426,7 +429,7 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
     create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     let clone_name =
         format!("clone-{}", clone_key(&canonicalize_repo_url(REPO_URL).expect("repo canonicalization"), &host_direct_env_name()));
-    create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone").await;
+    create_ready_clone(&lease_engine.clones, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone");
     let implement =
         create_workspace(&backend, NAMESPACE, "workspace-shared-implement", "convoy-shared", "implement", "policy-shared", REPO_URL).await;
     let review =
@@ -504,7 +507,7 @@ async fn stuck_provisioning_vessel_surfaces_the_statusless_checkout_it_is_retryi
     create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     let clone_name =
         format!("clone-{}", clone_key(&canonicalize_repo_url(REPO_URL).expect("repo canonicalization"), &host_direct_env_name()));
-    create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone").await;
+    create_ready_clone(&lease_engine.clones, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone");
     let vessels = backend.clone().using::<Vessel>(NAMESPACE);
     let vessel = create_workspace(&backend, NAMESPACE, "workspace-stuck", "convoy-stuck", "implement", "policy-stuck", REPO_URL).await;
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
@@ -564,7 +567,7 @@ async fn unrelated_convoys_with_the_same_branch_use_distinct_worktree_paths() {
     create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     let clone_name =
         format!("clone-{}", clone_key(&canonicalize_repo_url(REPO_URL).expect("repo canonicalization"), &host_direct_env_name()));
-    create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone").await;
+    create_ready_clone(&lease_engine.clones, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone");
     let first = create_workspace(&backend, NAMESPACE, "workspace-one", "convoy-one", "implement", "policy-shared-branch", REPO_URL).await;
     let second = create_workspace(&backend, NAMESPACE, "workspace-two", "convoy-two", "implement", "policy-shared-branch", REPO_URL).await;
 
@@ -730,8 +733,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
                 &host_direct_env_name()
             )
         );
-        create_ready_clone(&backend, NAMESPACE, &clone_name, url, &host_direct_env_name(), &format!("/clones/{}", repository.leaf_slug()))
-            .await;
+        create_ready_clone(&lease_engine.clones, &clone_name, url, &host_direct_env_name(), &format!("/clones/{}", repository.leaf_slug()));
     }
     let vessel = backend
         .clone()
@@ -933,20 +935,20 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
     .await;
     create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
 
+    // Each engine below holds both repositories' clones, which the checkouts name.
+    let put_clones = |engine: &VesselFixture| {
+        for slug in ["flotilla", "cleat"] {
+            create_ready_clone(
+                &engine.clones,
+                &format!("clone-{slug}"),
+                &format!("https://github.com/flotilla-org/{slug}"),
+                &host_direct_env_name(),
+                &format!("/Users/alice/dev/flotilla-repos/{slug}"),
+            );
+        }
+    };
+    put_clones(lease_engine);
     for (repository, slug) in [(&repositories[0], "flotilla"), (&repositories[1], "cleat")] {
-        create_ready_clone(
-            &backend,
-            NAMESPACE,
-            &format!("clone-{slug}"),
-            match slug {
-                "flotilla" => "https://github.com/flotilla-org/flotilla",
-                "cleat" => "https://github.com/flotilla-org/cleat",
-                _ => unreachable!("fixture repository slug"),
-            },
-            &host_direct_env_name(),
-            &format!("/Users/alice/dev/flotilla-repos/{slug}"),
-        )
-        .await;
         let name = format!("checkout-convoy-multi-docker-{slug}");
         let path = format!("/Users/alice/dev/flotilla-repos/workspace-multi-docker/{slug}");
         let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
@@ -1037,6 +1039,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
     legacy.mounts.retain(|mount| !mount.source_path.contains("/worktrees"));
     let legacy_engine = &VesselFixture::new(false);
     create_ready_host_direct_environment(&legacy_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
+    put_clones(legacy_engine);
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, legacy_engine);
     let environment = create_ready_docker_environment(&legacy_engine.environments, "env-workspace-multi-docker", legacy);
     let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
@@ -1094,6 +1097,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
     stale.mounts.pop();
     let stale_engine = &VesselFixture::new(false);
     create_ready_host_direct_environment(&stale_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
+    put_clones(stale_engine);
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, stale_engine);
     create_ready_docker_environment(&stale_engine.environments, "env-workspace-multi-docker", stale);
     let deps = reconciler.prepare(&vessel).await.expect("stale environment");
@@ -1114,6 +1118,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
     });
     let reordered_engine = &VesselFixture::new(false);
     create_ready_host_direct_environment(&reordered_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
+    put_clones(reordered_engine);
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, reordered_engine);
     create_ready_docker_environment(&reordered_engine.environments, "env-workspace-multi-docker", reordered);
     let deps = reconciler.prepare(&vessel).await.expect("matching membership");
@@ -1249,14 +1254,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&vessel).await.expect("deps should load");
     let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
-    let clone = outcome
-        .actuations
-        .iter()
-        .find_map(|actuation| match actuation {
-            Actuation::CreateClone { spec, .. } => Some(spec),
-            _ => None,
-        })
-        .expect("scoped repository clone should be created");
+    let clone = requested_clones(lease_engine).into_iter().next().expect("scoped repository clone should be requested").spec;
     assert_eq!(clone.path, "/Users/alice/dev/flotilla-repos/cleat");
     let (checkout_name, checkout) = outcome
         .actuations
@@ -1317,12 +1315,11 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
         .await
         .expect("adopted vessel should create");
 
+    let clones = requested_clones(lease_engine);
     let deps = reconciler.prepare(&adopted_vessel).await.expect("adopted deps should load");
     let outcome = reconciler.reconcile(&adopted_vessel, &deps, Utc::now());
-    assert!(outcome
-        .actuations
-        .iter()
-        .all(|actuation| !matches!(actuation, Actuation::CreateClone { .. } | Actuation::CreateCheckout { .. })));
+    assert!(outcome.actuations.iter().all(|actuation| !matches!(actuation, Actuation::CreateCheckout { .. })));
+    assert_eq!(requested_clones(lease_engine), clones, "an adopted checkout requests no clone");
     assert!(matches!(
         outcome.patch,
         Some(flotilla_resources::VesselStatusPatch::MarkReady { checkout_refs, .. })
@@ -1658,14 +1655,15 @@ async fn reuses_existing_clone_by_deterministic_name() {
 
     let canonical_repo = canonicalize_repo_url(REPO_URL).expect("repo canonicalization");
     let clone_name = format!("clone-{}", clone_key(&canonical_repo, &host_direct_env_name()));
-    create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone").await;
+    let launch =
+        create_ready_clone(&lease_engine.clones, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone");
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-b", "convoy-b", "implement", "policy-a", REPO_URL).await;
 
     let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
-    assert!(outcome.actuations.iter().all(|actuation| !matches!(actuation, Actuation::CreateClone { .. })));
+    assert_eq!(requested_clones(lease_engine).len(), 1, "the ready clone is reused, not requested again");
     assert!(outcome.actuations.iter().any(|actuation| {
         matches!(
             actuation,
@@ -1673,7 +1671,7 @@ async fn reuses_existing_clone_by_deterministic_name() {
                 if matches!(
                     spec,
                     CheckoutSpec::Worktree(worktree)
-                        if worktree.clone_ref == clone_name && worktree.base_ref.as_deref() == Some(GIT_REF)
+                        if worktree.clone_ref == launch && worktree.base_ref.as_deref() == Some(GIT_REF)
                 )
         )
     }));
@@ -1700,7 +1698,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
 
     let canonical_repo = canonicalize_repo_url(REPO_URL).expect("repo canonicalization");
     let clone_name = format!("clone-{}", clone_key(&canonical_repo, &host_direct_env_name()));
-    create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone").await;
+    create_ready_clone(&lease_engine.clones, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone");
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-c", "convoy-c", "implement", "policy-worktree", REPO_URL).await;
 
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
@@ -2005,7 +2003,7 @@ async fn create_ready_host_worktree(backend: &ResourceBackend, lease_engine: &Ve
     create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     let canonical_repo = canonicalize_repo_url(REPO_URL).expect("repo canonicalization");
     let clone_name = format!("clone-{}", clone_key(&canonical_repo, &host_direct_env_name()));
-    create_ready_clone(backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone").await;
+    create_ready_clone(&lease_engine.clones, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone");
     let path = format!("/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.{workspace_name}");
     create_ready_checkout(
         backend,
@@ -2065,7 +2063,7 @@ async fn child_failure_propagates_to_workspace_failure() {
 
     let canonical_repo = canonicalize_repo_url(REPO_URL).expect("repo canonicalization");
     let clone_name = format!("clone-{}", clone_key(&canonical_repo, &host_direct_env_name()));
-    create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone").await;
+    create_ready_clone(&lease_engine.clones, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone");
     create_ready_checkout(
         &backend,
         NAMESPACE,
@@ -2142,7 +2140,7 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
     create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     let clone_name =
         format!("clone-{}", clone_key(&canonicalize_repo_url(REPO_URL).expect("repo canonicalization"), &host_direct_env_name()));
-    create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone").await;
+    create_ready_clone(&lease_engine.clones, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone");
     let checkout_path = "/Users/alice/dev/flotilla-repos/convoy-recover";
     create_ready_checkout(
         &backend,
@@ -2209,8 +2207,9 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
         let terminal = backend.using::<TerminalSession>(NAMESPACE).get(terminal_name).await.expect("terminal");
         lifecycle.request(&terminal);
         lifecycle.finish(&terminal, flotilla_provisioning_testkit::Ending::Released);
-        // These reads replace the lease engine's, so they hold the vessel's environment too.
+        // These reads replace the lease engine's, so they hold the vessel's environment and clone too.
         create_ready_host_direct_environment(&lifecycle.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
+        create_ready_clone(&lifecycle.clones, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone");
         test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine).with_lifecycle_reads(lifecycle.reads.clone())
     } else {
         test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine)
@@ -2281,10 +2280,8 @@ async fn adopted_checkout_ref_reuses_checkout_without_creating_clone_or_checkout
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
-    assert!(outcome
-        .actuations
-        .iter()
-        .all(|actuation| { !matches!(actuation, Actuation::CreateClone { .. } | Actuation::CreateCheckout { .. }) }));
+    assert!(outcome.actuations.iter().all(|actuation| !matches!(actuation, Actuation::CreateCheckout { .. })));
+    assert!(requested_clones(lease_engine).is_empty(), "an adopted checkout requests no clone");
     assert!(outcome.actuations.iter().any(|actuation| {
         matches!(
             actuation,
@@ -2720,7 +2717,7 @@ async fn observed_checkout_at_managed_name_marks_workspace_failed() {
 
     let canonical_repo = canonicalize_repo_url(REPO_URL).expect("repo canonicalization");
     let clone_name = format!("clone-{}", clone_key(&canonical_repo, &host_direct_env_name()));
-    create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone").await;
+    create_ready_clone(&lease_engine.clones, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone");
     create_ready_observed_checkout_without_status_path(&backend, NAMESPACE, "checkout-convoy-observed").await;
     let workspace =
         create_workspace(&backend, NAMESPACE, "workspace-observed", "convoy-observed", "implement", "policy-observed", REPO_URL).await;
@@ -2870,7 +2867,7 @@ async fn terminal_session_actuation_includes_system_and_user_labels() {
 
     let canonical_repo = canonicalize_repo_url(REPO_URL).expect("repo canonicalization");
     let clone_name = format!("clone-{}", clone_key(&canonical_repo, &host_direct_env_name()));
-    create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone").await;
+    create_ready_clone(&lease_engine.clones, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone");
     create_ready_checkout(
         &backend,
         NAMESPACE,
@@ -2953,7 +2950,7 @@ async fn assert_terminal_cwd_for_strategy(
 
     let canonical_repo = canonicalize_repo_url(REPO_URL).expect("repo canonicalization");
     let clone_name = format!("clone-{}", clone_key(&canonical_repo, &host_direct_env_name()));
-    create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone").await;
+    create_ready_clone(&lease_engine.clones, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone");
     if let Some(docker) = docker_env {
         create_ready_docker_environment(&lease_engine.environments, &format!("env-{workspace_name}"), docker);
     }

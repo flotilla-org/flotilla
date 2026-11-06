@@ -52,6 +52,12 @@ pub trait LifecycleReads: Send + Sync {
         Err("environment records are not served without the engine".into())
     }
 
+    /// The engine's clones (#3108): every clone reader and requester goes through them.
+    /// Unavailable where no engine is installed.
+    fn clones(&self) -> Result<&dyn crate::clone_records::CloneRecords, String> {
+        Err("clone records are not served without the engine".into())
+    }
+
     /// The reading of `name` homed at `origin` (a replica's origin root; `None` for this home), or
     /// `None` when the engine holds no such resource: the switch is off, or it was written before.
     ///
@@ -112,6 +118,10 @@ impl LifecycleReads for LateLifecycleReads {
 
     fn environments(&self) -> Result<&dyn crate::environment_records::EnvironmentRecords, String> {
         self.installed.get().ok_or_else(|| "provisioning lifecycle reads are not installed".to_owned())?.environments()
+    }
+
+    fn clones(&self) -> Result<&dyn crate::clone_records::CloneRecords, String> {
+        self.installed.get().ok_or_else(|| "provisioning lifecycle reads are not installed".to_owned())?.clones()
     }
 
     fn try_reading(

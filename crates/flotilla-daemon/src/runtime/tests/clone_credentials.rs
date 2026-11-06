@@ -98,6 +98,8 @@ async fn cloud_vessel() -> CloudVessel {
     }
     let config = Arc::new(ConfigStore::with_base(temp.path()));
     let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+    // The engine's readings, which a running daemon always has: they hold no clone here.
+    engine_environments(&daemon);
     daemon
         .resource_backend()
         .definitions::<CredentialSpec>(NAMESPACE)

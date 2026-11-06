@@ -252,6 +252,16 @@ pub struct ExplainedCheckout {
     /// The engine's judgement of the checkout, when `[primitives]` is on and the engine holds it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<crate::LifecycleReading>,
+    /// The clone launch a worktree checkout is made from, as the engine reads it (#3108).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone: Option<ExplainedClone>,
+}
+
+/// One clone launch (`<clone>#<n>`) and the engine's reading of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedClone {
+    pub name: String,
+    pub reading: crate::LifecycleReading,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

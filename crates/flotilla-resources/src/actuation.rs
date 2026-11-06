@@ -1,10 +1,7 @@
-use crate::{CheckoutSpec, CloneSpec, InputMeta, TerminalSessionSpec, VesselSpec};
-use chrono::{DateTime, Utc};
+use crate::{CheckoutSpec, InputMeta, TerminalSessionSpec, VesselSpec};
 #[derive(Debug, Clone)]
 pub enum Actuation {
     CreateRepository { key: crate::RepositoryKey, spec: crate::RepositorySpec },
-    CreateClone { meta: InputMeta, spec: CloneSpec },
-    RetryClone { name: String, failed_at: DateTime<Utc> },
     CreateCheckout { meta: InputMeta, spec: CheckoutSpec },
     // Boxed: the spec dwarfs every other variant.
     CreateTerminalSession { meta: InputMeta, spec: Box<TerminalSessionSpec> },

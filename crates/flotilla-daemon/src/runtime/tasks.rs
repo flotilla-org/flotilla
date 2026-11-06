@@ -23,9 +23,9 @@ use flotilla_discovery::registry::{command_provider_registry, ProviderRegistry};
 use flotilla_environment::environment::EnvironmentInput;
 use flotilla_protocol::CanonicalHostId;
 use flotilla_resources::{
-    Checkout, Clone, Convoy, FulfilmentFacts, Host, HostStatusPatch, Resource, ResourceError, RetryBackoff, TerminalSession, Vessel,
+    Checkout, Convoy, FulfilmentFacts, Host, HostStatusPatch, Resource, ResourceError, RetryBackoff, TerminalSession, Vessel,
 };
-use flotilla_store::{watch_resource_kind, watch_resource_kind_including_replicas, ResourceBackend};
+use flotilla_store::{watch_resource_kind_including_replicas, ResourceBackend};
 use flotilla_vcs::vcs::REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT;
 use futures::stream::{BoxStream, SelectAll};
 use futures::FutureExt;
@@ -126,9 +126,11 @@ pub(super) async fn run_checkout_archive_gc(backend: ResourceBackend, namespace:
                 Ok(recorded) => roots.extend(recorded),
                 Err(error) => warn!(%error, "checkout archive sweep could not load archive roots"),
             }
-            match backend.clone().using::<Clone>(&namespace).list().await {
+            let reads = archive_sweep.daemon.lifecycle_reads();
+            match tokio::task::spawn_blocking(move || reads.clones()?.here()).await.map_err(|error| error.to_string()).and_then(|here| here)
+            {
                 Ok(clones) => {
-                    for clone in clones.items {
+                    for clone in clones {
                         if let Some(parent) = Path::new(&clone.spec.path).parent() {
                             roots.insert(CheckoutArchiveRoot { env_ref: clone.spec.env_ref, path: parent.join(".flotilla-archives") });
                         }
@@ -516,14 +518,16 @@ pub(super) fn spawn_heartbeat_task_with_credentials(
     runtime_health: RuntimeHealth,
     interval: Duration,
 ) -> JoinHandle<()> {
-    spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
-        let daemon = Arc::clone(&daemon);
-        let namespace = namespace.clone();
-        let profile = profile.clone();
-        let credential_store = Arc::clone(&credential_store);
-        let health = health.clone();
-        let runtime_health = runtime_health.clone();
-        async move {
+    // Each tick publishes, and so does a condition that must not wait for one (a remote a clone
+    // could not reach).
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                () = runtime_health.heartbeat_now.notified() => {}
+            }
             if let Err(err) =
                 apply_host_heartbeat_with_credentials(&daemon, &namespace, &profile, credential_store.as_deref(), &health, &runtime_health)
                     .await
@@ -822,10 +826,19 @@ pub(super) fn spawn_dispatch_reconciler_task(daemon: Arc<InProcessDaemon>, names
 pub(super) async fn convoy_ensure_dependency_watches(
     backend: &ResourceBackend,
     namespace: &str,
+    reads: &Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
 ) -> SelectAll<BoxStream<'static, Result<Value, ResourceError>>> {
     let mut watches = Vec::new();
-    match watch_resource_kind(backend, namespace, "Clone").await {
-        Ok(watch) => watches.push(watch.stream),
+    match reads.clones() {
+        Ok(clones) => {
+            let changed = futures::stream::unfold(clones.changes(), |mut changes| async move {
+                match changes.recv().await {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some((Ok(Value::Null), changes)),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+                }
+            });
+            watches.push(Box::pin(changed) as BoxStream<'static, Result<Value, ResourceError>>);
+        }
         Err(error) => warn!(kind = "Clone", %error, "could not watch standing convoy admission trigger"),
     }
     // Clone and ConvoyEnsure lifecycle changes are trigger dependencies:
@@ -872,7 +885,7 @@ pub(super) fn spawn_convoy_ensure_reconciler_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let backend = state.daemon.resource_backend();
-        let mut dependency_events = convoy_ensure_dependency_watches(&backend, &namespace).await;
+        let mut dependency_events = convoy_ensure_dependency_watches(&backend, &namespace, &state.daemon.lifecycle_reads()).await;
         let mut resync = tokio::time::interval(interval);
         resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -896,7 +909,7 @@ pub(super) fn spawn_convoy_ensure_reconciler_task(
             if restart_watches {
                 // Reconciliation below is level-triggered; re-arm dependencies
                 // after overflow so subsequent changes still wake admission.
-                dependency_events = convoy_ensure_dependency_watches(&backend, &namespace).await;
+                dependency_events = convoy_ensure_dependency_watches(&backend, &namespace, &state.daemon.lifecycle_reads()).await;
             }
             let result = run_watched_operation(
                 interval,
