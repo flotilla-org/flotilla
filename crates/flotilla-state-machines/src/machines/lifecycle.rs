@@ -62,16 +62,72 @@ pub enum Ending {
 }
 
 /// The observation that ended a realised lifecycle.
+///
+/// A lost thing may carry why its home lost it (`cgroup_oom`, say): the
+/// reason travels in the `Vanish` edge's arguments, so readers find it in the
+/// log entry that ended the record, and the stored [`Ending`] stays `Lost`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "VanishCauseRecord")]
 pub enum VanishCause {
-    Lost,
+    Lost { reason: Option<String> },
     Failed { reason: String },
+}
+
+impl VanishCause {
+    /// Lost, with no reason known.
+    pub const fn lost() -> Self {
+        VanishCause::Lost { reason: None }
+    }
+
+    /// Why the thing vanished, when the home said.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            VanishCause::Lost { reason } => reason.as_deref(),
+            VanishCause::Failed { reason } => Some(reason),
+        }
+    }
+}
+
+/// Every `Vanish` cause the log holds: the current shape, and the bare `Lost`
+/// the previous generation wrote before a lost thing carried its reason.
+/// Remove the bare form one fleet roll after this lands (ADR 0047 N→N+1).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum VanishCauseRecord {
+    Current(CurrentVanishCause),
+    Bare(BareVanishCause),
+}
+
+#[derive(Deserialize)]
+enum CurrentVanishCause {
+    Lost {
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    Failed {
+        reason: String,
+    },
+}
+
+#[derive(Deserialize)]
+enum BareVanishCause {
+    Lost,
+}
+
+impl From<VanishCauseRecord> for VanishCause {
+    fn from(record: VanishCauseRecord) -> Self {
+        match record {
+            VanishCauseRecord::Current(CurrentVanishCause::Lost { reason }) => VanishCause::Lost { reason },
+            VanishCauseRecord::Current(CurrentVanishCause::Failed { reason }) => VanishCause::Failed { reason },
+            VanishCauseRecord::Bare(BareVanishCause::Lost) => VanishCause::lost(),
+        }
+    }
 }
 
 impl From<&VanishCause> for Ending {
     fn from(cause: &VanishCause) -> Self {
         match cause {
-            VanishCause::Lost => Self::Lost,
+            VanishCause::Lost { .. } => Self::Lost,
             VanishCause::Failed { reason } => Self::Failed { reason: reason.clone() },
         }
     }

@@ -398,7 +398,7 @@ fn provisioning_load() {
     let started = Instant::now();
     for n in &locals {
         let view = reads.checkout(&format!("checkout-{n}-d"), "local").expect("read").expect("held");
-        assert_eq!(view.judgement, Judgement::Lost, "told from its last log entry");
+        assert_eq!(view.judgement, Judgement::Lost { reason: None }, "told from its last log entry");
     }
     eprintln!("{:>40}: {:>8.1} µs/query", "port: one Gone checkout, judged", started.elapsed().as_secs_f64() * 1e6 / locals.len() as f64);
     let started = Instant::now();

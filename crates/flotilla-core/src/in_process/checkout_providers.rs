@@ -508,7 +508,7 @@ mod lifecycle_contract {
                         Ok(Some(if self.0.fetch_add(1, Ordering::SeqCst) < 2 {
                             LifecycleReading::Ready { identity: "/engine-path".into() }
                         } else {
-                            LifecycleReading::Lost
+                            LifecycleReading::Lost { reason: None }
                         }))
                     }
                 }

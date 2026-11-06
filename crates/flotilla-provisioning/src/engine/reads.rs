@@ -10,9 +10,10 @@ use std::sync::{Arc, Mutex};
 use flotilla_schema::{Address, IndexQuery, Kind, Ref, Timestamp};
 use flotilla_schema_sqlite::{Read, ResourceId, Store, StoreError};
 use flotilla_state_machines::{
+    edge_event,
     machines::{
         convoy::ConvoyId,
-        lifecycle::{Ending, Lifecycle, LifecycleKind, LifecycleState},
+        lifecycle::{Ending, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleState, VanishCause},
         vessel::{VesselKind, VesselSpec},
     },
     Cause, Resource,
@@ -38,8 +39,9 @@ pub enum Judgement {
     Exhausted { last: Cause },
     /// Realised under `identity`.
     Ready { identity: String },
-    /// Gone, observed absent without a release.
-    Lost,
+    /// Gone, observed absent without a release; `reason` is why, when its home said, read from
+    /// the `Vanish` entry that ended it.
+    Lost { reason: Option<String> },
     /// Gone after an observed failure.
     Failed { reason: String },
     /// Gone, torn down on purpose.
@@ -81,7 +83,7 @@ pub fn judge<K: LifecycleKind>(state: &LifecycleState) -> Judgement {
         LifecycleState::Realised { identity } => Judgement::Ready { identity: identity.clone() },
         LifecycleState::Gone { ending } => match ending {
             Ending::Released => Judgement::Released,
-            Ending::Lost => Judgement::Lost,
+            Ending::Lost => Judgement::Lost { reason: None },
             Ending::Failed { reason } => Judgement::Failed { reason: reason.clone() },
         },
         LifecycleState::GaveUp { cause } => Judgement::GaveUp { cause: cause.clone() },
@@ -231,14 +233,43 @@ where
 {
     let Some(loaded) = read.load::<Resource<Lifecycle<K>>>(id)? else { return Ok(None) };
     let state = loaded.value.state().clone();
+    let judgement = match judge::<K>(&state) {
+        Judgement::Lost { .. } => Judgement::Lost { reason: lost_reason::<K>(read, id)? },
+        judgement => judgement,
+    };
     Ok(Some(View {
-        judgement: judge::<K>(&state),
+        judgement,
         name: loaded.name,
         home: loaded.home,
         request: loaded.value.spec().clone(),
         since: loaded.value.since(),
         state,
     }))
+}
+
+/// Why `id` was lost, when its home said: the reason its `Vanish` entry carries. The few
+/// entries of one lifecycle resource are read in order; the latest `Vanish` is the one that
+/// ended it. A replica holding the record from a snapshot has no entry yet, and no reason.
+fn lost_reason<K>(read: &mut Read<'_>, id: ResourceId) -> Result<Option<String>, ReadError>
+where
+    K: LifecycleKind,
+{
+    let mut reason = None;
+    let mut after = 0;
+    loop {
+        let entries = read.changes(id, after, 64)?;
+        let Some(last) = entries.last() else { return Ok(reason) };
+        after = last.home_seq;
+        for entry in &entries {
+            let edge = edge_event::<Lifecycle<K>>(entry, Timestamp(0)).map_err(|error| ReadError(error.to_string()))?;
+            if let Some(LifecycleEdge::Vanish(vanish)) = edge.map(|edge| edge.arguments) {
+                reason = match vanish.cause {
+                    VanishCause::Lost { reason } => reason,
+                    VanishCause::Failed { .. } => None,
+                };
+            }
+        }
+    }
 }
 
 pub(crate) fn keyed<K>(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<View<K>>, ReadError>
@@ -363,7 +394,7 @@ impl Judgement {
             Judgement::Exhausted { last } => LifecycleReading::Exhausted { cause: last.detail.clone() },
             Judgement::Ready { identity } => LifecycleReading::Ready { identity: identity.clone() },
             Judgement::Failed { reason } => LifecycleReading::Failed { reason: reason.clone() },
-            Judgement::Lost => LifecycleReading::Lost,
+            Judgement::Lost { reason } => LifecycleReading::Lost { reason: reason.clone() },
             Judgement::Released => LifecycleReading::Released,
             Judgement::GaveUp { cause } => LifecycleReading::GaveUp { cause: cause.detail.clone() },
         }

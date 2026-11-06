@@ -392,11 +392,19 @@ pub(super) fn startup_clones(
     Arc::new(flotilla_provisioning::engine::LifecycleHome::new(&home, flotilla_engine_store::open_home(log).expect("clone home")))
 }
 
-/// Startup seeding as the runtime runs it, over a freshly opened engine Clone home.
+/// Startup seeding as the runtime runs it, over a freshly opened engine Clone home and the
+/// daemon's [`engine_environments`], with its host-direct root realised.
 pub(super) async fn register_startup(
     daemon: &Arc<InProcessDaemon>,
     namespace: &str,
     profile: &LocalProvisioningProfile,
 ) -> Result<(), String> {
-    register_startup_resources(daemon, namespace, profile, &startup_clones(daemon)).await
+    let environments = engine_environments(daemon);
+    register_startup_resources(daemon, namespace, profile, &startup_clones(daemon)).await?;
+    // No Environment controller runs here: the host-direct root is realised as it would realise it.
+    let name = profile.host_direct_environment_name();
+    if environments.environments.find(&name)?.is_some_and(|environment| !environment.is_ready() && !environment.ended()) {
+        environments.ready(&name, &profile.repo_default_dir, Default::default());
+    }
+    Ok(())
 }

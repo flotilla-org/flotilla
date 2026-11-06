@@ -37,15 +37,13 @@ use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::CanonicalHostId;
 use flotilla_provisioning::engine::{
-    checkout::CheckoutBinding, clone::CloneBinding, environment::EnvironmentBinding, image_build::ImageBuildBinding,
-    terminal_session::TerminalSessionBinding, vessel::VesselBinding, Engine,
+    checkout::CheckoutBinding, clone::CloneBinding, image_build::ImageBuildBinding, terminal_session::TerminalSessionBinding,
+    vessel::VesselBinding, Engine,
 };
-use flotilla_provisioning::reconcilers::{
-    CheckoutReconciler, CloneReconciler, EnvironmentReconciler, ForgeDefaultBranchResolver, RepositoryReconciler,
-};
+use flotilla_provisioning::reconcilers::{CheckoutReconciler, CloneReconciler, ForgeDefaultBranchResolver, RepositoryReconciler};
 use flotilla_resources::LANDING_EVIDENCE_TTL;
 use flotilla_resources::{
-    host_direct_environment_name, ChangeRequest, Checkout, Clone, Convoy, Environment, Forge, Host, Repository, Resource, ResourceError,
+    host_direct_environment_name, ChangeRequest, Checkout, Clone, Convoy, Forge, Host, Repository, Resource, ResourceError,
     TerminalSession, Vessel, WorkflowTemplate,
 };
 use flotilla_store::{controller::ControllerLoop, ResourceBackend};
@@ -180,7 +178,7 @@ impl DaemonRuntime {
         let daemon_config = config.load_daemon_config()?;
         // ADR 0064 (#3108): Message and the provisioning lifecycles run on the decided store.
         result_phase("open_message_primitives", open_message_primitives(&daemon)).await?;
-        let provisioning = open_provisioning_lifecycles(&daemon).await?;
+        let (provisioning, environment_changes) = open_provisioning_lifecycles(&daemon).await?;
         let startup_clones: Arc<dyn flotilla_provisioning::engine::Lifecycles<flotilla_provisioning::stored::clone::CloneKind>> =
             Arc::clone(&provisioning.clones);
         let provisioning_lifecycles = Some(provisioning);
@@ -305,7 +303,14 @@ impl DaemonRuntime {
         let mut registered_ssh_profiles = Vec::new();
         for ssh in ssh_profiles {
             if let Err(error) = retry_phase("register_ssh_host_resources", || async {
-                register_ssh_host_resources(&daemon.resource_backend(), &options.namespace, &profile.host_id, &ssh).await
+                register_ssh_host_resources(
+                    &daemon.resource_backend(),
+                    daemon.lifecycle_reads(),
+                    &options.namespace,
+                    &profile.host_id,
+                    &ssh,
+                )
+                .await
             })
             .await
             {
@@ -328,6 +333,7 @@ impl DaemonRuntime {
         .await?;
 
         let mut tasks = vec![
+            environment_changes,
             spawn_local_fulfilment_probe_task(
                 Arc::clone(&daemon),
                 options.namespace.clone(),
@@ -615,13 +621,15 @@ impl StartupRestoration {
         if let Some((_, provider)) =
             local_registry.environment_providers.for_legacy_input(flotilla_environment::environment::EnvironmentInput::Docker)
         {
-            let live =
-                phase("list_environments_for_credential_sweep", daemon.resource_backend().using::<Environment>(&options.namespace).list())
-                    .await;
+            let reads = daemon.lifecycle_reads();
+            let live = phase("list_environments_for_credential_sweep", tokio::task::spawn_blocking(move || reads.environments()?.live()))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|live| live);
             let running = phase("list_docker_backings_for_credential_sweep", provider.list()).await;
             match (live, running) {
                 (Ok(live), Ok(running)) => {
-                    let live = live.items.into_iter().map(|environment| environment.metadata.name).collect::<BTreeSet<_>>();
+                    let live = live.into_iter().map(|environment| environment.name).collect::<BTreeSet<_>>();
                     let running = running.into_iter().map(|handle| handle.id().to_string()).collect::<BTreeSet<_>>();
                     if let Err(error) =
                         phase("sweep_orphaned_registry_configs", credential_store.sweep_orphaned_registry_configs(&live, &running)).await
@@ -886,36 +894,18 @@ fn spawn_controller_loops(
             runtime_health.clone(),
         ),
         controller!(Repository, {
+            let lifecycle_reads = state.daemon.lifecycle_reads();
             let observed_backend = observed_backend.clone();
             let forge_default_branch_resolver = forge_default_branch_resolver.clone();
             move |backend: ResourceBackend, namespace_string: String| {
                 let observed_backend = observed_backend.clone();
                 let forge_default_branch_resolver = forge_default_branch_resolver.clone();
-                let mut reconciler = RepositoryReconciler::new(backend, observed_backend.clone(), &namespace_string);
+                let mut reconciler = RepositoryReconciler::new(backend, observed_backend.clone(), &namespace_string)
+                    .with_lifecycle_reads(lifecycle_reads.clone());
                 if let Some(resolver) = forge_default_branch_resolver {
                     reconciler = reconciler.with_forge_default_branch_resolver(resolver);
                 }
                 (RepositoryReconciler::secondary_watches(observed_backend, &namespace_string), reconciler)
-            }
-        }),
-        controller!(Environment, {
-            let state = Arc::clone(&state);
-            move |backend: ResourceBackend, namespace_string: String| {
-                let local_host_ref = state.local_host_ref.clone();
-                let additional_host_refs = state.ssh_host_refs();
-                let lifecycle_reads = state.daemon.lifecycle_reads();
-                let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.environments));
-                let state = Arc::clone(&state);
-                (
-                    vec![],
-                    Engine::<_, EnvironmentBinding>::new(
-                        EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state }), backend, &namespace_string)
-                            .with_lifecycle_reads(lifecycle_reads)
-                            .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
-                            .with_additional_host_refs(additional_host_refs),
-                        lifecycles,
-                    ),
-                )
             }
         }),
         controller!(Clone, {
@@ -995,8 +985,13 @@ fn spawn_controller_loops(
                 let local_host_ref = local_host_ref.clone();
                 let additional_host_refs = additional_host_refs.clone();
                 let lifecycles = state.provisioning.as_ref().map(|engine| Arc::clone(&engine.vessels));
+                let mut secondaries = VesselReconciler::secondary_watches();
+                // A vessel's environment is the engine's: its changes wake the vessel holding it.
+                if let Ok(service) = state.daemon.decided_store() {
+                    secondaries.push(Box::new(flotilla_provisioning::engine::environments::EnvironmentHolderWake::new(service)));
+                }
                 (
-                    VesselReconciler::secondary_watches(),
+                    secondaries,
                     Engine::<_, VesselBinding>::new(
                         VesselReconciler::new_with_config_dir(backend.clone(), &namespace_string, config_dir)
                             .with_lifecycle_reads(state.daemon.lifecycle_reads())
@@ -1045,6 +1040,7 @@ fn spawn_controller_loops(
             }
         }),
     ];
+    controllers.extend(spawn_environment_controller(&state));
     if let Some(distributor) = &state.image_inventory {
         let distributor = Arc::clone(distributor);
         controllers.push(tokio::spawn(async move {
@@ -1264,34 +1260,85 @@ fn archive_shipper(
     )))
 }
 
+/// The Environment controller (#3108): the single writer of this home's environment launches,
+/// realising them through the host's providers and told by its probes what became of them.
+fn spawn_environment_controller(state: &Arc<ControllerRuntimeState>) -> Option<JoinHandle<()>> {
+    use flotilla_provisioning::engine::{controller::Controller, environment_actuator::EnvironmentActuator, reads::StoreReads};
+    let engine = state.provisioning.as_ref()?;
+    let backings = state.environment_backing_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()?;
+    let service = match state.daemon.decided_store() {
+        Ok(service) => service,
+        Err(error) => {
+            error!(%error, "the Environment controller has no decided store; environments will not launch");
+            return None;
+        }
+    };
+    let home = service.home().to_owned();
+    let actuator = EnvironmentActuator::new(
+        Arc::new(DockerControllerRuntime { state: Arc::clone(state) }),
+        StoreReads::new(service.store()),
+        home,
+        engine.environment_facts.clone(),
+        Arc::new(VesselLaunchEnvironment { backend: state.daemon.resource_backend(), namespace: state.namespace.clone() }),
+    );
+    match Controller::start(Arc::clone(&engine.environments), Arc::new(actuator), state.daemon.clock_for_scenarios(), service) {
+        Ok(controller) => Some(tokio::spawn(controller.run(backings))),
+        Err(error) => {
+            error!(%error, "the Environment controller could not start; environments will not launch");
+            None
+        }
+    }
+}
+
+/// The env each vessel's environment is launched with beyond its stored recipe: its crews' skills
+/// and credential grants, from its convoy's frozen requirement.
+struct VesselLaunchEnvironment {
+    backend: ResourceBackend,
+    namespace: String,
+}
+
+#[async_trait::async_trait]
+impl flotilla_provisioning::engine::environment_actuator::LaunchEnvironment for VesselLaunchEnvironment {
+    async fn launch_env(&self, vessel: &str) -> Result<std::collections::BTreeMap<String, String>, String> {
+        flotilla_crew::reconcilers::vessel::vessel_launch_env(&self.backend, &self.namespace, vessel).await
+    }
+}
+
 /// The provisioning kinds' engine homes over the decided store (#3629 layer 3), each restored
-/// with the resources this home holds.
+/// with the resources this home holds, and the task that tells environment readers (the
+/// aggregator) what changed among the environments, written here or replicated.
 async fn open_provisioning_lifecycles(
     daemon: &Arc<InProcessDaemon>,
-) -> Result<flotilla_provisioning::engine::ProvisioningLifecycles, String> {
-    use flotilla_engine_store::{open_home, StoreLog};
-    use flotilla_provisioning::engine::{reads::StoreReads, vessel::PlacementLifecycles, LifecycleHome, ProvisioningLifecycles};
+) -> Result<(flotilla_provisioning::engine::ProvisioningLifecycles, JoinHandle<()>), String> {
+    use flotilla_engine_store::{open_home, open_home_with, StoreLog};
+    use flotilla_provisioning::engine::{
+        environments::EngineEnvironments,
+        launch_log::{LaunchLog, StagedFacts},
+        reads::{LifecycleReadPort, StoreReads},
+        vessel::PlacementLifecycles,
+        LifecycleHome, ProvisioningLifecycles,
+    };
     let store = daemon.decided_store()?.store();
     let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
-    daemon.install_lifecycle_reads(Arc::new(flotilla_provisioning::engine::reads::LifecycleReadPort::new(
-        StoreReads::new(Arc::clone(&store)),
-        home,
-    )))?;
     daemon.install_vessel_seats(Arc::new(EngineVesselSeats {
         reads: StoreReads::new(Arc::clone(&store)),
         backend: daemon.resource_backend(),
     }))?;
     let backend = daemon.resource_backend();
-    tokio::task::spawn_blocking(move || {
+    let opened = Arc::clone(&store);
+    let lifecycles = tokio::task::spawn_blocking(move || {
+        let store = opened;
         let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
         let log = || StoreLog::new(Arc::clone(&store));
+        // An environment's launch facts are written in the transaction that realises it.
+        let environment_facts = StagedFacts::default();
         let terminal_sessions = Arc::new(LifecycleHome::new(&home, open_home(log())?));
         backend.install_terminal_launches(Arc::new(flotilla_provisioning::engine::terminal_session::EngineTerminalLaunches {
             lifecycles: terminal_sessions.clone(),
         }));
-        Ok(ProvisioningLifecycles {
-            environments: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
-            environment_facts: Default::default(),
+        Ok::<_, String>(ProvisioningLifecycles {
+            environments: Arc::new(LifecycleHome::new(&home, open_home_with(&log(), LaunchLog::new(log(), environment_facts.clone()))?)),
+            environment_facts,
             image_builds: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
             clones: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
             checkouts: Arc::new(LifecycleHome::new(&home, open_home(log())?)),
@@ -1300,7 +1347,15 @@ async fn open_provisioning_lifecycles(
         })
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())??;
+    // Every environment reader and requester goes through the engine's environments.
+    let environments = Arc::new(EngineEnvironments::new(Arc::clone(&lifecycles.environments), Arc::clone(&store)));
+    let environment_changes = environments.follow(daemon.decided_store()?)?;
+    daemon.install_lifecycle_reads(Arc::new(
+        LifecycleReadPort::new(StoreReads::new(store), home)
+            .with_environments(environments as Arc<dyn flotilla_resources::environment_records::EnvironmentRecords>),
+    ))?;
+    Ok((lifecycles, environment_changes))
 }
 
 /// Which seats a vessel serves (#3629 layer 8): its sessions by their vessel label, with each role

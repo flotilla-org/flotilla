@@ -75,9 +75,9 @@ impl Fixture {
     }
     async fn with_initial_launch(phase: Phase, requested: bool) -> Self {
         let backend = ResourceBackend::new(flotilla_store_sqlite::SqliteBackend::open_in_memory().expect("resources"));
-        super::terminal_session_reconciler::create_ready_environment(&backend, "env").await;
         let obj = store_object(&backend, terminal_session(phase)).await;
         let lifecycle = LifecycleFixture::<TerminalSessionBinding>::new(false);
+        super::terminal_session_reconciler::create_ready_environment(&lifecycle.environments, "env");
         if requested {
             lifecycle.request(&obj);
         }
@@ -204,7 +204,7 @@ async fn temporary_unobservability_revives_without_a_launch_then_absence_request
             fixture.lifecycle.home.get("terminal-a#1").expect("first").state()
         )
         .reading(),
-        LifecycleReading::Lost
+        LifecycleReading::Lost { reason: None }
     );
 }
 
@@ -241,7 +241,7 @@ fn phase_and_ending_views_do_not_reuse_old_phase(tc: hegel::TestCase) {
         0 => (LifecycleReading::InProgress, Phase::Starting),
         1 => (LifecycleReading::Ready { identity: "different-current-session".into() }, Phase::Running),
         2 => (LifecycleReading::Released, Phase::Stopped),
-        3 => (LifecycleReading::Lost, Phase::Lost),
+        3 => (LifecycleReading::Lost { reason: None }, Phase::Lost),
         4 => (LifecycleReading::Failed { reason: cause }, Phase::Failed),
         5 => (LifecycleReading::GaveUp { cause }, Phase::Failed),
         6 => (LifecycleReading::Exhausted { cause }, Phase::Failed),
@@ -367,7 +367,7 @@ async fn replacement_intent_and_predecessor_ending_recover_from_storage_failures
                 home.get("terminal-a#1").expect("predecessor").state()
             )
             .reading(),
-            LifecycleReading::Lost
+            LifecycleReading::Lost { reason: None }
         );
         assert!(home.get("terminal-a#3").is_none());
     }

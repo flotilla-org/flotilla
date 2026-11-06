@@ -9,7 +9,7 @@ use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
 use flotilla_resources::{
     access_delivery::{DeliveredNeed, DeliveryMechanism, DeliveryRetry},
     account_access::{requester_convoy_dir, REQUESTER_HOME_DIR, REQUESTER_MATERIAL_DIR},
-    AccessDelivery, AccessDeliverySpec, Convoy, Environment, InputMeta, ResourceError, ResourceObject, CONVOY_LABEL,
+    AccessDelivery, AccessDeliverySpec, Convoy, InputMeta, ResourceError, ResourceObject, CONVOY_LABEL,
 };
 use flotilla_schema::Timestamp;
 use flotilla_store::controller::{ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileOutcome, Reconciler, SecondaryWatch};
@@ -219,8 +219,9 @@ impl AccessStatusReconciler {
             }
         };
         let place = &record.spec.place;
+        // A place that ended is gone: its environment is not launched again.
         let place_gone = *place != self.state.host_direct_environment_name
-            && gone(backend.including_replicas::<Environment>(&self.namespace).get(place).await.map(drop))?;
+            && self.state.environment(place).await?.is_none_or(|environment| environment.ended());
         let convoy_gone = match record.metadata.labels.get(CONVOY_LABEL) {
             Some(convoy) => gone(backend.including_replicas::<Convoy>(&self.namespace).get(convoy).await.map(drop))?,
             None => false,

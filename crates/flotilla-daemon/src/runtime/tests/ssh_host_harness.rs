@@ -289,6 +289,8 @@ struct SshHostRuntime {
     agents: Arc<RunnerVesselAgents>,
     vessel: VesselPaths,
     spec: flotilla_resources::TerminalSessionSpec,
+    // Only the Linux-only acceptance tests use this.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     /// The host's discovery bag, which places each vessel's paths.
     bag: EnvironmentBag,
 }
@@ -354,7 +356,9 @@ async fn ssh_host_runtime(host: SshHost, adapter: &str) -> SshHostRuntime {
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
         vessel_agent: Err("the test's vessel agents run on the host runner".into()),
     };
-    register_ssh_host_resources(&backend, NAMESPACE, &local_host_id, &profile).await.expect("register SSH host resources");
+    register_ssh_host_resources(&backend, engine_environments(&daemon).reads.clone(), NAMESPACE, &local_host_id, &profile)
+        .await
+        .expect("register SSH host resources");
     let source = LocalSkillSource::new(temp.path(), "research");
     let skills = if skills { vec![source.selected.clone()] } else { Vec::new() };
     freeze_crew(&backend, "demo", "demo-work", "coder", adapter, skills).await;
@@ -473,9 +477,14 @@ impl SshHostRuntime {
 
     /// What `convoy explain` shows the access layer delivered for the convoy.
     async fn deliveries(&self) -> Vec<flotilla_protocol::ExplainedAccessDelivery> {
-        flotilla_projections::read_projections::access_delivery_evidence(&self.daemon.resource_backend(), NAMESPACE, "demo")
-            .await
-            .expect("access deliveries")
+        flotilla_projections::read_projections::access_delivery_evidence(
+            &self.daemon.resource_backend(),
+            self.daemon.lifecycle_reads().as_ref(),
+            NAMESPACE,
+            "demo",
+        )
+        .await
+        .expect("access deliveries")
     }
 }
 
@@ -589,6 +598,8 @@ async fn launched_claude_crew() -> (SshHostRuntime, Arc<FakeHost>, flotilla_test
 }
 
 impl SshHostRuntime {
+    // Only the Linux-only acceptance tests use this.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     /// Move the crew to `vessel_ref`, a new vessel of its convoy on the same host, as one
     /// replacing a retired vessel is: the same home, under another vessel agent.
     async fn move_to_vessel(&mut self, vessel_ref: &str) {

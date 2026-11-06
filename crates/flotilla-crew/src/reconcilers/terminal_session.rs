@@ -1,5 +1,5 @@
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
-use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
+use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads};
 use flotilla_resources::Actuation;
 use flotilla_terminal::{TerminalPool, TerminalSessionTag};
 use std::{sync::Arc, time::Duration};
@@ -8,12 +8,12 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, LifecycleReading};
 use flotilla_resources::{
-    attentions::Attention, Convoy, ConvoyPhase, CrewMessageDelivery, Demand, Environment, EnvironmentPhase, LifecycleAuthority, Resource,
-    ResourceError, ResourceObject, ResourceProvenance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
-    TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatusPatch,
-    TerminalSessionTarget, Vessel, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
-    CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG,
-    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG, TERMINAL_DELIVERY_EXPIRED_REASON, TERMINAL_DELIVERY_NOT_SUBMITTED_REASON,
+    attentions::Attention, Convoy, ConvoyPhase, CrewMessageDelivery, Demand, LifecycleAuthority, Resource, ResourceError, ResourceObject,
+    ResourceProvenance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatusPatch, TerminalSessionTarget, Vessel,
+    ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION,
+    CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION,
+    CREDENTIAL_SCOPES_SESSION_TAG, TERMINAL_DELIVERY_EXPIRED_REASON, TERMINAL_DELIVERY_NOT_SUBMITTED_REASON,
     TERMINAL_DELIVERY_UNCONFIRMED_REASON, VESSEL_REF_LABEL,
 };
 use flotilla_store::{
@@ -185,7 +185,6 @@ pub struct TerminalSessionReconciler<R> {
     decisions: crate::decision_log::DecisionLog,
     convoys: TypedResolver<Convoy>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
-    environments: TypedResolver<Environment>,
     vessels: TypedResolver<Vessel>,
     demands: TypedResolver<Demand>,
     local_host_ref: Option<CanonicalHostId>,
@@ -202,12 +201,16 @@ impl<R> TerminalSessionReconciler<R> {
             decisions: Default::default(),
             convoys: backend.clone().using::<Convoy>(namespace),
             federated_convoys: None,
-            environments: backend.clone().using::<Environment>(namespace),
             vessels: backend.clone().using::<Vessel>(namespace),
             demands: backend.using::<Demand>(namespace),
             local_host_ref: None,
             additional_host_refs: Default::default(),
         }
+    }
+
+    /// The environment `name`, at whichever home holds it: the engine's (#3108).
+    fn environment(&self, name: &str) -> Result<Option<flotilla_resources::environment_records::EnvironmentRecord>, ResourceError> {
+        self.lifecycle_reads.environments().and_then(|environments| environments.find(name)).map_err(ResourceError::other)
     }
 
     pub fn with_clock(mut self, clock: Arc<dyn flotilla_resources::Clock>) -> Self {
@@ -422,24 +425,15 @@ impl<R: TerminalRuntime + 'static> TerminalSessionReconciler<R> {
         if !self.actuates(obj) {
             return Ok(TerminalPrepared::None);
         }
-        let environment = match self.environments.get(&obj.spec.env_ref).await {
-            Ok(environment) => environment,
-            Err(ResourceError::NotFound { .. }) => {
-                log_reclaim_decision(obj, "not_required", "owning environment is absent");
-                return Ok(TerminalPrepared::OwnerMissing);
-            }
-            Err(err) => return Err(err),
+        let Some(environment) = self.environment(&obj.spec.env_ref)? else {
+            log_reclaim_decision(obj, "not_required", "owning environment is absent");
+            return Ok(TerminalPrepared::OwnerMissing);
         };
-        let environment_reading = self
-            .lifecycle_reads
-            .try_reading(ProvisioningKind::Environment, &environment.metadata.name, None)
-            .map_err(ResourceError::other)?;
-        let owner_failed = match &environment_reading {
-            Some(reading) => {
-                matches!(reading, LifecycleReading::Failed { .. } | LifecycleReading::Exhausted { .. } | LifecycleReading::GaveUp { .. })
-            }
-            None => environment.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Failed),
-        };
+        let environment_reading = &environment.reading;
+        let owner_failed = matches!(
+            environment_reading,
+            LifecycleReading::Failed { .. } | LifecycleReading::Exhausted { .. } | LifecycleReading::GaveUp { .. }
+        );
         if owner_failed {
             return Ok(TerminalPrepared::OwnerTerminal);
         }
@@ -451,16 +445,14 @@ impl<R: TerminalRuntime + 'static> TerminalSessionReconciler<R> {
 
         // Backing loss is recoverable work interruption, not provisioning failure.
         // Keep it distinct from process loss: never probe or relaunch in a dead environment.
-        let lost_reason =
-            match &environment_reading {
-                Some(reading @ (LifecycleReading::Lost | LifecycleReading::Released)) => {
-                    Some(format!("environment {} {}", environment.metadata.name, reading.reason().unwrap_or_default()))
-                }
-                Some(_) => None,
-                None => environment.status.as_ref().filter(|status| status.phase == EnvironmentPhase::Lost).map(|status| {
-                    status.message.clone().unwrap_or_else(|| format!("environment {} disappeared", environment.metadata.name))
-                }),
-            };
+        // A loss its home explained (`cgroup_oom`) is named as the home said it.
+        let lost_reason = match environment_reading {
+            LifecycleReading::Lost { reason: Some(reason) } => Some(reason.clone()),
+            reading @ (LifecycleReading::Lost { reason: None } | LifecycleReading::Released) => {
+                Some(format!("environment {} {}", environment.name, reading.reason().unwrap_or_default()))
+            }
+            _ => None,
+        };
         if let Some(reason) = lost_reason {
             return Ok(TerminalPrepared::EnvironmentLost(reason));
         }
@@ -696,11 +688,7 @@ impl<R: TerminalRuntime + 'static> TerminalSessionReconciler<R> {
             return Ok(TerminalPrepared::None);
         }
 
-        let environment_ready = match &environment_reading {
-            Some(reading) => matches!(reading, LifecycleReading::Ready { .. }),
-            None => environment.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Ready && status.ready),
-        };
-        if !environment_ready {
+        if !environment.is_ready() {
             return Ok(TerminalPrepared::Waiting);
         }
         if !self.runtime.brief_ready(obj.into()).await.map_err(ResourceError::other)? {
@@ -1047,13 +1035,9 @@ where
         if !self.actuates(obj) {
             return Ok(());
         }
-        let environment_exists = match self.environments.get(&obj.spec.env_ref).await {
-            Ok(_) => true,
-            Err(ResourceError::NotFound { .. }) => false,
-            Err(error) => return Err(error),
-        };
+        let environment_exists = self.environment(&obj.spec.env_ref)?.is_some_and(|environment| !environment.ended());
         let mut errors = Vec::new();
-        // Once the environment record is gone, its teardown has already removed the
+        // Once the environment has ended, its teardown has already removed the
         // backing container. Its terminal pool and agent adapter are no longer
         // available, so there is nothing left for either runtime hook to clean.
         if environment_exists {

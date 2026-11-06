@@ -308,7 +308,7 @@ fn reading_blocker(reading: &LifecycleReading, not_ready: &str) -> Option<(Readi
         // Exhausted gives up on the next reconcile; until then a retry may still be under way.
         // An ended checkout or clone never comes back: the engine has no incarnations, so a vessel
         // waiting on it waits on a replacement under a new name, and readiness says so.
-        LifecycleReading::Failed { .. } | LifecycleReading::Lost | LifecycleReading::Released | LifecycleReading::GaveUp { .. } => {
+        LifecycleReading::Failed { .. } | LifecycleReading::Lost { .. } | LifecycleReading::Released | LifecycleReading::GaveUp { .. } => {
             ReadinessState::Failed
         }
     };

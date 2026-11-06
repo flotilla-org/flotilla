@@ -3,10 +3,9 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use flotilla_protocol::{CanonicalHostId, LifecycleReading};
-use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
+use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads};
 use flotilla_resources::{
-    Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureStatusPatch, ConvoyProvisioningState, Environment as ResourceEnvironment,
-    EnvironmentPhase, ReadResourceObject, ResourceObject, CONVOY_LABEL,
+    Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureStatusPatch, ConvoyProvisioningState, ReadResourceObject, ResourceObject,
 };
 
 use crate::convoy_admission::PreparedConvoyAdmission;
@@ -113,44 +112,43 @@ impl ResourceStandingConvoyBackingInspector {
 #[async_trait]
 impl StandingConvoyBackingInspector for ResourceStandingConvoyBackingInspector {
     async fn verify_backing_dead(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String> {
-        let environments = self
-            .resource_backend
-            .using::<ResourceEnvironment>(&convoy.metadata.namespace)
-            .list()
-            .await
-            .map_err(|error| format!("could not inspect backing environments: {error}"))?
-            .items
-            .into_iter()
-            .filter(|environment| environment.metadata.labels.get(CONVOY_LABEL) == Some(&convoy.metadata.name))
-            .collect::<Vec<_>>();
+        // The convoy's environments are those held for its vessels.
+        let vessels = convoy
+            .status
+            .as_ref()
+            .and_then(|status| status.workflow_snapshot.as_ref())
+            .map(|snapshot| {
+                snapshot
+                    .vessels
+                    .iter()
+                    .map(|requirement| flotilla_resources::vessel_resource_name(&convoy.metadata.name, &requirement.name))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let reads = Arc::clone(&self.lifecycle_reads);
+        let environments = tokio::task::spawn_blocking(move || {
+            let environments = reads.environments()?;
+            let mut held = Vec::new();
+            for vessel in &vessels {
+                held.extend(environments.held(vessel)?);
+            }
+            Ok::<_, String>(held)
+        })
+        .await
+        .map_err(|error| format!("could not inspect backing environments: {error}"))?
+        .map_err(|error| format!("could not inspect backing environments: {error}"))?;
         if environments.is_empty() {
             if convoy.status.as_ref().and_then(|status| status.provisioning) == Some(ConvoyProvisioningState::NotStarted) {
                 return Ok(());
             }
             return Err("no backing environment evidence is available".to_string());
         }
-        let reads = Arc::clone(&self.lifecycle_reads);
-        let not_dead = tokio::task::spawn_blocking(move || {
-            let mut not_dead = Vec::new();
-            for environment in environments {
-                let phase = match reads.try_reading(ProvisioningKind::Environment, &environment.metadata.name, None)? {
-                    Some(LifecycleReading::GaveUp { .. } | LifecycleReading::Released) => continue,
-                    // Lost or snapshot-only Gone is not positive teardown evidence; exhaustion is not yet GiveUp.
-                    Some(reading) => reading.label().to_string(),
-                    None => {
-                        let phase = environment.status.as_ref().map(|status| status.phase).unwrap_or_default();
-                        if phase == EnvironmentPhase::Failed {
-                            continue;
-                        }
-                        format!("{phase:?}")
-                    }
-                };
-                not_dead.push(format!("Environment/{} is {phase}", environment.metadata.name));
-            }
-            Ok::<_, String>(not_dead)
-        })
-        .await
-        .map_err(|error| format!("could not inspect backing lifecycles: {error}"))??;
+        let not_dead = environments
+            .into_iter()
+            // Lost or a failed backing is not positive teardown evidence; exhaustion is not yet GiveUp.
+            .filter(|environment| !matches!(environment.reading, LifecycleReading::GaveUp { .. } | LifecycleReading::Released))
+            .map(|environment| format!("Environment/{} is {}", environment.name, environment.reading.label()))
+            .collect::<Vec<_>>();
         if not_dead.is_empty() {
             Ok(())
         } else {
@@ -162,9 +160,10 @@ impl StandingConvoyBackingInspector for ResourceStandingConvoyBackingInspector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flotilla_provisioning::engine::environment::EnvironmentBinding;
-    use flotilla_provisioning_testkit::{Ending, LifecycleFixture};
-    use flotilla_resources::{ConvoySpec, EnvironmentSpec, EnvironmentStatus, HostDirectEnvironmentSpec, InputMeta};
+    use flotilla_provisioning_testkit::{Ending, EnvironmentFixture};
+    use flotilla_resources::{
+        ConvoySpec, ConvoyStatus, EnvironmentSpec, HostDirectEnvironmentSpec, InputMeta, VesselRequirement, WorkflowSnapshot,
+    };
     use flotilla_store::ResourceBackend;
 
     // Teardown accepts an engine release or give-up, but Lost is not positive teardown evidence.
@@ -172,32 +171,32 @@ mod tests {
     async fn backing_inspection_reads_the_engine_without_a_status_copy() {
         for ending in [Ending::Lost("/work"), Ending::Released, Ending::GaveUp("失敗")] {
             let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-            let convoy = backend
-                .using::<ResourceConvoy>("flotilla")
+            let convoys = backend.using::<ResourceConvoy>("flotilla");
+            let created = convoys
                 .create(&InputMeta::builder().name("convoy".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
                 .await
                 .expect("convoy");
-            let records = backend.using::<ResourceEnvironment>("flotilla");
-            let mut obj = records
-                .create(
-                    &InputMeta::builder().name("env".into()).labels([(CONVOY_LABEL.into(), "convoy".into())].into()).build(),
-                    &EnvironmentSpec {
-                        host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/work".into() }),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("environment");
-            let old = EnvironmentStatus { phase: EnvironmentPhase::Failed, ..Default::default() };
-            obj = records.update_status("env", &obj.metadata.resource_version, &old).await.expect("stale status");
-            let fixture = LifecycleFixture::<EnvironmentBinding>::new(false);
+            let snapshot = WorkflowSnapshot {
+                cascade: None,
+                exit: None,
+                turn_delivery: Default::default(),
+                stall_nudges: Default::default(),
+                supervision: None,
+                vessels: vec![VesselRequirement::builder().name("work".into()).crew(Vec::new()).build()],
+            };
+            let status = ConvoyStatus { workflow_snapshot: Some(snapshot), ..Default::default() };
+            let convoy = convoys.update_status("convoy", &created.metadata.resource_version, &status).await.expect("snapshot");
+            let fixture = EnvironmentFixture::default();
             let inspector = ResourceStandingConvoyBackingInspector::new(backend).with_lifecycle_reads(fixture.reads.clone());
-            assert!(inspector.verify_backing_dead(&convoy).await.is_ok());
-            fixture.request(&obj);
+            assert!(inspector.verify_backing_dead(&convoy).await.is_err(), "a provisioning convoy with no environment has no evidence");
+            let spec = EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/work".into() }),
+                ..Default::default()
+            };
+            fixture.request("env", &spec, Some(&flotilla_resources::vessel_resource_name("convoy", "work")));
             assert!(inspector.verify_backing_dead(&convoy).await.is_err());
-            fixture.finish(&obj, ending);
+            fixture.finish("env", ending);
             assert_eq!(inspector.verify_backing_dead(&convoy).await.is_ok(), !matches!(ending, Ending::Lost(_)));
-            assert_eq!(records.get("env").await.expect("unchanged").status, Some(old));
             fixture.poison();
             assert!(inspector.verify_backing_dead(&convoy).await.expect_err("read error").contains("poisoned"));
         }

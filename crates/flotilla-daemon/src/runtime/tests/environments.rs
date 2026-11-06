@@ -1,5 +1,6 @@
 use super::*;
 use crate::environment_tools::EnvironmentToolProvisioner;
+use flotilla_provisioning::engine::controller::{Backing, BackingEvent};
 
 #[tokio::test]
 async fn standing_backing_inspection_accepts_durable_pre_provisioning_failure() {
@@ -35,6 +36,7 @@ async fn standing_backing_inspection_accepts_durable_pre_provisioning_failure() 
         )
         .await
         .expect("failed convoy status");
+    engine_environments(&daemon);
     let state = ControllerRuntimeState::new(
         daemon,
         config,
@@ -108,6 +110,7 @@ async fn standing_backing_inspection_accepts_local_absence_only_after_startup_ob
         ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "docker"),
         Arc::new(AdoptionEnvironmentProvider { handles: vec![sibling] }),
     );
+    engine_environments(&daemon);
     let state = Arc::new(ControllerRuntimeState::new(
         daemon,
         config,
@@ -142,48 +145,43 @@ async fn standing_backing_inspection_trusts_live_docker_over_failed_resource_pha
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
-    let convoy = daemon
-        .resource_backend()
-        .using::<Convoy>(NAMESPACE)
-        .create(&empty_meta("quartermaster"), &ConvoySpec::builder().workflow_ref("standing".to_string()).build())
-        .await
-        .expect("convoy");
-    let environments = daemon.resource_backend().using::<Environment>(NAMESPACE);
-    let environment = environments
-        .create(
-            &empty_meta_with_labels("quartermaster-work", BTreeMap::from([(CONVOY_LABEL.to_string(), "quartermaster".to_string())])),
-            &flotilla_resources::EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: None,
-                docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                    image_build_ref: None,
-                    host_ref: "host-test".to_string(),
-                    image: "contained-image".to_string(),
-                    declared_agent_adapters: BTreeSet::new(),
-                    required_agent_adapters: BTreeSet::new(),
-                    pull_policy: Default::default(),
-                    mounts: Vec::new(),
-                    env: BTreeMap::new(),
-                }),
-            },
-        )
-        .await
-        .expect("environment");
-    environments
-        .update_status(
-            &environment.metadata.name,
-            &environment.metadata.resource_version,
-            &flotilla_resources::EnvironmentStatus {
-                phase: EnvironmentPhase::Failed,
-                ready: false,
-                docker_container_id: Some("test-interior".to_string()),
-                message: Some("provider registry unavailable".to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("failed daemon-side environment phase");
+    // A standing convoy's environments are those its vessels hold.
+    let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
+    let mut standing = Vec::new();
+    for name in ["quartermaster", "purser"] {
+        let convoy =
+            convoys.create(&empty_meta(name), &ConvoySpec::builder().workflow_ref("standing".to_string()).build()).await.expect("convoy");
+        let convoy = convoys
+            .update_status(
+                &convoy.metadata.name,
+                &convoy.metadata.resource_version,
+                &flotilla_resources::ConvoyStatus {
+                    provisioning: Some(ConvoyProvisioningState::Started { started_at: Utc::now() }),
+                    workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                        cascade: None,
+                        vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],
+                        exit: None,
+                        turn_delivery: Default::default(),
+                        stall_nudges: Default::default(),
+                        supervision: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("convoy status");
+        standing.push(convoy);
+    }
+    let [convoy, unrealised]: [_; 2] = standing.try_into().expect("two convoys");
+    let environments = engine_environments(&daemon);
+    let spec = docker_environment_spec("host-test", BTreeSet::new());
+    // A launch realised under its container, after a failed attempt on the daemon's side.
+    environments.request("quartermaster-work", &spec, Some(&flotilla_resources::vessel_resource_name("quartermaster", "work")));
+    environments.retry("quartermaster-work", "provider registry unavailable");
+    environments.ready("quartermaster-work", "test-interior", Default::default());
+    // A launch whose only attempt failed before it was realised has no container identity.
+    environments.request("purser-work", &spec, Some(&flotilla_resources::vessel_resource_name("purser", "work")));
+    environments.retry("purser-work", "provider registry unavailable");
     let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
         id: EnvironmentId::new("quartermaster-work"),
         image: ImageId::new("contained-image"),
@@ -197,6 +195,7 @@ async fn standing_backing_inspection_trusts_live_docker_over_failed_resource_pha
         ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "docker"),
         Arc::new(AdoptionEnvironmentProvider { handles: vec![handle] }),
     );
+    engine_environments(&daemon);
     let state = ControllerRuntimeState::new(
         daemon,
         config,
@@ -210,16 +209,7 @@ async fn standing_backing_inspection_trusts_live_docker_over_failed_resource_pha
 
     assert!(refusal.contains("backing is live") && refusal.contains("test-interior"), "unexpected refusal: {refusal}");
 
-    let environment = environments.get("quartermaster-work").await.expect("environment");
-    environments
-        .update_status(
-            &environment.metadata.name,
-            &environment.metadata.resource_version,
-            &flotilla_resources::EnvironmentStatus { phase: EnvironmentPhase::Failed, ..Default::default() },
-        )
-        .await
-        .expect("remove container identity");
-    let refusal = state.verify_backing_dead(&convoy).await.expect_err("missing container identity must hold standing teardown");
+    let refusal = state.verify_backing_dead(&unrealised).await.expect_err("missing container identity must hold standing teardown");
     assert!(refusal.contains("no Docker container identity"), "unexpected refusal: {refusal}");
 }
 
@@ -251,23 +241,15 @@ async fn fresh_daemon_readopts_running_environment_from_shared_store_and_backing
             env_vars: HashMap::from([("HOME".to_string(), "/home/crew".to_string())]),
             destroyed: Arc::new(AtomicBool::new(false)),
         });
-        create_ready_docker_environment(&first, env_id.as_str(), "test-interior", BTreeSet::new()).await;
-        if let Some(instance) = instance {
-            let api = first.resource_backend().using::<Environment>(NAMESPACE);
-            let mut environment = api.get(env_id.as_str()).await.expect("record");
-            environment
-                .metadata
-                .labels
-                .insert(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL.into(), instance.into());
-            environment.spec.provider_address = Some(
-                flotilla_address::Address::root(flotilla_address::Kind::Host, environment.spec.host_ref().expect("host"))
-                    .and_then(|place| place.child(flotilla_address::Kind::Provider, instance))
-                    .expect("address"),
-            );
-            api.update(&InputMeta::from(&environment.metadata), &environment.metadata.resource_version, &environment.spec)
-                .await
-                .expect("bind instance");
-        }
+        // The environment is requested bound to `instance` where one is named.
+        let host_ref = first.local_host_id().expect("local host identity").to_string();
+        let mut spec = docker_environment_spec(&host_ref, BTreeSet::new());
+        spec.provider_address = instance.map(|instance| {
+            flotilla_address::Address::root(flotilla_address::Kind::Host, &host_ref)
+                .and_then(|place| place.child(flotilla_address::Kind::Provider, instance))
+                .expect("address")
+        });
+        engine_environments(&first).put_ready(env_id.as_str(), &spec, None, "test-interior", Default::default());
         first
             .register_provisioned_environment(env_id.clone(), Arc::clone(&handle), EnvironmentBag::new(), Some(passthrough_registry()))
             .expect("initial provision registration");
@@ -291,6 +273,7 @@ async fn fresh_daemon_readopts_running_environment_from_shared_store_and_backing
                 Arc::new(AdoptionEnvironmentProvider { handles: Vec::new() }),
             );
         }
+        engine_environments(&restarted);
         let state = Arc::new(ControllerRuntimeState::new(
             Arc::clone(&restarted),
             config,
@@ -334,6 +317,7 @@ async fn environment_readoption_marks_missing_container_lost() {
     .await;
     let env_id = EnvironmentId::new("env-dead");
     create_ready_docker_environment(&daemon, env_id.as_str(), "missing-container", BTreeSet::new()).await;
+    engine_environments(&daemon);
     let state = Arc::new(ControllerRuntimeState::new(
         Arc::clone(&daemon),
         config,
@@ -345,12 +329,14 @@ async fn environment_readoption_marks_missing_container_lost() {
 
     reconcile_provisioned_environments(&state, NAMESPACE).await.expect("reconcile missing backing");
 
-    let environment = daemon.resource_backend().using::<Environment>(NAMESPACE).get(env_id.as_str()).await.expect("environment record");
-    let status = environment.status.expect("environment status");
-    assert_eq!(status.phase, EnvironmentPhase::Lost);
+    // The probe tells the Environment controller the backing is absent, and why; the controller
+    // ends the launch Lost with that reason.
     assert_eq!(
-        status.message.as_deref(),
-        Some("lost, recoverable: Docker container missing-container is not running; rehydration is not available yet (#2872)")
+        observed_backings(&state),
+        [BackingEvent {
+            name: env_id.to_string(),
+            observed: Backing::Absent { reason: Some("Docker container missing-container is not running".to_string()) },
+        }]
     );
     assert!(daemon.environment_registry_for_environment(&env_id).is_none());
 }
@@ -374,6 +360,7 @@ async fn transient_environment_liveness_error_remains_ready_for_retry() {
     create_ready_docker_environment(&daemon, env_id.as_str(), "uncertain-container", BTreeSet::new()).await;
     let handle: EnvironmentHandle =
         Arc::new(TestUncertainEnvironment { id: env_id.clone(), status_error: "Docker daemon temporarily unavailable".to_string() });
+    engine_environments(&daemon);
     let state = Arc::new(ControllerRuntimeState::new(
         Arc::clone(&daemon),
         config,
@@ -386,8 +373,9 @@ async fn transient_environment_liveness_error_remains_ready_for_retry() {
     let error = reconcile_provisioned_environments(&state, NAMESPACE).await.expect_err("uncertain liveness should request a retry");
 
     assert!(error.contains("temporarily unavailable") && error.contains("will retry"));
-    let environment = daemon.resource_backend().using::<Environment>(NAMESPACE).get(env_id.as_str()).await.expect("environment record");
-    assert_eq!(environment.status.expect("environment status").phase, EnvironmentPhase::Ready);
+    assert_eq!(observed_backings(&state), [], "an uncertain probe tells the Environment controller nothing");
+    let environment = engine_environments(&daemon).environments.find(env_id.as_str()).expect("read").expect("environment record");
+    assert!(environment.is_ready());
     assert!(daemon.environment_registry_for_environment(&env_id).is_none());
 }
 
@@ -411,41 +399,17 @@ async fn failed_environment_readoption_does_not_block_a_live_sibling() {
     let orphaned_id = EnvironmentId::new("env-orphaned");
     create_ready_docker_environment(&daemon, bad_id.as_str(), "test-interior", BTreeSet::from(["missing-adapter".to_string()])).await;
     create_ready_docker_environment(&daemon, good_id.as_str(), "test-interior", BTreeSet::new()).await;
-    let environments = daemon.resource_backend().using::<Environment>(NAMESPACE);
-    environments
-        .create(
-            &empty_meta(orphaned_id.as_str()),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: None,
-                docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                    image_build_ref: None,
-                    host_ref: "deleted-host".to_string(),
-                    image: "contained-image".to_string(),
-                    declared_agent_adapters: BTreeSet::new(),
-                    required_agent_adapters: BTreeSet::new(),
-                    pull_policy: Default::default(),
-                    mounts: Vec::new(),
-                    env: BTreeMap::new(),
-                }),
-            },
-        )
-        .await
-        .expect("create orphaned environment");
-    flotilla_store::apply_status_patch(
-        &environments,
+    engine_environments(&daemon).put_ready(
         orphaned_id.as_str(),
-        &EnvironmentStatusPatch::MarkReady {
-            configured_limits: None,
-            docker_container_id: Some("orphaned-container".to_string()),
+        &docker_environment_spec("deleted-host", BTreeSet::new()),
+        None,
+        "orphaned-container",
+        flotilla_resources::environment_records::LaunchFacts {
             image_ref: Some("contained-image".to_string()),
             local_image_id: Some("sha256:contained".to_string()),
-            registry_digest: None,
+            ..Default::default()
         },
-    )
-    .await
-    .expect("mark orphaned environment ready");
+    );
     let handle = |id: EnvironmentId| {
         Arc::new(TestInteriorEnvironment {
             id,
@@ -455,6 +419,7 @@ async fn failed_environment_readoption_does_not_block_a_live_sibling() {
             destroyed: Arc::new(AtomicBool::new(false)),
         }) as EnvironmentHandle
     };
+    engine_environments(&daemon);
     let state = Arc::new(ControllerRuntimeState::new(
         Arc::clone(&daemon),
         config,
@@ -466,8 +431,12 @@ async fn failed_environment_readoption_does_not_block_a_live_sibling() {
 
     reconcile_provisioned_environments(&state, NAMESPACE).await.expect("fail one environment without aborting its sibling");
 
-    let bad = daemon.resource_backend().using::<Environment>(NAMESPACE).get(bad_id.as_str()).await.expect("bad environment");
-    assert_eq!(bad.status.expect("bad environment status").phase, EnvironmentPhase::Failed);
+    let observed = observed_backings(&state);
+    assert!(
+        matches!(observed.as_slice(), [BackingEvent { name, observed: Backing::Failed { reason } }]
+            if name == bad_id.as_str() && reason.starts_with("environment adoption failed")),
+        "the bad environment alone is reported failed to the Environment controller: {observed:?}"
+    );
     assert!(daemon.environment_registry_for_environment(&bad_id).is_none());
     assert!(daemon.environment_registry_for_environment(&orphaned_id).is_none());
     assert!(daemon.environment_registry_for_environment(&good_id).is_some(), "live sibling should still be adopted");
@@ -533,6 +502,7 @@ async fn cloud_unknown_does_not_abort_gone_sibling() {
         Arc::new(CloudHandle { id: EnvironmentId::new("b-gone"), state: ObservationState::Gone { cause: GoneCause::LifetimeCapReached } }),
         Arc::new(CloudHandle { id: EnvironmentId::new("c-stale"), state: ObservationState::Running }),
     ];
+    engine_environments(&daemon);
     let mut state = ControllerRuntimeState::new(
         daemon.clone(),
         config,
@@ -543,27 +513,14 @@ async fn cloud_unknown_does_not_abort_gone_sibling() {
     );
     state.environment_providers.insert(address.clone(), Arc::new(AdoptionEnvironmentProvider { handles: handles.clone() })).unwrap();
     let state = Arc::new(state);
-    let environments = daemon.resource_backend().using::<Environment>(NAMESPACE);
+    let environments = engine_environments(&daemon);
     for handle in &handles {
         let spec: flotilla_resources::EnvironmentSpec = serde_json::from_value(serde_json::json!({
             "provider_address": address.to_string(), "cloud_sandbox": {
                 "image": "cloud", "size": {"cpus":1,"memory_bytes":1024,"disk_bytes":1024}, "env": {} }
         }))
         .unwrap();
-        let object = environments.create(&empty_meta(handle.id().as_str()), &spec).await.unwrap();
-        environments
-            .update_status(
-                &object.metadata.name,
-                &object.metadata.resource_version,
-                &flotilla_resources::EnvironmentStatus {
-                    phase: EnvironmentPhase::Ready,
-                    ready: true,
-                    backing_id: Some(handle.backing_id().into()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
+        environments.put_ready(handle.id().as_str(), &spec, None, handle.backing_id(), Default::default());
         state
             .provisioned_environments
             .lock()
@@ -571,12 +528,18 @@ async fn cloud_unknown_does_not_abort_gone_sibling() {
             .insert(handle.id().to_string(), ActiveProvisionedEnvironment { handle: handle.clone() });
     }
     assert!(reconcile_provisioned_environments(&state, NAMESPACE).await.unwrap_err().contains("unknown"));
-    assert_eq!(environments.get("a-unknown").await.unwrap().status.unwrap().phase, EnvironmentPhase::Ready);
-    assert_eq!(environments.get("b-gone").await.unwrap().status.unwrap().phase, EnvironmentPhase::Lost);
-    let stale = environments.get("c-stale").await.unwrap().status.unwrap();
-    assert!(stale.ready);
-    assert_eq!(stale.phase, EnvironmentPhase::Ready);
-    assert!(stale.message.unwrap().contains("degraded"));
+    // Only the gone sandbox is reported absent to the Environment controller: the unknown one
+    // waits for a retry, and the degraded one is logged, never recorded.
+    assert_eq!(
+        observed_backings(&state),
+        [BackingEvent {
+            name: "b-gone".into(),
+            observed: Backing::Absent { reason: Some("cloud sandbox gone: LifetimeCapReached".into()) }
+        }]
+    );
+    for name in ["a-unknown", "c-stale"] {
+        assert!(environments.environments.find(name).unwrap().unwrap().is_ready(), "{name} stays ready");
+    }
 }
 
 // #3780: bound active cloud work, admit queued siblings in order as slots free,
@@ -693,6 +656,7 @@ async fn docker_readoption_restores_the_daemon_forward() {
         cache: Arc::default(),
         forwards: Arc::clone(&forwards),
     });
+    engine_environments(&daemon);
     let state = Arc::new(
         ControllerRuntimeState::new(
             Arc::clone(&daemon),
@@ -772,6 +736,7 @@ async fn undescribed_cloud_backing_is_discarded(spec: flotilla_resources::Enviro
         destroyed: Arc::clone(&destroyed),
     });
     let address = spec.provider_address.clone().unwrap();
+    engine_environments(&daemon);
     let mut state = ControllerRuntimeState::new(
         daemon.clone(),
         config,
@@ -784,7 +749,14 @@ async fn undescribed_cloud_backing_is_discarded(spec: flotilla_resources::Enviro
         .environment_providers
         .insert(address.clone(), Arc::new(TestInteriorEnvironmentProvider { handle: tokio::sync::Mutex::new(Some(handle)) }))
         .unwrap();
-    daemon.resource_backend().using::<Environment>(NAMESPACE).create(&empty_meta("undescribed"), &spec).await.unwrap();
+    // A cloud sandbox beside a Docker input is refused at request, so it can never take the
+    // Docker path; the cloud sandbox alone takes its provider's.
+    if spec.docker.is_some() {
+        let refusal = engine_environments(&daemon).environments.request("undescribed", &spec, None).expect_err("two backings");
+        assert!(refusal.contains("exactly one of docker, host_direct and cloud_sandbox"), "{refusal}");
+        return;
+    }
+    engine_environments(&daemon).request("undescribed", &spec, None);
     let error =
         DockerControllerRuntime { state: Arc::new(state) }.provision_environment("undescribed", &spec).await.expect_err("no descriptor");
     assert!(

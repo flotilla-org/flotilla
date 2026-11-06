@@ -229,7 +229,9 @@ pub(super) async fn run_message_batch_pool_case(operator_closes: bool) {
         pool.clone(),
     );
     let profile = build_local_profile(&daemon, &registry).await.expect("cross-host Message fixture operation succeeds");
-    ensure_host_direct_environment_exists(&backend, NAMESPACE, &profile).await.expect("cross-host Message fixture operation succeeds");
+    ensure_host_direct_environment_exists(engine_environments(&daemon).reads.clone(), &profile)
+        .await
+        .expect("cross-host Message fixture operation succeeds");
     backend
         .using::<Convoy>(NAMESPACE)
         .create(&empty_meta("message-pool"), &ConvoySpec::builder().workflow_ref("test".into()).project_ref(NAMESPACE.into()).build())

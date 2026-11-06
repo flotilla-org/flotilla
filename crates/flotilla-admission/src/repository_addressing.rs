@@ -8,7 +8,7 @@ use std::{
 use flotilla_protocol::LifecycleReading;
 use flotilla_protocol::{RepoIdentity, RepoSelector};
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
-use flotilla_resources::{Checkout, CheckoutPhase, CheckoutSpec, Environment, Project, Repository, RepositoryKey};
+use flotilla_resources::{Checkout, CheckoutPhase, CheckoutSpec, Project, Repository, RepositoryKey};
 use flotilla_store::ResourceBackend;
 
 use flotilla_paths::path_context::canonical_or_original;
@@ -156,17 +156,6 @@ pub async fn local_checkouts_with_lifecycle_reads(
         };
         checkouts.insert(source.object.metadata.name.clone(), (source.object, origin));
     }
-    let local_environments = backend
-        .including_replicas::<Environment>(namespace)
-        .list()
-        .await
-        .map_err(|error| error.to_string())?
-        .items
-        .into_iter()
-        .filter(|source| source.object.spec.host_direct.as_ref().is_some_and(|direct| direct.host_ref == local_host))
-        .map(|source| source.object.metadata.name)
-        .collect::<BTreeSet<_>>();
-
     let mut ready = Vec::new();
     for (mut checkout, origin) in checkouts.into_values() {
         if !matches!(checkout.spec, CheckoutSpec::Observed(_)) {
@@ -182,6 +171,18 @@ pub async fn local_checkouts_with_lifecycle_reads(
             }
         }
         ready.push(checkout);
+    }
+    // The environments those checkouts stand on that run directly on this host, read from the engine.
+    let mut local_environments = BTreeSet::new();
+    let standing_on = ready.iter().filter_map(|checkout| checkout.spec.env_ref()).collect::<BTreeSet<_>>();
+    if !standing_on.is_empty() {
+        let environments = reads.environments()?;
+        for name in standing_on {
+            let environment = environments.find(name)?;
+            if environment.is_some_and(|environment| environment.spec.host_direct.is_some_and(|direct| direct.host_ref == local_host)) {
+                local_environments.insert(name.to_owned());
+            }
+        }
     }
     Ok(ready
         .into_iter()
@@ -401,11 +402,9 @@ mod tests {
             host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/work".into() }),
             docker: None,
         };
-        durable
-            .using::<Environment>("test")
-            .create(&InputMeta::builder().name("host-direct".into()).build(), &environment)
-            .await
-            .expect("environment");
+        let environments = flotilla_provisioning_testkit::EnvironmentFixture::default();
+        environments.request("host-direct", &environment, None);
+        let reads = environments.reads.as_ref();
         let spec = CheckoutSpec::FreshClone(
             FreshCloneCheckoutSpec::builder()
                 .repo_ref(key.clone())
@@ -418,7 +417,15 @@ mod tests {
         let checkouts = durable.using::<Checkout>("test");
         let current = checkouts.create(&InputMeta::builder().name("created".into()).build(), &spec).await.expect("checkout");
         assert_eq!(
-            resolve_repository(&durable, &observed, "test", "local", &RepoSelector::Path("/desired/widgets".into())).await,
+            resolve_repository_with_lifecycle_reads(
+                &durable,
+                &observed,
+                "test",
+                "local",
+                &RepoSelector::Path("/desired/widgets".into()),
+                reads
+            )
+            .await,
             Ok(None)
         );
         let current = checkouts
@@ -430,11 +437,27 @@ mod tests {
             .await
             .expect("ready checkout");
         assert_eq!(
-            resolve_repository(&durable, &observed, "test", "local", &RepoSelector::Path("/actual/widgets/src".into())).await,
+            resolve_repository_with_lifecycle_reads(
+                &durable,
+                &observed,
+                "test",
+                "local",
+                &RepoSelector::Path("/actual/widgets/src".into()),
+                reads
+            )
+            .await,
             Ok(Some(key.clone()))
         );
         assert_eq!(
-            resolve_repository(&durable, &observed, "test", "remote", &RepoSelector::Path("/actual/widgets/src".into())).await,
+            resolve_repository_with_lifecycle_reads(
+                &durable,
+                &observed,
+                "test",
+                "remote",
+                &RepoSelector::Path("/actual/widgets/src".into()),
+                reads
+            )
+            .await,
             Ok(None)
         );
         // A stale ephemeral record cannot resurrect a durable Gone checkout.
@@ -447,7 +470,18 @@ mod tests {
             )
             .await
             .expect("gone checkout");
-        assert_eq!(resolve_repository(&durable, &observed, "test", "local", &RepoSelector::Path("/actual/widgets".into())).await, Ok(None));
+        assert_eq!(
+            resolve_repository_with_lifecycle_reads(
+                &durable,
+                &observed,
+                "test",
+                "local",
+                &RepoSelector::Path("/actual/widgets".into()),
+                reads
+            )
+            .await,
+            Ok(None)
+        );
     }
     // Local repository addressing uses the engine's ready path and excludes every non-ready held
     // checkout, preserving durable precedence over observations and each selected replica's origin.
@@ -455,7 +489,7 @@ mod tests {
     async fn repository_paths_follow_checkout_engine_without_a_copy() {
         use flotilla_provisioning::engine::checkout::CheckoutBinding;
         use flotilla_provisioning_testkit::{object, store_object, Ending, LifecycleFixture};
-        use flotilla_resources::{CheckoutStatus, CheckoutWorktreeSpec, EnvironmentSpec, EnvironmentStatus, HostDirectEnvironmentSpec};
+        use flotilla_resources::{CheckoutStatus, CheckoutWorktreeSpec, EnvironmentSpec, HostDirectEnvironmentSpec};
         for replica in [false, true] {
             let durable = backend();
             let observed = backend();
@@ -464,16 +498,6 @@ mod tests {
             let temp = tempfile::tempdir().expect("paths");
             let live = temp.path().join("live");
             let stale = temp.path().join("stale");
-            let mut env = object::<Environment>(
-                "env",
-                EnvironmentSpec {
-                    host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/work".into() }),
-                    ..Default::default()
-                },
-                EnvironmentStatus::default(),
-            );
-            env.metadata.namespace = "test".into();
-            store_object(&durable, env).await;
             checkout().backend(&observed).name("managed").path(stale.to_str().expect("path")).key(key.clone()).call().await;
             let mut checkout = object::<Checkout>(
                 "managed",
@@ -498,6 +522,11 @@ mod tests {
                     .expect("replica");
             }
             let fixture = LifecycleFixture::<CheckoutBinding>::new(replica);
+            let env = EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/work".into() }),
+                ..Default::default()
+            };
+            fixture.environments.request("env", &env, None);
             fixture.request(&checkout);
             assert!(local_checkouts_with_lifecycle_reads(&durable, &observed, "test", "local", fixture.reads.as_ref())
                 .await

@@ -948,7 +948,7 @@ impl ConvoyAdmission {
         evidence: BriefEvidence<'_>,
     ) -> Result<(ResourceBackend, ResourceBackend), String> {
         use flotilla_resources::TerminalSession as ResourceTerminalSession;
-        use flotilla_resources::{CrewDefaults, Environment, FleetDesignation, ReadResourceList, FLEET_DESIGNATION_NAME};
+        use flotilla_resources::{CrewDefaults, FleetDesignation, ReadResourceList, FLEET_DESIGNATION_NAME};
         let read_source = evidence.definitions;
         let repository_names = spec
             .repositories
@@ -961,17 +961,27 @@ impl ConvoyAdmission {
             .await
             .map_err(|error| error.to_string())?;
         let local_host = self.environments.local_host_id().as_str();
-        let local_environment_query = host_direct_environment_query(local_host)?;
-        let environments = self
-            .backend
-            .query_declared::<Environment>(namespace, &StoreQuery { include_replicas: true, ..local_environment_query.clone() })
+        // This host's direct environments, from the engine: this home holds them.
+        let local_environments = {
+            let reads = Arc::clone(&self.lifecycle_reads);
+            let local_host = local_host.to_owned();
+            tokio::task::spawn_blocking(move || {
+                let mut local = Vec::new();
+                for environment in reads.environments()?.live()? {
+                    if is_local_direct_environment(&environment.spec, &local_host)? {
+                        local.push(environment.name);
+                    }
+                }
+                Ok::<_, String>(local)
+            })
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("read local environments: {error}"))??
+        };
         let local_checkout_query = StoreQuery {
             field_values: BTreeMap::from([("spec.repo_ref".into(), repository_names.into_iter().collect())]),
             any_of: Some(vec![
                 StoreQuery { fields: BTreeMap::from([("spec.host_ref".into(), local_host.into())]), ..Default::default() },
-                StoreQuery::related_kind("spec.env_ref", "Environment", "metadata.name", local_environment_query),
+                StoreQuery { field_values: BTreeMap::from([("spec.env_ref".into(), local_environments)]), ..Default::default() },
             ]),
             ..Default::default()
         };
@@ -1006,7 +1016,6 @@ impl ConvoyAdmission {
             .map_err(|error| error.to_string())?;
         let mut snapshot = flotilla_store::RequestSnapshot::new(&self.backend, namespace)?;
         snapshot.insert::<Repository>(repositories)?;
-        snapshot.insert::<Environment>(environments)?;
         snapshot.insert::<ResourceCheckout>(checkouts)?;
         if let Some(project) = spec.project_ref.as_deref() {
             // Every graph/default layer participates in topic and cascade refusals.
@@ -1722,25 +1731,20 @@ impl PlacementBuildJoiner<'_> {
     }
 }
 
-fn host_direct_environment_query(local_host: &str) -> Result<StoreQuery, String> {
-    let host_address = flotilla_address::Address::root(flotilla_address::Kind::Host, local_host).map_err(|error| error.to_string())?;
-    // Keep admission bounded to this host's direct environments. A full
-    // Environment scan grows with every per-vessel cloud/container backing.
-    Ok(StoreQuery {
-        any_of: Some(vec![
-            StoreQuery {
-                field_prefixes: BTreeMap::from([("spec.provider_address".into(), format!("{host_address}/provider:"))]),
-                present: vec!["spec.host_direct".into()],
-                ..Default::default()
-            },
-            StoreQuery {
-                fields: BTreeMap::from([("spec.host_direct.host_ref".into(), local_host.into())]),
-                missing_fields: BTreeSet::from(["spec.provider_address".into()]),
-                ..Default::default()
-            },
-        ]),
-        ..Default::default()
-    })
+/// Whether `spec` is a direct environment of `local_host`: one its provider address places on
+/// the host, or, with no address, whose host reference names it.
+fn is_local_direct_environment(spec: &flotilla_resources::EnvironmentSpec, local_host: &str) -> Result<bool, String> {
+    if spec.host_direct.is_none() {
+        return Ok(false);
+    }
+    match &spec.provider_address {
+        Some(address) => {
+            let host_address =
+                flotilla_address::Address::root(flotilla_address::Kind::Host, local_host).map_err(|error| error.to_string())?;
+            Ok(address.to_string().starts_with(&format!("{host_address}/provider:")))
+        }
+        None => Ok(spec.host_direct.as_ref().is_some_and(|direct| direct.host_ref == local_host)),
+    }
 }
 
 /// Write composed images into the placement: the convoy-level kind carries
@@ -4922,6 +4926,8 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
         .host_name(host_name.clone())
         .clock(Arc::clone(&clock))
         .fulfilment_decider(Arc::new(StaticFulfilmentDecider))
+        // The engine's environments, as composition installs them; none is held here.
+        .lifecycle_reads(flotilla_provisioning_testkit::EnvironmentFixture::default().reads)
         .build();
     HandlerContractFixture {
         owner: admission,
@@ -5114,7 +5120,7 @@ mod tests {
         // inputs, and a conflicting legacy host alongside an explicit address.
         let host = tc.draw(gs::text().alphabet("aZ09 /:%é").min_size(1).max_size(16));
         let address = flotilla_address::Address::root(flotilla_address::Kind::Host, &host).expect("host address");
-        let mut index = flotilla_store::QueryIndex::default();
+        let mut selected = BTreeSet::new();
         let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(24));
         let mut expected = BTreeSet::new();
         for row in 0..count {
@@ -5134,15 +5140,14 @@ mod tests {
                 spec["docker"] = serde_json::json!({"host_ref": target, "image":"image"});
             }
             let name = format!("environment-{row}");
-            index.update(&name, Some(&serde_json::json!({"kind":"Environment", "metadata":{"name":name}, "spec":spec})));
+            let spec = serde_json::from_value::<flotilla_resources::EnvironmentSpec>(spec).expect("environment spec");
+            if is_local_direct_environment(&spec, &host).expect("predicate") {
+                selected.insert(name.clone());
+            }
             if local && direct {
                 expected.insert(name);
             }
-            assert_eq!(
-                index.names(&host_direct_environment_query(&host).expect("query")),
-                expected,
-                "candidate cover after every insert at {address}"
-            );
+            assert_eq!(selected, expected, "candidate cover after every insert at {address}");
         }
     }
 

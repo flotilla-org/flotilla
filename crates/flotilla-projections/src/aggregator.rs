@@ -30,13 +30,14 @@ use flotilla_protocol::{
     ResourceRef, UNKNOWN_REPOSITORY_LABEL,
 };
 use flotilla_resources::attentions::{Attentions, OpenAttention, Sender, Subject as AttentionSubject, HOLD_ESCALATES_AFTER};
+use flotilla_resources::environment_records::EnvironmentChange;
 use flotilla_resources::{
     api_version, convoy_subject_rows, repository_display_labels, subject_relationship_conflicts, Checkout, CheckoutSpec,
     Clone as CloneResource, Convoy, ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource,
-    Demand, Environment, FulfilmentKind, FulfilmentRealisation, Project, ReadResourceObject, ReadWatchEvent, Repository, Resource,
-    ResourceError, ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalAttention, TerminalAttentionState,
-    TerminalSession, TerminalSessionPhase, Vessel, VesselPhase, VesselRequirement, WatchEvent, WatchStream, WorkPhase as ResourceWorkPhase,
-    WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    Demand, FulfilmentKind, FulfilmentRealisation, Project, ReadResourceObject, ReadWatchEvent, Repository, Resource, ResourceError,
+    ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalAttention, TerminalAttentionState, TerminalSession,
+    TerminalSessionPhase, Vessel, VesselPhase, VesselRequirement, WatchEvent, WatchStream, WorkPhase as ResourceWorkPhase, WorkState,
+    CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{ReadResourceList, ResourceList, WatchStart};
@@ -79,7 +80,6 @@ pub struct AggregatorResolvers {
     durable_convoys: ReplicaReadResolver<Convoy>,
     durable_convoy_ensures: ReplicaReadResolver<ConvoyEnsure>,
     durable_demands: TypedResolver<Demand>,
-    durable_environments: TypedResolver<Environment>,
     durable_fulfilment_kinds: Option<ReplicaReadResolver<FulfilmentKind>>,
     durable_sessions: ReplicaReadResolver<TerminalSession>,
     durable_projects: ReplicaReadResolver<Project>,
@@ -100,7 +100,6 @@ struct AggregatorSourceRefs<'a> {
     durable_convoys: &'a dyn AggregatorReplicaWatchSource<Convoy>,
     durable_convoy_ensures: &'a dyn AggregatorReplicaWatchSource<ConvoyEnsure>,
     durable_demands: &'a dyn AggregatorWatchSource<Demand>,
-    durable_environments: &'a dyn AggregatorWatchSource<Environment>,
     durable_fulfilment_kinds: Option<&'a dyn AggregatorReplicaWatchSource<FulfilmentKind>>,
     durable_sessions: &'a dyn AggregatorReplicaWatchSource<TerminalSession>,
     durable_projects: &'a dyn AggregatorReplicaWatchSource<Project>,
@@ -453,7 +452,6 @@ impl Aggregator {
             durable_convoys,
             durable_convoy_ensures,
             durable_demands,
-            durable_environments,
             durable_fulfilment_kinds,
             durable_sessions,
             durable_projects,
@@ -472,7 +470,6 @@ impl Aggregator {
             .durable_convoys(&durable_convoys)
             .durable_convoy_ensures(&durable_convoy_ensures)
             .durable_demands(&durable_demands)
-            .durable_environments(&durable_environments)
             .maybe_durable_fulfilment_kinds(
                 durable_fulfilment_kinds.as_ref().map(|source| source as &dyn AggregatorReplicaWatchSource<FulfilmentKind>),
             )
@@ -501,7 +498,6 @@ impl Aggregator {
             durable_convoys,
             durable_convoy_ensures,
             durable_demands,
-            durable_environments,
             durable_fulfilment_kinds,
             durable_sessions,
             durable_projects,
@@ -546,7 +542,6 @@ impl Aggregator {
         };
         let mut durable_convoy_stream = self.recover_replica_convoy_watch(durable_convoys).await?;
         let mut durable_demand_stream = self.recover_demand_watch(durable_demands).await?;
-        let mut durable_environment_stream = self.recover_environment_watch(durable_environments).await?;
         let mut durable_session_stream = self.recover_replica_session_watch(durable_sessions).await?;
         let mut durable_fleet_stream = match durable_fleet_designation {
             Some(source) => self.recover_fleet_designation_watch(source).await?,
@@ -582,6 +577,8 @@ impl Aggregator {
         // An engine edge writes no old record: follow the engine's changes to
         // re-project the convoy's row (#3587 layer 8).
         let mut engine_changes = self.convoy_engine.get().map(|engine| engine.changes());
+        // Environments are the engine's: their changes come from its log (#3108).
+        let mut environment_changes = self.lifecycle_reads.environments().ok().map(|environments| environments.changes());
         let mut attention_changes = self.attention_port.as_ref().and_then(|port| port.changes());
         let mut change_request_sweep =
             tokio::time::interval_at(Instant::now() + CHANGE_REQUEST_SWEEP_INTERVAL, CHANGE_REQUEST_SWEEP_INTERVAL);
@@ -623,6 +620,12 @@ impl Aggregator {
             };
             let engine_change = async {
                 match engine_changes.as_mut() {
+                    Some(changes) => changes.recv().await,
+                    None => futures::future::pending().await,
+                }
+            };
+            let environment_change = async {
+                match environment_changes.as_mut() {
                     Some(changes) => changes.recv().await,
                     None => futures::future::pending().await,
                 }
@@ -807,13 +810,13 @@ impl Aggregator {
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator durable demand watch ended")),
                 },
-                event = durable_environment_stream.next() => match event {
-                    Some(Ok(event)) => self.apply_environment_event(event).await,
-                    Some(Err(ResourceError::WatchExpired { .. })) => {
-                        durable_environment_stream = self.recover_environment_watch(durable_environments).await?;
+                change = environment_change => match change {
+                    Ok(change) => self.environment_changed(Some(change)).await,
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        tracing::warn!(missed, "aggregator lagged behind the environments' changes");
+                        self.environment_changed(None).await;
                     }
-                    Some(Err(err)) => return Err(err),
-                    None => return Err(ResourceError::other("aggregator durable environment watch ended")),
+                    Err(broadcast::error::RecvError::Closed) => environment_changes = None,
                 },
 
                 event = durable_session_stream.next() => match event {
@@ -933,13 +936,6 @@ impl Aggregator {
 
     async fn recover_demand_watch(&mut self, resolver: &dyn AggregatorWatchSource<Demand>) -> Result<WatchStream<Demand>, ResourceError> {
         self.list_and_watch_demands(resolver).await
-    }
-
-    async fn recover_environment_watch(
-        &mut self,
-        resolver: &dyn AggregatorWatchSource<Environment>,
-    ) -> Result<WatchStream<Environment>, ResourceError> {
-        self.list_and_watch_environments(resolver).await
     }
 
     async fn recover_observed_session_watch(
@@ -1149,15 +1145,6 @@ impl Aggregator {
         if let Err(error) = self.rebuild_checkout_rows().await {
             debug!(%error, "could not refresh checkout orphan attention after convoy relist");
         }
-    }
-
-    async fn list_and_watch_environments(
-        &mut self,
-        resolver: &dyn AggregatorWatchSource<Environment>,
-    ) -> Result<WatchStream<Environment>, ResourceError> {
-        let (_listed, watch) = recover_local_view(resolver).await?;
-        self.rebuild_independents_projection().await;
-        Ok(watch)
     }
 
     async fn list_and_watch_checkouts(
@@ -1816,12 +1803,13 @@ impl Aggregator {
         self.rebuild_local_projection().await;
     }
 
-    async fn apply_environment_event(&mut self, event: WatchEvent<Environment>) {
-        let name = match &event {
-            WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => &object.metadata.name,
-            _ => return,
-        };
-        self.attach_refresh_inputs.retain(|_, input| &input.environment != name);
+    /// An environment's engine record changed, or any of them may have (`None` or a rescan):
+    /// sessions in it are attachable afresh.
+    async fn environment_changed(&mut self, change: Option<EnvironmentChange>) {
+        match change {
+            Some(EnvironmentChange::Changed(name)) => self.attach_refresh_inputs.retain(|_, input| input.environment != name),
+            Some(EnvironmentChange::Rescanned) | None => self.attach_refresh_inputs.clear(),
+        }
         self.rebuild_independents_projection().await;
         self.rebuild_local_projection().await;
     }
@@ -2574,7 +2562,7 @@ impl Aggregator {
             Some(LifecycleReading::Failed { .. } | LifecycleReading::GaveUp { .. } | LifecycleReading::Exhausted { .. }) => {
                 VesselPhase::Failed
             }
-            Some(LifecycleReading::Lost | LifecycleReading::Released) => VesselPhase::Lost,
+            Some(LifecycleReading::Lost { .. } | LifecycleReading::Released) => VesselPhase::Lost,
             None => vessel.object.status.as_ref().map(|status| status.phase).unwrap_or_default(),
         }
     }
@@ -3258,9 +3246,9 @@ mod tests {
     use chrono::Utc;
     use flotilla_protocol::{result_set::Rows, PrincipalRef, Subject};
     use flotilla_resources::{
-        BoundChangeRequest, ConvoyRepositorySpec, ConvoySpec, CrewSpec, DeclaredSubject, EnvironmentSpec, HostDirectEnvironmentSpec,
-        InputMeta, ObjectMeta, ObservedCheckoutSpec, PlacementStatus, ProjectSpec, RepositorySpec, TerminalAttention,
-        TerminalAttentionSource, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
+        BoundChangeRequest, ConvoyRepositorySpec, ConvoySpec, CrewSpec, DeclaredSubject, InputMeta, ObjectMeta, ObservedCheckoutSpec,
+        PlacementStatus, ProjectSpec, RepositorySpec, TerminalAttention, TerminalAttentionSource, TerminalSessionSource,
+        TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
     };
     use flotilla_store::ResourceBackend;
     use futures::stream;
@@ -3895,7 +3883,7 @@ mod tests {
             let convoy = before.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
             assert_eq!(convoy.surface_state, SurfaceState::Available, "availability dropped at observation age {age}s");
             assert_eq!(convoy.vessels[0].surface_state, SurfaceState::Available);
-            aggregator.apply_environment_event(WatchEvent::Added(environment_object("unrelated").await)).await;
+            aggregator.environment_changed(Some(EnvironmentChange::Changed("unrelated".into()))).await;
             let after = state.result_set().await;
             assert_eq!(after.seq, before.seq, "unrelated rebuild changed attention at observation age {age}s");
         }
@@ -4170,7 +4158,6 @@ mod tests {
             .durable_convoys(durable.including_replicas::<Convoy>("flotilla"))
             .durable_convoy_ensures(durable.including_replicas::<ConvoyEnsure>("flotilla"))
             .durable_demands(durable.clone().using::<Demand>("flotilla"))
-            .durable_environments(durable.clone().using::<Environment>("flotilla"))
             .durable_sessions(durable.including_replicas::<TerminalSession>("flotilla"))
             .durable_projects(durable.including_replicas::<Project>("flotilla"))
             .durable_repositories(durable.including_replicas::<Repository>("flotilla"))
@@ -4790,7 +4777,6 @@ mod tests {
         durable_convoys: &dyn AggregatorReplicaWatchSource<Convoy>,
         observed_convoys: &dyn AggregatorWatchSource<Convoy>,
     ) -> Result<(), ResourceError> {
-        let durable_environments = ScriptedSource::<Environment>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_demands = ScriptedSource::<Demand>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_sessions = ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_projects = ScriptedSource::<Project>::new(vec![empty_list()], vec![Ok(pending_watch())]);
@@ -4806,7 +4792,6 @@ mod tests {
         let sources = AggregatorSourceRefs::builder()
             .durable_convoys(durable_convoys)
             .durable_demands(&durable_demands)
-            .durable_environments(&durable_environments)
             .durable_sessions(&durable_sessions)
             .durable_projects(&durable_projects)
             .durable_convoy_ensures(&durable_convoy_ensures)
@@ -5074,23 +5059,6 @@ mod tests {
             )
             .await
             .expect("set scripted terminal session status")
-    }
-
-    async fn environment_object(name: &str) -> ResourceObject<Environment> {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        backend
-            .using::<Environment>("flotilla")
-            .create(
-                &InputMeta::builder().name(name.to_string()).build(),
-                &EnvironmentSpec {
-                    cloud_sandbox: None,
-                    provider_address: None,
-                    host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".to_string(), repo_default_dir: "/repo".to_string() }),
-                    docker: None,
-                },
-            )
-            .await
-            .expect("create scripted environment")
     }
 
     #[tokio::test]
@@ -5667,7 +5635,7 @@ mod tests {
         let before = state.result_set().await;
         assert_eq!(before.rows.as_convoys().expect("convoy rows")[0].vessels[0].materialize, None);
 
-        aggregator.apply_environment_event(WatchEvent::Modified(environment_object("local").await)).await;
+        aggregator.environment_changed(Some(EnvironmentChange::Changed("local".into()))).await;
 
         settle_attach_refresh(&mut aggregator).await;
         let after = state.result_set().await;
@@ -5687,7 +5655,6 @@ mod tests {
             vec![Ok(pending_watch())],
         );
         let durable_demands = ScriptedSource::<Demand>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let durable_environments = ScriptedSource::<Environment>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_sessions = ScriptedSource::new(
             vec![ResourceList { items: vec![session], resource_version: "1".to_string(), generation: None }],
             vec![Ok(pending_watch())],
@@ -5706,7 +5673,6 @@ mod tests {
         let sources = AggregatorSourceRefs::builder()
             .durable_convoys(&durable_convoys)
             .durable_demands(&durable_demands)
-            .durable_environments(&durable_environments)
             .durable_sessions(&durable_sessions)
             .durable_projects(&durable_projects)
             .durable_convoy_ensures(&durable_convoy_ensures)
@@ -7007,7 +6973,7 @@ mod tests {
         assert_eq!(state, ReadinessState::Blocked);
         assert!(blockers[0].1.starts_with("worktree add failed (2 failed"));
         assert_eq!(checkout(Some(LifecycleReading::InProgress)), (ReadinessState::Provisioning, blocker("being realised")));
-        assert_eq!(checkout(Some(LifecycleReading::Lost)), (ReadinessState::Failed, blocker("observed absent")));
+        assert_eq!(checkout(Some(LifecycleReading::Lost { reason: None })), (ReadinessState::Failed, blocker("observed absent")));
         assert!(checkout(Some(LifecycleReading::Ready { identity: "/work/repo".into() })).1.is_empty());
         reads.errors.lock().expect("errors").insert((Kind, "checkout-a".into()), "checkout store unavailable".into());
         assert_eq!(checkout(None), (ReadinessState::Blocked, blocker("checkout store unavailable")));
@@ -7663,7 +7629,6 @@ mod tests {
                     .durable_convoys(durable.including_replicas::<Convoy>("flotilla"))
                     .durable_convoy_ensures(durable.including_replicas::<ConvoyEnsure>("flotilla"))
                     .durable_demands(durable.clone().using::<Demand>("flotilla"))
-                    .durable_environments(durable.clone().using::<Environment>("flotilla"))
                     .durable_sessions(durable.including_replicas::<TerminalSession>("flotilla"))
                     .durable_projects(durable.including_replicas::<Project>("flotilla"))
                     .durable_repositories(durable.including_replicas::<Repository>("flotilla"))
@@ -7737,7 +7702,6 @@ mod tests {
     async fn expired_session_watch_relists_its_source_and_removes_missed_deletion() {
         let stale = session_object("deleted-while-watch-expired").await;
         let durable_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
-        let durable_environments = Arc::new(ScriptedSource::<Environment>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_demands = Arc::new(ScriptedSource::<Demand>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_sessions = Arc::new(ScriptedSource::new(
             vec![ResourceList { items: vec![stale], resource_version: "1".to_string(), generation: None }, empty_list()],
@@ -7763,7 +7727,6 @@ mod tests {
             let sources = AggregatorSourceRefs::builder()
                 .durable_convoys(durable_convoys.as_ref())
                 .durable_demands(durable_demands.as_ref())
-                .durable_environments(durable_environments.as_ref())
                 .durable_sessions(run_durable_sessions.as_ref())
                 .durable_projects(durable_projects.as_ref())
                 .durable_convoy_ensures(durable_convoy_ensures.as_ref())
@@ -8120,7 +8083,6 @@ mod tests {
             .durable_convoys(d.including_replicas::<Convoy>("flotilla"))
             .durable_convoy_ensures(d.including_replicas::<ConvoyEnsure>("flotilla"))
             .durable_demands(d.using::<Demand>("flotilla"))
-            .durable_environments(d.using::<Environment>("flotilla"))
             .durable_sessions(d.including_replicas::<TerminalSession>("flotilla"))
             .durable_projects(d.including_replicas::<Project>("flotilla"))
             .durable_repositories(d.including_replicas::<Repository>("flotilla"))

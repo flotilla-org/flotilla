@@ -5,19 +5,32 @@ use flotilla_store_memory::InMemoryBackend;
 #[tokio::test]
 async fn credential_refresh_retry_waits_until_deadline_without_rewriting_status() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let environments = backend.clone().using::<Environment>(NAMESPACE);
-    environments
+    // The refresh retry is held by the vessels standing on the environment.
+    let vessels = backend.clone().using::<Vessel>(NAMESPACE);
+    let vessel = vessels
         .create(
-            &empty_meta("refresh-work"),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
-                docker: None,
+            &empty_meta("refresh-vessel"),
+            &VesselSpec {
+                convoy_ref: "refresh-convoy".to_string(),
+                vessel_name: "work".to_string(),
+                fulfilment_kind_ref: "test".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
             },
         )
         .await
-        .expect("create environment");
+        .expect("create vessel");
+    vessels
+        .update_status(
+            &vessel.metadata.name,
+            &vessel.metadata.resource_version,
+            &VesselStatus {
+                phase: flotilla_resources::VesselPhase::Ready,
+                environment_ref: Some("refresh-work".to_string()),
+                ..VesselStatus::default()
+            },
+        )
+        .await
+        .expect("place vessel");
     let failure = CredentialRefreshError {
         environment_ref: "refresh-work".into(),
         credential_name: Some("github-app".into()),
@@ -25,24 +38,17 @@ async fn credential_refresh_retry_waits_until_deadline_without_rewriting_status(
         should_surface: true,
     };
     record_credential_refresh_dispositions(&backend, NAMESPACE, std::slice::from_ref(&failure)).await.expect("record first failure");
-    let first = environments.get("refresh-work").await.expect("environment after first failure");
+    let first = vessels.get("refresh-vessel").await.expect("vessel after first failure");
     let retry = first.status.expect("status").credential_refresh_retry.expect("retry record");
     assert_eq!(retry.attempts, 1);
     record_credential_refresh_dispositions(&backend, NAMESPACE, std::slice::from_ref(&failure))
         .await
         .expect("observe failure again before deadline");
-    let second = environments.get("refresh-work").await.expect("environment after repeated failure");
+    let second = vessels.get("refresh-vessel").await.expect("vessel after repeated failure");
     assert_eq!(second.metadata.resource_version, first.metadata.resource_version);
     assert_eq!(second.status.expect("status").credential_refresh_retry, Some(retry));
     record_credential_refresh_dispositions(&backend, NAMESPACE, &[]).await.expect("clear on recovery");
-    assert!(environments
-        .get("refresh-work")
-        .await
-        .expect("environment after recovery")
-        .status
-        .expect("status")
-        .credential_refresh_retry
-        .is_none());
+    assert!(vessels.get("refresh-vessel").await.expect("vessel after recovery").status.expect("status").credential_refresh_retry.is_none());
 }
 
 #[tokio::test]
@@ -80,19 +86,14 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
         .await
         .expect("set convoy status");
     // The vessel's environment keeps its credential retry episode.
-    backend
-        .using::<Environment>(NAMESPACE)
-        .create(
-            &empty_meta("standing-vessel"),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
-                docker: None,
-            },
-        )
-        .await
-        .expect("create environment");
+    engine_environments(&daemon).request(
+        "standing-vessel",
+        &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
+            ..Default::default()
+        },
+        None,
+    );
     let vessels = backend.using::<Vessel>(NAMESPACE);
     let vessel = vessels
         .create(
@@ -454,28 +455,9 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_pushed_into(
         .await
         .expect("credential declaration");
     let env_id = EnvironmentId::new("contained-claude");
-    backend
-        .using::<Environment>(NAMESPACE)
-        .create(
-            &empty_meta(env_id.as_str()),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: None,
-                docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                    image_build_ref: None,
-                    host_ref: "host-test".into(),
-                    image: "contained-image".into(),
-                    declared_agent_adapters: BTreeSet::from(["claude-code".into()]),
-                    required_agent_adapters: BTreeSet::from(["claude-code".into()]),
-                    pull_policy: Default::default(),
-                    mounts: Vec::new(),
-                    env: BTreeMap::new(),
-                }),
-            },
-        )
-        .await
-        .expect("environment record");
+    let mut spec = docker_environment_spec("host-test", BTreeSet::from(["claude-code".into()]));
+    spec.docker.as_mut().expect("docker").required_agent_adapters = BTreeSet::from(["claude-code".into()]);
+    engine_environments(&daemon).request(env_id.as_str(), &spec, None);
     let source = LocalSkillSource::new(temp.path(), "research");
     freeze_crew(&backend, "demo", "demo-work", "coder", "claude-code", vec![source.selected.clone()]).await;
     bind_account(&daemon, "demo", "coder", "claude-max", "test@example.com").await;
@@ -522,6 +504,7 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_pushed_into(
         FLOTILLA_SKILLS_DIR_ENV,
         source.supply.display().to_string(),
     )]))));
+    engine_environments(&daemon);
     let state = Arc::new(
         ControllerRuntimeState::new(
             Arc::clone(&daemon),
@@ -563,7 +546,10 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_pushed_into(
         pool: "fake-terminals".to_string(),
     };
 
-    TerminalControllerRuntime { state }.ensure_session("terminal-demo-work-coder", (&spec).into(), &[]).await.expect("launch");
+    TerminalControllerRuntime { state: Arc::clone(&state) }
+        .ensure_session("terminal-demo-work-coder", (&spec).into(), &[])
+        .await
+        .expect("launch");
 
     let ensured = pool.ensured.lock().await;
     let [launch] = ensured.as_slice() else { panic!("expected one launch") };
@@ -575,8 +561,14 @@ async fn contained_claude_crew_launches_in_the_home_its_skills_were_pushed_into(
         "the crew's frozen skills are pushed into the agent's cache and linked from that same home"
     );
     // Contract 4: the access's status shows the same home and each need's mechanism.
-    let deliveries =
-        flotilla_projections::read_projections::access_delivery_evidence(&backend, NAMESPACE, "demo").await.expect("deliveries");
+    let deliveries = flotilla_projections::read_projections::access_delivery_evidence(
+        &backend,
+        state.daemon.lifecycle_reads().as_ref(),
+        NAMESPACE,
+        "demo",
+    )
+    .await
+    .expect("deliveries");
     let [delivery] = deliveries.as_slice() else { panic!("one access delivered: {deliveries:?}") };
     assert_eq!(Path::new(&delivery.home), home);
     let mechanisms = delivery.needs.iter().map(|need| (need.need.as_str(), need.mechanism.as_str())).collect::<BTreeMap<_, _>>();
@@ -629,6 +621,7 @@ async fn codex_adapter_delivers_the_central_credential_in_a_writable_codex_home(
         ("HOME", home.display().to_string()),
         (FLOTILLA_SKILLS_DIR_ENV, skill_sources.display().to_string()),
     ]))));
+    engine_environments(&daemon);
     let state = Arc::new(
         ControllerRuntimeState::new(
             daemon,
@@ -778,6 +771,7 @@ async fn codex_credential_and_agent_material_conflict_before_container_creation(
         config.state_dir().as_path().to_path_buf(),
     ));
     let agent_material = Arc::new(test_agent_material_registry(env));
+    engine_environments(&daemon);
     let state = Arc::new(
         ControllerRuntimeState::new(
             daemon,
@@ -870,6 +864,7 @@ async fn an_unprovisioned_central_codex_credential_fails_before_registry_preflig
         ("HOME", home.display().to_string()),
         (FLOTILLA_SKILLS_DIR_ENV, skill_sources.display().to_string()),
     ]))));
+    engine_environments(&daemon);
     let state = Arc::new(
         ControllerRuntimeState::new(
             daemon,

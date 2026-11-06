@@ -928,7 +928,7 @@ impl ReadProjections<'_> {
         convoy: Option<&str>,
     ) -> Result<FleetListResponse, String> {
         let (reads, selected_project, matching) = self.fleet_inventory(namespace, project, crew_id, convoy).await?;
-        let rows = self.fleet.rows_with_backend(&reads, namespace, self.host_registry).await?;
+        let rows = self.fleet.rows_with_backend(&reads, namespace, self.host_registry, self.lifecycles).await?;
         let mut fleet = self.with_backend(&reads).fleet_list(namespace, rows, self.clock.now()).await?;
         if let Some(selected_project) = selected_project {
             fleet.rows.retain(|row| row.convoy_ref.as_ref().is_some_and(|reference| matching.contains(reference)));
@@ -992,14 +992,13 @@ impl ReadProjections<'_> {
             .map_err(|error| error.to_string())?;
         let mut snapshot = project_ops::RequestSnapshot::new(&reads, namespace)?;
         snapshot.copy::<ResourceTerminalSession>(&reads).await?;
-        snapshot.copy::<flotilla_resources::Environment>(&reads).await?;
         snapshot.copy::<ResourceHost>(&reads).await?;
         snapshot.copy::<ResourceCheckout>(&reads).await?;
         snapshot.copy::<Project>(&reads).await?;
         snapshot.copy::<flotilla_resources::FleetDesignation>(&reads).await?;
         snapshot.insert::<FulfilmentKind>(kinds)?;
         let reads = snapshot.finish();
-        let rows = self.fleet.rows_with_backend(&reads, namespace, self.host_registry).await?;
+        let rows = self.fleet.rows_with_backend(&reads, namespace, self.host_registry, self.lifecycles).await?;
         let mut response = self.with_backend(&reads).fleet_health(namespace, host_list, rows, local_host_id, now).await?;
         for host in hosts.items {
             if let Some(value) = host.object.status.and_then(|status| status.capabilities.get("forge_budgets").cloned()) {
@@ -1018,7 +1017,7 @@ impl ReadProjections<'_> {
         crew_id: Option<&str>,
         convoy: Option<&str>,
     ) -> Result<(ResourceBackend, Option<String>, BTreeSet<String>), String> {
-        use flotilla_resources::{Environment, FleetDesignation, FLEET_DESIGNATION_NAME};
+        use flotilla_resources::{FleetDesignation, FLEET_DESIGNATION_NAME};
         let scoped = project.is_some() || crew_id.is_some() || convoy.is_some();
         let (scope, context) = if !scoped {
             // Every convoy participates in the full fleet address catalog.
@@ -1130,27 +1129,10 @@ impl ReadProjections<'_> {
             .filter(|source| selected_project.as_deref().is_none_or(|project| source.object.spec.project_ref.as_deref() == Some(project)))
             .map(|source| source.object.metadata.name.clone())
             .collect::<BTreeSet<_>>();
-        let environments = self
-            .backend
-            .query_declared::<Environment>(
-                namespace,
-                &StoreQuery::names(sessions.items.iter().map(|source| source.object.spec.env_ref.clone()), false),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut host_names = environments
-            .items
-            .iter()
-            .filter_map(|source| {
-                source
-                    .object
-                    .spec
-                    .host_direct
-                    .as_ref()
-                    .map(|spec| spec.host_ref.clone())
-                    .or_else(|| source.object.spec.docker.as_ref().map(|spec| spec.host_ref.clone()))
-            })
-            .collect::<BTreeSet<_>>();
+        let mut host_names =
+            crate::fleet::environment_hosts(self.lifecycles, sessions.items.iter().map(|source| source.object.spec.env_ref.as_str()))?
+                .into_values()
+                .collect::<BTreeSet<_>>();
         let summary = self.host_registry.local_host_summary().await;
         if let Some(host) = summary.environment_id.host_id() {
             host_names.insert(host.to_string());
@@ -1208,7 +1190,6 @@ impl ReadProjections<'_> {
         let mut snapshot = project_ops::RequestSnapshot::new(self.backend, namespace)?;
         snapshot.insert::<ResourceTerminalSession>(sessions)?;
         snapshot.insert::<ResourceConvoy>(convoys)?;
-        snapshot.insert::<Environment>(environments)?;
         snapshot.insert::<ResourceHost>(hosts)?;
         snapshot.insert::<ResourceCheckout>(checkouts)?;
         snapshot.insert_definitions::<Project>(projects)?;
@@ -1709,19 +1690,10 @@ impl ReadProjections<'_> {
         }
         // Sessions can predate placement evidence. Include their realized
         // environment hosts, without attributing an unrelated host's failure.
-        let environments = self
-            .backend
-            .query_declared::<flotilla_resources::Environment>(
-                namespace,
-                &StoreQuery::names(selected_sessions.values().map(|session| session.spec.env_ref.clone()), true),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        for environment in environments.items {
-            if let Some(host) = crate::fleet::resource_environment_host_ref(&environment.object) {
-                host_names.insert(host.to_string());
-            }
-        }
+        host_names.extend(
+            crate::fleet::environment_hosts(self.lifecycles, selected_sessions.values().map(|session| session.spec.env_ref.as_str()))?
+                .into_values(),
+        );
         warnings.extend(message_controller_warnings(self.backend, namespace, host_names).await?);
         warnings.sort();
         warnings.dedup();
@@ -1859,7 +1831,7 @@ impl ReadProjections<'_> {
             recent_events,
             lifecycle_mutations,
             account_bindings: account_binding_evidence(self.accounts, namespace, &convoy.metadata.name).await?,
-            access_deliveries: access_delivery_evidence(self.backend, namespace, &convoy.metadata.name).await?,
+            access_deliveries: access_delivery_evidence(self.backend, self.lifecycles, namespace, &convoy.metadata.name).await?,
         };
         Ok((explanation, convoy))
     }
@@ -2135,6 +2107,7 @@ pub async fn message_views(
 /// home, each need's mechanism and digest, and a failed delivery's retry.
 pub async fn access_delivery_evidence(
     backend: &ResourceBackend,
+    lifecycles: &dyn crate::ports::LifecycleReads,
     namespace: &str,
     convoy: &str,
 ) -> Result<Vec<flotilla_protocol::ExplainedAccessDelivery>, String> {
@@ -2150,14 +2123,14 @@ pub async fn access_delivery_evidence(
         )
         .await
         .map_err(|error| format!("read access deliveries: {error}"))?;
-    let environments = backend.including_replicas::<flotilla_resources::Environment>(namespace);
+    let environments = lifecycles.environments().ok();
     let mut connections = BTreeMap::new();
     for record in &records.items {
         let place = &record.object.spec.place;
         if !connections.contains_key(place) {
             // A place whose Environment is gone or unreadable simply reports no connection.
-            let connection = environments.get(place).await.ok().and_then(|environment| {
-                environment.object.status.and_then(|status| status.provider_descriptor).and_then(|descriptor| descriptor.agent_connection)
+            let connection = environments.and_then(|environments| environments.find(place).ok().flatten()).and_then(|environment| {
+                environment.launch.and_then(|launch| launch.provider_descriptor).and_then(|descriptor| descriptor.agent_connection)
             });
             connections.insert(place.clone(), connection);
         }

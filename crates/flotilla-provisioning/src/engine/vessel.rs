@@ -133,7 +133,7 @@ impl Binding for VesselBinding {
 /// A realised backing's observed ending has the same cause on both binding paths.
 fn vanished(patch: &VesselStatusPatch) -> Vec<Step> {
     match patch {
-        VesselStatusPatch::MarkLost { .. } => vec![Step::Vanished { cause: VanishCause::Lost }],
+        VesselStatusPatch::MarkLost { .. } => vec![Step::Vanished { cause: VanishCause::lost() }],
         VesselStatusPatch::MarkFailed { message } => vec![Step::Vanished { cause: VanishCause::Failed { reason: message.clone() } }],
         _ => vec![],
     }

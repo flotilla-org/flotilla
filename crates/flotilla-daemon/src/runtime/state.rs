@@ -22,9 +22,11 @@ use flotilla_environment::environment::{vessel_ops::RunnerVesselAgent, VesselAge
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::{CanonicalHostId, EnvironmentId};
 use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
+use flotilla_provisioning::engine::controller::BackingEvent;
 use flotilla_provisioning::reconcilers::clone::runtime::CloneFlights;
 use flotilla_provisioning::reconcilers::{CheckoutRemoval, ForgeDefaultBranchResolver};
-use flotilla_resources::{Convoy, ConvoyProvisioningState, Environment, Host, HostSpec, ResourceError, ResourceObject};
+use flotilla_resources::environment_records::EnvironmentRecord;
+use flotilla_resources::{Convoy, ConvoyProvisioningState, Host, HostSpec, ResourceError, ResourceObject};
 use flotilla_store::load_metrics::ControllerMetricsRegistry;
 use tokio::sync::{Mutex, Semaphore};
 
@@ -85,6 +87,10 @@ pub(super) struct ControllerRuntimeState {
     /// The provisioning kinds' engine homes behind `[primitives]` (#3629): the single writer
     /// of the resources they hold. Absent with the switch off.
     pub(super) provisioning: Option<flotilla_provisioning::engine::ProvisioningLifecycles>,
+    /// What the host's probes observe of its environments' backings, for the Environment
+    /// controller: the sender the probes use, and the receiver its controller takes once.
+    pub(super) environment_backings: tokio::sync::mpsc::Sender<BackingEvent>,
+    pub(super) environment_backing_events: StdMutex<Option<tokio::sync::mpsc::Receiver<BackingEvent>>>,
 }
 
 impl ControllerRuntimeState {
@@ -125,16 +131,36 @@ impl ControllerRuntimeState {
         Ok(address)
     }
 
+    /// The environment `name`, at whichever home holds it: the engine's (#3108). The read is a
+    /// store transaction, so it runs off the async workers.
+    pub(super) async fn environment(&self, name: &str) -> Result<Option<EnvironmentRecord>, String> {
+        let reads = self.daemon.lifecycle_reads();
+        let name = name.to_owned();
+        tokio::task::spawn_blocking(move || reads.environments()?.find(&name))
+            .await
+            .map_err(|error| format!("read environment: {error}"))?
+    }
+
+    /// This home's environments that have not ended.
+    pub(super) async fn live_environments(&self) -> Result<Vec<EnvironmentRecord>, String> {
+        let reads = self.daemon.lifecycle_reads();
+        tokio::task::spawn_blocking(move || reads.environments()?.live()).await.map_err(|error| format!("read environments: {error}"))?
+    }
+
+    /// Tells the Environment controller what a probe observed of `name`'s backing.
+    pub(super) async fn observe_environment_backing(&self, name: &str, observed: flotilla_provisioning::engine::controller::Backing) {
+        if self.environment_backings.send(BackingEvent { name: name.to_owned(), observed }).await.is_err() {
+            tracing::warn!(environment = name, "the Environment controller is not running; the backing observation is dropped");
+        }
+    }
+
     /// The provider instance that owns the Environment `name`.
     pub(super) async fn provider_for_environment(
         &self,
         name: &str,
     ) -> Result<Arc<dyn flotilla_environment::environment::EnvironmentProvider>, String> {
-        use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
-        let environment =
-            self.daemon.resource_backend().using::<Environment>(&self.namespace).get(name).await.map_err(|error| error.to_string())?;
-        let instance = environment.metadata.labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str);
-        let address = self.provider_address(name, &environment.spec, instance).await?;
+        let environment = self.environment(name).await?.ok_or_else(|| format!("environment {name} not found"))?;
+        let address = self.provider_address(name, &environment.spec, None).await?;
         self.environment_providers.get(&address)
     }
 
@@ -265,6 +291,7 @@ impl ControllerRuntimeState {
             Arc::new(flotilla_vcs::vcs::FlotillaVcs::object_cache(Arc::clone(&daemon.discovery_runtime().runner))),
             config.state_dir().as_path().join("skill-source-cache"),
         ));
+        let (environment_backings, environment_backing_events) = tokio::sync::mpsc::channel(64);
         Self {
             environment_providers,
             skill_trees,
@@ -297,6 +324,8 @@ impl ControllerRuntimeState {
             forge_default_branches: None,
             controller_metrics: Arc::default(),
             provisioning: None,
+            environment_backings,
+            environment_backing_events: StdMutex::new(Some(environment_backing_events)),
         }
     }
 
@@ -464,17 +493,32 @@ pub(super) async fn canonical_runtime_host_id(
 #[async_trait]
 impl StandingConvoyBackingInspector for ControllerRuntimeState {
     async fn verify_backing_dead(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String> {
-        let environments = self
-            .daemon
-            .resource_backend()
-            .using::<Environment>(&convoy.metadata.namespace)
-            .list()
-            .await
-            .map_err(|error| format!("could not inspect backing environments: {error}"))?
-            .items
-            .into_iter()
-            .filter(|environment| environment.metadata.labels.get(flotilla_resources::CONVOY_LABEL) == Some(&convoy.metadata.name))
-            .collect::<Vec<_>>();
+        // The convoy's environments are those held for its vessels; an ended one's backing was
+        // torn down or observed gone.
+        let vessels = convoy
+            .status
+            .as_ref()
+            .and_then(|status| status.workflow_snapshot.as_ref())
+            .map(|snapshot| {
+                snapshot
+                    .vessels
+                    .iter()
+                    .map(|requirement| flotilla_resources::vessel_resource_name(&convoy.metadata.name, &requirement.name))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let reads = self.daemon.lifecycle_reads();
+        let environments = tokio::task::spawn_blocking(move || {
+            let environments = reads.environments()?;
+            let mut held = Vec::new();
+            for vessel in &vessels {
+                held.extend(environments.held(vessel)?.into_iter().filter(|environment| !environment.ended()));
+            }
+            Ok::<_, String>(held)
+        })
+        .await
+        .map_err(|error| format!("could not inspect backing environments: {error}"))?
+        .map_err(|error| format!("could not inspect backing environments: {error}"))?;
         if environments.is_empty() {
             if convoy.status.as_ref().and_then(|status| status.provisioning) == Some(ConvoyProvisioningState::NotStarted) {
                 return Ok(());
@@ -530,19 +574,18 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
         // wired in; refusal is never evidence that such a backing is dead.
         // The EnvironmentRuntime provisioning/teardown port has no such filter.
         if let Some(environment) = environments.iter().find(|environment| environment.spec.docker.is_none()) {
-            return Err(format!("Environment/{} has no inspectable Docker backing", environment.metadata.name));
+            return Err(format!("Environment/{} has no inspectable Docker backing", environment.name));
         }
         let local_host_id = CanonicalHostId::resolved(&self.local_host_ref);
         for environment in &environments {
             let host_ref = &environment.spec.docker.as_ref().expect("Docker environment checked above").host_ref;
             let canonical = canonical_runtime_host_id(&self.daemon, &convoy.metadata.namespace, &local_host_id, host_ref).await?;
             if canonical != local_host_id {
-                return Err(format!("Environment/{} is backed by remote host {host_ref}", environment.metadata.name));
+                return Err(format!("Environment/{} is backed by remote host {host_ref}", environment.name));
             }
         }
         for environment in environments {
-            let instance = environment.metadata.labels.get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL);
-            let address = self.provider_address(&environment.metadata.name, &environment.spec, instance.map(String::as_str)).await?;
+            let address = self.provider_address(&environment.name, &environment.spec, None).await?;
             let provider = self.environment_providers.get(&address)?;
             let handles = provider
                 .list()
@@ -551,13 +594,10 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
                 .into_iter()
                 .map(|handle| ((handle.id().clone(), handle.backing_id().to_string()), handle))
                 .collect::<HashMap<_, _>>();
-            let Some(container_id) = environment.status.as_ref().and_then(|status| status.docker_container_id.as_ref()) else {
-                return Err(format!(
-                    "backing is not verifiable: Environment/{} has no Docker container identity",
-                    environment.metadata.name
-                ));
+            let Some(container_id) = environment.identity().map(str::to_owned) else {
+                return Err(format!("backing is not verifiable: Environment/{} has no Docker container identity", environment.name));
             };
-            let key = (EnvironmentId::new(environment.metadata.name.clone()), container_id.clone());
+            let key = (EnvironmentId::new(environment.name.clone()), container_id.clone());
             // Old Docker status values were transport names, before opaque IDs.
             let Some(handle) = handles.get(&key).or_else(|| {
                 handles.values().find(|handle| handle.id() == &key.0 && handle.container_name() == Some(container_id.as_str()))
@@ -566,14 +606,14 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
             };
             match handle.observe().await.state {
                 flotilla_environment::environment::ObservationState::Running => {
-                    return Err(format!("backing is live: Docker container {container_id} for Environment/{}", environment.metadata.name))
+                    return Err(format!("backing is live: Docker container {container_id} for Environment/{}", environment.name))
                 }
                 flotilla_environment::environment::ObservationState::Stopped { .. }
                 | flotilla_environment::environment::ObservationState::Gone { .. } => {}
                 flotilla_environment::environment::ObservationState::Unknown { reason } => {
                     return Err(format!(
                         "backing is not verifiable: Docker container {container_id} for Environment/{}: {reason:?}",
-                        environment.metadata.name
+                        environment.name
                     ));
                 }
             }

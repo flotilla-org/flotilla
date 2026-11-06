@@ -1325,38 +1325,25 @@ fn awaiting_records_take_the_stall_or_the_expectations_kind() {
 // catches up, including a session previously misclassified as failed.
 #[hegel::test]
 fn lost_environment_resume_reports_cause(tc: hegel::TestCase) {
-    use flotilla_resources::{
-        Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, HostDirectEnvironmentSpec, VesselPhase, VesselSpec, VesselStatus,
-    };
+    use flotilla_provisioning_testkit::{Ending, EnvironmentFixture};
+    use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec, VesselPhase, VesselSpec, VesselStatus};
     let failed_session = tc.draw(hegel::generators::booleans());
     let provisioning_failed = tc.draw(hegel::generators::booleans());
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-        let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Working).await;
-        let environments = backend.using::<Environment>("flotilla");
-        let env = environments
-            .create(
-                &InputMeta::builder().name("resume-env".into()).build(),
-                &EnvironmentSpec {
-                    cloud_sandbox: None,
-                    provider_address: None,
-                    docker: None,
-                    host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
-                },
-            )
-            .await
-            .expect("environment");
-        environments
-            .update_status(
-                "resume-env",
-                &env.metadata.resource_version,
-                &EnvironmentStatus {
-                    phase: if provisioning_failed { EnvironmentPhase::Failed } else { EnvironmentPhase::Lost },
-                    message: Some("cgroup_oom".into()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("lost environment");
+        let (mut crew, backend, probe, _config) = fixture(CrewWorkPhase::Working).await;
+        let environments = EnvironmentFixture::default();
+        Arc::get_mut(&mut crew).expect("unique service").lifecycle_reads = environments.reads.clone();
+        let spec = EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
+            ..Default::default()
+        };
+        environments.request("resume-env", &spec, None);
+        // The home's probe ends the launch with what it saw: failed, or lost to an OOM kill.
+        if provisioning_failed {
+            environments.finish("resume-env", Ending::Failed("cgroup_oom"));
+        } else {
+            environments.lose("resume-env", "cgroup_oom");
+        }
         let vessels = backend.using::<Vessel>("flotilla");
         let vessel = vessels
             .create(

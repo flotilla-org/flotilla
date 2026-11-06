@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::aggregator_projection::AggregatorProjectionState;
 use flotilla_daemon_api::event_sink::EventSink;
 use flotilla_protocol::{DaemonEvent, HostName};
-use flotilla_resources::{Checkout, Convoy, Demand, Environment, Project, Repository, ResourceError};
+use flotilla_resources::{Checkout, Convoy, Demand, Project, Repository, ResourceError};
 use flotilla_store::ResourceBackend;
 use futures::future::BoxFuture;
 use tokio::sync::broadcast;
@@ -67,7 +67,6 @@ pub fn run(
                     .durable_convoys(durable.including_replicas::<Convoy>(namespace))
                     .durable_convoy_ensures(durable.including_replicas::<flotilla_resources::ConvoyEnsure>(namespace))
                     .durable_demands(durable.clone().using::<Demand>(namespace))
-                    .durable_environments(durable.clone().using::<Environment>(namespace))
                     .durable_fulfilment_kinds(durable.including_replicas::<flotilla_resources::FulfilmentKind>(namespace))
                     .durable_sessions(durable.including_replicas::<flotilla_resources::TerminalSession>(namespace))
                     .durable_projects(durable.including_replicas::<Project>(namespace))

@@ -494,7 +494,7 @@ mod placements_tests {
         placements.place(&a, host(), Timestamp(1)).expect("granted");
         let world = MemoryLifecycleWorld::default();
         let unrealised = placements
-            .apply(&a, Vanish { cause: VanishCause::Lost, observed: Ref::new("a") }.into(), &world, Timestamp(2))
+            .apply(&a, Vanish { cause: VanishCause::lost(), observed: Ref::new("a") }.into(), &world, Timestamp(2))
             .expect_err("a Requested vessel cannot vanish");
         assert_eq!(unrealised.refusal(), Some(PlacementRefusal::MissingEvidence));
         let cause = Cause::new(CauseCategory::External, "provider refused provisioning");

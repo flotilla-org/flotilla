@@ -171,7 +171,7 @@ pub fn candidates<K: LifecycleKind>(tc: &TestCase, state: &LifecycleState) -> Ve
     candidates.push((
         Vanish {
             cause: if tc.draw(gs::booleans()) {
-                flotilla_state_machines::machines::lifecycle::VanishCause::Lost
+                flotilla_state_machines::machines::lifecycle::VanishCause::lost()
             } else {
                 flotilla_state_machines::machines::lifecycle::VanishCause::Failed { reason: text(tc) }
             },

@@ -311,6 +311,8 @@ mod tests {
         fleet: FleetService,
         accounts: flotilla_store::OldStoreAccounts,
         manifest_roots: flotilla_store::OldStoreManifestRoots,
+        /// The engine's environments the projections read.
+        engine: flotilla_provisioning_testkit::EnvironmentFixture,
     }
 
     #[async_trait]
@@ -378,6 +380,7 @@ mod tests {
                 fleet,
                 accounts,
                 manifest_roots,
+                engine: flotilla_provisioning_testkit::EnvironmentFixture::default(),
             }
         }
 
@@ -393,7 +396,7 @@ mod tests {
                 clock: &self.clock,
                 leaf_subscriptions: &self.subscriptions,
                 fleet: &self.fleet,
-                lifecycles: &flotilla_projections::ports::NoLifecycleReads,
+                lifecycles: self.engine.reads.as_ref(),
                 convoy_engine: &NO_CONVOY_ENGINE,
                 accounts: &self.accounts,
                 manifest_roots: &self.manifest_roots,
@@ -818,7 +821,12 @@ mod tests {
             .await
             .expect("replicate unmapped session");
 
-        let merged_rows = fixture.fleet.rows_with_backend(&fixture.backend, "flotilla", &fixture.registry).await.expect("fleet rows");
+        let engine = flotilla_provisioning_testkit::EnvironmentFixture::default();
+        let merged_rows = fixture
+            .fleet
+            .rows_with_backend(&fixture.backend, "flotilla", &fixture.registry, engine.reads.as_ref())
+            .await
+            .expect("fleet rows");
         assert_eq!(merged_rows.len(), 1, "unmapped origin must not create a phantom host row");
         assert_eq!(merged_rows[0].host, HostName::new("remote"));
         assert!(matches!(merged_rows[0].staleness, flotilla_protocol::FleetStaleness::Stale { .. }));

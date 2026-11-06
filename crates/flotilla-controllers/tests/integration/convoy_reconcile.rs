@@ -11,7 +11,6 @@ use common::{
     task_provisioning_convoy_spec, timestamp, tool_only_workflow_template_object, valid_convoy_spec, valid_workflow_template_object,
     workflow_template_meta,
 };
-use flotilla_environment::environment::EnvironmentProvisionError;
 use flotilla_resources::{
     controller_patches, evaluate_crew_completion, evaluate_landing_settlement, external_patches, implement_review_workflow_spec,
     interactive_single_workflow_spec, reconcile, Actuation, BoundChangeRequest, ChangeRequest, ChangeRequestMergeability,
@@ -31,7 +30,6 @@ use flotilla_store::{
 
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_crew::reconcilers::vessel::VesselReconciler;
-use flotilla_provisioning::reconcilers::{EnvironmentReconciler, EnvironmentRuntime};
 use flotilla_store_testkit::fixtures as common;
 
 use crate::common::cr_name;
@@ -2899,58 +2897,30 @@ async fn running_task_with_failed_workspace_marks_task_failed() {
     ));
 }
 
-// The container runtime boundary injects the same failure returned by skill staging.
-struct FailedSkillStaging;
-#[async_trait]
-impl EnvironmentRuntime for FailedSkillStaging {
-    async fn provision_environment(
-        &self,
-        _: &str,
-        _spec: &flotilla_resources::EnvironmentSpec,
-    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, EnvironmentProvisionError> {
-        Err("skill staging: pinned source unavailable".into())
-    }
-    async fn destroy(&self, _: &str, _: &str) -> Result<(), String> {
-        Ok(())
-    }
-}
-
 async fn skill_failure_vessel(convoy: &flotilla_resources::ResourceObject<Convoy>) -> flotilla_resources::ResourceObject<Vessel> {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     backend.using::<Convoy>("flotilla").create(&convoy_meta(&convoy.metadata.name), &convoy.spec).await.expect("convoy");
-    let environments = backend.using::<flotilla_resources::Environment>("flotilla");
-    let environment = environments
-        .create(
-            &InputMeta::builder().name("failed-skills".into()).build(),
-            &flotilla_resources::EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: None,
-                docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                    host_ref: "host".into(),
-                    image: "test".into(),
-                    image_build_ref: None,
-                    declared_agent_adapters: Default::default(),
-                    required_agent_adapters: Default::default(),
-                    pull_policy: Default::default(),
-                    mounts: Vec::new(),
-                    env: Default::default(),
-                }),
-            },
-        )
-        .await
-        .expect("environment");
-    let env_reconciler = EnvironmentReconciler::new(Arc::new(FailedSkillStaging), backend.clone(), "flotilla");
-    let prepared = env_reconciler.prepare(&environment).await.expect("injected provisioning");
-    let mut env_status = Default::default();
-    env_reconciler.reconcile(&environment, &prepared, timestamp(20)).patch.expect("failed environment").apply(&mut env_status);
-    environments
-        .update_status(&environment.metadata.name, &environment.metadata.resource_version, &env_status)
-        .await
-        .expect("persist failure");
+    // Skill staging fails at the environment's launch: its provider refuses, and the engine gives the
+    // environment up with that cause.
+    let environments = flotilla_provisioning_testkit::EnvironmentFixture::default();
+    let spec = flotilla_resources::EnvironmentSpec {
+        docker: Some(flotilla_resources::DockerEnvironmentSpec {
+            host_ref: "host".into(),
+            image: "test".into(),
+            image_build_ref: None,
+            declared_agent_adapters: Default::default(),
+            required_agent_adapters: Default::default(),
+            pull_policy: Default::default(),
+            mounts: Vec::new(),
+            env: Default::default(),
+        }),
+        ..Default::default()
+    };
+    environments.request("failed-skills", &spec, None);
+    environments.finish("failed-skills", flotilla_provisioning_testkit::Ending::GaveUp("skill staging: pinned source unavailable"));
     let mut vessel = vessel_object(&convoy.metadata.name, "implement", VesselPhase::Provisioning, None);
-    vessel.status.as_mut().expect("status").environment_ref = Some(environment.metadata.name);
-    let reconciler = VesselReconciler::new(backend, "flotilla");
+    vessel.status.as_mut().expect("status").environment_ref = Some("failed-skills".into());
+    let reconciler = VesselReconciler::new(backend, "flotilla").with_lifecycle_reads(environments.reads.clone());
     let prepared = reconciler.prepare(&vessel).await.expect("observe environment failure");
     reconciler.reconcile(&vessel, &prepared, timestamp(21)).patch.expect("failed vessel").apply(vessel.status.as_mut().expect("status"));
     assert_eq!(vessel.status.as_ref().expect("status").phase, VesselPhase::Failed);
@@ -3652,7 +3622,7 @@ async fn engine_ended_vessel_ends_its_seat_despite_provisioning_status() {
     use flotilla_protocol::{CanonicalHostId, LifecycleReading, PlacementDecision, PlacementTargetHost};
     use flotilla_provisioning_testkit::{Ending, VesselFixture};
     let endings = [
-        (Ending::Lost("env-implement"), LifecycleReading::Lost),
+        (Ending::Lost("env-implement"), LifecycleReading::Lost { reason: None }),
         (Ending::GaveUp("host unreachable"), LifecycleReading::GaveUp { cause: "host unreachable".into() }),
         (Ending::Released, LifecycleReading::Released),
     ];

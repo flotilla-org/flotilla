@@ -72,10 +72,10 @@ fn views_are_read_by_key_and_index_and_judged_per_key() {
 
     checkouts.step("b", &Step::Realised { identity: "/w".into() }, Timestamp(3)).expect("realised");
     checkouts
-        .step("b", &Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost }, Timestamp(4))
+        .step("b", &Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost() }, Timestamp(4))
         .expect("vanished");
     checkouts.step("c", &Step::Released, Timestamp(4)).expect("released");
-    assert_eq!(reads.checkout("b", HOME).expect("read").expect("held").judgement, Judgement::Lost);
+    assert_eq!(reads.checkout("b", HOME).expect("read").expect("held").judgement, Judgement::Lost { reason: None });
     assert_eq!(reads.checkout("c", HOME).expect("read").expect("held").judgement, Judgement::Released);
 
     let names = |views: Vec<flotilla_provisioning::engine::reads::View<CheckoutKind>>| {
@@ -114,7 +114,7 @@ fn a_replica_reads_the_ending_from_its_snapshot(tc: hegel::TestCase) {
     let reason = ["", "provider failed", "失敗"][tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(2))];
     let (ending, expected) = match tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(2)) {
         0 => (Step::Released, Judgement::Released),
-        1 => (Step::Vanished { cause: VanishCause::Lost }, Judgement::Lost),
+        1 => (Step::Vanished { cause: VanishCause::lost() }, Judgement::Lost { reason: None }),
         _ => (Step::Vanished { cause: VanishCause::Failed { reason: reason.into() } }, Judgement::Failed { reason: reason.into() }),
     };
     let origin = store();
@@ -272,14 +272,14 @@ fn a_vessel_reads_as_its_lease() {
     vessels.request("convoy-a-review", lease(), Timestamp(3)).expect("granted");
     vessels.step("convoy-a-review", &Step::Realised { identity: "env-b".into() }, Timestamp(4)).expect("ready");
     vessels
-        .step("convoy-a-review", &Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost }, Timestamp(5))
+        .step("convoy-a-review", &Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost() }, Timestamp(5))
         .expect("lost");
 
     let reads = StoreReads::new(store);
     let implement = reads.vessel("convoy-a-implement", HOME).expect("read").expect("held");
     assert_eq!(implement.judgement, Judgement::Ready { identity: "env-a".into() });
     assert_eq!(implement.request.host, Host::new("feta"));
-    assert_eq!(reads.vessel("convoy-a-review", HOME).expect("read").expect("held").judgement, Judgement::Lost);
+    assert_eq!(reads.vessel("convoy-a-review", HOME).expect("read").expect("held").judgement, Judgement::Lost { reason: None });
     assert!(reads.vessel("convoy-b-implement", HOME).expect("read").is_none());
     let mut convoy: Vec<String> =
         reads.convoy_vessels(&ConvoyId::new("convoy-a", HOME)).expect("index").into_iter().map(|view| view.name).collect();

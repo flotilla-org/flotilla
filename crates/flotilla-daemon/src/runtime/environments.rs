@@ -11,11 +11,9 @@ use flotilla_environment::environment::EnvironmentHandle;
 use flotilla_protocol::{CanonicalHostId, EnvironmentId, LifecycleReading};
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
-use flotilla_provisioning::engine::environment::EnvironmentBinding;
-use flotilla_resources::lifecycle_reads::ProvisioningKind;
-use flotilla_resources::{
-    Checkout, Environment, EnvironmentPhase, EnvironmentStatusPatch, ResourceError, ResourceObject, Vessel, VesselStatusPatch,
-};
+use flotilla_provisioning::engine::controller::Backing;
+use flotilla_resources::environment_records::EnvironmentRecord;
+use flotilla_resources::{Checkout, ResourceError, Vessel, VesselStatusPatch};
 use tracing::{info, warn};
 
 use super::docker::{probe_provisioned_environment, verify_declared_agent_adapters};
@@ -62,36 +60,16 @@ impl EnvironmentReadiness {
     }
 }
 
-pub(super) async fn environment_readiness(
-    daemon: &flotilla_core::in_process::InProcessDaemon,
-    environment: &ResourceObject<Environment>,
-) -> Result<EnvironmentReadiness, String> {
-    let reads = daemon.lifecycle_reads();
-    let name = environment.metadata.name.clone();
-    let reading = tokio::task::spawn_blocking(move || reads.try_reading(ProvisioningKind::Environment, &name, None))
-        .await
-        .map_err(|error| format!("read Environment lifecycle: {error}"))??;
-    Ok(match reading {
-        Some(LifecycleReading::Ready { identity }) => EnvironmentReadiness::Ready { identity: Some(identity) },
-        Some(_) => EnvironmentReadiness::NotReady,
-        None => match environment.status.as_ref() {
-            Some(status) if status.phase == EnvironmentPhase::Ready => {
-                EnvironmentReadiness::Ready { identity: status.docker_container_id.clone() }
-            }
-            _ => EnvironmentReadiness::NotReady,
-        },
-    })
+pub(super) fn environment_readiness(environment: &EnvironmentRecord) -> EnvironmentReadiness {
+    match &environment.reading {
+        LifecycleReading::Ready { identity } => EnvironmentReadiness::Ready { identity: Some(identity.clone()) },
+        _ => EnvironmentReadiness::NotReady,
+    }
 }
 
 pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRuntimeState>, namespace: &str) -> Result<(), String> {
-    let candidates = state
-        .daemon
-        .resource_backend()
-        .using::<Environment>(namespace)
-        .list()
-        .await
-        .map_err(|error| format!("list environments for adoption: {error}"))?
-        .items;
+    // This home's environments: the ones its providers realise.
+    let candidates = state.live_environments().await.map_err(|error| format!("list environments for adoption: {error}"))?;
     let local_host_id = CanonicalHostId::resolved(&state.local_host_ref);
     let mut environments = Vec::new();
     // Lifecycle read errors abort candidate selection: skipping an unreadable environment
@@ -101,14 +79,13 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
     let mut cloud_jobs = Vec::new();
     for environment in cloud {
         if !environment.spec.provider_address.as_ref().is_some_and(|address| state.environment_providers.get(address).is_ok())
-            || !environment_readiness(&state.daemon, &environment).await?.is_ready()
+            || !environment_readiness(&environment).is_ready()
         {
             continue;
         }
         let state = Arc::clone(state);
         let namespace = namespace.to_owned();
-        cloud_jobs
-            .push((environment.metadata.name.clone(), async move { reconcile_cloud_environment(&state, &namespace, &environment).await }));
+        cloud_jobs.push((environment.name.clone(), async move { reconcile_cloud_environment(&state, &namespace, &environment).await }));
     }
     // Start cloud work before any Docker inventory/SSH awaits. Dropping this
     // JoinSet aborts its coordinator, which in turn aborts its active jobs.
@@ -121,12 +98,11 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
             continue;
         };
         if canonical == local_host_id {
-            if let EnvironmentReadiness::Ready { identity } = environment_readiness(&state.daemon, &environment).await? {
+            if let EnvironmentReadiness::Ready { identity } = environment_readiness(&environment) {
                 environments.push((environment, identity));
             }
         }
     }
-    use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
     // This adoption path still consumes stored Docker status. Its input filter
     // must stay narrower than the profile's per_vessel capability test. Retire
     // the legacy-input bridge and these recovery filters together at #3108.
@@ -149,13 +125,7 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
     let mut inventories = HashMap::new();
     let mut reconciliations = Vec::new();
     for (environment, container_id) in environments {
-        let instance = state
-            .provider_address(
-                &environment.metadata.name,
-                &environment.spec,
-                environment.metadata.labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str),
-            )
-            .await?;
+        let instance = state.provider_address(&environment.name, &environment.spec, None).await?;
         if !inventories.contains_key(&instance) {
             let provider = state.environment_providers.get(&instance)?;
             let handles = provider
@@ -169,7 +139,7 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
                 .collect::<HashMap<_, _>>();
             inventories.insert(instance.clone(), handles);
         }
-        let env_id = EnvironmentId::new(environment.metadata.name.clone());
+        let env_id = EnvironmentId::new(environment.name.clone());
         let handles = inventories.get_mut(&instance).expect("provider inventory loaded");
         // Preceding-generation records stored a Docker transport name. Accept
         // that alias during adoption; new provisioning stores the opaque ID.
@@ -283,7 +253,7 @@ async fn collect_cloud_reconciliations(mut jobs: tokio::task::JoinSet<Result<(),
 pub(super) async fn reconcile_provisioned_environment(
     state: &Arc<ControllerRuntimeState>,
     namespace: &str,
-    environment: ResourceObject<Environment>,
+    environment: EnvironmentRecord,
     env_id: EnvironmentId,
     container_id: Option<String>,
     handle: Option<EnvironmentHandle>,
@@ -394,15 +364,16 @@ pub(super) async fn reconcile_provisioned_environment(
 /// immediately start teardown, and neither inspect nor cgroup evidence survives it.
 /// Cloud liveness uses provider facts, including cap loss. Restart adoption
 /// re-enters ordinary idempotent provisioning so forwarding and credentials are
-/// restored together; a cached image/SSH recipe never proves liveness.
+/// restored together; a cached image/SSH recipe never proves liveness. A sandbox
+/// present but unhealthy is logged, never recorded: only its absence ends the launch.
 async fn reconcile_cloud_environment(
     state: &Arc<ControllerRuntimeState>,
     namespace: &str,
-    environment: &ResourceObject<Environment>,
+    environment: &EnvironmentRecord,
 ) -> Result<(), String> {
     use flotilla_environment::environment::ObservationState;
-    let provider = state.provider_for_environment(&environment.metadata.name).await?;
-    let id = EnvironmentId::new(&environment.metadata.name);
+    let provider = state.provider_for_environment(&environment.name).await?;
+    let id = EnvironmentId::new(&environment.name);
     let cached =
         state.provisioned_environments.lock().await.values().find(|active| active.handle.id() == &id).map(|active| active.handle.clone());
     let handle = match cached.clone() {
@@ -413,15 +384,8 @@ async fn reconcile_cloud_environment(
         Some(handle) => match handle.observe().await.state {
             ObservationState::Running => {
                 if cached.is_none() {
-                    if let Err(error) = super::provider_path::provision(state, &environment.metadata.name, &environment.spec).await {
-                        record_cloud_health(
-                            state,
-                            namespace,
-                            &environment.metadata.name,
-                            false,
-                            Some(format!("Unknown: adoption failed; will retry: {error}")),
-                        )
-                        .await?;
+                    if let Err(error) = super::provider_path::provision(state, &environment.name, &environment.spec).await {
+                        warn!(environment = %environment.name, %error, "cloud sandbox adoption failed; will retry");
                         return Err(error.to_string());
                     }
                 }
@@ -433,7 +397,9 @@ async fn reconcile_cloud_environment(
                     | flotilla_environment::environment::ProviderReadiness::MissingCredential { reason } => Some(reason),
                     flotilla_environment::environment::ProviderReadiness::Ready => handle.health_message(),
                 };
-                record_cloud_health(state, namespace, &environment.metadata.name, ready, message).await?;
+                if !ready {
+                    warn!(environment = %environment.name, message = message.as_deref().unwrap_or_default(), "cloud sandbox is unhealthy");
+                }
                 Ok(())
             }
             ObservationState::Gone { cause } => {
@@ -452,7 +418,7 @@ async fn reconcile_cloud_environment(
             }
             ObservationState::Unknown { reason } => {
                 let message = format!("cloud sandbox observation unknown: {reason:?}");
-                record_cloud_health(state, namespace, &environment.metadata.name, false, Some(message.clone())).await?;
+                warn!(environment = %environment.name, %message, "cloud sandbox liveness unknown; will retry");
                 Err(message)
             }
         },
@@ -469,24 +435,6 @@ async fn reconcile_cloud_environment(
     }
 }
 
-async fn record_cloud_health(
-    state: &ControllerRuntimeState,
-    namespace: &str,
-    name: &str,
-    ready: bool,
-    message: Option<String>,
-) -> Result<(), String> {
-    let environments = state.daemon.resource_backend().using::<Environment>(namespace);
-    let current = environments.get(name).await.map_err(|e| e.to_string())?;
-    let mut status = current.status.clone().unwrap_or_default();
-    if status.message != message || status.ready != ready {
-        status.message = message;
-        status.ready = ready;
-        environments.update_status(name, &current.metadata.resource_version, &status).await.map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
 pub(super) async fn record_environment_observation(
     state: &ControllerRuntimeState,
     namespace: &str,
@@ -494,16 +442,8 @@ pub(super) async fn record_environment_observation(
     observation: &flotilla_protocol::EnvironmentRuntimeObservation,
 ) -> Result<(), String> {
     use flotilla_store::apply_status_patch;
+    // The runtime observation is the vessel's to show; an environment record stores none.
     let backend = state.daemon.resource_backend();
-    let environments = backend.using::<Environment>(namespace);
-    let environment = environments.get(env_id.as_str()).await.map_err(|error| error.to_string())?;
-    if let Some(observation) =
-        changed_runtime_observation(environment.status.as_ref().and_then(|status| status.runtime_observation.as_ref()), observation)
-    {
-        apply_status_patch(&environments, env_id.as_str(), &EnvironmentStatusPatch::ObserveRuntime { observation })
-            .await
-            .map_err(|error| error.to_string())?;
-    }
     let vessels = backend.using::<Vessel>(namespace);
     for vessel in vessels.list().await.map_err(|error| error.to_string())?.items {
         if vessel.status.as_ref().and_then(|status| status.environment_ref.as_deref()) != Some(env_id.as_str()) {
@@ -521,8 +461,8 @@ pub(super) async fn record_environment_observation(
 }
 
 /// Keep a sample's original timestamp while its value is unchanged. Compare
-/// each dependent independently so newly attached vessels still get their first
-/// observation even when the Environment already has the same evidence.
+/// each vessel independently so newly attached vessels still get their first
+/// observation.
 pub(super) fn changed_runtime_observation(
     current: Option<&flotilla_protocol::EnvironmentRuntimeObservation>,
     incoming: &flotilla_protocol::EnvironmentRuntimeObservation,
@@ -581,6 +521,7 @@ pub(super) async fn mark_unavailable_environment(
     }
     retained_paths.sort();
     retained_paths.dedup();
+    let cause = message;
     let message = match disposition {
         BackingDisposition::Lost => format!("lost, recoverable: {message}; rehydration is not available yet (#2872)"),
         BackingDisposition::Failed => message.to_string(),
@@ -590,48 +531,13 @@ pub(super) async fn mark_unavailable_environment(
     } else {
         format!("{message}; recover work from retained checkout(s): {}", retained_paths.join(", "))
     };
-    let environments = state.daemon.resource_backend().using::<Environment>(namespace);
-    let mut patch = Some(match disposition {
-        BackingDisposition::Lost => EnvironmentStatusPatch::MarkLost { message: message.clone() },
-        BackingDisposition::Failed => EnvironmentStatusPatch::MarkFailed { message: message.clone() },
-    });
-    // Behind `[primitives]` the engine decides first (#3629 layer 3): the old status is written
-    // only as the engine's answer.
-    if let Some(engine) = &state.provisioning {
-        match environments.get(env_id.as_str()).await {
-            Ok(environment) => {
-                // The engine's steps are synchronous SQLite transactions; they run off the async
-                // workers, as in `Engine::prepare`.
-                let lifecycles = Arc::clone(&engine.environments);
-                patch = tokio::task::spawn_blocking(move || {
-                    flotilla_provisioning::engine::decide::<EnvironmentBinding>(
-                        lifecycles.as_ref(),
-                        &environment,
-                        patch,
-                        chrono::Utc::now(),
-                    )
-                    .patch
-                })
-                .await
-                .map_err(|error| format!("mark unavailable environment {env_id}: engine decision: {error}"))?;
-                if patch.is_none() {
-                    // A refused edge (a backing lost before it was realised) or one the engine
-                    // already took: the old status stays as it is.
-                    tracing::info!(environment = %env_id, "the engine took no edge for this backing; its old status is unchanged");
-                }
-            }
-            Err(ResourceError::NotFound { .. }) => {
-                tracing::debug!(environment = %env_id, "environment record gone; nothing to mark");
-                patch = None;
-            }
-            Err(error) => return Err(format!("mark unavailable environment {env_id}: {error}")),
-        }
-    }
-    if let Some(patch) = patch {
-        flotilla_store::apply_status_patch(&environments, env_id.as_str(), &patch)
-            .await
-            .map_err(|error| format!("mark unavailable environment {env_id}: {error}"))?;
-    }
+    // The Environment controller is the launch's single writer: it ends the launch Lost, or
+    // Failed with the reason, as the probe observed.
+    let observed = match disposition {
+        BackingDisposition::Lost => Backing::Absent { reason: Some(cause.to_string()) },
+        BackingDisposition::Failed => Backing::Failed { reason: message.clone() },
+    };
+    state.observe_environment_backing(env_id.as_str(), observed).await;
     warn!(environment = %env_id, %message, "provisioned environment backing is unavailable");
     Ok(())
 }

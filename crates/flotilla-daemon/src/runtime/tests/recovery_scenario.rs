@@ -24,7 +24,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
     let backend = daemon.resource_backend();
 
-    register_startup(&daemon, NAMESPACE, &profile).await.expect("startup resources");
+    let provisioning = engine_startup(&daemon, NAMESPACE, &profile).await.expect("startup resources");
     apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("host heartbeat");
     let mut state = ControllerRuntimeState::new(
         Arc::clone(&daemon),
@@ -33,7 +33,8 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         None,
         profile.host_id.clone(),
         profile.host_direct_environment_name(),
-    );
+    )
+    .with_provisioning_lifecycles(Some(provisioning));
     state.local_core_count = || Ok(std::num::NonZeroUsize::new(32).expect("32 cores"));
     let state = Arc::new(state);
     let controller_handles = spawn_controller_loops(
@@ -435,14 +436,18 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         })
         .collect();
     pool.add_sessions(surviving_sessions).await;
-    let state = Arc::new(ControllerRuntimeState::new(
-        Arc::clone(&daemon),
-        Arc::clone(&config),
-        local_registry,
-        None,
-        profile.host_id.clone(),
-        profile.host_direct_environment_name(),
-    ));
+    let provisioning = engine_provisioning(&daemon).await;
+    let state = Arc::new(
+        ControllerRuntimeState::new(
+            Arc::clone(&daemon),
+            Arc::clone(&config),
+            local_registry,
+            None,
+            profile.host_id.clone(),
+            profile.host_direct_environment_name(),
+        )
+        .with_provisioning_lifecycles(Some(provisioning)),
+    );
     let controller_handles = spawn_controller_loops(
         Arc::clone(&state),
         NAMESPACE,

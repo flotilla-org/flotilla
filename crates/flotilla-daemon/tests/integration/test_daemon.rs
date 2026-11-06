@@ -7,13 +7,19 @@ use flotilla_dummy_fleet::{
     catalog::{CrewMix, DUMMY_CLOUD_FULFILMENT_KIND, DUMMY_FULFILMENT_KIND},
     DummyVendor,
 };
-use flotilla_resources::{Convoy, ConvoyPhase, Environment, EnvironmentPhase, ResourceObject, VESSEL_REF_LABEL};
+use flotilla_protocol::table::Row;
+use flotilla_resources::{Convoy, ConvoyPhase, ResourceObject};
 
-/// An environment of one of `convoy`'s vessels, in `phase`.
-fn of_convoy(convoy: &str, phase: EnvironmentPhase) -> impl Fn(&ResourceObject<Environment>) -> bool + '_ {
-    move |environment| {
-        environment.metadata.labels.get(VESSEL_REF_LABEL).is_some_and(|vessel| vessel.starts_with(&format!("{convoy}-")))
-            && environment.status.as_ref().is_some_and(|status| status.phase == phase)
+fn text<'a>(row: &'a Row, column: &str) -> &'a str {
+    row.get(column).and_then(serde_json::Value::as_str).unwrap_or_default()
+}
+
+/// An environment held for one of `convoy`'s vessels, in `state`.
+fn of_convoy<'a>(convoy: &'a str, state: &'a str) -> impl Fn(&Row) -> bool + 'a {
+    move |row| {
+        let holder = text(row, "holder");
+        let vessel = holder.rsplit([':', '/']).next().unwrap_or(holder);
+        vessel.starts_with(&format!("{convoy}-")) && text(row, "state") == state
     }
 }
 
@@ -38,14 +44,16 @@ async fn a_cloud_sandbox_the_vendor_stops_becomes_lost() {
 async fn cloud_sandbox_becomes_lost(vendor: fn(&DummyVendor, &str) -> bool) {
     let daemon = TestDaemon::builder().start().await;
     let convoy = daemon.dispatch(CrewMix::Coder, DUMMY_CLOUD_FULFILMENT_KIND).await;
-    let ready = daemon.wait("a Ready cloud sandbox", of_convoy(&convoy, EnvironmentPhase::Ready)).await;
-    assert!(ready.spec.cloud_sandbox.is_some(), "{ready:?}");
-    assert!(vendor(daemon.vendor(), &ready.metadata.name));
-    let name = ready.metadata.name;
-    let lost = |environment: &ResourceObject<Environment>| {
-        environment.metadata.name == name && environment.status.as_ref().is_some_and(|s| s.phase == EnvironmentPhase::Lost)
-    };
-    daemon.wait("Lost", lost).await;
+    let ready = daemon.wait_row("a Realised cloud sandbox", "environment", "", of_convoy(&convoy, "Realised")).await;
+    // A cloud sandbox's recipe sizes the sandbox.
+    assert!(ready.get("recipe").and_then(|recipe| recipe.get("size")).is_some(), "{ready:?}");
+    let name = text(&ready, "resource.name").to_owned();
+    assert!(vendor(daemon.vendor(), &name), "{ready:?}");
+    daemon
+        .wait_row("Lost", "environment", "", |row| {
+            text(row, "resource.name") == name && text(row, "state") == "Gone" && text(row, "ending") == "Lost"
+        })
+        .await;
 }
 
 // A restarted daemon finds its running vessels again: the vendor's backings and
@@ -55,14 +63,17 @@ async fn cloud_sandbox_becomes_lost(vendor: fn(&DummyVendor, &str) -> bool) {
 async fn a_restarted_daemon_adopts_its_running_vessels() {
     let daemon = TestDaemon::builder().agent("turn_delay_ms = 5000").start().await;
     let convoy = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
-    let environment = daemon.wait("a Ready environment", of_convoy(&convoy, EnvironmentPhase::Ready)).await;
+    let environment = daemon.wait_row("a Realised environment", "environment", "", of_convoy(&convoy, "Realised")).await;
+    let name = text(&environment, "resource.name").to_owned();
     daemon.wait("a launched coder", |_: &ResourceObject<Convoy>| daemon.counts().sessions_launched == 1).await;
     let daemon = daemon.restart().await;
     daemon.wait("Landed", in_phase(&convoy, ConvoyPhase::Landed)).await;
     let counts = daemon.counts();
     assert_eq!((counts.sessions_launched, counts.environments_provisioned, counts.command_errors), (1, 1, 0), "{counts:?}");
     // The adopted backing is the one torn down once the convoy lands.
-    daemon.wait_gone::<Environment>(&environment.metadata.name).await;
+    daemon
+        .wait_row("its environment Gone", "environment", "", |row| text(row, "resource.name") == name && text(row, "state") == "Gone")
+        .await;
     assert_eq!(daemon.counts().environments_destroyed, 1);
 }
 

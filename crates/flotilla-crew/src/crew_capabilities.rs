@@ -12,9 +12,9 @@ use flotilla_protocol::LifecycleReading;
 use flotilla_resources::account_access::AccountRecords;
 use flotilla_resources::lifecycle_reads::{LifecycleReads, ProvisioningKind};
 use flotilla_resources::{
-    message_record_name, vessel_placement_pin, Convoy, Environment, EnvironmentMount, EnvironmentMountMode, FulfilmentKind, ImageBuild,
-    ImageBuildPhase, InputMeta, Message, MessageReference, MessageRelation, MessageSpec, ResourceError, ResourceObject, ResourceProvenance,
-    ResourceRef, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel, CREDENTIAL_REFS_ANNOTATION,
+    message_record_name, vessel_placement_pin, Convoy, EnvironmentMount, EnvironmentMountMode, FulfilmentKind, ImageBuild, ImageBuildPhase,
+    InputMeta, Message, MessageReference, MessageRelation, MessageSpec, ResourceError, ResourceObject, ResourceProvenance, ResourceRef,
+    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel, CREDENTIAL_REFS_ANNOTATION,
 };
 use flotilla_store::ResourceBackend;
 use sha2::{Digest, Sha256};
@@ -108,8 +108,7 @@ pub async fn session_card(
             text.push_str(&format!("- `{path}` — {}{branch}, remote {}\n", repository.repo_ref, repository.url));
         }
     }
-    let environment =
-        backend.including_replicas::<Environment>(namespace).get(&spec.env_ref).await.map_err(|error| error.to_string())?.object;
+    let environment = reads.environments()?.find(&spec.env_ref)?.ok_or_else(|| format!("environment {} not found", spec.env_ref))?;
     // Backing host/image identities are not reachable capabilities; an equivalent
     // placement move must not generate a capability notice.
     text.push_str("\n### Reachable paths\n");

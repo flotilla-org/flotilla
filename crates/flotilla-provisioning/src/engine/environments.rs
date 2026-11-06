@@ -9,7 +9,7 @@ use std::{
 
 use flotilla_protocol::ConfiguredResourceLimits;
 use flotilla_resources::{
-    environment_records::{EnvironmentRecord, EnvironmentRecords, LaunchFacts},
+    environment_records::{EnvironmentChange, EnvironmentRecord, EnvironmentRecords, LaunchFacts},
     CloudSandboxEnvironmentSpec, DockerEnvironmentSpec, EnvironmentSpec, HostDirectEnvironmentSpec,
 };
 use flotilla_schema::{Frozen, Kind, Ref, Timestamp};
@@ -204,11 +204,43 @@ fn record(read: &mut Read<'_>, view: View<EnvironmentKind>) -> Result<Environmen
 pub struct EngineEnvironments {
     lifecycles: Arc<dyn Lifecycles<EnvironmentKind>>,
     reads: StoreReads,
+    changes: tokio::sync::broadcast::Sender<EnvironmentChange>,
 }
+
+/// How many changes a slow follower may fall behind by; one that lags rereads everything.
+const CHANGES: usize = 256;
 
 impl EngineEnvironments {
     pub fn new(lifecycles: Arc<dyn Lifecycles<EnvironmentKind>>, store: Arc<Mutex<Store>>) -> Self {
-        Self { lifecycles, reads: StoreReads::new(store) }
+        Self { lifecycles, reads: StoreReads::new(store), changes: tokio::sync::broadcast::channel(CHANGES).0 }
+    }
+
+    /// Follows the environments' records in `service`'s log, at every home, telling
+    /// [`EnvironmentRecords::changes`] of each. It runs at the store's commits.
+    pub fn follow(&self, service: Arc<flotilla_schema_sqlite::stream::Service>) -> Result<tokio::task::JoinHandle<()>, String> {
+        let mut watch =
+            super::watch::EngineWatch::start(service, [<Resource<Environment> as Kind>::CODE]).map_err(|error| error.to_string())?;
+        let changes = self.changes.clone();
+        Ok(tokio::spawn(async move {
+            loop {
+                let followed = watch
+                    .next(|_, followed| {
+                        Ok(followed
+                            .into_iter()
+                            .map(|followed| match followed {
+                                flotilla_engine_store::follow::Followed::Changed(identity) => EnvironmentChange::Changed(identity.name),
+                                flotilla_engine_store::follow::Followed::Rescan(_) => EnvironmentChange::Rescanned,
+                            })
+                            .collect::<Vec<_>>())
+                    })
+                    .await;
+                match followed {
+                    // No follower is no reason to stop: one may subscribe later.
+                    Ok(followed) => followed.into_iter().for_each(|change| drop(changes.send(change))),
+                    Err(error) => tracing::warn!(%error, "the environments' changes could not be read from the log; retrying"),
+                }
+            }
+        }))
     }
 
     fn home(&self) -> &str {
@@ -217,6 +249,10 @@ impl EngineEnvironments {
 }
 
 impl EnvironmentRecords for EngineEnvironments {
+    fn changes(&self) -> tokio::sync::broadcast::Receiver<EnvironmentChange> {
+        self.changes.subscribe()
+    }
+
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<EnvironmentRecord>, String> {
         let home = home.unwrap_or(self.home()).to_owned();
         self.reads
@@ -277,5 +313,79 @@ impl EnvironmentRecords for EngineEnvironments {
         let request = request_of(spec, vessel, self.home())?;
         let at = Timestamp::from_datetime(&chrono::Utc::now());
         self.lifecycles.request(name, request, at).map(|_| true).map_err(|error| format!("request environment {name}: {error}"))
+    }
+}
+
+/// Wakes a vessel's reconciler when the environment held for it changes: its readiness, facts
+/// and ending live in the engine, with no old record to watch (#3108).
+///
+/// A host's own environment (host-direct) is held for no vessel, yet a vessel placed on that host
+/// waits for it to be ready before it plans its clone and checkouts. Its change wakes every
+/// vessel: it is realised once per host start and ends with the host, so this is rare.
+#[derive(Clone)]
+pub struct EnvironmentHolderWake {
+    service: Arc<flotilla_schema_sqlite::stream::Service>,
+}
+
+impl EnvironmentHolderWake {
+    pub fn new(service: Arc<flotilla_schema_sqlite::stream::Service>) -> Self {
+        Self { service }
+    }
+}
+
+impl flotilla_store::controller::SecondaryWatch for EnvironmentHolderWake {
+    type Primary = flotilla_resources::Vessel;
+
+    fn clone_box(&self) -> Box<dyn flotilla_store::controller::SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        backend: flotilla_store::ResourceBackend,
+        namespace: String,
+        sender: flotilla_store::controller::WorkQueueSender,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), flotilla_resources::ResourceError>> + Send>> {
+        Box::pin(async move {
+            let mut watch = super::watch::EngineWatch::start(Arc::clone(&self.service), [<Resource<Environment> as Kind>::CODE])
+                .map_err(|error| flotilla_resources::ResourceError::other(error.to_string()))?;
+            loop {
+                let woken = watch
+                    .next(|read, followed| {
+                        let mut vessels = Vec::new();
+                        let mut every_vessel = false;
+                        for followed in followed {
+                            // A rescan names no resource: the vessels' resync covers it.
+                            let flotilla_engine_store::follow::Followed::Changed(identity) = followed else { continue };
+                            let Some(id) = read.resolve(<Resource<Environment> as Kind>::CODE, &identity.name, &identity.home)? else {
+                                continue;
+                            };
+                            let Some(loaded) = read.load::<Resource<Environment>>(id)? else { continue };
+                            match loaded.value.spec().holder.as_ref() {
+                                Some(holder) => vessels.extend(holder.0.strip_prefix("vessel:").map(str::to_owned)),
+                                None => every_vessel = true,
+                            }
+                        }
+                        Ok((vessels, every_vessel))
+                    })
+                    .await;
+                match woken {
+                    Ok((mut vessels, every_vessel)) => {
+                        if every_vessel {
+                            match backend.clone().using::<flotilla_resources::Vessel>(&namespace).list().await {
+                                Ok(list) => vessels.extend(list.items.into_iter().map(|vessel| vessel.metadata.name)),
+                                Err(error) => tracing::warn!(%error, "the environment holder wake could not list the vessels"),
+                            }
+                        }
+                        for vessel in vessels {
+                            if sender.send(vessel).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "the environment holder wake could not read the log; retrying"),
+                }
+            }
+        })
     }
 }

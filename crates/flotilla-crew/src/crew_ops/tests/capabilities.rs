@@ -16,7 +16,7 @@ use flotilla_resources::CREDENTIAL_REFS_ANNOTATION;
 
 #[tokio::test]
 async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
-    use flotilla_resources::{Environment, EnvironmentSpec, HostDirectEnvironmentSpec, Message, MessageReference, Vessel, VesselSpec};
+    use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec, Message, MessageReference, Vessel, VesselSpec};
 
     use flotilla_capability_contract::{CredentialCapability, SessionCapabilitySource};
     // In-memory port stands in for credential mint/delivery I/O.
@@ -32,7 +32,7 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
             Ok(self.1.read().await.clone())
         }
     }
-    let (crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
+    let (mut crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
     backend
         .using::<Vessel>("flotilla")
         .create(
@@ -46,19 +46,16 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
         )
         .await
         .expect("vessel");
-    backend
-        .using::<Environment>("flotilla")
-        .create(
-            &InputMeta::builder().name("resume-env".into()).build(),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
-                docker: None,
-            },
-        )
-        .await
-        .expect("environment");
+    let environments = flotilla_provisioning_testkit::EnvironmentFixture::default();
+    Arc::get_mut(&mut crew).expect("unique service").lifecycle_reads = environments.reads.clone();
+    environments.request(
+        "resume-env",
+        &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
+            ..Default::default()
+        },
+        None,
+    );
     let source = Arc::new(Delivery(
         RwLock::new(vec![CredentialCapability::builder()
             .name("github".into())
@@ -123,7 +120,7 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
             "flotilla",
             source.as_ref(),
             &crew.capability_cards,
-            Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+            environments.reads.clone(),
             &flotilla_store::OldStoreAccounts::new(backend.clone()),
         )
         .await
@@ -326,7 +323,7 @@ async fn previous_generation_gets_full_card_once_then_delivered_deltas() {
 async fn refresh_after_reaped_message_recovers_with_full_card() {
     use crate::crew_capabilities::{refresh_cards, CapabilityCardTracker};
     use flotilla_capability_contract::{CredentialCapability, SessionCapabilitySource};
-    use flotilla_resources::{Environment, EnvironmentSpec, HostDirectEnvironmentSpec, Message, Vessel, VesselSpec};
+    use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec, Message, Vessel, VesselSpec};
     // Credential/endpoint delivery is the runtime I/O boundary; resources use the real memory backend.
     struct Delivery(RwLock<BTreeMap<String, String>>);
     #[async_trait]
@@ -352,19 +349,15 @@ async fn refresh_after_reaped_message_recovers_with_full_card() {
         )
         .await
         .expect("vessel");
-    backend
-        .using::<Environment>("flotilla")
-        .create(
-            &InputMeta::builder().name("resume-env".into()).build(),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
-                docker: None,
-            },
-        )
-        .await
-        .expect("environment");
+    let environments = flotilla_provisioning_testkit::EnvironmentFixture::default();
+    environments.request(
+        "resume-env",
+        &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
+            ..Default::default()
+        },
+        None,
+    );
     let sessions = backend.using::<ResourceTerminalSession>("flotilla");
     let session = sessions.get("session").await.expect("session");
     sessions
@@ -382,7 +375,7 @@ async fn refresh_after_reaped_message_recovers_with_full_card() {
         "flotilla",
         &source,
         &tracker,
-        Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+        environments.reads.clone(),
         &flotilla_store::OldStoreAccounts::new(backend.clone()),
     )
     .await
@@ -393,7 +386,7 @@ async fn refresh_after_reaped_message_recovers_with_full_card() {
         "flotilla",
         &source,
         &tracker,
-        Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+        environments.reads.clone(),
         &flotilla_store::OldStoreAccounts::new(backend.clone()),
     )
     .await
@@ -409,7 +402,7 @@ async fn refresh_after_reaped_message_recovers_with_full_card() {
         "flotilla",
         &source,
         &tracker,
-        Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+        environments.reads.clone(),
         &flotilla_store::OldStoreAccounts::new(backend.clone()),
     )
     .await
@@ -419,7 +412,7 @@ async fn refresh_after_reaped_message_recovers_with_full_card() {
         "flotilla",
         &source,
         &tracker,
-        Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+        environments.reads.clone(),
         &flotilla_store::OldStoreAccounts::new(backend.clone()),
     )
     .await
@@ -439,7 +432,7 @@ async fn refresh_after_reaped_message_recovers_with_full_card() {
 async fn failing_source_never_publishes_an_empty_card() {
     use crate::crew_capabilities::{refresh_cards, CapabilityCardTracker};
     use flotilla_capability_contract::{CredentialCapability, SessionCapabilitySource};
-    use flotilla_resources::{Environment, EnvironmentSpec, HostDirectEnvironmentSpec, Message, Vessel, VesselSpec};
+    use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec, Message, Vessel, VesselSpec};
     // Credential/endpoint delivery is the runtime I/O boundary; resources use the real memory backend.
     struct Delivery(RwLock<BTreeMap<String, String>>, std::sync::atomic::AtomicBool);
     #[async_trait]
@@ -468,19 +461,15 @@ async fn failing_source_never_publishes_an_empty_card() {
         )
         .await
         .expect("vessel");
-    backend
-        .using::<Environment>("flotilla")
-        .create(
-            &InputMeta::builder().name("resume-env".into()).build(),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
-                docker: None,
-            },
-        )
-        .await
-        .expect("environment");
+    let environments = flotilla_provisioning_testkit::EnvironmentFixture::default();
+    environments.request(
+        "resume-env",
+        &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
+            ..Default::default()
+        },
+        None,
+    );
     let sessions = backend.using::<ResourceTerminalSession>("flotilla");
     let session = sessions.get("session").await.expect("session");
     sessions
@@ -498,7 +487,7 @@ async fn failing_source_never_publishes_an_empty_card() {
         "flotilla",
         &source,
         &tracker,
-        Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+        environments.reads.clone(),
         &flotilla_store::OldStoreAccounts::new(backend.clone()),
     )
     .await
@@ -513,7 +502,7 @@ async fn failing_source_never_publishes_an_empty_card() {
         "flotilla",
         &source,
         &tracker,
-        Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads),
+        environments.reads.clone(),
         &flotilla_store::OldStoreAccounts::new(backend.clone()),
     )
     .await
@@ -528,33 +517,28 @@ async fn failing_source_never_publishes_an_empty_card() {
 async fn image_capabilities_follow_engine_without_a_copy() {
     use flotilla_provisioning::engine::image_build::ImageBuildBinding;
     use flotilla_provisioning_testkit::{image_build, store_object, Ending, LifecycleFixture};
-    use flotilla_resources::{DockerEnvironmentSpec, Environment, EnvironmentSpec, ImageBuildPhase};
+    use flotilla_resources::{DockerEnvironmentSpec, EnvironmentSpec, ImageBuildPhase};
     let (_, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
     let build = image_build(ImageBuildPhase::Built);
     store_object(&backend, build.clone()).await;
-    backend
-        .using::<Environment>("flotilla")
-        .create(
-            &InputMeta::builder().name("resume-env".into()).build(),
-            &EnvironmentSpec {
-                provider_address: None,
-                host_direct: None,
-                cloud_sandbox: None,
-                docker: Some(DockerEnvironmentSpec {
-                    host_ref: "builder".into(),
-                    image: "composed".into(),
-                    image_build_ref: Some(build.metadata.name.clone()),
-                    declared_agent_adapters: Default::default(),
-                    required_agent_adapters: Default::default(),
-                    pull_policy: Default::default(),
-                    mounts: vec![],
-                    env: Default::default(),
-                }),
-            },
-        )
-        .await
-        .expect("environment");
     let fixture = LifecycleFixture::<ImageBuildBinding>::new(false);
+    fixture.environments.request(
+        "resume-env",
+        &EnvironmentSpec {
+            docker: Some(DockerEnvironmentSpec {
+                host_ref: "builder".into(),
+                image: "composed".into(),
+                image_build_ref: Some(build.metadata.name.clone()),
+                declared_agent_adapters: Default::default(),
+                required_agent_adapters: Default::default(),
+                pull_policy: Default::default(),
+                mounts: vec![],
+                env: Default::default(),
+            }),
+            ..Default::default()
+        },
+        None,
+    );
     let session = backend.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");
     // A command-source card exercises the same image reader without unrelated vessel-placement setup.
     let mut spec = session.spec;

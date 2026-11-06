@@ -15,14 +15,14 @@ use flotilla_crew::reconcilers::terminal_session::{
     TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalObservation, TerminalRuntime,
     TerminalRuntimeState, TerminalSessionReconciler,
 };
+use flotilla_provisioning_testkit::{Ending, EnvironmentFixture};
+use flotilla_resources::environment_records::LaunchFacts;
 use flotilla_resources::Actuation;
 use flotilla_resources::Checkout;
 use flotilla_resources::Convoy;
 use flotilla_resources::ConvoyPhase;
 use flotilla_resources::ConvoyTeardownRuntime;
 use flotilla_resources::EnvironmentSpec;
-use flotilla_resources::EnvironmentStatus;
-use flotilla_resources::EnvironmentStatusPatch;
 use flotilla_resources::HostDirectEnvironmentSpec;
 use flotilla_resources::InputMeta;
 use flotilla_resources::LifecycleAuthority;
@@ -66,30 +66,18 @@ use tracing::instrument::WithSubscriber;
 
 use crate::common;
 
-pub(super) async fn create_ready_environment(backend: &ResourceBackend, name: &str) {
-    let environments = backend.clone().using::<flotilla_resources::Environment>("flotilla");
-    let environment = environments
-        .create(
-            &meta(name),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "01HXYZ".to_string(), repo_default_dir: "/workspace".to_string() }),
-                docker: None,
-            },
-        )
-        .await
-        .expect("create environment");
-    let mut status = EnvironmentStatus::default();
-    EnvironmentStatusPatch::MarkReady {
-        configured_limits: None,
-        docker_container_id: None,
-        image_ref: None,
-        local_image_id: None,
-        registry_digest: None,
-    }
-    .apply(&mut status);
-    environments.update_status(name, &environment.metadata.resource_version, &status).await.expect("mark environment ready");
+/// `name`, a ready host-direct environment on the engine.
+pub(super) fn create_ready_environment(environments: &EnvironmentFixture, name: &str) {
+    environments.put_ready(
+        name,
+        &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "01HXYZ".to_string(), repo_default_dir: "/workspace".to_string() }),
+            ..Default::default()
+        },
+        None,
+        "/workspace",
+        LaunchFacts::default(),
+    );
 }
 
 #[derive(Default)]
@@ -141,8 +129,9 @@ impl TerminalRuntime for DeadThenRestoredRuntime {
 
 #[tokio::test]
 async fn dead_generation_is_lost_then_recreated() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_environment(&backend, "env-a").await;
+    create_ready_environment(&environments, "env-a");
     create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
@@ -193,7 +182,8 @@ async fn dead_generation_is_lost_then_recreated() {
     .apply(&mut running);
     let running = sessions.update_status("term-a", &created.metadata.resource_version, &running).await.expect("running status");
     let runtime = Arc::new(DeadThenRestoredRuntime::default());
-    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+    let reconciler =
+        TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla").with_lifecycle_reads(environments.reads.clone());
     let prepared = reconciler.prepare(&running).await.expect("probe");
     let lost_at = Utc::now() - chrono::Duration::seconds(6);
     let outcome = reconciler.reconcile(&running, &prepared, lost_at);
@@ -256,8 +246,9 @@ impl TerminalRuntime for BrieflyMissingRuntime {
 
 #[tokio::test]
 async fn a_briefly_missing_live_session_recovers_without_a_second_launch() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_environment(&backend, "env-a").await;
+    create_ready_environment(&environments, "env-a");
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
         .create(
@@ -286,7 +277,8 @@ async fn a_briefly_missing_live_session_recovers_without_a_second_launch() {
     .apply(&mut status);
     let running = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running");
     let runtime = Arc::new(BrieflyMissingRuntime::default());
-    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+    let reconciler =
+        TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla").with_lifecycle_reads(environments.reads.clone());
     let prepared = reconciler.prepare(&running).await.expect("first probe");
     let outcome = reconciler.reconcile(&running, &prepared, Utc::now());
     outcome.patch.expect("lost patch").apply(&mut status);
@@ -304,38 +296,21 @@ async fn a_briefly_missing_live_session_recovers_without_a_second_launch() {
 #[tokio::test]
 async fn terminal_session_failure_uses_injected_now_for_stopped_at() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let environments = backend.clone().using::<flotilla_resources::Environment>("flotilla");
+    let environments = EnvironmentFixture::default();
+    environments.put_ready(
+        "env-a",
+        &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec {
+                host_ref: "01HXYZ".into(),
+                repo_default_dir: "/Users/alice/dev/flotilla-repos".into(),
+            }),
+            ..Default::default()
+        },
+        None,
+        "/Users/alice/dev/flotilla-repos",
+        LaunchFacts::default(),
+    );
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
-    let env = environments
-        .create(
-            &meta("env-a"),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(HostDirectEnvironmentSpec {
-                    host_ref: "01HXYZ".to_string(),
-                    repo_default_dir: "/Users/alice/dev/flotilla-repos".to_string(),
-                }),
-                docker: None,
-            },
-        )
-        .await
-        .expect("env create should succeed");
-    environments
-        .update_status("env-a", &env.metadata.resource_version, &{
-            let mut status = EnvironmentStatus::default();
-            EnvironmentStatusPatch::MarkReady {
-                configured_limits: None,
-                docker_container_id: None,
-                image_ref: None,
-                local_image_id: None,
-                registry_digest: None,
-            }
-            .apply(&mut status);
-            status
-        })
-        .await
-        .expect("env ready update should succeed");
 
     let session = sessions
         .create(
@@ -351,7 +326,8 @@ async fn terminal_session_failure_uses_injected_now_for_stopped_at() {
         )
         .await
         .expect("session create should succeed");
-    let reconciler = TerminalSessionReconciler::new(Arc::new(FailingTerminalRuntime), backend, "flotilla");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(FailingTerminalRuntime), backend, "flotilla")
+        .with_lifecycle_reads(environments.reads.clone());
     let deps = reconciler.prepare(&session).await.expect("deps should load");
     let now = Utc::now();
     let outcome = reconciler.reconcile(&session, &deps, now);
@@ -383,6 +359,7 @@ impl TerminalRuntime for FailingTerminalRuntime {
 
 #[tokio::test]
 async fn terminal_session_is_reclaimed_when_its_environment_is_gone() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let session = backend
         .clone()
@@ -400,7 +377,8 @@ async fn terminal_session_is_reclaimed_when_its_environment_is_gone() {
         )
         .await
         .expect("create orphaned terminal session");
-    let reconciler = TerminalSessionReconciler::new(Arc::new(RecordingTerminalRuntime::default()), backend, "flotilla");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(RecordingTerminalRuntime::default()), backend, "flotilla")
+        .with_lifecycle_reads(environments.reads.clone());
 
     let deps = reconciler.prepare(&session).await.expect("missing environment should be lifecycle state");
     let outcome = reconciler.reconcile(&session, &deps, Utc::now());
@@ -435,6 +413,7 @@ impl TerminalRuntime for GoneEnvironmentTerminalRuntime {
 
 #[tokio::test]
 async fn terminal_finalizer_drains_after_its_environment_is_deleted() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
@@ -482,7 +461,8 @@ async fn terminal_finalizer_drains_after_its_environment_is_deleted() {
         )
         .await
         .expect("attention demand");
-    let reconciler = TerminalSessionReconciler::new(Arc::new(GoneEnvironmentTerminalRuntime), backend, "flotilla");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(GoneEnvironmentTerminalRuntime), backend, "flotilla")
+        .with_lifecycle_reads(environments.reads.clone());
 
     reconciler.run_finalizer(&deleting).await.expect("missing environment means there is no terminal process or artifact to tear down");
     assert!(matches!(demands.get("terminal-attention-terminal-orphan").await, Err(ResourceError::NotFound { .. })));
@@ -531,10 +511,12 @@ async fn vessel_owned_session(backend: &ResourceBackend, session_name: &str, ves
 
 #[tokio::test]
 async fn managed_terminal_session_is_reclaimed_when_its_vessel_owner_is_gone() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_environment(&backend, "env-a").await;
+    create_ready_environment(&environments, "env-a");
     let session = vessel_owned_session(&backend, "terminal-orphan", "deleted-vessel").await;
-    let reconciler = TerminalSessionReconciler::new(Arc::new(RecordingTerminalRuntime::default()), backend, "flotilla");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(RecordingTerminalRuntime::default()), backend, "flotilla")
+        .with_lifecycle_reads(environments.reads.clone());
 
     let prepared = reconciler.prepare(&session).await.expect("missing vessel should be lifecycle state");
     let outcome = reconciler.reconcile(&session, &prepared, Utc::now());
@@ -547,8 +529,9 @@ async fn managed_terminal_session_is_reclaimed_when_its_vessel_owner_is_gone() {
 
 #[tokio::test]
 async fn managed_terminal_session_is_preserved_while_its_vessel_owner_exists() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_environment(&backend, "env-a").await;
+    create_ready_environment(&environments, "env-a");
     backend
         .clone()
         .using::<Vessel>("flotilla")
@@ -556,7 +539,8 @@ async fn managed_terminal_session_is_preserved_while_its_vessel_owner_exists() {
         .await
         .expect("create live governor vessel");
     let session = vessel_owned_session(&backend, "terminal-convoy-governor-work-governor", "convoy-governor-work").await;
-    let reconciler = TerminalSessionReconciler::new(Arc::new(FailingTerminalRuntime), backend, "flotilla");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(FailingTerminalRuntime), backend, "flotilla")
+        .with_lifecycle_reads(environments.reads.clone());
 
     let prepared = reconciler.prepare(&session).await.expect("live vessel should be readable");
     let outcome = reconciler.reconcile(&session, &prepared, Utc::now());
@@ -566,6 +550,7 @@ async fn managed_terminal_session_is_preserved_while_its_vessel_owner_exists() {
 
 #[tokio::test]
 async fn abandoned_convoy_reaps_terminal_without_calling_its_runtime() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(
         &backend,
@@ -600,7 +585,8 @@ async fn abandoned_convoy_reaps_terminal_without_calling_its_runtime() {
         )
         .await
         .expect("terminal should exist");
-    let reconciler = TerminalSessionReconciler::new(Arc::new(RecordingTerminalRuntime::default()), backend, "flotilla");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(RecordingTerminalRuntime::default()), backend, "flotilla")
+        .with_lifecycle_reads(environments.reads.clone());
 
     let deps = reconciler.prepare(&session).await.expect("abandoned owner should be handled as lifecycle state");
     let outcome = reconciler.reconcile(&session, &deps, Utc::now());
@@ -616,7 +602,8 @@ async fn abandoned_convoy_reaps_terminal_without_calling_its_runtime() {
 async fn failed_convoy_terminal_stops_without_probing_its_gone_environment_runtime() {
     for phase in [TerminalSessionPhase::Starting, TerminalSessionPhase::Running, TerminalSessionPhase::Lost] {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        create_ready_environment(&backend, "env-failed-convoy").await;
+        let environments = EnvironmentFixture::default();
+        create_ready_environment(&environments, "env-failed-convoy");
         let convoy = create_convoy_with_single_task(
             &backend,
             "flotilla",
@@ -631,13 +618,7 @@ async fn failed_convoy_terminal_stops_without_probing_its_gone_environment_runti
         convoy_status.phase = ConvoyPhase::Failed;
         convoys.update_status("failed-convoy", &convoy.metadata.resource_version, &convoy_status).await.expect("fail convoy");
 
-        flotilla_store::apply_status_patch(
-            &backend.clone().using::<flotilla_resources::Environment>("flotilla"),
-            "env-failed-convoy",
-            &EnvironmentStatusPatch::MarkLost { message: "cgroup_oom".into() },
-        )
-        .await
-        .expect("lost backing");
+        environments.lose("env-failed-convoy", "cgroup_oom");
         let sessions = backend.clone().using::<TerminalSession>("flotilla");
         let session = sessions
             .create(
@@ -673,7 +654,8 @@ async fn failed_convoy_terminal_stops_without_probing_its_gone_environment_runti
             .await
             .expect("mark terminal running");
         let runtime = Arc::new(UnavailableRunningRuntime::default());
-        let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+        let reconciler =
+            TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla").with_lifecycle_reads(environments.reads.clone());
 
         let prepared = reconciler.prepare(&session).await.expect("terminal owner state");
         let outcome = reconciler.reconcile(&session, &prepared, Utc::now());
@@ -689,15 +671,9 @@ async fn failed_convoy_terminal_stops_without_probing_its_gone_environment_runti
 async fn failed_environment_terminal_stops_without_probing_its_runtime() {
     for phase in [TerminalSessionPhase::Starting, TerminalSessionPhase::Running, TerminalSessionPhase::Lost] {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        create_ready_environment(&backend, "env-failed").await;
-        let environments = backend.clone().using::<flotilla_resources::Environment>("flotilla");
-        let environment = environments.get("env-failed").await.expect("environment");
-        let mut environment_status = environment.status.expect("environment status");
-        EnvironmentStatusPatch::MarkFailed { message: "container is permanently gone".to_string() }.apply(&mut environment_status);
-        environments
-            .update_status("env-failed", &environment.metadata.resource_version, &environment_status)
-            .await
-            .expect("fail environment");
+        let environments = EnvironmentFixture::default();
+        create_ready_environment(&environments, "env-failed");
+        environments.finish("env-failed", Ending::Failed("container is permanently gone"));
 
         let sessions = backend.clone().using::<TerminalSession>("flotilla");
         let session = sessions
@@ -723,7 +699,8 @@ async fn failed_environment_terminal_stops_without_probing_its_runtime() {
             .await
             .expect("session phase");
         let runtime = Arc::new(UnavailableRunningRuntime::default());
-        let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+        let reconciler =
+            TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla").with_lifecycle_reads(environments.reads.clone());
 
         let prepared = reconciler.prepare(&session).await.expect("terminal environment state");
         let outcome = reconciler.reconcile(&session, &prepared, Utc::now());
@@ -767,8 +744,9 @@ impl TerminalRuntime for UnavailableRunningRuntime {
 
 #[tokio::test(start_paused = true)]
 async fn transient_runtime_probe_failure_holds_and_recovers_automatically() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_environment(&backend, "env-a").await;
+    create_ready_environment(&environments, "env-a");
     create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
@@ -807,7 +785,8 @@ async fn transient_runtime_probe_failure_holds_and_recovers_automatically() {
         ControllerLoop {
             primary: sessions.clone(),
             secondaries: Vec::new(),
-            reconciler: TerminalSessionReconciler::new(Arc::clone(&runtime), backend.clone(), "flotilla"),
+            reconciler: TerminalSessionReconciler::new(Arc::clone(&runtime), backend.clone(), "flotilla")
+                .with_lifecycle_reads(environments.reads.clone()),
             resync_interval: Duration::from_secs(3600),
             backend,
         }
@@ -881,8 +860,9 @@ async fn transient_runtime_probe_failure_holds_and_recovers_automatically() {
 
 #[tokio::test(start_paused = true)]
 async fn foreign_actuator_runtime_failure_is_skipped_and_convoy_stays_active() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_environment(&backend, "env-a").await;
+    create_ready_environment(&environments, "env-a");
     create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let convoy = convoys.get("demo").await.expect("convoy");
@@ -929,6 +909,7 @@ async fn foreign_actuator_runtime_failure_is_skipped_and_convoy_stays_active() {
             primary: sessions.clone(),
             secondaries: Vec::new(),
             reconciler: TerminalSessionReconciler::new(Arc::clone(&runtime), backend.clone(), "flotilla")
+                .with_lifecycle_reads(environments.reads.clone())
                 .with_local_host_ref(flotilla_protocol::CanonicalHostId::resolved("kiwi")),
             resync_interval: Duration::from_secs(60),
             backend,
@@ -956,6 +937,7 @@ const GHOST_SESSION_NAME: &str = "terminal-deleted-convoy-work-coder";
 
 struct GhostRecoveryWorld {
     backend: ResourceBackend,
+    environments: EnvironmentFixture,
     stale_session: ResourceObject<TerminalSession>,
     runtime: Arc<GhostRecoveryRuntime>,
     reconciler: TerminalSessionReconciler<GhostRecoveryRuntime>,
@@ -971,35 +953,17 @@ impl WorldBuilder for GhostRecoveryWorldBuilder {
 
     async fn build(&self, _scenario: LivenessScenario) -> Result<Self::World, String> {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        let environments = backend.clone().using::<flotilla_resources::Environment>("flotilla");
-        let env = environments
-            .create(
-                &meta("host-direct-feta"),
-                &EnvironmentSpec {
-                    cloud_sandbox: None,
-                    provider_address: None,
-                    host_direct: Some(HostDirectEnvironmentSpec {
-                        host_ref: "feta".to_string(),
-                        repo_default_dir: "/worktrees".to_string(),
-                    }),
-                    docker: None,
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut env_status = EnvironmentStatus::default();
-        EnvironmentStatusPatch::MarkReady {
-            configured_limits: None,
-            docker_container_id: None,
-            image_ref: None,
-            local_image_id: None,
-            registry_digest: None,
-        }
-        .apply(&mut env_status);
-        environments
-            .update_status("host-direct-feta", &env.metadata.resource_version, &env_status)
-            .await
-            .map_err(|error| error.to_string())?;
+        let environments = EnvironmentFixture::default();
+        environments.put_ready(
+            "host-direct-feta",
+            &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "feta".into(), repo_default_dir: "/worktrees".into() }),
+                ..Default::default()
+            },
+            None,
+            "/worktrees",
+            LaunchFacts::default(),
+        );
 
         let stale_session = backend
             .clone()
@@ -1035,9 +999,11 @@ impl WorldBuilder for GhostRecoveryWorldBuilder {
             .await
             .map_err(|error| error.to_string())?;
         let runtime = Arc::new(GhostRecoveryRuntime::default());
-        let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend.clone(), "flotilla");
+        let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend.clone(), "flotilla")
+            .with_lifecycle_reads(environments.reads.clone());
         Ok(GhostRecoveryWorld {
             backend,
+            environments,
             stale_session,
             runtime,
             reconciler,
@@ -1133,7 +1099,8 @@ impl TransitionDriver<GhostRecoveryWorld> for GhostRecoveryStep {
     }
 
     async fn restart_controller(&self, world: &mut GhostRecoveryWorld) -> Result<(), String> {
-        world.reconciler = TerminalSessionReconciler::new(Arc::clone(&world.runtime), world.backend.clone(), "flotilla");
+        world.reconciler = TerminalSessionReconciler::new(Arc::clone(&world.runtime), world.backend.clone(), "flotilla")
+            .with_lifecycle_reads(world.environments.reads.clone());
         Ok(())
     }
 
@@ -1174,8 +1141,9 @@ async fn deleted_terminal_session_is_not_resurrected_from_stale_state_after_rest
 
 #[tokio::test]
 async fn terminal_finalizer_kills_the_persisted_session_using_its_spec() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_environment(&backend, "host-direct-feta").await;
+    create_ready_environment(&environments, "host-direct-feta");
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let spec = TerminalSessionSpec {
         env_ref: "host-direct-feta".to_string(),
@@ -1214,7 +1182,8 @@ async fn terminal_finalizer_kills_the_persisted_session_using_its_spec() {
         .await
         .expect("attention demand");
     let runtime = Arc::new(RecordingTerminalRuntime::default());
-    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+    let reconciler =
+        TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla").with_lifecycle_reads(environments.reads.clone());
 
     // A turn still settling defers the kill without blocking (#3894).
     runtime.settling.store(true, Ordering::SeqCst);
@@ -1258,30 +1227,18 @@ impl TerminalRuntime for RecordingTerminalRuntime {
 async fn session_provisioning_passes_convoy_and_vessel_tags_to_runtime() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
-    let environments = backend.clone().using::<flotilla_resources::Environment>("flotilla");
+    let environments = EnvironmentFixture::default();
+    environments.put_ready(
+        "env-a",
+        &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host-a".into(), repo_default_dir: "/repos".into() }),
+            ..Default::default()
+        },
+        None,
+        "/repos",
+        LaunchFacts::default(),
+    );
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
-    let env = environments
-        .create(
-            &meta("env-a"),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host-a".into(), repo_default_dir: "/repos".into() }),
-                docker: None,
-            },
-        )
-        .await
-        .expect("environment");
-    let mut env_status = EnvironmentStatus::default();
-    EnvironmentStatusPatch::MarkReady {
-        configured_limits: None,
-        docker_container_id: None,
-        image_ref: None,
-        local_image_id: None,
-        registry_digest: None,
-    }
-    .apply(&mut env_status);
-    environments.update_status("env-a", &env.metadata.resource_version, &env_status).await.expect("ready environment");
     let input = InputMeta::builder()
         .name("term-a".to_string())
         .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "demo".to_string()), (VESSEL_REF_LABEL.to_string(), "demo-work".to_string())]))
@@ -1305,7 +1262,8 @@ async fn session_provisioning_passes_convoy_and_vessel_tags_to_runtime() {
         .await
         .expect("terminal");
     let runtime = Arc::new(TagRecordingRuntime::default());
-    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+    let reconciler =
+        TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla").with_lifecycle_reads(environments.reads.clone());
 
     reconciler.prepare(&session).await.expect("provisioning dependencies");
 
@@ -1359,9 +1317,10 @@ impl TerminalRuntime for BriefGateRuntime {
 
 #[tokio::test]
 async fn digest_backed_session_waits_for_blob_then_launches() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
-    create_ready_environment(&backend, "env-a").await;
+    create_ready_environment(&environments, "env-a");
     let session = backend
         .using::<TerminalSession>("flotilla")
         .create(
@@ -1398,7 +1357,8 @@ async fn digest_backed_session_waits_for_blob_then_launches() {
         .await
         .expect("terminal");
     let runtime = Arc::new(BriefGateRuntime::default());
-    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+    let reconciler =
+        TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla").with_lifecycle_reads(environments.reads.clone());
     let waiting = reconciler.prepare(&session).await.expect("wait for blob");
     let outcome = reconciler.reconcile(&session, &waiting, Utc::now());
     assert!(outcome.patch.is_none());
@@ -1442,8 +1402,9 @@ impl TerminalRuntime for TagRecordingRuntime {
 
 #[tokio::test]
 async fn a_disappeared_running_session_is_observed_as_stopped() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_environment(&backend, "env-a").await;
+    create_ready_environment(&environments, "env-a");
     create_convoy_with_single_task(&backend, "flotilla", "demo", "implement", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let created = sessions
@@ -1486,7 +1447,8 @@ async fn a_disappeared_running_session_is_observed_as_stopped() {
     }
     .apply(&mut status);
     let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
-    let reconciler = TerminalSessionReconciler::new(Arc::new(MissingTerminalRuntime), backend, "flotilla");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(MissingTerminalRuntime), backend, "flotilla")
+        .with_lifecycle_reads(environments.reads.clone());
 
     let deps = reconciler.prepare(&session).await.expect("observe session");
     let now = Utc::now();
@@ -1530,8 +1492,9 @@ impl TerminalRuntime for ReachRuntime {
 // why its crew cannot reach the daemon, without leaving Running; recovery clears it.
 #[tokio::test]
 async fn unreachable_daemon_is_recorded_on_a_running_session_and_cleared() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_environment(&backend, "env-a").await;
+    create_ready_environment(&environments, "env-a");
     create_convoy_with_single_task(&backend, "flotilla", "demo", "implement", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let created = sessions
@@ -1561,7 +1524,7 @@ async fn unreachable_daemon_is_recorded_on_a_running_session_and_cleared() {
     .apply(&mut status);
     let mut session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
     let runtime = Arc::new(ReachRuntime(Mutex::new(Some("daemon forward down: ssh forward exited".into()))));
-    let reconciler = TerminalSessionReconciler::new(runtime.clone(), backend, "flotilla");
+    let reconciler = TerminalSessionReconciler::new(runtime.clone(), backend, "flotilla").with_lifecycle_reads(environments.reads.clone());
 
     for expected in [Some("daemon forward down: ssh forward exited"), None] {
         *runtime.0.lock().expect("reach") = expected.map(str::to_string);
@@ -1586,6 +1549,7 @@ struct MissingTerminalRuntime;
 
 #[tokio::test]
 async fn a_fresh_turn_launched_as_the_brief_is_not_delivered_again() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let text = "[flotilla · turn: conflicting]\n\nRebase the PR";
@@ -1624,7 +1588,8 @@ async fn a_fresh_turn_launched_as_the_brief_is_not_delivered_again() {
         )
         .await
         .expect("create fresh turn session");
-    let reconciler = TerminalSessionReconciler::new(Arc::new(MissingTerminalRuntime), backend, "flotilla");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(MissingTerminalRuntime), backend, "flotilla")
+        .with_lifecycle_reads(environments.reads.clone());
     let prepared = flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Running(TerminalRuntimeState {
         configured_limits: None,
         session_id: "cleat-session".into(),
@@ -1675,8 +1640,9 @@ impl TerminalRuntime for MissingTerminalRuntime {
 
 #[tokio::test]
 async fn a_message_queued_during_startup_is_delivered_before_attention_observation() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_environment(&backend, "env-a").await;
+    create_ready_environment(&environments, "env-a");
     create_convoy_with_single_task(&backend, "flotilla", "demo", "review", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let created = sessions
@@ -1740,7 +1706,8 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
     .apply(&mut status);
     let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
     let runtime = Arc::new(DeliveringTerminalRuntime::default());
-    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+    let reconciler =
+        TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla").with_lifecycle_reads(environments.reads.clone());
 
     // #2599 review: optional observation failure must not back off or starve
     // a pending delivery. No queued message is acknowledged until it succeeds.
@@ -1820,7 +1787,8 @@ async fn submissions_that_sent_no_bytes_back_off_and_stop_at_the_bound() {
 
 async fn delivery_failure_scenario(startup_not_ready: bool) {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_environment(&backend, "env-a").await;
+    let environments = EnvironmentFixture::default();
+    create_ready_environment(&environments, "env-a");
     create_convoy_with_single_task(&backend, "flotilla", "demo", "review", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
@@ -1879,7 +1847,8 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
             .observation_failed(AtomicBool::new(false))
             .build(),
     );
-    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend.clone(), "flotilla");
+    let reconciler =
+        TerminalSessionReconciler::new(Arc::clone(&runtime), backend.clone(), "flotilla").with_lifecycle_reads(environments.reads.clone());
 
     let pending =
         reconciler.reconcile(&session, &flotilla_crew::reconcilers::terminal_session::TerminalPrepared::MessageDeliveryPending, Utc::now());
@@ -2089,7 +2058,8 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
         outcome.patch.expect("visible timeout").apply(&mut status);
         assert!(status.degraded.as_ref().expect("timeout").message.contains("deadline"));
         flagged = sessions.update_status("term-a", &flagged.metadata.resource_version, &status).await.expect("persist timeout");
-        let fresh = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+        let fresh =
+            TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla").with_lifecycle_reads(environments.reads.clone());
         let prepared = fresh.prepare(&flagged).await.expect("observe expired hold after restart");
         let outcome = fresh.reconcile(&flagged, &prepared, Utc::now());
         assert!(
@@ -2170,7 +2140,7 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
     let mut status = flagged.status.clone().expect("status");
     status.degraded.as_mut().expect("condition").observed_at -= chrono::Duration::hours(1);
     flagged = sessions.update_status("term-a", &flagged.metadata.resource_version, &status).await.expect("late resync");
-    let fresh = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+    let fresh = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla").with_lifecycle_reads(environments.reads.clone());
     let prepared = fresh.prepare(&flagged).await.expect("hold survives restart");
     assert!(matches!(prepared, flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(_)));
     assert_eq!(runtime.delivered.lock().expect("delivered mutex").len(), 3);
@@ -2180,6 +2150,7 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
 // repeating the same output is a no-op and cannot keep a hung turn alive.
 #[tokio::test]
 async fn meaningful_output_progress_survives_coalesced_attention() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
@@ -2199,7 +2170,8 @@ async fn meaningful_output_progress_survives_coalesced_attention() {
     let start = Utc::now();
     let status = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() };
     sessions.update_status("output-crew", &created.metadata.resource_version, &status).await.expect("running session");
-    let reconciler = TerminalSessionReconciler::new(Arc::new(HooklessTerminalRuntime), backend, "flotilla");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(HooklessTerminalRuntime), backend, "flotilla")
+        .with_lifecycle_reads(environments.reads.clone());
     for (digest, second, expected, changed) in
         [("first", 0, 0, true), ("second", 10, 0, false), ("second", 29, 0, false), ("second", 30, 30, true), ("second", 60, 30, false)]
     {
@@ -2226,6 +2198,7 @@ async fn meaningful_output_progress_survives_coalesced_attention() {
 // when the composer does; repeats write nothing.
 #[tokio::test]
 async fn screen_obstruction_is_recorded_while_attention_is_debounced() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
@@ -2250,7 +2223,8 @@ async fn screen_obstruction_is_recorded_while_attention_is_debounced() {
     };
     let status = TerminalSessionStatus { phase: TerminalSessionPhase::Running, attention: Some(unobservable(0)), ..Default::default() };
     sessions.update_status("stray-crew", &created.metadata.resource_version, &status).await.expect("running session");
-    let reconciler = TerminalSessionReconciler::new(Arc::new(HooklessTerminalRuntime), backend, "flotilla");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(HooklessTerminalRuntime), backend, "flotilla")
+        .with_lifecycle_reads(environments.reads.clone());
     let stray = flotilla_resources::ScreenObstruction::ComposerText { reply: Some("6;24;9t".into()), chars: 7 };
     for (second, obstruction, changed) in
         [(1, Some(stray.clone()), true), (2, Some(stray.clone()), false), (3, None, true), (4, None, false)]
@@ -2274,8 +2248,9 @@ async fn screen_obstruction_is_recorded_while_attention_is_debounced() {
 
 #[tokio::test]
 async fn terminal_finalizer_cleans_agent_artifacts() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_environment(&backend, "env-a").await;
+    create_ready_environment(&environments, "env-a");
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let created = sessions
         .create(
@@ -2318,7 +2293,8 @@ async fn terminal_finalizer_cleans_agent_artifacts() {
     .apply(&mut status);
     let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
     let runtime = Arc::new(CleanupRecordingTerminalRuntime::default());
-    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+    let reconciler =
+        TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla").with_lifecycle_reads(environments.reads.clone());
 
     reconciler.run_finalizer(&session).await.expect("finalizer");
 
@@ -2461,7 +2437,8 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
 async fn stale_attention_decays_to_unobservable_without_losing_a_live_session() {
     for source in [TerminalAttentionSource::Hook, TerminalAttentionSource::Screen] {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        create_ready_environment(&backend, "env-a").await;
+        let environments = EnvironmentFixture::default();
+        create_ready_environment(&environments, "env-a");
         let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
         let created = sessions
             .create(
@@ -2494,7 +2471,8 @@ async fn stale_attention_decays_to_unobservable_without_losing_a_live_session() 
             source,
         });
         let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
-        let reconciler = TerminalSessionReconciler::new(Arc::new(HooklessTerminalRuntime), backend, "flotilla");
+        let reconciler = TerminalSessionReconciler::new(Arc::new(HooklessTerminalRuntime), backend, "flotilla")
+            .with_lifecycle_reads(environments.reads.clone());
 
         let deps = reconciler.prepare(&session).await.expect("observe stale attention");
         let now = Utc::now();
@@ -2550,8 +2528,9 @@ impl TerminalRuntime for AuthFailedTerminalRuntime {
 
 #[tokio::test]
 async fn fatal_runtime_observation_fails_a_running_terminal_naming_its_credential() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_environment(&backend, "env-a").await;
+    create_ready_environment(&environments, "env-a");
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
         .create(
@@ -2579,7 +2558,8 @@ async fn fatal_runtime_observation_fails_a_running_terminal_naming_its_credentia
     }
     .apply(&mut status);
     let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
-    let reconciler = TerminalSessionReconciler::new(Arc::new(AuthFailedTerminalRuntime), backend, "flotilla");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(AuthFailedTerminalRuntime), backend, "flotilla")
+        .with_lifecycle_reads(environments.reads.clone());
 
     let prepared = reconciler.prepare(&session).await.expect("observe auth failure");
     let patch = reconciler.reconcile(&session, &prepared, Utc::now()).patch.expect("failure patch");
@@ -2595,8 +2575,9 @@ async fn fatal_runtime_observation_fails_a_running_terminal_naming_its_credentia
 // changing delivery order or leaving delivered bodies in the stored resource.
 #[tokio::test]
 async fn controller_loop_prunes_acknowledged_message_payloads() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_environment(&backend, "env-a").await;
+    create_ready_environment(&environments, "env-a");
     create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let new_message = |id: usize| flotilla_resources::TerminalCrewMessage {
@@ -2657,7 +2638,8 @@ async fn controller_loop_prunes_acknowledged_message_payloads() {
         ControllerLoop {
             primary: sessions.clone(),
             secondaries: Vec::new(),
-            reconciler: TerminalSessionReconciler::new(runtime.clone(), backend.clone(), "flotilla"),
+            reconciler: TerminalSessionReconciler::new(runtime.clone(), backend.clone(), "flotilla")
+                .with_lifecycle_reads(environments.reads.clone()),
             resync_interval: Duration::from_secs(3600),
             backend,
         }
@@ -2779,7 +2761,8 @@ async fn agent_exit_is_observed_even_while_its_terminal_shell_is_running() {
         (1, TerminalSessionPhase::Running, "error: unknown model", "claude-code", false),
     ]) {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        create_ready_environment(&backend, "env-a").await;
+        let environments = EnvironmentFixture::default();
+        create_ready_environment(&environments, "env-a");
         create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
         let sessions = backend.clone().using::<TerminalSession>("flotilla");
         let created = sessions
@@ -2833,7 +2816,8 @@ async fn agent_exit_is_observed_even_while_its_terminal_shell_is_running() {
             )
             .await
             .expect("running shell");
-        let reconciler = TerminalSessionReconciler::new(Arc::new(ExitedAgentRuntime(code, screen, adapter)), backend, "flotilla");
+        let reconciler = TerminalSessionReconciler::new(Arc::new(ExitedAgentRuntime(code, screen, adapter)), backend, "flotilla")
+            .with_lifecycle_reads(environments.reads.clone());
         let prepared = reconciler.prepare(&running).await.expect("observe process");
         let outcome = reconciler.reconcile(&running, &prepared, Utc::now());
         let mut status = running.status.clone().expect("status");
@@ -2859,8 +2843,9 @@ async fn agent_exit_is_observed_even_while_its_terminal_shell_is_running() {
 // Lost grace permits another launch. A successful probe can still revive it.
 #[tokio::test]
 async fn typed_unavailability_preserves_lost_session_until_provider_recovers() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_environment(&backend, "env-a").await;
+    create_ready_environment(&environments, "env-a");
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let spec = TerminalSessionSpec {
         env_ref: "env-a".into(),
@@ -2889,7 +2874,7 @@ async fn typed_unavailability_preserves_lost_session_until_provider_recovers() {
         runtime.session_liveness("existing-session", (&spec).into()).await.expect("typed outcome"),
         TerminalLiveness::Unavailable(_)
     ));
-    let reconciler = TerminalSessionReconciler::new(runtime.clone(), backend, "flotilla");
+    let reconciler = TerminalSessionReconciler::new(runtime.clone(), backend, "flotilla").with_lifecycle_reads(environments.reads.clone());
     assert!(reconciler.prepare(&lost).await.is_err(), "outage cannot authorize recovery based only on elapsed time");
     runtime.available.store(true, Ordering::SeqCst);
     let prepared = reconciler.prepare(&lost).await.expect("provider recovers");
@@ -2982,6 +2967,7 @@ impl TerminalRuntime for ReceiptLifecycleRuntime {
 // teardown removes its final receipt without touching another role's launch.
 #[tokio::test]
 async fn receipt_lifecycle_survives_failed_relaunch_cleanup_outage_and_restart() {
+    let environments = EnvironmentFixture::default();
     use flotilla_agent::process::exit_receipt;
     use flotilla_provider_runtime::ChannelLabel;
     use flotilla_provider_runtime::CommandRunner;
@@ -2994,7 +2980,7 @@ async fn receipt_lifecycle_survives_failed_relaunch_cleanup_outage_and_restart()
             .expect("exit receipt");
     }
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_environment(&backend, "env-a").await;
+    create_ready_environment(&environments, "env-a");
     create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
@@ -3039,7 +3025,8 @@ async fn receipt_lifecycle_survives_failed_relaunch_cleanup_outage_and_restart()
     let starting = sessions.update_status("receipt-session", &created.metadata.resource_version, &status).await.expect("resume");
     let runtime = Arc::new(ReceiptLifecycleRuntime::default());
     runtime.fail_launch.store(true, Ordering::SeqCst);
-    let reconciler = TerminalSessionReconciler::new(runtime.clone(), backend.clone(), "flotilla");
+    let reconciler =
+        TerminalSessionReconciler::new(runtime.clone(), backend.clone(), "flotilla").with_lifecycle_reads(environments.reads.clone());
     let prepared = reconciler.prepare(&starting).await.expect("failed launch preparation");
     let failed = reconciler.reconcile(&starting, &prepared, Utc::now());
     let mut failed_status = status.clone();
@@ -3062,7 +3049,8 @@ async fn receipt_lifecycle_survives_failed_relaunch_cleanup_outage_and_restart()
         .expect("persist successful replacement");
     let restarted_runtime = Arc::new(ReceiptLifecycleRuntime::default());
     restarted_runtime.fail_cleanup.store(true, Ordering::SeqCst);
-    let restarted = TerminalSessionReconciler::new(restarted_runtime.clone(), backend, "flotilla");
+    let restarted =
+        TerminalSessionReconciler::new(restarted_runtime.clone(), backend, "flotilla").with_lifecycle_reads(environments.reads.clone());
     let prepared = restarted.prepare(&running).await.expect("cleanup outage does not block positive exit observation");
     let outcome = restarted.reconcile(&running, &prepared, Utc::now());
     assert_eq!(outcome.requeue_after, Some(Duration::from_secs(1)), "retain a cleanup retry after process exit");
@@ -3126,9 +3114,10 @@ async fn retained_terminal_convoy_orphans_follow_reclaim_matrix(
     #[values(false, true)] initially_refused: bool,
     #[values(LifecycleAuthority::Managed, LifecycleAuthority::Adopted, LifecycleAuthority::Observed)] authority_kind: LifecycleAuthority,
 ) {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let authority = if replicated { ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()) } else { backend.clone() };
-    create_ready_environment(&backend, "env-a").await;
+    create_ready_environment(&environments, "env-a");
     create_convoy_with_single_task(&authority, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
     let convoys = authority.using::<Convoy>("flotilla");
     let convoy = convoys.get("demo").await.expect("convoy");
@@ -3185,6 +3174,7 @@ async fn retained_terminal_convoy_orphans_follow_reclaim_matrix(
             primary: sessions.clone(),
             secondaries: Vec::new(),
             reconciler: TerminalSessionReconciler::new(runtime.clone(), backend.clone(), "flotilla")
+                .with_lifecycle_reads(environments.reads.clone())
                 .with_federated_convoys(&backend, "flotilla"),
             resync_interval: Duration::from_secs(60),
             backend,
@@ -3321,6 +3311,7 @@ async fn convoy_reclaim_logs_distinguish_gate_from_session_disposition(
 // independent session must not acquire a fabricated convoy name in the log.
 #[tokio::test]
 async fn independent_owner_absence_log_does_not_claim_gate_approval() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let sessions = backend.using::<TerminalSession>("flotilla");
     let session = sessions
@@ -3337,7 +3328,8 @@ async fn independent_owner_absence_log_does_not_claim_gate_approval() {
         )
         .await
         .expect("session");
-    let reconciler = TerminalSessionReconciler::new(Arc::new(CleanupRecordingTerminalRuntime::default()), backend, "flotilla");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(CleanupRecordingTerminalRuntime::default()), backend, "flotilla")
+        .with_lifecycle_reads(environments.reads.clone());
     let logs = ReclaimLogBuffer::default();
     let writer = logs.clone();
     let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_writer(move || writer.clone()).finish();
@@ -3356,6 +3348,7 @@ async fn independent_owner_absence_log_does_not_claim_gate_approval() {
 // changing the incoming state emits a new decision even with the same resource key.
 #[tokio::test]
 async fn unchanged_attention_decisions_log_once() {
+    let environments = EnvironmentFixture::default();
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
@@ -3389,7 +3382,8 @@ async fn unchanged_attention_decisions_log_once() {
         )
         .await
         .expect("attention tracing scenario");
-    let reconciler = TerminalSessionReconciler::new(Arc::new(HooklessTerminalRuntime), backend, "flotilla");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(HooklessTerminalRuntime), backend, "flotilla")
+        .with_lifecycle_reads(environments.reads.clone());
     let logs = ReclaimLogBuffer::default();
     let writer = logs.clone();
     let subscriber = tracing_subscriber::fmt()
@@ -3429,7 +3423,8 @@ async fn terminal_reconciliation_leaves_message_submissions_to_the_inbox() {
     use flotilla_resources::{Message, MessagePhase, MessageRelation, MessageSpec, MessageStatus, MessageSubmission};
     for (crew, session_id) in [("current-crew", "cleat-session"), ("older-crew", "cleat-session"), ("current-crew", "older-session")] {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        create_ready_environment(&backend, "env-a").await;
+        let environments = EnvironmentFixture::default();
+        create_ready_environment(&environments, "env-a");
         create_convoy_with_single_task(&backend, "flotilla", "demo", "review", "https://github.com/flotilla-org/flotilla", "main").await;
         let sessions = backend.clone().using::<TerminalSession>("flotilla");
         let created = sessions
@@ -3515,7 +3510,8 @@ async fn terminal_reconciliation_leaves_message_submissions_to_the_inbox() {
             .unwrap();
         // A fresh reconciler has no in-memory submission task to consult.
         let runtime = Arc::new(DeliveringTerminalRuntime::default());
-        let reconciler = TerminalSessionReconciler::new(runtime.clone(), backend, "flotilla");
+        let reconciler =
+            TerminalSessionReconciler::new(runtime.clone(), backend, "flotilla").with_lifecycle_reads(environments.reads.clone());
         let prepared = reconciler.prepare(&session).await.unwrap();
         assert!(runtime.delivered.lock().unwrap().is_empty());
         assert!(matches!(prepared, flotilla_crew::reconcilers::terminal_session::TerminalPrepared::Attention(_)));
@@ -3526,14 +3522,15 @@ async fn terminal_reconciliation_leaves_message_submissions_to_the_inbox() {
 // passes beyond the process recovery delay must never touch the dead runtime.
 #[hegel::test]
 fn environment_loss_preserves_recoverable_work(tc: hegel::TestCase) {
+    let environments = EnvironmentFixture::default();
     use flotilla_crew::reconcilers::vessel::VesselReconciler;
-    use flotilla_resources::{CrewSource, CrewWorkPhase, CrewWorkState, Environment, VesselPhase, VesselStatus, WorkPhase};
+    use flotilla_resources::{CrewSource, CrewWorkPhase, CrewWorkState, VesselPhase, VesselStatus, WorkPhase};
     // Cover both interleavings and duplicate passes, including the recovery boundary.
     let session_first = tc.draw(hegel::generators::booleans());
     let passes = tc.draw(hegel::generators::integers::<usize>().min_value(2).max_value(4));
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        create_ready_environment(&backend, "loss-env").await;
+        create_ready_environment(&environments, "loss-env");
         let convoy =
             create_convoy_with_single_task(&backend, "flotilla", "loss", "work", "https://github.com/flotilla-org/flotilla", "main").await;
         let convoys = backend.clone().using::<Convoy>("flotilla");
@@ -3614,13 +3611,11 @@ fn environment_loss_preserves_recoverable_work(tc: hegel::TestCase) {
         }
         .apply(&mut running);
         sessions.update_status("loss-session", &session.metadata.resource_version, &running).await.expect("running");
-        let environments = backend.clone().using::<Environment>("flotilla");
-        flotilla_store::apply_status_patch(&environments, "loss-env", &EnvironmentStatusPatch::MarkLost { message: "cgroup_oom".into() })
-            .await
-            .expect("loss");
+        environments.lose("loss-env", "cgroup_oom");
         let runtime = Arc::new(UnavailableRunningRuntime::default());
-        let session_reconciler = TerminalSessionReconciler::new(runtime.clone(), backend.clone(), "flotilla");
-        let vessel_reconciler = VesselReconciler::new(backend.clone(), "flotilla");
+        let session_reconciler =
+            TerminalSessionReconciler::new(runtime.clone(), backend.clone(), "flotilla").with_lifecycle_reads(environments.reads.clone());
+        let vessel_reconciler = VesselReconciler::new(backend.clone(), "flotilla").with_lifecycle_reads(environments.reads.clone());
         let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<flotilla_resources::WorkflowTemplate>("flotilla"))
             .with_vessels(vessels.clone())
             .with_terminal_sessions(sessions.clone());
@@ -3664,21 +3659,13 @@ fn environment_loss_preserves_recoverable_work(tc: hegel::TestCase) {
 // Enumerate all old phases, both ready-flag values, success, both Gone endings and empty/Unicode failures.
 #[tokio::test]
 async fn terminal_reads_its_environment_without_a_status_copy() {
-    use flotilla_provisioning::engine::environment::EnvironmentBinding;
-    use flotilla_provisioning_testkit::{Ending, LifecycleFixture};
-    use flotilla_resources::{Environment, EnvironmentPhase};
+    use flotilla_provisioning_testkit::{Ending, EnvironmentFixture};
+    use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec};
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    create_ready_environment(&backend, "env").await;
-    let records = backend.using::<Environment>("flotilla");
-    let mut env = records.get("env").await.expect("environment");
-    env = records
-        .update_status(
-            "env",
-            &env.metadata.resource_version,
-            &EnvironmentStatus { phase: EnvironmentPhase::Failed, ready: false, message: Some("stale".into()), ..Default::default() },
-        )
-        .await
-        .expect("stale status");
+    let env = EnvironmentSpec {
+        host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/workspace".into() }),
+        ..Default::default()
+    };
     let session = backend
         .using::<TerminalSession>("flotilla")
         .create(
@@ -3694,19 +3681,19 @@ async fn terminal_reads_its_environment_without_a_status_copy() {
         )
         .await
         .expect("session");
-    let fixture = LifecycleFixture::<EnvironmentBinding>::new(false);
-    fixture.request(&env);
+    let fixture = EnvironmentFixture::default();
+    fixture.request("env", &env, None);
     // Only the terminal-process boundary is a stand-in.
     let reconciler =
         TerminalSessionReconciler::new(Arc::new(FailingTerminalRuntime), backend, "flotilla").with_lifecycle_reads(fixture.reads.clone());
     let prepared = reconciler.prepare(&session).await.expect("requested");
     assert!(reconciler.reconcile(&session, &prepared, Utc::now()).patch.is_none());
-    fixture.finish(&env, Ending::Ready("/workspace"));
+    fixture.finish("env", Ending::Ready("/workspace"));
     let prepared = reconciler.prepare(&session).await.expect("ready");
     assert!(
         matches!(reconciler.reconcile(&session, &prepared, Utc::now()).patch, Some(TerminalSessionStatusPatch::MarkFailed { message, .. }) if message == "boom")
     );
-    fixture.finish(&env, Ending::Lost("/workspace"));
+    fixture.finish("env", Ending::Lost("/workspace"));
     let prepared = reconciler.prepare(&session).await.expect("lost");
     assert!(
         matches!(reconciler.reconcile(&session, &prepared, Utc::now()).patch, Some(TerminalSessionStatusPatch::MarkLost { reason, .. }) if reason == "environment env observed absent")

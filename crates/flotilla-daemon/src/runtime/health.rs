@@ -52,7 +52,7 @@ pub(super) fn image_build_failure_condition(
             LifecycleReading::Exhausted { cause } | LifecycleReading::GaveUp { cause } | LifecycleReading::Failed { reason: cause },
         )) => ("ImageBuildFailed", cause),
         // Absence or release makes the image unusable, but does not establish a failed build execution.
-        Ok(Some(LifecycleReading::Lost | LifecycleReading::Released)) => return None,
+        Ok(Some(LifecycleReading::Lost { .. } | LifecycleReading::Released)) => return None,
         Ok(Some(_)) => return None,
         Ok(None) => {
             let status = build.status.as_ref().filter(|status| status.phase == flotilla_resources::ImageBuildPhase::Failed)?;

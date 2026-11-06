@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::{fs, path::Path};
 
@@ -6,8 +6,6 @@ use flotilla_core::in_process::InProcessDaemon;
 #[cfg(not(target_os = "macos"))]
 use flotilla_protocol::CallerProcess;
 use flotilla_protocol::{CallerCrew, CommandCaller, EnvironmentId, PrincipalRef};
-use flotilla_resources::Environment;
-use flotilla_store::StoreQuery;
 
 use super::environment_sockets::SocketReach;
 
@@ -263,26 +261,20 @@ pub(super) async fn resolve_main_caller(
         caller.crew = legacy_crew_identity(claims);
         return Ok(CallerResolution { caller, transport_bound: false });
     }
-    let namespace = daemon.provisioning_namespace().await;
-    let environments = daemon
-        .resource_backend()
-        .query_declared::<Environment>(
-            &namespace,
-            &StoreQuery {
-                fields: BTreeMap::from([("status.runtime_observation.container_id".into(), container.clone())]),
-                ..Default::default()
-            },
-        )
+    // The container is the backing a contained environment of this home was realised under.
+    let reads = daemon.lifecycle_reads();
+    let live = tokio::task::spawn_blocking(move || reads.environments()?.live())
         .await
+        .map_err(|error| format!("CallerIdentityUnavailable: {error}"))?
         .map_err(|error| format!("CallerIdentityUnavailable: {error}"))?;
-    // Host-direct records cannot establish container authority, even if an
-    // obsolete observation still carries a Docker container ID.
-    let mut environments = environments.items.into_iter().filter(|item| item.object.spec.docker.is_some());
+    // Host-direct records cannot establish container authority.
+    let mut environments =
+        live.into_iter().filter(|environment| environment.spec.docker.is_some() && environment.identity() == Some(container.as_str()));
     let environment = environments.next().ok_or("CallerIdentityUnavailable: container has no placed environment")?;
     if environments.next().is_some() {
         return Err("CallerIdentityAmbiguous: container maps to multiple environments".into());
     }
-    let environment = EnvironmentId::new(environment.object.metadata.name);
+    let environment = EnvironmentId::new(environment.name);
     if !environment_socket_is_mounted(Some(&environment), &mounts.mountinfo)? {
         return Err("CallerIdentityMismatch: container has no matching environment socket mount".into());
     }

@@ -10,9 +10,9 @@ use flotilla_protocol::{
 };
 use flotilla_resources::canonical_placement_host_ref_from_sources;
 use flotilla_resources::{
-    crew_attention, Checkout as ResourceCheckout, Environment as ResourceEnvironment, Host as ResourceHost,
-    HostStatus as ResourceHostStatus, ReadResourceObject, ResourceProvenance, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    crew_attention, Checkout as ResourceCheckout, Host as ResourceHost, HostStatus as ResourceHostStatus, ReadResourceObject,
+    ResourceProvenance, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, CONVOY_LABEL,
+    ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::ResourceBackend;
 use tokio::sync::RwLock;
@@ -188,9 +188,9 @@ impl FleetService {
         backend: &ResourceBackend,
         namespace: &str,
         host_registry: &HostRegistry,
+        lifecycles: &dyn crate::ports::LifecycleReads,
     ) -> Result<Vec<FleetListRow>, String> {
         let now = Utc::now();
-        let environments = backend.clone().using::<ResourceEnvironment>(namespace);
         let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
 
         let session_list =
@@ -219,14 +219,8 @@ impl FleetService {
             .flatten()
             .map(|convoy| ((convoy.resource.namespace.clone(), convoy.resource.name.clone()), convoy.surface_state))
             .collect::<HashMap<_, _>>();
-        let environment_map: HashMap<_, _> = environments
-            .list()
-            .await
-            .map_err(|err| err.to_string())?
-            .items
-            .into_iter()
-            .map(|environment| (environment.metadata.name.clone(), environment))
-            .collect();
+        // The hosts the sessions' environments run on, from the engine's records.
+        let environment_map = environment_hosts(lifecycles, session_list.iter().map(|session| session.object.spec.env_ref.as_str()))?;
         // The Aggregator maintains this catalog from watch events. Health polls
         // consume projected rows, never stored Convoy bodies or frozen workflows.
         let convoy_addresses = result_sets
@@ -278,9 +272,7 @@ impl FleetService {
                     continue;
                 };
                 host
-            } else if let Some(host_ref) =
-                environment_map.get(&session.spec.env_ref).and_then(|environment| resource_environment_host_ref(environment))
-            {
+            } else if let Some(host_ref) = environment_map.get(&session.spec.env_ref).map(String::as_str) {
                 canonical_placement_host_ref_from_sources(&host_sources.items, host_ref).ok().flatten().map_or_else(
                     || {
                         if self.canonical_local_host_id.clone().is_some_and(|local| local.as_str() == host_ref) {
@@ -516,13 +508,27 @@ fn append_crewless_convoy_rows(
     }
 }
 
-pub(crate) fn resource_environment_host_ref(environment: &flotilla_resources::ResourceObject<ResourceEnvironment>) -> Option<&str> {
-    environment
-        .spec
-        .host_direct
-        .as_ref()
-        .map(|spec| spec.host_ref.as_str())
-        .or_else(|| environment.spec.docker.as_ref().map(|spec| spec.host_ref.as_str()))
+pub(crate) fn environment_host_ref(spec: &flotilla_resources::EnvironmentSpec) -> Option<&str> {
+    spec.host_direct.as_ref().map(|spec| spec.host_ref.as_str()).or_else(|| spec.docker.as_ref().map(|spec| spec.host_ref.as_str()))
+}
+
+/// The host each of `names` runs on, for those the engine holds and that run on a host.
+pub(crate) fn environment_hosts<'a>(
+    lifecycles: &dyn crate::ports::LifecycleReads,
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<HashMap<String, String>, String> {
+    let names = names.into_iter().collect::<std::collections::BTreeSet<_>>();
+    if names.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let environments = lifecycles.environments()?;
+    let mut hosts = HashMap::new();
+    for name in names {
+        if let Some(host) = environments.find(name)?.as_ref().and_then(|environment| environment_host_ref(&environment.spec)) {
+            hosts.insert(name.to_owned(), host.to_owned());
+        }
+    }
+    Ok(hosts)
 }
 
 #[cfg(test)]

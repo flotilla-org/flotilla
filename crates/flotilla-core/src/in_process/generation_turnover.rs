@@ -3,7 +3,7 @@ use flotilla_store_memory::InMemoryBackend;
 use std::path::Path;
 
 use flotilla_discovery::generation_turnover::{AdvanceRequest, GenerationTurnovers, RecordedSession, RecordedSessions};
-use flotilla_resources::{Environment, HostCondition, TerminalSession, TerminalSessionPhase};
+use flotilla_resources::{HostCondition, TerminalSession, TerminalSessionPhase};
 use flotilla_terminal::generation::{persist, RollReport};
 
 use super::InProcessDaemon;
@@ -37,7 +37,11 @@ impl InProcessDaemon {
                 if let Some(environment) = self.resolve_environment_ref(&session.spec.env_ref) {
                     recorded.running.push(RecordedSession { pool, environment: environment.id, vessel, endpoint });
                 } else if endpoint.is_some() {
-                    let environment = self.resource_backend.using::<Environment>(&namespace).get(&session.spec.env_ref).await.ok();
+                    let environment = self
+                        .lifecycle_reads()
+                        .environments()
+                        .ok()
+                        .and_then(|environments| environments.find(&session.spec.env_ref).ok().flatten());
                     if environment
                         .as_ref()
                         .and_then(|environment| environment.spec.docker.as_ref())
@@ -222,11 +226,9 @@ mod tests {
             "host_ref": daemon.environment_manager.local_host_id().as_str(), "image": "pinned-image"
         }}))
         .expect("stored Docker spec");
-        backend
-            .using::<Environment>("other-namespace")
-            .create(&InputMeta::builder().name("unregistered-vessel-env".into()).build(), &environment_spec)
-            .await
-            .expect("stored environment");
+        let environments = flotilla_provisioning_testkit::EnvironmentFixture::default();
+        environments.request("unregistered-vessel-env", &environment_spec, None);
+        daemon.install_lifecycle_reads(environments.reads.clone()).expect("engine reads");
         let sessions = backend.using::<TerminalSession>("other-namespace");
         let missing = sessions
             .create(
@@ -317,7 +319,9 @@ mod tests {
             "host_ref": daemon.environment_manager.local_host_id().as_str(), "image": "pinned-image"
         }}))
         .expect("stored Docker spec");
-        backend.using::<Environment>("flotilla").create(&InputMeta::builder().name("vessel-env".into()).build(), &spec).await.expect("env");
+        let environments = flotilla_provisioning_testkit::EnvironmentFixture::default();
+        environments.request("vessel-env", &spec, None);
+        daemon.install_lifecycle_reads(environments.reads.clone()).expect("engine reads");
         let sessions = backend.using::<TerminalSession>("flotilla");
         let session = sessions
             .create(

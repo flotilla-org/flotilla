@@ -21,12 +21,12 @@ use flotilla_resources::{
     canonicalize_repo_url, clone_key, interactive_single_workflow_spec, Artifact, ArtifactSpec, BoundChangeRequest, Checkout,
     CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, ClaimExit, Convoy, ConvoyIssue, ConvoyPhase, ConvoyRepositorySpec,
     ConvoySpec, ConvoyStatus, ConvoyTeardownRuntime, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, DockerEnvironmentSpec,
-    DockerImagePullPolicy, Environment, EnvironmentSpec, ExitDeclaration, FulfilmentKindSpec, FulfilmentRealisation,
-    HostDirectEnvironmentSpec, InnerCommandStatus, InputMeta, IssueSnapshot, LifecycleAuthority, ObservedCheckoutSpec, Repository,
-    RepositorySpec, ResourceError, Selector, Stance, StatusPatch, TerminalBrief, TerminalCrewContext, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselPhase, VesselRequirement,
-    VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
-    CREDENTIAL_SCOPES_ANNOTATION, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    DockerImagePullPolicy, EnvironmentSpec, ExitDeclaration, FulfilmentKindSpec, FulfilmentRealisation, InnerCommandStatus, InputMeta,
+    IssueSnapshot, LifecycleAuthority, ObservedCheckoutSpec, Repository, RepositorySpec, ResourceError, Selector, Stance, StatusPatch,
+    TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
+    TerminalSessionStatus, Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowSnapshot,
+    WorkflowTemplate, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_SCOPES_ANNOTATION, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 use flotilla_store::{
     controller::{ControllerLoop, Reconciler},
@@ -37,6 +37,7 @@ use rstest::rstest;
 use tokio::time::{timeout, Duration};
 
 use crate::common;
+use flotilla_provisioning_testkit::VesselFixture;
 
 const NAMESPACE: &str = "flotilla";
 const REPO_URL: &str = "https://github.com/flotilla-org/flotilla.git";
@@ -69,12 +70,32 @@ impl WorktreeMetadataResolver for TestWorktreeMetadata {
     }
 }
 
-fn test_vessel_reconciler(backend: ResourceBackend, namespace: &str) -> VesselReconciler {
-    VesselReconciler::new(backend.clone(), namespace).with_worktree_metadata(Arc::new(TestWorktreeMetadata(backend)))
+/// The reconciler under test, reading the engine's leases and environments from `engine`.
+/// What `vessel` requested of the engine: its environment, held for it.
+fn requested_environment(engine: &VesselFixture, vessel: &str) -> Option<flotilla_resources::environment_records::EnvironmentRecord> {
+    let requested = flotilla_resources::environment_records::EnvironmentRecords::find(
+        engine.environments.environments.as_ref(),
+        &format!("env-{vessel}"),
+    )
+    .expect("environment read")?;
+    assert_eq!(requested.vessel.as_deref(), Some(vessel), "the environment is held for its vessel");
+    Some(requested)
+}
+
+/// The container recipe of what `vessel` requested of the engine.
+fn requested_docker(engine: &VesselFixture, vessel: &str) -> Option<DockerEnvironmentSpec> {
+    requested_environment(engine, vessel).and_then(|environment| environment.spec.docker)
+}
+
+fn test_vessel_reconciler(backend: ResourceBackend, namespace: &str, engine: &VesselFixture) -> VesselReconciler {
+    VesselReconciler::new(backend.clone(), namespace)
+        .with_worktree_metadata(Arc::new(TestWorktreeMetadata(backend)))
+        .with_lifecycle_reads(engine.reads.clone())
 }
 
 #[tokio::test]
 async fn landed_convoy_does_not_recreate_a_missing_checkout() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-landed", "implement", REPO_URL, GIT_REF).await;
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
@@ -82,11 +103,11 @@ async fn landed_convoy_does_not_recreate_a_missing_checkout() {
     status.phase = ConvoyPhase::Landed;
     convoys.update_status("convoy-landed", &convoy.metadata.resource_version, &status).await.expect("mark landed");
     create_host_direct_kind(&backend, NAMESPACE, "policy-landed", HOST_REF, "cleat").await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/tmp/convoy-landed").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/tmp/convoy-landed");
     let vessel =
         create_workspace(&backend, NAMESPACE, "convoy-landed-implement", "convoy-landed", "implement", "policy-landed", REPO_URL).await;
 
-    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     let prepared = reconciler.prepare(&vessel).await.expect("landed vessel dependencies");
     let outcome = reconciler.reconcile(&vessel, &prepared, Utc::now());
     assert!(outcome.actuations.is_empty(), "landed convoy still desires checkout provisioning");
@@ -97,7 +118,7 @@ async fn landed_convoy_does_not_recreate_a_missing_checkout() {
         ControllerLoop {
             primary: vessels,
             secondaries: VesselReconciler::secondary_watches(),
-            reconciler: test_vessel_reconciler(backend.clone(), NAMESPACE),
+            reconciler: test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine),
             resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
@@ -111,10 +132,11 @@ async fn landed_convoy_does_not_recreate_a_missing_checkout() {
 
 #[tokio::test]
 async fn repeated_checkout_removal_backs_off_and_reports_the_conflict() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-churn", "implement", REPO_URL, GIT_REF).await;
     create_host_direct_kind(&backend, NAMESPACE, "policy-churn", HOST_REF, "cleat").await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/tmp/convoy-churn").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/tmp/convoy-churn");
     create_workspace(&backend, NAMESPACE, "convoy-churn-implement", "convoy-churn", "implement", "policy-churn", REPO_URL).await;
     let vessels = backend.clone().using::<Vessel>(NAMESPACE);
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
@@ -123,7 +145,7 @@ async fn repeated_checkout_removal_backs_off_and_reports_the_conflict() {
         ControllerLoop {
             primary: vessels.clone(),
             secondaries: VesselReconciler::secondary_watches(),
-            reconciler: test_vessel_reconciler(backend.clone(), NAMESPACE),
+            reconciler: test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine),
             resync_interval: Duration::from_secs(60),
             backend,
         }
@@ -209,6 +231,7 @@ async fn secondary_watches_map_checkout_events_by_convoy_only() {
 
 #[tokio::test]
 async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = backend
         .clone()
@@ -269,7 +292,7 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
         .await
         .expect("convoy status should update");
     create_host_direct_kind(&backend, NAMESPACE, "policy-scratch", HOST_REF, "cleat").await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     let vessel = backend
         .clone()
         .using::<Vessel>(NAMESPACE)
@@ -285,7 +308,7 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
         .await
         .expect("vessel should create");
 
-    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&vessel).await.expect("deps should load");
     let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
 
@@ -301,14 +324,15 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
 
 #[tokio::test]
 async fn host_direct_placement_is_not_refused_by_template_stance() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-contained", "implement", REPO_URL, GIT_REF).await;
     create_host_direct_kind(&backend, NAMESPACE, "policy-host", HOST_REF, "cleat").await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     let workspace =
         create_workspace(&backend, NAMESPACE, "workspace-contained", "convoy-contained", "implement", "policy-host", REPO_URL).await;
 
-    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
@@ -317,10 +341,11 @@ async fn host_direct_placement_is_not_refused_by_template_stance() {
 
 #[tokio::test]
 async fn ready_vessel_records_requested_and_effective_stance() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-stance", "implement", REPO_URL, GIT_REF).await;
     create_host_direct_kind(&backend, NAMESPACE, "policy-stance", HOST_REF, "cleat").await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     let clone_name =
         format!("clone-{}", clone_key(&canonicalize_repo_url(REPO_URL).expect("repo canonicalization"), &host_direct_env_name()));
     create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone").await;
@@ -351,7 +376,7 @@ async fn ready_vessel_records_requested_and_effective_stance() {
     let workspace =
         create_workspace(&backend, NAMESPACE, "workspace-stance", "convoy-stance", "implement", "policy-stance", REPO_URL).await;
 
-    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
@@ -368,6 +393,7 @@ async fn ready_vessel_records_requested_and_effective_stance() {
 
 #[tokio::test]
 async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-shared", "implement", REPO_URL, GIT_REF).await;
     let mut status = convoy.status.clone().expect("convoy status");
@@ -397,7 +423,7 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
     });
     convoys.update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec).await.expect("bind change request");
     create_host_direct_kind(&backend, NAMESPACE, "policy-shared", HOST_REF, "cleat").await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     let clone_name =
         format!("clone-{}", clone_key(&canonicalize_repo_url(REPO_URL).expect("repo canonicalization"), &host_direct_env_name()));
     create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone").await;
@@ -406,7 +432,7 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
     let review =
         create_workspace(&backend, NAMESPACE, "workspace-shared-review", "convoy-shared", "review", "policy-shared", REPO_URL).await;
 
-    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     let implement_deps = reconciler.prepare(&implement).await.expect("implement dependencies");
     let implement_outcome = reconciler.reconcile(&implement, &implement_deps, Utc::now());
     let (checkout_meta, checkout_spec) = implement_outcome
@@ -471,16 +497,17 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
 
 #[tokio::test]
 async fn stuck_provisioning_vessel_surfaces_the_statusless_checkout_it_is_retrying() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-stuck", "implement", REPO_URL, GIT_REF).await;
     create_host_direct_kind(&backend, NAMESPACE, "policy-stuck", HOST_REF, "cleat").await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     let clone_name =
         format!("clone-{}", clone_key(&canonicalize_repo_url(REPO_URL).expect("repo canonicalization"), &host_direct_env_name()));
     create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone").await;
     let vessels = backend.clone().using::<Vessel>(NAMESPACE);
     let vessel = create_workspace(&backend, NAMESPACE, "workspace-stuck", "convoy-stuck", "implement", "policy-stuck", REPO_URL).await;
-    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&vessel).await.expect("initial dependencies");
     let initial = reconciler.reconcile(&vessel, &deps, Utc::now());
     let (checkout_meta, checkout_spec) = initial
@@ -529,18 +556,19 @@ async fn stuck_provisioning_vessel_surfaces_the_statusless_checkout_it_is_retryi
 
 #[tokio::test]
 async fn unrelated_convoys_with_the_same_branch_use_distinct_worktree_paths() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-one", "implement", REPO_URL, GIT_REF).await;
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-two", "implement", REPO_URL, GIT_REF).await;
     create_host_direct_kind(&backend, NAMESPACE, "policy-shared-branch", HOST_REF, "cleat").await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     let clone_name =
         format!("clone-{}", clone_key(&canonicalize_repo_url(REPO_URL).expect("repo canonicalization"), &host_direct_env_name()));
     create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone").await;
     let first = create_workspace(&backend, NAMESPACE, "workspace-one", "convoy-one", "implement", "policy-shared-branch", REPO_URL).await;
     let second = create_workspace(&backend, NAMESPACE, "workspace-two", "convoy-two", "implement", "policy-shared-branch", REPO_URL).await;
 
-    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
     let first_deps = reconciler.prepare(&first).await.expect("first dependencies");
     let second_deps = reconciler.prepare(&second).await.expect("second dependencies");
     let first_outcome = reconciler.reconcile(&first, &first_deps, Utc::now());
@@ -565,6 +593,7 @@ async fn unrelated_convoys_with_the_same_branch_use_distinct_worktree_paths() {
 
 #[tokio::test]
 async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_workspace_root() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let repository_specs = [
         RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("flotilla repository"),
@@ -684,7 +713,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
         .await
         .expect("convoy status should update");
     create_host_direct_kind(&backend, NAMESPACE, "policy-multi", HOST_REF, "cleat").await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     for (repository, url) in [
         (&repository_specs[0], "https://github.com/flotilla-org/flotilla"),
         (&repository_specs[1], "https://github.com/flotilla-org/cleat"),
@@ -718,7 +747,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
         )
         .await
         .expect("vessel should create");
-    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
 
     let deps = reconciler.prepare(&vessel).await.expect("deps should load");
     let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
@@ -805,6 +834,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
 
 #[tokio::test]
 async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let repositories = [
         RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("flotilla repository"),
@@ -901,7 +931,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
             .build(),
     )
     .await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
 
     for (repository, slug) in [(&repositories[0], "flotilla"), (&repositories[1], "cleat")] {
         create_ready_clone(
@@ -967,14 +997,12 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
         .await
         .expect("vessel should create");
 
-    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
+    lease_engine.lease("workspace-multi-docker", "convoy-multi-docker", HOST_REF);
     let deps = reconciler.prepare(&vessel).await.expect("deps should load");
-    let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
-    let mounts = outcome.actuations.iter().find_map(|actuation| match actuation {
-        Actuation::CreateEnvironment { spec, .. } => spec.docker.as_ref().map(|docker| docker.mounts.as_slice()),
-        _ => None,
-    });
-    let mounts = mounts.expect("docker environment should be created");
+    reconciler.reconcile(&vessel, &deps, Utc::now());
+    let docker = requested_docker(lease_engine, "workspace-multi-docker").expect("docker environment should be created");
+    let mounts = docker.mounts.as_slice();
     assert_eq!(mounts.len(), 11);
     assert_eq!(mounts[0].source_path, "/Users/alice/dev/flotilla-repos/convoy-multi-docker/feature-multi");
     assert_eq!(mounts[0].target_path, "/workspace");
@@ -1001,26 +1029,22 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
 
     // Removing or adding an own-admin overlay requires environment recreation;
     // no crew may be launched using the stale membership's writable grants.
-    let docker = outcome
-        .actuations
-        .iter()
-        .find_map(|actuation| match actuation {
-            Actuation::CreateEnvironment { spec, .. } => spec.docker.clone(),
-            _ => None,
-        })
-        .expect("docker spec");
+    let docker = docker.clone();
     // A fleet roll leaves legacy mounts on a Ready vessel with running crews.
     // Report recreation without changing that phase or interrupting its session.
+    // Each environment below is a fresh engine's: an ended launch is never launched again.
     let mut legacy = docker.clone();
     legacy.mounts.retain(|mount| !mount.source_path.contains("/worktrees"));
-    let environments = backend.clone().using::<Environment>(NAMESPACE);
-    let environment = create_ready_docker_environment(&backend, NAMESPACE, "env-workspace-multi-docker", legacy).await;
+    let legacy_engine = &VesselFixture::new(false);
+    create_ready_host_direct_environment(&legacy_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, legacy_engine);
+    let environment = create_ready_docker_environment(&legacy_engine.environments, "env-workspace-multi-docker", legacy);
     let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
     let session = sessions
         .create(
             &meta("existing-crew"),
             &TerminalSessionSpec {
-                env_ref: environment.metadata.name.clone(),
+                env_ref: environment.name.clone(),
                 role: "coder".into(),
                 source: TerminalSessionSource::Tool { command: "codex".into() },
                 cwd: "/workspace".into(),
@@ -1041,7 +1065,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
     let mut running = vessel.clone();
     running.status = Some(VesselStatus {
         phase: VesselPhase::Ready,
-        environment_ref: Some(environment.metadata.name.clone()),
+        environment_ref: Some(environment.name.clone()),
         terminal_session_refs: vec![session.metadata.name.clone()],
         ..Default::default()
     });
@@ -1065,11 +1089,13 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
         .as_deref()
         .is_some_and(|message| message.contains("stop crews and recreate") && message.contains("environment env-workspace-multi-docker")));
     assert_eq!(sessions.get(&session.metadata.name).await.expect("existing crew").status, session.status);
-    environments.delete(&environment.metadata.name).await.expect("remove legacy environment");
 
     let mut stale = docker.clone();
     stale.mounts.pop();
-    let environment = create_ready_docker_environment(&backend, NAMESPACE, "env-workspace-multi-docker", stale).await;
+    let stale_engine = &VesselFixture::new(false);
+    create_ready_host_direct_environment(&stale_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, stale_engine);
+    create_ready_docker_environment(&stale_engine.environments, "env-workspace-multi-docker", stale);
     let deps = reconciler.prepare(&vessel).await.expect("stale environment");
     let blocked = reconciler.reconcile(&vessel, &deps, Utc::now());
     assert!(
@@ -1079,8 +1105,6 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
     assert!(
         matches!(blocked.patch, Some(flotilla_resources::VesselStatusPatch::MarkProvisioning { ref message, .. }) if message.as_deref().is_some_and(|message| message.contains("recreate the environment")))
     );
-    let environments = backend.clone().using::<Environment>(NAMESPACE);
-    environments.delete(&environment.metadata.name).await.expect("remove stale environment");
     let mut reordered = docker;
     reordered.mounts.reverse();
     reordered.mounts.push(flotilla_resources::EnvironmentMount {
@@ -1088,7 +1112,10 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
         target_path: "/cache".into(),
         mode: flotilla_resources::EnvironmentMountMode::Rw,
     });
-    create_ready_docker_environment(&backend, NAMESPACE, "env-workspace-multi-docker", reordered).await;
+    let reordered_engine = &VesselFixture::new(false);
+    create_ready_host_direct_environment(&reordered_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, reordered_engine);
+    create_ready_docker_environment(&reordered_engine.environments, "env-workspace-multi-docker", reordered);
     let deps = reconciler.prepare(&vessel).await.expect("matching membership");
     let unblocked = reconciler.reconcile(&vessel, &deps, Utc::now());
     assert!(
@@ -1121,6 +1148,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
 
 #[tokio::test]
 async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let flotilla = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("flotilla repository");
     let cleat = RepositorySpec::remote("https://github.com/flotilla-org/cleat").expect("cleat repository");
@@ -1202,7 +1230,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
         .await
         .expect("convoy status should update");
     create_host_direct_kind(&backend, NAMESPACE, "policy-scoped", HOST_REF, "cleat").await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     let vessel = backend
         .clone()
         .using::<Vessel>(NAMESPACE)
@@ -1218,7 +1246,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
         .await
         .expect("vessel should create");
 
-    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&vessel).await.expect("deps should load");
     let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
     let clone = outcome
@@ -1304,6 +1332,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
 
 #[tokio::test]
 async fn contained_requirement_runs_in_contained_docker_placement() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-docker-stance", "implement", REPO_URL, GIT_REF).await;
     let status = convoy.status.expect("convoy should have status");
@@ -1325,15 +1354,13 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
             .build(),
     )
     .await;
-    create_ready_host_worktree(&backend, "convoy-docker-stance", "workspace-docker-stance").await;
+    create_ready_host_worktree(&backend, lease_engine, "convoy-docker-stance", "workspace-docker-stance").await;
     let environment_ref = "env-workspace-docker-stance";
     create_ready_docker_environment(
-        &backend,
-        NAMESPACE,
+        &lease_engine.environments,
         environment_ref,
         docker_worktree_environment("workspace-docker-stance", Default::default()),
-    )
-    .await;
+    );
     create_running_terminal(
         &backend,
         NAMESPACE,
@@ -1356,7 +1383,7 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
     )
     .await;
 
-    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
@@ -1376,6 +1403,7 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
 // provider instance admission froze into the placement decision.
 #[tokio::test]
 async fn docker_kind_environment_uses_constant_pull_policy_and_decided_instance() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-decided", "implement", REPO_URL, GIT_REF).await;
     let mut status = convoy.status.expect("convoy status");
@@ -1407,10 +1435,10 @@ async fn docker_kind_environment_uses_constant_pull_policy_and_decided_instance(
             .build(),
     )
     .await;
-    create_ready_host_worktree(&backend, "convoy-decided", "workspace-decided").await;
+    create_ready_host_worktree(&backend, lease_engine, "convoy-decided", "workspace-decided").await;
     let vessel = create_workspace(&backend, NAMESPACE, "workspace-decided", "convoy-decided", "implement", "kind-decided", REPO_URL).await;
 
-    let environment = created_docker_environment(&backend, &vessel).await;
+    let environment = created_docker_environment(&backend, lease_engine, &vessel).await;
     assert_eq!(environment, ("rootless".to_string(), "flotilla-dev-env:latest".to_string(), DockerImagePullPolicy::Always));
 }
 
@@ -1421,6 +1449,7 @@ async fn docker_kind_environment_uses_constant_pull_policy_and_decided_instance(
 // the grants covering its repository (#4218).
 #[tokio::test]
 async fn a_cloud_vessel_clones_below_the_workspace_root_and_crews_run_at_the_recorded_checkout() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-cloud", "implement", REPO_URL, GIT_REF).await;
     let mut status = convoy.status.expect("convoy status");
@@ -1458,34 +1487,30 @@ async fn a_cloud_vessel_clones_below_the_workspace_root_and_crews_run_at_the_rec
     )
     .await;
     let vessel = create_workspace(&backend, NAMESPACE, "workspace-cloud", "convoy-cloud", "implement", "kind-cloud", REPO_URL).await;
-    let environments = backend.clone().using::<Environment>(NAMESPACE);
-    let environment = environments
-        .create(
-            &meta("env-workspace-cloud"),
-            &EnvironmentSpec {
-                cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
-                    image: image.clone(),
-                    image_build_ref: None,
-                    size: flotilla_resources::realisation_settings::CLOUD_SANDBOX_SIZE,
-                    lifetime_cap_seconds: None,
-                    probe_needs: Default::default(),
-                    env: Default::default(),
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("environment");
-    let ready = flotilla_resources::EnvironmentStatus {
-        phase: flotilla_resources::EnvironmentPhase::Ready,
-        ready: true,
-        image_ref: Some(image),
-        local_image_id: Some(format!("sha256:{}", "a".repeat(64))),
-        ..Default::default()
-    };
-    environments.update_status("env-workspace-cloud", &environment.metadata.resource_version, &ready).await.expect("ready");
+    lease_engine.environments.put_ready(
+        "env-workspace-cloud",
+        &EnvironmentSpec {
+            provider_address: Some("account:local/provider:local".parse().expect("address")),
+            cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+                image: image.clone(),
+                image_build_ref: None,
+                size: flotilla_resources::realisation_settings::CLOUD_SANDBOX_SIZE,
+                lifetime_cap_seconds: None,
+                probe_needs: Default::default(),
+                env: Default::default(),
+            }),
+            ..Default::default()
+        },
+        Some("workspace-cloud"),
+        "sandbox-workspace-cloud",
+        flotilla_resources::environment_records::LaunchFacts {
+            image_ref: Some(image),
+            local_image_id: Some(format!("sha256:{}", "a".repeat(64))),
+            ..Default::default()
+        },
+    );
 
-    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     let reconcile = |vessel| {
         let reconciler = &reconciler;
         async move {
@@ -1545,6 +1570,7 @@ async fn a_cloud_vessel_clones_below_the_workspace_root_and_crews_run_at_the_rec
 #[case::ordinary("claude-code", None)]
 #[tokio::test]
 async fn docker_environment_enables_the_adapters_its_crew_requires(#[case] adapter: &str, #[case] enabled: Option<&str>) {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-adapter", "implement", REPO_URL, GIT_REF).await;
     let mut status = convoy.status.expect("convoy status");
@@ -1568,54 +1594,50 @@ async fn docker_environment_enables_the_adapters_its_crew_requires(#[case] adapt
             .build(),
     )
     .await;
-    create_ready_host_worktree(&backend, "convoy-adapter", "workspace-adapter").await;
+    create_ready_host_worktree(&backend, lease_engine, "convoy-adapter", "workspace-adapter").await;
     let vessel = create_workspace(&backend, NAMESPACE, "workspace-adapter", "convoy-adapter", "implement", "kind-adapter", REPO_URL).await;
 
-    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
+    lease_engine.lease(&vessel.metadata.name, &vessel.spec.convoy_ref, HOST_REF);
     let deps = reconciler.prepare(&vessel).await.expect("deps should load");
     let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
-    let docker = outcome
-        .actuations
-        .iter()
-        .find_map(|actuation| match actuation {
-            Actuation::CreateEnvironment { spec, .. } => spec.docker.clone(),
-            _ => None,
-        })
+    let docker = requested_docker(lease_engine, &vessel.metadata.name)
         .unwrap_or_else(|| panic!("docker environment should be created: {:?}", outcome.patch));
     assert_eq!(docker.required_agent_adapters, BTreeSet::from([adapter.to_string()]));
     assert_eq!(docker.env.get("FLOTILLA_FLEET_CANARY").map(String::as_str), enabled);
 }
 
+/// The provider instance, image and pull policy of the container environment `vessel` requests.
 async fn created_docker_environment(
     backend: &ResourceBackend,
+    lease_engine: &VesselFixture,
     vessel: &flotilla_resources::ResourceObject<Vessel>,
 ) -> (String, String, DockerImagePullPolicy) {
-    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
+    lease_engine.lease(&vessel.metadata.name, &vessel.spec.convoy_ref, HOST_REF);
     let deps = reconciler.prepare(vessel).await.expect("deps should load");
     let outcome = reconciler.reconcile(vessel, &deps, Utc::now());
-    outcome
-        .actuations
-        .iter()
-        .find_map(|actuation| match actuation {
-            Actuation::CreateEnvironment { spec, meta } => spec.docker.as_ref().map(|docker| {
-                (
-                    meta.labels.get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL).cloned().unwrap_or_default(),
-                    docker.image.clone(),
-                    docker.pull_policy,
-                )
-            }),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("docker environment should be created: {:?}", outcome.patch))
+    let environment = requested_environment(lease_engine, &vessel.metadata.name)
+        .unwrap_or_else(|| panic!("docker environment should be created: {:?}", outcome.patch));
+    // The provider instance is the provider its address names on the host.
+    let instance = environment
+        .spec
+        .provider_address
+        .as_ref()
+        .and_then(|address| address.to_string().rsplit_once("/provider:").map(|(_, provider)| provider.to_owned()))
+        .unwrap_or_default();
+    let docker = environment.spec.docker.expect("docker environment");
+    (instance, docker.image, docker.pull_policy)
 }
 
 #[tokio::test]
 async fn missing_fulfilment_kind_marks_workspace_failed() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-a", "implement", REPO_URL, GIT_REF).await;
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-a", "convoy-a", "implement", "kind-missing", REPO_URL).await;
 
-    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
@@ -1628,17 +1650,18 @@ async fn missing_fulfilment_kind_marks_workspace_failed() {
 
 #[tokio::test]
 async fn reuses_existing_clone_by_deterministic_name() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-b", "implement", REPO_URL, GIT_REF).await;
     create_host_direct_kind(&backend, NAMESPACE, "policy-a", HOST_REF, "cleat").await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
 
     let canonical_repo = canonicalize_repo_url(REPO_URL).expect("repo canonicalization");
     let clone_name = format!("clone-{}", clone_key(&canonical_repo, &host_direct_env_name()));
     create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone").await;
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-b", "convoy-b", "implement", "policy-a", REPO_URL).await;
 
-    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
@@ -1659,6 +1682,7 @@ async fn reuses_existing_clone_by_deterministic_name() {
 #[tokio::test]
 // Contained worktrees receive tracking defaults while the shared config and hooks stay read-only.
 async fn docker_worktree_waits_for_checkout_before_creating_environment() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-c", "implement", REPO_URL, GIT_REF).await;
     create_docker_kind(
@@ -1672,18 +1696,19 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
             .build(),
     )
     .await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
 
     let canonical_repo = canonicalize_repo_url(REPO_URL).expect("repo canonicalization");
     let clone_name = format!("clone-{}", clone_key(&canonical_repo, &host_direct_env_name()));
     create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone").await;
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-c", "convoy-c", "implement", "policy-worktree", REPO_URL).await;
 
-    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
+    lease_engine.lease("workspace-c", "convoy-c", HOST_REF);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
     assert!(outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreateCheckout { .. })));
-    assert!(outcome.actuations.iter().all(|actuation| !matches!(actuation, Actuation::CreateEnvironment { .. })));
+    assert!(requested_environment(lease_engine, "workspace-c").is_none());
 
     create_ready_checkout(
         &backend,
@@ -1704,13 +1729,13 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
     .await;
     let current = backend.clone().using::<Vessel>(NAMESPACE).get("workspace-c").await.expect("workspace get should succeed");
     let deps = reconciler.prepare(&current).await.expect("deps should reload");
-    let outcome = reconciler.reconcile(&current, &deps, chrono::Utc::now());
+    reconciler.reconcile(&current, &deps, chrono::Utc::now());
+    let requested = requested_docker(lease_engine, "workspace-c");
 
-    assert!(outcome.actuations.iter().any(|actuation| {
-        matches!(
-            actuation,
-            Actuation::CreateEnvironment { spec, .. }
-                if spec.docker.as_ref().map(|docker| docker.mounts.as_slice()) == Some(&[
+    assert!(matches!(
+            &requested,
+            Some(docker)
+                if docker.mounts.as_slice() == [
                     flotilla_resources::EnvironmentMount {
                         source_path: "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-c".to_string(),
                         target_path: "/workspace".to_string(),
@@ -1741,19 +1766,11 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
                         target_path: "/Users/alice/dev/flotilla-repos/clone/.git/worktrees/resolved-github-com-flotilla-org-flotilla.workspace-c".to_string(),
                         mode: flotilla_resources::EnvironmentMountMode::Rw,
                     },
-                ])
-        )
-    }));
+                ]
+    ));
 
     #[cfg(unix)]
-    let docker = outcome
-        .actuations
-        .iter()
-        .find_map(|actuation| match actuation {
-            Actuation::CreateEnvironment { spec, .. } => spec.docker.as_ref(),
-            _ => None,
-        })
-        .expect("contained environment");
+    let docker = requested.as_ref().expect("contained environment");
     #[cfg(unix)]
     assert_contained_tracking(&docker.env);
 }
@@ -1858,6 +1875,7 @@ fn assert_contained_tracking(env: &BTreeMap<String, String>) {
 
 #[tokio::test]
 async fn docker_worktree_rejects_an_adopted_checkout_without_shared_clone_metadata() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-adopted-docker", "implement", REPO_URL, GIT_REF).await;
     let repo_ref = convoy.spec.repositories[0].repo_ref.clone();
@@ -1872,7 +1890,7 @@ async fn docker_worktree_rejects_an_adopted_checkout_without_shared_clone_metada
             .build(),
     )
     .await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     create_ready_adopted_checkout(&backend, NAMESPACE, "adopted-checkout-convoy-adopted-docker", "/Users/alice/dev/flotilla-existing")
         .await;
     let workspace = backend
@@ -1890,7 +1908,7 @@ async fn docker_worktree_rejects_an_adopted_checkout_without_shared_clone_metada
         .await
         .expect("workspace should create");
 
-    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("dependencies should resolve to a vessel failure");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -1903,6 +1921,7 @@ async fn docker_worktree_rejects_an_adopted_checkout_without_shared_clone_metada
 
 #[tokio::test]
 async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failure() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-missing-clone", "implement", REPO_URL, GIT_REF).await;
     create_docker_kind(
@@ -1916,7 +1935,7 @@ async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failu
             .build(),
     )
     .await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     create_ready_checkout(
         &backend,
         NAMESPACE,
@@ -1945,7 +1964,7 @@ async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failu
     )
     .await;
 
-    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("dependencies should resolve to a vessel failure");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -1982,8 +2001,8 @@ async fn terminal_sessions_use_strategy_specific_cwd(
     assert_terminal_cwd_for_strategy(workspace_name, realisation, checkout_path, expected_cwd, docker_env).await;
 }
 
-async fn create_ready_host_worktree(backend: &ResourceBackend, convoy_name: &str, workspace_name: &str) {
-    create_ready_host_direct_environment(backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+async fn create_ready_host_worktree(backend: &ResourceBackend, lease_engine: &VesselFixture, convoy_name: &str, workspace_name: &str) {
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     let canonical_repo = canonicalize_repo_url(REPO_URL).expect("repo canonicalization");
     let clone_name = format!("clone-{}", clone_key(&canonical_repo, &host_direct_env_name()));
     create_ready_clone(backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone").await;
@@ -2038,10 +2057,11 @@ fn docker_worktree_environment(workspace_name: &str, required_agent_adapters: BT
 
 #[tokio::test]
 async fn child_failure_propagates_to_workspace_failure() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-f", "implement", REPO_URL, GIT_REF).await;
     create_host_direct_kind(&backend, NAMESPACE, "policy-f", HOST_REF, "cleat").await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
 
     let canonical_repo = canonicalize_repo_url(REPO_URL).expect("repo canonicalization");
     let clone_name = format!("clone-{}", clone_key(&canonical_repo, &host_direct_env_name()));
@@ -2079,7 +2099,7 @@ async fn child_failure_propagates_to_workspace_failure() {
     .await;
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-f", "convoy-f", "implement", "policy-f", REPO_URL).await;
 
-    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
@@ -2098,6 +2118,7 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
     #[case] crew_phase: CrewWorkPhase,
     #[values(false, true)] engine: bool,
 ) {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-recover", "implement", REPO_URL, GIT_REF).await;
     let mut status = convoy.status.expect("convoy status");
@@ -2118,7 +2139,7 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
         .await
         .expect("agent crew status");
     create_host_direct_kind(&backend, NAMESPACE, "policy-recover", HOST_REF, "cleat").await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     let clone_name =
         format!("clone-{}", clone_key(&canonicalize_repo_url(REPO_URL).expect("repo canonicalization"), &host_direct_env_name()));
     create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone").await;
@@ -2188,9 +2209,11 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
         let terminal = backend.using::<TerminalSession>(NAMESPACE).get(terminal_name).await.expect("terminal");
         lifecycle.request(&terminal);
         lifecycle.finish(&terminal, flotilla_provisioning_testkit::Ending::Released);
-        test_vessel_reconciler(backend.clone(), NAMESPACE).with_lifecycle_reads(lifecycle.reads.clone())
+        // These reads replace the lease engine's, so they hold the vessel's environment too.
+        create_ready_host_direct_environment(&lifecycle.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
+        test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine).with_lifecycle_reads(lifecycle.reads.clone())
     } else {
-        test_vessel_reconciler(backend.clone(), NAMESPACE)
+        test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine)
     };
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
@@ -2232,11 +2255,12 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
 
 #[tokio::test]
 async fn adopted_checkout_ref_reuses_checkout_without_creating_clone_or_checkout() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-adopted", "implement", REPO_URL, GIT_REF).await;
     let repo_ref = convoy.spec.repositories[0].repo_ref.clone();
     create_host_direct_kind(&backend, NAMESPACE, "policy-adopted", HOST_REF, "cleat").await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     create_ready_adopted_checkout(&backend, NAMESPACE, "adopted-checkout-convoy-adopted", "/Users/alice/dev/flotilla-existing").await;
     let workspace = backend
         .clone()
@@ -2253,7 +2277,7 @@ async fn adopted_checkout_ref_reuses_checkout_without_creating_clone_or_checkout
         .await
         .expect("workspace create should succeed");
 
-    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -2286,6 +2310,7 @@ async fn adopted_checkout_ref_reuses_checkout_without_creating_clone_or_checkout
 
 #[tokio::test]
 async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents_remain_latent() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-crew", "implement", REPO_URL, GIT_REF).await;
     let repo_ref = convoy.spec.repositories[0].repo_ref.clone();
@@ -2325,7 +2350,7 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
         .await
         .expect("update convoy crew");
     create_host_direct_kind(&backend, NAMESPACE, "policy-crew", HOST_REF, "cleat").await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     create_ready_adopted_checkout(&backend, NAMESPACE, "adopted-checkout-convoy-crew", "/Users/alice/dev/flotilla-existing").await;
     let workspace = backend
         .clone()
@@ -2342,7 +2367,7 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
         .await
         .expect("workspace create");
 
-    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -2429,6 +2454,7 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
 
 #[tokio::test]
 async fn vessel_waits_for_admission_brief_envelope_then_pins_its_digest() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-artifact", "implement", REPO_URL, GIT_REF).await;
     let repo_ref = convoy.spec.repositories[0].repo_ref.clone();
@@ -2446,7 +2472,7 @@ async fn vessel_waits_for_admission_brief_envelope_then_pins_its_digest() {
         .await
         .expect("artifact admission marker");
     create_host_direct_kind(&backend, NAMESPACE, "policy-artifact", HOST_REF, "cleat").await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     create_ready_adopted_checkout(&backend, NAMESPACE, "adopted-artifact", "/Users/alice/dev/flotilla-existing").await;
     let vessel = backend
         .using::<Vessel>(NAMESPACE)
@@ -2461,7 +2487,7 @@ async fn vessel_waits_for_admission_brief_envelope_then_pins_its_digest() {
         )
         .await
         .expect("vessel");
-    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     let waiting = reconciler.prepare(&vessel).await.expect("wait for artifact");
     assert!(reconciler
         .reconcile(&vessel, &waiting, Utc::now())
@@ -2511,6 +2537,7 @@ async fn vessel_waits_for_admission_brief_envelope_then_pins_its_digest() {
 
 #[tokio::test]
 async fn repo_level_brief_template_override_changes_one_block_for_that_repo_convoy() {
+    let lease_engine = &VesselFixture::new(false);
     let temp = tempfile::tempdir().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let override_dir = repo_path.join(".flotilla/brief-templates");
@@ -2537,7 +2564,7 @@ async fn repo_level_brief_template_override_changes_one_block_for_that_repo_conv
         .await
         .expect("update convoy crew");
     create_host_direct_kind(&backend, NAMESPACE, "policy-repo-override", HOST_REF, "cleat").await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     create_ready_adopted_checkout(
         &backend,
         NAMESPACE,
@@ -2560,7 +2587,7 @@ async fn repo_level_brief_template_override_changes_one_block_for_that_repo_conv
         .await
         .expect("workspace create");
 
-    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -2577,6 +2604,7 @@ async fn repo_level_brief_template_override_changes_one_block_for_that_repo_conv
 
 #[tokio::test]
 async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
     let repository_key = repository_spec.key();
@@ -2648,7 +2676,7 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
         .await
         .expect("convoy status update");
     create_host_direct_kind(&backend, NAMESPACE, "policy-issue-brief", HOST_REF, "cleat").await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
     create_ready_adopted_checkout(&backend, NAMESPACE, "adopted-checkout-issue-brief", "/Users/alice/dev/flotilla-existing").await;
     let workspace = backend
         .clone()
@@ -2665,7 +2693,7 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
         .await
         .expect("workspace create");
 
-    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -2684,10 +2712,11 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
 
 #[tokio::test]
 async fn observed_checkout_at_managed_name_marks_workspace_failed() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-observed", "implement", REPO_URL, GIT_REF).await;
     create_host_direct_kind(&backend, NAMESPACE, "policy-observed", HOST_REF, "cleat").await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
 
     let canonical_repo = canonicalize_repo_url(REPO_URL).expect("repo canonicalization");
     let clone_name = format!("clone-{}", clone_key(&canonical_repo, &host_direct_env_name()));
@@ -2696,7 +2725,7 @@ async fn observed_checkout_at_managed_name_marks_workspace_failed() {
     let workspace =
         create_workspace(&backend, NAMESPACE, "workspace-observed", "convoy-observed", "implement", "policy-observed", REPO_URL).await;
 
-    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -2713,20 +2742,16 @@ async fn observed_checkout_at_managed_name_marks_workspace_failed() {
 
 #[tokio::test]
 async fn run_finalizer_deletes_vessel_owned_children_but_preserves_checkout() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-finalize", "convoy-a", "implement", "policy-a", REPO_URL).await;
 
-    create_labeled_environment(&backend, NAMESPACE, "env-workspace-finalize", "workspace-finalize").await;
     create_labeled_checkout(&backend, NAMESPACE, "checkout-workspace-finalize", "workspace-finalize").await;
     create_labeled_terminal(&backend, NAMESPACE, "terminal-workspace-finalize-coder", "workspace-finalize").await;
 
-    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     reconciler.run_finalizer(&workspace).await.expect("finalizer should succeed");
 
-    assert!(matches!(
-        backend.clone().using::<Environment>(NAMESPACE).get("env-workspace-finalize").await,
-        Err(ResourceError::NotFound { .. })
-    ));
     backend.clone().using::<Checkout>(NAMESPACE).get("checkout-workspace-finalize").await.expect("convoy cascade owns checkout cleanup");
     assert!(matches!(
         backend.clone().using::<TerminalSession>(NAMESPACE).get("terminal-workspace-finalize-coder").await,
@@ -2736,11 +2761,11 @@ async fn run_finalizer_deletes_vessel_owned_children_but_preserves_checkout() {
 
 #[tokio::test]
 async fn completed_convoy_does_not_repeat_vessel_delete_while_its_finalizer_is_pending() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let vessels = backend.clone().using::<Vessel>(NAMESPACE);
     let terminals = backend.clone().using::<TerminalSession>(NAMESPACE);
-    let environments = backend.clone().using::<Environment>(NAMESPACE);
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-finalizer", "implement", REPO_URL, GIT_REF).await;
 
     let mut status = convoy.status.expect("convoy status");
@@ -2765,7 +2790,6 @@ async fn completed_convoy_does_not_repeat_vessel_delete_while_its_finalizer_is_p
         .update(&vessel_meta, &vessel.metadata.resource_version, &vessel.spec)
         .await
         .expect("vessel finalizer and convoy label should be recorded");
-    create_labeled_environment(&backend, NAMESPACE, "env-convoy-finalizer-implement", "convoy-finalizer-implement").await;
     create_labeled_terminal(&backend, NAMESPACE, "terminal-convoy-finalizer-implement-coder", "convoy-finalizer-implement").await;
 
     let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE))
@@ -2793,7 +2817,7 @@ async fn completed_convoy_does_not_repeat_vessel_delete_while_its_finalizer_is_p
         "a vessel already awaiting finalization should not be deleted again"
     );
 
-    let vessel_reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let vessel_reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     vessel_reconciler.run_finalizer(&pending_vessel).await.expect("vessel finalizer should delete terminal children");
     let clear_finalizer = InputMeta::from(&pending_vessel.metadata).without_finalizer("flotilla.work/vessel-workspace-teardown");
     vessels
@@ -2803,18 +2827,18 @@ async fn completed_convoy_does_not_repeat_vessel_delete_while_its_finalizer_is_p
 
     assert!(matches!(vessels.get("convoy-finalizer-implement").await, Err(ResourceError::NotFound { .. })));
     assert!(matches!(terminals.get("terminal-convoy-finalizer-implement-coder").await, Err(ResourceError::NotFound { .. })));
-    assert!(matches!(environments.get("env-convoy-finalizer-implement").await, Err(ResourceError::NotFound { .. })));
 }
 
 #[tokio::test]
 async fn run_finalizer_preserves_adopted_checkout() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-adopted", "convoy-a", "implement", "policy-a", REPO_URL).await;
 
     create_labeled_adopted_checkout(&backend, NAMESPACE, "checkout-workspace-adopted", "workspace-adopted").await;
     create_labeled_terminal(&backend, NAMESPACE, "terminal-workspace-adopted-coder", "workspace-adopted").await;
 
-    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     reconciler.run_finalizer(&workspace).await.expect("finalizer should succeed");
 
     let checkout =
@@ -2828,26 +2852,21 @@ async fn run_finalizer_preserves_adopted_checkout() {
 
 #[tokio::test]
 async fn run_finalizer_ignores_missing_children_and_cleans_partial_workspace() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-partial", "convoy-a", "implement", "policy-a", REPO_URL).await;
 
-    create_labeled_environment(&backend, NAMESPACE, "env-workspace-partial", "workspace-partial").await;
-
-    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE, lease_engine);
     reconciler.run_finalizer(&workspace).await.expect("finalizer should succeed");
-
-    assert!(matches!(
-        backend.clone().using::<Environment>(NAMESPACE).get("env-workspace-partial").await,
-        Err(ResourceError::NotFound { .. })
-    ));
 }
 
 #[tokio::test]
 async fn terminal_session_actuation_includes_system_and_user_labels() {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_labeled_processes(&backend, NAMESPACE, "convoy-labels", REPO_URL, GIT_REF).await;
     create_host_direct_kind(&backend, NAMESPACE, "policy-labels", HOST_REF, "cleat").await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
 
     let canonical_repo = canonicalize_repo_url(REPO_URL).expect("repo canonicalization");
     let clone_name = format!("clone-{}", clone_key(&canonical_repo, &host_direct_env_name()));
@@ -2882,7 +2901,7 @@ async fn terminal_session_actuation_includes_system_and_user_labels() {
     .await;
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-labels", "convoy-labels", "review", "policy-labels", REPO_URL).await;
 
-    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -2920,6 +2939,7 @@ async fn assert_terminal_cwd_for_strategy(
     expected_cwd: &str,
     docker_env: Option<DockerEnvironmentSpec>,
 ) {
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-cwd", "implement", REPO_URL, GIT_REF).await;
     create_kind(
@@ -2929,13 +2949,13 @@ async fn assert_terminal_cwd_for_strategy(
         FulfilmentKindSpec::builder().host_ref(HOST_REF.to_string()).pool("cleat".to_string()).realisation(realisation).build(),
     )
     .await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_host_direct_environment(&lease_engine.environments, HOST_REF, "/Users/alice/dev/flotilla-repos");
 
     let canonical_repo = canonicalize_repo_url(REPO_URL).expect("repo canonicalization");
     let clone_name = format!("clone-{}", clone_key(&canonical_repo, &host_direct_env_name()));
     create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone").await;
     if let Some(docker) = docker_env {
-        create_ready_docker_environment(&backend, NAMESPACE, &format!("env-{workspace_name}"), docker).await;
+        create_ready_docker_environment(&lease_engine.environments, &format!("env-{workspace_name}"), docker);
     }
     create_ready_checkout(
         &backend,
@@ -2951,7 +2971,7 @@ async fn assert_terminal_cwd_for_strategy(
     .await;
     let workspace = create_workspace(&backend, NAMESPACE, workspace_name, "convoy-cwd", "implement", "kind-cwd", REPO_URL).await;
 
-    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
@@ -3156,26 +3176,6 @@ async fn create_running_terminal(
     sessions.get(name).await.expect("terminal get should succeed")
 }
 
-async fn create_labeled_environment(backend: &ResourceBackend, namespace: &str, name: &str, workspace_name: &str) {
-    backend
-        .clone()
-        .using::<Environment>(namespace)
-        .create(
-            &labeled_meta(name, [(VESSEL_REF_LABEL.to_string(), workspace_name.to_string())]),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(HostDirectEnvironmentSpec {
-                    host_ref: HOST_REF.to_string(),
-                    repo_default_dir: "/Users/alice/dev/flotilla-repos".to_string(),
-                }),
-                docker: None,
-            },
-        )
-        .await
-        .expect("environment create should succeed");
-}
-
 async fn create_labeled_checkout(backend: &ResourceBackend, namespace: &str, name: &str, workspace_name: &str) {
     backend
         .clone()
@@ -3305,6 +3305,7 @@ async fn create_labeled_terminal(backend: &ResourceBackend, namespace: &str, nam
 // starts and the digest once its Environment is Ready.
 #[tokio::test]
 async fn composed_placement_records_identity_then_digest() {
+    let lease_engine = &VesselFixture::new(false);
     use flotilla_resources::{PlacementImageSource, VesselImage, VesselStatusPatch};
     let identity = format!("sha256:{}", "c".repeat(64));
     let image_build_ref = format!("image-{}-amd64", "c".repeat(40));
@@ -3319,19 +3320,13 @@ async fn composed_placement_records_identity_then_digest() {
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-composed", "implement", REPO_URL, GIT_REF).await;
     create_kind(&backend, NAMESPACE, "kind-composed", kind.clone()).await;
-    create_ready_host_worktree(&backend, "convoy-composed", "vessel-composed").await;
+    create_ready_host_worktree(&backend, lease_engine, "convoy-composed", "vessel-composed").await;
     let vessel = create_workspace(&backend, NAMESPACE, "vessel-composed", "convoy-composed", "implement", "kind-composed", REPO_URL).await;
-    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
+    lease_engine.lease("vessel-composed", "convoy-composed", HOST_REF);
     let deps = reconciler.prepare(&vessel).await.expect("deps should load");
     let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
-    let environment = outcome
-        .actuations
-        .iter()
-        .find_map(|actuation| match actuation {
-            Actuation::CreateEnvironment { spec, .. } => spec.docker.clone(),
-            _ => None,
-        })
-        .expect("composed placement creates its Environment");
+    let environment = requested_docker(lease_engine, "vessel-composed").expect("composed placement creates its Environment");
     assert_eq!(environment.image_build_ref.as_deref(), Some(image_build_ref.as_str()));
     assert!(environment.image.is_empty(), "the Environment reconciler supplies the build's digest");
     assert_eq!(environment.declared_agent_adapters, environment.required_agent_adapters);
@@ -3341,18 +3336,17 @@ async fn composed_placement_records_identity_then_digest() {
             if *image == VesselImage { identity: identity.clone(), digest: None }
     ));
 
+    let lease_engine = &VesselFixture::new(false);
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-composed", "implement", REPO_URL, GIT_REF).await;
     create_kind(&backend, NAMESPACE, "kind-composed", kind).await;
-    create_ready_host_worktree(&backend, "convoy-composed", "vessel-composed").await;
+    create_ready_host_worktree(&backend, lease_engine, "convoy-composed", "vessel-composed").await;
     let environment_ref = "env-vessel-composed";
     create_ready_docker_environment(
-        &backend,
-        NAMESPACE,
+        &lease_engine.environments,
         environment_ref,
         DockerEnvironmentSpec { image: digest.clone(), image_build_ref: Some(image_build_ref), ..environment },
-    )
-    .await;
+    );
     create_running_terminal(
         &backend,
         NAMESPACE,
@@ -3365,7 +3359,7 @@ async fn composed_placement_records_identity_then_digest() {
     )
     .await;
     let vessel = create_workspace(&backend, NAMESPACE, "vessel-composed", "convoy-composed", "implement", "kind-composed", REPO_URL).await;
-    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE, lease_engine);
     let deps = reconciler.prepare(&vessel).await.expect("deps should load");
     let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
     assert!(

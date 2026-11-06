@@ -238,7 +238,7 @@ fn the_host_ledger_is_rebuilt_from_live_vessels() {
     vessels
         .apply(
             "gone",
-            Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost, observed: absent },
+            Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost(), observed: absent },
             &world,
             Timestamp(2),
         )

@@ -11,11 +11,15 @@ use std::{
 use async_trait::async_trait;
 const NAMESPACE: &str = "flotilla";
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_protocol::LifecycleReading;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::ProcessCommandRunner;
-use flotilla_resources::{CheckoutBranchProvenance, Convoy, ConvoySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec};
+use flotilla_resources::{
+    environment_records::{EnvironmentRecord, EnvironmentRecords},
+    CheckoutBranchProvenance, Convoy, ConvoySpec, EnvironmentSpec, HostDirectEnvironmentSpec,
+};
 use flotilla_store::ResourceBackend;
 use tempfile::TempDir;
 
@@ -263,6 +267,54 @@ async fn convoy_parent_cleanup_contract() {
     }
 }
 
+/// This home's live environments as the engine reads them, or the error its listing fails with.
+struct LiveEnvironments(Result<Vec<EnvironmentRecord>, String>);
+
+impl LiveEnvironments {
+    /// Host-direct environments, each `(name, host, root)`.
+    fn host_direct<'a>(environments: impl IntoIterator<Item = (&'a str, &'a str, &'a Path)>) -> Self {
+        let record = |(name, host, root): (&str, &str, &Path)| EnvironmentRecord {
+            name: name.into(),
+            home: "home".into(),
+            spec: EnvironmentSpec {
+                cloud_sandbox: None,
+                provider_address: None,
+                host_direct: Some(HostDirectEnvironmentSpec {
+                    host_ref: host.into(),
+                    repo_default_dir: root.to_str().expect("root path").into(),
+                }),
+                docker: None,
+            },
+            vessel: None,
+            reading: LifecycleReading::Ready { identity: root.to_str().expect("root path").into() },
+            launch: None,
+        };
+        Self(Ok(environments.into_iter().map(record).collect()))
+    }
+}
+
+impl EnvironmentRecords for LiveEnvironments {
+    fn get(&self, _: &str, _: Option<&str>) -> Result<Option<EnvironmentRecord>, String> {
+        unreachable!("the sweep reads live environments only")
+    }
+
+    fn find(&self, _: &str) -> Result<Option<EnvironmentRecord>, String> {
+        unreachable!("the sweep reads live environments only")
+    }
+
+    fn live(&self) -> Result<Vec<EnvironmentRecord>, String> {
+        self.0.clone()
+    }
+
+    fn held(&self, _: &str) -> Result<Vec<EnvironmentRecord>, String> {
+        unreachable!("the sweep reads live environments only")
+    }
+
+    fn request(&self, _: &str, _: &EnvironmentSpec, _: Option<&str>) -> Result<bool, String> {
+        unreachable!("the sweep requests nothing")
+    }
+}
+
 // #2610: a convoy in another namespace protects its shared host root,
 // using the same sanitized directory name as checkout provisioning.
 // Roots belonging to another host must never be swept by this daemon.
@@ -275,38 +327,22 @@ async fn empty_convoy_sweep_respects_namespaces_and_hosts() {
     fs::create_dir_all(local.join("convoy-live")).expect("test fixture operation succeeds");
     fs::create_dir_all(local.join("convoy-gone")).expect("test fixture operation succeeds");
     fs::create_dir_all(remote.join("convoy-gone")).expect("test fixture operation succeeds");
-    for (name, host, root) in [("local-env", "local", &local), ("remote-env", "remote", &remote)] {
-        backend
-            .using::<Environment>("environments")
-            .create(
-                &empty_meta(name),
-                &EnvironmentSpec {
-                    cloud_sandbox: None,
-                    provider_address: None,
-                    host_direct: Some(HostDirectEnvironmentSpec {
-                        host_ref: host.into(),
-                        repo_default_dir: root.to_str().expect("test fixture operation succeeds").into(),
-                    }),
-                    docker: None,
-                },
-            )
-            .await
-            .expect("test fixture operation succeeds");
-    }
+    let environments = LiveEnvironments::host_direct([("local-env", "local", local.as_path()), ("remote-env", "remote", remote.as_path())]);
     backend
         .using::<Convoy>("another-project")
         .create(&empty_meta("convoy/live"), &ConvoySpec::builder().workflow_ref("test".into()).build())
         .await
         .expect("test fixture operation succeeds");
-    sweep_host_empty_convoy_directories(&backend, "local").await.expect("test fixture operation succeeds");
+    sweep_host_empty_convoy_directories(&backend, &environments, "local").await.expect("test fixture operation succeeds");
     assert!(local.join("convoy-live").exists());
     assert!(!local.join("convoy-gone").exists());
     assert!(remote.join("convoy-gone").exists());
 }
 
 // #2610: failed resource discovery must leave every candidate untouched.
-// Corrupt the real SQLite store's sequence table to make a typed listing
-// fail after namespace discovery, both for Convoys and for Environments.
+// Corrupt the real SQLite store's sequence table to make the Convoy listing
+// fail after namespace discovery; with no Convoy namespace, the engine's
+// listing of this home's environments fails instead.
 #[tokio::test]
 async fn empty_convoy_sweep_fails_closed_on_listing_errors() {
     for has_convoy_namespace in [false, true] {
@@ -316,22 +352,6 @@ async fn empty_convoy_sweep_fails_closed_on_listing_errors() {
         fs::create_dir_all(&candidate).expect("empty stale convoy directory");
         let database = temp.path().join("resources.sqlite");
         let backend = ResourceBackend::new(SqliteBackend::open(&database).expect("resource store"));
-        backend
-            .using::<Environment>(NAMESPACE)
-            .create(
-                &empty_meta("host-direct"),
-                &EnvironmentSpec {
-                    cloud_sandbox: None,
-                    provider_address: None,
-                    host_direct: Some(HostDirectEnvironmentSpec {
-                        host_ref: "local".into(),
-                        repo_default_dir: root.to_str().expect("root path").into(),
-                    }),
-                    docker: None,
-                },
-            )
-            .await
-            .expect("host environment");
         if has_convoy_namespace {
             backend
                 .using::<Convoy>(NAMESPACE)
@@ -342,8 +362,15 @@ async fn empty_convoy_sweep_fails_closed_on_listing_errors() {
         let connection = rusqlite::Connection::open(&database).expect("fault injection connection");
         connection.execute("DROP TABLE resource_sequences", []).expect("inject listing failure");
         drop(connection);
-        let error = sweep_host_empty_convoy_directories(&backend, "local").await.expect_err("failed listing must stop sweep");
-        assert!(error.contains("resource_sequences"), "{error}");
+        let environments = if has_convoy_namespace {
+            LiveEnvironments::host_direct([("host-direct", "local", root.as_path())])
+        } else {
+            LiveEnvironments(Err("environment listing failed".into()))
+        };
+        let error =
+            sweep_host_empty_convoy_directories(&backend, &environments, "local").await.expect_err("failed listing must stop sweep");
+        let expected = if has_convoy_namespace { "resource_sequences" } else { "environment listing failed" };
+        assert!(error.contains(expected), "{error}");
         assert!(candidate.exists(), "listing failure must preserve empty candidates");
     }
 }

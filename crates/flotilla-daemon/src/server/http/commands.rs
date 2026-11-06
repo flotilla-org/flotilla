@@ -696,7 +696,7 @@ mod tests {
     use super::*;
     use crate::blob_store::{BlobStore, TieredBlobStore};
     use crate::server::http::{HttpRouter, ListenerOrigin, LoginStore};
-    use crate::server::tests::{caller_mountinfo, placed_crew_daemon, supervisor_daemon};
+    use crate::server::tests::{caller_mountinfo, engine_environments, placed_crew_daemon, supervisor_daemon};
     use crate::server::{caller, http::auth::PeerEvidence};
     use flotilla_protocol::PrincipalRef;
 
@@ -906,31 +906,16 @@ mod tests {
     // A container reaching the main socket retains crew authority, never operator authority.
     #[tokio::test]
     async fn unix_peer_evidence_keeps_container_crew_bound() {
-        use flotilla_resources::{Environment, EnvironmentStatus, InputMeta};
         for cbor in [false, true] {
             let (temp, daemon) = placed_crew_daemon("unix-crew").await;
-            let environments = daemon.resource_backend().using::<Environment>("flotilla");
-            let env = environments
-                .create(
-                    &InputMeta::builder().name("unix-crew".into()).build(),
-                    &serde_json::from_value(json!({"docker":{"host_ref":"host","image":"image"}})).unwrap(),
-                )
-                .await
-                .unwrap();
-            environments
-                .update_status(
-                    "unix-crew",
-                    &env.metadata.resource_version,
-                    &EnvironmentStatus {
-                        runtime_observation: Some(flotilla_protocol::EnvironmentRuntimeObservation {
-                            container_id: Some("kernel-container".into()),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .unwrap();
+            // The environment is realised under its container's immutable ID.
+            engine_environments(&daemon).put_ready(
+                "unix-crew",
+                &serde_json::from_value(json!({"docker":{"host_ref":"host","image":"image"}})).unwrap(),
+                None,
+                "kernel-container",
+                Default::default(),
+            );
             let h = Harness::from_daemon(temp, daemon);
             let mut evidence = host_evidence();
             Arc::get_mut(&mut evidence).unwrap().caller.process.as_mut().unwrap().container = Some("kernel-container".into());

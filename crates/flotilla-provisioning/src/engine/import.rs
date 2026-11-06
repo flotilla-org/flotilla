@@ -1,14 +1,15 @@
 //! The import of old provisioning and crew records into the engine (#3629 layer 9).
 //!
 //! One function per kind maps an old record's status onto a stored lifecycle state; the request is
-//! the kind's [`Binding::request`], as the write path makes it. A record that cannot be mapped is
+//! the kind's [`Binding::request`], as the write path makes it (an Environment's is the request
+//! the environment port makes, [`super::environments::request_of`]). A record that cannot be mapped is
 //! refused with the record named. [`import_records`] writes every mapped resource into an
 //! [`ImportTarget`], reads it back, and lists what it refused.
 //!
 //! | Kind | Old phase | Stored state |
 //! |---|---|---|
 //! | Environment | Pending, Provisioning | Requested |
-//! | | Ready | Realised (its container, cloud sandbox backing, or host-direct root) |
+//! | | Ready | Realised (its container, cloud sandbox backing, or host-direct root), with its launch facts |
 //! | | Lost | Gone(Lost) |
 //! | | Failed | GaveUp |
 //! | Cloud sandbox Environment, deleted | Lost (its sandbox gone) | not stored: dropped |
@@ -43,8 +44,8 @@ use std::collections::BTreeMap;
 use flotilla_engine_store::{ImportTarget, Rehearsal, IMPORT_WRITER};
 use flotilla_resources::{
     Checkout as OldCheckout, CheckoutPhase, Clone as OldClone, ClonePhase, Environment as OldEnvironment, EnvironmentPhase,
-    ImageBuild as OldImageBuild, ImageBuildFailureClass, ImageBuildPhase, ResourceObject, TerminalSession as OldTerminalSession,
-    TerminalSessionPhase, Vessel as OldVessel, VesselPhase,
+    EnvironmentStatus, ImageBuild as OldImageBuild, ImageBuildFailureClass, ImageBuildPhase, ResourceObject,
+    TerminalSession as OldTerminalSession, TerminalSessionPhase, Vessel as OldVessel, VesselPhase,
 };
 use flotilla_schema::{Kind, NewChange, State, Timestamp};
 use flotilla_state_machines::{
@@ -53,9 +54,10 @@ use flotilla_state_machines::{
 };
 
 use super::{
-    checkout::CheckoutBinding, clone::CloneBinding, environment::EnvironmentBinding, image_build::ImageBuildBinding, launch,
+    checkout::CheckoutBinding, clone::CloneBinding, environments, image_build::ImageBuildBinding, launch,
     terminal_session::TerminalSessionBinding, vessel::VesselBinding, Binding,
 };
+use crate::stored::{environment::EnvironmentKind, launch_facts::EnvironmentLaunchFacts};
 
 /// A kind whose old records the import maps.
 pub trait Imported: Binding {
@@ -265,7 +267,48 @@ pub fn import_environments(
     if !dropped.is_empty() {
         *report.dropped.entry(("Environment", "a deleted cloud sandbox, its sandbox gone")).or_default() += dropped.len();
     }
-    import_records::<EnvironmentBinding>(&kept, target, report);
+    for (environment, home) in &kept {
+        let refuse = |reason: String| ImportRefusal { kind: EnvironmentKind::NAME, record: environment.metadata.name.clone(), reason };
+        let result = import_environment(environment, home).and_then(|imported| {
+            let change = NewChange::new(IMPORT_WRITER, imported.resource.since());
+            target.write(home, imported.resource.name(), &change, &imported.resource).map_err(refuse)?;
+            // A realised launch keeps the facts its provider reported, written beside it.
+            if matches!(imported.resource.state(), LifecycleState::Realised { .. }) {
+                let facts = launch_facts(environment.status.as_ref()).map_err(refuse)?;
+                target.write(home, imported.resource.name(), &change, &facts).map_err(refuse)?;
+            }
+            Ok(imported)
+        });
+        report.record(&result);
+    }
+}
+
+/// Maps old Environment `obj`, homed at `home`, onto its engine resource: the request the
+/// environment port makes, held for the vessel its label names.
+pub fn import_environment(obj: &ResourceObject<OldEnvironment>, home: &str) -> Result<ImportedResource<EnvironmentKind>, ImportRefusal> {
+    let refuse = |reason: String| ImportRefusal { kind: EnvironmentKind::NAME, record: obj.metadata.name.clone(), reason };
+    // An empty label names no vessel.
+    let vessel = obj.metadata.labels.get(flotilla_resources::VESSEL_REF_LABEL).filter(|vessel| !vessel.is_empty());
+    let request = environments::request_of(&obj.spec, vessel.map(String::as_str), home).map_err(refuse)?;
+    let state = environment_state(obj).map_err(refuse)?;
+    let since = Timestamp::from_datetime(&obj.metadata.creation_timestamp);
+    Ok(ImportedResource {
+        record: obj.metadata.name.clone(),
+        home: home.to_owned(),
+        resource: Resource::stored(obj.metadata.name.clone(), request, State::new(state, since), Version(1)),
+    })
+}
+
+/// The facts a Ready environment's status recorded for its launch.
+fn launch_facts(status: Option<&EnvironmentStatus>) -> Result<EnvironmentLaunchFacts, String> {
+    let status = status.cloned().unwrap_or_default();
+    environments::launch_facts(&flotilla_resources::environment_records::LaunchFacts {
+        image_ref: status.image_ref,
+        local_image_id: status.local_image_id,
+        registry_digest: status.registry_digest,
+        configured_limits: status.configured_limits,
+        provider_descriptor: status.provider_descriptor,
+    })
 }
 
 fn failed_by(detail: Option<&str>, fallback: &str) -> Cause {
@@ -276,8 +319,9 @@ fn realised(identity: Option<String>, what: &str) -> Result<LifecycleState, Stri
     identity.map(|identity| LifecycleState::Realised { identity }).ok_or_else(|| format!("realised with no {what} to realise under"))
 }
 
-impl Imported for EnvironmentBinding {
-    fn imported_state(obj: &ResourceObject<OldEnvironment>) -> Result<LifecycleState, String> {
+/// The stored state old Environment `obj`'s status maps to.
+fn environment_state(obj: &ResourceObject<OldEnvironment>) -> Result<LifecycleState, String> {
+    {
         let status = obj.status.as_ref();
         let message = status.and_then(|status| status.message.as_deref());
         Ok(match status.map(|status| status.phase).unwrap_or_default() {

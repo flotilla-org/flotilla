@@ -5,10 +5,10 @@ use std::{collections::BTreeMap, future::Future, time::Duration};
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
     canonicalize_repo_url, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Clone, ClonePhase, CloneSpec, CloneStatus,
-    Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerEnvironmentSpec, Environment, EnvironmentPhase,
-    EnvironmentSpec, EnvironmentStatus, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HostDirectEnvironmentSpec, InputMeta,
-    Repository, RepositorySpec, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, Vessel,
-    VesselRequirement, VesselSpec, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerEnvironmentSpec, EnvironmentSpec, FulfilmentKind,
+    FulfilmentKindSpec, FulfilmentRealisation, HostDirectEnvironmentSpec, InputMeta, Repository, RepositorySpec, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkCompletionAuthority,
+    WorkPhase, WorkState, WorkflowSnapshot,
 };
 use flotilla_store::{ensure_repository, ResourceBackend};
 use tokio::{
@@ -216,89 +216,42 @@ pub async fn create_docker_kind(backend: &ResourceBackend, namespace: &str, fixt
     .await;
 }
 
-pub async fn create_ready_host_direct_environment(
-    backend: &ResourceBackend,
-    namespace: &str,
+/// This host's direct environment, ready under its root, held by the engine `environments` serve.
+pub fn create_ready_host_direct_environment(
+    environments: &flotilla_provisioning_testkit::EnvironmentFixture,
     host_ref: &str,
     repo_default_dir: &str,
-) -> flotilla_resources::ResourceObject<Environment> {
-    let environments = backend.clone().using::<Environment>(namespace);
+) -> flotilla_resources::environment_records::EnvironmentRecord {
     let name = format!("host-direct-{host_ref}");
-    let created = environments
-        .create(
-            &meta(&name),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(HostDirectEnvironmentSpec {
-                    host_ref: host_ref.to_string(),
-                    repo_default_dir: repo_default_dir.to_string(),
-                }),
-                docker: None,
-            },
-        )
-        .await
-        .expect("environment create should succeed");
-    environments
-        .update_status(
-            &name,
-            &created.metadata.resource_version,
-            &EnvironmentStatus {
-                backing_id: None,
-                provider_descriptor: None,
-                configured_limits: None,
-                runtime_observation: None,
-                phase: EnvironmentPhase::Ready,
-                ready: true,
-                docker_container_id: None,
-                image_ref: None,
-                local_image_id: None,
-                registry_digest: None,
-                message: None,
-                credential_delivery_retry: None,
-                credential_refresh_retry: None,
-            },
-        )
-        .await
-        .expect("environment status update should succeed");
-    environments.get(&name).await.expect("environment get should succeed")
+    let spec = EnvironmentSpec {
+        cloud_sandbox: None,
+        provider_address: None,
+        host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_ref.to_string(), repo_default_dir: repo_default_dir.to_string() }),
+        docker: None,
+    };
+    environments.put_ready(&name, &spec, None, repo_default_dir, Default::default());
+    flotilla_resources::environment_records::EnvironmentRecords::find(environments.environments.as_ref(), &name)
+        .expect("environment read")
+        .expect("environment held")
 }
 
-pub async fn create_ready_docker_environment(
-    backend: &ResourceBackend,
-    namespace: &str,
+/// A ready container environment `name`, launched from `docker`'s image, held by the engine
+/// `environments` serve.
+pub fn create_ready_docker_environment(
+    environments: &flotilla_provisioning_testkit::EnvironmentFixture,
     name: &str,
     docker: DockerEnvironmentSpec,
-) -> flotilla_resources::ResourceObject<Environment> {
-    let environments = backend.clone().using::<Environment>(namespace);
-    let image_ref = docker.image.clone();
-    let created = environments
-        .create(&meta(name), &EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: Some(docker) })
-        .await
-        .expect("docker env create should succeed");
-    environments
-        .update_status(
-            name,
-            &created.metadata.resource_version,
-            &EnvironmentStatus {
-                backing_id: None,
-                provider_descriptor: None,
-                configured_limits: None,
-                runtime_observation: None,
-                phase: EnvironmentPhase::Ready,
-                ready: true,
-                docker_container_id: Some(format!("container-{name}")),
-                image_ref: Some(image_ref),
-                local_image_id: Some("sha256:test-image".to_string()),
-                registry_digest: None,
-                message: None,
-                credential_delivery_retry: None,
-                credential_refresh_retry: None,
-            },
-        )
-        .await
-        .expect("docker env status update should succeed");
-    environments.get(name).await.expect("docker env get should succeed")
+) -> flotilla_resources::environment_records::EnvironmentRecord {
+    let facts = flotilla_resources::environment_records::LaunchFacts {
+        image_ref: Some(docker.image.clone()),
+        local_image_id: Some("sha256:test-image".to_string()),
+        ..Default::default()
+    };
+    let spec = EnvironmentSpec { cloud_sandbox: None, provider_address: None, host_direct: None, docker: Some(docker) };
+    environments.put_ready(name, &spec, None, &format!("container-{name}"), facts);
+    flotilla_resources::environment_records::EnvironmentRecords::find(environments.environments.as_ref(), name)
+        .expect("environment read")
+        .expect("environment held")
 }
 
 pub async fn create_ready_clone(

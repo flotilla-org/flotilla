@@ -22,9 +22,9 @@ use flotilla_protocol::{
     ResolvedAttachAction, ResolvedAttachPlan,
 };
 use flotilla_resources::{
-    terminal_session_attach_target_with_stale_status, Convoy as ResourceConvoy, ConvoyPhase as ResourceConvoyPhase,
-    Environment as ResourceEnvironment, Host as ResourceHost, Project, ReadResourceObject, ResourceProvenance,
-    TerminalSession as ResourceTerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    terminal_session_attach_target_with_stale_status, Convoy as ResourceConvoy, ConvoyPhase as ResourceConvoyPhase, Host as ResourceHost,
+    Project, ReadResourceObject, ResourceProvenance, TerminalSession as ResourceTerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    VESSEL_REF_LABEL,
 };
 use flotilla_store::{ResourceBackend, StoreQuery};
 use sha2::{Digest, Sha256};
@@ -35,6 +35,7 @@ use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_projections::aggregator_projection::AggregatorProjectionState;
 use flotilla_provider_runtime::host_environment::HostEnvironment;
 use flotilla_resources::convoy_address::{convoy_address, RoleAddress};
+use flotilla_resources::environment_records::EnvironmentRecord;
 use flotilla_terminal::TerminalSessionLiveness;
 
 // A held environment can only attach to its realised backing; unheld environments use the legacy handle.
@@ -144,7 +145,7 @@ impl<'a> AttachResolver<'a> {
         mode: AttachMode,
     ) -> Result<ResolvedAttach, String> {
         let namespace = self.provisioning_namespace().await;
-        let environment = self.resource_backend.using::<ResourceEnvironment>(&namespace).get(id).await.map_err(|e| e.to_string())?;
+        let environment = self.lifecycle_reads.environments()?.find(id)?.ok_or_else(|| format!("environment {id} not found"))?;
         let spec = environment.spec.docker.as_ref().ok_or("environment shell requires a contained environment")?;
         let owner = self.target_host_with_reads(&AttachReadContext::default(), &namespace, &spec.host_ref).await?;
         if host.is_some_and(|requested| requested != &owner) {
@@ -635,11 +636,12 @@ impl<'a> AttachResolver<'a> {
         seat: AttachMode,
     ) -> Result<(ResolvedAttachPlan, HostName), String> {
         let namespace = self.provisioning_namespace().await;
-        let environments = self.resource_backend.clone().using::<ResourceEnvironment>(&namespace);
-        let environment = environments
-            .get(&session.spec.env_ref)
-            .await
-            .map_err(|err| format!("environment {} lookup failed: {err}", session.spec.env_ref))?;
+        let environment = self
+            .lifecycle_reads
+            .environments()
+            .and_then(|environments| environments.find(&session.spec.env_ref))
+            .map_err(|err| format!("environment {} lookup failed: {err}", session.spec.env_ref))?
+            .ok_or_else(|| format!("environment {} lookup failed: not found", session.spec.env_ref))?;
         if let Some(handle) = self.checked_provisioned_handle(&environment)? {
             // Host-direct resources retain their existing pool/host routing: the
             // host is the vessel, and its agent works in process. Every other
@@ -736,10 +738,10 @@ impl<'a> AttachResolver<'a> {
 
     fn checked_provisioned_handle(
         &self,
-        environment: &flotilla_resources::ResourceObject<ResourceEnvironment>,
+        environment: &EnvironmentRecord,
     ) -> Result<Option<flotilla_environment::environment::EnvironmentHandle>, String> {
         let handle = self.environment_manager.managed_environments().into_iter().find_map(|(id, state)| {
-            if id.as_str() != environment.metadata.name {
+            if id.as_str() != environment.name {
                 return None;
             }
             match state {
@@ -752,9 +754,9 @@ impl<'a> AttachResolver<'a> {
         };
         // The engine's checked identity is authoritative; no copied status or
         // provider discriminator can authorize a handle for a different backing.
-        let realised = environment_attach_backing(self.lifecycle_reads, &environment.metadata.name)?;
-        if handle.id().as_str() != environment.metadata.name || realised.as_ref().is_some_and(|backing| handle.backing_id() != backing) {
-            return Err(format!("environment {} has no live handle for realised backing {realised:?}", environment.metadata.name));
+        let realised = environment_attach_backing(self.lifecycle_reads, &environment.name)?;
+        if handle.id().as_str() != environment.name || realised.as_ref().is_some_and(|backing| handle.backing_id() != backing) {
+            return Err(format!("environment {} has no live handle for realised backing {realised:?}", environment.name));
         }
         Ok(Some(handle))
     }
@@ -763,7 +765,7 @@ impl<'a> AttachResolver<'a> {
         &self,
         reads: &AttachReadContext,
         session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
-        environment: &flotilla_resources::ResourceObject<ResourceEnvironment>,
+        environment: &EnvironmentRecord,
         handle: flotilla_environment::environment::EnvironmentHandle,
         seat: AttachMode,
     ) -> Result<ResolvedAttachPlan, String> {
@@ -803,7 +805,7 @@ impl<'a> AttachResolver<'a> {
         &self,
         reads: &AttachReadContext,
         session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
-        environment: &flotilla_resources::ResourceObject<ResourceEnvironment>,
+        environment: &EnvironmentRecord,
         cwd: &ExecutionEnvironmentPath,
         seat: AttachMode,
     ) -> Result<Vec<Arg>, String> {
@@ -848,23 +850,23 @@ impl<'a> AttachResolver<'a> {
     async fn registry_for_resource_environment(
         &self,
         reads: &AttachReadContext,
-        environment: &flotilla_resources::ResourceObject<ResourceEnvironment>,
+        environment: &EnvironmentRecord,
         cwd: &Path,
     ) -> Result<Arc<ProviderRegistry>, String> {
         let environment_id = if let Some(host_direct) = environment.spec.host_direct.as_ref() {
-            let canonical_ref =
-                match reads.canonical_host(self.resource_backend, &environment.metadata.namespace, &host_direct.host_ref).await {
-                    Ok(Some(target_host)) => target_host.reference,
-                    Ok(None) => return Err(format!("references unknown host `{}`", host_direct.host_ref)),
-                    Err(error) => return Err(error),
-                };
+            let namespace = self.provisioning_namespace().await;
+            let canonical_ref = match reads.canonical_host(self.resource_backend, &namespace, &host_direct.host_ref).await {
+                Ok(Some(target_host)) => target_host.reference,
+                Ok(None) => return Err(format!("references unknown host `{}`", host_direct.host_ref)),
+                Err(error) => return Err(error),
+            };
             if self.canonical_local_host_id().as_ref() == Some(&canonical_ref) {
                 self.local_environment_id.clone()
             } else {
-                EnvironmentId::new(environment.metadata.name.clone())
+                EnvironmentId::new(environment.name.clone())
             }
         } else {
-            EnvironmentId::new(environment.metadata.name.clone())
+            EnvironmentId::new(environment.name.clone())
         };
 
         if let Some(registry) = self.environment_registry_for_environment(&environment_id) {
@@ -1386,8 +1388,8 @@ mod tests {
     use super::*;
     use crate::in_process::tests::create_identity_convoy;
     use crate::in_process::tests::create_running_session;
-    use crate::in_process::tests::create_test_environment;
     use crate::in_process::tests::test_meta;
+    use crate::in_process::tests::{create_test_environment, test_environments};
     use crate::in_process::InProcessDaemon;
     use crate::testkits::discovery::fake_discovery;
     use flotilla_config::ConfigStore;
@@ -1397,25 +1399,20 @@ mod tests {
     // Every old phase is stale; repeated reads cannot create a copy or resurrect a stale handle.
     #[tokio::test]
     async fn attach_reads_environment_backing_without_a_copy() {
-        use flotilla_provisioning::engine::environment::EnvironmentBinding;
-        use flotilla_provisioning_testkit::{object, Ending, LifecycleFixture};
-        use flotilla_resources::{EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, HostDirectEnvironmentSpec};
-        let obj = object::<ResourceEnvironment>(
-            "env",
-            EnvironmentSpec {
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/work".into() }),
-                ..Default::default()
-            },
-            EnvironmentStatus { phase: EnvironmentPhase::Failed, docker_container_id: Some("stale".into()), ..Default::default() },
-        );
-        let fixture = LifecycleFixture::<EnvironmentBinding>::new(false);
+        use flotilla_provisioning_testkit::{Ending, EnvironmentFixture};
+        use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec};
+        let spec = EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/work".into() }),
+            ..Default::default()
+        };
+        let fixture = EnvironmentFixture::default();
         let read = || environment_attach_backing(fixture.reads.as_ref(), "env");
         assert_eq!(read().expect("unheld"), None);
-        fixture.request(&obj);
+        fixture.request("env", &spec, None);
         assert!(read().is_err());
-        fixture.finish(&obj, Ending::Ready("live-backing"));
+        fixture.finish("env", Ending::Ready("live-backing"));
         assert_eq!(read().expect("ready"), Some("live-backing".into()));
-        fixture.finish(&obj, Ending::Lost("live-backing"));
+        fixture.finish("env", Ending::Lost("live-backing"));
         assert!(read().expect_err("lost").contains("observed absent"));
         fixture.poison();
         assert!(read().expect_err("read error").contains("poisoned"));
@@ -1787,7 +1784,27 @@ mod tests {
                 ..Default::default()
             },
         };
-        let environments = backend.using::<ResourceEnvironment>("flotilla");
+        // The engine holds the environment realised under its backing. A neutral provider has no
+        // recipe the engine takes (#3719): the independent provider's is a cloud sandbox's.
+        let held_spec = match provider_kind {
+            ContractProvider::Docker => spec.clone(),
+            ContractProvider::Independent => flotilla_resources::EnvironmentSpec {
+                cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+                    probe_needs: Default::default(),
+                    image: "base".into(),
+                    image_build_ref: None,
+                    size: flotilla_resources::CloudSandboxSize { cpus: 1, memory_bytes: 1024, disk_bytes: 1024 },
+                    lifetime_cap_seconds: None,
+                    env: Default::default(),
+                }),
+                ..spec.clone()
+            },
+        };
+        let engine = flotilla_provisioning_testkit::EnvironmentFixture::default();
+        engine.put_ready("pre-agent", &held_spec, None, "backing", Default::default());
+        daemon.install_lifecycle_reads(engine.reads.clone()).expect("engine reads");
+        // An old record's copied status beside it, which attach never reads or writes.
+        let environments = backend.using::<flotilla_resources::Environment>("flotilla");
         let environment = environments.create(&test_meta("pre-agent"), &spec).await.unwrap();
         environments
             .update_status(
@@ -1823,6 +1840,7 @@ mod tests {
                     Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
                 )
                 .await;
+                daemon.install_lifecycle_reads(engine.reads.clone()).expect("engine reads");
             }
             let available = Arc::new(std::sync::atomic::AtomicBool::new(true));
             let runner = Arc::new(Inventory(real.clone(), available.clone()));
@@ -1884,19 +1902,23 @@ mod tests {
                 "degraded terminal access preserves the resident-agent recovery diagnostic"
             );
 
-            struct BackingReading(&'static str);
+            // The environment's reading, overridden; its record is the engine's.
+            struct BackingReading(&'static str, Arc<dyn flotilla_projections::ports::LifecycleReads>);
             impl flotilla_projections::ports::LifecycleReads for BackingReading {
                 fn try_reading(&self, kind: ProvisioningKind, _: &str, _: Option<&str>) -> Result<Option<LifecycleReading>, String> {
                     Ok((kind == ProvisioningKind::Environment).then(|| LifecycleReading::Ready { identity: self.0.into() }))
                 }
+                fn environments(&self) -> Result<&dyn flotilla_resources::environment_records::EnvironmentRecords, String> {
+                    self.1.environments()
+                }
             }
-            let ready = BackingReading("backing");
+            let ready = BackingReading("backing", engine.reads.clone());
             let mut held = daemon.attach_resolver();
             held.lifecycle_reads = &ready;
             held.resolve_attach("crew", None, false, AttachMode::Default, None).await.expect("current engine identity");
-            let engine = BackingReading("current-backing");
+            let current = BackingReading("current-backing", engine.reads.clone());
             let mut resolver = daemon.attach_resolver();
-            resolver.lifecycle_reads = &engine;
+            resolver.lifecycle_reads = &current;
             let error = resolver.resolve_attach("crew", None, false, AttachMode::Default, None).await.unwrap_err();
             assert!(error.contains("current-backing"), "the engine's realised identity overrides older resource status: {error}");
 
@@ -2152,7 +2174,8 @@ mod tests {
             )
             .await
             .expect("local host resource");
-        let environment = create_test_environment(&daemon, "governor-env", &local_host).await;
+        let environments = test_environments(&daemon);
+        let environment = create_test_environment(&environments, "governor-env", &local_host);
         create_running_session(&daemon, &environment, "governor-session", "convoy-andamento", "governor").await;
         create_running_session(&daemon, &environment, "flotilla-governor-session", "convoy-flotilla", "governor").await;
 
@@ -2217,7 +2240,8 @@ mod tests {
             )
             .await
             .expect("local host resource");
-        let environment = create_test_environment(&daemon, "coder-env", &host).await;
+        let environments = test_environments(&daemon);
+        let environment = create_test_environment(&environments, "coder-env", &host);
         create_running_session(&daemon, &environment, "coder-session", "convoy-failed", "coder").await;
         let convoys = backend.using::<ResourceConvoy>("flotilla");
         let convoy = convoys.get("convoy-failed").await.expect("convoy");
@@ -2269,7 +2293,8 @@ mod tests {
             )
             .await
             .expect("local host resource");
-        let environment = create_test_environment(&daemon, "coder-env", &host).await;
+        let environments = test_environments(&daemon);
+        let environment = create_test_environment(&environments, "coder-env", &host);
         create_running_session(&daemon, &environment, "terminal-old", "convoy-old", "coder").await;
         create_running_session(&daemon, &environment, "terminal-new", "convoy-new", "coder").await;
 
@@ -2326,7 +2351,8 @@ mod tests {
                 .create(&test_meta(&host), &HostSpec { display_name: "host".into(), connection: Default::default(), ..Default::default() })
                 .await
                 .expect("host");
-            let environment = create_test_environment(&daemon, "env-main", &host).await;
+            let environments = test_environments(&daemon);
+            let environment = create_test_environment(&environments, "env-main", &host);
             create_running_session(&daemon, &environment, "terminal-main", "convoy-main", "coder").await;
             for n in 0..unrelated {
                 create_identity_convoy(&backend, &format!("unrelated-{n}"), "other", Some("other")).await;
@@ -2415,7 +2441,8 @@ mod tests {
             )
             .await
             .expect("local host resource");
-        let environment = create_test_environment(&daemon, "coder-env", &host).await;
+        let environments = test_environments(&daemon);
+        let environment = create_test_environment(&environments, "coder-env", &host);
         create_running_session(&daemon, &environment, "terminal-gone", "convoy-gone", "coder").await;
         backend.using::<ResourceTerminalSession>("flotilla").delete("terminal-gone").await.expect("delete terminal session");
 

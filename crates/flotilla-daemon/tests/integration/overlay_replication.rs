@@ -113,6 +113,9 @@ async fn fleet_list_and_health_include_replicated_remote_crew_without_snapshot_f
     let temp = tempfile::tempdir().expect("tempdir");
     let kiwi = daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
     let feta = daemon(temp.path().join("feta"), "feta-root", "feta").await;
+    // Each daemon reads the engine's environments, as its runtime installs them.
+    crate::engine_environments(&kiwi);
+    crate::engine_environments(&feta);
     let feta_host_id = feta.local_host_id().expect("feta host id").to_string();
     let feta_hosts = feta.resource_backend().using::<Host>("flotilla");
     let host =
@@ -1608,6 +1611,9 @@ async fn attach_routes_by_session_host_when_convoy_is_homed_elsewhere() {
     let temp = tempfile::tempdir().expect("tempdir");
     let kiwi = daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
     let feta = daemon(temp.path().join("feta"), "feta-root", "feta").await;
+    // Each daemon reads the engine's environments, as its runtime installs them.
+    crate::engine_environments(&kiwi);
+    let feta_environments = crate::engine_environments(&feta);
     let feta_host_id = feta.local_host_id().expect("feta host id").to_string();
     let feta_hosts = feta.resource_backend().using::<Host>("flotilla");
     let host = feta_hosts.create(&InputMeta::builder().name(feta_host_id.clone()).build(), &HostSpec::default()).await.expect("feta host");
@@ -1619,22 +1625,17 @@ async fn attach_routes_by_session_host_when_convoy_is_homed_elsewhere() {
         )
         .await
         .expect("feta heartbeat");
-    feta.resource_backend()
-        .using::<flotilla_resources::Environment>("flotilla")
-        .create(
-            &InputMeta::builder().name("feta-environment".to_string()).build(),
-            &flotilla_resources::EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec {
-                    host_ref: feta_host_id.clone(),
-                    repo_default_dir: "/tmp".to_string(),
-                }),
-                docker: None,
-            },
-        )
-        .await
-        .expect("feta environment");
+    feta_environments.request(
+        "feta-environment",
+        &flotilla_resources::EnvironmentSpec {
+            host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec {
+                host_ref: feta_host_id.clone(),
+                repo_default_dir: "/tmp".to_string(),
+            }),
+            ..Default::default()
+        },
+        None,
+    );
     let mut spec = ConvoySpec::builder().workflow_ref("workflow".to_string()).role("coder".to_string()).build();
     spec.project_ref = Some("flotilla".to_string());
     kiwi.resource_backend()

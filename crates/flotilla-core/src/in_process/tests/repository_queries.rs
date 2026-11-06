@@ -311,7 +311,7 @@ async fn cli_checkout_rows_follow_engine_without_a_copy() {
                             assert!(matches!(lifecycle, flotilla_protocol::LifecycleReading::Ready { identity } if identity == "/work"))
                         }
                         "released" => assert_eq!(lifecycle, &flotilla_protocol::LifecycleReading::Released),
-                        "lost" => assert_eq!(lifecycle, &flotilla_protocol::LifecycleReading::Lost),
+                        "lost" => assert_eq!(lifecycle, &flotilla_protocol::LifecycleReading::Lost { reason: None }),
                         cause => assert_eq!(lifecycle, &flotilla_protocol::LifecycleReading::GaveUp { cause: cause.into() }),
                     }
                     if matches!(ending, "released" | "lost") {

@@ -176,7 +176,15 @@ async fn ssh_host_provisions_clone_and_worktree_through_its_runner() {
         fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
         vessel_agent: Err("the test's vessel agents run on the host runner".into()),
     };
-    register_ssh_host_resources(&daemon.resource_backend(), NAMESPACE, &local_host_id, &profile).await.expect("register SSH resources");
+    register_ssh_host_resources(
+        &daemon.resource_backend(),
+        engine_environments(&daemon).reads.clone(),
+        NAMESPACE,
+        &local_host_id,
+        &profile,
+    )
+    .await
+    .expect("register SSH resources");
     profile
         .fulfilment_facts
         .write()
@@ -238,30 +246,25 @@ async fn ssh_host_provisions_clone_and_worktree_through_its_runner() {
     );
     // The SSH host's host-direct Environment resolves to the provider in the
     // SSH environment's registry, not the owner's.
-    let environment =
-        daemon.resource_backend().using::<Environment>(NAMESPACE).get(environment_id.as_str()).await.expect("SSH host-direct Environment");
+    let environments_engine = engine_environments(&daemon);
+    let environment = EnvironmentRecords::find(environments_engine.environments.as_ref(), environment_id.as_str())
+        .expect("read")
+        .expect("SSH host-direct Environment");
     assert_eq!(
         environment.spec.provider_address.as_ref().expect("new SSH environments write an address").to_string(),
         format!("host:{host_id}/provider:host-direct")
     );
     let environments = DockerControllerRuntime { state: Arc::clone(&state) };
-    // A labelled preceding-generation record may carry a host display alias.
-    // Resolving its label must preserve the SSH place authority and instance.
-    let legacy_meta = InputMeta::builder()
-        .name("legacy-ssh-alias".into())
-        .labels(BTreeMap::from([(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL.into(), "host-direct".into())]))
-        .build();
-    daemon
-        .resource_backend()
-        .store()
-        .create_raw(
-            flotilla_store::ResourceKind::of::<Environment>(),
-            NAMESPACE,
-            &legacy_meta,
-            &json!({"host_direct":{"host_ref":"beaufort", "repo_default_dir":"/work"}}),
-        )
-        .await
-        .expect("legacy SSH record");
+    // A request naming its host by a display alias, with no provider address. Resolving the
+    // alias must preserve the SSH place authority and instance.
+    environments_engine.request(
+        "legacy-ssh-alias",
+        &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "beaufort".into(), repo_default_dir: "/work".into() }),
+            ..Default::default()
+        },
+        None,
+    );
     let selected = environments.provider_for_environment("legacy-ssh-alias").await.expect("SSH alias provider");
     let expected = environments.provider_for_environment(environment_id.as_str()).await.expect("SSH provider");
     assert!(Arc::ptr_eq(&selected, &expected), "alias and canonical place must retain the same instance");

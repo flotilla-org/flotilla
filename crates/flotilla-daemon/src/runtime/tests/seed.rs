@@ -100,12 +100,15 @@ async fn startup_registration_is_idempotent_and_discovers_existing_clone() {
 
     let backend = daemon.resource_backend();
     let hosts = backend.clone().using::<Host>(NAMESPACE);
-    let environments = backend.clone().using::<Environment>(NAMESPACE);
+    let environments = engine_environments(&daemon);
     let kinds = backend.clone().using::<FulfilmentKind>(NAMESPACE);
     let clones = backend.using::<Clone>(NAMESPACE);
 
     assert!(hosts.get(&host_id).await.is_ok(), "host resource should exist");
-    assert!(environments.get(&format!("host-direct-{host_id}")).await.is_ok(), "host-direct environment should exist");
+    assert!(
+        environments.environments.find(&format!("host-direct-{host_id}")).expect("read").is_some(),
+        "host-direct environment should exist"
+    );
     assert!(kinds.get(&format!("host-direct-{host_id}")).await.is_ok(), "host-direct kind should exist");
 
     let clone_name = format!(

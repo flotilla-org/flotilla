@@ -110,7 +110,12 @@ pub(super) async fn run_checkout_archive_gc(backend: ResourceBackend, namespace:
         interval.tick().await;
         {
             if let Some(host) = archive_sweep.daemon.local_host_id() {
-                if let Err(error) = sweep_host_empty_convoy_directories(&backend, host.as_str()).await {
+                let reads = archive_sweep.daemon.lifecycle_reads();
+                let swept = match reads.environments() {
+                    Ok(environments) => sweep_host_empty_convoy_directories(&backend, environments, host.as_str()).await,
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = swept {
                     warn!(%error, "empty convoy directory sweep failed");
                 }
             } else {
@@ -789,9 +794,12 @@ pub(super) fn spawn_environment_orphan_sweep_task(state: Arc<ControllerRuntimeSt
                 return;
             };
             let runtime = DockerControllerRuntime { state: Arc::clone(&state) };
-            if let Err(error) =
-                sweep.lock().await.sweep(&state.daemon.resource_backend(), &**provider, &runtime, tokio::time::Instant::now()).await
-            {
+            let reads = state.daemon.lifecycle_reads();
+            let swept = match reads.environments() {
+                Ok(environments) => sweep.lock().await.sweep(environments, &**provider, &runtime, tokio::time::Instant::now()).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = swept {
                 warn!(%error, host = %state.local_host_ref, "orphan environment sweep failed; will retry");
             }
         }

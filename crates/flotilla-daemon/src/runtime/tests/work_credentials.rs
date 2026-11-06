@@ -112,6 +112,7 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
         .await
         .expect("place vessel");
     create_credential_test_session(&backend, "credential-work-session", "credential-work", "credential-work-vessel", env_id.as_str()).await;
+    engine_environments(&daemon);
     let state = ControllerRuntimeState::new(
         Arc::clone(&daemon),
         config,
@@ -227,24 +228,41 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
     let scoped_error =
         reconcile_work_credentials_for_environment(&state, NAMESPACE, "aaa-unavailable").await.expect_err("unavailable target still fails");
     assert!(scoped_error.contains("aaa-unavailable"), "{scoped_error}");
+    // The scoped failure's retry is held by the vessel standing on the environment; once it is due
+    // the full pass meets the unavailable target again.
+    let held_retry = vessels
+        .get("unavailable-work-vessel")
+        .await
+        .expect("unavailable vessel")
+        .status
+        .expect("status")
+        .credential_delivery_retry
+        .expect("scoped failure retry");
+    flotilla_store::apply_status_patch(
+        &vessels,
+        "unavailable-work-vessel",
+        &flotilla_resources::VesselStatusPatch::CredentialDelivery {
+            retry: Some(ControllerRetry {
+                disposition: ControllerRetryDisposition::Retryable { next_attempt_at: Utc::now() - chrono::Duration::seconds(1) },
+                ..held_retry
+            }),
+        },
+    )
+    .await
+    .expect("advance retry deadline");
     assert!(reconcile_work_credentials(&state, NAMESPACE).await.is_err());
     assert!(can_fill_git_credential().await, "unavailable placement must not block another environment's delivery");
     vessels.delete("unavailable-work-vessel").await.expect("remove unavailable vessel");
     backend.clone().using::<TerminalSession>(NAMESPACE).delete("unavailable-work-session").await.expect("remove unavailable session");
 
-    let environments = backend.clone().using::<Environment>(NAMESPACE);
-    environments
-        .create(
-            &empty_meta(env_id.as_str()),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
-                docker: None,
-            },
-        )
-        .await
-        .expect("create durable shared environment");
+    engine_environments(&daemon).request(
+        env_id.as_str(),
+        &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
+            ..Default::default()
+        },
+        None,
+    );
 
     let conflicting_convoy = convoys
         .create(
@@ -315,22 +333,23 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
     .await;
     let error = reconcile_work_credentials(&state, NAMESPACE).await.expect_err("shared environment must reject differing permissions");
     assert!(error.contains("different minted permissions for `work-token`"), "{error}");
-    let conflict_retry = environments
-        .get(env_id.as_str())
+    // The shared environment's retry is held by each vessel standing on it.
+    let conflict_retry = vessels
+        .get("credential-work-vessel")
         .await
-        .expect("shared environment")
+        .expect("first vessel")
         .status
         .expect("status")
         .credential_delivery_retry
         .expect("durable conflict retry");
     assert!(matches!(conflict_retry.disposition, ControllerRetryDisposition::Retryable { .. }));
-    let conflict_environment_version = environments.get(env_id.as_str()).await.expect("shared environment").metadata.resource_version;
+    let conflict_other_vessel_version = vessels.get("conflicting-work-vessel").await.expect("second vessel").metadata.resource_version;
     let conflict_vessel_version = vessels.get("credential-work-vessel").await.expect("first vessel").metadata.resource_version;
     let repeated_error = reconcile_work_credentials(&state, NAMESPACE).await.expect_err("persistent conflict remains retryable");
     assert!(repeated_error.contains("different minted permissions for `work-token`"), "{repeated_error}");
     assert_eq!(
-        environments.get(env_id.as_str()).await.expect("shared environment").metadata.resource_version,
-        conflict_environment_version
+        vessels.get("conflicting-work-vessel").await.expect("second vessel").metadata.resource_version,
+        conflict_other_vessel_version
     );
     assert_eq!(vessels.get("credential-work-vessel").await.expect("first vessel").metadata.resource_version, conflict_vessel_version);
     vessels.delete("conflicting-work-vessel").await.expect("remove second vessel");
@@ -343,16 +362,16 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
         ..conflict_retry
     };
     flotilla_store::apply_status_patch(
-        &environments,
-        env_id.as_str(),
-        &EnvironmentStatusPatch::CredentialDelivery { retry: Some(due_retry) },
+        &vessels,
+        "credential-work-vessel",
+        &flotilla_resources::VesselStatusPatch::CredentialDelivery { retry: Some(due_retry) },
     )
     .await
     .expect("advance retry deadline");
 
     reconcile_work_credentials(&state, NAMESPACE).await.expect("stage running credentials");
     assert!(
-        environments.get(env_id.as_str()).await.expect("shared environment").status.expect("status").credential_delivery_retry.is_none(),
+        vessels.get("credential-work-vessel").await.expect("first vessel").status.expect("status").credential_delivery_retry.is_none(),
         "resolved conflict should clear durable retry"
     );
     assert!(can_fill_git_credential().await);
@@ -433,19 +452,32 @@ async fn undecodable_credential_spec_parks_delivery_as_a_terminal_controller_fai
     let temp = TempDir::new().expect("tempdir");
     let sqlite_path = temp.path().join("resources.sqlite");
     let backend = ResourceBackend::new(SqliteBackend::open(&sqlite_path).expect("sqlite store"));
-    let environments = backend.clone().using::<Environment>(NAMESPACE);
-    environments
+    // The work environment's delivery retry is held by the vessel standing on it.
+    let vessels = backend.clone().using::<Vessel>(NAMESPACE);
+    let vessel = vessels
         .create(
-            &empty_meta("credential-work"),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
-                docker: None,
+            &empty_meta("credential-work-vessel"),
+            &VesselSpec {
+                convoy_ref: "credential-work".to_string(),
+                vessel_name: "work".to_string(),
+                fulfilment_kind_ref: "test".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
             },
         )
         .await
-        .expect("work environment");
+        .expect("work vessel");
+    vessels
+        .update_status(
+            &vessel.metadata.name,
+            &vessel.metadata.resource_version,
+            &VesselStatus {
+                phase: flotilla_resources::VesselPhase::Ready,
+                environment_ref: Some("credential-work".to_string()),
+                ..VesselStatus::default()
+            },
+        )
+        .await
+        .expect("place vessel");
     let connection = rusqlite::Connection::open(&sqlite_path).expect("raw sqlite store");
     insert_undecodable_resource::<CredentialSpec>(&connection, "broken-spec");
     drop(connection);
@@ -459,31 +491,31 @@ async fn undecodable_credential_spec_parks_delivery_as_a_terminal_controller_fai
     record_credential_delivery_retry(&backend, NAMESPACE, "credential-work", Some(need.clone()), true)
         .await
         .expect("persist terminal delivery disposition");
-    let retry = environments
-        .get("credential-work")
+    let retry = vessels
+        .get("credential-work-vessel")
         .await
-        .expect("environment")
+        .expect("vessel")
         .status
         .expect("status")
         .credential_delivery_retry
         .expect("delivery retry");
     assert_eq!(retry.stall_reason(Utc::now(), flotilla_resources::RetryCeiling::default()), Some(need.clone()));
     assert!(matches!(retry.disposition, ControllerRetryDisposition::Terminal { .. }));
-    let resource_version = environments.get("credential-work").await.expect("environment").metadata.resource_version;
+    let resource_version = vessels.get("credential-work-vessel").await.expect("vessel").metadata.resource_version;
     record_credential_delivery_retry(&backend, NAMESPACE, "credential-work", Some(need), true).await.expect("repeat terminal disposition");
     // A repeated terminal failure does not churn durable status.
-    let after_repeat = environments.get("credential-work").await.expect("environment");
+    let after_repeat = vessels.get("credential-work-vessel").await.expect("vessel");
     assert_eq!(after_repeat.metadata.resource_version, resource_version);
     record_credential_delivery_retry(&backend, NAMESPACE, "credential-work", None, false).await.expect("operator retry reset");
-    assert!(environments.get("credential-work").await.expect("environment").status.expect("status").credential_delivery_retry.is_none());
+    assert!(vessels.get("credential-work-vessel").await.expect("vessel").status.expect("status").credential_delivery_retry.is_none());
     record_credential_delivery_retry(&backend, NAMESPACE, "credential-work", Some("provider unavailable".into()), false)
         .await
         .expect("retry after operator reset");
     assert_eq!(
-        environments
-            .get("credential-work")
+        vessels
+            .get("credential-work-vessel")
             .await
-            .expect("environment")
+            .expect("vessel")
             .status
             .expect("status")
             .credential_delivery_retry

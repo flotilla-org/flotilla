@@ -162,28 +162,9 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
     fs::create_dir_all(&workspace).expect("workspace");
     let env_id = EnvironmentId::new("contained-claude");
     if !matches!(observation, LaunchObservationRecord::MissingEnvironment) {
-        backend
-            .using::<Environment>(NAMESPACE)
-            .create(
-                &empty_meta(env_id.as_str()),
-                &EnvironmentSpec {
-                    cloud_sandbox: None,
-                    provider_address: None,
-                    host_direct: None,
-                    docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                        image_build_ref: None,
-                        host_ref: "host-test".into(),
-                        image: "contained-image".into(),
-                        declared_agent_adapters: BTreeSet::from(["claude-code".into()]),
-                        required_agent_adapters: BTreeSet::from(["claude-code".into()]),
-                        pull_policy: Default::default(),
-                        mounts: Vec::new(),
-                        env: BTreeMap::new(),
-                    }),
-                },
-            )
-            .await
-            .expect("environment");
+        let mut spec = docker_environment_spec("host-test", BTreeSet::from(["claude-code".into()]));
+        spec.docker.as_mut().expect("docker").required_agent_adapters = BTreeSet::from(["claude-code".into()]);
+        engine_environments(&daemon).request(env_id.as_str(), &spec, None);
     }
     // #3907: the requester's bound home, keyed by convoy and role.
     let crew_config_dir = PathBuf::from("/home/crew/flotilla/agent-homes/requesters/demo/coder/claude");
@@ -242,6 +223,7 @@ pub(super) async fn assert_contained_claude_invocation_home(observation: LaunchO
         },
     );
     let hooks = crate::server::HookEndpoint::listening_at("http://127.0.0.1:7878");
+    engine_environments(&daemon);
     let state = Arc::new(
         ControllerRuntimeState::new(
             Arc::clone(&daemon),

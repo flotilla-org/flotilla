@@ -21,8 +21,8 @@ use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
 use flotilla_resources::attentions::{Attention, Attentions, Sender, Subject};
 use flotilla_resources::{
-    ControllerRetry, ControllerRetryDisposition, Convoy, Environment, EnvironmentStatusPatch, Repository, RepositoryTrust, ResourceError,
-    RetryBackoff, TerminalSession, TerminalSessionSource, Vessel, VesselStatusPatch,
+    ControllerRetry, ControllerRetryDisposition, Convoy, Repository, RepositoryTrust, RetryBackoff, TerminalSession, TerminalSessionSource,
+    Vessel, VesselStatusPatch,
 };
 use flotilla_store::ResourceBackend;
 use tokio::task::JoinHandle;
@@ -87,14 +87,7 @@ impl SessionCapabilitySource for RuntimeSessionCapabilities {
                 endpoints.insert("Flotilla daemon".into(), socket.display().to_string());
             }
         } else {
-            let record = state
-                .daemon
-                .resource_backend()
-                .including_replicas::<Environment>(&state.namespace)
-                .get(environment)
-                .await
-                .map_err(|error| error.to_string())?
-                .object;
+            let record = state.environment(environment).await?.ok_or_else(|| format!("environment {environment} not found"))?;
             if let Some(docker) = record.spec.docker {
                 for (key, value) in &docker.env {
                     if let Some((destination, address)) = flotilla_capability_contract::endpoint_for_env(key, value) {
@@ -327,16 +320,17 @@ pub(super) async fn reconcile_work_credentials_filtered(
             record_credential_delivery_retry(&backend, namespace, &environment_ref, None, false).await?;
             continue;
         }
-        if let Ok(environment) = backend.clone().using::<Environment>(namespace).get(&environment_ref).await {
-            if let Some(retry) = environment.status.as_ref().and_then(|status| status.credential_delivery_retry.as_ref()) {
-                match retry.disposition {
-                    ControllerRetryDisposition::Terminal { .. } => {
-                        mirror_credential_retry_to_vessels(&backend, namespace, &environment_ref, Some(retry.clone()), false).await?;
-                        continue;
-                    }
-                    ControllerRetryDisposition::Retryable { next_attempt_at } if Utc::now() < next_attempt_at => continue,
-                    _ => {}
+        // Stopgap (#3108): credential delivery gates on the Vessel's copy of its retry, since the
+        // engine's environment record holds no credential state. It moves with credentials' own
+        // events-and-single-writer design, after which this backoff goes.
+        if let Some(retry) = vessel_credential_retry(&backend, namespace, &environment_ref, false).await? {
+            match retry.disposition {
+                ControllerRetryDisposition::Terminal { .. } => {
+                    mirror_credential_retry_to_vessels(&backend, namespace, &environment_ref, Some(retry), false).await?;
+                    continue;
                 }
+                ControllerRetryDisposition::Retryable { next_attempt_at } if Utc::now() < next_attempt_at => continue,
+                _ => {}
             }
         }
         if let Some(error) = credential_quarantine_need(&backend, namespace, &granted).await? {
@@ -407,13 +401,8 @@ pub(super) async fn record_credential_delivery_retry(
     error: Option<String>,
     terminal: bool,
 ) -> Result<(), String> {
-    let environments = backend.clone().using::<Environment>(namespace);
-    let environment = match environments.get(environment_ref).await {
-        Ok(environment) => environment,
-        Err(ResourceError::NotFound { .. }) => return Ok(()),
-        Err(error) => return Err(format!("read credential delivery environment: {error}")),
-    };
-    let previous = environment.status.as_ref().and_then(|status| status.credential_delivery_retry.as_ref());
+    let previous = vessel_credential_retry(backend, namespace, environment_ref, false).await?;
+    let previous = previous.as_ref();
     if !terminal
         && error.is_some()
         && previous.is_some_and(
@@ -434,19 +423,26 @@ pub(super) async fn record_credential_delivery_retry(
             )
         }
     });
-    if previous == retry.as_ref() {
-        mirror_credential_retry_to_vessels(backend, namespace, environment_ref, retry, false).await?;
-        return Ok(());
-    }
-    flotilla_store::apply_status_patch(
-        &environments,
-        environment_ref,
-        &EnvironmentStatusPatch::CredentialDelivery { retry: retry.clone() },
-    )
-    .await
-    .map_err(|error| format!("record credential delivery disposition: {error}"))?;
-    mirror_credential_retry_to_vessels(backend, namespace, environment_ref, retry, false).await?;
-    Ok(())
+    mirror_credential_retry_to_vessels(backend, namespace, environment_ref, retry, false).await
+}
+
+/// The credential retry the vessels on `environment_ref` hold: the copy delivery gates on (#3108 stopgap).
+async fn vessel_credential_retry(
+    backend: &ResourceBackend,
+    namespace: &str,
+    environment_ref: &str,
+    refresh: bool,
+) -> Result<Option<ControllerRetry>, String> {
+    let vessels = backend.clone().using::<Vessel>(namespace);
+    let listed = vessels.list().await.map_err(|error| format!("list credential delivery vessels: {error}"))?;
+    Ok(listed.items.into_iter().find_map(|vessel| {
+        let status = vessel.status.filter(|status| status.environment_ref.as_deref() == Some(environment_ref))?;
+        if refresh {
+            status.credential_refresh_retry
+        } else {
+            status.credential_delivery_retry
+        }
+    }))
 }
 
 pub(super) async fn mirror_credential_retry_to_vessels(
@@ -670,11 +666,21 @@ pub(super) async fn record_credential_refresh_dispositions(
     namespace: &str,
     errors: &[CredentialRefreshError],
 ) -> Result<(), String> {
-    let environments = backend.clone().using::<Environment>(namespace);
-    let listed = environments.list().await.map_err(|error| format!("list credential refresh environments: {error}"))?;
-    for environment in listed.items {
-        let previous = environment.status.as_ref().and_then(|status| status.credential_refresh_retry.as_ref());
-        let error = errors.iter().find(|error| error.environment_ref == environment.metadata.name);
+    // Each environment some vessel stands on, with the refresh retry its vessels hold (#3108 stopgap).
+    let vessels = backend.clone().using::<Vessel>(namespace);
+    let listed = vessels.list().await.map_err(|error| format!("list credential refresh vessels: {error}"))?;
+    let mut environments = BTreeMap::<String, Option<ControllerRetry>>::new();
+    for vessel in listed.items {
+        let Some(status) = vessel.status else { continue };
+        let Some(environment_ref) = status.environment_ref else { continue };
+        let held = environments.entry(environment_ref).or_default();
+        if held.is_none() {
+            *held = status.credential_refresh_retry;
+        }
+    }
+    for (environment_ref, previous) in environments {
+        let previous = previous.as_ref();
+        let error = errors.iter().find(|error| error.environment_ref == environment_ref);
         if error.is_some()
             && previous.is_some_and(|retry| {
                 matches!(retry.disposition, ControllerRetryDisposition::Retryable { next_attempt_at } if Utc::now() < next_attempt_at)
@@ -689,17 +695,7 @@ pub(super) async fn record_credential_refresh_dispositions(
                 RetryBackoff { initial: Duration::from_secs(30), maximum: Duration::from_secs(120) },
             )
         });
-        if previous == retry.as_ref() {
-            continue;
-        }
-        flotilla_store::apply_status_patch(
-            &environments,
-            &environment.metadata.name,
-            &EnvironmentStatusPatch::CredentialRefresh { retry: retry.clone() },
-        )
-        .await
-        .map_err(|error| format!("record credential refresh disposition: {error}"))?;
-        mirror_credential_retry_to_vessels(backend, namespace, &environment.metadata.name, retry, true).await?;
+        mirror_credential_retry_to_vessels(backend, namespace, &environment_ref, retry, true).await?;
     }
     Ok(())
 }
@@ -722,7 +718,7 @@ pub(super) fn spawn_codex_credential_redelivery_task(
         let state = Arc::clone(&state);
         let namespace = namespace.clone();
         async move {
-            if let Err(error) = redeliver_codex_credentials(&state, &namespace).await {
+            if let Err(error) = redeliver_codex_credentials(&state).await {
                 warn!(%error, "failed to redeliver the central Codex credential to live crews");
             }
             // #4037: every crew home holding a copy, on Docker and SSH hosts alike.
@@ -733,19 +729,15 @@ pub(super) fn spawn_codex_credential_redelivery_task(
     })
 }
 
-pub(super) async fn redeliver_codex_credentials(state: &ControllerRuntimeState, namespace: &str) -> Result<(), String> {
+pub(super) async fn redeliver_codex_credentials(state: &ControllerRuntimeState) -> Result<(), String> {
     let Some(registry) = state.agent_material.as_deref() else {
         return Ok(());
     };
-    let environments = state.daemon.resource_backend().using::<Environment>(namespace);
-    for environment in environments.list().await.map_err(|error| error.to_string())?.items {
+    for environment in state.live_environments().await? {
         let Some(spec) = environment.spec.docker.as_ref() else {
             continue;
         };
-        if !spec.required_agent_adapters.contains("codex")
-            || spec.env.contains_key("CODEX_HOME")
-            || !super::environments::environment_readiness(&state.daemon, &environment).await?.is_ready()
-        {
+        if !spec.required_agent_adapters.contains("codex") || spec.env.contains_key("CODEX_HOME") || !environment.is_ready() {
             continue;
         }
         // A redelivery failure is never fatal to the environment: the crew keeps
@@ -753,27 +745,27 @@ pub(super) async fn redeliver_codex_credentials(state: &ControllerRuntimeState, 
         let mounts = state
             .daemon
             .environment_manager()
-            .provisioned_mounts(&flotilla_protocol::EnvironmentId::new(environment.metadata.name.as_str()))
+            .provisioned_mounts(&flotilla_protocol::EnvironmentId::new(environment.name.as_str()))
             .unwrap_or_else(|| {
-                tracing::warn!(environment = %environment.metadata.name,
+                tracing::warn!(environment = %environment.name,
                     "provisioned environment mounts unavailable; falling back to pushed Codex credential delivery");
                 Vec::new()
             });
         // The fallback writes only auth.json through the guest runner. If the
         // home is actually Shared, this reaches the same RW host mount and
         // preserves its session files while rotating the credential.
-        let result = if registry.codex_home_is_shared(&environment.metadata.name, &mounts) {
-            registry.refresh_delivered_credentials(&environment.metadata.name).await
+        let result = if registry.codex_home_is_shared(&environment.name, &mounts) {
+            registry.refresh_delivered_credentials(&environment.name).await
         } else {
-            match state.daemon.command_runner_for_environment_ref(&environment.metadata.name) {
-                Some(runner) => registry.refresh_delivered_credentials_through(&environment.metadata.name, runner.as_ref()).await,
+            match state.daemon.command_runner_for_environment_ref(&environment.name) {
+                Some(runner) => registry.refresh_delivered_credentials_through(&environment.name, runner.as_ref()).await,
                 None => Err("agent runner unavailable for Codex auth rotation".into()),
             }
         };
         match result {
-            Ok(true) => info!(environment = %environment.metadata.name, "redelivered the central Codex credential"),
+            Ok(true) => info!(environment = %environment.name, "redelivered the central Codex credential"),
             Ok(false) => {}
-            Err(error) => warn!(environment = %environment.metadata.name, %error, "failed to redeliver the central Codex credential"),
+            Err(error) => warn!(environment = %environment.name, %error, "failed to redeliver the central Codex credential"),
         }
     }
     Ok(())

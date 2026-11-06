@@ -61,8 +61,8 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
     };
     fs::create_dir_all(&kiwi_profile.repo_default_dir).expect("kiwi repo root");
     fs::create_dir_all(&feta_profile.repo_default_dir).expect("feta repo root");
-    register_startup(&kiwi, NAMESPACE, &kiwi_profile).await.expect("register kiwi resources");
-    register_startup(&feta, NAMESPACE, &feta_profile).await.expect("register feta resources");
+    let kiwi_provisioning = engine_startup(&kiwi, NAMESPACE, &kiwi_profile).await.expect("register kiwi resources");
+    let feta_provisioning = engine_startup(&feta, NAMESPACE, &feta_profile).await.expect("register feta resources");
     assert!(
         feta.resource_backend()
             .replica_writer::<Convoy>(kiwi.node_id().clone(), NAMESPACE)
@@ -82,14 +82,17 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
         "the placement host must begin with an empty replica store"
     );
 
-    let kiwi_state = Arc::new(ControllerRuntimeState::new(
-        Arc::clone(&kiwi),
-        Arc::clone(&kiwi_config),
-        passthrough_registry(),
-        None,
-        kiwi_host_ref.clone(),
-        kiwi_profile.host_direct_environment_name(),
-    ));
+    let kiwi_state = Arc::new(
+        ControllerRuntimeState::new(
+            Arc::clone(&kiwi),
+            Arc::clone(&kiwi_config),
+            passthrough_registry(),
+            None,
+            kiwi_host_ref.clone(),
+            kiwi_profile.host_direct_environment_name(),
+        )
+        .with_provisioning_lifecycles(Some(kiwi_provisioning)),
+    );
     let feta_registry = if docker {
         let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
             id: EnvironmentId::new("env-remote-placement-work"),
@@ -111,7 +114,8 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
             feta_host_ref.clone(),
             feta_profile.host_direct_environment_name(),
         )
-        .with_environment_tools(fixed_environment_tools(temp.path())),
+        .with_environment_tools(fixed_environment_tools(temp.path()))
+        .with_provisioning_lifecycles(Some(feta_provisioning)),
     );
     let mut controller_handles = spawn_controller_loops(
         kiwi_state,
@@ -250,7 +254,7 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
             let feta_clones = feta.resource_backend().using::<Clone>(NAMESPACE).list().await.expect("feta Clones");
             let feta_checkouts = feta.resource_backend().using::<ResourceCheckout>(NAMESPACE).list().await.expect("feta Checkouts");
             let feta_terminals = feta.resource_backend().using::<TerminalSession>(NAMESPACE).list().await.expect("feta TerminalSessions");
-            let feta_environments = feta.resource_backend().using::<Environment>(NAMESPACE).list().await.expect("feta Environments");
+            let feta_environments = feta.lifecycle_reads().environments().and_then(|environments| environments.live());
             panic!(
                 "remote placement did not reach Running: convoy={kiwi_convoy:?} kiwi_vessels={kiwi_vessels:?} \
                      feta_vessels={feta_vessels:?} feta_clones={feta_clones:?} feta_checkouts={feta_checkouts:?} \
@@ -269,10 +273,11 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
         "the admitting-side Vessel must not attempt remote actuation"
     );
     assert!(
-        matches!(
-            kiwi.resource_backend().using::<Environment>(NAMESPACE).get(&feta_profile.host_direct_environment_name()).await,
-            Err(ResourceError::NotFound { .. })
-        ),
+        kiwi.lifecycle_reads()
+            .environments()
+            .and_then(|environments| environments.get(&feta_profile.host_direct_environment_name(), None))
+            .expect("read kiwi's environments")
+            .is_none(),
         "the placement host's Environment must remain host-local"
     );
     let ready_checkouts = feta

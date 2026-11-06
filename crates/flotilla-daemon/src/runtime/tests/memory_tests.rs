@@ -1,4 +1,5 @@
 use super::*;
+use flotilla_provisioning::engine::controller::{Backing, BackingEvent};
 
 // Process boundary only: the actual Docker provider decodes the real incident
 // recording; this runner supplies its subprocess outputs without a live Docker.
@@ -148,6 +149,7 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
         .expect("vessel ready");
     let provider = flotilla_environment::environment::docker::DockerEnvironmentProvider::new(Arc::new(MemoryIncidentRunner::default()));
     let handles = provider.list().await.expect("list backing");
+    engine_environments(&daemon);
     let state = Arc::new(ControllerRuntimeState::new(
         daemon.clone(),
         config,
@@ -167,36 +169,30 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
     for _ in 0..2 {
         record_environment_observation(&state, NAMESPACE, &env_id, &sample).await.expect("sample");
     }
-    let environments = backend.using::<Environment>(NAMESPACE);
-    let before_environment = environments.get(env_id.as_str()).await.expect("environment");
+    // The observation is the vessel's to show; the environment's record stores none.
     let before_vessel = vessels.get("memory-incident-work").await.expect("vessel");
     let mut duplicate = sample.clone();
     duplicate.memory_observed_at = Some("2026-10-05T10:13:30Z".into());
     record_environment_observation(&state, NAMESPACE, &env_id, &duplicate).await.expect("unchanged sample");
     assert_eq!(
-        environments.get(env_id.as_str()).await.expect("environment").metadata.resource_version,
-        before_environment.metadata.resource_version
-    );
-    assert_eq!(
         vessels.get("memory-incident-work").await.expect("vessel").metadata.resource_version,
         before_vessel.metadata.resource_version
     );
     reconcile_provisioned_environments(&state, NAMESPACE).await.expect("observe death");
-    let environments = backend.using::<Environment>(NAMESPACE);
-    let environment = environments.get(env_id.as_str()).await.expect("environment");
-    let status = environment.status.expect("status");
-    assert_eq!(status.phase, EnvironmentPhase::Lost);
-    let message = status.message.expect("failure message");
-    assert!(message.contains("host oomd") && message.contains("exit code 137") && message.contains("/hulls/work/flotilla"), "{message}");
-    let observation = status.runtime_observation.expect("persisted evidence");
+    // The probe tells the Environment controller the backing is gone, and why; the controller
+    // ends the launch Lost with that reason, as the fixture steps it here.
+    let observed = observed_backings(&state);
+    let [BackingEvent { name, observed: Backing::Absent { reason: Some(reason) } }] = observed.as_slice() else {
+        panic!("the dead backing is reported absent with its cause: {observed:?}");
+    };
+    assert_eq!(name, env_id.as_str());
+    engine_environments(&daemon).lose(env_id.as_str(), reason);
+    let observation =
+        vessels.get("memory-incident-work").await.expect("vessel").status.expect("status").runtime_observation.expect("persisted evidence");
     assert_eq!(observation.memory_usage_bytes, sample.memory_usage_bytes);
     assert_eq!(observation.memory_observed_at, sample.memory_observed_at);
     assert_eq!(observation.termination.as_ref().expect("termination").cause, EnvironmentExitCause::HostOomd);
-    assert_eq!(
-        vessels.get("memory-incident-work").await.expect("vessel").status.expect("status").runtime_observation,
-        Some(observation.clone())
-    );
-    let vessel_reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let vessel_reconciler = VesselReconciler::new(backend.clone(), NAMESPACE).with_lifecycle_reads(daemon.lifecycle_reads());
     let vessel = vessels.get("memory-incident-work").await.expect("vessel");
     // A restart can encounter an already-interrupted vessel whose backing
     // loss was persisted separately. Reconstruct its stored status before
@@ -213,7 +209,8 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
         .expect("persist vessel loss");
     let lost_status = vessels.get(&vessel.metadata.name).await.expect("vessel").status.expect("status");
     assert_eq!(lost_status.phase, flotilla_resources::VesselPhase::Lost);
-    assert_eq!(lost_status.message.as_deref(), Some(message.as_str()));
+    let message = lost_status.message.expect("failure message");
+    assert!(message.contains("host oomd") && message.contains("exit code 137") && message.contains("/hulls/work/flotilla"), "{message}");
     let lost = vessels.get(&vessel.metadata.name).await.expect("lost vessel");
     let prepared = vessel_reconciler.prepare(&lost).await.expect("lost vessel prepare");
     let frozen = vessel_reconciler.reconcile(&lost, &prepared, chrono::Utc::now());
@@ -246,7 +243,8 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
     assert_eq!(interrupted.work["work"].message.as_deref(), Some(message.as_str()));
     assert_eq!(interrupted.crew_work["work"]["shell"].phase, flotilla_resources::CrewWorkPhase::Interrupted);
     assert!(interrupted.crew_work["work"]["shell"].message.as_ref().expect("loss reason").contains("lost, recoverable"));
-    environments.delete(env_id.as_str()).await.expect("remove backing resource");
+    // The launch has already ended Lost, so nothing is left to release. The evidence lives on
+    // the vessel and the convoy.
     let result = daemon
         .execute_query(
             Command::builder()
@@ -281,6 +279,7 @@ async fn observation_error_preserves_backing_and_retries() {
             inspect_error: true,
         }));
         let handles = provider.list().await.expect("list backing");
+        engine_environments(&daemon);
         let state = Arc::new(ControllerRuntimeState::new(
             daemon.clone(),
             config,
@@ -290,16 +289,10 @@ async fn observation_error_preserves_backing_and_retries() {
             "host-direct-test".into(),
         ));
         let result = reconcile_provisioned_environments(&state, NAMESPACE).await;
-        let status = daemon
-            .resource_backend()
-            .using::<Environment>(NAMESPACE)
-            .get(env_id.as_str())
-            .await
-            .expect("environment")
-            .status
-            .expect("status");
         assert!(result.expect_err("unknown inspection failure retries").contains("will retry"));
-        assert_eq!(status.phase, EnvironmentPhase::Ready);
-        assert!(status.runtime_observation.is_none(), "unavailable evidence stays unknown");
+        assert_eq!(observed_backings(&state), [], "an unknown inspection tells the Environment controller nothing");
+        let environment = engine_environments(&daemon).environments.find(env_id.as_str()).expect("read").expect("environment");
+        assert!(environment.is_ready());
+        // The observation is the vessel's to show; no vessel holds this environment, so none is recorded.
     }
 }

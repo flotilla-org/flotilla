@@ -34,7 +34,7 @@ impl EnvironmentRecord {
     pub fn ended(&self) -> bool {
         matches!(
             self.reading,
-            LifecycleReading::Released | LifecycleReading::Lost | LifecycleReading::Failed { .. } | LifecycleReading::GaveUp { .. }
+            LifecycleReading::Released | LifecycleReading::Lost { .. } | LifecycleReading::Failed { .. } | LifecycleReading::GaveUp { .. }
         )
     }
 
@@ -57,6 +57,15 @@ pub struct LaunchFacts {
     pub provider_descriptor: Option<EnvironmentProviderDescriptor>,
 }
 
+/// What changed among the environments, at any home.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EnvironmentChange {
+    /// The record of the environment of this name changed.
+    Changed(String),
+    /// Any of them may have changed: a home's log was read afresh.
+    Rescanned,
+}
+
 /// The environment port, served by the engine's [`crate::lifecycle_reads::LifecycleReads`]. Each
 /// read is keyed or indexed; [`EnvironmentRecords::request`] is the only write, and only for this
 /// home: the Environment controller writes every edge after it.
@@ -73,4 +82,9 @@ pub trait EnvironmentRecords: Send + Sync {
     /// Requests `name` at this home with `spec`, held for `vessel`. An environment already held
     /// under the name is left as it is: `Ok(false)`.
     fn request(&self, name: &str, spec: &EnvironmentSpec, vessel: Option<&str>) -> Result<bool, String>;
+    /// The environments' changes from now on, as their records are written or replicated here.
+    /// Where none are followed, the channel is closed.
+    fn changes(&self) -> tokio::sync::broadcast::Receiver<EnvironmentChange> {
+        tokio::sync::broadcast::channel(1).1
+    }
 }

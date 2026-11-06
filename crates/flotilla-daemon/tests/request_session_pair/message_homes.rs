@@ -165,6 +165,9 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     .await
     .expect("two-home router");
     let (a, b) = (&mesh.hosts[0], &mesh.hosts[1]);
+    // Each daemon reads the engine's environments, as its runtime installs them.
+    engine_environments(a);
+    engine_environments(b);
     let ((store_a, engine_a), (store_b, engine_b)) = (engine(a).await, engine(b).await);
     let (home_a, home_b) = (a.node_id().as_str().to_owned(), b.node_id().as_str().to_owned());
 
@@ -374,4 +377,16 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
             );
         }
     }
+}
+
+/// The engine's environments `daemon` reads (#3108), on its decided store, stepped as the
+/// Environment controller would step them.
+pub(super) fn engine_environments(
+    daemon: &flotilla_core::in_process::InProcessDaemon,
+) -> flotilla_provisioning_testkit::EnvironmentFixture {
+    let store = daemon.decided_store().expect("decided store").store();
+    let home = flotilla_engine_store::StoreLog::new(std::sync::Arc::clone(&store)).home().to_owned();
+    let fixture = flotilla_provisioning_testkit::EnvironmentFixture::over(&home, store);
+    daemon.install_lifecycle_reads(std::sync::Arc::clone(&fixture.reads)).expect("install the engine's environments");
+    fixture
 }

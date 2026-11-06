@@ -1,6 +1,8 @@
 //! Real decided-store fixture shared by lifecycle reader contract tests.
+pub mod environments;
 pub mod image_build;
 pub mod other_home;
+pub use environments::EnvironmentFixture;
 pub use other_home::{other_home_for, put_host_at_its_home, put_host_at_its_home_heard, replicate_home, replicate_home_at, OtherHome};
 use std::sync::{Arc, Mutex};
 
@@ -9,7 +11,7 @@ use flotilla_provisioning::engine::{
     reads::{LifecycleReadPort, StoreReads},
     Binding, LifecycleHome, Lifecycles, Step,
 };
-use flotilla_resources::{lifecycle_reads::LifecycleReads, ResourceObject};
+use flotilla_resources::{environment_records::EnvironmentRecords, lifecycle_reads::LifecycleReads, ResourceObject};
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::{
@@ -35,6 +37,8 @@ where
     pub home: Arc<LifecycleHome<B::Kind, StoreLog>>,
     pub reads: Arc<dyn LifecycleReads>,
     pub store: Arc<Mutex<Store>>,
+    /// The environments its readers find, homed at `home` on the same store.
+    pub environments: EnvironmentFixture,
 }
 
 impl<B: Binding> LifecycleFixture<B>
@@ -47,8 +51,12 @@ where
         let store =
             Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", registry).expect("store")));
         let home = Arc::new(LifecycleHome::new("home", Home::with_log("home", StoreLog::new(Arc::clone(&store))).expect("home")));
-        let reads = Arc::new(LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), if replica { "reader" } else { "home" }.into()));
-        Self { home, reads, store }
+        let environments = EnvironmentFixture::over("home", Arc::clone(&store));
+        let reads = Arc::new(
+            LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), if replica { "reader" } else { "home" }.into())
+                .with_environments(Arc::clone(&environments.environments) as Arc<dyn EnvironmentRecords>),
+        );
+        Self { home, reads, store, environments }
     }
 
     pub fn name(&self, obj: &ResourceObject<B::Old>) -> String {
@@ -93,7 +101,7 @@ where
                 }) {
                     self.home.step(name, &Step::Realised { identity: identity.into() }, Timestamp(3_000_000)).expect("ready");
                 }
-                Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost }
+                Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost() }
             }
             Ending::Released => Step::Released,
             Ending::Failed(reason) => {
@@ -163,6 +171,34 @@ pub async fn store_object<T: flotilla_resources::Resource>(
 
 /// The Vessel lease using the same real store and reader contract.
 pub type VesselFixture = LifecycleFixture<flotilla_provisioning::engine::vessel::VesselBinding>;
+
+impl VesselFixture {
+    /// Holds the lease of `vessel`, of `convoy`, pinned to `host`, as its placement does: the
+    /// environment requested for it waits on this.
+    pub fn lease(&self, vessel: &str, convoy: &str, host: &str) {
+        use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
+        use flotilla_resources::{Vessel, VesselSpec, VesselStatus};
+        let placed = object::<Vessel>(
+            vessel,
+            VesselSpec {
+                convoy_ref: convoy.into(),
+                vessel_name: vessel.into(),
+                fulfilment_kind_ref: String::new(),
+                adopted_checkout_refs: Default::default(),
+            },
+            VesselStatus {
+                placement_decision: Some(
+                    PlacementDecision::builder()
+                        .kind("pinned".into())
+                        .target_host(PlacementTargetHost { reference: CanonicalHostId::resolved(host), display_name: host.into() })
+                        .build(),
+                ),
+                ..Default::default()
+            },
+        );
+        self.request(&placed);
+    }
+}
 
 /// Contradictory actuator evidence for image reader contracts; the engine supplies phase/digest/cause.
 pub fn image_build(phase: flotilla_resources::ImageBuildPhase) -> ResourceObject<flotilla_resources::ImageBuild> {

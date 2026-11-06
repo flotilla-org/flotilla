@@ -940,7 +940,12 @@ async fn daemon_startup_reaps_retained_landed_convoy_orphan() {
     assert!(pool.list_sessions().await.expect("pool").is_empty(), "terminal finalizer must kill the old process");
     assert_eq!(*pool.killed.lock().await, vec!["old-process"]);
     assert!(
-        backend.using::<Environment>(NAMESPACE).get(&profile.host_direct_environment_name()).await.is_ok(),
+        restarted
+            .lifecycle_reads()
+            .environments()
+            .and_then(|environments| environments.find(&profile.host_direct_environment_name()))
+            .expect("read environments")
+            .is_some(),
         "the gate, rather than a missing environment shortcut, must authorize cleanup"
     );
     assert!(backend.using::<Convoy>(NAMESPACE).list().await.expect("local convoys").items.is_empty());

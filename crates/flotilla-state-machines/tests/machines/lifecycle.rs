@@ -57,7 +57,7 @@ fn release() -> Release {
 }
 
 fn vanish() -> Vanish {
-    Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost, observed: Ref::new("r") }
+    Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost(), observed: Ref::new("r") }
 }
 
 fn observed(identity: &str) -> MemoryLifecycleWorld {
@@ -276,4 +276,26 @@ fn attempts_only_while_requested() {
     let mut h = home();
     h.apply("r", realise("a"), &observed("a"), at(1)).expect("realised");
     assert_eq!(h.apply("r", succeeded(), &MemoryLifecycleWorld::default(), at(2)).err(), refused(LifecycleRefusal::WrongState));
+}
+
+// Behaviour (ADR 0047 N→N+1): a lost thing's reason travels in its Vanish edge's arguments, and the
+// bare `Lost` the previous generation logged still decodes, with no reason.
+#[test]
+fn vanish_causes_decode_with_and_without_a_lost_reason() {
+    use flotilla_state_machines::machines::lifecycle::VanishCause;
+    #[derive(serde::Serialize)]
+    enum PreviousVanishCause {
+        Lost,
+    }
+    let limits = flotilla_schema::INLINE_LIMITS;
+    let bare = flotilla_cbor::to_vec(&PreviousVanishCause::Lost, &limits).expect("encode bare");
+    assert_eq!(flotilla_cbor::from_slice::<VanishCause>(&bare, &limits).expect("decode bare"), VanishCause::lost());
+    for cause in [
+        VanishCause::Lost { reason: Some("cgroup_oom".into()) },
+        VanishCause::lost(),
+        VanishCause::Failed { reason: "image pull refused".into() },
+    ] {
+        let bytes = flotilla_cbor::to_vec(&cause, &limits).expect("encode");
+        assert_eq!(flotilla_cbor::from_slice::<VanishCause>(&bytes, &limits).expect("decode"), cause);
+    }
 }

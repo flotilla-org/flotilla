@@ -34,8 +34,8 @@ use flotilla_resources::{
         binding_name, material_generation, AccessName, AccountBindingSpec, AccountChange, AccountProvisionSpec, AccountRecords,
         BindingRecord, Delivered, ProvisionPlan, ProvisionRecord,
     },
-    Convoy, CredentialGrant, CredentialSpec, Environment, ReadWatchEvent, ResourceError, ResourceObject, ResourceProvenance,
-    TerminalSession, TerminalSessionSource,
+    Convoy, CredentialGrant, CredentialSpec, ReadWatchEvent, ResourceError, ResourceObject, ResourceProvenance, TerminalSession,
+    TerminalSessionSource,
 };
 use flotilla_schema::{Ref, Timestamp};
 use flotilla_store::{
@@ -63,11 +63,7 @@ async fn place_environment_kind(state: &ControllerRuntimeState, launch: &Account
     if launch.env_ref == state.host_direct_environment_name {
         return Ok(EnvironmentKind::HostDirect);
     }
-    let environment = match state.daemon.resource_backend().including_replicas::<Environment>(launch.namespace).get(launch.env_ref).await {
-        Ok(environment) => Some(environment.object.spec),
-        Err(ResourceError::NotFound { .. }) => None,
-        Err(error) => return Err(error.to_string()),
-    };
+    let environment = state.environment(launch.env_ref).await?.map(|environment| environment.spec);
     EnvironmentKind::of_environment(environment.as_ref()).map_err(|reason| format!("environment `{}`: {reason}", launch.env_ref))
 }
 
@@ -236,11 +232,9 @@ async fn reconcile_provision(state: &Arc<ControllerRuntimeState>, namespace: &st
     let _withdrawing = lock.lock().await;
     let Some(provision) = accounts.provision(namespace, name).await? else { return Ok(()) };
     let spec = &provision.spec;
+    // A place that ended is gone: its environment is not launched again.
     if spec.place != state.host_direct_environment_name
-        && matches!(
-            state.daemon.resource_backend().including_replicas::<Environment>(namespace).get(&spec.place).await,
-            Err(ResourceError::NotFound { .. })
-        )
+        && state.environment(&spec.place).await?.is_none_or(|environment| environment.ended())
     {
         return accounts.delete_provision(namespace, name).await;
     }

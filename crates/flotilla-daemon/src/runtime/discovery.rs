@@ -211,6 +211,7 @@ pub(super) fn vessel_agent_reach(
 
 pub(super) async fn register_ssh_host_resources(
     backend: &ResourceBackend,
+    reads: Arc<dyn flotilla_projections::ports::LifecycleReads>,
     namespace: &str,
     owner_host_id: &str,
     profile: &SshHostProfile,
@@ -242,7 +243,7 @@ pub(super) async fn register_ssh_host_resources(
         }
         Err(error) => return Err(error.to_string()),
     }
-    ensure_host_direct_environment_exists(backend, namespace, provisioning).await?;
+    ensure_host_direct_environment_exists(reads, provisioning).await?;
     let platform = ssh_host_platform(profile.runner.as_ref()).await;
     ensure_default_kinds(backend, namespace, provisioning, &platform).await
 }

@@ -55,23 +55,28 @@ async fn launch_through_the_provider_path(declared_path: Option<&str>, harness_i
     let mut stand_in = stand_in(declared_path, harness_in_image).await;
     let env_id = stand_in.env_id.clone();
     let root = stand_in.root().to_path_buf();
-    // #4163: provisioned through the Environment reconciler, which records it Ready.
-    let environments = stand_in.backend.using::<Environment>(NAMESPACE);
-    let record = environments.get(env_id.as_str()).await.expect("environment record");
-    let reconciler = EnvironmentReconciler::new(
-        Arc::new(DockerControllerRuntime { state: Arc::clone(&stand_in.state) }),
-        stand_in.backend.clone(),
-        NAMESPACE,
-    );
-    let prepared = reconciler.prepare(&record).await.expect("prepare");
-    let mut status = record.status.clone().unwrap_or_default();
-    reconciler.reconcile(&record, &prepared, chrono::Utc::now()).patch.expect("provision patch").apply(&mut status);
-    assert_eq!((status.phase, status.message.as_deref()), (EnvironmentPhase::Ready, None), "a drydock vessel reaches Ready");
+    // #4163: provisioned through the environment runtime the Environment controller realises
+    // launches with; the launch is then recorded Ready with the facts it reported.
+    let provisioning = DockerControllerRuntime { state: Arc::clone(&stand_in.state) }
+        .provision_environment(env_id.as_str(), &stand_in.spec)
+        .await
+        .expect("a drydock vessel is provisioned");
+    let flotilla_provisioning::reconcilers::EnvironmentProvisioning::Cloud(cloud) = provisioning else {
+        panic!("a cloud sandbox is provisioned as one")
+    };
     let handle = stand_in.handle().await.expect("provisioned handle");
-    assert_eq!(status.backing_id.as_deref(), Some(handle.backing_id()));
-    assert_eq!(status.image_ref.as_deref(), stand_in.spec.cloud_sandbox.as_ref().map(|cloud| cloud.image.as_str()));
-    assert_eq!(status.provider_descriptor.as_ref().map(|descriptor| descriptor.instance.as_str()), Some("stand-in"));
-    environments.update_status(env_id.as_str(), &record.metadata.resource_version, &status).await.expect("environment status");
+    assert_eq!(cloud.backing_id, handle.backing_id());
+    assert_eq!(Some(cloud.image_ref.as_str()), stand_in.spec.cloud_sandbox.as_ref().map(|cloud| cloud.image.as_str()));
+    assert_eq!(cloud.provider_descriptor.instance, "stand-in");
+    engine_environments(&stand_in.state.daemon).ready(
+        env_id.as_str(),
+        &cloud.backing_id,
+        flotilla_resources::environment_records::LaunchFacts {
+            image_ref: Some(cloud.image_ref.clone()),
+            provider_descriptor: Some(*cloud.provider_descriptor.clone()),
+            ..Default::default()
+        },
+    );
 
     // The vessel layer: the generation's CLI is on the vessel's own PATH beside
     // the provider's environment, and the socket the vessel's environment names
@@ -141,9 +146,14 @@ async fn launch_through_the_provider_path(declared_path: Option<&str>, harness_i
     // #3663: the home's skills link resolves into the agent's content cache.
     assert!(fs::symlink_metadata(home.join("skills")).expect("skills link").file_type().is_symlink());
     assert!(fs::read_to_string(home.join("skills/research/SKILL.md")).expect("pushed skill").contains("name: research"));
-    let deliveries = flotilla_projections::read_projections::access_delivery_evidence(&stand_in.backend, NAMESPACE, &stand_in.convoy)
-        .await
-        .expect("deliveries");
+    let deliveries = flotilla_projections::read_projections::access_delivery_evidence(
+        &stand_in.backend,
+        stand_in.state.daemon.lifecycle_reads().as_ref(),
+        NAMESPACE,
+        &stand_in.convoy,
+    )
+    .await
+    .expect("deliveries");
     let [delivery] = deliveries.as_slice() else { panic!("one access delivered: {deliveries:?}") };
     assert_eq!(Path::new(&delivery.home), home);
     let mechanisms = delivery.needs.iter().map(|need| (need.need.as_str(), need.mechanism.as_str())).collect::<BTreeMap<_, _>>();
@@ -416,7 +426,7 @@ async fn stand_in_with(declared_path: Option<&str>, harness_in_image: bool, host
         }),
         ..Default::default()
     };
-    backend.using::<Environment>(NAMESPACE).create(&empty_meta(env_id.as_str()), &spec).await.expect("environment record");
+    engine_environments(&daemon).request(env_id.as_str(), &spec, None);
     let source = LocalSkillSource::new(root, "research");
     freeze_crew(&backend, &convoy, "demo-work", "coder", "claude-code", vec![source.selected.clone()]).await;
     bind_account(&daemon, &convoy, "coder", "claude-max", "test@example.com").await;

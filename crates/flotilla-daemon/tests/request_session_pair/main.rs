@@ -4705,7 +4705,7 @@ fn generated_message_role_waiting_home(tc: hegel::TestCase) {
 async fn capabilities_routing_scenario(remote: bool, workflows: bool) {
     use flotilla_capability_contract::CredentialCapability;
     use flotilla_capability_contract::SessionCapabilitySource;
-    use flotilla_resources::{Environment, EnvironmentSpec, HostDirectEnvironmentSpec};
+    use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec};
     // Credential-delivery I/O is the boundary; routing and stores are real.
     struct Delivery(bool);
     #[async_trait]
@@ -4727,6 +4727,10 @@ async fn capabilities_routing_scenario(remote: bool, workflows: bool) {
     let follower = empty_daemon_named("capabilities-session").await;
     let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("connect capability scenario");
     let owner = if remote { &topology.follower } else { &topology.leader };
+    // Each daemon reads the engine's environments, as its runtime installs them.
+    let leader_environments = message_homes::engine_environments(&topology.leader);
+    let follower_environments = message_homes::engine_environments(&topology.follower);
+    let owner_environments = if remote { &follower_environments } else { &leader_environments };
     let role = if workflows { "governor" } else { "coder" };
     topology.leader.set_session_capability_source(Arc::new(Delivery(!workflows))).await;
     owner.set_session_capability_source(Arc::new(Delivery(workflows))).await;
@@ -4765,19 +4769,14 @@ async fn capabilities_routing_scenario(remote: bool, workflows: bool) {
         )
         .await
         .expect("vessel");
-    backend
-        .using::<Environment>("flotilla")
-        .create(
-            &InputMeta::builder().name("capabilities-env".into()).build(),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "session-host".into(), repo_default_dir: "/repo".into() }),
-                docker: None,
-            },
-        )
-        .await
-        .expect("environment");
+    owner_environments.request(
+        "capabilities-env",
+        &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "session-host".into(), repo_default_dir: "/repo".into() }),
+            ..Default::default()
+        },
+        None,
+    );
     backend
         .using::<TerminalSession>("flotilla")
         .create(

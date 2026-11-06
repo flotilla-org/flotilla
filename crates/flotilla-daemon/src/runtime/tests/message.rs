@@ -33,6 +33,7 @@ async fn redelivery_refreshes_live_codex_crews_and_ignores_externally_managed_ho
             ("HOME", home.display().to_string()),
             (FLOTILLA_SKILLS_DIR_ENV, write_test_skill_sources(temp.path()).display().to_string()),
         ]))));
+        engine_environments(&daemon);
         let state = ControllerRuntimeState::new(
             Arc::clone(&daemon),
             config,
@@ -46,39 +47,23 @@ async fn redelivery_refreshes_live_codex_crews_and_ignores_externally_managed_ho
         let deliveries = material.prepare("work", &required, &BTreeMap::new()).await.expect("initial delivery");
         let codex_home = deliveries[0].mount.host_path.as_path().to_path_buf();
 
-        let environments = daemon.resource_backend().using::<Environment>(NAMESPACE);
         for (name, env) in
             [("work", BTreeMap::new()), ("external-home", BTreeMap::from([("CODEX_HOME".to_string(), "/image/codex".to_string())]))]
         {
-            let environment = environments
-                .create(
-                    &empty_meta(name),
-                    &EnvironmentSpec {
-                        cloud_sandbox: None,
-                        provider_address: None,
-                        host_direct: None,
-                        docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                            image_build_ref: None,
-                            host_ref: "host-test".to_string(),
-                            image: "test".to_string(),
-                            declared_agent_adapters: required.clone(),
-                            required_agent_adapters: required.clone(),
-                            pull_policy: Default::default(),
-                            mounts: Vec::new(),
-                            env,
-                        }),
-                    },
-                )
-                .await
-                .expect("environment");
-            environments
-                .update_status(
-                    &environment.metadata.name,
-                    &environment.metadata.resource_version,
-                    &flotilla_resources::EnvironmentStatus { phase: EnvironmentPhase::Ready, ready: true, ..Default::default() },
-                )
-                .await
-                .expect("ready");
+            let spec = EnvironmentSpec {
+                docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                    image_build_ref: None,
+                    host_ref: "host-test".to_string(),
+                    image: "test".to_string(),
+                    declared_agent_adapters: required.clone(),
+                    required_agent_adapters: required.clone(),
+                    pull_policy: Default::default(),
+                    mounts: Vec::new(),
+                    env,
+                }),
+                ..Default::default()
+            };
+            engine_environments(&daemon).put_ready(name, &spec, None, &format!("container-{name}"), Default::default());
         }
 
         // The guest process boundary records the protected files call; the registry
@@ -133,7 +118,7 @@ async fn redelivery_refreshes_live_codex_crews_and_ignores_externally_managed_ho
             .unwrap();
 
         fs::write(&central, "{\"tokens\":{\"access_token\":\"access-token-two\"}}").expect("rotate central auth");
-        redeliver_codex_credentials(&state, NAMESPACE).await.expect("redeliver the rotated credential");
+        redeliver_codex_credentials(&state).await.expect("redeliver the rotated credential");
 
         if shared {
             assert!(!guest_auth.exists(), "mounted homes must rotate on the host without a guest push");
@@ -310,13 +295,14 @@ async fn durable_message_transport_accepts_idle_input_once_and_restart_poll_neve
         pool.clone(),
     );
     let profile = build_local_profile(&daemon, &registry).await.expect("profile");
-    ensure_host_direct_environment_exists(&backend, NAMESPACE, &profile).await.expect("environment");
+    ensure_host_direct_environment_exists(engine_environments(&daemon).reads.clone(), &profile).await.expect("environment");
     create_credential_test_session(&backend, ID, "message", "message-work", &profile.host_direct_environment_name()).await;
     let sessions = backend.using::<TerminalSession>(NAMESPACE);
     let holder = sessions.get(ID).await.expect("holder");
     let mut spec = holder.spec.clone();
     spec.pool = "hookless".into();
     let holder = sessions.update(&empty_meta(ID), &holder.metadata.resource_version, &spec).await.expect("pool");
+    engine_environments(&daemon);
     let runtime = TerminalControllerRuntime {
         state: Arc::new(ControllerRuntimeState::new(
             daemon,
@@ -549,7 +535,7 @@ async fn held_pool_delivery_scenario(mode: &str) {
         pool.clone(),
     );
     let profile = build_local_profile(&daemon, &registry).await.expect("profile");
-    ensure_host_direct_environment_exists(&backend, NAMESPACE, &profile).await.expect("environment");
+    ensure_host_direct_environment_exists(engine_environments(&daemon).reads.clone(), &profile).await.expect("environment");
     backend
         .using::<Convoy>(NAMESPACE)
         .create(&empty_meta("held-pool"), &ConvoySpec::builder().workflow_ref("test".into()).build())
@@ -587,6 +573,7 @@ async fn held_pool_delivery_scenario(mode: &str) {
         Some(flotilla_resources::CrewSessionStatus { id: "held-crew".into(), adapter: "codex".into(), model: None, stance: "work".into() });
     status.started_at = Some(Utc::now() - chrono::Duration::minutes(20));
     session = sessions.update_status("agent", &session.metadata.resource_version, &status).await.expect("running session");
+    engine_environments(&daemon);
     let runtime = Arc::new(TerminalControllerRuntime {
         state: Arc::new(ControllerRuntimeState::new(
             daemon,
@@ -874,6 +861,7 @@ async fn codex_idle_hook_confirms_held_submission() {
     let (daemon, _) = crew_daemon(config.clone()).await;
     let backend = daemon.resource_backend();
     create_credential_test_session(&backend, "codex-held", "hook", "hook-work", "contained-vessel").await;
+    engine_environments(&daemon);
     let runtime = TerminalControllerRuntime {
         state: Arc::new(ControllerRuntimeState::new(
             daemon,
@@ -986,6 +974,7 @@ async fn message_resync_coalesces_active_messages() {
                 .await
                 .expect("admit");
         }
+        engine_environments(&daemon);
         let state = Arc::new(ControllerRuntimeState::new(
             daemon,
             config,
@@ -1103,7 +1092,9 @@ async fn controller_input_detach_and_empty_or_abandoned_composer_delivers_withou
             cleat,
         );
         let profile = build_local_profile(&daemon, &registry).await.expect("cross-host Message fixture operation succeeds");
-        ensure_host_direct_environment_exists(&backend, NAMESPACE, &profile).await.expect("cross-host Message fixture operation succeeds");
+        ensure_host_direct_environment_exists(engine_environments(&daemon).reads.clone(), &profile)
+            .await
+            .expect("cross-host Message fixture operation succeeds");
         backend
             .using::<Convoy>(NAMESPACE)
             .create(&empty_meta("message-pool"), &ConvoySpec::builder().workflow_ref("test".into()).project_ref(NAMESPACE.into()).build())
@@ -1137,6 +1128,7 @@ async fn controller_input_detach_and_empty_or_abandoned_composer_delivers_withou
             .update_status("agent", &terminal.metadata.resource_version, &status)
             .await
             .expect("cross-host Message fixture operation succeeds");
+        engine_environments(&daemon);
         let runtime = TerminalControllerRuntime {
             state: Arc::new(ControllerRuntimeState::new(
                 daemon.clone(),

@@ -12,7 +12,7 @@ use flotilla_provisioning::{
     stored::clone::{CloneKind, CloneRequest},
 };
 use flotilla_resources::{
-    canonical_host_id, definition_provenance::SEEDING_MANAGER, descriptive_repo_slug, is_prepared_snapshot, Clone, CloneSpec, Environment,
+    canonical_host_id, definition_provenance::SEEDING_MANAGER, descriptive_repo_slug, is_prepared_snapshot, Clone, CloneSpec,
     EnvironmentSpec, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostDirectEnvironmentSpec, HostSpec,
     InputMeta, PlacementImageSource, Platform, Repository, ResourceError, ResourceObject, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND,
 };
@@ -31,7 +31,7 @@ pub(super) async fn register_startup_resources(
     ensure_host_exists(&backend, namespace, &profile.host_id, &profile.display_name, profile.max_vessels)
         .await
         .map_err(|error| format!("ensure_host_exists: {error}"))?;
-    ensure_host_direct_environment_exists(&backend, namespace, profile)
+    ensure_host_direct_environment_exists(daemon.lifecycle_reads(), profile)
         .await
         .map_err(|error| format!("ensure_host_direct_environment_exists: {error}"))?;
     discover_local_clones(daemon, &backend, namespace, profile, clones).await.map_err(|error| format!("discover_local_clones: {error}"))?;
@@ -87,39 +87,28 @@ pub(super) async fn ensure_host_exists(
         .map_err(|err| err.to_string())
 }
 
+/// Requests the host's direct environment from the engine, once: one already held is left as it is.
 pub(super) async fn ensure_host_direct_environment_exists(
-    backend: &ResourceBackend,
-    namespace: &str,
+    reads: Arc<dyn flotilla_projections::ports::LifecycleReads>,
     profile: &LocalProvisioningProfile,
 ) -> Result<(), String> {
     let name = profile.host_direct_environment_name();
-    let environments = backend.clone().using::<Environment>(namespace);
-    match environments.get(&name).await {
-        Ok(_) => return Ok(()),
-        Err(ResourceError::NotFound { .. }) => {}
-        Err(err) => return Err(format!("check environment {name}: {err}")),
-    }
-
     let address = flotilla_address::Address::root(flotilla_address::Kind::Host, &profile.host_id)
         .and_then(|place| place.child(flotilla_address::Kind::Provider, &profile.host_direct_provider))
         .map_err(|error| error.to_string())?;
 
-    environments
-        .create(
-            &empty_meta(&name),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: Some(address),
-                host_direct: Some(HostDirectEnvironmentSpec {
-                    host_ref: profile.host_id.clone(),
-                    repo_default_dir: profile.repo_default_dir.clone(),
-                }),
-                docker: None,
-            },
-        )
+    let spec = EnvironmentSpec {
+        cloud_sandbox: None,
+        provider_address: Some(address),
+        host_direct: Some(HostDirectEnvironmentSpec {
+            host_ref: profile.host_id.clone(),
+            repo_default_dir: profile.repo_default_dir.clone(),
+        }),
+        docker: None,
+    };
+    tokio::task::spawn_blocking(move || reads.environments()?.request(&name, &spec, None).map(drop))
         .await
-        .map(|_| ())
-        .map_err(|err| err.to_string())
+        .map_err(|error| format!("request environment: {error}"))?
 }
 
 pub(super) async fn discover_local_clones(

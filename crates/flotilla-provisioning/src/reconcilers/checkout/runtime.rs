@@ -8,8 +8,7 @@ use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::checkout_integration::convoy_change_request_id_for_checkout;
 use flotilla_resources::checkout_path::{checkout_path_component, checkout_path_from_status_and_spec};
 use flotilla_resources::{
-    canonicalize_repo_url, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, Convoy, Environment, ForgeSpec,
-    ResourceObject,
+    canonicalize_repo_url, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, Convoy, ForgeSpec, ResourceObject,
 };
 use flotilla_store::{ReplicaReadResolver, ResourceBackend};
 use flotilla_vcs::checkout_integration::{
@@ -324,7 +323,11 @@ async fn cleanup_convoy_checkout_parents(runner: &dyn CommandRunner, target: &Pa
     }
 }
 
-pub async fn sweep_host_empty_convoy_directories(backend: &ResourceBackend, host: &str) -> Result<(), String> {
+pub async fn sweep_host_empty_convoy_directories(
+    backend: &ResourceBackend,
+    environments: &dyn flotilla_resources::environment_records::EnvironmentRecords,
+    host: &str,
+) -> Result<(), String> {
     // Repository roots are shared across namespaces. Include replicated convoys,
     // and fail closed on any listing error before touching the filesystem.
     // VesselReconciler reads its existing Convoy before creating Checkouts;
@@ -344,13 +347,12 @@ pub async fn sweep_host_empty_convoy_directories(backend: &ResourceBackend, host
                 .map(|convoy| checkout_path_component(&convoy.object.metadata.name)),
         );
     }
+    // The host's own environments are homed here, and never released.
     let mut roots = BTreeSet::new();
-    for namespace in backend.local_namespaces::<Environment>().await.map_err(|error| error.to_string())? {
-        for environment in backend.using::<Environment>(&namespace).list().await.map_err(|error| error.to_string())?.items {
-            if let Some(direct) = environment.spec.host_direct {
-                if direct.host_ref == host {
-                    roots.insert(direct.repo_default_dir);
-                }
+    for environment in environments.live()? {
+        if let Some(direct) = environment.spec.host_direct {
+            if direct.host_ref == host {
+                roots.insert(direct.repo_default_dir);
             }
         }
     }

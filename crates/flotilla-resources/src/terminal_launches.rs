@@ -35,7 +35,7 @@ impl TerminalLaunch {
             reading => {
                 status.phase = match reading {
                     LifecycleReading::Released => TerminalSessionPhase::Stopped,
-                    LifecycleReading::Lost => TerminalSessionPhase::Lost,
+                    LifecycleReading::Lost { .. } => TerminalSessionPhase::Lost,
                     _ => TerminalSessionPhase::Failed,
                 };
                 status.message = reading.reason();

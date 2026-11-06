@@ -25,10 +25,9 @@ use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
     ClaimExit, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSessionStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState,
-    Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, ExitDeclaration, FulfilmentKind, FulfilmentKindSpec,
-    FulfilmentRealisation, HostDirectEnvironmentSpec, InputMeta, Message, MessageExpectation, MessagePhase, Resource, Selector,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase,
-    WorkState, WorkflowSnapshot, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    EnvironmentSpec, ExitDeclaration, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HostDirectEnvironmentSpec, InputMeta,
+    Message, MessageExpectation, MessagePhase, Resource, Selector, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkState, WorkflowSnapshot, ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
 use flotilla_store::{controller::Reconciler, ResourceBackend};
 use futures::StreamExt;
@@ -178,30 +177,19 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         home_daemon.node_id().as_str(),
         &placement_daemon.decided_store().expect("placement decided store"),
     );
-    let environments = placement.clone().using::<Environment>("flotilla");
-    let environment = environments
-        .create(
-            &meta("host-direct-placement-host"),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(HostDirectEnvironmentSpec {
-                    host_ref: "placement-host".to_string(),
-                    repo_default_dir: "/workspace".to_string(),
-                }),
-                docker: None,
-            },
-        )
-        .await
-        .expect("placement environment");
-    environments
-        .update_status(
-            &environment.metadata.name,
-            &environment.metadata.resource_version,
-            &EnvironmentStatus { phase: EnvironmentPhase::Ready, ready: true, ..Default::default() },
-        )
-        .await
-        .expect("ready environment");
+    crate::engine_environments(&placement_daemon).put_ready(
+        "host-direct-placement-host",
+        &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec {
+                host_ref: "placement-host".to_string(),
+                repo_default_dir: "/workspace".to_string(),
+            }),
+            ..Default::default()
+        },
+        None,
+        "/workspace",
+        Default::default(),
+    );
     let vessel = placement
         .using::<Vessel>("flotilla")
         .create(
@@ -219,6 +207,7 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         .await
         .expect("placement vessel");
     let reconciler = VesselReconciler::new(placement.clone(), "flotilla")
+        .with_lifecycle_reads(placement_daemon.lifecycle_reads())
         .with_federated_dependencies(&placement, flotilla_protocol::CanonicalHostId::resolved("placement-host"));
     let dependencies = reconciler.prepare(&vessel).await.expect("vessel dependencies");
     let (session_meta, session_spec) = reconciler

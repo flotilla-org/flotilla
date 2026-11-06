@@ -36,7 +36,6 @@ pub mod clone;
 pub mod controller;
 pub mod definition_import;
 pub mod definitions;
-pub mod environment;
 pub mod environment_actuator;
 pub mod environments;
 pub mod forge_observation_import;
@@ -221,7 +220,7 @@ fn finish_predecessor<K: LifecycleKind, L: Log<Lifecycle<K>>>(
     let held = home.get(&previous).ok_or(EngineError::Unknown)?;
     match held.state() {
         LifecycleState::Realised { .. } => {
-            let cause = flotilla_state_machines::machines::lifecycle::VanishCause::Lost;
+            let cause = flotilla_state_machines::machines::lifecycle::VanishCause::lost();
             let step = Step::Vanished { cause: cause.clone() };
             home.apply(&previous, Vanish { cause, observed: Ref::new(&previous) }, &evidence(&previous, &step), at)?;
             Ok(())

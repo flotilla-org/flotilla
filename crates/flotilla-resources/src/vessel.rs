@@ -190,7 +190,7 @@ impl VesselPhase {
     /// The phase the engine's reading decides; without a reading, the stored phase.
     pub fn from_reading(reading: Option<&LifecycleReading>, status: Option<&VesselStatus>) -> Self {
         match reading {
-            Some(LifecycleReading::Lost | LifecycleReading::Released) => Self::Lost,
+            Some(LifecycleReading::Lost { .. } | LifecycleReading::Released) => Self::Lost,
             Some(LifecycleReading::Failed { .. } | LifecycleReading::GaveUp { .. }) => Self::Failed,
             Some(LifecycleReading::Ready { .. }) if status.is_some_and(|status| !status.interrupted_roles.is_empty()) => Self::Interrupted,
             Some(LifecycleReading::Ready { .. }) => Self::Ready,
@@ -434,7 +434,7 @@ mod reading_tests {
             (LifecycleReading::Exhausted { cause: "c".into() }, BTreeSet::new(), VesselPhase::Provisioning, Some("stored")),
             (LifecycleReading::Ready { identity: "env".into() }, BTreeSet::new(), VesselPhase::Ready, None),
             (LifecycleReading::Ready { identity: "env".into() }, roles, VesselPhase::Interrupted, Some("stored")),
-            (LifecycleReading::Lost, BTreeSet::new(), VesselPhase::Lost, Some("observed absent")),
+            (LifecycleReading::Lost { reason: None }, BTreeSet::new(), VesselPhase::Lost, Some("observed absent")),
             (LifecycleReading::Released, BTreeSet::new(), VesselPhase::Lost, Some("released")),
             (LifecycleReading::Failed { reason: "boom".into() }, BTreeSet::new(), VesselPhase::Failed, Some("boom")),
             (LifecycleReading::GaveUp { cause: "host gone".into() }, BTreeSet::new(), VesselPhase::Failed, Some("host gone")),

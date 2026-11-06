@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use common::meta;
 use flotilla_provisioning::reconcilers::{ForgeDefaultBranchResolver, RepositoryReconciler};
 use flotilla_resources::{
-    Checkout, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, CloneStatus, Environment, EnvironmentSpec, ForgeIdentity,
+    Checkout, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, CloneStatus, EnvironmentSpec, ForgeIdentity,
     FreshCloneCheckoutSpec, HostDirectEnvironmentSpec, LifecycleAuthority, ObservedCheckoutSpec, Repository, RepositoryCheckoutKind,
     RepositorySpec,
 };
@@ -35,20 +35,15 @@ async fn repository_status_groups_typed_checkout_associations_by_explicit_host()
         .create(&meta(&repository_key.to_string()), &repository_spec)
         .await
         .expect("repository create");
-    durable
-        .clone()
-        .using::<Environment>(NAMESPACE)
-        .create(
-            &meta("env-host-a"),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host-a".to_string(), repo_default_dir: "/repos".to_string() }),
-                docker: None,
-            },
-        )
-        .await
-        .expect("environment create");
+    let environments = flotilla_provisioning_testkit::EnvironmentFixture::default();
+    environments.request(
+        "env-host-a",
+        &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host-a".to_string(), repo_default_dir: "/repos".to_string() }),
+            ..Default::default()
+        },
+        None,
+    );
     durable
         .clone()
         .using::<Checkout>(NAMESPACE)
@@ -127,6 +122,7 @@ async fn repository_status_groups_typed_checkout_associations_by_explicit_host()
         .expect("clone status");
 
     let reconciler = RepositoryReconciler::new(durable, observed, NAMESPACE)
+        .with_lifecycle_reads(environments.reads.clone())
         .with_forge_default_branch_resolver(Arc::new(FixedForgeDefaultBranch("stable")));
     let status = reconciler.prepare(&repository).await.expect("status projection");
 

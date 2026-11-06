@@ -52,8 +52,9 @@ use super::{
 pub enum Backing {
     /// Its backing exists under `identity`.
     Present { identity: String },
-    /// It has no backing.
-    Absent,
+    /// It has no backing; `reason` is why its home lost it (`cgroup_oom`), when known. The
+    /// reason ends the launch with it, on its `Vanish` edge.
+    Absent { reason: Option<String> },
     /// Its backing is there but broken for good, as `reason` says: it ends as failed.
     Failed { reason: String },
 }
@@ -363,7 +364,7 @@ where
     /// A successor launch is requested: its predecessor, if still realised, is gone.
     async fn end_predecessor(&self, previous: &str) {
         if self.lifecycles.get(previous).is_some_and(|resource| matches!(resource.state(), LifecycleState::Realised { .. })) {
-            self.write(previous, Step::Vanished { cause: VanishCause::Lost }).await;
+            self.write(previous, Step::Vanished { cause: VanishCause::lost() }).await;
         }
     }
 
@@ -436,8 +437,8 @@ where
             (Done::Observed(Ok(Backing::Present { identity })), LifecycleState::Requested { .. }) => {
                 self.write(name, Step::Realised { identity }).await;
             }
-            (Done::Observed(Ok(Backing::Absent)), LifecycleState::Realised { .. }) => {
-                self.write(name, Step::Vanished { cause: VanishCause::Lost }).await;
+            (Done::Observed(Ok(Backing::Absent { reason })), LifecycleState::Realised { .. }) => {
+                self.write(name, Step::Vanished { cause: VanishCause::Lost { reason } }).await;
             }
             (Done::Observed(Ok(Backing::Failed { reason })), LifecycleState::Realised { .. }) => {
                 self.write(name, Step::Vanished { cause: VanishCause::Failed { reason } }).await;

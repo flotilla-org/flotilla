@@ -6352,8 +6352,14 @@ impl InProcessDaemon {
             include_replicas: true,
             ..Default::default()
         };
-        let host_ref = match self.resource_backend.query_declared::<flotilla_resources::Environment>(namespace, &by_name(env_ref)).await {
-            Ok(found) => found.items.into_iter().find_map(|source| source.object.spec.host_ref().map(str::to_string)),
+        let reads = self.lifecycle_reads();
+        let name = env_ref.to_owned();
+        let found = tokio::task::spawn_blocking(move || reads.environments()?.find(&name))
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|found| found);
+        let host_ref = match found {
+            Ok(found) => found.and_then(|environment| environment.spec.host_ref().map(str::to_string)),
             Err(error) => {
                 tracing::warn!(%env_ref, %error, "could not read checkout environment owner");
                 None

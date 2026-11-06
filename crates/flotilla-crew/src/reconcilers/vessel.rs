@@ -1,5 +1,6 @@
 use flotilla_resources::account_access::AccountRecords;
 use flotilla_resources::checkout_path::checkout_path_component;
+use flotilla_resources::environment_records::{EnvironmentRecord, EnvironmentRecords};
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::Actuation;
 use flotilla_store::PlacementImageSourceStoreExt;
@@ -21,12 +22,12 @@ use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, LifecycleRead
 use flotilla_resources::{
     address::artifact_slot_record_name, canonicalize_repo_url, host_direct_environment_name, is_prepared_snapshot,
     repository_workspace_slugs, Artifact, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy,
-    CrewSource, CrewWorkPhase, DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase,
-    EnvironmentSpec, FreshCloneCheckoutSpec, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, InputMeta, LifecycleAuthority,
-    OwnerReference, PlacementImageSource, Repository, RepositoryKey, RepositorySpec, Resource, ResourceError, ResourceObject,
-    ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, Vessel, VesselImage,
-    VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL,
-    CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
+    CrewSource, CrewWorkPhase, DockerEnvironmentSpec, EnvironmentMount, EnvironmentMountMode, EnvironmentSpec, FreshCloneCheckoutSpec,
+    FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, InputMeta, LifecycleAuthority, OwnerReference, PlacementImageSource,
+    Repository, RepositoryKey, RepositorySpec, Resource, ResourceError, ResourceObject, ResourceProvenance, Stance, TerminalSession,
+    TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, Vessel, VesselImage, VesselPhase, VesselStatusPatch, WorkPhase,
+    ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
+    CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
     CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND, VESSEL_REF_LABEL,
 };
 use flotilla_resources::{realisation_settings, BRIEF_ARTIFACTS_ANNOTATION};
@@ -89,7 +90,6 @@ pub struct VesselReconciler {
     convoys: TypedResolver<Convoy>,
     repositories: TypedResolver<Repository>,
     kinds: TypedResolver<FulfilmentKind>,
-    environments: TypedResolver<Environment>,
     clones: TypedResolver<Clone>,
     checkouts: TypedResolver<Checkout>,
     terminal_sessions: TypedResolver<TerminalSession>,
@@ -106,7 +106,6 @@ pub struct VesselReconciler {
 }
 
 struct EnvironmentDependency {
-    engine_held: bool,
     ready: bool,
     waiting: Option<String>,
     unavailable: Option<VesselPrepared>,
@@ -127,7 +126,6 @@ impl VesselReconciler {
             convoys: backend.clone().using::<Convoy>(namespace),
             repositories: backend.clone().using::<Repository>(namespace),
             kinds: backend.clone().using::<FulfilmentKind>(namespace),
-            environments: backend.clone().using::<Environment>(namespace),
             clones: backend.clone().using::<Clone>(namespace),
             checkouts: backend.clone().using::<Checkout>(namespace),
             terminal_sessions: backend.clone().using::<TerminalSession>(namespace),
@@ -186,7 +184,7 @@ impl VesselReconciler {
             Some(
                 LifecycleReading::Failed { reason: cause } | LifecycleReading::GaveUp { cause } | LifecycleReading::Exhausted { cause },
             ) => CheckoutDependency { phase: CheckoutPhase::Failed, failure: Some(cause), path: None },
-            Some(LifecycleReading::Lost | LifecycleReading::Released) => {
+            Some(LifecycleReading::Lost { .. } | LifecycleReading::Released) => {
                 CheckoutDependency { phase: CheckoutPhase::Gone, failure: None, path: None }
             }
             Some(_) => CheckoutDependency { phase: CheckoutPhase::Pending, failure: None, path: None },
@@ -202,40 +200,24 @@ impl VesselReconciler {
         })
     }
 
-    fn environment_dependency(&self, environment: &ResourceObject<Environment>) -> Result<EnvironmentDependency, ResourceError> {
-        let reading = self
-            .lifecycle_reads
-            .try_reading(ProvisioningKind::Environment, &environment.metadata.name, None)
-            .map_err(ResourceError::other)?;
-        Ok(match reading {
-            Some(reading) => {
-                let unavailable = match &reading {
-                    LifecycleReading::Failed { reason: cause }
-                    | LifecycleReading::Exhausted { cause }
-                    | LifecycleReading::GaveUp { cause } => Some(VesselPrepared::failed(cause.clone())),
-                    LifecycleReading::Lost | LifecycleReading::Released => Some(VesselPrepared {
-                        phase: None,
-                        patch: PlannedPatch::Lost {
-                            message: format!("environment {} {}", environment.metadata.name, reading.reason().unwrap_or_default()),
-                        },
-                        actuations: Vec::new(),
-                    }),
-                    _ => None,
-                };
-                EnvironmentDependency {
-                    engine_held: true,
-                    ready: matches!(reading, LifecycleReading::Ready { .. }),
-                    waiting: reading.reason(),
-                    unavailable,
-                }
-            }
-            None => EnvironmentDependency {
-                engine_held: false,
-                ready: environment.status.as_ref().map(|status| status.phase) == Some(EnvironmentPhase::Ready),
-                waiting: environment.status.as_ref().and_then(|status| status.message.clone()),
-                unavailable: VesselPrepared::legacy_unavailable_environment(environment),
-            },
-        })
+    /// The engine's environments (#3108).
+    fn environments(&self) -> Result<&dyn EnvironmentRecords, ResourceError> {
+        self.lifecycle_reads.environments().map_err(ResourceError::other)
+    }
+
+    /// The environment `name`, at whichever home holds it: environment names are fleet-unique.
+    fn environment(&self, name: &str) -> Result<Option<EnvironmentRecord>, ResourceError> {
+        self.environments()?.find(name).map_err(ResourceError::other)
+    }
+
+    /// Requests the vessel's environment, held for its lease: the environment's launch waits on
+    /// the lease and ends with it. `Some` says what the request waits for first.
+    fn request_environment(&self, vessel: &str, name: &str, spec: &EnvironmentSpec) -> Result<Option<String>, ResourceError> {
+        if self.lifecycle_reads.try_reading(ProvisioningKind::Vessel, vessel, None).map_err(ResourceError::other)?.is_none() {
+            return Ok(Some(format!("vessel {vessel}'s lease, which holds environment {name}")));
+        }
+        self.environments()?.request(name, spec, Some(vessel)).map_err(ResourceError::other)?;
+        Ok(None)
     }
 
     pub fn new_with_config_dir(backend: ResourceBackend, namespace: &str, config_dir: impl Into<PathBuf>) -> Self {
@@ -307,9 +289,10 @@ impl VesselReconciler {
         self
     }
 
+    /// The old-store kinds a vessel follows. Its environment is the engine's: the daemon adds the
+    /// engine's environment holder wake beside these.
     pub fn secondary_watches() -> Vec<Box<dyn SecondaryWatch<Primary = Vessel>>> {
         vec![
-            Box::new(LabelMappedWatch::<Environment, Vessel> { label_key: VESSEL_REF_LABEL, _marker: PhantomData }),
             Box::new(LabelJoinWatch::<Checkout, Vessel> { label_key: CONVOY_LABEL, _marker: PhantomData }),
             Box::new(LabelMappedWatch::<TerminalSession, Vessel> { label_key: VESSEL_REF_LABEL, _marker: PhantomData }),
         ]
@@ -404,6 +387,36 @@ impl VesselReconciler {
         };
         Ok(flotilla_resources::provider_placement::match_provider(&kind.spec.host_ref, &kind.spec.realisation, None, &providers)
             .map(|provider| Some(provider.instance.clone())))
+    }
+
+    /// What `environment` means for `vessel`. A lost one names the vessel's checkouts that are
+    /// still present, where its work can be recovered.
+    async fn environment_dependency(
+        &self,
+        vessel: &ResourceObject<Vessel>,
+        environment: &EnvironmentRecord,
+    ) -> Result<EnvironmentDependency, ResourceError> {
+        let retained = match environment.reading {
+            LifecycleReading::Lost { .. } => self.retained_checkout_paths(vessel).await?,
+            _ => Vec::new(),
+        };
+        Ok(environment_dependency(environment, &retained))
+    }
+
+    /// The paths of `vessel`'s checkouts that are still present, sorted. Checkouts are not on the
+    /// engine yet, so they are read from the vessel's checkout refs.
+    async fn retained_checkout_paths(&self, vessel: &ResourceObject<Vessel>) -> Result<Vec<String>, ResourceError> {
+        let mut paths = Vec::new();
+        for checkout in vessel.status.iter().flat_map(|status| status.checkout_refs.values()) {
+            match self.checkouts.get(checkout).await {
+                Ok(checkout) => paths.extend(checkout.status.and_then(|status| status.path)),
+                Err(ResourceError::NotFound { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
     }
 
     fn missing_host_local_environment(&self, environment_ref: &str, placement_host_ref: &str) -> String {
@@ -564,25 +577,6 @@ impl VesselPrepared {
         }
     }
 
-    fn legacy_unavailable_environment(environment: &ResourceObject<Environment>) -> Option<Self> {
-        let status = environment.status.as_ref()?;
-        let patch = match status.phase {
-            EnvironmentPhase::Lost => PlannedPatch::Lost {
-                message: status.message.clone().unwrap_or_else(|| {
-                    format!(
-                        "lost, recoverable: environment {} disappeared; rehydration is not available yet (#2872)",
-                        environment.metadata.name
-                    )
-                }),
-            },
-            EnvironmentPhase::Failed => PlannedPatch::Failed {
-                message: status.message.clone().unwrap_or_else(|| format!("environment {} failed", environment.metadata.name)),
-            },
-            _ => return None,
-        };
-        Some(Self { phase: None, patch, actuations: Vec::new() })
-    }
-
     fn waiting() -> Self {
         Self { phase: None, patch: PlannedPatch::Waiting, actuations: Vec::new() }
     }
@@ -630,15 +624,10 @@ impl VesselReconciler {
         // Once backing is known, its failure takes precedence over planning
         // dependencies: retain the recorded death cause and recovery paths.
         if let Some(environment_ref) = obj.status.as_ref().and_then(|status| status.environment_ref.as_ref()) {
-            match self.environments.get(environment_ref).await {
-                Ok(environment) => {
-                    let dependency = self.environment_dependency(&environment)?;
-                    if let Some(prepared) = dependency.unavailable {
-                        return Ok(prepared);
-                    }
+            if let Some(environment) = self.environment(environment_ref)? {
+                if let Some(prepared) = self.environment_dependency(obj, &environment).await?.unavailable {
+                    return Ok(prepared);
                 }
-                Err(ResourceError::NotFound { .. }) => {}
-                Err(error) => return Err(error),
             }
         }
 
@@ -734,18 +723,14 @@ impl VesselReconciler {
         let clone_env_ref = host_direct_environment_name(strategy.host_ref());
         let mut actuations = Vec::new();
         let shared_clone_root = if strategy.needs_shared_clone() {
-            let clone_env = match self.environments.get(&clone_env_ref).await {
-                Ok(environment) => environment,
-                Err(ResourceError::NotFound { .. }) => {
-                    return Ok(VesselPrepared::failed(self.missing_host_local_environment(&clone_env_ref, strategy.host_ref())))
-                }
-                Err(err) => return Err(err),
+            let Some(clone_env) = self.environment(&clone_env_ref)? else {
+                return Ok(VesselPrepared::failed(self.missing_host_local_environment(&clone_env_ref, strategy.host_ref())));
             };
             let clone_env_spec = match clone_env.spec.host_direct.as_ref() {
                 Some(spec) => spec,
                 None => return Ok(VesselPrepared::failed(format!("environment {clone_env_ref} is not a host_direct environment"))),
             };
-            if !self.environment_dependency(&clone_env)?.ready {
+            if !clone_env.is_ready() {
                 return Ok(VesselPrepared::provisioning(
                     &placement,
                     placement_decision.clone(),
@@ -761,9 +746,9 @@ impl VesselReconciler {
         let precreated_environment = match &strategy {
             PlacementStrategy::CloneInVessel { image, .. } => {
                 let env_name = environment_name(&obj.metadata.name);
-                let image = match self.environments.get(&env_name).await {
-                    Ok(existing) => {
-                        let dependency = self.environment_dependency(&existing)?;
+                let image = match self.environment(&env_name)? {
+                    Some(existing) => {
+                        let dependency = self.environment_dependency(obj, &existing).await?;
                         if let Some(prepared) = dependency.unavailable {
                             return Ok(prepared);
                         }
@@ -773,14 +758,10 @@ impl VesselReconciler {
                         }
                         match image_stamp(&existing, &placement) {
                             Ok(image) => image,
-                            Err(message) if dependency.engine_held => {
-                                // Readiness can commit before the provider's image observations are published.
-                                return Ok(VesselPrepared::provisioning(&placement, placement_decision.clone(), message, actuations));
-                            }
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         }
                     }
-                    Err(ResourceError::NotFound { .. }) => {
+                    None => {
                         let probe_needs = requirement
                             .crew
                             .iter()
@@ -792,18 +773,11 @@ impl VesselReconciler {
                             Ok(spec) => spec,
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         };
-                        actuations.push(Actuation::CreateEnvironment {
-                            meta: owned_child_meta(&env_name, obj, environment_provider_labels(&placement)),
-                            spec,
-                        });
-                        return Ok(VesselPrepared::provisioning(
-                            &placement,
-                            placement_decision.clone(),
-                            format!("environment {env_name} to become ready"),
-                            actuations,
-                        ));
+                        let waiting_for = self
+                            .request_environment(&obj.metadata.name, &env_name, &spec)?
+                            .unwrap_or_else(|| format!("environment {env_name} to become ready"));
+                        return Ok(VesselPrepared::provisioning(&placement, placement_decision.clone(), waiting_for, actuations));
                     }
-                    Err(err) => return Err(err),
                 };
                 Some((env_name, image))
             }
@@ -1097,14 +1071,10 @@ impl VesselReconciler {
         let (resolved_environment_ref, image) = match &strategy {
             PlacementStrategy::HostDirect { host_ref, .. } => {
                 let env_name = host_direct_environment_name(host_ref);
-                let environment = match self.environments.get(&env_name).await {
-                    Ok(environment) => environment,
-                    Err(ResourceError::NotFound { .. }) => {
-                        return Ok(VesselPrepared::failed(self.missing_host_local_environment(&env_name, host_ref)))
-                    }
-                    Err(err) => return Err(err),
+                let Some(environment) = self.environment(&env_name)? else {
+                    return Ok(VesselPrepared::failed(self.missing_host_local_environment(&env_name, host_ref)));
                 };
-                let dependency = self.environment_dependency(&environment)?;
+                let dependency = self.environment_dependency(obj, &environment).await?;
                 if let Some(prepared) = dependency.unavailable {
                     return Ok(prepared);
                 }
@@ -1126,8 +1096,8 @@ impl VesselReconciler {
                     Err(error) => return Err(error),
                 };
                 let env_name = environment_name(&obj.metadata.name);
-                let image = match self.environments.get(&env_name).await {
-                    Ok(existing) => {
+                let image = match self.environment(&env_name)? {
+                    Some(existing) => {
                         // Docker bind mounts cannot change in place. Refuse a stale
                         // grant set until the environment is explicitly recreated.
                         let existing_git_mounts = existing
@@ -1153,7 +1123,7 @@ impl VesselReconciler {
                             });
                         }
 
-                        let dependency = self.environment_dependency(&existing)?;
+                        let dependency = self.environment_dependency(obj, &existing).await?;
                         if let Some(prepared) = dependency.unavailable {
                             return Ok(prepared);
                         }
@@ -1163,14 +1133,10 @@ impl VesselReconciler {
                         }
                         match image_stamp(&existing, &placement) {
                             Ok(image) => image,
-                            Err(message) if dependency.engine_held => {
-                                // Readiness can commit before the provider's image observations are published.
-                                return Ok(VesselPrepared::provisioning(&placement, placement_decision.clone(), message, actuations));
-                            }
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         }
                     }
-                    Err(ResourceError::NotFound { .. }) => {
+                    None => {
                         let mut mounts = has_repositories
                             .then(|| EnvironmentMount {
                                 source_path: workspace_root.clone(),
@@ -1190,64 +1156,40 @@ impl VesselReconciler {
                             Ok(image) => image,
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         };
-                        actuations.push(Actuation::CreateEnvironment {
-                            meta: owned_child_meta(&env_name, obj, environment_provider_labels(&placement)),
-                            spec: EnvironmentSpec {
-                                cloud_sandbox: None,
-                                provider_address: Some(
-                                    flotilla_address::Address::root(flotilla_address::Kind::Host, host_ref)
-                                        .and_then(|place| {
-                                            place.child(
-                                                flotilla_address::Kind::Provider,
-                                                environment_provider_labels(&placement)
-                                                    .get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL)
-                                                    .map(String::as_str)
-                                                    .unwrap_or("docker"),
-                                            )
-                                        })
-                                        .map_err(|error| ResourceError::other(error.to_string()))?,
-                                ),
-                                host_direct: None,
-                                docker: Some(DockerEnvironmentSpec {
-                                    image_build_ref,
-                                    host_ref: host_ref.clone(),
-                                    image: image_ref.clone(),
-                                    declared_agent_adapters: declared_agent_adapters.clone(),
-                                    required_agent_adapters: required_adapters.clone(),
-                                    pull_policy: realisation_settings::DOCKER_PULL_POLICY,
-                                    mounts,
-                                    env: environment_with_credentials(
-                                        {
-                                            let mut env = env.clone();
-                                            env.insert(
-                                                flotilla_resources::CREW_SKILLS_ENV.to_string(),
-                                                serde_json::to_string(
-                                                    &requirement
-                                                        .crew
-                                                        .iter()
-                                                        .filter(|crew| matches!(crew.source, CrewSource::Agent { .. }))
-                                                        .map(|crew| (&crew.role, &crew.skills.selected))
-                                                        .collect::<BTreeMap<_, _>>(),
-                                                )
-                                                .expect("serialize resolved skills"),
-                                            );
-                                            env
-                                        },
-                                        &requirement.credential_refs,
-                                        &requirement.credential_scopes,
-                                        &requirement.credential_permissions,
-                                    ),
-                                }),
-                            },
-                        });
-                        return Ok(VesselPrepared::provisioning(
-                            &placement,
-                            placement_decision.clone(),
-                            format!("environment {env_name} to become ready"),
-                            actuations,
-                        ));
+                        let spec = EnvironmentSpec {
+                            cloud_sandbox: None,
+                            provider_address: Some(
+                                flotilla_address::Address::root(flotilla_address::Kind::Host, host_ref)
+                                    .and_then(|place| {
+                                        place.child(
+                                            flotilla_address::Kind::Provider,
+                                            environment_provider_labels(&placement)
+                                                .get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL)
+                                                .map(String::as_str)
+                                                .unwrap_or("docker"),
+                                        )
+                                    })
+                                    .map_err(|error| ResourceError::other(error.to_string()))?,
+                            ),
+                            host_direct: None,
+                            docker: Some(DockerEnvironmentSpec {
+                                image_build_ref,
+                                host_ref: host_ref.clone(),
+                                image: image_ref.clone(),
+                                declared_agent_adapters: declared_agent_adapters.clone(),
+                                required_agent_adapters: required_adapters.clone(),
+                                pull_policy: realisation_settings::DOCKER_PULL_POLICY,
+                                mounts,
+                                // The crew's skills and credential grants are composed at
+                                // launch ([`launch_env`]), never stored.
+                                env,
+                            }),
+                        };
+                        let waiting_for = self
+                            .request_environment(&obj.metadata.name, &env_name, &spec)?
+                            .unwrap_or_else(|| format!("environment {env_name} to become ready"));
+                        return Ok(VesselPrepared::provisioning(&placement, placement_decision.clone(), waiting_for, actuations));
                     }
-                    Err(err) => return Err(err),
                 };
                 (env_name, Some(image))
             }
@@ -1493,14 +1435,14 @@ impl VesselReconciler {
                     }
                     actuations.push(Actuation::CreateTerminalSession {
                         meta: terminal_meta,
-                        spec: TerminalSessionSpec {
+                        spec: Box::new(TerminalSessionSpec {
                             env_ref: resolved_environment_ref.clone(),
                             role: process.role.clone(),
                             source,
                             cwd: terminal_cwd.clone(),
                             env: Default::default(),
                             pool: strategy.pool().to_string(),
-                        },
+                        }),
                     });
                     return Ok(VesselPrepared::provisioning(
                         &placement,
@@ -1513,8 +1455,10 @@ impl VesselReconciler {
             }
         }
 
-        let mut configured_limits =
-            self.environments.get(&resolved_environment_ref).await?.status.and_then(|status| status.configured_limits);
+        let mut configured_limits = self
+            .environment(&resolved_environment_ref)?
+            .and_then(|environment| environment.launch)
+            .and_then(|launch| launch.configured_limits);
         for terminal_ref in &terminal_refs {
             if let Some(limits) = self.terminal_sessions.get(terminal_ref).await?.status.and_then(|status| status.configured_limits) {
                 // Only host-direct launches record terminal limits today. Merge
@@ -1650,8 +1594,8 @@ impl Reconciler for VesselReconciler {
 
         delete_lifecycle_owned_matching(&self.terminal_sessions, &selector).await?;
         // Checkouts are convoy-owned and are removed by the convoy finalizer's
-        // ownership cascade, independently of vessel teardown.
-        delete_lifecycle_owned_matching(&self.environments, &selector).await?;
+        // ownership cascade, independently of vessel teardown. The environment is held for the
+        // vessel's lease, which ends with this teardown; its controller then releases it.
 
         Ok(())
     }
@@ -1661,13 +1605,37 @@ impl Reconciler for VesselReconciler {
     }
 }
 
-fn image_stamp(environment: &ResourceObject<Environment>, placement: &Placement) -> Result<ImageStamp, String> {
-    let status =
-        environment.status.as_ref().ok_or_else(|| format!("environment {} awaiting image observations", environment.metadata.name))?;
-    let image_ref =
-        status.image_ref.clone().ok_or_else(|| format!("environment {} is missing its image ref", environment.metadata.name))?;
+/// What `environment` means for a vessel whose checkouts still present are at `retained`.
+fn environment_dependency(environment: &EnvironmentRecord, retained: &[String]) -> EnvironmentDependency {
+    let reading = &environment.reading;
+    let unavailable = match reading {
+        LifecycleReading::Failed { reason: cause } | LifecycleReading::Exhausted { cause } | LifecycleReading::GaveUp { cause } => {
+            Some(VesselPrepared::failed(cause.clone()))
+        }
+        // Lost is recoverable: its cause, as the backing reported it, and where the work is.
+        LifecycleReading::Lost { reason } => {
+            let cause = reason.clone().unwrap_or_else(|| format!("environment {} disappeared", environment.name));
+            let mut message = format!("lost, recoverable: {cause}; rehydration is not available yet (#2872)");
+            if !retained.is_empty() {
+                message = format!("{message}; recover work from retained checkout(s): {}", retained.join(", "));
+            }
+            Some(VesselPrepared { phase: None, patch: PlannedPatch::Lost { message }, actuations: Vec::new() })
+        }
+        LifecycleReading::Released => Some(VesselPrepared {
+            phase: None,
+            patch: PlannedPatch::Lost { message: format!("environment {} {}", environment.name, reading.reason().unwrap_or_default()) },
+            actuations: Vec::new(),
+        }),
+        _ => None,
+    };
+    EnvironmentDependency { ready: matches!(reading, LifecycleReading::Ready { .. }), waiting: reading.reason(), unavailable }
+}
+
+fn image_stamp(environment: &EnvironmentRecord, placement: &Placement) -> Result<ImageStamp, String> {
+    let launch = environment.launch.as_ref().ok_or_else(|| format!("environment {} awaiting image observations", environment.name))?;
+    let image_ref = launch.image_ref.clone().ok_or_else(|| format!("environment {} is missing its image ref", environment.name))?;
     let local_image_id =
-        status.local_image_id.clone().ok_or_else(|| format!("environment {} is missing its image digest", environment.metadata.name))?;
+        launch.local_image_id.clone().ok_or_else(|| format!("environment {} is missing its image digest", environment.name))?;
     // A composed environment provisioned from its build's digest.
     let image_build_ref = match (&environment.spec.docker, &environment.spec.cloud_sandbox) {
         (Some(docker), _) => docker.image_build_ref.as_ref(),
@@ -1675,7 +1643,7 @@ fn image_stamp(environment: &ResourceObject<Environment>, placement: &Placement)
         (None, None) => None,
     };
     let composed = image_build_ref.and_then(|_| composed_image(placement, Some(image_ref.clone())));
-    Ok(ImageStamp { image_ref, local_image_id, registry_digest: status.registry_digest.clone(), composed })
+    Ok(ImageStamp { image_ref, local_image_id, registry_digest: launch.registry_digest.clone(), composed })
 }
 
 /// Git's ordinary upstream writes target the common config, even with
@@ -1704,6 +1672,41 @@ fn configure_contained_tracking(env: &mut BTreeMap<String, String>, branches: &B
     }
     env.insert("GIT_CONFIG_COUNT".to_string(), count.to_string());
     Ok(())
+}
+
+/// What a vessel's environment is launched with beyond its stored recipe: its agent crews' skills
+/// and its credential grants, from its convoy's frozen requirement. Never stored (#3719 ruling 5).
+pub fn launch_env(requirement: &flotilla_resources::VesselRequirement) -> BTreeMap<String, String> {
+    let skills = requirement
+        .crew
+        .iter()
+        .filter(|crew| matches!(crew.source, CrewSource::Agent { .. }))
+        .map(|crew| (&crew.role, &crew.skills.selected))
+        .collect::<BTreeMap<_, _>>();
+    let env = BTreeMap::from([(
+        flotilla_resources::CREW_SKILLS_ENV.to_string(),
+        serde_json::to_string(&skills).expect("serialize resolved skills"),
+    )]);
+    environment_with_credentials(env, &requirement.credential_refs, &requirement.credential_scopes, &requirement.credential_permissions)
+}
+
+/// The launch env of vessel `vessel`'s environment ([`launch_env`]), read from its convoy's
+/// frozen requirement.
+pub async fn vessel_launch_env(backend: &ResourceBackend, namespace: &str, vessel: &str) -> Result<BTreeMap<String, String>, String> {
+    let vessel = backend.using::<Vessel>(namespace).get(vessel).await.map_err(|error| format!("read vessel {vessel}: {error}"))?;
+    let convoy = backend
+        .including_replicas::<Convoy>(namespace)
+        .get(&vessel.spec.convoy_ref)
+        .await
+        .map_err(|error| format!("read convoy {}: {error}", vessel.spec.convoy_ref))?
+        .object;
+    let requirement = convoy
+        .status
+        .as_ref()
+        .and_then(|status| status.workflow_snapshot.as_ref())
+        .and_then(|snapshot| snapshot.vessels.iter().find(|requirement| requirement.name == vessel.spec.vessel_name))
+        .ok_or_else(|| format!("vessel {} missing from convoy {}'s snapshot", vessel.spec.vessel_name, convoy.metadata.name))?;
+    Ok(launch_env(requirement))
 }
 
 fn environment_with_credentials(
@@ -1857,21 +1860,6 @@ fn vessel_clone_path(workspace_root: &str, vessel: &str) -> String {
 
 fn environment_provider_labels(placement: &Placement) -> BTreeMap<String, String> {
     placement.instance.iter().map(|instance| (ENVIRONMENT_PROVIDER_INSTANCE_LABEL.into(), instance.clone())).collect()
-}
-
-fn owned_child_meta(name: &str, workspace: &ResourceObject<Vessel>, mut extra_labels: BTreeMap<String, String>) -> InputMeta {
-    extra_labels.insert(VESSEL_REF_LABEL.to_string(), workspace.metadata.name.clone());
-    InputMeta::builder()
-        .name(name.to_string())
-        .labels(extra_labels)
-        .annotations(actuator_annotations(workspace))
-        .owner_references(vec![OwnerReference {
-            api_version: format!("{}/{}", Vessel::API_PATHS.group, Vessel::API_PATHS.version),
-            kind: Vessel::API_PATHS.kind.to_string(),
-            name: workspace.metadata.name.clone(),
-            controller: true,
-        }])
-        .build()
 }
 
 fn actuator_annotations(workspace: &ResourceObject<Vessel>) -> BTreeMap<String, String> {
@@ -2562,29 +2550,33 @@ mod tests {
     // Enumerate all old phases, success, both Gone endings and empty/Unicode give-up causes.
     #[tokio::test]
     async fn vessel_reads_environment_dependencies_without_a_status_copy() {
-        use flotilla_provisioning::engine::environment::EnvironmentBinding;
-        use flotilla_provisioning_testkit::{object, Ending, LifecycleFixture};
-        use flotilla_resources::{Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, HostDirectEnvironmentSpec};
-        let env = object::<Environment>(
-            "env",
-            EnvironmentSpec {
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/work".into() }),
-                ..Default::default()
-            },
-            EnvironmentStatus { phase: EnvironmentPhase::Ready, message: Some("stale".into()), ..Default::default() },
-        );
-        let fixture = LifecycleFixture::<EnvironmentBinding>::new(false);
+        use flotilla_provisioning_testkit::{Ending, EnvironmentFixture};
+        use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec};
+        let spec = EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/work".into() }),
+            ..Default::default()
+        };
+        let fixture = EnvironmentFixture::default();
         let reconciler = VesselReconciler::new(ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()), "flotilla")
             .with_lifecycle_reads(fixture.reads.clone());
-        fixture.request(&env);
-        assert!(!reconciler.environment_dependency(&env).expect("requested").ready);
-        fixture.finish(&env, Ending::Ready("/work"));
-        assert!(reconciler.environment_dependency(&env).expect("ready").ready);
-        fixture.finish(&env, Ending::Lost("/work"));
-        let plan = reconciler.environment_dependency(&env).expect("lost").unavailable.expect("unavailable");
-        assert!(matches!(plan.patch, super::PlannedPatch::Lost { message } if message == "environment env observed absent"));
+        let dependency = || reconciler.environment("env").map(|record| super::environment_dependency(&record.expect("held"), &[]));
+        fixture.request("env", &spec, None);
+        assert!(!dependency().expect("requested").ready);
+        fixture.finish("env", Ending::Ready("/work"));
+        assert!(dependency().expect("ready").ready);
+        fixture.finish("env", Ending::Lost("/work"));
+        let plan = dependency().expect("lost").unavailable.expect("unavailable");
+        assert!(
+            matches!(
+                &plan.patch,
+                super::PlannedPatch::Lost { message }
+                    if message == "lost, recoverable: environment env disappeared; rehydration is not available yet (#2872)"
+            ),
+            "{:?}",
+            plan.patch
+        );
         fixture.poison();
-        assert!(reconciler.environment_dependency(&env).err().expect("checked read").to_string().contains("poisoned"));
+        assert!(dependency().err().expect("checked read").to_string().contains("poisoned"));
     }
     // A held lease decides terminality even while old status disagrees; read errors never fall back.
     #[tokio::test]

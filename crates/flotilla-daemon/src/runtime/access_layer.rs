@@ -23,7 +23,7 @@ use flotilla_environment::environment::{vessel_ops, EntryKind, VesselAgent};
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
     account_access::{requester_home, requester_material, AccessName},
-    AccessDelivery, Convoy, Environment, PinUnpack, ResourceError, ResourceObject, Vessel, CONVOY_LABEL,
+    AccessDelivery, Convoy, PinUnpack, ResourceObject, Vessel, CONVOY_LABEL,
 };
 use flotilla_schema::Timestamp;
 use flotilla_vessel_delivery::{
@@ -315,14 +315,11 @@ async fn frozen_crew(state: &ControllerRuntimeState, launch: &AccountLaunch<'_>,
 
 /// What the vessel's Environment declares for its harnesses, such as an explicit home.
 async fn declared_environment(state: &ControllerRuntimeState, launch: &AccountLaunch<'_>) -> Result<BTreeMap<String, String>, String> {
-    match state.daemon.resource_backend().including_replicas::<Environment>(launch.namespace).get(launch.env_ref).await {
-        Ok(environment) => {
-            let spec = environment.object.spec;
-            Ok(spec.docker.map(|docker| docker.env).or(spec.cloud_sandbox.map(|cloud| cloud.env)).unwrap_or_default())
-        }
-        Err(ResourceError::NotFound { .. }) => Ok(BTreeMap::new()),
-        Err(error) => Err(error.to_string()),
-    }
+    Ok(state
+        .environment(launch.env_ref)
+        .await?
+        .and_then(|environment| environment.spec.docker.map(|docker| docker.env).or(environment.spec.cloud_sandbox.map(|cloud| cloud.env)))
+        .unwrap_or_default())
 }
 
 /// The crew's skill tree, fetched on the controlling daemon and pushed into the vessel

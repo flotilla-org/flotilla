@@ -406,7 +406,7 @@ fn lifecycle_step<K: LifecycleKind>(
             if seen {
                 world.absences.put(&observed, true);
             }
-            lifecycle::Vanish { cause: lifecycle::VanishCause::Lost, observed }.into()
+            lifecycle::Vanish { cause: lifecycle::VanishCause::lost(), observed }.into()
         }
         other => panic!("{step}: lifecycle operation {other}"),
     };
@@ -431,7 +431,8 @@ fn lifecycle_end_refuses<K: LifecycleKind>(
     let probes = vec![
         lifecycle::Realise { identity: identity.into(), observed: witness }.into(),
         lifecycle::Release { teardown: Ref::new("witness") }.into(),
-        lifecycle::Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost, observed: Ref::new("witness") }.into(),
+        lifecycle::Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost(), observed: Ref::new("witness") }
+            .into(),
         lifecycle::GiveUp { cause: cause("failure") }.into(),
         lifecycle::Attempted { outcome: Outcome::Succeeded }.into(),
     ];
@@ -560,7 +561,7 @@ fn refuse_without_evidence(
             (realise().into(), &stranger),
             (lifecycle::Release { teardown: Ref::new(ONE) }.into(), &none),
             (
-                lifecycle::Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost, observed: Ref::new(ONE) }
+                lifecycle::Vanish { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost(), observed: Ref::new(ONE) }
                     .into(),
                 &none,
             ),

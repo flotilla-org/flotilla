@@ -290,15 +290,15 @@ fn a_checkout_request_names_its_holder() {
 fn an_empty_label_holds_nothing_and_a_rootless_host_direct_environment_is_refused() {
     use flotilla_resources::{CONVOY_LABEL, VESSEL_REF_LABEL};
 
-    use super::environment::EnvironmentBinding;
+    use super::{environments::request_of, import::import_environment};
     let mut checkout = worktree(None);
     checkout.metadata.labels.insert(CONVOY_LABEL.into(), String::new());
     assert_eq!(CheckoutBinding::request(&checkout, HOME).expect("request").holder, None);
     let mut environment = environment_object(false);
     environment.metadata.labels.insert(VESSEL_REF_LABEL.into(), String::new());
-    assert_eq!(EnvironmentBinding::request(&environment, HOME).expect("request").holder, None);
+    assert_eq!(import_environment(&environment, HOME).expect("request").resource.spec().holder, None);
     environment.spec.host_direct.as_mut().expect("host direct").repo_default_dir = String::new();
-    assert!(EnvironmentBinding::request(&environment, HOME).expect_err("refused").contains("checkout root"));
+    assert!(request_of(&environment.spec, None, HOME).expect_err("refused").contains("checkout root"));
 }
 
 // Behaviour (#3719 look-over ruling 4): a checkout held for no one is still the engine's: the
@@ -327,7 +327,7 @@ fn patches_read_as_lifecycle_steps() {
     let checkout = worktree(Some("c"));
     assert_eq!(
         CheckoutBinding::steps(&checkout, &CheckoutStatusPatch::MarkGone),
-        vec![Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::Lost }]
+        vec![Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost() }]
     );
 }
 
@@ -392,15 +392,15 @@ fn environment_object(docker: bool) -> ResourceObject<flotilla_resources::Enviro
 
 // A cloud sandbox environment is an engine request whose recipe is its spec's fields, the image
 // built when a build is named and pinned otherwise, with nothing derived at launch stored; a pinned
-// image with a blank reference is refused. Once requested it is realised under its backing.
+// image with a blank reference is refused. The spec its readers see reads back from the request.
 // Generates built and pinned images (blank, whitespace and real references), env with and without
 // launch-derived keys, size and lifetime boundaries, and empty and mixed probe needs.
 #[hegel::test]
 fn a_cloud_sandbox_environment_is_requested_from_its_recipe(tc: hegel::TestCase) {
-    use flotilla_resources::{CapabilityNeed, CloudSandboxEnvironmentSpec, CloudSandboxSize, EnvironmentStatusPatch};
+    use flotilla_resources::{CapabilityNeed, CloudSandboxEnvironmentSpec, CloudSandboxSize};
     use hegel::generators as gs;
 
-    use super::{decide, environment::EnvironmentBinding};
+    use super::environments::{request_of, spec_of};
     use crate::stored::environment::CloudSandboxRecipe;
     let pick = |tc: &hegel::TestCase, n: usize| tc.draw(gs::integers::<usize>().min_value(0).max_value(n - 1));
     let built = tc.draw(gs::booleans());
@@ -430,7 +430,7 @@ fn a_cloud_sandbox_environment_is_requested_from_its_recipe(tc: hegel::TestCase)
         lifetime_cap_seconds,
         env,
     });
-    let request = EnvironmentBinding::request(&obj, HOME);
+    let request = request_of(&obj.spec, None, HOME);
     if !built && reference.trim().is_empty() {
         assert!(request.is_err(), "a pinned image names its reference: {request:?}");
         return;
@@ -442,54 +442,37 @@ fn a_cloud_sandbox_environment_is_requested_from_its_recipe(tc: hegel::TestCase)
     );
     let expected = CloudSandboxRecipe {
         image: if built { DockerImage::Built } else { DockerImage::Pinned { reference: reference.into() } },
-        size,
+        size: size.clone(),
         lifetime_cap_seconds,
         env: [("A".to_owned(), "1".to_owned())].into(),
-        probe_needs,
+        probe_needs: probe_needs.clone(),
     };
     assert_eq!(request.recipe.value().read::<CloudSandboxRecipe>().expect("the cloud sandbox recipe"), expected);
-
-    let home = lifecycles::<EnvironmentBinding>();
-    let ready = EnvironmentStatusPatch::MarkCloudReady {
-        backing_id: "sandbox-1".into(),
-        image_ref: "registry/flotilla@sha256:00".into(),
-        provider_descriptor: Box::new(flotilla_resources::EnvironmentProviderDescriptor {
-            instance: "dummy-cloud".into(),
-            kind: flotilla_protocol::provider::ProviderKind::new(flotilla_protocol::provider::EnvironmentClass::CloudSandbox, "dummy"),
-            image_digest: "sha256:00".into(),
-            host_version: "1".into(),
-            module_version: "1".into(),
-            capabilities: Default::default(),
-            agent_connection: None,
-        }),
-    };
-    let decision = decide::<EnvironmentBinding>(home.as_ref(), &obj, Some(ready.clone()), Utc::now());
-    assert_eq!(decision.patch, Some(ready));
-    assert_eq!(home.get("env-a").expect("held").state(), &LifecycleState::Realised { identity: "sandbox-1".into() });
+    let spec = spec_of(&request).expect("its spec");
+    assert_eq!(spec.provider_address, obj.spec.provider_address);
+    assert_eq!(
+        spec.cloud_sandbox,
+        Some(CloudSandboxEnvironmentSpec {
+            probe_needs,
+            // A built image's digest is its build's, read at launch.
+            image: if built { String::new() } else { reference.into() },
+            image_build_ref: built.then(|| "image-00-amd64".into()),
+            size,
+            lifetime_cap_seconds,
+            env: [("A".to_owned(), "1".to_owned())].into(),
+        })
+    );
 }
 
-// Behaviour: an environment is realised under its container, or the host-direct root; its recipe is
-// its provider's typed recipe (one image choice, nothing derived at launch, #3719 rulings 5-6), and
-// its request names its image build at this home.
+// Behaviour: an environment's recipe is its provider's typed recipe (one image choice, nothing
+// derived at launch, #3719 rulings 5-6), its request names its image build at this home, and it is
+// held for its vessel. (The identity it is realised under is the controller's: see
+// `tests/environment_controller.rs`.)
 #[test]
-fn an_environment_is_realised_under_its_container_or_root() {
-    use super::environment::EnvironmentBinding;
-    use flotilla_resources::EnvironmentStatusPatch;
-    let ready = |container: Option<&str>| EnvironmentStatusPatch::MarkReady {
-        configured_limits: None,
-        docker_container_id: container.map(str::to_owned),
-        image_ref: None,
-        local_image_id: None,
-        registry_digest: None,
-    };
-    assert_eq!(
-        EnvironmentBinding::steps(&environment_object(true), &ready(Some("c0ffee"))),
-        vec![Step::Realised { identity: "c0ffee".into() }]
-    );
-    assert_eq!(EnvironmentBinding::steps(&environment_object(false), &ready(None)), vec![Step::Realised { identity: "/work".into() }]);
-    let mut held = environment_object(true);
-    held.metadata.labels.insert(flotilla_resources::VESSEL_REF_LABEL.into(), "convoy-a-implement".into());
-    let request = EnvironmentBinding::request(&held, HOME).expect("request");
+fn an_environment_request_is_its_provider_s_recipe() {
+    use super::environments::request_of;
+    let held = environment_object(true);
+    let request = request_of(&held.spec, Some("convoy-a-implement"), HOME).expect("request");
     assert_eq!(request.holder, Some(Holder::vessel("convoy-a-implement")), "held for its vessel");
     assert_eq!(request.image_build.map(|build| (build.name, build.home)), Some(("image-00-amd64".into(), HOME.into())));
     // The Docker provider's recipe, read back by the provider: built, so the build is the column
@@ -499,60 +482,12 @@ fn an_environment_is_realised_under_its_container_or_root() {
     assert_eq!(recipe.env.keys().collect::<Vec<_>>(), ["A"], "the credential grant and the skills are not stored");
     let mut pinned = environment_object(true);
     pinned.spec.docker.as_mut().expect("docker").image_build_ref = None;
-    let request = EnvironmentBinding::request(&pinned, HOME).expect("request");
+    let request = request_of(&pinned.spec, None, HOME).expect("request");
     assert_eq!(request.image_build, None);
     assert_eq!(
         request.recipe.value().read::<DockerRecipe>().expect("recipe").image,
         DockerImage::Pinned { reference: "registry/flotilla@sha256:00".into() }
     );
-}
-
-// Failure before readiness gives up; failure after readiness vanishes. Every old phase is
-// deliberately stale: the engine alone determines the ending and never supplies a status copy.
-#[tokio::test]
-async fn environment_failure_uses_engine_readiness_without_a_copy() {
-    use super::{decide, environment::EnvironmentBinding};
-    use flotilla_resources::{EnvironmentPhase, EnvironmentStatus, EnvironmentStatusPatch};
-    use flotilla_schema::Timestamp;
-    for old_phase in [
-        EnvironmentPhase::Pending,
-        EnvironmentPhase::Provisioning,
-        EnvironmentPhase::Ready,
-        EnvironmentPhase::Failed,
-        EnvironmentPhase::Lost,
-    ] {
-        for realised in [false, true] {
-            for cause in ["", "container exited", "失敗"] {
-                let home = lifecycles::<EnvironmentBinding>();
-                let mut obj = environment_object(true);
-                home.request("env-a", EnvironmentBinding::request(&obj, HOME).expect("request"), Timestamp(1)).expect("held");
-                if realised {
-                    home.step("env-a", &Step::Realised { identity: "container".into() }, Timestamp(2)).expect("ready");
-                }
-                obj.status = Some(EnvironmentStatus { phase: old_phase, message: Some("stale".into()), ..Default::default() });
-                let old_status = obj.status.clone();
-                let failed = EnvironmentStatusPatch::MarkFailed { message: cause.into() };
-                let decision = decide::<EnvironmentBinding>(home.as_ref(), &obj, Some(failed.clone()), Utc::now());
-                assert!(decision.ended);
-                assert_eq!(decision.patch, Some(failed));
-                let held = home.get("env-a").expect("held");
-                if realised {
-                    assert_eq!(
-                        held.state(),
-                        &LifecycleState::Gone {
-                            ending: flotilla_state_machines::machines::lifecycle::Ending::Failed { reason: cause.into() }
-                        }
-                    );
-                } else {
-                    assert!(matches!(held.state(), LifecycleState::GaveUp { cause: actual } if actual.detail == cause));
-                }
-                assert_eq!(obj.status, old_status);
-                let repeated = decide::<EnvironmentBinding>(home.as_ref(), &obj, None, Utc::now());
-                assert!(repeated.ended);
-                assert_eq!(repeated.patch, None);
-            }
-        }
-    }
 }
 
 // Behaviour: an image build's infrastructure failures are retried until ImageBuild's policy
@@ -797,9 +732,8 @@ fn every_old_phase_imports_and_rehearses() {
     };
 
     use super::{
-        environment::EnvironmentBinding,
         image_build::ImageBuildBinding,
-        import::{import, label, rehearse, ImportReport},
+        import::{import, import_environment, label, rehearse, ImportReport},
         terminal_session::TerminalSessionBinding,
     };
     let mut report = ImportReport::default();
@@ -846,7 +780,7 @@ fn every_old_phase_imports_and_rehearses() {
     ] {
         let mut obj = environment_object(true);
         obj.status = Some(EnvironmentStatus { phase, docker_container_id: Some("c0ffee".into()), ..Default::default() });
-        let imported = import::<EnvironmentBinding>(&obj, HOME).expect("imports");
+        let imported = import_environment(&obj, HOME).expect("imports");
         if phase == EnvironmentPhase::Lost {
             assert_eq!(
                 imported.resource.state(),
@@ -936,10 +870,7 @@ fn every_old_phase_imports_and_rehearses() {
 fn the_rehearsal_lists_records_with_no_mapping() {
     use flotilla_resources::{EnvironmentPhase, EnvironmentStatus, ObservedCheckoutSpec};
 
-    use super::{
-        environment::EnvironmentBinding,
-        import::{import, ImportReport},
-    };
+    use super::import::{import, import_environment, ImportReport};
     let mut report = ImportReport::default();
     let mut observed = worktree(Some("convoy-a"));
     observed.metadata.name = "observed-a".into();
@@ -955,7 +886,7 @@ fn the_rehearsal_lists_records_with_no_mapping() {
     report.record(&import::<CheckoutBinding>(&observed, HOME));
     let mut nameless = environment_object(true);
     nameless.status = Some(EnvironmentStatus { phase: EnvironmentPhase::Ready, ..Default::default() });
-    report.record(&import::<EnvironmentBinding>(&nameless, HOME));
+    report.record(&import_environment(&nameless, HOME));
     let listed: Vec<(&str, &str)> = report.refused.iter().map(|refusal| (refusal.kind, refusal.record.as_str())).collect();
     assert_eq!(listed, [("Checkout", "observed-a"), ("Environment", "env-a")]);
     assert!(report.refused[0].reason.contains("observed checkout"));
@@ -1012,7 +943,7 @@ fn the_import_maps_live_cloud_sandboxes_and_drops_deleted_gone_ones() {
                 assert_eq!(report.imported.get(&("Environment", label)), Some(&1), "{phase:?}");
             }
             if phase == EnvironmentPhase::Ready {
-                let imported = super::import::import::<super::environment::EnvironmentBinding>(&obj, HOME).expect("imports");
+                let imported = super::import::import_environment(&obj, HOME).expect("imports");
                 assert_eq!(imported.resource.state(), &LifecycleState::Realised { identity: "sandbox-1".into() });
             }
         }

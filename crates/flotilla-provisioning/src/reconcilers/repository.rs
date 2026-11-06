@@ -3,7 +3,8 @@ use std::{marker::PhantomData, sync::Arc};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
-    resolve_default_branch, Checkout, CheckoutSpec, Clone, DefaultBranchObservation, DefaultBranchProvenance, Environment, ForgeIdentity,
+    lifecycle_reads::{LifecycleReads, NoLifecycleReads},
+    resolve_default_branch, Checkout, CheckoutSpec, Clone, DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity,
     LifecycleAuthority, Repository, RepositoryCheckoutRef, RepositoryKey, RepositoryStatus, RepositoryStatusPatch, ResourceError,
     ResourceObject, REPO_KEY_LABEL,
 };
@@ -17,11 +18,11 @@ pub trait ForgeDefaultBranchResolver: Send + Sync {
     async fn default_branch(&self, forge: &ForgeIdentity) -> Result<Option<String>, String>;
 }
 
-#[derive(bon::Builder)]
 pub struct RepositoryReconciler {
     checkout_sources: Vec<TypedResolver<Checkout>>,
     clones: TypedResolver<Clone>,
-    environments: TypedResolver<Environment>,
+    /// The engine's environments, through its readings: a checkout's host is its environment's.
+    lifecycle_reads: Arc<dyn LifecycleReads>,
     forge_default_branch_resolver: Option<Arc<dyn ForgeDefaultBranchResolver>>,
 }
 
@@ -29,10 +30,15 @@ impl RepositoryReconciler {
     pub fn new(durable: ResourceBackend, observed: ResourceBackend, namespace: &str) -> Self {
         Self {
             checkout_sources: vec![durable.clone().using::<Checkout>(namespace), observed.using::<Checkout>(namespace)],
-            clones: durable.clone().using::<Clone>(namespace),
-            environments: durable.using::<Environment>(namespace),
+            clones: durable.using::<Clone>(namespace),
+            lifecycle_reads: Arc::new(NoLifecycleReads),
             forge_default_branch_resolver: None,
         }
+    }
+
+    pub fn with_lifecycle_reads(mut self, reads: Arc<dyn LifecycleReads>) -> Self {
+        self.lifecycle_reads = reads;
+        self
     }
 
     pub fn with_forge_default_branch_resolver(mut self, resolver: Arc<dyn ForgeDefaultBranchResolver>) -> Self {
@@ -62,9 +68,10 @@ impl RepositoryReconciler {
 
     async fn environment_host(&self, environment_ref: &str) -> Result<String, String> {
         let environment = self
-            .environments
-            .get(environment_ref)
-            .await
+            .lifecycle_reads
+            .environments()
+            .and_then(|environments| environments.find(environment_ref))
+            .and_then(|environment| environment.ok_or_else(|| "not found".to_owned()))
             .map_err(|error| format!("cannot resolve host for environment {environment_ref}: {error}"))?;
         environment
             .spec

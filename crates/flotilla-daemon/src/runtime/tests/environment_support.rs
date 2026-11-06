@@ -772,6 +772,69 @@ pub(super) fn passthrough_registry_with_environment(handle: EnvironmentHandle) -
     Arc::new(registry)
 }
 
+/// The fixtures serving test daemons' environments, by daemon.
+static ENGINE_ENVIRONMENTS: std::sync::LazyLock<StdMutex<HashMap<usize, Arc<EnvironmentFixture>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn daemon_key(daemon: &InProcessDaemon) -> usize {
+    daemon as *const InProcessDaemon as usize
+}
+
+/// The engine's environments a test daemon reads (#3108), on its decided store: installed as its
+/// lifecycle reads on first use, and the same fixture after. Records are written as the
+/// Environment controller would write them; a daemon whose controller runs opens its lifecycles
+/// with [`engine_provisioning`] instead.
+pub(super) fn engine_environments(daemon: &InProcessDaemon) -> Arc<EnvironmentFixture> {
+    let mut fixtures = ENGINE_ENVIRONMENTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if daemon.lifecycle_reads().environments().is_ok() {
+        return Arc::clone(fixtures.get(&daemon_key(daemon)).expect("the daemon's environments were installed by these helpers"));
+    }
+    let store = daemon.decided_store().expect("decided store").store();
+    let home = flotilla_engine_store::StoreLog::new(Arc::clone(&store)).home().to_owned();
+    let fixture = Arc::new(EnvironmentFixture::over(&home, store));
+    daemon.install_lifecycle_reads(Arc::clone(&fixture.reads)).expect("install the engine's environments");
+    fixtures.insert(daemon_key(daemon), Arc::clone(&fixture));
+    fixture
+}
+
+/// Startup seeding as the runtime runs it, over the provisioning lifecycles [`engine_provisioning`]
+/// opens for `daemon`'s controllers.
+pub(super) async fn engine_startup(
+    daemon: &Arc<InProcessDaemon>,
+    namespace: &str,
+    profile: &LocalProvisioningProfile,
+) -> Result<flotilla_provisioning::engine::ProvisioningLifecycles, String> {
+    let provisioning = engine_provisioning(daemon).await;
+    register_startup_resources(daemon, namespace, profile, &provisioning.clones).await?;
+    Ok(provisioning)
+}
+
+/// The provisioning lifecycles a test daemon's controllers run on, opened as the runtime opens
+/// them: the Environment controller among its controller loops realises its environments.
+pub(super) async fn engine_provisioning(daemon: &Arc<InProcessDaemon>) -> flotilla_provisioning::engine::ProvisioningLifecycles {
+    let (lifecycles, _environment_changes) =
+        super::super::open_provisioning_lifecycles(daemon).await.expect("open the provisioning lifecycles");
+    lifecycles
+}
+
+/// A Docker environment's request on `host_ref`, declaring `declared_agent_adapters`.
+pub(super) fn docker_environment_spec(host_ref: &str, declared_agent_adapters: BTreeSet<String>) -> EnvironmentSpec {
+    EnvironmentSpec {
+        docker: Some(flotilla_resources::DockerEnvironmentSpec {
+            image_build_ref: None,
+            host_ref: host_ref.to_owned(),
+            image: "contained-image".to_string(),
+            declared_agent_adapters,
+            required_agent_adapters: BTreeSet::new(),
+            pull_policy: Default::default(),
+            mounts: Vec::new(),
+            env: BTreeMap::new(),
+        }),
+        ..Default::default()
+    }
+}
+
+/// A Docker environment on the daemon's host, realised under `container_id`.
 pub(super) async fn create_ready_docker_environment(
     daemon: &InProcessDaemon,
     name: &str,
@@ -779,41 +842,28 @@ pub(super) async fn create_ready_docker_environment(
     declared_agent_adapters: BTreeSet<String>,
 ) {
     let host_ref = daemon.local_host_id().expect("local host identity").to_string();
-    let environments = daemon.resource_backend().using::<Environment>(NAMESPACE);
-    environments
-        .create(
-            &empty_meta(name),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: None,
-                docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                    image_build_ref: None,
-                    host_ref,
-                    image: "contained-image".to_string(),
-                    declared_agent_adapters,
-                    required_agent_adapters: BTreeSet::new(),
-                    pull_policy: Default::default(),
-                    mounts: Vec::new(),
-                    env: BTreeMap::new(),
-                }),
-            },
-        )
-        .await
-        .expect("create environment record");
-    flotilla_store::apply_status_patch(
-        &environments,
+    engine_environments(daemon).put_ready(
         name,
-        &EnvironmentStatusPatch::MarkReady {
-            configured_limits: None,
-            docker_container_id: Some(container_id.to_string()),
+        &docker_environment_spec(&host_ref, declared_agent_adapters),
+        None,
+        container_id,
+        flotilla_resources::environment_records::LaunchFacts {
             image_ref: Some("contained-image".to_string()),
             local_image_id: Some("sha256:test-interior".to_string()),
-            registry_digest: None,
+            ..Default::default()
         },
-    )
-    .await
-    .expect("mark environment ready");
+    );
+}
+
+/// What the probes told the Environment controller, in order, since the last call.
+pub(super) fn observed_backings(state: &ControllerRuntimeState) -> Vec<flotilla_provisioning::engine::controller::BackingEvent> {
+    let mut events = state.environment_backing_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let receiver = events.as_mut().expect("the Environment controller has not taken the backing events");
+    let mut observed = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        observed.push(event);
+    }
+    observed
 }
 
 pub(super) fn adoption_registry(handles: Vec<EnvironmentHandle>) -> Arc<ProviderRegistry> {

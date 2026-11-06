@@ -89,17 +89,20 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
     let profile = LocalProvisioningProfile { repo_default_dir: repo_default_dir.display().to_string(), ..manual_profile(&host_id, false) };
     let backend = daemon.resource_backend();
 
-    register_startup(&daemon, NAMESPACE, &profile).await.expect("startup registration should succeed");
+    let provisioning = engine_startup(&daemon, NAMESPACE, &profile).await.expect("startup registration should succeed");
     apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("host heartbeat should succeed");
 
-    let state = Arc::new(ControllerRuntimeState::new(
-        Arc::clone(&daemon),
-        Arc::clone(&config),
-        passthrough_registry(),
-        None,
-        profile.host_id.clone(),
-        profile.host_direct_environment_name(),
-    ));
+    let state = Arc::new(
+        ControllerRuntimeState::new(
+            Arc::clone(&daemon),
+            Arc::clone(&config),
+            passthrough_registry(),
+            None,
+            profile.host_id.clone(),
+            profile.host_direct_environment_name(),
+        )
+        .with_provisioning_lifecycles(Some(provisioning)),
+    );
     let controller_handles = spawn_controller_loops(
         Arc::clone(&state),
         NAMESPACE,
@@ -107,6 +110,20 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
         ControllerSupervision::default(),
         RuntimeHealth::default(),
     );
+    // Startup realises the host's environment before work arrives. Nothing holds a host-direct
+    // environment, so its realisation wakes no vessel: one placed before it waits for the resync.
+    let host_environment = profile.host_direct_environment_name();
+    let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !daemon
+        .lifecycle_reads()
+        .environments()
+        .and_then(|environments| environments.find(&host_environment))
+        .expect("host environment")
+        .is_some_and(|environment| environment.is_ready())
+    {
+        assert!(tokio::time::Instant::now() < ready_deadline, "the host environment {host_environment} was never realised");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
     backend
         .clone()

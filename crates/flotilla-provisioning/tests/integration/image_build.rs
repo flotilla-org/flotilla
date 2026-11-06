@@ -2,29 +2,25 @@
 //! and the host's materials are in-process stand-ins; the store, the
 //! reconcilers and admission's get-or-create are real.
 use std::{
-    collections::BTreeSet,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     time::Duration,
 };
 
-use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_environment::environment::image::FailedImageBuild;
-use flotilla_environment::environment::EnvironmentProvisionError;
 use flotilla_protocol::LifecycleReading;
 use flotilla_provisioning::reconcilers::{
     image_build::{attribute_recipe_failure, image_build_retry_backoff},
-    EnvironmentProvisioning, EnvironmentReconciler, EnvironmentRuntime, ImageBuildMaterials, ImageBuildReconciler, LocalProvisioning,
+    ImageBuildMaterials, ImageBuildReconciler,
 };
 use flotilla_resources::lifecycle_reads::{LifecycleReads, ProvisioningKind};
 use flotilla_resources::{
-    image_identity, DockerEnvironmentSpec, DockerImagePullPolicy, Environment, EnvironmentPhase, EnvironmentSpec, FleetDesignation,
-    FleetDesignationSpec, ImageBuild, ImageBuildCapacity, ImageBuildFailure, ImageBuildFailureClass, ImageBuildPhase,
-    ImageBuildReservation, ImageBuildResourceSpec, ImageBuildSpec, ImageCacheBinding, ImageDelivery, ImageLayerSource, ImageLayerSpec,
-    ImageLayerTier, ImageProbeOutcome, InputMeta, ResolvedImage, FLEET_DESIGNATION_NAME, IMAGE_BUILD_MAX_ATTEMPTS,
+    image_identity, FleetDesignation, FleetDesignationSpec, ImageBuild, ImageBuildCapacity, ImageBuildFailure, ImageBuildFailureClass,
+    ImageBuildPhase, ImageBuildReservation, ImageBuildResourceSpec, ImageBuildSpec, ImageCacheBinding, ImageDelivery, ImageLayerSource,
+    ImageLayerSpec, ImageLayerTier, ImageProbeOutcome, InputMeta, ResolvedImage, FLEET_DESIGNATION_NAME, IMAGE_BUILD_MAX_ATTEMPTS,
 };
 use flotilla_store::{apply_status_patch, controller::Reconciler, ResourceBackend};
 use flotilla_store_testkit::VirtualClock;
@@ -489,100 +485,6 @@ async fn retired_records_are_deleted() {
     assert_eq!(service.calls.load(Ordering::SeqCst), 0);
 }
 
-/// Docker runtime stand-in: records what the provider was asked to run.
-#[derive(Default)]
-struct Docker {
-    provisioned: Mutex<Vec<(String, DockerImagePullPolicy)>>,
-}
-#[async_trait]
-impl EnvironmentRuntime for Docker {
-    async fn provision_environment(
-        &self,
-        _name: &str,
-        spec: &flotilla_resources::EnvironmentSpec,
-    ) -> Result<flotilla_provisioning::reconcilers::EnvironmentProvisioning, EnvironmentProvisionError> {
-        let spec = spec.docker.as_ref().expect("Docker scenario input");
-
-        self.provisioned.lock().expect("provisioned").push((spec.image.clone(), spec.pull_policy));
-        Ok(EnvironmentProvisioning::Local(LocalProvisioning {
-            configured_limits: None,
-            backing_id: Some("container".into()),
-            image_ref: Some(spec.image.clone()),
-            local_image_id: Some(digest('d')),
-            registry_digest: spec.image.split_once('@').map(|(_, digest)| digest.to_string()),
-        }))
-    }
-    async fn destroy(&self, _: &str, _: &str) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-// End to end: a composed Environment waits while its build runs, then
-// becomes Ready on the built digest: `repository@digest` pulled with the
-// authored policy for registry delivery, the local image ID with pull policy
-// Never for single-host local mode.
-#[rstest::rstest]
-#[case::registry(ImageDelivery::Registry { repository: REPOSITORY.into() })]
-#[case::local(ImageDelivery::Local)]
-#[tokio::test]
-async fn environment_becomes_ready_with_the_built_digest(#[case] delivery: ImageDelivery) {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    host(&backend, "amd64", builder(1)).await;
-    let spec = build_spec(layers(0, &[]), "amd64", delivery.clone(), 2);
-    let name = create(&backend, &spec).await;
-    let environments = backend.using::<Environment>(NS);
-    environments
-        .create(
-            &InputMeta::builder().name("env".into()).build(),
-            &EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: None,
-                docker: Some(DockerEnvironmentSpec {
-                    image_build_ref: Some(name.clone()),
-                    host_ref: HOST.into(),
-                    image: String::new(),
-                    declared_agent_adapters: BTreeSet::new(),
-                    required_agent_adapters: BTreeSet::new(),
-                    pull_policy: DockerImagePullPolicy::IfNotPresent,
-                    mounts: Vec::new(),
-                    env: Default::default(),
-                }),
-            },
-        )
-        .await
-        .expect("environment");
-    let docker = Arc::new(Docker::default());
-    let environment = EnvironmentReconciler::new(Arc::clone(&docker), backend.clone(), NS);
-    let step_environment = || async {
-        let env = environments.get("env").await.expect("environment");
-        let prepared = environment.prepare(&env).await.expect("prepare");
-        if let Some(patch) = environment.reconcile(&env, &prepared, Utc::now()).patch {
-            apply_status_patch(&environments, "env", &patch).await.expect("environment patch");
-        }
-        environments.get("env").await.expect("environment").status.expect("status")
-    };
-    let waiting = step_environment().await;
-    assert_eq!(waiting.phase, EnvironmentPhase::Provisioning);
-    assert!(docker.provisioned.lock().expect("provisioned").is_empty(), "no image before the build");
-
-    let service = BuildService::new(Behaviour::Succeed);
-    service.expect(&spec);
-    let materials = Arc::new(Materials::default());
-    let clock = Arc::new(VirtualClock::new(Utc::now()));
-    let reconciler = reconciler(&backend, &service, &materials, &clock);
-    settle(&backend, &reconciler, &clock, &name).await;
-    let built = status(&backend, &name).await.digest.expect("built digest");
-    let ready = step_environment().await;
-    assert_eq!(ready.phase, EnvironmentPhase::Ready);
-    let expected = match delivery {
-        ImageDelivery::Registry { .. } => (format!("{REPOSITORY}@{}", digest('d')), DockerImagePullPolicy::IfNotPresent),
-        ImageDelivery::Local => (digest('d'), DockerImagePullPolicy::Never),
-    };
-    assert_eq!(built, expected.0);
-    assert_eq!(*docker.provisioned.lock().expect("provisioned"), vec![expected]);
-}
-
 // Shared property helper: engine phase, tally and deadlines win over stale build evidence without a copy.
 pub(super) async fn assert_image_lifecycle(old_phase: ImageBuildPhase, ending: flotilla_provisioning_testkit::Ending<'_>) {
     use flotilla_provisioning::{engine::image_build::ImageBuildBinding, reconcilers::image_build::ImageBuildAction};
@@ -655,54 +557,6 @@ pub(super) async fn assert_image_lifecycle(old_phase: ImageBuildPhase, ending: f
         .await
         .expect_err("authority read errors cannot select legacy validation, even for an unchanged status");
     assert!(error.to_string().contains("poisoned"));
-}
-
-// Environment provisioning uses the selected engine digest and refuses stale Built evidence after loss.
-#[tokio::test]
-async fn environment_image_dependency_follows_engine_without_a_copy() {
-    use flotilla_provisioning::engine::image_build::ImageBuildBinding;
-    use flotilla_provisioning::reconcilers::environment::EnvironmentPrepared;
-    use flotilla_provisioning_testkit::{image_build, store_object, Ending, LifecycleFixture};
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    host(&backend, "amd64", None).await;
-    let mut build = image_build(ImageBuildPhase::Built);
-    build.metadata.namespace = NS.into();
-    store_object(&backend, build.clone()).await;
-    let env = backend
-        .using::<Environment>(NS)
-        .create(
-            &InputMeta::builder().name("env".into()).build(),
-            &EnvironmentSpec {
-                provider_address: None,
-                host_direct: None,
-                cloud_sandbox: None,
-                docker: Some(DockerEnvironmentSpec {
-                    host_ref: HOST.into(),
-                    image: String::new(),
-                    image_build_ref: Some(build.metadata.name.clone()),
-                    declared_agent_adapters: Default::default(),
-                    required_agent_adapters: Default::default(),
-                    pull_policy: Default::default(),
-                    mounts: vec![],
-                    env: Default::default(),
-                }),
-            },
-        )
-        .await
-        .expect("environment");
-    let fixture = LifecycleFixture::<ImageBuildBinding>::new(false);
-    fixture.request(&build);
-    let docker = Arc::new(Docker::default());
-    let reconciler = EnvironmentReconciler::new(docker.clone(), backend, NS).with_lifecycle_reads(fixture.reads.clone());
-    assert!(matches!(reconciler.prepare(&env).await.expect("requested"), EnvironmentPrepared::Waiting(_)));
-    fixture.finish(&build, Ending::Ready("engine digest"));
-    reconciler.prepare(&env).await.expect("ready");
-    assert_eq!(*docker.provisioned.lock().expect("calls"), vec![("engine digest".into(), DockerImagePullPolicy::Never)]);
-    fixture.finish(&build, Ending::Lost("engine digest"));
-    assert!(matches!(reconciler.prepare(&env).await.expect("lost"), EnvironmentPrepared::Waiting(_)));
-    assert_eq!(docker.provisioned.lock().expect("calls").len(), 1);
-    fixture.poison();
-    assert!(reconciler.prepare(&env).await.is_err());
 }
 
 // Pin the reachable Queued → infrastructure failure → engine-permitted retry path independently of stale terminal examples.

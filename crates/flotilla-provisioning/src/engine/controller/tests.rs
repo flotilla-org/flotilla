@@ -99,7 +99,7 @@ impl Actuator<EnvironmentKind> for Scripted {
     async fn observe(&self, _: &str, request: &EnvironmentRequest) -> Result<Backing, Cause> {
         Ok(match self.script().present.get(&key(request)) {
             Some(identity) => Backing::Present { identity: identity.clone() },
-            None => Backing::Absent,
+            None => Backing::Absent { reason: None },
         })
     }
 
@@ -379,7 +379,13 @@ async fn a_pushed_absence_loses_the_resource() {
     world.start();
     world.request("a");
     world.until("a realised", |world| world.state("a").realised()).await;
-    world.backing.as_ref().expect("started").send(BackingEvent { name: "a".into(), observed: Backing::Absent }).await.expect("send");
+    world
+        .backing
+        .as_ref()
+        .expect("started")
+        .send(BackingEvent { name: "a".into(), observed: Backing::Absent { reason: None } })
+        .await
+        .expect("send");
     world.until("a lost", |world| world.state("a").gone()).await;
 }
 

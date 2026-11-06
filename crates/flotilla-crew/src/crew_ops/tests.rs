@@ -256,24 +256,13 @@ async fn legacy_adoption_reads_only_live_convoys() {
 // Unheld resources preserve the legacy refusal; requested, retrying and realised resources may resume.
 #[tokio::test]
 async fn resume_reads_environment_lifecycle_without_a_copy() {
-    use flotilla_provisioning::engine::environment::EnvironmentBinding;
-    use flotilla_provisioning_testkit::{object, store_object, Ending, LifecycleFixture};
-    use flotilla_resources::{
-        Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, HostDirectEnvironmentSpec, Vessel, VesselSpec, VesselStatus,
-    };
+    use flotilla_provisioning_testkit::{object, store_object, Ending, EnvironmentFixture};
+    use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec, Vessel, VesselSpec, VesselStatus};
     let (mut crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
-    let env = store_object(
-        &backend,
-        object::<Environment>(
-            "env",
-            EnvironmentSpec {
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/work".into() }),
-                ..Default::default()
-            },
-            EnvironmentStatus { phase: EnvironmentPhase::Ready, message: Some("stale".into()), ..Default::default() },
-        ),
-    )
-    .await;
+    let env = EnvironmentSpec {
+        host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/work".into() }),
+        ..Default::default()
+    };
     store_object(
         &backend,
         object::<Vessel>(
@@ -288,13 +277,13 @@ async fn resume_reads_environment_lifecycle_without_a_copy() {
         ),
     )
     .await;
-    let lifecycle = LifecycleFixture::<EnvironmentBinding>::new(false);
+    let lifecycle = EnvironmentFixture::default();
     Arc::get_mut(&mut crew).expect("unique service").lifecycle_reads = lifecycle.reads.clone();
-    lifecycle.request(&env);
+    lifecycle.request("env", &env, None);
     crew.ensure_vessel_backing_available("flotilla", "crew", "work").await.expect("requested may resume");
-    lifecycle.finish(&env, Ending::Ready("/work"));
+    lifecycle.finish("env", Ending::Ready("/work"));
     crew.ensure_vessel_backing_available("flotilla", "crew", "work").await.expect("ready may resume");
-    lifecycle.finish(&env, Ending::Lost("/work"));
+    lifecycle.finish("env", Ending::Lost("/work"));
     let error = crew.ensure_vessel_backing_available("flotilla", "crew", "work").await.expect_err("lost cannot resume");
     assert!(error.contains("lost, recoverable") && !error.contains("stale"));
     lifecycle.poison();

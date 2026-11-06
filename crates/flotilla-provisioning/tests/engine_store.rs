@@ -76,16 +76,17 @@ fn engine_writes_survive_a_reopened_home() {
 }
 
 // Behaviour (#3729 review): a restart keeps every provisioning kind's engine state. Each kind is
-// requested and realised through `decide` over the store, and a home reopened over the store
-// holds it realised under the same identity.
+// requested and realised through `decide` over the store (an Environment through its port, as
+// its controller realises it), and a home reopened over the store holds it realised under the
+// same identity.
 #[test]
 fn every_kind_survives_a_reopened_home() {
-    use flotilla_provisioning::engine::{
-        checkout::CheckoutBinding, environment::EnvironmentBinding, image_build::ImageBuildBinding, Binding, Lifecycles,
-    };
+    use flotilla_provisioning::engine::{checkout::CheckoutBinding, image_build::ImageBuildBinding, Binding, Lifecycles};
+    use flotilla_provisioning_testkit::EnvironmentFixture;
     use flotilla_resources::{
-        CheckoutSpec, CheckoutStatusPatch, CheckoutWorktreeSpec, EnvironmentSpec, EnvironmentStatusPatch, HostDirectEnvironmentSpec,
-        ImageBuildReservation, ImageBuildResourceSpec, ImageBuildSpec, ImageBuildStatusPatch, ImageDelivery, CONVOY_LABEL,
+        environment_records::LaunchFacts, CheckoutSpec, CheckoutStatusPatch, CheckoutWorktreeSpec, EnvironmentSpec,
+        HostDirectEnvironmentSpec, ImageBuildReservation, ImageBuildResourceSpec, ImageBuildSpec, ImageBuildStatusPatch, ImageDelivery,
+        CONVOY_LABEL,
     };
     fn reopened<B: Binding>(
         store: &Arc<Mutex<Store>>,
@@ -110,24 +111,17 @@ fn every_kind_survives_a_reopened_home() {
     let meta = |name: &str| {
         ResourceObject::<OldClone> { metadata: ObjectMeta { name: name.into(), ..clone_object().metadata }, ..clone_object() }.metadata
     };
-    let environment = ResourceObject::<flotilla_resources::Environment> {
-        metadata: meta("env-a"),
-        spec: EnvironmentSpec {
-            provider_address: Some("host:feta/provider:host-direct".parse().expect("provider")),
-            host_direct: Some(HostDirectEnvironmentSpec { host_ref: String::new(), repo_default_dir: "/work".into() }),
-            docker: None,
-            cloud_sandbox: None,
-        },
-        status: None,
+    let environment = EnvironmentSpec {
+        provider_address: Some("host:feta/provider:host-direct".parse().expect("provider")),
+        host_direct: Some(HostDirectEnvironmentSpec { host_ref: String::new(), repo_default_dir: "/work".into() }),
+        docker: None,
+        cloud_sandbox: None,
     };
-    let ready = EnvironmentStatusPatch::MarkReady {
-        configured_limits: None,
-        docker_container_id: None,
-        image_ref: None,
-        local_image_id: None,
-        registry_digest: None,
-    };
-    reopened::<EnvironmentBinding>(&store, environment, ready, "/work");
+    let environments = EnvironmentFixture::over(HOME, Arc::clone(&store));
+    environments.put_ready("env-a", &environment, None, "/work", LaunchFacts::default());
+    let restored = EnvironmentFixture::over(HOME, Arc::clone(&store)).lifecycles.get("env-a").expect("restored");
+    assert_eq!(restored.state(), &LifecycleState::Realised { identity: "/work".into() });
+    assert_eq!(restored.spec(), environments.lifecycles.get("env-a").expect("held").spec());
     let build = ResourceObject::<flotilla_resources::ImageBuild> {
         metadata: meta("image-a"),
         spec: ImageBuildResourceSpec::Current(Box::new(ImageBuildSpec {

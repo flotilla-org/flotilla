@@ -18,7 +18,7 @@ use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
 use flotilla_protocol::HostName;
 use flotilla_resources::{
-    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CredentialExpiry, CrewWorkPhase, CrewWorkState, Environment as ResourceEnvironment,
+    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CredentialExpiry, CrewWorkPhase, CrewWorkState,
     EnvironmentSpec as ResourceEnvironmentSpec, FulfilmentFacts, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec,
     FulfilmentRealisation, HarnessFacts, Host as ResourceHost, HostDirectEnvironmentSpec, HostSpec, HostStatus, InputMeta, ResourceObject,
     Selector, TerminalAttention, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
@@ -520,21 +520,24 @@ pub(super) fn trusted_codex_workflow() -> WorkflowTemplateSpec {
     flotilla_resources::single_agent_workflow_spec()
 }
 
-pub(in crate::in_process) async fn create_test_environment(daemon: &InProcessDaemon, name: &str, host_ref: &str) -> String {
-    daemon
-        .resource_backend()
-        .using::<ResourceEnvironment>("flotilla")
-        .create(
-            &test_meta(name),
-            &ResourceEnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_ref.to_string(), repo_default_dir: "/tmp".to_string() }),
-                docker: None,
-            },
-        )
-        .await
-        .expect("environment");
+/// The engine's environments for `daemon`'s tests, installed as its lifecycle reads.
+pub(in crate::in_process) fn test_environments(daemon: &InProcessDaemon) -> flotilla_provisioning_testkit::EnvironmentFixture {
+    let environments = flotilla_provisioning_testkit::EnvironmentFixture::default();
+    daemon.install_lifecycle_reads(environments.reads.clone()).expect("engine reads");
+    environments
+}
+
+/// `name`, a ready host-direct environment of `host_ref` on the engine.
+pub(in crate::in_process) fn create_test_environment(
+    environments: &flotilla_provisioning_testkit::EnvironmentFixture,
+    name: &str,
+    host_ref: &str,
+) -> String {
+    let spec = ResourceEnvironmentSpec {
+        host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_ref.to_string(), repo_default_dir: "/tmp".to_string() }),
+        ..Default::default()
+    };
+    environments.put_ready(name, &spec, None, "/tmp", Default::default());
     name.to_string()
 }
 

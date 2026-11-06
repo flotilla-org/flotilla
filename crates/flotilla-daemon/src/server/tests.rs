@@ -2330,50 +2330,26 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
     assert_eq!(vessels.items[0].spec.convoy_ref, convoy.metadata.name);
     assert!(daemon.resource_backend().using::<Vessel>("flotilla").list().await.expect("dispatcher vessels").items.is_empty());
 
-    let environments = placed.using::<flotilla_resources::Environment>("flotilla");
     let environment_name = format!("host-direct-{remote_host_id}");
-    let environment = environments
-        .create(
-            &InputMeta::builder().name(environment_name.clone()).build(),
-            &flotilla_resources::EnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec {
-                    host_ref: remote_host_id.clone(),
-                    repo_default_dir: "/workspace".to_string(),
-                }),
-                docker: None,
-            },
-        )
-        .await
-        .expect("placement host environment");
-    environments
-        .update_status(
-            &environment_name,
-            &environment.metadata.resource_version,
-            &flotilla_resources::EnvironmentStatus {
-                backing_id: None,
-                provider_descriptor: None,
-                configured_limits: None,
-                runtime_observation: None,
-                phase: flotilla_resources::EnvironmentPhase::Ready,
-                ready: true,
-                docker_container_id: None,
-                image_ref: None,
-                local_image_id: None,
-                registry_digest: None,
-                message: None,
-                credential_delivery_retry: None,
-                credential_refresh_retry: None,
-            },
-        )
-        .await
-        .expect("placement host environment ready");
+    engine_environments(&remote_daemon).put_ready(
+        &environment_name,
+        &flotilla_resources::EnvironmentSpec {
+            host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec {
+                host_ref: remote_host_id.clone(),
+                repo_default_dir: "/workspace".to_string(),
+            }),
+            ..Default::default()
+        },
+        None,
+        "/workspace",
+        Default::default(),
+    );
     let vessel_task = tokio::spawn(
         ControllerLoop {
             primary: placed.using::<Vessel>("flotilla"),
             secondaries: flotilla_crew::reconcilers::vessel::VesselReconciler::secondary_watches(),
-            reconciler: flotilla_crew::reconcilers::vessel::VesselReconciler::new(placed.clone(), "flotilla"),
+            reconciler: flotilla_crew::reconcilers::vessel::VesselReconciler::new(placed.clone(), "flotilla")
+                .with_lifecycle_reads(remote_daemon.lifecycle_reads()),
             resync_interval: Duration::from_millis(20),
             backend: placed.clone(),
         }
@@ -2387,7 +2363,8 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
                 Arc::new(RunningTerminalRuntime),
                 placed.clone(),
                 "flotilla",
-            ),
+            )
+            .with_lifecycle_reads(remote_daemon.lifecycle_reads()),
             resync_interval: Duration::from_millis(20),
             backend: placed.clone(),
         }
@@ -5735,6 +5712,16 @@ async fn failed_connection_tasks_are_reaped() {
     assert!(tasks.is_empty());
 }
 
+/// The engine's environments `daemon` reads (#3108), on its decided store, stepped as the
+/// Environment controller would step them.
+pub(super) fn engine_environments(daemon: &InProcessDaemon) -> flotilla_provisioning_testkit::EnvironmentFixture {
+    let store = daemon.decided_store().expect("decided store").store();
+    let home = flotilla_engine_store::StoreLog::new(Arc::clone(&store)).home().to_owned();
+    let fixture = flotilla_provisioning_testkit::EnvironmentFixture::over(&home, store);
+    daemon.install_lifecycle_reads(Arc::clone(&fixture.reads)).expect("install the engine's environments");
+    fixture
+}
+
 pub(super) async fn placed_crew_daemon(environment: &str) -> (tempfile::TempDir, Arc<InProcessDaemon>) {
     let (_tmp, daemon) = empty_daemon().await;
     place_crew(&daemon, environment, PlacedCrew { convoy: "own", vessel: "placed-vessel", session: "placed-session", crew: "placed-crew" })
@@ -5856,34 +5843,17 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
     assert_eq!(crews[0].vessel, "placed-vessel");
     // #3271: real indexed placement maps a kernel-derived container identity;
     // new-style container claims never select a crew outside that environment.
-    let environments = backend.using::<flotilla_resources::Environment>("flotilla");
-    let environment = environments
-        .create(
-            &InputMeta::builder().name("placed-environment".into()).build(),
-            &serde_json::from_value::<flotilla_resources::EnvironmentSpec>(
-                serde_json::json!({"docker": {"host_ref": "host", "image": "image"}}),
-            )
-            .unwrap(),
+    // The environment is realised under its container's immutable ID.
+    engine_environments(&daemon).put_ready(
+        "placed-environment",
+        &serde_json::from_value::<flotilla_resources::EnvironmentSpec>(
+            serde_json::json!({"docker": {"host_ref": "host", "image": "image"}}),
         )
-        .await
-        .unwrap();
-    environments
-        .update_status(
-            "placed-environment",
-            &environment.metadata.resource_version,
-            &flotilla_resources::EnvironmentStatus {
-                backing_id: None,
-                provider_descriptor: None,
-                docker_container_id: Some("actuation-container-name".into()),
-                runtime_observation: Some(flotilla_protocol::EnvironmentRuntimeObservation {
-                    container_id: Some("kernel-container".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+        .unwrap(),
+        None,
+        "kernel-container",
+        Default::default(),
+    );
     let mounts = caller_mountinfo(&EnvironmentId::new("placed-environment"), true);
     let evidence = flotilla_protocol::CommandCaller {
         principal_ref: flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"),
@@ -6394,43 +6364,19 @@ async fn caller_can_stall_and_complete(daemon: &InProcessDaemon, caller: flotill
 #[tokio::test]
 async fn host_direct_caller_keeps_crew_completion_and_stall() {
     let (_tmp, daemon) = placed_crew_daemon("host-direct-fixture").await;
-    daemon
-        .resource_backend()
-        .using::<flotilla_resources::Environment>("flotilla")
-        .create(
-            &InputMeta::builder().name("host-direct-fixture".into()).build(),
-            &serde_json::from_value::<flotilla_resources::EnvironmentSpec>(
-                serde_json::json!({"host_direct": {"host_ref": "local", "repo_default_dir": "/workspace"}}),
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
+    let environments = engine_environments(&daemon);
+    let host_direct = serde_json::from_value::<flotilla_resources::EnvironmentSpec>(
+        serde_json::json!({"host_direct": {"host_ref": "local", "repo_default_dir": "/workspace"}}),
+    )
+    .unwrap();
     let evidence = flotilla_protocol::CommandCaller {
         principal_ref: flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"),
         process: Some(flotilla_protocol::CallerProcess::builder().pid(42).uid(1000).build()),
         crew: None,
     };
-    // A stale container observation on a host-direct record cannot establish
-    // container authority, even when its ID and dedicated mount name match.
-    let environments = daemon.resource_backend().using::<flotilla_resources::Environment>("flotilla");
-    let current = environments.get("host-direct-fixture").await.unwrap();
-    environments
-        .update_status(
-            "host-direct-fixture",
-            &current.metadata.resource_version,
-            &flotilla_resources::EnvironmentStatus {
-                backing_id: None,
-                provider_descriptor: None,
-                runtime_observation: Some(flotilla_protocol::EnvironmentRuntimeObservation {
-                    container_id: Some("stale-container".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    // A host-direct environment cannot establish container authority, even when realised under
+    // the caller's container ID and its dedicated mount name matches.
+    environments.put_ready("host-direct-fixture", &host_direct, None, "stale-container", Default::default());
     let mut contained = evidence.clone();
     contained.process.as_mut().unwrap().container = Some("stale-container".into());
     let mounts = caller_mountinfo(&EnvironmentId::new("host-direct-fixture"), true);
@@ -6451,31 +6397,15 @@ async fn host_direct_caller_keeps_crew_completion_and_stall() {
 #[tokio::test]
 async fn legacy_mount_caller_keeps_working_until_vessel_ends() {
     let (_tmp, daemon) = placed_crew_daemon("placed-environment").await;
-    let backend = daemon.resource_backend();
-    let environments = backend.using::<flotilla_resources::Environment>("flotilla");
-    let created = environments
-        .create(
-            &InputMeta::builder().name("placed-environment".into()).build(),
-            &serde_json::from_value::<flotilla_resources::EnvironmentSpec>(
-                serde_json::json!({"docker": {"host_ref": "host", "image": "image"}}),
-            )
-            .unwrap(),
+    let environments = engine_environments(&daemon);
+    environments.request(
+        "placed-environment",
+        &serde_json::from_value::<flotilla_resources::EnvironmentSpec>(
+            serde_json::json!({"docker": {"host_ref": "host", "image": "image"}}),
         )
-        .await
-        .unwrap();
-    environments
-        .update_status(
-            "placed-environment",
-            &created.metadata.resource_version,
-            &flotilla_resources::EnvironmentStatus {
-                backing_id: None,
-                provider_descriptor: None,
-                docker_container_id: Some("actuation-container-name".into()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+        .unwrap(),
+        None,
+    );
     let evidence = flotilla_protocol::CommandCaller {
         principal_ref: flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"),
         process: Some(flotilla_protocol::CallerProcess::builder().pid(42).uid(1000).container("kernel-container".into()).build()),
@@ -6487,15 +6417,11 @@ async fn legacy_mount_caller_keeps_working_until_vessel_ends() {
     let legacy = super::caller::resolve_main_caller(&daemon, evidence.clone(), &claims, Some(&old_mounts)).await.unwrap();
     assert!(!legacy.transport_bound);
     caller_can_stall_and_complete(&daemon, legacy.caller).await;
-    // Legacy operation did not need an inspected ID (as at first restart).
-    // Once inspection is available, its immutable ID enables the strict path;
-    // the Docker actuation name deliberately remains a different value.
-    let current = environments.get("placed-environment").await.unwrap();
-    let mut status = current.status.unwrap();
-    assert!(status.runtime_observation.is_none());
-    status.runtime_observation =
-        Some(flotilla_protocol::EnvironmentRuntimeObservation { container_id: Some("kernel-container".into()), ..Default::default() });
-    environments.update_status("placed-environment", &current.metadata.resource_version, &status).await.unwrap();
+    // Legacy operation did not need the environment realised under the container's ID.
+    // Once it is, that immutable ID enables the strict path.
+    use flotilla_resources::environment_records::EnvironmentRecords;
+    assert!(!environments.environments.find("placed-environment").unwrap().unwrap().is_ready());
+    environments.ready("placed-environment", "kernel-container", Default::default());
     let new_mounts = caller_mountinfo(&environment, true);
     let bound = super::caller::resolve_main_caller(&daemon, evidence.clone(), &claims, Some(&new_mounts)).await.unwrap();
     assert!(bound.transport_bound);

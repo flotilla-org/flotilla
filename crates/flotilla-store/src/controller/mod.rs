@@ -600,10 +600,6 @@ impl<R: Reconciler> ControllerLoop<R> {
                 let resolver = backend.using::<crate::Repository>(namespace);
                 crate::ensure_repository(&resolver, &key, &spec).await.map(|_| ())
             }
-            Actuation::CreateEnvironment { meta, spec } => {
-                let resolver = backend.using::<crate::Environment>(namespace);
-                Self::create_if_missing(&resolver, meta, spec).await
-            }
             Actuation::CreateClone { meta, spec } => {
                 let resolver = backend.using::<crate::Clone>(namespace);
                 Self::create_if_missing(&resolver, meta, spec).await
@@ -629,7 +625,7 @@ impl<R: Reconciler> ControllerLoop<R> {
             }
             Actuation::CreateTerminalSession { meta, spec } => {
                 let resolver = backend.using::<crate::TerminalSession>(namespace);
-                Self::create_if_missing(&resolver, meta, spec).await
+                Self::create_if_missing(&resolver, meta, *spec).await
             }
             Actuation::RaiseAttention { attention } => {
                 backend.attentions().raise(namespace, &attention).await.map_err(ResourceError::other)

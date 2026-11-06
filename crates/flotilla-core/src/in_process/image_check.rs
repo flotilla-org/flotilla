@@ -301,7 +301,7 @@ fn build_report(
         Some(LifecycleReading::Exhausted { cause } | LifecycleReading::GaveUp { cause }) => {
             (ImageBuildReportPhase::Failed, true, None, lifecycle_failure(cause.clone()))
         }
-        Some(ending @ (LifecycleReading::Lost | LifecycleReading::Released | LifecycleReading::Failed { .. })) => {
+        Some(ending @ (LifecycleReading::Lost { .. } | LifecycleReading::Released | LifecycleReading::Failed { .. })) => {
             (ImageBuildReportPhase::Failed, true, None, lifecycle_failure(ending.reason().unwrap_or_default()))
         }
         None => {

@@ -116,6 +116,7 @@ async fn contained_terminal_session_never_falls_back_from_the_requested_interior
     daemon
         .register_provisioned_environment(env_id.clone(), handle, EnvironmentBag::new(), Some(passthrough_registry()))
         .expect("register contained environment");
+    engine_environments(&daemon);
     let runtime = TerminalControllerRuntime {
         state: Arc::new(ControllerRuntimeState::new(
             daemon,
@@ -216,6 +217,7 @@ async fn convoy_holds_and_recovers_when_terminal_pool_is_transiently_unavailable
     pool.set_available(false);
     let restarted = daemon_with_transient_terminal_pool(Arc::clone(&config), backend.clone(), Arc::clone(&pool)).await;
     let restarted_registry = probe_local_provider_registry(&restarted, &config).await.expect("restarted provider registry");
+    engine_environments(&restarted);
     let state = Arc::new(ControllerRuntimeState::new(
         Arc::clone(&restarted),
         config,
@@ -228,7 +230,8 @@ async fn convoy_holds_and_recovers_when_terminal_pool_is_transiently_unavailable
         ControllerLoop {
             primary: sessions.clone(),
             secondaries: Vec::new(),
-            reconciler: TerminalSessionReconciler::new(Arc::new(TerminalControllerRuntime { state }), backend.clone(), NAMESPACE),
+            reconciler: TerminalSessionReconciler::new(Arc::new(TerminalControllerRuntime { state }), backend.clone(), NAMESPACE)
+                .with_lifecycle_reads(restarted.lifecycle_reads()),
             resync_interval: Duration::from_secs(3600),
             backend,
         }
@@ -307,6 +310,7 @@ async fn starting_agent_replaces_a_pool_session_left_by_a_previous_daemon_runtim
     daemon.set_daemon_socket_path(current_socket.clone()).await;
     let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
     let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
+    engine_environments(&daemon);
     let state = Arc::new(ControllerRuntimeState::new(
         Arc::clone(&daemon),
         config,
@@ -398,6 +402,7 @@ async fn terminal_teardown_kills_a_persisted_session_after_runtime_restart() {
     let (daemon, pool) = crew_daemon_with_process_runner(Arc::clone(&config)).await;
     let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
     let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
+    engine_environments(&daemon);
     let runtime = TerminalControllerRuntime {
         state: Arc::new(ControllerRuntimeState::new(
             Arc::clone(&daemon),
@@ -454,6 +459,7 @@ async fn codex_interactive_prompt_is_observed_as_needing_input() {
         .prepare(&profile.host_direct_environment_name(), &BTreeSet::from(["codex".to_string()]), &BTreeMap::new())
         .await
         .expect("deliver the central credential");
+    engine_environments(&daemon);
     let runtime = TerminalControllerRuntime {
         state: Arc::new(
             ControllerRuntimeState::new(
@@ -551,6 +557,7 @@ async fn terminal_teardown_skips_a_session_absent_from_the_pool() {
     let (daemon, pool) = crew_daemon_with_process_runner(Arc::clone(&config)).await;
     let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
     let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
+    engine_environments(&daemon);
     let runtime = TerminalControllerRuntime {
         state: Arc::new(ControllerRuntimeState::new(
             Arc::clone(&daemon),
@@ -596,6 +603,7 @@ async fn terminal_teardown_lets_a_typed_engine_turn_settle_for_its_receipt() {
         let (daemon, pool) = crew_daemon_with_process_runner(Arc::clone(&config)).await;
         let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
         let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
+        engine_environments(&daemon);
         let runtime = TerminalControllerRuntime {
             state: Arc::new(ControllerRuntimeState::new(
                 Arc::clone(&daemon),
@@ -733,6 +741,7 @@ async fn host_direct_claude_code_launches_with_http_hooks_while_flotillad_listen
             Arc::new(ProcessCommandRunner),
             state_dir.clone(),
         ));
+        engine_environments(&daemon);
         let state = Arc::new(
             ControllerRuntimeState::new(
                 Arc::clone(&daemon),

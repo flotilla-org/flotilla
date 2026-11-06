@@ -6,7 +6,7 @@ use tracing::Instrument;
 use flotilla_agent::brief_artifact::BriefArtifactWriter;
 use flotilla_resources::convoy_address::convoy_address;
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
-use flotilla_resources::{Environment, EnvironmentPhase, ResumeIntent};
+use flotilla_resources::ResumeIntent;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
@@ -75,7 +75,7 @@ fn vessel_ending_reason(
     Ok(match reads.try_reading(ProvisioningKind::Vessel, &vessel.object.metadata.name, origin.as_deref())? {
         Some(
             reading @ (LifecycleReading::Released
-            | LifecycleReading::Lost
+            | LifecycleReading::Lost { .. }
             | LifecycleReading::Failed { .. }
             | LifecycleReading::GaveUp { .. }),
         ) => reading.reason().map(|reason| (reading, reason)),
@@ -88,7 +88,7 @@ fn vessel_ending_reason(
             .status
             .as_ref()
             .filter(|status| status.phase == flotilla_resources::VesselPhase::Lost)
-            .map(|status| (LifecycleReading::Lost, status.message.clone().unwrap_or_else(|| legacy_reason.into()))),
+            .map(|status| (LifecycleReading::Lost { reason: None }, status.message.clone().unwrap_or_else(|| legacy_reason.into()))),
     })
 }
 
@@ -1829,7 +1829,7 @@ impl CrewService {
                 origins.get(&checkout.metadata.name).map(String::as_str),
             )? {
                 Some(
-                    flotilla_protocol::LifecycleReading::Lost
+                    flotilla_protocol::LifecycleReading::Lost { .. }
                     | flotilla_protocol::LifecycleReading::Released
                     | flotilla_protocol::LifecycleReading::Failed { .. },
                 ) => true,
@@ -3022,62 +3022,29 @@ impl CrewService {
         match self.resource_backend.including_replicas::<flotilla_resources::Vessel>(namespace).get(&vessel_ref).await {
             Ok(resource) => {
                 if let Some((ending, reason)) = vessel_ending_reason(self.lifecycle_reads.as_ref(), &resource, "environment disappeared")? {
-                    if !matches!(ending, flotilla_protocol::LifecycleReading::Lost) {
+                    if !matches!(ending, flotilla_protocol::LifecycleReading::Lost { .. }) {
                         return Err(format!("vessel `{vessel}` lease ended: {reason}; it cannot be resumed"));
                     }
                     return Err(format!("vessel `{vessel}` is lost, recoverable: {reason}; rehydration is not available yet (#2872)"));
                 }
                 if let Some(environment_ref) = resource.object.status.as_ref().and_then(|status| status.environment_ref.as_ref()) {
-                    match self.resource_backend.including_replicas::<Environment>(namespace).get(environment_ref).await {
-                        Ok(environment) => {
-                            let origin = match &environment.provenance {
-                                ResourceProvenance::Local => None,
-                                ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
-                            };
-                            match self.lifecycle_reads.try_reading(
-                                ProvisioningKind::Environment,
-                                &environment.object.metadata.name,
-                                origin.as_deref(),
-                            )? {
-                                Some(
-                                    flotilla_protocol::LifecycleReading::Failed { reason: cause }
-                                    | flotilla_protocol::LifecycleReading::GaveUp { cause }
-                                    | flotilla_protocol::LifecycleReading::Exhausted { cause },
-                                ) => return Err(format!("vessel `{vessel}` failed provisioning and cannot be resumed: {cause}")),
-                                Some(
-                                    reading @ (flotilla_protocol::LifecycleReading::Lost | flotilla_protocol::LifecycleReading::Released),
-                                ) => {
-                                    return Err(format!(
-                                        "vessel `{vessel}` is lost, recoverable: {}; rehydration is not available yet (#2872)",
-                                        reading.reason().unwrap_or_default()
-                                    ))
-                                }
-                                Some(_) => {}
-                                None => {
-                                    if let Some(status) = environment.object.status.as_ref() {
-                                        match status.phase {
-                                            EnvironmentPhase::Lost => {
-                                                let reason = status.message.as_deref().unwrap_or("environment disappeared");
-                                                return Err(format!(
-                                                    "vessel `{vessel}` is lost, recoverable: {reason}; rehydration is not available yet (#2872)"
-                                                ));
-                                            }
-                                            EnvironmentPhase::Failed => {
-                                                let reason = status.message.as_deref().unwrap_or("environment provisioning failed");
-                                                return Err(format!(
-                                                    "vessel `{vessel}` failed provisioning and cannot be resumed: {reason}"
-                                                ));
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
+                    // Missing backing alone is not an observed loss: the resume path stays open
+                    // until reconciliation records its cause.
+                    match self.lifecycle_reads.environments()?.find(environment_ref)?.map(|environment| environment.reading) {
+                        Some(
+                            flotilla_protocol::LifecycleReading::Failed { reason: cause }
+                            | flotilla_protocol::LifecycleReading::GaveUp { cause }
+                            | flotilla_protocol::LifecycleReading::Exhausted { cause },
+                        ) => return Err(format!("vessel `{vessel}` failed provisioning and cannot be resumed: {cause}")),
+                        Some(
+                            reading @ (flotilla_protocol::LifecycleReading::Lost { .. } | flotilla_protocol::LifecycleReading::Released),
+                        ) => {
+                            return Err(format!(
+                                "vessel `{vessel}` is lost, recoverable: {}; rehydration is not available yet (#2872)",
+                                reading.reason().unwrap_or_default()
+                            ))
                         }
-                        // Missing backing alone is not an observed loss. Preserve the
-                        // existing resume path until reconciliation records its cause.
-                        Err(ResourceError::NotFound { .. }) => {}
-                        Err(error) => return Err(error.to_string()),
+                        _ => {}
                     }
                 }
                 Ok(())

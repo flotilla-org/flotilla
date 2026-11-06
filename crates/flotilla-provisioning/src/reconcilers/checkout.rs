@@ -393,7 +393,7 @@ fn checkout_phase(obj: &ResourceObject<Checkout>, reading: Option<&LifecycleRead
         Some(LifecycleReading::Failed { .. } | LifecycleReading::Exhausted { .. } | LifecycleReading::GaveUp { .. }) => {
             CheckoutPhase::Failed
         }
-        Some(LifecycleReading::Lost | LifecycleReading::Released) => CheckoutPhase::Gone,
+        Some(LifecycleReading::Lost { .. } | LifecycleReading::Released) => CheckoutPhase::Gone,
         None => obj.status.as_ref().map(|status| status.phase).unwrap_or_default(),
     }
 }

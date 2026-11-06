@@ -729,6 +729,12 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         ..RuntimeOptions::default()
     };
     let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("runtime start");
+    // The sessions' environment is the engine's, requested through the reads the runtime installs (#3108).
+    daemon
+        .lifecycle_reads()
+        .environments()
+        .and_then(|records| records.request(&environment_name, &environment_spec, None))
+        .expect("request attach environment");
 
     let created = sessions
         .create(

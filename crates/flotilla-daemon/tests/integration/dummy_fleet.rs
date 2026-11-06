@@ -1032,10 +1032,10 @@ async fn two_daemons_replicate_every_kind() {
     apply_transport_fixtures(&a, "engine-a").await;
     apply_transport_fixtures(&b, "engine-b").await;
     let (before_a, before_b) = tokio::join!(inventories(&a), inventories(&b));
-    // A Message lives only on the engine, which `get`
+    // A Message and an Environment live only on the engine, which `get`
     // does not read (see `assert_no_old_messages`), so there is none to compare.
     let unmade: Vec<_> = before_a.iter().filter(|(_, records)| records.is_empty()).map(|(kind, _)| *kind).collect();
-    assert_eq!(unmade, ["Message"], "every other kind has a record to replicate");
+    assert_eq!(unmade, ["Environment", "Message"], "every other kind has a record to replicate");
     let _peering = TestDaemon::peer(&a, &b).await;
     assert_every_kind_replicated(&before_a, &before_b, &b).await;
     assert_every_kind_replicated(&before_b, &before_a, &a).await;

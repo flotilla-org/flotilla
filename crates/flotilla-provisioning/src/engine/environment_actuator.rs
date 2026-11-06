@@ -178,12 +178,16 @@ impl<R> EnvironmentActuator<R> {
 /// The identity a provision is realised under, and the facts it fixes.
 fn realised(name: &str, spec: &EnvironmentSpec, provisioning: EnvironmentProvisioning) -> (String, LaunchFacts) {
     match provisioning {
+        // A cloud sandbox runs its image by digest, from a registry: the digest is its image's
+        // identity, and the pinned reference is the registry digest.
         EnvironmentProvisioning::Cloud(cloud) => (
             cloud.backing_id,
             LaunchFacts {
+                local_image_id: cloud.image_ref.rsplit_once('@').map(|(_, digest)| digest.to_owned()),
+                registry_digest: Some(cloud.image_ref.clone()),
                 image_ref: Some(cloud.image_ref),
                 provider_descriptor: Some(*cloud.provider_descriptor),
-                ..LaunchFacts::default()
+                configured_limits: None,
             },
         ),
         EnvironmentProvisioning::Local(local) => {
@@ -220,7 +224,7 @@ where
             .map_err(|error| Cause::new(CauseCategory::Transient, format!("read environment {name}: {error}")))?;
         Ok(match state {
             Some(LifecycleState::Realised { identity }) => Backing::Present { identity },
-            _ => Backing::Absent,
+            _ => Backing::Absent { reason: None },
         })
     }
 
