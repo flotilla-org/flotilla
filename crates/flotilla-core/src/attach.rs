@@ -50,6 +50,16 @@ fn environment_attach_backing(
     }
 }
 
+/// Attach is offered only while an environment is live on the engine: an ended one (released,
+/// lost, failed, given up) has no backing to attach to.
+fn live_for_attach(environment: &EnvironmentRecord) -> Result<(), String> {
+    if !environment.ended() {
+        return Ok(());
+    }
+    let reading = &environment.reading;
+    Err(format!("environment {} is {}: {}", environment.name, reading.label(), reading.reason().unwrap_or_default()))
+}
+
 type HostSnapshot = Result<Vec<ReadResourceObject<ResourceHost>>, String>;
 
 /// One lazy Host snapshot per attach request (including failed loads). Namespace
@@ -146,6 +156,7 @@ impl<'a> AttachResolver<'a> {
     ) -> Result<ResolvedAttach, String> {
         let namespace = self.provisioning_namespace().await;
         let environment = self.lifecycle_reads.environments()?.find(id)?.ok_or_else(|| format!("environment {id} not found"))?;
+        live_for_attach(&environment)?;
         let spec = environment.spec.docker.as_ref().ok_or("environment shell requires a contained environment")?;
         let owner = self.target_host_with_reads(&AttachReadContext::default(), &namespace, &spec.host_ref).await?;
         if host.is_some_and(|requested| requested != &owner) {
@@ -642,6 +653,7 @@ impl<'a> AttachResolver<'a> {
             .and_then(|environments| environments.find(&session.spec.env_ref))
             .map_err(|err| format!("environment {} lookup failed: {err}", session.spec.env_ref))?
             .ok_or_else(|| format!("environment {} lookup failed: not found", session.spec.env_ref))?;
+        live_for_attach(&environment)?;
         if let Some(handle) = self.checked_provisioned_handle(&environment)? {
             // Host-direct resources retain their existing pool/host routing: the
             // host is the vessel, and its agent works in process. Every other

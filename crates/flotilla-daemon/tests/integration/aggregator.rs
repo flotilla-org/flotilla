@@ -903,57 +903,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         .map(independent_rows)
         .expect("local independents result set");
     assert_eq!(local_independents.len(), 2);
-
-    environments.delete(&environment_name).await.expect("delete attach environment");
-    let unavailable = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match rx.recv().await {
-                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == (QueryId::Independents { scope: None }) => {
-                    if let Some(row) = delta
-                        .changes
-                        .as_independents()
-                        .expect("independent rows")
-                        .iter()
-                        .find(|row| row.name == "terminal-yeoman" && row.attach.is_none())
-                    {
-                        return row.clone();
-                    }
-                }
-                Ok(_) => continue,
-                Err(err) => panic!("broadcast receive error: {err}"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for attach capability removal");
-    assert_eq!(unavailable.attach, None);
-
-    environments
-        .create(&InputMeta::builder().name(environment_name.clone()).build(), &environment_spec)
-        .await
-        .expect("recreate attach environment");
-    let available = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match rx.recv().await {
-                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == (QueryId::Independents { scope: None }) => {
-                    if let Some(row) = delta
-                        .changes
-                        .as_independents()
-                        .expect("independent rows")
-                        .iter()
-                        .find(|row| row.name == "terminal-yeoman" && row.attach.as_deref() == Some("terminal-yeoman"))
-                    {
-                        return row.clone();
-                    }
-                }
-                Ok(_) => continue,
-                Err(err) => panic!("broadcast receive error: {err}"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for attach capability restoration");
-    assert_eq!(available.attach.as_deref(), Some("terminal-yeoman"));
+    // Withdrawal when the environment ends: test_daemon.rs a_lost_environment_withdraws_its_sessions_attach.
 
     let running = sessions.get("terminal-yeoman").await.expect("running terminal session");
     sessions

@@ -412,6 +412,18 @@ impl TestDaemon {
                 };
                 match next {
                     Ok(DaemonEvent::ResultSet(result)) if result.query() == query => last = Some(*result),
+                    // A delta carries only what changed: read the whole set again, as a client
+                    // that resubscribes does.
+                    Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == query => {
+                        let current = self.operator.client.subscribe_queries(uuid::Uuid::new_v4(), &cursors).await.expect("subscribe");
+                        for event in current {
+                            if let DaemonEvent::ResultSet(result) = event {
+                                if result.query() == query {
+                                    last = Some(*result);
+                                }
+                            }
+                        }
+                    }
                     Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => panic!("the daemon closed while waiting on {query:?}"),
                 }

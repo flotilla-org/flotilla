@@ -7,7 +7,11 @@ use flotilla_dummy_fleet::{
     catalog::{CrewMix, DUMMY_CLOUD_FULFILMENT_KIND, DUMMY_FULFILMENT_KIND},
     DummyVendor,
 };
-use flotilla_protocol::table::Row;
+use flotilla_protocol::{
+    commands::{AttachMode, CommandValue},
+    table::Row,
+    CommandAction, QueryId, ResultSet,
+};
 use flotilla_resources::{Convoy, ConvoyPhase, ResourceObject};
 
 fn text<'a>(row: &'a Row, column: &str) -> &'a str {
@@ -54,6 +58,46 @@ async fn cloud_sandbox_becomes_lost(vendor: fn(&DummyVendor, &str) -> bool) {
             text(row, "resource.name") == name && text(row, "state") == "Gone" && text(row, "ending") == "Lost"
         })
         .await;
+}
+
+// Attach is offered only while a session's environment is live on the engine (owner ruling): once
+// the vendor deletes the crew's backing and the probe ends it Lost, attaching to the crew's
+// session is refused for that reason and its vessel row offers no attach. The dummy fleet's
+// containers offer no terminal route, so before the loss attach is refused for that instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_environment_withdraws_its_sessions_attach() {
+    let daemon = TestDaemon::builder().agent("turn_delay_ms = 60000").start().await;
+    let convoy = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    let ready = daemon.wait_row("a Realised environment", "environment", "", of_convoy(&convoy, "Realised")).await;
+    let name = text(&ready, "resource.name").to_owned();
+    let vessel_row = |set: &ResultSet| {
+        set.rows
+            .as_convoys()
+            .and_then(|rows| rows.iter().find(|row| row.resource.name == convoy))
+            .and_then(|row| row.vessels.first().cloned())
+    };
+    let launched = daemon
+        .wait_query(QueryId::Convoys { scope: None }, |set| {
+            vessel_row(set).is_some_and(|vessel| vessel.crew.iter().any(|crew| crew.session.is_some()))
+        })
+        .await;
+    // The row names the session by address; attach takes its name.
+    let address = vessel_row(&launched).and_then(|vessel| vessel.crew.into_iter().find_map(|crew| crew.session)).expect("session");
+    let session = address.rsplit('/').next().unwrap_or(&address).to_owned();
+    let attach = || CommandAction::Attach { reference: session.clone(), host: None, mode: AttachMode::default() };
+    let lost = format!("environment {name} is Lost");
+    let before = daemon.execute(attach()).await;
+    assert!(!matches!(&before, CommandValue::Error { message } if message.contains(&lost)), "{before:?}");
+    assert!(DummyVendor::vanish(daemon.vendor(), &name), "{ready:?}");
+    daemon
+        .wait_row("Lost", "environment", "", |row| {
+            text(row, "resource.name") == name && text(row, "state") == "Gone" && text(row, "ending") == "Lost"
+        })
+        .await;
+    let refused = daemon.execute(attach()).await;
+    let CommandValue::Error { message } = &refused else { panic!("attach to {session} on a lost environment: {refused:?}") };
+    assert!(message.contains(&lost), "{message}");
+    daemon.wait_query(QueryId::Convoys { scope: None }, |set| vessel_row(set).is_some_and(|vessel| vessel.materialize.is_none())).await;
 }
 
 // A restarted daemon finds its running vessels again: the vendor's backings and
