@@ -212,10 +212,38 @@ impl Crew {
         }
     }
 
+    /// What the crew's fail and stall draws are keyed on: its convoy's role, its vessel's name in
+    /// the workflow and its crew role. The role is the name a dispatcher chose, so a scenario can
+    /// pick a case by it; the convoy's record name is generated at admission.
+    async fn draw_subject(&self) -> String {
+        let identity = &self.identity;
+        let role = self.convoy_role().await.unwrap_or_else(|| identity.convoy.clone());
+        let vessel = identity.vessel.strip_prefix(&format!("{}-", identity.convoy)).unwrap_or(&identity.vessel);
+        format!("{role}/{vessel}/{}", identity.role)
+    }
+
+    /// The crew's convoy's role, read from the daemon as any client reads a resource.
+    async fn convoy_role(&self) -> Option<String> {
+        let action = CommandAction::QueryResourceGet {
+            namespace: self.identity.namespace.clone(),
+            kind: "Convoy".into(),
+            name: self.identity.convoy.clone(),
+        };
+        let object = match self.fleet.execute(action).await.ok()? {
+            CommandValue::ResourceObject(response) => response.value,
+            CommandValue::ResourceRead(read) => read.records.into_iter().find_map(|record| record.object)?,
+            _ => return None,
+        };
+        object.pointer("/spec/role")?.as_str().map(str::to_owned)
+    }
+
     /// Fail or stall at the configured rates before doing any work.
     async fn begin(&mut self) -> Option<Ending> {
         let agent = &self.fleet.config.agent;
-        let subject = self.identity.subject();
+        if agent.fail_rate <= 0.0 && agent.stall_rate <= 0.0 {
+            return None;
+        }
+        let subject = self.draw_subject().await;
         if dummy_draw(self.fleet.config.seed, "crew-failure", &subject) < agent.fail_rate {
             let action = CommandAction::CrewStall {
                 context: self.identity.context(),

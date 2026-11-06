@@ -281,6 +281,17 @@ mod tests {
     #[async_trait]
     impl CrewCommandPort for RecordingPort {
         async fn execute(&self, action: CommandAction) -> Result<CommandValue, String> {
+            // A crew reads its convoy's role to key its draws; the read is not a crew command.
+            if let CommandAction::QueryResourceGet { kind, name, namespace } = &action {
+                assert_eq!(kind, "Convoy");
+                return Ok(CommandValue::ResourceObject(Box::new(flotilla_protocol::commands::ResourceJsonResponse {
+                    kind: kind.clone(),
+                    plural: "convoys".into(),
+                    namespace: namespace.clone(),
+                    value: serde_json::json!({ "metadata": { "name": name }, "spec": { "role": name } }),
+                    replica_origin: None,
+                })));
+            }
             let (entry, value) = match action {
                 CommandAction::CrewPromise { operation: CrewPromiseOperation::Promise { .. }, .. } => {
                     ("promise".to_string(), CommandValue::Ok)

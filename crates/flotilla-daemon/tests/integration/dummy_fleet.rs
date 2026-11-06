@@ -411,6 +411,33 @@ fn skip_to_retry(clock: &SkippingClock, retry_at: Option<chrono::DateTime<chrono
 
 // A fixed admitted identity makes the dummy provider's seeded failure draw
 // reproducible while the runtime still bootstraps and reconciles the convoy.
+/// Requests a convoy of `workflow` with the role `role`, as `flotilla convoy create` does, and
+/// returns the record name admission gave it.
+async fn create_through_admission(fleet: &TestDaemon, role: &str, workflow: &str) -> String {
+    let forge = catalog::forge(&catalog_forge_url(fleet).await);
+    let created = fleet
+        .execute(CommandAction::ConvoyCreate {
+            name: role.into(),
+            workflow_ref: workflow.into(),
+            inputs: Vec::new(),
+            repository_url: Some(catalog::repository_url(&forge)),
+            r#ref: Some("main".into()),
+            project_ref: None,
+            placement_policy: Some(DUMMY_FULFILMENT_KIND.into()),
+            adopted_checkout: None,
+        })
+        .await;
+    assert!(matches!(created, CommandValue::ConvoyCreated { .. }), "create {role}: {created:?}");
+    fleet
+        .list::<Convoy>()
+        .await
+        .into_iter()
+        .find(|convoy| convoy.spec.role == role)
+        .unwrap_or_else(|| panic!("no convoy {role}"))
+        .metadata
+        .name
+}
+
 async fn create_named(fleet: &TestDaemon, name: &str, workflow: &str) {
     let forge = catalog::forge(&catalog_forge_url(fleet).await);
     let repository = catalog::repository(&forge).expect("repository");
@@ -450,13 +477,13 @@ async fn supervised_coder_scenario(action: CrewSupervisionAction) {
 
     let (domain, agent) =
         if action == CrewSupervisionAction::Resume { ("crew-stall", "stall_rate = 0.5\n") } else { ("crew-failure", "fail_rate = 0.5\n") };
-    // Explicitly cover a faulting coder and a healthy supervisor, without
-    // random UUIDs changing the dummy provider's deterministic draws.
-    let name = (0..128)
+    // Explicitly cover a faulting coder and a healthy supervisor: the dummy crews draw on the
+    // convoy's role, which the test chooses, not on the record name admission generates.
+    let role = (0..128)
         .map(|n| format!("engine-supervised-{n}"))
-        .find(|name| {
-            dummy_draw(0, domain, &format!("{name}/{name}-implement/coder")) < 0.5
-                && dummy_draw(0, domain, &format!("{name}/{name}-supervise/governor")) >= 0.5
+        .find(|role| {
+            dummy_draw(0, domain, &format!("{role}/implement/coder")) < 0.5
+                && dummy_draw(0, domain, &format!("{role}/supervise/governor")) >= 0.5
         })
         .expect("seeded case");
     let fleet = TestDaemon::builder().agent(agent).start().await;
@@ -464,7 +491,7 @@ async fn supervised_coder_scenario(action: CrewSupervisionAction) {
     workflow.supervision =
         Some(vec![SupervisionTarget::ConvoyCrew { vessel: "supervise".into(), role: "governor".into() }, SupervisionTarget::Operator]);
     fleet.apply::<WorkflowTemplate>("engine-supervised", workflow).await;
-    create_named(&fleet, &name, "engine-supervised").await;
+    let name = create_through_admission(&fleet, &role, "engine-supervised").await;
     let supervised = |status: &ConvoyStatus| status.stalled.as_ref().is_some_and(|stall| stall.supervisor.is_some());
     fleet.wait("crew-supervised stall", convoy(&name, supervised)).await;
     let supervisor =

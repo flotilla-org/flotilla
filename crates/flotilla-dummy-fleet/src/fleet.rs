@@ -316,6 +316,10 @@ fn lock(slots: &Mutex<HashMap<u64, Slot>>) -> std::sync::MutexGuard<'_, HashMap<
 impl CrewCommandPort for DaemonCommandPort {
     async fn execute(&self, action: CommandAction) -> Result<CommandValue, String> {
         let daemon = self.daemon.upgrade().ok_or("daemon has stopped")?;
+        // A query answers at once, as a client's read does; only commands run asynchronously.
+        if action.is_query() {
+            return daemon.execute_query(Command::builder().action(action).build(), uuid::Uuid::new_v4()).await;
+        }
         let command_id = daemon.execute(Command::builder().action(action).build()).await?;
         drop(daemon);
         let (sender, receiver) = oneshot::channel();
