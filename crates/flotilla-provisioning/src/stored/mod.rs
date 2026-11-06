@@ -110,6 +110,8 @@ fn register_provisioning(registry: &mut KindRegistry) -> Result<(), RegistryErro
     registry.register::<Resource<clone::Clone>>()?;
     registry.register::<clone::CloneFacts>()?;
     registry.register::<Resource<checkout::Checkout>>()?;
+    registry.register::<checkout::CheckoutFacts>()?;
+    registry.register::<checkout::CheckoutIntegration>()?;
     Ok(())
 }
 

@@ -73,7 +73,7 @@ CREATE TABLE "checkout" (
   "branch" TEXT NOT NULL,
   "base" TEXT,
   "path" TEXT NOT NULL,
-  "source" TEXT NOT NULL CHECK ("source" IN ('fc', 'wt')),
+  "source" TEXT NOT NULL CHECK ("source" IN ('ad', 'fc', 'wt')),
   "source_url" TEXT,
   "clone" INTEGER REFERENCES "resource_identity" ("id"),
   "holder" INTEGER REFERENCES "strings" ("id"),
@@ -94,6 +94,9 @@ CREATE TABLE "checkout" (
       END),
   CHECK (CASE WHEN "source" = 'fc'
       THEN "source_url" IS NOT NULL
+      END),
+  CHECK (CASE WHEN "source" = 'ad'
+      THEN "source_url" IS NULL
       END),
   CHECK (CASE WHEN "last_failure_at" IS NOT NULL
       THEN "last_failure_cause_category" IS NOT NULL
@@ -159,7 +162,9 @@ CREATE TABLE "checkout" (
 CREATE INDEX "checkout_by_clone" ON "checkout" ("clone") WHERE "clone" IS NOT NULL;
 CREATE INDEX "checkout_by_environment" ON "checkout" ("environment");
 CREATE INDEX "checkout_by_holder" ON "checkout" ("holder") WHERE "holder" IS NOT NULL;
+CREATE INDEX "checkout_by_repository" ON "checkout" ("repository");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('ck', 'source', 'ad', 'Adopted'),
   ('ck', 'source', 'fc', 'FreshClone'),
   ('ck', 'source', 'wt', 'Worktree'),
   ('ck', 'state', 'go', 'Gone'),
@@ -642,6 +647,58 @@ CREATE VIEW "image_build_view" AS SELECT
   (SELECT "name" FROM "codes" WHERE "kind" = 'ib' AND "field" = 'cause_category' AND "code" = "image_build"."cause_category") AS "cause_category",
   "image_build"."cause_detail"
 FROM "image_build";
+CREATE TABLE "checkout_facts" (
+  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+  "version" INTEGER NOT NULL,
+  "degraded" TEXT
+) STRICT;
+CREATE VIEW "checkout_facts_view" AS SELECT
+  "checkout_facts"."id",
+  "checkout_facts"."version",
+  "checkout_facts"."degraded"
+FROM "checkout_facts";
+CREATE TABLE "checkout_integration" (
+  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+  "version" INTEGER NOT NULL,
+  "failing_since" INTEGER,
+  "head_revision" TEXT,
+  "clean" INTEGER CHECK ("clean" IN (0, 1)),
+  "pushed" INTEGER CHECK ("pushed" IN (0, 1)),
+  "landed" INTEGER CHECK ("landed" IN (0, 1)),
+  "clean_details" BLOB NOT NULL,
+  "pushed_details" BLOB NOT NULL,
+  "landed_details" BLOB NOT NULL,
+  "change_request" INTEGER,
+  "landed_evidence_change_request" INTEGER,
+  "landed_evidence_merged_at" INTEGER,
+  "landed_evidence_target_ref" TEXT,
+  "landed_evidence_head_in_merged_head" INTEGER CHECK ("landed_evidence_head_in_merged_head" IN (0, 1)),
+  "remote_digest" TEXT,
+  CHECK (CASE WHEN "landed_evidence_change_request" IS NOT NULL
+      THEN "landed_evidence_head_in_merged_head" IS NOT NULL
+      ELSE "landed_evidence_merged_at" IS NULL
+      AND "landed_evidence_target_ref" IS NULL
+      AND "landed_evidence_head_in_merged_head" IS NULL
+      END)
+) STRICT;
+CREATE VIEW "checkout_integration_view" AS SELECT
+  "checkout_integration"."id",
+  "checkout_integration"."version",
+  "checkout_integration"."failing_since",
+  "checkout_integration"."head_revision",
+  "checkout_integration"."clean",
+  "checkout_integration"."pushed",
+  "checkout_integration"."landed",
+  "checkout_integration"."clean_details",
+  "checkout_integration"."pushed_details",
+  "checkout_integration"."landed_details",
+  "checkout_integration"."change_request",
+  "checkout_integration"."landed_evidence_change_request",
+  "checkout_integration"."landed_evidence_merged_at",
+  "checkout_integration"."landed_evidence_target_ref",
+  "checkout_integration"."landed_evidence_head_in_merged_head",
+  "checkout_integration"."remote_digest"
+FROM "checkout_integration";
 CREATE VIEW "log_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "l"."home") AS "home",
   "l"."home_seq",

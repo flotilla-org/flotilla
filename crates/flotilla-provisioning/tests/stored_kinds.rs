@@ -53,6 +53,8 @@ fn provisioning_kind_codes_are_pinned() {
     assert_eq!(held("Clone"), Some(KindCode::new("cl")));
     assert_eq!(held("CloneFacts"), Some(KindCode::new("cf")));
     assert_eq!(held("Checkout"), Some(KindCode::new("ck")));
+    assert_eq!(held("CheckoutFacts"), Some(KindCode::new("kf")));
+    assert_eq!(held("CheckoutIntegration"), Some(KindCode::new("ki")));
     assert_eq!(held("TerminalSession"), Some(KindCode::new("ts")));
     assert_eq!(held("AccountBinding"), Some(KindCode::new("ab")));
     assert_eq!(held("AccountProvision"), Some(KindCode::new("ap")));
@@ -68,7 +70,7 @@ fn provisioning_kind_codes_are_pinned() {
     assert_eq!(held("Host"), Some(KindCode::new("ho")));
     assert_eq!(held("HostObservation"), Some(KindCode::new("ob")));
     assert_eq!(held("AccessDelivery"), Some(KindCode::new("ad")));
-    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 27);
+    assert_eq!(registry.iter().count(), flotilla_state_machines::kinds().expect("engine kinds").iter().count() + 29);
     // The definition kinds (#3824 layer 2b), in the decided store with their writers (2b-ii).
     for (kind, code) in [
         ("Forge", "fo"),
