@@ -17,6 +17,7 @@ mod charter_store;
 pub use charter_store::{CharterPointer, CharterSource, CharterStoreBinding};
 #[doc(hidden)]
 pub mod checkout;
+pub mod checkout_records;
 #[doc(hidden)]
 pub mod clock;
 mod clone;

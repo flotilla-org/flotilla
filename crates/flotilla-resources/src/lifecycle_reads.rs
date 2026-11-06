@@ -58,6 +58,12 @@ pub trait LifecycleReads: Send + Sync {
         Err("clone records are not served without the engine".into())
     }
 
+    /// The engine's checkouts (#3108): every checkout reader and requester goes through them.
+    /// Unavailable where no engine is installed.
+    fn checkouts(&self) -> Result<&dyn crate::checkout_records::CheckoutRecords, String> {
+        Err("checkout records are not served without the engine".into())
+    }
+
     /// The reading of `name` homed at `origin` (a replica's origin root; `None` for this home), or
     /// `None` when the engine holds no such resource: the switch is off, or it was written before.
     ///
@@ -122,6 +128,10 @@ impl LifecycleReads for LateLifecycleReads {
 
     fn clones(&self) -> Result<&dyn crate::clone_records::CloneRecords, String> {
         self.installed.get().ok_or_else(|| "provisioning lifecycle reads are not installed".to_owned())?.clones()
+    }
+
+    fn checkouts(&self) -> Result<&dyn crate::checkout_records::CheckoutRecords, String> {
+        self.installed.get().ok_or_else(|| "provisioning lifecycle reads are not installed".to_owned())?.checkouts()
     }
 
     fn try_reading(

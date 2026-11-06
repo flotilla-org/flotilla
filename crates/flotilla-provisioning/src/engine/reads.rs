@@ -152,16 +152,23 @@ pub struct LifecycleReadPort {
     home: String,
     environments: Option<Arc<dyn flotilla_resources::environment_records::EnvironmentRecords>>,
     clones: Option<Arc<dyn flotilla_resources::clone_records::CloneRecords>>,
+    checkouts: Option<Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>>,
 }
 
 impl LifecycleReadPort {
     pub fn new(reads: StoreReads, home: String) -> Self {
-        Self { reads, home, environments: None, clones: None }
+        Self { reads, home, environments: None, clones: None, checkouts: None }
     }
 
     /// Serves `clones` as the engine's clones.
     pub fn with_clones(mut self, clones: Arc<dyn flotilla_resources::clone_records::CloneRecords>) -> Self {
         self.clones = Some(clones);
+        self
+    }
+
+    /// Serves `checkouts` as the engine's checkouts.
+    pub fn with_checkouts(mut self, checkouts: Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>) -> Self {
+        self.checkouts = Some(checkouts);
         self
     }
 
@@ -179,6 +186,10 @@ impl flotilla_resources::lifecycle_reads::LifecycleReads for LifecycleReadPort {
 
     fn clones(&self) -> Result<&dyn flotilla_resources::clone_records::CloneRecords, String> {
         self.clones.as_deref().ok_or_else(|| "this read port serves no clones".to_owned())
+    }
+
+    fn checkouts(&self) -> Result<&dyn flotilla_resources::checkout_records::CheckoutRecords, String> {
+        self.checkouts.as_deref().ok_or_else(|| "this read port serves no checkouts".to_owned())
     }
 
     fn try_terminal_launch(

@@ -32,6 +32,7 @@ pub mod account;
 pub mod artifact_import;
 pub mod artifacts;
 pub mod checkout;
+pub mod checkouts;
 pub mod clone_actuator;
 pub mod clones;
 pub mod controller;

@@ -1,4 +1,5 @@
 //! Real decided-store fixture shared by lifecycle reader contract tests.
+pub mod checkouts;
 pub mod clones;
 pub mod environments;
 pub mod image_build;
