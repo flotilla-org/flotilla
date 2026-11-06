@@ -6,7 +6,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from check import (AGENT_CONNECTOR, AGENT_CONNECTOR_FORBIDDEN, CAPABILITY_CRATES, C_FREE_BASE, DISCOVERY_FORBIDDEN, DRYDOCK_COMPOSITION, DRYDOCK_IMPLEMENTATION, RESOURCE_EXEMPTIONS, SCHEMA_CRATES, STATE_MACHINES, c_free_violations,
+from check import (AGENT_CONNECTOR, AGENT_CONNECTOR_FORBIDDEN, CAPABILITY_CRATES, C_FREE_BASE, DISCOVERY_FORBIDDEN, DRYDOCK_COMPOSITION, DRYDOCK_IMPLEMENTATION, RESOURCE_EXEMPTIONS, SCHEMA_CRATES, STATE_MACHINES, VERBS, c_free_violations,
                    vessel_graph_violations, operator_graph_violations, feature_differences, is_testkit, layer, main, tree_features, violations)
 
 
@@ -97,6 +97,26 @@ class BuildGraphContract(unittest.TestCase):
         # The operator CLI still composes core and the daemon.
         self.assertEqual(operator_graph_violations({"flotilla-cli v0.1": set(), "flotilla-core v0.1": set(),
                                                     "flotilla-daemon v0.1": set(), "comfy-table v7": set()}), [])
+
+    def test_verbs_reach_only_address_protocol_and_schema(self):
+        # #4267 ruling 2: a crate declaring verbs takes flotilla-verbs without reaching storage,
+        # the daemon or a capability crate. Finite generator: the allowed crates pass; storage,
+        # resource, capability and daemon crates fail, directly or through the protocol, on
+        # normal and build edges.
+        allowed = (package(VERBS, normal=("flotilla-address", "flotilla-protocol", "flotilla-schema-derive")),
+                   package("flotilla-protocol", normal=("flotilla-schema",)),
+                   package("flotilla-schema", normal=("flotilla-schema-derive", "flotilla-address", "flotilla-cbor")),
+                   package("flotilla-schema-derive"), package("flotilla-address"), package("flotilla-cbor"))
+        self.assertEqual(violations(graph(*allowed)), [])
+        for target in ("flotilla-store", "flotilla-resources", "flotilla-projections", "flotilla-daemon"):
+            for kind in ("normal", "build"):
+                for middle in (target, "flotilla-protocol"):
+                    through = () if middle == target else (package(middle, normal=(target,)),)
+                    with self.subTest(target=target, kind=kind, middle=middle):
+                        errors = violations(graph(package(VERBS, **{kind: (middle,)}), *through, package(target)))
+                        self.assertEqual([error for error in errors if error.startswith(VERBS)],
+                                         [f"{VERBS}: must not depend on {target}, directly or transitively; the verb types depend only "
+                                          "on flotilla-address, flotilla-protocol, the schema crates and what they reach"])
 
     def test_state_machines_are_c_free_and_self_contained(self):
         # ADR 0064 / #3319: the engine is base-tier and may be a dev-dependency of anything.

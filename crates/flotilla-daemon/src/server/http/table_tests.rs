@@ -981,7 +981,7 @@ async fn messages_filter_under_a_convoy_address() {
 // always projected, and filterable with `under`; each row's address resolves to that convoy.
 #[tokio::test]
 async fn convoy_rows_name_their_subject_by_address() {
-    use crate::server::verbs::{catalog::Subjects, convoy::ResourceSubjects};
+    use crate::server::verbs::{catalog::Subjects, subjects::ResourceSubjects};
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoys = backend.using::<Convoy>("test");
     // As admission labels them: a convoy without a project carries an empty project label.

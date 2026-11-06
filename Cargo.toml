@@ -65,6 +65,7 @@ members = [
     "crates/flotilla-inbox-testkit",
     "crates/flotilla-quint-testkit",
     "crates/flotilla-state-machines",
+    "crates/flotilla-verbs",
     "crates/flotilla-store",
     "crates/flotilla-store-memory",
     "crates/flotilla-store-sqlite",

@@ -192,8 +192,9 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
         )
         .await
         .expect("explained convoy");
-    // A live convoy's score is independent of whether its address is a record name, role or qualified role.
-    for address in ["convoy-explained", "explained", "explained@large"] {
+    // A live convoy's score is independent of whether its address is a record name or its role
+    // under its project.
+    for address in ["convoy-explained", "explained@large"] {
         let explanation = tokio::time::timeout(Duration::from_secs(1), daemon.explain_convoy_internal(Some("flotilla"), address))
             .await
             .expect("explain stays local")

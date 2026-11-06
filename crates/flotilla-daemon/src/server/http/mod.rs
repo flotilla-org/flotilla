@@ -86,7 +86,7 @@ pub(in crate::server) struct HttpRouter {
     hooks: HookEndpoint,
     /// Where `GET /` sends a browser (`[web] link_prefix`); unset means the fleet default.
     link_prefix: Option<String>,
-    /// The verb route's verbs; the built-in verbs over `backend` and `daemon` unless a test
+    /// The verb route's verbs; the registered verbs over `backend` and `daemon` unless a test
     /// supplies its own. Building the router hands them to the route.
     verbs: Option<Arc<Verbs>>,
     /// Tables derived from code (`verbs`), filled in when the router is built.
@@ -182,7 +182,10 @@ impl HttpRouter {
     }
 
     pub(in crate::server) fn into_router(mut self) -> Router {
-        let verbs = self.verbs.take().unwrap_or_else(|| Arc::new(verbs::builtin(self.backend.clone(), self.daemon.clone())));
+        let verbs = self.verbs.take().unwrap_or_else(|| {
+            let registry = crate::runtime::verb_registry(self.daemon.clone()).expect("each native verb is registered once");
+            Arc::new(verbs::serve(registry, Arc::new(verbs::subjects::ResourceSubjects::new(self.backend.clone()))))
+        });
         self.derived = vec![Arc::new(verbs.tables())];
         let router = Router::new()
             .route("/", get(root::handle))
