@@ -521,6 +521,10 @@ mod shape {
             "forge:github/repo:flotilla-org%2Fflotilla/issue:7",
             "forge:github/repo:flotilla-org%2Fflotilla/commit:0123456789abcdef0123456789abcdef01234567",
             "usage:claude/account:team",
+            "host:kiwi/role:checkout-inspector",
+            "host:kiwi/role:checkout-inspector/message:m1",
+            "host:kiwi/checkout:feature-x",
+            "host:kiwi/provider:docker",
         ] {
             assert_eq!(text.parse::<Address>().map(|a| a.to_string()).as_deref(), Ok(text));
         }
@@ -593,4 +597,37 @@ fn fleet_shape_and_short_input() {
         assert!(invalid.parse::<Address>().is_err(), "{invalid}");
     }
     assert_eq!(record_name(&Address::fleet("lab").expect("fleet")), None);
+}
+
+// ADR 0066 amendment (Q11): a host has roles, its daemon's own inboxes, and
+// checkouts, by name; a checkout sits only directly under its host.
+#[hegel::test]
+fn host_roles_and_checkouts_round_trip(tc: hegel::TestCase) {
+    let host = value(&tc, 1);
+    let name = value(&tc, 1);
+    let place = Address::root(Kind::Host, &host).expect("host");
+    let role = place.child(Kind::Role, &name).expect("role");
+    let checkout = place.child(Kind::Checkout, &name).expect("checkout");
+    for address in [role.clone(), Address::message(&role, &name).expect("message"), checkout.clone()] {
+        assert_eq!(address.get(Kind::Host), Some(host.as_str()));
+        assert_eq!(address.to_string().parse::<Address>().expect("canonical"), address);
+        assert_eq!(resolve(&address.to_string(), &BuiltinForges).expect("lenient"), address);
+    }
+    assert_eq!(record_name(&checkout), Some(name.clone()));
+    assert_eq!(record_name(&role), None);
+}
+
+#[test]
+fn a_checkout_sits_only_under_its_host() {
+    for invalid in [
+        "checkout:x",
+        "project:p/checkout:x",
+        "fleet:f/checkout:x",
+        "host:h/role:r/checkout:x",
+        "host:h/checkout:x/role:r",
+        "host:h/checkout:x/checkout:y",
+        "host:h/provider:p/role:r",
+    ] {
+        assert!(invalid.parse::<Address>().is_err(), "{invalid}");
+    }
 }

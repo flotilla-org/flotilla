@@ -16,7 +16,8 @@ const GITHUB_RECORD_SERVICE: &str = "github.com";
 /// - issue: `issue-<hex service>-<hex owner/repo>-<number>`;
 /// - artifact slot: `artifact-<sha256 of convoy, role, kind and subject>`;
 /// - usage account: `usage-<sha256 prefix of provider and account>`;
-/// - project, convoy and host: their name.
+/// - project, convoy and host: their name;
+/// - checkout: its name, which reads its latest launch (`<name>#<n>`).
 ///
 /// These are the names records already carry, so this is a read and write
 /// boundary, not a stored-shape change. A convoy's Project does not take part
@@ -49,7 +50,7 @@ pub fn record_name(address: &Address) -> Option<String> {
             let digest = format!("{:x}", hash.finalize());
             Some(format!("usage-{}", &digest[..54]))
         }
-        Kind::Project | Kind::Convoy | Kind::Host => Some(address.name().to_string()),
+        Kind::Project | Kind::Convoy | Kind::Host | Kind::Checkout => Some(address.name().to_string()),
         Kind::Fleet
         | Kind::Provider
         | Kind::Vessel

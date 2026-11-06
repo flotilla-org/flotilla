@@ -21,7 +21,9 @@ pub enum Kind {
     Convoy,
     /// A convoy's vessel.
     Vessel,
-    /// A standing role under a fleet or project, or a convoy role.
+    /// A standing role under a fleet, project or host, or a convoy role. A
+    /// host's role is one of that host's daemon's own inboxes, such as its
+    /// checkout inspector (ADR 0066 amendment, Q11).
     Role,
     /// An artifact slot under its producing role; always followed by `of:`.
     Artifact,
@@ -45,10 +47,13 @@ pub enum Kind {
     Usage,
     /// A provider account place, or an account under a usage provider.
     Account,
+    /// A checkout on its host, by the checkout's name: the subject a host's
+    /// checkout inspector is asked about (ADR 0066 amendment, Q11).
+    Checkout,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 18] = [
+    pub const ALL: [Kind; 19] = [
         Kind::Host,
         Kind::Provider,
         Kind::Project,
@@ -67,6 +72,7 @@ impl Kind {
         Kind::Ref,
         Kind::Usage,
         Kind::Account,
+        Kind::Checkout,
     ];
 
     /// The segment token, as printed before `:`.
@@ -90,6 +96,7 @@ impl Kind {
             Kind::Ref => "ref",
             Kind::Usage => "usage",
             Kind::Account => "account",
+            Kind::Checkout => "checkout",
         }
     }
 
@@ -102,7 +109,7 @@ impl Kind {
             // is optional); a convoy with one sits under it.
             Kind::Convoy => matches!(parent, None | Some(Kind::Project)),
             Kind::Vessel => parent == Some(Kind::Convoy),
-            Kind::Role => matches!(parent, Some(Kind::Fleet | Kind::Project | Kind::Convoy)),
+            Kind::Role => matches!(parent, Some(Kind::Fleet | Kind::Project | Kind::Convoy | Kind::Host)),
             Kind::Artifact => parent == Some(Kind::Role),
             // A message sits under its inbox, which is always a role.
             Kind::Message => parent == Some(Kind::Role),
@@ -110,6 +117,7 @@ impl Kind {
             Kind::ChangeRequest | Kind::Issue | Kind::Comment | Kind::Commit | Kind::Ref => parent == Some(Kind::Repo),
             Kind::Account => matches!(parent, None | Some(Kind::Usage)),
             Kind::Provider => matches!(parent, Some(Kind::Host | Kind::Account)),
+            Kind::Checkout => parent == Some(Kind::Host),
         }
     }
 }

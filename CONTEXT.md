@@ -64,6 +64,10 @@ dynamic, such as `coder-pr45`, with the role type as an attribute of the
 **Inbox**. A Message's sender is a declared role too: a person sends as their
 declared role, and each `system:<subsystem>` producer becomes a declared fleet
 role; there is no `system` address kind (#3424).)*
+*(ADR 0066 amendment, Q11, 2026-11-06: a role may also sit under a host,
+`host:<h>/role:<r>`, as one of that host's daemon's own inboxes, such as
+`host:kiwi/role:checkout-inspector`; and a checkout is addressed under its
+host by name, `host:<h>/checkout:<name>`, which is valid nowhere else.)*
 
 **Resource**:
 A thing with its own identity that others refer to, which someone wants to
