@@ -150,6 +150,8 @@ enum Trigger {
     Dependency,
     /// The controller started: the backing is observed.
     Start,
+    /// A host probe saw the backing change: a realised one is observed again.
+    Recheck,
 }
 
 /// What to do with one resource now.
@@ -215,7 +217,7 @@ fn act(state: &LifecycleState, judgement: &Judgement, found: &Found, trigger: Tr
             Judgement::Retrying { .. } if usable && (trigger == Trigger::Dependency || usable_again) => Action::Realise,
             _ => Action::Nothing,
         },
-        LifecycleState::Realised { .. } if trigger == Trigger::Start => Action::Observe,
+        LifecycleState::Realised { .. } if matches!(trigger, Trigger::Start | Trigger::Recheck) => Action::Observe,
         _ => Action::Nothing,
     }
 }
@@ -278,7 +280,15 @@ where
     }
 
     /// Runs until `backing` closes.
-    pub async fn run(mut self, mut backing: mpsc::Receiver<BackingEvent>) {
+    pub async fn run(self, backing: mpsc::Receiver<BackingEvent>) {
+        let (_none, rechecks) = mpsc::channel(1);
+        self.run_with(backing, rechecks).await
+    }
+
+    /// Runs until `backing` closes, observing again each realised resource named on `rechecks`:
+    /// a host probe that saw its backing change without knowing what it now is.
+    pub async fn run_with(mut self, mut backing: mpsc::Receiver<BackingEvent>, mut rechecks: mpsc::Receiver<String>) {
+        let mut rechecking = true;
         let start = self.lifecycles.live().iter().map(|resource| (resource.name().to_owned(), Trigger::Start)).collect();
         self.evaluate(start).await;
         loop {
@@ -308,6 +318,10 @@ where
                         self.evaluate(BTreeMap::from([(event.name, Trigger::Own)])).await;
                     }
                     None => return,
+                },
+                name = rechecks.recv(), if rechecking => match name {
+                    Some(name) => self.evaluate(BTreeMap::from([(name, Trigger::Recheck)])).await,
+                    None => rechecking = false,
                 },
             }
         }

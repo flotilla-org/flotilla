@@ -13,7 +13,7 @@ use flotilla_protocol::LifecycleReading;
 use flotilla_provisioning::engine::{checkout_actuator::convoy_holding, checkouts::request_of};
 use flotilla_provisioning::{
     engine::{
-        checkout_actuator::{Against, CheckoutActuator, CheckoutProvider, FreshClone, NamedHolderInputs},
+        checkout_actuator::{Against, BranchValidation, CheckoutActuator, CheckoutProvider, FreshClone, NamedHolderInputs},
         controller::Controller,
         reads::StoreReads,
     },
@@ -58,6 +58,8 @@ struct Asked {
     refusals: usize,
     /// Each removal tried, refused or not.
     removal_tries: usize,
+    /// Each worktree whose registration protection was restored: its target.
+    protected: Vec<String>,
 }
 
 #[derive(Default)]
@@ -141,15 +143,43 @@ impl CheckoutProvider for RecordingProvider {
         asked.removals.push(removal.clone());
         Ok(CheckoutRemovalOutcome::Removed)
     }
+
+    async fn protect(&self, _: &str, _: &str, target: &str, _: &str) -> Result<(), String> {
+        self.asked().protected.push(target.into());
+        Ok(())
+    }
+}
+
+/// A forge's answers to branch validation, in order; once they run out, every branch may be made.
+#[derive(Default)]
+struct ScriptedValidation {
+    answers: Mutex<Vec<Result<Option<String>, String>>>,
+    asked: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl BranchValidation for ScriptedValidation {
+    async fn validate_new_branch(&self, _: &str, branch: &str, _: bool) -> Result<Option<String>, String> {
+        self.asked.lock().expect("asked").push(branch.into());
+        let mut answers = self.answers.lock().expect("answers");
+        if answers.is_empty() {
+            Ok(None)
+        } else {
+            answers.remove(0)
+        }
+    }
 }
 
 struct World {
     _directory: tempfile::TempDir,
     provider: Arc<RecordingProvider>,
+    validation: Arc<ScriptedValidation>,
     checkouts: CheckoutFixture,
     clones: CloneFixture,
     commits: Arc<Notify>,
     _listener: Arc<CommitListener>,
+    /// What a host probe sends when it sees a checkout's backing change.
+    rechecks: tokio::sync::mpsc::Sender<String>,
 }
 
 fn host_direct() -> EnvironmentSpec {
@@ -171,6 +201,11 @@ impl World {
     /// A decided store with its Checkout controller started over `provider`, this host's direct
     /// environment realised and a clone of the repository realised in it.
     fn start(provider: RecordingProvider) -> Self {
+        Self::validated(provider, ScriptedValidation::default())
+    }
+
+    /// As [`World::start`], each new branch validated by `validation`.
+    fn validated(provider: RecordingProvider, validation: ScriptedValidation) -> Self {
         let directory = tempfile::tempdir().expect("directory");
         let service =
             Arc::new(Service::open(&directory.path().join("decided.sqlite"), HOME, decided_registry().expect("registry")).expect("store"));
@@ -186,23 +221,28 @@ impl World {
         let clones = CloneFixture::over(HOME, service.store());
         let checkouts = CheckoutFixture::over(HOME, service.store());
         let provider = Arc::new(provider);
-        let actuator = Arc::new(CheckoutActuator::new(
-            Arc::clone(&provider),
-            Arc::new(NamedHolderInputs),
-            Arc::clone(&checkouts.checkouts) as Arc<dyn CheckoutRecords>,
-            StoreReads::new(service.store()),
-            HOME,
-            checkouts.staged.clone(),
-        ));
+        let validation = Arc::new(validation);
+        let actuator = Arc::new(
+            CheckoutActuator::new(
+                Arc::clone(&provider),
+                Arc::new(NamedHolderInputs),
+                Arc::clone(&checkouts.checkouts) as Arc<dyn CheckoutRecords>,
+                StoreReads::new(service.store()),
+                HOME,
+                checkouts.staged.clone(),
+            )
+            .with_branch_validation(Arc::clone(&validation) as Arc<dyn BranchValidation>),
+        );
         let controller = Controller::start(Arc::clone(&checkouts.lifecycles), actuator, Arc::new(SystemClock), Arc::clone(&service))
             .expect("controller");
         let (backing, receiver) = tokio::sync::mpsc::channel(1);
+        let (rechecks, recheck_receiver) = tokio::sync::mpsc::channel(8);
         // The sender is kept by the controller's task: a checkout's backing is never pushed.
         tokio::spawn(async move {
             let _backing = backing;
-            controller.run(receiver).await;
+            controller.run_with(receiver, recheck_receiver).await;
         });
-        Self { _directory: directory, provider, checkouts, clones, commits, _listener: listener }
+        Self { _directory: directory, provider, validation, checkouts, clones, commits, _listener: listener, rechecks }
     }
 
     /// Requests the repository's clone in this host's environment, realised or not.
@@ -514,4 +554,87 @@ fn a_holder_ending_lost_to_a_snapshot_is_judged_from_the_snapshot() {
     assert!(ended_across_a_snapshot(|beta| beta.rollover_convoy("c1")), "rolled over");
     assert!(!ended_across_a_snapshot(|beta| beta.readmit_convoy("c1")), "readmitted, still open");
     assert!(!ended_across_a_snapshot(|_| ()), "nothing written since");
+}
+
+fn gave_up_with(world: &World, launch: &str, cause: &str) -> bool {
+    matches!(world.reading(launch), Some(LifecycleReading::GaveUp { cause: given }) if given.contains(cause))
+}
+
+// Behaviour: a branch another live checkout of the repository already holds in the environment is
+// refused, in the old reconciler's words, and nothing is made; once that checkout's convoy has
+// ended, a new request for the branch is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_branch_another_live_checkout_holds_is_refused() {
+    let world = World::start(RecordingProvider {
+        asked: Mutex::new(Asked { inspection: Some(inspection(true, true, false)), ..Asked::default() }),
+    });
+    world.checkouts.open_convoy("c1");
+    world.checkouts.open_convoy("c2");
+    let first = world.ready_worktree("c1", "feature").await;
+    let clone = world.clone(true);
+    let second_spec = |name: &str| {
+        CheckoutSpec::Worktree(CheckoutWorktreeSpec { target_path: format!("/work/c/{name}"), ..world_worktree(&clone, "feature") })
+    };
+    let second = world.checkouts.request("second", &second_spec("second"), Some(&convoy("c2")));
+    world.until("refused", |world| world.reading(&second).is_some_and(|reading| matches!(reading, LifecycleReading::GaveUp { .. }))).await;
+    assert!(
+        gave_up_with(&world, &second, "checkout branch feature conflicts with Checkout feature; choose a fresh branch name"),
+        "{:?}",
+        world.reading(&second)
+    );
+    assert_eq!(world.provider.asked().worktrees.len(), 1, "only the first was made");
+
+    world.checkouts.abandon_convoy("c1", "deleted");
+    world.until("the first released", |world| world.released(&first)).await;
+    let third = world.checkouts.request("third", &second_spec("third"), Some(&convoy("c2")));
+    world.until("third ready", |world| world.ready(&third)).await;
+}
+
+fn world_worktree(clone: &str, branch: &str) -> CheckoutWorktreeSpec {
+    CheckoutWorktreeSpec {
+        repo_ref: repository().key(),
+        env_ref: ENVIRONMENT.into(),
+        r#ref: branch.into(),
+        base_ref: Some("main".into()),
+        target_path: format!("/work/c/{branch}"),
+        clone_ref: clone.into(),
+    }
+}
+
+// Behaviour: a new branch the forge already has a change request from is refused as the forge
+// says; a lookup that fails refuses nothing, and leaves the checkout requested, unmade.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_branch_is_validated_with_the_forge_before_it_is_made() {
+    let validation = ScriptedValidation {
+        answers: Mutex::new(vec![
+            Ok(Some("checkout branch taken conflicts with Open change request #7; choose a fresh branch name".into())),
+            Err("rate limited".into()),
+        ]),
+        ..ScriptedValidation::default()
+    };
+    let world = World::validated(RecordingProvider::default(), validation);
+    world.checkouts.open_convoy("c1");
+    let clone = world.clone(true);
+    let taken = world.checkouts.request("taken", &world.worktree(&clone, "taken"), Some(&convoy("c1")));
+    world.until("refused", |world| gave_up_with(world, &taken, "conflicts with Open change request #7")).await;
+    let unknown = world.checkouts.request("unknown", &world.worktree(&clone, "unknown"), Some(&convoy("c1")));
+    world.until("tried", |world| world.validation.asked.lock().expect("asked").len() == 2).await;
+    world.until("retrying", |world| matches!(world.reading(&unknown), Some(LifecycleReading::Retrying { .. }))).await;
+    assert!(world.provider.asked().worktrees.is_empty(), "neither was made");
+}
+
+// Behaviour: a host probe's recheck observes a realised worktree again: one still there has its
+// registration protection restored, and one whose path vanished is recorded lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recheck_reprotects_a_present_worktree_and_records_a_vanished_one() {
+    let world = World::start(RecordingProvider::default());
+    world.checkouts.open_convoy("c1");
+    let launch = world.ready_worktree("c1", "feature").await;
+    let protected = world.provider.asked().protected.len();
+    world.rechecks.send(launch.clone()).await.expect("recheck");
+    world.until("reprotected", |world| world.provider.asked().protected.len() == protected + 1).await;
+    assert!(world.ready(&launch));
+    world.provider.asked().paths.remove("/work/c/feature");
+    world.rechecks.send(launch.clone()).await.expect("recheck");
+    world.until("lost", |world| matches!(world.reading(&launch), Some(LifecycleReading::Lost { .. }))).await;
 }

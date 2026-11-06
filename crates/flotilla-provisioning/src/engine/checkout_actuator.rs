@@ -95,6 +95,29 @@ pub trait CheckoutProvider: Send + Sync + 'static {
     async fn inspect(&self, environment: &str, path: &str, spec: &CheckoutSpec, against: Against<'_>) -> Result<Inspection, String>;
     /// Removes a checkout as `removal` says.
     async fn remove(&self, environment: &str, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String>;
+    /// Restores the registration protection of the worktree at `target` of the clone at
+    /// `clone_path`, registered as `reason`. Idempotent: a protected worktree stays so.
+    async fn protect(&self, _environment: &str, _clone_path: &str, _target: &str, _reason: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Whether a new branch may be made: one that is already a forge change request's head is
+/// refused. `Ok(Some)` names the conflict, which gives the launch up; `Err` is a lookup that
+/// failed, tried again.
+#[async_trait]
+pub trait BranchValidation: Send + Sync + 'static {
+    async fn validate_new_branch(&self, repository: &str, branch: &str, continuing: bool) -> Result<Option<String>, String>;
+}
+
+/// No forge to ask: every new branch may be made.
+pub struct NoBranchValidation;
+
+#[async_trait]
+impl BranchValidation for NoBranchValidation {
+    async fn validate_new_branch(&self, _: &str, _: &str, _: bool) -> Result<Option<String>, String> {
+        Ok(None)
+    }
 }
 
 /// A fresh clone of `url` at `target` on `branch`, from `base` when the branch is new, with
@@ -136,6 +159,8 @@ pub struct Against<'a> {
     pub change_request: Option<&'a str>,
     pub change_request_searched: bool,
     pub held: Option<&'a Inspection>,
+    /// The branch's ref on its remote is read too.
+    pub remote: bool,
 }
 
 /// Where a checkout's [`CheckoutInputs`] come from: its holder's records.
@@ -270,6 +295,27 @@ pub fn removal_for(request: &CheckoutRequest, clone_path: Option<String>, integr
     }
 }
 
+/// A removal's outcome as structured telemetry: the audit of what a release kept, by checkout,
+/// home and environment (owner ruling: audit records are telemetry). `event` names what happened.
+fn removal_events(checkout: &str, home: &str, environment: &str, outcome: &CheckoutRemovalOutcome) {
+    const TARGET: &str = "flotilla::checkout";
+    let preserved = match outcome {
+        CheckoutRemovalOutcome::Removed => None,
+        CheckoutRemovalOutcome::ArchivedAndRemoved { archive_path, preserved_branch } => {
+            tracing::warn!(target: TARGET, event = "CheckoutArchived", checkout, home, environment, archive = %archive_path, reason = "the checkout was not clean, pushed or landed", "checkout archived before removal");
+            preserved_branch.as_ref().map(|(branch, reason)| (branch, reason))
+        }
+        CheckoutRemovalOutcome::PreservedBranch { branch, reason } => Some((branch, reason)),
+        CheckoutRemovalOutcome::PreservedOrphanedCheckout { path } => {
+            tracing::warn!(target: TARGET, event = "OrphanedCheckoutPreserved", checkout, home, environment, path = %path, reason = "its Git admin directory is missing", "checkout preserved; recover its files before removing it");
+            None
+        }
+    };
+    if let Some((branch, reason)) = preserved {
+        tracing::warn!(target: TARGET, event = "CheckoutBranchPreserved", checkout, home, environment, branch = %branch, reason = %reason, "branch preserved during checkout removal");
+    }
+}
+
 /// The clone launch a checkout is made from, as its request names it: a launch name reads that
 /// launch, and a clone's name, from a checkout made before clones had launches, its latest.
 fn clone_launch(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<(String, LifecycleState, CloneRequest)>, StoreError> {
@@ -294,6 +340,13 @@ fn clone_launch(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<(S
         found
     };
     Ok(held.map(|held| (launch, held.state().clone(), held.spec().clone())))
+}
+
+/// The home sequence of the change that created checkout launch `name` at `home`: its request
+/// order there. One not held reads as the latest.
+fn created_at(read: &mut Read<'_>, name: &str, home: &str) -> Result<u64, StoreError> {
+    let Some(id) = read.resolve(CHECKOUT, name, home)? else { return Ok(u64::MAX) };
+    Ok(read.changes(id, 0, 1)?.first().map_or(u64::MAX, |entry| entry.home_seq))
 }
 
 fn transient(message: impl Into<String>) -> ProviderFailure {
@@ -327,6 +380,7 @@ pub struct CheckoutActuator<P> {
     reads: StoreReads,
     home: String,
     staged: StagedFacts<CheckoutFacts>,
+    validation: Arc<dyn BranchValidation>,
 }
 
 impl<P> CheckoutActuator<P> {
@@ -338,7 +392,13 @@ impl<P> CheckoutActuator<P> {
         home: impl Into<String>,
         staged: StagedFacts<CheckoutFacts>,
     ) -> Self {
-        Self { provider, inputs, records, reads, home: home.into(), staged }
+        Self { provider, inputs, records, reads, home: home.into(), staged, validation: Arc::new(NoBranchValidation) }
+    }
+
+    /// New branches are validated by `validation` before they are made.
+    pub fn with_branch_validation(mut self, validation: Arc<dyn BranchValidation>) -> Self {
+        self.validation = validation;
+        self
     }
 }
 
@@ -385,6 +445,76 @@ impl<P: CheckoutProvider> CheckoutActuator<P> {
         }))
     }
 
+    /// The checkout that already holds this launch's branch, if one does: another live launch of
+    /// the same repository's branch in the same environment, or in any environment when the
+    /// branch is continued. A requested one holds it only if it was requested first; local
+    /// clones held for the same convoy share their branch; a launch whose holder has ended
+    /// holds nothing.
+    fn conflicting(&self, name: &str, request: &CheckoutRequest, continuing: bool) -> Result<Option<String>, ProviderFailure> {
+        let local = |request: &CheckoutRequest| matches!(request.source, Source::FreshClone { .. }) && request.clone.is_some();
+        let home = self.home.clone();
+        self.reads
+            .read(|read| {
+                let others = super::reads::indexed::<CheckoutKind, _>(read, &CheckoutRequest::by_repository(&request.repository))?;
+                let own = created_at(read, name, &home)?;
+                for other in others {
+                    if launched(&other.name) == launched(name)
+                        || other.request.branch != request.branch
+                        || !(continuing || other.request.environment == request.environment)
+                        || (local(request) && local(&other.request) && other.request.holder == request.holder)
+                    {
+                        continue;
+                    }
+                    let holds = match other.state {
+                        LifecycleState::Realised { .. } => true,
+                        // Requested ones reserve in request order; names break ties and order
+                        // launches of different homes.
+                        LifecycleState::Requested { .. } if other.home == home => {
+                            (created_at(read, &other.name, &other.home)?, &other.name) < (own, &name.to_owned())
+                        }
+                        LifecycleState::Requested { .. } => other.name.as_str() < name,
+                        _ => false,
+                    };
+                    if holds && !convoy_holding(read, &other.name, &other.home)?.ended {
+                        return Ok(Some(launched(&other.name).to_owned()));
+                    }
+                }
+                Ok(None)
+            })
+            .map_err(|error| transient(format!("read the checkouts of repository {}: {error}", request.repository)))
+    }
+
+    /// Refuses a branch another live checkout holds, and a new branch the forge already has a
+    /// change request from; a branch shared with a ready local clone of the same convoy, or a
+    /// launch whose target already exists (a retry), is not asked about.
+    async fn admit_branch(&self, name: &str, request: &CheckoutRequest, continuing: bool, sharing: bool) -> Result<(), ProviderFailure> {
+        let refused = |message: String| ProviderFailure { cause: Cause::new(CauseCategory::Misconfigured, message), retryable: false };
+        if let Some(other) = self.conflicting(name, request, continuing)? {
+            return Err(refused(format!("checkout branch {} conflicts with Checkout {other}; choose a fresh branch name", request.branch)));
+        }
+        if sharing || self.provider.path_exists(&request.environment.name, &request.path).await.ok().flatten() == Some(true) {
+            return Ok(());
+        }
+        match self.validation.validate_new_branch(&request.repository, &request.branch, continuing).await {
+            Ok(None) => Ok(()),
+            Ok(Some(conflict)) => Err(refused(conflict)),
+            Err(error) => Err(transient(format!("validate checkout branch {}: {error}", request.branch))),
+        }
+    }
+
+    /// Restores a present worktree's registration protection, as the old reconciler did on every
+    /// pass while it was ready.
+    async fn protect(&self, name: &str, request: &CheckoutRequest) -> Result<(), String> {
+        if request.source != Source::Worktree {
+            return Ok(());
+        }
+        let Some(clone_path) = self.clone_path(request).map_err(|failure| failure.cause.detail)? else { return Ok(()) };
+        let holder = request.holder.as_ref().and_then(super::checkouts::checkout_holder);
+        let inputs = self.inputs.inputs(holder.as_ref(), &spec_of(request)).await?;
+        let reason = managed_checkout_reason(inputs.owner.as_deref(), launched(name));
+        self.provider.protect(&request.environment.name, &clone_path, &request.path, &reason).await
+    }
+
     /// Inspects launch `name` afresh and records it; the integration its removal is decided from.
     /// A failed inspection is recorded as failing and judges nothing.
     async fn inspected(&self, name: &str, request: &CheckoutRequest, inputs: &CheckoutInputs) -> Option<Inspection> {
@@ -406,6 +536,7 @@ impl<P: CheckoutProvider> CheckoutActuator<P> {
             change_request: inputs.change_request.as_deref(),
             change_request_searched: inputs.change_request_searched,
             held: held.as_ref(),
+            remote: false,
         };
         let inspection = self.provider.inspect(&request.environment.name, &request.path, &spec, against).await;
         let records = Arc::clone(&self.records);
@@ -441,6 +572,9 @@ where
     async fn observe(&self, name: &str, request: &CheckoutRequest) -> Result<Backing, Cause> {
         match self.provider.path_exists(&request.environment.name, &request.path).await {
             Ok(Some(true)) => {
+                if let Err(error) = self.protect(name, request).await {
+                    return Err(Cause::new(CauseCategory::Transient, format!("protect checkout {}: {error}", request.path)));
+                }
                 // A requested launch found already made is realised as it is found.
                 self.staged.stage(name, CheckoutFacts { degraded: None });
                 Ok(Backing::Present { identity: request.path.clone() })
@@ -475,6 +609,9 @@ where
             }
             Source::Worktree => {
                 let clone_path = self.clone_path(request)?.ok_or_else(|| transient("a worktree names no clone"))?;
+                if request.holder.is_some() {
+                    self.admit_branch(name, request, inputs.continuing, false).await?;
+                }
                 let made = if inputs.continuing {
                     self.provider.continue_worktree(environment, &clone_path, &request.branch, &request.path, &reason).await
                 } else {
@@ -486,9 +623,13 @@ where
             }
             Source::FreshClone { url } => match self.clone_path(request)? {
                 Some(source) => {
+                    let sharing = self.sharing_ready_branch(name, request)?;
+                    if request.holder.is_some() {
+                        self.admit_branch(name, request, inputs.continuing, sharing).await?;
+                    }
                     let intent = if inputs.continuing {
                         LocalCloneIntent::ContinueBranch
-                    } else if self.sharing_ready_branch(name, request)? {
+                    } else if sharing {
                         LocalCloneIntent::ShareConvoyBranch
                     } else {
                         LocalCloneIntent::NewBranch
@@ -505,6 +646,9 @@ where
                     degraded
                 }
                 None => {
+                    if request.holder.is_some() {
+                        self.admit_branch(name, request, inputs.continuing, false).await?;
+                    }
                     let clone = FreshClone {
                         url,
                         branch: &request.branch,
@@ -552,18 +696,7 @@ where
         };
         let Some(removal) = removal_for(request, clone_path, integration.as_ref()) else { return Ok(()) };
         let outcome = self.provider.remove(environment, &removal).await.map_err(transient)?;
-        match outcome {
-            CheckoutRemovalOutcome::Removed => {}
-            CheckoutRemovalOutcome::ArchivedAndRemoved { archive_path, preserved_branch } => {
-                warn!(checkout = name, archive = %archive_path, ?preserved_branch, "checkout archived before removal");
-            }
-            CheckoutRemovalOutcome::PreservedBranch { branch, reason } => {
-                warn!(checkout = name, %branch, %reason, "branch preserved during checkout removal");
-            }
-            CheckoutRemovalOutcome::PreservedOrphanedCheckout { path } => {
-                warn!(checkout = name, %path, "checkout preserved: its Git admin directory is missing; recover its files before removing it");
-            }
-        }
+        removal_events(launched(name), &self.home, environment, &outcome);
         Ok(())
     }
 
