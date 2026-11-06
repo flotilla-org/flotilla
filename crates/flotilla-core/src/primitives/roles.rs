@@ -35,6 +35,10 @@ pub const STANDING: FleetRole = FleetRole {
 pub const TEARDOWN: FleetRole =
     FleetRole { name: "teardown", purpose: "Reclaims a finished convoy's resources, and tells a person when reclaim is refused." };
 
+/// The checkout inspector (#3108): each host's controller that inspects the checkouts homed there
+/// when a gate asks, through its own inbox `fleet:<fleet>/role:checkout-inspector.<host>`.
+pub const CHECKOUT_INSPECTOR: &str = "checkout-inspector";
+
 /// The defaults the system sends as, in declaration order.
 pub const FLEET_ROLES: [FleetRole; 7] = [TURN_RULES, NUDGE, STALL_JUDGE, CAPABILITIES, FLEET_STORE, STANDING, TEARDOWN];
 
@@ -109,6 +113,14 @@ impl FleetRoles {
     pub fn role_of<'a>(&self, inbox: &'a Address) -> Option<&'a str> {
         (inbox.kind() == Kind::Role && inbox.parent().as_ref() == Some(&self.fleet) && self.purposes.contains_key(inbox.name()))
             .then(|| inbox.name())
+    }
+
+    /// Host `host`'s checkout inspector's inbox: `fleet:<fleet>/role:checkout-inspector.<host>`.
+    /// A role sits under a fleet, not a host, so the host is part of the role's name.
+    pub fn checkout_inspector(&self, host: &str) -> Result<Address, String> {
+        self.fleet
+            .child(Kind::Role, &format!("{CHECKOUT_INSPECTOR}.{host}"))
+            .map_err(|error| format!("checkout inspector of {host}: {error}"))
     }
 
     /// A person role's inbox under the fleet: `fleet:<fleet>/role:<name>`.

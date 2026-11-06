@@ -117,7 +117,7 @@ pub struct StoreLog {
 }
 
 impl StoreLog {
-    /// A log homed at the store's own home, accepting AgentSession and Person receipts.
+    /// A log homed at the store's own home, accepting AgentSession, Person and Controller receipts.
     pub fn new(store: Arc<Mutex<Store>>) -> Self {
         let home = lock_store(&store).home().to_owned();
         Self { store, home, receipts: ReceiptLog::new() }

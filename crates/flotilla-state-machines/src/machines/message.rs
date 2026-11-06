@@ -109,6 +109,12 @@ pub enum RequestBody {
     /// boxed for its size: the stored body is the request itself.
     #[serde(rename = "cv")]
     Convoy(Box<ConvoyRequest>),
+    /// A request to the checkout inspector at a checkout's home (#3108): inspect the checkout the
+    /// message's subject reference names, now, and write what changed. `remote` asks for the
+    /// branch's ref on its remote too. The inspector's receipt answers it; an undeliverable
+    /// request is a failed inspection to the gate that sent it.
+    #[serde(rename = "ci")]
+    CheckoutInspection { remote: bool },
 }
 
 /// A thing the message refers to, at a revision (ADR 0066 §4). At most one
@@ -348,7 +354,10 @@ pub struct ReceiptLog {
 
 impl Default for ReceiptLog {
     fn default() -> Self {
-        ReceiptLog { consumers: BTreeMap::new(), messages: BTreeMap::new() }.consumer::<AgentSession>().consumer::<Person>()
+        ReceiptLog { consumers: BTreeMap::new(), messages: BTreeMap::new() }
+            .consumer::<AgentSession>()
+            .consumer::<Person>()
+            .consumer::<super::controller::Controller>()
     }
 }
 

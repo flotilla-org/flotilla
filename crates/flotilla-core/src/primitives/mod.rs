@@ -50,6 +50,7 @@ use flotilla_state_machines::{
     machines::{
         agent_session::{AgentSession, MemoryAgentSessionWorld, Receive},
         consumer::{ConsumerKind, Receiver},
+        controller::{self, Controller},
         message::{Deliver, DropReason, MemoryMessageWorld, Message, MessageRef, MessageState, Supersedes},
         person::{self, Person},
     },
@@ -265,6 +266,76 @@ impl ConsumerPort for PersonReceipts {
     }
 }
 
+/// The records of this home's inbox-consuming controllers (#3108), holding their receipts: one per
+/// controller, created when it first registers and kept across restarts. Most controllers never
+/// consume an inbox and have none.
+pub struct Controllers {
+    home: Mutex<Home<Controller, StoreLog>>,
+}
+
+impl Controllers {
+    /// Creates the controller's record, Running, unless it exists.
+    pub fn ensure(&self, name: &str, now: Timestamp) -> Result<bool, String> {
+        let mut home = self.home.lock().expect("controller home");
+        if home.get(name).is_some() {
+            return Ok(false);
+        }
+        home.create(name, (), &(), now).map_err(|error| format!("Controller `{name}`: {error:?}"))?;
+        Ok(true)
+    }
+
+    /// One keyed read of a controller's record; absence means no such record.
+    pub fn get(&self, name: &str) -> Option<Resource<Controller>> {
+        self.home.lock().expect("controller home").get(name).cloned()
+    }
+}
+
+/// What a gate's request to a controller (an inspection, #3108) has come to, read from the
+/// request's own Message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestAnswer {
+    /// Not yet taken: the gate waits for the next change to the message.
+    Waiting,
+    /// The controller took it: its receipt is written, after the records it wrote for it.
+    Answered { receiver: Receiver },
+    /// It will never be answered: dropped as undeliverable (the inbox stayed unbound), expired,
+    /// superseded or withdrawn. The gate fails, never proceeds on older evidence.
+    Failed { reason: String },
+}
+
+impl RequestAnswer {
+    /// The answer `state` gives to a request sent to a controller consumer.
+    pub fn of(state: &MessageState) -> RequestAnswer {
+        match state {
+            MessageState::Pending => RequestAnswer::Waiting,
+            MessageState::Dropped { reason, .. } => RequestAnswer::Failed { reason: format!("the request was dropped: {reason:?}") },
+            MessageState::Awaiting { receiver } | MessageState::Settled { receiver: Some(receiver) } => {
+                RequestAnswer::Answered { receiver: receiver.clone() }
+            }
+            MessageState::Settled { receiver: None } => RequestAnswer::Failed { reason: "the request settled with no receiver".into() },
+        }
+    }
+}
+
+/// The inbox's consumer port for one controller: `Receive` on its own record.
+struct ControllerReceipts {
+    controllers: Arc<Controllers>,
+    name: String,
+    scope: Option<ReceiptScope>,
+}
+
+impl ConsumerPort for ControllerReceipts {
+    fn receipt_scope(&self) -> Option<ReceiptScope> {
+        self.scope.clone()
+    }
+    fn receive(&mut self, message: &str, transport: Transport, now: Timestamp) -> Result<(), flotilla_inbox::Error> {
+        let mut home = self.controllers.home.lock().expect("controller home");
+        home.apply(&self.name, controller::Receive { message: message.into(), transport }, &(), now)
+            .map(|_| ())
+            .map_err(|error| flotilla_inbox::Error::Consumer(format!("{error:?}")))
+    }
+}
+
 /// Every stored record of machine `M` homed at `home`.
 fn stored<M>(service: &Service, home: &str) -> Result<Vec<Resource<M>>, String>
 where
@@ -299,6 +370,7 @@ pub struct MessagePrimitives {
     inbox: SqliteInbox,
     sessions: Arc<Sessions>,
     people: Arc<People>,
+    controllers: Arc<Controllers>,
     convoys: Arc<convoys::Convoys>,
     convoy_engine: Arc<convoy_engine::ConvoyEngine>,
     awaiting: Arc<awaiting::AwaitingReplies>,
@@ -350,12 +422,18 @@ impl MessagePrimitives {
         let people = Arc::new(People {
             home: Mutex::new(Home::with_log(home, receipts.clone()).map_err(|error| format!("Person home: {error:?}"))?),
         });
+        let controllers = Arc::new(Controllers {
+            home: Mutex::new(Home::with_log(home, receipts.clone()).map_err(|error| format!("Controller home: {error:?}"))?),
+        });
         // Consumer records persist; reopen them so a restart keeps their receipts.
         for session in stored::<AgentSession>(&service, home)? {
             sessions.home.lock().expect("session home").restore(session).map_err(|error| format!("{error:?}"))?;
         }
         for person in stored::<Person>(&service, home)? {
             people.home.lock().expect("person home").restore(person).map_err(|error| format!("{error:?}"))?;
+        }
+        for controller in stored::<Controller>(&service, home)? {
+            controllers.home.lock().expect("controller home").restore(controller).map_err(|error| format!("{error:?}"))?;
         }
         let convoys = Arc::new(convoys::Convoys::open(home, &service)?);
         let convoy_engine = Arc::new(convoy_engine::ConvoyEngine::new(Arc::clone(&convoys), backend.clone(), Arc::clone(&clock)));
@@ -374,6 +452,7 @@ impl MessagePrimitives {
             inbox,
             sessions,
             people,
+            controllers,
             convoys,
             convoy_engine,
             awaiting,
@@ -406,6 +485,10 @@ impl MessagePrimitives {
     /// This home's person consumer records (#3938).
     pub fn people(&self) -> &Arc<People> {
         &self.people
+    }
+    /// This home's inbox-consuming controllers' records (#3108).
+    pub fn controllers(&self) -> &Arc<Controllers> {
+        &self.controllers
     }
     /// This home's Convoy records (#3587 layer 6).
     pub fn convoys(&self) -> &Arc<convoys::Convoys> {
@@ -500,6 +583,47 @@ impl MessagePrimitives {
             }
         }
         Ok(consumer)
+    }
+
+    /// The consumer identity of controller `name` at this home (#3108).
+    pub fn controller(&self, name: &str) -> Receiver {
+        Receiver { kind: ConsumerKind::Controller, id: name.to_owned(), host: self.home.clone() }
+    }
+
+    /// Registers controller `name` as a consumer (#3108): its record exists, and the inbox writes
+    /// its receipts there. It fills roles through ordinary bindings; other homes address the
+    /// role, never the record.
+    pub async fn register_controller(&self, name: &str, now: Timestamp) -> Result<Receiver, String> {
+        let consumer = self.controller(name);
+        // Registered consumers already have their record; skip the blocking hop.
+        if self.consumers.lock().expect("consumers").contains(&consumer) {
+            return Ok(consumer);
+        }
+        let controllers = Arc::clone(&self.controllers);
+        let owned = name.to_owned();
+        // A SQLite write: off the async workers.
+        tokio::task::spawn_blocking(move || controllers.ensure(&owned, now)).await.map_err(|error| error.to_string())??;
+        if self.consumers.lock().expect("consumers").insert(consumer.clone()) {
+            let port = ControllerReceipts {
+                controllers: Arc::clone(&self.controllers),
+                name: name.to_owned(),
+                scope: self.receipts.receipt_scope(),
+            };
+            if let Err(error) = self.inbox.register_async(consumer.clone(), port).await {
+                self.consumers.lock().expect("consumers").remove(&consumer);
+                return Err(error.to_string());
+            }
+        }
+        Ok(consumer)
+    }
+
+    /// What request `message`, homed here, sent to a controller has come to (#3108). A request
+    /// that is gone has failed.
+    pub async fn request_answer(&self, message: &str) -> Result<RequestAnswer, String> {
+        Ok(match self.inbox.get_async(message).await.map_err(|error| error.to_string())? {
+            Some(message) => RequestAnswer::of(message.state()),
+            None => RequestAnswer::Failed { reason: format!("request `{message}` is gone") },
+        })
     }
 
     /// Every person role's inbox in `namespace` (#3938): each person role
