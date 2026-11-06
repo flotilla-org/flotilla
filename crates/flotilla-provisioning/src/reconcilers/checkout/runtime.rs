@@ -8,11 +8,13 @@ use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::checkout_integration::convoy_change_request_id_for_checkout;
 use flotilla_resources::checkout_path::{checkout_path_component, checkout_path_from_status_and_spec};
 use flotilla_resources::{
-    canonicalize_repo_url, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, Convoy, ForgeSpec, ResourceObject,
+    canonicalize_repo_url, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, CheckoutSpec, Convoy, ForgeSpec,
+    LandedEvidence, ResourceObject,
 };
 use flotilla_store::{ReplicaReadResolver, ResourceBackend};
 use flotilla_vcs::checkout_integration::{
-    inspect_checkout_integration, inspect_convoy_checkout_integration, ChangeRequestIntegrationInput,
+    inspect_checkout_integration, inspect_convoy_checkout_integration, inspect_recorded_checkout_integration,
+    ChangeRequestIntegrationInput, RecordedAssociation,
 };
 use flotilla_vcs::vcs as core_vcs;
 use flotilla_vcs::vcs::CheckoutRegistration;
@@ -60,11 +62,16 @@ impl CheckoutControllerRuntime {
         checkout: &ResourceObject<Checkout>,
         id: &str,
     ) -> Result<Option<ChangeRequestStatus>, String> {
-        let Some(change_requests) = &self.change_requests else { return Ok(None) };
         let Some(repository) = convoy.spec.repositories.iter().find(|repository| repository.repo_ref == *checkout.spec.repo_ref()) else {
             return Ok(None);
         };
-        let Ok(canonical) = canonicalize_repo_url(&repository.url) else { return Ok(None) };
+        self.observed_change_request_of(&repository.url, id).await
+    }
+
+    /// The replicated observation of change request `id` of the repository at `url`.
+    async fn observed_change_request_of(&self, url: &str, id: &str) -> Result<Option<ChangeRequestStatus>, String> {
+        let Some(change_requests) = &self.change_requests else { return Ok(None) };
+        let Ok(canonical) = canonicalize_repo_url(url) else { return Ok(None) };
         let qualified = canonical.split_once("://").map(|(_, qualified)| qualified).unwrap_or(&canonical);
         let Some((service, scope)) = qualified.split_once('/') else { return Ok(None) };
         let Ok(number) = id.parse::<u64>() else { return Ok(None) };
@@ -173,6 +180,35 @@ impl CheckoutControllerRuntime {
             .await);
         }
         Ok(inspect_checkout_integration(&*runner, vcs.as_ref(), path, &checkout.spec, change_request_id).await)
+    }
+
+    /// Inspects the checkout of `spec` at `path` for settlement, as the engine's Checkout
+    /// controller releases it: against the change request its holder associates with its branch
+    /// (`association`), whose replicated observation of the repository at `repository_url` is
+    /// read, and the landing evidence held from an earlier inspection.
+    pub async fn inspect_at(
+        &self,
+        path: &str,
+        spec: &CheckoutSpec,
+        repository_url: Option<&str>,
+        association: RecordedAssociation<'_>,
+        landed_evidence: Option<&LandedEvidence>,
+    ) -> Result<CheckoutIntegrationStatus, String> {
+        let runner = self.local_runner()?;
+        let vcs = controller_vcs(&self.vcs, &self.runner, path)?;
+        let observed = match (repository_url, association.change_request_id) {
+            (Some(url), Some(id)) => self.observed_change_request_of(url, id).await?,
+            _ => None,
+        };
+        Ok(inspect_recorded_checkout_integration(
+            &*runner,
+            vcs.as_ref(),
+            Path::new(path),
+            spec,
+            association,
+            ChangeRequestIntegrationInput { status: observed.as_ref(), landed_evidence },
+        )
+        .await)
     }
 
     async fn remove_checkout_impl(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {

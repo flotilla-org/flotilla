@@ -74,13 +74,48 @@ pub async fn inspect_convoy_checkout_integration(
     let observe_remote_ref = convoy.status.as_ref().is_some_and(|status| {
         status.crew_work.values().flat_map(BTreeMap::values).any(|work| work.phase == CrewWorkPhase::Done && work.claim_evidence.is_some())
     });
+    inspect_recorded_checkout_integration(
+        runner,
+        vcs,
+        checkout_path,
+        spec,
+        RecordedAssociation {
+            change_request_id,
+            complete: convoy.status.as_ref().is_some_and(|status| status.branch_subject_scan_at.is_some()) || change_request_id.is_some(),
+            observe_remote_ref,
+        },
+        recorded,
+    )
+    .await
+}
+
+/// What a checkout's holder records of its branch's change request: the request, if one is
+/// associated; whether the association is complete, so that no request means none exists; and
+/// whether the branch's remote ref is observed too.
+#[derive(Clone, Copy, Debug)]
+pub struct RecordedAssociation<'a> {
+    pub change_request_id: Option<&'a str>,
+    pub complete: bool,
+    pub observe_remote_ref: bool,
+}
+
+/// Inspect a checkout for settlement against the replicated observation of its associated change
+/// request, as its holder records the association.
+pub async fn inspect_recorded_checkout_integration(
+    runner: &dyn CommandRunner,
+    vcs: &dyn Vcs,
+    checkout_path: &Path,
+    spec: &CheckoutSpec,
+    association: RecordedAssociation<'_>,
+    recorded: ChangeRequestIntegrationInput<'_>,
+) -> CheckoutIntegrationStatus {
     inspect_checkout_integration_with_association(
         IntegrationProviders { runner, vcs },
         checkout_path,
         spec,
-        change_request_id,
-        convoy.status.as_ref().is_some_and(|status| status.branch_subject_scan_at.is_some()) || change_request_id.is_some(),
-        observe_remote_ref,
+        association.change_request_id,
+        association.complete,
+        association.observe_remote_ref,
         Some(recorded),
     )
     .await

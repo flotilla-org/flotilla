@@ -13,7 +13,7 @@ use flotilla_protocol::LifecycleReading;
 use flotilla_provisioning::engine::{checkout_actuator::convoy_holding, checkouts::request_of};
 use flotilla_provisioning::{
     engine::{
-        checkout_actuator::{CheckoutActuator, CheckoutProvider, FreshClone, NamedHolderInputs},
+        checkout_actuator::{Against, CheckoutActuator, CheckoutProvider, FreshClone, NamedHolderInputs},
         controller::Controller,
         reads::StoreReads,
     },
@@ -116,7 +116,7 @@ impl CheckoutProvider for RecordingProvider {
         Ok((self.made(request.target), degraded))
     }
 
-    async fn inspect(&self, _: &str, path: &str, _: &CheckoutSpec, _: Option<&str>) -> Result<Inspection, String> {
+    async fn inspect(&self, _: &str, path: &str, _: &CheckoutSpec, _: Against<'_>) -> Result<Inspection, String> {
         let mut asked = self.asked();
         asked.inspected.push(path.into());
         asked.inspection.clone().ok_or_else(|| "fatal: not a git repository".into())

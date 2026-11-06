@@ -24,7 +24,30 @@ pub fn convoy_change_request_id_for_checkout(
     if let Some(id) = checkout.metadata.labels.get(CHANGE_REQUEST_ID_LABEL) {
         return Some(id.clone());
     }
-    let repository = convoy.spec.repositories.iter().find(|repository| repository.repo_ref == *checkout.spec.repo_ref())?;
+    subject_change_request_id(convoy, checkout.spec.repo_ref(), forges)
+}
+
+/// The change request a convoy associates with its branch in repository `repo_ref`, as its
+/// checkout there was labelled with when it was made: the one it is bound to there, else the one
+/// active subject it has in that repository.
+pub fn convoy_change_request_id(
+    convoy: &ResourceObject<Convoy>,
+    repo_ref: &crate::RepositoryKey,
+    forges: &[crate::ForgeSpec],
+) -> Option<String> {
+    if let Some(bound) = convoy.spec.change_request.as_ref().filter(|bound| bound.repository_ref == *repo_ref) {
+        return Some(bound.id.clone());
+    }
+    subject_change_request_id(convoy, repo_ref, forges)
+}
+
+/// The one active change request subject a convoy has in repository `repo_ref`.
+fn subject_change_request_id(
+    convoy: &ResourceObject<Convoy>,
+    repo_ref: &crate::RepositoryKey,
+    forges: &[crate::ForgeSpec],
+) -> Option<String> {
+    let repository = convoy.spec.repositories.iter().find(|repository| repository.repo_ref == *repo_ref)?;
     let repository = crate::address::repository_address(&repository.url, forges).ok()?;
     // Subjects keep the spelling they were recorded with; compare the
     // repositories they name.

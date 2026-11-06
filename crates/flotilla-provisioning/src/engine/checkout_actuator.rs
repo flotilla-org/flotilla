@@ -90,10 +90,9 @@ pub trait CheckoutProvider: Send + Sync + 'static {
         environment: &str,
         request: LocalCloneRequest<'_>,
     ) -> Result<(PreparedCheckout, Option<String>), String>;
-    /// Inspects the checkout of `spec` at `path` now, against `change_request` when one is
-    /// expected of its branch.
-    async fn inspect(&self, environment: &str, path: &str, spec: &CheckoutSpec, change_request: Option<&str>)
-        -> Result<Inspection, String>;
+    /// Inspects the checkout of `spec` at `path` now, against what its holder records of its
+    /// branch's change request.
+    async fn inspect(&self, environment: &str, path: &str, spec: &CheckoutSpec, against: Against<'_>) -> Result<Inspection, String>;
     /// Removes a checkout as `removal` says.
     async fn remove(&self, environment: &str, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String>;
 }
@@ -111,15 +110,32 @@ pub struct FreshClone<'a> {
     pub continuing: bool,
 }
 
-/// What a checkout's holder supplies its making: whether it continues the repository's branch,
-/// the credentials a fresh clone carries, the owner its registration names, and the change
-/// request its branch is expected to have.
+/// What a checkout's holder supplies its making and its inspection: whether it continues the
+/// repository's branch, the credentials a fresh clone carries, the owner its registration names,
+/// the repository's URL as the holder names it, and the change request its branch is expected to
+/// have.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CheckoutInputs {
     pub continuing: bool,
     pub credentials: CloneCredentials,
     pub owner: Option<String>,
+    pub repository_url: Option<String>,
+    /// The change request associated with the branch, by its forge number.
     pub change_request: Option<String>,
+    /// The holder searched the forge for the branch's change request, so that none associated
+    /// means none exists.
+    pub change_request_searched: bool,
+}
+
+/// What a checkout is inspected against: its holder's association of its branch with a change
+/// request in the repository at `repository_url`, and the inspection held before, whose landing
+/// evidence the inspection need not fetch again.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Against<'a> {
+    pub repository_url: Option<&'a str>,
+    pub change_request: Option<&'a str>,
+    pub change_request_searched: bool,
+    pub held: Option<&'a Inspection>,
 }
 
 /// Where a checkout's [`CheckoutInputs`] come from: its holder's records.
@@ -371,9 +387,27 @@ impl<P: CheckoutProvider> CheckoutActuator<P> {
 
     /// Inspects launch `name` afresh and records it; the integration its removal is decided from.
     /// A failed inspection is recorded as failing and judges nothing.
-    async fn inspected(&self, name: &str, request: &CheckoutRequest, change_request: Option<&str>) -> Option<Inspection> {
+    async fn inspected(&self, name: &str, request: &CheckoutRequest, inputs: &CheckoutInputs) -> Option<Inspection> {
         let spec = spec_of(request);
-        let inspection = self.provider.inspect(&request.environment.name, &request.path, &spec, change_request).await;
+        let records = Arc::clone(&self.records);
+        let launch = name.to_owned();
+        let held = tokio::task::spawn_blocking(move || records.get(&launch, None))
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|held| held)
+            .unwrap_or_else(|error| {
+                warn!(checkout = name, %error, "a released checkout's held inspection could not be read; it is inspected afresh");
+                None
+            })
+            .and_then(|record| record.integration)
+            .map(|integration| integration.inspection);
+        let against = Against {
+            repository_url: inputs.repository_url.as_deref(),
+            change_request: inputs.change_request.as_deref(),
+            change_request_searched: inputs.change_request_searched,
+            held: held.as_ref(),
+        };
+        let inspection = self.provider.inspect(&request.environment.name, &request.path, &spec, against).await;
         let records = Arc::clone(&self.records);
         let launch = name.to_owned();
         let written = tokio::task::spawn_blocking(move || match inspection {
@@ -502,14 +536,11 @@ where
             Err(error) => return Err(transient(error)),
         }
         let holder = request.holder.as_ref().and_then(super::checkouts::checkout_holder);
-        let change_request = match self.inputs.inputs(holder.as_ref(), &spec_of(request)).await {
-            Ok(inputs) => inputs.change_request,
-            Err(error) => {
-                warn!(checkout = name, %error, "a released checkout's inputs could not be read; it is inspected with none");
-                None
-            }
-        };
-        let integration = self.inspected(name, request, change_request.as_deref()).await;
+        let inputs = self.inputs.inputs(holder.as_ref(), &spec_of(request)).await.unwrap_or_else(|error| {
+            warn!(checkout = name, %error, "a released checkout's inputs could not be read; it is inspected with none");
+            CheckoutInputs::default()
+        });
+        let integration = self.inspected(name, request, &inputs).await;
         let clone_path = match &request.source {
             Source::Worktree => match self.clone_path(request) {
                 Ok(path) => path,

@@ -88,6 +88,43 @@ pub struct Inspection {
 }
 
 impl Inspection {
+    /// The inspection a checkout's VCS inspection made, as `status` reports it. An unknown
+    /// condition is a judgement it could not make; a change request whose forge number does not
+    /// parse is not one this inspection can name.
+    pub fn of_status(status: &crate::CheckoutIntegrationStatus) -> Self {
+        use crate::ConditionValue;
+        let judged = |condition: &crate::IntegrationCondition| match condition.value {
+            ConditionValue::True => Some(true),
+            ConditionValue::False => Some(false),
+            ConditionValue::Unknown => None,
+        };
+        let number = |id: &str| id.parse::<u64>().ok();
+        Self {
+            head_revision: status.head_revision.clone(),
+            clean: judged(&status.clean),
+            pushed: judged(&status.pushed),
+            landed: judged(&status.landed),
+            clean_details: status.clean.details.clone(),
+            pushed_details: status.pushed.details.clone(),
+            landed_details: status.landed.details.clone(),
+            change_request: status.change_request.as_ref().and_then(|observation| number(&observation.id)),
+            landed_evidence: status.landed_evidence.as_ref().and_then(|evidence| {
+                Some(Landed {
+                    change_request: number(&evidence.change_request_id)?,
+                    merged_at: evidence
+                        .merged_at
+                        .as_deref()
+                        .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+                        .map(|at| at.with_timezone(&Utc)),
+                    target_ref: evidence.target_ref.clone(),
+                    head_in_merged_head: evidence.checkout_head_in_merged_head,
+                })
+            }),
+            // Only the checkout's own branch's ref is observed.
+            remote_digest: status.remote_refs.values().next().map(|observation| observation.digest.clone()),
+        }
+    }
+
     /// This inspection merged onto `held`: a landing the held inspection had evidence for latches,
     /// so an inspection that cannot judge `landed` keeps the held evidence.
     pub fn latched(mut self, held: &Inspection) -> Self {
@@ -202,5 +239,68 @@ mod tests {
         // Without evidence, a held landing does not latch.
         let held = Inspection { landed_evidence: None, ..landed() };
         assert_eq!(Inspection::default().latched(&held), Inspection::default());
+    }
+
+    // Behaviour: a VCS inspection's conditions become judgements (unknown is no judgement), its
+    // landing evidence and change request their forge numbers, and its branch's remote ref its
+    // digest.
+    #[test]
+    fn a_vcs_inspection_reads_as_the_engines_inspection() {
+        use crate::{
+            ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, CheckoutIntegrationStatus, ConditionValue,
+            IntegrationCondition, LandedEvidence, RemoteRefObservation,
+        };
+        let condition = |value, detail: &str| IntegrationCondition::builder().value(value).details(vec![detail.to_owned()]).build();
+        let status = CheckoutIntegrationStatus {
+            head_revision: Some("abc".into()),
+            clean: condition(ConditionValue::True, "clean"),
+            pushed: condition(ConditionValue::Unknown, "no upstream"),
+            landed: condition(ConditionValue::True, "PR #7 merged"),
+            landed_evidence: Some(LandedEvidence {
+                change_request_id: "7".into(),
+                merged_at: Some("2026-11-06T10:00:00Z".into()),
+                target_ref: Some("main".into()),
+                checkout_head_in_merged_head: true,
+            }),
+            change_request: Some(
+                ChangeRequestObservation::builder()
+                    .id("7".into())
+                    .state(ChangeRequestState::Merged)
+                    .mergeability(ChangeRequestMergeability::Unknown)
+                    .observed_at(String::new())
+                    .build(),
+            ),
+            remote_refs: [(
+                "refs/heads/feature".to_owned(),
+                RemoteRefObservation::builder().digest("d1".into()).observed_at(String::new()).build(),
+            )]
+            .into(),
+        };
+        let inspection = Inspection::of_status(&status);
+        assert_eq!(
+            inspection,
+            Inspection {
+                head_revision: Some("abc".into()),
+                clean: Some(true),
+                pushed: None,
+                landed: Some(true),
+                clean_details: vec!["clean".into()],
+                pushed_details: vec!["no upstream".into()],
+                landed_details: vec!["PR #7 merged".into()],
+                change_request: Some(7),
+                landed_evidence: Some(Landed {
+                    change_request: 7,
+                    merged_at: DateTime::parse_from_rfc3339("2026-11-06T10:00:00Z").ok().map(|at| at.with_timezone(&Utc)),
+                    target_ref: Some("main".into()),
+                    head_in_merged_head: true,
+                }),
+                remote_digest: Some("d1".into()),
+            }
+        );
+        let unnumbered = CheckoutIntegrationStatus {
+            landed_evidence: status.landed_evidence.clone().map(|evidence| LandedEvidence { change_request_id: "x".into(), ..evidence }),
+            ..status
+        };
+        assert_eq!(Inspection::of_status(&unnumbered).landed_evidence, None);
     }
 }
