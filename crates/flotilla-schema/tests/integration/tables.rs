@@ -356,3 +356,24 @@ fn generated_record_stamps_have_sequence_roles() {
     let gates = set.tables.iter().find(|table| table.name == "plan_steps_gates").unwrap();
     assert!(gates.columns.iter().find(|column| column.name == "version").unwrap().properties.is_empty());
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Stored)]
+#[store(kind = "Held", code = "k3")]
+struct Held {
+    #[store(flatten)]
+    ident: Option<Ident>,
+}
+
+// Behaviour (#3108): a flattened optional struct is present exactly when its required columns are
+// set, so one holding an option field round-trips absent, and present with that field unset.
+#[test]
+fn a_flattened_option_with_option_fields_round_trips_absent() {
+    for value in [
+        Held { ident: None },
+        Held { ident: Some(Ident { session: "s".into(), pid: None }) },
+        Held { ident: Some(Ident { session: "s".into(), pid: Some(4) }) },
+    ] {
+        let rows = Encoder::encode(&value).expect("encode");
+        assert_eq!(Decoder::decode::<Held>(rows).expect("decode"), value);
+    }
+}

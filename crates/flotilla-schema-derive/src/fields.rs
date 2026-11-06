@@ -247,6 +247,18 @@ impl<'a> Field<'a> {
         }
     }
 
+    /// Whether the field's decoded local (bound by [`Self::decode_optional`]) says its columns are
+    /// all null. An `Option` field's null columns decode as `Some(None)`, a present empty option;
+    /// as a part of a flattened optional struct, that is an absent field too.
+    pub(crate) fn absent(&self) -> TokenStream {
+        let local = &self.local;
+        if crate::shape::option_inner(self.ty).is_some() {
+            quote!(::core::matches!(#local, ::core::option::Option::None | ::core::option::Option::Some(::core::option::Option::None)))
+        } else {
+            quote!(#local.is_none())
+        }
+    }
+
     pub(crate) fn decode_absent(&self) -> TokenStream {
         let (via, name) = (self.via(), &self.name);
         quote!(#via::decode_absent(d).map_err(|error| error.at(#name))?;)

@@ -276,6 +276,22 @@ fn part_impls(input: &DeriveInput, fields: &[Field<'_>], indexes: &Indexes<'_, '
     let decode_absent = fields.iter().map(Field::decode_absent);
     let idents: Vec<_> = fields.iter().map(|field| field.ident).collect();
     let locals: Vec<_> = fields.iter().map(|field| &field.local).collect();
+    // Absent when every column is null. A struct with a required field is present exactly when
+    // its required columns are set (the layout's presence rule), so its option fields' null
+    // columns count as absent; a struct of option fields alone is always present when
+    // flattened, and only `Option` of it is ever absent.
+    let required = fields.iter().any(|field| shape::option_inner(field.ty).is_none());
+    let absent: Vec<_> = fields
+        .iter()
+        .map(|field| {
+            if required {
+                field.absent()
+            } else {
+                let local = &field.local;
+                quote!(#local.is_none())
+            }
+        })
+        .collect();
     let names: Vec<_> = fields.iter().map(|field| &field.name).collect();
     quote! {
         #element
@@ -300,7 +316,7 @@ fn part_impls(input: &DeriveInput, fields: &[Field<'_>], indexes: &Indexes<'_, '
             /// Absent when every field is absent; a partly present value is missing a column.
             fn decode(d: &mut #schema::Decoder) -> ::core::result::Result<::core::option::Option<Self>, #schema::DecodeError> {
                 #(#decode)*
-                if #(#locals.is_none())&&* {
+                if #(#absent)&&* {
                     return ::core::result::Result::Ok(::core::option::Option::None);
                 }
                 ::core::result::Result::Ok(::core::option::Option::Some(Self {
