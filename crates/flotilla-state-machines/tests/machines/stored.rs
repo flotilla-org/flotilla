@@ -40,6 +40,10 @@ fn kind_codes_are_pinned() {
     let declared = [
         (Resource::<AgentSession>::KIND, Resource::<AgentSession>::CODE),
         (Resource::<AwaitingReply>::KIND, Resource::<AwaitingReply>::CODE),
+        (
+            Resource::<flotilla_state_machines::machines::controller::Controller>::KIND,
+            Resource::<flotilla_state_machines::machines::controller::Controller>::CODE,
+        ),
         (Resource::<Convoy>::KIND, Resource::<Convoy>::CODE),
         (Resource::<Ensure>::KIND, Resource::<Ensure>::CODE),
         (Resource::<Message>::KIND, Resource::<Message>::CODE),
@@ -49,6 +53,7 @@ fn kind_codes_are_pinned() {
     let expected = [
         ("AgentSession", KindCode::new("as")),
         ("AwaitingReply", KindCode::new("ar")),
+        ("Controller", KindCode::new("cn")),
         ("Convoy", KindCode::new("cv")),
         ("Ensure", KindCode::new("en")),
         ("Message", KindCode::new("ms")),

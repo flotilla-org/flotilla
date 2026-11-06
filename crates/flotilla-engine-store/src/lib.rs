@@ -49,6 +49,8 @@ pub fn machine_registry() -> Result<MachineRegistry, RegistryError> {
     register!(Message);
     register!(AgentSession);
     register!(Person);
+    // A controller consumer's receipts: first, each host's checkout inspector (#3108).
+    register!(flotilla_state_machines::machines::controller::Controller);
     register!(convoy::Convoy);
     register!(AwaitingReply);
     Ok(MachineRegistry { kinds, diagrams })

@@ -160,6 +160,25 @@ CREATE VIEW "agent_session_view" AS SELECT
   "agent_session"."activity_cause",
   (SELECT "name" FROM "codes" WHERE "kind" = 'as' AND "field" = 'reason' AND "code" = "agent_session"."reason") AS "reason"
 FROM "agent_session";
+CREATE TABLE "controller" (
+  "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
+  "version" INTEGER NOT NULL,
+  "state" TEXT NOT NULL CHECK ("state" IN ('re', 'ru')),
+  "state_since" INTEGER NOT NULL
+) STRICT;
+INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
+  ('cn', 'state', 're', 'Retired'),
+  ('cn', 'state', 'ru', 'Running'),
+  ('cn', 'log:edge', 'rt', 'Retire'),
+  ('cn', 'log:edge', 'rv', 'Receive'),
+  ('cn', 'log:label', 're', 'Retired'),
+  ('cn', 'log:label', 'ru', 'Running');
+CREATE VIEW "controller_view" AS SELECT
+  "controller"."id",
+  "controller"."version",
+  (SELECT "name" FROM "codes" WHERE "kind" = 'cn' AND "field" = 'state' AND "code" = "controller"."state") AS "state",
+  "controller"."state_since"
+FROM "controller";
 CREATE TABLE "convoy" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,

@@ -27,8 +27,8 @@ use flotilla_schema::{
 
 use crate::{
     machines::{
-        agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, ensure::Ensure, message::Message, person::Person,
-        vessel::Vessel,
+        agent_session::AgentSession, awaiting_reply::AwaitingReply, controller::Controller, convoy::Convoy, ensure::Ensure,
+        message::Message, person::Person, vessel::Vessel,
     },
     EdgeEventOf, EdgeKind, EdgePayload, Label, Machine, NoRecords, Resource, Version,
 };
@@ -49,6 +49,7 @@ pub fn kinds() -> Result<KindRegistry, RegistryError> {
     registry.register::<Resource<Ensure>>()?;
     registry.register::<Resource<AwaitingReply>>()?;
     registry.register::<Resource<Person>>()?;
+    registry.register::<Resource<Controller>>()?;
     Ok(registry)
 }
 

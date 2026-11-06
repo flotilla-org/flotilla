@@ -118,6 +118,20 @@ records the Message's `deliver` edge once it observes the receipt through
 replication, naming the receiver as a consumer identity: its kind, its
 resource's id and its host (ADR 0064, #3424).
 
+**Controller (consumer record)**:
+"Controller" in general means any deterministic daemon code that reacts to
+records: the reconcilers and engine controllers of the **Control Plane**. Most
+controllers are only that. The `Controller` stored kind (code `cn`) is something
+narrower: the record a controller gets once it consumes an **Inbox**, so that it
+has somewhere to write its **Receipts**. A controller that consumes no Inbox
+never has one. There is one record per such controller per host, homed on that
+host, and only that host writes its receipts. It fills roles through ordinary
+**Role Bindings**; other hosts address the role, never the record. It lasts
+across daemon restarts, and is retired only when that controller is removed from
+the host or the host is retired (#4351). The first is each host's checkout
+inspector, which answers inspection requests.
+_Avoid_: using "Controller" for the record when the code that reacts is meant.
+
 **Delivery Mode**:
 A consumer's choice of how a matching Message reaches it: `turn` (pushed),
 `notify` (listed for the agent to read, receipt on read) or `mute` (receipt
