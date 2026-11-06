@@ -133,7 +133,7 @@ const ENVIRONMENT: KindCode = <Resource<Lifecycle<EnvironmentKind>> as Kind>::CO
 const OBSERVATION: KindCode = <HostObservation as Kind>::CODE;
 
 /// The host whose provider realises environment `name` at `home`.
-fn environment_host(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<String>, StoreError> {
+pub(crate) fn environment_host(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<String>, StoreError> {
     let Some(id) = read.resolve(ENVIRONMENT, name, home)? else { return Ok(None) };
     let Some(loaded) = read.load::<Resource<Lifecycle<EnvironmentKind>>>(id)? else { return Ok(None) };
     Ok(host_provider(&loaded.value.spec().provider).map(|(host, _)| host.to_owned()))

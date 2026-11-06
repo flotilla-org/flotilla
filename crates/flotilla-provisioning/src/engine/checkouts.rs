@@ -51,7 +51,6 @@ fn is_main_branch(branch: &str) -> bool {
 pub fn holder_of(holder: &CheckoutHolder) -> Holder {
     match holder {
         CheckoutHolder::Convoy(convoy) => Holder::convoy(convoy),
-        CheckoutHolder::Ensure(ensure) => Holder::ensure(ensure),
     }
 }
 
@@ -81,7 +80,6 @@ pub(crate) fn checkout_holder(holder: &Holder) -> Option<CheckoutHolder> {
     let (kind, name) = holder.0.split_once(':')?;
     match kind {
         "convoy" => Some(CheckoutHolder::Convoy(name.to_owned())),
-        "ensure" => Some(CheckoutHolder::Ensure(name.to_owned())),
         _ => None,
     }
 }
@@ -356,7 +354,7 @@ impl EngineCheckouts {
     }
 
     /// What a launch held for `holder` is created under: a convoy's open engine Convoy at the
-    /// version read now. A standing role's Ensure is not read yet: its launches carry no item.
+    /// version read now. A launch held for no one carries no item.
     fn holder_items(&self, holder: Option<&CheckoutHolder>) -> Result<Vec<ChangeItem>, String> {
         let Some(CheckoutHolder::Convoy(convoy)) = holder else { return Ok(Vec::new()) };
         let (record, version) =
@@ -499,9 +497,8 @@ mod tests {
 
     #[test]
     fn a_holder_reads_back_as_it_was_given() {
-        for holder in [CheckoutHolder::Convoy("a:b".into()), CheckoutHolder::Ensure("e".into())] {
-            assert_eq!(checkout_holder(&holder_of(&holder)), Some(holder));
-        }
+        let holder = CheckoutHolder::Convoy("a:b".into());
+        assert_eq!(checkout_holder(&holder_of(&holder)), Some(holder));
         assert_eq!(checkout_holder(&Holder::vessel("v")), None);
     }
 }

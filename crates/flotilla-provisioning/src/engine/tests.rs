@@ -302,7 +302,7 @@ fn the_checkout_writer_refuses_a_worktree_without_its_clone() {
     let valid = CheckoutBinding::request(&worktree(Some("convoy-a")), HOME).expect("valid");
     let orphan = CheckoutRequest { clone: None, ..valid.clone() };
     assert!(orphan.validate().expect_err("no clone").contains("names its clone"));
-    assert_eq!(CheckoutRequest { holder: Some(Holder::ensure("standing")), ..valid.clone() }.validate(), Ok(()));
+    assert_eq!(CheckoutRequest { holder: Some(Holder::convoy("standing")), ..valid.clone() }.validate(), Ok(()));
     assert_eq!(CheckoutRequest { holder: None, ..valid }.validate(), Ok(()));
 }
 

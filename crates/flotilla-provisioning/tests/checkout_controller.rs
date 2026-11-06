@@ -10,6 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_protocol::LifecycleReading;
+use flotilla_provisioning::engine::{checkout_actuator::convoy_holding, checkouts::request_of};
 use flotilla_provisioning::{
     engine::{
         checkout_actuator::{CheckoutActuator, CheckoutProvider, FreshClone, NamedHolderInputs},
@@ -19,6 +20,7 @@ use flotilla_provisioning::{
     reconcilers::{CheckoutRemoval, CheckoutRemovalOutcome, PreparedCheckout},
     stored::decided_registry,
 };
+use flotilla_provisioning_testkit::replicate_home;
 use flotilla_provisioning_testkit::{checkouts::CheckoutFixture, environments::EnvironmentFixture, CloneFixture};
 use flotilla_resources::{
     checkout_records::{CheckoutHolder, CheckoutRecords, Inspection},
@@ -26,6 +28,7 @@ use flotilla_resources::{
     CheckoutBranchProvenance, CheckoutSpec, CheckoutWorktreeSpec, CloneSpec, EnvironmentSpec, FreshCloneCheckoutSpec,
     HostDirectEnvironmentSpec, ObservedCheckoutSpec, RepositorySpec, SystemClock,
 };
+use flotilla_schema::{ChangeItem, Timestamp};
 use flotilla_schema_sqlite::stream::{CommitListener, Service};
 use flotilla_state_machines::machines::lifecycle::LifecycleState;
 use flotilla_vcs::vcs::{CheckoutMaterialisationError, LocalCloneRequest};
@@ -51,6 +54,10 @@ struct Asked {
     inspection: Option<Inspection>,
     /// What a local clone reports it made short of.
     degraded: Option<String>,
+    /// How many removals to refuse, as the reclaim guard refuses unclean work.
+    refusals: usize,
+    /// Each removal tried, refused or not.
+    removal_tries: usize,
 }
 
 #[derive(Default)]
@@ -117,6 +124,11 @@ impl CheckoutProvider for RecordingProvider {
 
     async fn remove(&self, _: &str, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
         let mut asked = self.asked();
+        asked.removal_tries += 1;
+        if asked.refusals > 0 {
+            asked.refusals -= 1;
+            return Err("preserving local clone /work/c/feature: uncommitted changes".into());
+        }
         let target = match removal {
             CheckoutRemoval::Worktree { target_path, .. }
             | CheckoutRemoval::ForcedWorktree { target_path, .. }
@@ -227,7 +239,7 @@ impl World {
         self.reading(launch) == Some(LifecycleReading::Released)
     }
 
-    /// Waits for `holds`, rechecked at each commit.
+    /// Waits for `holds`, rechecked at each commit and every 50ms.
     async fn until(&self, what: &str, holds: impl Fn(&Self) -> bool) {
         let wait = async {
             loop {
@@ -237,7 +249,8 @@ impl World {
                 if holds(self) {
                     return;
                 }
-                committed.await;
+                // The provider's answers commit nothing: they are rechecked now and then too.
+                let _ = tokio::time::timeout(Duration::from_millis(50), committed).await;
             }
         };
         tokio::time::timeout(Duration::from_secs(10), wait).await.unwrap_or_else(|_| panic!("timed out waiting for {what}"));
@@ -408,4 +421,97 @@ async fn a_local_clone_records_its_degradation_and_a_sibling_shares_its_branch()
     world.until("second ready", |world| world.ready(&second)).await;
     let intents: Vec<String> = world.provider.asked().local_clones.iter().map(|(_, _, intent)| intent.clone()).collect();
     assert_eq!(intents, ["NewBranch", "ShareConvoyBranch"]);
+}
+
+// Behaviour: a rollover ends the generation a checkout was requested in: its checkout is released,
+// and a checkout requested after the rollover is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rollover_releases_the_previous_generations_checkouts_only() {
+    let world = World::start(RecordingProvider {
+        asked: Mutex::new(Asked { inspection: Some(inspection(true, true, false)), ..Asked::default() }),
+    });
+    world.checkouts.open_convoy("c1");
+    let before = world.ready_worktree("c1", "before").await;
+    world.checkouts.rollover_convoy("c1");
+    world.until("released", |world| world.released(&before)).await;
+    let after = world.ready_worktree("c1", "after").await;
+    // Another write to the Convoy wakes the later checkout: it is still held.
+    world.checkouts.readmit_convoy("c1");
+    world.until("the readmission passed", |world| world.ready(&after) && world.provider.asked().removals.len() == 1).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(world.ready(&after), "a checkout requested after the rollover is held by the next generation");
+    assert_eq!(world.provider.asked().removals.len(), 1);
+}
+
+// Behaviour: a refused removal is not tried again at once; the checkout's integration being
+// written again, as cleaning its work up does, tries it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_removal_waits_for_the_checkouts_integration_to_change() {
+    let world = World::start(RecordingProvider {
+        asked: Mutex::new(Asked { inspection: Some(inspection(true, true, false)), refusals: 1, ..Asked::default() }),
+    });
+    world.checkouts.open_convoy("c1");
+    let launch = world.ready_worktree("c1", "feature").await;
+    world.checkouts.abandon_convoy("c1", "deleted");
+    world.until("a refused removal", |world| world.provider.asked().removal_tries == 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(world.provider.asked().removal_tries, 1, "not tried again until something changes");
+    assert!(world.ready(&launch));
+    // The work is cleaned up: the next inspection writes a changed integration.
+    world
+        .checkouts
+        .checkouts
+        .inspected(&launch, Inspection { head_revision: Some("def".into()), ..inspection(true, true, false) })
+        .expect("write");
+    world.until("released", |world| world.released(&launch)).await;
+    assert_eq!(world.provider.asked().removal_tries, 2);
+}
+
+/// Convoy `c1` at home `beta`, written as `write` says after a checkout at `alpha` read it, and
+/// held at `alpha` only from a snapshot taken after that write: whether the checkout's holder has
+/// ended, judged at `alpha`.
+fn ended_across_a_snapshot(write: impl FnOnce(&CheckoutFixture)) -> bool {
+    let registry = || flotilla_provisioning::stored::decided_registry().expect("registry");
+    let directory = tempfile::tempdir().expect("directory");
+    let beta_service = Arc::new(Service::open(&directory.path().join("beta.sqlite"), "beta", registry()).expect("beta"));
+    let alpha_service = Arc::new(Service::open(&directory.path().join("alpha.sqlite"), "alpha", registry()).expect("alpha"));
+    let beta = CheckoutFixture::over("beta", beta_service.store());
+    beta.open_convoy("c1");
+    let (convoy, read_at) = beta.convoy_version("c1");
+    write(&beta);
+    replicate_home(&beta_service, "beta", &alpha_service);
+
+    let alpha = CheckoutFixture::over("alpha", alpha_service.store());
+    let spec = CheckoutSpec::Observed(ObservedCheckoutSpec {
+        r#ref: "found".into(),
+        path: "/work/found".into(),
+        repo_ref: repository().key(),
+        host_ref: "alpha".into(),
+        is_main: false,
+    });
+    let request = request_of(&spec, Some(&convoy_holder()), "alpha").expect("request");
+    alpha.inputs.stage("found#1", vec![ChangeItem::new(convoy.clone(), Some(read_at.to_string()))]);
+    alpha.lifecycles.request("found#1", request, Timestamp::from_datetime(&chrono::Utc::now())).expect("requested");
+
+    let store = alpha_service.store();
+    let mut store = store.lock().expect("store");
+    let mut read = store.read().expect("read");
+    let held = read.resolve(convoy.kind, &convoy.name, &convoy.home).expect("resolve").expect("the convoy is held at alpha");
+    assert!(read.changes(held, 0, 16).expect("entries").is_empty(), "alpha holds the convoy from a snapshot alone");
+    convoy_holding(&mut read, "found#1", "alpha").expect("judged").ended
+}
+
+fn convoy_holder() -> CheckoutHolder {
+    convoy("c1")
+}
+
+// Behaviour: where the Convoy's entries after the version read were lost to a snapshot, its end
+// is judged from the snapshot: an abandonment or a rollover since the read ends the checkout's
+// holder, and a write that ends nothing does not.
+#[test]
+fn a_holder_ending_lost_to_a_snapshot_is_judged_from_the_snapshot() {
+    assert!(ended_across_a_snapshot(|beta| beta.abandon_convoy("c1", "deleted")), "abandoned");
+    assert!(ended_across_a_snapshot(|beta| beta.rollover_convoy("c1")), "rolled over");
+    assert!(!ended_across_a_snapshot(|beta| beta.readmit_convoy("c1")), "readmitted, still open");
+    assert!(!ended_across_a_snapshot(|_| ()), "nothing written since");
 }

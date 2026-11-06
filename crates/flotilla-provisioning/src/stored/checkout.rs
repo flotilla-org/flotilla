@@ -56,7 +56,7 @@ pub struct CheckoutRequest {
     pub source: Source,
     /// A worktree's Clone; for a fresh clone, the local clone it seeds from, if any.
     pub clone: Option<Ref<Resource<clone::Clone>>>,
-    /// Who it is held for: `convoy:<name>` or `ensure:<name>`. A finishing
+    /// Who it is held for: `convoy:<name>`. A finishing
     /// holder finds its checkouts through this index and releases them.
     pub holder: Option<Holder>,
 }

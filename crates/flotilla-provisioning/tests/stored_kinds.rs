@@ -236,7 +236,7 @@ fn each_kind_survives_the_codec() {
                 path: "/w".into(),
                 source: source.clone(),
                 clone: clone.clone(),
-                holder: holder.clone().or_else(|| Some(Holder::ensure("standing"))),
+                holder: holder.clone().or_else(|| Some(Holder::convoy("standing"))),
             };
             round_trip::<CheckoutKind>(spec, state);
         }

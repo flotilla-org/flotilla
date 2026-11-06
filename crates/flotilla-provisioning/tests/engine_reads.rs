@@ -85,7 +85,7 @@ fn views_are_read_by_key_and_index_and_judged_per_key() {
     };
     assert_eq!(names(reads.environment_checkouts("env-1", HOME).expect("index")), ["a", "b"]);
     assert_eq!(names(reads.held_checkouts(&Holder::convoy("convoy-1")).expect("index")), ["a", "c"]);
-    assert!(reads.held_checkouts(&Holder::ensure("convoy-1")).expect("index").is_empty(), "the holder's kind is part of it");
+    assert!(reads.held_checkouts(&Holder::vessel("convoy-1")).expect("index").is_empty(), "the holder's kind is part of it");
     assert!(reads.environment_checkouts("env-3", HOME).expect("index").is_empty());
 }
 

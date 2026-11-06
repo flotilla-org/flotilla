@@ -13,11 +13,14 @@
 //!   provider's readiness, an input's realisation;
 //! - a record blocking a release changing ([`Actuator::release_blockers`]), such as a checkout
 //!   made in an environment ending;
+//! - a fact a failed release waits on changing ([`Actuator::release_waits`]), such as a
+//!   checkout's integration once its work is cleaned up;
 //! - one of its own flights (realise, release, observe) finishing;
 //! - a [`BackingEvent`] its provider pushes, such as a container's death.
 //!
 //! A retryable failure is recorded and nothing else: the resource is tried again only on an event
-//! that could change the outcome. A non-retryable failure, or a spent failure limit, gives up.
+//! that could change the outcome. A non-retryable failure, or a spent failure limit, gives up. A
+//! failed release is tried again only on a change of a record it depends on, never at once.
 //!
 //! Who writes what: the holder's controller requests a resource (`Lifecycles::request`, or
 //! `replace_launch` for a successor launch); this controller writes every edge after that,
@@ -131,6 +134,11 @@ pub trait Actuator<K: LifecycleKind>: Send + Sync + 'static {
     fn release_blockers(&self, _read: &mut Read<'_>, _name: &str, _request: &K::Request) -> Result<Vec<Identity>, StoreError> {
         Ok(Vec::new())
     }
+    /// The facts whose change could let a failed release of `name` succeed, read once its holder
+    /// has ended: each one's change tries the release again.
+    fn release_waits(&self, _read: &mut Read<'_>, _name: &str, _request: &K::Request) -> Result<Vec<Identity>, StoreError> {
+        Ok(Vec::new())
+    }
 }
 
 /// Why a resource is looked at.
@@ -173,6 +181,8 @@ struct Found {
     usability: Vec<Usability>,
     /// The records its release waits on, read only once its holder has ended.
     blockers: Vec<Identity>,
+    /// The facts a failed release waits on, read only once its holder has ended.
+    release_waits: Vec<Identity>,
 }
 
 impl Found {
@@ -186,12 +196,14 @@ impl Found {
     }
 }
 
-/// The decision for one resource, from its state and what was read for it.
-fn act(state: &LifecycleState, judgement: &Judgement, found: &Found, trigger: Trigger, usable_again: bool) -> Action {
+/// The decision for one resource, from its state and what was read for it. A release that failed
+/// (`release_failed`) is tried again only when a record it depends on changed.
+fn act(state: &LifecycleState, judgement: &Judgement, found: &Found, trigger: Trigger, usable_again: bool, release_failed: bool) -> Action {
     let usable = found.usable();
+    let release_again = !release_failed || trigger == Trigger::Dependency;
     match state {
-        LifecycleState::Requested { .. } if found.release() => Action::Release { identity: None },
-        LifecycleState::Realised { identity } if found.release() => Action::Release { identity: Some(identity.clone()) },
+        LifecycleState::Requested { .. } if found.release() && release_again => Action::Release { identity: None },
+        LifecycleState::Realised { identity } if found.release() && release_again => Action::Release { identity: Some(identity.clone()) },
         // Its holder ended, but a record it serves is still live: it waits for that one.
         _ if found.holder_ended => Action::Nothing,
         LifecycleState::Requested { .. } if trigger == Trigger::Start => Action::Observe,
@@ -229,6 +241,8 @@ pub struct Controller<K: LifecycleKind, A: Actuator<K>> {
     usable: BTreeMap<String, bool>,
     flights: JoinSet<(String, Done)>,
     in_flight: BTreeSet<String>,
+    /// The resources whose last release failed: tried again only on a dependency's change.
+    release_failed: BTreeSet<String>,
 }
 
 impl<K, A> Controller<K, A>
@@ -259,6 +273,7 @@ where
             usable: BTreeMap::new(),
             flights: JoinSet::new(),
             in_flight: BTreeSet::new(),
+            release_failed: BTreeSet::new(),
         })
     }
 
@@ -352,8 +367,12 @@ where
                     .iter()
                     .map(|(name, request)| {
                         let Holding { ended: holder_ended, record: holder } = actuator.holder(read, name, request)?;
-                        let blockers = if holder_ended { actuator.release_blockers(read, name, request)? } else { Vec::new() };
-                        Ok(Found { holder_ended, holder, usability: actuator.usability(read, request)?, blockers })
+                        let (blockers, release_waits) = if holder_ended {
+                            (actuator.release_blockers(read, name, request)?, actuator.release_waits(read, name, request)?)
+                        } else {
+                            (Vec::new(), Vec::new())
+                        };
+                        Ok(Found { holder_ended, holder, usability: actuator.usability(read, request)?, blockers, release_waits })
                     })
                     .collect::<Result<Vec<_>, StoreError>>()
             })
@@ -379,7 +398,7 @@ where
                     self.end_predecessor(&previous).await;
                 }
             }
-            let action = act(state, &judge::<K>(state), &found, trigger, usable_again);
+            let action = act(state, &judge::<K>(state), &found, trigger, usable_again, self.release_failed.contains(&name));
             self.perform(&name, resource.spec().clone(), action).await;
         }
     }
@@ -447,14 +466,18 @@ where
                 self.write(name, Step::Attempted(Outcome::Failed { cause: failure.cause, retryable: failure.retryable })).await;
             }
             (Done::Released(Ok(())), state) if state.live() => {
+                self.release_failed.remove(name);
                 self.write(name, Step::Released).await;
             }
             (Done::Released(Err(failure)), LifecycleState::Requested { .. }) => {
+                self.release_failed.insert(name.to_owned());
                 self.write(name, Step::Attempted(Outcome::Failed { cause: failure.cause, retryable: failure.retryable })).await;
             }
             (Done::Released(Err(failure)), _) => {
-                // A realised resource has no failed-teardown edge; its holder's next change, or
-                // the next start, tries the release again.
+                // A realised resource has no failed-teardown edge yet, so the failure is not
+                // counted: a change of a record its release depends on, or the next start, tries
+                // the release again.
+                self.release_failed.insert(name.to_owned());
                 warn!(kind = K::NAME, name, cause = ?failure.cause, "release failed");
             }
             (Done::Observed(Ok(Backing::Present { identity })), LifecycleState::Requested { .. }) => {
@@ -489,6 +512,7 @@ where
         let mut depends = self.actuator.dependencies(request);
         depends.extend(found.usability.iter().map(|usability| usability.fact.clone()));
         depends.extend(found.blockers.iter().cloned());
+        depends.extend(found.release_waits.iter().cloned());
         depends.extend(found.holder.iter().cloned());
         if self.depends.get(name) == Some(&depends) {
             return;
@@ -502,6 +526,7 @@ where
 
     fn forget(&mut self, name: &str) {
         self.usable.remove(name);
+        self.release_failed.remove(name);
         self.unlink(name);
     }
 

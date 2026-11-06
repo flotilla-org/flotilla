@@ -1,8 +1,8 @@
 //! Checkouts as the engine holds them (#3108): the port every checkout reader and requester
 //! uses, served over the decided store.
 //!
-//! A checkout is one branch checked out at one path in one environment, held for the role's owner
-//! (a convoy, or a standing role's Ensure). Each try at it is a launch of its own
+//! A checkout is one branch checked out at one path in one environment, held for the role's
+//! convoy. Each try at it is a launch of its own
 //! (`<checkout>#<n>`): a launch that ended (given up, lost, released) is never revived, and a new
 //! request after it starts the next launch. Its integration is its home's inspection, written only
 //! when an inspected value changes; when the values were last confirmed is judged at read time.
@@ -20,8 +20,6 @@ use crate::{CheckoutSpec, RepositoryKey};
 pub enum CheckoutHolder {
     /// A convoy role's: the convoy, by name.
     Convoy(String),
-    /// A standing role's: its Ensure, by name.
-    Ensure(String),
 }
 
 /// One launch of a checkout as a reader sees it.

@@ -54,7 +54,8 @@ fn a_realised_checkout_reads_back_with_its_facts_through_each_index() {
     fixture.open_convoy("c1");
     let held = fixture.request("co", &worktree("feature"), Some(&convoy("c1")));
     fixture.ready(&held, Some("objects not shared"));
-    fixture.put_ready("standing", &worktree("standing"), Some(&CheckoutHolder::Ensure("e1".into())));
+    fixture.open_convoy("c3");
+    fixture.put_ready("standing", &worktree("standing"), Some(&convoy("c3")));
 
     let record = fixture.record(&held);
     assert!(record.is_ready());
@@ -70,7 +71,7 @@ fn a_realised_checkout_reads_back_with_its_facts_through_each_index() {
         names
     };
     assert_eq!(names(fixture.checkouts.held(&convoy("c1")).expect("held")), vec![held.clone()]);
-    assert_eq!(names(fixture.checkouts.held(&CheckoutHolder::Ensure("e1".into())).expect("held")), vec!["standing#1".to_owned()]);
+    assert_eq!(names(fixture.checkouts.held(&convoy("c3")).expect("held")), vec!["standing#1".to_owned()]);
     assert_eq!(names(fixture.checkouts.held(&convoy("c2")).expect("held")), Vec::<String>::new());
     assert_eq!(names(fixture.checkouts.of_repository(&repository()).expect("of")), vec![held.clone(), "standing#1".into()]);
     assert_eq!(names(fixture.checkouts.in_environment("host-direct-home", None).expect("in")), vec![held.clone(), "standing#1".into()]);

@@ -18,17 +18,17 @@ use flotilla_resources::{
     lifecycle_reads::LifecycleReads,
     CheckoutSpec,
 };
-use flotilla_schema::{Address, Frozen, Timestamp};
+use flotilla_schema::{Address, ChangeItem, Frozen, Identity, Kind, Timestamp};
 use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::{
     machines::{
         convoy::{
-            Abandon, Convoy, ConvoyRequest, Deliver, Duty, DutyId, DutyScope, MemoryConvoyWorld, Priority, PromiseKinds, RetireDuty, Seat,
-            SeatName, Terms, VesselClass,
+            Abandon, Convoy, ConvoyRequest, Deliver, Duty, DutyId, DutyScope, MemoryConvoyWorld, Priority, PromiseKinds, Readmit,
+            RetireDuty, Rollover, Seat, SeatName, Terms, VesselClass,
         },
         lifecycle::{LifecycleState, VanishCause},
     },
-    Cause, CauseCategory, Home, Outcome, Ref,
+    Cause, CauseCategory, Home, Outcome, Ref, Resource,
 };
 
 use crate::Ending;
@@ -44,6 +44,9 @@ pub struct CheckoutFixture {
     /// The facts the launch log writes with each Realise: a Checkout controller over these
     /// lifecycles stages into it.
     pub staged: StagedFacts<CheckoutFacts>,
+    /// The items each launch is created under, staged for the launch log as the checkout port
+    /// stages them: a test may stage its own before requesting through [`Self::lifecycles`].
+    pub inputs: StagedFacts<Vec<ChangeItem>>,
     /// The engine Convoys checkouts are held for, at this home.
     convoys: Mutex<Home<Convoy, StoreLog>>,
 }
@@ -87,13 +90,13 @@ impl CheckoutFixture {
             home,
             open_home_with(&log, LaunchLog::new(log.clone(), staged.clone()).with_inputs(inputs.clone())).expect("checkouts"),
         ));
-        let checkouts = Arc::new(EngineCheckouts::new(Arc::clone(&lifecycles), Arc::clone(&store), inputs));
+        let checkouts = Arc::new(EngineCheckouts::new(Arc::clone(&lifecycles), Arc::clone(&store), inputs.clone()));
         let convoys = Mutex::new(open_home_with::<Convoy, _>(&log, log.clone()).expect("convoys"));
         let reads = Arc::new(
             LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), home.to_owned())
                 .with_checkouts(Arc::clone(&checkouts) as Arc<dyn CheckoutRecords>),
         );
-        Self { home: home.to_owned(), store, lifecycles, checkouts, reads, staged, convoys }
+        Self { home: home.to_owned(), store, lifecycles, checkouts, reads, staged, inputs, convoys }
     }
 
     /// Admits engine Convoy `name` here, open, its one obligation the lead's lifetime duty: what a
@@ -120,6 +123,29 @@ impl CheckoutFixture {
     }
 
     /// Ends engine Convoy `name` as delivered: its lead's duty retired, nothing holds it open.
+    /// Rolls engine Convoy `name` over to its next generation: its lead's duty is standing.
+    pub fn rollover_convoy(&self, name: &str) {
+        let rollover = Rollover { by: lead(), authority: Ref::new(AUTHORITY) };
+        self.convoys.lock().expect("convoys").apply(name, rollover, &convoy_world(), Self::now()).expect("convoy rolled over");
+    }
+
+    /// Readmits engine Convoy `name` with one more standard vessel: a write that ends nothing.
+    pub fn readmit_convoy(&self, name: &str) {
+        let readmit =
+            Readmit { quota: [(VesselClass::new("standard"), 2)].into_iter().collect(), by: lead(), authority: Ref::new(AUTHORITY) };
+        self.convoys.lock().expect("convoys").apply(name, readmit, &convoy_world(), Self::now()).expect("convoy readmitted");
+    }
+
+    /// The engine Convoy `name`'s version here, and its identity.
+    pub fn convoy_version(&self, name: &str) -> (Identity, u64) {
+        let mut store = self.store.lock().expect("store");
+        let mut read = store.read().expect("read");
+        let code = <Resource<Convoy> as Kind>::CODE;
+        let id = read.resolve(code, name, &self.home).expect("resolve").expect("convoy held");
+        let loaded = read.load::<Resource<Convoy>>(id).expect("load").expect("convoy held");
+        (Identity { kind: code, name: loaded.name, home: loaded.home }, loaded.version)
+    }
+
     pub fn deliver_convoy(&self, name: &str) {
         let mut convoys = self.convoys.lock().expect("convoys");
         let retire = RetireDuty { duty: DUTY, by: lead(), authority: Ref::new(AUTHORITY) };
