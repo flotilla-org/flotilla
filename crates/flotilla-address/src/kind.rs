@@ -23,7 +23,7 @@ pub enum Kind {
     Vessel,
     /// A standing role under a fleet, project or host, or a convoy role. A
     /// host's role is one of that host's daemon's own inboxes, such as its
-    /// checkout inspector (ADR 0066 amendment, Q11).
+    /// checkout inspector, and has no artifact slots (ADR 0066 amendment).
     Role,
     /// An artifact slot under its producing role; always followed by `of:`.
     Artifact,
@@ -48,7 +48,7 @@ pub enum Kind {
     /// A provider account place, or an account under a usage provider.
     Account,
     /// A checkout on its host, by the checkout's name: the subject a host's
-    /// checkout inspector is asked about (ADR 0066 amendment, Q11).
+    /// checkout inspector is asked about (ADR 0066 amendment).
     Checkout,
 }
 

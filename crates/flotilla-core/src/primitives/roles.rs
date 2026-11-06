@@ -39,8 +39,9 @@ pub const TEARDOWN: FleetRole =
 /// when a gate asks, through its host's inbox `host:<host>/role:checkout-inspector`.
 pub const CHECKOUT_INSPECTOR: &str = "checkout-inspector";
 
-/// Host `host`'s checkout inspector's inbox: `host:<host>/role:checkout-inspector` (ADR 0066
-/// amendment, Q11). It names the host, not the fleet: a gate at any home asks the checkout's home.
+/// Host `host`'s checkout inspector's inbox: `host:<host>/role:checkout-inspector`, a role under
+/// its host (ADR 0066 amendment). It names the host, not the fleet: a gate at any home asks the
+/// checkout's home.
 pub fn checkout_inspector(host: &str) -> Result<Address, String> {
     Address::root(Kind::Host, host)
         .and_then(|place| place.child(Kind::Role, CHECKOUT_INSPECTOR))

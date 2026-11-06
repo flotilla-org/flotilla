@@ -67,7 +67,7 @@ impl ArchiveTarget for S3BlobStore {
 pub(crate) fn archive_kinds() -> ArchiveKinds {
     use flotilla_provisioning::stored::{
         account::AccountBinding,
-        checkout::Checkout,
+        checkout::{Checkout, CheckoutFacts, CheckoutIntegration},
         clone::{Clone, CloneFacts},
         environment::Environment,
         image_build::ImageBuild,
@@ -76,8 +76,8 @@ pub(crate) fn archive_kinds() -> ArchiveKinds {
         terminal_session::TerminalSession,
     };
     use flotilla_state_machines::machines::{
-        agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, ensure::Ensure, message::Message, person::Person,
-        vessel::Vessel,
+        agent_session::AgentSession, awaiting_reply::AwaitingReply, controller::Controller, convoy::Convoy, ensure::Ensure,
+        message::Message, person::Person, vessel::Vessel,
     };
     ArchiveKinds::new()
         .with::<Message>()
@@ -92,6 +92,9 @@ pub(crate) fn archive_kinds() -> ArchiveKinds {
         // The facts a clone launch found end with it.
         .companion::<Clone, CloneFacts>()
         .with::<Checkout>()
+        // A checkout launch's facts and its last inspection end with it.
+        .companion::<Checkout, CheckoutFacts>()
+        .companion::<Checkout, CheckoutIntegration>()
         .with::<TerminalSession>()
         .with::<Vessel>()
         .with::<Ensure>()
@@ -99,6 +102,8 @@ pub(crate) fn archive_kinds() -> ArchiveKinds {
         .with::<ManifestRoot>()
         // A person consumer has no end, so it stays live and is never shipped (#3938).
         .with::<Person>()
+        // A controller's record ends when the controller retires.
+        .with::<Controller>()
 }
 
 /// What one pass did.

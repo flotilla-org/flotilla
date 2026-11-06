@@ -62,8 +62,12 @@ fn address(tc: &hegel::TestCase) -> Address {
     };
     let depth = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
     for _ in 0..depth {
-        let children =
-            Kind::ALL.into_iter().filter(|kind| *kind != Kind::Repo && kind.may_follow(Some(address.kind()))).collect::<Vec<_>>();
+        // A host's role has no artifact slots, which `may_follow` alone cannot tell.
+        let host_role = address.kind() == Kind::Role && address.parent().is_some_and(|parent| parent.kind() == Kind::Host);
+        let children = Kind::ALL
+            .into_iter()
+            .filter(|kind| *kind != Kind::Repo && kind.may_follow(Some(address.kind())) && !(host_role && *kind == Kind::Artifact))
+            .collect::<Vec<_>>();
         if children.is_empty() || address.kind() == Kind::Artifact {
             break;
         }
@@ -599,7 +603,7 @@ fn fleet_shape_and_short_input() {
     assert_eq!(record_name(&Address::fleet("lab").expect("fleet")), None);
 }
 
-// ADR 0066 amendment (Q11): a host has roles, its daemon's own inboxes, and
+// ADR 0066 amendment: a host has roles, its daemon's own inboxes, and
 // checkouts, by name; a checkout sits only directly under its host.
 #[hegel::test]
 fn host_roles_and_checkouts_round_trip(tc: hegel::TestCase) {
@@ -629,5 +633,18 @@ fn a_checkout_sits_only_under_its_host() {
         "host:h/provider:p/role:r",
     ] {
         assert!(invalid.parse::<Address>().is_err(), "{invalid}");
+    }
+}
+
+// Behaviour: a host's role is an inbox, so messages sit under it, but it has no artifact slots;
+// the roles that have them keep them.
+#[test]
+fn a_hosts_role_has_no_artifact_slots() {
+    assert_eq!("host:h/role:r/artifact:k/of:s".parse::<Address>(), Err(Error::ArtifactUnderHostRole));
+    let role = Address::root(Kind::Host, "h").and_then(|host| host.child(Kind::Role, "r")).expect("host role");
+    assert_eq!(role.artifact("k", "s"), Err(Error::ArtifactUnderHostRole));
+    assert!(Address::message(&role, "m1").is_ok());
+    for valid in ["convoy:c/role:r/artifact:k/of:s", "project:p/role:r/artifact:k/of:s", "fleet:f/role:r/artifact:k/of:s"] {
+        assert!(valid.parse::<Address>().is_ok(), "{valid}");
     }
 }
