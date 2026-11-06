@@ -30,6 +30,7 @@ fn convoy(name: &str) -> CheckoutHolder {
 #[test]
 fn a_request_is_served_by_its_live_launch_and_an_ended_one_starts_the_next() {
     let fixture = CheckoutFixture::default();
+    fixture.open_convoy("c1");
     let first = fixture.request("co", &worktree("feature"), Some(&convoy("c1")));
     assert_eq!(first, launch("co", 1));
     assert_eq!(fixture.record(&first).reading, LifecycleReading::InProgress);
@@ -50,6 +51,7 @@ fn a_request_is_served_by_its_live_launch_and_an_ended_one_starts_the_next() {
 #[test]
 fn a_realised_checkout_reads_back_with_its_facts_through_each_index() {
     let fixture = CheckoutFixture::default();
+    fixture.open_convoy("c1");
     let held = fixture.request("co", &worktree("feature"), Some(&convoy("c1")));
     fixture.ready(&held, Some("objects not shared"));
     fixture.put_ready("standing", &worktree("standing"), Some(&CheckoutHolder::Ensure("e1".into())));
@@ -80,6 +82,7 @@ fn a_realised_checkout_reads_back_with_its_facts_through_each_index() {
 #[test]
 fn an_adopted_checkout_is_its_hosts_and_reads_back_observed() {
     let fixture = CheckoutFixture::default();
+    fixture.open_convoy("c1");
     let spec = CheckoutSpec::Observed(ObservedCheckoutSpec {
         r#ref: "main".into(),
         path: "/src/repo".into(),

@@ -434,6 +434,32 @@ impl StoreLog {
         let items: Vec<ChangeItem> = reads.iter().filter_map(|_| None).collect();
         NewChange::new(writer, at).with_items(items)
     }
+
+    /// Creates `resource` under a change whose items are `items`: the records its requester read
+    /// to make it, each at the version read (#4024 ruling 1), such as a Checkout's holder Convoy.
+    pub fn create_with_items<M>(
+        &self,
+        writer: &str,
+        at: Timestamp,
+        resource: &Resource<M>,
+        items: Vec<ChangeItem>,
+    ) -> Result<Version, LogError>
+    where
+        M: Machine,
+        M::Spec: KindSpec<State = M::State>,
+        M::State: StateData + Labelled<Label = Label<M>>,
+        M::Write: StoredWrite<Resource<M>>,
+        EdgePayload<M::Edge>: Cbor,
+        M::Edge: Cbor,
+    {
+        let change = NewChange::new(writer, at).with_items(items);
+        let mut store = lock_store(&self.store);
+        let mut write = store.write().map_err(refused)?;
+        let change = write.open_change(&change).map_err(refused)?;
+        let stamp = write.insert(resource.name(), resource, change).map_err(refused)?;
+        write.commit().map_err(refused)?;
+        Ok(Version(stamp.version))
+    }
 }
 
 impl<M> Log<M> for StoreLog

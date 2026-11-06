@@ -18,11 +18,17 @@ use flotilla_resources::{
     lifecycle_reads::LifecycleReads,
     CheckoutSpec,
 };
-use flotilla_schema::Timestamp;
+use flotilla_schema::{Address, Frozen, Timestamp};
 use flotilla_schema_sqlite::Store;
 use flotilla_state_machines::{
-    machines::lifecycle::{LifecycleState, VanishCause},
-    Cause, CauseCategory, Outcome,
+    machines::{
+        convoy::{
+            Abandon, Convoy, ConvoyRequest, Deliver, Duty, DutyId, DutyScope, MemoryConvoyWorld, Priority, PromiseKinds, RetireDuty, Seat,
+            SeatName, Terms, VesselClass,
+        },
+        lifecycle::{LifecycleState, VanishCause},
+    },
+    Cause, CauseCategory, Home, Outcome, Ref,
 };
 
 use crate::Ending;
@@ -35,7 +41,26 @@ pub struct CheckoutFixture {
     pub checkouts: Arc<EngineCheckouts>,
     /// The engine's readings, serving [`Self::checkouts`].
     pub reads: Arc<dyn LifecycleReads>,
-    staged: StagedFacts<CheckoutFacts>,
+    /// The facts the launch log writes with each Realise: a Checkout controller over these
+    /// lifecycles stages into it.
+    pub staged: StagedFacts<CheckoutFacts>,
+    /// The engine Convoys checkouts are held for, at this home.
+    convoys: Mutex<Home<Convoy, StoreLog>>,
+}
+
+/// The project every fixture convoy is admitted under; the authority that holds.
+const PROJECT: &str = "p";
+const AUTHORITY: &str = "yes";
+const DUTY: DutyId = DutyId(1);
+
+fn convoy_world() -> MemoryConvoyWorld {
+    let mut world = MemoryConvoyWorld::default().with_project(&Address::project(PROJECT).expect("project"));
+    world.authority.put(&Ref::new(AUTHORITY), true);
+    world
+}
+
+fn lead() -> SeatName {
+    SeatName::new("lead", "")
 }
 
 impl Default for CheckoutFixture {
@@ -56,15 +81,60 @@ impl CheckoutFixture {
     /// A fixture over `store`, whose home is `home`.
     pub fn over(home: &str, store: Arc<Mutex<Store>>) -> Self {
         let staged = StagedFacts::default();
+        let inputs = StagedFacts::default();
         let log = StoreLog::new(Arc::clone(&store));
-        let lifecycles: Arc<dyn Lifecycles<CheckoutKind>> =
-            Arc::new(LifecycleHome::new(home, open_home_with(&log, LaunchLog::new(log.clone(), staged.clone())).expect("checkouts")));
-        let checkouts = Arc::new(EngineCheckouts::new(Arc::clone(&lifecycles), Arc::clone(&store)));
+        let lifecycles: Arc<dyn Lifecycles<CheckoutKind>> = Arc::new(LifecycleHome::new(
+            home,
+            open_home_with(&log, LaunchLog::new(log.clone(), staged.clone()).with_inputs(inputs.clone())).expect("checkouts"),
+        ));
+        let checkouts = Arc::new(EngineCheckouts::new(Arc::clone(&lifecycles), Arc::clone(&store), inputs));
+        let convoys = Mutex::new(open_home_with::<Convoy, _>(&log, log.clone()).expect("convoys"));
         let reads = Arc::new(
             LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), home.to_owned())
                 .with_checkouts(Arc::clone(&checkouts) as Arc<dyn CheckoutRecords>),
         );
-        Self { home: home.to_owned(), store, lifecycles, checkouts, reads, staged }
+        Self { home: home.to_owned(), store, lifecycles, checkouts, reads, staged, convoys }
+    }
+
+    /// Admits engine Convoy `name` here, open, its one obligation the lead's lifetime duty: what a
+    /// checkout held for it is requested under.
+    pub fn open_convoy(&self, name: &str) {
+        let seat = Seat {
+            role: "lead".into(),
+            seat: String::new(),
+            parent: None,
+            supervised_by: Address::project(PROJECT).expect("project"),
+            retired: false,
+            replacements: 0,
+        };
+        let request = ConvoyRequest {
+            project: Address::project(PROJECT).expect("project"),
+            promises: Default::default(),
+            duties: [(DUTY, Duty { owner: lead(), scope: DutyScope::Lifetime, terms: Terms::default() })].into_iter().collect(),
+            seats: vec![seat],
+            quota: [(VesselClass::new("standard"), 1)].into_iter().collect(),
+            priority: Priority(1),
+            kinds: Frozen::new(PromiseKinds::default()).expect("freeze"),
+        };
+        self.convoys.lock().expect("convoys").create(name, request, &convoy_world(), Self::now()).expect("convoy admitted");
+    }
+
+    /// Ends engine Convoy `name` as delivered: its lead's duty retired, nothing holds it open.
+    pub fn deliver_convoy(&self, name: &str) {
+        let mut convoys = self.convoys.lock().expect("convoys");
+        let retire = RetireDuty { duty: DUTY, by: lead(), authority: Ref::new(AUTHORITY) };
+        convoys.apply(name, retire, &convoy_world(), Self::now()).expect("duty retired");
+        convoys.apply(name, Deliver, &convoy_world(), Self::now()).expect("convoy delivered");
+    }
+
+    /// Ends engine Convoy `name` as abandoned by the operator, for `reason`.
+    pub fn abandon_convoy(&self, name: &str, reason: &str) {
+        let abandon = Abandon { by: lead(), reason: reason.into(), authority: Ref::new(AUTHORITY) };
+        self.convoys.lock().expect("convoys").apply(name, abandon, &convoy_world(), Self::now()).expect("convoy abandoned");
+    }
+
+    fn now() -> Timestamp {
+        Timestamp::from_datetime(&chrono::Utc::now())
     }
 
     /// Requests checkout `name` with `spec`, held for `holder`, returning the launch that serves it.

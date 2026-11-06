@@ -28,7 +28,7 @@ use flotilla_state_machines::{
 };
 
 use super::{
-    controller::{Actuator, Backing, ProviderFailure, Usability},
+    controller::{Actuator, Backing, Holding, ProviderFailure, Usability},
     environment_actuator::{host_provider, state_of},
     launch_log::StagedFacts,
     reads::StoreReads,
@@ -200,8 +200,8 @@ where
         vec![Identity { kind: ENVIRONMENT, name: request.environment.name.clone(), home: request.environment.home.clone() }]
     }
 
-    fn holder_ended(&self, _: &mut Read<'_>, _: &CloneRequest) -> Result<bool, StoreError> {
-        Ok(false)
+    fn holder(&self, _: &mut Read<'_>, _: &str, _: &CloneRequest) -> Result<Holding, StoreError> {
+        Ok(Holding::open())
     }
 
     fn usability(&self, read: &mut Read<'_>, request: &CloneRequest) -> Result<Vec<Usability>, StoreError> {

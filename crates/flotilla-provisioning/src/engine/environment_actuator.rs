@@ -31,7 +31,7 @@ use flotilla_state_machines::{
 };
 
 use super::{
-    controller::{Actuator, Backing, ProviderFailure, Usability},
+    controller::{Actuator, Backing, Holding, ProviderFailure, Usability},
     environments::{launch_facts, spec_of},
     launch_log::StagedFacts,
     reads::{keyed, StoreReads},
@@ -274,11 +274,11 @@ where
         depends
     }
 
-    fn holder_ended(&self, read: &mut Read<'_>, request: &EnvironmentRequest) -> Result<bool, StoreError> {
+    fn holder(&self, read: &mut Read<'_>, _: &str, request: &EnvironmentRequest) -> Result<Holding, StoreError> {
         // The vessel's lease is homed here, on its pinned host; its environment is requested only
         // once the lease exists, so an absent lease has ended.
-        let Some(vessel) = vessel_of(&request.holder) else { return Ok(false) };
-        Ok(state_of::<VesselKind>(read, vessel, &self.home)?.is_none_or(|state| !state.live()))
+        let Some(vessel) = vessel_of(&request.holder) else { return Ok(Holding::open()) };
+        Ok(Holding::ended(state_of::<VesselKind>(read, vessel, &self.home)?.is_none_or(|state| !state.live())))
     }
 
     fn usability(&self, read: &mut Read<'_>, request: &EnvironmentRequest) -> Result<Vec<Usability>, StoreError> {

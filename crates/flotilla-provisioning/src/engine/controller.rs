@@ -82,6 +82,27 @@ pub struct Usability {
     pub usable: bool,
 }
 
+/// A resource's holder as its controller reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Holding {
+    /// The holder has ended: the resource is released once nothing it serves is live.
+    pub ended: bool,
+    /// The holder's record, when it has one: its commits look at the resource again.
+    pub record: Option<Identity>,
+}
+
+impl Holding {
+    /// A holder that has not ended, or no holder, followed through no record.
+    pub fn open() -> Holding {
+        Holding::default()
+    }
+
+    /// A holder whose end is judged from `ended` alone, followed through no record.
+    pub fn ended(ended: bool) -> Holding {
+        Holding { ended, record: None }
+    }
+}
+
 /// One lifecycle kind's provider work. Nothing here writes the engine.
 #[async_trait]
 pub trait Actuator<K: LifecycleKind>: Send + Sync + 'static {
@@ -99,8 +120,9 @@ pub trait Actuator<K: LifecycleKind>: Send + Sync + 'static {
     /// The records whose change could change an attempt's outcome, or end the resource: its
     /// inputs and its holder.
     fn dependencies(&self, request: &K::Request) -> Vec<Identity>;
-    /// Whether `request`'s holder has ended. A request with no holder is never released here.
-    fn holder_ended(&self, read: &mut Read<'_>, request: &K::Request) -> Result<bool, StoreError>;
+    /// Whether resource `name`'s holder has ended, and the holder's record, whose commits wake
+    /// it. A request with no holder is never released here.
+    fn holder(&self, read: &mut Read<'_>, name: &str, request: &K::Request) -> Result<Holding, StoreError>;
     /// The facts that say whether `request` can be realised now: its provider's readiness, an
     /// input's realisation. It is tried only while every one is usable; none means nothing waits.
     fn usability(&self, read: &mut Read<'_>, request: &K::Request) -> Result<Vec<Usability>, StoreError>;
@@ -147,6 +169,7 @@ enum Done {
 /// What a read found for one resource.
 struct Found {
     holder_ended: bool,
+    holder: Option<Identity>,
     usability: Vec<Usability>,
     /// The records its release waits on, read only once its holder has ended.
     blockers: Vec<Identity>,
@@ -328,9 +351,9 @@ where
                 requests
                     .iter()
                     .map(|(name, request)| {
-                        let holder_ended = actuator.holder_ended(read, request)?;
+                        let Holding { ended: holder_ended, record: holder } = actuator.holder(read, name, request)?;
                         let blockers = if holder_ended { actuator.release_blockers(read, name, request)? } else { Vec::new() };
-                        Ok(Found { holder_ended, usability: actuator.usability(read, request)?, blockers })
+                        Ok(Found { holder_ended, holder, usability: actuator.usability(read, request)?, blockers })
                     })
                     .collect::<Result<Vec<_>, StoreError>>()
             })
@@ -466,6 +489,7 @@ where
         let mut depends = self.actuator.dependencies(request);
         depends.extend(found.usability.iter().map(|usability| usability.fact.clone()));
         depends.extend(found.blockers.iter().cloned());
+        depends.extend(found.holder.iter().cloned());
         if self.depends.get(name) == Some(&depends) {
             return;
         }

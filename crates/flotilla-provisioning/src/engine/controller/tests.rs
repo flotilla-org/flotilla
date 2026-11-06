@@ -26,7 +26,7 @@ use flotilla_state_machines::{
 };
 use tokio::sync::{mpsc, Notify};
 
-use super::{Actuator, Backing, BackingEvent, Controller, ProviderFailure, Usability};
+use super::{Actuator, Backing, BackingEvent, Controller, Holding, ProviderFailure, Usability};
 use crate::{
     engine::{launch, LifecycleHome, Lifecycles, Step},
     stored::{
@@ -124,8 +124,8 @@ impl Actuator<EnvironmentKind> for Scripted {
         vec![record(&format!("input-{key}")), record(&format!("holder-{key}"))]
     }
 
-    fn holder_ended(&self, read: &mut Read<'_>, request: &EnvironmentRequest) -> Result<bool, StoreError> {
-        Ok(state_of(read, &format!("holder-{}", key(request)))?.is_some_and(|state| state.gone()))
+    fn holder(&self, read: &mut Read<'_>, _: &str, request: &EnvironmentRequest) -> Result<Holding, StoreError> {
+        Ok(Holding::ended(state_of(read, &format!("holder-{}", key(request)))?.is_some_and(|state| state.gone())))
     }
 
     fn usability(&self, read: &mut Read<'_>, request: &EnvironmentRequest) -> Result<Vec<Usability>, StoreError> {

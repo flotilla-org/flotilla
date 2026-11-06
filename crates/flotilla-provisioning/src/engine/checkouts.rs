@@ -6,6 +6,11 @@
 //! next launch. The Checkout controller writes every lifecycle edge after the request, and the
 //! launch's facts with its Realise. Its integration is a plain record of the same name, written by
 //! its home's inspection only when an inspected value changes.
+//!
+//! A launch held for a convoy is created under a change whose one item is that engine Convoy at
+//! the version its requester read (#4024 ruling 1). The Checkout controller judges the holder
+//! ended from the first entry after that version that ends the Convoy (Delivered or Abandoned),
+//! read from the log rather than from the Convoy's current state.
 
 use std::sync::{Arc, Mutex};
 
@@ -16,12 +21,16 @@ use flotilla_resources::{
     host_direct_environment_name, CheckoutSpec, CheckoutWorktreeSpec, FreshCloneCheckoutSpec, ObservedCheckoutSpec, RepositoryKey,
     HOST_DIRECT_NAME_PREFIX,
 };
-use flotilla_schema::{Kind, NewChange, Ref, Timestamp};
+use flotilla_schema::{ChangeItem, Identity, Kind, NewChange, Ref, Timestamp};
 use flotilla_schema_sqlite::{Read, Store};
-use flotilla_state_machines::Resource;
+use flotilla_state_machines::{
+    machines::convoy::{Convoy as EngineConvoy, ConvoyLabel},
+    Resource, StateValue,
+};
 
 use super::{
     latest_launch,
+    launch_log::StagedFacts,
     reads::{indexed, keyed, latest, view, ReadError, StoreReads, View},
     EngineError, Lifecycles,
 };
@@ -46,8 +55,29 @@ pub fn holder_of(holder: &CheckoutHolder) -> Holder {
     }
 }
 
+/// The engine Convoy `name` a checkout held for it is requested under: the one that is open, with
+/// the version read. A convoy not held here, or one that has ended, holds no new checkout.
+fn open_convoy(read: &mut Read<'_>, name: &str) -> Result<Result<(Identity, u64), String>, ReadError> {
+    let code = <Resource<EngineConvoy> as Kind>::CODE;
+    let mut ended = false;
+    for id in read.resolve_named(code, name)? {
+        let Some(loaded) = read.load::<Resource<EngineConvoy>>(id)? else { continue };
+        if loaded.value.state().label() == ConvoyLabel::Open {
+            return Ok(Ok((Identity { kind: code, name: loaded.name, home: loaded.home }, loaded.version)));
+        }
+        ended = true;
+    }
+    Ok(Err(if ended { format!("convoy {name} has ended") } else { format!("convoy {name} is not held here") }))
+}
+
+/// The launch after `launch` (`<name>#<n + 1>`).
+fn next_launch(name: &str, launch: &str) -> Option<String> {
+    let n = launch.rsplit_once('#')?.1.parse::<u32>().ok()?;
+    Some(super::launch(name, n.checked_add(1)?))
+}
+
 /// The holder a stored `holder` names, if it is a checkout's.
-fn checkout_holder(holder: &Holder) -> Option<CheckoutHolder> {
+pub(crate) fn checkout_holder(holder: &Holder) -> Option<CheckoutHolder> {
     let (kind, name) = holder.0.split_once(':')?;
     match kind {
         "convoy" => Some(CheckoutHolder::Convoy(name.to_owned())),
@@ -184,6 +214,8 @@ pub struct EngineCheckouts {
     lifecycles: Arc<dyn Lifecycles<CheckoutKind>>,
     reads: StoreReads,
     log: PlainLog,
+    /// What each launch is created under, staged here for the launch log that creates it.
+    inputs: StagedFacts<Vec<ChangeItem>>,
     changes: tokio::sync::broadcast::Sender<CheckoutChange>,
 }
 
@@ -194,11 +226,14 @@ const CHANGES: usize = 256;
 const REQUEST_ATTEMPTS: usize = 3;
 
 impl EngineCheckouts {
-    pub fn new(lifecycles: Arc<dyn Lifecycles<CheckoutKind>>, store: Arc<Mutex<Store>>) -> Self {
+    /// The port over `lifecycles`, whose launch log creates each launch under the items staged
+    /// in `inputs` ([`super::launch_log::LaunchLog::with_inputs`]).
+    pub fn new(lifecycles: Arc<dyn Lifecycles<CheckoutKind>>, store: Arc<Mutex<Store>>, inputs: StagedFacts<Vec<ChangeItem>>) -> Self {
         Self {
             lifecycles,
             log: PlainLog::new(Arc::clone(&store)),
             reads: StoreReads::new(store),
+            inputs,
             changes: tokio::sync::broadcast::channel(CHANGES).0,
         }
     }
@@ -293,17 +328,40 @@ impl EngineCheckouts {
             .map_err(|error| format!("engine checkouts {what}: {error}"))
     }
 
-    /// One try at the launch that serves `request` for `checkout`.
-    fn serve(&self, checkout: &str, request: &CheckoutRequest) -> Result<String, EngineError> {
+    /// One try at the launch that serves `request` for `checkout`; a launch it creates is created
+    /// under `items`.
+    fn serve(&self, checkout: &str, request: &CheckoutRequest, items: &[ChangeItem]) -> Result<String, EngineError> {
         let (latest, held) = latest_launch(checkout, |name| self.lifecycles.get(name));
+        let created = |launch: &str, create: &dyn Fn() -> Result<String, EngineError>| {
+            if !items.is_empty() {
+                self.inputs.stage(launch, items.to_vec());
+            }
+            let created = create();
+            // Taken by the create that ran; a create that did not run leaves nothing behind.
+            self.inputs.take(launch);
+            created
+        };
         match held {
             Some(held) if held.state().live() && held.spec() != request => {
                 Err(EngineError::Failed(format!("checkout {checkout} is held for another request ({latest})")))
             }
             Some(held) if held.state().live() => Ok(latest),
-            Some(_) => self.lifecycles.replace_launch(checkout, &latest, request.clone(), Self::now()),
-            None => self.lifecycles.request(&latest, request.clone(), Self::now()).map(|_| latest),
+            Some(_) => {
+                let next =
+                    next_launch(checkout, &latest).ok_or_else(|| EngineError::Failed(format!("launch {latest} has no successor")))?;
+                created(&next, &|| self.lifecycles.replace_launch(checkout, &latest, request.clone(), Self::now()))
+            }
+            None => created(&latest, &|| self.lifecycles.request(&latest, request.clone(), Self::now()).map(|_| latest.clone())),
         }
+    }
+
+    /// What a launch held for `holder` is created under: a convoy's open engine Convoy at the
+    /// version read now. A standing role's Ensure is not read yet: its launches carry no item.
+    fn holder_items(&self, holder: Option<&CheckoutHolder>) -> Result<Vec<ChangeItem>, String> {
+        let Some(CheckoutHolder::Convoy(convoy)) = holder else { return Ok(Vec::new()) };
+        let (record, version) =
+            self.reads.read(|read| open_convoy(read, convoy)).map_err(|error| format!("read convoy {convoy}: {error}"))??;
+        Ok(vec![ChangeItem::new(record, Some(version.to_string()))])
     }
 
     /// This home's held inspection of `launch`, at its version.
@@ -372,9 +430,10 @@ impl CheckoutRecords for EngineCheckouts {
             return Err(format!("checkout {name} is a launch's name, not a checkout's"));
         }
         let request = request_of(spec, holder, self.home())?;
+        let items = self.holder_items(holder).map_err(|error| format!("request checkout {name}: {error}"))?;
         let mut last = None;
         for _ in 0..REQUEST_ATTEMPTS {
-            match self.serve(name, &request) {
+            match self.serve(name, &request, &items) {
                 Ok(launch) => return Ok(launch),
                 // Another requester took the launch name first: read again.
                 Err(error @ (EngineError::Refused(_) | EngineError::Unknown)) => last = Some(error),

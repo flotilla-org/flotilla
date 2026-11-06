@@ -14,7 +14,7 @@ use std::{
 };
 
 use flotilla_engine_store::StoreLog;
-use flotilla_schema::{Kind, Timestamp};
+use flotilla_schema::{ChangeItem, Kind, Timestamp};
 use flotilla_state_machines::{
     machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleLabel},
     EdgeEventOf, InputRead, Log, LogError, Resource, StoredState, Version,
@@ -47,7 +47,8 @@ impl<F> StagedFacts<F> {
         self.lock().insert(name.to_owned(), facts);
     }
 
-    fn take(&self, name: &str) -> Option<F> {
+    /// Takes what is staged for `name`, if anything.
+    pub fn take(&self, name: &str) -> Option<F> {
         self.lock().remove(name)
     }
 
@@ -62,18 +63,26 @@ impl<F> StagedFacts<F> {
 pub struct LaunchLog<K = EnvironmentKind, F = EnvironmentLaunchFacts> {
     inner: StoreLog,
     staged: StagedFacts<F>,
+    inputs: StagedFacts<Vec<ChangeItem>>,
     kind: PhantomData<fn() -> K>,
 }
 
 impl<K, F> Clone for LaunchLog<K, F> {
     fn clone(&self) -> Self {
-        Self { inner: self.inner.clone(), staged: self.staged.clone(), kind: PhantomData }
+        Self { inner: self.inner.clone(), staged: self.staged.clone(), inputs: self.inputs.clone(), kind: PhantomData }
     }
 }
 
 impl<K, F> LaunchLog<K, F> {
     pub fn new(inner: StoreLog, staged: StagedFacts<F>) -> Self {
-        Self { inner, staged, kind: PhantomData }
+        Self { inner, staged, inputs: StagedFacts::default(), kind: PhantomData }
+    }
+
+    /// This log, creating each launch under a change whose items are those staged in `inputs`
+    /// for it: the records its requester read to request it.
+    pub fn with_inputs(mut self, inputs: StagedFacts<Vec<ChangeItem>>) -> Self {
+        self.inputs = inputs;
+        self
     }
 }
 
@@ -85,7 +94,10 @@ where
     F: Kind,
 {
     fn create(&mut self, writer: &str, at: Timestamp, resource: &Resource<Lifecycle<K>>, reads: &[InputRead]) -> Result<Version, LogError> {
-        self.inner.create(writer, at, resource, reads)
+        match self.inputs.take(resource.name()) {
+            Some(items) => self.inner.create_with_items(writer, at, resource, items),
+            None => self.inner.create(writer, at, resource, reads),
+        }
     }
 
     fn edge(
