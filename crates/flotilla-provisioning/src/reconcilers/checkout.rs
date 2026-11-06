@@ -232,38 +232,20 @@ impl<R> CheckoutReconciler<R> {
     /// What the checkout waits for, or why it fails, from the clone launch it is made from. A
     /// launch that ended stays ended: a new request for the clone starts its next launch, and a
     /// checkout made then names that one.
-    async fn clone_dependency(
-        &self,
-        checkout: &ResourceObject<Checkout>,
-        clone: &CloneRecord,
-    ) -> Result<Option<CheckoutPrepared>, ResourceError> {
-        // The engine owns the retry episode; a retry an old controller recorded must not survive it.
-        self.observe_clone_retry(checkout, None).await?;
-        Ok(match &clone.reading {
+    fn clone_dependency(clone: &CloneRecord) -> Option<CheckoutPrepared> {
+        match &clone.reading {
             LifecycleReading::Ready { .. } => None,
             LifecycleReading::InProgress | LifecycleReading::Retrying { .. } | LifecycleReading::Exhausted { .. } => {
                 Some(CheckoutPrepared::Waiting)
             }
             other => Some(CheckoutPrepared::Failed(other.reason().unwrap_or_default())),
-        })
+        }
     }
 
     /// Bound background task admission as well as the runtime's active removals.
     pub fn with_background_removal_limit(mut self, limit: NonZeroUsize) -> Self {
         self.background_removal_limit = limit;
         self
-    }
-
-    async fn observe_clone_retry(
-        &self,
-        checkout: &ResourceObject<Checkout>,
-        retry: Option<flotilla_resources::ControllerRetry>,
-    ) -> Result<(), ResourceError> {
-        if checkout.status.as_ref().and_then(|status| status.clone_retry.as_ref()) == retry.as_ref() {
-            return Ok(());
-        }
-        apply_status_patch(&self.checkouts, &checkout.metadata.name, &CheckoutStatusPatch::ObserveCloneRetry { retry }).await?;
-        Ok(())
     }
 
     pub fn with_federated_convoys(mut self, backend: &ResourceBackend, namespace: &str) -> Self {
@@ -555,10 +537,9 @@ where
         match &obj.spec {
             CheckoutSpec::Worktree(spec) => {
                 let Some(clone) = self.clone_record(&spec.clone_ref).await? else {
-                    self.observe_clone_retry(obj, None).await?;
                     return Ok(CheckoutPrepared::Waiting);
                 };
-                if let Some(waiting) = self.clone_dependency(obj, &clone).await? {
+                if let Some(waiting) = Self::clone_dependency(&clone) {
                     return Ok(waiting);
                 }
                 if clone.spec.env_ref != spec.env_ref {
@@ -599,7 +580,7 @@ where
             CheckoutSpec::FreshClone(spec) if spec.source_clone_ref.is_some() => {
                 let clone_name = spec.source_clone_ref.as_ref().expect("local clone source");
                 let Some(clone) = self.clone_record(clone_name).await? else { return Ok(CheckoutPrepared::Waiting) };
-                if let Some(waiting) = self.clone_dependency(obj, &clone).await? {
+                if let Some(waiting) = Self::clone_dependency(&clone) {
                     return Ok(waiting);
                 }
                 if clone.spec.env_ref != spec.env_ref || clone.spec.repo_ref != spec.repo_ref {

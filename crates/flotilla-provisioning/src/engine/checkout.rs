@@ -70,7 +70,6 @@ impl Binding for CheckoutBinding {
                 vec![Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost() }]
             }
             CheckoutStatusPatch::ObserveDegradation { .. }
-            | CheckoutStatusPatch::ObserveCloneRetry { .. }
             | CheckoutStatusPatch::ObserveValidation { .. }
             | CheckoutStatusPatch::UpdateIntegration { .. } => vec![],
         }

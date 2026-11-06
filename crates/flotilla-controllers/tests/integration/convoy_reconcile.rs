@@ -708,7 +708,6 @@ async fn reconcile_with_observed_change_request(
                 &checkout.metadata.resource_version,
                 &CheckoutStatus {
                     degraded: None,
-                    clone_retry: None,
                     phase: CheckoutPhase::Ready,
                     path: Some("/tmp/checkout-a".to_string()),
                     commit: None,
@@ -2109,7 +2108,6 @@ async fn reconcile_terminal_bound_change_request(
                 &checkout.metadata.resource_version,
                 &CheckoutStatus {
                     degraded: None,
-                    clone_retry: None,
                     phase: CheckoutPhase::Ready,
                     path: Some("/tmp/checkout-a".to_string()),
                     commit: None,
@@ -2151,7 +2149,6 @@ async fn reconcile_terminal_bound_change_request(
                 &checkout.metadata.resource_version,
                 &CheckoutStatus {
                     degraded: None,
-                    clone_retry: None,
                     phase: CheckoutPhase::Ready,
                     path: Some("/tmp/checkout-context".to_string()),
                     commit: None,
@@ -2364,7 +2361,6 @@ async fn federated_open_checkout_holds_landing_on_authority_host() {
             &checkout.metadata.resource_version,
             &CheckoutStatus {
                 degraded: None,
-                clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: Some("/remote/worktree".to_string()),
                 commit: None,

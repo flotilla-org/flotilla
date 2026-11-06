@@ -6623,16 +6623,12 @@ mod tests {
     #[hegel::test]
     fn provisioning_readiness_tracks_current_checkout_evidence(tc: hegel::TestCase) {
         use flotilla_protocol::{result_set::ReadinessState, LifecycleReading};
-        use flotilla_resources::{
-            CheckoutPhase, CheckoutStatus, ControllerRetry, ControllerRetryDisposition, VesselPhase, VesselSpec, VesselStatus,
-        };
+        use flotilla_resources::{CheckoutPhase, CheckoutStatus, VesselPhase, VesselSpec, VesselStatus};
         use hegel::generators as gs;
         // Includes ordinary tasks and standing governors, repeats, failure,
         // retry, success, empty status and deletion, in arbitrary order.
         let governor = tc.draw(gs::booleans());
         let remote = tc.draw(gs::booleans());
-        // Clone is local-only; replicated checkouts retain their own retry evidence.
-        let shared_clone = tc.draw(gs::booleans()) && !remote;
         let operations = (0..tc.draw(gs::integers::<usize>().min_value(1).max_value(10)))
             .map(|_| tc.draw(gs::integers::<usize>().min_value(0).max_value(6)))
             .collect::<Vec<_>>();
@@ -6676,17 +6672,17 @@ mod tests {
             );
             let mut checkout = checkout_object("checkout-a", "/work/repo", RepositoryKey("repo".into())).await;
             checkout.metadata.labels.insert(CONVOY_LABEL.into(), convoy.metadata.name.clone());
-            if shared_clone {
-                checkout.spec = CheckoutSpec::Worktree(
-                    flotilla_resources::CheckoutWorktreeSpec::builder()
-                        .repo_ref(RepositoryKey("repo".into()))
-                        .env_ref("local".into())
-                        .r#ref("main".into())
-                        .target_path("/work/ops".into())
-                        .clone_ref("ops-clone".into())
-                        .build(),
-                );
-            }
+            // A worktree: its clone's retries are the engine's reading of the clone, read at the
+            // checkout's home whether the checkout is local or replicated (#3108).
+            checkout.spec = CheckoutSpec::Worktree(
+                flotilla_resources::CheckoutWorktreeSpec::builder()
+                    .repo_ref(RepositoryKey("repo".into()))
+                    .env_ref("local".into())
+                    .r#ref("main".into())
+                    .target_path("/work/ops".into())
+                    .clone_ref("ops-clone".into())
+                    .build(),
+            );
             let reference =
                 ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", &convoy.metadata.name).on_host(HostName::new("kiwi"));
             let mut terminal = session_object("terminal-ops-coder").await;
@@ -6706,31 +6702,18 @@ mod tests {
                         3 | 6 => CheckoutPhase::Ready,
                         _ => CheckoutPhase::Pending,
                     },
-                    message: (op != 3).then(|| "Forgejo authentication refused".into()),
-                    clone_retry: (op == 1 || op == 6).then(|| ControllerRetry {
-                        attempts: 1,
-                        first_failure_at: Utc::now(),
-                        disposition: ControllerRetryDisposition::Retryable { next_attempt_at: Utc::now() },
-                    }),
+                    message: (op == 2).then(|| "Forgejo authentication refused".into()),
                     ..Default::default()
                 });
-                if shared_clone {
-                    let cause = "Forgejo authentication refused".to_owned();
-                    let reading = match op {
-                        1 | 6 => Some(LifecycleReading::Retrying { failures: 1, next: Utc::now(), cause }),
-                        2 => Some(LifecycleReading::GaveUp { cause }),
-                        3 => Some(LifecycleReading::Ready { identity: "/work/ops".into() }),
-                        4 => None,
-                        _ => Some(LifecycleReading::InProgress),
-                    };
-                    reads.set(crate::ports::ProvisioningKind::Clone, "ops-clone", reading);
-                    if op != 2 {
-                        if let Some(status) = checkout.status.as_mut() {
-                            status.message = None;
-                            status.clone_retry = None;
-                        }
-                    }
-                }
+                let cause = "Forgejo authentication refused".to_owned();
+                let reading = match op {
+                    1 | 6 => Some(LifecycleReading::Retrying { failures: 1, next: Utc::now(), cause }),
+                    2 => Some(LifecycleReading::GaveUp { cause }),
+                    3 => Some(LifecycleReading::Ready { identity: "/work/ops".into() }),
+                    4 => None,
+                    _ => Some(LifecycleReading::InProgress),
+                };
+                reads.set(crate::ports::ProvisioningKind::Clone, "ops-clone", reading);
                 vessel.status.as_mut().expect("status").phase =
                     if op == 3 || op == 6 { VesselPhase::Ready } else { VesselPhase::Provisioning };
                 apply_readiness_event(

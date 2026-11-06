@@ -304,7 +304,6 @@ pub async fn create_ready_checkout(
             &created.metadata.resource_version,
             &CheckoutStatus {
                 degraded: None,
-                clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: Some(fixture.path.clone()),
                 commit: Some("44982740".to_string()),

@@ -176,13 +176,7 @@ impl Aggregator {
                 let (state, phase, reason) = match engine.as_ref().and_then(|reading| reading_blocker(reading, "checkout is not ready")) {
                     Some(blocker) => blocker,
                     None => (
-                        if phase == CheckoutPhase::Failed {
-                            ReadinessState::Failed
-                        } else if status.is_some_and(|status| status.clone_retry.is_some()) {
-                            ReadinessState::Blocked
-                        } else {
-                            ReadinessState::Provisioning
-                        },
+                        if phase == CheckoutPhase::Failed { ReadinessState::Failed } else { ReadinessState::Provisioning },
                         format!("{phase:?}"),
                         status.and_then(|status| status.message.clone()).unwrap_or_else(|| "checkout is not ready".into()),
                     ),

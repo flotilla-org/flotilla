@@ -631,7 +631,6 @@ async fn create_deleting_checkout(backend: &ResourceBackend, name: &str, target_
             &created.metadata.resource_version,
             &CheckoutStatus {
                 degraded: None,
-                clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: Some(target_path.to_string()),
                 commit: Some("base-commit".to_string()),
@@ -715,7 +714,6 @@ async fn worktree_finalizer_supplies_clone_branch_and_target_to_runtime() {
             &created.metadata.resource_version,
             &CheckoutStatus {
                 degraded: None,
-                clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: Some("/checkouts/convoy-a/repo.feature-cleanup".to_string()),
                 commit: Some("base-commit".to_string()),
@@ -1001,7 +999,6 @@ async fn ready_checkout_reconciler_patches_integration_conditions() {
             &created.metadata.resource_version,
             &CheckoutStatus {
                 degraded: None,
-                clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: Some("/checkouts/convoy-a/repo.feature-cleanup".to_string()),
                 commit: Some("base-commit".to_string()),
@@ -1056,7 +1053,6 @@ async fn ready_checkout_reconciler_retries_protection_errors_without_failing_fre
             &created.metadata.resource_version,
             &CheckoutStatus {
                 degraded: None,
-                clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: Some("/checkouts/convoy-a/repo.feature-cleanup".to_string()),
                 commit: Some("base-commit".to_string()),

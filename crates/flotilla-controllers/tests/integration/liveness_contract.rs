@@ -162,7 +162,6 @@ impl WorldBuilder for CheckoutWorldBuilder {
                     &created.metadata.resource_version,
                     &CheckoutStatus {
                         degraded: None,
-                        clone_retry: None,
                         phase: CheckoutPhase::Ready,
                         path: None,
                         commit: Some("abc123".to_string()),
@@ -385,7 +384,6 @@ impl WorldBuilder for ConvoyWorldBuilder {
                 &checkout.metadata.resource_version,
                 &CheckoutStatus {
                     degraded: None,
-                    clone_retry: None,
                     phase: CheckoutPhase::Ready,
                     path: Some("/work/checkout-a".to_string()),
                     commit: Some("abc123".to_string()),

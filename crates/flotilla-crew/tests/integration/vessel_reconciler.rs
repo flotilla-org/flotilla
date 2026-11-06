@@ -459,7 +459,6 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
             &checkout.metadata.resource_version,
             &CheckoutStatus {
                 degraded: Default::default(),
-                clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: checkout_spec.target_path().map(str::to_string),
                 commit: None,
@@ -778,7 +777,6 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
                 &created.metadata.resource_version,
                 &CheckoutStatus {
                     degraded: Default::default(),
-                    clone_retry: None,
                     phase: CheckoutPhase::Ready,
                     path: spec.target_path().map(str::to_string),
                     commit: Some("44982740".to_string()),
@@ -972,7 +970,6 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
                 &created.metadata.resource_version,
                 &CheckoutStatus {
                     degraded: Default::default(),
-                    clone_retry: None,
                     phase: CheckoutPhase::Ready,
                     path: Some(path),
                     commit: Some("44982740".to_string()),
@@ -1289,7 +1286,6 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
             &adopted.metadata.resource_version,
             &CheckoutStatus {
                 degraded: Default::default(),
-                clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: Some(adopted_path.to_string()),
                 commit: Some("abc123".to_string()),
@@ -3230,7 +3226,6 @@ async fn create_ready_adopted_checkout(backend: &ResourceBackend, namespace: &st
             &created.metadata.resource_version,
             &CheckoutStatus {
                 degraded: Default::default(),
-                clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: Some(path.to_string()),
                 commit: Some("abc123".to_string()),
@@ -3264,7 +3259,6 @@ async fn create_ready_observed_checkout_without_status_path(backend: &ResourceBa
             &checkout.metadata.resource_version,
             &CheckoutStatus {
                 degraded: Default::default(),
-                clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: None,
                 commit: Some("abc123".to_string()),

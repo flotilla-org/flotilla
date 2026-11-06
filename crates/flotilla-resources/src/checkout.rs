@@ -129,6 +129,10 @@ impl CheckoutBranchProvenance {
     }
 }
 
+// ADR 0047: `clone_retry` retired with the old Clone controller (#3108); the engine's clone
+// reading holds a clone's retries. A status stored with it still decodes (unknown fields are
+// dropped, `stored_clone_retry_is_accepted_and_dropped`); remove that test one fleet roll after
+// this lands.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CheckoutStatus {
     /// ADR 0047: absent in the previous generation; retain the default for one roll.
@@ -147,8 +151,6 @@ pub struct CheckoutStatus {
     pub integration: CheckoutIntegrationStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clone_retry: Option<crate::ControllerRetry>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -253,7 +255,6 @@ pub enum ChangeRequestMergeability {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutStatusPatch {
     ObserveDegradation { message: Option<String> },
-    ObserveCloneRetry { retry: Option<crate::ControllerRetry> },
     ObserveValidation { message: Option<String> },
     MarkReady { path: String, commit: Option<String>, branch_provenance: CheckoutBranchProvenance },
     MarkFailed { message: String },
@@ -281,7 +282,6 @@ impl StatusPatch<CheckoutStatus> for CheckoutStatusPatch {
     fn apply(&self, status: &mut CheckoutStatus) {
         match self {
             Self::ObserveDegradation { message } => status.degraded = message.clone(),
-            Self::ObserveCloneRetry { retry } => status.clone_retry = retry.clone(),
             Self::ObserveValidation { message } => status.message = message.clone(),
             Self::MarkReady { path, commit, branch_provenance } => {
                 status.phase = CheckoutPhase::Ready;
@@ -289,7 +289,6 @@ impl StatusPatch<CheckoutStatus> for CheckoutStatusPatch {
                 status.commit = commit.clone();
                 status.branch_provenance = *branch_provenance;
                 status.message = None;
-                status.clone_retry = None;
             }
             Self::MarkFailed { message } => {
                 status.phase = CheckoutPhase::Failed;
@@ -313,6 +312,24 @@ impl StatusPatch<CheckoutStatus> for CheckoutStatusPatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ADR 0047: a status stored by the previous generation, with its retired `clone_retry`,
+    // decodes and drops it. Remove one fleet roll after `clone_retry` was retired (#3108).
+    #[test]
+    fn stored_clone_retry_is_accepted_and_dropped() {
+        let stored = serde_json::json!({
+            "phase": "Pending",
+            "message": "waiting for clone",
+            "clone_retry": {
+                "attempts": 2,
+                "first_failure_at": "2026-11-01T00:00:00Z",
+                "disposition": { "kind": "retryable", "next_attempt_at": "2026-11-01T00:01:00Z" }
+            }
+        });
+        let status: CheckoutStatus = serde_json::from_value(stored).expect("decodes");
+        assert_eq!(status, CheckoutStatus { message: Some("waiting for clone".into()), ..Default::default() });
+        assert!(serde_json::to_value(&status).expect("encodes").get("clone_retry").is_none(), "written in the new shape only");
+    }
 
     fn condition(value: ConditionValue) -> IntegrationCondition {
         IntegrationCondition::builder().value(value).observed_at("2026-07-27T00:00:00Z".to_string()).build()
