@@ -152,8 +152,7 @@ impl MessageDelivery {
     /// gates at any home ask it for an inspection there, and a request that finds the inbox unbound
     /// is dropped as undeliverable, which the gate takes as a failed inspection.
     async fn inspector(&self) -> Result<(Address, Receiver), String> {
-        let roles = self.primitives.roles(&self.namespace).await?;
-        let inbox = roles.checkout_inspector(self.primitives.home())?;
+        let inbox = flotilla_core::primitives::roles::checkout_inspector(self.primitives.home())?;
         let consumer = self
             .primitives
             .register_controller(flotilla_core::primitives::roles::CHECKOUT_INSPECTOR, Timestamp::from_datetime(&Utc::now()))

@@ -4,7 +4,11 @@
 
 use std::sync::Arc;
 
-use flotilla_core::primitives::{roles::CHECKOUT_INSPECTOR, sweep::OpenMessages, MessagePrimitives, RequestAnswer};
+use flotilla_core::primitives::{
+    roles::{checkout_inspector, CHECKOUT_INSPECTOR},
+    sweep::OpenMessages,
+    MessagePrimitives, RequestAnswer,
+};
 use flotilla_inbox::InboxBackend;
 use flotilla_resources::{FleetDesignation, FleetDesignationSpec, InputMeta, Project, ProjectSpec, SystemClock, FLEET_DESIGNATION_NAME};
 use flotilla_schema::{Frozen, Timestamp};
@@ -57,7 +61,7 @@ async fn inspection(primitives: &MessagePrimitives, host: &str) -> MessageSpec {
     let roles = primitives.roles(NAMESPACE).await.expect("roles");
     MessageSpec::new(
         roles.address("teardown").expect("declared"),
-        roles.checkout_inspector(host).expect("inspector inbox"),
+        checkout_inspector(host).expect("inspector inbox"),
         Relation::System,
         Frozen::new(MessageBody::Request(RequestBody::CheckoutInspection { remote: true })).expect("body"),
     )
