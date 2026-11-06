@@ -67,11 +67,13 @@ CREATE TABLE "change_request" (
   "review_decision" TEXT CHECK ("review_decision" IN ('ap', 'cr', 'no', 'rq')),
   "review_requested_from_owner" INTEGER CHECK ("review_requested_from_owner" IN (0, 1)),
   "head_sha" TEXT,
+  "head_branch" TEXT,
   "checks" TEXT CHECK ("checks" IN ('fa', 'pa', 'pe')),
   "actionable_at_head" INTEGER CHECK ("actionable_at_head" IN (0, 1)),
   "mergeable" TEXT CHECK ("mergeable" IN ('co', 'me')),
   "failing_since" INTEGER
 ) STRICT;
+CREATE INDEX "change_request_by_branch" ON "change_request" ("service", "scope", "head_branch") WHERE "head_branch" IS NOT NULL;
 CREATE INDEX "change_request_by_subject" ON "change_request" ("service", "scope", "number");
 INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cq', 'state', 'cl', 'Closed'),
@@ -99,6 +101,7 @@ CREATE VIEW "change_request_view" AS SELECT
   (SELECT "name" FROM "codes" WHERE "kind" = 'cq' AND "field" = 'review_decision' AND "code" = "change_request"."review_decision") AS "review_decision",
   "change_request"."review_requested_from_owner",
   "change_request"."head_sha",
+  "change_request"."head_branch",
   (SELECT "name" FROM "codes" WHERE "kind" = 'cq' AND "field" = 'checks' AND "code" = "change_request"."checks") AS "checks",
   "change_request"."actionable_at_head",
   (SELECT "name" FROM "codes" WHERE "kind" = 'cq' AND "field" = 'mergeable' AND "code" = "change_request"."mergeable") AS "mergeable",

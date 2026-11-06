@@ -173,7 +173,13 @@ fn at<T>(value: Option<T>, observed_at: DateTime<Utc>) -> Observation<T> {
 /// The observing home's view of one change request: kind code `cq`, named by the subject's record
 /// name. A null value is one the forge has not reported.
 #[derive(Clone, Debug, PartialEq, Eq, Stored)]
-#[store(kind = "ChangeRequest", code = "cq", index(name = "by_subject", eq(service, scope, number)))]
+#[store(
+    kind = "ChangeRequest",
+    code = "cq",
+    index(name = "by_subject", eq(service, scope, number)),
+    // A repository's change requests from one of its own branches (#3108).
+    index(name = "by_branch", eq(service, scope, head_branch), when(head_branch is_some))
+)]
 pub struct ChangeRequestRecord {
     pub service: String,
     pub scope: String,
@@ -184,6 +190,10 @@ pub struct ChangeRequestRecord {
     pub review_decision: Option<ReviewDecision>,
     pub review_requested_from_owner: Option<bool>,
     pub head_sha: Option<String>,
+    /// The branch the change request merges from, when that branch is in the change request's
+    /// own repository. A request from a fork has none, so a fork's branch of the same name never
+    /// matches `by_branch`. Written only by the forge observer.
+    pub head_branch: Option<String>,
     pub checks: Option<Checks>,
     pub actionable_at_head: Option<bool>,
     pub mergeable: Option<Mergeability>,
@@ -204,6 +214,7 @@ impl ChangeRequestRecord {
             review_decision: status.review_decision.value.map(Into::into),
             review_requested_from_owner: status.review_requested_from_owner.value,
             head_sha: status.head_sha.value.clone(),
+            head_branch: None,
             checks: status.checks.value.map(Into::into),
             actionable_at_head: status.review.actionable_at_head.value,
             mergeable: status.mergeable.value.map(Into::into),
@@ -223,6 +234,7 @@ impl ChangeRequestRecord {
             review_decision: None,
             review_requested_from_owner: None,
             head_sha: None,
+            head_branch: None,
             checks: None,
             actionable_at_head: None,
             mergeable: None,
