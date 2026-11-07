@@ -37,11 +37,7 @@ impl VerbRegistry {
 
     /// Registers `verb` with its presentation. A name registered twice is refused.
     pub fn register(&mut self, verb: impl NativeVerb, presentation: Presentation) -> Result<(), DuplicateVerb> {
-        self.register_handler(Arc::new(verb), presentation)
-    }
-
-    /// Registers a verb whose parameter type is already erased.
-    pub fn register_handler(&mut self, handler: Arc<dyn Handler>, presentation: Presentation) -> Result<(), DuplicateVerb> {
+        let handler: Arc<dyn Handler> = Arc::new(verb);
         let name = handler.declaration().name;
         if self.verbs.iter().any(|registered| registered.handler.declaration().name == name) {
             return Err(DuplicateVerb(name));
@@ -51,10 +47,6 @@ impl VerbRegistry {
     }
 
     /// The registered verbs, in registration order.
-    pub fn iter(&self) -> impl Iterator<Item = &Registered> {
-        self.verbs.iter()
-    }
-
     pub fn into_verbs(self) -> Vec<Registered> {
         self.verbs
     }

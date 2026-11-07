@@ -69,7 +69,8 @@ impl KnownConvoy {
 /// lookup reads it: `<name>@<project>`, or `<name>` for a convoy of no project.
 ///
 /// `typed` is an ADR 0066 address (`convoy:lander`, `project:flotilla/convoy:lander`), the
-/// CLI's `<name>@<project>`, which is whole, or a bare `<name>`, which is `convoy:<name>`.
+/// CLI's `<name>@<project>` or `<name>@` (of no project), which are whole, or a bare `<name>`,
+/// which is `convoy:<name>`.
 /// `known` gives the vessel's own convoy its project, and the candidates when the context does
 /// not place the reference.
 pub fn complete_convoy(typed: &str, sources: &ContextSources, known: &[KnownConvoy]) -> Result<String, String> {
@@ -78,7 +79,11 @@ pub fn complete_convoy(typed: &str, sources: &ContextSources, known: &[KnownConv
         Some((name, project)) if !project.is_empty() => {
             KnownConvoy::address(Some(project), name).ok_or_else(|| format!("convoy `{typed}` is not an address"))?
         }
-        Some((name, _)) => KnownConvoy::address(None, name).ok_or_else(|| format!("convoy `{typed}` is not an address"))?,
+        // `<name>@` names the convoy of no project explicitly: whole, so it goes as typed.
+        Some((name, _)) => {
+            KnownConvoy::address(None, name).ok_or_else(|| format!("convoy `{typed}` is not an address"))?;
+            return Ok(typed.to_owned());
+        }
         None => KnownConvoy::address(None, typed).ok_or_else(|| format!("convoy `{typed}` is not an address"))?,
     };
     if partial.kind() != Kind::Convoy {
@@ -180,6 +185,11 @@ mod tests {
         assert_eq!(complete_convoy("loner", &none, &convoys()), Ok("loner".into()));
         // Whole references go as typed; an unknown one is left for the exact lookup to answer.
         assert_eq!(complete_convoy("lander@other", &checkout, &convoys()), Ok("lander@other".into()));
+        // `<name>@` is the convoy of no project, never completed into the checkout's project.
+        let mut projectless = convoys();
+        projectless.push(known("convoy-5", "lander", None));
+        assert_eq!(complete_convoy("lander@", &checkout, &projectless), Ok("lander@".into()));
+        assert_eq!(complete_convoy("loner@", &checkout, &convoys()), Ok("loner@".into()));
         assert_eq!(complete_convoy("project:other/convoy:lander", &checkout, &convoys()), Ok("lander@other".into()));
         assert_eq!(complete_convoy("missing", &none, &convoys()), Ok("missing".into()));
         assert_eq!(complete_convoy("missing", &checkout, &convoys()), Ok("missing@flotilla".into()));

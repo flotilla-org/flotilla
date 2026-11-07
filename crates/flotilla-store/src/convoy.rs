@@ -70,33 +70,39 @@ impl<'a> ConvoyName<'a> {
         &self,
         rows: &'r [flotilla_resources::ReadResourceObject<flotilla_resources::Convoy>],
     ) -> Result<Option<&'r flotilla_resources::ReadResourceObject<flotilla_resources::Convoy>>, String> {
-        let in_project = |row: &&flotilla_resources::ReadResourceObject<flotilla_resources::Convoy>| {
-            let project = row.object.metadata.labels.get(flotilla_resources::PROJECT_LABEL).filter(|project| !project.is_empty());
-            project.map(String::as_str) == self.project
-        };
-        let holders: Vec<_> = rows
-            .iter()
-            .filter(in_project)
-            .filter(|row| row.object.metadata.labels.get(flotilla_resources::ROLE_LABEL).map(String::as_str) == Some(self.name))
-            .collect();
-        let terminal = |row: &&flotilla_resources::ReadResourceObject<flotilla_resources::Convoy>| {
-            row.object.status.as_ref().is_some_and(|status| status.phase.is_terminal())
-        };
-        let (live, ended): (Vec<_>, Vec<_>) = holders.into_iter().partition(|row| !terminal(row));
+        let identities: Vec<_> = rows.iter().map(|row| ConvoyIdentity::of(&row.object)).collect();
+        let selected = self.select_indices(&identities)?;
+        Ok(selected
+            .into_iter()
+            .map(|index| &rows[index])
+            .max_by_key(|row| matches!(row.provenance, flotilla_resources::ResourceProvenance::Local)))
+    }
+
+    /// The rows among `identities` holding the record this name answers with: every copy of
+    /// it, for a caller that weighs them (local or replica, home host); `Err` when the role is
+    /// held by several records. [`Self::select`] is this over stored rows.
+    pub fn select_indices(&self, identities: &[ConvoyIdentity<'_>]) -> Result<Vec<usize>, String> {
+        let in_project = |identity: &ConvoyIdentity<'_>| identity.project.filter(|project| !project.is_empty()) == self.project;
+        let holders = || identities.iter().enumerate().filter(|(_, identity)| in_project(identity) && identity.role == Some(self.name));
+        let live: Vec<usize> = holders().filter(|(_, identity)| !identity.terminal).map(|(index, _)| index).collect();
         let candidates = if !live.is_empty() {
             live
-        } else if !ended.is_empty() {
-            ended
         } else {
-            let named = |row: &&flotilla_resources::ReadResourceObject<flotilla_resources::Convoy>| row.object.metadata.name == self.name;
-            rows.iter().filter(named).filter(|row| self.project.is_none() || in_project(row)).collect()
+            let ended: Vec<usize> = holders().map(|(index, _)| index).collect();
+            if !ended.is_empty() {
+                ended
+            } else {
+                let named =
+                    |identity: &ConvoyIdentity<'_>| identity.record == self.name && (self.project.is_none() || in_project(identity));
+                identities.iter().enumerate().filter(|(_, identity)| named(identity)).map(|(index, _)| index).collect()
+            }
         };
-        let records: std::collections::BTreeSet<&str> = candidates.iter().map(|row| row.object.metadata.name.as_str()).collect();
+        let records: std::collections::BTreeSet<&str> = candidates.iter().map(|index| identities[*index].record).collect();
         if records.len() > 1 {
             let records = records.into_iter().collect::<Vec<_>>().join(", ");
             return Err(format!("convoy `{self}` is held by several records; name one by its record: {records}"));
         }
-        Ok(candidates.into_iter().max_by_key(|row| matches!(row.provenance, flotilla_resources::ResourceProvenance::Local)))
+        Ok(candidates)
     }
 
     /// The convoy this name answers with in `namespace`, read through one indexed query.
@@ -108,6 +114,29 @@ impl<'a> ConvoyName<'a> {
         let rows =
             backend.query_declared::<flotilla_resources::Convoy>(namespace, &self.query()).await.map_err(|error| error.to_string())?;
         Ok(self.select(&rows.items)?.cloned())
+    }
+}
+
+/// What [`ConvoyName::select_indices`] reads of a convoy row, from a stored convoy or a projected
+/// one (the routing table's aggregator rows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConvoyIdentity<'a> {
+    pub record: &'a str,
+    pub role: Option<&'a str>,
+    /// The project label; empty for a convoy of no project.
+    pub project: Option<&'a str>,
+    pub terminal: bool,
+}
+
+impl<'a> ConvoyIdentity<'a> {
+    pub fn of(convoy: &'a flotilla_resources::ResourceObject<flotilla_resources::Convoy>) -> Self {
+        let label = |name| convoy.metadata.labels.get(name).map(String::as_str);
+        Self {
+            record: &convoy.metadata.name,
+            role: label(flotilla_resources::ROLE_LABEL),
+            project: label(flotilla_resources::PROJECT_LABEL),
+            terminal: convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()),
+        }
     }
 }
 
@@ -267,6 +296,33 @@ mod lookup_tests {
         convoy(&backend, "convoy-4", "reviewer", Some("flotilla"), Some(ConvoyPhase::Abandoned)).await;
         let ambiguous = lookup(&backend, "project:flotilla/convoy:reviewer").await.unwrap_err();
         assert_eq!(ambiguous, "convoy `reviewer@flotilla` is held by several records; name one by its record: convoy-3, convoy-4");
+    }
+
+    // #2767, #4272: routing and the executor select through `select_indices`. Terminal history
+    // never displaces a live holder, and a record name still names history. Exhaustive finite
+    // generator: with and without a project, all six orders of two ended namesakes and a live
+    // holder; a second live holder is refused, naming both live records and neither ended one.
+    #[test]
+    fn a_live_holder_answers_ahead_of_ended_namesakes_in_any_order() {
+        for project in [None, Some("p")] {
+            let role = ConvoyName { project, name: "governor" };
+            for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+                let names = ["old-a", "old-b", "live"];
+                let identities =
+                    order.map(|index| ConvoyIdentity { record: names[index], role: Some("governor"), project, terminal: index < 2 });
+                let records = |indices: Vec<usize>| indices.into_iter().map(|index| identities[index].record).collect::<Vec<_>>();
+                assert_eq!(records(role.select_indices(&identities).unwrap()), ["live"]);
+                assert_eq!(records(ConvoyName { project, name: "old-a" }.select_indices(&identities).unwrap()), ["old-a"]);
+
+                let mut ambiguous = Vec::from(identities);
+                ambiguous.push(ConvoyIdentity { record: "another-live", role: Some("governor"), project, terminal: false });
+                let error = role.select_indices(&ambiguous).unwrap_err();
+                let named = error.split(|c: char| !c.is_ascii_alphanumeric() && c != '-').collect::<std::collections::BTreeSet<_>>();
+                assert!(named.contains("another-live") && named.contains("live"), "{error}");
+                assert!(!named.contains("old-a") && !named.contains("old-b"), "{error}");
+            }
+            assert_eq!(role.select_indices(&[]), Ok(vec![]));
+        }
     }
 
     // The text spelling names the same convoy as the address: `<name>@<project>`, or `<name>` (and

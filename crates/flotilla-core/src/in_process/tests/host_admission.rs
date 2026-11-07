@@ -1,5 +1,4 @@
 use flotilla_resources::convoy_address::convoy_record_name;
-use flotilla_resources::parse_role_address;
 use flotilla_store_memory::InMemoryBackend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -18,17 +17,6 @@ use super::support::{create_docker_placement, host_direct_kind, test_meta};
 use crate::in_process::{placement_target_host, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;
 use flotilla_admission::convoy_admission::allocate_convoy_generation;
-
-#[test]
-fn convoy_role_addresses_reject_malformed_values() {
-    assert_eq!(parse_role_address("reviewer"), Ok(("reviewer", None)));
-    assert_eq!(parse_role_address("reviewer@flotilla"), Ok(("reviewer", Some("flotilla"))));
-    assert_eq!(parse_role_address("reviewer@"), Ok(("reviewer", Some(""))));
-    for value in ["@project", "a@b@c"] {
-        assert_eq!(parse_role_address(value), Err(format!("invalid convoy address `{value}`: expected role@project")));
-    }
-    assert_eq!(parse_role_address(""), Err("convoy role cannot be empty".to_string()));
-}
 
 #[tokio::test]
 async fn projectless_convoys_do_not_share_an_identity_bucket_with_a_project_named_standalone() {

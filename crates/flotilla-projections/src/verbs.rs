@@ -24,7 +24,7 @@ pub fn register_verbs(registry: &mut VerbRegistry, port: Arc<dyn ProjectionsActi
 /// Explains a convoy: why it is where it is, and what it waits on.
 #[derive(Verb, serde::Deserialize)]
 #[verb(name = "convoy.explain", subject = "convoy", effect = "read", idempotent)]
-pub struct Explain {}
+struct Explain {}
 
 /// `convoy.explain` over the explanation projection.
 struct ExplainConvoy {
