@@ -514,6 +514,7 @@ pub async fn operator_reap_restarts_immediately_without_burning_budget_and_past_
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    install_engine(&restarted_daemon);
     restarted_daemon
         .install_convoy_ensure_reconciler(factory.create(
             restarted_daemon.convoy_teardown(),

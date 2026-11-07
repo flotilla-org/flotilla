@@ -111,10 +111,10 @@ pub trait EnsureScenarioController: Send + Sync {
 }
 
 async fn assert_independent_placement_snapshots(factory: &dyn EnsureScenarioController, replica_before_admission: bool) {
-    let (first, first_backend, _first_clock, _first_temp) = standing_ensure_fixture_for(factory, "feta", true).await;
-    let (second, second_backend, _second_clock, _second_temp) = standing_ensure_fixture_for(factory, "udder", true).await;
-    for backend in [&first_backend, &second_backend] {
-        configure_standing_ensure_agent(backend, Vec::new()).await;
+    let (first, _first_backend, _first_clock, _first_temp) = standing_ensure_fixture_for(factory, "feta", true).await;
+    let (second, _second_backend, _second_clock, _second_temp) = standing_ensure_fixture_for(factory, "udder", true).await;
+    for daemon in [&first, &second] {
+        configure_standing_ensure_agent(daemon, Vec::new()).await;
     }
 
     // Exercise both simultaneous first admissions and an already-visible replica.
@@ -199,6 +199,14 @@ async fn seed_convoy_routing_row(
     daemon.aggregator_projection_state().await.write().await.local_rows.insert(resource, row);
 }
 
+/// Installs the engine `daemon` reads its environments, clones and checkouts from, on its decided
+/// store, as the runtime's composition does; a scenario daemon is not composed by the runtime.
+fn install_engine(daemon: &InProcessDaemon) {
+    let service = daemon.decided_store().expect("decided store");
+    let engine = flotilla_provisioning_testkit::EngineFixture::over(service.home(), service.store());
+    daemon.install_lifecycle_reads(engine.reads()).expect("install the engine's readings");
+}
+
 fn test_meta(name: &str) -> InputMeta {
     InputMeta::builder().name(name.to_string()).build()
 }
@@ -229,13 +237,14 @@ async fn standing_ensure_fixture_for(
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    install_engine(&daemon);
     daemon
         .install_convoy_ensure_reconciler(factory.create(daemon.convoy_teardown(), daemon.resource_backend(), daemon.clock_for_scenarios()))
         .await;
     let repository_spec = RepositorySpec::remote("https://github.com/acme/standing").expect("repository spec");
     let repository_key = repository_spec.key();
     backend.using::<Repository>("flotilla").create(&test_meta(&repository_key.to_string()), &repository_spec).await.expect("repository");
-    create_host_direct_placement(&backend, &format!("host-direct-{host}-vessels"), &format!("{host}-vessels")).await;
+    create_host_direct_placement((&*daemon).into(), &format!("host-direct-{host}-vessels"), &format!("{host}-vessels")).await;
     if materialize_ensure {
         backend
             .definitions::<Project>("flotilla")
@@ -262,7 +271,12 @@ async fn standing_ensure_fixture_for(
         .create(
             &InputMeta::builder()
                 .name(flotilla_charter::ops_entry::materialized_workflow_name("standing-project", "quartermaster"))
-                .annotations(BTreeMap::from([(MATERIALIZED_PROJECT_ANNOTATION.to_string(), "standing-project".to_string())]))
+                // Project operations stamp what they materialise with the repository and commit read.
+                .annotations(BTreeMap::from([
+                    (MATERIALIZED_PROJECT_ANNOTATION.to_string(), "standing-project".to_string()),
+                    (SOURCE_REPOSITORY_ANNOTATION.to_string(), repository_key.to_string()),
+                    (SOURCE_COMMIT_ANNOTATION.to_string(), "abc123".to_string()),
+                ]))
                 .build(),
             &WorkflowTemplateSpec::builder()
                 .vessels(vec![VesselRequirement::builder()
@@ -379,19 +393,16 @@ async fn fail_latest_ensured_generation(backend: &ResourceBackend, clock: &Virtu
     convoy.metadata.name
 }
 
-async fn configure_standing_ensure_agent(backend: &ResourceBackend, overrides: Vec<flotilla_protocol::AgentOverride>) {
-    create_docker_placement(backend, "standing-agent", "standing-agent-host", BTreeSet::new()).await;
-    let hosts = backend.using::<ResourceHost>("flotilla");
-    let host = hosts.get("standing-agent-host").await.expect("standing agent host");
-    let mut status = host.status.expect("standing agent host status");
-    status.fulfilment_facts.insert(
+async fn configure_standing_ensure_agent(daemon: &InProcessDaemon, overrides: Vec<flotilla_protocol::AgentOverride>) {
+    let facts = BTreeMap::from([(
         "standing-agent".into(),
         flotilla_resources::FulfilmentFacts {
             harnesses: BTreeMap::from([("codex".into(), HarnessFacts { version: "0.160.0".into(), models: BTreeMap::new() })]),
             ..Default::default()
         },
-    );
-    hosts.update_status(&host.metadata.name, &host.metadata.resource_version, &status).await.expect("standing agent host facts");
+    )]);
+    create_docker_placement(daemon.into(), "standing-agent", "standing-agent-host", BTreeSet::new(), facts).await;
+    let backend = &daemon.resource_backend();
     let workflows = backend.using::<WorkflowTemplate>("flotilla");
     let mut workflow = workflows.get("standing-project--quartermaster").await.expect("standing workflow");
     workflow.spec.vessels[0].crew = vec![CrewSpec::builder()
@@ -477,57 +488,99 @@ async fn placement_kind(backend: &ResourceBackend, name: &str, host_ref: &str) -
         .expect("fulfilment kind")
 }
 
-/// A ready host with room for vessels, advertising the fixture providers. Its
-/// heartbeat stays fresh however far a scenario advances its virtual clock.
-async fn create_placement_host(backend: &ResourceBackend, host_ref: &str, capabilities: BTreeMap<String, serde_json::Value>) {
-    let hosts = backend.using::<ResourceHost>("flotilla");
-    let host = hosts
-        .create(
-            &test_meta(host_ref),
-            &HostSpec { display_name: host_ref.to_string(), connection: Default::default(), ..HostSpec::default() },
-        )
-        .await
-        .expect("host create");
+/// Where a scenario's placement Hosts are written. A plain store holds whatever it is given; a
+/// daemon's engine takes another host's Host only from that host's home (ADR 0064), so it is
+/// written there and replicated in, as that host's daemon would publish it.
+#[derive(Clone, Copy)]
+enum HostsAt<'a> {
+    Store(&'a ResourceBackend),
+    Daemon(&'a InProcessDaemon),
+}
+
+impl<'a> From<&'a ResourceBackend> for HostsAt<'a> {
+    fn from(backend: &'a ResourceBackend) -> Self {
+        Self::Store(backend)
+    }
+}
+
+impl<'a> From<&'a InProcessDaemon> for HostsAt<'a> {
+    fn from(daemon: &'a InProcessDaemon) -> Self {
+        Self::Daemon(daemon)
+    }
+}
+
+impl HostsAt<'_> {
+    fn backend(self) -> ResourceBackend {
+        match self {
+            Self::Store(backend) => backend.clone(),
+            Self::Daemon(daemon) => daemon.resource_backend(),
+        }
+    }
+}
+
+/// A ready host with room for vessels, advertising the fixture providers and `facts`. Its
+/// heartbeat, and when its home was last heard, stay fresh however far a scenario advances its
+/// virtual clock.
+async fn create_placement_host(
+    at: HostsAt<'_>,
+    host_ref: &str,
+    capabilities: BTreeMap<String, serde_json::Value>,
+    facts: BTreeMap<String, flotilla_resources::FulfilmentFacts>,
+) {
+    let fresh_until = Utc::now() + ChronoDuration::days(365);
+    let spec = HostSpec { display_name: host_ref.to_string(), connection: Default::default(), ..HostSpec::default() };
     let mut capabilities = capabilities;
     capabilities.insert(
         flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(),
         serde_json::json!(flotilla_discovery_testkit::environment::ready_placement_advertisements()),
     );
-    hosts
-        .update_status(
-            &host.metadata.name,
-            &host.metadata.resource_version,
-            &HostStatus {
-                capabilities,
-                heartbeat_at: Some(Utc::now() + ChronoDuration::days(365)),
-                ready: true,
-                disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
-                admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
-                ..HostStatus::default()
-            },
-        )
-        .await
-        .expect("host status update");
+    let status = HostStatus {
+        capabilities,
+        fulfilment_facts: facts,
+        heartbeat_at: Some(fresh_until),
+        ready: true,
+        disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
+        admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
+        ..HostStatus::default()
+    };
+    match at {
+        HostsAt::Daemon(daemon) => {
+            let target = daemon.decided_store().expect("decided store");
+            flotilla_provisioning_testkit::put_host_at_its_home_heard(&target, host_ref, &spec, Some(&status), fresh_until).await;
+        }
+        HostsAt::Store(backend) => {
+            let hosts = backend.using::<ResourceHost>("flotilla");
+            let host = hosts.create(&test_meta(host_ref), &spec).await.expect("host create");
+            hosts.update_status(&host.metadata.name, &host.metadata.resource_version, &status).await.expect("host status update");
+        }
+    }
 }
 
 /// Registers the host-direct kind standing convoys place onto.
-async fn create_host_direct_placement(backend: &ResourceBackend, kind_name: &str, host_ref: &str) {
-    create_placement_host(backend, host_ref, BTreeMap::new()).await;
-    placement_kind(backend, kind_name, host_ref).await;
+async fn create_host_direct_placement(at: HostsAt<'_>, kind_name: &str, host_ref: &str) {
+    create_placement_host(at, host_ref, BTreeMap::new(), BTreeMap::new()).await;
+    placement_kind(&at.backend(), kind_name, host_ref).await;
 }
 
-async fn create_docker_placement(backend: &ResourceBackend, kind_name: &str, host_ref: &str, held_credentials: BTreeSet<String>) {
+async fn create_docker_placement(
+    at: HostsAt<'_>,
+    kind_name: &str,
+    host_ref: &str,
+    held_credentials: BTreeSet<String>,
+    facts: BTreeMap<String, flotilla_resources::FulfilmentFacts>,
+) {
     create_placement_host(
-        backend,
+        at,
         host_ref,
         BTreeMap::from([
             (flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(held_credentials)),
             ("docker".to_string(), serde_json::json!(true)),
             ("os".to_string(), serde_json::json!("linux")),
         ]),
+        facts,
     )
     .await;
-    backend
+    at.backend()
         .using::<FulfilmentKind>("flotilla")
         .create(
             &test_meta(kind_name),

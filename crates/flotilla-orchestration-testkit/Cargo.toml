@@ -28,6 +28,7 @@ flotilla-environment = { path = "../flotilla-environment" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
 flotilla-store-testkit = { path = "../flotilla-store-testkit" }
+flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
 tempfile = { workspace = true }
 
 [lints]

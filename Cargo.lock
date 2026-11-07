@@ -3287,6 +3287,7 @@ dependencies = [
  "flotilla-environment",
  "flotilla-protocol",
  "flotilla-provider-runtime",
+ "flotilla-provisioning-testkit",
  "flotilla-resources",
  "flotilla-store",
  "flotilla-store-memory",

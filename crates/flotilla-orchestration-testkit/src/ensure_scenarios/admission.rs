@@ -13,7 +13,7 @@ pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_
     use flotilla_store::controller::Reconciler;
 
     let (daemon, backend, clock, temp) = standing_ensure_fixture(factory).await;
-    configure_standing_ensure_agent(&backend, Vec::new()).await;
+    configure_standing_ensure_agent(&daemon, Vec::new()).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("admit standing governor");
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let convoy_name = backend
@@ -89,6 +89,7 @@ pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    install_engine(&restarted);
     restarted
         .install_convoy_ensure_reconciler(factory.create(
             restarted.convoy_teardown(),
@@ -331,7 +332,7 @@ pub async fn ensure_drift_names_config_changes_and_invalid_roll_keeps_the_curren
 pub async fn standing_ensure_applies_agent_overrides_to_the_admitted_workflow_snapshot(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     configure_standing_ensure_agent(
-        &backend,
+        &daemon,
         vec![flotilla_protocol::AgentOverride {
             capability: "governor".to_string(),
             adapter: "codex".to_string(),
@@ -348,7 +349,7 @@ pub async fn standing_ensure_applies_agent_overrides_to_the_admitted_workflow_sn
 
 pub async fn standing_ensure_without_agent_overrides_preserves_the_workflow_selector(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
-    configure_standing_ensure_agent(&backend, Vec::new()).await;
+    configure_standing_ensure_agent(&daemon, Vec::new()).await;
 
     let workflow = admitted_standing_workflow(&daemon, &backend).await;
     let CrewSource::Agent { selector, .. } = &workflow.vessels[0].crew[0].source else { panic!("governor must remain an agent") };
@@ -358,7 +359,7 @@ pub async fn standing_ensure_without_agent_overrides_preserves_the_workflow_sele
 
 pub async fn standing_readmission_writes_a_new_brief_artifact(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, clock, _temp) = standing_ensure_fixture(factory).await;
-    configure_standing_ensure_agent(&backend, Vec::new()).await;
+    configure_standing_ensure_agent(&daemon, Vec::new()).await;
     let writer = Arc::new(RecordingBriefArtifacts::default());
     daemon.set_brief_artifact_writer(writer.clone()).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
@@ -626,6 +627,7 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    install_engine(&daemon);
     daemon
         .install_convoy_ensure_reconciler(factory.create(daemon.convoy_teardown(), daemon.resource_backend(), daemon.clock_for_scenarios()))
         .await;
@@ -638,7 +640,7 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
         )
         .await
         .expect("root B host resource");
-    create_host_direct_placement(&target, "host-direct-root-b-vessels", "root-b-vessels").await;
+    create_host_direct_placement((&*daemon).into(), "host-direct-root-b-vessels", "root-b-vessels").await;
     let source = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
     let repository_spec = RepositorySpec::remote("https://github.com/acme/cross-root").expect("repository spec");
     let repository_key = repository_spec.key();
@@ -863,7 +865,7 @@ pub async fn off_home_driver_admits_an_ensure_from_replicated_project_definition
     std::fs::write(driver_temp.path().join("daemon.toml"), "machine_id = \"driver-test\"\n").expect("driver config");
     let driver_backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("driver-root"));
     let home_root = NodeId::new("home-root");
-    create_host_direct_placement(&driver_backend, "host-direct-driver-vessels", "driver-vessels").await;
+    create_host_direct_placement((&driver_backend).into(), "host-direct-driver-vessels", "driver-vessels").await;
     driver_backend
         .replica_writer::<Project>(home_root.clone(), "flotilla")
         .replace(&home_backend.using::<Project>("flotilla").list().await.expect("home projects"), Utc::now())
@@ -890,6 +892,7 @@ pub async fn off_home_driver_admits_an_ensure_from_replicated_project_definition
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    install_engine(&driver);
     driver
         .install_convoy_ensure_reconciler(factory.create(driver.convoy_teardown(), driver.resource_backend(), driver.clock_for_scenarios()))
         .await;
@@ -911,7 +914,7 @@ pub async fn standing_presence_inherits_role_shape_and_delivers_charter_artifact
     use flotilla_resources::{FleetDesignation, FleetDesignationSpec, RoleDefinition};
 
     let (daemon, backend, _, _temp) = standing_ensure_fixture(factory).await;
-    configure_standing_ensure_agent(&backend, Vec::new()).await;
+    configure_standing_ensure_agent(&daemon, Vec::new()).await;
     let projects = backend.definitions::<Project>("flotilla");
     let fleet = ProjectSpec::builder()
         .display_name("Fleet".into())
