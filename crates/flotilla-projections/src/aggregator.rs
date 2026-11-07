@@ -283,6 +283,10 @@ pub struct Aggregator {
     /// `HOME_HEARD_WITHIN` after (#3108).
     #[builder(skip)]
     agent_session_heard: HashMap<flotilla_protocol::NodeId, chrono::DateTime<chrono::Utc>>,
+    /// The daemon's wall clock: readings' ages, a quiet home's staleness and escalation deadlines
+    /// are judged against it, so a test drives them by setting it.
+    #[builder(skip = Arc::new(flotilla_resources::SystemClock))]
+    clock: Arc<dyn flotilla_resources::Clock>,
     event_sink: Arc<dyn EventSink>,
     event_rx: broadcast::Receiver<DaemonEvent>,
 }
@@ -392,9 +396,16 @@ impl Aggregator {
             agent_sessions: HashMap::new(),
             agent_session_home: None,
             agent_session_heard: HashMap::new(),
+            clock: Arc::new(flotilla_resources::SystemClock),
             event_sink,
             event_rx,
         }
+    }
+
+    /// Judges times against `clock`, the daemon's, rather than the system's.
+    pub fn with_clock(mut self, clock: Arc<dyn flotilla_resources::Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Crew members show their AgentSessions, read from the decided store through `port`.
@@ -605,8 +616,8 @@ impl Aggregator {
         change_request_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            let escalation_delay = self.next_escalation_delay(chrono::Utc::now());
-            let home_stale_delay = self.next_home_stale_delay(chrono::Utc::now());
+            let escalation_delay = self.next_escalation_delay(self.clock.now());
+            let home_stale_delay = self.next_home_stale_delay(self.clock.now());
             let escalation = async move {
                 match escalation_delay {
                     Some(delay) => tokio::time::sleep(delay).await,
@@ -1848,7 +1859,7 @@ impl Aggregator {
                 }
             }
             AgentSessionUpdate::Heard { home, at } => {
-                let now = chrono::Utc::now();
+                let now = self.clock.now();
                 let was = agent_activity::home_current(self.agent_session_heard.get(&home).copied(), now);
                 self.agent_session_heard.insert(home, at);
                 // A keepalive from a home already current changes no row.
@@ -2098,7 +2109,7 @@ impl Aggregator {
                         .issue(entry.issue.clone())
                         .title(entry.title.clone())
                         .ready_observed_at(entry.ready_observed_at)
-                        .age_seconds(chrono::Utc::now().signed_duration_since(entry.ready_observed_at).num_seconds().max(0) as u64)
+                        .age_seconds(self.clock.now().signed_duration_since(entry.ready_observed_at).num_seconds().max(0) as u64)
                         .attention(attention)
                         .maybe_score(entry.score.clone())
                         .provenance(entry.provenance.clone())
@@ -2333,7 +2344,7 @@ impl Aggregator {
     }
 
     fn salience_facts(&self) -> SalienceFacts {
-        self.salience_facts_at(chrono::Utc::now())
+        self.salience_facts_at(self.clock.now())
     }
 
     fn salience_facts_at(&self, now: chrono::DateTime<chrono::Utc>) -> SalienceFacts {
@@ -2948,7 +2959,7 @@ impl Aggregator {
             .and_then(|placement| placement.fields.get("placement_decision"))
             .and_then(|value| serde_json::from_value(value.clone()).ok());
         let (vessel_host, carried_by) = self.vessel_hosts(convoy_ref, state);
-        let now = chrono::Utc::now();
+        let now = self.clock.now();
         let vessel_resource =
             placement.and_then(|placement| placement.fields.get("vessel_ref")).and_then(serde_json::Value::as_str).map(|name| {
                 ResourceRef::new(api_version(Vessel::API_PATHS), Vessel::API_PATHS.kind, &convoy_ref.namespace, name)
@@ -4016,10 +4027,15 @@ mod tests {
     // HOME_HEARD_WITHIN after it was last heard, and hearing from it again restores them.
     #[tokio::test]
     async fn a_quiet_homes_agents_become_unobservable_once_at_its_deadline() {
+        use flotilla_resources::Clock as _;
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(8);
         let resolver = Arc::new(CountingAttachResolver::with_origin("feta-node-id", "feta"));
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx).with_attach_resolver(resolver);
+        // The daemon's clock, which the test moves: the deadline is judged against it.
+        let clock = Arc::new(ManualClock(std::sync::Mutex::new(Utc::now())));
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx)
+            .with_attach_resolver(resolver)
+            .with_clock(Arc::clone(&clock) as Arc<dyn flotilla_resources::Clock>);
         let mut convoy = convoy_with_vessel("convoy-a").await;
         let status = convoy.status.as_mut().expect("convoy status");
         status.work.get_mut("implement").expect("work status").placement =
@@ -4028,7 +4044,7 @@ mod tests {
             .crew
             .push(CrewSpec::builder().role("coder".to_string()).source(CrewSource::Tool { command: "codex".to_string() }).build());
         aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
-        let now = Utc::now();
+        let now = clock.now();
         let heard = now - agent_activity::HOME_HEARD_WITHIN + chrono::Duration::milliseconds(200);
         home_heard(&mut aggregator, "feta-node-id", heard).await;
         let name = "terminal-convoy-a-implement-coder";
@@ -4051,8 +4067,8 @@ mod tests {
         assert!(!aggregator.salience_facts_at(now).attention.is_empty());
         assert_eq!(aggregator.next_home_stale_delay(now), Some(Duration::from_millis(200)));
 
-        tokio::time::sleep(aggregator.next_home_stale_delay(Utc::now()).expect("stale wake") + Duration::from_millis(5)).await;
-        assert_eq!(aggregator.next_home_stale_delay(Utc::now()), None, "a home already stale schedules no wake");
+        clock.advance(aggregator.next_home_stale_delay(clock.now()).expect("stale wake") + Duration::from_millis(5));
+        assert_eq!(aggregator.next_home_stale_delay(clock.now()), None, "a home already stale schedules no wake");
         aggregator.rebuild_local_projection().await;
         let stale = state.result_set().await;
         let convoy = &stale.rows.as_convoys().expect("convoy rows")[0];
@@ -4060,18 +4076,34 @@ mod tests {
         let agent = convoy.vessels[0].crew[0].agent_session.as_ref().expect("the row still shows the reading");
         assert!(agent.stale);
         assert_eq!(agent.activity, Some(flotilla_protocol::AgentActivity::Idle));
-        assert!(aggregator.salience_facts_at(Utc::now()).attention.is_empty());
+        assert!(aggregator.salience_facts_at(clock.now()).attention.is_empty());
         assert_eq!(stale.seq, before.seq + 1);
         aggregator.rebuild_local_projection().await;
         assert_eq!(state.result_set().await.seq, stale.seq, "going stale is reported once");
 
         // Heard from again: current, and a keepalive while current changes nothing.
-        home_heard(&mut aggregator, "feta-node-id", Utc::now()).await;
+        home_heard(&mut aggregator, "feta-node-id", clock.now()).await;
         let restored = state.result_set().await;
         assert_eq!(restored.rows.as_convoys().expect("convoy rows")[0].surface_state, SurfaceState::Available);
         assert!(!restored.rows.as_convoys().expect("convoy rows")[0].vessels[0].crew[0].agent_session.as_ref().expect("reading").stale);
-        home_heard(&mut aggregator, "feta-node-id", Utc::now()).await;
+        home_heard(&mut aggregator, "feta-node-id", clock.now()).await;
         assert_eq!(state.result_set().await.seq, restored.seq);
+    }
+
+    /// A wall clock a test sets.
+    struct ManualClock(std::sync::Mutex<chrono::DateTime<Utc>>);
+
+    impl ManualClock {
+        fn advance(&self, by: Duration) {
+            let mut now = self.0.lock().expect("clock");
+            *now += chrono::Duration::from_std(by).expect("duration");
+        }
+    }
+
+    impl flotilla_resources::Clock for ManualClock {
+        fn now(&self) -> chrono::DateTime<Utc> {
+            *self.0.lock().expect("clock")
+        }
     }
 
     #[tokio::test]

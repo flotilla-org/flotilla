@@ -61,7 +61,8 @@ pub fn run(
             .with_issue_resolver_arc(context.issues)
             .with_issue_polling_health(issue_polling)
             .with_convoy_engine(context.convoy_engine, namespace)
-            .with_attentions(durable.attentions(), namespace);
+            .with_attentions(durable.attentions(), namespace)
+            .with_clock(context.clock);
         aggregator
             .run(
                 AggregatorResolvers::builder()
@@ -104,4 +105,6 @@ pub struct AggregatorContext {
     /// The decided store's AgentSessions, at every home followed (#3108); `NoAgentSessions`
     /// where none is composed.
     pub agent_sessions: Arc<dyn ports::AgentSessions>,
+    /// The daemon's injected wall clock, which the projection judges times against.
+    pub clock: Arc<dyn flotilla_resources::Clock>,
 }
