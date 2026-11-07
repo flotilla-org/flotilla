@@ -389,7 +389,8 @@ pub struct MessagePrimitives {
     home_reads: std::sync::OnceLock<Arc<dyn ports::HomeReads>>,
     /// Old record names to their engine id and home, filled as messages are seen.
     located: Mutex<BTreeMap<String, (String, String)>>,
-    /// Old-store records, reread at most once a second per namespace.
+    /// Old-store records, reread at most once a second per namespace. Goes
+    /// with Convoy and Vessel when they leave the old store (see `view_of`).
     records: tokio::sync::Mutex<BTreeMap<String, RecordsRead>>,
     /// Signalled after an attention here is raised, cleared or acknowledged, and after another
     /// home's Messages are applied.
@@ -1300,6 +1301,11 @@ impl MessagePrimitives {
     /// convoy or session the message names, so a miss is judged again on
     /// records read now: once per held read, or again when the message
     /// changed after the read it missed on.
+    ///
+    /// A patch over the old store, not a design: the timed cache and the
+    /// reread on a miss go with Convoy and Vessel (and the session kinds) when
+    /// they leave the old store; the view then reads the engine's records,
+    /// which hold what a message names when it is admitted.
     async fn view_of(
         &self,
         resource: &Resource<Message>,
