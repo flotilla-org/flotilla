@@ -67,6 +67,36 @@ pub trait ObservationFailures: Send + Sync + std::fmt::Debug {
     async fn failing(&self, kind: &str, name: &str) -> Result<(), String>;
 }
 
+/// Which forge sources this home observes: a source's observer is the single writer of its
+/// change requests' and issues' records (#3108), so a write from any other home is refused.
+#[async_trait::async_trait]
+pub trait SourceObservers: Send + Sync + std::fmt::Debug {
+    /// Whether this home observes `(service, scope)`, as the observers judge it; true when no
+    /// home is known to observe it.
+    async fn observes(&self, service: &str, scope: &str) -> Result<bool, String>;
+}
+
+/// [`SourceObservers`] installed once the daemon that judges them is composed, after the records
+/// that consult them are opened. Before then every write is refused: no home is known to observe.
+#[derive(Debug, Default)]
+pub struct LateSourceObservers(std::sync::OnceLock<std::sync::Arc<dyn SourceObservers>>);
+
+impl LateSourceObservers {
+    pub fn install(&self, observers: std::sync::Arc<dyn SourceObservers>) -> Result<(), String> {
+        self.0.set(observers).map_err(|_| "the source observers are already installed".to_owned())
+    }
+}
+
+#[async_trait::async_trait]
+impl SourceObservers for LateSourceObservers {
+    async fn observes(&self, service: &str, scope: &str) -> Result<bool, String> {
+        match self.0.get() {
+            Some(observers) => observers.observes(service, scope).await,
+            None => Err(format!("the observers of {service} {scope} are not known yet")),
+        }
+    }
+}
+
 /// A change request the forge observer found merging from a branch of its own repository
 /// (#3108). A fork's branch of the same name is another branch: the observer records none for it.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -214,6 +214,35 @@ async fn remote_change_request_scenario(late_watcher: bool) {
         vec![owner.node_id().to_string()],
         "the requester reads the observer's record, replicated from its home"
     );
+    // The observer is the record's single writer (#3108): the requester's writes through the
+    // old interface are refused, and every home still reads the observer's facts.
+    let requester_records = requester.resource_backend().using::<ChangeRequest>("flotilla");
+    let refused = requester_records.create(&InputMeta::builder().name(name.clone()).build(), &record.spec).await;
+    assert!(
+        refused.as_ref().is_err_and(|error| error.to_string().contains("written only by the observer of github.com org/shared")),
+        "a requester's create is refused: {refused:?}"
+    );
+    // The requester holds no record of its own to write a status to.
+    let held =
+        requester.resource_backend().including_replicas::<ChangeRequest>("flotilla").get(&name).await.expect("the observer's record");
+    let mut forged = held.object.status.clone().expect("the observer's status");
+    forged.state = Observation::known(ObservedChangeRequestState::Closed, Utc::now());
+    let refused = requester_records.update_status(&name, &held.object.metadata.resource_version, &forged).await;
+    assert!(refused.is_err(), "a requester's status write is refused: {refused:?}");
+    assert_eq!(change_request_homes(&requester, &name).await, vec![owner.node_id().to_string()]);
+    assert_eq!(
+        requester
+            .resource_backend()
+            .including_replicas::<ChangeRequest>("flotilla")
+            .get(&name)
+            .await
+            .expect("the observer's record")
+            .object
+            .status
+            .and_then(|status| status.state.value),
+        Some(ObservedChangeRequestState::Open),
+        "the observer's facts win"
+    );
     assert_eq!(
         ChangeRequestLeafSubject { change_request: &record, now: Utc::now(), stale_after: Duration::from_secs(180) }
             .value(".ready")

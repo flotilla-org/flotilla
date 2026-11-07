@@ -254,3 +254,67 @@ async fn another_homes_values_are_confirmed_when_that_home_was_last_heard() {
     assert_eq!(alpha_records.sources("ChangeRequest").await.expect("sources").len(), 2);
     assert_eq!(alpha_records.list("ChangeRequest").await.expect("list").len(), 1);
 }
+
+/// Observes every source, or none.
+#[derive(Debug)]
+struct Observes(bool);
+
+#[async_trait::async_trait]
+impl flotilla_resources::engine_records::SourceObservers for Observes {
+    async fn observes(&self, _: &str, _: &str) -> Result<bool, String> {
+        Ok(self.0)
+    }
+}
+
+// Behaviour (single writer, #3108): a home that does not observe a change request's source is
+// refused every write of it through the store's typed paths, its record and its failures alike,
+// so no copy of its own, however recently written, stands beside the observer's; every read here
+// is the observer's facts, replicated from its home.
+#[tokio::test]
+async fn a_home_that_does_not_observe_the_source_writes_nothing_and_reads_the_observers_facts() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let clock = ManualClock::at(1_800_000_000);
+    let (beta, beta_records) = open(&directory, "beta", clock.clone());
+    let mut kinds = flotilla_schema::KindRegistry::new();
+    flotilla_provisioning::stored::forge_observation::register(&mut kinds).expect("register");
+    let alpha = Arc::new(Service::open(&directory.path().join("alpha.sqlite"), "alpha", kinds).expect("store"));
+    let alpha_records = Arc::new(
+        EngineObservations::open(Arc::clone(&alpha), clock.clone() as Arc<dyn Clock>).expect("open").observed_by(Arc::new(Observes(false))),
+    );
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    backend.install_engine_records(alpha_records.clone());
+
+    let spec = serde_json::to_value(cr_spec(1, "beta")).expect("spec");
+    beta_records.apply("ChangeRequest", "cr-1", &BTreeMap::new(), &BTreeMap::new(), spec).await.expect("the observer's record");
+    let merged = cr_status(ObservedChangeRequestState::Merged, ObservedChecks::Pass, epoch(0));
+    beta_records.set_status("ChangeRequest", "cr-1", serde_json::to_value(&merged).expect("status")).await.expect("publish");
+    pump(&beta, "beta", &alpha, None, epoch(1_800_000_050));
+
+    let change_requests = backend.using::<ChangeRequest>(NS);
+    let refused = change_requests.create(&InputMeta::builder().name("cr-1".into()).build(), &cr_spec(1, "alpha")).await;
+    let error = refused.expect_err("a home that does not observe the source writes no record of it").to_string();
+    assert!(error.contains("written only by the observer of github.com flotilla-org/flotilla"), "{error}");
+    let branch = flotilla_resources::engine_records::BranchChangeRequest {
+        name: "cr-1".into(),
+        home: "alpha".into(),
+        service: "github.com".into(),
+        scope: "flotilla-org/flotilla".into(),
+        number: 1,
+        branch: "feature".into(),
+        state: Some(ObservedChangeRequestState::Open),
+    };
+    use flotilla_resources::engine_records::ChangeRequestBranches;
+    assert!(alpha_records.found_on_branch(&branch).await.is_err(), "nor what a branch read found");
+
+    let read = backend.including_replicas::<ChangeRequest>(NS).get("cr-1").await.expect("read").object;
+    assert_eq!(read.spec.observing_authority, "beta");
+    assert_eq!(values(read.status.as_ref().expect("status")), values(&merged));
+    let selected = flotilla_resources::select_change_requests(
+        backend.including_replicas::<ChangeRequest>(NS).list().await.expect("list").items.iter().map(|copy| &copy.object),
+    );
+    assert_eq!(selected.values().map(|record| record.spec.observing_authority.as_str()).collect::<Vec<_>>(), vec!["beta"]);
+    assert_eq!(
+        alpha_records.sources("ChangeRequest").await.expect("sources").iter().map(|copy| copy.home.as_str()).collect::<Vec<_>>(),
+        vec!["beta"]
+    );
+}

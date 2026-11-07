@@ -897,7 +897,8 @@ pub(super) async fn daemon_with_decided_store(
                 Arc::new(EngineKinds::open(Arc::clone(&store), clock())?),
                 Arc::new(EngineHosts::open(Arc::clone(&store), identity.host_id.to_string(), clock())?),
             ];
-            let observations = Arc::new(EngineObservations::open(Arc::clone(&store), clock())?);
+            let source_observers = Arc::new(flotilla_resources::engine_records::LateSourceObservers::default());
+            let observations = Arc::new(EngineObservations::open(Arc::clone(&store), clock())?.observed_by(source_observers.clone()));
             Ok(flotilla_core::in_process::ComposedEngine {
                 accounts: Arc::new(EngineAccounts::open(Arc::clone(&store), clock())?),
                 manifest_roots: Arc::new(EngineManifestRoots::open(Arc::clone(&store), clock())?),
@@ -906,6 +907,7 @@ pub(super) async fn daemon_with_decided_store(
                 observations: observations.clone(),
                 observation_failures: observations.clone(),
                 change_request_branches: observations,
+                source_observers,
             })
         }) as futures::future::BoxFuture<'static, _>
     });

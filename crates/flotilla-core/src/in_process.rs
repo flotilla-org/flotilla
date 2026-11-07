@@ -839,6 +839,9 @@ pub struct ComposedEngine {
     pub observation_failures: Arc<dyn flotilla_resources::engine_records::ObservationFailures>,
     /// The change requests the forge observers found on their repositories' own branches (#3108).
     pub change_request_branches: Arc<dyn flotilla_resources::engine_records::ChangeRequestBranches>,
+    /// Which sources this daemon observes, which the observation records consult before a write:
+    /// the daemon installs its judgement once composed.
+    pub source_observers: Arc<flotilla_resources::engine_records::LateSourceObservers>,
     pub accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,
     pub manifest_roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
 }
@@ -1463,6 +1466,10 @@ impl InProcessDaemon {
             local_placement_provider_statuses: RwLock::new(Vec::new()),
         });
         daemon.install_decided_store(engine.service)?;
+        engine.source_observers.install(Arc::new(flotilla_observation::forge_observation::DaemonSourceObservers::new(
+            daemon.resource_backend(),
+            Arc::clone(&daemon.provisioning_namespace),
+        )))?;
         daemon.install_observation_records(engine.observations, engine.observation_failures)?;
         daemon
             .change_request_branches

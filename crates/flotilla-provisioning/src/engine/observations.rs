@@ -6,6 +6,11 @@
 //! judgement made when it is read: a record holds no observation times, so its values were last
 //! confirmed when its home was last heard (now, at this home), unless its reads are failing, in
 //! which case they were last confirmed when they started to fail.
+//!
+//! A source's observer is the single writer of its records: once the observers are installed
+//! ([`EngineObservations::observed_by`]), a write of a record whose source this home does
+//! not observe is refused, so no other home's copy, however fresh its write, stands beside the
+//! observer's facts. A home may still delete a copy of its own.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -18,7 +23,7 @@ use flotilla_engine_store::{
     plain::{PendingChange, PlainError, PlainLog},
 };
 use flotilla_resources::{
-    engine_records::{BranchChangeRequest, ChangeRequestBranches, EngineObject, EngineRecords, ObservationFailures},
+    engine_records::{BranchChangeRequest, ChangeRequestBranches, EngineObject, EngineRecords, ObservationFailures, SourceObservers},
     ChangeRequestSpec, ChangeRequestStatus, IssueSpec, IssueStatus,
 };
 use flotilla_schema::{Kind, KindCode, NewChange, Timestamp};
@@ -68,6 +73,10 @@ trait Observed: Kind + PartialEq + Clone {
     type Spec: serde::de::DeserializeOwned;
     type Status: serde::de::DeserializeOwned;
 
+    /// The source `(service, scope)` `spec` names.
+    fn spec_source(spec: &Self::Spec) -> (&str, &str);
+    /// The source `(service, scope)` the record is of.
+    fn source(&self) -> (&str, &str);
     /// The record of `spec`'s subject, keeping `current`'s observed values when there is one.
     fn of_subject(current: Option<Self>, spec: &Self::Spec) -> Self;
     /// `self`'s subject as observed in `status`, which a successful read wrote, so not failing.
@@ -79,6 +88,14 @@ trait Observed: Kind + PartialEq + Clone {
 impl Observed for ChangeRequestRecord {
     type Spec = ChangeRequestSpec;
     type Status = ChangeRequestStatus;
+
+    fn spec_source(spec: &ChangeRequestSpec) -> (&str, &str) {
+        (&spec.service, &spec.scope)
+    }
+
+    fn source(&self) -> (&str, &str) {
+        (&self.service, &self.scope)
+    }
 
     fn of_subject(current: Option<Self>, spec: &ChangeRequestSpec) -> Self {
         let mut record = current.unwrap_or_else(|| Self::unobserved(spec));
@@ -103,6 +120,14 @@ impl Observed for ChangeRequestRecord {
 impl Observed for IssueRecord {
     type Spec = IssueSpec;
     type Status = IssueStatus;
+
+    fn spec_source(spec: &IssueSpec) -> (&str, &str) {
+        (&spec.service, &spec.scope)
+    }
+
+    fn source(&self) -> (&str, &str) {
+        (&self.service, &self.scope)
+    }
 
     fn of_subject(current: Option<Self>, spec: &IssueSpec) -> Self {
         let mut record = current.unwrap_or_else(|| Self::unobserved(spec));
@@ -206,6 +231,8 @@ pub struct EngineObservations {
     /// Whether the store has committed since the resident map was last brought up to it.
     commits: CommitsSeen,
     clock: Arc<dyn flotilla_resources::Clock>,
+    /// Which sources this home observes; a port with none, standing alone, observes all.
+    observers: Option<Arc<dyn SourceObservers>>,
 }
 
 impl std::fmt::Debug for EngineObservations {
@@ -221,7 +248,8 @@ impl EngineObservations {
         let home = log.home().to_owned();
         let follower = Follower::new([CHANGE_REQUEST_CODE, ISSUE_CODE]);
         let resident = Resident { follower, records: Records::new(), warned: Default::default() };
-        let opened = Self { commits: CommitsSeen::follow(&service), service, home, log, resident: Mutex::new(resident), clock };
+        let opened =
+            Self { commits: CommitsSeen::follow(&service), service, home, log, resident: Mutex::new(resident), clock, observers: None };
         let homes = opened.service.homes();
         {
             let mut resident = locked(&opened.resident);
@@ -239,6 +267,47 @@ impl EngineObservations {
                 .map_err(|error| error.to_string())?;
         }
         Ok(opened)
+    }
+
+    /// These records judged by `observers`: a write of a record whose source this home does not
+    /// observe is refused.
+    pub fn observed_by(self, observers: Arc<dyn SourceObservers>) -> Self {
+        Self { observers: Some(observers), ..self }
+    }
+
+    /// Refuses a write of `kind`'s record `name`, of source `(service, scope)`, unless this home
+    /// observes the source.
+    async fn observer_write(&self, kind: &str, name: &str, (service, scope): (&str, &str)) -> Result<(), String> {
+        let Some(observers) = &self.observers else { return Ok(()) };
+        if observers.observes(service, scope).await? {
+            return Ok(());
+        }
+        Err(format!("{kind} {name} is written only by the observer of {service} {scope}, and {} does not observe it", self.home))
+    }
+
+    /// The source of this home's record `name` of `K`, if it holds one.
+    fn held_source<K: Observed>(&self, name: &str) -> Result<Option<(String, String)>, String> {
+        let current = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())?;
+        Ok(current.map(|current| {
+            let (service, scope) = current.spec.source();
+            (service.to_owned(), scope.to_owned())
+        }))
+    }
+
+    /// Refuses a write of this home's record `name` of `K` unless this home observes its source;
+    /// a record this home does not hold is left to the write to report.
+    async fn observer_rewrite<K: Observed>(&self, kind: &str, name: &str) -> Result<(), String> {
+        match self.held_source::<K>(name)? {
+            Some((service, scope)) => self.observer_write(kind, name, (&service, &scope)).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Writes this home's record `name` of `K` from `spec`, as its observer.
+    async fn apply_observed<K: Observed>(&self, kind: &'static str, name: &str, spec: Value) -> Result<EngineObject, String> {
+        let spec: K::Spec = serde_json::from_value(spec).map_err(|error| format!("{kind} spec: {error}"))?;
+        self.observer_write(kind, name, K::spec_source(&spec)).await?;
+        self.apply_as::<K>(kind, name, &spec)
     }
 
     /// Brings the resident map up to the store: every entry written since the last refresh.
@@ -370,10 +439,9 @@ impl EngineObservations {
         written.map_err(|error| format!("write {} {name}: {error}", K::KIND))
     }
 
-    fn apply_as<K: Observed>(&self, kind: &'static str, name: &str, spec: Value) -> Result<EngineObject, String> {
-        let spec: K::Spec = serde_json::from_value(spec).map_err(|error| format!("{kind} spec: {error}"))?;
+    fn apply_as<K: Observed>(&self, kind: &'static str, name: &str, spec: &K::Spec) -> Result<EngineObject, String> {
         let current = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())?.map(|current| current.spec);
-        self.write(name, &K::of_subject(current, &spec))?;
+        self.write(name, &K::of_subject(current, spec))?;
         self.written(kind, name)
     }
 
@@ -440,15 +508,21 @@ impl EngineRecords for EngineObservations {
         spec: Value,
     ) -> Result<EngineObject, String> {
         match kind_of(kind)? {
-            CHANGE_REQUEST => self.apply_as::<ChangeRequestRecord>(CHANGE_REQUEST, name, spec),
-            _ => self.apply_as::<IssueRecord>(ISSUE, name, spec),
+            CHANGE_REQUEST => self.apply_observed::<ChangeRequestRecord>(CHANGE_REQUEST, name, spec).await,
+            _ => self.apply_observed::<IssueRecord>(ISSUE, name, spec).await,
         }
     }
 
     async fn set_status(&self, kind: &str, name: &str, status: Value) -> Result<EngineObject, String> {
         match kind_of(kind)? {
-            CHANGE_REQUEST => self.set_status_as::<ChangeRequestRecord>(CHANGE_REQUEST, name, status),
-            _ => self.set_status_as::<IssueRecord>(ISSUE, name, status),
+            CHANGE_REQUEST => {
+                self.observer_rewrite::<ChangeRequestRecord>(CHANGE_REQUEST, name).await?;
+                self.set_status_as::<ChangeRequestRecord>(CHANGE_REQUEST, name, status)
+            }
+            _ => {
+                self.observer_rewrite::<IssueRecord>(ISSUE, name).await?;
+                self.set_status_as::<IssueRecord>(ISSUE, name, status)
+            }
         }
     }
 
@@ -481,8 +555,14 @@ impl ObservationFailures for EngineObservations {
     /// it first reads, so only another home's subject is absent.
     async fn failing(&self, kind: &str, name: &str) -> Result<(), String> {
         match kind_of(kind)? {
-            CHANGE_REQUEST => self.failing_as::<ChangeRequestRecord>(name),
-            _ => self.failing_as::<IssueRecord>(name),
+            CHANGE_REQUEST => {
+                self.observer_rewrite::<ChangeRequestRecord>(CHANGE_REQUEST, name).await?;
+                self.failing_as::<ChangeRequestRecord>(name)
+            }
+            _ => {
+                self.observer_rewrite::<IssueRecord>(ISSUE, name).await?;
+                self.failing_as::<IssueRecord>(name)
+            }
         }
     }
 }
@@ -491,6 +571,7 @@ impl ObservationFailures for EngineObservations {
 impl ChangeRequestBranches for EngineObservations {
     /// A change request with no record here gets one holding only what the branch read found.
     async fn found_on_branch(&self, found: &BranchChangeRequest) -> Result<(), String> {
+        self.observer_write(CHANGE_REQUEST, &found.name, (&found.service, &found.scope)).await?;
         let current = self.log.get::<ChangeRequestRecord>(&found.name, &self.home).map_err(|error| error.to_string())?;
         let mut record = current.map(|current| current.spec).unwrap_or_else(|| ChangeRequestRecord {
             service: found.service.clone(),
