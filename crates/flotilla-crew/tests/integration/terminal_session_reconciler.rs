@@ -65,6 +65,35 @@ use tracing::instrument::WithSubscriber;
 
 use crate::common;
 
+/// Waits, on the paused clock, for what a test can observe. The reconciler reads the engine on
+/// the blocking pool, and that work finishes in real time whatever the paused clock says, so a
+/// fixed count of yields is no measure of it. Panics after ten seconds of real time.
+async fn settled<F: std::future::Future<Output = bool>>(what: &str, mut done: impl FnMut() -> F) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !done().await {
+        assert!(std::time::Instant::now() < deadline, "{what} did not happen");
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Moves the paused clock on a second at a time until `done`, so backoff and resync timers come
+/// due, for at most `limit` of paused time. Each step first yields, so work already runnable
+/// lands before the clock moves.
+async fn advance_until<F: std::future::Future<Output = bool>>(what: &str, limit: Duration, mut done: impl FnMut() -> F) {
+    let mut moved = Duration::ZERO;
+    loop {
+        for _ in 0..10 {
+            if done().await {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(moved < limit, "{what} did not happen within {limit:?} of paused time");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        moved += Duration::from_secs(1);
+    }
+}
+
 /// `name`, a ready host-direct environment on the engine.
 pub(super) fn create_ready_environment(environments: &EnvironmentFixture, name: &str) {
     environments.put_ready(
@@ -792,14 +821,17 @@ async fn transient_runtime_probe_failure_holds_and_recovers_automatically() {
         .run(),
     );
 
-    for delay in [0, 60, 120, 240, 480] {
-        if delay > 0 {
-            tokio::time::advance(Duration::from_secs(delay)).await;
-        }
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
-    }
+    // Five probes, each after its backoff, spend the retry budget.
+    advance_until("five probes", Duration::from_secs(3600), || async { runtime.probes.load(Ordering::SeqCst) >= 5 }).await;
+    settled("the degraded condition", || async {
+        sessions
+            .get("terminal-demo-work-coder")
+            .await
+            .ok()
+            .and_then(|session| session.status)
+            .is_some_and(|status| status.degraded.is_some())
+    })
+    .await;
 
     let status = sessions
         .get("terminal-demo-work-coder")
@@ -815,19 +847,15 @@ async fn transient_runtime_probe_failure_holds_and_recovers_automatically() {
     assert_eq!(runtime.probes.load(Ordering::SeqCst), 5);
 
     runtime.available.store(true, Ordering::SeqCst);
-    tokio::time::advance(Duration::from_secs(15 * 60)).await;
-    for _ in 0..40 {
-        tokio::task::yield_now().await;
-        if sessions
+    advance_until("recovery", Duration::from_secs(3600), || async {
+        sessions
             .get("terminal-demo-work-coder")
             .await
             .ok()
             .and_then(|session| session.status)
             .is_some_and(|status| status.degraded.is_none())
-        {
-            break;
-        }
-    }
+    })
+    .await;
     let recovered =
         sessions.get("terminal-demo-work-coder").await.expect("terminal should recover").status.expect("terminal should retain status");
     assert_eq!(recovered.phase, TerminalSessionPhase::Running);
@@ -841,13 +869,10 @@ async fn transient_runtime_probe_failure_holds_and_recovers_automatically() {
     let mut convoy_status = convoy.status.expect("owning convoy should have status");
     convoy_status.phase = ConvoyPhase::Abandoned;
     convoys.update_status("demo", &convoy.metadata.resource_version, &convoy_status).await.expect("owning convoy should be abandoned");
-    tokio::time::advance(Duration::from_secs(3600)).await;
-    for _ in 0..40 {
-        tokio::task::yield_now().await;
-        if matches!(sessions.get("terminal-demo-work-coder").await, Err(ResourceError::NotFound { .. })) {
-            break;
-        }
-    }
+    advance_until("the reap", Duration::from_secs(2 * 3600), || async {
+        matches!(sessions.get("terminal-demo-work-coder").await, Err(ResourceError::NotFound { .. }))
+    })
+    .await;
     assert!(
         matches!(sessions.get("terminal-demo-work-coder").await, Err(ResourceError::NotFound { .. })),
         "abandonment must wake and reap a previously degraded terminal"
@@ -3172,6 +3197,8 @@ async fn retained_terminal_convoy_orphans_follow_reclaim_matrix(
     let logs = ReclaimLogBuffer::default();
     let writer = logs.clone();
     let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_writer(move || writer.clone()).finish();
+    // The loop's metrics say when a reconcile has finished, the evidence a session kept needs.
+    let metrics = Arc::new(flotilla_store::load_metrics::ControllerLoadMetrics::default());
     let task = tokio::spawn(
         ControllerLoop {
             primary: sessions.clone(),
@@ -3182,14 +3209,21 @@ async fn retained_terminal_convoy_orphans_follow_reclaim_matrix(
             resync_interval: Duration::from_secs(60),
             backend,
         }
-        .run()
+        .run_observed(Arc::default(), Arc::clone(&metrics))
         .with_subscriber(subscriber),
     );
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
     let managed = authority_kind == LifecycleAuthority::Managed;
     let startup_reclaimed = managed && phase.is_terminal() && (!initially_refused || phase == ConvoyPhase::Abandoned);
+    let gone = || async { matches!(sessions.get("old-orphan").await, Err(ResourceError::NotFound { .. })) };
+    // A managed session is reconciled; one the controller does not own is only taken from the
+    // queue, which is all there is to wait for.
+    if startup_reclaimed {
+        settled("the startup reap", gone).await;
+    } else if managed {
+        settled("the startup reconcile", || async { metrics.reconcile.snapshot().count() >= 1 }).await;
+    } else {
+        settled("the startup wake", || async { metrics.wakes.get() >= 1 }).await;
+    }
     assert_eq!(
         matches!(sessions.get("old-orphan").await, Err(ResourceError::NotFound { .. })),
         startup_reclaimed,
@@ -3209,12 +3243,17 @@ async fn retained_terminal_convoy_orphans_follow_reclaim_matrix(
     // The verification boundary recovers without a resource write. Only the
     // periodic resync can discover that the retained convoy is now reclaimable.
     runtime.reclaim_refused.store(false, Ordering::SeqCst);
+    let (reconciled, woken) = (metrics.reconcile.snapshot().count(), metrics.wakes.get());
     tokio::time::advance(Duration::from_secs(60)).await;
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
+    let reclaimed = managed && phase.is_terminal();
+    if reclaimed {
+        settled("the resync reap", gone).await;
+    } else if managed {
+        settled("the resync reconcile", || async { metrics.resyncs.get() >= 1 && metrics.reconcile.snapshot().count() > reconciled }).await;
+    } else {
+        settled("the resync wake", || async { metrics.resyncs.get() >= 1 && metrics.wakes.get() > woken }).await;
     }
     task.abort();
-    let reclaimed = managed && phase.is_terminal();
     assert_eq!(
         matches!(sessions.get("old-orphan").await, Err(ResourceError::NotFound { .. })),
         reclaimed,
