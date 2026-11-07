@@ -321,17 +321,32 @@ impl ArtifactService<'_> {
         Ok(digest)
     }
 
-    pub async fn reap_expired(&self) -> Result<HashSet<BlobDigest>, String> {
+    /// Deletes this home's unpinned artifacts past their expiry: the digests still referenced, and
+    /// when the next unpinned artifact expires.
+    pub async fn reap_expired(&self) -> Result<Reaped, String> {
         let resolver = self.backend.using::<Artifact>(self.namespace);
         let now = Utc::now();
+        let mut next_expiry = None;
         for artifact in resolver.list().await.map_err(|error| error.to_string())?.items {
-            if !artifact.spec.pinned && artifact.spec.expires_at <= now {
+            if artifact.spec.pinned {
+                continue;
+            }
+            if artifact.spec.expires_at <= now {
                 resolver.delete(&artifact.metadata.name).await.map_err(|error| error.to_string())?;
+            } else {
+                next_expiry = next_expiry.min(Some(artifact.spec.expires_at)).or(Some(artifact.spec.expires_at));
             }
         }
         let refs = self.list(None, None, None).await?;
-        refs.into_iter().map(|item| BlobDigest::parse(&item.spec.digest)).collect()
+        let referenced = refs.into_iter().map(|item| BlobDigest::parse(&item.spec.digest)).collect::<Result<_, _>>()?;
+        Ok(Reaped { referenced, next_expiry })
     }
+}
+
+/// What a reap left: the digests still referenced, and when the next unpinned artifact expires.
+pub struct Reaped {
+    pub referenced: HashSet<BlobDigest>,
+    pub next_expiry: Option<chrono::DateTime<Utc>>,
 }
 
 #[cfg(test)]
@@ -551,7 +566,7 @@ mod tests {
             )
             .await
             .expect("expire artifact");
-        assert!(service.reap_expired().await.expect("reap").is_empty());
+        assert!(service.reap_expired().await.expect("reap").referenced.is_empty());
         assert!(service.list(None, None, None).await.expect("list after reap").is_empty());
 
         expired.subject = "pinned-head".into();
@@ -561,7 +576,7 @@ mod tests {
         )
         .expect("record name");
         resolver.create(&InputMeta::builder().name(pinned_name).build(), &expired).await.expect("create pinned artifact");
-        assert_eq!(service.reap_expired().await.expect("reap pinned").len(), 1);
+        assert_eq!(service.reap_expired().await.expect("reap pinned").referenced.len(), 1);
         assert_eq!(service.list(None, None, None).await.expect("list pinned").len(), 1);
     }
 

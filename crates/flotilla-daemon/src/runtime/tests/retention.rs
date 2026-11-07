@@ -1,0 +1,48 @@
+//! Artifact retention runs on artifact changes and its next deadline (#3108).
+
+use super::*;
+use crate::blob_store::{BlobStore, TieredBlobStore};
+use flotilla_resources::{Artifact, ArtifactSpec};
+use flotilla_store_memory::InMemoryBackend;
+
+// Behaviour (#3108): retention wakes when the next unpinned artifact expires, with no timer and
+// no further change: an artifact due to expire soon is reaped at its expiry, a pinned one stays.
+#[tokio::test]
+async fn an_artifact_is_reaped_at_its_expiry_without_a_timer() {
+    let state = tempfile::tempdir().expect("state dir");
+    let blobs = Arc::new(TieredBlobStore::new(state.path(), Vec::new()));
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let task = tokio::spawn(run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs)));
+    let artifacts = backend.using::<Artifact>(NAMESPACE);
+    let digest = blobs.put(b"review notes").await.expect("put blob");
+    let name = |subject: &str| {
+        flotilla_resources::address::record_name(
+            &flotilla_resources::address::artifact_address("demo", "coder", "review-round", subject).expect("artifact address"),
+        )
+        .expect("record name")
+    };
+    for (subject, pinned) in [("soon", false), ("kept", true)] {
+        let spec = ArtifactSpec::builder()
+            .convoy("demo".into())
+            .producer("coder".into())
+            .kind("review-round".into())
+            .subject(subject.into())
+            .digest(digest.as_str().to_owned())
+            .size(12)
+            .media_type("text/plain".into())
+            .expires_at(Utc::now() + chrono::Duration::milliseconds(300))
+            .pinned(pinned)
+            .build();
+        artifacts.create(&InputMeta::builder().name(name(subject)).build(), &spec).await.expect("create artifact");
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while artifacts.get(&name("soon")).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the expired artifact is reaped at its expiry");
+    assert!(artifacts.get(&name("kept")).await.is_ok(), "a pinned artifact is never reaped");
+    assert!(!task.is_finished());
+    task.abort();
+}

@@ -84,19 +84,68 @@ pub(super) async fn load_checkout_archive_roots(path: &Path) -> Result<BTreeSet<
     }
 }
 
+/// How long an unreferenced blob stands before it is collected.
+const BLOB_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+/// The wait before retrying a failed collection.
+const GC_RETRY: RetryBackoff = RetryBackoff { initial: Duration::from_secs(60), maximum: Duration::from_secs(60 * 60) };
+/// Consecutive failed collections retried at [`GC_RETRY`]; past it, the next Artifact change retries.
+const GC_RETRY_LIMIT: u32 = 10;
+
+/// Reaps expired artifacts and collects unreferenced blobs at once, then at each change to this
+/// home's Artifacts and at the next time an artifact expires or a blob's grace passes, never on a
+/// timer. A failed collection retries at a backoff a finite number of times.
 pub(super) async fn run_artifact_gc(backend: ResourceBackend, namespace: String, blobs: Arc<TieredBlobStore>) {
-    let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut changes = None;
+    let mut failures = 0_u32;
     loop {
-        interval.tick().await;
+        if changes.is_none() {
+            match backend.using::<flotilla_resources::Artifact>(&namespace).watch(flotilla_resources::WatchStart::Now).await {
+                Ok(watch) => changes = Some(watch.ready_chunks(64)),
+                Err(error) => warn!(%error, "artifact retention could not watch artifacts"),
+            }
+        }
         let service = crate::artifact::ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
-        match service.reap_expired().await {
-            Ok(referenced) => {
-                if let Err(error) = blobs.gc_unreferenced(&referenced, Duration::from_secs(24 * 60 * 60)).await {
-                    warn!(%error, "artifact blob GC failed");
+        let collected = match service.reap_expired().await {
+            Ok(reaped) => {
+                let expires_in = reaped.next_expiry.map(|at| (at - Utc::now()).to_std().unwrap_or_default());
+                blobs.gc_unreferenced(&reaped.referenced, BLOB_GRACE).await.map(|grace| expires_in.into_iter().chain(grace).min())
+            }
+            Err(error) => Err(format!("artifact retention sweep failed: {error}")),
+        };
+        if let Err(error) = &collected {
+            warn!(%error, failures, "artifact garbage collection failed");
+        }
+        // A missing watch fails the pass too: without it, only a retry sees new artifacts.
+        let retry = if collected.is_ok() && changes.is_some() {
+            failures = 0;
+            None
+        } else {
+            failures = failures.saturating_add(1);
+            (failures <= GC_RETRY_LIMIT).then(|| GC_RETRY.delay(failures))
+        };
+        let mut wait = collected.ok().flatten().into_iter().chain(retry).min();
+        if failures == GC_RETRY_LIMIT + 1 {
+            warn!(failures, "artifact garbage collection keeps failing; the next artifact change retries");
+        }
+        let changed = async {
+            match changes.as_mut() {
+                Some(changes) => changes.next().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            batch = changed => {
+                if !batch.is_some_and(|events| events.iter().all(Result::is_ok)) {
+                    warn!("artifact watch ended; reopening it");
+                    changes = None;
                 }
             }
-            Err(error) => warn!(%error, "artifact retention sweep failed"),
+            () = async {
+                match wait.take() {
+                    Some(wait) => tokio::time::sleep(wait).await,
+                    None => std::future::pending().await,
+                }
+            } => {}
         }
     }
 }

@@ -138,6 +138,7 @@ mod health;
 mod heartbeat;
 mod memory_tests;
 mod message;
+mod retention;
 mod seed;
 mod ssh_host_harness;
 mod supervisor_turns;

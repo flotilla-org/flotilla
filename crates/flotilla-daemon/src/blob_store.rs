@@ -651,20 +651,28 @@ impl TieredBlobStore {
     }
 
     /// Reap each tier independently, using local files and sync markers as
-    /// that tier's inventory. Failed fleet deletions retain their marker and
-    /// are retried on the next sweep.
-    pub async fn gc_unreferenced(&self, referenced: &HashSet<BlobDigest>, grace: Duration) -> Result<(), String> {
+    /// that tier's inventory, deleting copies no artifact references once
+    /// `grace` has passed since they were written. Failed fleet deletions
+    /// retain their marker and are retried on the next sweep. Returns how long
+    /// until the next unreferenced copy passes its grace.
+    pub async fn gc_unreferenced(&self, referenced: &HashSet<BlobDigest>, grace: Duration) -> Result<Option<Duration>, String> {
         let mut failures = Vec::new();
+        let mut next = None;
         for digest in self.local.digests().await? {
-            if !referenced.contains(&digest) && older_than(&self.local.path(&digest), grace).await? {
-                if let Err(error) = self.local.delete(&digest).await {
-                    failures.push(format!("local {}: {error}", digest.as_str()));
-                } else {
-                    let _ = tokio::fs::remove_file(self.media_types.join(digest.as_str())).await;
-                    let mut inventory = self.inventory.lock().await;
-                    inventory.known.remove(&digest);
-                    inventory.pending.remove(&digest);
-                }
+            if referenced.contains(&digest) {
+                continue;
+            }
+            if let Some(left) = grace_left(&self.local.path(&digest), grace).await? {
+                next = next.min(Some(left)).or(Some(left));
+                continue;
+            }
+            if let Err(error) = self.local.delete(&digest).await {
+                failures.push(format!("local {}: {error}", digest.as_str()));
+            } else {
+                let _ = tokio::fs::remove_file(self.media_types.join(digest.as_str())).await;
+                let mut inventory = self.inventory.lock().await;
+                inventory.known.remove(&digest);
+                inventory.pending.remove(&digest);
             }
         }
         for target in &self.fleet {
@@ -677,20 +685,25 @@ impl TieredBlobStore {
             while let Some(entry) = entries.next_entry().await.map_err(|error| error.to_string())? {
                 let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
                 let Ok(digest) = BlobDigest::parse(&name) else { continue };
-                if !referenced.contains(&digest) && older_than(&entry.path(), grace).await? {
-                    match target.store.delete(&digest).await {
-                        Ok(()) => {
-                            if let Err(error) = tokio::fs::remove_file(entry.path()).await {
-                                failures.push(format!("{} marker {}: {error}", target.id, digest.as_str()));
-                            }
+                if referenced.contains(&digest) {
+                    continue;
+                }
+                if let Some(left) = grace_left(&entry.path(), grace).await? {
+                    next = next.min(Some(left)).or(Some(left));
+                    continue;
+                }
+                match target.store.delete(&digest).await {
+                    Ok(()) => {
+                        if let Err(error) = tokio::fs::remove_file(entry.path()).await {
+                            failures.push(format!("{} marker {}: {error}", target.id, digest.as_str()));
                         }
-                        Err(error) => failures.push(format!("{} {}: {error}", target.id, digest.as_str())),
                     }
+                    Err(error) => failures.push(format!("{} {}: {error}", target.id, digest.as_str())),
                 }
             }
         }
         if failures.is_empty() {
-            Ok(())
+            Ok(next)
         } else {
             Err(failures.join("; "))
         }
@@ -778,9 +791,11 @@ impl TieredBlobStore {
     }
 }
 
-async fn older_than(path: &Path, grace: Duration) -> Result<bool, String> {
+/// How much of `grace` is left since `path` was written; `None` once it has passed.
+async fn grace_left(path: &Path, grace: Duration) -> Result<Option<Duration>, String> {
     let modified = tokio::fs::metadata(path).await.map_err(|error| error.to_string())?.modified().map_err(|error| error.to_string())?;
-    Ok(std::time::SystemTime::now().duration_since(modified).is_ok_and(|age| age >= grace))
+    let age = std::time::SystemTime::now().duration_since(modified).unwrap_or_default();
+    Ok(grace.checked_sub(age).filter(|left| !left.is_zero()))
 }
 
 async fn digest_file(path: &Path) -> Result<(BlobDigest, u64), String> {
