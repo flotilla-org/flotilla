@@ -22,10 +22,12 @@ use flotilla_state_machines::{
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
-use super::{read_by_name, ArchiveShipper, ArchiveTarget, ALERT_AFTER, ARCHIVE_CONDITION, EXPUNGE_GRACE, PASS_INTERVAL};
+use super::{read_by_name, ArchiveShipper, ArchiveTarget, ALERT_AFTER, ARCHIVE_CONDITION, EXPUNGE_GRACE, RETRY_LIMIT};
 use crate::blob_store::{S3BlobStore, S3Credentials};
 
 const HOME: &str = "alpha";
+/// A step between the passes these tests drive by hand.
+const STEP: Duration = Duration::from_secs(10 * 60);
 const ENDPOINT: &str = "https://artifacts.example.test";
 const BUCKET: &str = "flotilla-artifacts";
 const PREFIX: &str = "fleet";
@@ -175,6 +177,7 @@ struct Harness {
     store: Arc<Mutex<Store>>,
     s3: Arc<S3StandIn>,
     targets: Vec<Arc<dyn ArchiveTarget>>,
+    clock: Arc<dyn Clock>,
     shipper: ArchiveShipper,
     conditions: Arc<Mutex<Vec<Option<HostCondition>>>>,
     name: String,
@@ -222,10 +225,10 @@ impl Harness {
             Arc::clone(&store),
             super::archive_kinds(),
             targets.clone(),
-            clock,
+            Arc::clone(&clock),
             Arc::new(move |condition| reported.lock().unwrap().push(condition)),
         );
-        Self { store, s3, targets, shipper, conditions, name }
+        Self { store, s3, targets, clock, shipper, conditions, name }
     }
 
     fn stored(&self) -> (bool, bool) {
@@ -239,6 +242,28 @@ impl Harness {
 
     fn condition(&self) -> Option<HostCondition> {
         self.conditions.lock().unwrap().last().cloned().expect("every pass reports")
+    }
+
+    /// Runs a shipper over this store, woken only by the returned notifier and its deadlines.
+    fn run(&self) -> (Arc<tokio::sync::Notify>, tokio::task::JoinHandle<()>) {
+        let reported = Arc::clone(&self.conditions);
+        let shipper = ArchiveShipper::new(
+            Arc::clone(&self.store),
+            super::archive_kinds(),
+            self.targets.clone(),
+            Arc::clone(&self.clock),
+            Arc::new(move |condition| reported.lock().unwrap().push(condition)),
+        );
+        let wake = Arc::new(tokio::sync::Notify::new());
+        (Arc::clone(&wake), tokio::spawn(shipper.run_woken(wake)))
+    }
+
+    /// Lets the running shipper settle: its passes take blocking reads, which hold paused time.
+    async fn settle(&self) {
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
     }
 
     async fn after(&mut self, wait: Duration) -> super::PassReport {
@@ -257,11 +282,11 @@ fn message_code() -> KindCode {
 #[tokio::test(start_paused = true)]
 async fn an_ended_message_is_shipped_expunged_and_read_back_by_name() {
     let mut harness = Harness::new();
-    let early = harness.after(Duration::from_secs(7 * 24 * 60 * 60) - PASS_INTERVAL).await;
+    let early = harness.after(Duration::from_secs(7 * 24 * 60 * 60) - STEP).await;
     assert!(early.shipped.is_empty() && harness.s3.keys().is_empty(), "nothing ships before a week");
     assert_eq!(harness.stored(), (true, true));
 
-    let shipped = harness.after(PASS_INTERVAL).await;
+    let shipped = harness.after(STEP).await;
     assert_eq!(shipped.shipped.iter().map(|identity| identity.name.as_str()).collect::<Vec<_>>(), [harness.name.as_str()]);
     let key = format!("archive/{HOME}/{}/{}", message_code(), harness.name.replace(':', "%3A").replace('/', "%2F"));
     assert_eq!(harness.s3.keys(), std::slice::from_ref(&key));
@@ -307,7 +332,7 @@ async fn failed_uploads_keep_the_resource_and_a_stuck_bundle_alerts_infra() {
     assert_eq!(harness.condition(), None, "not yet a day past due");
 
     harness.s3.set(Behaviour::LosePuts);
-    let lost = harness.after(PASS_INTERVAL).await;
+    let lost = harness.after(STEP).await;
     assert!(lost.failed[0].1.contains("does not hold the uploaded bundle"), "{:?}", lost.failed);
     assert_eq!(harness.stored(), (true, true), "an unconfirmed upload leaves the resource in place");
 
@@ -323,11 +348,52 @@ async fn failed_uploads_keep_the_resource_and_a_stuck_bundle_alerts_infra() {
     );
 
     harness.s3.set(Behaviour::Healthy);
-    let recovered = harness.after(PASS_INTERVAL).await;
+    let recovered = harness.after(STEP).await;
     assert_eq!(recovered.shipped.len(), 2);
     assert_eq!(harness.condition(), None, "shipped bundles clear the alert");
     assert_eq!(harness.after(EXPUNGE_GRACE).await.expunged.len(), 2);
     assert_eq!(harness.stored(), (false, false));
+}
+
+// Behaviour (#3108): the running shipper wakes at each time work falls due, with no timer and no
+// commit: it ships a week after the end, not a second before, and expunges the grace after.
+#[tokio::test(start_paused = true)]
+async fn the_running_shipper_wakes_when_work_falls_due() {
+    let harness = Harness::new();
+    let (_wake, task) = harness.run();
+    harness.settle().await;
+    tokio::time::advance(Duration::from_secs(7 * 24 * 60 * 60) - Duration::from_secs(1)).await;
+    harness.settle().await;
+    assert!(harness.s3.keys().is_empty(), "nothing ships before a week");
+    tokio::time::advance(Duration::from_secs(1)).await;
+    harness.settle().await;
+    assert_eq!(harness.s3.keys().len(), 1);
+    assert_eq!(harness.stored(), (true, false), "shipped and deleted at the week's end");
+    tokio::time::advance(EXPUNGE_GRACE).await;
+    harness.settle().await;
+    assert_eq!(harness.stored(), (false, false), "expunged at the grace's end");
+    task.abort();
+}
+
+// Behaviour (#3108): a pass that leaves due work undone is retried at a backoff a finite number of
+// times, then only at the next commit.
+#[tokio::test(start_paused = true)]
+async fn failed_passes_retry_a_finite_number_of_times_then_wait_for_a_commit() {
+    let harness = Harness::new();
+    harness.s3.set(Behaviour::RefusePuts);
+    tokio::time::advance(Duration::from_secs(7 * 24 * 60 * 60)).await;
+    let (wake, task) = harness.run();
+    // Far longer than every backoff together, short of the day-overdue alert's wake.
+    for _ in 0..(20 * 6) {
+        tokio::time::advance(STEP).await;
+        harness.settle().await;
+    }
+    let puts = harness.s3.puts.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(puts, 1 + RETRY_LIMIT as usize, "the first pass and each retry ask the store once");
+    wake.notify_one();
+    harness.settle().await;
+    assert_eq!(harness.s3.puts.load(std::sync::atomic::Ordering::SeqCst), puts + 1, "a commit tries again");
+    task.abort();
 }
 
 // Every machine the decided store holds archives once it ends. A plain kind (#3824 layer 0)

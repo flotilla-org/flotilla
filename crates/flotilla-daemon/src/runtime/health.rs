@@ -3,10 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex as StdMutex,
-    },
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
@@ -230,24 +227,6 @@ impl RuntimeHealth {
                 failures.remove(FLEET_DESIGNATION_CONDITION_TYPE);
             }
         }
-    }
-
-    pub(super) fn report_controller_loop_stall(&self, name: &str, elapsed: Duration) {
-        let condition_type = format!("ControllerLoop/{name}");
-        let condition = HostCondition::builder()
-            .condition_type(condition_type.clone())
-            .value(ConditionValue::False)
-            .reason("HeartbeatStale")
-            .message(format!("{name} controller loop made no progress for {elapsed:?}"))
-            .observed_at(Utc::now())
-            // A stalled actuator reconcile does not stop the independent forge reader.
-            .blocks_forge_observation(false)
-            .build();
-        self.failures.lock().expect("runtime health lock poisoned").insert(condition_type, condition);
-    }
-
-    pub(super) fn clear_controller_loop_stall(&self, name: &str) {
-        self.failures.lock().expect("runtime health lock poisoned").remove(&format!("ControllerLoop/{name}"));
     }
 
     pub(super) fn report_projection_parity(&self, condition: Option<HostCondition>) {
@@ -911,32 +890,6 @@ pub(super) fn host_capabilities(
         ("os".to_string(), json!(summary.system.os)),
         ("terminal_pools".to_string(), json!(profile.available_pools)),
     ])
-}
-
-/// A long reconcile also stalls other names, so it counts as missing loop progress.
-pub(super) fn spawn_controller_loop_watchdog(
-    name: &'static str,
-    heartbeat: Arc<AtomicU64>,
-    interval: Duration,
-    health: RuntimeHealth,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.tick().await;
-        let mut last_value = heartbeat.load(Ordering::Relaxed);
-        let mut last_progress = tokio::time::Instant::now();
-        loop {
-            ticker.tick().await;
-            let value = heartbeat.load(Ordering::Relaxed);
-            if value != last_value {
-                last_value = value;
-                last_progress = tokio::time::Instant::now();
-                health.clear_controller_loop_stall(name);
-            } else if last_progress.elapsed() >= interval.saturating_mul(2) {
-                health.report_controller_loop_stall(name, last_progress.elapsed());
-            }
-        }
-    })
 }
 
 #[cfg(test)]

@@ -42,12 +42,7 @@ pub(super) struct MessageController {
 }
 
 impl MessageController {
-    pub(super) async fn run(
-        self,
-        resync_interval: std::time::Duration,
-        heartbeat: Arc<std::sync::atomic::AtomicU64>,
-        metrics: Arc<flotilla_store::load_metrics::ControllerLoadMetrics>,
-    ) -> Result<(), ResourceError> {
+    pub(super) async fn run(self, metrics: Arc<flotilla_store::load_metrics::ControllerLoadMetrics>) -> Result<(), ResourceError> {
         let backend = self.state.daemon.resource_backend();
         let queued = Arc::new(Mutex::new(None));
         let (wake, receiver) = tokio::sync::watch::channel(());
@@ -73,7 +68,7 @@ impl MessageController {
         // Durable batch intent makes passes safe to cancel and rerun after
         // watch failure; recovery observes held submissions without retyping.
         tokio::select! {
-            result = run_delivery(&inbox, &router, receiver, queued, resync_interval, heartbeat, metrics) => result,
+            result = run_delivery(&inbox, &router, receiver, queued, metrics) => result,
             result = watches.join_next() => {
                 match result {
                     Some(Ok(result)) => result,
@@ -93,22 +88,13 @@ async fn run_delivery(
     router: &TransportRouter,
     mut wake: tokio::sync::watch::Receiver<()>,
     queued: Arc<Mutex<Option<tokio::time::Instant>>>,
-    resync_interval: std::time::Duration,
-    heartbeat: Arc<std::sync::atomic::AtomicU64>,
     metrics: Arc<flotilla_store::load_metrics::ControllerLoadMetrics>,
 ) -> Result<(), ResourceError> {
-    let mut resync = tokio::time::interval(resync_interval);
-    resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut next = None;
     loop {
-        heartbeat.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::select! {
             result = wake.changed() => {
                 result.map_err(|_| ResourceError::other("Message inbox wake channel closed"))?;
-            }
-            _ = resync.tick() => {
-                metrics.resyncs.increment();
-                metrics.resync_enqueued.increment();
             }
             _ = async {
                 match next {

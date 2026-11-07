@@ -926,11 +926,12 @@ async fn codex_idle_hook_confirms_held_submission() {
     }
 }
 
-// #3408: a namespace resync must cost one delivery pass, independent of the
-// number of active messages. Real inbox/store/watch collaborators keep this
-// at the scheduling seam; absent receivers avoid terminal subprocesses.
+// #3408, #3108: delivery passes run on events and deadlines, never on a timer,
+// so an idle inbox costs no pass whatever the number of active messages. Real
+// inbox/store/watch collaborators keep this at the scheduling seam; absent
+// receivers avoid terminal subprocesses.
 #[tokio::test(start_paused = true)]
-async fn message_resync_coalesces_active_messages() {
+async fn message_delivery_runs_on_events_not_a_timer() {
     async fn wait_for_passes(metrics: &flotilla_store::load_metrics::ControllerLoadMetrics, minimum: u64) {
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -984,18 +985,16 @@ async fn message_resync_coalesces_active_messages() {
             "host-direct-host-test".into(),
         ));
         let metrics = Arc::new(flotilla_store::load_metrics::ControllerLoadMetrics::default());
-        let heartbeat = Arc::new(AtomicU64::new(0));
         let controller = super::super::message::MessageController { state, namespace: NAMESPACE.into() };
-        let task = tokio::spawn(controller.run(Duration::from_secs(60), heartbeat, Arc::clone(&metrics)));
+        let task = tokio::spawn(controller.run(Arc::clone(&metrics)));
         wait_for_passes(&metrics, 1).await;
         let before = metrics.snapshot().reconcile.count();
         tokio::time::advance(Duration::from_secs(60)).await;
-        wait_for_passes(&metrics, before + 1).await;
+        tokio::time::timeout(Duration::from_secs(1), std::future::pending::<()>()).await.ok();
         let passes = metrics.snapshot().reconcile.count() - before;
-        assert_eq!(passes, 1, "active={n}: resync must run one inbox pass");
+        assert_eq!(passes, 0, "active={n}: an idle inbox runs no pass");
         // New-message watches must still wake an idle inbox, including after
-        // startup with no records. Admissions can interleave with passes;
-        // liveness here complements the quiescent resync budget above.
+        // startup with no records. Admissions can interleave with passes.
         let before = metrics.snapshot().reconcile.count();
         for i in 0..n.max(1) {
             inbox

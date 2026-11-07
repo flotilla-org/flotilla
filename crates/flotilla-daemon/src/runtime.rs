@@ -20,12 +20,7 @@ pub(crate) mod ssh_host_vessels;
 mod state;
 mod tasks;
 mod terminal;
-use std::{
-    collections::BTreeSet,
-    path::PathBuf,
-    sync::{atomic::AtomicU64, Arc},
-    time::Duration,
-};
+use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
 pub(crate) use terminal::{DELIVERY_CONFIRMATION_POLL, DELIVERY_CONFIRMATION_STABLE_FOR};
 
 use chrono::Utc;
@@ -62,10 +57,7 @@ use self::discovery::{
 };
 use self::docker::DockerControllerRuntime;
 use self::environments::reconcile_provisioned_environments;
-use self::health::{
-    apply_host_heartbeat_with_credentials, spawn_controller_loop_watchdog, spawn_projection_parity_task, DaemonHealthIdentity,
-    RuntimeHealth,
-};
+use self::health::{apply_host_heartbeat_with_credentials, spawn_projection_parity_task, DaemonHealthIdentity, RuntimeHealth};
 use self::message::MessageController;
 use self::ports::{
     ChainedForgeDefaultBranchResolver, DaemonConvoyTeardownRuntime, GhForgeDefaultBranchResolver, RoutingCheckoutRuntime,
@@ -390,8 +382,8 @@ impl DaemonRuntime {
                 runtime_health.clone(),
             ),
         ]);
-        if let Some(shipper) = archive_shipper(&daemon, &daemon_config.blob_stores, &runtime_health)? {
-            tasks.push(tokio::spawn(shipper.run(archive::PASS_INTERVAL)));
+        if let Some((shipper, service)) = archive_shipper(&daemon, &daemon_config.blob_stores, &runtime_health)? {
+            tasks.push(tokio::spawn(shipper.run(service)));
         }
         if let Some(relay) = relay {
             tasks.push(crate::event_relay::spawn(Arc::clone(&daemon), relay, config.state_dir().as_path().to_path_buf())?);
@@ -824,7 +816,6 @@ fn spawn_controller_loops(
         ($primary:ty, $name:expr, $make_parts:expr) => {{
             let make_parts = $make_parts;
             let write_lifecycle_reads = Arc::clone(&status_lifecycle_reads);
-            let loop_health = runtime_health.clone();
             let loop_metrics = Arc::clone(&state.controller_metrics);
             spawn_named_controller(
                 $name,
@@ -844,17 +835,8 @@ fn spawn_controller_loops(
                         resync_interval: controller_resync_interval,
                         backend,
                     };
-                    let heartbeat = Arc::new(AtomicU64::new(0));
-                    let health = loop_health.clone();
                     let metrics = loop_metrics.for_kind($name);
-                    async move {
-                        let watchdog =
-                            spawn_controller_loop_watchdog($name, Arc::clone(&heartbeat), controller_resync_interval, health.clone());
-                        let result = controller.run_observed(heartbeat, metrics).await;
-                        watchdog.abort();
-                        health.clear_controller_loop_stall($name);
-                        result
-                    }
+                    async move { controller.run_observed(metrics).await }
                 },
             )
         }};
@@ -1088,7 +1070,6 @@ fn spawn_controller_loops(
     } else {
         controllers.push({
             let state = Arc::clone(&state);
-            let health = runtime_health.clone();
             spawn_resource_controller::<flotilla_resources::Message, _, _>(
                 backend.clone(),
                 namespace_string.clone(),
@@ -1096,17 +1077,8 @@ fn spawn_controller_loops(
                 runtime_health.clone(),
                 move |_backend, namespace| {
                     let controller = MessageController { state: Arc::clone(&state), namespace };
-                    let heartbeat = Arc::new(AtomicU64::new(0));
-                    let health = health.clone();
                     let metrics = state.controller_metrics.for_kind("Message");
-                    async move {
-                        let watchdog =
-                            spawn_controller_loop_watchdog("Message", Arc::clone(&heartbeat), controller_resync_interval, health.clone());
-                        let result = controller.run(controller_resync_interval, heartbeat, metrics).await;
-                        watchdog.abort();
-                        health.clear_controller_loop_stall("Message");
-                        result
-                    }
+                    async move { controller.run(metrics).await }
                 },
             )
         });
@@ -1204,7 +1176,7 @@ fn archive_shipper(
     daemon: &Arc<InProcessDaemon>,
     stores: &[flotilla_config::BlobStoreConfig],
     health: &RuntimeHealth,
-) -> Result<Option<archive::ArchiveShipper>, String> {
+) -> Result<Option<(archive::ArchiveShipper, Arc<flotilla_schema_sqlite::stream::Service>)>, String> {
     let Ok(decided) = daemon.decided_store() else { return Ok(None) };
     if stores.is_empty() {
         info!("no [[blob_stores]] configured: ended engine resources stay local");
@@ -1212,13 +1184,14 @@ fn archive_shipper(
     }
     let targets = archive::targets(stores)?;
     let health = health.clone();
-    Ok(Some(archive::ArchiveShipper::new(
+    let shipper = archive::ArchiveShipper::new(
         decided.store(),
         archive::archive_kinds(),
         targets,
         daemon.clock_for_scenarios(),
         Arc::new(move |condition| health.report_archive(condition)),
-    )))
+    );
+    Ok(Some((shipper, decided)))
 }
 
 /// The Environment controller (#3108): the single writer of this home's environment launches,

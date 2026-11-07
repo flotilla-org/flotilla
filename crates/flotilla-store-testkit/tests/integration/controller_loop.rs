@@ -1927,7 +1927,7 @@ async fn an_observed_controller_loop_records_wakes_requeues_and_resyncs() {
             resync_interval: Duration::from_millis(50),
             backend,
         }
-        .run_observed(Arc::new(std::sync::atomic::AtomicU64::new(0)), Arc::clone(&metrics)),
+        .run_observed(Arc::clone(&metrics)),
     );
     timeout(Duration::from_secs(5), async {
         while metrics.resyncs.get() < 2 || passes.load(Ordering::SeqCst) < 6 {

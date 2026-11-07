@@ -2,24 +2,6 @@ use super::*;
 use flotilla_resources::FulfilmentGrant;
 use flotilla_store_memory::InMemoryBackend;
 
-#[tokio::test(start_paused = true)]
-async fn controller_loop_watchdog_reports_and_clears_a_stale_heartbeat() {
-    let health = RuntimeHealth::default();
-    let heartbeat = Arc::new(AtomicU64::new(1));
-    let watchdog = spawn_controller_loop_watchdog("TestPrimary", Arc::clone(&heartbeat), Duration::from_millis(10), health.clone());
-    tokio::task::yield_now().await;
-    for _ in 0..3 {
-        tokio::time::advance(Duration::from_millis(10)).await;
-        tokio::task::yield_now().await;
-    }
-    assert!(health.conditions().await.iter().any(|condition| condition.condition_type == "ControllerLoop/TestPrimary"));
-    heartbeat.fetch_add(1, Ordering::Relaxed);
-    tokio::time::advance(Duration::from_millis(10)).await;
-    tokio::task::yield_now().await;
-    assert!(!health.conditions().await.iter().any(|condition| condition.condition_type == "ControllerLoop/TestPrimary"));
-    watchdog.abort();
-}
-
 #[tokio::test]
 async fn heartbeat_publishes_ambient_claude_expiry_metadata_without_material() {
     let temp = TempDir::new().expect("tempdir");

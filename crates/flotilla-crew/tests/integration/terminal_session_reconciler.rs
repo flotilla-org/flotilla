@@ -3209,7 +3209,7 @@ async fn retained_terminal_convoy_orphans_follow_reclaim_matrix(
             resync_interval: Duration::from_secs(60),
             backend,
         }
-        .run_observed(Arc::default(), Arc::clone(&metrics))
+        .run_observed(Arc::clone(&metrics))
         .with_subscriber(subscriber),
     );
     let managed = authority_kind == LifecycleAuthority::Managed;

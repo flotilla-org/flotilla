@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex as StdMutex,
     },
     time::Duration,

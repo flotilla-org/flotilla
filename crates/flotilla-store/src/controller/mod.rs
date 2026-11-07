@@ -3,10 +3,7 @@ use std::{
     future::Future,
     marker::PhantomData,
     pin::Pin,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex as StdMutex,
-    },
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
@@ -703,34 +700,19 @@ impl<R: Reconciler> ControllerLoop<R> {
     where
         <R::Resource as Resource>::Status: Default,
     {
-        self.run_with_optional_heartbeat(None).await
+        self.run_instrumented(Arc::default()).await
     }
 
-    /// Exposes progress of the loop itself to an independent watchdog.
-    pub async fn run_with_heartbeat(self, heartbeat: Arc<AtomicU64>) -> Result<(), ResourceError>
+    /// [`Self::run`], also recording wakes, reconcile latency, requeues and
+    /// resyncs into `metrics` for load measurement (#3206).
+    pub async fn run_observed(self, metrics: Arc<ControllerLoadMetrics>) -> Result<(), ResourceError>
     where
         <R::Resource as Resource>::Status: Default,
     {
-        self.run_with_optional_heartbeat(Some(heartbeat)).await
+        self.run_instrumented(metrics).await
     }
 
-    /// [`Self::run_with_heartbeat`], also recording wakes, reconcile latency,
-    /// requeues and resyncs into `metrics` for load measurement (#3206).
-    pub async fn run_observed(self, heartbeat: Arc<AtomicU64>, metrics: Arc<ControllerLoadMetrics>) -> Result<(), ResourceError>
-    where
-        <R::Resource as Resource>::Status: Default,
-    {
-        self.run_instrumented(Some(heartbeat), metrics).await
-    }
-
-    async fn run_with_optional_heartbeat(self, heartbeat: Option<Arc<AtomicU64>>) -> Result<(), ResourceError>
-    where
-        <R::Resource as Resource>::Status: Default,
-    {
-        self.run_instrumented(heartbeat, Arc::default()).await
-    }
-
-    async fn run_instrumented(self, heartbeat: Option<Arc<AtomicU64>>, metrics: Arc<ControllerLoadMetrics>) -> Result<(), ResourceError>
+    async fn run_instrumented(self, metrics: Arc<ControllerLoadMetrics>) -> Result<(), ResourceError>
     where
         <R::Resource as Resource>::Status: Default,
     {
@@ -766,9 +748,6 @@ impl<R: Reconciler> ControllerLoop<R> {
 
         loop {
             sender.made_progress();
-            if let Some(heartbeat) = &heartbeat {
-                heartbeat.fetch_add(1, Ordering::Relaxed);
-            }
             if let Some(name) = pending.pop_front() {
                 metrics.wakes.increment();
                 metrics.queue_peak.observe(pending.len() as u64 + 1);
