@@ -31,6 +31,7 @@ use flotilla_resources::{
     TerminalSessionPhase, TerminalSessionSource, TerminalSessionTarget, Vessel, CREDENTIAL_PERMISSIONS_SESSION_TAG,
     CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_SESSION_TAG,
 };
+use flotilla_state_machines::machines::agent_session::Activity;
 use flotilla_store::ResourceBackend;
 use flotilla_terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, TerminalSize, TerminalSubmission};
 use flotilla_vcs::vcs::CheckoutVcsResolver as _;
@@ -114,6 +115,17 @@ pub(super) async fn observe_terminal_screen(
     session_id: &str,
     now: chrono::DateTime<Utc>,
 ) -> Result<Option<TerminalObservation>, String> {
+    Ok(read_terminal_screen(pool, adapter, session_id, now).await?.map(|(observation, _)| observation))
+}
+
+/// The terminal's observation, and the agent activity its adapter read from the
+/// screen: only an adapter's reading is the agent's, never the pool's screen motion.
+async fn read_terminal_screen(
+    pool: &dyn TerminalPool,
+    adapter: Option<&dyn AgentAdapter>,
+    session_id: &str,
+    now: chrono::DateTime<Utc>,
+) -> Result<Option<(TerminalObservation, Option<TerminalAttentionState>)>, String> {
     let Some(session) = pool.list_sessions().await?.into_iter().find(|session| session.session_name == session_id) else {
         return Ok(None);
     };
@@ -135,18 +147,53 @@ pub(super) async fn observe_terminal_screen(
             Err(error) => tracing::debug!(%session_id, %error, "could not capture terminal screen for attention observation"),
         }
     }
+    let agent = state;
     let state = state.or_else(|| {
         session.screen_activity.map(|activity| match activity {
             ScreenActivity::Active => TerminalAttentionState::Working,
             ScreenActivity::Stable => TerminalAttentionState::Idle,
         })
     });
-    Ok(Some(TerminalObservation {
-        output_digest,
-        obstruction,
-        attention: state.map(|state| flotilla_resources::TerminalAttention { state, as_of: now, source: TerminalAttentionSource::Screen }),
-        occupancy,
-    }))
+    Ok(Some((
+        TerminalObservation {
+            output_digest,
+            obstruction,
+            attention: state.map(|state| flotilla_resources::TerminalAttention {
+                state,
+                as_of: now,
+                source: TerminalAttentionSource::Screen,
+            }),
+            occupancy,
+        },
+        agent,
+    )))
+}
+
+/// The agent activity an adapter's screen reading shows; an unreadable screen shows none.
+fn screen_activity(state: TerminalAttentionState) -> Option<Activity> {
+    match state {
+        TerminalAttentionState::Working => Some(Activity::Working),
+        TerminalAttentionState::NeedsInput => Some(Activity::NeedsInput),
+        TerminalAttentionState::Idle => Some(Activity::Idle),
+        TerminalAttentionState::Unobservable => None,
+    }
+}
+
+impl TerminalControllerRuntime {
+    /// Records the agent's screen-read activity on its AgentSession, named by
+    /// the TerminalSession record. Another observer: its errors are logged and
+    /// never fail the terminal's own observation.
+    async fn observe_agent_screen(&self, record: &str, activity: Activity, now: chrono::DateTime<Utc>) {
+        let Some(primitives) = self.state.daemon.message_primitives() else { return };
+        let sessions = Arc::clone(primitives.sessions());
+        let name = record.to_owned();
+        let now = flotilla_schema::Timestamp::from_datetime(&now);
+        match tokio::task::spawn_blocking(move || sessions.observe_screen(&name, activity, now)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => warn!(session = %record, %error, "failed to record agent session activity from its screen"),
+            Err(error) => warn!(session = %record, %error, "agent session screen observation did not finish"),
+        }
+    }
 }
 
 pub(super) async fn session_busy_after_delivery_grace(
@@ -711,7 +758,12 @@ impl TerminalRuntime for TerminalControllerRuntime {
             }
         }
         let adapter = self.adapter_for_spec(spec).await?;
-        observe_terminal_screen(&*pool, adapter.as_deref(), session_id, Utc::now()).await
+        let now = Utc::now();
+        let Some((observation, agent)) = read_terminal_screen(&*pool, adapter.as_deref(), session_id, now).await? else { return Ok(None) };
+        if let (Some(record), Some(activity)) = (spec.record, agent.and_then(screen_activity)) {
+            self.observe_agent_screen(record, activity, now).await;
+        }
+        Ok(Some(observation))
     }
 
     async fn agent_exit_failure(

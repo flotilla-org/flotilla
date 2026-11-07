@@ -459,6 +459,7 @@ async fn terminal_teardown_kills_a_persisted_session_after_runtime_restart() {
 
 #[tokio::test]
 async fn codex_interactive_prompt_is_observed_as_needing_input() {
+    use flotilla_state_machines::machines::agent_session::Activity;
     use std::os::unix::fs::PermissionsExt;
 
     let temp = TempDir::new().expect("tempdir");
@@ -531,29 +532,59 @@ async fn codex_interactive_prompt_is_observed_as_needing_input() {
         env: Default::default(),
         pool: "fake-terminals".to_string(),
     };
+    // The adapter's screen reading is the agent's activity, recorded on the AgentSession the
+    // TerminalSession record names; the pool's screen motion is not.
+    let service = Arc::new(
+        flotilla_schema_sqlite::stream::Service::open(
+            &temp.path().join("decided.sqlite"),
+            "home",
+            flotilla_engine_store::registry().unwrap(),
+        )
+        .unwrap(),
+    );
+    let primitives = Arc::new(
+        flotilla_core::primitives::MessagePrimitives::open(
+            "home",
+            service,
+            daemon.resource_backend(),
+            Arc::new(flotilla_resources::SystemClock),
+        )
+        .unwrap(),
+    );
+    daemon.install_message_primitives(Arc::clone(&primitives)).unwrap();
+    let record = "codex-crew";
+    let agent_activity =
+        || primitives.sessions().get(record).and_then(|session| session.state().observation()).map(|observation| observation.activity);
+    let target = || {
+        let mut target = flotilla_resources::TerminalSessionTarget::from(&spec);
+        target.record = Some(record);
+        target
+    };
 
-    let observation =
-        runtime.observe_attention(session_name, (&spec).into()).await.expect("observe prompt").expect("attention observation");
+    let observation = runtime.observe_attention(session_name, target()).await.expect("observe prompt").expect("attention observation");
     assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::NeedsInput);
+    assert_eq!(agent_activity(), Some(Activity::NeedsInput));
 
     pool.set_captured_screen(session_name, "› Ask Codex to do anything\n\ngpt-5.6-sol high · /workspace").await;
     let observation =
-        runtime.observe_attention(session_name, (&spec).into()).await.expect("observe normal composer").expect("attention observation");
+        runtime.observe_attention(session_name, target()).await.expect("observe normal composer").expect("attention observation");
     assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::Idle);
+    assert_eq!(agent_activity(), Some(Activity::Idle));
 
     // #2560: stable pixels alone do not end a Codex turn. An interrupt
     // returning to the composer is a boundary even without a notify hook.
     pool.set_captured_screen(session_name, "• Working (2h 12m • esc to interrupt)\n\n› Ask Codex to do anything").await;
-    let observation =
-        runtime.observe_attention(session_name, (&spec).into()).await.expect("observe quiet working turn").expect("observation");
+    let observation = runtime.observe_attention(session_name, target()).await.expect("observe quiet working turn").expect("observation");
     assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::Working);
+    assert_eq!(agent_activity(), Some(Activity::Working));
     pool.set_captured_screen(session_name, "■ Conversation interrupted\n\n› Ask Codex to do anything").await;
-    let observation =
-        runtime.observe_attention(session_name, (&spec).into()).await.expect("observe interrupted prompt").expect("observation");
+    let observation = runtime.observe_attention(session_name, target()).await.expect("observe interrupted prompt").expect("observation");
     assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::Idle);
+    assert_eq!(agent_activity(), Some(Activity::Idle));
     pool.set_captured_screen(session_name, "Loading unknown screen").await;
-    let observation = runtime.observe_attention(session_name, (&spec).into()).await.expect("observe unknown screen").expect("observation");
+    let observation = runtime.observe_attention(session_name, target()).await.expect("observe unknown screen").expect("observation");
     assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::Unobservable);
+    assert_eq!(agent_activity(), Some(Activity::Idle), "an unreadable screen shows no activity, so the last reading stands");
 
     pool.set_captured_screen(
         session_name,

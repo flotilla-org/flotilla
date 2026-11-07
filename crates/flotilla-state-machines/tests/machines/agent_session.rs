@@ -170,7 +170,7 @@ fn an_ended_session_refuses_everything_with_already_ended() {
 
 // Owner ruling #3625: only changes write the observation and the home log;
 // all lifecycle edges preserve it, and an ended session refuses Observe.
-// Generate all three activities, repeated causes, both channel states and both ends.
+// Generate all four activities, repeated causes, both channel states and both ends.
 #[hegel::test]
 fn activity_observations_change_only_on_a_real_change(tc: hegel::TestCase) {
     use hegel::generators as gs;
@@ -178,8 +178,8 @@ fn activity_observations_change_only_on_a_real_change(tc: hegel::TestCase) {
     assert_eq!(state(&h).observation(), None);
     let world = MemoryAgentSessionWorld::default();
     for tick in 1..=tc.draw(gs::integers::<i64>().min_value(4).max_value(30)) {
-        let activity =
-            [Activity::Working, Activity::Idle, Activity::Interrupted][tc.draw(gs::integers::<usize>().min_value(0).max_value(2))];
+        let activity = [Activity::Working, Activity::NeedsInput, Activity::Idle, Activity::Interrupted]
+            [tc.draw(gs::integers::<usize>().min_value(0).max_value(3))];
         let cause = format!("event-{}", tc.draw(gs::integers::<u8>().min_value(0).max_value(3)));
         let before = h.get("s").unwrap().clone();
         let result = h.apply("s", Observe { activity, cause: cause.clone() }, &world, at(tick));

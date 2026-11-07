@@ -6557,13 +6557,16 @@ async fn agent_activity_hooks_record_only_changes_for_each_harness_and_transport
                 let interrupt =
                     if harness_name == "codex" { ("interrupt", "Interrupt") } else { ("post-tool-use-failure", "PostToolUseFailure") };
                 let mut previous = None;
-                for (argument, native, activity) in [
-                    ("user-prompt-submit", "UserPromptSubmit", Activity::Working),
-                    ("pre-tool-use", "PreToolUse", Activity::Working),
-                    ("stop", "Stop", Activity::Idle),
-                    (interrupt.0, interrupt.1, Activity::Interrupted),
-                ] {
+                let mut steps =
+                    vec![("user-prompt-submit", "UserPromptSubmit", Activity::Working), ("pre-tool-use", "PreToolUse", Activity::Working)];
+                // Claude Code reports a permission prompt through its Notification hook.
+                if harness_name == "claude-code" {
+                    steps.push(("notification", "Notification", Activity::NeedsInput));
+                }
+                steps.extend([("stop", "Stop", Activity::Idle), (interrupt.0, interrupt.1, Activity::Interrupted)]);
+                for (argument, native, activity) in steps {
                     let payload = serde_json::json!({ "session_id":"native-1", "cwd":"/repo", "hook_event_name":native,
+                        "notification_type":"permission_prompt",
                         "is_interrupt":true, "stop_hook_active":false, "prompt":"work", "tool_name":"Bash",
                         "tool_input":{"command":"secret-call-detail"}, "tool_use_id":"call-detail" });
                     if http {

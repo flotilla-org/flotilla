@@ -79,6 +79,7 @@ impl Conformance for SessionConformance {
                 use flotilla_state_machines::machines::agent_session::{Activity, Observe};
                 let activity = match tag(&o["activity"]) {
                     "Working" => Activity::Working,
+                    "NeedsInput" => Activity::NeedsInput,
                     "Idle" => Activity::Idle,
                     "Interrupted" => Activity::Interrupted,
                     other => panic!("activity {other}"),

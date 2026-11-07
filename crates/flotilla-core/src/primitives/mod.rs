@@ -118,6 +118,13 @@ fn fallback_system_sender() -> Address {
         .expect("a valid default namespace")
 }
 
+/// The cause an activity read from the agent's screen records. A hook records
+/// its native event name instead.
+pub const SCREEN_CAUSE: &str = "screen";
+
+/// How long a hook's activity stands over a screen read that disagrees.
+pub const HOOK_STANDS_FOR: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// The minimal AgentSession records at this home (#3317): one per live crew
 /// session, named by its TerminalSession record, holding the receipts.
 pub struct Sessions {
@@ -190,6 +197,32 @@ impl Sessions {
             Err(WriteError::Refused(AgentSessionRefusal::UnchangedActivity | AgentSessionRefusal::AlreadyEnded)) => Ok(false),
             Err(error) => Err(format!("AgentSession `{name}`: {error:?}")),
         }
+    }
+
+    /// Records activity read from the agent's screen, with cause [`SCREEN_CAUSE`].
+    /// A hook reports the agent itself, so its observation stands over a screen
+    /// read while it is younger than [`HOOK_STANDS_FOR`]; a screen read still
+    /// records an idle agent working again, and an agent waiting on a person,
+    /// which some harnesses' hooks (Codex) never report.
+    pub fn observe_screen(
+        &self,
+        name: &str,
+        activity: flotilla_state_machines::machines::agent_session::Activity,
+        now: Timestamp,
+    ) -> Result<bool, String> {
+        use flotilla_state_machines::machines::agent_session::Activity;
+        {
+            let home = self.home.lock().map_err(|_| "session home lock poisoned".to_string())?;
+            if let Some(old) = home.get(name).and_then(|session| session.state().observation()) {
+                let from_hook = old.activity_cause != SCREEN_CAUSE;
+                let fresh = now.since(old.activity_since) < HOOK_STANDS_FOR.as_micros() as i64;
+                let screen_wins = activity == Activity::NeedsInput || (old.activity == Activity::Idle && activity == Activity::Working);
+                if from_hook && fresh && !screen_wins {
+                    return Ok(false);
+                }
+            }
+        }
+        self.observe(name, activity, SCREEN_CAUSE.to_owned(), now)
     }
 
     /// One keyed read of a session; absence means no such record.

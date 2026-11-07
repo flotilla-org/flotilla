@@ -17,7 +17,7 @@ use super::{
     name, timestamp, Fixture, Pick,
 };
 
-/// Covering indexes span lifecycle, channel/end reason and absent/all three activities.
+/// Covering indexes span lifecycle, channel/end reason and absent/all four activities.
 pub const COVERING: usize = 64;
 
 pub fn state_value(tc: &TestCase, pick: Pick) -> AgentSessionState {
@@ -27,10 +27,10 @@ pub fn state_value(tc: &TestCase, pick: Pick) -> AgentSessionState {
         (_, 0) => AgentSessionState::ended(EndReason::Completed),
         _ => AgentSessionState::ended(EndReason::Lost),
     };
-    let observation = match pick.digit(tc, 4, 4) {
+    let observation = match pick.digit(tc, 5, 4) {
         0 => None,
         digit => Some(ActivityObservation {
-            activity: [Activity::Working, Activity::Idle, Activity::Interrupted][digit - 1],
+            activity: [Activity::Working, Activity::NeedsInput, Activity::Idle, Activity::Interrupted][digit - 1],
             activity_since: timestamp(tc),
             activity_cause: name(tc),
         }),
@@ -74,7 +74,7 @@ pub fn candidates(tc: &TestCase, pick: Pick) -> Vec<Candidate<AgentSession>> {
         world.ends.put(&observed, reason);
         candidates.push((End { reason, observed }.into(), boxed(world), now));
     }
-    for activity in [Activity::Working, Activity::Idle, Activity::Interrupted] {
+    for activity in [Activity::Working, Activity::NeedsInput, Activity::Idle, Activity::Interrupted] {
         candidates.push((Observe { activity, cause: name(tc) }.into(), boxed(MemoryAgentSessionWorld::default()), now));
     }
     candidates.push((receive(tc, pick).into(), boxed(MemoryAgentSessionWorld::default()), now));

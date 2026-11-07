@@ -734,9 +734,10 @@ pub(super) async fn record_hook_activity(
     use flotilla_state_machines::machines::agent_session::Activity;
     let activity = match event.event_type {
         AgentEventType::Active | AgentEventType::ToolActive => Activity::Working,
+        AgentEventType::WaitingForPermission => Activity::NeedsInput,
         AgentEventType::Idle => Activity::Idle,
         AgentEventType::Interrupted => Activity::Interrupted,
-        _ => return Ok(()),
+        AgentEventType::Started | AgentEventType::Ended | AgentEventType::NoChange => return Ok(()),
     };
     let (Some(terminal), Some(cause)) = (event.terminal.as_ref(), event.hook_event.as_ref()) else { return Ok(()) };
     if !primitives.sessions().needs_observation(&terminal.session_name, activity)? {
