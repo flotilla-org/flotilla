@@ -412,6 +412,9 @@ struct StallTick<'a> {
     controller_queue: Option<&'a flotilla_store::controller::WorkQueueSender>,
 }
 
+/// A convoy's crew sessions and vessels, by name.
+type ConvoyChildren = (BTreeMap<String, ResourceObject<TerminalSession>>, BTreeMap<String, ResourceObject<flotilla_resources::Vessel>>);
+
 /// A judged convoy's crew: its sessions and vessels, nudge obligations, and whether its phase
 /// holds crew work.
 struct ConvoyCrew {
@@ -542,7 +545,7 @@ impl ReconcilerWake {
                 );
                 continue;
             }
-            off_frame(|| self.judge_convoy_stall(tick, convoy)).await?;
+            self.judge_convoy_stall(tick, convoy).await?;
         }
         Ok(())
     }
@@ -634,10 +637,9 @@ impl ReconcilerWake {
         let read_backend = &tick.inputs.read_backend;
         let projects = &tick.inputs.projects;
         let Some(status) = &convoy.status else { return Ok(()) };
-        let Some(crew) = off_frame(|| self.observe_convoy_crew(tick, convoy, status)).await? else { return Ok(()) };
+        let Some(crew) = self.observe_convoy_crew(tick, convoy, status).await? else { return Ok(()) };
         let ConvoyCrew { sessions: selected_sessions, vessels: selected_vessels, mut obligations, holding } = crew;
-        let verdict =
-            off_frame(|| self.judge_convoy_rows(tick, convoy, status, &selected_sessions, &selected_vessels, &mut obligations)).await?;
+        let verdict = self.judge_convoy_rows(tick, convoy, status, &selected_sessions, &selected_vessels, &mut obligations).await?;
         let RowsVerdict { progress_changed, unable, mut able, mut unknown, actionable_rows } = verdict;
         // A crew's own stall declaration is its evidence: another crew's able or
         // unjudged row (such as its idle supervisor) must not hold it at the operator rung.
@@ -646,7 +648,7 @@ impl ReconcilerWake {
             able = false;
             unknown = false;
         }
-        let policy = off_frame(|| super::supervision::supervision_policy(read_backend, namespace, convoy, &projects.items)).await?;
+        let policy = super::supervision::supervision_policy(read_backend, namespace, convoy, &projects.items).await?;
         // An exhausted cursor on a crew target is a legacy failed lookup,
         // not a consumed operator policy. Retry that target after one roll.
         let retry_exhausted = status.stalled.as_ref().is_some_and(|stalled| {
@@ -668,19 +670,9 @@ impl ReconcilerWake {
             return Ok(());
         }
         let next = if holding && !able && !unknown && (status.phase != ConvoyPhase::Active || actionable_rows > 0) {
-            let condition = off_frame(|| {
-                self.next_stall_condition(
-                    tick,
-                    convoy,
-                    status,
-                    &selected_sessions,
-                    &mut obligations,
-                    unable.as_ref(),
-                    &policy,
-                    retry_exhausted,
-                )
-            })
-            .await?;
+            let condition = self
+                .next_stall_condition(tick, convoy, status, &selected_sessions, &mut obligations, unable.as_ref(), &policy, retry_exhausted)
+                .await?;
             Some(condition)
         } else {
             status
@@ -697,19 +689,39 @@ impl ReconcilerWake {
                 })
                 .cloned()
         };
-        off_frame(|| self.write_stall_status(namespace, convoy, status, obligations, next)).await
+        self.write_stall_status(namespace, convoy, status, obligations, next).await
     }
 
     /// The convoy's crew sessions and vessels, with its turn-hook health and a working stall
-    /// source observed; none once the convoy has nothing left to judge.
+    /// source observed; none once the convoy has nothing left to judge. It runs for every convoy
+    /// each tick, so its steps are awaited in place rather than boxed.
     async fn observe_convoy_crew(
         &self,
         tick: StallTick<'_>,
         convoy: &ResourceObject<Convoy>,
         status: &ConvoyStatus,
     ) -> Result<Option<ConvoyCrew>, String> {
+        let StallTick { namespace, .. } = tick;
+        let (selected_sessions, selected_vessels) = self.observe_crew_progress(tick, convoy).await?;
+        let mut obligations = status.nudge_obligations.clone();
+        let holding = matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing);
+        if holding {
+            self.observe_turn_hook_health(tick, convoy, status, &selected_sessions, &obligations).await?;
+        }
+        if self.clear_working_source_stall(tick, convoy, status, &selected_sessions, &mut obligations).await? {
+            return Ok(None);
+        }
+        if !holding && status.stalled.is_none() {
+            self.end_settled_stalls(namespace, convoy, status, None).await;
+            return Ok(None);
+        }
+        Ok(Some(ConvoyCrew { sessions: selected_sessions, vessels: selected_vessels, obligations, holding }))
+    }
+
+    /// The convoy's crew sessions and vessels, after observing its queued turns and launch
+    /// progress.
+    async fn observe_crew_progress(&self, tick: StallTick<'_>, convoy: &ResourceObject<Convoy>) -> Result<ConvoyChildren, String> {
         let StallTick { namespace, now, .. } = tick;
-        let backend = &self.subscriptions.inner.backend;
         let sessions = &tick.inputs.sessions_list.items;
         let vessels = &tick.inputs.vessels_list.items;
         let messages = &tick.inputs.messages_list.items;
@@ -725,28 +737,52 @@ impl ReconcilerWake {
             .map_err(|error| error.to_string())?,
         );
         self.observe_launch_progress(convoy, &selected_vessels, &selected_sessions, now).await?;
-        let mut obligations = status.nudge_obligations.clone();
-        let holding = matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing);
-        if holding {
-            let mut missing_hooks =
-                selected_sessions.values().filter_map(|session| missing_turn_hook(session, &obligations, now)).collect::<Vec<_>>();
-            missing_hooks.sort();
-            let reason = (!missing_hooks.is_empty()).then(|| missing_hooks.join("\n"));
-            let prior = status.attention.as_ref().filter(|attention| attention.source == ConvoyAttention::MISSING_TURN_HOOK_SOURCE);
-            // Skip no-op writes here; the patch repeats the source guard after
-            // an optimistic retry so concurrent settlement attention stays intact.
-            if status.attention.as_ref().is_none_or(|attention| attention.source == ConvoyAttention::MISSING_TURN_HOOK_SOURCE)
-                && prior.map(|attention| &attention.reason) != reason.as_ref()
-            {
-                flotilla_store::apply_status_patch(
-                    &backend.clone().using::<Convoy>(namespace),
-                    &convoy.metadata.name,
-                    &flotilla_resources::ConvoyStatusPatch::ObserveTurnHookHealth { reason, observed_at: now },
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            }
+        Ok((selected_sessions, selected_vessels))
+    }
+
+    /// Records which crew sessions lack a turn hook, skipping no-op writes.
+    async fn observe_turn_hook_health(
+        &self,
+        tick: StallTick<'_>,
+        convoy: &ResourceObject<Convoy>,
+        status: &ConvoyStatus,
+        selected_sessions: &BTreeMap<String, ResourceObject<TerminalSession>>,
+        obligations: &[NudgeObligation],
+    ) -> Result<(), String> {
+        let StallTick { namespace, now, .. } = tick;
+        let backend = &self.subscriptions.inner.backend;
+        let mut missing_hooks =
+            selected_sessions.values().filter_map(|session| missing_turn_hook(session, obligations, now)).collect::<Vec<_>>();
+        missing_hooks.sort();
+        let reason = (!missing_hooks.is_empty()).then(|| missing_hooks.join("\n"));
+        let prior = status.attention.as_ref().filter(|attention| attention.source == ConvoyAttention::MISSING_TURN_HOOK_SOURCE);
+        // Skip no-op writes here; the patch repeats the source guard after
+        // an optimistic retry so concurrent settlement attention stays intact.
+        if status.attention.as_ref().is_none_or(|attention| attention.source == ConvoyAttention::MISSING_TURN_HOOK_SOURCE)
+            && prior.map(|attention| &attention.reason) != reason.as_ref()
+        {
+            flotilla_store::apply_status_patch(
+                &backend.clone().using::<Convoy>(namespace),
+                &convoy.metadata.name,
+                &flotilla_resources::ConvoyStatusPatch::ObserveTurnHookHealth { reason, observed_at: now },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
         }
+        Ok(())
+    }
+
+    /// Clears a supervised stall whose source crew is working again; true once cleared.
+    async fn clear_working_source_stall(
+        &self,
+        tick: StallTick<'_>,
+        convoy: &ResourceObject<Convoy>,
+        status: &ConvoyStatus,
+        selected_sessions: &BTreeMap<String, ResourceObject<TerminalSession>>,
+        obligations: &mut Vec<NudgeObligation>,
+    ) -> Result<bool, String> {
+        let StallTick { namespace, now, .. } = tick;
+        let backend = &self.subscriptions.inner.backend;
         if let Some(stalled) =
             status.stalled.as_ref().filter(|stalled| stalled.supervisor.is_some() && stalled.source != StallEvidenceSource::Crew)
         {
@@ -754,20 +790,20 @@ impl ReconcilerWake {
                 let source_working = selected_sessions.values().any(|session| {
                     session.metadata.labels.get(VESSEL_LABEL).is_some_and(|name| name == vessel)
                         && session.metadata.labels.get(ROLE_LABEL).is_some_and(|name| name == role)
-                        && session.status.as_ref().is_some_and(|status| actor_is_working(status, &obligations, vessel, role, now))
+                        && session.status.as_ref().is_some_and(|status| actor_is_working(status, obligations, vessel, role, now))
                 });
                 if source_working {
-                    for obligation in &mut obligations {
+                    for obligation in obligations.iter_mut() {
                         if matches!(&obligation.maker, LeafMaker::Actor { vessel: actor_vessel, role: actor_role } if actor_vessel == vessel && actor_role == role)
                         {
                             obligation.quiet_since = None;
                         }
                     }
-                    if status.nudge_obligations != obligations {
+                    if status.nudge_obligations != *obligations {
                         flotilla_store::apply_status_patch(
                             &backend.clone().using::<Convoy>(namespace),
                             &convoy.metadata.name,
-                            &flotilla_resources::ConvoyStatusPatch::SetNudgeObligations { obligations },
+                            &flotilla_resources::ConvoyStatusPatch::SetNudgeObligations { obligations: std::mem::take(obligations) },
                         )
                         .await
                         .map_err(|error| error.to_string())?;
@@ -780,15 +816,11 @@ impl ReconcilerWake {
                     .await
                     .map_err(|error| error.to_string())?;
                     self.end_settled_stalls(namespace, convoy, status, None).await;
-                    return Ok(None);
+                    return Ok(true);
                 }
             }
         }
-        if !holding && status.stalled.is_none() {
-            self.end_settled_stalls(namespace, convoy, status, None).await;
-            return Ok(None);
-        }
-        Ok(Some(ConvoyCrew { sessions: selected_sessions, vessels: selected_vessels, obligations, holding }))
+        Ok(false)
     }
 
     /// Judges the convoy's subscription rows: whether any maker is able, unable or unknown.
@@ -845,27 +877,25 @@ impl ReconcilerWake {
             actionable_rows += 1;
             let judgement = match &row.maker {
                 LeafMaker::Actor { vessel, role } => {
-                    off_frame(|| {
-                        self.judge_actor_row(
-                            tick,
-                            convoy,
-                            status,
-                            selected_sessions,
-                            selected_vessels,
-                            obligations,
-                            &mut selected_checkouts,
-                            &mut progress_changed,
-                            row,
-                            vessel,
-                            role,
-                        )
-                    })
+                    self.judge_actor_row(
+                        tick,
+                        convoy,
+                        status,
+                        selected_sessions,
+                        selected_vessels,
+                        obligations,
+                        &mut selected_checkouts,
+                        &mut progress_changed,
+                        row,
+                        vessel,
+                        role,
+                    )
                     .await?
                 }
                 LeafMaker::Supervisor { convoy: supervisor_convoy, vessel, role } => {
-                    off_frame(|| self.judge_supervisor_row(tick, row, supervisor_convoy, vessel, role)).await
+                    self.judge_supervisor_row(tick, row, supervisor_convoy, vessel, role).await
                 }
-                LeafMaker::Observed { .. } => off_frame(|| self.judge_observed_row(tick, row)).await,
+                LeafMaker::Observed { .. } => self.judge_observed_row(tick, row).await,
                 LeafMaker::Controller { resource_kind, name, retry, ceiling } => {
                     let controller_queue = tick.controller_queue;
                     let reason = if resource_kind == "Convoy" {
