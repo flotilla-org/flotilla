@@ -26,6 +26,25 @@ use flotilla_store::ResourceBackend;
 
 use crate::blob_store::BlobStore;
 
+/// Projects build demands at once and again at each change to an ImageBuild, local or replicated,
+/// never on a timer. A burst of changes during a projection costs one more. The watch ending is
+/// an error, so supervision restarts it.
+pub(crate) async fn run_build_projection(backend: &ResourceBackend, namespace: &str, host_ref: &str) -> Result<(), ResourceError> {
+    use futures::StreamExt;
+    let mut changes = backend.including_replicas::<flotilla_resources::ImageBuild>(namespace).watch().await?.ready_chunks(64);
+    loop {
+        project_builds(backend, namespace, host_ref).await?;
+        match changes.next().await {
+            Some(events) => {
+                for event in events {
+                    event?;
+                }
+            }
+            None => return Err(ResourceError::other("ImageBuild watch closed")),
+        }
+    }
+}
+
 /// Mirror build demands onto their builder host, following Vessel placement's
 /// projection convention, and delete projected copies whose demand is gone.
 /// Retired ADR 0053 records are never projected.
@@ -354,6 +373,43 @@ mod tests {
         assert!(matches!(builds.get(&name).await, Err(flotilla_resources::ResourceError::NotFound { .. })));
         assert!(builds.get(&own_name).await.is_ok());
         assert!(builds.get(&lagging_name).await.is_ok(), "a root without a replica snapshot may merely lag");
+    }
+
+    // #3108: the running projection follows ImageBuild changes, with no timer: a replicated
+    // demand is projected, and its withdrawal deletes the copy.
+    #[tokio::test]
+    async fn the_running_projection_follows_demand_changes() {
+        let home = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("home"));
+        let builder = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("builder-root"));
+        let task = tokio::spawn({
+            let builder = builder.clone();
+            async move { run_build_projection(&builder, "test", "builder").await }
+        });
+        let demand = spec("builder");
+        let name = demand.resource_name();
+        let demands = home.using::<ImageBuild>("test");
+        demands.create(&InputMeta::builder().name(name.clone()).build(), &demand.into()).await.expect("demand");
+        let replica = builder.replica_writer::<ImageBuild>(NodeId::new("home"), "test");
+        replica.replace(&demands.list().await.expect("demand snapshot"), Utc::now()).await.expect("replicate demand");
+        let builds = builder.using::<ImageBuild>("test");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while builds.get(&name).await.is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the replicated demand is projected");
+        demands.delete(&name).await.expect("operator retry");
+        replica.replace(&demands.list().await.expect("empty snapshot"), Utc::now()).await.expect("replicate deletion");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while builds.get(&name).await.is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the withdrawn demand's copy is deleted");
+        assert!(!task.is_finished());
+        task.abort();
     }
 
     // Credential and command boundary: minting and staging never run a command.

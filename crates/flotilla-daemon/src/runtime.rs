@@ -1043,15 +1043,7 @@ fn spawn_controller_loops(
                 let backend = projection_backend.clone();
                 let namespace = projection_namespace.clone();
                 let host = projection_host.clone();
-                async move {
-                    let mut interval = tokio::time::interval(Duration::from_secs(1));
-                    loop {
-                        interval.tick().await;
-                        crate::image_build::project_builds(&backend, &namespace, &host).await?;
-                    }
-                    #[allow(unreachable_code)]
-                    Ok(())
-                }
+                async move { crate::image_build::run_build_projection(&backend, &namespace, &host).await }
             })
             .await;
         }));
