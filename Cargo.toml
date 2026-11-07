@@ -1,6 +1,11 @@
 [profile.dev]
 debug = "line-tables-only"
 
+# SQLite's C at full optimisation in debug builds: every test that opens a store runs its DDL and
+# queries through it, about two to three times faster than unoptimised. Dev profile only.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
+
 [workspace]
 members = [
     "crates/flotilla-tracing",
