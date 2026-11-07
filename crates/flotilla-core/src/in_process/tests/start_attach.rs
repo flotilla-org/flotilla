@@ -188,3 +188,42 @@ async fn start_attach_stage_uses_vessel_status() {
         }
     }
 }
+
+// #4300: a cloud vessel is reached only through its live handle. When this
+// host has not adopted one, attach says so and gives the Environment's status
+// message (why adoption has not succeeded), not that the environment has no
+// host binding.
+#[tokio::test]
+async fn attach_to_an_unadopted_cloud_vessel_names_why() {
+    use super::support::{create_running_session, test_meta};
+    use flotilla_resources::{
+        CloudSandboxEnvironmentSpec, CloudSandboxSize, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus,
+    };
+    let (daemon, backend, _temp) = fixture().await;
+    create_identity_convoy(&backend, "convoy-cloud", "coder", Some("flotilla")).await;
+    let environments = backend.using::<Environment>("flotilla");
+    let spec = EnvironmentSpec {
+        provider_address: Some("account:daytona/provider:daytona".parse().unwrap()),
+        cloud_sandbox: Some(CloudSandboxEnvironmentSpec {
+            probe_needs: Default::default(),
+            image: String::new(),
+            image_build_ref: Some("image-composed-amd64".into()),
+            size: CloudSandboxSize { cpus: 1, memory_bytes: 1024, disk_bytes: 1024 },
+            lifetime_cap_seconds: None,
+            env: Default::default(),
+        }),
+        ..Default::default()
+    };
+    let created = environments.create(&test_meta("cloud-env"), &spec).await.unwrap();
+    let status = EnvironmentStatus {
+        phase: EnvironmentPhase::Ready,
+        message: Some("Unknown: adoption failed; will retry: agent unreachable".into()),
+        ..Default::default()
+    };
+    environments.update_status("cloud-env", &created.metadata.resource_version, &status).await.unwrap();
+    create_running_session(&daemon, "cloud-env", "terminal-cloud", "convoy-cloud", "coder").await;
+
+    let error = daemon.resolve_attach_command_internal("convoy-cloud").await.unwrap_err();
+    assert!(error.contains("not adopted on this host"), "{error}");
+    assert!(error.contains("adoption failed; will retry: agent unreachable"), "{error}");
+}

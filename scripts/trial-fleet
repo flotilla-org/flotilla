@@ -3,7 +3,7 @@
 
     scripts/trial-fleet run [--provider-config FILE [--provider NAME] [--image REF | --image-cache FILE]]
                             [--crew scripted|<agent>] [--until provisioned|attached|landed]
-                            [--guest-tools DIR]
+                            [--guest-tools DIR] [--restart-daemon]
 
 Builds flotillad, flotilla, the vessel CLI, drydock-agent and drydock-host
 (debug, in this checkout's target directory), starts one flotillad with its
@@ -29,6 +29,12 @@ delivered through a CredentialSpec and CredentialGrant as on the fleet.
 named one (see image_cache_config): this machine builds it for linux/amd64
 through Docker and pushes it to that registry, as a fleet's builder does, and
 the provider pulls it from there with the cache's pull credential.
+
+--restart-daemon restarts flotillad once the crew is attached, with the vessel
+running, as a roll does (#4300), and checks that the restarted daemon adopts
+the vessel: its Environment reports no adoption failure, the crew reaches the
+daemon through its crew socket again (the path its hooks take), its screen is
+read again, credentials are delivered and attach works.
 
 The guest tools pushed into a vessel are linux-amd64. On another host
 --guest-tools names an installed generation's guest tools
@@ -445,7 +451,12 @@ LEDGER
   rm -f "$ledger"
   echo "flotilla trial crew · submitted"
 fi
-while true; do sleep 1; done
+# The crew's daemon reach, the path its hooks take: one line, rewritten in place.
+while true; do
+  if flotilla crew list >/dev/null 2>&1; then reach=reachable; else reach=unreachable; fi
+  printf '\r\033[Kflotilla trial crew · daemon %s at %s' "$reach" "$(date +%s)"
+  sleep 3
+done
 '''
 
 
@@ -803,6 +814,10 @@ class Trial:
 
     def attached(self):
         self.until('crew session Running', lambda: [name for name, phase in self.phase('terminalsessions') if phase == 'Running'])
+        self.read_crew_screen()
+
+    def read_crew_screen(self):
+        """Attach to the crew and read its screen; the crew's lines on it."""
         # `--json attach` resolves the plan `flotilla attach` would exec; run it
         # under a pseudo-terminal and read the crew's screen through it.
         plan = self.until('attach resolves', lambda: json.loads(self.cli('attach', self.convoy, timeout=30)))
@@ -821,6 +836,46 @@ class Trial:
             raise TrialFailure(f'the crew reports: {failed[-1][-300:]}')
         if self.cache is not None and not [line for line in lines if re.search(r'· gh /', line)]:
             raise TrialFailure(f'the composed image puts no gh on the crew\'s PATH: {lines[-3:]!r}')
+        return lines
+
+    def restart_daemon(self, log):
+        """Stop flotillad with the convoy running and start it again on the same
+        config and state, as a roll or a crash does."""
+        stop(self.daemon)
+        self.daemon = None
+        self.restarted_at = time.time()
+        self.start_daemon(log)
+
+    def adopted(self):
+        """What a restarted daemon owes a running cloud vessel (#4300)."""
+        def environment_adopted():
+            for item in self.objects('environments'):
+                if item['metadata']['name'] not in self.environments:
+                    continue
+                status = item.get('status') or {}
+                if 'adoption failed' in (status.get('message') or ''):
+                    raise TrialFailure(f'environment {item["metadata"]["name"]}: {status["message"]}')
+                if status.get('phase') != 'Ready' or not status.get('ready') or status.get('credential_delivery_retry'):
+                    return None
+            return True
+        self.until('environment adopted, its credentials delivered', environment_adopted)
+
+        def screen_read():
+            for item in self.objects('terminalsessions'):
+                attention = (item.get('status') or {}).get('attention') or {}
+                as_of = attention.get('as_of')
+                if as_of and parse_time(as_of) > self.restarted_at:
+                    return attention
+            return None
+        self.until('crew screen read by the restarted daemon', screen_read)
+
+        def hooks():
+            for line in self.read_crew_screen():
+                found = re.search(r'· daemon (reachable|unreachable) at (\d+)', line)
+                if found and found.group(1) == 'reachable' and int(found.group(2)) > self.restarted_at:
+                    return line
+            return None
+        self.until('crew reaches the restarted daemon through its crew socket, and attach works', hooks)
 
     def landed(self):
         if self.real:
@@ -874,6 +929,12 @@ class Trial:
 
 class Failed(Exception):
     pass
+
+
+def parse_time(text):
+    """Epoch seconds of an RFC 3339 timestamp, as the resources serialize them."""
+    from datetime import datetime
+    return datetime.fromisoformat(text.replace('Z', '+00:00')).timestamp()
 
 
 def plan_argv(plan):
@@ -985,6 +1046,9 @@ def run(args):
             if args.until in ('attached', 'landed'):
                 trial.step('attached', trial.attached)
                 reached = 'attached'
+                if args.restart_daemon:
+                    trial.step('flotillad restarted', lambda: trial.restart_daemon(daemon_log))
+                    trial.step('adopted after the restart', trial.adopted)
             if args.until == 'landed':
                 trial.step('landed', trial.landed)
                 reached = 'landed'
@@ -1104,6 +1168,8 @@ def main(argv=None):
     trial.add_argument('--until', choices=END_POINTS, default='landed')
     trial.add_argument('--timeout', type=int, default=300, help='seconds allowed for each phase (default 300)')
     trial.add_argument('--tools', type=Path, help='installed tools layer providing cleat (default: from cleat on PATH)')
+    trial.add_argument('--restart-daemon', action='store_true',
+                       help='once attached, restart flotillad and check that it adopts the running vessel (#4300)')
     trial.add_argument('--keep', action='store_true', help='leave everything running for inspection instead of tearing down')
     args = parser.parse_args(argv)
     return run(args)

@@ -129,6 +129,8 @@ pub trait AgentClient: Send + Sync {
     /// The current configuration's tag. It changes whenever the configuration
     /// does and whenever the agent restarts.
     async fn configuration_tag(&self) -> io::Result<String>;
+    /// The current configuration, with its tag.
+    async fn configuration(&self) -> io::Result<(Configuration, String)>;
     /// Run to completion, keeping at most `limit` bytes of each stream.
     async fn run(&self, exec: Exec, limit: usize) -> io::Result<Output>;
     /// Run with `input` on stdin, written while output is read. A process may

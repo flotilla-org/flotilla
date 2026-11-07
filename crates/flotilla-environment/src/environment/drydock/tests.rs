@@ -289,3 +289,25 @@ fn a_protocol_error_keeps_the_providers_explanation() {
     assert_eq!(api_error(error), "drydock provider internal: provider daytona operation provision; Total memory limit exceeded");
     assert_eq!(api_error(ApiError::NotReady), "drydock provider not ready");
 }
+
+// #4300: a restarted controller's provider instance adopts the vessel drydock
+// keeps under a label: the same backing, reached through its agent, with no
+// prepare or provision. A label drydock holds no backing for is no vessel to
+// adopt, which the caller reports and retries.
+#[tokio::test]
+async fn adoption_reconnects_to_the_labelled_vessel_without_provisioning() {
+    let fixture = Fixture::new();
+    let provisioning = fixture.provider();
+    let prepared = provisioning.prepare(&spec(), &Default::default()).await.unwrap();
+    let provisioned = provisioning.provision(EnvironmentId::new("crew"), &prepared, Default::default()).await.unwrap();
+    let image = spec().cloud_sandbox.unwrap().image;
+
+    let restarted = fixture.provider();
+    let adopted = restarted.adopt(&EnvironmentId::new("crew"), &image).await.unwrap().expect("the labelled vessel");
+    assert_eq!(adopted.backing_id(), provisioned.backing_id());
+    assert!(!adopted.created_for_setup(), "adoption never grants setup rollback");
+    adopted.agent().ready().await.expect("its agent answers");
+    assert_eq!(fixture.api.prepares.lock().unwrap().len(), 1, "no prepare");
+    assert_eq!(fixture.api.environments.lock().unwrap().len(), 1, "no provision");
+    assert!(restarted.adopt(&EnvironmentId::new("absent"), &image).await.unwrap().is_none());
+}
