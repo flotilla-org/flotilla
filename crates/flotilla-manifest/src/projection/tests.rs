@@ -954,6 +954,7 @@ fn crew_roles_remain_a_flat_fact() {
         command_preview: "codex".to_owned(),
         requested_stance: None,
         effective_stance: None,
+        agent_session: None,
     }];
     let convoy = ConvoyRow::builder()
         .resource(reference)
@@ -2679,6 +2680,7 @@ fn placement_catalog_preserves_raw_facts(tc: hegel::TestCase) {
         session: Some("feta/dev/session-work".into()),
         adapter: Some("codex".into()),
         model: known_model.then(|| "gpt-6.1-sol".into()),
+        agent_session: None,
     }];
     let convoy = ConvoyRow::builder()
         .resource(reference)

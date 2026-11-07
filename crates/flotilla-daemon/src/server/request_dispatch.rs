@@ -740,20 +740,5 @@ pub(super) async fn record_hook_activity(
         AgentEventType::Started | AgentEventType::Ended | AgentEventType::NoChange => return Ok(()),
     };
     let (Some(terminal), Some(cause)) = (event.terminal.as_ref(), event.hook_event.as_ref()) else { return Ok(()) };
-    if !primitives.sessions().needs_observation(&terminal.session_name, activity)? {
-        return Ok(());
-    }
-    // A hook token can outlive its terminal, so first observations still validate
-    // that identity instead of creating orphan records for stale tokens.
-    backend
-        .using::<flotilla_resources::TerminalSession>(&terminal.namespace)
-        .get(&terminal.session_name)
-        .await
-        .map_err(|error| error.to_string())?;
-    let sessions = std::sync::Arc::clone(primitives.sessions());
-    let name = terminal.session_name.clone();
-    let cause = cause.clone();
-    let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
-    tokio::task::spawn_blocking(move || sessions.observe(&name, activity, cause, now)).await.map_err(|error| error.to_string())??;
-    Ok(())
+    crate::agent_attention::record_agent_activity(backend, primitives, &terminal.namespace, &terminal.session_name, activity, cause).await
 }

@@ -56,6 +56,7 @@ pub fn run(
         let aggregator = Aggregator::with_events(state, context.host_name, context.event_sink, context.events)
             .with_attach_resolver_arc(context.attach)
             .with_lifecycle_reads(context.lifecycles)
+            .with_agent_sessions(context.agent_sessions)
             .with_change_request_resolver_arc(context.change_requests)
             .with_issue_resolver_arc(context.issues)
             .with_issue_polling_health(issue_polling)
@@ -100,4 +101,7 @@ pub struct AggregatorContext {
     /// The `[primitives]` Convoy path: rows show the engine's promises when it
     /// holds a convoy (#3587 layer 8). Empty while the switch is off.
     pub convoy_engine: flotilla_resources::convoy::engine::EngineConvoyPath,
+    /// The decided store's AgentSessions, at every home followed (#3108); `NoAgentSessions`
+    /// where none is composed.
+    pub agent_sessions: Arc<dyn ports::AgentSessions>,
 }

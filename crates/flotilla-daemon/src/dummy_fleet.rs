@@ -46,12 +46,18 @@ pub fn attach_dummy_fleet(fleet: &DummyFleet, daemon: &Arc<InProcessDaemon>) -> 
 /// process outlives a daemon restart, forwards to the current daemon's port.
 pub fn daemon_crew_port(daemon: &Arc<InProcessDaemon>) -> Arc<dyn CrewCommandPort> {
     let handle = Arc::clone(daemon) as Arc<dyn DaemonHandle>;
-    Arc::new(DaemonCrewPort { commands: DaemonCommandPort::new(&handle), backend: daemon.resource_backend() })
+    Arc::new(DaemonCrewPort {
+        commands: DaemonCommandPort::new(&handle),
+        backend: daemon.resource_backend(),
+        daemon: Arc::downgrade(daemon),
+    })
 }
 
 struct DaemonCrewPort {
     commands: Arc<DaemonCommandPort>,
     backend: ResourceBackend,
+    // Weak: the daemon holds its fleet, which holds this port.
+    daemon: std::sync::Weak<InProcessDaemon>,
 }
 
 #[async_trait]
@@ -61,10 +67,28 @@ impl CrewCommandPort for DaemonCrewPort {
     }
 
     async fn report_attention(&self, namespace: &str, session: &str, working: bool) -> Result<(), String> {
-        let state = if working { TerminalAttentionState::Working } else { TerminalAttentionState::Idle };
+        use flotilla_state_machines::machines::agent_session::Activity;
+        let (state, activity, cause) = if working {
+            (TerminalAttentionState::Working, Activity::Working, DUMMY_WORKING_CAUSE)
+        } else {
+            (TerminalAttentionState::Idle, Activity::Idle, DUMMY_IDLE_CAUSE)
+        };
+        if let Some(primitives) = self.daemon.upgrade().and_then(|daemon| daemon.message_primitives()) {
+            if let Err(error) =
+                crate::agent_attention::record_agent_activity(&self.backend, &primitives, namespace, session, activity, cause).await
+            {
+                // As for a harness hook: the AgentSession is an additional observer.
+                warn!(%session, %error, "failed to record dummy crew activity");
+            }
+        }
         crate::agent_attention::observe_hook_attention(&self.backend, namespace, session, state, false).await
     }
 }
+
+/// The causes a dummy crew's reports carry on its AgentSession, in place of a harness's native
+/// hook event names.
+const DUMMY_WORKING_CAUSE: &str = "dummy-working";
+const DUMMY_IDLE_CAUSE: &str = "dummy-idle";
 
 /// Every repository on the dummy forge has the default branch `main`.
 pub(crate) fn dummy_forge_default_branches(config: Option<&DummyFleetConfig>) -> Option<Arc<dyn ForgeDefaultBranchResolver>> {

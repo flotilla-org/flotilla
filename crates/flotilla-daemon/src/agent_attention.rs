@@ -1,6 +1,7 @@
 //! Crew attention reported by harness hooks, recorded on the crew's
-//! TerminalSession. Shared by the agent-hook socket request and by in-process
-//! harnesses (the dummy fleet's crews) that report the same events.
+//! TerminalSession and its activity on the crew's AgentSession. Shared by the
+//! agent-hook socket request and by in-process harnesses (the dummy fleet's
+//! crews) that report the same events.
 
 use flotilla_resources::{TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionStatusPatch};
 use flotilla_store::ResourceBackend;
@@ -29,6 +30,31 @@ pub(crate) async fn observe_hook_attention(
         TerminalSessionStatusPatch::ObserveAttention { attention }
     };
     flotilla_store::apply_status_patch(&sessions, session_name, &patch).await.map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Record a hook's activity on the crew's AgentSession, named by its TerminalSession record,
+/// only when it changes: duplicate hooks stay off the store and the blocking pool. The
+/// machine's gate remains authoritative across races.
+pub(crate) async fn record_agent_activity(
+    backend: &ResourceBackend,
+    primitives: &flotilla_core::primitives::MessagePrimitives,
+    namespace: &str,
+    session_name: &str,
+    activity: flotilla_state_machines::machines::agent_session::Activity,
+    cause: &str,
+) -> Result<(), String> {
+    if !primitives.sessions().needs_observation(session_name, activity)? {
+        return Ok(());
+    }
+    // A hook token can outlive its terminal, so first observations still validate
+    // that identity instead of creating orphan records for stale tokens.
+    backend.using::<TerminalSession>(namespace).get(session_name).await.map_err(|error| error.to_string())?;
+    let sessions = std::sync::Arc::clone(primitives.sessions());
+    let name = session_name.to_owned();
+    let cause = cause.to_owned();
+    let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
+    tokio::task::spawn_blocking(move || sessions.observe(&name, activity, cause, now)).await.map_err(|error| error.to_string())??;
     Ok(())
 }
 

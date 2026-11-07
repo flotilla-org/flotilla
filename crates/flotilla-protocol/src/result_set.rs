@@ -1383,6 +1383,43 @@ pub struct CrewMemberSummary {
     pub requested_stance: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_stance: Option<String>,
+    /// The member's AgentSession as its home's engine log holds it (#3108), joined by the
+    /// TerminalSession's record name; absent while no such record is held here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session: Option<AgentSessionReading>,
+}
+
+/// An AgentSession's lifecycle and latest activity, as recorded at its home.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
+pub struct AgentSessionReading {
+    /// How the session ended; absent while it is live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<AgentSessionEnd>,
+    /// The latest activity recorded; absent until one is observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<AgentActivity>,
+    /// When the recorded activity began: the record changes only when the activity does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_since: Option<Timestamp>,
+    /// What reported it: a harness's native event, or `screen`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_cause: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionEnd {
+    Completed,
+    Lost,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, flotilla_schema::Describe)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentActivity {
+    Working,
+    NeedsInput,
+    Idle,
+    Interrupted,
 }
 
 #[cfg(test)]

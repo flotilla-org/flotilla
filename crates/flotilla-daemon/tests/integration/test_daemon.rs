@@ -10,7 +10,7 @@ use flotilla_dummy_fleet::{
 use flotilla_protocol::{
     commands::{AttachMode, CommandValue},
     table::Row,
-    CommandAction, QueryId, ResultSet,
+    AgentActivity, AgentSessionReading, CommandAction, QueryId, ResultSet,
 };
 use flotilla_resources::{Convoy, ConvoyPhase, ResourceObject};
 
@@ -98,6 +98,51 @@ async fn a_lost_environment_withdraws_its_sessions_attach() {
     let CommandValue::Error { message } = &refused else { panic!("attach to {session} on a lost environment: {refused:?}") };
     assert!(message.contains(&lost), "{message}");
     daemon.wait_query(QueryId::Convoys { scope: None }, |set| vessel_row(set).is_some_and(|vessel| vessel.materialize.is_none())).await;
+}
+
+// A crew member's row shows its AgentSession as the decided store holds it (#3108), joined by
+// the TerminalSession's record name. The crew reports working, then idle once its work is
+// done, as a harness's hooks do; each is written after the view began following the store, so
+// the row reaching it shows the view woke on the store's commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crew_members_row_follows_its_agent_session() {
+    let daemon = TestDaemon::builder().start().await;
+    let convoy = daemon.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    let reading = |set: &ResultSet| -> Option<AgentSessionReading> {
+        let row = set.rows.as_convoys()?.iter().find(|row| row.resource.name == convoy)?;
+        row.vessels.iter().flat_map(|vessel| &vessel.crew).find_map(|crew| crew.agent_session.clone())
+    };
+    let activity = |set: &ResultSet, activity: AgentActivity| reading(set).is_some_and(|reading| reading.activity == Some(activity));
+    let working = daemon.wait_query(QueryId::Convoys { scope: None }, |set| activity(set, AgentActivity::Working)).await;
+    let working = reading(&working).expect("working reading");
+    assert_eq!(working.ended, None, "{working:?}");
+    assert_eq!(working.activity_cause.as_deref(), Some("dummy-working"), "{working:?}");
+    let idle = daemon.wait_query(QueryId::Convoys { scope: None }, |set| activity(set, AgentActivity::Idle)).await;
+    let idle = reading(&idle).expect("idle reading");
+    assert_eq!(idle.activity_cause.as_deref(), Some("dummy-idle"), "{idle:?}");
+    assert!(idle.activity_since > working.activity_since, "{working:?} then {idle:?}");
+}
+
+// Another home's crew shows its AgentSession here too: the session is written at its home, and
+// this daemon reads the replica its decided store follows from that home's log, joined to the
+// replicated TerminalSession by home and record name. A stalled crew waits idle for guidance, so
+// its reading holds still while the peers connect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crew_members_row_shows_its_agent_session_at_another_home() {
+    let (a, b) = tokio::join!(
+        TestDaemon::builder().agent("stall_rate = 1.0").settings("host_name = \"agents-a\"\n").start(),
+        TestDaemon::builder().agent("stall_rate = 1.0").settings("host_name = \"agents-b\"\n").start()
+    );
+    let convoy = a.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    let reading = |set: &ResultSet| -> Option<AgentSessionReading> {
+        let row = set.rows.as_convoys()?.iter().find(|row| row.resource.name == convoy)?;
+        row.vessels.iter().flat_map(|vessel| &vessel.crew).find_map(|crew| crew.agent_session.clone())
+    };
+    let idle = |set: &ResultSet| reading(set).is_some_and(|reading| reading.activity == Some(AgentActivity::Idle));
+    let at_home = reading(&a.wait_query(QueryId::Convoys { scope: None }, idle).await).expect("reading at its home");
+    let _peering = TestDaemon::peer(&a, &b).await;
+    let elsewhere = b.wait_query(QueryId::Convoys { scope: None }, |set| reading(set).is_some_and(|reading| reading == at_home)).await;
+    assert_eq!(reading(&elsewhere), Some(at_home));
 }
 
 // A restarted daemon finds its running vessels again: the vendor's backings and

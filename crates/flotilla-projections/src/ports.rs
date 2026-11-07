@@ -17,3 +17,51 @@ pub struct ResolvedAttach {
 }
 
 pub use flotilla_resources::lifecycle_reads::{LateLifecycleReads, LifecycleReads, NoLifecycleReads, ProvisioningKind};
+
+use flotilla_protocol::{AgentSessionReading, NodeId};
+use futures::stream::BoxStream;
+
+/// An AgentSession's identity: its home, and its name, which is the name of the
+/// TerminalSession record it runs in.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AgentSessionKey {
+    pub home: NodeId,
+    pub name: String,
+}
+
+/// What changed among the AgentSessions the store holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentSessionUpdate {
+    /// These sessions were written: each with its reading now, or `None` once it is gone.
+    Changed(Vec<(AgentSessionKey, Option<AgentSessionReading>)>),
+    /// Every session held for `home` now, replacing what was held for it.
+    Home { home: NodeId, sessions: Vec<(String, AgentSessionReading)> },
+}
+
+/// The AgentSessions held when following began, and every update after them.
+pub struct AgentSessionFollow {
+    /// The home the store writes; this daemon's own sessions carry it.
+    pub home: NodeId,
+    pub held: Vec<(AgentSessionKey, AgentSessionReading)>,
+    pub updates: BoxStream<'static, AgentSessionUpdate>,
+}
+
+/// The AgentSessions in the local decided store (#3108): this home's, and the replicas of
+/// every followed home's. Updates arrive as the store commits, local writes and other homes'
+/// entries alike; no timer reads them.
+#[async_trait]
+pub trait AgentSessions: Send + Sync {
+    /// Starts following before reading what is held, so no write between the two is missed.
+    /// Unavailable where no decided store is composed.
+    async fn follow(&self) -> Result<AgentSessionFollow, String>;
+}
+
+/// No decided store: no crew member shows an AgentSession.
+pub struct NoAgentSessions;
+
+#[async_trait]
+impl AgentSessions for NoAgentSessions {
+    async fn follow(&self) -> Result<AgentSessionFollow, String> {
+        Err("AgentSessions are not served without the decided store".into())
+    }
+}

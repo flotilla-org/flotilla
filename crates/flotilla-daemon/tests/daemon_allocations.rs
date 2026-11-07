@@ -117,6 +117,7 @@ async fn memory_scenario(n: usize) -> Vec<(usize, usize, usize, usize)> {
                 issues: aggregate_daemon.clone(),
                 lifecycles: aggregate_daemon.lifecycle_reads(),
                 convoy_engine: aggregate_daemon.convoy_engine_path(),
+                agent_sessions: aggregate_daemon.clone(),
             },
             "flotilla",
             aggregate_state,

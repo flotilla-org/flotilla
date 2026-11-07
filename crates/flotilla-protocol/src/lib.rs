@@ -313,11 +313,11 @@ pub use query::{
 pub use repository::{RepositoryRelation, RepositoryUpstream};
 pub use resource_ref::ResourceRef;
 pub use result_set::{
-    AwarenessCounts, AwarenessEntry, AwarenessFamily, AwarenessFamilySummary, AwarenessGrouping, AwarenessKind, AwarenessLimit,
-    AwarenessLink, AwarenessNode, AwarenessPhase, AwarenessState, CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow,
-    CrewMemberSummary, DemandBackedMetadata, IndependentRow, IssueRow, ProjectRepositoriesRow, ProjectRepositoryMembership, QueryChanges,
-    QueryId, QueryScope, ResultDelta, ResultSet, ResultSetCondition, ResultSetState, Rows, Salience, SessionPhase, StandingRoleHold,
-    StandingRoleRow, VesselRow, WorkPhase,
+    AgentActivity, AgentSessionEnd, AgentSessionReading, AwarenessCounts, AwarenessEntry, AwarenessFamily, AwarenessFamilySummary,
+    AwarenessGrouping, AwarenessKind, AwarenessLimit, AwarenessLink, AwarenessNode, AwarenessPhase, AwarenessState, CheckoutRow,
+    ConvoyChangeRequest, ConvoyPhase, ConvoyRow, CrewMemberSummary, DemandBackedMetadata, IndependentRow, IssueRow, ProjectRepositoriesRow,
+    ProjectRepositoryMembership, QueryChanges, QueryId, QueryScope, ResultDelta, ResultSet, ResultSetCondition, ResultSetState, Rows,
+    Salience, SessionPhase, StandingRoleHold, StandingRoleRow, VesselRow, WorkPhase,
 };
 use serde::{Deserialize, Serialize};
 

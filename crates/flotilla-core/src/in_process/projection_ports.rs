@@ -157,3 +157,129 @@ impl flotilla_projections::read_projections::MessageReceiverRead for MessageRece
         self.1.as_deref()
     }
 }
+
+/// The decided store's AgentSessions (#3108): this home's and every followed home's replicas,
+/// followed through the store's commits.
+#[async_trait]
+impl flotilla_projections::ports::AgentSessions for InProcessDaemon {
+    async fn follow(&self) -> Result<flotilla_projections::ports::AgentSessionFollow, String> {
+        agent_sessions::follow(self.decided_store()?).await
+    }
+}
+
+mod agent_sessions {
+    use std::sync::Arc;
+
+    use flotilla_engine_store::follow::Followed;
+    use flotilla_projections::ports::{AgentSessionFollow, AgentSessionKey, AgentSessionUpdate};
+    use flotilla_protocol::{AgentActivity, AgentSessionEnd, AgentSessionReading, NodeId};
+    use flotilla_provisioning::engine::watch::EngineWatch;
+    use flotilla_schema::Kind as StoredKind;
+    use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
+    use flotilla_state_machines::{
+        machines::agent_session::{Activity, AgentSession, EndReason},
+        Resource,
+    };
+    use futures::StreamExt;
+
+    const CODE: flotilla_schema::KindCode = <Resource<AgentSession> as StoredKind>::CODE;
+
+    pub(super) async fn follow(service: Arc<Service>) -> Result<AgentSessionFollow, String> {
+        let home = NodeId::new(service.home());
+        // Started first: a write landing before the read below still reaches the stream.
+        let watch = EngineWatch::start(Arc::clone(&service), [CODE]).map_err(|error| error.to_string())?;
+        let homes = service.homes();
+        let held = watch
+            .read(move |read| {
+                let mut held = Vec::new();
+                for home in homes {
+                    held.extend(
+                        scan(read, &home)?.into_iter().map(|(name, reading)| (AgentSessionKey { home: NodeId::new(&home), name }, reading)),
+                    );
+                }
+                Ok(held)
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let updates = futures::stream::unfold(watch, |mut watch| async move {
+            loop {
+                // A pass that fails is tried again at the next commit.
+                match watch.next(updates).await {
+                    Ok(updates) if !updates.is_empty() => return Some((futures::stream::iter(updates), watch)),
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%error, "the AgentSession follow could not read the log; retrying"),
+                }
+            }
+        })
+        .flatten()
+        .boxed();
+        Ok(AgentSessionFollow { home, held, updates })
+    }
+
+    /// What one pass over the log found, in log order: written sessions as they are now, and
+    /// a home's whole set where it must be reread.
+    fn updates(read: &mut Read<'_>, followed: Vec<Followed>) -> Result<Vec<AgentSessionUpdate>, StoreError> {
+        let mut updates = Vec::new();
+        let mut changed = Vec::new();
+        for followed in followed {
+            match followed {
+                Followed::Changed(identity) => {
+                    let reading = load(read, &identity.name, &identity.home)?;
+                    changed.push((AgentSessionKey { home: NodeId::new(&identity.home), name: identity.name }, reading));
+                }
+                Followed::Rescan(home) => {
+                    if !changed.is_empty() {
+                        updates.push(AgentSessionUpdate::Changed(std::mem::take(&mut changed)));
+                    }
+                    let sessions = scan(read, &home)?;
+                    updates.push(AgentSessionUpdate::Home { home: NodeId::new(&home), sessions });
+                }
+            }
+        }
+        if !changed.is_empty() {
+            updates.push(AgentSessionUpdate::Changed(changed));
+        }
+        Ok(updates)
+    }
+
+    fn load(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<AgentSessionReading>, StoreError> {
+        let Some(id) = read.resolve(CODE, name, home)? else { return Ok(None) };
+        Ok(read.load::<Resource<AgentSession>>(id)?.map(|loaded| reading(&loaded.value)))
+    }
+
+    fn scan(read: &mut Read<'_>, home: &str) -> Result<Vec<(String, AgentSessionReading)>, StoreError> {
+        let mut sessions = Vec::new();
+        let mut after = None;
+        loop {
+            let page = read.scan::<Resource<AgentSession>>(home, after, 64)?;
+            for id in page.ids {
+                if let Some(loaded) = read.load::<Resource<AgentSession>>(id)? {
+                    sessions.push((loaded.value.name().to_owned(), reading(&loaded.value)));
+                }
+            }
+            after = page.next;
+            if after.is_none() {
+                return Ok(sessions);
+            }
+        }
+    }
+
+    fn reading(session: &Resource<AgentSession>) -> AgentSessionReading {
+        let state = session.state();
+        let observation = state.observation();
+        AgentSessionReading {
+            ended: state.end_reason().map(|reason| match reason {
+                EndReason::Completed => AgentSessionEnd::Completed,
+                EndReason::Lost => AgentSessionEnd::Lost,
+            }),
+            activity: observation.as_ref().map(|observation| match observation.activity {
+                Activity::Working => AgentActivity::Working,
+                Activity::NeedsInput => AgentActivity::NeedsInput,
+                Activity::Idle => AgentActivity::Idle,
+                Activity::Interrupted => AgentActivity::Interrupted,
+            }),
+            activity_since: observation.as_ref().and_then(|observation| observation.activity_since.to_datetime()),
+            activity_cause: observation.map(|observation| observation.activity_cause),
+        }
+    }
+}

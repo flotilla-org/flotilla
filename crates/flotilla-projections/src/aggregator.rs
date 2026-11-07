@@ -13,6 +13,7 @@ use std::{
 
 use crate::{
     aggregator_projection::AggregatorProjectionState,
+    ports::{AgentSessionKey, AgentSessionUpdate},
     salience::{AttentionFact, RaisedFact, SalienceFacts},
     terminal_health,
 };
@@ -271,6 +272,14 @@ pub struct Aggregator {
     change_request_refresh_queue: ChangeRequestRefreshQueue,
     #[builder(skip)]
     issue_materializer: Option<IssueMaterializer>,
+    /// The decided store's AgentSessions (#3108), joined to crew members by record name.
+    #[builder(skip = Arc::new(crate::ports::NoAgentSessions))]
+    agent_session_port: Arc<dyn crate::ports::AgentSessions>,
+    #[builder(skip)]
+    agent_sessions: HashMap<AgentSessionKey, flotilla_protocol::AgentSessionReading>,
+    /// The home this daemon's own sessions carry, once following has begun.
+    #[builder(skip)]
+    agent_session_home: Option<flotilla_protocol::NodeId>,
     event_sink: Arc<dyn EventSink>,
     event_rx: broadcast::Receiver<DaemonEvent>,
 }
@@ -377,9 +386,18 @@ impl Aggregator {
             change_request_retriggers: HashSet::new(),
             change_request_refresh_queue: ChangeRequestRefreshQueue::default(),
             issue_materializer: None,
+            agent_session_port: Arc::new(crate::ports::NoAgentSessions),
+            agent_sessions: HashMap::new(),
+            agent_session_home: None,
             event_sink,
             event_rx,
         }
+    }
+
+    /// Crew members show their AgentSessions, read from the decided store through `port`.
+    pub fn with_agent_sessions(mut self, port: Arc<dyn crate::ports::AgentSessions>) -> Self {
+        self.agent_session_port = port;
+        self
     }
 
     /// Read engine-held provisioning resources through `reads` (#3629 layer 4).
@@ -546,6 +564,18 @@ impl Aggregator {
         self.replace_hosts(items);
         // The engine's checkout commits, at every home, wake readiness (#3108).
         let mut checkout_changes = self.lifecycle_reads.checkouts().ok().map(|checkouts| checkouts.changes());
+        // AgentSessions are the engine's, at every home: followed from the decided store (#3108).
+        let mut agent_session_updates = match self.agent_session_port.follow().await {
+            Ok(follow) => {
+                self.agent_session_home = Some(follow.home);
+                self.agent_sessions = follow.held.into_iter().collect();
+                Some(follow.updates)
+            }
+            Err(error) => {
+                debug!(%error, "crew members show no AgentSessions");
+                None
+            }
+        };
         self.refresh_origin_hosts().await;
         self.rebuild_local_projection().await;
         self.bootstrapping = false;
@@ -622,7 +652,20 @@ impl Aggregator {
                     None => futures::future::pending().await,
                 }
             };
+            let agent_session_update = async {
+                match agent_session_updates.as_mut() {
+                    Some(updates) => updates.next().await,
+                    None => futures::future::pending().await,
+                }
+            };
             tokio::select! {
+                update = agent_session_update => match update {
+                    Some(update) => self.agent_sessions_changed(update).await,
+                    None => {
+                        tracing::warn!("the AgentSession follow ended; crew members keep the last readings");
+                        agent_session_updates = None;
+                    }
+                },
                 change = attention_change => match change {
                     Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => self.refresh_attentions().await,
                     Err(broadcast::error::RecvError::Closed) => attention_changes = None,
@@ -1778,6 +1821,67 @@ impl Aggregator {
         self.rebuild_local_projection().await;
     }
 
+    /// AgentSessions changed in the decided store: the convoys whose crew run in them are
+    /// projected again; a home reread projects every convoy.
+    async fn agent_sessions_changed(&mut self, update: AgentSessionUpdate) {
+        match update {
+            AgentSessionUpdate::Changed(sessions) => {
+                let mut changed = Vec::new();
+                for (key, reading) in sessions {
+                    let differs = match reading {
+                        Some(reading) => self.agent_sessions.insert(key.clone(), reading.clone()).as_ref() != Some(&reading),
+                        None => self.agent_sessions.remove(&key).is_some(),
+                    };
+                    if differs {
+                        changed.push(key);
+                    }
+                }
+                let keys: Vec<ConvoyKey> = changed.iter().flat_map(|key| self.convoys_running_in(key)).collect();
+                if !keys.is_empty() {
+                    self.projection_keys.extend(keys);
+                    self.schedule_local_projection().await;
+                }
+            }
+            AgentSessionUpdate::Home { home, sessions } => {
+                let held: HashMap<_, _> =
+                    sessions.into_iter().map(|(name, reading)| (AgentSessionKey { home: home.clone(), name }, reading)).collect();
+                let previous: HashMap<_, _> = self.agent_sessions.extract_if(|key, _| key.home == home).collect();
+                let changed = previous != held;
+                self.agent_sessions.extend(held);
+                if changed {
+                    self.rebuild_local_projection().await;
+                }
+            }
+        }
+    }
+
+    /// The convoys with a crew member running in the TerminalSession that `key` names.
+    fn convoys_running_in(&self, key: &AgentSessionKey) -> Vec<ConvoyKey> {
+        self.terminal_sessions
+            .values()
+            .filter(|session| session.object.metadata.name == key.name && self.agent_session_home_of(session).as_ref() == Some(&key.home))
+            .filter_map(|session| {
+                Some((session.object.metadata.namespace.clone(), session.object.metadata.labels.get(CONVOY_LABEL)?.clone()))
+            })
+            .flat_map(|convoy| self.convoy_keys_by_name.get(&convoy).into_iter().flatten().cloned())
+            .collect()
+    }
+
+    /// The home whose AgentSession a crew in `session` records on: the session's own home.
+    fn agent_session_home_of(&self, session: &ReadResourceObject<TerminalSession>) -> Option<flotilla_protocol::NodeId> {
+        match &session.provenance {
+            ResourceProvenance::Local => self.agent_session_home.clone(),
+            ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.clone()),
+        }
+    }
+
+    /// The AgentSession of the crew member running in `session`: the one its home holds under
+    /// the TerminalSession record's name.
+    fn agent_session_of(&self, session: &ReadResourceObject<TerminalSession>) -> Option<&flotilla_protocol::AgentSessionReading> {
+        let home = self.agent_session_home_of(session)?;
+        self.agent_sessions.get(&AgentSessionKey { home, name: session.object.metadata.name.clone() })
+    }
+
     /// An environment's engine record changed, or any of them may have (`None` or a rescan):
     /// sessions in it are attachable afresh.
     async fn environment_changed(&mut self, change: Option<EnvironmentChange>) {
@@ -2877,6 +2981,7 @@ impl Aggregator {
                     command_preview,
                     requested_stance: requested_stance.clone(),
                     effective_stance: effective_stance.clone(),
+                    agent_session: session.and_then(|session| self.agent_session_of(session)).cloned(),
                 }
             })
             .collect();
