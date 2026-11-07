@@ -2,7 +2,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
-use flotilla_protocol::{CanonicalHostId, LifecycleReading};
+use flotilla_protocol::CanonicalHostId;
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads};
 use flotilla_resources::{
     Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureStatusPatch, ConvoyProvisioningState, ReadResourceObject, ResourceObject,
@@ -145,8 +145,9 @@ impl StandingConvoyBackingInspector for ResourceStandingConvoyBackingInspector {
         }
         let not_dead = environments
             .into_iter()
-            // Lost or a failed backing is not positive teardown evidence; exhaustion is not yet GiveUp.
-            .filter(|environment| !matches!(environment.reading, LifecycleReading::GaveUp { .. } | LifecycleReading::Released))
+            // An ended environment is dead: released, given up, or observed gone (Lost, or Failed
+            // when its home said why). Exhaustion is not yet GiveUp.
+            .filter(|environment| !environment.ended())
             .map(|environment| format!("Environment/{} is {}", environment.name, environment.reading.label()))
             .collect::<Vec<_>>();
         if not_dead.is_empty() {
@@ -166,10 +167,10 @@ mod tests {
     };
     use flotilla_store::ResourceBackend;
 
-    // Teardown accepts an engine release or give-up, but Lost is not positive teardown evidence.
+    // Teardown accepts any ended environment: a release, a give-up, or one observed gone.
     #[tokio::test]
     async fn backing_inspection_reads_the_engine_without_a_status_copy() {
-        for ending in [Ending::Lost("/work"), Ending::Released, Ending::GaveUp("失敗")] {
+        for ending in [Ending::Lost("/work"), Ending::Failed("container is not running"), Ending::Released, Ending::GaveUp("失敗")] {
             let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
             let convoys = backend.using::<ResourceConvoy>("flotilla");
             let created = convoys
@@ -196,7 +197,7 @@ mod tests {
             fixture.request("env", &spec, Some(&flotilla_resources::vessel_resource_name("convoy", "work")));
             assert!(inspector.verify_backing_dead(&convoy).await.is_err());
             fixture.finish("env", ending);
-            assert_eq!(inspector.verify_backing_dead(&convoy).await.is_ok(), !matches!(ending, Ending::Lost(_)));
+            assert!(inspector.verify_backing_dead(&convoy).await.is_ok(), "an ended environment is verified dead");
             fixture.poison();
             assert!(inspector.verify_backing_dead(&convoy).await.expect_err("read error").contains("poisoned"));
         }
