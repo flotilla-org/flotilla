@@ -71,8 +71,8 @@ fn a_store_whose_receiver_kinds_predate_the_person_consumer_is_widened_at_open()
     use flotilla_schema_sqlite::{Store, StoreError};
     let current = schema_ddl(&registry().expect("registry"), DdlMode::IfNotExists);
     let previous = current.replace(
-        r#""receiver_kind" TEXT CHECK ("receiver_kind" IN ('as', 'co', 'pe'))"#,
-        r#""receiver_kind" TEXT CHECK ("receiver_kind" IN ('as', 'co'))"#,
+        r#""receiver_kind" TEXT CHECK ("receiver_kind" IN ('as', 'pe', 'sv'))"#,
+        r#""receiver_kind" TEXT CHECK ("receiver_kind" IN ('as', 'sv'))"#,
     );
     assert_ne!(previous, current, "the previous generation's CHECK is reconstructed");
     let connection = rusqlite::Connection::open_in_memory().expect("connection");
@@ -82,9 +82,9 @@ fn a_store_whose_receiver_kinds_predate_the_person_consumer_is_widened_at_open()
         .into_connection()
         .query_row("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'message'", [], |row| row.get(0))
         .expect("message table");
-    assert!(sql.contains(r#"CHECK ("receiver_kind" IN ('as', 'co', 'pe'))"#), "widened to the Person consumer: {sql}");
+    assert!(sql.contains(r#"CHECK ("receiver_kind" IN ('as', 'pe', 'sv'))"#), "widened to the Person consumer: {sql}");
     // A CHECK that cannot be read fails closed rather than passing as current.
-    let unchecked = current.replace(r#""receiver_kind" TEXT CHECK ("receiver_kind" IN ('as', 'co', 'pe'))"#, r#""receiver_kind" TEXT"#);
+    let unchecked = current.replace(r#""receiver_kind" TEXT CHECK ("receiver_kind" IN ('as', 'pe', 'sv'))"#, r#""receiver_kind" TEXT"#);
     let connection = rusqlite::Connection::open_in_memory().expect("connection");
     connection.execute_batch(&unchecked).expect("unchecked schema");
     match Store::open(connection, "home", registry().expect("registry")) {

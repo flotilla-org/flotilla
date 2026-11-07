@@ -24,9 +24,8 @@ pub enum ConsumerKind {
     /// An agent conversation (`AgentSession`).
     #[store(code = "as")]
     AgentSession,
-    /// Daemon code that takes messages, through its own resource (`Service`). The code predates
-    /// the name: stored messages name their receivers by it.
-    #[store(code = "co")]
+    /// Daemon code that takes messages, through its own resource (`Service`).
+    #[store(code = "sv")]
     Service,
     /// A person, through their own resource (`Person`).
     #[store(code = "pe")]

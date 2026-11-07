@@ -37,7 +37,7 @@ fn narrowed(kinds: KindRegistry, without: &[(&str, &str, &str)]) -> KindRegistry
 
 /// The engine registry before the Service consumer and the Dependency relation.
 fn registry_without_services() -> KindRegistry {
-    narrowed(registry().expect("registry"), &[("message", "receiver_kind", "co"), ("message", "relation", "dy")])
+    narrowed(registry().expect("registry"), &[("message", "receiver_kind", "sv"), ("message", "relation", "dy")])
 }
 
 fn message(id: &str, kind: ConsumerKind, relation: Relation) -> Resource<Message> {
@@ -81,7 +81,7 @@ fn a_store_with_fewer_codes_opens_wider_and_keeps_its_rows() {
             (id, old.read().expect("read").load::<Resource<Message>>(id).expect("load").expect("stored").value)
         })
         .collect();
-    assert!(insert(&mut old, &message("early", ConsumerKind::Service, Relation::System)).is_err(), "the old table refuses `co`");
+    assert!(insert(&mut old, &message("early", ConsumerKind::Service, Relation::System)).is_err(), "the old table refuses `sv`");
     let conn = old.into_connection();
     let (messages, references) = (count(&conn, "message"), count(&conn, "message_references"));
     assert_eq!((messages, references), (2, 2));
@@ -119,10 +119,10 @@ fn a_store_with_a_removed_code_is_refused() {
     let mut store = Store::open(Connection::open_in_memory().expect("SQLite"), HOME, registry().expect("registry")).expect("store");
     insert(&mut store, &message("service", ConsumerKind::Service, Relation::System)).expect("service message");
     let refused =
-        Store::open(store.into_connection(), HOME, narrowed(registry().expect("registry"), &[("message", "receiver_kind", "co")]));
+        Store::open(store.into_connection(), HOME, narrowed(registry().expect("registry"), &[("message", "receiver_kind", "sv")]));
     assert!(
         matches!(&refused, Err(StoreError::KindCodeRemoved { table, column, removed })
-            if table == "message" && column == "receiver_kind" && removed == &["co"]),
+            if table == "message" && column == "receiver_kind" && removed == &["sv"]),
         "{:?}",
         refused.err()
     );
