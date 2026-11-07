@@ -75,10 +75,7 @@ impl Default for CheckoutFixture {
 impl CheckoutFixture {
     /// A fixture whose checkouts are homed at `home`.
     pub fn at(home: &str) -> Self {
-        let registry = flotilla_provisioning::stored::production_kinds().expect("registry");
-        let store =
-            Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().expect("memory"), home, registry).expect("store")));
-        Self::over(home, store)
+        Self::over(home, Arc::new(Mutex::new(crate::memory_store(home))))
     }
 
     /// A fixture over `store`, whose home is `home`.

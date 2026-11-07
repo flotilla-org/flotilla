@@ -3,10 +3,12 @@ pub mod checkouts;
 pub mod clones;
 pub mod environments;
 pub mod image_build;
+mod memory_store;
 pub mod other_home;
 pub use checkouts::CheckoutFixture;
 pub use clones::CloneFixture;
 pub use environments::EnvironmentFixture;
+pub use memory_store::memory_store;
 pub use other_home::{other_home_for, put_host_at_its_home, put_host_at_its_home_heard, replicate_home, replicate_home_at, OtherHome};
 use std::sync::{Arc, Mutex};
 
@@ -93,9 +95,7 @@ where
     StoreLog: Log<Lifecycle<B::Kind>>,
 {
     pub fn new(replica: bool) -> Self {
-        let registry = flotilla_provisioning::stored::production_kinds().expect("registry");
-        let store =
-            Arc::new(Mutex::new(Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", registry).expect("store")));
+        let store = Arc::new(Mutex::new(memory_store("home")));
         let home = Arc::new(LifecycleHome::new("home", Home::with_log("home", StoreLog::new(Arc::clone(&store))).expect("home")));
         let environments = EnvironmentFixture::over("home", Arc::clone(&store));
         let clones = CloneFixture::over("home", Arc::clone(&store));

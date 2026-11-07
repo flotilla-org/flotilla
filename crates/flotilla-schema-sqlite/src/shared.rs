@@ -1,10 +1,13 @@
 //! The shared tables every kind's tables reference.
 
-use std::collections::BTreeSet;
+use std::{
+    collections::{BTreeSet, HashMap},
+    fmt::Write as _,
+};
 
 use crate::{quote_ident, render_ddl_with, render_views, DdlMode, StoreError, CODES_DDL, LOG_EDGE_FIELD, LOG_LABEL_FIELD};
 use flotilla_schema::{ColumnDef, ColumnType, KindRegistry, Table, TableSet};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
 /// `strings` interns names and interned columns; `resource_identity` holds every resource's
 /// (kind, name, home), with homes filtered through `resource_identity_by_home`, and its `seq`:
@@ -277,9 +280,16 @@ pub(crate) const SEQUENCE_RAISE: &str =
 pub(crate) const OBJECT_EXISTS: &str = "SELECT 1 FROM objects WHERE hash = ?1";
 pub(crate) const SEQUENCE_LAST: &str = "SELECT last FROM home_sequence WHERE home = ?1";
 pub(crate) const OBJECT_BYTES: &str = "SELECT bytes FROM objects WHERE hash = ?1";
-/// Read once per view on open, outside the runtime's statements: it reads the schema table, which
-/// has no index to search by key.
-pub(crate) const VIEW_SQL: &str = "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?1";
+/// Every stored statement of one type of schema object, by name. Read once on open, outside the
+/// runtime's statements: the schema table has no index to search by name, so reading it once is
+/// one scan where a read per object would be one each.
+const SCHEMA_SQL: &str = "SELECT name, sql FROM sqlite_schema WHERE type = ?1";
+
+fn stored_schema(conn: &Connection, kind: &str) -> rusqlite::Result<HashMap<String, String>> {
+    let mut statement = conn.prepare(SCHEMA_SQL)?;
+    let rows = statement.query_map([kind], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect()
+}
 
 /// The whole schema a store with these kinds holds: shared tables and `codes`, then each kind in
 /// code order, with its `codes` rows and readable views, then the readable `log_view`. Like the
@@ -315,11 +325,16 @@ pub(crate) fn render_schema(kinds: &KindRegistry, mode: DdlMode, shared: &str, l
 /// connections re-prepare on.
 pub(crate) fn sync_views(conn: &Connection, kinds: &KindRegistry) -> rusqlite::Result<()> {
     let log = (LOG_VIEW.to_owned(), log_view());
+    // Each view is compared, and replaced, once, so the statements read before any is replaced hold.
+    let stored = stored_schema(conn, "view")?;
+    let mut replace = String::new();
     for (name, sql) in kinds.iter().flat_map(render_views).chain([log]).chain(progress_views()) {
-        let stored: Option<String> = conn.query_row(VIEW_SQL, [&name], |row| row.get(0)).optional()?;
-        if stored.as_deref() != Some(sql.as_str()) {
-            conn.execute_batch(&format!("DROP VIEW IF EXISTS {};\n{sql};", quote_ident(&name)))?;
+        if stored.get(&name) != Some(&sql) {
+            let _ = writeln!(replace, "DROP VIEW IF EXISTS {};\n{sql};", quote_ident(&name));
         }
+    }
+    if !replace.is_empty() {
+        conn.execute_batch(&replace)?;
     }
     Ok(())
 }
@@ -393,11 +408,12 @@ pub(crate) fn check_kind_columns(conn: &Connection, kinds: &KindRegistry) -> Res
 /// transaction `PRAGMA foreign_keys` cannot change): with them on, the drop would delete each
 /// child table's rows through their `ON DELETE CASCADE`.
 pub(crate) fn check_kind_codes(conn: &Connection, kinds: &KindRegistry) -> Result<(), StoreError> {
-    let mut statement = conn.prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1")?;
+    // Read again after a table is rebuilt, which is rare, so each table's text is as stored.
+    let mut tables = stored_schema(conn, "table")?;
     let mut columns = conn.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?;
     for set in kinds.iter() {
         for table in &set.tables {
-            let Some(sql) = statement.query_row([&table.name], |row| row.get::<_, String>(0)).optional()? else { continue };
+            let Some(sql) = tables.get(&table.name).cloned() else { continue };
             let present = columns.query_map([&table.name], |row| row.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
             // The table as this build renders it with the stored code lists and without the
             // columns opening may add, and the first column missing codes.
@@ -437,6 +453,7 @@ pub(crate) fn check_kind_codes(conn: &Connection, kinds: &KindRegistry) -> Resul
             let Some((column, missing)) = missing else {
                 if nullability_widens {
                     widen_table(conn, set, table, &present)?;
+                    tables = stored_schema(conn, "table")?;
                 }
                 continue;
             };
@@ -445,6 +462,7 @@ pub(crate) fn check_kind_codes(conn: &Connection, kinds: &KindRegistry) -> Resul
             }
             // Every coded column is rebuilt with its kind's codes, not only the first one missing some.
             widen_table(conn, set, table, &present)?;
+            tables = stored_schema(conn, "table")?;
         }
     }
     Ok(())
