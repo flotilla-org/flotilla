@@ -78,6 +78,7 @@ use flotilla_resources::{
     WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL,
     ROLE_LABEL, VESSEL_LABEL,
 };
+use flotilla_store::off_frame;
 use flotilla_store::{controller::ControllerLoop, list_resource_kind, old_store_resource_kinds, ResourceBackend};
 use hegel::generators as gs;
 
@@ -3720,150 +3721,12 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
     for (daemon, name, vessel, role, crew_id) in
         [(a, "stalled-work", "work", "coder", "coder-id"), (b, "governor", "govern", "governor", "governor-id")]
     {
-        let backend = daemon.resource_backend();
-        let convoys = backend.using::<Convoy>("flotilla");
-        let spec = ConvoySpec::builder().workflow_ref("scratch".into()).project_ref("project".into()).role(role.into()).build();
-        let convoy = convoys.create(&convoy_meta(name, role), &spec).await.expect("convoy");
-        let snapshot = WorkflowSnapshot {
-            cascade: None,
-            vessels: vec![VesselRequirement::builder()
-                .name(vessel.into())
-                .crew(vec![CrewSpec::builder()
-                    .role(role.into())
-                    .source(CrewSource::Tool { command: "test".into() })
-                    .completion_conditions(vec![CrewCompletionExpectation::artifact_exists(
-                        role,
-                        "decision-ledger",
-                        ArtifactSubjectBinding::Convoy,
-                    )])
-                    .build()])
-                .build()],
-            stall_nudges: Default::default(),
-            supervision: None,
-            exit: (name == "stalled-work").then(flotilla_resources::ExitDeclaration::standard_table),
-            turn_delivery: Default::default(),
-        };
-        convoys
-            .update_status(
-                name,
-                &convoy.metadata.resource_version,
-                &ConvoyStatus {
-                    phase: ResourceConvoyPhase::Active,
-                    workflow_snapshot: Some(snapshot),
-                    work: BTreeMap::from([(vessel.into(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
-                    crew_work: BTreeMap::from([(
-                        vessel.into(),
-                        BTreeMap::from([(role.into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-                    )]),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("active crew");
-        let sessions = backend.using::<TerminalSession>("flotilla");
-        let session = sessions
-            .create(
-                &InputMeta::builder()
-                    .name(format!("{name}-session"))
-                    .labels(BTreeMap::from([
-                        (CONVOY_LABEL.into(), name.into()),
-                        (VESSEL_LABEL.into(), vessel.into()),
-                        (ROLE_LABEL.into(), role.into()),
-                    ]))
-                    .build(),
-                &TerminalSessionSpec {
-                    env_ref: "test-env".into(),
-                    role: role.into(),
-                    cwd: "/workspace".into(),
-                    env: Default::default(),
-                    pool: "cleat".into(),
-                    source: TerminalSessionSource::Agent {
-                        selector: Selector::for_capability("coding"),
-                        brief: TerminalBrief {
-                            path: "brief.md".into(),
-                            content: "original".into(),
-                            artifact_digest: None,
-                            copies: Vec::new(),
-                        },
-                        context: Box::new(TerminalCrewContext {
-                            namespace: "flotilla".into(),
-                            convoy: name.into(),
-                            vessel_ref: vessel.into(),
-                        }),
-                        message: None,
-                    },
-                },
-            )
-            .await
-            .expect("session");
-        sessions
-            .update_status(
-                &session.metadata.name,
-                &session.metadata.resource_version,
-                &TerminalSessionStatus {
-                    phase: flotilla_resources::TerminalSessionPhase::Running,
-                    crew: Some(CrewSessionStatus { id: crew_id.into(), adapter: "codex".into(), model: None, stance: role.into() }),
-                    attention: Some(flotilla_resources::TerminalAttention {
-                        state: flotilla_resources::TerminalAttentionState::Working,
-                        as_of: Utc::now(),
-                        source: flotilla_resources::TerminalAttentionSource::Hook,
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("running crew session");
+        off_frame(|| seed_supervision_crew(daemon, name, vessel, role, crew_id)).await;
     }
     let a_backend = a.resource_backend();
     let b_backend = b.resource_backend();
     if subscriptions {
-        use flotilla_resources::{
-            ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, Project, ProjectSpec, RoleDefinition, RoleSubscription,
-        };
-        a_backend
-            .definitions::<Project>("flotilla")
-            .create(
-                &InputMeta::builder().name("project".into()).build(),
-                &ProjectSpec::builder()
-                    .display_name("project".into())
-                    .role_definitions(BTreeMap::from([(
-                        "governor".into(),
-                        RoleDefinition {
-                            subscriptions: Some(vec![RoleSubscription::builder().topic("supervision".into()).build()]),
-                            ..Default::default()
-                        },
-                    )]))
-                    .build(),
-            )
-            .await
-            .expect("project subscriptions");
-        b_backend
-            .replica_writer::<Project>(a.node_id().clone(), "flotilla")
-            .replace(&a_backend.using::<Project>("flotilla").list().await.expect("project"), Utc::now())
-            .await
-            .expect("replicate shape");
-        let ensures = b_backend.using::<ConvoyEnsure>("flotilla");
-        ensures
-            .create(
-                &InputMeta::builder().name("project-governor".into()).build(),
-                &ConvoyEnsureSpec::builder().project_ref("project".into()).role("governor".into()).repositories(Vec::new()).build(),
-            )
-            .await
-            .expect("presence");
-        let ensure = ensures.get("project-governor").await.expect("local ensure");
-        ensures
-            .update_status(
-                "project-governor",
-                &ensure.metadata.resource_version,
-                &ConvoyEnsureStatus { convoy_ref: Some("governor".into()), ..Default::default() },
-            )
-            .await
-            .expect("holder");
-        a_backend
-            .replica_writer::<ConvoyEnsure>(b.node_id().clone(), "flotilla")
-            .replace(&ensures.list().await.expect("ensure"), Utc::now())
-            .await
-            .expect("replicate presence");
+        off_frame(|| seed_governor_subscription(a, b)).await;
     }
     let convoys = a_backend.using::<Convoy>("flotilla");
     flotilla_store::apply_status_patch(
@@ -3914,24 +3777,7 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
     }
 
     for _ in 0..passes {
-        a.reconcile_crew_stalls_once("flotilla").await.expect("one escalation pass");
-        let stall = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stall");
-        assert_eq!(stall.rung, flotilla_resources::StallRung::Governor);
-        assert_eq!(stall.supervisor.expect("governor").convoy, "governor");
-        let messages = b_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("receiver inbox");
-        assert_eq!(messages.items.len(), 1, "repeat passes must not publish duplicates");
-        assert!(a_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("source inbox").items.is_empty());
-        let session = b_backend.using::<TerminalSession>("flotilla").get("governor-session").await.expect("governor session");
-        assert!(
-            matches!(session.spec.source, TerminalSessionSource::Agent { message: None, .. }),
-            "escalation uses durable Message intent"
-        );
-        let message = &messages.items[0];
-        assert_eq!(message.spec.relation, flotilla_resources::MessageRelation::Supervisor);
-        assert_eq!(message.spec.sender, "project/stalled-work/work/coder");
-        assert!(message.spec.body.starts_with("Escalated from coder@work in coder@project:"), "{}", message.spec.body);
-        assert!(message.spec.body.contains("Supervise stalled crew coder@work in convoy coder@project (resource ref: stalled-work)"));
-        assert!(message.spec.body.contains("--convoy 'stalled-work' --vessel 'work' --role 'coder' resume"));
+        off_frame(|| check_supervision_escalation_pass(a, b)).await;
     }
     let escalation_name =
         b_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("governor inbox").items[0].metadata.name.clone();
@@ -3943,6 +3789,181 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
         .replace(&convoys.list().await.expect("stalled convoy"), Utc::now())
         .await
         .expect("replicate stall to governor");
+    off_frame(|| supervise_stall_from_governor(&topology, a)).await;
+    let status = convoys.get("stalled-work").await.expect("source").status.expect("status");
+    assert!(status.stalled.is_none());
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
+    // Reply identity does not depend on the escalation replicating back from B.
+    let replies = a_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("source replies");
+    assert!(replies.items.iter().any(|message| message.spec.in_reply_to.as_deref() == Some(escalation_name.as_str())));
+}
+
+/// One convoy with a working crew member and its running session, at `daemon`.
+async fn seed_supervision_crew(daemon: &InProcessDaemon, name: &str, vessel: &str, role: &str, crew_id: &str) {
+    let backend = daemon.resource_backend();
+    let convoys = backend.using::<Convoy>("flotilla");
+    let spec = ConvoySpec::builder().workflow_ref("scratch".into()).project_ref("project".into()).role(role.into()).build();
+    let convoy = convoys.create(&convoy_meta(name, role), &spec).await.expect("convoy");
+    let snapshot = WorkflowSnapshot {
+        cascade: None,
+        vessels: vec![VesselRequirement::builder()
+            .name(vessel.into())
+            .crew(vec![CrewSpec::builder()
+                .role(role.into())
+                .source(CrewSource::Tool { command: "test".into() })
+                .completion_conditions(vec![CrewCompletionExpectation::artifact_exists(
+                    role,
+                    "decision-ledger",
+                    ArtifactSubjectBinding::Convoy,
+                )])
+                .build()])
+            .build()],
+        stall_nudges: Default::default(),
+        supervision: None,
+        exit: (name == "stalled-work").then(flotilla_resources::ExitDeclaration::standard_table),
+        turn_delivery: Default::default(),
+    };
+    convoys
+        .update_status(
+            name,
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                phase: ResourceConvoyPhase::Active,
+                workflow_snapshot: Some(snapshot),
+                work: BTreeMap::from([(vessel.into(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
+                crew_work: BTreeMap::from([(
+                    vessel.into(),
+                    BTreeMap::from([(role.into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                )]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("active crew");
+    let sessions = backend.using::<TerminalSession>("flotilla");
+    let session = sessions
+        .create(
+            &InputMeta::builder()
+                .name(format!("{name}-session"))
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.into(), name.into()),
+                    (VESSEL_LABEL.into(), vessel.into()),
+                    (ROLE_LABEL.into(), role.into()),
+                ]))
+                .build(),
+            &TerminalSessionSpec {
+                env_ref: "test-env".into(),
+                role: role.into(),
+                cwd: "/workspace".into(),
+                env: Default::default(),
+                pool: "cleat".into(),
+                source: TerminalSessionSource::Agent {
+                    selector: Selector::for_capability("coding"),
+                    brief: TerminalBrief { path: "brief.md".into(), content: "original".into(), artifact_digest: None, copies: Vec::new() },
+                    context: Box::new(TerminalCrewContext { namespace: "flotilla".into(), convoy: name.into(), vessel_ref: vessel.into() }),
+                    message: None,
+                },
+            },
+        )
+        .await
+        .expect("session");
+    sessions
+        .update_status(
+            &session.metadata.name,
+            &session.metadata.resource_version,
+            &TerminalSessionStatus {
+                phase: flotilla_resources::TerminalSessionPhase::Running,
+                crew: Some(CrewSessionStatus { id: crew_id.into(), adapter: "codex".into(), model: None, stance: role.into() }),
+                attention: Some(flotilla_resources::TerminalAttention {
+                    state: flotilla_resources::TerminalAttentionState::Working,
+                    as_of: Utc::now(),
+                    source: flotilla_resources::TerminalAttentionSource::Hook,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("running crew session");
+}
+
+/// The project's governor role subscribes to supervision; its presence is held at `b` and
+/// replicated to `a`.
+async fn seed_governor_subscription(a: &InProcessDaemon, b: &InProcessDaemon) {
+    let a_backend = a.resource_backend();
+    let b_backend = b.resource_backend();
+    use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, Project, ProjectSpec, RoleDefinition, RoleSubscription};
+    a_backend
+        .definitions::<Project>("flotilla")
+        .create(
+            &InputMeta::builder().name("project".into()).build(),
+            &ProjectSpec::builder()
+                .display_name("project".into())
+                .role_definitions(BTreeMap::from([(
+                    "governor".into(),
+                    RoleDefinition {
+                        subscriptions: Some(vec![RoleSubscription::builder().topic("supervision".into()).build()]),
+                        ..Default::default()
+                    },
+                )]))
+                .build(),
+        )
+        .await
+        .expect("project subscriptions");
+    b_backend
+        .replica_writer::<Project>(a.node_id().clone(), "flotilla")
+        .replace(&a_backend.using::<Project>("flotilla").list().await.expect("project"), Utc::now())
+        .await
+        .expect("replicate shape");
+    let ensures = b_backend.using::<ConvoyEnsure>("flotilla");
+    ensures
+        .create(
+            &InputMeta::builder().name("project-governor".into()).build(),
+            &ConvoyEnsureSpec::builder().project_ref("project".into()).role("governor".into()).repositories(Vec::new()).build(),
+        )
+        .await
+        .expect("presence");
+    let ensure = ensures.get("project-governor").await.expect("local ensure");
+    ensures
+        .update_status(
+            "project-governor",
+            &ensure.metadata.resource_version,
+            &ConvoyEnsureStatus { convoy_ref: Some("governor".into()), ..Default::default() },
+        )
+        .await
+        .expect("holder");
+    a_backend
+        .replica_writer::<ConvoyEnsure>(b.node_id().clone(), "flotilla")
+        .replace(&ensures.list().await.expect("ensure"), Utc::now())
+        .await
+        .expect("replicate presence");
+}
+
+/// One escalation pass at `a`, checked at the governor's home `b`.
+async fn check_supervision_escalation_pass(a: &InProcessDaemon, b: &InProcessDaemon) {
+    let a_backend = a.resource_backend();
+    let b_backend = b.resource_backend();
+    let convoys = a_backend.using::<Convoy>("flotilla");
+    a.reconcile_crew_stalls_once("flotilla").await.expect("one escalation pass");
+    let stall = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stall");
+    assert_eq!(stall.rung, flotilla_resources::StallRung::Governor);
+    assert_eq!(stall.supervisor.expect("governor").convoy, "governor");
+    let messages = b_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("receiver inbox");
+    assert_eq!(messages.items.len(), 1, "repeat passes must not publish duplicates");
+    assert!(a_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("source inbox").items.is_empty());
+    let session = b_backend.using::<TerminalSession>("flotilla").get("governor-session").await.expect("governor session");
+    assert!(matches!(session.spec.source, TerminalSessionSource::Agent { message: None, .. }), "escalation uses durable Message intent");
+    let message = &messages.items[0];
+    assert_eq!(message.spec.relation, flotilla_resources::MessageRelation::Supervisor);
+    assert_eq!(message.spec.sender, "project/stalled-work/work/coder");
+    assert!(message.spec.body.starts_with("Escalated from coder@work in coder@project:"), "{}", message.spec.body);
+    assert!(message.spec.body.contains("Supervise stalled crew coder@work in convoy coder@project (resource ref: stalled-work)"));
+    assert!(message.spec.body.contains("--convoy 'stalled-work' --vessel 'work' --role 'coder' resume"));
+}
+
+/// The governor's supervision from its host resumes the stalled crew at `a`; another crew is
+/// refused.
+async fn supervise_stall_from_governor(topology: &InMemoryRequestTopology, a: &InProcessDaemon) {
+    let convoys = a.resource_backend().using::<Convoy>("flotilla");
     let mut events = topology.leader.subscribe();
     for crew_id in ["unrelated-crew", "governor-id"] {
         let id = topology
@@ -3971,12 +3992,6 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
             assert!(convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.is_some());
         }
     }
-    let status = convoys.get("stalled-work").await.expect("source").status.expect("status");
-    assert!(status.stalled.is_none());
-    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
-    // Reply identity does not depend on the escalation replicating back from B.
-    let replies = a_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("source replies");
-    assert!(replies.items.iter().any(|message| message.spec.in_reply_to.as_deref() == Some(escalation_name.as_str())));
 }
 
 #[tokio::test]
