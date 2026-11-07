@@ -207,6 +207,16 @@ fn install_engine(daemon: &InProcessDaemon) {
     daemon.install_lifecycle_reads(engine.reads()).expect("install the engine's readings");
 }
 
+/// The stamps project operations put on a definition they materialise for `project` from
+/// `repository`: the project, and the repository and commit read.
+fn project_ops_stamps(project: &str, repository: &RepositoryKey) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (MATERIALIZED_PROJECT_ANNOTATION.to_string(), project.to_string()),
+        (SOURCE_REPOSITORY_ANNOTATION.to_string(), repository.to_string()),
+        (SOURCE_COMMIT_ANNOTATION.to_string(), "abc123".to_string()),
+    ])
+}
+
 fn test_meta(name: &str) -> InputMeta {
     InputMeta::builder().name(name.to_string()).build()
 }
@@ -271,12 +281,7 @@ async fn standing_ensure_fixture_for(
         .create(
             &InputMeta::builder()
                 .name(flotilla_charter::ops_entry::materialized_workflow_name("standing-project", "quartermaster"))
-                // Project operations stamp what they materialise with the repository and commit read.
-                .annotations(BTreeMap::from([
-                    (MATERIALIZED_PROJECT_ANNOTATION.to_string(), "standing-project".to_string()),
-                    (SOURCE_REPOSITORY_ANNOTATION.to_string(), repository_key.to_string()),
-                    (SOURCE_COMMIT_ANNOTATION.to_string(), "abc123".to_string()),
-                ]))
+                .annotations(project_ops_stamps("standing-project", &repository_key))
                 .build(),
             &WorkflowTemplateSpec::builder()
                 .vessels(vec![VesselRequirement::builder()

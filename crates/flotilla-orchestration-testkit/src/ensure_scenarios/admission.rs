@@ -77,7 +77,7 @@ pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_
         )
         .await
         .expect("lost container");
-    assert!(backend.using::<ResourceCheckout>("flotilla").list().await.expect("ephemeral checkout observations").items.is_empty());
+    assert!(daemon.lifecycle_reads().checkouts().and_then(|checkouts| checkouts.here()).expect("checkouts here").is_empty());
     drop(daemon);
     let restarted = InProcessDaemon::new_with_resource_backend_and_clock(
         Vec::new(),
@@ -98,8 +98,9 @@ pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_
         ))
         .await;
 
-    let reconciler =
-        flotilla_crew::convoy::ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla")).with_vessels(vessels.clone());
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+        .with_vessels(vessels.clone())
+        .with_lifecycle_reads(restarted.lifecycle_reads());
     let convoy = convoys.get(&convoy_name).await.expect("governor after reboot");
     let outcome = reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("reboot observations"), clock.now());
     assert!(matches!(outcome.patch, Some(flotilla_resources::ConvoyStatusPatch::WorkProvisioningRetry { .. })));
@@ -527,14 +528,14 @@ pub async fn unavailable_declared_driver_surfaces_named_admission_conditions_wit
     assert_eq!(condition.reason, "UnknownDriver");
     assert!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("convoys").items.is_empty());
 
-    let hosts = backend.using::<ResourceHost>("flotilla");
-    hosts
-        .create(
-            &test_meta("missing-driver"),
-            &HostSpec { display_name: "missing-driver".to_string(), connection: Default::default(), ..HostSpec::default() },
-        )
-        .await
-        .expect("known but unreachable driver");
+    // Known but unreachable: its daemon published its Host and nothing since.
+    flotilla_provisioning_testkit::put_host_at_its_home(
+        &daemon.decided_store().expect("decided store"),
+        "missing-driver",
+        &HostSpec { display_name: "missing-driver".to_string(), connection: Default::default(), ..HostSpec::default() },
+        None,
+    )
+    .await;
     assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("unreachable driver skip").is_empty());
     let ensure = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("conditioned ensure");
     let condition = ensure
@@ -832,12 +833,13 @@ pub async fn standing_ensure_does_not_capture_another_projects_bare_workflow_but
     let own_name = flotilla_charter::ops_entry::materialized_workflow_name("standing-project", "quartermaster");
     let own = backend.definitions::<WorkflowTemplate>("flotilla").get(&own_name).await.expect("own workflow");
     backend.definitions::<WorkflowTemplate>("flotilla").delete(&own_name).await.expect("remove own workflow");
+    let repository_key = backend.using::<Repository>("flotilla").list().await.expect("repositories").items[0].spec.key();
     backend
         .definitions::<WorkflowTemplate>("flotilla")
         .apply(
             &InputMeta::builder()
                 .name("quartermaster".to_string())
-                .annotations(BTreeMap::from([(MATERIALIZED_PROJECT_ANNOTATION.to_string(), "other-project".to_string())]))
+                .annotations(project_ops_stamps("other-project", &repository_key))
                 .build(),
             &own.spec,
         )

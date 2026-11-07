@@ -490,10 +490,7 @@ pub async fn operator_reap_restarts_immediately_without_burning_budget_and_past_
     backend
         .definitions::<WorkflowTemplate>("flotilla")
         .apply(
-            &InputMeta::builder()
-                .name(materialized_name)
-                .annotations(BTreeMap::from([(MATERIALIZED_PROJECT_ANNOTATION.to_string(), "standing-project".to_string())]))
-                .build(),
+            &InputMeta::builder().name(materialized_name).annotations(project_ops_stamps("standing-project", &repository_key)).build(),
             &WorkflowTemplateSpec::builder()
                 .vessels(vec![VesselRequirement::builder()
                     .name("work".to_string())
