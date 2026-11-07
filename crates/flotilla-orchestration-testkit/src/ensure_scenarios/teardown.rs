@@ -371,49 +371,45 @@ pub async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_rest
                 started_at: Some(now),
                 finished_at: Some(now),
                 observed_workflow_ref: Some("quartermaster".to_string()),
+                // The workflow its convoy controller froze when it started: its vessel names the
+                // environment held for it.
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],
+                }),
                 ..Default::default()
             },
         )
         .await
         .expect("fail convoy after resolution loss");
-    let environments = backend.using::<ResourceEnvironment>("flotilla");
-    let environment = environments
-        .create(
-            &InputMeta::builder()
-                .name("quartermaster-work".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), first_ref.clone())]))
-                .build(),
-            &ResourceEnvironmentSpec {
-                cloud_sandbox: None,
-                provider_address: None,
-                host_direct: None,
-                docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                    image_build_ref: None,
-                    host_ref: "local".to_string(),
-                    image: "standing:latest".to_string(),
-                    declared_agent_adapters: BTreeSet::new(),
-                    required_agent_adapters: BTreeSet::new(),
-                    pull_policy: Default::default(),
-                    mounts: Vec::new(),
-                    env: BTreeMap::new(),
-                }),
-            },
-        )
-        .await
-        .expect("backing environment");
-    environments
-        .update_status(
-            &environment.metadata.name,
-            &environment.metadata.resource_version,
-            &ResourceEnvironmentStatus {
-                phase: EnvironmentPhase::Ready,
-                ready: true,
-                docker_container_id: Some("live-container".to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("mark backing live");
+    let vessel = flotilla_resources::vessel_resource_name(&first_ref, "work");
+    // Its live backing environment, held for that vessel on the engine.
+    let environments = engine(&daemon);
+    environments.environments.put_ready(
+        "quartermaster-work",
+        &ResourceEnvironmentSpec {
+            cloud_sandbox: None,
+            provider_address: None,
+            host_direct: None,
+            docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                image_build_ref: None,
+                host_ref: "local".to_string(),
+                image: "standing:latest".to_string(),
+                declared_agent_adapters: BTreeSet::new(),
+                required_agent_adapters: BTreeSet::new(),
+                pull_policy: Default::default(),
+                mounts: Vec::new(),
+                env: BTreeMap::new(),
+            }),
+        },
+        Some(&vessel),
+        "live-container",
+        Default::default(),
+    );
 
     assert_eq!(
         daemon.reconcile_convoy_ensures_once("flotilla").await.expect("hold live backing"),
@@ -431,20 +427,10 @@ pub async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_rest
     );
     assert_eq!(backend.using::<ResourceDemand>("flotilla").list().await.expect("attention demands").items.len(), 1);
 
-    let environment = environments.get("quartermaster-work").await.expect("backing environment");
+    // Its container stopped: on the engine the environment vanished, failed.
     environments
-        .update_status(
-            &environment.metadata.name,
-            &environment.metadata.resource_version,
-            &ResourceEnvironmentStatus {
-                phase: EnvironmentPhase::Failed,
-                ready: false,
-                message: Some("Docker container live-container is not running".to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("verify backing dead");
+        .environments
+        .finish("quartermaster-work", flotilla_provisioning_testkit::Ending::Failed("Docker container live-container is not running"));
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("record crash backoff");
     clock.advance(ChronoDuration::seconds(30));
     assert_eq!(
@@ -548,28 +534,24 @@ pub async fn forced_convoy_delete_retains_force_intent_until_checkout_finalizes(
         .status
         .and_then(|status| status.convoy_ref)
         .expect("convoy ref");
-    backend
-        .clone()
-        .using::<ResourceCheckout>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name("checkout-at-risk".to_string())
-                .labels(BTreeMap::from([
-                    (AUTHORITY_LABEL.to_string(), LifecycleAuthority::Managed.as_label_value().to_string()),
-                    (CONVOY_LABEL.to_string(), convoy_ref.clone()),
-                ]))
-                .finalizers(vec!["flotilla.work/checkout-cleanup".to_string()])
+    // A checkout the convoy holds on the engine, made for it and not yet removed.
+    let convoy = backend.using::<ResourceConvoy>("flotilla").get(&convoy_ref).await.expect("standing convoy");
+    let engine_convoy = flotilla_resources::convoy::engine::engine_name(&convoy).expect("engine convoy name");
+    engine(&daemon).checkouts.open_convoy(&engine_convoy);
+    let holder = flotilla_resources::checkout_records::CheckoutHolder::Convoy(engine_convoy);
+    engine(&daemon).checkouts.put_ready(
+        "checkout-at-risk",
+        &ResourceCheckoutSpec::Worktree(
+            flotilla_resources::CheckoutWorktreeSpec::builder()
+                .repo_ref(RepositoryKey("repo-a".into()))
+                .env_ref("host-direct-host-test".into())
+                .r#ref("feature/work".into())
+                .target_path("/tmp/checkout-at-risk".into())
+                .clone_ref("clone".into())
                 .build(),
-            &ResourceCheckoutSpec::Observed(flotilla_resources::ObservedCheckoutSpec {
-                r#ref: "feature/work".to_string(),
-                path: "/tmp/checkout-at-risk".to_string(),
-                repo_ref: RepositoryKey("repo-a".to_string()),
-                host_ref: "host-test".to_string(),
-                is_main: false,
-            }),
-        )
-        .await
-        .expect("checkout");
+        ),
+        Some(&holder),
+    );
 
     daemon.reap_convoy_internal("flotilla", &convoy_ref, true).await.expect("force delete");
 

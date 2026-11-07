@@ -69,6 +69,13 @@ impl OtherHome {
         repositories.apply("Repository", name, &Default::default(), &Default::default(), spec).await.expect("write repository at its home");
     }
 
+    /// Records what this home's Repository reconciler observed of Repository `name`.
+    pub async fn repository_status(&self, name: &str, status: &flotilla_resources::RepositoryStatus) {
+        let repositories = EngineRepositories::open(Arc::clone(&self.service), Arc::new(SystemClock)).expect("other home repositories");
+        let status = serde_json::to_value(status).expect("repository status");
+        repositories.set_status("Repository", name, status).await.expect("observe repository at its home");
+    }
+
     /// Writes Project `name` here with its writer's stamps, as this home declares it.
     pub async fn project(&self, name: &str, labels: &BTreeMap<String, String>, annotations: &BTreeMap<String, String>, spec: &ProjectSpec) {
         let projects = EngineProjects::open(Arc::clone(&self.service), Arc::new(SystemClock)).expect("other home projects");
@@ -79,10 +86,15 @@ impl OtherHome {
     /// Writes definition `name` of `kind` (a Forge, a credential declaration, ...) here, as this
     /// home's operator would declare it.
     pub async fn definition(&self, kind: &str, name: &str, spec: serde_json::Value) {
+        self.stamped_definition(kind, name, &BTreeMap::new(), spec).await;
+    }
+
+    /// [`OtherHome::definition`], with the stamps its writer puts on it.
+    pub async fn stamped_definition(&self, kind: &str, name: &str, annotations: &BTreeMap<String, String>, spec: serde_json::Value) {
         let definitions =
             flotilla_provisioning::engine::definitions::EngineDefinitions::open(Arc::clone(&self.service), Arc::new(SystemClock))
                 .expect("other home definitions");
-        definitions.apply(kind, name, &Default::default(), &Default::default(), spec).await.expect("write definition at its home");
+        definitions.apply(kind, name, &Default::default(), annotations, spec).await.expect("write definition at its home");
     }
 
     /// Sends everything this home holds to `target`, heard now.

@@ -7,9 +7,8 @@ use flotilla_config::ConfigStore;
 use flotilla_protocol::{CommandAction, HostName, NodeId};
 use flotilla_resources::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_resources::{
-    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Clock, Convoy as ResourceConvoy, ConvoyEnsure,
-    Host as ResourceHost, InputMeta, Project, ProjectSpec, Repository, RepositoryKey, RepositorySpec, ResourceError, ResourceObject,
-    WorkflowTemplate,
+    CheckoutSpec as ResourceCheckoutSpec, Clock, Convoy as ResourceConvoy, ConvoyEnsure, Host as ResourceHost, InputMeta, Project,
+    ProjectSpec, Repository, RepositoryKey, RepositorySpec, ResourceError, ResourceObject, WorkflowTemplate,
 };
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
@@ -36,10 +35,7 @@ use flotilla_resources::CrewWorkPhase;
 use flotilla_resources::CrewWorkState;
 use flotilla_resources::Demand as ResourceDemand;
 use flotilla_resources::DemandStatusPatch;
-use flotilla_resources::Environment as ResourceEnvironment;
-use flotilla_resources::EnvironmentPhase;
 use flotilla_resources::EnvironmentSpec as ResourceEnvironmentSpec;
-use flotilla_resources::EnvironmentStatus as ResourceEnvironmentStatus;
 use flotilla_resources::Event;
 use flotilla_resources::FulfilmentKindSpec;
 use flotilla_resources::FulfilmentRealisation;
@@ -202,9 +198,25 @@ async fn seed_convoy_routing_row(
 /// Installs the engine `daemon` reads its environments, clones and checkouts from, on its decided
 /// store, as the runtime's composition does; a scenario daemon is not composed by the runtime.
 fn install_engine(daemon: &InProcessDaemon) {
+    daemon.install_lifecycle_reads(engine(daemon).reads()).expect("install the engine's readings");
+}
+
+/// The engine over `daemon`'s decided store: one per store, so a scenario's writes go through the
+/// same lifecycles its readings serve, and a daemon restarted over the store reads the same one.
+fn engine(daemon: &InProcessDaemon) -> Arc<flotilla_provisioning_testkit::EngineFixture> {
+    type Engines =
+        std::sync::Mutex<Vec<(std::sync::Weak<dyn std::any::Any + Send + Sync>, Arc<flotilla_provisioning_testkit::EngineFixture>)>>;
+    static ENGINES: std::sync::OnceLock<Engines> = std::sync::OnceLock::new();
     let service = daemon.decided_store().expect("decided store");
-    let engine = flotilla_provisioning_testkit::EngineFixture::over(service.home(), service.store());
-    daemon.install_lifecycle_reads(engine.reads()).expect("install the engine's readings");
+    let held: Arc<dyn std::any::Any + Send + Sync> = service.clone();
+    let mut engines = ENGINES.get_or_init(Engines::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    engines.retain(|(store, _)| store.strong_count() > 0);
+    if let Some((_, engine)) = engines.iter().find(|(store, _)| std::ptr::addr_eq(store.as_ptr(), Arc::as_ptr(&held))) {
+        return Arc::clone(engine);
+    }
+    let engine = Arc::new(flotilla_provisioning_testkit::EngineFixture::over(service.home(), service.store()));
+    engines.push((Arc::downgrade(&held), Arc::clone(&engine)));
+    engine
 }
 
 /// The stamps project operations put on a definition they materialise for `project` from
@@ -215,6 +227,24 @@ fn project_ops_stamps(project: &str, repository: &RepositoryKey) -> BTreeMap<Str
         (SOURCE_REPOSITORY_ANNOTATION.to_string(), repository.to_string()),
         (SOURCE_COMMIT_ANNOTATION.to_string(), "abc123".to_string()),
     ])
+}
+
+/// The other home `home` writing for `daemon`, opened on first use. On the engine a record is
+/// written only at its home; one written there reaches `daemon` as that home's log would, once
+/// [`replicate_other_home`] sends it.
+fn other_home(daemon: &InProcessDaemon, home: &str) -> Arc<flotilla_provisioning_testkit::OtherHome> {
+    flotilla_provisioning_testkit::other_home_for(&daemon.decided_store().expect("decided store"), home)
+}
+
+/// Sends what the other home `home` holds to `daemon`, heard now.
+fn replicate_other_home(daemon: &InProcessDaemon, home: &str) {
+    other_home(daemon, home).replicate_to(&daemon.decided_store().expect("decided store"));
+}
+
+/// Writes `project` at the other home `home` with its stamps, and sends that home to `daemon`.
+async fn project_at_other_home(daemon: &InProcessDaemon, home: &str, project: &ResourceObject<Project>) {
+    other_home(daemon, home).project(&project.metadata.name, &project.metadata.labels, &project.metadata.annotations, &project.spec).await;
+    replicate_other_home(daemon, home);
 }
 
 fn test_meta(name: &str) -> InputMeta {

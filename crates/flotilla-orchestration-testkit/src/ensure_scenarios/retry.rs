@@ -1,7 +1,6 @@
 //! Retry scenarios using the shared daemon harness.
 
 use super::*;
-use flotilla_store_memory::InMemoryBackend;
 
 pub async fn standing_ensure_holds_after_three_failed_generations_and_resumes_when_attention_is_cleared(
     factory: &dyn EnsureScenarioController,
@@ -129,13 +128,12 @@ pub async fn declared_driver_derives_bounded_backoff_from_its_homed_generations(
     let driver_id = driver.local_host_id().expect("driver host identity").to_string();
     set_ensure_driver(&authority_backend, &driver_id).await;
 
+    // The authority's Project reaches the others through its log; its ConvoyEnsure through the
+    // old store's replication.
     let authority_root = authority.node_id().clone();
-    for backend in [&driver_backend, &other_backend] {
-        backend
-            .replica_writer::<Project>(authority_root.clone(), "flotilla")
-            .replace(&authority_backend.using::<Project>("flotilla").list().await.expect("authority projects"), Utc::now())
-            .await
-            .expect("replicate projects");
+    let decided = |daemon: &InProcessDaemon| daemon.decided_store().expect("decided store");
+    for (backend, daemon) in [(&driver_backend, &driver), (&other_backend, &other)] {
+        flotilla_provisioning_testkit::replicate_home(&decided(&authority), authority_root.as_str(), &decided(daemon));
         backend
             .replica_writer::<ConvoyEnsure>(authority_root.clone(), "flotilla")
             .replace(&authority_backend.using::<ConvoyEnsure>("flotilla").list().await.expect("authority ensures"), Utc::now())
@@ -143,26 +141,24 @@ pub async fn declared_driver_derives_bounded_backoff_from_its_homed_generations(
             .expect("replicate ensures");
     }
 
-    let host_origin = ResourceBackend::new(InMemoryBackend::default()).with_local_root(driver.node_id().clone());
-    let hosts = host_origin.using::<ResourceHost>("flotilla");
-    let host = hosts
-        .create(
-            &test_meta(&driver_id),
-            &HostSpec { display_name: "udder".to_string(), connection: Default::default(), ..HostSpec::default() },
-        )
-        .await
-        .expect("driver host");
+    // The driver publishes its own Host, ready, and every root hears it.
+    let hosts = driver_backend.using::<ResourceHost>("flotilla");
+    let host = match hosts.get(&driver_id).await {
+        Ok(host) => host,
+        Err(_) => hosts
+            .create(
+                &test_meta(&driver_id),
+                &HostSpec { display_name: "udder".to_string(), connection: Default::default(), ..HostSpec::default() },
+            )
+            .await
+            .expect("driver host"),
+    };
     hosts
         .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus { ready: true, ..Default::default() })
         .await
         .expect("ready driver host");
-    let host_snapshot = hosts.list().await.expect("driver host snapshot");
-    for backend in [&authority_backend, &driver_backend, &other_backend] {
-        backend
-            .replica_writer::<ResourceHost>(driver.node_id().clone(), "flotilla")
-            .replace(&host_snapshot, Utc::now())
-            .await
-            .expect("replicate driver host");
+    for daemon in [&authority, &other] {
+        flotilla_provisioning_testkit::replicate_home(&decided(&driver), driver.node_id().as_str(), &decided(daemon));
     }
 
     assert!(authority.reconcile_convoy_ensures_once("flotilla").await.expect("authority skip").is_empty());
@@ -339,23 +335,16 @@ pub async fn resolved_default_branch_dependency_change_retries_admission_before_
 
     let repository =
         backend.using::<Repository>("flotilla").list().await.expect("repositories").items.into_iter().next().expect("repository");
-    let source = ResourceBackend::new(InMemoryBackend::default());
-    let source_repositories = source.using::<Repository>("flotilla");
-    let source_repository =
-        source_repositories.create(&test_meta(&repository.metadata.name), &repository.spec).await.expect("replica repository source");
-    source_repositories
-        .update_status(
-            &source_repository.metadata.name,
-            &source_repository.metadata.resource_version,
+    // Another root resolves the default branch, and its record arrives through that root's log.
+    let readiness_root = other_home(&daemon, "readiness-root");
+    readiness_root.repository(&repository.metadata.name, &repository.spec).await;
+    readiness_root
+        .repository_status(
+            &repository.metadata.name,
             &flotilla_resources::RepositoryStatus { default_branch: Some("main".to_string()), ..Default::default() },
         )
-        .await
-        .expect("resolve default branch on another root");
-    backend
-        .replica_writer::<Repository>(NodeId::new("readiness-root"), "flotilla")
-        .replace(&source_repositories.list().await.expect("repository source snapshot"), Utc::now())
-        .await
-        .expect("replicate resolved default branch");
+        .await;
+    replicate_other_home(&daemon, "readiness-root");
 
     assert_eq!(
         daemon.reconcile_convoy_ensures_once("flotilla").await.expect("dependency change bypasses deadline"),

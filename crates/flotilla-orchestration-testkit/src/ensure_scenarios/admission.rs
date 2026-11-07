@@ -441,10 +441,14 @@ pub async fn ensure_dependency_fingerprint_tracks_replicated_placement_changes(f
         )
         .await
         .expect("absent fingerprint");
-    let source = ResourceBackend::new(InMemoryBackend::default());
-    let mut kind = placement_kind(&source, "remote-policy", "other-host").await;
-    let writer = backend.replica_writer::<FulfilmentKind>(NodeId::new("other-root"), "flotilla");
-    writer.replace(&source.using::<FulfilmentKind>("flotilla").list().await.expect("kinds"), Utc::now()).await.expect("replicate kind");
+    // The kind is declared at another root and arrives through its log.
+    let mut spec = FulfilmentKindSpec::builder()
+        .host_ref("other-host".to_string())
+        .pool("passthrough".to_string())
+        .realisation(FulfilmentRealisation::HostDirect)
+        .build();
+    other_home(&daemon, "other-root").kind("remote-policy", &spec).await;
+    replicate_other_home(&daemon, "other-root");
     let present = factory
         .dependency_hash(
             daemon.as_ref(),
@@ -457,16 +461,9 @@ pub async fn ensure_dependency_fingerprint_tracks_replicated_placement_changes(f
         .await
         .expect("replica fingerprint");
     assert_ne!(absent, present, "arrival must invalidate an admission refusal");
-    kind.spec.cost_class = flotilla_resources::FulfilmentCostClass::Metered;
-    source
-        .using::<FulfilmentKind>("flotilla")
-        .update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &kind.spec)
-        .await
-        .expect("change kind");
-    writer
-        .replace(&source.using::<FulfilmentKind>("flotilla").list().await.expect("updated kinds"), Utc::now())
-        .await
-        .expect("replicate change");
+    spec.cost_class = flotilla_resources::FulfilmentCostClass::Metered;
+    other_home(&daemon, "other-root").kind("remote-policy", &spec).await;
+    replicate_other_home(&daemon, "other-root");
     assert_ne!(
         present,
         factory
@@ -493,13 +490,9 @@ pub async fn replicated_ensure_is_not_reconciled_away_from_its_project_home(fact
 
     let remote_root = NodeId::new("remote-root");
     let origin = ResourceBackend::new(InMemoryBackend::default()).with_local_root(remote_root.clone());
-    origin.using::<Project>("flotilla").create(&InputMeta::from(&project.metadata), &project.spec).await.expect("remote project");
+    // The Project is homed at the remote root and reaches this daemon through that home's log.
+    project_at_other_home(&daemon, remote_root.as_str(), &project).await;
     origin.using::<ConvoyEnsure>("flotilla").create(&InputMeta::from(&ensure.metadata), &ensure.spec).await.expect("remote ensure");
-    backend
-        .replica_writer::<Project>(remote_root.clone(), "flotilla")
-        .replace(&origin.using::<Project>("flotilla").list().await.expect("remote projects"), Utc::now())
-        .await
-        .expect("replicate project");
     backend
         .replica_writer::<ConvoyEnsure>(remote_root, "flotilla")
         .replace(&origin.using::<ConvoyEnsure>("flotilla").list().await.expect("remote ensures"), Utc::now())
@@ -645,29 +638,25 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
     let source = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
     let repository_spec = RepositorySpec::remote("https://github.com/acme/cross-root").expect("repository spec");
     let repository_key = repository_spec.key();
-    let source_repository = source
-        .using::<Repository>("flotilla")
-        .create(&test_meta(&repository_key.to_string()), &repository_spec)
-        .await
-        .expect("source repository");
-    source
-        .using::<Repository>("flotilla")
-        .update_status(
-            &source_repository.metadata.name,
-            &source_repository.metadata.resource_version,
+    // Root A's Repository and Project are homed there, and reach root B through its log.
+    let root_a = other_home(&daemon, "root-a");
+    root_a.repository(&repository_key.to_string(), &repository_spec).await;
+    root_a
+        .repository_status(
+            &repository_key.to_string(),
             &RepositoryStatus { default_branch: Some("main".to_string()), ..Default::default() },
         )
-        .await
-        .expect("source default branch observation");
+        .await;
     target
         .using::<Repository>("flotilla")
         .create(&test_meta(&repository_key.to_string()), &repository_spec)
         .await
         .expect("driver repository without a local status observation");
-    source
-        .definitions::<Project>("flotilla")
-        .create(
-            &test_meta("cross-root-project"),
+    root_a
+        .project(
+            "cross-root-project",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &ProjectSpec::builder()
                 .display_name("Cross Root Project".to_string())
                 .default_workflow_ref("cross-root-workflow".to_string())
@@ -681,8 +670,7 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
                 }])
                 .build(),
         )
-        .await
-        .expect("source project");
+        .await;
     target
         .using::<WorkflowTemplate>("flotilla")
         .create(
@@ -725,16 +713,7 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
         .expect("source ensure");
 
     let origin = NodeId::new("root-a");
-    target
-        .replica_writer::<Repository>(origin.clone(), "flotilla")
-        .replace(&source.using::<Repository>("flotilla").list().await.expect("source repositories"), Utc::now())
-        .await
-        .expect("replicate repositories");
-    target
-        .replica_writer::<Project>(origin.clone(), "flotilla")
-        .replace(&source.using::<Project>("flotilla").list().await.expect("source projects"), Utc::now())
-        .await
-        .expect("replicate projects");
+    replicate_other_home(&daemon, "root-a");
     target
         .replica_writer::<ConvoyEnsure>(origin, "flotilla")
         .replace(&source.using::<ConvoyEnsure>("flotilla").list().await.expect("source ensures"), Utc::now())
@@ -756,26 +735,15 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
         .expect("admitted convoy on root B");
     assert_eq!(convoy.spec.project_ref.as_deref(), Some("cross-root-project"));
 
-    let conflicting_source = ResourceBackend::new(InMemoryBackend::default());
-    let conflicting_repository = conflicting_source
-        .using::<Repository>("flotilla")
-        .create(&test_meta(&repository_key.to_string()), &repository_spec)
-        .await
-        .expect("conflicting source repository");
-    conflicting_source
-        .using::<Repository>("flotilla")
-        .update_status(
-            &conflicting_repository.metadata.name,
-            &conflicting_repository.metadata.resource_version,
+    let root_c = other_home(&daemon, "root-c");
+    root_c.repository(&repository_key.to_string(), &repository_spec).await;
+    root_c
+        .repository_status(
+            &repository_key.to_string(),
             &RepositoryStatus { default_branch: Some("trunk".to_string()), ..Default::default() },
         )
-        .await
-        .expect("conflicting default branch observation");
-    target
-        .replica_writer::<Repository>(NodeId::new("root-c"), "flotilla")
-        .replace(&conflicting_source.using::<Repository>("flotilla").list().await.expect("conflicting repositories"), Utc::now())
-        .await
-        .expect("replicate conflicting repository status");
+        .await;
+    replicate_other_home(&daemon, "root-c");
 
     let error = daemon
         .snapshot_project_repositories("flotilla", "cross-root-project", None)
@@ -866,25 +834,6 @@ pub async fn off_home_driver_admits_an_ensure_from_replicated_project_definition
     let driver_temp = tempfile::tempdir().expect("driver tempdir");
     std::fs::write(driver_temp.path().join("daemon.toml"), "machine_id = \"driver-test\"\n").expect("driver config");
     let driver_backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("driver-root"));
-    let home_root = NodeId::new("home-root");
-    create_host_direct_placement((&driver_backend).into(), "host-direct-driver-vessels", "driver-vessels").await;
-    driver_backend
-        .replica_writer::<Project>(home_root.clone(), "flotilla")
-        .replace(&home_backend.using::<Project>("flotilla").list().await.expect("home projects"), Utc::now())
-        .await
-        .expect("replicate projects");
-    driver_backend
-        .replica_writer::<WorkflowTemplate>(home_root.clone(), "flotilla")
-        .replace(&home_backend.using::<WorkflowTemplate>("flotilla").list().await.expect("home workflows"), Utc::now())
-        .await
-        .expect("replicate workflows");
-    for repository in home_backend.using::<Repository>("flotilla").list().await.expect("home repositories").items {
-        driver_backend
-            .using::<Repository>("flotilla")
-            .create(&InputMeta::from(&repository.metadata), &repository.spec)
-            .await
-            .expect("driver repository observation");
-    }
     let driver = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(driver_temp.path())),
@@ -895,6 +844,25 @@ pub async fn off_home_driver_admits_an_ensure_from_replicated_project_definition
     )
     .await;
     install_engine(&driver);
+    create_host_direct_placement((&*driver).into(), "host-direct-driver-vessels", "driver-vessels").await;
+    // The project's definitions are homed at the project's home and reach the driver through its
+    // log; the driver observes the repositories itself.
+    let home = other_home(&driver, "home-root");
+    for project in home_backend.using::<Project>("flotilla").list().await.expect("home projects").items {
+        home.project(&project.metadata.name, &project.metadata.labels, &project.metadata.annotations, &project.spec).await;
+    }
+    for workflow in home_backend.using::<WorkflowTemplate>("flotilla").list().await.expect("home workflows").items {
+        let spec = serde_json::to_value(&workflow.spec).expect("workflow spec");
+        home.stamped_definition("WorkflowTemplate", &workflow.metadata.name, &workflow.metadata.annotations, spec).await;
+    }
+    replicate_other_home(&driver, "home-root");
+    for repository in home_backend.using::<Repository>("flotilla").list().await.expect("home repositories").items {
+        driver_backend
+            .using::<Repository>("flotilla")
+            .create(&InputMeta::from(&repository.metadata), &repository.spec)
+            .await
+            .expect("driver repository observation");
+    }
     driver
         .install_convoy_ensure_reconciler(factory.create(driver.convoy_teardown(), driver.resource_backend(), driver.clock_for_scenarios()))
         .await;
@@ -941,7 +909,11 @@ pub async fn standing_presence_inherits_role_shape_and_delivers_charter_artifact
     let mut project = projects.get("standing-project").await.expect("project");
     project.spec.default_workflow_ref.clear();
     project.spec.charter_prose.insert("governor".into(), "Govern the child project from this delivered charter.".into());
+    // Declared by its repository's charter at commit charter-2719: a declaration's origin is its
+    // repository and that commit together.
     let mut meta = InputMeta::from(&project.metadata);
+    let repository = project.spec.repositories[0].repo.to_string();
+    meta.annotations.insert(flotilla_charter::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION.into(), repository);
     meta.annotations.insert(flotilla_charter::project_declaration::BOOTSTRAP_COMMIT_ANNOTATION.into(), "charter-2719".into());
     projects.apply(&meta, &project.spec).await.expect("local charter");
     let ensures = backend.definitions::<ConvoyEnsure>("flotilla");
