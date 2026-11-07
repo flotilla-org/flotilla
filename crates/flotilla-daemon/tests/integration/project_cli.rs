@@ -2413,19 +2413,8 @@ async fn image_check_command_reads_the_ref_and_reports_its_build() {
     let inspector = LayerInspector::default();
     daemon.set_repository_inspector(Arc::new(inspector.clone())).await;
     let host = daemon.local_host_id().expect("local host").to_string();
-    let hosts = backend.using::<flotilla_resources::Host>("flotilla");
-    let current = match hosts.get(&host).await {
-        Ok(current) => current,
-        Err(_) => hosts.create(&InputMeta::builder().name(host.clone()).build(), &Default::default()).await.expect("host"),
-    };
-    let mut status = current.status.clone().unwrap_or_default();
-    let mut description = match status.description.clone() {
-        Some(description) => description,
-        None => daemon.local_host_summary().await,
-    };
-    description.system.arch = Some("x86_64".into());
-    status.description = Some(description);
-    hosts.update_status(&host, &current.metadata.resource_version, &status).await.expect("host arch");
+    // The build's architecture is the host's own: the runtime's startup heartbeat publishes it
+    // before `start_daemon` returns, and the heartbeats after it publish the same one.
 
     let repository = RepositorySpec::remote("https://github.com/example/demo").expect("repository");
     backend
