@@ -147,19 +147,17 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
         })
         .collect::<Vec<_>>();
 
-    // Each daemon writes its own Host; readiness is judged from when its home was heard.
+    // Each daemon writes its own Host and heartbeats: only Hosts that have sent a
+    // heartbeat are observer candidates.
+    let heartbeat = || HostStatus { heartbeat_at: Some(Utc::now()), ..HostStatus::default() };
     let own_hosts = daemons.iter().map(|daemon| daemon.local_host_id().unwrap().to_string()).collect::<Vec<_>>();
     for (index, daemon) in daemons.iter().enumerate() {
         let hosts = daemon.resource_backend().using::<ResourceHost>("flotilla");
         let host = hosts.create(&test_meta(&own_hosts[index]), &HostSpec::default()).await.unwrap();
-        if index == 0 {
-            continue;
-        }
-        hosts.update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus::default()).await.unwrap();
+        hosts.update_status(&host.metadata.name, &host.metadata.resource_version, &heartbeat()).await.unwrap();
     }
     replicate(&daemons);
-    // A declared Host whose first heartbeat has not arrived is unknown, not
-    // positive unready evidence. Ready replicas must not steal its source.
+    // Every daemon names the preferred observer as the one owner.
     for daemon in &daemons {
         assert_eq!(
             flotilla_observation::forge_observation::source_owner(&daemon.resource_backend(), "flotilla", &source).await.unwrap(),
@@ -168,7 +166,7 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
     }
     let hosts = daemons[0].resource_backend().using::<ResourceHost>("flotilla");
     let host = hosts.get(&own_hosts[0]).await.unwrap();
-    hosts.update_status(&own_hosts[0], &host.metadata.resource_version, &HostStatus::default()).await.unwrap();
+    hosts.update_status(&own_hosts[0], &host.metadata.resource_version, &heartbeat()).await.unwrap();
     replicate(&daemons);
     for refresher in &refreshers {
         refresher.refresh_once(&subject).await.unwrap();
@@ -236,7 +234,7 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
                     // Explicit withdrawal must work independently of placement readiness.
                     .blocks_forge_observation(true)
                     .build()],
-                ..Default::default()
+                ..heartbeat()
             },
         )
         .await
@@ -257,7 +255,7 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
 
     // Recovery restores the preferred observer; the fallback stops polling.
     let host = hosts.get(&own_hosts[0]).await.unwrap();
-    hosts.update_status(&own_hosts[0], &host.metadata.resource_version, &HostStatus::default()).await.unwrap();
+    hosts.update_status(&own_hosts[0], &host.metadata.resource_version, &heartbeat()).await.unwrap();
     replicate(&daemons);
     for daemon in &daemons {
         assert_eq!(
