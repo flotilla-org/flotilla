@@ -26,13 +26,31 @@ pub(super) fn replicate_decided_store(source: &InProcessDaemon, target: &InProce
 pub(super) async fn bridge_runtime_resource_stores(first: &InProcessDaemon, second: &InProcessDaemon) {
     replicate_local_kind::<Convoy>(first, second).await;
     replicate_local_kind::<Vessel>(first, second).await;
-    replicate_local_kind::<ResourceCheckout>(first, second).await;
     replicate_local_kind::<TerminalSession>(first, second).await;
+    follow_engine_home(first, second);
 
     replicate_local_kind::<Convoy>(second, first).await;
     replicate_local_kind::<Vessel>(second, first).await;
-    replicate_local_kind::<ResourceCheckout>(second, first).await;
     replicate_local_kind::<TerminalSession>(second, first).await;
+    follow_engine_home(second, first);
+}
+
+/// One round of `from`'s engine home after what `to` holds of it, as a peer's follower receives
+/// it: the engine Convoys, clones and checkouts `from` decided reach `to`.
+fn follow_engine_home(from: &InProcessDaemon, to: &InProcessDaemon) {
+    let (Ok(from), Ok(to)) = (from.decided_store(), to.decided_store()) else { return };
+    let home = from.home().to_owned();
+    let after = to.last_sequence(&home).expect("the follower's cursor");
+    let mut frames = Vec::new();
+    from.serve(Some(after), flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now()), |frame| {
+        frames.push(frame.to_vec());
+        Ok(())
+    })
+    .expect("serve the engine home");
+    to.with_store(|store| {
+        flotilla_schema_sqlite::stream::Follower::new(store).receive(&home, |sink| frames.iter().try_for_each(|frame| sink(frame)))
+    })
+    .expect("follow the engine home");
 }
 
 pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) {
@@ -158,6 +176,7 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
                     .name("work".to_string())
                     .crew(vec![CrewSpec::builder()
                         .role("coder".to_string())
+                        .promises(vec![flotilla_resources::TemplatePromise::decision_ledger("coder")])
                         .source(CrewSource::Tool { command: "true".to_string() })
                         .build()])
                     .build()])
@@ -239,7 +258,9 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
         .await
         .expect("record remote placement");
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Two daemons, each with its own controllers and engine, share the test threads: under a
+    // full parallel run the remote checkout takes longer than ten seconds to realise.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let running = convoys.get("remote-placement").await.ok().and_then(|convoy| convoy.status).is_some_and(|status| {
             status.phase == ConvoyPhase::Active && status.work.get("work").is_some_and(|work| work.phase == WorkPhase::Running)
@@ -252,7 +273,7 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
             let kiwi_vessels = kiwi.resource_backend().using::<Vessel>(NAMESPACE).list().await.expect("kiwi Vessels");
             let feta_vessels = feta.resource_backend().using::<Vessel>(NAMESPACE).list().await.expect("feta Vessels");
             let feta_clones = feta.resource_backend().using::<Clone>(NAMESPACE).list().await.expect("feta Clones");
-            let feta_checkouts = feta.resource_backend().using::<ResourceCheckout>(NAMESPACE).list().await.expect("feta Checkouts");
+            let feta_checkouts = feta.lifecycle_reads().checkouts().and_then(|checkouts| checkouts.here());
             let feta_terminals = feta.resource_backend().using::<TerminalSession>(NAMESPACE).list().await.expect("feta TerminalSessions");
             let feta_environments = feta.lifecycle_reads().environments().and_then(|environments| environments.live());
             panic!(
@@ -280,17 +301,11 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
             .is_none(),
         "the placement host's Environment must remain host-local"
     );
-    let ready_checkouts = feta
-        .resource_backend()
-        .using::<ResourceCheckout>(NAMESPACE)
-        .list()
-        .await
-        .expect("feta Checkouts")
-        .items
-        .into_iter()
-        .filter(|checkout| checkout.status.as_ref().map(|status| status.phase) == Some(ResourceCheckoutPhase::Ready))
-        .count();
-    assert_eq!(ready_checkouts, 1);
+    // The work's checkout is feta's, ready there, and only there.
+    let ready_checkouts = feta.lifecycle_reads().checkouts().and_then(|checkouts| checkouts.here()).expect("feta's checkouts");
+    assert_eq!(ready_checkouts.iter().filter(|checkout| checkout.is_ready()).count(), 1, "{ready_checkouts:?}");
+    let kiwi_checkouts = kiwi.lifecycle_reads().checkouts().and_then(|checkouts| checkouts.here()).expect("kiwi's checkouts");
+    assert!(kiwi_checkouts.is_empty(), "the placement host's checkout is not kiwi's: {kiwi_checkouts:?}");
 
     bridge.abort();
     for handle in controller_handles {

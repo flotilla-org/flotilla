@@ -9,8 +9,7 @@ use std::{
 };
 
 use flotilla_resources::{
-    ApiPaths, Checkout, CheckoutSpec, CheckoutWorktreeSpec, InputMeta, LifecycleAuthority, NoStatusPatch, RepositoryKey, Resource,
-    ResourceError, ResourceObject, StatusPatch, Vessel, VesselSpec,
+    ApiPaths, InputMeta, LifecycleAuthority, NoStatusPatch, Resource, ResourceError, ResourceObject, StatusPatch, Vessel, VesselSpec,
 };
 use flotilla_store::{
     controller::{
@@ -1822,11 +1821,11 @@ async fn controller_loop_applies_delete_actuations_idempotently() {
 }
 
 #[tokio::test]
-async fn controller_loop_delete_actuations_preserve_observed_and_adopted_resources() {
+// An adopted checkout is the engine's, never removed by its Checkout controller (#3108).
+async fn controller_loop_delete_actuations_preserve_observed_resources() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let primaries = backend.clone().using::<PrimaryResource>("flotilla");
     let vessels = backend.clone().using::<Vessel>("flotilla");
-    let checkouts = backend.clone().using::<Checkout>("flotilla");
     primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
     vessels
         .create(
@@ -1840,21 +1839,6 @@ async fn controller_loop_delete_actuations_preserve_observed_and_adopted_resourc
         )
         .await
         .expect("task workspace create should succeed");
-    checkouts
-        .create(
-            &resource_meta().name("adopted-checkout").call().with_lifecycle_authority(LifecycleAuthority::Adopted),
-            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
-                repo_ref: RepositoryKey("repo-a".to_string()),
-                env_ref: "host-direct-a".to_string(),
-                r#ref: "feature/adopted".to_string(),
-                base_ref: Some("main".to_string()),
-                target_path: "/checkouts/adopted".to_string(),
-                clone_ref: "clone-a".to_string(),
-            }),
-        )
-        .await
-        .expect("adopted checkout create should succeed");
-
     let reconciled = Arc::new(Mutex::new(Vec::new()));
     let mut harness = TestLoopHarness::new();
     harness.spawn(
@@ -1883,37 +1867,6 @@ async fn controller_loop_delete_actuations_preserve_observed_and_adopted_resourc
     .expect("delete task workspace actuation should run");
     let vessel = vessels.get("observed-task").await.expect("observed task workspace should remain");
     assert_eq!(vessel.metadata.lifecycle_authority().expect("authority label should parse"), Some(LifecycleAuthority::Observed));
-
-    harness.shutdown().await;
-
-    let reconciled = Arc::new(Mutex::new(Vec::new()));
-    let mut harness = TestLoopHarness::new();
-    harness.spawn(
-        ControllerLoop {
-            primary: primaries,
-            secondaries: Vec::new(),
-            reconciler: ActuatingReconciler {
-                actuation: Actuation::DeleteCheckout { name: "adopted-checkout".to_string() },
-                reconciled: Some(Arc::clone(&reconciled)),
-            },
-            resync_interval: Duration::from_secs(60),
-            backend,
-        }
-        .run(),
-    );
-
-    timeout(Duration::from_secs(1), async {
-        loop {
-            if reconciled.lock().expect("reconciled lock").iter().any(|name| name == "alpha") {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("delete checkout actuation should run");
-    let checkout = checkouts.get("adopted-checkout").await.expect("adopted checkout owner record should remain");
-    assert_eq!(checkout.metadata.lifecycle_authority().expect("authority label should parse"), Some(LifecycleAuthority::Adopted));
 
     harness.shutdown().await;
 }

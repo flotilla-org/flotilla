@@ -534,7 +534,7 @@ impl<'a> RequestDispatcher<'a> {
             &self.daemon.resource_backend(),
             self.agent_state_store,
             self.hook_identity_policy,
-            self.daemon.message_primitives(),
+            Some(Arc::clone(self.daemon)),
             event,
         )
         .await
@@ -579,9 +579,10 @@ pub(super) async fn handle_agent_hook(
     backend: &flotilla_store::ResourceBackend,
     agent_state_store: &SharedAgentStateStore,
     hook_identity_policy: HookIdentityPolicy,
-    primitives: Option<std::sync::Arc<flotilla_core::primitives::MessagePrimitives>>,
+    daemon: Option<std::sync::Arc<InProcessDaemon>>,
     mut event: AgentHookEvent,
 ) -> Result<(), String> {
+    let primitives = daemon.as_ref().and_then(|daemon| daemon.message_primitives());
     use flotilla_protocol::AgentEventType;
 
     // Older notify clients allocate a candidate UUID on every invocation.
@@ -666,6 +667,12 @@ pub(super) async fn handle_agent_hook(
     }
 
     let Some(terminal) = event.terminal.as_ref() else { return Ok(()) };
+    // A turn's end (the Stop hook) inspects the checkouts it worked in (#3108).
+    if event.event_type == AgentEventType::Idle && matches!(event.hook_event.as_deref(), Some("Stop" | "agent-turn-complete")) {
+        if let Some(daemon) = daemon.as_ref() {
+            daemon.inspect_after_turn(&terminal.namespace, &terminal.session_name);
+        }
+    }
     if let Some(primitives) = primitives {
         if let Err(error) = record_hook_activity(backend, &primitives, &event).await {
             // Activity is an additional observer. Its store/join errors must not

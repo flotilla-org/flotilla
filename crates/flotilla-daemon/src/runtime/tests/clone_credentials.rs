@@ -2,7 +2,7 @@
 // takes its repository's grants through the session's delivery path.
 use super::*;
 use flotilla_orchestration_testkit::InProcessDiscoveryExt;
-use flotilla_provisioning::reconcilers::PreparedCheckout;
+use flotilla_provisioning::checkout_runtime::PreparedCheckout;
 use flotilla_resources::CloneCredentials;
 
 const FORGE_URL: &str = "https://forge.test/acme/widgets";

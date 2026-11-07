@@ -680,6 +680,8 @@ fn error_status(class: DispatcherErrorClass) -> StatusCode {
 mod tests {
     use std::sync::Arc;
 
+    use crate::testkits::engine::engine as install_engine;
+
     use axum::{
         body::{to_bytes, Body},
         http::Request as HttpRequest,
@@ -726,6 +728,8 @@ mod tests {
                 Arc::new(crate::peer::HostPeerOverlay::default()),
             )
             .await;
+            // Composed with its engine, as the runtime composes a daemon.
+            install_engine(&daemon);
             Self::from_daemon(temp, daemon)
         }
 

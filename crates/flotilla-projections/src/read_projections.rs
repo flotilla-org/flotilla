@@ -38,17 +38,17 @@ use flotilla_resources::resolve_project_issue_sources_from_inventory;
 use flotilla_resources::{
     address::{leaf_address, leaf_record_name, record_name},
     bound_change_request_address, convoy_subject_rows, evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs,
-    repository_display_labels, ChangeRequestStatus, Checkout as ResourceCheckout, Clock, ConditionValue, Convoy as ResourceConvoy,
-    ConvoyStatus, CrewMessageSender, CrewWorkPhase, Forge, FulfilmentKind, FulfilmentRealisation, Host as ResourceHost,
-    HostStatus as ResourceHostStatus, IssueSourceResolution, IssueSourceUnavailable, Project, ReadResourceObject, Repository,
-    RepositoryKey, ResourceObject, ResourceProvenance, SettlementMode, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
+    repository_display_labels, ChangeRequestStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyStatus, CrewMessageSender,
+    CrewWorkPhase, Forge, FulfilmentKind, FulfilmentRealisation, Host as ResourceHost, HostStatus as ResourceHostStatus,
+    IssueSourceResolution, IssueSourceUnavailable, Project, ReadResourceObject, Repository, RepositoryKey, ResourceObject,
+    ResourceProvenance, SettlementMode, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, Vessel, WorkPhase as ResourceWorkPhase, WorkflowTemplate,
     CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::{EventRecorder, ProjectHierarchyStoreExt, ResourceBackend, StoreQuery};
 use tracing::warn;
 
-use crate::resource_explain::{explain_condition, explained_provenance, observed_freshness};
+use crate::resource_explain::{checkout_provenance, explain_judgement, explained_provenance, observed_freshness};
 use crate::{
     fleet::{
         accumulate_fleet_health_counts, fleet_observation_agreement, format_resource_replication_failures, host_credential_attention,
@@ -57,6 +57,7 @@ use crate::{
     },
     host_registry::HostCounts,
 };
+use flotilla_resources::checkout_records::{latest_launches, CheckoutHolder};
 use flotilla_resources::LANDING_EVIDENCE_TTL;
 use flotilla_resources::{
     explain_unmet_expectation, resolve_convoy_candidate_indices, ConvoyAddressIdentity, LeafFiringRecord, LeafSubscriptionRow, LeafWatcher,
@@ -991,9 +992,22 @@ impl ReadProjections<'_> {
             .await
             .map_err(|error| error.to_string())?;
         let mut snapshot = project_ops::RequestSnapshot::new(&reads, namespace)?;
-        snapshot.copy::<ResourceTerminalSession>(&reads).await?;
+        let sessions = reads
+            .query_declared::<ResourceTerminalSession>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
+            .await
+            .map_err(|error| error.to_string())?;
+        // Only the crewed convoys, whose checkouts' authority the rows name: health reads no
+        // other Convoy body.
+        let crewed =
+            sessions.items.iter().filter_map(|session| session.object.metadata.labels.get(CONVOY_LABEL).cloned()).collect::<BTreeSet<_>>();
+        let convoys = if crewed.is_empty() {
+            flotilla_resources::ReadResourceList { items: Vec::new() }
+        } else {
+            reads.query_declared::<ResourceConvoy>(namespace, &StoreQuery::names(crewed, true)).await.map_err(|error| error.to_string())?
+        };
+        snapshot.insert::<ResourceTerminalSession>(sessions)?;
+        snapshot.insert::<ResourceConvoy>(convoys)?;
         snapshot.copy::<ResourceHost>(&reads).await?;
-        snapshot.copy::<ResourceCheckout>(&reads).await?;
         snapshot.copy::<Project>(&reads).await?;
         snapshot.copy::<flotilla_resources::FleetDesignation>(&reads).await?;
         snapshot.insert::<FulfilmentKind>(kinds)?;
@@ -1165,20 +1179,6 @@ impl ReadProjections<'_> {
             )
             .await
             .map_err(|error| error.to_string())?;
-        let checkouts = self
-            .backend
-            .query_declared::<ResourceCheckout>(
-                namespace,
-                &StoreQuery {
-                    field_values: BTreeMap::from([(
-                        "metadata.labels.\"flotilla.work/convoy\"".into(),
-                        matching.clone().into_iter().collect(),
-                    )]),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
         // The graph is also the fleet-designation projection's complete catalog.
         let projects = project_ops::read_definition_catalog::<Project>(self.backend, namespace).await?;
         let fleet = self
@@ -1191,7 +1191,6 @@ impl ReadProjections<'_> {
         snapshot.insert::<ResourceTerminalSession>(sessions)?;
         snapshot.insert::<ResourceConvoy>(convoys)?;
         snapshot.insert::<ResourceHost>(hosts)?;
-        snapshot.insert::<ResourceCheckout>(checkouts)?;
         snapshot.insert_definitions::<Project>(projects)?;
         snapshot.insert_definitions::<FleetDesignation>(fleet)?;
         Ok((snapshot.finish(), selected_project, matching))
@@ -1307,17 +1306,12 @@ impl ReadProjections<'_> {
         let subjects = convoy_subject_rows(&convoy, &reference_context);
         let change_request_stale_after = self.leaf_subscriptions.change_request_stale_after();
 
-        let checkout_sources = self
-            .backend
-            .query_declared::<ResourceCheckout>(
-                namespace,
-                &StoreQuery::labels(&BTreeMap::from([(CONVOY_LABEL.into(), convoy.metadata.name.clone())]), true, true),
-            )
-            .await
-            .map_err(|error| error.to_string())?
-            .items;
-        let selected_checkout_sources = flotilla_resources::select_convoy_child_sources(&convoy, &checkout_sources);
-        let selected_checkouts = selected_checkout_sources.iter().map(|(name, source)| (name.clone(), source.object.clone())).collect();
+        // The convoy's checkouts as the engine holds them, across homes (#3108).
+        let selected_checkouts = self
+            .lifecycles
+            .checkouts()?
+            .held(&CheckoutHolder::Convoy(flotilla_resources::convoy::engine::engine_name(&convoy)?))
+            .map(latest_launches)?;
         let vessel_sources = self
             .backend
             .query_declared::<Vessel>(
@@ -1332,35 +1326,32 @@ impl ReadProjections<'_> {
         let checkouts = expected
             .iter()
             .map(|checkout_name| {
-                let source = selected_checkout_sources.get(checkout_name);
-                let selected = source.map(|source| &source.object);
-                let provenance = source.map(|source| explained_provenance(&source.provenance, self.node_id));
-                // One keyed engine read per checkout, and one for a worktree's clone, at the
-                // checkout's home (its environment's host, which also holds the clone).
-                let origin = source.and_then(|source| match &source.provenance {
-                    flotilla_resources::ResourceProvenance::Local => None,
-                    flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
-                });
-                let lifecycle = source
-                    .map(|_| self.lifecycles.try_reading(crate::ports::ProvisioningKind::Checkout, checkout_name, origin.as_deref()))
-                    .transpose()?
-                    .flatten();
-                let clone = match selected.map(|checkout| &checkout.spec) {
-                    Some(flotilla_resources::CheckoutSpec::Worktree(spec)) => self
+                let selected = selected_checkouts.get(checkout_name);
+                let provenance = selected.map(|checkout| checkout_provenance(checkout, self.node_id));
+                let lifecycle = selected.map(|checkout| checkout.reading.clone());
+                // A worktree's clone is read at the checkout's home, which also holds the clone.
+                let clone = match selected.map(|checkout| (&checkout.spec, checkout.home.as_str())) {
+                    Some((flotilla_resources::CheckoutSpec::Worktree(spec), home)) => self
                         .lifecycles
                         .clones()?
-                        .get(&spec.clone_ref, origin.as_deref())?
+                        .get(&spec.clone_ref, Some(home))?
                         .map(|clone| ExplainedClone { name: clone.name, reading: clone.reading }),
                     _ => None,
                 };
-                let integration = selected.and_then(|checkout| checkout.status.as_ref()).map(|status| &status.integration);
+                let integration = selected.and_then(|checkout| checkout.integration.as_ref());
+                let explain = |value: fn(&flotilla_resources::checkout_records::Inspection) -> (Option<bool>, &Vec<String>)| {
+                    integration.map(|integration| {
+                        let (judged, details) = value(&integration.inspection);
+                        explain_judgement(judged, details, integration, now, LANDING_EVIDENCE_TTL)
+                    })
+                };
                 Ok(ExplainedCheckout {
                     name: checkout_name.clone(),
                     observed: selected.is_some(),
                     provenance,
-                    clean: integration.map(|status| explain_condition(&status.clean, now, LANDING_EVIDENCE_TTL)),
-                    pushed: integration.map(|status| explain_condition(&status.pushed, now, LANDING_EVIDENCE_TTL)),
-                    landed: integration.map(|status| explain_condition(&status.landed, now, LANDING_EVIDENCE_TTL)),
+                    clean: explain(|inspection| (inspection.clean, &inspection.clean_details)),
+                    pushed: explain(|inspection| (inspection.pushed, &inspection.pushed_details)),
+                    landed: explain(|inspection| (inspection.landed, &inspection.landed_details)),
                     lifecycle,
                     clone,
                 })

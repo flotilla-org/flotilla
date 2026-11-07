@@ -72,11 +72,11 @@ async fn observe(daemon: &InProcessDaemon, backend: &ResourceBackend, name: &str
 // #1770: observation alone never constructs a provider. Concurrent demands
 // share one discovered provider, deletion releases it, and recreation gets a
 // new provider even when the resource name and path are reused.
-// Generator spans both backends, one to three lifetimes, duplicate requests,
-// both deletion orders, and an empty inventory between lifetimes.
+// Generator spans one to three lifetimes, duplicate requests, both deletion
+// orders, and an empty inventory between lifetimes. The engine's checkouts'
+// lifetimes are `checkout_providers::lifecycle_contract`'s (#3108).
 #[hegel::test]
 fn observed_checkout_provider_lifetimes(tc: hegel::TestCase) {
-    let durable = tc.draw(gs::booleans());
     let cycles = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
     let duplicates = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
     let reverse = tc.draw(gs::booleans());
@@ -97,7 +97,9 @@ fn observed_checkout_provider_lifetimes(tc: hegel::TestCase) {
             std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
-        let backend = if durable { &daemon.resource_backend } else { &daemon.observed_resource_backend };
+        // The engine's readings, which a running daemon always has.
+        super::tests::test_engine(&daemon);
+        let backend = &daemon.observed_resource_backend;
         let repository = RepositorySpec::remote("https://github.com/example/lifetime").expect("repository");
         let key = repository.key();
         daemon
@@ -170,6 +172,8 @@ async fn generic_checkout_executes_without_presentation_roots() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    super::tests::test_engine(&daemon);
     let spec = RepositorySpec::remote("https://github.com/acme/commands").expect("repository");
     let key = spec.key();
     daemon
@@ -273,6 +277,8 @@ async fn project_issue_binding_keeps_conditional_lease_after_checkout_removal() 
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    super::tests::test_engine(&daemon);
     let spec = RepositorySpec::remote("https://github.com/acme/issues").expect("repository");
     let key = spec.key();
     daemon
@@ -345,6 +351,8 @@ async fn checkout_provider_watch_follows_namespace_changes() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    super::tests::test_engine(&daemon);
     let spec = RepositorySpec::remote("https://github.com/example/namespace").expect("repository");
     let key = spec.key();
     // The decided store has no namespaces: one Repository record reads in both.
@@ -415,6 +423,8 @@ async fn project_issue_binding_uses_source_forge_instead_of_mirror_transport() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    super::tests::test_engine(&daemon);
     let forge = ForgeSpec::builder()
         .forge_id("source-forge".into())
         .kind(ForgeKind::Forgejo)
@@ -504,6 +514,8 @@ async fn github_observation_credential_failure_is_visible_and_recovers() {
         Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    super::tests::test_engine(&daemon);
     let backend = daemon.resource_backend();
     let forge = flotilla_resources::ForgeSpec::builder()
         .forge_id("github".into())

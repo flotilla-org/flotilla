@@ -6,6 +6,7 @@ use flotilla_protocol::{ConvoyStartIntent, NodeId};
 use flotilla_protocol_testkit::event_sink::RecordingEventSink;
 use flotilla_resources::{Convoy, CrewSource, CrewSpec, VesselRequirement, WorkflowTemplateSpec};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use crate::test_support::TestProjectOperations as Worker;
 
@@ -13,34 +14,24 @@ fn handlers<'a>(
     worker: &'a Worker,
     owner: &'a ConvoyAdmission,
     backend: &'a ResourceBackend,
-    observed: &'a ResourceBackend,
     events: ActionEvents<'a>,
-    reconciliation: &'a Arc<Mutex<()>>,
     namespace: &'a std::sync::RwLock<String>,
 ) -> AdmissionActions<'a> {
-    AdmissionActions {
-        port: worker,
-        admission: owner,
-        resource_backend: backend,
-        observed_resource_backend: observed,
-        observed_checkout_reconciliation: reconciliation,
-        namespace,
-        events,
-    }
+    AdmissionActions { port: worker, admission: owner, resource_backend: backend, namespace, events }
 }
 
 // #2975: admission emits Started before Finished, freezes inputs and principal,
 // and serializes competing admissions so the duplicate creates no resources.
 #[tokio::test]
 async fn direct_admission_contract_success_and_duplicate() {
-    let HandlerContractFixture { owner, backend, observed, reconciliation, namespace, temp } =
+    let HandlerContractFixture { owner, backend, observed: _, namespace, temp } =
         super::super::convoy_admission::handler_contract_fixture().await;
     super::super::convoy_admission::register_host_direct_kind(&backend, "host").await;
     let worker = Worker::default();
     let recording = Arc::new(RecordingEventSink::default());
     let sink: Arc<dyn EventSink> = recording.clone();
     let node = NodeId::new("handler");
-    let actions = handlers(&worker, &owner, &backend, &observed, ActionEvents { sink: &sink, node_id: &node }, &reconciliation, &namespace);
+    let actions = handlers(&worker, &owner, &backend, ActionEvents { sink: &sink, node_id: &node }, &namespace);
     let workflow = WorkflowTemplateSpec::builder()
         .vessels(vec![VesselRequirement::builder()
             .name("work".into())
@@ -85,24 +76,24 @@ async fn direct_admission_contract_success_and_duplicate() {
     assert_eq!(convoys[0].spec.inputs["task"], flotilla_resources::InputValue::String("preserve me".into()));
     assert_eq!(convoys[0].spec.role, "contract");
     assert_eq!(worker.inspections.load(Ordering::SeqCst), 1, "duplicate must refuse before checkout inspection");
-    for store in [&backend, &observed] {
-        let checkouts = store.using::<flotilla_resources::Checkout>("flotilla").list().await.unwrap().items;
-        assert_eq!(checkouts.len(), 1, "duplicate must not leave an orphan checkout");
-        assert!(convoys[0].spec.adopted_checkout_refs.values().any(|name| name == &checkouts[0].metadata.name));
-    }
+    // The adopted checkout is recorded on the one convoy for its vessel to request (#3108).
+    let adopted = flotilla_resources::convoy::adopted_checkout(&convoys[0]).unwrap().expect("adopted checkout recorded");
+    let flotilla_resources::CheckoutSpec::Observed(adopted) = adopted else { panic!("adopted checkout is observed") };
+    assert_eq!(adopted.r#ref, "feature/contract");
+    assert_eq!(convoys[0].spec.adopted_checkout_refs.len(), 1);
 }
 
 // #2975: failed worker submission clears the pending key; a queued duplicate
 // refuses without submission, and owner cleanup allows the next attempt.
 #[tokio::test]
 async fn direct_admission_contract_worker_cleanup_and_duplicate() {
-    let HandlerContractFixture { owner, backend, observed, reconciliation, namespace, temp: _temp } =
+    let HandlerContractFixture { owner, backend, observed: _, namespace, temp: _temp } =
         super::super::convoy_admission::handler_contract_fixture().await;
     let worker = Worker::default();
     let recording = Arc::new(RecordingEventSink::default());
     let sink: Arc<dyn EventSink> = recording.clone();
     let node = NodeId::new("handler");
-    let actions = handlers(&worker, &owner, &backend, &observed, ActionEvents { sink: &sink, node_id: &node }, &reconciliation, &namespace);
+    let actions = handlers(&worker, &owner, &backend, ActionEvents { sink: &sink, node_id: &node }, &namespace);
     let intent = ConvoyStartIntent::builder().project_ref("project".into()).name("unit".into()).build();
     let command = Command::builder().action(CommandAction::ConvoyStart { intent: Box::new(intent.clone()) }).build();
     actions.execute_action_convoy_start(1, &command, &None).await.unwrap();

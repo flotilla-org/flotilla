@@ -13,8 +13,8 @@ use super::{
 };
 use crate::{
     address::{artifact_slot_record_name, leaf_record_name},
-    checkout::Checkout,
-    labels::{LifecycleAuthority, CONVOY_LABEL, VESSEL_LABEL},
+    checkout_records::CheckoutRecord,
+    labels::{CONVOY_LABEL, VESSEL_LABEL},
     pinned_placement_ref,
     resource::ResourceObject,
     status_patch::StatusPatch,
@@ -34,7 +34,7 @@ pub fn is_ensured(convoy: &ResourceObject<Convoy>) -> bool {
 #[async_trait]
 pub trait ConvoyTeardownRuntime: Send + Sync {
     /// Re-verify ADR 0017 teardown eligibility at the execution edge.
-    async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>, checkouts: &[ResourceObject<Checkout>]) -> Result<(), String>;
+    async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>, checkouts: &[CheckoutRecord]) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -380,7 +380,7 @@ pub struct LandingSettlement {
 pub fn evaluate_landing_settlement(
     convoy: &ResourceObject<Convoy>,
     vessels: &BTreeMap<String, ResourceObject<Vessel>>,
-    checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
+    checkouts: &BTreeMap<String, CheckoutRecord>,
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
     forges: &[ForgeSpec],
     change_request_stale_after: std::time::Duration,
@@ -404,7 +404,7 @@ pub fn evaluate_landing_settlement(
 pub fn evaluate_landing_settlement_with_disposition(
     convoy: &ResourceObject<Convoy>,
     vessels: &BTreeMap<String, ResourceObject<Vessel>>,
-    checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
+    checkouts: &BTreeMap<String, CheckoutRecord>,
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
     forges: &[ForgeSpec],
     change_request_stale_after: std::time::Duration,
@@ -435,7 +435,7 @@ pub fn evaluate_landing_settlement_with_disposition(
 fn evaluate_exit_with_disposition(
     convoy: &ResourceObject<Convoy>,
     vessels: &BTreeMap<String, ResourceObject<Vessel>>,
-    checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
+    checkouts: &BTreeMap<String, CheckoutRecord>,
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
     forges: &[ForgeSpec],
     change_request_stale_after: std::time::Duration,
@@ -678,7 +678,7 @@ pub fn observed_digest_claims(status: &super::ConvoyStatus) -> Vec<&crate::Settl
 
 fn evaluate_observed_digest_anchor(
     convoy: &ResourceObject<Convoy>,
-    checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
+    checkouts: &BTreeMap<String, CheckoutRecord>,
     stale_after: std::time::Duration,
     now: DateTime<Utc>,
 ) -> Option<LandingSettlement> {
@@ -689,28 +689,31 @@ fn evaluate_observed_digest_anchor(
 
     let mut unmet = Vec::new();
     for claim in claims {
+        // A checkout's inspection reads its own branch's ref on its remote.
+        let branch = claim.refs.head.strip_prefix("refs/heads/").unwrap_or(&claim.refs.head);
+        // A checkout that has ended confirms nothing: it is no longer inspected.
         let observations = checkouts
             .values()
-            .filter_map(|checkout| checkout.status.as_ref()?.integration.remote_refs.get(&claim.refs.head))
+            .filter(|checkout| !checkout.ended() && checkout.branch() == branch)
+            .filter_map(|checkout| {
+                let integration = checkout.integration.as_ref()?;
+                Some((integration.inspection.remote_digest.as_ref()?, integration))
+            })
             .collect::<Vec<_>>();
-        let Some(observation) = observations.into_iter().max_by_key(|observation| &observation.observed_at) else {
+        let Some((digest, integration)) = observations.into_iter().max_by_key(|(_, integration)| integration.confirmed_at) else {
             unmet.push(UnmetSettlementExpectation::MissingObservedRef { reference: claim.refs.head.clone() });
             continue;
         };
-        let fresh = DateTime::parse_from_rfc3339(&observation.observed_at)
-            .ok()
-            .and_then(|observed_at| now.signed_duration_since(observed_at).to_std().ok())
-            .is_some_and(|age| age < stale_after);
-        if !fresh {
+        if !integration.confirmed_within(now, stale_after) {
             unmet.push(UnmetSettlementExpectation::StaleObservedRef {
                 reference: claim.refs.head.clone(),
-                observed_at: observation.observed_at.clone(),
+                observed_at: integration.confirmed_at.to_rfc3339(),
             });
-        } else if observation.digest != claim.claimed_head_digest {
+        } else if *digest != claim.claimed_head_digest {
             unmet.push(UnmetSettlementExpectation::ObservedDigestMismatch {
                 reference: claim.refs.head.clone(),
                 claimed: claim.claimed_head_digest.clone(),
-                observed: observation.digest.clone(),
+                observed: digest.clone(),
             });
         }
     }
@@ -795,7 +798,7 @@ pub fn reconcile_internal(
     convoy: &ResourceObject<Convoy>,
     template: Option<&ResourceObject<WorkflowTemplate>>,
     vessels: &BTreeMap<String, ResourceObject<Vessel>>,
-    checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
+    checkouts: &BTreeMap<String, CheckoutRecord>,
     conditions: LifecycleConditions,
     now: DateTime<Utc>,
 ) -> InternalReconcileOutcome {
@@ -811,7 +814,7 @@ fn reconcile_internal_without_landing_event(
     convoy: &ResourceObject<Convoy>,
     template: Option<&ResourceObject<WorkflowTemplate>>,
     vessels: &BTreeMap<String, ResourceObject<Vessel>>,
-    checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
+    checkouts: &BTreeMap<String, CheckoutRecord>,
     conditions: LifecycleConditions,
     now: DateTime<Utc>,
 ) -> InternalReconcileOutcome {
@@ -840,7 +843,6 @@ fn reconcile_internal_without_landing_event(
             convoy,
             &status,
             vessels,
-            checkouts,
             conditions.reclaim_eligible,
             InternalReconcileOutcome { patch: None, actuations: Vec::new(), events: Vec::new() },
         );
@@ -852,7 +854,6 @@ fn reconcile_internal_without_landing_event(
                 convoy,
                 &status,
                 vessels,
-                checkouts,
                 conditions.reclaim_eligible,
                 InternalReconcileOutcome {
                     patch: Some(controller_patches::fail_init(
@@ -872,16 +873,16 @@ fn reconcile_internal_without_landing_event(
     }
 
     if let Some(outcome) = backfill_crew_work_outcome(&status) {
-        return with_cleanup(convoy, &status, vessels, checkouts, conditions.reclaim_eligible, outcome);
+        return with_cleanup(convoy, &status, vessels, conditions.reclaim_eligible, outcome);
     }
 
     if let Some(outcome) = fail_fast_outcome(&status, now) {
-        return with_cleanup(convoy, &status, vessels, checkouts, conditions.reclaim_eligible, outcome);
+        return with_cleanup(convoy, &status, vessels, conditions.reclaim_eligible, outcome);
     }
 
     let provisioning = vessel_outcome(convoy, &status, vessels, now);
     if provisioning.patch.is_some() {
-        return with_cleanup(convoy, &status, vessels, checkouts, conditions.reclaim_eligible, provisioning);
+        return with_cleanup(convoy, &status, vessels, conditions.reclaim_eligible, provisioning);
     }
 
     if let Some(outcome) = roll_up_crew_work_outcome(convoy, &status, vessels, now) {
@@ -889,7 +890,6 @@ fn reconcile_internal_without_landing_event(
             convoy,
             &status,
             vessels,
-            checkouts,
             conditions.reclaim_eligible,
             InternalReconcileOutcome { patch: outcome.patch, actuations: provisioning.actuations, events: outcome.events },
         );
@@ -900,7 +900,6 @@ fn reconcile_internal_without_landing_event(
             convoy,
             &status,
             vessels,
-            checkouts,
             conditions.reclaim_eligible,
             InternalReconcileOutcome { patch: outcome.patch, actuations: provisioning.actuations, events: outcome.events },
         );
@@ -911,13 +910,12 @@ fn reconcile_internal_without_landing_event(
             convoy,
             &status,
             vessels,
-            checkouts,
             conditions.reclaim_eligible,
             InternalReconcileOutcome { patch: outcome.patch, actuations: provisioning.actuations, events: outcome.events },
         );
     }
 
-    with_cleanup(convoy, &status, vessels, checkouts, conditions.reclaim_eligible, provisioning)
+    with_cleanup(convoy, &status, vessels, conditions.reclaim_eligible, provisioning)
 }
 
 fn bootstrap_outcome(
@@ -1240,7 +1238,7 @@ fn roll_up_crew_work_outcome(
 fn roll_up_phase_outcome(
     convoy: &ResourceObject<Convoy>,
     status: &super::ConvoyStatus,
-    checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
+    checkouts: &BTreeMap<String, CheckoutRecord>,
     conditions: &LifecycleConditions,
     now: DateTime<Utc>,
 ) -> Option<ReconcileOutcome> {
@@ -1256,13 +1254,13 @@ fn roll_up_phase_outcome(
                 checkouts
                     .values()
                     .find(|checkout| checkout.spec.repo_ref() == &repository.repo_ref)
-                    .and_then(|checkout| checkout.status.as_ref())
-                    .and_then(|status| status.integration.landed_evidence.as_ref())
+                    .and_then(CheckoutRecord::inspection)
+                    .and_then(|inspection| inspection.landed_evidence.as_ref())
                     .and_then(|evidence| {
                         let observed_target_ref = evidence.target_ref.as_ref()?;
                         (observed_target_ref != &repository.target_ref).then(|| super::TargetMismatch {
                             repo_ref: repository.repo_ref.clone(),
-                            change_request_id: evidence.change_request_id.clone(),
+                            change_request_id: evidence.change_request.to_string(),
                             declared_target_ref: repository.target_ref.clone(),
                             observed_target_ref: observed_target_ref.clone(),
                         })
@@ -1500,11 +1498,10 @@ fn with_cleanup(
     convoy: &ResourceObject<Convoy>,
     status: &super::ConvoyStatus,
     vessels: &BTreeMap<String, ResourceObject<Vessel>>,
-    checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     reclaim_eligible: bool,
     mut outcome: InternalReconcileOutcome,
 ) -> InternalReconcileOutcome {
-    let (patch, actuations) = cleanup_plan(convoy, status, vessels, checkouts, reclaim_eligible, outcome.patch.as_ref());
+    let (patch, actuations) = cleanup_plan(convoy, status, vessels, reclaim_eligible, outcome.patch.as_ref());
     if outcome.patch.is_none() {
         outcome.patch = patch;
     }
@@ -1516,7 +1513,6 @@ fn cleanup_plan(
     convoy: &ResourceObject<Convoy>,
     status: &super::ConvoyStatus,
     vessels: &BTreeMap<String, ResourceObject<Vessel>>,
-    checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     reclaim_eligible: bool,
     patch: Option<&ConvoyStatusPatch>,
 ) -> (Option<ConvoyStatusPatch>, Vec<Actuation>) {
@@ -1533,29 +1529,18 @@ fn cleanup_plan(
         return (None, Vec::new());
     }
 
+    // A convoy's checkouts are the engine's, held for its engine Convoy: the Checkout controller
+    // releases them once that convoy has ended.
     let mut actuations = extract_actuations(convoy);
     actuations.extend(
         vessels
             .values()
             .filter(|vessel| vessel.metadata.deletion_timestamp.is_none())
-            .map(|vessel| Actuation::DeleteVessel { name: vessel.metadata.name.clone() })
-            .chain(
-                checkouts
-                    .values()
-                    .filter(|checkout| checkout.metadata.deletion_timestamp.is_none())
-                    .filter(|checkout| {
-                        !matches!(
-                            checkout.metadata.lifecycle_authority(),
-                            Ok(Some(LifecycleAuthority::Observed | LifecycleAuthority::Adopted))
-                        )
-                    })
-                    .map(|checkout| Actuation::DeleteCheckout { name: checkout.metadata.name.clone() }),
-            ),
+            .map(|vessel| Actuation::DeleteVessel { name: vessel.metadata.name.clone() }),
     );
     actuations.sort_by_key(|actuation| match actuation {
         Actuation::DeleteVessel { name } => (1, name.clone()),
-        Actuation::DeleteCheckout { name } => (2, name.clone()),
-        _ => (3, String::new()),
+        _ => (2, String::new()),
     });
     (None, actuations)
 }

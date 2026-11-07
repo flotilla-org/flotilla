@@ -13,7 +13,7 @@ async fn reconciler_wake_rederives_at_boot_and_lands_without_resync() {
         stale_after: Duration::from_secs(60),
     };
     let refresher = ChangeRequestRefresher::new("fleet".to_string(), backend.clone(), "authority".to_string(), source.clone(), cadence);
-    let table = LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher);
+    let table = served_table(backend.clone(), broadcast_test_sink(event_tx), refresher);
     let repo_ref = RepositoryKey("repo".to_string());
     let spec = ConvoySpec::builder()
         .workflow_ref("workflow".to_string())
@@ -52,6 +52,7 @@ async fn reconciler_wake_rederives_at_boot_and_lands_without_resync() {
             primary: convoys.clone(),
             secondaries: vec![table.reconciler_wake_watch()],
             reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+                .with_lifecycle_reads(no_held_checkouts())
                 .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
             resync_interval: Duration::from_secs(3600),
             backend: backend.clone(),
@@ -166,7 +167,7 @@ async fn zero_subject_landing_settles_as_claim_exit_through_engine() {
         Arc::new(UnavailableChangeRequests),
         cadence,
     );
-    let table = LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher);
+    let table = served_table(backend.clone(), broadcast_test_sink(event_tx), refresher);
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let created = convoys
         .create(
@@ -200,7 +201,8 @@ async fn zero_subject_landing_settles_as_claim_exit_through_engine() {
         ControllerLoop {
             primary: convoys.clone(),
             secondaries: vec![table.reconciler_wake_watch()],
-            reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla")),
+            reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+                .with_lifecycle_reads(no_held_checkouts()),
             resync_interval: Duration::from_secs(3600),
             backend,
         }
@@ -219,7 +221,14 @@ async fn zero_subject_landing_settles_as_claim_exit_through_engine() {
     .await
     .expect("zero-subject convoy should claim-exit");
     assert_eq!(status.disposition.as_deref(), Some("claim"));
-    assert!(table.rows().await.is_empty(), "claim exit should not arm leaves");
+    // The wake follows the landing in its own task: once it has, no leaf stays armed.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !table.rows().await.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("claim exit should not arm leaves");
     controller.abort();
 }
 
@@ -235,7 +244,7 @@ async fn change_request_bound_after_claims_instantiates_and_settles() {
         stale_after: Duration::from_secs(60),
     };
     let refresher = ChangeRequestRefresher::new("fleet".to_string(), backend.clone(), "authority".to_string(), source.clone(), cadence);
-    let table = LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher);
+    let table = served_table(backend.clone(), broadcast_test_sink(event_tx), refresher);
     let repo_ref = RepositoryKey("repo".to_string());
     let mut spec = ConvoySpec::builder()
         .workflow_ref("workflow".to_string())
@@ -281,6 +290,7 @@ async fn change_request_bound_after_claims_instantiates_and_settles() {
             primary: convoys.clone(),
             secondaries: vec![table.reconciler_wake_watch()],
             reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+                .with_lifecycle_reads(no_held_checkouts())
                 .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
             resync_interval: Duration::from_secs(3600),
             backend: backend.clone(),

@@ -27,7 +27,7 @@ use flotilla_protocol::{ConfiguredResourceLimits, TerminalStatus};
 use flotilla_provider_runtime::execution_context::BoundLayer;
 use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
 use flotilla_resources::{
-    Checkout, Convoy, FulfilmentKind, ResourceObject, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession,
+    Convoy, FulfilmentKind, ResourceObject, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession,
     TerminalSessionPhase, TerminalSessionSource, TerminalSessionTarget, Vessel, CREDENTIAL_PERMISSIONS_SESSION_TAG,
     CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_SESSION_TAG,
 };
@@ -293,9 +293,7 @@ pub(super) fn terminal_liveness_for_source(source: &TerminalSessionSource, liven
 #[async_trait]
 impl TerminalRuntime for TerminalControllerRuntime {
     async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String> {
-        let backend = self.state.daemon.resource_backend();
-        let records = backend.including_replicas::<Checkout>(&convoy.metadata.namespace).list().await.map_err(|error| error.to_string())?;
-        let checkouts = flotilla_resources::select_convoy_children(convoy, &records.items).into_values().collect::<Vec<_>>();
+        let checkouts = self.state.daemon.held_checkouts(convoy).await?;
         self.state.daemon.verify_convoy_teardown_gate_for_checkouts(convoy, &checkouts, false).await
     }
 

@@ -67,54 +67,24 @@ use flotilla_protocol_testkit::TestIssue;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
-use flotilla_provisioning::reconcilers::{CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout};
 use flotilla_resources::{
     Artifact, ArtifactSubjectBinding, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Convoy, ConvoyPhase as ResourceConvoyPhase,
     ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
     CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewCompletionExpectation, CrewSessionStatus,
-    CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, FreshCloneCheckoutSpec, FulfilmentKind, FulfilmentKindSpec, Host, HostSpec,
-    HostStatus, InputMeta, LifecycleAuthority, Message, RepositoryKey, Resource, ResourceError, ResourceProvenance, Selector, SystemClock,
-    TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel,
-    VesselRequirement, VesselSpec, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
-    WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, GENERATION_LABEL,
-    HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, FulfilmentKind, FulfilmentKindSpec, Host, HostSpec, HostStatus, InputMeta, Message,
+    RepositoryKey, Resource, ResourceError, ResourceProvenance, Selector, SystemClock, TerminalBrief, TerminalCrewContext, TerminalSession,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkCompletionAuthority,
+    WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
+    CONVOY_LABEL, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
-use flotilla_store::{controller::ControllerLoop, list_resource_kind, OwnerGarbageCollector, ResourceBackend, REGISTERED_RESOURCE_KINDS};
+use flotilla_store::{controller::ControllerLoop, list_resource_kind, ResourceBackend, REGISTERED_RESOURCE_KINDS};
 use hegel::generators as gs;
 
-struct TeardownCheckoutRuntime;
-
-#[async_trait]
-impl CheckoutRuntime for TeardownCheckoutRuntime {
-    async fn create_worktree(&self, _: &str, _: &str, _: Option<&str>, _: &str) -> Result<PreparedCheckout, String> {
-        Err("unexpected provisioning".into())
-    }
-
-    async fn create_fresh_clone(&self, _: &str, _: &str, _: Option<&str>, _: &str) -> Result<PreparedCheckout, String> {
-        Err("unexpected provisioning".into())
-    }
-
-    async fn inspect_integration(
-        &self,
-        _: &flotilla_resources::ResourceObject<flotilla_resources::Checkout>,
-        _: Option<&flotilla_resources::ResourceObject<Convoy>>,
-    ) -> Result<flotilla_resources::CheckoutIntegrationStatus, String> {
-        Ok(Default::default())
-    }
-
-    async fn remove_checkout(&self, _: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
-        Ok(CheckoutRemovalOutcome::Removed)
-    }
-}
-
+// A convoy's checkouts are the engine's, released at their home when the convoy ends (#3108):
+// `flotilla-provisioning`'s `checkout_controller` tests cover that half, a holder at another home
+// included. A routed forced delete still finalizes the convoy at its own home.
 #[tokio::test]
-async fn deleting_mis_homed_convoy_finalizes_checkout_at_its_home() {
-    use flotilla_core::command_target::TargetHost;
-    use flotilla_resources::{
-        Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, FreshCloneCheckoutSpec, LifecycleAuthority, ACTUATOR_SOURCE_ROOT_ANNOTATION,
-        CONVOY_LABEL,
-    };
-
+async fn deleting_mis_homed_convoy_finalizes_it_at_its_home() {
     let topology =
         spawn_in_memory_request_topology_stateful(empty_daemon_named("convoy-home").await, empty_daemon_named("checkout-home").await)
             .await
@@ -123,7 +93,6 @@ async fn deleting_mis_homed_convoy_finalizes_checkout_at_its_home() {
     let parent_backend = topology.leader.resource_backend();
     let child_backend = topology.follower.resource_backend();
     let parent_root = topology.leader.node_id().clone();
-    let child_root = topology.follower.node_id().clone();
     let convoys = parent_backend.clone().using::<Convoy>(namespace);
     convoys
         .create(
@@ -132,74 +101,17 @@ async fn deleting_mis_homed_convoy_finalizes_checkout_at_its_home() {
         )
         .await
         .expect("create parent on dispatcher host");
-    let checkouts = child_backend.clone().using::<Checkout>(namespace);
-    let child = checkouts
-        .create(
-            &InputMeta::builder()
-                .name("old-child".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "old-convoy".to_string())]))
-                .annotations(BTreeMap::from([(ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), parent_root.to_string())]))
-                .finalizers(vec!["flotilla.work/checkout-cleanup".into()])
-                .build()
-                .with_lifecycle_authority(LifecycleAuthority::Managed),
-            &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
-                source_clone_ref: None,
-                repo_ref: flotilla_resources::RepositoryKey(flotilla_resources::repo_key("https://github.com/flotilla-org/flotilla")),
-                env_ref: "host-direct-checkout-home".into(),
-                r#ref: "feature/old-child".into(),
-                base_ref: Some("main".into()),
-                target_path: "/checkouts/old-child".into(),
-                url: "https://github.com/flotilla-org/flotilla".into(),
-            }),
-        )
-        .await
-        .expect("create child at placement home");
-    checkouts
-        .update_status(
-            "old-child",
-            &child.metadata.resource_version,
-            &CheckoutStatus { phase: CheckoutPhase::Failed, ..Default::default() },
-        )
-        .await
-        .expect("settle child before teardown");
     child_backend
         .replica_writer::<Convoy>(parent_root.clone(), namespace)
         .replace(&convoys.list().await.expect("list parent"), Utc::now())
         .await
         .expect("replicate parent to child home");
-    parent_backend
-        .replica_writer::<Checkout>(child_root.clone(), namespace)
-        .replace(&checkouts.list().await.expect("list child"), Utc::now())
-        .await
-        .expect("replicate child to parent home");
-    let child_delete = CommandAction::ResourceDelete {
-        namespace: namespace.into(),
-        kind: "Checkout".into(),
-        name: "old-child".into(),
-        replica_origin: None,
-    };
-    assert_eq!(
-        topology.leader.resolve_command_target(&child_delete, None).await.expect("resolve child home").host,
-        TargetHost::Node(child_root.clone()),
-        "explicit child deletion routes to the checkout's home, not its parent's home",
-    );
-    let child_controller = tokio::spawn(
-        ControllerLoop {
-            primary: checkouts.clone(),
-            secondaries: CheckoutReconciler::<TeardownCheckoutRuntime>::federated_secondary_watches(&child_backend, namespace),
-            reconciler: CheckoutReconciler::new(Arc::new(TeardownCheckoutRuntime), child_backend.clone(), namespace)
-                .with_federated_convoys(&child_backend, namespace),
-            resync_interval: Duration::from_secs(3600),
-            backend: child_backend.clone(),
-        }
-        .run(),
-    );
     let parent_controller = tokio::spawn(
         ControllerLoop {
             primary: convoys.clone(),
             secondaries: ConvoyReconciler::federated_secondary_watches(&parent_backend, namespace),
             reconciler: ConvoyReconciler::new(parent_backend.definitions::<WorkflowTemplate>(namespace))
-                .with_federated_checkouts(parent_backend.including_replicas::<Checkout>(namespace)),
+                .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads),
             resync_interval: Duration::from_secs(3600),
             backend: parent_backend.clone(),
         }
@@ -216,25 +128,10 @@ async fn deleting_mis_homed_convoy_finalizes_checkout_at_its_home() {
         .await
         .expect("route parent delete");
     assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::Ok);
-    child_backend
-        .replica_writer::<Convoy>(parent_root, namespace)
-        .replace(&convoys.list().await.expect("list deleting parent"), Utc::now())
-        .await
-        .expect("replicate deletion to child home");
-    eventually(Duration::from_secs(3), Duration::from_millis(10), "child home runs checkout finalizer", || async {
-        matches!(checkouts.get("old-child").await, Err(ResourceError::NotFound { .. }))
-    })
-    .await;
-    parent_backend
-        .replica_writer::<Checkout>(child_root, namespace)
-        .replace(&checkouts.list().await.expect("list drained child"), Utc::now())
-        .await
-        .expect("replicate drained child to parent home");
-    eventually(Duration::from_secs(3), Duration::from_millis(10), "parent finalizer completes after child home cleanup", || async {
+    eventually(Duration::from_secs(3), Duration::from_millis(10), "the convoy finalizes at its home", || async {
         matches!(convoys.get("old-convoy").await, Err(ResourceError::NotFound { .. }))
     })
     .await;
-    child_controller.abort();
     parent_controller.abort();
 }
 
@@ -278,6 +175,8 @@ async fn empty_daemon_named_with_floor(host_name: &str, free_space_floor_gib: Op
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // Composed with its engine, as the runtime composes a daemon.
+    flotilla_daemon_testkit::engine::engine(&daemon);
     daemon
         .install_convoy_ensure_reconciler(Arc::new(
             EnsureReconciler::builder()
@@ -1021,8 +920,11 @@ fn generated_admission_covers_remote_placement_for_origin_first_fault_model() {
     assert!(failure.is_err(), "the #2335 origin-first fault escaped the generated CI budget");
 }
 
+// The checkout on another host is the engine's, released at its home when its convoy ends
+// (#3108): `flotilla-provisioning`'s `checkout_controller` tests cover that half. A forced teardown
+// dispatched from a third host still finalizes the convoy at its home.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn forced_convoy_teardown_cascades_to_checkout_on_another_host() {
+async fn forced_convoy_teardown_from_another_host_finalizes_at_its_home() {
     let hosts = vec![empty_daemon_named("home-a").await, empty_daemon_named("checkout-b").await, empty_daemon_named("desk-c").await];
     let mesh = spawn_in_memory_request_mesh(hosts).await.expect("request mesh");
     let namespace = "flotilla";
@@ -1045,70 +947,21 @@ async fn forced_convoy_teardown_cascades_to_checkout_on_another_host() {
         )
         .await
         .expect("convoy on A");
-    mesh.hosts[1]
-        .resource_backend()
-        .using::<Checkout>(namespace)
-        .create(
-            &InputMeta::builder()
-                .name("checkout-on-b".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy_name.to_string())]))
-                .annotations(BTreeMap::from([(ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), mesh.hosts[0].node_id().to_string())]))
-                .build()
-                .with_lifecycle_authority(LifecycleAuthority::Managed),
-            &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
-                source_clone_ref: None,
-                r#ref: "test/cross-home".to_string(),
-                target_path: "/tmp/cross-home".to_string(),
-                repo_ref: RepositoryKey("test-repo".to_string()),
-                env_ref: "host-direct-checkout-b".to_string(),
-                base_ref: Some("main".to_string()),
-                url: "https://example.test/repo".to_string(),
-            }),
-        )
-        .await
-        .expect("checkout on B");
-    let checkout = mesh.hosts[1].resource_backend().using::<Checkout>(namespace).get("checkout-on-b").await.expect("checkout");
-    mesh.hosts[1]
-        .resource_backend()
-        .using::<Checkout>(namespace)
-        .update_status(
-            &checkout.metadata.name,
-            &checkout.metadata.resource_version,
-            &CheckoutStatus { phase: CheckoutPhase::Ready, path: Some("/tmp/cross-home".to_string()), ..Default::default() },
-        )
-        .await
-        .expect("ready checkout");
-    let checkout_backend = mesh.hosts[1].resource_backend();
-    let checkout_controller = ControllerLoop {
-        primary: checkout_backend.using::<Checkout>(namespace),
-        secondaries: CheckoutReconciler::<TeardownCheckoutRuntime>::federated_secondary_watches(&checkout_backend, namespace),
-        reconciler: CheckoutReconciler::new(Arc::new(TeardownCheckoutRuntime), checkout_backend.clone(), namespace)
-            .with_federated_convoys(&checkout_backend, namespace),
-        resync_interval: Duration::from_millis(20),
-        backend: checkout_backend,
-    };
-    let checkout_task = tokio::spawn(checkout_controller.run());
     let convoy_backend = mesh.hosts[0].resource_backend();
     let convoy_controller = ControllerLoop {
         primary: convoy_backend.using::<Convoy>(namespace),
         secondaries: ConvoyReconciler::federated_secondary_watches(&convoy_backend, namespace),
         reconciler: ConvoyReconciler::new(convoy_backend.definitions::<WorkflowTemplate>(namespace))
-            .with_checkouts(convoy_backend.using::<Checkout>(namespace))
-            .with_federated_checkouts(convoy_backend.including_replicas::<Checkout>(namespace)),
+            .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads),
         resync_interval: Duration::from_millis(20),
         backend: convoy_backend,
     };
     let convoy_task = tokio::spawn(convoy_controller.run());
     eventually(Duration::from_secs(5), Duration::from_millis(10), "desk sees convoy", || async {
-        let checkout = mesh.hosts[1].resource_backend().using::<Checkout>(namespace).get("checkout-on-b").await;
-        checkout.is_ok_and(|checkout| checkout.metadata.finalizers.iter().any(|finalizer| finalizer == "flotilla.work/checkout-cleanup"))
-            && mesh.hosts[2].resource_backend().including_replicas::<Convoy>(namespace).get(convoy_name).await.is_ok()
+        mesh.hosts[2].resource_backend().including_replicas::<Convoy>(namespace).get(convoy_name).await.is_ok()
             && mesh.hosts[1].resource_backend().including_replicas::<Convoy>(namespace).get(convoy_name).await.is_ok()
-            && mesh.hosts[0].resource_backend().including_replicas::<Checkout>(namespace).get("checkout-on-b").await.is_ok()
     })
     .await;
-    let collector = OwnerGarbageCollector::new(mesh.hosts[1].resource_backend(), namespace);
-    let collector_task = tokio::spawn(async move { collector.run(Duration::from_millis(20)).await });
     apply_convoy_replica_feed(&mesh.hosts[2], namespace, convoy_name, mesh.hosts[0].host_name().clone()).await;
     let mut events = mesh.hosts[2].subscribe();
     let command_id = mesh.clients[2]
@@ -1120,19 +973,11 @@ async fn forced_convoy_teardown_cascades_to_checkout_on_another_host() {
         .await
         .expect("dispatch forced teardown");
     assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::Ok);
-    eventually(Duration::from_secs(5), Duration::from_millis(10), "#2343: checkout on B and convoy on A must both finalize", || async {
-        matches!(
-            mesh.hosts[1].resource_backend().using::<Checkout>(namespace).get("checkout-on-b").await,
-            Err(ResourceError::NotFound { .. })
-        ) && matches!(
-            mesh.hosts[0].resource_backend().using::<Convoy>(namespace).get(convoy_name).await,
-            Err(ResourceError::NotFound { .. })
-        )
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "#2343: the convoy on A must finalize", || async {
+        matches!(mesh.hosts[0].resource_backend().using::<Convoy>(namespace).get(convoy_name).await, Err(ResourceError::NotFound { .. }))
     })
     .await;
     assert_no_orphaned_finalizers(&mesh.hosts).await;
-    collector_task.abort();
-    checkout_task.abort();
     convoy_task.abort();
 }
 
@@ -3166,7 +3011,8 @@ async fn assert_convoy_start_routes_through_peer_session(caller: Option<CommandC
         secondaries: Vec::new(),
         reconciler: ConvoyReconciler::new(placement.definitions::<WorkflowTemplate>(namespace))
             .with_hosts(placement.including_replicas::<Host>(namespace))
-            .with_vessels(placement.using::<Vessel>(namespace)),
+            .with_vessels(placement.using::<Vessel>(namespace))
+            .with_lifecycle_reads(topology.follower.lifecycle_reads()),
         resync_interval: Duration::from_millis(20),
         backend: placement.clone(),
     };
@@ -4361,14 +4207,16 @@ async fn repository_identity_operations_scenario(alias: bool, observed: bool) {
         discovery.factories.vcs = vec![Box::new(FakeVcsFactory::new(
             FakeVcsState::builder(path).branch("main", true).checkout("main").is_main(true).path(path).build().build(),
         ))];
-        InProcessDaemon::new(
+        let daemon = InProcessDaemon::new(
             Vec::new(),
             test_config_store_with_floor(tmp.keep(), None),
             discovery,
             HostName::new("leader"),
             std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
-        .await
+        .await;
+        flotilla_daemon_testkit::engine::engine(&daemon);
+        daemon
     } else {
         empty_daemon_named("leader").await
     };
@@ -4413,7 +4261,10 @@ async fn repository_identity_operations_scenario(alias: bool, observed: bool) {
         )
         .await
         .expect("providers through router");
-    assert!(matches!(providers, CommandValue::RepoProviders(response) if response.repository == key && response.path.is_none()));
+    assert!(
+        matches!(&providers, CommandValue::RepoProviders(response) if response.repository == key && response.path.is_none()),
+        "{providers:?}"
+    );
     for (action, refresh) in
         [(CommandAction::Refresh { repo: Some(selector.clone()) }, true), (CommandAction::CloseChangeRequest { id: "55".into() }, false)]
     {

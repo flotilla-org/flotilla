@@ -4,11 +4,10 @@ use std::{collections::BTreeMap, future::Future, time::Duration};
 
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
-    canonicalize_repo_url, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CloneSpec, Convoy, ConvoyRepositorySpec,
-    ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerEnvironmentSpec, EnvironmentSpec, FulfilmentKind, FulfilmentKindSpec,
-    FulfilmentRealisation, HostDirectEnvironmentSpec, InputMeta, Repository, RepositorySpec, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkCompletionAuthority, WorkPhase, WorkState,
-    WorkflowSnapshot,
+    canonicalize_repo_url, repo_key, CheckoutSpec, CloneSpec, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec,
+    DockerEnvironmentSpec, EnvironmentSpec, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HostDirectEnvironmentSpec,
+    InputMeta, Repository, RepositorySpec, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, Vessel,
+    VesselRequirement, VesselSpec, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 use flotilla_store::{ensure_repository, ResourceBackend};
 use tokio::{
@@ -285,36 +284,24 @@ pub struct ReadyCheckoutFixture {
     pub fresh_clone: Option<flotilla_resources::FreshCloneCheckoutSpec>,
 }
 
-pub async fn create_ready_checkout(
-    backend: &ResourceBackend,
-    namespace: &str,
+/// A checkout the engine holds ready for engine Convoy `convoy` (admitted here if it is not yet),
+/// as a vessel's earlier request left it: its latest launch, realised at its target path.
+pub fn create_ready_checkout(
+    checkouts: &flotilla_provisioning_testkit::CheckoutFixture,
+    convoy: &str,
     fixture: ReadyCheckoutFixture,
-) -> flotilla_resources::ResourceObject<Checkout> {
-    let checkouts = backend.clone().using::<Checkout>(namespace);
+) -> flotilla_resources::checkout_records::CheckoutRecord {
     let spec = match (fixture.worktree, fixture.fresh_clone) {
         (Some(worktree), None) => CheckoutSpec::Worktree(worktree),
         (None, Some(fresh_clone)) => CheckoutSpec::FreshClone(fresh_clone),
         (None, None) => panic!("ready checkout fixture must provide a checkout strategy"),
         (Some(_), Some(_)) => panic!("ready checkout fixture must provide exactly one checkout strategy"),
     };
-    let created = checkouts.create(&meta(&fixture.name), &spec).await.expect("checkout create should succeed");
-    checkouts
-        .update_status(
-            &fixture.name,
-            &created.metadata.resource_version,
-            &CheckoutStatus {
-                degraded: None,
-                phase: CheckoutPhase::Ready,
-                path: Some(fixture.path.clone()),
-                commit: Some("44982740".to_string()),
-                branch_provenance: Default::default(),
-                integration: Default::default(),
-                message: None,
-            },
-        )
-        .await
-        .expect("checkout status update should succeed");
-    checkouts.get(&fixture.name).await.expect("checkout get should succeed")
+    assert_eq!(spec.target_path(), Some(fixture.path.as_str()), "a checkout is realised at its target path");
+    checkouts.ensure_convoy(convoy);
+    let holder = flotilla_resources::checkout_records::CheckoutHolder::Convoy(convoy.to_owned());
+    let launch = checkouts.put_ready(&fixture.name, &spec, Some(&holder));
+    checkouts.record(&launch)
 }
 
 #[derive(bon::Builder)]

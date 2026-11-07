@@ -5,23 +5,12 @@ use std::{
     path::Path,
 };
 
-use flotilla_protocol::LifecycleReading;
 use flotilla_protocol::{RepoIdentity, RepoSelector};
-use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
+use flotilla_resources::lifecycle_reads::LifecycleReads;
 use flotilla_resources::{Checkout, CheckoutPhase, CheckoutSpec, Project, Repository, RepositoryKey};
 use flotilla_store::ResourceBackend;
 
 use flotilla_paths::path_context::canonical_or_original;
-
-pub async fn resolve_repository(
-    backend: &ResourceBackend,
-    observed: &ResourceBackend,
-    namespace: &str,
-    local_host: &str,
-    selector: &RepoSelector,
-) -> Result<Option<RepositoryKey>, String> {
-    resolve_repository_with_lifecycle_reads(backend, observed, namespace, local_host, selector, &NoLifecycleReads).await
-}
 
 pub async fn resolve_repository_with_lifecycle_reads(
     backend: &ResourceBackend,
@@ -72,7 +61,7 @@ pub async fn resolve_repository_with_lifecycle_reads(
         }
         RepoSelector::Path(cwd) => {
             let cwd = canonical_or_original(cwd);
-            let checkouts = local_checkouts_with_lifecycle_reads(backend, observed, namespace, local_host, reads).await?;
+            let checkouts = local_checkouts_with_lifecycle_reads(observed, namespace, local_host, reads).await?;
             // Nested known checkouts scope to the deepest containing checkout.
             let mut deepest = 0;
             for checkout in checkouts {
@@ -121,18 +110,10 @@ pub async fn resolve_repository_with_lifecycle_reads(
     }
 }
 
-/// Ready checkout facts on the local host, with durable-over-observed precedence.
-pub async fn local_checkouts(
-    backend: &ResourceBackend,
-    observed: &ResourceBackend,
-    namespace: &str,
-    local_host: &str,
-) -> Result<Vec<flotilla_resources::ResourceObject<Checkout>>, String> {
-    local_checkouts_with_lifecycle_reads(backend, observed, namespace, local_host, &NoLifecycleReads).await
-}
-
+/// Ready checkouts on the local host: the engine's ready checkouts held here whose environment
+/// runs directly on this host, and the checkouts this host's refresh observed. An engine checkout
+/// of a name, ready or not, wins over the observation of it.
 pub async fn local_checkouts_with_lifecycle_reads(
-    backend: &ResourceBackend,
     observed: &ResourceBackend,
     namespace: &str,
     local_host: &str,
@@ -146,35 +127,18 @@ pub async fn local_checkouts_with_lifecycle_reads(
         .map_err(|error| error.to_string())?
         .items
         .into_iter()
-        .map(|checkout| (checkout.metadata.name.clone(), (checkout, None)))
+        .map(|checkout| (checkout.metadata.name.clone(), checkout))
         .collect::<BTreeMap<_, _>>();
-    // Match Aggregator precedence: durable status wins over its ephemeral projection.
-    for source in backend.including_replicas::<Checkout>(namespace).list().await.map_err(|error| error.to_string())?.items {
-        let origin = match source.provenance {
-            flotilla_resources::ResourceProvenance::Local => None,
-            flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
-        };
-        checkouts.insert(source.object.metadata.name.clone(), (source.object, origin));
+    let held = flotilla_resources::checkout_records::latest_launches(reads.checkouts()?.here()?);
+    // The engine's checkout of a name, in any state, wins over the observation of it: an ended
+    // checkout's stale observation cannot resurrect it.
+    for name in held.keys() {
+        checkouts.remove(name);
     }
-    let mut ready = Vec::new();
-    for (mut checkout, origin) in checkouts.into_values() {
-        if !matches!(checkout.spec, CheckoutSpec::Observed(_)) {
-            match reads.try_reading(ProvisioningKind::Checkout, &checkout.metadata.name, origin.as_deref())? {
-                Some(LifecycleReading::Ready { identity }) => {
-                    // This transient read view supplies one authoritative phase/path pair; it is never persisted.
-                    let status = checkout.status.get_or_insert_with(Default::default);
-                    status.phase = CheckoutPhase::Ready;
-                    status.path = Some(identity);
-                }
-                Some(_) => continue,
-                None => {}
-            }
-        }
-        ready.push(checkout);
-    }
-    // The environments those checkouts stand on that run directly on this host, read from the engine.
+    let ready = held.into_values().filter(|record| record.is_ready()).collect::<Vec<_>>();
+    // The environments those checkouts stand on that run directly on this host.
     let mut local_environments = BTreeSet::new();
-    let standing_on = ready.iter().filter_map(|checkout| checkout.spec.env_ref()).collect::<BTreeSet<_>>();
+    let standing_on = ready.iter().filter_map(|record| record.spec.env_ref()).collect::<BTreeSet<_>>();
     if !standing_on.is_empty() {
         let environments = reads.environments()?;
         for name in standing_on {
@@ -184,22 +148,26 @@ pub async fn local_checkouts_with_lifecycle_reads(
             }
         }
     }
-    Ok(ready
-        .into_iter()
+    for record in ready {
+        let local = match &record.spec {
+            CheckoutSpec::Observed(spec) => spec.host_ref == local_host,
+            spec => spec.env_ref().is_some_and(|env| local_environments.contains(env)),
+        };
+        if local {
+            let mut view = record.read_view();
+            view.metadata.namespace = namespace.to_owned();
+            checkouts.insert(view.metadata.name.clone(), view);
+        }
+    }
+    Ok(checkouts
+        .into_values()
         .filter(|checkout| {
             if checkout.status.as_ref().is_some_and(|status| status.phase != CheckoutPhase::Ready) {
                 return false;
             }
             match &checkout.spec {
                 CheckoutSpec::Observed(spec) => spec.host_ref == local_host && Path::new(&spec.path).is_absolute(),
-                spec => {
-                    spec.env_ref().is_some_and(|env| local_environments.contains(env))
-                        && checkout
-                            .status
-                            .as_ref()
-                            .and_then(|status| status.path.as_deref())
-                            .is_some_and(|path| Path::new(path).is_absolute())
-                }
+                _ => checkout.status.as_ref().and_then(|status| status.path.as_deref()).is_some_and(|path| Path::new(path).is_absolute()),
             }
         })
         .map(|mut checkout| {
@@ -217,6 +185,7 @@ pub async fn local_checkouts_with_lifecycle_reads(
 
 #[cfg(test)]
 mod tests {
+    use flotilla_provisioning_testkit::Ending;
     use flotilla_resources::{InputMeta, ObservedCheckoutSpec, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, RepositorySpec};
     use flotilla_store_memory::InMemoryBackend;
     use hegel::generators as gs;
@@ -225,6 +194,44 @@ mod tests {
 
     fn backend() -> ResourceBackend {
         ResourceBackend::new(InMemoryBackend::default())
+    }
+
+    /// Resolves `selector` with no checkout held on the engine.
+    async fn resolve_repository(
+        durable: &ResourceBackend,
+        observed: &ResourceBackend,
+        namespace: &str,
+        local_host: &str,
+        selector: &RepoSelector,
+    ) -> Result<Option<RepositoryKey>, String> {
+        resolve_repository_with_lifecycle_reads(
+            durable,
+            observed,
+            namespace,
+            local_host,
+            selector,
+            crate::test_support::no_held_checkouts().as_ref(),
+        )
+        .await
+    }
+
+    /// The engine's checkouts, served with its environments: `host-direct` runs directly on `host`.
+    fn engine_on(host: &str) -> flotilla_provisioning_testkit::CheckoutFixture {
+        use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec};
+        use std::sync::Arc;
+        let store = flotilla_provisioning_testkit::CheckoutFixture::default().store;
+        let environments = flotilla_provisioning_testkit::EnvironmentFixture::over("home", Arc::clone(&store));
+        let clones = flotilla_provisioning_testkit::CloneFixture::over("home", Arc::clone(&store));
+        environments.request(
+            "host-direct",
+            &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: host.into(), repo_default_dir: "/work".into() }),
+                ..Default::default()
+            },
+            None,
+        );
+        flotilla_provisioning_testkit::CheckoutFixture::over("home", store)
+            .serving(Arc::clone(&environments.environments) as _, Arc::clone(&clones.clones) as _)
     }
 
     async fn repository(backend: &ResourceBackend, name: &str, slug: &str) -> RepositoryKey {
@@ -387,187 +394,89 @@ mod tests {
         assert_eq!(durable.using::<Repository>("test").list().await.expect("repositories").items.len(), 2);
         assert!(observed.using::<Checkout>("test").list().await.expect("checkouts").items.is_empty());
     }
-    // Controller-created checkout status is a presence fact; a desired target path
-    // alone, or a checkout in another host/environment, must never scope the CLI.
+    // An engine checkout scopes the CLI only once it is ready on this host: a requested
+    // checkout's path, or one in another host's environment, never does, and its ending removes
+    // it even where a stale observation of its name remains.
     #[tokio::test]
-    async fn cwd_uses_ready_local_checkout_status_and_durable_precedence() {
-        use flotilla_resources::{CheckoutStatus, EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectEnvironmentSpec};
+    async fn cwd_uses_ready_local_engine_checkouts_over_observations() {
+        use flotilla_resources::FreshCloneCheckoutSpec;
 
         let durable = backend();
         let observed = backend();
         let key = repository(&durable, "widgets", "acme/widgets").await;
-        let environment = EnvironmentSpec {
-            cloud_sandbox: None,
-            provider_address: None,
-            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/work".into() }),
-            docker: None,
-        };
-        let environments = flotilla_provisioning_testkit::EnvironmentFixture::default();
-        environments.request("host-direct", &environment, None);
-        let reads = environments.reads.as_ref();
+        let engine = engine_on("local");
         let spec = CheckoutSpec::FreshClone(
             FreshCloneCheckoutSpec::builder()
                 .repo_ref(key.clone())
                 .env_ref("host-direct".into())
                 .r#ref("main".into())
-                .target_path("/desired/widgets".into())
+                .target_path("/actual/widgets".into())
                 .url("https://github.com/acme/widgets".into())
                 .build(),
         );
-        let checkouts = durable.using::<Checkout>("test");
-        let current = checkouts.create(&InputMeta::builder().name("created".into()).build(), &spec).await.expect("checkout");
-        assert_eq!(
-            resolve_repository_with_lifecycle_reads(
-                &durable,
-                &observed,
-                "test",
-                "local",
-                &RepoSelector::Path("/desired/widgets".into()),
-                reads
-            )
-            .await,
-            Ok(None)
-        );
-        let current = checkouts
-            .update_status(
-                "created",
-                &current.metadata.resource_version,
-                &CheckoutStatus::builder().phase(CheckoutPhase::Ready).path("/actual/widgets".into()).build(),
-            )
-            .await
-            .expect("ready checkout");
-        assert_eq!(
-            resolve_repository_with_lifecycle_reads(
-                &durable,
-                &observed,
-                "test",
-                "local",
-                &RepoSelector::Path("/actual/widgets/src".into()),
-                reads
-            )
-            .await,
-            Ok(Some(key.clone()))
-        );
-        assert_eq!(
-            resolve_repository_with_lifecycle_reads(
-                &durable,
-                &observed,
-                "test",
-                "remote",
-                &RepoSelector::Path("/actual/widgets/src".into()),
-                reads
-            )
-            .await,
-            Ok(None)
-        );
-        // A stale ephemeral record cannot resurrect a durable Gone checkout.
-        checkout().backend(&observed).name("created").path("/actual/widgets").key(key).call().await;
-        checkouts
-            .update_status(
-                "created",
-                &current.metadata.resource_version,
-                &CheckoutStatus::builder().phase(CheckoutPhase::Gone).path("/actual/widgets".into()).build(),
-            )
-            .await
-            .expect("gone checkout");
-        assert_eq!(
-            resolve_repository_with_lifecycle_reads(
-                &durable,
-                &observed,
-                "test",
-                "local",
-                &RepoSelector::Path("/actual/widgets".into()),
-                reads
-            )
-            .await,
-            Ok(None)
-        );
-    }
-    // Local repository addressing uses the engine's ready path and excludes every non-ready held
-    // checkout, preserving durable precedence over observations and each selected replica's origin.
-    #[tokio::test]
-    async fn repository_paths_follow_checkout_engine_without_a_copy() {
-        use flotilla_provisioning::engine::checkout::CheckoutBinding;
-        use flotilla_provisioning_testkit::{object, store_object, Ending, LifecycleFixture};
-        use flotilla_resources::{CheckoutStatus, CheckoutWorktreeSpec, EnvironmentSpec, HostDirectEnvironmentSpec};
-        for replica in [false, true] {
-            let durable = backend();
-            let observed = backend();
-            let author = if replica { backend() } else { durable.clone() };
-            let key = repository(&durable, "widgets", "acme/widgets").await;
-            let temp = tempfile::tempdir().expect("paths");
-            let live = temp.path().join("live");
-            let stale = temp.path().join("stale");
-            checkout().backend(&observed).name("managed").path(stale.to_str().expect("path")).key(key.clone()).call().await;
-            let mut checkout = object::<Checkout>(
-                "managed",
-                CheckoutSpec::Worktree(CheckoutWorktreeSpec {
-                    repo_ref: key.clone(),
-                    env_ref: "env".into(),
-                    r#ref: "main".into(),
-                    base_ref: None,
-                    target_path: stale.to_string_lossy().into_owned(),
-                    clone_ref: "source".into(),
-                }),
-                CheckoutStatus { phase: CheckoutPhase::Gone, path: Some(stale.to_string_lossy().into_owned()), ..Default::default() },
-            );
-            checkout.metadata.namespace = "test".into();
-            checkout.metadata.labels.insert(flotilla_resources::CONVOY_LABEL.into(), "crew".into());
-            let checkout = store_object(&author, checkout).await;
-            if replica {
-                durable
-                    .replica_writer::<Checkout>(flotilla_protocol::NodeId::new("home"), "test")
-                    .replace(&author.using::<Checkout>("test").list().await.expect("snapshot"), chrono::Utc::now())
+        let launch = engine.request("created", &spec, None);
+        let resolve = |host: &'static str, path: &'static str| {
+            let (durable, observed, reads) = (durable.clone(), observed.clone(), engine.reads.clone());
+            async move {
+                resolve_repository_with_lifecycle_reads(&durable, &observed, "test", host, &RepoSelector::Path(path.into()), reads.as_ref())
                     .await
-                    .expect("replica");
             }
-            let fixture = LifecycleFixture::<CheckoutBinding>::new(replica);
-            let env = EnvironmentSpec {
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/work".into() }),
-                ..Default::default()
-            };
-            fixture.environments.request("env", &env, None);
-            fixture.request(&checkout);
-            assert!(local_checkouts_with_lifecycle_reads(&durable, &observed, "test", "local", fixture.reads.as_ref())
-                .await
-                .expect("requested")
-                .is_empty());
-            fixture.finish(&checkout, Ending::Ready(live.to_str().expect("path")));
-            assert_eq!(
-                resolve_repository_with_lifecycle_reads(
-                    &durable,
-                    &observed,
-                    "test",
-                    "local",
-                    &RepoSelector::Path(live.clone()),
-                    fixture.reads.as_ref()
-                )
+        };
+        assert_eq!(resolve("local", "/actual/widgets").await, Ok(None), "a requested checkout's path does not scope");
+        engine.ready(&launch, None);
+        assert_eq!(resolve("local", "/actual/widgets/src").await, Ok(Some(key.clone())));
+        assert_eq!(resolve("remote", "/actual/widgets/src").await, Ok(None), "another host's checkout does not scope");
+        // A stale observation of its name cannot resurrect a released checkout.
+        checkout().backend(&observed).name("created").path("/actual/widgets").key(key).call().await;
+        engine.finish(&launch, Ending::Released);
+        assert_eq!(resolve("local", "/actual/widgets").await, Ok(None));
+    }
+
+    // Local repository addressing uses the engine's ready path and excludes every non-ready held
+    // checkout, the engine's checkout of a name winning over an observation of it; a read that
+    // fails is an error, never an empty answer.
+    #[tokio::test]
+    async fn repository_paths_follow_checkout_engine() {
+        use flotilla_resources::CheckoutWorktreeSpec;
+        let durable = backend();
+        let observed = backend();
+        let key = repository(&durable, "widgets", "acme/widgets").await;
+        let temp = tempfile::tempdir().expect("paths");
+        let live = temp.path().join("live");
+        let stale = temp.path().join("stale");
+        checkout().backend(&observed).name("managed").path(stale.to_str().expect("path")).key(key.clone()).call().await;
+        let engine = engine_on("local");
+        let launch = engine.request(
+            "managed",
+            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                repo_ref: key.clone(),
+                env_ref: "host-direct".into(),
+                r#ref: "main".into(),
+                base_ref: None,
+                target_path: live.to_string_lossy().into_owned(),
+                clone_ref: "source".into(),
+            }),
+            None,
+        );
+        let reads = engine.reads.as_ref();
+        assert!(local_checkouts_with_lifecycle_reads(&observed, "test", "local", reads).await.expect("requested").is_empty());
+        engine.finish(&launch, Ending::Ready(live.to_str().expect("path")));
+        assert_eq!(
+            resolve_repository_with_lifecycle_reads(&durable, &observed, "test", "local", &RepoSelector::Path(live.clone()), reads)
                 .await
                 .expect("ready path"),
-                Some(key)
-            );
-            assert!(resolve_repository_with_lifecycle_reads(
-                &durable,
-                &observed,
-                "test",
-                "local",
-                &RepoSelector::Path(stale),
-                fixture.reads.as_ref()
-            )
+            Some(key)
+        );
+        assert!(resolve_repository_with_lifecycle_reads(&durable, &observed, "test", "local", &RepoSelector::Path(stale), reads)
             .await
             .expect("stale path")
             .is_none());
-            fixture.finish(&checkout, Ending::Lost(live.to_str().expect("path")));
-            assert!(local_checkouts_with_lifecycle_reads(&durable, &observed, "test", "local", fixture.reads.as_ref())
-                .await
-                .expect("lost")
-                .is_empty());
-            assert_eq!(author.using::<Checkout>("test").get("managed").await.expect("unchanged").status, checkout.status);
-            fixture.poison();
-            assert!(local_checkouts_with_lifecycle_reads(&durable, &observed, "test", "local", fixture.reads.as_ref())
-                .await
-                .expect_err("checked read")
-                .contains("poisoned"));
-        }
+        engine.finish(&launch, Ending::Lost(live.to_str().expect("path")));
+        assert!(local_checkouts_with_lifecycle_reads(&observed, "test", "local", reads).await.expect("lost").is_empty());
+        engine.poison();
+        assert!(local_checkouts_with_lifecycle_reads(&observed, "test", "local", reads)
+            .await
+            .expect_err("checked read")
+            .contains("poisoned"));
     }
 }

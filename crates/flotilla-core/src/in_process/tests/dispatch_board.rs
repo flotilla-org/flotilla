@@ -36,6 +36,8 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    super::test_engine(&daemon);
     let projects = backend.using::<Project>("flotilla");
     let mut binding = flotilla_resources::IssueSourceBindingSpec::from(source.clone());
     binding.alias = Some("large".into());

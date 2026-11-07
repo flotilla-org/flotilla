@@ -8,9 +8,8 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
-    Checkout as OldCheckout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch, CheckoutWorktreeSpec, Clone as OldClone,
-    ClonePhase, CloneSpec, CloneStatus, ObjectMeta, RepositoryKey, Resource as OldResource, ResourceError, ResourceObject, StatusPatch,
-    CONVOY_LABEL,
+    Checkout as OldCheckout, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clone as OldClone, ClonePhase, CloneSpec, CloneStatus,
+    ObjectMeta, RepositoryKey, Resource as OldResource, ResourceError, ResourceObject, StatusPatch, CONVOY_LABEL,
 };
 use flotilla_state_machines::{
     machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState},
@@ -18,7 +17,7 @@ use flotilla_state_machines::{
 };
 use flotilla_store::controller::{ReconcileOutcome, Reconciler};
 
-use super::{checkout::CheckoutBinding, Binding, Engine, LifecycleHome, Lifecycles, Step};
+use super::{Binding, Engine, LifecycleHome, Lifecycles, Step};
 use crate::stored::{
     checkout::{CheckoutRequest, Source},
     environment::{DockerImage, DockerRecipe},
@@ -115,6 +114,14 @@ fn worktree(convoy: Option<&str>) -> ResourceObject<OldCheckout> {
     }
 }
 
+/// The convoy import's holder for old convoy `convoy-a`, the only one these tests import.
+fn imported_convoy(convoy: &str) -> Option<super::import::ImportedHolder> {
+    (convoy == "convoy-a").then(|| {
+        let kind = <flotilla_state_machines::Resource<flotilla_state_machines::machines::convoy::Convoy> as flotilla_schema::Kind>::CODE;
+        (flotilla_schema::Identity { kind, name: "convoy-a".into(), home: HOME.into() }, 1)
+    })
+}
+
 fn lifecycles<B: Binding>() -> Arc<dyn Lifecycles<B::Kind>>
 where
     <B::Kind as LifecycleKind>::Request: Send + Sync,
@@ -139,111 +146,90 @@ where
     outcome
 }
 
+fn image_build(phase: Option<flotilla_resources::ImageBuildPhase>) -> ResourceObject<flotilla_resources::ImageBuild> {
+    use flotilla_resources::{ImageBuildReservation, ImageBuildResourceSpec, ImageBuildSpec, ImageBuildStatus, ImageDelivery};
+    ResourceObject {
+        metadata: meta("image-a"),
+        spec: ImageBuildResourceSpec::Current(Box::new(ImageBuildSpec {
+            identity: "sha256:feed".into(),
+            architecture: "amd64".into(),
+            layers: vec![],
+            host_ref: "feta".into(),
+            delivery: ImageDelivery::Local,
+            reservation: ImageBuildReservation { cpu: 1, disk_bytes: 1 },
+        })),
+        status: phase.map(|phase| ImageBuildStatus { phase, ..ImageBuildStatus::default() }),
+    }
+}
+
+fn built() -> flotilla_resources::ImageBuildStatusPatch {
+    flotilla_resources::ImageBuildStatusPatch::Built {
+        at: DateTime::UNIX_EPOCH,
+        digest: "sha256:beef".into(),
+        probes: vec![],
+        log_ref: "log".into(),
+    }
+}
+
+fn build_failed() -> flotilla_resources::ImageBuildStatusPatch {
+    flotilla_resources::ImageBuildStatusPatch::Failed {
+        at: DateTime::UNIX_EPOCH,
+        failure: flotilla_resources::ImageBuildFailure { class: flotilla_resources::ImageBuildFailureClass::Recipe, reason: "x".into() },
+        probes: vec![],
+        log_ref: String::new(),
+    }
+}
+
 // Behaviour: a resource written before the switch (past its initial phase, not held by the
 // engine) stays on the old path until the import: its patch passes and nothing is requested.
 #[tokio::test]
 async fn a_resource_the_engine_does_not_hold_stays_on_the_old_path() {
-    let home = lifecycles::<CheckoutBinding>();
-    let patch = CheckoutStatusPatch::MarkFailed { message: "gone".into() };
-    let engine = Engine::<_, CheckoutBinding>::new(Scripted::<OldCheckout>::new([Some(patch.clone())]), Some(home.clone()));
-    let mut obj = worktree(Some("convoy-a"));
-    obj.status = Some(CheckoutStatus { phase: CheckoutPhase::Ready, path: Some("/work/feature".into()), ..CheckoutStatus::default() });
+    use super::image_build::ImageBuildBinding;
+    let home = lifecycles::<ImageBuildBinding>();
+    let patch = build_failed();
+    let engine =
+        Engine::<_, ImageBuildBinding>::new(Scripted::<flotilla_resources::ImageBuild>::new([Some(patch.clone())]), Some(home.clone()));
+    let mut obj = image_build(Some(flotilla_resources::ImageBuildPhase::Built));
     assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(patch));
-    assert!(home.get("checkout-a").is_none());
+    assert!(home.get("image-a").is_none());
 }
 
-// Behaviour: a patch with no lifecycle meaning (an observation) requests nothing.
+// Behaviour: a patch with no lifecycle meaning (an attempt starting) requests nothing.
 #[tokio::test]
 async fn an_in_progress_patch_requests_nothing() {
-    let home = lifecycles::<CheckoutBinding>();
-    let observed = CheckoutStatusPatch::ObserveDegradation { message: Some("slow disk".into()) };
-    let engine = Engine::<_, CheckoutBinding>::new(Scripted::<OldCheckout>::new([Some(observed.clone())]), Some(home.clone()));
-    let mut obj = worktree(Some("convoy-a"));
-    assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(observed));
-    assert!(home.get("checkout-a").is_none());
+    use super::image_build::ImageBuildBinding;
+    let home = lifecycles::<ImageBuildBinding>();
+    let start = flotilla_resources::ImageBuildStatusPatch::Start { at: DateTime::UNIX_EPOCH, attempt: 1 };
+    let engine =
+        Engine::<_, ImageBuildBinding>::new(Scripted::<flotilla_resources::ImageBuild>::new([Some(start.clone())]), Some(home.clone()));
+    let mut obj = image_build(None);
+    assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(start));
+    assert!(home.get("image-a").is_none());
 }
 
 // Behaviour: a finished teardown releases the engine's resource.
 #[tokio::test]
 async fn a_finished_teardown_releases_the_resource() {
-    let home = lifecycles::<CheckoutBinding>();
-    let ready = CheckoutStatusPatch::MarkReady { path: "/work/feature".into(), commit: None, branch_provenance: Default::default() };
-    let engine = Engine::<_, CheckoutBinding>::new(Scripted::<OldCheckout>::new([Some(ready)]), Some(home.clone()));
-    let mut obj = worktree(Some("convoy-a"));
+    use super::image_build::ImageBuildBinding;
+    let home = lifecycles::<ImageBuildBinding>();
+    let engine = Engine::<_, ImageBuildBinding>::new(Scripted::<flotilla_resources::ImageBuild>::new([Some(built())]), Some(home.clone()));
+    let mut obj = image_build(None);
     reconcile(&engine, &mut obj).await;
     engine.run_finalizer(&obj).await.expect("teardown");
     assert_eq!(engine.inner().finalized.load(Ordering::SeqCst), 1);
     assert_eq!(
-        home.get("checkout-a").expect("held").state(),
+        home.get("image-a").expect("held").state(),
         &LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Released }
     );
 }
 
-// Behaviour: a checkout observed absent vanishes; observed again, it is not revived (no
-// incarnations: its owner requests a replacement), so the old status stays Gone and the old
-// reconciler is not run on it.
-#[tokio::test]
-async fn a_vanished_checkout_is_not_revived() {
-    let home = lifecycles::<CheckoutBinding>();
-    let ready = CheckoutStatusPatch::MarkReady { path: "/work/feature".into(), commit: None, branch_provenance: Default::default() };
-    let engine = Engine::<_, CheckoutBinding>::new(
-        Scripted::<OldCheckout>::new([Some(ready.clone()), Some(CheckoutStatusPatch::MarkGone), Some(ready)]),
-        Some(home.clone()),
-    );
-    let mut obj = worktree(Some("convoy-a"));
-    reconcile(&engine, &mut obj).await;
-    assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(CheckoutStatusPatch::MarkGone));
-    assert_eq!(
-        home.get("checkout-a").expect("held").state(),
-        &LifecycleState::Gone { ending: flotilla_state_machines::machines::lifecycle::Ending::Lost }
-    );
-    assert_eq!(reconcile(&engine, &mut obj).await.patch, None);
-    assert_eq!(engine.inner().prepared.load(Ordering::SeqCst), 2);
-    assert_eq!(obj.status.as_ref().map(|status| status.phase), Some(CheckoutPhase::Gone));
-}
-
-// A checkout observation remains publishable while old phase drifts; the binding never copies
-// engine phase into that status, and the realised lifecycle remains authoritative.
-#[tokio::test]
-async fn checkout_observations_do_not_copy_engine_phase_into_drifted_status() {
-    let home = lifecycles::<CheckoutBinding>();
-    let ready =
-        CheckoutStatusPatch::MarkReady { path: "/work/feature".into(), commit: Some("abc".into()), branch_provenance: Default::default() };
-    let engine = Engine::<_, CheckoutBinding>::new(
-        Scripted::<OldCheckout>::new([Some(ready), Some(CheckoutStatusPatch::ObserveDegradation { message: None })]),
-        Some(home.clone()),
-    );
-    let mut obj = worktree(Some("convoy-a"));
-    reconcile(&engine, &mut obj).await;
-    obj.status = Some(CheckoutStatus { phase: CheckoutPhase::Failed, commit: Some("abc".into()), ..CheckoutStatus::default() });
-    let outcome = reconcile(&engine, &mut obj).await;
-    assert_eq!(outcome.patch, Some(CheckoutStatusPatch::ObserveDegradation { message: None }));
-    assert_eq!(obj.status.as_ref().expect("status").phase, CheckoutPhase::Failed);
-    let held = home.get("checkout-a").expect("held");
-    assert_eq!(held.state(), &LifecycleState::Realised { identity: "/work/feature".into() });
-}
-
-// Behaviour (#3719 look-over ruling 4): a checkout's request names who it is held for, its
-// convoy (`convoy:<name>`), and its environment and clone at this home.
-#[test]
-fn a_checkout_request_names_its_holder() {
-    let request = CheckoutBinding::request(&worktree(Some("convoy-a")), HOME).expect("request");
-    assert_eq!(request.holder, Some(Holder::convoy("convoy-a")));
-    assert_eq!(request.clone.as_ref().map(|clone| clone.name.as_str()), Some("clone-a"));
-    assert_eq!(request.source, Source::Worktree);
-    assert_eq!(request.environment.home, HOME);
-}
-
-// Behaviour (#3729 review): an empty holder label names no holder, and a host-direct environment
-// with no checkout root is refused before it is requested.
+// Behaviour (#3729 review): a host-direct environment with no checkout root is refused before it
+// is requested, and an empty holder label names no holder.
 #[test]
 fn an_empty_label_holds_nothing_and_a_rootless_host_direct_environment_is_refused() {
-    use flotilla_resources::{CONVOY_LABEL, VESSEL_REF_LABEL};
+    use flotilla_resources::VESSEL_REF_LABEL;
 
     use super::{environments::request_of, import::import_environment};
-    let mut checkout = worktree(None);
-    checkout.metadata.labels.insert(CONVOY_LABEL.into(), String::new());
-    assert_eq!(CheckoutBinding::request(&checkout, HOME).expect("request").holder, None);
     let mut environment = environment_object(false);
     environment.metadata.labels.insert(VESSEL_REF_LABEL.into(), String::new());
     assert_eq!(import_environment(&environment, HOME).expect("request").resource.spec().holder, None);
@@ -251,45 +237,14 @@ fn an_empty_label_holds_nothing_and_a_rootless_host_direct_environment_is_refuse
     assert!(request_of(&environment.spec, None, HOME).expect_err("refused").contains("checkout root"));
 }
 
-// Behaviour (#3719 look-over ruling 4): a checkout held for no one is still the engine's: the
-// holder carries no ownership, so nothing refuses it.
-#[tokio::test]
-async fn a_checkout_held_for_no_one_is_the_engines() {
-    let request = CheckoutBinding::request(&worktree(None), HOME).expect("request");
-    assert_eq!(request.holder, None);
-    let home = lifecycles::<CheckoutBinding>();
-    let ready = CheckoutStatusPatch::MarkReady { path: "/work/feature".into(), commit: None, branch_provenance: Default::default() };
-    let engine = Engine::<_, CheckoutBinding>::new(Scripted::<OldCheckout>::new([Some(ready.clone())]), Some(home.clone()));
-    let mut obj = worktree(None);
-    assert_eq!(reconcile(&engine, &mut obj).await.patch, Some(ready));
-    assert_eq!(home.get("checkout-a").expect("held").state(), &LifecycleState::Realised { identity: "/work/feature".into() });
-}
-
-// Behaviour: steps for each kind's patches.
-#[test]
-fn patches_read_as_lifecycle_steps() {
-    let checkout = worktree(Some("c"));
-    assert_eq!(CheckoutBinding::steps(&checkout, &CheckoutStatusPatch::ObserveDegradation { message: None }), vec![]);
-    assert_eq!(
-        CheckoutBinding::steps(
-            &checkout,
-            &CheckoutStatusPatch::MarkReady { path: "/work/feature".into(), commit: None, branch_provenance: Default::default() }
-        ),
-        vec![Step::Realised { identity: "/work/feature".into() }]
-    );
-    assert_eq!(
-        CheckoutBinding::steps(&checkout, &CheckoutStatusPatch::MarkGone),
-        vec![Step::Vanished { cause: flotilla_state_machines::machines::lifecycle::VanishCause::lost() }]
-    );
-}
-
 // Behaviour: with the switch off the wrapper is the old reconciler: its patch and requeue pass
 // unchanged and nothing is requested.
 #[tokio::test]
 async fn without_lifecycles_the_old_reconciler_is_unchanged() {
-    let failed = CheckoutStatusPatch::MarkFailed { message: "x".into() };
-    let engine = Engine::<_, CheckoutBinding>::new(Scripted::<OldCheckout>::new([Some(failed.clone())]), None);
-    let mut obj = worktree(Some("convoy-a"));
+    use super::image_build::ImageBuildBinding;
+    let failed = build_failed();
+    let engine = Engine::<_, ImageBuildBinding>::new(Scripted::<flotilla_resources::ImageBuild>::new([Some(failed.clone())]), None);
+    let mut obj = image_build(None);
     let outcome = reconcile(&engine, &mut obj).await;
     assert_eq!(outcome.patch, Some(failed));
     assert_eq!(outcome.requeue_after, Some(std::time::Duration::from_secs(30)));
@@ -299,7 +254,17 @@ async fn without_lifecycles_the_old_reconciler_is_unchanged() {
 // clone; who it is held for, or whether it is held at all, is no check.
 #[test]
 fn the_checkout_writer_refuses_a_worktree_without_its_clone() {
-    let valid = CheckoutBinding::request(&worktree(Some("convoy-a")), HOME).expect("valid");
+    use flotilla_schema::Ref;
+    let valid = CheckoutRequest {
+        repository: "github.com/org/repo".into(),
+        environment: Ref::new("env-a".to_owned(), HOME),
+        branch: "feature".into(),
+        base: Some("main".into()),
+        path: "/work/feature".into(),
+        source: Source::Worktree,
+        clone: Some(Ref::new("clone-a".to_owned(), HOME)),
+        holder: Some(Holder::convoy("convoy-a")),
+    };
     let orphan = CheckoutRequest { clone: None, ..valid.clone() };
     assert!(orphan.validate().expect_err("no clone").contains("names its clone"));
     assert_eq!(CheckoutRequest { holder: Some(Holder::convoy("standing")), ..valid.clone() }.validate(), Ok(()));
@@ -786,7 +751,7 @@ fn every_old_phase_imports_and_rehearses() {
     ] {
         let mut obj = worktree(Some("convoy-a"));
         obj.status = Some(CheckoutStatus { phase, path: Some("/work/feature".into()), ..CheckoutStatus::default() });
-        let imported = import::<CheckoutBinding>(&obj, HOME).expect("imports");
+        let imported = super::import::import_checkout(&obj, HOME, &imported_convoy).expect("imports").0;
         if phase == CheckoutPhase::Gone {
             assert_eq!(
                 imported.resource.state(),
@@ -799,32 +764,23 @@ fn every_old_phase_imports_and_rehearses() {
     assert_eq!(report.imported.values().sum::<usize>(), 5);
 }
 
-// Behaviour (layer 9): the rehearsal lists what has no mapping, each record named: an observed
-// checkout, and a Realised record with no identity.
+// Behaviour (layer 9): the rehearsal lists what has no mapping, each record named: a checkout
+// held for a convoy that was not imported (#3108), and a Realised record with no identity.
 #[test]
 fn the_rehearsal_lists_records_with_no_mapping() {
-    use flotilla_resources::{EnvironmentPhase, EnvironmentStatus, ObservedCheckoutSpec};
+    use flotilla_resources::{EnvironmentPhase, EnvironmentStatus};
 
-    use super::import::{import, import_environment, ImportReport};
+    use super::import::{import_checkout, import_environment, ImportReport};
     let mut report = ImportReport::default();
-    let mut observed = worktree(Some("convoy-a"));
-    observed.metadata.name = "observed-a".into();
-    observed.spec = CheckoutSpec::Observed(
-        ObservedCheckoutSpec::builder()
-            .r#ref("main".into())
-            .path("/repo".into())
-            .repo_ref(RepositoryKey("repo".into()))
-            .host_ref("feta".into())
-            .is_main(true)
-            .build(),
-    );
-    report.record(&import::<CheckoutBinding>(&observed, HOME));
+    let mut orphan = worktree(Some("convoy-gone"));
+    orphan.metadata.name = "orphan-a".into();
+    report.record(&import_checkout(&orphan, HOME, &imported_convoy).map(|(imported, _)| imported));
     let mut nameless = environment_object(true);
     nameless.status = Some(EnvironmentStatus { phase: EnvironmentPhase::Ready, ..Default::default() });
     report.record(&import_environment(&nameless, HOME));
     let listed: Vec<(&str, &str)> = report.refused.iter().map(|refusal| (refusal.kind, refusal.record.as_str())).collect();
-    assert_eq!(listed, [("Checkout", "observed-a"), ("Environment", "env-a")]);
-    assert!(report.refused[0].reason.contains("observed checkout"));
+    assert_eq!(listed, [("Checkout", "orphan-a"), ("Environment", "env-a")]);
+    assert!(report.refused[0].reason.contains("was not imported"));
     assert!(report.refused[1].reason.contains("no container, backing or root"));
 }
 

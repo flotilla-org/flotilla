@@ -155,24 +155,70 @@ impl flotilla_provisioning::engine::clone_actuator::RemoteReachability for NoRem
 }
 
 /// A decided store at `home` whose Clone controller runs over a clone runtime, for tests that run
-/// the controllers together: its environments and clones are homed at `home`, and
-/// [`Self::reads`] serves both. Their changes are followed in the store's log, as the runtime
-/// follows them.
+/// the controllers together: its environments, clones and checkouts are homed at `home`, and
+/// [`Self::reads`] serves them all. Their changes are followed in the store's log, as the runtime
+/// follows them. Its Checkout controller runs too when it is started with a checkout provider.
 pub struct RunningClones {
     pub service: Arc<flotilla_schema_sqlite::stream::Service>,
     /// The environments the clones are made in, on the same store.
     pub environments: crate::EnvironmentFixture,
     pub clones: Arc<EngineClones>,
-    /// The engine's readings, serving [`Self::environments`] and [`Self::clones`].
+    /// The checkouts, and the engine Convoys they are held for, on the same store.
+    pub checkouts: crate::CheckoutFixture,
+    /// The engine's readings, serving [`Self::environments`], [`Self::clones`] and
+    /// [`Self::checkouts`].
     pub reads: Arc<dyn LifecycleReads>,
-    controller: tokio::task::JoinHandle<()>,
-    follower: tokio::task::JoinHandle<()>,
+    controllers: Vec<tokio::task::JoinHandle<()>>,
     _directory: tempfile::TempDir,
 }
 
 impl RunningClones {
     /// Starts the Clone controller over `runtime`. Must be called within a Tokio runtime.
     pub fn start<R>(home: &str, runtime: Arc<R>) -> Self
+    where
+        R: flotilla_provisioning::reconcilers::CloneRuntime + 'static,
+    {
+        Self::started(home, runtime)
+    }
+
+    /// Starts the Clone controller over `runtime` and the Checkout controller over `provider`,
+    /// each checkout's inputs only its holder's name. Must be called within a Tokio runtime.
+    pub fn start_with_checkouts<R, P>(home: &str, runtime: Arc<R>, provider: Arc<P>) -> Self
+    where
+        R: flotilla_provisioning::reconcilers::CloneRuntime + 'static,
+        P: flotilla_provisioning::engine::checkout_actuator::CheckoutProvider,
+    {
+        use flotilla_provisioning::engine::{
+            checkout_actuator::{CheckoutActuator, NamedHolderInputs},
+            controller::Controller,
+        };
+        let mut running = Self::started(home, runtime);
+        let actuator = Arc::new(CheckoutActuator::new(
+            provider,
+            Arc::new(NamedHolderInputs),
+            Arc::clone(&running.checkouts.checkouts) as Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>,
+            StoreReads::new(running.service.store()),
+            home,
+            running.checkouts.staged.clone(),
+        ));
+        let controller = Controller::start(
+            Arc::clone(&running.checkouts.lifecycles),
+            actuator,
+            Arc::new(flotilla_resources::SystemClock),
+            Arc::clone(&running.service),
+        )
+        .expect("checkout controller");
+        let (backing, backings) = tokio::sync::mpsc::channel(1);
+        let (rechecks, recheck_receiver) = tokio::sync::mpsc::channel(1);
+        // The senders are kept by the controller's task: nothing is pushed to it.
+        running.controllers.push(tokio::spawn(async move {
+            let _senders = (backing, rechecks);
+            controller.run_with(backings, recheck_receiver).await;
+        }));
+        running
+    }
+
+    fn started<R>(home: &str, runtime: Arc<R>) -> Self
     where
         R: flotilla_provisioning::reconcilers::CloneRuntime + 'static,
     {
@@ -193,10 +239,12 @@ impl RunningClones {
         let environments = crate::EnvironmentFixture::over(home, service.store());
         let clones = Arc::new(EngineClones::new(Arc::clone(&lifecycles), service.store()));
         let follower = clones.follow(Arc::clone(&service)).expect("follow the clones");
+        let checkouts = crate::CheckoutFixture::over(home, service.store());
         let reads = Arc::new(
             LifecycleReadPort::new(StoreReads::new(service.store()), home.to_owned())
                 .with_environments(Arc::clone(&environments.environments) as _)
-                .with_clones(Arc::clone(&clones) as Arc<dyn CloneRecords>),
+                .with_clones(Arc::clone(&clones) as Arc<dyn CloneRecords>)
+                .with_checkouts(Arc::clone(&checkouts.checkouts) as _),
         );
         let actuator = Arc::new(CloneActuator::new(runtime, StoreReads::new(service.store()), home, staged, Arc::new(NoRemotes)));
         let controller =
@@ -207,13 +255,95 @@ impl RunningClones {
             let _backing = backing;
             controller.run(backings).await;
         });
-        Self { service, environments, clones, reads, controller, follower, _directory: directory }
+        Self { service, environments, clones, checkouts, reads, controllers: vec![controller, follower], _directory: directory }
     }
 }
 
 impl Drop for RunningClones {
     fn drop(&mut self) {
-        self.controller.abort();
-        self.follower.abort();
+        for controller in &self.controllers {
+            controller.abort();
+        }
+    }
+}
+
+/// A checkout provider whose every checkout is made, found present and inspected with nothing
+/// judged, and whose removals succeed; it counts the checkouts it makes.
+#[derive(Default)]
+pub struct MadeCheckouts {
+    pub made: std::sync::atomic::AtomicUsize,
+}
+
+impl MadeCheckouts {
+    fn made(&self) -> flotilla_provisioning::checkout_runtime::PreparedCheckout {
+        self.made.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        flotilla_provisioning::checkout_runtime::PreparedCheckout {
+            commit: Some("44982740".to_string()),
+            branch_provenance: flotilla_resources::CheckoutBranchProvenance::CreatedForConvoy,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl flotilla_provisioning::engine::checkout_actuator::CheckoutProvider for MadeCheckouts {
+    async fn path_exists(&self, _: &str, _: &str) -> Result<Option<bool>, String> {
+        Ok(Some(true))
+    }
+
+    async fn create_worktree(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+        _: &str,
+        _: &str,
+    ) -> Result<flotilla_provisioning::checkout_runtime::PreparedCheckout, flotilla_vcs::vcs::CheckoutMaterialisationError> {
+        Ok(self.made())
+    }
+
+    async fn continue_worktree(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<flotilla_provisioning::checkout_runtime::PreparedCheckout, flotilla_vcs::vcs::CheckoutMaterialisationError> {
+        Ok(self.made())
+    }
+
+    async fn create_fresh_clone(
+        &self,
+        _: &str,
+        _: flotilla_provisioning::engine::checkout_actuator::FreshClone<'_>,
+    ) -> Result<flotilla_provisioning::checkout_runtime::PreparedCheckout, String> {
+        Ok(self.made())
+    }
+
+    async fn create_local_clone(
+        &self,
+        _: &str,
+        _: flotilla_vcs::vcs::LocalCloneRequest<'_>,
+    ) -> Result<(flotilla_provisioning::checkout_runtime::PreparedCheckout, Option<String>), String> {
+        Ok((self.made(), None))
+    }
+
+    async fn inspect(
+        &self,
+        _: &str,
+        _: &str,
+        _: &flotilla_resources::CheckoutSpec,
+        _: flotilla_provisioning::engine::checkout_actuator::Against<'_>,
+    ) -> Result<flotilla_resources::checkout_records::Inspection, String> {
+        Ok(flotilla_resources::checkout_records::Inspection::default())
+    }
+
+    async fn remove(
+        &self,
+        _: &str,
+        _: &flotilla_provisioning::checkout_runtime::CheckoutRemoval,
+    ) -> Result<flotilla_provisioning::checkout_runtime::CheckoutRemovalOutcome, String> {
+        Ok(flotilla_provisioning::checkout_runtime::CheckoutRemovalOutcome::Removed)
     }
 }

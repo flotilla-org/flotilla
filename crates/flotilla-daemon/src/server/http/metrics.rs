@@ -236,8 +236,26 @@ mod tests {
         // and command port used by the fleet integration harness.
         use flotilla_daemon_api::daemon::DaemonHandle;
         use flotilla_dummy_fleet::catalog::{self, CrewMix, DUMMY_FULFILMENT_KIND};
-        use flotilla_resources::{FulfilmentKind, Host, InputMeta, Repository, WorkflowTemplate};
+        use flotilla_resources::{
+            FleetDesignation, FleetDesignationSpec, FulfilmentKind, Host, InputMeta, Project, ProjectSpec, Repository, WorkflowTemplate,
+            FLEET_DESIGNATION_NAME,
+        };
         let backend = daemon.resource_backend();
+        // The fleet is designated, as the dummy catalog designates it: a checkout's branch is
+        // looked up through the fleet's forge observer role.
+        backend
+            .definitions::<Project>("flotilla")
+            .create(&InputMeta::builder().name("fleet".into()).build(), &ProjectSpec::builder().display_name("Fleet".into()).build())
+            .await
+            .unwrap();
+        backend
+            .definitions::<FleetDesignation>("flotilla")
+            .create(
+                &InputMeta::builder().name(FLEET_DESIGNATION_NAME.into()).build(),
+                &FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
+            )
+            .await
+            .unwrap();
         let host = backend.clone().using::<Host>("flotilla").list().await.unwrap().items.remove(0);
         let repository = catalog::repository(&forge).unwrap();
         let repositories = backend.clone().using::<Repository>("flotilla");

@@ -241,6 +241,7 @@ async fn replicated_remote_declaration_resolution_preserves_existing_mirror_proj
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    crate::engine(&daemon);
     let feta = daemon.resource_backend();
     // kiwi authors the declaration at its home; it reaches feta as kiwi's log does.
     let kiwi = flotilla_provisioning_testkit::other_home::OtherHome::open("kiwi-root");
@@ -296,6 +297,7 @@ async fn independently_observed_same_repository_remains_resolvable_after_replica
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    crate::engine(&daemon);
     let feta = daemon.resource_backend();
     // kiwi observes the same repository at its home; it reaches feta as kiwi's log does.
     let kiwi = flotilla_provisioning_testkit::other_home::OtherHome::open("kiwi-root");
@@ -486,7 +488,7 @@ async fn selected_detached_ops_checkout_loads_without_rederiving_identity() {
         .await,
     );
     // The engine's readings, which a running daemon always has: they hold no clone here.
-    daemon.install_lifecycle_reads(flotilla_provisioning_testkit::CloneFixture::default().reads).expect("engine reads");
+    crate::engine(&daemon);
     git(&ops, &["remote", "add", "lab", "https://forgejo.example.org/example/ops"]);
     git(&ops, &["checkout", "--detach"]);
     let mut rx = daemon.subscribe();
@@ -1187,6 +1189,7 @@ async fn tracked_repo_labels_materialized_project_without_overwriting_user_field
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    crate::engine(&daemon);
     daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "host-01".to_string() })).await;
 
     let projects = backend.definitions::<Project>("flotilla");
@@ -1243,7 +1246,7 @@ async fn mirror_and_canonical_roots_preserve_the_existing_mirror_project() {
     )
     .await;
     // The engine's readings, which a running daemon always has: they hold no clone here.
-    daemon.install_lifecycle_reads(flotilla_provisioning_testkit::CloneFixture::default().reads).expect("engine reads");
+    crate::engine(&daemon);
 
     let canonical = RepositorySpec::remote(mirror_url)
         .expect("mirror observation")
@@ -1330,6 +1333,7 @@ async fn tracked_repo_labels_matching_unlabelled_project_once() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    crate::engine(&daemon);
     daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec.clone(), host_ref: "host-01".to_string() })).await;
 
     let projects = backend.definitions::<Project>("flotilla");
@@ -1608,7 +1612,7 @@ async fn refresh_surfaces_repository_identity_change_without_materializing_a_pro
 }
 
 #[tokio::test]
-async fn identity_migration_marks_repository_retained_by_durable_checkout() {
+async fn identity_migration_marks_repository_retained_by_engine_checkout() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let mut rx = daemon.subscribe();
     let checkout_path = tmp.path().join("retained");
@@ -1627,21 +1631,18 @@ async fn identity_migration_marks_repository_retained_by_durable_checkout() {
         .await
         .expect("initial repo add");
     assert!(matches!(await_command_result(&mut rx, add_id).await, CommandValue::RepoTracked { .. }));
-    backend
-        .clone()
-        .using::<Checkout>("flotilla")
-        .create(
-            &InputMeta::builder().name("durable-old-checkout".to_string()).build(),
-            &CheckoutSpec::Observed(ObservedCheckoutSpec {
-                r#ref: "main".to_string(),
-                path: checkout_path.to_string_lossy().into_owned(),
-                repo_ref: local_key.clone(),
-                host_ref: "host-01".to_string(),
-                is_main: true,
-            }),
-        )
-        .await
-        .expect("durable checkout");
+    // The engine holds a checkout of the old repository: it retains that repository.
+    flotilla_daemon_testkit::engine::runtime_checkouts(&daemon).put_ready(
+        "durable-old-checkout",
+        &CheckoutSpec::Observed(ObservedCheckoutSpec {
+            r#ref: "main".to_string(),
+            path: checkout_path.to_string_lossy().into_owned(),
+            repo_ref: local_key.clone(),
+            host_ref: "host-01".to_string(),
+            is_main: true,
+        }),
+        None,
+    );
 
     let remote_spec = RepositorySpec::remote("https://github.com/flotilla-org/retained").expect("remote repository spec");
     let remote_key = remote_spec.key();

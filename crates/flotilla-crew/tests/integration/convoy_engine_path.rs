@@ -142,6 +142,7 @@ fn reconciler(backend: &ResourceBackend, engine: Arc<Recording>) -> ConvoyReconc
     let engine: Arc<dyn EngineConvoys> = engine;
     assert!(path.set(engine).is_ok());
     ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE))
+        .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads)
         .with_artifacts(backend.including_replicas::<Artifact>(NAMESPACE))
         .with_engine(path)
 }

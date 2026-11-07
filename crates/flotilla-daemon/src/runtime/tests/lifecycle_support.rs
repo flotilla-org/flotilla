@@ -137,6 +137,7 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
                     .name("implement".to_string())
                     .crew(vec![CrewSpec::builder()
                         .role("coder".to_string())
+                        .promises(vec![flotilla_resources::TemplatePromise::decision_ledger("coder")])
                         .source(CrewSource::Tool { command: "bash -lc 'echo stage4a'".to_string() })
                         .build()])
                     .build()])
@@ -232,16 +233,17 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
     }
 
     let teardown_checkout_path = if matches!(completion_action, CompletionAction::Delete) {
-        let checkouts = backend.clone().using::<ResourceCheckout>(NAMESPACE);
-        let checkout = checkouts
-            .list()
-            .await
-            .expect("checkout list should succeed")
-            .items
+        // The convoy's checkout, held for its engine Convoy.
+        let holder = flotilla_resources::checkout_records::CheckoutHolder::Convoy("convoy-a".to_string());
+        let checkout = daemon
+            .lifecycle_reads()
+            .checkouts()
+            .and_then(|checkouts| checkouts.held(&holder))
+            .expect("held checkouts")
             .into_iter()
-            .find(|checkout| checkout.metadata.labels.get(flotilla_resources::CONVOY_LABEL).is_some_and(|value| value == "convoy-a"))
+            .find(|checkout| !checkout.ended())
             .expect("convoy checkout should exist");
-        let checkout_path = checkout.status.expect("checkout should be ready").path.expect("checkout should have a path");
+        let checkout_path = checkout.ready_path().expect("checkout should be ready under its path").to_owned();
         for args in [
             ["update-ref", "refs/remotes/origin/main", "HEAD"].as_slice(),
             ["branch", "--set-upstream-to", "origin/main", "stage4a-work"].as_slice(),
@@ -249,13 +251,6 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
             let status = ProcessCommand::new("git").arg("-C").arg(&checkout_path).args(args).status().expect("prepare pushed state");
             assert!(status.success());
         }
-        let current = checkouts.get(&checkout.metadata.name).await.expect("checkout should still exist");
-        let mut status = current.status.expect("checkout should remain ready");
-        status.integration.pushed.observed_at = None;
-        checkouts
-            .update_status(&checkout.metadata.name, &current.metadata.resource_version, &status)
-            .await
-            .expect("filesystem mutation should invalidate cached integration evidence");
         Some(checkout_path)
     } else {
         None

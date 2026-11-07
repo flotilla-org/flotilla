@@ -157,6 +157,8 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
             std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
+        // The engine's readings, which a running daemon always has.
+        super::test_engine(&daemon);
         let credentials = Arc::new(RecordingWorkCredentials {
             backend: backend.clone(),
             delivered: tokio::sync::Mutex::new(BTreeSet::new()),

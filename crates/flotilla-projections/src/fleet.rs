@@ -9,10 +9,12 @@ use flotilla_protocol::{
     NodeId, PeerConnectionState,
 };
 use flotilla_resources::canonical_placement_host_ref_from_sources;
+use flotilla_resources::checkout_records::{latest_launches, CheckoutHolder};
+use flotilla_resources::LifecycleAuthority;
 use flotilla_resources::{
-    crew_attention, Checkout as ResourceCheckout, Host as ResourceHost, HostStatus as ResourceHostStatus, ReadResourceObject,
-    ResourceProvenance, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, CONVOY_LABEL,
-    ROLE_LABEL, VESSEL_LABEL,
+    crew_attention, Host as ResourceHost, HostStatus as ResourceHostStatus, ReadResourceObject, ResourceProvenance,
+    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, CONVOY_LABEL, ROLE_LABEL,
+    VESSEL_LABEL,
 };
 use flotilla_store::ResourceBackend;
 use tokio::sync::RwLock;
@@ -191,7 +193,6 @@ impl FleetService {
         lifecycles: &dyn crate::ports::LifecycleReads,
     ) -> Result<Vec<FleetListRow>, String> {
         let now = Utc::now();
-        let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
 
         let session_list =
             backend.including_replicas::<ResourceTerminalSession>(namespace).list().await.map_err(|err| err.to_string())?.items;
@@ -233,18 +234,29 @@ impl FleetService {
                 (convoy.resource.name.clone(), address)
             })
             .collect::<HashMap<_, _>>();
+        // A crewed convoy's checkout authority, from the checkouts the engine holds for it: adopted
+        // when it holds an adopted one, else managed (#3108).
+        let crewed = session_list.iter().filter_map(|session| session.object.metadata.labels.get(CONVOY_LABEL)).collect::<HashSet<_>>();
         let mut authority_by_convoy = HashMap::new();
-        for checkout in checkouts.list().await.map_err(|err| err.to_string())?.items {
-            let Some(convoy) = checkout.metadata.labels.get(CONVOY_LABEL).cloned() else {
-                continue;
-            };
-            let authority = checkout
-                .metadata
-                .lifecycle_authority()
-                .map_err(|err| err.to_string())?
-                .map(|authority| authority.as_label_value().to_string());
-            if authority.is_some() {
-                authority_by_convoy.insert(convoy, authority);
+        if !crewed.is_empty() {
+            let checkouts = lifecycles.checkouts()?;
+            for source in
+                backend.including_replicas::<flotilla_resources::Convoy>(namespace).list().await.map_err(|err| err.to_string())?.items
+            {
+                let convoy = source.object;
+                if !crewed.contains(&convoy.metadata.name) {
+                    continue;
+                }
+                let held =
+                    latest_launches(checkouts.held(&CheckoutHolder::Convoy(flotilla_resources::convoy::engine::engine_name(&convoy)?))?);
+                let authority = if held.values().any(|checkout| matches!(checkout.spec, flotilla_resources::CheckoutSpec::Observed(_))) {
+                    Some(LifecycleAuthority::Adopted)
+                } else {
+                    (!held.is_empty()).then_some(LifecycleAuthority::Managed)
+                };
+                if let Some(authority) = authority {
+                    authority_by_convoy.insert(convoy.metadata.name.clone(), Some(authority.as_label_value().to_string()));
+                }
             }
         }
 

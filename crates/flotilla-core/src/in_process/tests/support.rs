@@ -134,6 +134,7 @@ pub(super) async fn resume_staging_fixture_with_clock(
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    test_engine(&daemon);
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let convoy = convoys
         .create(
@@ -520,11 +521,25 @@ pub(super) fn trusted_codex_workflow() -> WorkflowTemplateSpec {
     flotilla_resources::single_agent_workflow_spec()
 }
 
-/// The engine's environments for `daemon`'s tests, installed as its lifecycle reads.
+/// The engine's environments for `daemon`'s tests, installed with its clones and checkouts (none
+/// held) as its lifecycle reads, as the daemon's runtime installs them.
 pub(in crate::in_process) fn test_environments(daemon: &InProcessDaemon) -> flotilla_provisioning_testkit::EnvironmentFixture {
-    let environments = flotilla_provisioning_testkit::EnvironmentFixture::default();
-    daemon.install_lifecycle_reads(environments.reads.clone()).expect("engine reads");
-    environments
+    test_engine(daemon).environments
+}
+
+/// The engine's environments, clones and checkouts on one store, as a daemon's runtime has them.
+pub(in crate::in_process) use flotilla_provisioning_testkit::EngineFixture as TestEngine;
+
+/// [`TestEngine`], installed as `daemon`'s lifecycle reads.
+pub(in crate::in_process) fn test_engine(daemon: &InProcessDaemon) -> TestEngine {
+    let engine = engine_fixture();
+    daemon.install_lifecycle_reads(engine.checkouts.reads.clone()).expect("engine reads");
+    engine
+}
+
+/// [`TestEngine`], not installed: each fixture's `reads` serve all three.
+pub(in crate::in_process) fn engine_fixture() -> TestEngine {
+    TestEngine::default()
 }
 
 /// `name`, a ready host-direct environment of `host_ref` on the engine.
@@ -669,6 +684,7 @@ pub(super) async fn stall_test_daemon_with_clock(
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    test_engine(&daemon);
     let (sender, mut receiver) = flotilla_store::controller::WorkQueueSender::channel();
     let watch = daemon.reconciler_wake_watch();
     let watch_backend = backend.clone();

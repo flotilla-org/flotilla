@@ -7,43 +7,28 @@ use std::collections::BTreeMap;
 use flotilla_core::primitives::ensures::import_ensures;
 use flotilla_engine_store::{Import, ImportTarget};
 use flotilla_provisioning::engine::{
-    checkout::CheckoutBinding,
     image_build::ImageBuildBinding,
-    import::{import_clones, import_environments, import_records, import_vessels, ImportRefusal, ImportReport},
+    import::{import_checkouts, import_clones, import_environments, import_records, import_vessels, ImportRefusal, ImportReport},
     terminal_session::TerminalSessionBinding,
 };
 use flotilla_resources::{
     convoy::engine::engine_name, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure, Environment, ImageBuild, TerminalSession, Vessel,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
 };
+use flotilla_schema::{Identity, Kind};
+use flotilla_state_machines::{machines::convoy::Convoy as EngineConvoy, Resource};
 
 use super::{Carried, Source};
 
 pub(super) const KINDS: [&str; 7] = ["environments", "imagebuilds", "clones", "checkouts", "terminalsessions", "vessels", "convoyensures"];
 
-/// Refusals that are deliberate non-imports, counted as dropped. Both kind and complete reason
-/// match, so a new refusal (a decode or store failure on a Checkout among them) still refuses.
-const EXEMPT_REFUSALS: &[(&str, &str)] = &[("Checkout", "an observed checkout is no engine request")];
-
-fn exempt(refusal: &ImportRefusal) -> bool {
-    EXEMPT_REFUSALS.contains(&(refusal.kind, refusal.reason.as_str()))
-}
-
-pub(super) fn lifecycles(source: &Source, target: &mut Import, _: &mut Carried, report: &mut ImportReport) {
+pub(super) fn lifecycles(source: &Source, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
     for namespace in source.namespaces(&KINDS) {
-        namespace_lifecycles(source, namespace, target, report);
-    }
-    let (exempted, refused): (Vec<_>, Vec<_>) = std::mem::take(&mut report.refused).into_iter().partition(exempt);
-    report.refused = refused;
-    for refusal in exempted {
-        *report
-            .dropped
-            .entry((refusal.kind, EXEMPT_REFUSALS.iter().find(|(kind, _)| *kind == refusal.kind).map_or("", |(_, reason)| reason)))
-            .or_default() += 1;
+        namespace_lifecycles(source, namespace, target, carried, report);
     }
 }
 
-fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, report: &mut ImportReport) {
+fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, carried: &Carried, report: &mut ImportReport) {
     let namespace = Some(namespace);
     macro_rules! records {
         ($old:ty, $plural:literal, $kind:literal, $binding:ty) => {{
@@ -68,8 +53,6 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, r
         .map(|record| (record.object, record.home))
         .collect();
     import_clones(&clones, target, report);
-    records!(Checkout, "checkouts", "Checkout", CheckoutBinding);
-    records!(TerminalSession, "terminalsessions", "TerminalSession", TerminalSessionBinding);
     let convoys = source.context::<Convoy>("convoys", namespace);
     let aliases: BTreeMap<_, _> = convoys
         .iter()
@@ -77,6 +60,26 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, r
             engine_name(&convoy.object).ok().map(|name| ((convoy.home.clone(), convoy.object.metadata.name.clone()), name))
         })
         .collect();
+    // Each checkout is created under the engine Convoy its convoy imported as, at the convoy's
+    // home. One whose convoy was not imported (ended, or staying on the old store) is not: nothing
+    // would release it.
+    let convoy_code = <Resource<EngineConvoy> as Kind>::CODE;
+    for record in
+        source.owned::<Checkout>("checkouts", namespace, "Checkout", target, report).into_iter().map(|record| (record.object, record.home))
+    {
+        let convoy_home = record.0.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).unwrap_or(&record.1).clone();
+        let holder = |old: &str| {
+            let name = aliases.get(&(convoy_home.clone(), old.to_owned()))?;
+            let version = carried.convoys.get(&(convoy_home.clone(), name.clone()))?;
+            Some((Identity { kind: convoy_code, name: name.clone(), home: convoy_home.clone() }, *version))
+        };
+        if record.0.metadata.labels.get(CONVOY_LABEL).is_some_and(|convoy| holder(convoy).is_none()) {
+            *report.dropped.entry(("Checkout", "held for a convoy that was not imported")).or_default() += 1;
+            continue;
+        }
+        import_checkouts(std::slice::from_ref(&record), &holder, target, report);
+    }
+    records!(TerminalSession, "terminalsessions", "TerminalSession", TerminalSessionBinding);
     let mut vessels: Vec<_> = source
         .owned::<Vessel>("vessels", namespace, "Vessel", target, report)
         .into_iter()

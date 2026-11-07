@@ -20,8 +20,10 @@ flotilla-forgejo-providers = { path = "../flotilla-forgejo-providers" }
 flotilla-github-providers = { path = "../flotilla-github-providers" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
+flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
 flotilla-replication = { path = "../flotilla-replication" }
 flotilla-resources = { path = "../flotilla-resources" }
+flotilla-schema-sqlite = { path = "../flotilla-schema-sqlite" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-transport = { path = "../flotilla-transport" }
 tokio = { workspace = true }

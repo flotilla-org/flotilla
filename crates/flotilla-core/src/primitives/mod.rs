@@ -51,7 +51,10 @@ use flotilla_state_machines::{
         agent_session::{AgentSession, MemoryAgentSessionWorld, Receive},
         consumer::{ConsumerKind, Receiver},
         controller::{self, Controller},
-        message::{Deliver, DropReason, MemoryMessageWorld, Message, MessageRef, MessageState, Supersedes},
+        message::{
+            Deliver, DropReason, MemoryMessageWorld, Message, MessageBody, MessageRef, MessageReference, MessageSpec, MessageState,
+            Relation, RequestBody, Supersedes,
+        },
         person::{self, Person},
     },
     Home, Resource, Transport,
@@ -624,6 +627,97 @@ impl MessagePrimitives {
             Some(message) => RequestAnswer::of(message.state()),
             None => RequestAnswer::Failed { reason: format!("request `{message}` is gone") },
         })
+    }
+
+    /// Asks the checkout inspector at `home` to inspect checkout `checkout` afresh, reading its
+    /// branch's remote ref, and waits for its answer (#3108): a CheckoutInspection request to
+    /// `host:<home>/role:checkout-inspector` from the teardown role, about
+    /// `host:<home>/checkout:<checkout>`. Answered, the inspection is on the checkout's launch.
+    /// It waits on the inbox's changes only; a request that will never be answered fails.
+    pub async fn inspect_checkout(&self, namespace: &str, home: &str, checkout: &str) -> Result<(), String> {
+        let subject = Address::root(AddressKind::Host, home)
+            .and_then(|host| host.child(AddressKind::Checkout, checkout))
+            .map_err(|error| format!("checkout {checkout} at {home} has no address: {error}"))?;
+        let body = RequestBody::CheckoutInspection { remote: true };
+        self.ask(namespace, roles::checkout_inspector(home)?, subject, body)
+            .await
+            .map_err(|reason| format!("checkout {checkout}'s inspection at {home} failed: {reason}"))
+    }
+
+    /// Asks this host's forge observer to look for a change request from `branch` of
+    /// `repository`, and waits for its answer (#3108): a ChangeRequestBranch request to
+    /// `host:<home>/role:forge-observer` from the teardown role, about the repository. Answered,
+    /// what it found is on the change requests' records, read through their `by_branch` index.
+    /// While the FleetDesignation is missing or invalid the request waits for it, as message
+    /// delivery does: a checkout's branch validation then goes on once it is designated.
+    pub async fn observe_branch(&self, namespace: &str, repository: &Address, branch: &str) -> Result<(), String> {
+        let looked_up = async {
+            self.designated_roles(namespace).await?;
+            let body = RequestBody::ChangeRequestBranch { branch: branch.to_owned() };
+            self.ask(namespace, roles::forge_observer(&self.home)?, repository.clone(), body).await
+        };
+        looked_up.await.map_err(|reason| format!("branch {branch} of {repository} could not be looked up: {reason}"))
+    }
+
+    /// The fleet roles once the FleetDesignation is designated: while it is missing or invalid,
+    /// this waits on its record's changes.
+    async fn designated_roles(&self, namespace: &str) -> Result<FleetRoles, String> {
+        if let Ok(roles) = self.roles_or_wait(namespace).await? {
+            return Ok(roles);
+        }
+        let designations = flotilla_store::WatchView::<flotilla_resources::FleetDesignation>::start(self.backend.clone(), namespace)
+            .await
+            .map_err(|error| format!("watch the FleetDesignation: {error}"))?;
+        let mut changes = designations.subscribe();
+        loop {
+            // Read after subscribing, so a designation made in between is not missed.
+            if let Ok(roles) = self.roles_or_wait(namespace).await? {
+                return Ok(roles);
+            }
+            changes.changed().await.map_err(|_| "the FleetDesignation watch ended".to_owned())?;
+        }
+    }
+
+    /// Sends `body` about `subject` to the controller inbox `inbox` as the teardown role, and
+    /// waits for its answer on the inbox's changes only. The error is why it was not answered.
+    async fn ask(&self, namespace: &str, inbox: Address, subject: Address, body: RequestBody) -> Result<(), String> {
+        use futures::StreamExt;
+        let roles = self.roles(namespace).await?;
+        let mut spec = MessageSpec::new(
+            roles.address("teardown").ok_or("the teardown role is not declared")?,
+            inbox.clone(),
+            Relation::System,
+            flotilla_schema::Frozen::new(MessageBody::Request(body)).map_err(|error| error.to_string())?,
+        );
+        spec.references.push(MessageReference { address: subject, revision: "1".into(), subject: true });
+        // The watch is opened before the request, so its answer cannot be missed.
+        let mut watch = self.inbox.watch(&inbox, None).await.map_err(|error| error.to_string())?;
+        let message = self.inbox.enqueue(spec).await.map_err(|error| error.to_string())?;
+        loop {
+            match self.request_answer(&message).await? {
+                RequestAnswer::Answered { .. } => return Ok(()),
+                RequestAnswer::Failed { reason } => return Err(reason),
+                RequestAnswer::Waiting => {}
+            }
+            match watch.next().await {
+                Some(Ok(_)) => {}
+                Some(Err(error)) => return Err(format!("watch {inbox}: {error}")),
+                None => {
+                    return match self.request_answer(&message).await? {
+                        RequestAnswer::Answered { .. } => Ok(()),
+                        _ => Err(format!("the watch of {inbox} ended before the request was answered")),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A controller here could not do what request `message` asked (#3108): it publishes the
+    /// delivery failure, the evidence an undeliverable drop needs, and drops the request so its
+    /// sender's wait fails instead of reading what is not there.
+    pub async fn fail_request(&self, message: &str) -> Result<(), String> {
+        self.world.update(|world| world.delivery_failure.put(&flotilla_state_machines::Ref::new(message), ()));
+        self.inbox.drop(message, DropReason::Undeliverable).await.map_err(|error| error.to_string())
     }
 
     /// Every person role's inbox in `namespace` (#3938): each person role

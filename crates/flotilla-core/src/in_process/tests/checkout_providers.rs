@@ -35,6 +35,8 @@ async fn checkout_vcs_discovery_is_cached_per_checkout() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    super::test_engine(&daemon);
 
     // #1770: only observed Checkout lifetimes retain discovered providers.
     for (name, path) in [("first", &first_path), ("second", &second_path)] {
@@ -118,8 +120,7 @@ async fn checkout_vcs_discovery_names_the_repository_a_clone_is_for() {
     )
     .await;
     let repository = RepositorySpec::remote("https://forge.example/team/repo").expect("repository");
-    let clones = flotilla_provisioning_testkit::CloneFixture::default();
-    daemon.install_lifecycle_reads(clones.reads.clone()).expect("engine reads");
+    let clones = super::test_engine(&daemon).clones;
     clones.put_named(
         "clone",
         &flotilla_resources::CloneSpec {
@@ -148,6 +149,8 @@ async fn repository_watch_evicts_deleted_providers_and_preserves_live_providers(
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    super::test_engine(&daemon);
     daemon.set_provisioning_namespace("flotilla".to_string()).await;
     let repositories = backend.clone().using::<Repository>("flotilla");
     let first = RepositorySpec::remote("https://github.com/example/first").expect("first repository");

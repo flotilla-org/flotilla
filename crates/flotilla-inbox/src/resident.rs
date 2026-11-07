@@ -99,6 +99,7 @@ pub(crate) fn resource(value: &Resource<Message>, receipts: Option<&BTreeMap<Rec
         + match body.value() {
             MessageBody::Text(text) => text.capacity(),
             MessageBody::Request(RequestBody::CheckoutInspection { remote: _ }) => 0,
+            MessageBody::Request(RequestBody::ChangeRequestBranch { branch }) => branch.capacity(),
             MessageBody::Request(RequestBody::Convoy(request)) => {
                 let ConvoyRequest { project, promises, duties, seats, quota, priority: _, kinds } = request.as_ref();
                 let nodes = |len: usize, slot: usize| if len == 0 { 0 } else { len.saturating_mul(2).max(11) * slot + (len / 5 + 1) * 96 };

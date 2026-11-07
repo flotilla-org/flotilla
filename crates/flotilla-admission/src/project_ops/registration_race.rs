@@ -150,7 +150,8 @@ impl Store for RacingStore {
             let backend = ResourceBackend::from_arc(Arc::clone(&self.inner));
             let repositories = backend.using::<Repository>(namespace);
             let repository = repositories.get(&meta.name).await?;
-            let reconciler = flotilla_provisioning::reconcilers::RepositoryReconciler::new(backend, self.observed.clone(), namespace);
+            let reconciler = flotilla_provisioning::reconcilers::RepositoryReconciler::new(self.observed.clone(), namespace)
+                .with_lifecycle_reads(Arc::clone(crate::test_support::no_held_checkouts()));
             let prepared = reconciler.prepare(&repository).await?;
             let outcome = reconciler.reconcile(&repository, &prepared, chrono::Utc::now());
             apply_status_patch(&repositories, &meta.name, &outcome.patch.expect("repository status patch")).await?;

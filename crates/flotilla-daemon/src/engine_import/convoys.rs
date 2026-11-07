@@ -27,6 +27,7 @@ impl ConvoyImportWorld for Messages<'_> {
 }
 
 pub(super) fn convoys(source: &Source, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
+    let mut written_convoys = Vec::new();
     for namespace in source.namespaces(&["convoys"]) {
         let mut homes = BTreeMap::<String, Vec<_>>::new();
         for convoy in source.owned::<Convoy>("convoys", Some(namespace), KIND, target, report) {
@@ -40,7 +41,10 @@ pub(super) fn convoys(source: &Source, target: &mut Import, carried: &mut Carrie
             let mapped = import_all(&convoys, &home, &forges, &world);
             for convoy in &mapped.imported {
                 match write_into(target, convoy) {
-                    Ok(_) => *report.imported.entry((KIND, "open")).or_default() += 1,
+                    Ok(written) => {
+                        *report.imported.entry((KIND, "open")).or_default() += 1;
+                        written_convoys.push(((convoy.home.clone(), written.name().to_owned()), written.version().0));
+                    }
                     Err(reason) => report.refused.push(ImportRefusal { kind: KIND, record: convoy.resource.name().to_owned(), reason }),
                 }
                 if let Some(reason) = &convoy.unrecorded_stall {
@@ -58,6 +62,7 @@ pub(super) fn convoys(source: &Source, target: &mut Import, carried: &mut Carrie
             }
         }
     }
+    carried.convoys.extend(written_convoys);
 }
 
 fn refused_name(refusal: &flotilla_core::primitives::convoy_import::ConvoyImportRefusal) -> String {

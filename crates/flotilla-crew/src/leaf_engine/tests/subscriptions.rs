@@ -297,7 +297,7 @@ async fn diagnostics_retain_the_last_firing_for_an_armed_reconciler_row() {
         Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) }),
         flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
-    let table = LeafSubscriptionTable::new(backend, broadcast_test_sink(event_tx), refresher);
+    let table = served_table(backend, broadcast_test_sink(event_tx), refresher);
     let id = uuid::Uuid::new_v4();
     let fired_leaf = leaf(LeafAddress::Convoy { name: "held".to_string() }, ".status.phase", "Landed");
     table.inner.rows.lock().await.insert(
@@ -359,7 +359,7 @@ async fn declared_exit_entry_name_is_recorded_when_its_instantiated_leaf_fires()
         stale_after: Duration::from_secs(60),
     };
     let refresher = ChangeRequestRefresher::new("fleet".to_string(), backend.clone(), "authority".to_string(), source.clone(), cadence);
-    let table = LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher);
+    let table = served_table(backend.clone(), broadcast_test_sink(event_tx), refresher);
     let repo_ref = RepositoryKey("repo".to_string());
     let spec = ConvoySpec::builder()
         .workflow_ref("workflow".to_string())
@@ -401,6 +401,7 @@ async fn declared_exit_entry_name_is_recorded_when_its_instantiated_leaf_fires()
             primary: convoys.clone(),
             secondaries: vec![table.reconciler_wake_watch()],
             reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+                .with_lifecycle_reads(no_held_checkouts())
                 .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
             resync_interval: Duration::from_secs(3600),
             backend: backend.clone(),
@@ -516,7 +517,7 @@ async fn routing_contract(backend: ResourceBackend, changes: &[usize], zero_read
         Arc::new(UnavailableChangeRequests),
         Default::default(),
     );
-    let table = LeafSubscriptionTable::new(counted.clone(), broadcast_test_sink(events), refresher);
+    let table = served_table(counted.clone(), broadcast_test_sink(events), refresher);
     let mut watchers = Vec::new();
     let mut ids = Vec::new();
     for index in [0, 1, 2, 0] {

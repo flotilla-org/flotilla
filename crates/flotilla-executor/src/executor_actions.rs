@@ -26,11 +26,9 @@ use flotilla_protocol::ProviderData;
 use flotilla_protocol::RepoIdentity;
 use flotilla_protocol::RepoSelector;
 use flotilla_protocol::ResourceJsonResponse;
-use flotilla_resources::Checkout as ResourceCheckout;
 use flotilla_resources::InputMeta;
 use flotilla_resources::Repository;
 use flotilla_resources::RepositoryKey;
-use flotilla_resources::Resource;
 use flotilla_resources::ResourceError;
 use flotilla_resources::ResourceObject;
 use flotilla_store::DynamicResourceObject;
@@ -73,7 +71,6 @@ pub trait ExecutorActionPort: Send + Sync {
     async fn detect_repo_identity(&self, repo_path: &Path) -> RepoIdentity;
     async fn local_checkout_for_repository(&self, key: &RepositoryKey) -> Result<Option<PathBuf>, String>;
     async fn reconcile_now(&self, namespace: &str, kind: &str, name: &str) -> Result<String, String>;
-    async fn delete_stale_adopted_checkouts(&self, namespace: &str) -> Result<(), ResourceError>;
     async fn peer_connection_status(&self, node_id: &NodeId) -> PeerConnectionState;
     async fn refresh(&self, repo: &RepoSelector) -> Result<Option<RepositoryIdentityChange>, String>;
     async fn remove_repo(&self, path: &Path) -> Result<(), String>;
@@ -257,9 +254,6 @@ impl ExecutorActions<'_> {
                 let _reconciliation = self.observed_checkout_reconciliation.lock().await;
                 let deleted = async {
                     let deleted = flotilla_store::delete_resource_kind(self.resource_backend, namespace, kind, name).await?;
-                    if deleted.object.kind == ResourceCheckout::API_PATHS.kind {
-                        self.port.delete_stale_adopted_checkouts(namespace).await?;
-                    }
                     Ok::<_, ResourceError>(deleted)
                 }
                 .await;

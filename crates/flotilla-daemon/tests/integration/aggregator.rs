@@ -31,10 +31,10 @@ use flotilla_protocol::QueryScope;
 use flotilla_protocol::TerminalStatus;
 use flotilla_protocol_testkit::TestIssue;
 use flotilla_resources::{
-    Checkout, CheckoutPhase, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, Environment,
-    EnvironmentSpec, HostDirectEnvironmentSpec, InputMeta, ObservedCheckoutSpec, Project, ProjectRepositorySpec, ProjectSpec, Repository,
-    RepositorySpec, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
-    VesselRequirement, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, VESSEL_LABEL,
+    Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, Environment, EnvironmentSpec,
+    HostDirectEnvironmentSpec, InputMeta, ObservedCheckoutSpec, Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec,
+    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement,
+    WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::ResourceBackend;
 use flotilla_terminal::{TerminalSession as PoolTerminalSession, TerminalSessionLiveness};
@@ -160,6 +160,8 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
         namespace: "flotilla".into(),
         heartbeat_interval: Duration::from_secs(300),
         controller_resync_interval: Duration::from_secs(300),
+        // The engine's checkouts below are stepped by the test, not by a Checkout controller.
+        start_controllers: false,
         ..RuntimeOptions::default()
     };
     let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("start runtime");
@@ -193,29 +195,25 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
     .expect("checkout scopes become available");
 
     let mut events = daemon.subscribe();
-    // An adopted Checkout is durable; the daemon projects it into the observed store,
-    // and removes an adopted projection whose durable source is gone.
-    let checkouts = backend.clone().using::<Checkout>("flotilla");
-    let checkout = checkouts
-        .create(
-            &InputMeta::builder()
-                .name("checkout-widgets".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "ship-it".to_string())]))
-                .build()
-                .with_lifecycle_authority(LifecycleAuthority::Adopted),
-            &CheckoutSpec::Observed(
-                ObservedCheckoutSpec::builder()
-                    .r#ref("feature/query".to_string())
-                    .path("/work/widgets".to_string())
-                    .repo_ref(repository_key.clone())
-                    .host_ref(daemon.local_host_id().expect("local host id").to_string())
-                    .is_main(false)
-                    .build(),
-            ),
+    // An adopted checkout is the engine's, held for its convoy; the daemon projects it into the
+    // observed store, and removes an adopted projection whose launch has ended.
+    let engine = flotilla_daemon_testkit::engine::runtime_checkouts(&daemon);
+    engine.open_convoy("ship-it");
+    let ship_it = flotilla_resources::checkout_records::CheckoutHolder::Convoy("ship-it".to_string());
+    let host_ref = daemon.local_host_id().expect("local host id").to_string();
+    let adopted = |branch: &str, path: &str| {
+        CheckoutSpec::Observed(
+            ObservedCheckoutSpec::builder()
+                .r#ref(branch.to_string())
+                .path(path.to_string())
+                .repo_ref(repository_key.clone())
+                .host_ref(host_ref.clone())
+                .is_main(false)
+                .build(),
         )
-        .await
-        .expect("adopt checkout");
-    daemon.reconcile_adopted_checkouts("flotilla").await.expect("project adopted checkout");
+    };
+    let launch = engine.put_ready("checkout-widgets", &adopted("feature/query", "/work/widgets"), Some(&ship_it));
+    daemon.project_adopted_checkouts("flotilla").await.expect("project adopted checkout");
 
     let mut additions = HashMap::new();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -239,28 +237,10 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
         assert_eq!(rows[0].for_convoy.as_deref(), Some("ship-it"));
     }
 
-    let checkout = checkouts.get(&checkout.metadata.name).await.expect("adopted checkout");
-    let checkout = checkouts
-        .update(
-            &InputMeta::builder()
-                .name(checkout.metadata.name.clone())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "ship-it".to_string())]))
-                .build()
-                .with_lifecycle_authority(LifecycleAuthority::Adopted),
-            &checkout.metadata.resource_version,
-            &CheckoutSpec::Observed(
-                ObservedCheckoutSpec::builder()
-                    .r#ref("feature/revised".to_string())
-                    .path("/work/widgets-revised".to_string())
-                    .repo_ref(repository_key)
-                    .host_ref(daemon.local_host_id().expect("local host id").to_string())
-                    .is_main(false)
-                    .build(),
-            ),
-        )
-        .await
-        .expect("modify adopted checkout");
-    daemon.reconcile_adopted_checkouts("flotilla").await.expect("project modified checkout");
+    // A checkout's spec is its launch's: the revision is the checkout's next launch.
+    engine.finish(&launch, flotilla_provisioning_testkit::Ending::Released);
+    let launch = engine.put_ready("checkout-widgets", &adopted("feature/revised", "/work/widgets-revised"), Some(&ship_it));
+    daemon.project_adopted_checkouts("flotilla").await.expect("project modified checkout");
     let mut modifications = HashMap::new();
     tokio::time::timeout(Duration::from_secs(5), async {
         while modifications.len() < 2 {
@@ -314,8 +294,8 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
         .expect("subscribe with current checkout cursors");
     assert!(current_replay.is_empty());
 
-    checkouts.delete(&checkout.metadata.name).await.expect("delete adopted checkout");
-    daemon.reconcile_adopted_checkouts("flotilla").await.expect("remove adopted projection");
+    engine.finish(&launch, flotilla_provisioning_testkit::Ending::Released);
+    daemon.project_adopted_checkouts("flotilla").await.expect("remove adopted projection");
     let mut removals = HashMap::new();
     tokio::time::timeout(Duration::from_secs(5), async {
         while removals.len() < 2 {
@@ -334,7 +314,7 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
 }
 
 #[tokio::test]
-async fn runtime_start_republishes_durable_adopted_checkouts_before_query_bootstrap() {
+async fn runtime_start_republishes_engine_adopted_checkouts_before_query_bootstrap() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
     let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -346,27 +326,6 @@ async fn runtime_start_republishes_durable_adopted_checkouts_before_query_bootst
         .create(&InputMeta::builder().name(repository_key.to_string()).build(), &repository_spec)
         .await
         .expect("create repository");
-    backend
-        .clone()
-        .using::<Checkout>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name("adopted-checkout-restart".to_string())
-                .build()
-                .with_lifecycle_authority(LifecycleAuthority::Adopted),
-            &CheckoutSpec::Observed(
-                ObservedCheckoutSpec::builder()
-                    .r#ref("feature/restart".to_string())
-                    .path("/work/widgets".to_string())
-                    .repo_ref(repository_key.clone())
-                    .host_ref("host-before-restart".to_string())
-                    .is_main(false)
-                    .build(),
-            ),
-        )
-        .await
-        .expect("persist durable adopted checkout without status");
-
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
@@ -376,6 +335,21 @@ async fn runtime_start_republishes_durable_adopted_checkouts_before_query_bootst
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine held the adopted checkout before this start.
+    let engine = flotilla_daemon_testkit::engine::runtime_checkouts(&daemon);
+    let launch = engine.put_ready(
+        "adopted-checkout-restart",
+        &CheckoutSpec::Observed(
+            ObservedCheckoutSpec::builder()
+                .r#ref("feature/restart".to_string())
+                .path("/work/widgets".to_string())
+                .repo_ref(repository_key.clone())
+                .host_ref("host-before-restart".to_string())
+                .is_main(false)
+                .build(),
+        ),
+        None,
+    );
     let options = RuntimeOptions::builder()
         .namespace("flotilla".to_string())
         .heartbeat_interval(Duration::from_secs(300))
@@ -411,11 +385,9 @@ async fn runtime_start_republishes_durable_adopted_checkouts_before_query_bootst
 
     let rows = result_set.rows.as_checkouts().expect("checkout rows");
     assert!(matches!(rows, [row] if row.authority == LifecycleAuthority::Adopted && row.branch == "feature/restart"));
-    let durable =
-        backend.using::<Checkout>("flotilla").get("adopted-checkout-restart").await.expect("durable adopted checkout should remain");
-    let durable_status = durable.status.expect("durable adopted checkout status");
-    assert_eq!(durable_status.phase, CheckoutPhase::Ready);
-    assert_eq!(durable_status.path.as_deref(), Some("/work/widgets"));
+    let held = engine.record(&launch);
+    assert!(held.is_ready(), "the engine's adopted checkout should remain ready: {held:?}");
+    assert_eq!(held.ready_path(), Some("/work/widgets"));
 }
 
 #[tokio::test]
@@ -1072,19 +1044,12 @@ impl flotilla_admission::repository_inspection::RepositoryInspector for Conflict
     }
 
     async fn resolve_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
-        // Admission resolves the remote after publishing the adopted checkout.
-        // Let the real Aggregator show that row before triggering final cleanup.
+        // Admission resolves the remote before it commits. The adopted checkout is recorded on
+        // the convoy for its vessel to request on the engine (#3108), so nothing adopted is
+        // published, nor shown by the real Aggregator, before then.
         let daemon = self.daemon.upgrade().expect("daemon remains alive");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if cleanup_checkout_rows(&daemon).await.iter().any(|row| row.authority == LifecycleAuthority::Adopted) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("adopted Aggregator row before admission conflict cleanup");
+        let rows = cleanup_checkout_rows(&daemon).await;
+        assert!(!rows.iter().any(|row| row.authority == LifecycleAuthority::Adopted), "nothing adopted before admission commits: {rows:?}");
         RepositorySpec::remote(remote)
     }
 }
@@ -1104,10 +1069,10 @@ async fn cleanup_checkout_rows(daemon: &InProcessDaemon) -> Vec<flotilla_protoco
         .expect("checkout result set")
 }
 
-// #768: both deletion paths remove adopted projections and their Aggregator
+// #768: both ways an adopted checkout goes remove adopted projections and their Aggregator
 // rows without periodic reconciliation. Non-adopted observations survive.
 #[tokio::test]
-async fn resource_delete_removes_adopted_projection_and_aggregator_row() {
+async fn ended_adopted_checkout_removes_projection_and_aggregator_row() {
     assert_adopted_checkout_cleanup(false).await;
 }
 
@@ -1160,7 +1125,8 @@ async fn assert_adopted_checkout_cleanup(admission_conflict: bool) {
         .create(&InputMeta::builder().name("unrelated".to_string()).build().with_lifecycle_authority(LifecycleAuthority::Observed), &spec)
         .await
         .expect("unrelated observation");
-    let action = if admission_conflict {
+    let engine = flotilla_daemon_testkit::engine::runtime_checkouts(&daemon);
+    if admission_conflict {
         std::fs::create_dir(tmp.path().join("checkout")).expect("checkout directory");
         backend
             .using::<WorkflowTemplate>("flotilla")
@@ -1181,23 +1147,29 @@ async fn assert_adopted_checkout_cleanup(admission_conflict: bool) {
         daemon
             .set_repository_inspector(Arc::new(ConflictCheckoutInspector { backend: backend.clone(), daemon: Arc::downgrade(&daemon) }))
             .await;
-        CommandAction::ConvoyCreate {
-            name: "cleanup".to_string(),
-            workflow_ref: "cleanup-workflow".to_string(),
-            inputs: vec![],
-            repository_url: None,
-            r#ref: None,
-            project_ref: None,
-            placement_policy: None,
-            adopted_checkout: Some(Box::new(tmp.path().join("checkout"))),
-        }
+        let result = cleanup_command_result(
+            &daemon,
+            CommandAction::ConvoyCreate {
+                name: "cleanup".to_string(),
+                workflow_ref: "cleanup-workflow".to_string(),
+                inputs: vec![],
+                repository_url: None,
+                r#ref: None,
+                project_ref: None,
+                placement_policy: None,
+                adopted_checkout: Some(Box::new(tmp.path().join("checkout"))),
+            },
+        )
+        .await;
+        assert!(matches!(result, CommandValue::Error { ref message } if message.contains("already exists")), "{result:?}");
+        use flotilla_resources::checkout_records::CheckoutRecords as _;
+        let held = engine.checkouts.here().expect("engine checkouts");
+        assert!(held.is_empty(), "a refused admission must not hold an adopted checkout: {held:?}");
+        let remaining = observed.list().await.expect("observed checkouts").items;
+        assert!(matches!(remaining.as_slice(), [checkout] if checkout.metadata.name == "unrelated"), "{remaining:?}");
     } else {
-        backend
-            .using::<Checkout>("flotilla")
-            .create(&InputMeta::builder().name("adopted".to_string()).build().with_lifecycle_authority(LifecycleAuthority::Adopted), &spec)
-            .await
-            .expect("adopt");
-        daemon.reconcile_adopted_checkouts("flotilla").await.expect("project adopted checkout");
+        let launch = engine.put_ready("adopted", &spec, None);
+        daemon.project_adopted_checkouts("flotilla").await.expect("project adopted checkout");
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if cleanup_checkout_rows(&daemon).await.iter().any(|row| row.authority == LifecycleAuthority::Adopted) {
@@ -1208,31 +1180,26 @@ async fn assert_adopted_checkout_cleanup(admission_conflict: bool) {
         })
         .await
         .expect("adopted Aggregator row");
-        CommandAction::ResourceDelete {
-            namespace: "flotilla".to_string(),
-            kind: "checkouts".to_string(),
-            name: "adopted".to_string(),
-            replica_origin: None,
-        }
-    };
-    let result = cleanup_command_result(&daemon, action.clone()).await;
-    if admission_conflict {
-        assert!(matches!(result, CommandValue::Error { ref message } if message.contains("already exists")), "{result:?}");
-    } else {
-        assert!(matches!(result, CommandValue::ResourceDeleted(_)), "{result:?}");
-    }
-    assert!(backend.using::<Checkout>("flotilla").list().await.expect("durable checkouts").items.is_empty());
-    let remaining = observed.list().await.expect("observed checkouts").items;
-    assert!(matches!(remaining.as_slice(), [checkout] if checkout.metadata.name == "unrelated"), "{remaining:?}");
-    if !admission_conflict {
-        // A cleanup failure can leave an orphan after the durable delete. A
-        // repeated command must accept the tombstone and retry projection cleanup.
+        // The checkout's launch ends: its change alone removes the adopted projection.
+        engine.finish(&launch, flotilla_provisioning_testkit::Ending::Released);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let remaining = observed.list().await.expect("observed checkouts").items;
+                if matches!(remaining.as_slice(), [checkout] if checkout.metadata.name == "unrelated") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the ended checkout's projection is removed");
+        // A cleanup failure can leave an orphan projection after the launch ended. The next
+        // projection removes it.
         observed
             .create(&InputMeta::builder().name("adopted".to_string()).build().with_lifecycle_authority(LifecycleAuthority::Adopted), &spec)
             .await
             .expect("orphan left by interrupted cleanup");
-        let repeated = cleanup_command_result(&daemon, action).await;
-        assert!(matches!(repeated, CommandValue::ResourceAlreadyDeleted(_)), "{repeated:?}");
+        daemon.project_adopted_checkouts("flotilla").await.expect("project adopted checkouts again");
         let remaining = observed.list().await.expect("observed checkouts after retry").items;
         assert!(matches!(remaining.as_slice(), [checkout] if checkout.metadata.name == "unrelated"), "{remaining:?}");
     }

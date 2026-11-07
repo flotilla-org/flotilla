@@ -18,7 +18,7 @@ use flotilla_engine_store::{
     plain::{PendingChange, PlainError, PlainLog},
 };
 use flotilla_resources::{
-    engine_records::{EngineObject, EngineRecords, ObservationFailures},
+    engine_records::{BranchChangeRequest, ChangeRequestBranches, EngineObject, EngineRecords, ObservationFailures},
     ChangeRequestSpec, ChangeRequestStatus, IssueSpec, IssueStatus,
 };
 use flotilla_schema::{Kind, KindCode, NewChange, Timestamp};
@@ -33,6 +33,9 @@ const CHANGE_REQUEST: &str = "ChangeRequest";
 const ISSUE: &str = "Issue";
 const CHANGE_REQUEST_CODE: KindCode = <ChangeRequestRecord as Kind>::CODE;
 const ISSUE_CODE: KindCode = <IssueRecord as Kind>::CODE;
+
+/// How many index rows one page of a branch read holds.
+const BRANCH_PAGE: u32 = 64;
 
 /// The writer the plain-kind port records for the observer's writes.
 const WRITER: &str = "forge-observer";
@@ -82,8 +85,9 @@ impl Observed for ChangeRequestRecord {
         record
     }
 
+    /// The head branch is not in the old status: only a branch observation writes it, so it stays.
     fn observed(&self, home: &str, status: &ChangeRequestStatus) -> Self {
-        Self::from_old(&self.old_spec(home), status)
+        Self { head_branch: self.head_branch.clone(), ..Self::from_old(&self.old_spec(home), status) }
     }
 
     fn failing_since(&self) -> Option<Timestamp> {
@@ -473,5 +477,66 @@ impl ObservationFailures for EngineObservations {
             CHANGE_REQUEST => self.failing_as::<ChangeRequestRecord>(name),
             _ => self.failing_as::<IssueRecord>(name),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl ChangeRequestBranches for EngineObservations {
+    /// A change request with no record here gets one holding only what the branch read found.
+    async fn found_on_branch(&self, found: &BranchChangeRequest) -> Result<(), String> {
+        let current = self.log.get::<ChangeRequestRecord>(&found.name, &self.home).map_err(|error| error.to_string())?;
+        let mut record = current.map(|current| current.spec).unwrap_or_else(|| ChangeRequestRecord {
+            service: found.service.clone(),
+            scope: found.scope.clone(),
+            number: found.number,
+            title: None,
+            author: None,
+            state: None,
+            review_decision: None,
+            review_requested_from_owner: None,
+            head_sha: None,
+            head_branch: None,
+            checks: None,
+            actionable_at_head: None,
+            mergeable: None,
+            failing_since: None,
+        });
+        record.head_branch = Some(found.branch.clone());
+        if let Some(state) = found.state {
+            record.state = Some(state.into());
+        }
+        self.write(&found.name, &record).map(|_| ())
+    }
+
+    async fn on_branch(&self, service: &str, scope: &str, branch: &str) -> Result<Vec<BranchChangeRequest>, String> {
+        let query = ChangeRequestRecord::by_branch(&service.to_owned(), &scope.to_owned(), &branch.to_owned());
+        self.service
+            .with_store(|store| {
+                let mut read = store.read()?;
+                let mut found = Vec::new();
+                let mut after = None;
+                loop {
+                    let page = read.page(&query, after.as_ref(), BRANCH_PAGE)?;
+                    for id in page.ids {
+                        if let Some(loaded) = read.load::<ChangeRequestRecord>(id)? {
+                            let record = loaded.value;
+                            found.push(BranchChangeRequest {
+                                name: loaded.name,
+                                home: loaded.home,
+                                service: record.service,
+                                scope: record.scope,
+                                number: record.number,
+                                branch: record.head_branch.unwrap_or_default(),
+                                state: record.state.map(Into::into),
+                            });
+                        }
+                    }
+                    match page.next {
+                        Some(next) => after = Some(next),
+                        None => return Ok(found),
+                    }
+                }
+            })
+            .map_err(|error| format!("change requests from branch {branch} of {service} {scope}: {error}"))
     }
 }

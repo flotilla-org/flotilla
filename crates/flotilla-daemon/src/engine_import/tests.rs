@@ -292,7 +292,11 @@ async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
         assert_eq!(kinds[kind]["imported"], 1, "{kind}: {report:#}");
     }
     assert_eq!(kinds["AccessDelivery"], json!({"imported": 2, "dropped": 0, "refused": 0}), "{report:#}");
-    assert_eq!(kinds["Checkout"], json!({"imported": 0, "dropped": 1, "refused": 0}), "an observed checkout is no request");
+    assert_eq!(
+        kinds["Checkout"],
+        json!({"imported": 1, "dropped": 0, "refused": 0}),
+        "an adopted (observed) checkout imports as an adopted launch: {report:#}"
+    );
     assert_eq!(kinds["Convoy"], json!({"imported": 0, "dropped": 1, "refused": 0}), "an unbootstrapped convoy stays old");
     assert!(kinds.get("Forge").is_none(), "another host's records are not this host's to count: {report:#}");
 
@@ -301,6 +305,10 @@ async fn a_first_start_imports_every_kind_homed_here_and_the_next_does_not() {
     assert!(
         holds::<flotilla_state_machines::Resource<flotilla_provisioning::stored::clone::Clone>>(&mut store, "clone-a#1", HERE),
         "a clone is imported as its first launch"
+    );
+    assert!(
+        holds::<flotilla_state_machines::Resource<flotilla_provisioning::stored::checkout::Checkout>>(&mut store, "observed-a#1", HERE),
+        "an adopted checkout is imported as its first launch"
     );
     for name in ["access-delivered", "access-failed"] {
         assert!(holds::<flotilla_resources::AccessDeliverySpec>(&mut store, name, HERE), "{name}");
@@ -592,7 +600,11 @@ fn lifecycle_records_import_by_state_and_name_what_they_cannot_map() {
         HERE,
     );
     assert_eq!(summary.kinds["Clone"], Counts { imported: 1, dropped: 0, refused: 1 }, "{summary:?}");
-    assert_eq!(summary.kinds["Checkout"], Counts { imported: 0, dropped: 1, refused: 0 }, "an observed checkout is no request");
+    assert_eq!(
+        summary.kinds["Checkout"],
+        Counts { imported: 1, dropped: 0, refused: 0 },
+        "an adopted (observed) checkout imports at its path: {summary:?}"
+    );
     assert_eq!(summary.kinds["Vessel"].imported, 1, "a placed vessel is its lease: {summary:?}");
     assert_eq!(summary.kinds["Ensure"].imported, 2);
     assert_eq!(refused(&summary), [("Clone", "broken-a")]);

@@ -14,6 +14,10 @@ use flotilla_protocol::LifecycleReading;
 pub use crate::clone_records::{launch, launched};
 use crate::{CheckoutSpec, RepositoryKey};
 
+/// What a refused request says when its holder's engine Convoy is not admitted yet: the request
+/// waits for the convoy rather than failing.
+pub const HOLDER_NOT_OPEN: &str = "is not admitted on the engine yet";
+
 /// Who a checkout is held for. The holder carries no ownership: a finishing holder finds its
 /// checkouts by it and releases them.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -33,6 +37,8 @@ pub struct CheckoutRecord {
     /// `is_main` derived from its branch.
     pub spec: CheckoutSpec,
     pub holder: Option<CheckoutHolder>,
+    /// When this launch was requested.
+    pub requested_at: DateTime<Utc>,
     pub reading: LifecycleReading,
     /// How it was made short of what was asked, as its launch found when it was realised.
     pub degraded: Option<String>,
@@ -63,6 +69,99 @@ impl CheckoutRecord {
         match &self.spec {
             CheckoutSpec::Observed(spec) => Some(&spec.path),
             spec => spec.target_path(),
+        }
+    }
+}
+
+/// Each checkout's latest launch among `records`, by checkout name: later launches of a checkout
+/// replace earlier ones.
+pub fn latest_launches(records: impl IntoIterator<Item = CheckoutRecord>) -> std::collections::BTreeMap<String, CheckoutRecord> {
+    let number = |record: &CheckoutRecord| record.name.rsplit_once('#').and_then(|(_, n)| n.parse::<u32>().ok()).unwrap_or(0);
+    let mut latest = std::collections::BTreeMap::<String, CheckoutRecord>::new();
+    for record in records {
+        match latest.get(record.checkout_name()) {
+            Some(held) if number(held) >= number(&record) => {}
+            _ => {
+                latest.insert(record.checkout_name().to_owned(), record);
+            }
+        }
+    }
+    latest
+}
+
+impl CheckoutRecord {
+    /// The branch it checks out, without `refs/heads/`.
+    pub fn branch(&self) -> &str {
+        let reference = match &self.spec {
+            CheckoutSpec::Worktree(spec) => spec.r#ref.as_str(),
+            CheckoutSpec::FreshClone(spec) => spec.r#ref.as_str(),
+            CheckoutSpec::Observed(spec) => spec.r#ref.as_str(),
+        };
+        reference.strip_prefix("refs/heads/").unwrap_or(reference)
+    }
+
+    /// Its home's inspection, if one has been written.
+    pub fn inspection(&self) -> Option<&Inspection> {
+        self.integration.as_ref().map(|integration| &integration.inspection)
+    }
+
+    /// The realised path: its reading's identity once ready.
+    pub fn ready_path(&self) -> Option<&str> {
+        match &self.reading {
+            LifecycleReading::Ready { identity } => Some(identity),
+            _ => None,
+        }
+    }
+
+    /// This launch in the shape the surfaces' rows take, under the checkout's name: its spec, its
+    /// phase and path from its reading, its holder as the convoy label and its authority as the
+    /// authority label. A read view, never stored. Its integration is not in it: a reader of
+    /// integration reads [`CheckoutRecord::integration`], with the forge observation's states.
+    pub fn read_view(&self) -> crate::ResourceObject<crate::Checkout> {
+        use crate::{CheckoutPhase, CheckoutStatus, LifecycleAuthority};
+        let (phase, message) = match &self.reading {
+            LifecycleReading::Ready { .. } => (CheckoutPhase::Ready, None),
+            LifecycleReading::Released => (CheckoutPhase::Gone, None),
+            LifecycleReading::Lost { reason } => (CheckoutPhase::Gone, reason.clone()),
+            LifecycleReading::Failed { reason } => (CheckoutPhase::Failed, Some(reason.clone())),
+            LifecycleReading::GaveUp { cause } => (CheckoutPhase::Failed, Some(cause.clone())),
+            LifecycleReading::InProgress => (CheckoutPhase::Pending, None),
+            LifecycleReading::Retrying { cause, .. } | LifecycleReading::Exhausted { cause } => {
+                (CheckoutPhase::Pending, Some(cause.clone()))
+            }
+        };
+        let authority =
+            if matches!(self.spec, CheckoutSpec::Observed(_)) { LifecycleAuthority::Adopted } else { LifecycleAuthority::Managed };
+        let mut labels = std::collections::BTreeMap::from([
+            (crate::AUTHORITY_LABEL.to_string(), authority.as_label_value().to_string()),
+            (crate::REPO_KEY_LABEL.to_string(), self.spec.repo_ref().to_string()),
+        ]);
+        if let Some(CheckoutHolder::Convoy(convoy)) = &self.holder {
+            labels.insert(crate::CONVOY_LABEL.to_string(), convoy.clone());
+        }
+        crate::ResourceObject {
+            metadata: crate::ObjectMeta {
+                name: self.checkout_name().to_owned(),
+                namespace: String::new(),
+                resource_version: self.name.clone(),
+                labels,
+                annotations: Default::default(),
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: self.requested_at,
+                merge: None,
+            },
+            spec: self.spec.clone(),
+            status: Some(CheckoutStatus {
+                degraded: self.degraded.clone(),
+                phase,
+                path: self.ready_path().map(str::to_owned),
+                commit: None,
+                branch_provenance: Default::default(),
+                integration: Default::default(),
+                message,
+            }),
         }
     }
 }
@@ -161,6 +260,14 @@ pub struct Integration {
     pub confirmed_at: DateTime<Utc>,
     /// Since when its home's inspections have failed.
     pub failing_since: Option<DateTime<Utc>>,
+}
+
+impl Integration {
+    /// Its values were confirmed within `lifetime` of `now`. A confirmation read after `now` (this
+    /// home's are confirmed as they are read) is as fresh as one at `now`.
+    pub fn confirmed_within(&self, now: DateTime<Utc>, lifetime: std::time::Duration) -> bool {
+        chrono::Duration::from_std(lifetime).is_ok_and(|lifetime| now.signed_duration_since(self.confirmed_at) < lifetime)
+    }
 }
 
 /// What changed among the checkouts, at any home.

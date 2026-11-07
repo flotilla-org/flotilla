@@ -127,6 +127,8 @@ pub(super) struct RestAdmissionFixture {
     pub(super) calls: Arc<AtomicUsize>,
     pub(super) daemon: Arc<InProcessDaemon>,
     pub(super) keys: Vec<RepositoryKey>,
+    /// The engine's readings, installed on the daemon, with no checkout held to start with.
+    pub(super) engine: super::TestEngine,
     pub(super) _config: tempfile::TempDir,
 }
 
@@ -153,6 +155,7 @@ pub(super) async fn rest_admission_fixture(outcomes: [RestAdmissionReply; 2], lo
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    let engine = super::test_engine(&daemon);
     daemon.set_provisioning_namespace("flotilla".into()).await;
     let mut keys = Vec::new();
     for index in 0..2 {
@@ -175,5 +178,5 @@ pub(super) async fn rest_admission_fixture(outcomes: [RestAdmissionReply; 2], lo
         );
         keys.push(key);
     }
-    RestAdmissionFixture { calls, daemon, keys, _config: config }
+    RestAdmissionFixture { calls, daemon, keys, engine, _config: config }
 }

@@ -201,7 +201,7 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
     flotilla_store::ensure_repository(&backend.using::<Repository>(NAMESPACE), &repository_key, &repository_spec)
         .await
         .expect("repository");
-    backend
+    let convoy = backend
         .using::<Convoy>(NAMESPACE)
         .create(
             &InputMeta::builder()
@@ -228,24 +228,21 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
             false,
         )
         .expect("clone request");
-    backend
-        .using::<Checkout>(NAMESPACE)
-        .create(
-            &InputMeta::builder()
-                .name("clone-failure-checkout".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "clone-failure-convoy".to_string())]))
-                .build(),
-            &CheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
-                repo_ref: repository_key,
-                env_ref: "host-direct-test".to_string(),
-                r#ref: "main".to_string(),
-                base_ref: None,
-                target_path: temp.path().join("checkout").display().to_string(),
-                clone_ref: launch.clone(),
-            }),
-        )
-        .await
-        .expect("checkout");
+    // The convoy's checkout, held for its engine Convoy, made from the clone.
+    let engine_convoy = flotilla_resources::convoy::engine::engine_name(&convoy).expect("engine convoy name");
+    engine.checkouts.open_convoy(&engine_convoy);
+    engine.checkouts.request(
+        "clone-failure-checkout",
+        &CheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
+            repo_ref: repository_key,
+            env_ref: "host-direct-test".to_string(),
+            r#ref: "main".to_string(),
+            base_ref: None,
+            target_path: temp.path().join("checkout").display().to_string(),
+            clone_ref: launch.clone(),
+        }),
+        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(engine_convoy)),
+    );
     let convoy_controller = tokio::spawn(
         ControllerLoop {
             primary: backend.using::<Convoy>(NAMESPACE),

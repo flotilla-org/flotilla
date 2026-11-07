@@ -4,6 +4,7 @@ pub mod clones;
 pub mod environments;
 pub mod image_build;
 pub mod other_home;
+pub use checkouts::CheckoutFixture;
 pub use clones::CloneFixture;
 pub use environments::EnvironmentFixture;
 pub use other_home::{other_home_for, put_host_at_its_home, put_host_at_its_home_heard, replicate_home, replicate_home_at, OtherHome};
@@ -21,6 +22,43 @@ use flotilla_state_machines::{
     machines::lifecycle::{Attempted, Lifecycle, LifecycleKind, MemoryLifecycleWorld},
     Cause, CauseCategory, Home, Log, Outcome,
 };
+
+/// The engine's environments, clones and checkouts homed at one home on one store, each fixture's
+/// `reads` serving all three, as a daemon's lifecycle reads do.
+pub struct EngineFixture {
+    pub environments: EnvironmentFixture,
+    pub clones: CloneFixture,
+    pub checkouts: CheckoutFixture,
+}
+
+impl Default for EngineFixture {
+    fn default() -> Self {
+        Self::at("home")
+    }
+}
+
+impl EngineFixture {
+    /// An engine whose records are homed at `home`.
+    pub fn at(home: &str) -> Self {
+        Self::over(home, CheckoutFixture::at(home).store)
+    }
+
+    /// An engine over `store`, whose home is `home`: a daemon's decided store, say.
+    pub fn over(home: &str, store: Arc<Mutex<Store>>) -> Self {
+        let mut environments = EnvironmentFixture::over(home, Arc::clone(&store));
+        let mut clones = CloneFixture::over(home, Arc::clone(&store));
+        let checkouts =
+            CheckoutFixture::over(home, store).serving(Arc::clone(&environments.environments) as _, Arc::clone(&clones.clones) as _);
+        environments.reads = checkouts.reads.clone();
+        clones.reads = checkouts.reads.clone();
+        Self { environments, clones, checkouts }
+    }
+
+    /// The readings serving all three.
+    pub fn reads(&self) -> Arc<dyn LifecycleReads> {
+        self.checkouts.reads.clone()
+    }
+}
 
 /// Endings shared by every resource reader; the identity belongs to that kind's realisation.
 #[derive(Clone, Copy)]
@@ -44,6 +82,9 @@ where
     pub environments: EnvironmentFixture,
     /// The clones its readers find, homed at `home` on the same store.
     pub clones: CloneFixture,
+    /// The checkouts its readers find, and the engine Convoys they are held for, homed at `home`
+    /// on the same store.
+    pub checkouts: CheckoutFixture,
 }
 
 impl<B: Binding> LifecycleFixture<B>
@@ -58,12 +99,14 @@ where
         let home = Arc::new(LifecycleHome::new("home", Home::with_log("home", StoreLog::new(Arc::clone(&store))).expect("home")));
         let environments = EnvironmentFixture::over("home", Arc::clone(&store));
         let clones = CloneFixture::over("home", Arc::clone(&store));
+        let checkouts = CheckoutFixture::over("home", Arc::clone(&store));
         let reads = Arc::new(
             LifecycleReadPort::new(StoreReads::new(Arc::clone(&store)), if replica { "reader" } else { "home" }.into())
                 .with_environments(Arc::clone(&environments.environments) as Arc<dyn EnvironmentRecords>)
-                .with_clones(Arc::clone(&clones.clones) as Arc<dyn flotilla_resources::clone_records::CloneRecords>),
+                .with_clones(Arc::clone(&clones.clones) as Arc<dyn flotilla_resources::clone_records::CloneRecords>)
+                .with_checkouts(Arc::clone(&checkouts.checkouts) as Arc<dyn flotilla_resources::checkout_records::CheckoutRecords>),
         );
-        Self { home, reads, store, environments, clones }
+        Self { home, reads, store, environments, clones, checkouts }
     }
 
     pub fn name(&self, obj: &ResourceObject<B::Old>) -> String {

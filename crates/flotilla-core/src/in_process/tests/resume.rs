@@ -340,6 +340,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    super::test_engine(&daemon);
     daemon.set_work_credential_reconciler(probe.clone()).await;
     daemon.crew.set_turn_delivery_actuator(supervision.clone()).await;
     let (tx, _rx) = flotilla_store::controller::WorkQueueSender::channel();

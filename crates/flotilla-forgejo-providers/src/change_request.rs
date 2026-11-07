@@ -254,7 +254,14 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
             )
             .await?;
             let items = value.as_array().ok_or("Forgejo pull request list response was not an array")?;
-            if let Some(request) = items.iter().filter_map(|value| self.parse(value)).find(|(_, request)| request.branch == branch) {
+            // Only a request from this repository's own branch counts: a fork's branch of the same
+            // name is another branch (#3108, ruled). A deleted fork reports no head repository.
+            let own_head = |value: &&serde_json::Value| {
+                value["head"]["repo"]["full_name"].as_str().is_some_and(|name| name.eq_ignore_ascii_case(&self.repo_slug))
+            };
+            if let Some(request) =
+                items.iter().filter(own_head).filter_map(|value| self.parse(value)).find(|(_, request)| request.branch == branch)
+            {
                 return Ok(Some(request));
             }
             if items.is_empty() {
@@ -812,11 +819,16 @@ mod tests {
     }
 
     // HTTP boundary: an observer reuses only proven absence, then checks again
-    // at the freshness boundary so a newly created fork-head PR can be found.
+    // at the freshness boundary so a newly created PR can be found. A fork's PR
+    // from a branch of the same name is not the repository's branch and is never
+    // found (#3108, ruled).
     #[tokio::test(start_paused = true)]
     async fn observer_repeated_absent_scans_are_bounded_and_expire() {
         let other = serde_json::json!([{"number": 1, "title": "Other", "head": {"ref": "other"}, "state": "open"}]);
-        let found = serde_json::json!([{"number": 7, "title": "Fork PR", "head": {"ref": "feature/wanted", "repo": {"full_name": "fork/repo"}}, "state": "closed", "merged": true}]);
+        let found = serde_json::json!([
+            {"number": 7, "title": "Fork PR", "head": {"ref": "feature/wanted", "repo": {"full_name": "fork/repo"}}, "state": "open"},
+            {"number": 8, "title": "Own PR", "head": {"ref": "feature/wanted", "repo": {"full_name": "team/repo"}}, "state": "closed", "merged": true}
+        ]);
         let http = Arc::new(MockHttp {
             responses: Mutex::new(VecDeque::from([
                 json_response(&other),
@@ -838,8 +850,8 @@ mod tests {
         assert_eq!(http.urls.lock().expect("urls").len(), 3);
         tokio::time::advance(tokio::time::Duration::from_secs(1)).await;
         for expected_calls in [4, 5] {
-            let (id, request) = observer.find("team/repo", &provider, "feature/wanted").await.expect("fresh lookup").expect("fork head");
-            assert_eq!(id, "7");
+            let (id, request) = observer.find("team/repo", &provider, "feature/wanted").await.expect("fresh lookup").expect("own head");
+            assert_eq!(id, "8", "the fork's PR from a same-named branch is not found");
             assert_eq!(request.status, ChangeRequestStatus::Merged);
             assert_eq!(http.urls.lock().expect("urls").len(), expected_calls, "positive observations are read fresh");
         }
@@ -1018,7 +1030,7 @@ mod tests {
                     .collect(),
             );
             let last = if found {
-                serde_json::json!([{"number": 101, "title": "Wanted", "head": {"ref": "wanted"}, "state": "closed", "merged": true}])
+                serde_json::json!([{"number": 101, "title": "Wanted", "head": {"ref": "wanted", "repo": {"full_name": "team/repo"}}, "state": "closed", "merged": true}])
             } else {
                 serde_json::json!([])
             };

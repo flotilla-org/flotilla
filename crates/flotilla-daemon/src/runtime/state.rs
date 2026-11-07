@@ -22,9 +22,10 @@ use flotilla_environment::environment::{vessel_ops::RunnerVesselAgent, VesselAge
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::{CanonicalHostId, EnvironmentId};
 use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
+use flotilla_provisioning::checkout_runtime::CheckoutRemoval;
 use flotilla_provisioning::engine::controller::BackingEvent;
 use flotilla_provisioning::reconcilers::clone::runtime::CloneFlights;
-use flotilla_provisioning::reconcilers::{CheckoutRemoval, ForgeDefaultBranchResolver};
+use flotilla_provisioning::reconcilers::ForgeDefaultBranchResolver;
 use flotilla_resources::environment_records::EnvironmentRecord;
 use flotilla_resources::{Convoy, ConvoyProvisioningState, Host, HostSpec, ResourceError, ResourceObject};
 use flotilla_store::load_metrics::ControllerMetricsRegistry;
@@ -92,6 +93,10 @@ pub(super) struct ControllerRuntimeState {
     /// controller: the sender the probes use, and the receiver its controller takes once.
     pub(super) environment_backings: tokio::sync::mpsc::Sender<BackingEvent>,
     pub(super) environment_backing_events: StdMutex<Option<tokio::sync::mpsc::Receiver<BackingEvent>>>,
+    /// The checkout launches a host probe saw change, for the Checkout controller to observe
+    /// again: the sender the probe uses, and the receiver its controller takes once.
+    pub(super) checkout_rechecks: tokio::sync::mpsc::Sender<String>,
+    pub(super) checkout_recheck_events: StdMutex<Option<tokio::sync::mpsc::Receiver<String>>>,
     /// The remotes this host's clones could not reach, published on its heartbeat (#3108).
     pub(super) remote_reachability: Arc<RemoteProbe>,
 }
@@ -295,6 +300,7 @@ impl ControllerRuntimeState {
             config.state_dir().as_path().join("skill-source-cache"),
         ));
         let (environment_backings, environment_backing_events) = tokio::sync::mpsc::channel(64);
+        let (checkout_rechecks, checkout_recheck_events) = tokio::sync::mpsc::channel(64);
         Self {
             environment_providers,
             skill_trees,
@@ -329,6 +335,8 @@ impl ControllerRuntimeState {
             provisioning: None,
             environment_backings,
             environment_backing_events: StdMutex::new(Some(environment_backing_events)),
+            checkout_rechecks,
+            checkout_recheck_events: StdMutex::new(Some(checkout_recheck_events)),
             remote_reachability: Arc::new(RemoteProbe::new(super::health::RuntimeHealth::default())),
         }
     }

@@ -115,6 +115,12 @@ pub enum RequestBody {
     /// request is a failed inspection to the gate that sent it.
     #[serde(rename = "ci")]
     CheckoutInspection { remote: bool },
+    /// A request to the forge observer at a host (#3108): look for a change request from
+    /// `branch` of the repository the message's subject reference names, and record what it finds
+    /// on its record's head branch. Only the repository's own branch counts, never a fork's of the
+    /// same name. Its receipt answers it; a lookup that failed is an undeliverable request.
+    #[serde(rename = "cb")]
+    ChangeRequestBranch { branch: String },
 }
 
 /// A thing the message refers to, at a revision (ADR 0066 §4). At most one

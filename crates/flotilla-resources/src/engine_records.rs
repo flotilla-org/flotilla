@@ -66,3 +66,31 @@ pub trait ObservationFailures: Send + Sync + std::fmt::Debug {
     /// Marks this home's record `name` of `kind` as failing, unless it already is; absent is done.
     async fn failing(&self, kind: &str, name: &str) -> Result<(), String>;
 }
+
+/// A change request the forge observer found merging from a branch of its own repository
+/// (#3108). A fork's branch of the same name is another branch: the observer records none for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchChangeRequest {
+    /// The record's name, the change request address's record name.
+    pub name: String,
+    /// The home whose observer found it.
+    pub home: String,
+    pub service: String,
+    pub scope: String,
+    pub number: u64,
+    pub branch: String,
+    /// Its state when found; none when the forge reported none.
+    pub state: Option<crate::ObservedChangeRequestState>,
+}
+
+/// The repository branches the forge observers have found change requests from (#3108): a
+/// branch-observation request's answer is written here at the observer's home, and branch
+/// validation reads every home's through the records' `by_branch` index.
+#[async_trait::async_trait]
+pub trait ChangeRequestBranches: Send + Sync + std::fmt::Debug {
+    /// Records at this home that `found.number` merges from `found.branch` of its own repository,
+    /// in `found.state`. Writes only what changed; the record's other observed values stay.
+    async fn found_on_branch(&self, found: &BranchChangeRequest) -> Result<(), String>;
+    /// Every home's change requests in `(service, scope)` found merging from `branch`.
+    async fn on_branch(&self, service: &str, scope: &str, branch: &str) -> Result<Vec<BranchChangeRequest>, String>;
+}

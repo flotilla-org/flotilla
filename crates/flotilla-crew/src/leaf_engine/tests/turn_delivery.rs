@@ -537,7 +537,7 @@ async fn issue_turn_delivery_fires_once_for_changed_issue() {
         Arc::new(UnavailableChangeRequests),
         flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
-    let table = LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher);
+    let table = served_table(backend.clone(), broadcast_test_sink(event_tx), refresher);
     let actuator = Arc::new(RecordingTurnDelivery::default());
     table.set_turn_delivery_actuator(actuator.clone()).await;
     let rule = TurnDeliveryRule::builder()
@@ -1065,7 +1065,7 @@ fn replica_status_turn_delivery(tc: hegel::TestCase) {
                 Default::default(),
             );
             let issues = IssueRefresher::new(home.clone(), "home".into(), Arc::new(UnavailableIssues), Default::default());
-            let table = LeafSubscriptionTable::new(home.clone(), broadcast_test_sink(tx), refresher.clone());
+            let table = served_table(home.clone(), broadcast_test_sink(tx), refresher.clone());
             let actuator = Arc::new(RecordingTurnDelivery::default());
             table.set_turn_delivery_actuator(actuator.clone()).await;
             let base = Utc::now() - chrono::Duration::seconds(10);

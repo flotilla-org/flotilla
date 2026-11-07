@@ -140,40 +140,35 @@ pub async fn gone_worktree_satisfies_teardown_gate_without_integration_observati
         )
         .await
         .expect("failed convoy");
-    let checkouts = backend.using::<ResourceCheckout>("flotilla");
-    let created_checkout = checkouts
-        .create(
-            &test_meta("checkout-gone"),
-            &ResourceCheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
-                repo_ref: RepositoryKey("repo".to_string()),
-                env_ref: "host-direct-test".to_string(),
-                r#ref: "feature/gone".to_string(),
-                base_ref: Some("main".to_string()),
-                target_path: "/missing/worktree".to_string(),
-                clone_ref: "clone".to_string(),
-            }),
-        )
-        .await
-        .expect("checkout");
-    let gone = checkouts
-        .update_status(
-            "checkout-gone",
-            &created_checkout.metadata.resource_version,
-            &ResourceCheckoutStatus {
-                phase: flotilla_resources::CheckoutPhase::Gone,
-                path: Some("/missing/worktree".to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("gone checkout");
+    // The checkout's latest launch as the engine reads it: its worktree observed gone, with no
+    // inspection written.
+    let gone = flotilla_resources::checkout_records::CheckoutRecord {
+        name: "checkout-gone#1".to_string(),
+        home: "test".to_string(),
+        spec: ResourceCheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
+            repo_ref: RepositoryKey("repo".to_string()),
+            env_ref: "host-direct-test".to_string(),
+            r#ref: "feature/gone".to_string(),
+            base_ref: Some("main".to_string()),
+            target_path: "/missing/worktree".to_string(),
+            clone_ref: "clone".to_string(),
+        }),
+        holder: Some(flotilla_resources::checkout_records::CheckoutHolder::Convoy("gone-worktree".to_string())),
+        requested_at: chrono::Utc::now(),
+        reading: flotilla_protocol::LifecycleReading::Lost { reason: None },
+        degraded: None,
+        integration: None,
+    };
 
     daemon
-        .verify_convoy_teardown_gate_for_checkouts(&convoy, &[gone], false)
+        .verify_convoy_teardown_gate_for_checkouts(&convoy, std::slice::from_ref(&gone), false)
         .await
         .expect("host-confirmed Gone checkout is safe to tear down");
-    let mut unknown = checkouts.get("checkout-gone").await.expect("checkout");
-    unknown.status = None;
+    // Still realised, with no inspection: its integration is unknown.
+    let unknown = flotilla_resources::checkout_records::CheckoutRecord {
+        reading: flotilla_protocol::LifecycleReading::Ready { identity: "/missing/worktree".to_string() },
+        ..gone
+    };
     assert!(daemon.verify_convoy_teardown_gate_for_checkouts(&convoy, &[unknown], false).await.is_err());
 }
 

@@ -258,6 +258,41 @@ fn resource_record_matches_name(record: &ResourceReadRecord, name: Option<&str>)
     })
 }
 
+/// A checkout's inspected judgement as the explanation shows it: confirmed when its home last
+/// confirmed its inspection (#3108).
+pub fn explain_judgement(
+    judged: Option<bool>,
+    details: &[String],
+    integration: &flotilla_resources::checkout_records::Integration,
+    now: DateTime<Utc>,
+    ttl: Duration,
+) -> ExplainedCondition {
+    ExplainedCondition {
+        value: match judged {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "unknown",
+        }
+        .to_string(),
+        observed_at: Some(integration.confirmed_at.to_rfc3339()),
+        freshness: if integration.confirmed_within(now, ttl) { EvidenceFreshness::Fresh } else { EvidenceFreshness::Stale },
+        details: details.to_vec(),
+    }
+}
+
+/// Where a checkout's record is held: this node, or its home.
+pub fn checkout_provenance(
+    checkout: &flotilla_resources::checkout_records::CheckoutRecord,
+    local_node_id: &NodeId,
+) -> ResourceRecordProvenance {
+    if checkout.home == local_node_id.as_str() {
+        ResourceRecordProvenance::Local { node_id: local_node_id.clone() }
+    } else {
+        let confirmed_at = checkout.integration.as_ref().map_or(checkout.requested_at, |integration| integration.confirmed_at);
+        ResourceRecordProvenance::Replica { origin_root: NodeId::new(checkout.home.clone()), last_synced_at: confirmed_at.to_rfc3339() }
+    }
+}
+
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;

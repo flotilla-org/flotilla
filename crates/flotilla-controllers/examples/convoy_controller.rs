@@ -5,7 +5,7 @@ use std::{env, path::PathBuf, time::Duration};
 
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_crew::reconcilers::vessel::VesselReconciler;
-use flotilla_resources::{Checkout, Convoy, Vessel, WorkflowTemplate};
+use flotilla_resources::{Convoy, Vessel, WorkflowTemplate};
 use flotilla_store::{controller::ControllerLoop, ResourceBackend};
 use tracing::info;
 
@@ -62,12 +62,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         async {
             let convoy_backend = backend.clone();
+            // A convoy's checkouts are the engine's (#3108), which this cluster store does not
+            // serve: a convoy that holds checkouts is not reconciled past its bootstrap here.
             ControllerLoop {
                 primary: convoys,
                 secondaries: ConvoyReconciler::secondary_watches(),
-                reconciler: ConvoyReconciler::new(templates)
-                    .with_vessels(convoy_backend.clone().using::<Vessel>(&namespace))
-                    .with_checkouts(convoy_backend.clone().using::<Checkout>(&namespace)),
+                reconciler: ConvoyReconciler::new(templates).with_vessels(convoy_backend.clone().using::<Vessel>(&namespace)),
                 resync_interval: Duration::from_secs(60),
                 backend: convoy_backend,
             }

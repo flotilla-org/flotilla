@@ -16,6 +16,7 @@ flotilla-engine-store = { path = "../flotilla-engine-store" }
 flotilla-store-testkit = { path = "../flotilla-store-testkit" }
 flotilla-environment = { path = "../flotilla-environment" }
 flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-vcs = { path = "../flotilla-vcs" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 async-trait = { workspace = true }
 reqwest = { workspace = true, features = ["charset", "http2", "json", "system-proxy"] }

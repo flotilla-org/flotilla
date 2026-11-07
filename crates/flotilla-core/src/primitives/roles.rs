@@ -48,6 +48,17 @@ pub fn checkout_inspector(host: &str) -> Result<Address, String> {
         .map_err(|error| format!("checkout inspector of {host}: {error}"))
 }
 
+/// The forge observer (#3108): each host's controller that looks up its repositories' change
+/// requests by branch when branch validation asks, through `host:<host>/role:forge-observer`.
+pub const FORGE_OBSERVER: &str = "forge-observer";
+
+/// Host `host`'s forge observer's inbox: `host:<host>/role:forge-observer`, a role under its host.
+pub fn forge_observer(host: &str) -> Result<Address, String> {
+    Address::root(Kind::Host, host)
+        .and_then(|place| place.child(Kind::Role, FORGE_OBSERVER))
+        .map_err(|error| format!("forge observer of {host}: {error}"))
+}
+
 /// The defaults the system sends as, in declaration order.
 pub const FLEET_ROLES: [FleetRole; 7] = [TURN_RULES, NUDGE, STALL_JUDGE, CAPABILITIES, FLEET_STORE, STANDING, TEARDOWN];
 

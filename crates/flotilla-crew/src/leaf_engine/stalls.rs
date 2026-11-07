@@ -457,8 +457,6 @@ impl ReconcilerWake {
         let observations = &observation_list.items;
         let forges =
             views.forges.definitions().await.map_err(|error| error.to_string())?.into_iter().map(|forge| forge.spec).collect::<Vec<_>>();
-        let checkouts_list = views.checkouts.shared_list().await.map_err(|error| error.to_string())?;
-        let checkouts = &checkouts_list.items;
         let vessels_list = views.vessels.shared_list().await.map_err(|error| error.to_string())?;
         let vessels = &vessels_list.items;
         let primitives = self.subscriptions.message_primitives();
@@ -553,7 +551,8 @@ impl ReconcilerWake {
                 .await
                 .map_err(|error| error.to_string())?,
             );
-            let selected_checkouts = select_convoy_children(convoy, checkouts);
+            // The checkouts held for the convoy, read from the engine once a stall's progress needs them.
+            let mut selected_checkouts: Option<BTreeMap<String, flotilla_resources::checkout_records::CheckoutRecord>> = None;
             self.observe_launch_progress(convoy, &selected_vessels, &selected_sessions, now).await?;
             let mut obligations = status.nudge_obligations.clone();
             let holding = matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing);
@@ -691,17 +690,28 @@ impl ReconcilerWake {
                             .flat_map(|object| object.status.iter().flat_map(|status| status.checkout_refs.values()))
                             .collect::<HashSet<_>>();
                         let mut progress = BTreeMap::new();
-                        for checkout in selected_checkouts.values() {
-                            if checkout_refs.contains(&checkout.metadata.name) {
-                                if let Some(commit) = checkout.status.as_ref().and_then(|status| status.integration.head_revision.as_ref())
-                                {
-                                    progress.insert(format!("checkout/{}", checkout.metadata.name), commit.clone());
-                                }
-                                if let Some(status) = &checkout.status {
-                                    for (reference, observation) in &status.integration.remote_refs {
-                                        progress.insert(format!("push/{}/{reference}", checkout.metadata.name), observation.digest.clone());
-                                    }
-                                }
+                        if selected_checkouts.is_none() {
+                            let holder = flotilla_resources::checkout_records::CheckoutHolder::Convoy(
+                                flotilla_resources::convoy::engine::engine_name(convoy)?,
+                            );
+                            let reads = Arc::clone(&self.subscriptions.inner.lifecycle_reads);
+                            let held = tokio::task::spawn_blocking(move || reads.checkouts()?.held(&holder))
+                                .await
+                                .map_err(|error| format!("held checkouts: {error}"))??;
+                            selected_checkouts = Some(flotilla_resources::checkout_records::latest_launches(held));
+                        }
+                        for checkout in selected_checkouts.iter().flat_map(BTreeMap::values) {
+                            let name = checkout.checkout_name();
+                            if !checkout_refs.contains(&name.to_owned()) {
+                                continue;
+                            }
+                            let Some(inspection) = checkout.inspection() else { continue };
+                            if let Some(commit) = &inspection.head_revision {
+                                progress.insert(format!("checkout/{name}"), commit.clone());
+                            }
+                            if let Some(digest) = &inspection.remote_digest {
+                                let reference = flotilla_resources::checkout_integration::remote_ref_for_branch(checkout.branch());
+                                progress.insert(format!("push/{name}/{reference}"), digest.clone());
                             }
                         }
                         for subject in flotilla_resources::active_change_request_subjects(convoy)? {

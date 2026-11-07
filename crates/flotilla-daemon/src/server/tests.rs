@@ -866,6 +866,8 @@ async fn empty_daemon_named(host_name: &str) -> (tempfile::TempDir, Arc<InProces
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    // Composed with its engine, as the runtime composes a daemon.
+    install_engine(&daemon);
     (tmp, daemon)
 }
 
@@ -902,7 +904,8 @@ pub(super) async fn daemon_with_decided_store(
                 service: store,
                 records,
                 observations: observations.clone(),
-                observation_failures: observations,
+                observation_failures: observations.clone(),
+                change_request_branches: observations,
             })
         }) as futures::future::BoxFuture<'static, _>
     });
@@ -2311,7 +2314,8 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
         secondaries: Vec::new(),
         reconciler: ConvoyReconciler::new(placed.definitions::<WorkflowTemplate>("flotilla"))
             .with_hosts(placed.including_replicas::<Host>("flotilla"))
-            .with_vessels(placed.using::<Vessel>("flotilla")),
+            .with_vessels(placed.using::<Vessel>("flotilla"))
+            .with_lifecycle_reads(remote_daemon.lifecycle_reads()),
         resync_interval: Duration::from_millis(20),
         backend: placed.clone(),
     };
@@ -2868,6 +2872,8 @@ async fn remote_command_remote_step_events_remap_to_client_command_id_and_global
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    // Composed with its engine, as the runtime composes a daemon.
+    install_engine(&daemon);
     daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -2979,6 +2985,8 @@ async fn remote_checkout_failure_with_empty_response_still_stops_local_workspace
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    // Composed with its engine, as the runtime composes a daemon.
+    install_engine(&daemon);
     daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -3226,6 +3234,8 @@ async fn cancel_active_remote_segment_routes_remote_step_cancel_and_finishes_com
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    // Composed with its engine, as the runtime composes a daemon.
+    install_engine(&daemon);
     daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -3392,6 +3402,8 @@ async fn cancel_disconnect_of_active_remote_segment_finishes_pending_command() {
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    // Composed with its engine, as the runtime composes a daemon.
+    install_engine(&daemon);
     daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -3582,6 +3594,8 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    // Composed with its engine, as the runtime composes a daemon.
+    install_engine(&daemon);
     daemon.add_repo(&repo).await.expect("adopt repo resources");
     // Refresh reports physical checkout paths (#2574); macOS tempdirs sit behind /var -> /private/var.
     let physical_repo = std::fs::canonicalize(&repo).expect("canonical repo path");
@@ -3698,6 +3712,8 @@ async fn execute_forwarded_checkout_resolves_repo_identity_across_different_root
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    // Composed with its engine, as the runtime composes a daemon.
+    install_engine(&daemon);
     daemon.add_repo(&remote_repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -5470,6 +5486,8 @@ async fn remote_command_mutations_route_remote_step_requests() {
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    // Composed with its engine, as the runtime composes a daemon.
+    install_engine(&daemon);
     daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -5565,6 +5583,8 @@ async fn remote_checkout_completion_is_headless() {
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
+    // Composed with its engine, as the runtime composes a daemon.
+    install_engine(&daemon);
     daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -5714,16 +5734,8 @@ async fn failed_connection_tasks_are_reaped() {
     assert!(tasks.is_empty());
 }
 
-/// The engine's environments `daemon` reads (#3108), on its decided store, stepped as the
-/// Environment controller would step them; its readings serve the engine's clones there too.
-pub(super) fn engine_environments(daemon: &InProcessDaemon) -> flotilla_provisioning_testkit::EnvironmentFixture {
-    let store = daemon.decided_store().expect("decided store").store();
-    let home = flotilla_engine_store::StoreLog::new(Arc::clone(&store)).home().to_owned();
-    let clones = flotilla_provisioning_testkit::CloneFixture::over(&home, Arc::clone(&store));
-    let fixture = flotilla_provisioning_testkit::EnvironmentFixture::over(&home, store).serving_clones(clones.clones);
-    daemon.install_lifecycle_reads(Arc::clone(&fixture.reads)).expect("install the engine's environments");
-    fixture
-}
+use crate::testkits::engine::engine as install_engine;
+pub(super) use crate::testkits::engine::engine_environments;
 
 pub(super) async fn placed_crew_daemon(environment: &str) -> (tempfile::TempDir, Arc<InProcessDaemon>) {
     let (_tmp, daemon) = empty_daemon().await;

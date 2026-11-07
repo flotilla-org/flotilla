@@ -16,15 +16,13 @@ use chrono::Utc;
 use flotilla_admission::reconcilers::vessel_placement::VesselPlacementProjector;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_projections::aggregator_projection::AggregatorProjectionState;
-use flotilla_provisioning::reconcilers::checkout::runtime::sweep_host_empty_convoy_directories;
+use flotilla_provisioning::checkout_runtime::sweep_host_empty_convoy_directories;
 
 use flotilla_credentials::CredentialStore;
 use flotilla_discovery::registry::{command_provider_registry, ProviderRegistry};
 use flotilla_environment::environment::EnvironmentInput;
 use flotilla_protocol::CanonicalHostId;
-use flotilla_resources::{
-    Checkout, Convoy, FulfilmentFacts, Host, HostStatusPatch, Resource, ResourceError, RetryBackoff, TerminalSession, Vessel,
-};
+use flotilla_resources::{Convoy, FulfilmentFacts, Host, HostStatusPatch, Resource, ResourceError, RetryBackoff, TerminalSession, Vessel};
 use flotilla_store::{watch_resource_kind_including_replicas, ResourceBackend};
 use flotilla_vcs::vcs::REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT;
 use futures::stream::{BoxStream, SelectAll};
@@ -103,7 +101,7 @@ pub(super) async fn run_artifact_gc(backend: ResourceBackend, namespace: String,
     }
 }
 
-pub(super) async fn run_checkout_archive_gc(backend: ResourceBackend, namespace: String, archive_sweep: CheckoutArchiveSweep) {
+pub(super) async fn run_checkout_archive_gc(backend: ResourceBackend, archive_sweep: CheckoutArchiveSweep) {
     let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -138,9 +136,14 @@ pub(super) async fn run_checkout_archive_gc(backend: ResourceBackend, namespace:
                 }
                 Err(error) => warn!(%error, "checkout archive sweep could not list clones"),
             }
-            match backend.clone().using::<Checkout>(&namespace).list().await {
+            let reads = archive_sweep.daemon.lifecycle_reads();
+            match tokio::task::spawn_blocking(move || reads.checkouts()?.here())
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|here| here)
+            {
                 Ok(checkouts) => {
-                    for checkout in checkouts.items {
+                    for checkout in checkouts {
                         if let Some(parent) = checkout.spec.target_path().and_then(|path| Path::new(path).parent()) {
                             if let Some(env_ref) = checkout.spec.env_ref() {
                                 roots.insert(CheckoutArchiveRoot { env_ref: env_ref.to_string(), path: parent.join(".flotilla-archives") });
@@ -747,17 +750,26 @@ pub(super) fn spawn_event_expiry_task(backend: ResourceBackend, namespace: Strin
     })
 }
 
-pub(super) fn spawn_adopted_checkout_reconciliation_task(
-    daemon: Arc<InProcessDaemon>,
-    namespace: String,
-    interval: Duration,
-) -> JoinHandle<()> {
-    spawn_periodic_task(interval, PeriodicTaskStart::AfterInterval, move || {
-        let daemon = Arc::clone(&daemon);
-        let namespace = namespace.clone();
-        async move {
-            if let Err(error) = daemon.reconcile_adopted_checkouts(&namespace).await {
-                warn!(%error, "failed to reconcile adopted checkout observations");
+/// Keeps the adopted checkouts' projection in the observed store current as the engine's
+/// checkouts change (#3108): each change projects the adopted checkouts held here again.
+pub(super) fn spawn_adopted_checkout_projection_task(daemon: Arc<InProcessDaemon>, namespace: String) -> JoinHandle<()> {
+    let changes = daemon.lifecycle_reads().checkouts().map(|checkouts| checkouts.changes());
+    tokio::spawn(async move {
+        let mut changes = match changes {
+            Ok(changes) => changes,
+            Err(error) => {
+                warn!(%error, "adopted checkouts are not projected: the engine's checkouts are unavailable");
+                return;
+            }
+        };
+        loop {
+            // Projected once on subscribing, so a change before it is not missed.
+            if let Err(error) = daemon.project_adopted_checkouts(&namespace).await {
+                warn!(%error, "failed to project adopted checkouts; the next checkout change projects them");
+            }
+            match changes.recv().await {
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
         }
     })

@@ -1,8 +1,9 @@
 use std::{marker::PhantomData, sync::Arc};
 
-use crate::engine::clones::CloneRepositoryWake;
+use crate::engine::{checkouts::CheckoutRepositoryWake, clones::CloneRepositoryWake};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use flotilla_resources::checkout_records::latest_launches;
 use flotilla_resources::{
     lifecycle_reads::{LifecycleReads, NoLifecycleReads},
     resolve_default_branch, Checkout, CheckoutSpec, DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity, LifecycleAuthority,
@@ -10,7 +11,7 @@ use flotilla_resources::{
     REPO_KEY_LABEL,
 };
 use flotilla_store::{
-    controller::{LabelMappedWatch, ReconcileOutcome, Reconciler, ResolverLabelMappedWatch, SecondaryWatch},
+    controller::{ReconcileOutcome, Reconciler, ResolverLabelMappedWatch, SecondaryWatch},
     ResourceBackend, TypedResolver,
 };
 
@@ -20,17 +21,18 @@ pub trait ForgeDefaultBranchResolver: Send + Sync {
 }
 
 pub struct RepositoryReconciler {
-    checkout_sources: Vec<TypedResolver<Checkout>>,
-    /// The engine's environments and clones, through its readings: a checkout's host is its
-    /// environment's, and each clone launch found the remote's default branch.
+    /// The checkouts the host's refresh observed.
+    observed_checkouts: TypedResolver<Checkout>,
+    /// The engine's environments, clones and checkouts, through its readings: a checkout's host is
+    /// its environment's, and each clone launch found the remote's default branch.
     lifecycle_reads: Arc<dyn LifecycleReads>,
     forge_default_branch_resolver: Option<Arc<dyn ForgeDefaultBranchResolver>>,
 }
 
 impl RepositoryReconciler {
-    pub fn new(durable: ResourceBackend, observed: ResourceBackend, namespace: &str) -> Self {
+    pub fn new(observed: ResourceBackend, namespace: &str) -> Self {
         Self {
-            checkout_sources: vec![durable.using::<Checkout>(namespace), observed.using::<Checkout>(namespace)],
+            observed_checkouts: observed.using::<Checkout>(namespace),
             lifecycle_reads: Arc::new(NoLifecycleReads),
             forge_default_branch_resolver: None,
         }
@@ -46,21 +48,21 @@ impl RepositoryReconciler {
         self
     }
 
-    /// The kinds a repository follows: its checkouts, and with the engine's `service` its clones.
+    /// The kinds a repository follows: its observed checkouts, and with the engine's `service` its
+    /// checkouts and clones.
     pub fn secondary_watches(
         observed: ResourceBackend,
         namespace: &str,
         service: Option<Arc<flotilla_schema_sqlite::stream::Service>>,
     ) -> Vec<Box<dyn SecondaryWatch<Primary = Repository>>> {
-        let mut watches: Vec<Box<dyn SecondaryWatch<Primary = Repository>>> = vec![
-            Box::new(LabelMappedWatch::<Checkout, Repository> { label_key: REPO_KEY_LABEL, _marker: PhantomData }),
-            Box::new(ResolverLabelMappedWatch::<Checkout, Repository> {
+        let mut watches: Vec<Box<dyn SecondaryWatch<Primary = Repository>>> =
+            vec![Box::new(ResolverLabelMappedWatch::<Checkout, Repository> {
                 label_key: REPO_KEY_LABEL,
                 resolver: observed.using::<Checkout>(namespace),
                 _marker: PhantomData,
-            }),
-        ];
+            })];
         if let Some(service) = service {
+            watches.push(Box::new(CheckoutRepositoryWake::new(Arc::clone(&service))));
             watches.push(Box::new(CloneRepositoryWake::new(service)));
         }
         watches
@@ -110,33 +112,44 @@ impl Reconciler for RepositoryReconciler {
             }
         }
 
-        for source in &self.checkout_sources {
-            for checkout in source.list().await?.items {
-                if checkout.spec.repo_ref() != &repository_key {
+        // The engine's checkouts of this repository that have not ended: an adopted one is its
+        // finder's, a made one its holder's. The observed ones are as the refresh found them.
+        let reads = Arc::clone(&self.lifecycle_reads);
+        let key = repository_key.clone();
+        let engine = tokio::task::spawn_blocking(move || reads.checkouts().and_then(|checkouts| checkouts.of_repository(&key)))
+            .await
+            .map_err(|error| ResourceError::other(format!("engine read: {error}")))?
+            .map_err(ResourceError::other)?;
+        let engine = latest_launches(engine).into_values().filter(|record| !record.ended()).map(|record| {
+            let authority =
+                if matches!(record.spec, CheckoutSpec::Observed(_)) { LifecycleAuthority::Adopted } else { LifecycleAuthority::Managed };
+            (record.checkout_name().to_owned(), record.spec, authority)
+        });
+        let mut observed = Vec::new();
+        for checkout in self.observed_checkouts.list().await?.items {
+            let authority = checkout.metadata.lifecycle_authority()?.unwrap_or(LifecycleAuthority::Observed);
+            observed.push((checkout.metadata.name, checkout.spec, authority));
+        }
+        for (checkout_ref, spec, authority) in engine.chain(observed) {
+            if spec.repo_ref() != &repository_key {
+                continue;
+            }
+            let host_ref = match self.checkout_host(&spec).await {
+                Ok(host_ref) => host_ref,
+                Err(diagnostic) => {
+                    status.diagnostics.push(diagnostic);
                     continue;
                 }
-                let host_ref = match self.checkout_host(&checkout.spec).await {
-                    Ok(host_ref) => host_ref,
-                    Err(diagnostic) => {
-                        status.diagnostics.push(diagnostic);
-                        continue;
-                    }
-                };
-                if let CheckoutSpec::Observed(spec) = &checkout.spec {
-                    if spec.is_main && matches!(spec.r#ref.as_str(), "main" | "master" | "trunk") {
-                        status
-                            .default_branch_observations
-                            .push(DefaultBranchObservation { branch: spec.r#ref.clone(), provenance: DefaultBranchProvenance::LocalTrunk });
-                    }
+            };
+            if let CheckoutSpec::Observed(spec) = &spec {
+                if spec.is_main && matches!(spec.r#ref.as_str(), "main" | "master" | "trunk") {
+                    status
+                        .default_branch_observations
+                        .push(DefaultBranchObservation { branch: spec.r#ref.clone(), provenance: DefaultBranchProvenance::LocalTrunk });
                 }
-                let kind = checkout.spec.repository_checkout_kind();
-                let authority = checkout.metadata.lifecycle_authority()?.unwrap_or(LifecycleAuthority::Managed);
-                status.checkouts_by_host.entry(host_ref).or_default().push(RepositoryCheckoutRef {
-                    checkout_ref: checkout.metadata.name,
-                    kind,
-                    authority,
-                });
             }
+            let kind = spec.repository_checkout_kind();
+            status.checkouts_by_host.entry(host_ref).or_default().push(RepositoryCheckoutRef { checkout_ref, kind, authority });
         }
 
         // Each clone launch found the remote's default branch when it was realised. The engine's

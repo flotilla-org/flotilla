@@ -114,7 +114,7 @@ impl ConvoyTeardownRuntime for AlwaysEligible {
     async fn verify_reclaim(
         &self,
         _convoy: &flotilla_resources::ResourceObject<Convoy>,
-        _checkouts: &[flotilla_resources::ResourceObject<flotilla_resources::Checkout>],
+        _checkouts: &[flotilla_resources::checkout_records::CheckoutRecord],
     ) -> Result<(), String> {
         Ok(())
     }
@@ -167,7 +167,8 @@ async fn completed_convoy_cleanup_converges_after_sqlite_restart_with_pending_ve
 
     let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
         .with_vessels(vessels.clone())
-        .with_teardown_runtime(Arc::new(AlwaysEligible));
+        .with_teardown_runtime(Arc::new(AlwaysEligible))
+        .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads);
     let completed_convoy = convoys.get("convoy-restart").await.expect("completed convoy should exist");
     let initial_dependencies = convoy_reconciler.prepare(&completed_convoy).await.expect("initial cleanup dependencies should load");
     let initial_cleanup = convoy_reconciler.reconcile(&completed_convoy, &initial_dependencies, Utc::now());
@@ -191,7 +192,8 @@ async fn completed_convoy_cleanup_converges_after_sqlite_restart_with_pending_ve
     let terminals = backend.clone().using::<TerminalSession>("flotilla");
     let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
         .with_vessels(vessels.clone())
-        .with_teardown_runtime(Arc::new(AlwaysEligible));
+        .with_teardown_runtime(Arc::new(AlwaysEligible))
+        .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads);
     let restarted_convoy = convoys.get("convoy-restart").await.expect("completed convoy should survive restart");
     let restart_dependencies = convoy_reconciler.prepare(&restarted_convoy).await.expect("restart cleanup dependencies should load");
     let restart_cleanup = convoy_reconciler.reconcile(&restarted_convoy, &restart_dependencies, Utc::now());

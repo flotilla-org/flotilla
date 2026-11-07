@@ -1,3 +1,4 @@
+use crate::in_process::tests::engine_fixture;
 use flotilla_projections::ports::EnvironmentSummaries;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -380,7 +381,7 @@ mod tests {
                 fleet,
                 accounts,
                 manifest_roots,
-                engine: flotilla_provisioning_testkit::EnvironmentFixture::default(),
+                engine: engine_fixture().environments,
             }
         }
 

@@ -18,7 +18,6 @@ use flotilla_crew::reconcilers::terminal_session::{
 use flotilla_provisioning_testkit::{Ending, EnvironmentFixture};
 use flotilla_resources::environment_records::LaunchFacts;
 use flotilla_resources::Actuation;
-use flotilla_resources::Checkout;
 use flotilla_resources::Convoy;
 use flotilla_resources::ConvoyPhase;
 use flotilla_resources::ConvoyTeardownRuntime;
@@ -3083,7 +3082,11 @@ async fn receipt_lifecycle_survives_failed_relaunch_cleanup_outage_and_restart()
 
 #[async_trait]
 impl ConvoyTeardownRuntime for CleanupRecordingTerminalRuntime {
-    async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>, _checkouts: &[ResourceObject<Checkout>]) -> Result<(), String> {
+    async fn verify_reclaim(
+        &self,
+        convoy: &ResourceObject<Convoy>,
+        _checkouts: &[flotilla_resources::checkout_records::CheckoutRecord],
+    ) -> Result<(), String> {
         TerminalRuntime::verify_reclaim(self, convoy).await
     }
 }
@@ -3278,6 +3281,7 @@ async fn convoy_reclaim_logs_distinguish_gate_from_session_disposition(
     let runtime = Arc::new(CleanupRecordingTerminalRuntime::default());
     runtime.reclaim_refused.store(refused, Ordering::SeqCst);
     let reconciler = ConvoyReconciler::new(backend.definitions::<flotilla_resources::WorkflowTemplate>("flotilla"))
+        .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads)
         .with_terminal_sessions(sessions)
         .with_teardown_runtime(runtime);
     let logs = ReclaimLogBuffer::default();
@@ -3617,6 +3621,7 @@ fn environment_loss_preserves_recoverable_work(tc: hegel::TestCase) {
             TerminalSessionReconciler::new(runtime.clone(), backend.clone(), "flotilla").with_lifecycle_reads(environments.reads.clone());
         let vessel_reconciler = VesselReconciler::new(backend.clone(), "flotilla").with_lifecycle_reads(environments.reads.clone());
         let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<flotilla_resources::WorkflowTemplate>("flotilla"))
+            .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads)
             .with_vessels(vessels.clone())
             .with_terminal_sessions(sessions.clone());
         for pass in 0..passes {

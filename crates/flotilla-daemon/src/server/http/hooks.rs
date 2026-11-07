@@ -378,15 +378,7 @@ async fn handle(
         .native_codex_hook(parsed.native_codex_hook)
         .maybe_terminal(terminal)
         .build();
-    match handle_agent_hook(
-        &state.backend,
-        agent_state_store,
-        policy,
-        state.daemon.as_ref().and_then(|daemon| daemon.message_primitives()),
-        event,
-    )
-    .await
-    {
+    match handle_agent_hook(&state.backend, agent_state_store, policy, state.daemon.clone(), event).await {
         // An empty 2xx is a command hook that exited 0 and printed nothing.
         Ok(()) => StatusCode::OK.into_response(),
         Err(error) => {

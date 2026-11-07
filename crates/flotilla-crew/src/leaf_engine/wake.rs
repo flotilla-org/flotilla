@@ -13,11 +13,11 @@ use flotilla_resources::checkout_integration::remote_ref_for_branch;
 use flotilla_resources::{
     actor_obligation,
     address::{leaf_address, leaf_for, record_name, subject_address},
+    checkout_records::{latest_launches, CheckoutChange, CheckoutHolder, CheckoutRecord},
     clone_records::{launched, CloneChange, CloneRecord},
-    instantiate_exit, instantiate_turn_delivery, select_convoy_children, subject_relationship_conflicts, ChangeRequest, Checkout,
-    CheckoutSpec, ControllerRetry, ControllerRetryDisposition, Convoy, ConvoyPhase, CrewWorkPhase, Forge, InstantiatedExit, LeafMaker,
-    ResourceError, ResourceObject, RetryCeiling, StatusPatch, TerminalAttentionSource, TerminalSession, TurnDeliveryOutcome, Vessel,
-    WorkPhase,
+    instantiate_exit, instantiate_turn_delivery, select_convoy_children, subject_relationship_conflicts, ChangeRequest, CheckoutSpec,
+    ControllerRetry, ControllerRetryDisposition, Convoy, ConvoyPhase, CrewWorkPhase, Forge, InstantiatedExit, LeafMaker, ResourceError,
+    ResourceObject, RetryCeiling, StatusPatch, TerminalAttentionSource, TerminalSession, TurnDeliveryOutcome, Vessel, WorkPhase,
 };
 use flotilla_store::{
     controller::{SecondaryWatch, WorkQueueSender},
@@ -87,7 +87,7 @@ impl FinalSettlementInputs {
         convoy: &ResourceObject<Convoy>,
         exit: &InstantiatedExit,
         vessels: &BTreeMap<String, ResourceObject<Vessel>>,
-        checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
+        checkouts: &BTreeMap<String, CheckoutRecord>,
         observations: &BTreeMap<String, ResourceObject<ChangeRequest>>,
         forges: &[flotilla_resources::ForgeSpec],
     ) -> Option<Self> {
@@ -109,7 +109,11 @@ impl FinalSettlementInputs {
         Some(Self {
             convoy: convoy.metadata.resource_version.clone(),
             vessels: selected_versions(vessels),
-            checkouts: selected_versions(checkouts),
+            // A checkout's launch, its reading and its inspection stand for its revision.
+            checkouts: checkouts
+                .iter()
+                .map(|(name, record)| (name.clone(), format!("{}:{:?}:{:?}", record.name, record.reading, record.inspection())))
+                .collect(),
             observations: revisions,
             forges: forges.to_vec(),
         })
@@ -150,7 +154,6 @@ pub(super) struct LeafViews {
     pub(super) ensures: WatchView<flotilla_resources::ConvoyEnsure>,
     pub(super) sessions: WatchView<TerminalSession>,
     pub(super) change_requests: WatchView<ChangeRequest>,
-    pub(super) checkouts: WatchView<Checkout>,
     pub(super) vessels: WatchView<Vessel>,
     pub(super) messages: WatchView<flotilla_resources::Message>,
     pub(super) forges: WatchView<Forge>,
@@ -173,7 +176,6 @@ impl LeafViews {
             ensures: WatchView::start(backend.clone(), namespace).await?,
             sessions: WatchView::start(backend.clone(), namespace).await?,
             change_requests: WatchView::start(backend.clone(), namespace).await?,
-            checkouts: WatchView::start(backend.clone(), namespace).await?,
             vessels: WatchView::start(backend.clone(), namespace).await?,
             messages: WatchView::start(backend.clone(), namespace).await?,
             forges: WatchView::start(backend.clone(), namespace).await?,
@@ -324,12 +326,13 @@ impl ReconcilerWake {
         let cell = self.views(&namespace).await?;
         let views = cell.get().expect("initialized views");
         let mut convoy_watch = views.convoys.subscribe_local_keys();
-        let mut checkout_watch = views.checkouts.subscribe_keys();
         let mut change_request_watch = views.change_requests.subscribe_keys();
         let mut vessel_watch = views.vessels.subscribe_keys();
         let mut forge_watch = views.forges.subscribe();
         // Clones are the engine's (#3108): where it serves none, no worktree's clone row is armed.
         let mut clone_changes = self.subscriptions.inner.lifecycle_reads.clones().ok().map(|clones| clones.changes());
+        // So are checkouts: a convoy's rows read the checkouts held for it.
+        let mut checkout_changes = self.subscriptions.inner.lifecycle_reads.checkouts().ok().map(|checkouts| checkouts.changes());
         let mut convoy_objects = views.local_convoys().await?.as_ref().clone();
         let mut wake_rx = self.subscriptions.inner.reconciler_tx.subscribe();
         self.sync_rows(&namespace, &convoy_objects).await?;
@@ -356,8 +359,22 @@ impl ReconcilerWake {
                     };
                     self.sync_rows_selected(&namespace, &convoy_objects, selected.as_ref()).await?;
                 }
-                event = checkout_watch.recv() => {
-                    let selected = affected_rows(views, &views.checkouts, event).await?;
+                change = async {
+                    match checkout_changes.as_mut() {
+                        Some(changes) => changes.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let selected = match change {
+                        Ok(CheckoutChange::Changed(name)) => Some(
+                            views.row_dependencies.lock().await.by_record.get(&checkout_dependency(launched(&name))).cloned().unwrap_or_default(),
+                        ),
+                        Ok(CheckoutChange::Rescanned) | Err(broadcast::error::RecvError::Lagged(_)) => None,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            checkout_changes = None;
+                            continue;
+                        }
+                    };
                     self.sync_rows_selected(&namespace, &convoy_objects, selected.as_ref()).await?;
                 }
                 event = change_request_watch.recv() => {
@@ -433,12 +450,6 @@ impl ReconcilerWake {
             include_replicas: true,
             ..Default::default()
         });
-        let checkout_sources = match &children_query {
-            Some(query) => views.checkouts.query(query).await,
-            None => views.checkouts.list().await,
-        }
-        .map_err(|error| error.to_string())?
-        .items;
         let vessel_sources = match &children_query {
             Some(query) => views.vessels.query(query).await,
             None => views.vessels.list().await,
@@ -548,8 +559,15 @@ impl ReconcilerWake {
                     episode_key: EpisodeKeyFields::default(),
                 });
             }
-            let checkouts = select_convoy_children(convoy, &checkout_sources);
-            inputs.extend(checkouts.keys().cloned());
+            let checkouts = {
+                let holder = CheckoutHolder::Convoy(flotilla_resources::convoy::engine::engine_name(convoy)?);
+                let reads = Arc::clone(&self.subscriptions.inner.lifecycle_reads);
+                let held = tokio::task::spawn_blocking(move || reads.checkouts()?.held(&holder))
+                    .await
+                    .map_err(|error| format!("held checkouts: {error}"))??;
+                latest_launches(held)
+            };
+            inputs.extend(checkouts.keys().map(|name| checkout_dependency(name)));
             // A worktree's clone stands as a controller row while the engine's reading of it is a
             // failure (#3108): the leaf shows its cause, or that its attempts are spent.
             for checkout in checkouts.values() {
@@ -812,17 +830,11 @@ impl ReconcilerWake {
                             }),
                         Unmet::MissingObservedRef { reference } | Unmet::StaleObservedRef { reference, .. } => checkouts
                             .values()
-                            .find(|checkout| {
-                                let branch = match &checkout.spec {
-                                    CheckoutSpec::Worktree(spec) => &spec.r#ref,
-                                    CheckoutSpec::FreshClone(spec) => &spec.r#ref,
-                                    CheckoutSpec::Observed(spec) => &spec.r#ref,
-                                };
-                                remote_ref_for_branch(branch) == *reference
-                            })
+                            // An ended checkout is no longer inspected: it produces no evidence.
+                            .find(|checkout| !checkout.ended() && remote_ref_for_branch(checkout.branch()) == *reference)
                             .map(|checkout| LeafMaker::Observed {
                                 refresher: "checkout_integration".into(),
-                                external_party: format!("Checkout/{}", checkout.metadata.name),
+                                external_party: format!("Checkout/{}", checkout.checkout_name()),
                             }),
                         _ => None,
                     };
@@ -1031,6 +1043,12 @@ impl ReconcilerWake {
 /// the stored records' names.
 fn clone_dependency(clone: &str) -> String {
     format!("Clone/{clone}")
+}
+
+/// The row-dependency key of checkout `checkout`: the engine's checkouts are keyed apart from the
+/// stored records a row reads.
+fn checkout_dependency(checkout: &str) -> String {
+    format!("Checkout/{checkout}")
 }
 
 /// The launch number of `<clone>#<n>`; a name without one sorts first.

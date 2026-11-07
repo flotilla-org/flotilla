@@ -406,77 +406,6 @@ impl<W: Resource, P: Resource> SecondaryWatch for ReplicaLabelMappedWatch<W, P> 
     }
 }
 
-/// Watch federated convoys and enqueue every checkout they currently claim.
-#[derive(Clone)]
-pub struct ReplicaConvoyCheckoutWatch {
-    pub resolver: ReplicaReadResolver<crate::Convoy>,
-}
-
-impl ReplicaConvoyCheckoutWatch {
-    async fn enqueue_checkouts(
-        sender: &WorkQueueSender,
-        checkouts: &TypedResolver<crate::Checkout>,
-        convoy: &ResourceObject<crate::Convoy>,
-    ) -> Result<(), ResourceError> {
-        for checkout_name in crate::expected_checkout_refs(convoy).unwrap_or_default() {
-            sender
-                .send(checkout_name)
-                .await
-                .map_err(|_| ResourceError::other("controller queue closed while forwarding federated convoy checkout event"))?;
-        }
-        // Older and adopted convoys may lack a frozen checkout reference.
-        // Listing locally labeled checkouts on each convoy event is acceptable
-        // at current scale and avoids another watch-side index to maintain.
-        let selector = BTreeMap::from([(crate::CONVOY_LABEL.to_string(), convoy.metadata.name.clone())]);
-        for checkout in
-            crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || checkouts.list_matching_labels(&selector))
-                .await?
-                .items
-        {
-            sender
-                .send(checkout.metadata.name)
-                .await
-                .map_err(|_| ResourceError::other("controller queue closed while forwarding federated convoy checkout event"))?;
-        }
-        Ok(())
-    }
-}
-
-impl SecondaryWatch for ReplicaConvoyCheckoutWatch {
-    type Primary = crate::Checkout;
-
-    fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Self::Primary>> {
-        Box::new(self.clone())
-    }
-
-    fn spawn(
-        self: Box<Self>,
-        backend: ResourceBackend,
-        namespace: String,
-        sender: WorkQueueSender,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
-        Box::pin(async move {
-            let checkouts = backend.using::<crate::Checkout>(&namespace);
-            let mut watch =
-                crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || self.resolver.watch()).await?;
-            let listed = crate::retry_store_read_for(crate::load_metrics::ReadRetryConsumer::Controller, || self.resolver.list()).await?;
-            for source in &listed.items {
-                Self::enqueue_checkouts(&sender, &checkouts, &source.object).await?;
-            }
-            while let Some(event) = watch.next().await {
-                let source = match event? {
-                    crate::ReadWatchEvent::Added(source)
-                    | crate::ReadWatchEvent::Modified(source)
-                    | crate::ReadWatchEvent::Deleted(source) => source,
-                    crate::ReadWatchEvent::DeletedByName { .. } => continue,
-                };
-                Self::enqueue_checkouts(&sender, &checkouts, &source.object).await?;
-            }
-            Ok(())
-        })
-    }
-}
-
 #[derive(Clone)]
 pub struct LabelJoinWatch<W: Resource, P: Resource> {
     pub label_key: &'static str,
@@ -600,10 +529,6 @@ impl<R: Reconciler> ControllerLoop<R> {
                 let resolver = backend.using::<crate::Repository>(namespace);
                 crate::ensure_repository(&resolver, &key, &spec).await.map(|_| ())
             }
-            Actuation::CreateCheckout { meta, spec } => {
-                let resolver = backend.using::<crate::Checkout>(namespace);
-                Self::create_if_missing(&resolver, meta, spec).await
-            }
             Actuation::CreateTerminalSession { meta, spec } => {
                 let resolver = backend.using::<crate::TerminalSession>(namespace);
                 Self::create_if_missing(&resolver, meta, *spec).await
@@ -661,10 +586,6 @@ impl<R: Reconciler> ControllerLoop<R> {
             }
             Actuation::DeleteVessel { name } => {
                 let resolver = backend.using::<crate::Vessel>(namespace);
-                Self::delete_if_lifecycle_owned(&resolver, &name).await
-            }
-            Actuation::DeleteCheckout { name } => {
-                let resolver = backend.using::<crate::Checkout>(namespace);
                 Self::delete_if_lifecycle_owned(&resolver, &name).await
             }
         }

@@ -15,16 +15,15 @@ use flotilla_crew::reconcilers::vessel::WorktreeMetadataResolver;
 use flotilla_protocol::RepoSelector;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
-use flotilla_provisioning::reconcilers::checkout::runtime::{removal_source_path, CheckoutControllerRuntime};
-use flotilla_provisioning::reconcilers::clone::runtime::CloneControllerRuntime;
-use flotilla_provisioning::reconcilers::{
-    CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneRuntime, ForgeDefaultBranchResolver, PreparedCheckout,
+use flotilla_provisioning::checkout_runtime::{
+    removal_source_path, CheckoutControllerRuntime, CheckoutRemoval, CheckoutRemovalOutcome, PreparedCheckout,
 };
+use flotilla_provisioning::reconcilers::clone::runtime::CloneControllerRuntime;
+use flotilla_provisioning::reconcilers::{CloneRuntime, ForgeDefaultBranchResolver};
 use flotilla_resources::attentions::{Attention, Fact, Sender, Subject};
-use flotilla_resources::checkout_path::checkout_path_from_status_and_spec;
 use flotilla_resources::{
-    canonicalize_repo_url, ChangeRequest, Checkout, CheckoutIntegrationStatus, CheckoutSpec, CloneCredentials, Convoy,
-    ConvoyTeardownRuntime, Forge, ForgeIdentity, InputMeta, Resource, ResourceObject,
+    canonicalize_repo_url, ChangeRequest, CloneCredentials, Convoy, ConvoyTeardownRuntime, Forge, ForgeIdentity, InputMeta, Resource,
+    ResourceObject,
 };
 use flotilla_store::{ReplicaReadResolver, ResourceBackend};
 use flotilla_vcs::vcs::CheckoutMaterialisationError;
@@ -151,7 +150,11 @@ impl DaemonConvoyTeardownRuntime {
 
 #[async_trait]
 impl ConvoyTeardownRuntime for DaemonConvoyTeardownRuntime {
-    async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>, checkouts: &[ResourceObject<Checkout>]) -> Result<(), String> {
+    async fn verify_reclaim(
+        &self,
+        convoy: &ResourceObject<Convoy>,
+        checkouts: &[flotilla_resources::checkout_records::CheckoutRecord],
+    ) -> Result<(), String> {
         let result = self.daemon.verify_convoy_teardown_gate_for_checkouts(convoy, checkouts, false).await;
         let key = format!("{}/{}", convoy.metadata.namespace, convoy.metadata.name);
         match &result {
@@ -383,7 +386,7 @@ impl RoutingCheckoutRuntime {
     /// The VCS a fresh clone runs through. A clone whose repository has grants
     /// gets them delivered into its environment first, as a crew session's are,
     /// and its Git runs with the delivered environment (#4218).
-    async fn fresh_clone_vcs(
+    pub(super) async fn fresh_clone_vcs(
         &self,
         env_ref: &str,
         url: &str,
@@ -415,73 +418,19 @@ impl RoutingCheckoutRuntime {
             .resolve_environment_ref(env_ref)
             .ok_or_else(|| format!("checkout environment {env_ref} is unavailable on this host"))?;
         let vcs = self.state.daemon.vcs_for_checkout(&environment.id, Path::new(checkout)).await?;
-        let runner = environment.runner;
-        let namespace = self.state.daemon.provisioning_namespace().await;
-        let forges = self
-            .state
-            .daemon
-            .resource_backend()
-            .definitions::<Forge>(&namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|forge| forge.spec)
-            .collect();
-        Ok(CheckoutControllerRuntime::new(runner, Some(vcs), self.change_requests.clone(), forges))
+        Ok(CheckoutControllerRuntime::new(environment.runner, Some(vcs), self.change_requests.clone()))
     }
 }
 
-#[async_trait]
-impl CheckoutRuntime for RoutingCheckoutRuntime {
-    async fn validate_new_branch(
-        &self,
-        checkout: &ResourceObject<Checkout>,
-    ) -> Result<Option<String>, flotilla_provider_runtime::ObservationError> {
-        let Some(target) = checkout.spec.target_path() else { return Ok(None) };
-        let env_ref = checkout.spec.env_ref().ok_or_else(|| "checkout environment unavailable".to_string())?;
-        let environment = self.state.daemon.resolve_environment_ref(env_ref).ok_or("checkout environment unavailable")?;
-        if environment.runner.path_exists(Path::new(target)).await? {
-            return Ok(None);
-        }
-        self.state.daemon.validate_new_checkout_branch(checkout).await
-    }
-
-    async fn continue_checkout_in(
-        &self,
-        checkout: &ResourceObject<Checkout>,
-        clone_path: Option<&str>,
-        reason: &str,
-    ) -> Result<PreparedCheckout, CheckoutMaterialisationError> {
-        let env_ref = checkout.spec.env_ref().ok_or_else(|| "checkout environment unavailable".to_string())?;
-        let target = checkout.spec.target_path().ok_or_else(|| "checkout target unavailable".to_string())?;
-        let path = clone_path.unwrap_or(target);
-        let runtime = self.runtime_for(env_ref, path).await?;
-        let vcs = runtime.vcs(path)?;
-        let result = match &checkout.spec {
-            CheckoutSpec::Worktree(spec) => vcs.continue_checkout(&spec.r#ref, target, reason).await?,
-            CheckoutSpec::FreshClone(spec) if spec.source_clone_ref.is_none() => {
-                let credentials = CloneCredentials::from_annotations(&checkout.metadata.annotations)?;
-                let (vcs, delivery) = self.fresh_clone_vcs(env_ref, &spec.url, target, &credentials).await?;
-                let continued = vcs.continue_fresh_clone(&spec.url, &spec.r#ref, target).await;
-                finish_clone_delivery(delivery, target).await;
-                continued.map_err(|error| unauthorised_clone(&spec.url, &credentials, error))?
-            }
-            CheckoutSpec::FreshClone(_) => {
-                return Err("local clones continue through host-local clone preparation with a managed source".to_string().into())
-            }
-            CheckoutSpec::Observed(_) => return Err("observed checkout cannot be continued".to_string().into()),
-        };
-        Ok(PreparedCheckout { commit: result.commit, branch_provenance: result.provenance })
-    }
-
-    async fn protect_worktree_in(&self, env_ref: &str, clone_path: &str, target: &str, reason: &str) -> Result<(), String> {
+/// This host's checkout work in its environments, for the engine's Checkout controller (#3108).
+impl RoutingCheckoutRuntime {
+    pub(super) async fn protect_worktree_in(&self, env_ref: &str, clone_path: &str, target: &str, reason: &str) -> Result<(), String> {
         let runtime = self.runtime_for(env_ref, clone_path).await?;
         let vcs = runtime.vcs(clone_path)?;
         vcs.checkout_registration(target, CheckoutRegistration::Protect { reason }).await
     }
 
-    async fn checkout_path_exists_in(&self, env_ref: &str, path: &str) -> Result<Option<bool>, String> {
+    pub(super) async fn checkout_path_exists_in(&self, env_ref: &str, path: &str) -> Result<Option<bool>, String> {
         if env_ref != self.state.host_direct_environment_name {
             return Ok(None);
         }
@@ -494,45 +443,7 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
         }
     }
 
-    async fn create_worktree(
-        &self,
-        clone_path: &str,
-        branch: &str,
-        base_ref: Option<&str>,
-        target_path: &str,
-    ) -> Result<PreparedCheckout, String> {
-        self.runtime_for(&self.state.host_direct_environment_name, clone_path)
-            .await?
-            .create_worktree(clone_path, branch, base_ref, target_path)
-            .await
-    }
-
-    async fn create_fresh_clone(
-        &self,
-        repo_url: &str,
-        branch: &str,
-        base_ref: Option<&str>,
-        target_path: &str,
-    ) -> Result<PreparedCheckout, String> {
-        self.runtime_for(&self.state.host_direct_environment_name, target_path)
-            .await?
-            .create_fresh_clone(repo_url, branch, base_ref, target_path)
-            .await
-    }
-
-    async fn inspect_integration(
-        &self,
-        checkout: &ResourceObject<Checkout>,
-        convoy: Option<&ResourceObject<Convoy>>,
-    ) -> Result<CheckoutIntegrationStatus, String> {
-        self.inspect_integration_in(&self.state.host_direct_environment_name, checkout, convoy).await
-    }
-
-    async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
-        self.remove_checkout_in(&self.state.host_direct_environment_name, removal).await
-    }
-
-    async fn create_worktree_in(
+    pub(super) async fn create_worktree_in(
         &self,
         env_ref: &str,
         clone_path: &str,
@@ -547,15 +458,15 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
         Ok(PreparedCheckout { commit: materialisation.commit, branch_provenance: materialisation.provenance })
     }
 
-    async fn create_local_clone_in(
+    pub(super) async fn create_local_clone_in(
         &self,
         env_ref: &str,
         request: flotilla_vcs::vcs::LocalCloneRequest<'_>,
     ) -> Result<(PreparedCheckout, Option<String>), String> {
-        self.runtime_for(env_ref, request.source).await?.create_local_clone_in(env_ref, request).await
+        self.runtime_for(env_ref, request.source).await?.create_local_clone(request).await
     }
 
-    async fn create_fresh_clone_in(
+    pub(super) async fn create_fresh_clone_in(
         &self,
         env_ref: &str,
         repo_url: &str,
@@ -571,18 +482,7 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
         Ok(PreparedCheckout { commit: materialisation.commit, branch_provenance: materialisation.provenance })
     }
 
-    async fn inspect_integration_in(
-        &self,
-        env_ref: &str,
-        checkout: &ResourceObject<Checkout>,
-        convoy: Option<&ResourceObject<Convoy>>,
-    ) -> Result<CheckoutIntegrationStatus, String> {
-        let path = checkout_path_from_status_and_spec(checkout.status.as_ref(), &checkout.spec).ok_or("checkout path unavailable")?;
-        let runtime = self.runtime_for(env_ref, path).await?;
-        runtime.inspect_integration(checkout, convoy).await
-    }
-
-    async fn remove_checkout_in(&self, env_ref: &str, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
+    pub(super) async fn remove_checkout_in(&self, env_ref: &str, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
         // Shared by every namespace and execution environment on this daemon.
         // Hold capacity through archive creation and every deletion in the
         // removal, releasing it on success, failure, or cancellation.
@@ -601,7 +501,7 @@ const GIT_SIGN_IN_REFUSALS: &[&str] =
 const GIT_NOT_FOUND: &str = "Repository not found";
 
 /// The clone's environment file holds raw tokens; it goes once the clone's Git is done.
-async fn finish_clone_delivery(delivery: Option<CloneDelivery>, target: &str) {
+pub(super) async fn finish_clone_delivery(delivery: Option<CloneDelivery>, target: &str) {
     let Some(delivery) = delivery else { return };
     if let Err(error) = delivery.finish().await {
         warn!(%target, %error, "could not remove a clone's credential environment file");
@@ -626,7 +526,7 @@ fn refused_clone_grant(url: &str, credentials: &CloneCredentials, error: &str) -
 
 /// A clone the forge refused for want of a sign-in says which grant is missing
 /// or refused, instead of leaving only Git's prompt failure (#4218).
-fn unauthorised_clone(url: &str, credentials: &CloneCredentials, error: String) -> String {
+pub(super) fn unauthorised_clone(url: &str, credentials: &CloneCredentials, error: String) -> String {
     let refused = if GIT_SIGN_IN_REFUSALS.iter().any(|refusal| error.contains(refusal)) {
         "requires a sign-in"
     } else if error.contains(GIT_NOT_FOUND) {
@@ -736,8 +636,8 @@ mod chained_default_branch_tests {
             .await
             .expect("repository");
         // No clone holds a default branch, so the forge's answer decides.
-        let reconciler = flotilla_provisioning::reconcilers::RepositoryReconciler::new(backend.clone(), backend, "ops")
-            .with_lifecycle_reads(flotilla_provisioning_testkit::CloneFixture::default().reads)
+        let reconciler = flotilla_provisioning::reconcilers::RepositoryReconciler::new(backend, "ops")
+            .with_lifecycle_reads(flotilla_provisioning_testkit::EngineFixture::default().reads())
             .with_forge_default_branch_resolver(Arc::new(GhForgeDefaultBranchResolver::new(runner.clone())));
         (runner, reconciler, repository)
     }

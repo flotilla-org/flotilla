@@ -20,8 +20,8 @@ use flotilla_state_machines::{machines::lifecycle::LifecycleState, Cause, CauseC
 const HOME: &str = "home";
 
 fn store() -> Arc<Mutex<Store>> {
-    let mut registry = KindRegistry::new();
-    stored::register(&mut registry).expect("registry");
+    // The production kinds: a checkout is held for an engine Convoy (#3108).
+    let registry = stored::production_kinds().expect("registry");
     let connection = rusqlite::Connection::open_in_memory().expect("memory");
     Arc::new(Mutex::new(Store::open(connection, HOME, registry).expect("store")))
 }
@@ -89,12 +89,11 @@ fn engine_writes_survive_a_reopened_home() {
 // same identity.
 #[test]
 fn every_kind_survives_a_reopened_home() {
-    use flotilla_provisioning::engine::{checkout::CheckoutBinding, image_build::ImageBuildBinding, Binding, Lifecycles};
-    use flotilla_provisioning_testkit::EnvironmentFixture;
+    use flotilla_provisioning::engine::{image_build::ImageBuildBinding, Binding, Lifecycles};
+    use flotilla_provisioning_testkit::{CheckoutFixture, EnvironmentFixture};
     use flotilla_resources::{
-        environment_records::LaunchFacts, CheckoutSpec, CheckoutStatusPatch, CheckoutWorktreeSpec, EnvironmentSpec,
-        HostDirectEnvironmentSpec, ImageBuildReservation, ImageBuildResourceSpec, ImageBuildSpec, ImageBuildStatusPatch, ImageDelivery,
-        CONVOY_LABEL,
+        environment_records::LaunchFacts, CheckoutSpec, CheckoutWorktreeSpec, EnvironmentSpec, HostDirectEnvironmentSpec,
+        ImageBuildReservation, ImageBuildResourceSpec, ImageBuildSpec, ImageBuildStatusPatch, ImageDelivery,
     };
     fn reopened<B: Binding>(
         store: &Arc<Mutex<Store>>,
@@ -145,22 +144,20 @@ fn every_kind_survives_a_reopened_home() {
     let built =
         ImageBuildStatusPatch::Built { at: DateTime::UNIX_EPOCH, digest: "sha256:beef".into(), probes: vec![], log_ref: "log".into() };
     reopened::<ImageBuildBinding>(&store, build, built, "sha256:beef");
-    let mut checkout_meta = meta("checkout-a");
-    checkout_meta.labels.insert(CONVOY_LABEL.into(), "convoy-a".into());
-    let checkout = ResourceObject::<flotilla_resources::Checkout> {
-        metadata: checkout_meta,
-        spec: CheckoutSpec::Worktree(CheckoutWorktreeSpec {
-            repo_ref: flotilla_protocol::RepositoryKey("github.com/org/repo".into()),
-            env_ref: "env-a".into(),
-            r#ref: "feature".into(),
-            base_ref: None,
-            target_path: "/work/feature".into(),
-            clone_ref: "clone-a".into(),
-        }),
-        status: None,
-    };
-    let ready = CheckoutStatusPatch::MarkReady { path: "/work/feature".into(), commit: None, branch_provenance: Default::default() };
-    reopened::<CheckoutBinding>(&store, checkout, ready, "/work/feature");
+    // A checkout is requested and realised through its port, as its controller realises it (#3108).
+    let checkouts = CheckoutFixture::over(HOME, Arc::clone(&store));
+    let spec = CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+        repo_ref: flotilla_protocol::RepositoryKey("github.com/org/repo".into()),
+        env_ref: "env-a".into(),
+        r#ref: "feature".into(),
+        base_ref: None,
+        target_path: "/work/feature".into(),
+        clone_ref: "clone-a".into(),
+    });
+    let launch = checkouts.put_ready("checkout-a", &spec, None);
+    let restored = CheckoutFixture::over(HOME, Arc::clone(&store)).lifecycles.get(&launch).expect("restored");
+    assert_eq!(restored.state(), &LifecycleState::Realised { identity: "/work/feature".into() });
+    assert_eq!(restored.spec(), checkouts.lifecycles.get(&launch).expect("held").spec());
     let held = clones(&store);
     realise_clone(held.as_ref(), false);
     let restored = clones(&store).get("clone-a").expect("restored");

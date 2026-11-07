@@ -54,11 +54,17 @@ use flotilla_state_machines::{
     Cause, CauseCategory, Failure, Resource, Version,
 };
 
+use flotilla_resources::{
+    checkout_records::{launched, CheckoutHolder, Inspection},
+    CONVOY_LABEL,
+};
+
 use super::{
-    checkout::CheckoutBinding, clones, environments, image_build::ImageBuildBinding, launch, terminal_session::TerminalSessionBinding,
+    checkouts, clones, environments, image_build::ImageBuildBinding, launch, terminal_session::TerminalSessionBinding,
     vessel::VesselBinding, Binding,
 };
 use crate::stored::{
+    checkout::{CheckoutFacts, CheckoutKind},
     clone::{CloneFacts, CloneKind},
     environment::EnvironmentKind,
     launch_facts::EnvironmentLaunchFacts,
@@ -424,21 +430,95 @@ pub fn import_clone(obj: &ResourceObject<OldClone>, home: &str) -> Result<Import
     })
 }
 
-impl Imported for CheckoutBinding {
-    fn imported_state(obj: &ResourceObject<OldCheckout>) -> Result<LifecycleState, String> {
-        let status = obj.status.as_ref();
-        Ok(match status.map(|status| status.phase).unwrap_or_default() {
-            CheckoutPhase::Pending => LifecycleState::requested(),
-            CheckoutPhase::Ready => {
-                realised(status.and_then(|status| status.path.clone()).or_else(|| obj.spec.target_path().map(str::to_owned)), "path")?
+/// The engine Convoy an old convoy name maps to, as the convoy import wrote it: its identity and
+/// the version written.
+pub type ImportedHolder = (flotilla_schema::Identity, u64);
+
+/// Maps each old Checkout, homed at its home, onto its first launch. One held for a convoy (its
+/// convoy label) is created under that convoy's engine Convoy at the version the convoy import
+/// wrote, which `holders` names by the label's old convoy name. Its facts and its inspection come
+/// with it. A checkout whose convoy was not imported, having ended or stayed on the old store,
+/// is not imported: nothing would release it.
+pub fn import_checkouts(
+    records: &[(ResourceObject<OldCheckout>, String)],
+    holders: &dyn Fn(&str) -> Option<ImportedHolder>,
+    target: &mut impl ImportTarget,
+    report: &mut ImportReport,
+) {
+    for (checkout, home) in records {
+        if !target.imports(home) {
+            continue;
+        }
+        let refuse = |reason: String| ImportRefusal { kind: CheckoutKind::NAME, record: checkout.metadata.name.clone(), reason };
+        let result = import_checkout(checkout, home, holders).and_then(|(imported, holder)| {
+            let mut change = NewChange::new(IMPORT_WRITER, imported.resource.since());
+            if let Some((identity, version)) = holder {
+                change.items.push(flotilla_schema::ChangeItem::new(identity, Some(version.to_string())));
             }
-            CheckoutPhase::Failed => {
-                LifecycleState::GaveUp { cause: failed_by(status.and_then(|status| status.message.as_deref()), "the checkout failed") }
+            target.write(home, imported.resource.name(), &change, &imported.resource).map_err(refuse)?;
+            let status = checkout.status.as_ref();
+            if matches!(imported.resource.state(), LifecycleState::Realised { .. }) {
+                let facts = CheckoutFacts { degraded: status.and_then(|status| status.degraded.clone()) };
+                target.write(home, imported.resource.name(), &change, &facts).map_err(refuse)?;
             }
-            // Legacy Gone retained no ending cause; import normalizes it to a release.
-            CheckoutPhase::Gone => LifecycleState::Gone { ending: Ending::Released },
-        })
+            if let Some(status) = status.filter(|status| status.integration != Default::default()) {
+                let integration = checkouts::stored_integration(Inspection::of_status(&status.integration), None);
+                target.write(home, imported.resource.name(), &change, &integration).map_err(refuse)?;
+            }
+            Ok(imported)
+        });
+        report.record(&result);
     }
+}
+
+/// Maps old Checkout `obj`, homed at `home`, onto its first launch, with the holder it is
+/// created under.
+pub fn import_checkout(
+    obj: &ResourceObject<OldCheckout>,
+    home: &str,
+    holders: &dyn Fn(&str) -> Option<ImportedHolder>,
+) -> Result<(ImportedResource<CheckoutKind>, Option<ImportedHolder>), ImportRefusal> {
+    let refuse = |reason: String| ImportRefusal { kind: CheckoutKind::NAME, record: obj.metadata.name.clone(), reason };
+    let holder = match obj.metadata.labels.get(CONVOY_LABEL) {
+        Some(convoy) => Some(holders(convoy).ok_or_else(|| refuse(format!("held for convoy `{convoy}`, which was not imported")))?),
+        None => None,
+    };
+    let status = obj.status.as_ref();
+    let state = match status.map(|status| status.phase).unwrap_or_default() {
+        CheckoutPhase::Pending => LifecycleState::requested(),
+        CheckoutPhase::Ready => {
+            // An adopted (observed) checkout is realised at the path it was adopted at.
+            let requested = match &obj.spec {
+                flotilla_resources::CheckoutSpec::Observed(spec) => Some(spec.path.as_str()),
+                spec => spec.target_path(),
+            };
+            let path = status.and_then(|status| status.path.clone()).or_else(|| requested.map(str::to_owned));
+            realised(path, "path").map_err(refuse)?
+        }
+        CheckoutPhase::Failed => {
+            LifecycleState::GaveUp { cause: failed_by(status.and_then(|status| status.message.as_deref()), "the checkout failed") }
+        }
+        // Legacy Gone retained no ending cause; import normalizes it to a release.
+        CheckoutPhase::Gone => LifecycleState::Gone { ending: Ending::Released },
+    };
+    // A worktree names the clone it was made from; that clone imports as its first launch.
+    let mut spec = obj.spec.clone();
+    if let flotilla_resources::CheckoutSpec::Worktree(worktree) = &mut spec {
+        if launched(&worktree.clone_ref) == worktree.clone_ref {
+            worktree.clone_ref = launch(&worktree.clone_ref, 1);
+        }
+    }
+    let holder_name = holder.as_ref().map(|(identity, _)| CheckoutHolder::Convoy(identity.name.clone()));
+    let request = checkouts::request_of(&spec, holder_name.as_ref(), home).map_err(refuse)?;
+    let since = Timestamp::from_datetime(&obj.metadata.creation_timestamp);
+    Ok((
+        ImportedResource {
+            record: obj.metadata.name.clone(),
+            home: home.to_owned(),
+            resource: Resource::stored(launch(&obj.metadata.name, 1), request, State::new(state, since), Version(1)),
+        },
+        holder,
+    ))
 }
 
 impl Imported for TerminalSessionBinding {

@@ -6,6 +6,7 @@ use std::{
 use std::{collections::HashMap, sync::Arc};
 
 use crate::convoy::ConvoyReconciler;
+use crate::no_held_checkouts;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_change_request::observation;
@@ -16,19 +17,19 @@ use flotilla_forge_github::github::GithubRetrySource;
 use flotilla_protocol::{DaemonEvent, Leaf, LeafFire, NodeId, WaitSubscriptionRequest};
 use flotilla_protocol::{LeafAddress, LeafOperator};
 use flotilla_provider_runtime::ObservationError;
+use flotilla_resources::checkout_records::CheckoutRecords as _;
 use flotilla_resources::StatusPatch;
 use flotilla_resources::{
-    external_patches, Artifact, ChangeRequest, Checkout, Convoy, ConvoyAttention, ConvoyEnsure, CrewCompletionRefusal,
-    CrewCompletionRefusalCause, HoldAct, Issue, LeafMaker, NudgeObligation, ObservedChecks, Project, ResourceError, RetryCeiling,
-    StallEvidenceSource, StallRung, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung, Vessel,
-    WatchEvent, WatchStart, ROLE_LABEL, VESSEL_LABEL,
+    external_patches, Artifact, ChangeRequest, Convoy, ConvoyAttention, ConvoyEnsure, CrewCompletionRefusal, CrewCompletionRefusalCause,
+    HoldAct, Issue, LeafMaker, NudgeObligation, ObservedChecks, Project, ResourceError, RetryCeiling, StallEvidenceSource, StallRung,
+    SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSource, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung, Vessel, WatchEvent, WatchStart,
+    ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_resources::{
-    BoundChangeRequest, ChangeRequestObservation, ChangeRequestState, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
-    CheckoutStatus, ConditionValue, ControllerRetry, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewWorkPhase,
-    CrewWorkState, ExitDeclaration, InputMeta, IntegrationCondition, LifecycleAuthority, ObservedCheckoutSpec, PlacementStatus,
-    RepositoryKey, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
+    BoundChangeRequest, CheckoutSpec, ControllerRetry, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewWorkPhase,
+    CrewWorkState, ExitDeclaration, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementStatus, RepositoryKey, WorkPhase,
+    WorkState, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
 };
 use flotilla_store::controller::ControllerLoop;
 use flotilla_store::ResourceBackend;
@@ -239,7 +240,10 @@ fn supervision_wake_with_limit(backend: &ResourceBackend, limit: u32) -> Reconci
         Arc::new(UnavailableChangeRequests),
         flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
-    ReconcilerWake::new(LeafSubscriptionTable::with_episode_limit(backend.clone(), broadcast_test_sink(event_tx), refresher, limit))
+    ReconcilerWake::new(
+        LeafSubscriptionTable::with_episode_limit(backend.clone(), broadcast_test_sink(event_tx), refresher, limit)
+            .with_lifecycle_reads(no_held_checkouts()),
+    )
 }
 
 async fn project_supervision_case(governors: &[(&str, u64, ConvoyPhase)]) -> (ResourceBackend, ReconcilerWake, Arc<RecordingTurnDelivery>) {
@@ -762,7 +766,7 @@ async fn assert_leaf_subscription_contract(backend: ResourceBackend) {
         Arc::new(UnavailableChangeRequests),
         flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
-    let table = LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx.clone()), refresher);
+    let table = served_table(backend.clone(), broadcast_test_sink(event_tx.clone()), refresher);
     let connection_id = uuid::Uuid::new_v4();
     let mut events = event_tx.subscribe();
 
@@ -1189,6 +1193,7 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
                 // explicit merged observation rather than a network refresher.
                 secondaries: Vec::new(),
                 reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+                    .with_lifecycle_reads(no_held_checkouts())
                     .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(60)),
                 resync_interval: Duration::from_secs(3600),
                 backend: backend.clone(),
@@ -1536,7 +1541,7 @@ async fn assert_turn_delivery_enforces_head_identity_and_records_rungs(
         Arc::new(UnavailableChangeRequests),
         flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
-    let table = LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher);
+    let table = served_table(backend.clone(), broadcast_test_sink(event_tx), refresher);
     let actuator = Arc::new(RecordingTurnDelivery::default());
     table.set_turn_delivery_actuator(actuator.clone()).await;
     let rule = TurnDeliveryRule::builder()
@@ -1717,6 +1722,16 @@ async fn assert_turn_delivery_enforces_head_identity_and_records_rungs(
     assert!(first_brief.contains("feature/wake"));
     assert!(first_brief.contains("Durable convoy record: `flotilla/wake-turn`"));
     assert!(first_brief.contains("Decision ledger: https://github.com/flotilla-org/flotilla/pull/1392#issuecomment-1"));
+}
+
+/// A subscription table whose readings serve no held checkouts; a test that holds checkouts gives
+/// the table its own readings.
+fn served_table(
+    backend: ResourceBackend,
+    event_sink: Arc<dyn super::EventSink>,
+    change_requests: ChangeRequestRefresher,
+) -> LeafSubscriptionTable {
+    LeafSubscriptionTable::new(backend, event_sink, change_requests).with_lifecycle_reads(no_held_checkouts())
 }
 
 mod change_request_authority;

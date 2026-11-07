@@ -4,7 +4,6 @@
 //! orchestration collaborators and shares their existing state.
 use flotilla_daemon_api::action_support::empty_repo_identity;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use flotilla_protocol::Command;
 use flotilla_protocol::CommandAction;
@@ -21,7 +20,6 @@ use flotilla_resources::ResourceError;
 use flotilla_resources::WorkflowTemplate;
 use flotilla_resources::WriterIdentity;
 use flotilla_store::ResourceBackend;
-use tokio::sync::Mutex;
 
 use crate::convoy_admission::allocate_convoy_generation;
 use crate::convoy_admission::normalize_convoy_start_intent;
@@ -34,8 +32,7 @@ use crate::convoy_admission::ConvoyStartTask;
 use crate::project_ops::is_declaration_backed_project;
 use crate::project_ops::validate_project_name;
 use crate::support::{
-    create_adopted_checkout_resource, parse_and_validate_workflow_template_yaml, parse_project_yaml, placement_target_host,
-    AdoptedCheckoutRequest,
+    adopted_checkout_spec, parse_and_validate_workflow_template_yaml, parse_project_yaml, placement_target_host, AdoptedCheckoutRequest,
 };
 use flotilla_resources::convoy_address::convoy_record_name;
 
@@ -44,8 +41,6 @@ pub struct AdmissionActions<'a> {
     pub port: &'a dyn crate::project_ops::ProjectOperations,
     pub namespace: &'a std::sync::RwLock<String>,
     pub resource_backend: &'a ResourceBackend,
-    pub observed_resource_backend: &'a ResourceBackend,
-    pub observed_checkout_reconciliation: &'a Arc<Mutex<()>>,
     pub admission: &'a ConvoyAdmission,
     pub events: flotilla_daemon_api::action_events::ActionEvents<'a>,
 }
@@ -237,31 +232,28 @@ impl AdmissionActions<'_> {
                             .as_deref()
                             .ok_or_else(|| "an adopted checkout requires a repository transport URL".to_string())?;
                         let git_ref = r#ref.as_deref().unwrap_or(&inspection.checkout.git_ref);
-                        let _reconciliation = self.observed_checkout_reconciliation.lock().await;
-                        let (checkout_ref, inferred_repository_url, inferred_ref) = create_adopted_checkout_resource(
+                        let (checkout_ref, spec) = adopted_checkout_spec(
                             self.resource_backend,
-                            self.observed_resource_backend,
                             AdoptedCheckoutRequest::builder()
                                 .namespace(&namespace)
                                 .convoy_name(name)
                                 .checkout_path(&inspection.checkout.path)
                                 .repository_spec(&inspection.spec)
-                                .repository_url(transport_url)
                                 .git_ref(git_ref)
                                 .host_ref(&inspection.checkout.host_ref)
                                 .build(),
                         )
                         .await?;
-                        Ok::<_, String>((repo_ref, checkout_ref, inferred_repository_url, inferred_ref))
+                        Ok::<_, String>((repo_ref, checkout_ref, spec, transport_url.to_string(), git_ref.to_string()))
                     }
                     .await;
                     match adopted_result {
-                        Ok((repo_ref, checkout_ref, inferred_repository_url, inferred_ref)) => {
+                        Ok((repo_ref, checkout_ref, spec, inferred_repository_url, inferred_ref)) => {
                             if project_repositories.is_none() {
                                 direct_repository_url.get_or_insert(inferred_repository_url);
                             }
                             r#ref.get_or_insert(inferred_ref);
-                            Some((repo_ref, checkout_ref))
+                            Some((repo_ref, checkout_ref, spec))
                         }
                         Err(message) => {
                             let result = CommandValue::Error { message };
@@ -317,9 +309,9 @@ impl AdmissionActions<'_> {
             } else {
                 Vec::new()
             };
-            let adopted_checkout_ref_to_cleanup = adopted_checkout.as_ref().map(|(_, checkout_ref)| checkout_ref.clone());
             let mut adopted_checkout_refs = BTreeMap::new();
-            if let Some((repo_ref, checkout_ref)) = adopted_checkout {
+            let mut adopted_checkout_spec = None;
+            if let Some((repo_ref, checkout_ref, spec)) = adopted_checkout {
                 if !repositories.iter().any(|repository| repository.repo_ref == repo_ref) {
                     let message =
                         format!("adopted checkout repository {repo_ref} is not part of project {}", project_ref.as_deref().unwrap_or(""));
@@ -327,6 +319,7 @@ impl AdmissionActions<'_> {
                     return Ok(id);
                 }
                 adopted_checkout_refs.insert(repo_ref, checkout_ref);
+                adopted_checkout_spec = Some(spec);
             }
             let mut placement = match self
                 .admission
@@ -431,7 +424,7 @@ impl AdmissionActions<'_> {
                         .maybe_source_ref(r#ref)
                         .maybe_project_ref(project_ref.clone())
                         .adopted_checkout_refs(adopted_checkout_refs)
-                        .maybe_adopted_checkout_ref_to_cleanup(adopted_checkout_ref_to_cleanup)
+                        .maybe_adopted_checkout(adopted_checkout_spec)
                         .maybe_dispatching_principal_ref(dispatching_principal_ref)
                         .vessel_placements(vessel_placements)
                         .image_builds(image_builds)

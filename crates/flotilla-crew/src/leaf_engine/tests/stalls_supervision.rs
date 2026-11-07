@@ -449,28 +449,26 @@ async fn operator_message_echo_preserves_clock_without_replenishing_budget() {
 #[tokio::test]
 async fn observed_commit_resets_budget_but_refresh_does_not() {
     let (backend, wake, delivery) = idle_nudge_scenario().await;
-    let checkouts = backend.using::<Checkout>("flotilla");
-    let checkout = checkouts
-        .create(
-            &InputMeta::builder()
-                .name("actor-checkout".into())
-                .labels(BTreeMap::from([(CONVOY_LABEL.into(), "stalled-work".into())]))
+    // The engine holds the actor's checkout for the convoy, its HEAD inspected.
+    let engine = flotilla_provisioning_testkit::CheckoutFixture::default();
+    let wake = ReconcilerWake::new(wake.subscriptions.with_lifecycle_reads(engine.reads.clone()));
+    engine.open_convoy("stalled-work");
+    let launch = engine.put_ready(
+        "actor-checkout",
+        &CheckoutSpec::Observed(
+            flotilla_resources::ObservedCheckoutSpec::builder()
+                .r#ref("work".into())
+                .path("/workspace".into())
+                .repo_ref(flotilla_protocol::RepositoryKey("repo".into()))
+                .host_ref("home".into())
+                .is_main(false)
                 .build(),
-            &CheckoutSpec::Observed(
-                flotilla_resources::ObservedCheckoutSpec::builder()
-                    .r#ref("work".into())
-                    .path("/workspace".into())
-                    .repo_ref(flotilla_protocol::RepositoryKey("repo".into()))
-                    .host_ref("host".into())
-                    .is_main(false)
-                    .build(),
-            ),
-        )
-        .await
-        .expect("checkout");
-    let mut checkout_status = flotilla_resources::CheckoutStatus::default();
-    checkout_status.integration.head_revision = Some("before".into());
-    checkouts.update_status("actor-checkout", &checkout.metadata.resource_version, &checkout_status).await.expect("initial HEAD");
+        ),
+        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy("stalled-work".into())),
+    );
+    let inspection =
+        |head: &str| flotilla_resources::checkout_records::Inspection { head_revision: Some(head.into()), ..Default::default() };
+    engine.checkouts.inspected(&launch, inspection("before")).expect("initial HEAD");
     let vessels = backend.using::<Vessel>("flotilla");
     let vessel = vessels
         .create(
@@ -503,14 +501,11 @@ async fn observed_commit_resets_budget_but_refresh_does_not() {
         observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
     assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
-    let checkout = checkouts.get("actor-checkout").await.expect("checkout");
-    checkouts.update_status("actor-checkout", &checkout.metadata.resource_version, &checkout_status).await.expect("same HEAD refresh");
+    engine.checkouts.inspected(&launch, inspection("before")).expect("same HEAD refresh");
     observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(240)).await;
     let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
     assert_eq!(convoy.status.expect("status").nudge_obligations[0].history.len(), 1);
-    let checkout = checkouts.get("actor-checkout").await.expect("checkout");
-    checkout_status.integration.head_revision = Some("after".into());
-    checkouts.update_status("actor-checkout", &checkout.metadata.resource_version, &checkout_status).await.expect("new commit");
+    engine.checkouts.inspected(&launch, inspection("after")).expect("new commit");
     for second in [241, 300, 360, 420, 421] {
         observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
     }
@@ -1079,7 +1074,7 @@ async fn lost_crew_session_stalls_with_dead_evidence_but_stale_busy_screen_does_
         Arc::new(UnavailableChangeRequests),
         flotilla_observation::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
-    let wake = ReconcilerWake::new(LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher));
+    let wake = ReconcilerWake::new(served_table(backend.clone(), broadcast_test_sink(event_tx), refresher));
     create_convoy(
         &backend,
         "delivery",
@@ -1180,8 +1175,13 @@ async fn credential_delivery_and_clone_controller_rows_judge_transient_terminal_
     );
     // The clones are the engine's (#3108): the worktree's clone row reads them.
     let clones = flotilla_provisioning_testkit::CloneFixture::default();
+    // So are the checkouts: the worktree is held for the convoy.
+    let engine = flotilla_provisioning_testkit::CheckoutFixture::over("home", Arc::clone(&clones.store)).serving(
+        Arc::clone(&flotilla_provisioning_testkit::EnvironmentFixture::over("home", Arc::clone(&clones.store)).environments) as _,
+        Arc::clone(&clones.clones) as _,
+    );
     let wake = ReconcilerWake::new(
-        LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher).with_lifecycle_reads(clones.reads.clone()),
+        served_table(backend.clone(), broadcast_test_sink(event_tx), refresher).with_lifecycle_reads(engine.reads.clone()),
     );
     create_convoy(&backend, "delivery", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
     let vessels = backend.using::<Vessel>("flotilla");
@@ -1264,25 +1264,20 @@ async fn credential_delivery_and_clone_controller_rows_judge_transient_terminal_
         path: "/tmp/clone".into(),
     };
     let clone = flotilla_resources::clone_records::clone_name(&repository, "delivery-env").expect("clone name");
-    let checkouts = backend.using::<Checkout>("flotilla");
-    checkouts
-        .create(
-            &InputMeta::builder()
-                .name("delivery-checkout".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "delivery".to_string())]))
-                .build(),
-            &CheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
-                repo_ref: repository.key(),
-                env_ref: "delivery-env".into(),
-                r#ref: "main".into(),
-                base_ref: None,
-                target_path: "/tmp/checkout".into(),
-                // Named by its clone, the checkout reads the clone's latest launch.
-                clone_ref: clone.clone(),
-            }),
-        )
-        .await
-        .expect("worktree checkout");
+    engine.open_convoy("delivery");
+    engine.put_ready(
+        "delivery-checkout",
+        &CheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
+            repo_ref: repository.key(),
+            env_ref: "delivery-env".into(),
+            r#ref: "main".into(),
+            base_ref: None,
+            target_path: "/tmp/checkout".into(),
+            // Named by its clone, the checkout reads the clone's latest launch.
+            clone_ref: clone.clone(),
+        }),
+        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy("delivery".into())),
+    );
     let first = clones.request(&repository, &clone_spec, false);
     let judge_clone = || async {
         let convoy = backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy");
@@ -1343,7 +1338,7 @@ async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
     .expect("key");
     refresher.refresh_once(&subject).await.expect_err("limited observation records its diagnostic");
     let (event_tx, _) = broadcast::channel(4);
-    let table = LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher);
+    let table = served_table(backend.clone(), broadcast_test_sink(event_tx), refresher);
     let convoys = backend.using::<Convoy>("flotilla");
     let created = convoys
         .create(

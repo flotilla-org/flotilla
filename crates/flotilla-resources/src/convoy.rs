@@ -68,6 +68,26 @@ pub const PLACEMENT_SNAPSHOT_ANNOTATION: &str = "flotilla.work/placement-snapsho
 pub const VESSEL_PLACEMENTS_ANNOTATION: &str = "flotilla.work/vessel-placements";
 pub const ENSURED_FROM_ANNOTATION: &str = "flotilla.work/ensured-from";
 
+/// The checkout a convoy adopts, as admission found it (#3108): the observed checkout spec its
+/// vessel requests on the engine, held for the convoy, once the engine holds the convoy. The
+/// engine Convoy is admitted after the old one is created, so admission cannot request it.
+/// When convoys leave the old store this becomes a field of the engine Convoy's request.
+pub const ADOPTED_CHECKOUT_ANNOTATION: &str = "flotilla.work/adopted-checkout";
+
+/// The checkout `convoy` adopts, if admission recorded one.
+pub fn adopted_checkout(convoy: &crate::ResourceObject<Convoy>) -> Result<Option<crate::CheckoutSpec>, String> {
+    convoy
+        .metadata
+        .annotations
+        .get(ADOPTED_CHECKOUT_ANNOTATION)
+        .map(|encoded| {
+            serde_json::from_str::<crate::ObservedCheckoutSpec>(encoded)
+                .map(crate::CheckoutSpec::Observed)
+                .map_err(|error| format!("convoy {} records an unreadable adopted checkout: {error}", convoy.metadata.name))
+        })
+        .transpose()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VesselPlacementPin {
     // Drop the alias one roll after the rename.
@@ -405,12 +425,15 @@ pub fn expected_checkout_refs(convoy: &crate::ResourceObject<Convoy>) -> Result<
     Ok(expected)
 }
 
-/// Change requests already known through the convoy's expected checkouts.
+/// Change requests already known through the convoy's expected checkouts: each checkout's
+/// inspection names the change request its branch is associated with, and `state_of` says what
+/// the forge observation of it last found. One whose state is not observed yet is not known.
 /// This is a home-side fact derived from local or replicated checkout evidence.
 pub fn observed_change_request_subjects(
     convoy: &crate::ResourceObject<Convoy>,
-    checkouts: &BTreeMap<String, crate::ResourceObject<crate::Checkout>>,
+    checkouts: &BTreeMap<String, crate::checkout_records::CheckoutRecord>,
     forges: &[crate::ForgeSpec],
+    state_of: &dyn Fn(&Subject) -> Option<crate::ObservedChangeRequestState>,
 ) -> Result<Vec<Subject>, String> {
     let expected = expected_checkout_refs(convoy)?;
     let adopted = convoy
@@ -423,25 +446,23 @@ pub fn observed_change_request_subjects(
     let mut subjects = Vec::new();
     for name in expected {
         let Some(checkout) = checkouts.get(&name) else { continue };
-        let Some(observed) = checkout.status.as_ref().and_then(|status| status.integration.change_request.as_ref()) else {
-            continue;
-        };
+        let Some(inspection) = checkout.inspection() else { continue };
+        let Some(observed) = inspection.change_request else { continue };
         let repository = convoy
             .spec
             .repositories
             .iter()
             .find(|repository| repository.repo_ref == *checkout.spec.repo_ref())
             .ok_or_else(|| format!("checkout {name} repository {} is absent from convoy", checkout.spec.repo_ref()))?;
-        let subject = crate::address::remote_change_request_subject(&repository.url, &observed.id, forges)?;
-        let terminal = observed.state != crate::ChangeRequestState::Open;
-        let merged_during_checkout = checkout
-            .status
+        let subject = crate::address::remote_change_request_subject(&repository.url, &observed.to_string(), forges)?;
+        let Some(state) = state_of(&subject) else { continue };
+        let terminal = !matches!(state, crate::ObservedChangeRequestState::Open | crate::ObservedChangeRequestState::Draft);
+        let merged_during_checkout = inspection
+            .landed_evidence
             .as_ref()
-            .and_then(|status| status.integration.landed_evidence.as_ref())
-            .filter(|evidence| evidence.change_request_id == observed.id)
-            .and_then(|evidence| evidence.merged_at.as_deref())
-            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
-            .is_some_and(|at| at >= checkout.metadata.creation_timestamp);
+            .filter(|evidence| evidence.change_request == observed)
+            .and_then(|evidence| evidence.merged_at)
+            .is_some_and(|at| at >= checkout.requested_at);
         // A subject recorded in another spelling of the same request is the
         // same subject: compare addresses, not spellings.
         let same = |other: &Subject| crate::address::same_subject(other, &subject, forges);

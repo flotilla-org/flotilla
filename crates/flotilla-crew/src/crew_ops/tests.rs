@@ -100,6 +100,7 @@ async fn fixture_with_message_path(
         ChangeRequestRefreshCadence::default(),
     );
     let subscriptions = LeafSubscriptionTable::new(backend.clone(), Arc::new(RecordingEventSink::default()), refresher)
+        .with_lifecycle_reads(crate::no_held_checkouts())
         .with_message_path(message_path.clone());
     let probe = Arc::new(StagingProbe { backend: backend.clone(), fail: AtomicBool::new(true), calls: AtomicUsize::new(0) });
     let reconciler: Arc<dyn WorkCredentialReconciler> = probe.clone();
@@ -108,6 +109,7 @@ async fn fixture_with_message_path(
             .resource_backend(backend.clone())
             .accounts(Arc::new(flotilla_store::OldStoreAccounts::new(backend.clone())))
             .leaf_subscriptions(subscriptions)
+            .lifecycle_reads(crate::no_held_checkouts())
             .work_credential_reconciler(RwLock::new(Some(reconciler)))
             .clock(Arc::new(SystemClock))
             .provisioning_namespace(namespace)
@@ -290,90 +292,36 @@ async fn resume_reads_environment_lifecycle_without_a_copy() {
     assert!(crew.ensure_vessel_backing_available("flotilla", "crew", "work").await.expect_err("checked read").contains("poisoned"));
 }
 
-// Teardown reads Checkout endings from the engine, including the selected replica's origin.
-// Stale Gone must not authorize deletion of a live checkout; every old phase is left unchanged.
+// Teardown reads Checkout endings from the engine's records of the convoy's checkouts: a live or
+// given-up launch refuses, and a released or lost one has ended and passes.
 #[tokio::test]
-async fn teardown_reads_checkout_endings_without_a_copy() {
-    use flotilla_provisioning::engine::checkout::CheckoutBinding;
-    use flotilla_resources::{Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, RepositoryKey};
+async fn teardown_reads_checkout_endings_from_the_engine() {
+    use flotilla_provisioning_testkit::{CheckoutFixture, Ending};
+    use flotilla_resources::{checkout_records::CheckoutHolder, CheckoutSpec, CheckoutWorktreeSpec, RepositoryKey};
 
-    for replica in [false, true] {
-        let old_phase = CheckoutPhase::Gone;
-        {
-            for ending in ["released", "lost", "gave_up"] {
-                let (mut crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
-                let fixture = flotilla_provisioning_testkit::LifecycleFixture::<CheckoutBinding>::new(replica);
-
-                Arc::get_mut(&mut crew).expect("unique service").lifecycle_reads = fixture.reads.clone();
-                let author = if replica { ResourceBackend::new(InMemoryBackend::default()) } else { backend.clone() };
-                let records = author.using::<Checkout>("flotilla");
-                let mut checkout = records
-                    .create(
-                        &InputMeta::builder()
-                            .name("checkout".into())
-                            .labels(BTreeMap::from([(CONVOY_LABEL.into(), "crew".into())]))
-                            .build(),
-                        &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
-                            repo_ref: RepositoryKey("github.com/org/repo".into()),
-                            env_ref: "env".into(),
-                            r#ref: "branch".into(),
-                            base_ref: None,
-                            target_path: "/work".into(),
-                            clone_ref: "source".into(),
-                        }),
-                    )
-                    .await
-                    .expect("checkout");
-                let old_status = CheckoutStatus { phase: old_phase, ..Default::default() };
-                records.update_status("checkout", &checkout.metadata.resource_version, &old_status).await.expect("status");
-                let mut convoy = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
-                convoy.spec.adopted_checkout_refs.insert(RepositoryKey("github.com/org/repo".into()), "checkout".into());
-                if replica {
-                    backend
-                        .replica_writer::<Checkout>(flotilla_protocol::NodeId::new("home"), "flotilla")
-                        .replace(&records.list().await.expect("snapshot"), chrono::Utc::now())
-                        .await
-                        .expect("replicate");
-                }
-                let sources = backend.including_replicas::<Checkout>("flotilla").list().await.expect("read sources");
-                let selected =
-                    flotilla_resources::select_convoy_child_sources(&convoy, &sources.items).remove("checkout").expect("selected");
-                let origins = match selected.provenance {
-                    flotilla_resources::ResourceProvenance::Local => BTreeMap::new(),
-                    flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => {
-                        [("checkout".into(), origin_root.to_string())].into()
-                    }
-                };
-                checkout = selected.object;
-                let list = std::slice::from_ref(&checkout);
-                assert_eq!(
-                    crew.verify_convoy_teardown_gate_at_origins(&convoy, list, &origins, false).await.is_ok(),
-                    old_phase == CheckoutPhase::Gone
-                );
-                fixture.request(&checkout);
-                assert!(crew.verify_convoy_teardown_gate_at_origins(&convoy, list, &origins, false).await.is_err());
-                let ending = match ending {
-                    "gave_up" => flotilla_provisioning_testkit::Ending::GaveUp("failure"),
-                    "released" => flotilla_provisioning_testkit::Ending::Released,
-                    _ => flotilla_provisioning_testkit::Ending::Lost("/work"),
-                };
-                fixture.finish(&checkout, ending);
-                for _ in 0..2 {
-                    assert_eq!(
-                        crew.verify_convoy_teardown_gate_at_origins(&convoy, std::slice::from_ref(&checkout), &origins, false)
-                            .await
-                            .is_ok(),
-                        !matches!(ending, flotilla_provisioning_testkit::Ending::GaveUp(_))
-                    );
-                }
-                assert_eq!(records.get("checkout").await.expect("record").status, Some(old_status));
-                fixture.poison();
-                assert!(crew
-                    .verify_convoy_teardown_gate_at_origins(&convoy, std::slice::from_ref(&checkout), &origins, false)
-                    .await
-                    .expect_err("read failure")
-                    .contains("poisoned"));
-            }
+    for ending in [Ending::Released, Ending::Lost("/work"), Ending::GaveUp("failure")] {
+        let (crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
+        let engine = CheckoutFixture::default();
+        let mut convoy = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
+        convoy.spec.adopted_checkout_refs.insert(RepositoryKey("github.com/org/repo".into()), "checkout".into());
+        engine.open_convoy("crew");
+        let launch = engine.request(
+            "checkout",
+            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                repo_ref: RepositoryKey("github.com/org/repo".into()),
+                env_ref: "env".into(),
+                r#ref: "branch".into(),
+                base_ref: None,
+                target_path: "/work".into(),
+                clone_ref: "source".into(),
+            }),
+            Some(&CheckoutHolder::Convoy("crew".into())),
+        );
+        assert!(crew.verify_convoy_teardown_gate_for_checkouts(&convoy, &[engine.record(&launch)], false).await.is_err());
+        let gave_up = matches!(ending, Ending::GaveUp(_));
+        engine.finish(&launch, ending);
+        for _ in 0..2 {
+            assert_eq!(crew.verify_convoy_teardown_gate_for_checkouts(&convoy, &[engine.record(&launch)], false).await.is_ok(), !gave_up);
         }
     }
 }

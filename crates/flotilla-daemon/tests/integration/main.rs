@@ -17,12 +17,4 @@ mod test_daemon;
 #[path = "../../../../tests/support/integration_modules.rs"]
 mod test_module_registration;
 
-/// The engine's environments `daemon` reads (#3108), on its decided store, stepped as the
-/// Environment controller would step them.
-fn engine_environments(daemon: &flotilla_core::in_process::InProcessDaemon) -> flotilla_provisioning_testkit::EnvironmentFixture {
-    let store = daemon.decided_store().expect("decided store").store();
-    let home = flotilla_engine_store::StoreLog::new(std::sync::Arc::clone(&store)).home().to_owned();
-    let fixture = flotilla_provisioning_testkit::EnvironmentFixture::over(&home, store);
-    daemon.install_lifecycle_reads(std::sync::Arc::clone(&fixture.reads)).expect("install the engine's environments");
-    fixture
-}
+use flotilla_daemon_testkit::engine::{engine, engine_environments};

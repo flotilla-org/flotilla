@@ -184,6 +184,9 @@ struct Carried {
     messages: BTreeMap<(String, String), (flotilla_state_machines::machines::message::MessageRef, flotilla_address::Address)>,
     /// The last admission sequence the imported messages took, by home.
     admitted: BTreeMap<String, u64>,
+    /// Each imported engine Convoy's version as written, by home and engine name: the checkouts
+    /// held for it are created under it.
+    convoys: BTreeMap<(String, String), u64>,
 }
 
 /// One importer: the old kinds it imports, by plural, and its writes.

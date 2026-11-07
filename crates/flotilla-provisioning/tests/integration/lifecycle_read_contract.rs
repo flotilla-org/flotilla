@@ -1,8 +1,8 @@
 use flotilla_protocol::LifecycleReading;
-use flotilla_provisioning_testkit::{CloneFixture, Ending, EnvironmentFixture};
+use flotilla_provisioning_testkit::{CheckoutFixture, CloneFixture, Ending, EnvironmentFixture};
 use flotilla_resources::{
-    clone_records::CloneRecords, environment_records::EnvironmentRecords, CheckoutPhase, CloneSpec, EnvironmentSpec,
-    HostDirectEnvironmentSpec, RepositorySpec,
+    clone_records::CloneRecords, environment_records::EnvironmentRecords, CloneSpec, EnvironmentSpec, HostDirectEnvironmentSpec,
+    RepositorySpec,
 };
 
 // Every own-reconciler shape follows the same engine sequence while old phase remains stale; an
@@ -24,13 +24,7 @@ fn lifecycle_phases_and_endings_override_old_status(tc: hegel::TestCase) {
     tokio::runtime::Runtime::new().expect("runtime").block_on(async {
         match kind {
             0 => assert_clone_lifecycle(ending),
-            1 => {
-                super::checkout_reconciler::assert_checkout_lifecycle(
-                    [CheckoutPhase::Pending, CheckoutPhase::Ready, CheckoutPhase::Failed, CheckoutPhase::Gone][phase % 4],
-                    ending,
-                )
-                .await
-            }
+            1 => assert_checkout_lifecycle(ending),
             2 => assert_environment_lifecycle(ending),
             _ => {
                 super::image_build::assert_image_lifecycle(
@@ -46,6 +40,38 @@ fn lifecycle_phases_and_endings_override_old_status(tc: hegel::TestCase) {
             }
         }
     });
+}
+
+// A Checkout's readers see the engine's sequence through the checkout port (#3108): in progress,
+// retrying after a retryable failure, then the ending; a read of a broken store is an error.
+fn assert_checkout_lifecycle(ending: Ending<'_>) {
+    use flotilla_resources::{checkout_records::CheckoutRecords, CheckoutSpec, CheckoutWorktreeSpec, RepositoryKey};
+    let fixture = CheckoutFixture::default();
+    let spec = CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+        repo_ref: RepositoryKey("github.com/flotilla-org/flotilla".into()),
+        env_ref: "env".into(),
+        r#ref: "feature".into(),
+        base_ref: None,
+        target_path: "/work".into(),
+        clone_ref: "source#1".into(),
+    });
+    let launch = fixture.request("checkout", &spec, None);
+    let reading = || fixture.checkouts.get(&launch, None).expect("read").expect("held").reading;
+    assert_eq!(reading(), LifecycleReading::InProgress);
+    fixture.retry(&launch, "retry");
+    assert!(matches!(reading(), LifecycleReading::Retrying { failures: 1, ref cause, .. } if cause.contains("retry")), "{:?}", reading());
+    fixture.finish(&launch, ending);
+    match ending {
+        Ending::Ready(_) => assert_eq!(reading(), LifecycleReading::Ready { identity: "/work".into() }),
+        Ending::Lost(_) => assert_eq!(reading(), LifecycleReading::Lost { reason: None }),
+        Ending::Released => assert_eq!(reading(), LifecycleReading::Released),
+        Ending::Failed(reason) => assert_eq!(reading(), LifecycleReading::Failed { reason: reason.into() }),
+        Ending::GaveUp(cause) => {
+            assert!(matches!(reading(), LifecycleReading::GaveUp { cause: ref read } if read.contains(cause)), "{:?}", reading())
+        }
+    }
+    fixture.poison();
+    assert!(fixture.checkouts.get(&launch, None).expect_err("read error").contains("poisoned"));
 }
 
 // An Environment's readers see the engine's sequence through the environment port: in progress,

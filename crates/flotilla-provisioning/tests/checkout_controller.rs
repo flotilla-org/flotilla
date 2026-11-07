@@ -12,12 +12,12 @@ use async_trait::async_trait;
 use flotilla_protocol::LifecycleReading;
 use flotilla_provisioning::engine::{checkout_actuator::convoy_holding, checkouts::request_of};
 use flotilla_provisioning::{
+    checkout_runtime::{CheckoutRemoval, CheckoutRemovalOutcome, PreparedCheckout},
     engine::{
         checkout_actuator::{Against, BranchValidation, CheckoutActuator, CheckoutProvider, FreshClone, NamedHolderInputs},
         controller::Controller,
         reads::StoreReads,
     },
-    reconcilers::{CheckoutRemoval, CheckoutRemovalOutcome, PreparedCheckout},
     stored::decided_registry,
 };
 use flotilla_provisioning_testkit::replicate_home;
@@ -60,6 +60,8 @@ struct Asked {
     removal_tries: usize,
     /// Each worktree whose registration protection was restored: its target.
     protected: Vec<String>,
+    /// How many inspections read the branch's ref on its remote.
+    remote_reads: usize,
 }
 
 #[derive(Default)]
@@ -118,9 +120,10 @@ impl CheckoutProvider for RecordingProvider {
         Ok((self.made(request.target), degraded))
     }
 
-    async fn inspect(&self, _: &str, path: &str, _: &CheckoutSpec, _: Against<'_>) -> Result<Inspection, String> {
+    async fn inspect(&self, _: &str, path: &str, _: &CheckoutSpec, against: Against<'_>) -> Result<Inspection, String> {
         let mut asked = self.asked();
         asked.inspected.push(path.into());
+        asked.remote_reads += usize::from(against.remote);
         asked.inspection.clone().ok_or_else(|| "fatal: not a git repository".into())
     }
 
@@ -174,6 +177,8 @@ struct World {
     _directory: tempfile::TempDir,
     provider: Arc<RecordingProvider>,
     validation: Arc<ScriptedValidation>,
+    /// The controller's actuator, which a checkout's inspector shares.
+    actuator: Arc<CheckoutActuator<RecordingProvider>>,
     checkouts: CheckoutFixture,
     clones: CloneFixture,
     commits: Arc<Notify>,
@@ -233,8 +238,9 @@ impl World {
             )
             .with_branch_validation(Arc::clone(&validation) as Arc<dyn BranchValidation>),
         );
-        let controller = Controller::start(Arc::clone(&checkouts.lifecycles), actuator, Arc::new(SystemClock), Arc::clone(&service))
-            .expect("controller");
+        let controller =
+            Controller::start(Arc::clone(&checkouts.lifecycles), Arc::clone(&actuator), Arc::new(SystemClock), Arc::clone(&service))
+                .expect("controller");
         let (backing, receiver) = tokio::sync::mpsc::channel(1);
         let (rechecks, recheck_receiver) = tokio::sync::mpsc::channel(8);
         // The sender is kept by the controller's task: a checkout's backing is never pushed.
@@ -242,7 +248,7 @@ impl World {
             let _backing = backing;
             controller.run_with(receiver, recheck_receiver).await;
         });
-        Self { _directory: directory, provider, validation, checkouts, clones, commits, _listener: listener, rechecks }
+        Self { _directory: directory, provider, validation, actuator, checkouts, clones, commits, _listener: listener, rechecks }
     }
 
     /// Requests the repository's clone in this host's environment, realised or not.
@@ -335,7 +341,7 @@ async fn a_checkout_is_requested_only_under_an_open_convoy() {
     let world = World::start(RecordingProvider::default());
     let clone = world.clone(true);
     let refused = world.checkouts.checkouts.request("feature", &world.worktree(&clone, "feature"), Some(&convoy("c1")));
-    assert!(refused.is_err_and(|error| error.contains("convoy c1 is not held here")));
+    assert!(refused.is_err_and(|error| error.contains(&format!("convoy c1 {}", flotilla_resources::checkout_records::HOLDER_NOT_OPEN))));
     world.checkouts.open_convoy("c1");
     world.checkouts.abandon_convoy("c1", "deleted");
     let refused = world.checkouts.checkouts.request("feature", &world.worktree(&clone, "feature"), Some(&convoy("c1")));
@@ -637,4 +643,63 @@ async fn a_recheck_reprotects_a_present_worktree_and_records_a_vanished_one() {
     world.provider.asked().paths.remove("/work/c/feature");
     world.rechecks.send(launch.clone()).await.expect("recheck");
     world.until("lost", |world| matches!(world.reading(&launch), Some(LifecycleReading::Lost { .. }))).await;
+}
+
+// Behaviour: a gate's inspection of a checkout reads its branch's ref on the remote and is recorded
+// on the checkout's latest launch; a checkout with no realised launch here has nothing to inspect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gate_inspection_is_recorded_on_the_checkouts_latest_launch() {
+    let world = World::start(RecordingProvider {
+        asked: Mutex::new(Asked { inspection: Some(inspection(false, true, false)), ..Asked::default() }),
+    });
+    world.checkouts.open_convoy("c1");
+    let launch = world.ready_worktree("c1", "feature").await;
+    let remote_reads = world.provider.asked().remote_reads;
+    assert_eq!(world.actuator.inspect_for_gate("feature", true).await.expect("inspected"), Some(launch.clone()));
+    assert_eq!(world.provider.asked().remote_reads, remote_reads + 1);
+    let record = world.checkouts.checkouts.get(&launch, None).expect("read").expect("held");
+    assert_eq!(record.integration.map(|integration| integration.inspection.clean), Some(Some(false)));
+    assert_eq!(world.actuator.inspect_for_gate("unknown", true).await.expect("read"), None);
+}
+
+// Behaviour (#3108): a checkout's change wakes the vessels of the convoy it is held for, and no
+// other vessel: a vessel waits for its convoy's checkouts to be ready and reads their paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_checkout_change_wakes_the_vessels_of_its_convoy_only() {
+    use flotilla_provisioning::engine::checkouts::CheckoutVesselWake;
+    use flotilla_resources::{Convoy, ConvoySpec, InputMeta, Vessel, VesselSpec};
+    use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
+
+    let directory = tempfile::tempdir().expect("directory");
+    let service =
+        Arc::new(Service::open(&directory.path().join("decided.sqlite"), HOME, decided_registry().expect("registry")).expect("store"));
+    let checkouts = CheckoutFixture::over(HOME, service.store());
+    let backend = flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    for (convoy, vessel) in [("held", "held-implement"), ("other", "other-implement")] {
+        let meta = |name: &str| InputMeta::builder().name(name.to_owned()).build();
+        backend
+            .clone()
+            .using::<Convoy>("flotilla")
+            .create(&meta(convoy), &ConvoySpec::builder().workflow_ref("wf".into()).build())
+            .await
+            .expect("convoy");
+        let spec = VesselSpec {
+            convoy_ref: convoy.into(),
+            vessel_name: "implement".into(),
+            fulfilment_kind_ref: "kind".into(),
+            adopted_checkout_refs: Default::default(),
+        };
+        backend.clone().using::<Vessel>("flotilla").create(&meta(vessel), &spec).await.expect("vessel");
+    }
+    let (sender, mut woken) = WorkQueueSender::channel();
+    let watch = tokio::spawn(Box::new(CheckoutVesselWake::new(Arc::clone(&service))).spawn(backend, "flotilla".into(), sender));
+    // The wake follows the log from its start: let it start before the checkout changes.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    checkouts.open_convoy("held");
+    checkouts.request("feature", &CheckoutSpec::Worktree(world_worktree("clone-widgets#1", "feature")), Some(&convoy("held")));
+    let first = tokio::time::timeout(Duration::from_secs(5), woken.recv()).await.expect("a vessel is woken");
+    assert_eq!(first.as_deref(), Some("held-implement"));
+    assert!(tokio::time::timeout(Duration::from_millis(200), woken.recv()).await.is_err(), "the other convoy's vessel is not woken");
+    watch.abort();
 }

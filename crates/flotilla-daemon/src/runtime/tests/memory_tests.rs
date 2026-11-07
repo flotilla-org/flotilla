@@ -1,4 +1,5 @@
 use super::*;
+use crate::testkits::engine::runtime_checkouts;
 use flotilla_provisioning::engine::controller::{Backing, BackingEvent};
 
 // Process boundary only: the actual Docker provider decodes the real incident
@@ -91,33 +92,21 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
         .await
         .expect("admitted convoy");
     let repo = RepositoryKey("test-repository".into());
-    let checkouts = backend.using::<ResourceCheckout>(NAMESPACE);
-    checkouts
-        .create(
-            &empty_meta("recoverable-work"),
-            &ResourceCheckoutSpec::Observed(
-                ResourceObservedCheckoutSpec::builder()
-                    .r#ref("fix/retained-work".into())
-                    .path("/hulls/work/flotilla".into())
-                    .repo_ref(repo.clone())
-                    .host_ref("host".into())
-                    .is_main(false)
-                    .build(),
-            ),
-        )
-        .await
-        .expect("checkout");
-    flotilla_store::apply_status_patch(
-        &checkouts,
+    // The work's adopted checkout, ready on the engine.
+    let checkouts = runtime_checkouts(&daemon);
+    checkouts.put_ready(
         "recoverable-work",
-        &flotilla_resources::CheckoutStatusPatch::MarkReady {
-            path: "/hulls/work/flotilla".into(),
-            commit: None,
-            branch_provenance: Default::default(),
-        },
-    )
-    .await
-    .expect("checkout ready");
+        &ResourceCheckoutSpec::Observed(
+            ResourceObservedCheckoutSpec::builder()
+                .r#ref("fix/retained-work".into())
+                .path("/hulls/work/flotilla".into())
+                .repo_ref(repo.clone())
+                .host_ref("host".into())
+                .is_main(false)
+                .build(),
+        ),
+        None,
+    );
     let vessels = backend.using::<Vessel>(NAMESPACE);
     let vessel = vessels
         .create(
@@ -216,7 +205,9 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
     let frozen = vessel_reconciler.reconcile(&lost, &prepared, chrono::Utc::now());
     assert!(frozen.patch.is_none() && frozen.actuations.is_empty(), "lost backing must not reprovision");
     let convoys = backend.using::<Convoy>(NAMESPACE);
-    let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE)).with_vessels(vessels.clone());
+    let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE))
+        .with_vessels(vessels.clone())
+        .with_lifecycle_reads(daemon.lifecycle_reads());
     let convoy = convoys.get("memory-incident").await.expect("convoy");
     let prepared = convoy_reconciler.prepare(&convoy).await.expect("prepare convoy");
     let outcome = convoy_reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
@@ -258,7 +249,7 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
         panic!("expected explanation, got {result:?}");
     };
     assert_eq!(explanation.environment_observations["work"], observation);
-    assert!(checkouts.get("recoverable-work").await.is_ok(), "failure must retain work");
+    assert!(!checkouts.record("recoverable-work").ended(), "failure must retain work");
 }
 
 // A failed observation has no separate liveness authority: Unknown preserves

@@ -72,12 +72,10 @@ pub trait EngineMessages: Send + Sync {
 /// when `[primitives]` is on.
 pub type MessagePath = std::sync::Arc<std::sync::OnceLock<std::sync::Arc<dyn EngineMessages>>>;
 
-/// Fresh inspection requested by an explicit convoy deletion before its stored-evidence gate.
+/// Fresh inspection requested by an explicit convoy deletion before its gate reads the evidence
+/// (#3108): the checkout's home inspects it and records the inspection on its launch; this
+/// returns once the request is answered.
 #[async_trait]
 pub trait CheckoutIntegrationInspector: Send + Sync {
-    async fn inspect(
-        &self,
-        convoy: &flotilla_resources::ResourceObject<flotilla_resources::Convoy>,
-        checkout: &flotilla_resources::ResourceObject<flotilla_resources::Checkout>,
-    ) -> Result<flotilla_resources::CheckoutIntegrationStatus, String>;
+    async fn inspect_now(&self, namespace: &str, checkout: &flotilla_resources::checkout_records::CheckoutRecord) -> Result<(), String>;
 }

@@ -89,7 +89,8 @@ pub fn open(state_dir: &Path, identity: EngineIdentity) -> Result<ComposedEngine
         service,
         records,
         observations: observations.clone(),
-        observation_failures: observations,
+        observation_failures: observations.clone(),
+        change_request_branches: observations,
         accounts,
         manifest_roots,
     })

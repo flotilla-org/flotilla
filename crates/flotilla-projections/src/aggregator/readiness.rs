@@ -4,7 +4,8 @@ use flotilla_protocol::{
     result_set::{Readiness, ReadinessBlocker, ReadinessState},
     LifecycleReading,
 };
-use flotilla_resources::{CheckoutPhase, CrewWorkPhase, CrewWorkState, VesselPhase};
+use flotilla_resources::checkout_records::{CheckoutChange, CheckoutRecord};
+use flotilla_resources::{CrewWorkPhase, CrewWorkState, VesselPhase};
 
 use super::*;
 use crate::ports::ProvisioningKind;
@@ -17,6 +18,7 @@ impl Aggregator {
         work: Option<&WorkState>,
         crew: Option<&BTreeMap<String, CrewWorkState>>,
         host: &HostName,
+        checkouts: &HeldCheckouts,
     ) -> (Readiness, Option<String>) {
         let phase = work.map(|work| work.phase).unwrap_or(ResourceWorkPhase::Pending);
         if phase.is_terminal() {
@@ -95,59 +97,48 @@ impl Aggregator {
                 let loss_reason = result.blockers.last().expect("lost vessel blocker").reason.clone();
                 return (result, Some(loss_reason));
             }
-            // Engine-backed vessels use adopted refs and convoy membership; stale status-only refs are not dependencies.
+            // The vessel's checkouts: those it records and adopts, and the ones the engine holds for
+            // the convoy at the vessel's home, provisioning before the ready vessel records them.
+            let held = match checkouts {
+                Ok(held) => held,
+                Err(error) => {
+                    result.state = result.state.max(ReadinessState::Blocked);
+                    result.blockers.push(ReadinessBlocker {
+                        resource: convoy.subresource(format!("vessels/{}/checkouts", definition.name)),
+                        phase: "Unknown".into(),
+                        reason: error.clone(),
+                    });
+                    return (result, None);
+                }
+            };
+            let vessel_home = engine_origin(&vessel.provenance);
+            let at_vessel_home = |checkout: &CheckoutRecord| match &vessel_home {
+                Some(home) => checkout.home == *home,
+                None => !self.known_origins.contains(&flotilla_protocol::NodeId::new(checkout.home.clone())),
+            };
             let mut checkout_refs =
                 status.map(|status| status.checkout_refs.values().cloned().collect::<BTreeSet<_>>()).unwrap_or_default();
             checkout_refs.extend(vessel.object.spec.adopted_checkout_refs.values().cloned());
-            // Provisioning checkouts belong to the convoy before the ready
-            // vessel records their refs. Host-scoped membership avoids joining
-            // a same-named replica or another convoy's checkout.
-            checkout_refs.extend(
-                self.convoy_checkouts(&convoy.namespace, &convoy.name)
-                    .filter(|source| {
-                        source.object.metadata.namespace == convoy.namespace
-                            && source.object.metadata.labels.get(CONVOY_LABEL) == Some(&convoy.name)
-                            && self.read_host(&source.provenance).as_ref() == Some(host)
-                    })
-                    .map(|source| source.object.metadata.name.clone()),
-            );
+            checkout_refs
+                .extend(held.values().filter(|checkout| at_vessel_home(checkout)).map(|checkout| checkout.checkout_name().to_owned()));
             for name in &checkout_refs {
-                let source = self.named_checkouts(&convoy.namespace, name).find(|source| {
-                    source.object.metadata.namespace == convoy.namespace
-                        && source.object.metadata.name == *name
-                        && self.read_host(&source.provenance).as_ref() == Some(host)
-                });
-                let Some(source) = source else {
+                let checkout_ref = || {
+                    ResourceRef::new(api_version(Checkout::API_PATHS), Checkout::API_PATHS.kind, &convoy.namespace, name)
+                        .on_host(host.clone())
+                };
+                let Some(checkout) = held.get(name).filter(|checkout| at_vessel_home(checkout)) else {
                     result.state = result.state.max(ReadinessState::Provisioning);
                     result.blockers.push(ReadinessBlocker {
-                        resource: ResourceRef::new(api_version(Checkout::API_PATHS), Checkout::API_PATHS.kind, &convoy.namespace, name)
-                            .on_host(host.clone()),
+                        resource: checkout_ref(),
                         phase: "Unknown".into(),
                         reason: "waiting for checkout evidence".into(),
                     });
                     continue;
                 };
-                // Behind `[primitives]` the engine's reading of the checkout decides (#3629 layer 4).
-                let origin = engine_origin(&source.provenance);
-                let engine = match self.lifecycle_reads.try_reading(ProvisioningKind::Checkout, name, origin.as_deref()) {
-                    Ok(reading) => reading,
-                    Err(error) => {
-                        result.state = result.state.max(ReadinessState::Blocked);
-                        result.blockers.push(ReadinessBlocker {
-                            resource: ResourceRef::new(api_version(Checkout::API_PATHS), Checkout::API_PATHS.kind, &convoy.namespace, name)
-                                .on_host(host.clone()),
-                            phase: "Unknown".into(),
-                            reason: error,
-                        });
-                        continue;
-                    }
-                };
-                let status = source.object.status.as_ref();
-                let phase = status.map(|status| status.phase).unwrap_or_default();
-                if engine.as_ref().map_or(phase == CheckoutPhase::Ready, |reading| matches!(reading, LifecycleReading::Ready { .. })) {
+                let Some((state, phase, reason)) = reading_blocker(&checkout.reading, "checkout is not ready") else {
                     continue;
-                }
-                if let CheckoutSpec::Worktree(spec) = &source.object.spec {
+                };
+                if let CheckoutSpec::Worktree(spec) = &checkout.spec {
                     // The clone launch the checkout was made from, at the checkout's home (#3108).
                     let clone_ref = || {
                         ResourceRef::new(
@@ -158,7 +149,7 @@ impl Aggregator {
                         )
                         .on_host(host.clone())
                     };
-                    match self.lifecycle_reads.clones().and_then(|clones| clones.get(&spec.clone_ref, origin.as_deref())) {
+                    match self.lifecycle_reads.clones().and_then(|clones| clones.get(&spec.clone_ref, Some(&checkout.home))) {
                         Ok(Some(clone)) => {
                             if let Some((state, phase, reason)) = reading_blocker(&clone.reading, "clone is not ready") {
                                 result.state = result.state.max(state);
@@ -173,21 +164,8 @@ impl Aggregator {
                         }
                     }
                 }
-                let (state, phase, reason) = match engine.as_ref().and_then(|reading| reading_blocker(reading, "checkout is not ready")) {
-                    Some(blocker) => blocker,
-                    None => (
-                        if phase == CheckoutPhase::Failed { ReadinessState::Failed } else { ReadinessState::Provisioning },
-                        format!("{phase:?}"),
-                        status.and_then(|status| status.message.clone()).unwrap_or_else(|| "checkout is not ready".into()),
-                    ),
-                };
                 result.state = result.state.max(state);
-                result.blockers.push(ReadinessBlocker {
-                    resource: ResourceRef::new(api_version(Checkout::API_PATHS), Checkout::API_PATHS.kind, &convoy.namespace, name)
-                        .on_host(host.clone()),
-                    phase,
-                    reason,
-                });
+                result.blockers.push(ReadinessBlocker { resource: checkout_ref(), phase, reason });
             }
         }
         for role in definition
@@ -250,6 +228,24 @@ pub(super) fn apply_readiness_event<T: Resource>(
 
 /// The engine home of a resource read from `provenance`: a replica's origin root, or `None` for
 /// this home.
+/// The checkouts the engine holds for one convoy, by checkout name, or why they could not be read.
+pub(super) type HeldCheckouts = Result<BTreeMap<String, CheckoutRecord>, String>;
+
+/// Waits for the engine's next checkout commit: true when the checkouts changed (or changes were
+/// missed), false once the changes end; never returns where none are followed.
+pub(super) async fn next_checkout_change(changes: &mut Option<tokio::sync::broadcast::Receiver<CheckoutChange>>) -> bool {
+    let Some(receiver) = changes.as_mut() else {
+        return std::future::pending().await;
+    };
+    match receiver.recv().await {
+        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
+        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+            *changes = None;
+            false
+        }
+    }
+}
+
 pub(super) fn engine_origin(provenance: &ResourceProvenance) -> Option<String> {
     match provenance {
         ResourceProvenance::Local => None,

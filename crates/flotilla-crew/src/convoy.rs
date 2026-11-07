@@ -38,8 +38,6 @@ pub struct ConvoyReconciler {
     vessels: Option<TypedResolver<Vessel>>,
     federated_vessels: Option<ReplicaReadResolver<Vessel>>,
     terminal_sessions: Option<TypedResolver<TerminalSession>>,
-    checkouts: Option<TypedResolver<Checkout>>,
-    federated_checkouts: Option<ReplicaReadResolver<Checkout>>,
     artifacts: Option<ReplicaReadResolver<Artifact>>,
     change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
     forges: Option<DefinitionResolver<Forge>>,
@@ -63,7 +61,8 @@ pub struct ConvoyPrepared {
     template: Option<ResourceObject<WorkflowTemplate>>,
     vessels: BTreeMap<String, ResourceObject<Vessel>>,
     terminal_sessions: Vec<ResourceObject<TerminalSession>>,
-    checkouts: BTreeMap<String, ResourceObject<Checkout>>,
+    /// The checkouts held for the convoy, each its latest launch, by checkout name.
+    checkouts: BTreeMap<String, flotilla_resources::checkout_records::CheckoutRecord>,
     observed_subjects: Vec<Subject>,
     promise_patch: Option<ConvoyStatusPatch>,
     exit_disposition: Option<String>,
@@ -90,8 +89,6 @@ impl ConvoyReconciler {
             vessels: None,
             federated_vessels: None,
             terminal_sessions: None,
-            checkouts: None,
-            federated_checkouts: None,
             artifacts: None,
             change_requests: None,
             forges: None,
@@ -215,16 +212,6 @@ impl ConvoyReconciler {
         self
     }
 
-    pub fn with_checkouts(mut self, checkouts: TypedResolver<Checkout>) -> Self {
-        self.checkouts = Some(checkouts);
-        self
-    }
-
-    pub fn with_federated_checkouts(mut self, checkouts: ReplicaReadResolver<Checkout>) -> Self {
-        self.federated_checkouts = Some(checkouts);
-        self
-    }
-
     pub fn with_change_requests(mut self, change_requests: ReplicaReadResolver<ChangeRequest>, stale_after: std::time::Duration) -> Self {
         self.change_requests = Some(change_requests);
         self.change_request_stale_after = stale_after;
@@ -260,7 +247,6 @@ impl ConvoyReconciler {
         vec![
             Box::new(LabelMappedWatch::<Vessel, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
             Box::new(LabelMappedWatch::<TerminalSession, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
-            Box::new(LabelMappedWatch::<Checkout, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
         ]
     }
 
@@ -275,11 +261,6 @@ impl ConvoyReconciler {
                 _marker: PhantomData,
             }),
             Box::new(LabelMappedWatch::<TerminalSession, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
-            Box::new(ReplicaLabelMappedWatch::<Checkout, Convoy> {
-                label_key: CONVOY_LABEL,
-                resolver: backend.including_replicas::<Checkout>(namespace),
-                _marker: PhantomData,
-            }),
             Box::new(EvidenceWake {
                 evidence: backend.including_replicas::<ChangeRequest>(namespace),
                 convoys: backend.including_replicas::<Convoy>(namespace),
@@ -344,13 +325,6 @@ impl<W: Resource> SecondaryWatch for EvidenceWake<W> {
     }
 }
 
-async fn federated_children<T: Resource + std::clone::Clone>(
-    resolver: &ReplicaReadResolver<T>,
-    convoy: &ResourceObject<Convoy>,
-) -> Result<BTreeMap<String, ResourceObject<T>>, ResourceError> {
-    Ok(select_convoy_children(convoy, &resolver.list().await?.items))
-}
-
 /// Wakes the convoy reconciler for each convoy whose engine record changed
 /// (#3587 layer 8): with the engine deciding, an engine edge writes no old
 /// record, so the reconciler's own watch would not see it.
@@ -402,6 +376,22 @@ impl SecondaryWatch for EngineConvoyWake {
 }
 
 impl ConvoyReconciler {
+    /// The checkouts held for `obj`'s engine Convoy, at any home, each its latest launch.
+    async fn held_checkouts(
+        &self,
+        obj: &ResourceObject<Convoy>,
+    ) -> Result<BTreeMap<String, flotilla_resources::checkout_records::CheckoutRecord>, ResourceError> {
+        let holder = flotilla_resources::checkout_records::CheckoutHolder::Convoy(
+            flotilla_resources::convoy::engine::engine_name(obj).map_err(ResourceError::other)?,
+        );
+        let reads = Arc::clone(&self.lifecycle_reads);
+        let held = tokio::task::spawn_blocking(move || reads.checkouts()?.held(&holder))
+            .await
+            .map_err(|error| ResourceError::other(format!("read held checkouts: {error}")))?
+            .map_err(ResourceError::other)?;
+        Ok(flotilla_resources::checkout_records::latest_launches(held))
+    }
+
     /// Admits a freshly bootstrapped convoy on the engine when the switch is
     /// on; returns the engine's refusal, if it refused. A convoy the engine
     /// skips stays on the old path.
@@ -425,12 +415,36 @@ impl ConvoyReconciler {
     }
 }
 
+impl ConvoyReconciler {
+    /// Ends a convoy that failed, or was abandoned without the engine hearing of it, as abandoned
+    /// on the engine (#3108): an engine convoy is Delivered or Abandoned, and what it holds (its
+    /// checkouts) is released once it has ended. Abandoning an ended engine convoy changes
+    /// nothing.
+    async fn abandon_failed_on_engine(&self, obj: &ResourceObject<Convoy>) {
+        let Some(engine) = self.engine.get() else { return };
+        let Some(status) = obj.status.as_ref().filter(|status| matches!(status.phase, ConvoyPhase::Failed | ConvoyPhase::Abandoned)) else {
+            return;
+        };
+        if !engine.holds(obj) {
+            return;
+        }
+        let reason = status.message.clone().unwrap_or_else(|| format!("the convoy ended {:?}", status.phase));
+        if let Err(error) = engine.abandon(obj, FAILED_CONVOY_PRINCIPAL, &reason).await {
+            tracing::warn!(convoy = %obj.metadata.name, %error, "the engine did not abandon the ended convoy; retrying on the next pass");
+        }
+    }
+}
+
+/// The principal a convoy that failed is abandoned on the engine by: the convoy's controller.
+const FAILED_CONVOY_PRINCIPAL: &str = "convoy-controller";
+
 impl Reconciler for ConvoyReconciler {
     type Resource = Convoy;
     type Prepared = ConvoyPrepared;
 
     async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         let engine_refusal = self.admit_on_engine(obj).await;
+        self.abandon_failed_on_engine(obj).await;
         // With the engine holding the convoy, every promise read below is the engine's.
         let engine = deciding(&self.engine, obj);
         let viewed = match engine {
@@ -555,18 +569,10 @@ impl Reconciler for ConvoyReconciler {
         };
         let vessels = select_convoy_children(obj, &flotilla_store::read_vessel_sources(Arc::clone(&self.lifecycle_reads), vessels).await?);
 
-        let checkouts = match (&self.federated_checkouts, &self.checkouts) {
-            (Some(checkouts), _) if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() => {
-                federated_children(checkouts, obj).await?
-            }
-            (None, Some(checkouts)) if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() => checkouts
-                .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), obj.metadata.name.clone())]))
-                .await?
-                .items
-                .into_iter()
-                .map(|checkout| (checkout.metadata.name.clone(), checkout))
-                .collect(),
-            _ => BTreeMap::new(),
+        let checkouts = if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() {
+            self.held_checkouts(obj).await?
+        } else {
+            BTreeMap::new()
         };
         let terminal_sessions = match &self.terminal_sessions {
             Some(sessions) if obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) => {
@@ -578,9 +584,13 @@ impl Reconciler for ConvoyReconciler {
             Some(forges) => forges.list().await?.into_iter().map(|forge| forge.spec).collect::<Vec<_>>(),
             None => Vec::new(),
         };
-        let observed_subjects = observed_change_request_subjects(obj, &checkouts, &forges).map_err(ResourceError::other)?;
         let is_landing = obj.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landing);
+        // A checkout's inspection names the change request its branch is associated with; what
+        // that request came to is the forge observation's.
+        let names_change_request =
+            checkouts.values().any(|checkout| checkout.inspection().is_some_and(|inspection| inspection.change_request.is_some()));
         let needs_pr = is_landing
+            || names_change_request
             || obj.status.as_ref().is_some_and(|status| {
                 flotilla_resources::convoy::promises::needs_observation(status, flotilla_resources::convoy::promises::PromiseKind::Pr)
             });
@@ -603,6 +613,11 @@ impl Reconciler for ConvoyReconciler {
             }
             _ => BTreeMap::new(),
         };
+        let state_of = |subject: &Subject| {
+            let address = flotilla_resources::address::subject_address(subject, &forges).ok()?;
+            change_requests.get(&record_name(&address)?)?.status.as_ref()?.state.value
+        };
+        let observed_subjects = observed_change_request_subjects(obj, &checkouts, &forges, &state_of).map_err(ResourceError::other)?;
         let artifacts = match &self.artifacts {
             Some(artifacts) if needs_ledger => {
                 artifacts.list().await?.items.into_iter().map(|item| (item.object.metadata.name.clone(), item.object)).collect()
@@ -938,21 +953,22 @@ impl Reconciler for ConvoyReconciler {
         if let Some(terminal_sessions) = &self.terminal_sessions {
             delete_lifecycle_owned_matching(terminal_sessions, &selector).await?;
         }
-        if let Some(checkouts) = &self.checkouts {
-            delete_lifecycle_owned_matching(checkouts, &selector).await?;
-        }
-        if let Some(checkouts) = &self.federated_checkouts {
-            let remaining = federated_children(checkouts, obj)
+        // A finite convoy's checkouts are held for it alone: the Checkout controller releases them
+        // once its engine Convoy has ended, and the convoy waits for that. A standing convoy's
+        // generations share their holder, which outlives this generation.
+        if !is_ensured(obj) {
+            let remaining = self
+                .held_checkouts(obj)
                 .await?
                 .into_values()
-                .filter(|checkout| checkout.metadata.lifecycle_authority() == Ok(Some(LifecycleAuthority::Managed)))
+                .filter(|checkout| !checkout.ended() && !matches!(checkout.spec, CheckoutSpec::Observed(_)))
                 .map(|checkout| FinalizerWaitReason::CheckoutAuthority {
-                    checkout: checkout.metadata.name,
-                    message: checkout
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.message.clone())
-                        .filter(|message| checkout.metadata.deletion_timestamp.is_some() || message.contains(" preserved: ")),
+                    message: match &checkout.reading {
+                        flotilla_protocol::LifecycleReading::Retrying { cause, .. }
+                        | flotilla_protocol::LifecycleReading::Exhausted { cause } => Some(cause.clone()),
+                        _ => None,
+                    },
+                    checkout: checkout.checkout_name().to_owned(),
                 })
                 .collect::<Vec<_>>();
             if !remaining.is_empty() {

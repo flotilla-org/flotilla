@@ -99,6 +99,22 @@ impl CheckoutFixture {
         Self { home: home.to_owned(), store, lifecycles, checkouts, reads, staged, inputs, convoys }
     }
 
+    /// The same fixture whose [`Self::reads`] serve `environments` and `clones` too, as a daemon's
+    /// readings do.
+    pub fn serving(
+        mut self,
+        environments: Arc<dyn flotilla_resources::environment_records::EnvironmentRecords>,
+        clones: Arc<dyn flotilla_resources::clone_records::CloneRecords>,
+    ) -> Self {
+        self.reads = Arc::new(
+            LifecycleReadPort::new(StoreReads::new(Arc::clone(&self.store)), self.home.clone())
+                .with_environments(environments)
+                .with_clones(clones)
+                .with_checkouts(Arc::clone(&self.checkouts) as Arc<dyn CheckoutRecords>),
+        );
+        self
+    }
+
     /// Admits engine Convoy `name` here, open, its one obligation the lead's lifetime duty: what a
     /// checkout held for it is requested under.
     pub fn open_convoy(&self, name: &str) {
@@ -122,7 +138,14 @@ impl CheckoutFixture {
         self.convoys.lock().expect("convoys").create(name, request, &convoy_world(), Self::now()).expect("convoy admitted");
     }
 
-    /// Ends engine Convoy `name` as delivered: its lead's duty retired, nothing holds it open.
+    /// Admits engine Convoy `name` here unless it is held already, as admission does once for a
+    /// convoy whose vessels follow.
+    pub fn ensure_convoy(&self, name: &str) {
+        if self.convoys.lock().expect("convoys").get(name).is_none() {
+            self.open_convoy(name);
+        }
+    }
+
     /// Rolls engine Convoy `name` over to its next generation: its lead's duty is standing.
     pub fn rollover_convoy(&self, name: &str) {
         let rollover = Rollover { by: lead(), authority: Ref::new(AUTHORITY) };
@@ -146,6 +169,7 @@ impl CheckoutFixture {
         (Identity { kind: code, name: loaded.name, home: loaded.home }, loaded.version)
     }
 
+    /// Ends engine Convoy `name` as delivered: its lead's duty retired, nothing holds it open.
     pub fn deliver_convoy(&self, name: &str) {
         let mut convoys = self.convoys.lock().expect("convoys");
         let retire = RetireDuty { duty: DUTY, by: lead(), authority: Ref::new(AUTHORITY) };
@@ -210,6 +234,16 @@ impl CheckoutFixture {
                 self.step(launch, Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Refused, cause), retryable: false }))
             }
         }
+    }
+
+    /// One retryable failed try of `launch`.
+    pub fn retry(&self, launch: &str, cause: &str) {
+        self.step(launch, Step::Attempted(Outcome::Failed { cause: Cause::new(CauseCategory::Transient, cause), retryable: true }));
+    }
+
+    /// Poisons the store's lock, so every read through it fails.
+    pub fn poison(&self) {
+        flotilla_store_testkit::poison_mutex(Arc::clone(&self.store));
     }
 
     fn step(&self, launch: &str, step: Step) {

@@ -97,6 +97,8 @@ async fn memory_scenario(n: usize) -> Vec<(usize, usize, usize, usize)> {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // Composed with its engine, as the runtime composes a daemon.
+    flotilla_daemon_testkit::engine::engine(&daemon);
     eprintln!("N={n} owner=daemon live={}", counters().0);
     let mut bootstrap_events = daemon.subscribe();
     let state = daemon.aggregator_projection_state().await;

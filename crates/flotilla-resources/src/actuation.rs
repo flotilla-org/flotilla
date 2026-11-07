@@ -1,8 +1,7 @@
-use crate::{CheckoutSpec, InputMeta, TerminalSessionSpec, VesselSpec};
+use crate::{InputMeta, TerminalSessionSpec, VesselSpec};
 #[derive(Debug, Clone)]
 pub enum Actuation {
     CreateRepository { key: crate::RepositoryKey, spec: crate::RepositorySpec },
-    CreateCheckout { meta: InputMeta, spec: CheckoutSpec },
     // Boxed: the spec dwarfs every other variant.
     CreateTerminalSession { meta: InputMeta, spec: Box<TerminalSessionSpec> },
     RaiseAttention { attention: crate::attentions::Attention },
@@ -12,5 +11,4 @@ pub enum Actuation {
     DeleteTerminalSession { name: String },
     CreateVessel { meta: InputMeta, spec: VesselSpec },
     DeleteVessel { name: String },
-    DeleteCheckout { name: String },
 }

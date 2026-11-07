@@ -31,7 +31,6 @@ pub mod access_delivery_import;
 pub mod account;
 pub mod artifact_import;
 pub mod artifacts;
-pub mod checkout;
 pub mod checkout_actuator;
 pub mod checkouts;
 pub mod clone_actuator;
@@ -83,7 +82,7 @@ use flotilla_state_machines::{
 use flotilla_store::controller::{ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler};
 
 use crate::stored::{
-    checkout::CheckoutKind,
+    checkout::{CheckoutFacts, CheckoutKind},
     clone::{CloneFacts, CloneKind},
     environment::EnvironmentKind,
     image_build::ImageBuildKind,
@@ -101,6 +100,10 @@ pub struct ProvisioningLifecycles {
     /// The facts the Clone controller stages for each launch's Realise edge.
     pub clone_facts: launch_log::StagedFacts<CloneFacts>,
     pub checkouts: Arc<dyn Lifecycles<CheckoutKind>>,
+    /// The facts the Checkout controller stages for each launch's Realise edge.
+    pub checkout_facts: launch_log::StagedFacts<CheckoutFacts>,
+    /// The checkout port every checkout reader and requester goes through.
+    pub checkout_records: Arc<checkouts::EngineCheckouts>,
     /// TerminalSession, each launch a resource (layer 7).
     pub terminal_sessions: Arc<dyn Lifecycles<TerminalSessionKind>>,
     /// Vessel, its lease placed on its pinned host (layer 7, Q6).

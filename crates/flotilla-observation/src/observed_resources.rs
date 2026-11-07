@@ -4,135 +4,81 @@ use std::{
 };
 
 use flotilla_protocol::{qualified_path::QualifiedPath, ProviderData};
+use flotilla_resources::checkout_records::{latest_launches, CheckoutRecord};
 use flotilla_resources::{
-    Checkout as ResourceCheckout, CheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus, InputMeta, LifecycleAuthority,
-    ObservedCheckoutSpec, RepositoryKey, ResourceError, ResourceObject, AUTHORITY_LABEL, REPO_KEY_LABEL, REPO_LABEL,
+    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, RepositoryKey,
+    ResourceError, ResourceObject, AUTHORITY_LABEL, REPO_KEY_LABEL, REPO_LABEL,
 };
 use flotilla_store::ResourceBackend;
 use sha2::{Digest, Sha256};
 
-/// Rebuild the query-facing adopted Checkout projection from the durable
-/// controller-facing resources.
-///
-/// Durable resources are authoritative. A missing durable status means the
-/// create was interrupted between its spec and status writes; an adopted
-/// observed Checkout requires no actuation, so its Ready status can be derived
-/// from the path already recorded in its spec.
-pub async fn reconcile_adopted_checkouts(
-    durable_backend: &ResourceBackend,
+/// Rebuild the query-facing projection of the adopted checkouts from the engine's (#3108): each
+/// adopted checkout held here whose latest launch has not ended is published into the ephemeral
+/// observed store, and every adopted projection of another name is removed. Callers serialize this
+/// with the observed-checkout refresh.
+pub async fn project_adopted_checkouts(
+    held_here: Vec<CheckoutRecord>,
     observed_backend: &ResourceBackend,
     namespace: &str,
 ) -> Result<(), ResourceError> {
     let selector = BTreeMap::from([(AUTHORITY_LABEL.to_string(), LifecycleAuthority::Adopted.as_label_value().to_string())]);
-    let durable_checkouts = durable_backend.clone().using::<ResourceCheckout>(namespace);
     let observed_checkouts = observed_backend.clone().using::<ResourceCheckout>(namespace);
+    let adopted = latest_launches(held_here)
+        .into_values()
+        .filter(|record| matches!(record.spec, ResourceCheckoutSpec::Observed(_)) && !record.ended())
+        .map(|record| {
+            let mut view = record.read_view();
+            view.metadata.namespace = namespace.to_owned();
+            (view.metadata.name.clone(), view)
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut failures = Vec::new();
-
-    for checkout in durable_checkouts.list_matching_labels(&selector).await?.items {
-        let name = checkout.metadata.name.clone();
-        let result = async {
-            let checkout = ensure_adopted_checkout_status(&durable_checkouts, checkout).await?;
-            project_adopted_checkout_with(&observed_checkouts, &checkout).await
-        }
-        .await;
-        if let Err(error) = result {
+    for (name, view) in &adopted {
+        if let Err(error) = project_adopted_checkout_with(&observed_checkouts, view).await {
             failures.push(format!("{name}: {error}"));
         }
     }
-
-    if let Err(error) = delete_stale_adopted_checkouts(durable_backend, observed_backend, namespace).await {
-        failures.push(error.to_string());
-    }
-
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(ResourceError::other(format!("failed to reconcile adopted checkouts: {}", failures.join("; "))))
-    }
-}
-
-/// Remove adopted projections whose durable adopted source no longer exists.
-/// Callers serialize this with adoption and projection so a stale reconcile
-/// cannot republish a checkout after its deletion.
-pub async fn delete_stale_adopted_checkouts(
-    durable_backend: &ResourceBackend,
-    observed_backend: &ResourceBackend,
-    namespace: &str,
-) -> Result<(), ResourceError> {
-    let selector = BTreeMap::from([(AUTHORITY_LABEL.to_string(), LifecycleAuthority::Adopted.as_label_value().to_string())]);
-    let durable_checkouts = durable_backend.clone().using::<ResourceCheckout>(namespace);
-    let observed_checkouts = observed_backend.clone().using::<ResourceCheckout>(namespace);
-    let mut failures = Vec::new();
     for checkout in observed_checkouts.list_matching_labels(&selector).await?.items {
         let name = &checkout.metadata.name;
-        let result = async {
-            match durable_checkouts.get(name).await {
-                Ok(source) if source.metadata.lifecycle_authority()? == Some(LifecycleAuthority::Adopted) => return Ok(()),
-                Ok(_) | Err(ResourceError::NotFound { .. }) => {}
-                Err(error) => return Err(error),
-            }
-            match observed_checkouts.delete(name).await {
-                Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
-                Err(error) => Err(error),
-            }
+        if adopted.contains_key(name) {
+            continue;
         }
-        .await;
-        if let Err(error) = result {
-            failures.push(format!("{name}: {error}"));
+        match observed_checkouts.delete(name).await {
+            Ok(()) | Err(ResourceError::NotFound { .. }) => {}
+            Err(error) => failures.push(format!("{name}: {error}")),
         }
     }
     if failures.is_empty() {
         Ok(())
     } else {
-        Err(ResourceError::other(format!("failed to delete stale adopted checkouts: {}", failures.join("; "))))
+        Err(ResourceError::other(format!("failed to project adopted checkouts: {}", failures.join("; "))))
     }
-}
-
-/// Publish one durable adopted Checkout into the ephemeral observed store.
-pub async fn project_adopted_checkout(
-    observed_backend: &ResourceBackend,
-    namespace: &str,
-    durable: &ResourceObject<ResourceCheckout>,
-) -> Result<(), ResourceError> {
-    project_adopted_checkout_with(&observed_backend.clone().using::<ResourceCheckout>(namespace), durable).await
-}
-
-async fn ensure_adopted_checkout_status(
-    checkouts: &flotilla_store::TypedResolver<ResourceCheckout>,
-    checkout: ResourceObject<ResourceCheckout>,
-) -> Result<ResourceObject<ResourceCheckout>, ResourceError> {
-    if checkout.status.is_some() {
-        return Ok(checkout);
-    }
-    let ResourceCheckoutSpec::Observed(spec) = &checkout.spec else {
-        return Err(ResourceError::invalid(format!("adopted checkout {} must use an observed checkout spec", checkout.metadata.name)));
-    };
-    let status = CheckoutStatus::builder().phase(CheckoutPhase::Ready).path(spec.path.clone()).build();
-    checkouts.update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &status).await
 }
 
 async fn project_adopted_checkout_with(
     checkouts: &flotilla_store::TypedResolver<ResourceCheckout>,
-    durable: &ResourceObject<ResourceCheckout>,
+    adopted: &ResourceObject<ResourceCheckout>,
 ) -> Result<(), ResourceError> {
-    let meta = InputMeta::from(&durable.metadata);
-    let projected = match checkouts.create(&meta, &durable.spec).await {
+    let meta = InputMeta::from(&adopted.metadata);
+    let projected = match checkouts.create(&meta, &adopted.spec).await {
         Ok(created) => created,
         Err(ResourceError::Conflict { .. }) => {
-            let existing = checkouts.get(&durable.metadata.name).await?;
+            let existing = checkouts.get(&adopted.metadata.name).await?;
             if existing.metadata.lifecycle_authority()? != Some(LifecycleAuthority::Adopted) {
                 return Err(ResourceError::invalid(format!(
                     "checkout {} already exists in the observed store but is not adopted",
-                    durable.metadata.name
+                    adopted.metadata.name
                 )));
             }
-            checkouts.update(&meta, &existing.metadata.resource_version, &durable.spec).await?
+            if existing.spec == adopted.spec && existing.metadata.labels == meta.labels && existing.status == adopted.status {
+                return Ok(());
+            }
+            checkouts.update(&meta, &existing.metadata.resource_version, &adopted.spec).await?
         }
         Err(error) => return Err(error),
     };
-
-    if let Some(status) = &durable.status {
-        checkouts.update_status(&durable.metadata.name, &projected.metadata.resource_version, status).await?;
+    if let Some(status) = &adopted.status {
+        checkouts.update_status(&adopted.metadata.name, &projected.metadata.resource_version, status).await?;
     }
     Ok(())
 }
@@ -317,10 +263,11 @@ mod tests {
         assert!(matches!(stored.as_slice(), [checkout] if checkout.spec.repo_ref() == &repository_key));
     }
 
-    // #768: reconciliation removes only adopted projections without a durable
-    // adopted source. Generate authority traversal order and reconcile repeats;
-    // exhaust source/observation presence and authorities in each draw so the
-    // profile's case limit cannot miss deletion or preservation boundaries.
+    // #768, on the engine's records (#3108): the projection removes only adopted
+    // projections with no live adopted launch held here. Generate authority
+    // traversal order and projection repeats; exhaust launch/observation presence
+    // and authorities in each draw so the profile's case limit cannot miss
+    // deletion or preservation boundaries.
     #[hegel::test]
     fn adopted_projection_cleanup_preserves_other_authorities(tc: hegel::TestCase) {
         use flotilla_resources::{CheckoutSpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec};
@@ -342,8 +289,26 @@ mod tests {
             for offset in 0..authorities.len() {
                 let authority = authorities[(authority_start + offset) % authorities.len()];
                 for observed_present in [false, true] {
-                    for durable_authority in [None, Some(LifecycleAuthority::Managed), Some(LifecycleAuthority::Adopted)] {
-                        let durable = ResourceBackend::new(InMemoryBackend::default());
+                    let launches = [
+                        None,
+                        Some(flotilla_protocol::LifecycleReading::Ready { identity: "/work/repo".into() }),
+                        Some(flotilla_protocol::LifecycleReading::Released),
+                    ];
+                    for launch in launches {
+                        let live = launch.as_ref().is_some_and(|reading| !matches!(reading, flotilla_protocol::LifecycleReading::Released));
+                        let held_here = launch
+                            .iter()
+                            .map(|reading| flotilla_resources::checkout_records::CheckoutRecord {
+                                name: "checkout#1".into(),
+                                home: "host".into(),
+                                spec: spec.clone(),
+                                holder: None,
+                                requested_at: chrono::DateTime::UNIX_EPOCH,
+                                reading: reading.clone(),
+                                degraded: None,
+                                integration: None,
+                            })
+                            .collect::<Vec<_>>();
                         let observed = ResourceBackend::new(InMemoryBackend::observed());
                         let mut meta = InputMeta::builder().name("checkout".to_string()).build();
                         if let Some(authority) = authority {
@@ -354,24 +319,15 @@ mod tests {
                         } else {
                             None
                         };
-                        if let Some(authority) = durable_authority {
-                            let durable_meta =
-                                InputMeta::builder().name("checkout".to_string()).build().with_lifecycle_authority(authority);
-                            durable.using::<ResourceCheckout>("flotilla").create(&durable_meta, &spec).await.expect("durable checkout");
-                        }
                         for _ in 0..repeats {
-                            let result = super::reconcile_adopted_checkouts(&durable, &observed, "flotilla").await;
-                            if observed_present
-                                && durable_authority == Some(LifecycleAuthority::Adopted)
-                                && authority != Some(LifecycleAuthority::Adopted)
-                            {
+                            let result = super::project_adopted_checkouts(held_here.clone(), &observed, "flotilla").await;
+                            if observed_present && live && authority != Some(LifecycleAuthority::Adopted) {
                                 assert!(result.is_err(), "non-adopted name collisions are refused");
                             } else {
                                 result.expect("reconcile");
                             }
                             let stored = observed.using::<ResourceCheckout>("flotilla").list().await.expect("list").items;
-                            let should_remain = (observed_present && authority != Some(LifecycleAuthority::Adopted))
-                                || durable_authority == Some(LifecycleAuthority::Adopted);
+                            let should_remain = (observed_present && authority != Some(LifecycleAuthority::Adopted)) || live;
                             assert_eq!(stored.len(), usize::from(should_remain));
                             if observed_present && authority != Some(LifecycleAuthority::Adopted) {
                                 let original = original.as_ref().expect("original observation");

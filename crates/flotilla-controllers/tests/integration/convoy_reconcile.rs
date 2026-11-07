@@ -13,15 +13,14 @@ use common::{
 };
 use flotilla_resources::{
     controller_patches, evaluate_crew_completion, evaluate_landing_settlement, external_patches, implement_review_workflow_spec,
-    interactive_single_workflow_spec, reconcile, Actuation, BoundChangeRequest, ChangeRequest, ChangeRequestMergeability,
-    ChangeRequestObservation, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestState, ChangeRequestStatus, Checkout,
-    CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clock, ConditionValue, Convoy,
-    ConvoyEvent, ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewCompletionRefusalCause, CrewSource,
-    CrewWorkPhase, InputMeta, InputValue, IntegrationCondition, LandedEvidence, LifecycleAuthority, Observation,
-    ObservedChangeRequestState, ObservedCheckoutSpec, ObservedChecks, ObservedMergeability, OwnerReference, RepositoryKey, ReviewRefPair,
-    SettlementClaimEvidence, StatusPatch, TargetMismatch, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec, TerminalSessionStatus, UnmetSettlementExpectation, ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus,
-    WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION,
+    interactive_single_workflow_spec, reconcile, Actuation, BoundChangeRequest, ChangeRequest, ChangeRequestReviewObservation,
+    ChangeRequestSpec, ChangeRequestStatus, CheckoutSpec, CheckoutWorktreeSpec, Clock, Convoy, ConvoyEvent, ConvoyPhase, ConvoyStatus,
+    ConvoyStatusPatch, ConvoyTeardownRuntime, CrewCompletionRefusalCause, CrewSource, CrewWorkPhase, InputMeta, InputValue,
+    LifecycleAuthority, Observation, ObservedChangeRequestState, ObservedCheckoutSpec, ObservedChecks, ObservedMergeability,
+    OwnerReference, RepositoryKey, ReviewRefPair, SettlementClaimEvidence, StatusPatch, TargetMismatch, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, UnmetSettlementExpectation, ValidationError,
+    Vessel, VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
+    WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 use flotilla_store::{
     controller::{ReconcileOutcome as ControllerReconcileOutcome, Reconciler},
@@ -30,6 +29,8 @@ use flotilla_store::{
 
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_crew::reconcilers::vessel::VesselReconciler;
+use flotilla_provisioning_testkit::{CheckoutFixture, Ending};
+use flotilla_resources::checkout_records::{latest_launches, CheckoutHolder, CheckoutRecord, CheckoutRecords as _, Inspection, Landed};
 use flotilla_store_testkit::fixtures as common;
 
 use crate::common::cr_name;
@@ -39,7 +40,8 @@ struct AlwaysEligible;
 #[test]
 fn convoy_finalizer_does_not_treat_arbitrary_error_text_as_a_teardown_wait() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"));
+    let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+        .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads);
     let convoy = convoy_object("convoy-a", valid_convoy_spec(), None);
     let error = flotilla_resources::ResourceError::other("teardown waiting on checkout misleading-error");
     assert!(reconciler.finalizer_error_patch(&convoy, &error).is_none());
@@ -48,7 +50,8 @@ fn convoy_finalizer_does_not_treat_arbitrary_error_text_as_a_teardown_wait() {
 #[test]
 fn convoy_finalizer_renders_multiple_typed_waits_at_the_status_boundary() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"));
+    let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+        .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads);
     let convoy = convoy_object("convoy-a", valid_convoy_spec(), None);
     let error = flotilla_resources::ResourceError::FinalizerWait {
         reasons: vec![
@@ -505,7 +508,7 @@ impl ConvoyTeardownRuntime for AlwaysEligible {
     async fn verify_reclaim(
         &self,
         _convoy: &flotilla_resources::ResourceObject<Convoy>,
-        _checkouts: &[flotilla_resources::ResourceObject<Checkout>],
+        _checkouts: &[flotilla_resources::checkout_records::CheckoutRecord],
     ) -> Result<(), String> {
         Ok(())
     }
@@ -541,7 +544,8 @@ async fn convoy_reconciler_bootstraps_from_a_replica_only_workflow_snapshot() {
         )
         .await
         .expect("create convoy");
-    let reconciler = ConvoyReconciler::new(driver.definitions::<WorkflowTemplate>("flotilla"));
+    let reconciler = ConvoyReconciler::new(driver.definitions::<WorkflowTemplate>("flotilla"))
+        .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads);
     let prepared = reconciler.prepare(&convoy).await.expect("read replica-only snapshot");
     let outcome = reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
 
@@ -554,7 +558,7 @@ async fn reconcile_once_with_resources(
     workspaces: Vec<flotilla_resources::ResourceObject<Vessel>>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> flotilla_store::controller::ReconcileOutcome<Convoy> {
-    reconcile_once_with_reads(convoy, template, workspaces, Arc::new(flotilla_resources::lifecycle_reads::NoLifecycleReads), now).await
+    reconcile_once_with_reads(convoy, template, workspaces, CheckoutFixture::default().reads, now).await
 }
 
 async fn reconcile_once_with_reads(
@@ -606,6 +610,43 @@ async fn reconcile_once_with_reads(
 
 struct FixedClock(chrono::DateTime<chrono::Utc>);
 
+/// The engine's checkouts for one convoy at home `home`: engine Convoy `convoy` admitted there,
+/// whose checkouts the convoy reads.
+fn engine_checkouts(home: &str, convoy: &str) -> CheckoutFixture {
+    let checkouts = CheckoutFixture::at(home);
+    checkouts.open_convoy(convoy);
+    checkouts
+}
+
+/// An adopted checkout of `repo_ref` on `branch` at `path`, held for `convoy` and realised, its
+/// branch inspected as `inspection` says: its launch.
+fn put_inspected(
+    checkouts: &CheckoutFixture,
+    convoy: &str,
+    name: &str,
+    (repo_ref, branch, path): (&RepositoryKey, &str, &str),
+    inspection: Inspection,
+) -> String {
+    let launch = checkouts.put_ready(
+        name,
+        &CheckoutSpec::Observed(ObservedCheckoutSpec {
+            r#ref: branch.to_string(),
+            path: path.to_string(),
+            repo_ref: repo_ref.clone(),
+            host_ref: checkouts.home.clone(),
+            is_main: false,
+        }),
+        Some(&CheckoutHolder::Convoy(convoy.to_string())),
+    );
+    checkouts.checkouts.inspected(&launch, inspection).expect("inspection written");
+    launch
+}
+
+/// Each checkout's latest launch `checkouts` holds, by name.
+fn held_checkouts(checkouts: &CheckoutFixture) -> BTreeMap<String, CheckoutRecord> {
+    latest_launches(checkouts.checkouts.here().expect("checkouts"))
+}
+
 impl Clock for FixedClock {
     fn now(&self) -> chrono::DateTime<chrono::Utc> {
         self.0
@@ -626,17 +667,20 @@ fn merged_change_request_status(observed_at: chrono::DateTime<chrono::Utc>) -> C
     }
 }
 
+/// A landing convoy whose checkout's inspection judged it `landed` (absent: no checkout), its
+/// landed evidence naming `observed_target_ref`; `failing` its home's inspections have failed
+/// since, so the evidence is no longer confirmed.
 async fn reconcile_with_observed_change_request(
     phase: ConvoyPhase,
-    condition: Option<ConditionValue>,
+    landed: Option<Option<bool>>,
     observed_target_ref: Option<&str>,
-    observed_at: chrono::DateTime<chrono::Utc>,
+    failing: bool,
 ) -> flotilla_store::controller::ReconcileOutcome<Convoy> {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let vessels = backend.clone().using::<Vessel>("flotilla");
-    let checkouts = backend.clone().using::<Checkout>("flotilla");
+    let checkouts = engine_checkouts("host-a", "convoy-a");
     let mut status = bootstrapped_convoy_status();
     status.phase = phase;
     status.branch_subject_scan_at = Some(timestamp(40));
@@ -683,56 +727,33 @@ async fn reconcile_with_observed_change_request(
         .await
         .expect("live vessel create");
 
-    if let Some(value) = condition {
-        let meta = InputMeta {
-            name: "checkout-a".to_string(),
-            labels: BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]),
-            ..Default::default()
-        };
-        let checkout = checkouts
-            .create(
-                &meta,
-                &CheckoutSpec::Observed(ObservedCheckoutSpec {
-                    r#ref: "feature/lifecycle".to_string(),
-                    path: "/tmp/checkout-a".to_string(),
-                    repo_ref: RepositoryKey("repo-a".to_string()),
-                    host_ref: "host-a".to_string(),
-                    is_main: false,
+    if let Some(landed) = landed {
+        let launch = put_inspected(
+            &checkouts,
+            "convoy-a",
+            "checkout-a",
+            (&RepositoryKey("repo-a".to_string()), "feature/lifecycle", "/tmp/checkout-a"),
+            Inspection {
+                landed,
+                landed_evidence: observed_target_ref.map(|target_ref| Landed {
+                    change_request: 42,
+                    merged_at: None,
+                    target_ref: Some(target_ref.to_string()),
+                    head_in_merged_head: false,
                 }),
-            )
-            .await
-            .expect("checkout create");
-        checkouts
-            .update_status(
-                &checkout.metadata.name,
-                &checkout.metadata.resource_version,
-                &CheckoutStatus {
-                    degraded: None,
-                    phase: CheckoutPhase::Ready,
-                    path: Some("/tmp/checkout-a".to_string()),
-                    commit: None,
-                    branch_provenance: Default::default(),
-                    integration: CheckoutIntegrationStatus {
-                        head_revision: None,
-                        clean: Default::default(),
-                        pushed: Default::default(),
-                        landed: IntegrationCondition::builder().value(value).observed_at(observed_at.to_rfc3339()).build(),
-                        landed_evidence: observed_target_ref.map(|target_ref| {
-                            LandedEvidence::builder().change_request_id("42".to_string()).target_ref(target_ref.to_string()).build()
-                        }),
-                        change_request: None,
-                        remote_refs: Default::default(),
-                    },
-                    message: None,
-                },
-            )
-            .await
-            .expect("checkout status");
+                ..Inspection::default()
+            },
+        );
+        if failing {
+            checkouts.checkouts.inspection_failed(&launch).expect("inspection failure recorded");
+        }
     }
 
     let current = convoys.get("convoy-a").await.expect("convoy");
-    let reconciler =
-        ConvoyReconciler::new(templates).with_vessels(vessels).with_checkouts(checkouts).with_clock(Arc::new(FixedClock(timestamp(40))));
+    let reconciler = ConvoyReconciler::new(templates)
+        .with_vessels(vessels)
+        .with_lifecycle_reads(checkouts.reads.clone())
+        .with_clock(Arc::new(FixedClock(timestamp(40))));
     let deps = reconciler.prepare(&current).await.expect("dependencies");
     reconciler.reconcile(&current, &deps, timestamp(40))
 }
@@ -741,11 +762,12 @@ async fn reconcile_with_observed_digest(
     phase: ConvoyPhase,
     observed_digest: Option<&str>,
     existing_attention: bool,
-) -> flotilla_store::controller::ReconcileOutcome<Convoy> {
-    let now = timestamp(40);
+) -> (flotilla_store::controller::ReconcileOutcome<Convoy>, chrono::DateTime<chrono::Utc>) {
+    // The engine confirms this home's inspection as of now: the reconcile runs now.
+    let now = chrono::Utc::now();
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoys = backend.clone().using::<Convoy>("flotilla");
-    let checkouts = backend.clone().using::<Checkout>("flotilla");
+    let checkouts = engine_checkouts("host-a", "digest-anchor");
     let repo_ref = RepositoryKey("repo-a".to_string());
     let convoy = convoys
         .create(
@@ -781,65 +803,33 @@ async fn reconcile_with_observed_digest(
     );
     status.work.insert("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Complete).build());
     let convoy = convoys.update_status("digest-anchor", &convoy.metadata.resource_version, &status).await.expect("convoy status");
-    let checkout = checkouts
-        .create(
-            &InputMeta::builder()
-                .name("checkout-a".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "digest-anchor".to_string())]))
-                .build(),
-            &CheckoutSpec::Observed(ObservedCheckoutSpec {
-                r#ref: "topic".to_string(),
-                path: "/tmp/checkout-a".to_string(),
-                repo_ref,
-                host_ref: "host-a".to_string(),
-                is_main: false,
-            }),
-        )
-        .await
-        .expect("checkout create");
-    checkouts
-        .update_status(
-            &checkout.metadata.name,
-            &checkout.metadata.resource_version,
-            &CheckoutStatus {
-                phase: CheckoutPhase::Ready,
-                integration: CheckoutIntegrationStatus {
-                    remote_refs: observed_digest.map_or_else(BTreeMap::new, |digest| {
-                        BTreeMap::from([(
-                            "refs/heads/topic".to_string(),
-                            flotilla_resources::RemoteRefObservation::builder()
-                                .digest(digest.to_string())
-                                .observed_at(now.to_rfc3339())
-                                .build(),
-                        )])
-                    }),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("checkout status");
+    put_inspected(
+        &checkouts,
+        "digest-anchor",
+        "checkout-a",
+        (&repo_ref, "topic", "/tmp/checkout-a"),
+        Inspection { remote_digest: observed_digest.map(str::to_string), ..Inspection::default() },
+    );
 
     let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
-        .with_checkouts(checkouts)
+        .with_lifecycle_reads(checkouts.reads.clone())
         .with_clock(Arc::new(FixedClock(now)));
     let prepared = reconciler.prepare(&convoy).await.expect("prepare convoy");
-    reconciler.reconcile(&convoy, &prepared, now)
+    (reconciler.reconcile(&convoy, &prepared, now), now)
 }
 
 #[tokio::test]
 async fn approved_claim_settles_when_remote_ref_is_observed_at_claimed_digest() {
-    let outcome = reconcile_with_observed_digest(ConvoyPhase::Landing, Some("claimed-digest"), false).await;
+    let (outcome, now) = reconcile_with_observed_digest(ConvoyPhase::Landing, Some("claimed-digest"), false).await;
     assert_eq!(
         settlement_transition(outcome.patch.clone()),
-        Some(controller_patches::settle("observed-digest".to_string(), Vec::new(), timestamp(40)))
+        Some(controller_patches::settle("observed-digest".to_string(), Vec::new(), now))
     );
 }
 
 #[tokio::test]
 async fn different_observed_digest_holds_settlement_and_raises_attention() {
-    let outcome = reconcile_with_observed_digest(ConvoyPhase::Landing, Some("different-digest"), false).await;
+    let (outcome, _) = reconcile_with_observed_digest(ConvoyPhase::Landing, Some("different-digest"), false).await;
     let Some(ConvoyStatusPatch::SetSettlementAttention { attention }) = outcome.patch else {
         panic!("digest mismatch should raise convoy attention")
     };
@@ -851,13 +841,13 @@ async fn different_observed_digest_holds_settlement_and_raises_attention() {
 
 #[tokio::test]
 async fn post_settlement_force_push_does_not_unsettle_convoy() {
-    let outcome = reconcile_with_observed_digest(ConvoyPhase::Landed, Some("different-digest"), false).await;
+    let (outcome, _) = reconcile_with_observed_digest(ConvoyPhase::Landed, Some("different-digest"), false).await;
     assert!(outcome.patch.is_none(), "Landed is terminal for the settled claim even after the remote ref moves");
 }
 
 #[tokio::test]
 async fn observed_digest_attention_clears_when_mismatch_is_no_longer_observed() {
-    let outcome = reconcile_with_observed_digest(ConvoyPhase::Landing, None, true).await;
+    let (outcome, _) = reconcile_with_observed_digest(ConvoyPhase::Landing, None, true).await;
     assert_eq!(outcome.patch, Some(ConvoyStatusPatch::SetSettlementAttention { attention: None }));
 }
 
@@ -886,6 +876,7 @@ async fn convoy_finalizer_deletes_orphaned_terminal_sessions() {
         .expect("terminal create should succeed");
 
     ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+        .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads)
         .with_terminal_sessions(sessions.clone())
         .run_finalizer(&convoy)
         .await
@@ -897,66 +888,36 @@ async fn convoy_finalizer_deletes_orphaned_terminal_sessions() {
 #[tokio::test]
 async fn convoy_finalizer_waits_for_remote_checkout_authority() {
     let authority = ResourceBackend::new(InMemoryBackend::default());
-    let remote = ResourceBackend::new(InMemoryBackend::default());
     let convoy =
         authority.clone().using::<Convoy>("flotilla").create(&convoy_meta("convoy-a"), &valid_convoy_spec()).await.expect("create convoy");
-    let remote_checkouts = remote.clone().using::<Checkout>("flotilla");
-    let checkout = remote_checkouts
-        .create(
-            &InputMeta::builder()
-                .name("checkout-convoy-a-feta".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]))
-                .build()
-                .with_lifecycle_authority(LifecycleAuthority::Managed),
-            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
-                repo_ref: RepositoryKey("repo-a".to_string()),
-                env_ref: "host-direct-feta".to_string(),
-                r#ref: "feature/a".to_string(),
-                base_ref: Some("main".to_string()),
-                target_path: "/checkouts/a".to_string(),
-                clone_ref: "clone-a".to_string(),
-            }),
-        )
-        .await
-        .expect("create remote checkout");
-    remote_checkouts
-        .update_status(
-            &checkout.metadata.name,
-            &checkout.metadata.resource_version,
-            &CheckoutStatus {
-                phase: CheckoutPhase::Failed,
-                message: Some("checkout teardown failed: checkout /checkouts/a preserved: DirtyCheckout".to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("record checkout preservation");
-    let remote_root = flotilla_protocol::NodeId::new("feta-root");
-    authority
-        .replica_writer::<Checkout>(remote_root.clone(), "flotilla")
-        .replace(&remote_checkouts.list().await.expect("list remote checkouts"), chrono::Utc::now())
-        .await
-        .expect("replicate checkout");
-    let reconciler = ConvoyReconciler::new(authority.definitions::<WorkflowTemplate>("flotilla"))
-        .with_checkouts(authority.clone().using::<Checkout>("flotilla"))
-        .with_federated_checkouts(authority.clone().including_replicas::<Checkout>("flotilla"));
+    // The checkout is held for the convoy at its own home, feta; its removal there was refused
+    // (preserved dirty work), so it stays realised.
+    let remote_checkouts = engine_checkouts("feta", "convoy-a");
+    let launch = remote_checkouts.put_ready(
+        "checkout-convoy-a-feta",
+        &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+            repo_ref: RepositoryKey("repo-a".to_string()),
+            env_ref: "host-direct-feta".to_string(),
+            r#ref: "feature/a".to_string(),
+            base_ref: Some("main".to_string()),
+            target_path: "/checkouts/a".to_string(),
+            clone_ref: "clone-a".to_string(),
+        }),
+        Some(&CheckoutHolder::Convoy("convoy-a".to_string())),
+    );
+    let reconciler =
+        ConvoyReconciler::new(authority.definitions::<WorkflowTemplate>("flotilla")).with_lifecycle_reads(remote_checkouts.reads.clone());
 
     let error = reconciler.run_finalizer(&convoy).await.expect_err("remote checkout should hold convoy finalization");
     assert!(matches!(&error, flotilla_resources::ResourceError::FinalizerWait { reasons } if reasons.len() == 1));
-    assert!(error.to_string().contains("teardown waiting on checkout checkout-convoy-a-feta: preserved (DirtyCheckout)"));
+    assert!(error.to_string().contains("teardown waiting on checkout checkout-convoy-a-feta"));
     let patch = reconciler.finalizer_error_patch(&convoy, &error).expect("waiting reason should reach convoy status");
     let mut status = ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() };
     patch.apply(&mut status);
-    assert_eq!(status.message.as_deref(), Some("teardown waiting on checkout checkout-convoy-a-feta: preserved (DirtyCheckout)"));
+    assert_eq!(status.message.as_deref(), Some("teardown waiting on checkout checkout-convoy-a-feta"));
 
-    authority
-        .replica_writer::<Checkout>(remote_root, "flotilla")
-        .replace(
-            &flotilla_resources::ResourceList { items: Vec::new(), resource_version: "2".to_string(), generation: None },
-            chrono::Utc::now(),
-        )
-        .await
-        .expect("replicate remote checkout deletion");
+    // Its home releases it once the work is cleaned up.
+    remote_checkouts.finish(&launch, Ending::Released);
     reconciler.run_finalizer(&convoy).await.expect("finalizer should complete after authority cleanup");
 }
 
@@ -1835,6 +1796,7 @@ async fn stale_branch_scan_error_only_holds_landing_without_subjects() {
             .await
             .expect("merged");
         let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+            .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads)
             .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(180))
             .with_clock(Arc::new(FixedClock(timestamp(40))));
         let current = convoys.get("stale-scan").await.expect("convoy");
@@ -1862,7 +1824,7 @@ async fn stale_branch_scan_error_only_holds_landing_without_subjects() {
 
 #[tokio::test]
 async fn landing_discharges_checkout_without_change_request_despite_false_landed_condition() {
-    let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(ConditionValue::False), None, timestamp(40)).await;
+    let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(Some(false)), None, false).await;
 
     assert_eq!(
         settlement_transition(outcome.patch.clone()),
@@ -1872,8 +1834,7 @@ async fn landing_discharges_checkout_without_change_request_despite_false_landed
 
 #[tokio::test]
 async fn landing_with_settled_change_request_becomes_landed() {
-    let outcome =
-        reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(ConditionValue::True), Some("main"), timestamp(40)).await;
+    let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(Some(true)), Some("main"), false).await;
 
     assert_eq!(
         settlement_transition(outcome.patch.clone()),
@@ -1916,8 +1877,7 @@ async fn completed_crew_cannot_stall_landing_while_change_request_merges() {
     assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Done);
     assert!(status.stalled.is_none());
 
-    let merged =
-        reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(ConditionValue::True), Some("main"), timestamp(40)).await;
+    let merged = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(Some(true)), Some("main"), false).await;
     merged.patch.expect("merged change request settles landing").apply(&mut status);
     assert_eq!(status.phase, ConvoyPhase::Landed);
 }
@@ -1963,15 +1923,14 @@ async fn resume_after_claim_preserves_landing() {
     assert_eq!(explicitly_reopened.crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
     assert!(explicitly_reopened.crew_work["implement"]["coder"].finished_at.is_none());
 
-    let merged = reconcile_with_observed_change_request(status.phase, Some(ConditionValue::True), Some("main"), timestamp(40)).await;
+    let merged = reconcile_with_observed_change_request(status.phase, Some(Some(true)), Some("main"), false).await;
     merged.patch.expect("settlement remains reachable").apply(&mut status);
     assert_eq!(status.phase, ConvoyPhase::Landed);
 }
 
 #[tokio::test]
 async fn landing_on_a_different_target_records_a_fact_and_still_becomes_landed() {
-    let outcome =
-        reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(ConditionValue::True), Some("release"), timestamp(40)).await;
+    let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(Some(true)), Some("release"), false).await;
 
     let expected_mismatch = TargetMismatch::builder()
         .repo_ref(RepositoryKey("repo-a".to_string()))
@@ -1991,14 +1950,14 @@ async fn landing_on_a_different_target_records_a_fact_and_still_becomes_landed()
 
 #[tokio::test]
 async fn landing_without_checkout_evidence_stays_landing() {
-    let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, None, None, timestamp(40)).await;
+    let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, None, None, false).await;
 
     assert_eq!(outcome.patch, None);
 }
 
 #[tokio::test]
 async fn landing_discharges_checkout_without_change_request_despite_stale_landed_evidence() {
-    let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(ConditionValue::True), None, timestamp(9)).await;
+    let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(Some(true)), None, true).await;
 
     assert_eq!(
         settlement_transition(outcome.patch.clone()),
@@ -2010,6 +1969,9 @@ struct TerminalChangeRequestReconcile {
     evaluation: flotilla_resources::SettlementEvaluation,
     outcome: ControllerReconcileOutcome<Convoy>,
     backend: ResourceBackend,
+    /// The engine's checkouts the convoy reads, and the launch of `checkout-a` when present.
+    checkouts: CheckoutFixture,
+    checkout_launch: Option<String>,
 }
 
 async fn reconcile_terminal_bound_change_request(
@@ -2020,7 +1982,7 @@ async fn reconcile_terminal_bound_change_request(
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
-    let checkouts = backend.clone().using::<Checkout>("flotilla");
+    let checkouts = engine_checkouts("host-a", "convoy-a");
     let change_requests = backend.clone().using::<ChangeRequest>("flotilla");
     let repo_ref = RepositoryKey("repo-a".to_string());
 
@@ -2084,87 +2046,18 @@ async fn reconcile_terminal_bound_change_request(
         .await
         .expect("convoy status update");
 
-    if checkout_present {
-        let checkout = checkouts
-            .create(
-                &InputMeta {
-                    name: "checkout-a".to_string(),
-                    labels: BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]),
-                    ..Default::default()
-                },
-                &CheckoutSpec::Observed(ObservedCheckoutSpec {
-                    r#ref: "feature/bound-cr".to_string(),
-                    path: "/tmp/checkout-a".to_string(),
-                    repo_ref: repo_ref.clone(),
-                    host_ref: "host-a".to_string(),
-                    is_main: false,
-                }),
-            )
-            .await
-            .expect("checkout create");
-        checkouts
-            .update_status(
-                &checkout.metadata.name,
-                &checkout.metadata.resource_version,
-                &CheckoutStatus {
-                    degraded: None,
-                    phase: CheckoutPhase::Ready,
-                    path: Some("/tmp/checkout-a".to_string()),
-                    commit: None,
-                    branch_provenance: Default::default(),
-                    integration: CheckoutIntegrationStatus {
-                        landed: IntegrationCondition::builder()
-                            .value(ConditionValue::False)
-                            .observed_at(timestamp(40).to_rfc3339())
-                            .build(),
-                        ..Default::default()
-                    },
-                    message: None,
-                },
-            )
-            .await
-            .expect("checkout status update");
-    }
+    let not_landed = Inspection { landed: Some(false), ..Inspection::default() };
+    let checkout_launch = checkout_present.then(|| {
+        put_inspected(&checkouts, "convoy-a", "checkout-a", (&repo_ref, "feature/bound-cr", "/tmp/checkout-a"), not_landed.clone())
+    });
     if untouched_checkout {
-        let checkout = checkouts
-            .create(
-                &InputMeta {
-                    name: "checkout-context".to_string(),
-                    labels: BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]),
-                    ..Default::default()
-                },
-                &CheckoutSpec::Observed(ObservedCheckoutSpec {
-                    r#ref: "main".to_string(),
-                    path: "/tmp/checkout-context".to_string(),
-                    repo_ref: RepositoryKey("repo-context".to_string()),
-                    host_ref: "host-a".to_string(),
-                    is_main: false,
-                }),
-            )
-            .await
-            .expect("context checkout create");
-        checkouts
-            .update_status(
-                &checkout.metadata.name,
-                &checkout.metadata.resource_version,
-                &CheckoutStatus {
-                    degraded: None,
-                    phase: CheckoutPhase::Ready,
-                    path: Some("/tmp/checkout-context".to_string()),
-                    commit: None,
-                    branch_provenance: Default::default(),
-                    integration: CheckoutIntegrationStatus {
-                        landed: IntegrationCondition::builder()
-                            .value(ConditionValue::False)
-                            .observed_at(timestamp(40).to_rfc3339())
-                            .build(),
-                        ..Default::default()
-                    },
-                    message: None,
-                },
-            )
-            .await
-            .expect("context checkout status update");
+        put_inspected(
+            &checkouts,
+            "convoy-a",
+            "checkout-context",
+            (&RepositoryKey("repo-context".to_string()), "main", "/tmp/checkout-context"),
+            not_landed,
+        );
     }
 
     let record_name = cr_name("github.com", "example/repo-a", 42);
@@ -2202,12 +2095,11 @@ async fn reconcile_terminal_bound_change_request(
     }
 
     let current = convoys.get("convoy-a").await.expect("convoy get");
-    let checkout_objects = checkouts.list().await.expect("checkouts").items;
     let change_request_objects = change_requests.list().await.expect("change requests").items;
     let evaluation = evaluate_landing_settlement(
         &current,
         &BTreeMap::new(),
-        &checkout_objects.into_iter().map(|checkout| (checkout.metadata.name.clone(), checkout)).collect(),
+        &held_checkouts(&checkouts),
         &change_request_objects.into_iter().map(|record| (record.metadata.name.clone(), record)).collect(),
         &[],
         Duration::from_secs(180),
@@ -2216,11 +2108,17 @@ async fn reconcile_terminal_bound_change_request(
     );
     let reconciler = ConvoyReconciler::new(templates)
         .with_vessels(vessels)
-        .with_checkouts(checkouts)
+        .with_lifecycle_reads(checkouts.reads.clone())
         .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), std::time::Duration::from_secs(180))
         .with_clock(Arc::new(FixedClock(timestamp(40))));
     let deps = reconciler.prepare(&current).await.expect("dependencies");
-    TerminalChangeRequestReconcile { evaluation, outcome: reconciler.reconcile(&current, &deps, timestamp(40)), backend }
+    TerminalChangeRequestReconcile {
+        evaluation,
+        outcome: reconciler.reconcile(&current, &deps, timestamp(40)),
+        backend,
+        checkouts,
+        checkout_launch,
+    }
 }
 
 #[tokio::test]
@@ -2237,7 +2135,7 @@ async fn terminal_bound_change_request_settles_checkout_without_own_landed_evide
 // no refresh of its checks or reviews is necessary.
 #[tokio::test]
 async fn landing_settles_on_merged_record_older_than_stale_after() {
-    let TerminalChangeRequestReconcile { backend, .. } = reconcile_terminal_bound_change_request(true, true, false).await;
+    let TerminalChangeRequestReconcile { backend, checkouts, .. } = reconcile_terminal_bound_change_request(true, true, false).await;
     let records = backend.using::<ChangeRequest>("flotilla");
     let old = timestamp(40) - chrono::Duration::hours(1);
     for record in records.list().await.expect("records").items {
@@ -2250,7 +2148,7 @@ async fn landing_settles_on_merged_record_older_than_stale_after() {
     let current = backend.using::<Convoy>("flotilla").get("convoy-a").await.expect("convoy");
     let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
         .with_vessels(backend.using::<Vessel>("flotilla"))
-        .with_checkouts(backend.using::<Checkout>("flotilla"))
+        .with_lifecycle_reads(checkouts.reads.clone())
         .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(180))
         .with_clock(Arc::new(FixedClock(timestamp(40))));
     let prepared = reconciler.prepare(&current).await.expect("prepare");
@@ -2292,7 +2190,7 @@ async fn merged_change_request_discharges_present_context_checkout_without_chang
 
 #[tokio::test]
 async fn landed_with_reopened_change_request_does_not_write_phase() {
-    let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landed, Some(ConditionValue::False), None, timestamp(40)).await;
+    let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landed, Some(Some(false)), None, false).await;
 
     assert_eq!(outcome.patch, None);
     assert!(outcome.events.is_empty());
@@ -2301,9 +2199,8 @@ async fn landed_with_reopened_change_request_does_not_write_phase() {
 #[tokio::test]
 async fn federated_open_checkout_holds_landing_on_authority_host() {
     let authority = ResourceBackend::new(InMemoryBackend::default());
-    let remote = ResourceBackend::new(InMemoryBackend::default());
     let convoys = authority.clone().using::<Convoy>("flotilla");
-    let remote_checkouts = remote.clone().using::<Checkout>("flotilla");
+    let remote_checkouts = engine_checkouts("feta", "cross-host");
     let mut status = bootstrapped_convoy_status();
     status.phase = ConvoyPhase::Landing;
     for work in status.work.values_mut() {
@@ -2339,58 +2236,39 @@ async fn federated_open_checkout_holds_landing_on_authority_host() {
         .await
         .expect("set landing status");
 
-    let checkout = remote_checkouts
+    put_inspected(
+        &remote_checkouts,
+        "cross-host",
+        "remote-checkout",
+        (&RepositoryKey("repo-a".to_string()), "feature/open-pr", "/remote/worktree"),
+        Inspection { landed: Some(false), change_request: Some(42), ..Inspection::default() },
+    );
+    // The forge observation found the change request open.
+    let records = authority.clone().using::<ChangeRequest>("flotilla");
+    let record_name = cr_name("github.com", "flotilla-org/flotilla", 42);
+    let record = records
         .create(
-            &InputMeta::builder()
-                .name("remote-checkout".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "cross-host".to_string())]))
+            &InputMeta::builder().name(record_name.clone()).build(),
+            &ChangeRequestSpec::builder()
+                .service("github.com".to_string())
+                .scope("flotilla-org/flotilla".to_string())
+                .number(42)
+                .observing_authority("feta".to_string())
                 .build(),
-            &CheckoutSpec::Observed(ObservedCheckoutSpec {
-                r#ref: "feature/open-pr".to_string(),
-                path: "/remote/worktree".to_string(),
-                repo_ref: RepositoryKey("repo-a".to_string()),
-                host_ref: "feta".to_string(),
-                is_main: false,
-            }),
         )
         .await
-        .expect("create remote checkout");
-    remote_checkouts
-        .update_status(
-            &checkout.metadata.name,
-            &checkout.metadata.resource_version,
-            &CheckoutStatus {
-                degraded: None,
-                phase: CheckoutPhase::Ready,
-                path: Some("/remote/worktree".to_string()),
-                commit: None,
-                branch_provenance: Default::default(),
-                integration: CheckoutIntegrationStatus {
-                    landed: IntegrationCondition::builder().value(ConditionValue::False).build(),
-                    change_request: Some(
-                        ChangeRequestObservation::builder()
-                            .id("42".to_string())
-                            .state(ChangeRequestState::Open)
-                            .mergeability(ChangeRequestMergeability::Mergeable)
-                            .observed_at(timestamp(40).to_rfc3339())
-                            .build(),
-                    ),
-                    ..Default::default()
-                },
-                message: None,
-            },
-        )
-        .await
-        .expect("record open change request");
-    authority
-        .replica_writer::<Checkout>(flotilla_protocol::NodeId::new("feta"), "flotilla")
-        .replace(&remote_checkouts.list().await.expect("list remote checkouts"), chrono::Utc::now())
-        .await
-        .expect("replicate remote checkout");
+        .expect("change request create");
+    let open = ChangeRequestStatus {
+        state: Observation::known(ObservedChangeRequestState::Open, timestamp(40)),
+        ..merged_change_request_status(timestamp(40))
+    };
+    records.update_status(&record_name, &record.metadata.resource_version, &open).await.expect("open change request");
 
     let current = convoys.get("cross-host").await.expect("get authority convoy");
     let reconciler = ConvoyReconciler::new(authority.definitions::<WorkflowTemplate>("flotilla"))
-        .with_federated_checkouts(authority.including_replicas::<Checkout>("flotilla"));
+        .with_lifecycle_reads(remote_checkouts.reads.clone())
+        .with_change_requests(authority.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(180))
+        .with_clock(Arc::new(FixedClock(timestamp(40))));
     let deps = reconciler.prepare(&current).await.expect("resolve federated dependencies");
     let outcome = reconciler.reconcile(&current, &deps, timestamp(40));
     let Some(ConvoyStatusPatch::DiscoverSubjects { subjects, .. }) = outcome.patch else {
@@ -2932,6 +2810,8 @@ async fn governor_deleting_failed_vessel_records_retry_before_it_disappears() {
     status.work.get_mut("implement").expect("work").phase = WorkPhase::Ready;
     let mut convoy = convoy_object("standing", task_provisioning_convoy_spec(), Some(status));
     convoy.metadata.annotations.insert("flotilla.work/ensured-from".into(), "governor".into());
+    // An ensured convoy is admitted under its ensure's role.
+    convoy.spec.role = "governor".into();
     let mut vessel = vessel_object("standing", "implement", VesselPhase::Failed, Some("skill staging failed during reboot"));
     vessel.metadata.deletion_timestamp = Some(timestamp(20));
     let outcome = reconcile_once_with_resources(&convoy, None, vec![vessel], timestamp(21)).await;
@@ -2953,6 +2833,8 @@ async fn governor_does_not_recreate_an_existing_or_deleting_vessel() {
             status.work.get_mut("implement").expect("work").phase = WorkPhase::Interrupted;
             let mut convoy = convoy_object("standing", task_provisioning_convoy_spec(), Some(status));
             convoy.metadata.annotations.insert("flotilla.work/ensured-from".into(), "governor".into());
+            // An ensured convoy is admitted under its ensure's role.
+            convoy.spec.role = "governor".into();
             let mut vessel = vessel_object("standing", "implement", phase, None);
             vessel.metadata.deletion_timestamp = deleting.then_some(timestamp(20));
             let outcome = reconcile_once_with_resources(&convoy, None, vec![vessel], timestamp(21)).await;
@@ -2987,6 +2869,8 @@ fn governor_failure_create_rate_is_bounded(tc: hegel::TestCase) {
         status.work.get_mut("implement").expect("work").phase = WorkPhase::Running;
         let mut convoy = convoy_object("standing", task_provisioning_convoy_spec(), Some(status));
         convoy.metadata.annotations.insert("flotilla.work/ensured-from".into(), "governor".into());
+        // An ensured convoy is admitted under its ensure's role.
+        convoy.spec.role = "governor".into();
         let failed = vessel_object("standing", "implement", VesselPhase::Failed, Some("skill staging failed: source unavailable"));
         let first = reconcile_once_with_resources(&convoy, None, vec![failed.clone()], timestamp(0)).await;
         first.patch.expect("retry").apply(convoy.status.as_mut().expect("status"));
@@ -3025,6 +2909,8 @@ async fn governor_provisioning_failure_backs_off_across_watch_ticks() {
     status.work.get_mut("implement").expect("work").phase = WorkPhase::Running;
     let mut convoy = convoy_object("standing", task_provisioning_convoy_spec(), Some(status));
     convoy.metadata.annotations.insert("flotilla.work/ensured-from".into(), "governor".into());
+    // An ensured convoy is admitted under its ensure's role.
+    convoy.spec.role = "governor".into();
     let failed_vessel = skill_failure_vessel(&convoy).await;
     let failed = reconcile_once_with_resources(&convoy, None, vec![failed_vessel.clone()], timestamp(21)).await;
     failed.patch.expect("visible failure and retry").apply(convoy.status.as_mut().expect("status"));
@@ -3048,6 +2934,8 @@ async fn ensured_work_with_lost_vessel_interrupts_and_replaces_it_without_failin
     status.work.get_mut("implement").expect("implement task").phase = WorkPhase::Running;
     let mut convoy = convoy_object("standing", task_provisioning_convoy_spec(), Some(status));
     convoy.metadata.annotations.insert("flotilla.work/ensured-from".to_string(), "governor".to_string());
+    // An ensured convoy is admitted under its ensure's role.
+    convoy.spec.role = "governor".into();
 
     let failed = reconcile_once_with_resources(
         &convoy,
@@ -3090,6 +2978,8 @@ async fn ensured_work_with_missing_vessel_observation_stalls_without_admitting_a
     status.work.get_mut("implement").expect("work").phase = WorkPhase::Running;
     let mut convoy = convoy_object("standing", task_provisioning_convoy_spec(), Some(status));
     convoy.metadata.annotations.insert("flotilla.work/ensured-from".to_string(), "governor".to_string());
+    // An ensured convoy is admitted under its ensure's role.
+    convoy.spec.role = "governor".into();
 
     let first = reconcile_once_with_resources(&convoy, None, Vec::new(), timestamp(21)).await;
     assert!(matches!(first.patch, Some(ConvoyStatusPatch::RollUpWork { phase: WorkPhase::Stalled, .. })));
@@ -3185,10 +3075,7 @@ async fn completed_work_without_a_landing_claim_keeps_resources_warm() {
     .await;
 
     assert_eq!(outcome.patch, None);
-    assert!(!outcome
-        .actuations
-        .iter()
-        .any(|actuation| matches!(actuation, Actuation::DeleteVessel { .. } | Actuation::DeleteCheckout { .. })));
+    assert!(!outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::DeleteVessel { .. })));
 }
 
 #[tokio::test]
@@ -3248,7 +3135,7 @@ impl ConvoyTeardownRuntime for NeverEligible {
     async fn verify_reclaim(
         &self,
         _convoy: &flotilla_resources::ResourceObject<Convoy>,
-        _checkouts: &[flotilla_resources::ResourceObject<Checkout>],
+        _checkouts: &[flotilla_resources::checkout_records::CheckoutRecord],
     ) -> Result<(), String> {
         Err("integration evidence mid-refresh".to_string())
     }
@@ -3278,6 +3165,7 @@ async fn refused_reclaim_requeues_at_the_evidence_staleness_horizon() {
     let convoy = convoys.get("convoy-a").await.expect("convoy get");
 
     let refused = ConvoyReconciler::new(templates.clone())
+        .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads)
         .with_teardown_runtime(Arc::new(NeverEligible))
         .with_landing_evidence_stale_after(Duration::from_secs(7));
     let deps = refused.prepare(&convoy).await.expect("dependencies");
@@ -3285,64 +3173,12 @@ async fn refused_reclaim_requeues_at_the_evidence_staleness_horizon() {
     assert_eq!(outcome.requeue_after, Some(Duration::from_secs(7)), "a refused reclaim must requeue at the staleness horizon");
 
     let eligible = ConvoyReconciler::new(templates)
+        .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads)
         .with_teardown_runtime(Arc::new(AlwaysEligible))
         .with_landing_evidence_stale_after(Duration::from_secs(7));
     let deps = eligible.prepare(&convoy).await.expect("dependencies");
     let outcome = eligible.reconcile(&convoy, &deps, timestamp(21));
     assert_eq!(outcome.requeue_after, None, "an eligible reclaim pass must not keep requeueing");
-}
-
-#[tokio::test]
-async fn abandoned_convoy_reclaims_managed_checkout_but_retains_adopted_owner_record() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
-    let convoys = backend.clone().using::<Convoy>("flotilla");
-    let checkouts = backend.clone().using::<Checkout>("flotilla");
-    let mut status = bootstrapped_tool_only_convoy_status();
-    status.phase = ConvoyPhase::Abandoned;
-    status.finished_at = Some(timestamp(20));
-    let source = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
-    let created = convoys.create(&convoy_meta("convoy-a"), &source.spec).await.expect("convoy create");
-    convoys
-        .update_status("convoy-a", &created.metadata.resource_version, source.status.as_ref().expect("convoy status"))
-        .await
-        .expect("convoy status update");
-
-    let checkout_spec = CheckoutSpec::Worktree(CheckoutWorktreeSpec {
-        repo_ref: RepositoryKey("repo-a".to_string()),
-        env_ref: "host-direct-a".to_string(),
-        r#ref: "feature/abandon".to_string(),
-        base_ref: Some("main".to_string()),
-        target_path: "/checkouts/convoy-a/repo-a".to_string(),
-        clone_ref: "clone-a".to_string(),
-    });
-    for (name, authority) in [("managed-checkout", LifecycleAuthority::Managed), ("adopted-checkout", LifecycleAuthority::Adopted)] {
-        checkouts
-            .create(
-                &InputMeta::builder()
-                    .name(name.to_string())
-                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]))
-                    .build()
-                    .with_lifecycle_authority(authority),
-                &checkout_spec,
-            )
-            .await
-            .expect("checkout create");
-    }
-
-    let convoy = convoys.get("convoy-a").await.expect("convoy get");
-    let reconciler = ConvoyReconciler::new(templates).with_checkouts(checkouts).with_teardown_runtime(Arc::new(AlwaysEligible));
-    let deps = reconciler.prepare(&convoy).await.expect("dependencies");
-    let outcome = reconciler.reconcile(&convoy, &deps, timestamp(21));
-
-    assert!(outcome
-        .actuations
-        .iter()
-        .any(|actuation| matches!(actuation, Actuation::DeleteCheckout { name } if name == "managed-checkout")));
-    assert!(!outcome
-        .actuations
-        .iter()
-        .any(|actuation| matches!(actuation, Actuation::DeleteCheckout { name } if name == "adopted-checkout")));
 }
 
 #[tokio::test]
@@ -3404,9 +3240,9 @@ fn collected_merge_evidence_preserves_settlement(tc: hegel::TestCase) {
     let legacy_disposition = tc.draw(hegel::generators::booleans());
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(async {
-        let TerminalChangeRequestReconcile { outcome, backend, .. } = reconcile_terminal_bound_change_request(true, true, false).await;
+        let TerminalChangeRequestReconcile { outcome, backend, checkouts, checkout_launch, .. } =
+            reconcile_terminal_bound_change_request(true, true, false).await;
         let convoys = backend.using::<Convoy>("flotilla");
-        let checkouts = backend.using::<Checkout>("flotilla");
         let changes = backend.using::<ChangeRequest>("flotilla");
         let vessels = backend.using::<Vessel>("flotilla");
         let sessions = backend.using::<TerminalSession>("flotilla");
@@ -3458,20 +3294,20 @@ fn collected_merge_evidence_preserves_settlement(tc: hegel::TestCase) {
             .expect("running orphan session");
         let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
             .with_vessels(vessels.clone())
-            .with_checkouts(checkouts.clone())
+            .with_lifecycle_reads(checkouts.reads.clone())
             .with_terminal_sessions(sessions.clone())
             .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(180))
             .with_teardown_runtime(Arc::new(AlwaysEligible))
             .with_clock(Arc::new(FixedClock(timestamp(40))));
         for (step, delete_checkout) in [checkout_first, !checkout_first].into_iter().enumerate() {
             if delete_checkout {
-                checkouts.delete("checkout-a").await.expect("collect checkout");
+                // Its home releases it: the launch ends.
+                checkouts.finish(checkout_launch.as_deref().expect("checkout present"), Ending::Released);
             } else {
                 changes.delete(&cr_name("github.com", "example/repo-a", 42)).await.expect("collect CR");
             }
             let current = convoys.get("convoy-a").await.expect("convoy");
-            let checkout_objects =
-                checkouts.list().await.expect("checkouts").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
+            let checkout_objects = held_checkouts(&checkouts);
             let change_objects =
                 changes.list().await.expect("changes").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
             let evaluation = evaluate_landing_settlement(
@@ -3557,6 +3393,7 @@ fn terminal_session_cleanup_respects_reclaim_and_authority(tc: hegel::TestCase) 
         // Inject only the daemon verification boundary; resource discovery uses the real backend.
         let gate: Arc<dyn ConvoyTeardownRuntime> = if eligible { Arc::new(AlwaysEligible) } else { Arc::new(NeverEligible) };
         let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+            .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads)
             .with_terminal_sessions(sessions.clone())
             .with_teardown_runtime(gate);
         let prepared = reconciler.prepare(&convoy).await.expect("prepare");
@@ -3756,6 +3593,7 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
             .unwrap();
         convoys.update_status("three-pr", &created.metadata.resource_version, &status).await.unwrap();
         let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+            .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads)
             .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(180))
             .with_clock(Arc::new(FixedClock(timestamp(55))));
         for number in 1..=3 {

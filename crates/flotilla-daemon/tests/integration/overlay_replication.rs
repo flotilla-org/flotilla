@@ -10,10 +10,10 @@ use flotilla_daemon_testkit::server::spawn_in_memory_request_topology;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{FleetStaleness, HostName, PeerConnectionState, QueryId, Relationship, SubjectKind};
 use flotilla_resources::{
-    ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus,
-    ConditionValue, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, Host, HostSpec, HostStatus, InputMeta, IntegrationCondition,
-    ObservedCheckoutSpec, Project, ProjectSpec, RepositoryKey, ResourceProvenance, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, ConditionValue, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, Host,
+    HostSpec, HostStatus, InputMeta, IntegrationCondition, ObservedCheckoutSpec, Project, ProjectSpec, RepositoryKey, ResourceProvenance,
+    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselSpec,
+    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::{watch_resource_kind_replica_sources, ResourceBackend};
 use futures::StreamExt;
@@ -600,61 +600,67 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
     .await
     .expect("start home controller before crew opens PR");
     let topology = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect hosts");
-    let kiwi_checkouts = kiwi.resource_backend().using::<Checkout>("flotilla");
-    let checkout = kiwi_checkouts
+    // The forge observes change request 2301 open; the crew's checkout, held for the convoy on
+    // the engine at its home, is inspected as associated with it. Neither changes the convoy's
+    // phase: the checkout's change wakes the convoy.
+    let now = chrono::Utc::now();
+    let change_requests = home.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
+    let record_name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 2301, &[])
+            .expect("change request address"),
+    )
+    .expect("record name");
+    let record = change_requests
         .create(
-            &InputMeta::builder()
-                .name("crew-checkout".to_string())
-                .labels(BTreeMap::from([("flotilla.work/convoy".to_string(), "crew-convoy".to_string())]))
+            &InputMeta::builder().name(record_name.clone()).build(),
+            &flotilla_resources::ChangeRequestSpec::builder()
+                .service("github.com".to_string())
+                .scope("flotilla-org/flotilla".to_string())
+                .number(2301)
+                .observing_authority("feta".to_string())
                 .build(),
-            &CheckoutSpec::Observed(ObservedCheckoutSpec {
-                r#ref: "fix/crew-branch".into(),
-                path: "/srv/crew/flotilla".into(),
-                repo_ref: repository_key,
-                host_ref: "kiwi".into(),
-                is_main: false,
-            }),
         )
         .await
-        .expect("create checkout after admission");
-    kiwi_checkouts
+        .expect("forge observes the change request");
+    change_requests
         .update_status(
-            &checkout.metadata.name,
-            &checkout.metadata.resource_version,
-            &CheckoutStatus {
-                phase: CheckoutPhase::Ready,
-                integration: flotilla_resources::CheckoutIntegrationStatus {
-                    change_request: Some(ChangeRequestObservation {
-                        id: "2301".into(),
-                        state: ChangeRequestState::Open,
-                        mergeability: ChangeRequestMergeability::Unknown,
-                        target_ref: Some("main".into()),
-                        observed_at: chrono::Utc::now().to_rfc3339(),
-                    }),
-                    ..Default::default()
+            &record_name,
+            &record.metadata.resource_version,
+            &flotilla_resources::ChangeRequestStatus {
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
+                state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, now),
+                head_sha: flotilla_resources::Observation::known("abc".to_string(), now),
+                checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, now),
+                review: flotilla_resources::ChangeRequestReviewObservation {
+                    actionable_at_head: flotilla_resources::Observation::known(false, now),
                 },
-                ..Default::default()
+                mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, now),
             },
         )
         .await
+        .expect("change request is open");
+    use flotilla_resources::checkout_records::CheckoutRecords as _;
+    let engine = flotilla_daemon_testkit::engine::runtime_checkouts(&feta);
+    let engine_convoy = flotilla_resources::convoy::engine::engine_name(&convoy).expect("engine convoy name");
+    engine.open_convoy(&engine_convoy);
+    let launch = engine.put_ready(
+        "crew-checkout",
+        &CheckoutSpec::Observed(ObservedCheckoutSpec {
+            r#ref: "fix/crew-branch".into(),
+            path: "/srv/crew/flotilla".into(),
+            repo_ref: repository_key,
+            host_ref: "feta".into(),
+            is_main: false,
+        }),
+        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(engine_convoy)),
+    );
+    engine
+        .checkouts
+        .inspected(&launch, flotilla_resources::checkout_records::Inspection { change_request: Some(2301), ..Default::default() })
         .expect("crew opens PR without changing convoy phase");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if home
-                .including_replicas::<Checkout>("flotilla")
-                .get("crew-checkout")
-                .await
-                .ok()
-                .and_then(|checkout| checkout.object.status)
-                .is_some_and(|status| status.integration.change_request.is_some())
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("home receives checkout observation");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if kiwi.resource_backend().including_replicas::<Convoy>("flotilla").get("crew-convoy").await.is_ok() {

@@ -423,7 +423,11 @@ fn merged_submission_entering_landing_owes_settlement_or_names_no_exit(tc: hegel
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut wake = supervision_wake(&backend);
         let now = Utc::now();
-        wake.subscriptions = wake.subscriptions.with_clock(Arc::new(flotilla_store_testkit::VirtualClock::new(now)));
+        let engine = flotilla_provisioning_testkit::CheckoutFixture::default();
+        wake.subscriptions = wake
+            .subscriptions
+            .with_clock(Arc::new(flotilla_store_testkit::VirtualClock::new(now)))
+            .with_lifecycle_reads(engine.reads.clone());
         let workflow = flotilla_resources::single_agent_workflow_spec();
         let mut status = ConvoyStatus {
             phase: ConvoyPhase::Active,
@@ -530,22 +534,20 @@ fn merged_submission_entering_landing_owes_settlement_or_names_no_exit(tc: hegel
             .await
             .unwrap();
         if checkout_present {
-            backend
-                .using::<Checkout>("flotilla")
-                .create(
-                    &InputMeta::builder().name("checkout".into()).labels(BTreeMap::from([(CONVOY_LABEL.into(), "merged".into())])).build(),
-                    &CheckoutSpec::Observed(
-                        ObservedCheckoutSpec::builder()
-                            .r#ref("branch".into())
-                            .path("/unused".into())
-                            .repo_ref(RepositoryKey("repo".into()))
-                            .host_ref("host".into())
-                            .is_main(false)
-                            .build(),
-                    ),
-                )
-                .await
-                .unwrap();
+            engine.open_convoy("merged");
+            engine.put_ready(
+                "checkout",
+                &CheckoutSpec::Observed(
+                    ObservedCheckoutSpec::builder()
+                        .r#ref("branch".into())
+                        .path("/unused".into())
+                        .repo_ref(RepositoryKey("repo".into()))
+                        .host_ref("home".into())
+                        .is_main(false)
+                        .build(),
+                ),
+                Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy("merged".into())),
+            );
         }
 
         let convoys = backend.using::<Convoy>("flotilla");
@@ -580,8 +582,10 @@ fn landing_digest_evidence_obligations_follow_observations(tc: hegel::TestCase) 
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut wake = supervision_wake(&backend);
-        let now = Utc::now();
-        wake.subscriptions = wake.subscriptions.with_clock(Arc::new(flotilla_store_testkit::VirtualClock::new(now)));
+        let clock = Arc::new(flotilla_store_testkit::VirtualClock::new(Utc::now()));
+        // This home's inspection is confirmed when it is read; a failing one, since it failed.
+        let engine = flotilla_provisioning_testkit::CheckoutFixture::default();
+        wake.subscriptions = wake.subscriptions.with_clock(clock.clone()).with_lifecycle_reads(engine.reads.clone());
         create_convoy(
             &backend,
             "digest",
@@ -605,44 +609,44 @@ fn landing_digest_evidence_obligations_follow_observations(tc: hegel::TestCase) 
             },
         )
         .await;
-        let checkouts = backend.using::<Checkout>("flotilla");
-        checkouts
-            .create(
-                &InputMeta::builder()
-                    .name("digest-checkout".into())
-                    .labels(BTreeMap::from([(CONVOY_LABEL.into(), "digest".into())]))
+        engine.open_convoy("digest");
+        let launch = engine.put_ready(
+            "digest-checkout",
+            &CheckoutSpec::Observed(
+                ObservedCheckoutSpec::builder()
+                    .r#ref(if qualified_branch { "refs/heads/branch" } else { "branch" }.into())
+                    .path("/unused".into())
+                    .repo_ref(RepositoryKey("repo".into()))
+                    .host_ref("home".into())
+                    .is_main(false)
                     .build(),
-                &CheckoutSpec::Observed(
-                    ObservedCheckoutSpec::builder()
-                        .r#ref(if qualified_branch { "refs/heads/branch" } else { "branch" }.into())
-                        .path("/unused".into())
-                        .repo_ref(RepositoryKey("repo".into()))
-                        .host_ref("host".into())
-                        .is_main(false)
-                        .build(),
-                ),
-            )
-            .await
-            .unwrap();
+            ),
+            Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy("digest".into())),
+        );
         let convoys = backend.using::<Convoy>("flotilla");
         for step in steps {
-            let checkout = checkouts.get("digest-checkout").await.unwrap();
-            let mut status = flotilla_resources::CheckoutStatus::default();
-            if step != 0 {
-                status.integration.remote_refs.insert(
-                    "refs/heads/branch".into(),
-                    flotilla_resources::RemoteRefObservation {
-                        digest: if step == 3 { "different" } else { "expected" }.into(),
-                        observed_at: (if step == 1 {
-                            now - chrono::Duration::from_std(flotilla_resources::LANDING_EVIDENCE_TTL).unwrap()
-                        } else {
-                            now
-                        })
-                        .to_rfc3339(),
-                    },
-                );
-            }
-            checkouts.update_status("digest-checkout", &checkout.metadata.resource_version, &status).await.unwrap();
+            let digest = match step {
+                0 => None,
+                3 => Some("different"),
+                _ => Some("expected"),
+            };
+            engine
+                .checkouts
+                .inspected(
+                    &launch,
+                    flotilla_resources::checkout_records::Inspection { remote_digest: digest.map(str::to_owned), ..Default::default() },
+                )
+                .unwrap();
+            // A stale inspection is one whose reads have failed for the evidence's lifetime; a
+            // fresh one is read within it.
+            let now = if step == 1 {
+                engine.checkouts.inspection_failed(&launch).unwrap();
+                let failing_since = engine.record(&launch).integration.and_then(|integration| integration.failing_since).unwrap();
+                failing_since + chrono::Duration::from_std(flotilla_resources::LANDING_EVIDENCE_TTL).unwrap()
+            } else {
+                Utc::now() + chrono::Duration::seconds(10)
+            };
+            clock.set(now);
             let objects = HashMap::from([("digest".into(), convoys.get("digest").await.unwrap())]);
             wake.sync_rows("flotilla", &objects).await.unwrap();
             wake.judge_stalls_at("flotilla", &objects, now).await.unwrap();
@@ -663,30 +667,28 @@ fn landing_digest_evidence_obligations_follow_observations(tc: hegel::TestCase) 
                 assert!(rows.is_empty());
             }
         }
-        checkouts.delete("digest-checkout").await.unwrap();
+        // A checkout the engine no longer has produces no evidence.
+        engine.finish(&launch, flotilla_provisioning_testkit::Ending::Released);
+        let now = Utc::now() + chrono::Duration::seconds(10);
+        clock.set(now);
         let objects = HashMap::from([("digest".into(), convoys.get("digest").await.unwrap())]);
         wake.sync_rows("flotilla", &objects).await.unwrap();
         wake.judge_stalls_at("flotilla", &objects, now).await.unwrap();
         assert!(wake.subscriptions.rows().await.is_empty());
         assert!(convoys.get("digest").await.unwrap().status.unwrap().stalled.is_some());
-        checkouts
-            .create(
-                &InputMeta::builder()
-                    .name("unrelated-checkout".into())
-                    .labels(BTreeMap::from([(CONVOY_LABEL.into(), "digest".into())]))
+        engine.put_ready(
+            "unrelated-checkout",
+            &CheckoutSpec::Observed(
+                ObservedCheckoutSpec::builder()
+                    .r#ref("other-branch".into())
+                    .path("/unused".into())
+                    .repo_ref(RepositoryKey("repo".into()))
+                    .host_ref("home".into())
+                    .is_main(false)
                     .build(),
-                &CheckoutSpec::Observed(
-                    ObservedCheckoutSpec::builder()
-                        .r#ref("other-branch".into())
-                        .path("/unused".into())
-                        .repo_ref(RepositoryKey("repo".into()))
-                        .host_ref("host".into())
-                        .is_main(false)
-                        .build(),
-                ),
-            )
-            .await
-            .unwrap();
+            ),
+            Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy("digest".into())),
+        );
         let objects = HashMap::from([("digest".into(), convoys.get("digest").await.unwrap())]);
         wake.sync_rows("flotilla", &objects).await.unwrap();
         wake.judge_stalls_at("flotilla", &objects, now).await.unwrap();

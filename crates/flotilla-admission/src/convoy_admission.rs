@@ -94,7 +94,8 @@ pub struct ConvoyCreateAdmission<'a> {
     source_ref: Option<String>,
     project_ref: Option<String>,
     adopted_checkout_refs: BTreeMap<RepositoryKey, String>,
-    adopted_checkout_ref_to_cleanup: Option<String>,
+    /// The checkout the convoy adopts, recorded on it for its vessel to request (#3108).
+    adopted_checkout: Option<flotilla_resources::ObservedCheckoutSpec>,
     dispatching_principal_ref: Option<PrincipalRef>,
     /// Per-vessel composed-image pins when vessels resolve to different images.
     #[builder(default)]
@@ -112,7 +113,6 @@ pub struct ConvoyAdmission {
     lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
     /// The account kinds' records: the old store's, or the engine's behind `[primitives]`.
     accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,
-    observed_checkout_reconciliation: Arc<Mutex<()>>,
     config: Arc<ConfigStore>,
     discovery: Arc<DiscoveryRuntime>,
     environments: Arc<dyn Environments>,
@@ -749,6 +749,7 @@ impl ConvoyAdmission {
                 placement_decision: admission.placement_decision,
                 vessel_placements: Some(&admission.vessel_placements),
                 image_builds: &admission.image_builds,
+                adopted_checkout: None,
             },
         )
         .await?;
@@ -846,12 +847,21 @@ impl ConvoyAdmission {
         name: &str,
         bundle: ConvoySnapshotBundle<'_>,
     ) -> Result<(), String> {
-        let ConvoySnapshotBundle { spec, workflow, placement, placement_decision, vessel_placements, image_builds, evidence } = bundle;
+        let ConvoySnapshotBundle {
+            spec,
+            workflow,
+            placement,
+            placement_decision,
+            vessel_placements,
+            image_builds,
+            adopted_checkout,
+            evidence,
+        } = bundle;
         let workflow_value = serde_json::to_value(workflow).map_err(|error| error.to_string())?;
         let workflow_name = prepared_snapshot_name("workflow", &workflow_value)?;
         ensure_prepared_workflow_snapshot(&self.backend, namespace, &workflow_name, workflow).await?;
         let mut annotations = BTreeMap::from([(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), workflow_name)]);
-        if self.write_admission_briefs_from_inventory(namespace, name, spec, workflow, evidence).await? {
+        if self.write_admission_briefs_from_inventory(namespace, name, spec, workflow, evidence, adopted_checkout).await? {
             annotations.insert(BRIEF_ARTIFACTS_ANNOTATION.to_string(), "true".to_string());
         }
         if let Some(placement) = placement {
@@ -860,6 +870,12 @@ impl ConvoyAdmission {
         }
         if let Some(vessel_placements) = vessel_placements {
             annotations.extend(self.prepare_vessel_placement_annotations(namespace, name, vessel_placements).await?);
+        }
+        if let Some(adopted) = adopted_checkout {
+            annotations.insert(
+                flotilla_resources::ADOPTED_CHECKOUT_ANNOTATION.to_string(),
+                serde_json::to_string(adopted).map_err(|error| error.to_string())?,
+            );
         }
         let created = crate::image_build::create_planned_builds(&self.backend, namespace, image_builds).await?;
         let result = self.create_convoy_with_annotations(namespace, name, spec, placement_decision, annotations).await;
@@ -985,38 +1001,14 @@ impl ConvoyAdmission {
             ]),
             ..Default::default()
         };
-        // The observed partition is an in-memory cache; durable rows override
-        // all selected cache names even when their ready/local predicates changed.
+        // The checkouts this host's refresh observed; the engine's are read through its port.
         let observed = self
             .observed_backend
             .query_declared::<ResourceCheckout>(namespace, &local_checkout_query)
             .await
             .map_err(|error| error.to_string())?;
-        let checkouts = self
-            .backend
-            .query_declared::<ResourceCheckout>(
-                namespace,
-                &StoreQuery {
-                    any_of: Some(vec![
-                        local_checkout_query,
-                        StoreQuery::names(
-                            observed
-                                .items
-                                .iter()
-                                .map(|source| source.object.metadata.name.clone())
-                                .chain(spec.adopted_checkout_refs.values().cloned()),
-                            true,
-                        ),
-                    ]),
-                    include_replicas: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
         let mut snapshot = flotilla_store::RequestSnapshot::new(&self.backend, namespace)?;
         snapshot.insert::<Repository>(repositories)?;
-        snapshot.insert::<ResourceCheckout>(checkouts)?;
         if let Some(project) = spec.project_ref.as_deref() {
             // Every graph/default layer participates in topic and cascade refusals.
             let projects = flotilla_store::read_definition_catalog::<Project>(read_source, namespace).await?;
@@ -1089,7 +1081,7 @@ impl ConvoyAdmission {
         spec: &ConvoySpec,
         workflow: &WorkflowTemplateSpec,
     ) -> Result<bool, String> {
-        self.write_briefs(namespace, name, spec, workflow, BriefReadSource::Load).await
+        self.write_briefs(namespace, name, spec, workflow, BriefReadSource::Load, None).await
     }
 
     async fn write_admission_briefs_from_inventory(
@@ -1099,8 +1091,9 @@ impl ConvoyAdmission {
         spec: &ConvoySpec,
         workflow: &WorkflowTemplateSpec,
         evidence: BriefEvidence<'_>,
+        adopted: Option<&flotilla_resources::ObservedCheckoutSpec>,
     ) -> Result<bool, String> {
-        self.write_briefs(namespace, name, spec, workflow, BriefReadSource::Prepared(evidence)).await
+        self.write_briefs(namespace, name, spec, workflow, BriefReadSource::Prepared(evidence), adopted).await
     }
 
     async fn write_briefs(
@@ -1110,6 +1103,7 @@ impl ConvoyAdmission {
         spec: &ConvoySpec,
         workflow: &WorkflowTemplateSpec,
         source: BriefReadSource<'_>,
+        adopted: Option<&flotilla_resources::ObservedCheckoutSpec>,
     ) -> Result<bool, String> {
         let Some(writer) = self.brief_artifact_writer.read().await.clone() else { return Ok(false) };
         // Admission brief addresses use (convoy, role, "brief", convoy). Role
@@ -1168,9 +1162,7 @@ impl ConvoyAdmission {
         };
         let templates = CrewBriefTemplateResolver::with_config_dir(self.config.base_path().as_path());
         let repositories = reads.clone().using::<Repository>(namespace);
-        let checkouts = reads.clone().using::<ResourceCheckout>(namespace);
         let local_checkouts = crate::repository_addressing::local_checkouts_with_lifecycle_reads(
-            &reads,
             &observed,
             namespace,
             self.environments.local_host_id().as_str(),
@@ -1196,16 +1188,18 @@ impl ConvoyAdmission {
                     fork_stance |= repository.spec.is_fork();
                 }
                 if let Some(checkout_ref) = spec.adopted_checkout_refs.get(repository_ref) {
-                    if let Ok(checkout) = checkouts.get(checkout_ref).await {
-                        if let Some(path) = checkout
-                            .status
-                            .as_ref()
-                            .and_then(|status| status.path.clone())
-                            .or_else(|| checkout.spec.target_path().map(str::to_string))
-                        {
-                            roots.push(PathBuf::from(path));
-                        }
-                    }
+                    // The adopted checkout, as admission found it or as the engine holds it.
+                    let path = match adopted.filter(|adopted| &adopted.repo_ref == repository_ref) {
+                        Some(adopted) => Some(adopted.path.clone()),
+                        None => self
+                            .lifecycle_reads
+                            .checkouts()
+                            .and_then(|checkouts| checkouts.get(checkout_ref, None))
+                            .ok()
+                            .flatten()
+                            .and_then(|record| record.path().map(str::to_owned)),
+                    };
+                    roots.extend(path.map(PathBuf::from));
                 }
             }
             roots.sort();
@@ -1443,6 +1437,7 @@ impl ConvoyAdmission {
                 &admission.spec,
                 &admission.workflow,
                 BriefEvidence { definitions: &admission.evidence, convoys: &inventory },
+                None,
             )
             .await?
         {
@@ -1495,7 +1490,7 @@ impl ConvoyAdmission {
             source_ref,
             project_ref,
             adopted_checkout_refs,
-            adopted_checkout_ref_to_cleanup,
+            adopted_checkout,
             dispatching_principal_ref,
             vessel_placements,
             image_builds,
@@ -1533,25 +1528,7 @@ impl ConvoyAdmission {
         };
         spec.generation = match allocate_convoy_generation_from_inventory(&inventory, spec.project_ref.as_deref(), role) {
             Ok(generation) => generation,
-            Err(message) => {
-                if let Some(checkout_ref) = adopted_checkout_ref_to_cleanup {
-                    let _reconciliation = self.observed_checkout_reconciliation.lock().await;
-                    let cleanup = async {
-                        self.backend.clone().using::<ResourceCheckout>(namespace).delete(&checkout_ref).await?;
-                        flotilla_observation::observed_resources::delete_stale_adopted_checkouts(
-                            &self.backend,
-                            &self.observed_backend,
-                            namespace,
-                        )
-                        .await
-                    }
-                    .await;
-                    if let Err(error) = cleanup {
-                        warn!(%error, %checkout_ref, "failed to clean up adopted checkout after convoy identity conflict");
-                    }
-                }
-                return CommandValue::Error { message };
-            }
+            Err(message) => return CommandValue::Error { message },
         };
         let bindings = match self
             .choose_account_bindings(
@@ -1582,6 +1559,7 @@ impl ConvoyAdmission {
                     placement_decision,
                     vessel_placements: (!vessel_placements.is_empty()).then_some(&vessel_placements),
                     image_builds: &image_builds,
+                    adopted_checkout: adopted_checkout.as_ref(),
                 },
             )
             .await
@@ -3965,6 +3943,8 @@ struct ConvoySnapshotBundle<'a> {
     /// Composed images' builds, created only with the convoy (refusals before
     /// this point never leave builds behind).
     pub image_builds: &'a [crate::image_build::PlannedImageBuild],
+    /// The checkout the convoy adopts, recorded on it (#3108).
+    pub adopted_checkout: Option<&'a flotilla_resources::ObservedCheckoutSpec>,
     evidence: BriefEvidence<'a>,
 }
 
@@ -4901,7 +4881,6 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
     let query_port: Arc<dyn ChangeRequestQueryPort> = Arc::new(FixtureQueries);
     let issue_query_port: Arc<dyn IssueQueryPort> = Arc::new(FixtureQueries);
     let observation_source = Arc::new(ProviderChangeRequestObservationSource::new(resource_backend.clone(), query_port.clone()));
-    let observed_checkout_reconciliation = Arc::new(Mutex::new(()));
     let repository_change_requests = Arc::new(RwLock::new(HashMap::new()));
     let brief_artifact_writer = Arc::new(RwLock::new(None));
     let admission_free_space_path = Arc::new(std::sync::RwLock::new(temp.path().to_path_buf()));
@@ -4911,7 +4890,6 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
         .backend(resource_backend.clone())
         .accounts(Arc::new(flotilla_store::OldStoreAccounts::new(resource_backend.clone())))
         .observed_backend(observed_resource_backend.clone())
-        .observed_checkout_reconciliation(Arc::clone(&observed_checkout_reconciliation))
         .config(Arc::clone(&config))
         .discovery(Arc::clone(&discovery))
         .environments(Arc::clone(&environments))
@@ -4926,14 +4904,13 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
         .host_name(host_name.clone())
         .clock(Arc::clone(&clock))
         .fulfilment_decider(Arc::new(StaticFulfilmentDecider))
-        // The engine's environments, as composition installs them; none is held here.
-        .lifecycle_reads(flotilla_provisioning_testkit::EnvironmentFixture::default().reads)
+        // The engine's readings, as composition installs them; none is held here.
+        .lifecycle_reads(Arc::clone(crate::test_support::no_held_checkouts()))
         .build();
     HandlerContractFixture {
         owner: admission,
         backend: resource_backend,
         observed: observed_resource_backend,
-        reconciliation: observed_checkout_reconciliation,
         namespace: provisioning_namespace,
         temp,
     }
@@ -4992,7 +4969,6 @@ pub struct HandlerContractFixture {
     pub owner: ConvoyAdmission,
     pub backend: ResourceBackend,
     pub observed: ResourceBackend,
-    pub reconciliation: Arc<Mutex<()>>,
     pub namespace: Arc<std::sync::RwLock<String>>,
     pub temp: tempfile::TempDir,
 }
@@ -5327,6 +5303,7 @@ mod tests {
                         &spec,
                         &workflow,
                         BriefEvidence { definitions: &missing, convoys: &inventory },
+                        None,
                     )
                     .await
                     .expect_err("missing prepared evidence");
@@ -5338,7 +5315,8 @@ mod tests {
                         "target",
                         &spec,
                         &workflow,
-                        BriefEvidence { definitions: &snapshot, convoys: &inventory }
+                        BriefEvidence { definitions: &snapshot, convoys: &inventory },
+                        None,
                     )
                     .await
                     .expect("render reused briefs"));

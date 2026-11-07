@@ -1,7 +1,7 @@
 use flotilla_crew::convoy::ConvoyReconciler;
 use flotilla_protocol::{IssueRef, IssueSource, IssueState};
 use flotilla_resources::{
-    external_patches, reconcile, Checkout, CheckoutSpec, Convoy, ConvoyIssue, ConvoyPhase, Event, FreshCloneCheckoutSpec, FulfilmentKind,
+    external_patches, reconcile, CheckoutSpec, Convoy, ConvoyIssue, ConvoyPhase, Event, FreshCloneCheckoutSpec, FulfilmentKind,
     FulfilmentKindSpec, FulfilmentRealisation, InputMeta, IssueSnapshot, LifecycleAuthority, RepositoryKey, RepositorySpec, ResourceError,
     Vessel, VesselPhase, VesselStatus, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, PLACEMENT_SNAPSHOT_ANNOTATION,
     PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_KIND,
@@ -126,7 +126,8 @@ async fn missing_template_transitions_convoy_to_failed() {
         ControllerLoop {
             primary: convoys.clone(),
             secondaries: Vec::new(),
-            reconciler: ConvoyReconciler::new(templates.clone()),
+            reconciler: ConvoyReconciler::new(templates.clone())
+                .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads),
             resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
@@ -169,7 +170,9 @@ async fn controller_loop_drives_convoy_progression_without_manual_reconcile_call
         ControllerLoop {
             primary: convoys.clone(),
             secondaries: Vec::new(),
-            reconciler: ConvoyReconciler::new(templates.clone()).with_vessels(backend.clone().using::<Vessel>("flotilla")),
+            reconciler: ConvoyReconciler::new(templates.clone())
+                .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads)
+                .with_vessels(backend.clone().using::<Vessel>("flotilla")),
             resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
@@ -252,7 +255,9 @@ async fn controller_loop_advances_task_via_vessel_secondary_watch() {
         ControllerLoop {
             primary: convoys.clone(),
             secondaries: ConvoyReconciler::secondary_watches(),
-            reconciler: ConvoyReconciler::new(templates.clone()).with_vessels(workspaces.clone()),
+            reconciler: ConvoyReconciler::new(templates.clone())
+                .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads)
+                .with_vessels(workspaces.clone()),
             resync_interval: Duration::from_millis(50),
             backend: backend.clone(),
         }
@@ -324,11 +329,12 @@ async fn controller_loop_advances_task_via_vessel_secondary_watch() {
 }
 
 #[tokio::test]
-async fn controller_loop_finalizer_deletes_vessels_and_checkouts() {
+async fn controller_loop_finalizer_deletes_vessels_and_waits_for_its_checkouts() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let workspaces = backend.clone().using::<Vessel>("flotilla");
-    let checkouts = backend.clone().using::<Checkout>("flotilla");
+    // The engine holds the convoy's checkout for its engine Convoy.
+    let checkouts = flotilla_provisioning_testkit::CheckoutFixture::default();
     let workflow_snapshot_name = "workflow-snapshot-012345abcdef";
     let placement_snapshot_name = "placement-snapshot-012345abcdef";
     let snapshot_labels = |kind: &str| [(PREPARED_SNAPSHOT_LABEL.to_string(), kind.to_string())].into_iter().collect();
@@ -385,24 +391,20 @@ async fn controller_loop_finalizer_deletes_vessels_and_checkouts() {
         )
         .await
         .expect("task workspace create should succeed");
-    checkouts
-        .create(
-            &InputMeta::builder()
-                .name("checkout-convoy-delete".to_string())
-                .labels([(CONVOY_LABEL.to_string(), "convoy-delete".to_string())].into_iter().collect())
-                .build(),
-            &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
-                source_clone_ref: None,
-                repo_ref: RepositoryKey("repo-a".to_string()),
-                env_ref: "env-convoy-delete".to_string(),
-                r#ref: "feature/delete".to_string(),
-                base_ref: Some("main".to_string()),
-                target_path: "/checkouts/convoy-delete".to_string(),
-                url: "https://github.com/flotilla-org/flotilla".to_string(),
-            }),
-        )
-        .await
-        .expect("checkout create should succeed");
+    checkouts.open_convoy("convoy-delete");
+    let launch = checkouts.put_ready(
+        "checkout-convoy-delete",
+        &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+            source_clone_ref: None,
+            repo_ref: RepositoryKey("repo-a".to_string()),
+            env_ref: "env-convoy-delete".to_string(),
+            r#ref: "feature/delete".to_string(),
+            base_ref: Some("main".to_string()),
+            target_path: "/checkouts/convoy-delete".to_string(),
+            url: "https://github.com/flotilla-org/flotilla".to_string(),
+        }),
+        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy("convoy-delete".to_string())),
+    );
     workspaces
         .create(
             &InputMeta::builder()
@@ -450,7 +452,7 @@ async fn controller_loop_finalizer_deletes_vessels_and_checkouts() {
             secondaries: ConvoyReconciler::secondary_watches(),
             reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
                 .with_vessels(workspaces.clone())
-                .with_checkouts(checkouts.clone())
+                .with_lifecycle_reads(checkouts.reads.clone())
                 .with_prepared_snapshot_gc(PreparedSnapshotGarbageCollector::new(backend.clone(), "flotilla")),
             resync_interval: Duration::from_millis(50),
             backend: backend.clone(),
@@ -472,11 +474,27 @@ async fn controller_loop_finalizer_deletes_vessels_and_checkouts() {
 
     convoys.delete("convoy-delete").await.expect("convoy delete should succeed");
 
+    // The convoy waits for its checkout, which the Checkout controller releases once the engine
+    // Convoy has ended.
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(workspaces.get("convoy-delete-implement").await, Err(ResourceError::NotFound { .. })) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("convoy finalizer should delete managed vessels");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(convoys.get("convoy-delete").await.is_ok(), "the convoy waits for its held checkout");
+    checkouts.abandon_convoy("convoy-delete", "deleted");
+    checkouts.finish(&launch, flotilla_provisioning_testkit::Ending::Released);
+
     timeout(Duration::from_secs(1), async {
         loop {
             if matches!(convoys.get("convoy-delete").await, Err(ResourceError::NotFound { .. }))
                 && matches!(workspaces.get("convoy-delete-implement").await, Err(ResourceError::NotFound { .. }))
-                && matches!(checkouts.get("checkout-convoy-delete").await, Err(ResourceError::NotFound { .. }))
                 && matches!(
                     backend.clone().definitions::<WorkflowTemplate>("flotilla").get(workflow_snapshot_name).await,
                     Err(ResourceError::NotFound { .. })
@@ -492,7 +510,7 @@ async fn controller_loop_finalizer_deletes_vessels_and_checkouts() {
         }
     })
     .await
-    .expect("convoy finalizer should delete managed vessels and checkouts");
+    .expect("convoy finalizer should finish once its checkout is released");
 
     assert_eq!(
         workspaces

@@ -1,37 +1,77 @@
-//! Checkout materialisation, integration inspection, removal, and convoy-directory cleanup.
+//! A host's checkout work (#3108): making, inspecting and removing checkouts through the
+//! environment's VCS, for the engine's Checkout controller, and the host's sweep of empty convoy
+//! directories.
 
 use std::{collections::BTreeSet, path::Path, sync::Arc};
 
-use async_trait::async_trait;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
-use flotilla_resources::checkout_integration::convoy_change_request_id_for_checkout;
-use flotilla_resources::checkout_path::{checkout_path_component, checkout_path_from_status_and_spec};
+use flotilla_resources::checkout_path::checkout_path_component;
 use flotilla_resources::{
-    canonicalize_repo_url, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, CheckoutSpec, Convoy, ForgeSpec,
-    LandedEvidence, ResourceObject,
+    canonicalize_repo_url, ChangeRequest, ChangeRequestStatus, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutSpec, Convoy,
+    LandedEvidence,
 };
 use flotilla_store::{ReplicaReadResolver, ResourceBackend};
-use flotilla_vcs::checkout_integration::{
-    inspect_checkout_integration, inspect_convoy_checkout_integration, inspect_recorded_checkout_integration,
-    ChangeRequestIntegrationInput, RecordedAssociation,
-};
+use flotilla_vcs::checkout_integration::{inspect_recorded_checkout_integration, ChangeRequestIntegrationInput, RecordedAssociation};
 use flotilla_vcs::vcs as core_vcs;
 use flotilla_vcs::vcs::CheckoutRegistration;
 use flotilla_vcs::vcs::Vcs;
 use tracing::{debug, warn};
 
-use crate::reconcilers::{
-    checkout::managed_checkout_reason,
-    clone::runtime::{clone_staging_path, controller_vcs, remove_checkout_path},
-    BranchPreservationReason, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
-};
+use crate::reconcilers::clone::runtime::{clone_staging_path, controller_vcs, remove_checkout_path};
+
+/// How a checkout is removed: a worktree from its clone (plainly, archiving first, or as landed),
+/// a worktree whose clone is gone, or a clone of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckoutRemoval {
+    Worktree { clone_path: String, branch: String, target_path: String },
+    ForcedWorktree { clone_path: String, branch: String, target_path: String },
+    LandedWorktree { clone_path: String, branch: String, target_path: String },
+    OrphanedWorktree { target_path: String },
+    FreshClone { target_path: String },
+    LocalClone { target_path: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchPreservationReason {
+    CommitsPastBase,
+    CheckedOutElsewhere,
+    NotCreatedForConvoy,
+}
+
+impl std::fmt::Display for BranchPreservationReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::CommitsPastBase => "has commits beyond the recorded base",
+            Self::CheckedOutElsewhere => "is checked out in another worktree",
+            Self::NotCreatedForConvoy => "was not created for this convoy",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckoutRemovalOutcome {
+    Removed,
+    ArchivedAndRemoved { archive_path: String, preserved_branch: Option<(String, BranchPreservationReason)> },
+    PreservedBranch { branch: String, reason: BranchPreservationReason },
+    PreservedOrphanedCheckout { path: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedCheckout {
+    pub commit: Option<String>,
+    pub branch_provenance: CheckoutBranchProvenance,
+}
+
+/// Diagnostic identity shared by convoy and standalone registration callers.
+pub fn managed_checkout_reason(owner: Option<&str>, checkout: &str) -> String {
+    format!("flotilla-managed: {}/{}", owner.unwrap_or("standalone"), checkout)
+}
 
 pub struct CheckoutControllerRuntime {
     runner: Arc<dyn CommandRunner>,
     vcs: Option<Arc<dyn Vcs>>,
     change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
-    forges: Vec<ForgeSpec>,
 }
 
 /// Selects the VCS discovery path used by the daemon’s environment-routing adapter.
@@ -49,23 +89,6 @@ pub fn removal_source_path(removal: &CheckoutRemoval) -> &str {
 impl CheckoutControllerRuntime {
     fn local_runner(&self) -> Result<Arc<dyn CommandRunner>, String> {
         Ok(Arc::clone(&self.runner))
-    }
-
-    fn checkout_path<'a>(&self, checkout: &'a ResourceObject<Checkout>) -> Result<&'a str, String> {
-        checkout_path_from_status_and_spec(checkout.status.as_ref(), &checkout.spec)
-            .ok_or_else(|| format!("checkout {} has no resolved path", checkout.metadata.name))
-    }
-
-    async fn observed_change_request(
-        &self,
-        convoy: &ResourceObject<Convoy>,
-        checkout: &ResourceObject<Checkout>,
-        id: &str,
-    ) -> Result<Option<ChangeRequestStatus>, String> {
-        let Some(repository) = convoy.spec.repositories.iter().find(|repository| repository.repo_ref == *checkout.spec.repo_ref()) else {
-            return Ok(None);
-        };
-        self.observed_change_request_of(&repository.url, id).await
     }
 
     /// The replicated observation of change request `id` of the repository at `url`.
@@ -88,9 +111,8 @@ impl CheckoutControllerRuntime {
     }
 }
 
-#[async_trait]
-impl CheckoutRuntime for CheckoutControllerRuntime {
-    async fn create_worktree(
+impl CheckoutControllerRuntime {
+    pub async fn create_worktree(
         &self,
         clone_path: &str,
         branch: &str,
@@ -110,7 +132,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         Ok(PreparedCheckout { commit: materialisation.commit, branch_provenance: materialisation.provenance })
     }
 
-    async fn create_fresh_clone(
+    pub async fn create_fresh_clone(
         &self,
         repo_url: &str,
         branch: &str,
@@ -122,64 +144,14 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         Ok(PreparedCheckout { commit: materialisation.commit, branch_provenance: materialisation.provenance })
     }
 
-    async fn create_local_clone_in(
-        &self,
-        _env_ref: &str,
-        request: core_vcs::LocalCloneRequest<'_>,
-    ) -> Result<(PreparedCheckout, Option<String>), String> {
+    pub async fn create_local_clone(&self, request: core_vcs::LocalCloneRequest<'_>) -> Result<(PreparedCheckout, Option<String>), String> {
         let vcs = controller_vcs(&self.vcs, &self.runner, request.source)?;
         let (result, message) = vcs.materialise_local_clone(request).await?;
         Ok((PreparedCheckout { commit: result.commit, branch_provenance: result.provenance }, message))
     }
 
-    async fn inspect_integration(
-        &self,
-        checkout: &ResourceObject<Checkout>,
-        convoy: Option<&ResourceObject<Convoy>>,
-    ) -> Result<CheckoutIntegrationStatus, String> {
-        let request = convoy
-            .and_then(|convoy| convoy_change_request_id_for_checkout(convoy, checkout, &self.forges))
-            .or_else(|| checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL).cloned());
-        self.inspect_integration_with_request(checkout, convoy, request.as_deref()).await
-    }
-
-    async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
+    pub async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
         self.remove_checkout_impl(removal).await
-    }
-}
-
-impl CheckoutControllerRuntime {
-    /// Accepts the change-request identity resolved by the daemon’s routing adapter.
-    #[tracing::instrument(name = "checkout_landing_evidence", skip_all)]
-    pub async fn inspect_integration_with_request(
-        &self,
-        checkout: &ResourceObject<Checkout>,
-        convoy: Option<&ResourceObject<Convoy>>,
-        change_request_id: Option<&str>,
-    ) -> Result<CheckoutIntegrationStatus, String> {
-        let runner = self.local_runner()?;
-        let path = Path::new(self.checkout_path(checkout)?);
-        let vcs = controller_vcs(&self.vcs, &self.runner, self.checkout_path(checkout)?)?;
-        if let Some(convoy) = convoy {
-            let observed_change_request = match change_request_id {
-                Some(id) => self.observed_change_request(convoy, checkout, id).await?,
-                None => None,
-            };
-            return Ok(inspect_convoy_checkout_integration(
-                &*runner,
-                vcs.as_ref(),
-                path,
-                &checkout.spec,
-                convoy,
-                change_request_id,
-                ChangeRequestIntegrationInput {
-                    status: observed_change_request.as_ref(),
-                    landed_evidence: checkout.status.as_ref().and_then(|status| status.integration.landed_evidence.as_ref()),
-                },
-            )
-            .await);
-        }
-        Ok(inspect_checkout_integration(&*runner, vcs.as_ref(), path, &checkout.spec, change_request_id).await)
     }
 
     /// Inspects the checkout of `spec` at `path` for settlement, as the engine's Checkout
@@ -443,9 +415,8 @@ impl CheckoutControllerRuntime {
         runner: Arc<dyn CommandRunner>,
         vcs: Option<Arc<dyn Vcs>>,
         change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
-        forges: Vec<ForgeSpec>,
     ) -> Self {
-        Self { runner, vcs, change_requests, forges }
+        Self { runner, vcs, change_requests }
     }
     pub fn vcs(&self, checkout: &str) -> Result<Arc<dyn Vcs>, String> {
         controller_vcs(&self.vcs, &self.runner, checkout)
@@ -462,5 +433,4 @@ fn branch_preservation_reason(reason: core_vcs::CheckoutPreservationReason) -> R
 }
 
 #[cfg(test)]
-#[path = "tests.rs"]
 mod tests;

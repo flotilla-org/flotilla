@@ -75,6 +75,7 @@ async fn convoy_waits_for_selected_minimal_kind_with_legacy_host_alias_and_resum
         .await
         .expect("decision");
     let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+        .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads)
         .with_hosts(backend.including_replicas::<Host>("flotilla"));
     let prepared = reconciler.prepare(&convoy).await.expect("prepare full");
     let outcome = reconciler.reconcile(&convoy, &prepared, Utc::now());

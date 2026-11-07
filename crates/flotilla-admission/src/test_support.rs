@@ -97,3 +97,10 @@ impl TestProjectOperations {
         Self { inspector: Some(inspector), ..Self::default() }
     }
 }
+
+/// The engine's readings as a daemon installs them, its environments, clones and checkouts with
+/// none held, shared: building a store per table or hegel case is slow.
+pub(crate) fn no_held_checkouts() -> &'static Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads> {
+    static READS: std::sync::OnceLock<Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>> = std::sync::OnceLock::new();
+    READS.get_or_init(|| flotilla_provisioning_testkit::EngineFixture::default().reads())
+}

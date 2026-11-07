@@ -25,10 +25,7 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::{
-    reconcilers::{
-        clone::runtime::clone_staging_path, runtime_tests::FailFirstCloneProcessRunner, BranchPreservationReason, CheckoutRemoval,
-        CheckoutRemovalOutcome,
-    },
+    reconcilers::{clone::runtime::clone_staging_path, runtime_tests::FailFirstCloneProcessRunner},
     test_git_repo::TestGitRepo,
 };
 
@@ -37,8 +34,7 @@ async fn checkout_runtime_creates_convoy_branch_from_snapshotted_base() {
     let temp = TempDir::new().expect("tempdir");
     let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
     let target = temp.path().join("workspace/flotilla");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
     runtime
         .create_worktree(
@@ -81,8 +77,7 @@ async fn checkout_runtime_branches_convoy_off_fetched_origin_tip_when_local_base
     let origin_tip = String::from_utf8(origin_tip.stdout).expect("utf-8 rev").trim().to_string();
 
     let target = temp.path().join("workspace/flotilla");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
     runtime
         .create_worktree(clone_path, "feature/fresh-from-origin", Some("main"), target.to_str().expect("utf-8 target path"))
@@ -126,8 +121,7 @@ async fn checkout_runtime_branches_off_a_force_pushed_origin_base_ref() {
     assert_ne!(origin_tip, cached_tip, "the rewrite should actually diverge from what the clone cached");
 
     let target = temp.path().join("workspace/flotilla");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
     runtime
         .create_worktree(clone_path, "feature/onto-rewritten-base", Some("main"), target.to_str().expect("utf-8 target path"))
@@ -156,8 +150,7 @@ async fn checkout_runtime_falls_back_to_local_base_ref_when_fetch_fails() {
     let clone =
         TestGitRepo::init(temp.path().join("clone")).with_initial_commit().with_origin(origin.path().to_str().expect("utf-8 origin path"));
     let target = temp.path().join("workspace/flotilla");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
     runtime
         .create_worktree(
@@ -181,8 +174,7 @@ async fn checkout_runtime_recovers_a_worktree_after_its_completion_is_lost() {
     let temp = TempDir::new().expect("tempdir");
     let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
     let target = temp.path().join("workspace/flotilla");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
     let first = runtime
         .create_worktree(
@@ -215,8 +207,7 @@ async fn convoy_parent_cleanup_contract() {
         let parent = temp.path().join("convoy-contract");
         let target = parent.join("branch/repository");
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
-        let runtime =
-            CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
         assert!(!parent.exists(), "materialisation must recreate missing convoy parents");
         runtime
             .create_worktree(
@@ -400,8 +391,7 @@ async fn checkout_runtime_removes_zero_commit_worktree_without_git_or_directory_
     let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
     let convoy_dir = temp.path().join("checkout-root/convoy-a");
     let target = convoy_dir.join("flotilla.feature-cleanup");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
     let prepared = runtime
         .create_worktree(
@@ -441,8 +431,7 @@ async fn checkout_runtime_treats_a_never_created_worktree_as_removed() {
     let temp = TempDir::new().expect("tempdir");
     let clone = temp.path().join("clone-that-failed-auth");
     let target = temp.path().join("workspace/never-created");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
     let removal = CheckoutRemoval::Worktree {
         clone_path: clone.to_str().expect("utf-8 clone path").to_string(),
         branch: "feature/never-created".to_string(),
@@ -460,8 +449,7 @@ async fn checkout_runtime_cleans_git_state_when_only_the_worktree_directory_is_m
     let temp = TempDir::new().expect("tempdir");
     let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
     let target = temp.path().join("workspace/removed-out-of-band");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
     runtime
         .create_worktree(
             clone.path().to_str().expect("utf-8 clone path"),
@@ -535,7 +523,6 @@ async fn checkout_runtime_prunes_base_clone_after_removing_worktree() {
         vcs: None,
         runner: Arc::new(RecordingProcessRunner { commands: Arc::clone(&commands) }),
         change_requests: None,
-        forges: Vec::new(),
     };
 
     runtime
@@ -671,8 +658,7 @@ async fn checkout_runtime_removes_unregistered_worktree_path_with_embedded_repos
     let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
     let target = temp.path().join("checkout-root/convoy-a/flotilla.feature-cleanup");
     TestGitRepo::init(target.join("embedded")).with_initial_commit();
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
     let removal = CheckoutRemoval::Worktree {
         clone_path: clone.path().to_str().expect("utf-8 clone path").to_string(),
         branch: "feature/cleanup".to_string(),
@@ -690,8 +676,7 @@ async fn checkout_runtime_preserves_and_reports_branch_with_commits() {
     let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
     let convoy_dir = temp.path().join("checkout-root/convoy-a");
     let target = convoy_dir.join("feature-work/flotilla");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
     let prepared = runtime
         .create_worktree(
@@ -761,8 +746,7 @@ async fn landed_checkout_on_deleted_squash_branch_does_not_hold_teardown() {
         .expect("add origin")
         .success());
     let target = temp.path().join("checkout-root/convoy-a/work");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
     runtime
         .create_worktree(
             clone.path().to_str().expect("clone path"),
@@ -808,8 +792,7 @@ async fn landed_checkout_on_deleted_squash_branch_does_not_hold_teardown() {
 async fn checkout_runtime_removes_a_shared_bootstrap_branch_in_either_teardown_order() {
     let temp = TempDir::new().expect("tempdir");
     let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
     for reverse_teardown in [false, true] {
         let case = if reverse_teardown { "reverse" } else { "forward" };
@@ -870,8 +853,7 @@ async fn checkout_runtime_refuses_unverified_base_and_recovers_existing_target()
     let clone =
         TestGitRepo::init(temp.path().join("clone")).with_initial_commit().with_origin(missing_origin.to_str().expect("utf-8 origin path"));
     let target = temp.path().join("workspace/flotilla");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
     // #3340: refuse adoption when the configured origin cannot verify the base.
     let error = runtime
@@ -946,8 +928,7 @@ async fn checkout_runtime_resolves_a_remote_only_snapshotted_base() {
         .expect("git clone should run")
         .success());
     let target = temp.path().join("workspace/flotilla");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
     runtime
         .create_worktree(
@@ -992,8 +973,7 @@ async fn checkout_runtime_refuses_an_existing_remote_convoy_branch() {
         .expect("git clone should run")
         .success());
     let target = temp.path().join("workspace/flotilla");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
     // #2698: even a branch visible only on the remote is a name conflict.
     let error = runtime
@@ -1034,8 +1014,7 @@ async fn checkout_runtime_refuses_a_remote_branch_created_after_the_clone() {
         .success());
 
     let target = temp.path().join("workspace/flotilla");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
     // #2698: even a branch visible only on the remote is a name conflict.
     let error = runtime
         .create_worktree(clone_path.to_str().expect("clone"), "feature/created-later", Some("main"), target.to_str().expect("target"))
@@ -1050,8 +1029,7 @@ async fn fresh_clone_checkout_creates_convoy_branch_from_snapshotted_base() {
     let temp = TempDir::new().expect("tempdir");
     let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
     let target = temp.path().join("fresh-clone");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
     runtime
         .create_fresh_clone(
@@ -1076,8 +1054,7 @@ async fn checkout_runtime_recovers_a_fresh_clone_after_its_completion_is_lost() 
     let temp = TempDir::new().expect("tempdir");
     let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
     let target = temp.path().join("fresh-clone");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
     let first = runtime
         .create_fresh_clone(
@@ -1110,7 +1087,6 @@ async fn checkout_runtime_retries_after_an_interrupted_fresh_clone() {
         vcs: None,
         runner: Arc::new(FailFirstCloneProcessRunner { failed: AtomicBool::new(false) }),
         change_requests: None,
-        forges: Vec::new(),
     };
 
     runtime
@@ -1150,8 +1126,7 @@ async fn checkout_runtime_removes_an_interrupted_fresh_clone() {
     let staging_path = clone_staging_path(target);
     fs::create_dir_all(&staging_path).expect("create partial clone directory");
     fs::write(Path::new(&staging_path).join("partial"), "incomplete clone").expect("write partial clone content");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
     let outcome = runtime
         .remove_checkout(&CheckoutRemoval::FreshClone { target_path: target.to_string() })
@@ -1175,8 +1150,7 @@ async fn checkout_runtime_holds_a_fresh_clone_with_an_unpushed_commit() {
     };
     git(&["clone", origin.path().to_str().expect("utf-8 origin path"), target]);
     git(&["-C", target, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "unpushed"]);
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
     let error = runtime
         .remove_checkout(&CheckoutRemoval::FreshClone { target_path: target.to_string() })
@@ -1194,8 +1168,7 @@ async fn pruned_worktree_registration_preserves_checkout_without_retry_error() {
     let temp = TempDir::new().expect("tempdir");
     let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
     let target = temp.path().join("orphan");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
     let path = target.to_str().expect("target");
     runtime.create_worktree(source.path().to_str().expect("source"), "convoy/work", Some("main"), path).await.expect("create");
     fs::remove_dir_all(source.path().join(".git/worktrees/orphan")).expect("prune admin directory");
@@ -1218,8 +1191,7 @@ async fn pruned_worktree_registration_preserves_checkout_without_retry_error() {
             ProcessCommandRunner.exists(cmd, args).await
         }
     }
-    let failing =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(FailOrphanProbeRunner), change_requests: None, forges: Vec::new() };
+    let failing = CheckoutControllerRuntime { vcs: None, runner: Arc::new(FailOrphanProbeRunner), change_requests: None };
     let error =
         failing.remove_checkout(&CheckoutRemoval::OrphanedWorktree { target_path: path.into() }).await.expect_err("both probes fail");
     assert!(error.contains("resolve shared Git directory"), "original Release failure is retained: {error}");
@@ -1256,8 +1228,7 @@ async fn orphaned_worktree_teardown_releases_registration_before_deleting_path()
     let temp = TempDir::new().expect("tempdir");
     let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
     let target = temp.path().join("orphan");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
     runtime
         .create_worktree(source.path().to_str().expect("source"), "convoy/work", Some("main"), target.to_str().expect("target"))
         .await
@@ -1277,8 +1248,7 @@ async fn orphaned_worktree_teardown_releases_registration_before_deleting_path()
 async fn checkout_runtime_treats_an_already_missing_orphaned_worktree_as_removed() {
     let temp = TempDir::new().expect("tempdir");
     let target = temp.path().join("already-removed-worktree");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
     let outcome = runtime
         .remove_checkout(&CheckoutRemoval::OrphanedWorktree { target_path: target.to_str().expect("utf-8 target path").to_string() })
@@ -1293,8 +1263,7 @@ async fn fresh_clone_checkout_treats_head_as_the_remote_default() {
     let temp = TempDir::new().expect("tempdir");
     let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
     let target = temp.path().join("fresh-clone");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
     runtime
         .create_fresh_clone(
@@ -1331,8 +1300,7 @@ async fn fresh_clone_checkout_refuses_an_existing_convoy_branch() {
         .expect("git commit should run")
         .success());
     let target = temp.path().join("fresh-clone");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
     // #2698: a new convoy branch must not silently adopt an existing remote tip.
     let error = runtime
@@ -1363,20 +1331,16 @@ async fn local_clone_teardown_preserves_dirty_work_and_removes_clean_clone() {
         .unwrap()
         .success());
     let target = temp.path().join("convoy-local/work");
-    let runtime =
-        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
     runtime
-        .create_local_clone_in(
-            "host",
-            core_vcs::LocalCloneRequest {
-                source: source.path().to_str().unwrap(),
-                url: remote.to_str().unwrap(),
-                branch: "crew",
-                base_ref: Some("main"),
-                target: target.to_str().unwrap(),
-                intent: core_vcs::LocalCloneIntent::NewBranch,
-            },
-        )
+        .create_local_clone(core_vcs::LocalCloneRequest {
+            source: source.path().to_str().unwrap(),
+            url: remote.to_str().unwrap(),
+            branch: "crew",
+            base_ref: Some("main"),
+            target: target.to_str().unwrap(),
+            intent: core_vcs::LocalCloneIntent::NewBranch,
+        })
         .await
         .expect("local clone");
     let agent = target.join("agents/one");
@@ -1405,8 +1369,8 @@ async fn local_clone_teardown_preserves_dirty_work_and_removes_clean_clone() {
 #[hegel::test]
 fn checkout_observation_prefers_replica_status(tc: hegel::TestCase) {
     use flotilla_resources::{
-        ChangeRequestReviewObservation, ChangeRequestSpec, ConvoyRepositorySpec, InputMeta, Observation, ObservedChangeRequestState,
-        ObservedCheckoutSpec, ObservedChecks, ObservedMergeability, RepositoryKey,
+        ChangeRequestReviewObservation, ChangeRequestSpec, InputMeta, Observation, ObservedChangeRequestState, ObservedChecks,
+        ObservedMergeability,
     };
     // Subprocess boundary: this store-only read must issue no commands or probes.
     struct NoCommands;
@@ -1426,39 +1390,6 @@ fn checkout_observation_prefers_replica_status(tc: hegel::TestCase) {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let home = ResourceBackend::new(InMemoryBackend::default());
         let observer = ResourceBackend::new(InMemoryBackend::default());
-        let repo = RepositoryKey("repo".into());
-        let convoy = home
-            .using::<Convoy>(NAMESPACE)
-            .create(
-                &InputMeta::builder().name("convoy".into()).build(),
-                &ConvoySpec::builder()
-                    .workflow_ref("workflow".into())
-                    .repositories(vec![ConvoyRepositorySpec::builder()
-                        .url("https://github.com/flotilla-org/flotilla".into())
-                        .repo_ref(repo.clone())
-                        .source_ref("feature".into())
-                        .target_ref("main".into())
-                        .workspace_slug("flotilla".into())
-                        .subpaths(vec![])
-                        .build()])
-                    .build(),
-            )
-            .await
-            .unwrap();
-        let checkout = home
-            .using::<Checkout>(NAMESPACE)
-            .create(
-                &InputMeta::builder().name("checkout".into()).build(),
-                &flotilla_resources::CheckoutSpec::Observed(ObservedCheckoutSpec {
-                    r#ref: "feature".into(),
-                    path: "/unused".into(),
-                    repo_ref: repo,
-                    host_ref: "home".into(),
-                    is_main: false,
-                }),
-            )
-            .await
-            .unwrap();
         let name = flotilla_resources::address::record_name(
             &flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/flotilla", 3556, &[]).unwrap(),
         )
@@ -1495,9 +1426,8 @@ fn checkout_observation_prefers_replica_status(tc: hegel::TestCase) {
             .replace(&remote_records.list().await.unwrap(), chrono::Utc::now())
             .await
             .unwrap();
-        let runtime =
-            CheckoutControllerRuntime::new(Arc::new(NoCommands), None, Some(home.including_replicas::<ChangeRequest>(NAMESPACE)), vec![]);
-        let observed = runtime.observed_change_request(&convoy, &checkout, "3556").await.unwrap();
+        let runtime = CheckoutControllerRuntime::new(Arc::new(NoCommands), None, Some(home.including_replicas::<ChangeRequest>(NAMESPACE)));
+        let observed = runtime.observed_change_request_of("https://github.com/flotilla-org/flotilla", "3556").await.unwrap();
         assert_eq!(observed.and_then(|status| status.state.value), Some(ObservedChangeRequestState::Merged));
     });
 }
@@ -1514,8 +1444,7 @@ async fn forced_checkout_runtime_maps_archive_and_preserved_branch() {
         let temp = TempDir::new().expect("tempdir");
         let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
         let target = temp.path().join("checkout");
-        let runtime =
-            CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
         runtime
             .create_worktree(source.path().to_str().expect("source"), "governor", Some("main"), target.to_str().expect("target"))
             .await

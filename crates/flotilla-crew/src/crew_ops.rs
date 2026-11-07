@@ -21,22 +21,20 @@ use flotilla_protocol::{
     CheckoutArchiveOutcome, CheckoutArchiveStatus, CommandValue, CrewCommandContext, CrewListMember, CrewListResponse, CrewProject,
     CrewProjectRepository, EnvironmentId, HostName, LeafAddress, PrincipalRef, ResourceRef,
 };
-use flotilla_resources::checkout_integration::{change_request_subjects_from_claim, convoy_change_request_id_for_checkout};
-use flotilla_resources::checkout_path::checkout_path;
+use flotilla_resources::checkout_integration::{change_request_subjects_from_claim, convoy_change_request_id};
+use flotilla_resources::checkout_records::{latest_launches, CheckoutHolder, CheckoutRecord};
 use flotilla_resources::{
     address::{
         leaf_address, leaf_record_name, record_name, remote_change_request_address, repository_address, subject_address,
         submission_subject_text, AddressKind,
     },
-    expected_change_request_leaves, external_patches as convoy_external_patches, ChangeRequest as ResourceChangeRequest,
-    Checkout as ResourceCheckout, CheckoutIntegrationStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyPhase,
-    ConvoyStatusPatch, CrewCompletionPending, CrewMessageSender, CrewSource, CrewWorkPhase, Forge, HoldAct, InputMeta,
-    IntegrationCondition, LifecycleAuthority, ObservedChangeRequestState, Project, Repository, RepositoryKey, ResourceError,
-    ResourceObject, ResourceProvenance, TerminalAttentionState, TerminalBrief, TerminalCrewContext,
-    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionStatusPatch, TurnDeliveryRung, Vessel, WorkCompletionAuthority, CONVOY_LABEL,
-    CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION, ROLE_LABEL, VESSEL_LABEL,
-    VESSEL_REF_LABEL,
+    expected_change_request_leaves, external_patches as convoy_external_patches, ChangeRequest as ResourceChangeRequest, Clock,
+    Convoy as ResourceConvoy, ConvoyPhase, ConvoyStatusPatch, CrewCompletionPending, CrewMessageSender, CrewSource, CrewWorkPhase, Forge,
+    HoldAct, InputMeta, ObservedChangeRequestState, Project, Repository, RepositoryKey, ResourceError, ResourceObject, ResourceProvenance,
+    TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, TurnDeliveryRung, Vessel,
+    WorkCompletionAuthority, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION,
+    ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{CrewMessageDelivery, TerminalCrewMessage};
@@ -271,23 +269,23 @@ fn handoff_crew_brief(
     Ok(brief)
 }
 
-async fn crew_brief_repo_roots(
-    backend: &ResourceBackend,
-    namespace: &str,
+/// The adopted checkouts' paths among `repository_refs`, as the engine holds them.
+fn crew_brief_repo_roots(
+    reads: &dyn LifecycleReads,
     convoy: &flotilla_resources::ResourceObject<ResourceConvoy>,
     repository_refs: &[RepositoryKey],
 ) -> Vec<PathBuf> {
-    let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
     let mut roots = Vec::new();
     for repository_ref in repository_refs {
         let Some(checkout_ref) = convoy.spec.adopted_checkout_refs.get(repository_ref) else {
             continue;
         };
-        let Ok(checkout) = checkouts.get(checkout_ref).await else {
-            continue;
-        };
-        let Some(path) =
-            checkout.status.as_ref().and_then(|status| status.path.clone()).or_else(|| checkout.spec.target_path().map(str::to_string))
+        let Some(path) = reads
+            .checkouts()
+            .and_then(|checkouts| checkouts.get(checkout_ref, None))
+            .ok()
+            .flatten()
+            .and_then(|record| record.path().map(str::to_owned))
         else {
             continue;
         };
@@ -1643,6 +1641,16 @@ impl CrewService {
         *self.checkout_inspector.write().expect("checkout inspector lock") = Some(inspector);
     }
 
+    /// The checkouts held for `convoy`'s engine Convoy, at any home, each its latest launch.
+    pub async fn held_checkouts(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<Vec<CheckoutRecord>, String> {
+        let holder = CheckoutHolder::Convoy(flotilla_resources::convoy::engine::engine_name(convoy)?);
+        let reads = Arc::clone(&self.lifecycle_reads);
+        let held = tokio::task::spawn_blocking(move || reads.checkouts()?.held(&holder))
+            .await
+            .map_err(|error| format!("read held checkouts: {error}"))??;
+        Ok(latest_launches(held).into_values().collect())
+    }
+
     pub async fn teardown(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
         if force {
             return Ok(());
@@ -1652,58 +1660,25 @@ impl CrewService {
         if convoy.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ConvoyPhase::Abandoned) {
             return Ok(());
         }
-
-        let checkout_sources = self
-            .resource_backend
-            .query_declared::<ResourceCheckout>(
-                namespace,
-                &StoreQuery::labels(&BTreeMap::from([(CONVOY_LABEL.into(), convoy.metadata.name.clone())]), true, true),
-            )
-            .await
-            .map_err(|err| err.to_string())?;
-        let selected = flotilla_resources::select_convoy_child_sources(&convoy, &checkout_sources.items);
-        let origins = selected
-            .iter()
-            .filter_map(|(name, source)| match &source.provenance {
-                flotilla_resources::ResourceProvenance::Local => None,
-                flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => Some((name.clone(), origin_root.to_string())),
-            })
-            .collect::<BTreeMap<_, _>>();
-        let mut checkout_list = selected.into_values().map(|source| source.object).collect::<Vec<_>>();
-        if !checkout_list.is_empty() && convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Active) {
+        let mut checkout_list = self.held_checkouts(&convoy).await?;
+        if checkout_list.iter().any(|checkout| !checkout.ended())
+            && convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Active)
+        {
             let inspector = self.checkout_inspector.read().expect("checkout inspector lock").clone().ok_or_else(|| {
                 tracing::warn!(convoy = name, "Active convoy checkout inspector is not configured");
                 "fresh checkout inspection is unavailable: inspector not configured".to_string()
             })?;
-            for checkout in &mut checkout_list {
-                // Fail closed: an unavailable inspection must not authorize deletion
-                // from the old six-hour observation, even if another checkout passed.
-                let mut integration = inspector
-                    .inspect(&convoy, checkout)
+            // Each live checkout is inspected afresh at its home before the gate reads it. Fail
+            // closed: an unavailable inspection must not authorize deletion from an older one.
+            for checkout in checkout_list.iter().filter(|checkout| !checkout.ended()) {
+                inspector
+                    .inspect_now(namespace, checkout)
                     .await
-                    .map_err(|error| format!("fresh inspection failed for checkout {}: {error}", checkout.metadata.name))?;
-                if let Some(status) = &checkout.status {
-                    flotilla_resources::latch_evidence_backed_integration(&status.integration, &mut integration);
-                }
-                let records = self.resource_backend.using::<ResourceCheckout>(namespace);
-                match records.get(&checkout.metadata.name).await {
-                    Ok(local) => {
-                        apply_resource_status_patch(
-                            &records,
-                            &local.metadata.name,
-                            &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: Box::new(integration.clone()) },
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
-                        *checkout = records.get(&local.metadata.name).await.map_err(|error| error.to_string())?;
-                    }
-                    // A selected checkout may exist only as a replica here.
-                    Err(ResourceError::NotFound { .. }) => checkout.status.get_or_insert_with(Default::default).integration = integration,
-                    Err(error) => return Err(error.to_string()),
-                }
+                    .map_err(|error| format!("fresh inspection failed for checkout {}: {error}", checkout.checkout_name()))?;
             }
+            checkout_list = self.held_checkouts(&convoy).await?;
         }
-        self.verify_convoy_teardown_gate_at_origins(&convoy, &checkout_list, &origins, false).await
+        self.verify_convoy_teardown_gate_for_checkouts(&convoy, &checkout_list, false).await
     }
 
     async fn cascade_convoy_children(&self, namespace: &str, name: &str) -> Result<(), String> {
@@ -1717,27 +1692,16 @@ impl CrewService {
         delete_lifecycle_owned_matching(&self.resource_backend.clone().using::<ResourceTerminalSession>(namespace), &selector)
             .await
             .map_err(|error| error.to_string())?;
-        delete_lifecycle_owned_matching(&self.resource_backend.clone().using::<ResourceCheckout>(namespace), &selector)
-            .await
-            .map_err(|error| error.to_string())?;
+        // The convoy's checkouts are the engine's: the Checkout controller releases them once its
+        // engine Convoy has ended.
         Ok(())
     }
 
-    /// Gate locally resolved checkouts; cross-root teardown retains typed origins in its private gate.
+    /// Gates teardown on the integration evidence of the convoy's checkouts, as the engine holds them.
     pub async fn verify_convoy_teardown_gate_for_checkouts(
         &self,
         convoy: &ResourceObject<ResourceConvoy>,
-        checkout_list: &[ResourceObject<ResourceCheckout>],
-        force: bool,
-    ) -> Result<(), String> {
-        self.verify_convoy_teardown_gate_at_origins(convoy, checkout_list, &BTreeMap::new(), force).await
-    }
-
-    async fn verify_convoy_teardown_gate_at_origins(
-        &self,
-        convoy: &ResourceObject<ResourceConvoy>,
-        checkout_list: &[ResourceObject<ResourceCheckout>],
-        origins: &BTreeMap<String, String>,
+        checkout_list: &[CheckoutRecord],
         force: bool,
     ) -> Result<(), String> {
         if force {
@@ -1752,17 +1716,14 @@ impl CrewService {
         if expected.is_empty() {
             return Ok(());
         }
-        // Once the convoy sanctions checkout reclaim (Landed, or the convoy is
-        // being deleted), the checkout authority's `OwnerTerminal` cascade may
-        // legitimately collect an expected checkout before this gate runs. An
-        // absent or already-deleting expected checkout under that sanction is
-        // evidence of completed reclaim, not missing evidence — refusing here
-        // would wedge vessel reclaim forever on a deletion the substrate itself
-        // authorized. Outside the sanction, absence stays a hard refusal.
+        // Once the convoy sanctions checkout reclaim (Landed, or the convoy is being deleted), the
+        // Checkout controller may legitimately release an expected checkout before this gate runs.
+        // An absent or ended expected checkout under that sanction is evidence of completed
+        // reclaim, not missing evidence. Outside the sanction, absence stays a hard refusal.
         let reclaim_sanctioned = flotilla_resources::convoy_sanctions_checkout_reclaim(convoy);
         let missing = expected
             .iter()
-            .filter(|checkout_name| !checkout_list.iter().any(|checkout| &checkout.metadata.name == *checkout_name))
+            .filter(|checkout_name| !checkout_list.iter().any(|checkout| checkout.checkout_name() == checkout_name.as_str()))
             .cloned()
             .collect::<Vec<_>>();
         if !missing.is_empty() && !reclaim_sanctioned {
@@ -1782,18 +1743,16 @@ impl CrewService {
             .into_iter()
             .map(|forge| forge.spec)
             .collect::<Vec<_>>();
-
-        // A completed convoy can outlive its checkout observation. In
-        // particular, checkout cleanup may remove the worktree and a new
-        // short-lived record may have no status at all. The merged change
-        // request is durable integration evidence for that repository.
-        let merged_change_requests = if convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landed)
-            && checkout_list.iter().any(|checkout| expected.contains(&checkout.metadata.name) && checkout.status.is_none())
-        {
-            let names = checkout_list
-                .iter()
-                .filter_map(|checkout| associated_change_request_name_without_checkout_status(convoy, checkout, &forges).transpose())
-                .collect::<Result<Vec<_>, _>>()?;
+        // What the forge observation found of each change request a checkout names, or the
+        // convoy associates with a checkout that has no inspection.
+        let names = checkout_list
+            .iter()
+            .filter(|checkout| expected.contains(checkout.checkout_name()))
+            .filter_map(|checkout| associated_change_request_name(convoy, checkout, &forges).transpose())
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let merged_change_requests = if names.is_empty() {
+            BTreeSet::new()
+        } else {
             let viewed = flotilla_resources::convoy::engine::viewed(&self.convoy_engine, convoy)?;
             let mut query = crew_change_request_query(&viewed, &forges)?;
             query.field_values.entry("metadata.name".into()).or_default().extend(names);
@@ -1811,77 +1770,64 @@ impl CrewService {
                 })
                 .map(|record| record.object.metadata.name.clone())
                 .collect::<BTreeSet<_>>()
-        } else {
-            BTreeSet::new()
         };
 
+        let now = self.clock.now();
         let mut refusals = Vec::new();
-        for checkout in checkout_list
-            .iter()
-            .filter(|checkout| expected.contains(&checkout.metadata.name))
-            .filter(|checkout| !(reclaim_sanctioned && checkout.metadata.deletion_timestamp.is_some()))
-        {
+        for checkout in checkout_list.iter().filter(|checkout| expected.contains(checkout.checkout_name())) {
             // Committed Gone endings include Failed after realisation. A failure before
             // realisation is GaveUp and still follows the protection checks below.
-            let gone = match self.lifecycle_reads.try_reading(
-                ProvisioningKind::Checkout,
-                &checkout.metadata.name,
-                origins.get(&checkout.metadata.name).map(String::as_str),
-            )? {
-                Some(
-                    flotilla_protocol::LifecycleReading::Lost { .. }
+            if matches!(
+                checkout.reading,
+                flotilla_protocol::LifecycleReading::Lost { .. }
                     | flotilla_protocol::LifecycleReading::Released
-                    | flotilla_protocol::LifecycleReading::Failed { .. },
-                ) => true,
-                Some(_) => false,
-                None => checkout.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::CheckoutPhase::Gone),
-            };
-            if gone {
+                    | flotilla_protocol::LifecycleReading::Failed { .. }
+            ) {
                 continue;
             }
-            let is_adopted = checkout.metadata.lifecycle_authority().map_err(|err| err.to_string())? == Some(LifecycleAuthority::Adopted);
-            let Some(integration) = checkout.status.as_ref().map(|status| &status.integration) else {
-                let merged_for_checkout = associated_change_request_name_without_checkout_status(convoy, checkout, &forges)?
-                    .is_some_and(|name| merged_change_requests.contains(&name));
-                if merged_for_checkout {
+            let checkout_name = checkout.checkout_name();
+            let is_adopted = matches!(checkout.spec, flotilla_resources::CheckoutSpec::Observed(_));
+            let merged =
+                associated_change_request_name(convoy, checkout, &forges)?.is_some_and(|name| merged_change_requests.contains(&name));
+            let Some(integration) = &checkout.integration else {
+                // A completed convoy can outlive its checkout's inspection: the merged change
+                // request is durable integration evidence for that repository.
+                if merged && convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landed) {
                     continue;
                 }
-                refusals.push(format!("{}: integration evidence is missing", checkout.metadata.name));
+                refusals.push(format!("{checkout_name}: integration evidence is missing"));
                 continue;
             };
-            let landed_by_merged_change_request = condition_is_true(&integration.landed)
-                && integration.change_request.as_ref().is_some_and(|change_request| {
-                    change_request.state == flotilla_resources::ChangeRequestState::Merged
-                        && integration.landed_evidence.as_ref().is_some_and(|evidence| {
-                            evidence.change_request_id == change_request.id && evidence.checkout_head_in_merged_head
-                        })
-                });
-            let required = if is_adopted {
-                vec![("Landed", &integration.landed)]
+            let inspection = &integration.inspection;
+            let landed_by_merged_change_request = inspection.landed == Some(true)
+                && merged
+                && inspection
+                    .landed_evidence
+                    .as_ref()
+                    .is_some_and(|evidence| Some(evidence.change_request) == inspection.change_request && evidence.head_in_merged_head);
+            let required: Vec<(&str, Option<bool>)> = if is_adopted {
+                vec![("Landed", inspection.landed)]
             } else if landed_by_merged_change_request {
-                vec![("Clean", &integration.clean), ("Landed", &integration.landed)]
+                vec![("Clean", inspection.clean), ("Landed", inspection.landed)]
             } else {
-                vec![("Clean", &integration.clean), ("Pushed", &integration.pushed), ("Landed", &integration.landed)]
+                vec![("Clean", inspection.clean), ("Pushed", inspection.pushed), ("Landed", inspection.landed)]
             };
-            let stale = required
-                .iter()
-                .filter_map(|(label, condition)| (!integration_condition_is_fresh(condition, self.clock.now())).then_some(*label))
-                .collect::<Vec<_>>();
-            if !stale.is_empty() {
-                refusals.push(format!("{}: {} evidence is missing or stale", checkout.metadata.name, stale.join(", ")));
+            let fresh = integration.failing_since.is_none() && integration.confirmed_within(now, LANDING_EVIDENCE_TTL);
+            let unjudged = required.iter().filter(|(_, judged)| judged.is_none()).map(|(label, _)| *label).collect::<Vec<_>>();
+            if !fresh || !unjudged.is_empty() {
+                let stale = if fresh { unjudged } else { required.iter().map(|(label, _)| *label).collect() };
+                refusals.push(format!("{checkout_name}: {} evidence is missing or stale", stale.join(", ")));
                 continue;
             }
             if is_adopted {
-                if !condition_is_true(&integration.landed) {
-                    refusals.push(
-                        checkout_integration_summary(checkout, integration)
-                            .unwrap_or_else(|| format!("{}: Landed is not verified", checkout.metadata.name)),
-                    );
+                if inspection.landed != Some(true) {
+                    refusals
+                        .push(checkout_integration_summary(checkout).unwrap_or_else(|| format!("{checkout_name}: Landed is not verified")));
                 }
                 continue;
             }
-            if !required.iter().all(|(_, condition)| condition_is_true(condition)) {
-                if let Some(summary) = checkout_integration_summary(checkout, integration) {
+            if !required.iter().all(|(_, judged)| *judged == Some(true)) {
+                if let Some(summary) = checkout_integration_summary(checkout) {
                     refusals.push(summary);
                 }
             }
@@ -1895,58 +1841,54 @@ impl CrewService {
     }
 
     pub async fn archive_convoy_checkouts_best_effort(&self, namespace: &str, name: &str) -> Result<Vec<CheckoutArchiveOutcome>, String> {
-        let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
-        let checkout_list = checkouts
-            .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), name.to_string())]))
+        let convoy = self.resource_backend.clone().using::<ResourceConvoy>(namespace).get(name).await.map_err(|err| err.to_string())?;
+        let held = self.held_checkouts(&convoy).await?;
+        let reads = Arc::clone(&self.lifecycle_reads);
+        let here = tokio::task::spawn_blocking(move || reads.checkouts()?.here())
             .await
-            .map_err(|err| err.to_string())?
-            .items;
+            .map_err(|error| format!("read checkouts held here: {error}"))??
+            .into_iter()
+            .map(|record| record.name)
+            .collect::<BTreeSet<_>>();
         let mut outcomes = Vec::new();
-        // Checkouts recorded on other hosts cannot be inspected here; each
-        // host's teardown archives its own uncommitted work. Name them.
-        let sources = self
-            .resource_backend
-            .query_declared::<ResourceCheckout>(
-                namespace,
-                &StoreQuery::labels(&BTreeMap::from([(CONVOY_LABEL.into(), name.to_string())]), true, true),
-            )
-            .await
-            .map_err(|err| err.to_string())?;
-        for source in sources.items {
-            let flotilla_resources::ResourceProvenance::Replica { origin_root, .. } = &source.provenance else {
+        let mut local = Vec::new();
+        for checkout in held.into_iter().filter(|checkout| !checkout.ended()) {
+            if here.contains(&checkout.name) {
+                local.push(checkout);
                 continue;
-            };
-            let checkout = &source.object;
-            let detail = match checkout_path(checkout) {
+            }
+            // Checkouts held on other hosts cannot be inspected here; each host's teardown
+            // archives its own uncommitted work. Name them.
+            let detail = match checkout.path() {
                 Some(path) => format!("{}; its host archives uncommitted work on teardown", checkout_work_location(&checkout.spec, path)),
-                None => format!("on node {origin_root}; its host archives uncommitted work on teardown"),
+                None => format!("on {}; its host archives uncommitted work on teardown", checkout.home),
             };
             outcomes.push(
                 CheckoutArchiveOutcome::builder()
-                    .checkout(checkout.metadata.name.clone())
+                    .checkout(checkout.checkout_name().to_owned())
                     .status(CheckoutArchiveStatus::ArchivingOnHost)
                     .detail(detail)
                     .build(),
             );
         }
-        for checkout in checkout_list {
-            let Some(path) = checkout_path(&checkout) else {
+        for checkout in local {
+            let Some(path) = checkout.ready_path().map(str::to_owned) else {
                 continue;
             };
-            if checkout.status.as_ref().is_some_and(|status| {
-                condition_is_true(&status.integration.pushed)
-                    && integration_condition_is_fresh(&status.integration.pushed, self.clock.now())
-            }) {
+            let fresh = checkout.integration.as_ref().is_some_and(|integration| {
+                integration.failing_since.is_none() && integration.confirmed_within(self.clock.now(), LANDING_EVIDENCE_TTL)
+            });
+            if fresh && checkout.inspection().is_some_and(|inspection| inspection.pushed == Some(true)) {
                 outcomes.push(
                     CheckoutArchiveOutcome::builder()
-                        .checkout(checkout.metadata.name)
+                        .checkout(checkout.checkout_name().to_owned())
                         .status(CheckoutArchiveStatus::NothingToArchive)
                         .build(),
                 );
                 continue;
             }
-            let name = checkout.metadata.name.clone();
-            let left_at = checkout_work_location(&checkout.spec, path);
+            let name = checkout.checkout_name().to_owned();
+            let left_at = checkout_work_location(&checkout.spec, &path);
             let failed = |detail: String| {
                 warn!(checkout = %name, %detail, "best-effort abandon archive push failed");
                 CheckoutArchiveOutcome::builder()
@@ -1955,7 +1897,7 @@ impl CrewService {
                     .detail(format!("{detail}; work not pushed, left {left_at}"))
                     .build()
             };
-            let vcs = match self.vcs_for_checkout_spec(&checkout.spec, Path::new(path)).await {
+            let vcs = match self.vcs_for_checkout_spec(&checkout.spec, Path::new(&path)).await {
                 Ok(vcs) => vcs,
                 Err(error) => {
                     outcomes.push(failed(error));
@@ -2371,7 +2313,7 @@ impl CrewService {
                         let anchor = anchor.ok_or_else(|| format!("crew target `{target}` disappeared during credential staging"))?;
                         let current_convoy = convoys.get(&context.convoy).await.map_err(|error| error.to_string())?;
                         let current = self.crew_state(&context, &current_convoy).await?;
-                        let repo_roots = crew_brief_repo_roots(&self.resource_backend, &context.namespace, &convoy, &repository_refs).await;
+                        let repo_roots = crew_brief_repo_roots(self.lifecycle_reads.as_ref(), &convoy, &repository_refs);
                         let repositories = self.resource_backend.clone().using::<Repository>(&context.namespace);
                         let mut fork_stance = false;
                         for repository_ref in &repository_refs {
@@ -3793,17 +3735,10 @@ impl CrewService {
                 let convoy = convoys.get(name).await.map_err(|error| error.to_string())?;
                 let expected_checkout = flotilla_resources::expected_checkout_refs(&convoy).map_or(true, |refs| !refs.is_empty());
                 let observed_checkout = self
-                    .resource_backend
-                    .using::<ResourceCheckout>(namespace)
-                    .query_declared(&StoreQuery::labels(&BTreeMap::from([(CONVOY_LABEL.into(), name.into())]), true, true))
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .items
+                    .held_checkouts(&convoy)
+                    .await?
                     .iter()
-                    .any(|source| {
-                        source.object.metadata.labels.get(CONVOY_LABEL).is_some_and(|label| label == name)
-                            && source.object.metadata.lifecycle_authority() == Ok(Some(LifecycleAuthority::Managed))
-                    });
+                    .any(|checkout| !checkout.ended() && !matches!(checkout.spec, flotilla_resources::CheckoutSpec::Observed(_)));
                 let mut meta = InputMeta::from(&convoy.metadata);
                 if expected_checkout || observed_checkout {
                     meta = meta.with_added_finalizer(flotilla_resources::CONVOY_TEARDOWN_FINALIZER);
@@ -3825,40 +3760,21 @@ impl CrewService {
     }
 }
 
-fn condition_is_true(condition: &IntegrationCondition) -> bool {
-    condition.value == ConditionValue::True
-}
-
-fn integration_condition_is_fresh(condition: &IntegrationCondition, now: chrono::DateTime<Utc>) -> bool {
-    condition
-        .observed_at
-        .as_deref()
-        .and_then(|observed_at| chrono::DateTime::parse_from_rfc3339(observed_at).ok())
-        .and_then(|observed_at| now.signed_duration_since(observed_at).to_std().ok())
-        .is_some_and(|age| age < LANDING_EVIDENCE_TTL)
-}
-
-fn condition_problem(label: &str, condition: &IntegrationCondition) -> Option<String> {
-    match condition.value {
-        ConditionValue::True => None,
-        ConditionValue::False => Some(format!("{label}=False{}", condition_detail_suffix(condition))),
-        ConditionValue::Unknown => Some(format!("{label}=Unknown{}", condition_detail_suffix(condition))),
+fn judged_problem(label: &str, judged: Option<bool>, details: &[String]) -> Option<String> {
+    let suffix = if details.is_empty() { String::new() } else { format!(" ({})", details.join(", ")) };
+    match judged {
+        Some(true) => None,
+        Some(false) => Some(format!("{label}=False{suffix}")),
+        None => Some(format!("{label}=Unknown{suffix}")),
     }
 }
 
-fn condition_detail_suffix(condition: &IntegrationCondition) -> String {
-    if condition.details.is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", condition.details.join(", "))
-    }
-}
-
-fn checkout_integration_summary(checkout: &ResourceObject<ResourceCheckout>, integration: &CheckoutIntegrationStatus) -> Option<String> {
+fn checkout_integration_summary(checkout: &CheckoutRecord) -> Option<String> {
+    let inspection = checkout.inspection()?;
     let problems = [
-        condition_problem("Clean", &integration.clean),
-        condition_problem("Pushed", &integration.pushed),
-        condition_problem("Landed", &integration.landed),
+        judged_problem("Clean", inspection.clean, &inspection.clean_details),
+        judged_problem("Pushed", inspection.pushed, &inspection.pushed_details),
+        judged_problem("Landed", inspection.landed, &inspection.landed_details),
     ]
     .into_iter()
     .flatten()
@@ -3866,25 +3782,33 @@ fn checkout_integration_summary(checkout: &ResourceObject<ResourceCheckout>, int
     if problems.is_empty() {
         None
     } else {
-        Some(format!("{} [{}]: {}", checkout.metadata.name, checkout_path(checkout).unwrap_or("<unknown path>"), problems.join("; ")))
+        Some(format!("{} [{}]: {}", checkout.checkout_name(), checkout.path().unwrap_or("<unknown path>"), problems.join("; ")))
     }
 }
 
-fn associated_change_request_name_without_checkout_status(
+/// The change request record a checkout's branch is associated with: the one its inspection
+/// names, else the one the convoy binds or has as its subject in its repository, else the one
+/// current change request leaf the convoy expects there.
+fn associated_change_request_name(
     convoy: &ResourceObject<ResourceConvoy>,
-    checkout: &ResourceObject<ResourceCheckout>,
+    checkout: &CheckoutRecord,
     forges: &[flotilla_resources::ForgeSpec],
 ) -> Result<Option<String>, String> {
     let Some(repository) = convoy.spec.repositories.iter().find(|repository| repository.repo_ref == *checkout.spec.repo_ref()) else {
         return Ok(None);
     };
-    if let Some(id) = convoy_change_request_id_for_checkout(convoy, checkout, forges) {
-        let number = id.parse::<u64>().map_err(|_| format!("change request id `{id}` is not a numeric forge number"))?;
+    let number = match checkout.inspection().and_then(|inspection| inspection.change_request) {
+        Some(number) => Some(number),
+        None => convoy_change_request_id(convoy, checkout.spec.repo_ref(), forges)
+            .map(|id| id.parse::<u64>().map_err(|_| format!("change request id `{id}` is not a numeric forge number")))
+            .transpose()?,
+    };
+    if let Some(number) = number {
         let address = remote_change_request_address(&repository.url, number, forges)?;
         return record_name(&address).ok_or_else(|| format!("{address} names no record")).map(Some);
     }
 
-    // A produced subject can retain PR identity after checkout status is gone.
+    // A produced subject can retain PR identity after the checkout's inspection is gone.
     // Require exactly one current PR for the repository if nothing singles one out.
     let repository = repository_address(&repository.url, forges)?;
     let names = expected_change_request_leaves(convoy, forges)?

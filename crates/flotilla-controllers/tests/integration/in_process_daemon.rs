@@ -836,6 +836,8 @@ async fn daemon_for_cwd() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) 
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     (temp, repo, daemon)
 }
 
@@ -852,6 +854,8 @@ async fn daemon_for_plain_dir() -> (tempfile::TempDir, PathBuf, Arc<InProcessDae
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     (temp, repo, daemon)
 }
 
@@ -868,6 +872,8 @@ async fn daemon_for_plain_dir_with_discovery(discovery: DiscoveryRuntime) -> (te
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
     (temp, repo, daemon)
 }
@@ -876,6 +882,18 @@ fn test_config_store(config_dir: PathBuf) -> Arc<ConfigStore> {
     std::fs::create_dir_all(&config_dir).expect("create config dir");
     std::fs::write(config_dir.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
     Arc::new(ConfigStore::with_base(config_dir))
+}
+
+/// Installs the engine's readings on `daemon`, as the daemon's runtime does (#3108): its
+/// environments, clones and checkouts, homed here, with none held to start with.
+fn install_engine_reads(daemon: &InProcessDaemon) -> flotilla_provisioning_testkit::CheckoutFixture {
+    let store = flotilla_provisioning_testkit::CheckoutFixture::default().store;
+    let environments = flotilla_provisioning_testkit::EnvironmentFixture::over("home", Arc::clone(&store));
+    let clones = flotilla_provisioning_testkit::CloneFixture::over("home", Arc::clone(&store));
+    let engine = flotilla_provisioning_testkit::CheckoutFixture::over("home", store)
+        .serving(Arc::clone(&environments.environments) as _, Arc::clone(&clones.clones) as _);
+    daemon.install_lifecycle_reads(engine.reads.clone()).expect("engine reads");
+    engine
 }
 
 #[tokio::test]
@@ -901,6 +919,8 @@ async fn host_capability_provider_is_constructed_once_for_multiple_tracked_repos
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
 
     assert_eq!(daemon.tracked_repo_paths().await.len(), 2);
     assert_eq!(probes.load(Ordering::SeqCst), 1, "host provider construction must not scale with repository count");
@@ -939,6 +959,8 @@ async fn demanded_host_issue_provider_keeps_its_lifetime_without_a_checkout() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let source = IssueSource { service: "fake".into(), scope: "owner/repo".into() };
     let first = daemon.issue_provider_for_source(&source).await.expect("first provider");
     let second = daemon.issue_provider_for_source(&source).await.expect("retained provider");
@@ -969,6 +991,8 @@ async fn fetch_issue_by_ref_does_not_require_a_tracked_checkout() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
 
     let fetched = daemon.fetch_issue_by_ref(&reference).await.expect("source-addressed fetch should succeed");
 
@@ -988,6 +1012,8 @@ async fn resource_list_and_get_queries_return_wire_json() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     daemon
         .resource_backend()
         .using::<ResourceConvoy>("flotilla")
@@ -1100,6 +1126,8 @@ async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown(
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let backend = daemon.resource_backend();
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let vessels = backend.clone().using::<flotilla_resources::Vessel>("flotilla");
@@ -1245,9 +1273,10 @@ async fn convoy_explain_reports_observed_digest_anchor_and_mismatch() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let engine = install_engine_reads(&daemon);
     let backend = daemon.resource_backend();
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let checkouts = backend.clone().using::<ResourceCheckout>("flotilla");
     let repo_ref = flotilla_resources::RepositoryKey("repo-a".to_string());
     let convoy = convoys
         .create(
@@ -1274,38 +1303,30 @@ async fn convoy_explain_reports_observed_digest_anchor_and_mismatch() {
     );
     convoys.update_status("digest-anchor", &convoy.metadata.resource_version, &status).await.expect("publish claim");
 
-    let checkout = checkouts
-        .create(
-            &InputMeta::builder()
-                .name("digest-checkout".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "digest-anchor".to_string())]))
-                .build(),
-            &ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
-                r#ref: "topic".to_string(),
-                path: "/tmp/digest-checkout".to_string(),
-                repo_ref,
-                host_ref: "host-test".to_string(),
-                is_main: false,
-            }),
-        )
-        .await
-        .expect("create checkout");
-    let observed_at = chrono::Utc::now().to_rfc3339();
-    let checkout_status = |digest: &str| flotilla_resources::CheckoutStatus {
-        phase: ResourceCheckoutPhase::Ready,
-        integration: flotilla_resources::CheckoutIntegrationStatus {
-            remote_refs: BTreeMap::from([(
-                "refs/heads/topic".to_string(),
-                flotilla_resources::RemoteRefObservation::builder().digest(digest.to_string()).observed_at(observed_at.clone()).build(),
-            )]),
-            ..Default::default()
-        },
-        ..Default::default()
+    // The engine holds the adopted checkout for the convoy; its inspection reads the remote ref.
+    engine.open_convoy("digest-anchor");
+    let launch = engine.put_ready(
+        "digest-checkout",
+        &ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
+            r#ref: "topic".to_string(),
+            path: "/tmp/digest-checkout".to_string(),
+            repo_ref,
+            host_ref: "home".to_string(),
+            is_main: false,
+        }),
+        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy("digest-anchor".to_string())),
+    );
+    let inspect = |digest: &str| {
+        use flotilla_resources::checkout_records::CheckoutRecords as _;
+        engine
+            .checkouts
+            .inspected(
+                &launch,
+                flotilla_resources::checkout_records::Inspection { remote_digest: Some(digest.to_string()), ..Default::default() },
+            )
+            .expect("publish observation");
     };
-    let checkout = checkouts
-        .update_status("digest-checkout", &checkout.metadata.resource_version, &checkout_status("other-digest"))
-        .await
-        .expect("publish mismatched observation");
+    inspect("other-digest");
 
     let explain = || async {
         daemon
@@ -1325,10 +1346,7 @@ async fn convoy_explain_reports_observed_digest_anchor_and_mismatch() {
     assert!(!explanation.settlement.satisfied);
     assert!(explanation.settlement.unmet.iter().any(|unmet| unmet.reason == "digest_mismatch"));
 
-    checkouts
-        .update_status("digest-checkout", &checkout.metadata.resource_version, &checkout_status("claimed-digest"))
-        .await
-        .expect("publish matching observation");
+    inspect("claimed-digest");
     let CommandValue::ConvoyExplanation(explanation) = explain().await else { panic!("expected convoy explanation") };
     assert!(explanation.settlement.satisfied);
     assert_eq!(explanation.settlement.mode, "observed_digest");
@@ -1345,6 +1363,8 @@ async fn resource_list_and_get_queries_return_local_non_replicated_resources() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     daemon
         .resource_backend()
         .using::<WorkflowTemplate>("flotilla")
@@ -1402,6 +1422,8 @@ async fn operator_can_remove_a_wrong_repository_remote_without_deleting_the_reco
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let stable = "https://github.com/flotilla-org/flotilla";
     let wrong = "https://github.com/wrong/flotilla";
     let spec = RepositorySpec::remote(stable).expect("repository").with_declared_remotes([wrong, stable]).expect("remote declaration");
@@ -1444,6 +1466,8 @@ async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&authority);
     let replica = InProcessDaemon::new(
         vec![],
         test_config_store(replica_temp.path().join("config")),
@@ -1452,6 +1476,8 @@ async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&replica);
     let origin = authority.node_id().clone();
     let convoys = authority.resource_backend().using::<ResourceConvoy>("flotilla");
     convoys
@@ -1560,6 +1586,8 @@ async fn orphaned_authority_record_can_be_collected_from_the_replica_store() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let authority_node = test_node("retired-authority");
     let origin = authority_node.node_id.clone();
     daemon.set_configured_peers(vec![authority_node.clone()]).await;
@@ -1643,6 +1671,8 @@ async fn deleting_a_missing_authoritative_resource_converges_across_peer_relay_c
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&authority);
     let peer_one_temp = tempfile::tempdir().expect("create first peer tempdir");
     let peer_one = InProcessDaemon::new(
         vec![],
@@ -1652,6 +1682,8 @@ async fn deleting_a_missing_authoritative_resource_converges_across_peer_relay_c
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&peer_one);
     let peer_two_temp = tempfile::tempdir().expect("create second peer tempdir");
     let peer_two = InProcessDaemon::new(
         vec![],
@@ -1661,6 +1693,8 @@ async fn deleting_a_missing_authoritative_resource_converges_across_peer_relay_c
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&peer_two);
     let origin = authority.node_id().clone();
     let fixture_backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let fixture = fixture_backend.using::<ResourceConvoy>("flotilla");
@@ -1789,6 +1823,8 @@ async fn manifest_resolution_command_persists_a_root_spec_token() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let roots = daemon.manifest_roots();
     roots
         .declare(
@@ -1884,6 +1920,8 @@ async fn resource_watch_streams_current_update_and_resumed_delete_without_loss()
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let convoys = daemon.resource_backend().using::<ResourceConvoy>("flotilla");
     let created = convoys
         .create(
@@ -2118,6 +2156,8 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let backend = daemon.resource_backend();
     let repository = RepositorySpec::remote("https://forgejo.lab/fork-issues/zellij")
         .expect("fork repository")
@@ -2329,6 +2369,8 @@ async fn exercise_existing_pr_admission(continuing: bool) {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     daemon
         .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh")))
         .expect("gh available for discovery");
@@ -3605,6 +3647,8 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let local_host_ref = daemon.local_host_id().expect("local host id").to_string();
     let backend = daemon.resource_backend();
     let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
@@ -3772,6 +3816,8 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let backend = daemon.resource_backend();
     let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     backend
@@ -3919,6 +3965,8 @@ async fn convoy_start_accepts_project_list_identifier() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let backend = daemon.resource_backend();
     let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     backend
@@ -4034,6 +4082,8 @@ async fn convoy_start_freezes_dispatch_promises_and_refuses_unresolvable_ones() 
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let backend = daemon.resource_backend();
     let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     backend
@@ -4161,6 +4211,8 @@ async fn convoy_start_unknown_project_reports_resolved_reference_tried() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let mut events = daemon.subscribe();
 
     let command_id = daemon
@@ -5091,13 +5143,25 @@ async fn landed_convoy_teardown_accepts_clean_squash_merge_after_branch_deletion
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let backend = daemon.resource_backend();
     let repo_ref = RepositoryKey("repo-a".to_string());
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let convoy = convoys
         .create(
             &InputMeta::builder().name("merged-deleted-branch".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("implement-review".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder()
+                .workflow_ref("implement-review".to_string())
+                .repositories(vec![flotilla_resources::ConvoyRepositorySpec::builder()
+                    .url("https://github.com/owner/repo".to_string())
+                    .repo_ref(repo_ref.clone())
+                    .source_ref("main".to_string())
+                    .target_ref("main".to_string())
+                    .workspace_slug("repo".to_string())
+                    .subpaths(Vec::new())
+                    .build()])
+                .build(),
         )
         .await
         .expect("create convoy");
@@ -5116,50 +5180,77 @@ async fn landed_convoy_teardown_accepts_clean_squash_merge_after_branch_deletion
         },
     );
     let convoy = convoys.update_status("merged-deleted-branch", &convoy.metadata.resource_version, &status).await.expect("mark landed");
-    let checkouts = backend.clone().using::<ResourceCheckout>("flotilla");
-    let checkout = checkouts
+    // The forge observed change request 127 merged.
+    let record_name = cr_name("github.com", "owner/repo", 127);
+    let changes = backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
+    let record = changes
         .create(
-            &InputMeta::builder()
-                .name("merged-checkout".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "merged-deleted-branch".to_string())]))
+            &InputMeta::builder().name(record_name.clone()).build(),
+            &flotilla_resources::ChangeRequestSpec::builder()
+                .service("github.com".to_string())
+                .scope("owner/repo".to_string())
+                .number(127)
+                .observing_authority("host-test".to_string())
                 .build(),
-            &ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
-                r#ref: "deleted-feature".to_string(),
-                path: "/tmp/merged-checkout".to_string(),
-                repo_ref,
-                host_ref: "host-test".to_string(),
-                is_main: false,
-            }),
         )
         .await
-        .expect("create checkout");
-    let observed_at = chrono::Utc::now().to_rfc3339();
-    let condition = |value| flotilla_resources::IntegrationCondition::builder().value(value).observed_at(observed_at.clone()).build();
-    let integration = flotilla_resources::CheckoutIntegrationStatus {
-        clean: condition(flotilla_resources::ConditionValue::True),
-        pushed: condition(flotilla_resources::ConditionValue::False),
-        landed: condition(flotilla_resources::ConditionValue::True),
-        landed_evidence: Some(
-            flotilla_resources::LandedEvidence::builder().change_request_id("127".to_string()).checkout_head_in_merged_head(true).build(),
-        ),
-        change_request: Some(
-            flotilla_resources::ChangeRequestObservation::builder()
-                .id("127".to_string())
-                .state(flotilla_resources::ChangeRequestState::Merged)
-                .mergeability(flotilla_resources::ChangeRequestMergeability::Unknown)
-                .observed_at(observed_at)
-                .build(),
-        ),
-        ..Default::default()
-    };
-    let checkout = checkouts
+        .expect("create change request");
+    let now = chrono::Utc::now();
+    changes
         .update_status(
-            "merged-checkout",
-            &checkout.metadata.resource_version,
-            &flotilla_resources::CheckoutStatus { integration, ..Default::default() },
+            &record_name,
+            &record.metadata.resource_version,
+            &flotilla_resources::ChangeRequestStatus {
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
+                state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, now),
+                head_sha: flotilla_resources::Observation::known("abc".to_string(), now),
+                checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, now),
+                review: flotilla_resources::ChangeRequestReviewObservation {
+                    actionable_at_head: flotilla_resources::Observation::known(false, now),
+                },
+                mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, now),
+            },
         )
         .await
-        .expect("publish integration observation");
+        .expect("mark change request merged");
+    // The engine's inspection of the managed worktree: clean, its branch deleted (so not
+    // pushed), landed by change request 127 with its HEAD in the merged head.
+    let checkout = flotilla_resources::checkout_records::CheckoutRecord {
+        name: "merged-checkout#1".to_string(),
+        home: "host-test".to_string(),
+        spec: ResourceCheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
+            repo_ref,
+            env_ref: "host-direct-test".to_string(),
+            r#ref: "deleted-feature".to_string(),
+            base_ref: Some("main".to_string()),
+            target_path: "/tmp/merged-checkout".to_string(),
+            clone_ref: "clone-test".to_string(),
+        }),
+        holder: Some(flotilla_resources::checkout_records::CheckoutHolder::Convoy("merged-deleted-branch".to_string())),
+        requested_at: now,
+        reading: flotilla_protocol::LifecycleReading::Ready { identity: "/tmp/merged-checkout".to_string() },
+        degraded: None,
+        integration: Some(flotilla_resources::checkout_records::Integration {
+            inspection: flotilla_resources::checkout_records::Inspection {
+                clean: Some(true),
+                pushed: Some(false),
+                landed: Some(true),
+                landed_evidence: Some(flotilla_resources::checkout_records::Landed {
+                    change_request: 127,
+                    merged_at: None,
+                    target_ref: None,
+                    head_in_merged_head: true,
+                }),
+                change_request: Some(127),
+                ..Default::default()
+            },
+            confirmed_at: now,
+            failing_since: None,
+        }),
+    };
 
     daemon
         .verify_convoy_teardown_gate_for_checkouts(&convoy, std::slice::from_ref(&checkout), false)
@@ -5168,30 +5259,30 @@ async fn landed_convoy_teardown_accepts_clean_squash_merge_after_branch_deletion
 
     let mut advanced = checkout.clone();
     advanced
-        .status
-        .as_mut()
-        .expect("checkout status")
         .integration
+        .as_mut()
+        .expect("checkout integration")
+        .inspection
         .landed_evidence
         .as_mut()
         .expect("landing evidence")
-        .checkout_head_in_merged_head = false;
+        .head_in_merged_head = false;
     assert!(daemon.verify_convoy_teardown_gate_for_checkouts(&convoy, &[advanced], false).await.is_err());
 
     let mut mismatched = checkout.clone();
     mismatched
-        .status
-        .as_mut()
-        .expect("checkout status")
         .integration
+        .as_mut()
+        .expect("checkout integration")
+        .inspection
         .landed_evidence
         .as_mut()
         .expect("landing evidence")
-        .change_request_id = "different-pr".to_string();
+        .change_request = 128;
     assert!(daemon.verify_convoy_teardown_gate_for_checkouts(&convoy, &[mismatched], false).await.is_err());
 
     let mut dirty = checkout;
-    dirty.status.as_mut().expect("checkout status").integration.clean.value = flotilla_resources::ConditionValue::False;
+    dirty.integration.as_mut().expect("checkout integration").inspection.clean = Some(false);
     assert!(daemon.verify_convoy_teardown_gate_for_checkouts(&convoy, &[dirty], false).await.is_err());
 }
 
@@ -5206,6 +5297,8 @@ async fn landed_convoy_teardown_accepts_merged_produced_subject_when_checkout_st
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let backend = daemon.resource_backend();
     let repo_ref = RepositoryKey("repo-a".to_string());
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
@@ -5251,25 +5344,25 @@ async fn landed_convoy_teardown_accepts_merged_produced_subject_when_checkout_st
         },
     );
     let convoy = convoys.update_status("landed-missing-status", &convoy.metadata.resource_version, &status).await.expect("mark landed");
-    let checkout = backend
-        .clone()
-        .using::<ResourceCheckout>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name("missing-status".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "landed-missing-status".to_string())]))
-                .build(),
-            &ResourceCheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
-                repo_ref,
-                env_ref: "host-direct-test".to_string(),
-                r#ref: "feature".to_string(),
-                base_ref: Some("main".to_string()),
-                target_path: temp.path().join("removed-worktree").display().to_string(),
-                clone_ref: "clone-test".to_string(),
-            }),
-        )
-        .await
-        .expect("create checkout without status");
+    // The engine holds the checkout, never inspected.
+    let target_path = temp.path().join("removed-worktree").display().to_string();
+    let checkout = flotilla_resources::checkout_records::CheckoutRecord {
+        name: "missing-status#1".to_string(),
+        home: "host-test".to_string(),
+        spec: ResourceCheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
+            repo_ref,
+            env_ref: "host-direct-test".to_string(),
+            r#ref: "feature".to_string(),
+            base_ref: Some("main".to_string()),
+            target_path: target_path.clone(),
+            clone_ref: "clone-test".to_string(),
+        }),
+        holder: Some(flotilla_resources::checkout_records::CheckoutHolder::Convoy("landed-missing-status".to_string())),
+        requested_at: chrono::Utc::now(),
+        reading: flotilla_protocol::LifecycleReading::Ready { identity: target_path },
+        degraded: None,
+        integration: None,
+    };
     let record_name = cr_name("github.com", "owner/repo", 42);
     let changes = backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
     let record = changes
@@ -5645,6 +5738,8 @@ async fn daemon_for_plain_dir_with_local_environment_id(local_environment_id: &s
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     (temp, repo, daemon)
 }
 
@@ -5775,6 +5870,8 @@ hostname = "buildbox.example"
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
 
     let remote_env_id = EnvironmentId::new("buildbox-env-id");
     let managed_ids = daemon.managed_environment_ids_for_test();
@@ -5888,6 +5985,8 @@ display_name = "Build Box"
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
 
     let local_environment_id = daemon.local_host_summary().await.environment_id;
     let status = daemon.get_host_status_internal(&local_environment_id).await.expect("host status");
@@ -5991,6 +6090,8 @@ hostname = "brokenbox.example"
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
 
     assert!(daemon.tracked_repo_identity_for_path(&repo).await.is_some(), "repo should still be tracked");
 
@@ -6050,6 +6151,8 @@ hostname = "buildbox.example"
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
 
     let local_bag = daemon.environment_bag_for_test(daemon.local_environment_id()).expect("local bag");
     assert_eq!(local_bag.find_env_var("LOCAL_ONLY_SECRET"), Some("secret-value"));
@@ -6176,6 +6279,8 @@ hostname = "buildbox.example"
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
 
     let result = daemon
         .discover_repo_for_environment_for_test(&repo, &EnvironmentId::new("static-ssh-6275696c64626f78"))
@@ -6327,6 +6432,8 @@ hostname = "builddash.example"
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
 
     let managed_ids = daemon.managed_environment_ids_for_test();
     assert!(managed_ids.contains(&EnvironmentId::new("static-ssh-6275696c6420626f78")));
@@ -6367,6 +6474,8 @@ async fn daemon_for_fake_repo() -> (tempfile::TempDir, PathBuf, Arc<InProcessDae
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".into()))).await;
     daemon.add_repo(&repo).await.expect("adopt test checkout into resources");
     let identity = daemon.tracked_repo_identity_for_path(&repo).await.expect("identity");
@@ -6439,6 +6548,8 @@ async fn daemon_for_duplicate_fake_repos() -> (tempfile::TempDir, PathBuf, PathB
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
     daemon.add_repo(&repo_a).await.expect("observe first checkout");
     daemon.add_repo(&repo_b).await.expect("observe second checkout");
@@ -6633,6 +6744,8 @@ async fn daemon_uses_persisted_local_environment_id() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&restarted);
     assert_eq!(restarted.local_environment_id().as_str(), "test-local-environment-id");
 }
 
@@ -6743,6 +6856,8 @@ async fn daemon_uses_config_machine_id_for_local_node_identity_storage() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
 
     assert!(
         config_dir.join("identity/override-machine/node.key").exists(),
@@ -6772,6 +6887,8 @@ async fn daemon_uses_persisted_fingerprint_backed_node_id() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
 
     let first_node_id = daemon.node_id().clone();
     assert_eq!(first_node_id.as_str().len(), 32, "node id should be a 16-byte hex fingerprint");
@@ -6787,6 +6904,8 @@ async fn daemon_uses_persisted_fingerprint_backed_node_id() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&restarted);
 
     assert_eq!(*restarted.node_id(), first_node_id, "restarting should reuse the persisted node keypair");
     assert_eq!(restarted.host_name().as_str(), "renamed-display-host", "display name should not affect node identity");
@@ -6794,8 +6913,10 @@ async fn daemon_uses_persisted_fingerprint_backed_node_id() {
     assert!(identity_dir.exists(), "node identity storage should live under the config identity dir");
 }
 
+// The checkouts the engine holds adopted at this home are projected into the observed store, and
+// withdrawn once they end there (#3108).
 #[tokio::test]
-async fn adopted_checkout_reconciliation_repairs_partial_durable_creation() {
+async fn adopted_checkouts_the_engine_holds_are_projected_and_withdrawn() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let daemon = InProcessDaemon::new(
         Vec::new(),
@@ -6805,44 +6926,40 @@ async fn adopted_checkout_reconciliation_repairs_partial_durable_creation() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    // The engine's readings, which a running daemon always has: they hold no clone here.
-    daemon.install_lifecycle_reads(flotilla_provisioning_testkit::CloneFixture::default().reads).expect("engine reads");
-    let durable = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
+    // The engine's readings, which a running daemon always has.
+    let engine = flotilla_provisioning_testkit::CheckoutFixture::default();
+    daemon.install_lifecycle_reads(engine.reads.clone()).expect("engine reads");
     let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
     let spec = ResourceCheckoutSpec::Observed(
         ObservedCheckoutSpec::builder()
             .r#ref("feature/reconcile".to_string())
             .path("/work/reconcile".to_string())
             .repo_ref(flotilla_resources::RepositoryKey("widgets-api".to_string()))
-            .host_ref("host-01".to_string())
+            .host_ref("home".to_string())
             .is_main(false)
             .build(),
     );
-    durable
-        .create(
-            &InputMeta::builder()
-                .name("adopted-checkout-reconcile".to_string())
-                .build()
-                .with_lifecycle_authority(LifecycleAuthority::Adopted),
-            &spec,
-        )
-        .await
-        .expect("durable checkout create should succeed");
+    let launch = engine.put_ready("adopted-checkout-reconcile", &spec, None);
 
-    daemon.reconcile_adopted_checkouts("flotilla").await.expect("adopted checkout reconciliation should succeed");
+    daemon.project_adopted_checkouts("flotilla").await.expect("adopted checkout projection should succeed");
 
-    let durable_checkout = durable.get("adopted-checkout-reconcile").await.expect("durable checkout should remain");
-    let durable_status = durable_checkout.status.as_ref().expect("repaired durable status");
-    assert_eq!(durable_status.phase, ResourceCheckoutPhase::Ready);
-    assert_eq!(durable_status.path.as_deref(), Some("/work/reconcile"));
-    let observed_checkout = observed.get("adopted-checkout-reconcile").await.expect("observed checkout should be projected");
-    assert_eq!(observed_checkout.spec, durable_checkout.spec);
-    assert_eq!(observed_checkout.status, durable_checkout.status);
-    assert_eq!(observed_checkout.metadata.labels, durable_checkout.metadata.labels);
+    let projected = observed.get("adopted-checkout-reconcile").await.expect("observed checkout should be projected");
+    assert_eq!(projected.spec, spec);
+    assert_eq!(projected.metadata.lifecycle_authority().expect("authority should parse"), Some(LifecycleAuthority::Adopted));
+    let status = projected.status.as_ref().expect("projected status");
+    assert_eq!(status.phase, ResourceCheckoutPhase::Ready);
+    assert_eq!(status.path.as_deref(), Some("/work/reconcile"));
+
+    engine.finish(&launch, flotilla_provisioning_testkit::Ending::Released);
+    daemon.project_adopted_checkouts("flotilla").await.expect("adopted checkout projection should succeed");
+    assert!(
+        matches!(observed.get("adopted-checkout-reconcile").await, Err(flotilla_resources::ResourceError::NotFound { .. })),
+        "a released adoption is no longer projected"
+    );
 }
 
 #[tokio::test]
-async fn adopted_checkout_reconciliation_isolates_an_observed_name_collision() {
+async fn adopted_checkout_projection_isolates_an_observed_name_collision() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let daemon = InProcessDaemon::new(
         Vec::new(),
@@ -6852,7 +6969,8 @@ async fn adopted_checkout_reconciliation_isolates_an_observed_name_collision() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    let durable = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
+    let engine = flotilla_provisioning_testkit::CheckoutFixture::default();
+    daemon.install_lifecycle_reads(engine.reads.clone()).expect("engine reads");
     let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
     let checkout_spec = |path: &str| {
         ResourceCheckoutSpec::Observed(
@@ -6860,19 +6978,13 @@ async fn adopted_checkout_reconciliation_isolates_an_observed_name_collision() {
                 .r#ref("feature/reconcile".to_string())
                 .path(path.to_string())
                 .repo_ref(flotilla_resources::RepositoryKey("widgets-api".to_string()))
-                .host_ref("host-01".to_string())
+                .host_ref("home".to_string())
                 .is_main(false)
                 .build(),
         )
     };
     for (name, path) in [("a-collision", "/work/collision"), ("z-valid", "/work/valid")] {
-        durable
-            .create(
-                &InputMeta::builder().name(name.to_string()).build().with_lifecycle_authority(LifecycleAuthority::Adopted),
-                &checkout_spec(path),
-            )
-            .await
-            .expect("durable checkout create should succeed");
+        engine.put_ready(name, &checkout_spec(path), None);
     }
     observed
         .create(
@@ -6882,12 +6994,12 @@ async fn adopted_checkout_reconciliation_isolates_an_observed_name_collision() {
         .await
         .expect("unrelated observed checkout should be created");
 
-    let error = daemon.reconcile_adopted_checkouts("flotilla").await.expect_err("the name collision should be reported");
+    let error = daemon.project_adopted_checkouts("flotilla").await.expect_err("the name collision should be reported");
 
     assert!(error.contains("a-collision"), "{error}");
     let collision = observed.get("a-collision").await.expect("colliding observation should remain");
     assert_eq!(collision.metadata.lifecycle_authority().expect("authority should parse"), Some(LifecycleAuthority::Observed));
-    let valid = observed.get("z-valid").await.expect("other durable adopted checkouts should still be projected");
+    let valid = observed.get("z-valid").await.expect("other adopted checkouts should still be projected");
     assert_eq!(valid.metadata.lifecycle_authority().expect("authority should parse"), Some(LifecycleAuthority::Adopted));
 }
 
@@ -6909,6 +7021,8 @@ async fn tracking_does_not_materialize_when_project_name_is_occupied() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
 
     let tracked = RepositorySpec::remote("https://github.com/owner/repo").expect("tracked repository spec");
@@ -6981,6 +7095,8 @@ async fn repository_identity_change_does_not_materialize_project_when_superseded
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     install_test_repository_inspector(&daemon, Arc::clone(&discovered_repo)).await;
     daemon.add_repo(&repo).await.expect("add repository with old identity");
 
@@ -7054,7 +7170,7 @@ async fn discovery_resolves_origin_forge_and_binds_both_forgejo_sources() {
     )
     .await;
     // The engine's readings, which a running daemon always has: they hold no clone here.
-    daemon.install_lifecycle_reads(flotilla_provisioning_testkit::CloneFixture::default().reads).expect("engine reads");
+    let _engine = install_engine_reads(&daemon);
     daemon
         .resource_backend()
         .definitions::<Forge>("flotilla")
@@ -7127,6 +7243,8 @@ async fn forge_alias_observations_from_two_hosts_record_canonical_live_remote_ad
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let backend = daemon.resource_backend();
     let forge = lab_forge_spec();
     backend
@@ -7179,6 +7297,8 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     daemon
         .set_repository_inspector(Arc::new(ForgeAliasInspector {
             path: repo.clone(),
@@ -7438,6 +7558,8 @@ async fn forge_identity_sweep_reports_conflicting_aliases_before_changing_reposi
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     daemon
         .set_repository_inspector(Arc::new(ForgeAliasInspector {
             path: repo.clone(),
@@ -7522,6 +7644,8 @@ async fn forge_identity_sweep_merges_separately_bootstrapped_records() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     daemon
         .set_repository_inspector(Arc::new(ForgeAliasInspector {
             path: repo.clone(),
@@ -7567,6 +7691,8 @@ async fn forge_identity_sweep_includes_replica_only_legacy_repository() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     // The legacy Repository is written at another home and reaches this daemon only as that
     // home's record.
     let old = RepositorySpec::remote("https://forgejo.lab.flotilla.work/robert/ghostty-ops")
@@ -7623,6 +7749,8 @@ async fn associated_checkout_remote_move_updates_repository_in_place() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     install_test_repository_inspector(&daemon, Arc::clone(&remote)).await;
     daemon.add_repo(&repo).await.expect("track old remote");
 
@@ -7678,6 +7806,8 @@ async fn associated_path_replaced_by_unrelated_repository_mints_new_identity() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     daemon
         .set_repository_inspector(Arc::new(TestRepositoryInspector {
             host_ref: daemon.local_host_id().expect("local Host").to_string(),
@@ -7853,6 +7983,8 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("new-repo".to_string()))).await;
     let mut rx = daemon.subscribe();
 
@@ -7939,6 +8071,8 @@ async fn remove_repo_persistence_failure_leaves_repo_tracked() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
     daemon.add_repo(&repo).await.expect("track repo");
 
@@ -7966,6 +8100,8 @@ async fn remove_repo_command_cleans_up_an_untracked_observation_root() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let mut rx = daemon.subscribe();
 
     let command_id = daemon
@@ -8037,6 +8173,8 @@ async fn adding_local_clone_promotes_remote_only_identity_to_local_execution() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
 
     daemon
@@ -8069,6 +8207,8 @@ async fn refresh_unobserved_checkout_refuses_without_started_event() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let mut rx = daemon.subscribe();
     let repo = std::path::PathBuf::from("/tmp/does-not-exist-for-daemon-test");
 
@@ -8103,6 +8243,8 @@ async fn stop_observing_missing_checkout_refuses_without_started_event() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let mut rx = daemon.subscribe();
     let repo = std::path::PathBuf::from("/tmp/does-not-exist-for-daemon-test");
 
@@ -8142,6 +8284,8 @@ async fn refresh_all_command_refreshes_every_tracked_repo() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     daemon
         .set_repository_inspector(Arc::new(TestRepositoryInspector {
             host_ref: daemon.local_host_id().expect("local Host").to_string(),
@@ -8191,6 +8335,8 @@ async fn symlinked_untrack_removes_unavailable_observation_root() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     daemon
         .execute(Command::builder().action(CommandAction::UntrackRepo { repo: RepoSelector::Path(alias) }).build())
         .await
@@ -8221,6 +8367,8 @@ async fn symlinked_remove_repo_retires_tracked_and_persisted_roots() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     // Legacy persisted spellings produce one physical root, and removal retires both.
     assert_eq!(daemon.tracked_repo_paths().await.len(), 1);
     daemon.remove_repo(&repo).await.expect("remove alias checkout");
@@ -8363,6 +8511,8 @@ async fn missing_issue_provider_names_the_missing_capability_on_every_host() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&leader);
     let leader_error = leader.issue_provider_for_source(&source).await.err().expect("leader should have no provider in test environment");
     assert_eq!(leader_error, "no issue provider available for https://github.com flotilla-org/flotilla");
 
@@ -8374,6 +8524,8 @@ async fn missing_issue_provider_names_the_missing_capability_on_every_host() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&follower);
     let follower_error = follower.issue_provider_for_source(&source).await.err().expect("follower should have no issue provider");
     assert_eq!(follower_error, "no issue provider available for https://github.com flotilla-org/flotilla");
 }
@@ -8390,6 +8542,8 @@ async fn add_virtual_repo_is_idempotent() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
 
     let synthetic_path = PathBuf::from("<remote>/desktop/home/dev/repo");
     let identity = RepoIdentity { authority: "github.com".into(), path: "owner/remote-only".into() };
@@ -8441,6 +8595,8 @@ async fn add_repo_uses_manager_backed_local_environment_for_repo_identity() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("manager-backed-repo".to_string()))).await;
 
     daemon
@@ -8487,6 +8643,8 @@ async fn add_repo_uses_manager_backed_local_environment_for_provider_discovery()
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("provider-discovery".to_string()))).await;
 
     daemon.add_repo(&repo).await.expect("add repo");
@@ -8676,6 +8834,8 @@ hostname = "buildbox.example"
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
 
     let result = daemon
         .discover_repo_for_environment_for_test(&repo, &EnvironmentId::new("static-ssh-6275696c64626f78"))
@@ -8758,6 +8918,8 @@ hostname = "buildbox.example"
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
 
     let result = daemon
         .discover_repo_for_environment_for_test(&repo, &EnvironmentId::new("static-ssh-6275696c64626f78"))
@@ -8794,6 +8956,8 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&authority);
     let terminal_host = InProcessDaemon::new(
         vec![],
         test_config_store(terminal_temp.path().join("config")),
@@ -8802,6 +8966,8 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&terminal_host);
     let publisher: Arc<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher> =
         Arc::new(ReceiverIntentPublisher { inbox: flotilla_messaging::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
     authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
@@ -8993,6 +9159,8 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&authority);
     let terminal_host = InProcessDaemon::new(
         vec![],
         test_config_store(terminal_temp.path().join("config")),
@@ -9001,6 +9169,8 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&terminal_host);
     let publisher: Arc<dyn flotilla_crew::leaf_engine::ResourceIntentPublisher> =
         Arc::new(ReceiverIntentPublisher { inbox: flotilla_messaging::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
     authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
@@ -9752,6 +9922,8 @@ fn repository_operations_without_tracked_roots(tc: hegel::TestCase) {
             std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
+        // The engine's readings, which a running daemon always has.
+        let _engine = install_engine_reads(&daemon);
         let spec = RepositorySpec::remote("https://github.com/owner/identity-repo").expect("Repository");
         let key = spec.key();
         daemon
@@ -9853,6 +10025,8 @@ async fn repository_github_execution_uses_forge_identity_without_checkout() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     daemon
         .replace_local_environment_bag_for_test(
             EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/bin/gh")).with(EnvironmentAssertion::remote_host(
@@ -9906,6 +10080,8 @@ async fn repository_forge_refusals_without_tracked_roots() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let spec = RepositorySpec::remote("https://github.com/owner/refusals").expect("Repository");
     let key = spec.key();
     let repositories = daemon.resource_backend().using::<Repository>("flotilla");
@@ -9945,6 +10121,8 @@ async fn startup_observation_publishes_repository_context_without_project_mintin
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let response = daemon.get_repo_providers_internal(&RepoSelector::Path(path.join("src"))).await.expect("startup cwd context");
     assert_eq!(response.repository, RepositorySpec::remote("https://github.com/owner/startup").expect("Repository").key());
     let tracked_identity = daemon.tracked_repo_identity_for_path(&path).await.expect("repo-info identity");
@@ -9982,6 +10160,8 @@ async fn checkoutless_refresh_honors_failure_policy() {
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let forge = ForgeSpec::builder()
         .forge_id("unavailable".into())
         .kind(ForgeKind::Github)
@@ -10072,7 +10252,7 @@ fn seeded_engine_opener(
 async fn startup_forgejo_case(
     work_credentials: usize,
     daemon_credential: Option<&str>,
-) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) {
+) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>, flotilla_provisioning_testkit::CheckoutFixture) {
     use flotilla_store_memory::InMemoryBackend;
     let (temp, fixture) = symlinked_fixture();
     let repo = fixture.join("repo");
@@ -10118,7 +10298,9 @@ async fn startup_forgejo_case(
     )
     .await
     .expect("compose the startup daemon");
-    (temp, repo, daemon)
+    // The engine's readings, which the daemon's runtime installs once it is composed.
+    let engine = install_engine_reads(&daemon);
+    (temp, repo, daemon, engine)
 }
 
 // #2571: zero, one, or multiple work identities never serve daemon discovery.
@@ -10127,7 +10309,7 @@ async fn startup_forgejo_case(
 #[tokio::test]
 async fn startup_forgejo_ignores_work_credentials() {
     for count in [0, 1, 3] {
-        let (temp, repo, daemon) = startup_forgejo_case(count, None).await;
+        let (temp, repo, daemon, _engine) = startup_forgejo_case(count, None).await;
         std::fs::write(temp.path().join("lab-forgejo-coder-token"), "ambient-work-token").expect("write ambient work token");
         assert_eq!(daemon.tracked_repo_paths().await.len(), 2);
         let result = daemon
@@ -10158,7 +10340,7 @@ async fn startup_forgejo_ignores_work_credentials() {
 // #2571: the named daemon identity wins independently of other work credentials.
 #[tokio::test]
 async fn startup_forgejo_selects_explicit_daemon_credential() {
-    let (temp, repo, daemon) = startup_forgejo_case(3, Some("daemon")).await;
+    let (temp, repo, daemon, _engine) = startup_forgejo_case(3, Some("daemon")).await;
     let result = daemon
         .discover_repo_for_environment_for_test(&repo, daemon.local_environment_id())
         .await
@@ -10187,7 +10369,7 @@ async fn startup_forgejo_selects_explicit_daemon_credential() {
 #[tokio::test]
 async fn startup_forgejo_discovery_error_preserves_other_repositories() {
     for name in ["missing", "work-0"] {
-        let (_temp, repo, daemon) = startup_forgejo_case(3, Some(name)).await;
+        let (_temp, repo, daemon, _engine) = startup_forgejo_case(3, Some(name)).await;
         let repo = std::fs::canonicalize(repo).expect("physical startup checkout");
         let status = daemon.get_status().await.expect("read startup provider status");
         assert_eq!(status.repos.len(), 2);
@@ -10221,6 +10403,8 @@ async fn message_apply_uses_document_namespace_and_guarded_status_rejects_stale_
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The engine's readings, which a running daemon always has.
+    let _engine = install_engine_reads(&daemon);
     let backend = daemon.resource_backend();
     backend
         .using::<ResourceConvoy>("document-namespace")
@@ -10421,7 +10605,8 @@ async fn convoy_resume_milliseconds_after_complete_still_lands() {
         CommandValue::ConvoyBriefInformational { message: "crew already claimed; delivered without reopening".into() }
     );
     assert_eq!(convoys.get("claimed-resume").await.unwrap().status.unwrap(), claimed);
-    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"));
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+        .with_lifecycle_reads(flotilla_provisioning_testkit::CheckoutFixture::default().reads);
     for _ in 0..3 {
         let current = convoys.get("claimed-resume").await.unwrap();
         let prepared = reconciler.prepare(&current).await.unwrap();

@@ -17,7 +17,6 @@ use flotilla_observation::sources::{
 #[cfg(test)]
 use flotilla_protocol::PlacementDecision;
 use flotilla_resources::address::{remote_change_request_subject, same_subject};
-use flotilla_resources::lifecycle_reads::LifecycleReads;
 use flotilla_resources::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
 #[cfg(test)]
 use flotilla_resources::{CapabilityNeed, ProjectSpec, Resource};
@@ -94,14 +93,12 @@ use flotilla_resources::{
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Clock, Convoy as ResourceConvoy, ConvoyEnsure,
     ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec,
     CrewCompletionPending, Forge, ForgeKind, FulfilmentKind, InputMeta, IssueSourceResolution, IssueSourceUnavailable,
-    LandingCredentialScope, LifecycleAuthority, ObservedChangeRequestState, Project, Repository, RepositoryIdentity, RepositoryKey,
-    RepositorySpec, ResourceError, ResourceObject, ResourceProvenance, SystemClock, TerminalSessionTarget, TurnDeliveryRung, WatchEvent,
-    WatchStart, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
+    LandingCredentialScope, ObservedChangeRequestState, Project, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec,
+    ResourceError, ResourceObject, ResourceProvenance, SystemClock, TerminalSessionTarget, TurnDeliveryRung, WatchEvent, WatchStart,
+    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
 };
 #[cfg(test)]
-use flotilla_resources::{
-    CheckoutIntegrationStatus, ConditionValue, IntegrationCondition, TerminalSessionIdentity, CREDENTIAL_SCOPES_ANNOTATION,
-};
+use flotilla_resources::{ConditionValue, TerminalSessionIdentity, CREDENTIAL_SCOPES_ANNOTATION};
 use flotilla_store::resolve_project_issue_sources;
 use flotilla_store::{
     apply_resource_document, apply_status_patch as apply_resource_status_patch, get_resource_kind_including_replicas, ResourceBackend,
@@ -163,11 +160,7 @@ use flotilla_provider_runtime::ssh_runner::SshCommandRunner;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
-use flotilla_resources::checkout_integration::convoy_change_request_id_for_checkout;
 use flotilla_resources::checkout_path::checkout_path;
-use flotilla_vcs::checkout_integration::{
-    inspect_checkout_integration, inspect_convoy_checkout_integration, ChangeRequestIntegrationInput,
-};
 
 struct ProviderChangeRequestQueryPort {
     forge_reads: flotilla_observation::forge_observation::ForgeReads,
@@ -733,6 +726,7 @@ const ENVIRONMENT_ADOPTION_DEADLINE: std::time::Duration = std::time::Duration::
 pub struct InProcessDaemon {
     change_stream_rounds: change_stream::Rounds,
     decided_store: std::sync::Mutex<Option<Arc<flotilla_schema_sqlite::stream::Service>>>,
+    change_request_branches: std::sync::OnceLock<Arc<dyn flotilla_resources::engine_records::ChangeRequestBranches>>,
     /// The engine's provisioning readings behind `[primitives]` (#3629 layer 4), installed with
     /// the decided store's provisioning homes; none before, and none with the switch off.
     lifecycle_reads: Arc<flotilla_projections::ports::LateLifecycleReads>,
@@ -842,6 +836,8 @@ pub struct ComposedEngine {
     /// ChangeRequest and Issue, which the forge observers write only on change.
     pub observations: Arc<dyn flotilla_resources::engine_records::EngineRecords>,
     pub observation_failures: Arc<dyn flotilla_resources::engine_records::ObservationFailures>,
+    /// The change requests the forge observers found on their repositories' own branches (#3108).
+    pub change_request_branches: Arc<dyn flotilla_resources::engine_records::ChangeRequestBranches>,
     pub accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,
     pub manifest_roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
 }
@@ -1410,7 +1406,6 @@ impl InProcessDaemon {
                 .accounts(accounts.clone() as Arc<dyn flotilla_resources::account_access::AccountRecords>)
                 .backend(resource_backend.clone())
                 .observed_backend(observed_resource_backend.clone())
-                .observed_checkout_reconciliation(Arc::clone(&observed_checkout_reconciliation))
                 .config(Arc::clone(&config))
                 .discovery(Arc::clone(&discovery))
                 .environments(Arc::clone(&environment_manager) as Arc<dyn Environments>)
@@ -1442,6 +1437,7 @@ impl InProcessDaemon {
             clock: Arc::clone(&clock),
             surfaces: Surfaces::default(),
             decided_store: Default::default(),
+            change_request_branches: Default::default(),
             change_stream_rounds: Default::default(),
             lifecycle_reads: Arc::clone(&lifecycle_reads),
             accounts,
@@ -1467,6 +1463,10 @@ impl InProcessDaemon {
         });
         daemon.install_decided_store(engine.service)?;
         daemon.install_observation_records(engine.observations, engine.observation_failures)?;
+        daemon
+            .change_request_branches
+            .set(engine.change_request_branches)
+            .map_err(|_| "the change request branches are already installed".to_owned())?;
         daemon.install_account_records(engine.accounts)?;
         daemon.install_manifest_roots(engine.manifest_roots)?;
         crew.set_checkout_inspector(Arc::new(CheckoutInspector(Arc::downgrade(&daemon))));
@@ -1737,7 +1737,6 @@ impl InProcessDaemon {
         let path = canonical_or_original(path);
         let namespace = self.provisioning_namespace().await;
         let checkouts = flotilla_admission::repository_addressing::local_checkouts_with_lifecycle_reads(
-            &self.resource_backend,
             &self.observed_resource_backend,
             &namespace,
             self.environment_manager.local_host_id().as_str(),
@@ -1964,11 +1963,9 @@ impl InProcessDaemon {
         for (meta, spec) in grant_updates {
             grants.apply(&meta, &spec).await.map_err(|error| error.to_string())?;
         }
-        let durable_checkouts =
-            self.resource_backend.clone().using::<ResourceCheckout>(namespace).list().await.map_err(|error| error.to_string())?;
         for source in old_local {
             let key = RepositoryKey(source.metadata.name.clone());
-            if durable_checkouts.items.iter().any(|checkout| checkout.spec.repo_ref() == &key) {
+            if self.repository_has_live_checkouts(&key).await? {
                 let mut meta = InputMeta::from(&source.metadata);
                 meta.annotations.insert(SUPERSEDED_BY_ANNOTATION.to_string(), target_name.clone());
                 repositories.update(&meta, &source.metadata.resource_version, &source.spec).await.map_err(|error| error.to_string())?;
@@ -1980,6 +1977,16 @@ impl InProcessDaemon {
             }
         }
         Ok(merged)
+    }
+
+    /// Whether the engine holds a checkout of `repository` that has not ended, at any home (#3108).
+    async fn repository_has_live_checkouts(&self, repository: &RepositoryKey) -> Result<bool, String> {
+        let reads = self.lifecycle_reads();
+        let repository = repository.clone();
+        let launches = tokio::task::spawn_blocking(move || reads.checkouts()?.of_repository(&repository))
+            .await
+            .map_err(|error| error.to_string())??;
+        Ok(flotilla_resources::checkout_records::latest_launches(launches).values().any(|checkout| !checkout.ended()))
     }
 
     async fn resolve_declared_repository(&self, observed: RepositorySpec) -> Result<RepositorySpec, String> {
@@ -2543,68 +2550,15 @@ impl InProcessDaemon {
         self.observed_resource_backend.clone()
     }
 
-    /// Refresh durable integration observations for adopted checkouts, then
-    /// restore their ephemeral query-facing projection.
-    pub async fn reconcile_adopted_checkouts(&self, namespace: &str) -> Result<(), String> {
+    /// Projects the adopted checkouts the engine holds at this home into the observed store, and
+    /// removes projections of ones it no longer holds (#3108). Their inspections are the engine's.
+    pub async fn project_adopted_checkouts(&self, namespace: &str) -> Result<(), String> {
         let _reconciliation = self.observed_checkout_reconciliation.lock().await;
-        flotilla_observation::observed_resources::reconcile_adopted_checkouts(
-            &self.resource_backend,
-            &self.observed_resource_backend,
-            namespace,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
-        let forges = self.checkout_integration_forges(namespace).await?;
-        // Read the Convoy inventory at most once per pass, and only once an
-        // adopted Checkout needs it, rather than once per adopted Checkout.
-        let convoys = tokio::sync::OnceCell::new();
-        for checkout in checkouts.list().await.map_err(|error| error.to_string())?.items {
-            if checkout.metadata.lifecycle_authority().map_err(|error| error.to_string())? != Some(LifecycleAuthority::Adopted) {
-                continue;
-            }
-            if checkout_path(&checkout).is_none() {
-                continue;
-            }
-            let convoy_ref = checkout.metadata.labels.get(CONVOY_LABEL).map(String::as_str);
-            let source_root = checkout.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).map(String::as_str);
-            let convoy = convoys
-                .get_or_try_init(|| async { self.resource_backend.including_replicas::<ResourceConvoy>(namespace).list().await })
-                .await
-                .map_err(|error| error.to_string())?
-                .items
-                .iter()
-                .find_map(|source| {
-                    let origin_matches = match (source_root, &source.provenance) {
-                        (Some(expected), ResourceProvenance::Replica { origin_root, .. }) => origin_root.as_str() == expected,
-                        (Some(_), ResourceProvenance::Local) => false,
-                        (None, _) => true,
-                    };
-                    let association_matches = convoy_ref.map_or_else(
-                        || {
-                            flotilla_resources::expected_checkout_refs(&source.object)
-                                .is_ok_and(|expected| expected.contains(&checkout.metadata.name))
-                        },
-                        |expected| source.object.metadata.name == expected,
-                    );
-                    (origin_matches && association_matches).then(|| source.object.clone())
-                });
-            let integration = self.inspect_resource_checkout_integration(&checkout, convoy.as_ref(), &forges).await?;
-            apply_resource_status_patch(
-                &checkouts,
-                &checkout.metadata.name,
-                &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: Box::new(integration) },
-            )
+        let reads = self.lifecycle_reads();
+        let held = tokio::task::spawn_blocking(move || reads.checkouts()?.here()).await.map_err(|error| error.to_string())??;
+        flotilla_observation::observed_resources::project_adopted_checkouts(held, &self.observed_resource_backend, namespace)
             .await
-            .map_err(|error| error.to_string())?;
-        }
-        flotilla_observation::observed_resources::reconcile_adopted_checkouts(
-            &self.resource_backend,
-            &self.observed_resource_backend,
-            namespace,
-        )
-        .await
-        .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())
     }
 
     /// Returns the current connection status for a peer host.
@@ -2976,7 +2930,6 @@ impl InProcessDaemon {
     ) -> Result<(PathBuf, String), String> {
         let namespace = self.provisioning_namespace().await;
         let checkouts = flotilla_admission::repository_addressing::local_checkouts_with_lifecycle_reads(
-            &self.resource_backend,
             &self.observed_resource_backend,
             &namespace,
             self.environment_manager.local_host_id().as_str(),
@@ -3044,12 +2997,12 @@ impl InProcessDaemon {
         }
     }
 
-    async fn checkout_has_network_forge(&self, checkout: &ResourceObject<ResourceCheckout>) -> Result<bool, String> {
+    async fn repository_has_network_forge(&self, repo_ref: &RepositoryKey) -> Result<bool, String> {
         let namespace = self.provisioning_namespace().await;
         let repository = self
             .resource_backend
             .including_replicas::<Repository>(&namespace)
-            .get(&checkout.spec.repo_ref().to_string())
+            .get(&repo_ref.to_string())
             .await
             .map_err(|error| error.to_string())?
             .object;
@@ -3059,99 +3012,145 @@ impl InProcessDaemon {
             .is_none_or(|forge| !forge.service_url.starts_with("https://") && !forge.service_url.starts_with("http://")))
     }
 
-    /// Creation requires a fresh forge lookup: a cached absence must not
-    /// authorize reusing a branch whose earlier request has since closed.
+    /// Whether `branch` may be made new in `repo_ref`: refused when a change request merges from
+    /// the repository's own branch of that name, unless `continuing` it and that request is still
+    /// open (#3108). The lookup is fresh: this host's forge observer is asked to look the branch up
+    /// and record what it finds, and only once it has answered are the records read, through their
+    /// `by_branch` index. A fork's branch of the same name is another branch and never counts.
     #[tracing::instrument(name = "checkout_branch_validation", skip_all)]
-    pub async fn validate_new_checkout_branch(
+    pub async fn validate_new_branch(
         &self,
-        checkout: &ResourceObject<ResourceCheckout>,
+        repo_ref: &RepositoryKey,
+        branch: &str,
+        continuing: bool,
     ) -> Result<Option<String>, flotilla_provider_runtime::ObservationError> {
-        if !self.checkout_has_network_forge(checkout).await? {
+        if !self.repository_has_network_forge(repo_ref).await? {
             return Ok(None);
         }
-        let continuing = if let Some(owner) = checkout.metadata.labels.get(CONVOY_LABEL) {
-            match self.resource_backend.including_replicas::<ResourceConvoy>(&checkout.metadata.namespace).get(owner).await {
-                Ok(owner) => owner.object.spec.continuation.as_ref() == Some(checkout.spec.repo_ref()),
-                Err(ResourceError::NotFound { .. }) => false,
-                Err(error) => return Err(error.to_string().into()),
-            }
-        } else {
-            false
-        };
-        let (candidates, failures) =
-            self.admission.repository_change_request_candidates(std::slice::from_ref(checkout.spec.repo_ref())).await;
-        if let Some(error) = failures.into_iter().next() {
-            return Err(error.into());
-        }
-        for (_, _, provider) in candidates {
-            if let Some((id, request)) = provider.find_change_request_by_branch_for_admission(checkout.spec.branch()).await? {
-                if continuing
-                    && matches!(
-                        request.status,
-                        flotilla_protocol::ChangeRequestStatus::Open | flotilla_protocol::ChangeRequestStatus::Draft
-                    )
-                {
-                    continue;
+        let namespace = self.provisioning_namespace().await;
+        let (repository, _) = self.repository_address_of(&namespace, repo_ref).await?;
+        let primitives = self.message_primitives().ok_or_else(|| "branch validation has no Message path".to_owned())?;
+        primitives.observe_branch(&namespace, &repository, branch).await?;
+        let (service, scope) = flotilla_resources::address::stored_service_scope(&repository)
+            .ok_or_else(|| format!("{repository} names no forge repository"))?;
+        let found = self.change_request_branches()?.on_branch(&service, &scope, branch).await?;
+        // One copy per change request: this home's, which its observer has just written, before
+        // another home's.
+        let mut by_number = BTreeMap::<u64, flotilla_resources::engine_records::BranchChangeRequest>::new();
+        for copy in found {
+            let ours = copy.home == self.node_id.as_str();
+            match by_number.get(&copy.number) {
+                Some(held) if held.home == self.node_id.as_str() || !ours => {}
+                _ => {
+                    by_number.insert(copy.number, copy);
                 }
-                return Ok(Some(format!(
-                    "checkout branch {} conflicts with {:?} change request #{}; choose a fresh branch name",
-                    checkout.spec.branch(),
-                    request.status,
-                    id
-                )));
             }
         }
-        Ok(None)
+        let open = |copy: &flotilla_resources::engine_records::BranchChangeRequest| {
+            matches!(
+                copy.state,
+                Some(flotilla_resources::ObservedChangeRequestState::Open | flotilla_resources::ObservedChangeRequestState::Draft)
+            )
+        };
+        if continuing && by_number.values().any(open) {
+            return Ok(None);
+        }
+        Ok(by_number.into_values().next().map(|copy| {
+            let state = copy.state.map_or_else(|| "unobserved".to_owned(), |state| format!("{state:?}"));
+            format!("checkout branch {branch} conflicts with {state} change request #{}; choose a fresh branch name", copy.number)
+        }))
     }
 
-    /// Resolve a checkout's PR from live VCS facts rather than its provisioning ref.
-    /// New automatic associations require an open request; terminal requests are
-    /// retained only when this checkout already observed them while open or has
-    /// merge evidence dating from its own lifetime.
-    pub async fn resolve_live_checkout_change_request(
+    /// The change request branches the forge observers record, once the engine is installed.
+    fn change_request_branches(&self) -> Result<&Arc<dyn flotilla_resources::engine_records::ChangeRequestBranches>, String> {
+        self.change_request_branches.get().ok_or_else(|| "the change request branch records are not installed".to_owned())
+    }
+
+    /// Repository `repo_ref`'s address, from the first of its remotes the namespace's Forges
+    /// resolve, with those Forges.
+    async fn repository_address_of(
         &self,
-        checkout: &ResourceObject<ResourceCheckout>,
-        vcs: &dyn flotilla_vcs::vcs::Vcs,
-        path: &Path,
-    ) -> Result<Option<String>, String> {
-        if !self.checkout_has_network_forge(checkout).await? {
-            return Ok(None);
+        namespace: &str,
+        repo_ref: &RepositoryKey,
+    ) -> Result<(flotilla_address::Address, Vec<flotilla_resources::ForgeSpec>), String> {
+        let repository = self
+            .resource_backend
+            .including_replicas::<Repository>(namespace)
+            .get(&repo_ref.to_string())
+            .await
+            .map_err(|error| error.to_string())?;
+        let forges = self.namespace_forges(namespace).await?;
+        let address = repository
+            .object
+            .spec
+            .remotes()
+            .iter()
+            .find_map(|remote| flotilla_resources::address::repository_address(remote, &forges).ok())
+            .ok_or_else(|| format!("repository {repo_ref} has no remote a Forge names"))?;
+        Ok((address, forges))
+    }
+
+    async fn namespace_forges(&self, namespace: &str) -> Result<Vec<flotilla_resources::ForgeSpec>, String> {
+        let forges = self.resource_backend.definitions::<Forge>(namespace).list().await.map_err(|error| error.to_string())?;
+        Ok(forges.into_iter().map(|forge| forge.spec).collect())
+    }
+
+    /// This host's forge observer's answer to a ChangeRequestBranch request (#3108): looks for a
+    /// change request from `branch` of `repository` with the repository's change request
+    /// provider, which counts only the repository's own branch, and records what it finds on that
+    /// change request's record here. Finding none records nothing. An error is a lookup that did
+    /// not complete, so the request is not answered as if it had.
+    pub async fn observe_change_request_branch(&self, repository: &flotilla_address::Address, branch: &str) -> Result<(), String> {
+        let namespace = self.provisioning_namespace().await;
+        let forges = self.namespace_forges(&namespace).await?;
+        let repositories =
+            self.resource_backend.including_replicas::<Repository>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let repo_ref = repositories
+            .items
+            .iter()
+            .find(|item| {
+                item.object
+                    .spec
+                    .remotes()
+                    .iter()
+                    .any(|remote| flotilla_resources::address::repository_address(remote, &forges).as_ref() == Ok(repository))
+            })
+            .map(|item| RepositoryKey(item.object.metadata.name.clone()))
+            .ok_or_else(|| format!("no repository here has a remote at {repository}"))?;
+        let (service, scope) = flotilla_resources::address::stored_service_scope(repository)
+            .ok_or_else(|| format!("{repository} names no forge repository"))?;
+        let (candidates, failures) = self.admission.repository_change_request_candidates(std::slice::from_ref(&repo_ref)).await;
+        if let Some(error) = failures.into_iter().next() {
+            return Err(error);
         }
-        let branch = vcs.read_repository(path, flotilla_vcs::vcs::RepositoryRead::CurrentBranch).await?;
-        let mut branches = vec![branch.trim().to_string()];
-        if let Ok(upstream) = vcs.read_repository(path, flotilla_vcs::vcs::RepositoryRead::UpstreamOf("@{upstream}")).await {
-            let remote = vcs.read_repository(path, flotilla_vcs::vcs::RepositoryRead::TrackedRemote(branch.trim())).await?;
-            let upstream = upstream.trim();
-            // Git uses remote "." for a local upstream; its full branch name has no remote prefix.
-            let upstream_branch =
-                if remote.trim() == "." { upstream } else { upstream.strip_prefix(&format!("{}/", remote.trim())).unwrap_or(upstream) };
-            if !branches.iter().any(|candidate| candidate == upstream_branch) {
-                branches.push(upstream_branch.to_string());
-            }
+        let branches = self.change_request_branches()?;
+        for (_, _, provider) in candidates {
+            let Some((id, request)) =
+                provider.find_change_request_by_branch_for_admission(branch).await.map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
+            let number = id.parse::<u64>().map_err(|_| format!("change request id `{id}` is not a number"))?;
+            let address = flotilla_resources::address::stored_change_request_address(&service, &scope, number, &forges)?;
+            let name = flotilla_address::record_name(&address).ok_or_else(|| format!("{address} has no record name"))?;
+            let state = match request.status {
+                flotilla_protocol::ChangeRequestStatus::Open => flotilla_resources::ObservedChangeRequestState::Open,
+                flotilla_protocol::ChangeRequestStatus::Draft => flotilla_resources::ObservedChangeRequestState::Draft,
+                flotilla_protocol::ChangeRequestStatus::Merged => flotilla_resources::ObservedChangeRequestState::Merged,
+                flotilla_protocol::ChangeRequestStatus::Closed => flotilla_resources::ObservedChangeRequestState::Closed,
+            };
+            let found = flotilla_resources::engine_records::BranchChangeRequest {
+                name,
+                home: self.node_id.as_str().to_owned(),
+                service: service.clone(),
+                scope: scope.clone(),
+                number,
+                branch: branch.to_owned(),
+                state: Some(state),
+            };
+            branches.found_on_branch(&found).await?;
         }
-        for branch in branches.into_iter().filter(|branch| !branch.is_empty() && branch != "HEAD") {
-            if let Some(request) = self.resolve_convoy_change_request(std::slice::from_ref(checkout.spec.repo_ref()), &branch, None).await?
-            {
-                let terminal = matches!(
-                    request.status,
-                    flotilla_protocol::ChangeRequestStatus::Merged | flotilla_protocol::ChangeRequestStatus::Closed
-                );
-                let prior = checkout.status.as_ref().map(|status| &status.integration);
-                let previously_open = prior
-                    .and_then(|integration| integration.change_request.as_ref())
-                    .is_some_and(|observed| observed.id == request.id && observed.state != flotilla_resources::ChangeRequestState::Merged);
-                let merged_during_checkout = prior
-                    .and_then(|integration| integration.landed_evidence.as_ref())
-                    .filter(|evidence| evidence.change_request_id == request.id)
-                    .and_then(|evidence| evidence.merged_at.as_deref())
-                    .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
-                    .is_some_and(|at| at >= checkout.metadata.creation_timestamp);
-                if !terminal || previously_open || merged_during_checkout {
-                    return Ok(Some(request.id));
-                }
-            }
-        }
-        Ok(None)
+        Ok(())
     }
 
     /// Persist every branch-matching PR across the convoy's repositories.
@@ -3187,9 +3186,8 @@ impl InProcessDaemon {
             }
             Err(error) => return Err(error.to_string()),
         };
-        let checkout_sources =
-            self.resource_backend.including_replicas::<ResourceCheckout>(namespace).list().await.map_err(|error| error.to_string())?;
-        let checkouts = flotilla_resources::select_convoy_children(&convoy, &checkout_sources.items);
+        let checkouts = self.crew.held_checkouts(&convoy).await?;
+        let checkouts = flotilla_resources::checkout_records::latest_launches(checkouts);
         let forges = self
             .resource_backend
             .definitions::<Forge>(namespace)
@@ -3215,7 +3213,32 @@ impl InProcessDaemon {
             !adopted.iter().any(same)
                 && !convoy.status.as_ref().is_some_and(|status| status.unlinked_subjects.iter().any(same) || status.produces_any(same))
         };
-        let observed_subjects = observed_change_request_subjects(&convoy, &checkouts, &forges)?;
+        // The forge observation's states of the change requests the checkouts' inspections name.
+        let change_requests =
+            if checkouts.values().any(|checkout| checkout.inspection().is_some_and(|inspection| inspection.change_request.is_some())) {
+                let sources = self
+                    .resource_backend
+                    .including_replicas::<ResourceChangeRequest>(namespace)
+                    .list()
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .items;
+                flotilla_resources::change_request::select_change_requests(sources.iter().map(|source| &source.object))
+                    .into_values()
+                    .filter_map(|record| {
+                        let name =
+                            record.spec.address(&forges).ok().and_then(|address| flotilla_resources::address::record_name(&address))?;
+                        Some((name, record))
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            } else {
+                BTreeMap::new()
+            };
+        let state_of = |subject: &flotilla_protocol::Subject| {
+            let address = flotilla_resources::address::subject_address(subject, &forges).ok()?;
+            change_requests.get(&flotilla_resources::address::record_name(&address)?)?.status.as_ref()?.state.value
+        };
+        let observed_subjects = observed_change_request_subjects(&convoy, &checkouts, &forges, &state_of)?;
         for subject in &observed_subjects {
             if should_discover(subject) {
                 subjects.push((subject.clone(), flotilla_protocol::Relationship::Produces));
@@ -3950,7 +3973,6 @@ impl InProcessDaemon {
         }
 
         let other_tracked_keys = flotilla_admission::repository_addressing::local_checkouts_with_lifecycle_reads(
-            &self.resource_backend,
             &self.observed_resource_backend,
             &namespace,
             self.environment_manager.local_host_id().as_str(),
@@ -3968,12 +3990,10 @@ impl InProcessDaemon {
         migratable_keys.extend(declared_alias_keys);
 
         let remaining_projects = projects.list().await.map_err(|error| error.to_string())?;
-        let durable_checkouts =
-            self.resource_backend.clone().using::<ResourceCheckout>(&namespace).list().await.map_err(|error| error.to_string())?.items;
         for old_key in &migratable_keys {
             let still_referenced =
                 remaining_projects.iter().any(|project| project.spec.repositories.iter().any(|entry| &entry.repo == old_key));
-            let has_durable_checkout = durable_checkouts.iter().any(|checkout| checkout.spec.repo_ref() == old_key);
+            let has_durable_checkout = self.repository_has_live_checkouts(old_key).await?;
             if !still_referenced && !has_durable_checkout {
                 flotilla_observation::observed_resources::delete_observed_checkouts(&self.observed_resource_backend, &namespace, old_key)
                     .await
@@ -4484,7 +4504,6 @@ impl InProcessDaemon {
         }
         let mut paths = BTreeMap::<RepositoryKey, Vec<PathBuf>>::new();
         for checkout in flotilla_admission::repository_addressing::local_checkouts_with_lifecycle_reads(
-            &self.resource_backend,
             &self.observed_resource_backend,
             namespace,
             self.environment_manager.local_host_id().as_str(),
@@ -4529,63 +4548,65 @@ impl InProcessDaemon {
                 }
             }
             CliListKind::Checkout => {
-                let durable = self
+                // The engine's checkouts of every known repository, at every home, then the
+                // observed ones it does not hold (#3108).
+                let repositories = self
                     .resource_backend
-                    .including_replicas::<ResourceCheckout>(&namespace)
+                    .including_replicas::<Repository>(&namespace)
                     .list()
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| error.to_string())?
+                    .items
+                    .into_iter()
+                    .map(|source| source.object.spec.key())
+                    .collect::<BTreeSet<_>>();
+                let reads = self.lifecycle_reads();
+                let held = tokio::task::spawn_blocking(move || {
+                    let checkouts = reads.checkouts()?;
+                    let mut held = Vec::new();
+                    for repository in &repositories {
+                        held.extend(checkouts.of_repository(repository)?);
+                    }
+                    Ok::<_, String>(flotilla_resources::checkout_records::latest_launches(held))
+                })
+                .await
+                .map_err(|error| error.to_string())??;
+                for (name, checkout) in &held {
+                    let status = match &checkout.reading {
+                        flotilla_protocol::LifecycleReading::Ready { .. } => "ready",
+                        flotilla_protocol::LifecycleReading::InProgress | flotilla_protocol::LifecycleReading::Retrying { .. } => "pending",
+                        flotilla_protocol::LifecycleReading::GaveUp { .. } | flotilla_protocol::LifecycleReading::Exhausted { .. } => {
+                            "failed"
+                        }
+                        _ => continue,
+                    };
+                    items.entry((String::new(), name.clone())).or_insert(CliListRow {
+                        repo: Some(checkout.spec.repo_ref().to_string()),
+                        reference: name.clone(),
+                        name: checkout.branch().to_string(),
+                        status: status.to_string(),
+                        provider: None,
+                    });
+                }
                 let observed =
                     self.observed_resource_backend.using::<ResourceCheckout>(&namespace).list().await.map_err(|error| error.to_string())?;
-                let mut engine_held = BTreeSet::new();
-                let durable = durable.items.into_iter().map(|source| {
-                    let origin = match source.provenance {
-                        ResourceProvenance::Local => None,
-                        ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.to_string()),
-                    };
-                    (source.object, origin)
-                });
-                for (checkout, origin) in durable.chain(observed.items.into_iter().map(|object| (object, None))) {
-                    let observed = matches!(checkout.spec, ResourceCheckoutSpec::Observed(_));
-                    if observed && engine_held.contains(&checkout.metadata.name) {
+                for checkout in observed.items {
+                    if held.contains_key(&checkout.metadata.name) {
                         continue;
                     }
-                    let reading = if observed {
-                        None
-                    } else {
-                        self.lifecycle_reads.try_reading(
-                            flotilla_resources::lifecycle_reads::ProvisioningKind::Checkout,
-                            &checkout.metadata.name,
-                            origin.as_deref(),
-                        )?
-                    };
-                    if reading.is_some() {
-                        engine_held.insert(checkout.metadata.name.clone());
-                    }
-                    let status = match reading {
-                        Some(flotilla_protocol::LifecycleReading::Ready { .. }) => "ready".to_string(),
-                        Some(flotilla_protocol::LifecycleReading::InProgress | flotilla_protocol::LifecycleReading::Retrying { .. }) => {
-                            "pending".to_string()
-                        }
-                        Some(
-                            flotilla_protocol::LifecycleReading::GaveUp { .. } | flotilla_protocol::LifecycleReading::Exhausted { .. },
-                        ) => "failed".to_string(),
-                        Some(_) => continue,
-                        None => match checkout.status.as_ref().map(|status| status.phase) {
-                            Some(ResourceCheckoutPhase::Gone) => continue,
-                            Some(ResourceCheckoutPhase::Pending) => "pending",
-                            Some(ResourceCheckoutPhase::Ready) => "ready",
-                            Some(ResourceCheckoutPhase::Failed) => "failed",
-                            None => "observed",
-                        }
-                        .to_string(),
+                    let status = match checkout.status.as_ref().map(|status| status.phase) {
+                        Some(ResourceCheckoutPhase::Gone) => continue,
+                        Some(ResourceCheckoutPhase::Pending) => "pending",
+                        Some(ResourceCheckoutPhase::Ready) => "ready",
+                        Some(ResourceCheckoutPhase::Failed) => "failed",
+                        None => "observed",
                     };
                     let reference = checkout.metadata.name;
                     items.entry((String::new(), reference.clone())).or_insert(CliListRow {
                         repo: Some(checkout.spec.repo_ref().to_string()),
                         reference,
                         name: checkout.spec.branch().to_string(),
-                        status,
+                        status: status.to_string(),
                         provider: None,
                     });
                 }
@@ -4788,122 +4809,57 @@ impl InProcessDaemon {
         self.crew.stall(requested, reason, proposed_disposition, message).await
     }
 
-    async fn checkout_integration_forges(&self, namespace: &str) -> Result<Vec<flotilla_resources::ForgeSpec>, String> {
-        Ok(self
-            .resource_backend
-            .definitions::<Forge>(namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|forge| forge.spec)
-            .collect())
-    }
-
-    #[tracing::instrument(name = "checkout_landing_evidence", skip_all)]
-    async fn inspect_resource_checkout_integration(
-        &self,
-        checkout: &ResourceObject<ResourceCheckout>,
-        convoy: Option<&ResourceObject<ResourceConvoy>>,
-        forges: &[flotilla_resources::ForgeSpec],
-    ) -> Result<flotilla_resources::CheckoutIntegrationStatus, String> {
-        let path = checkout_path(checkout).ok_or("checkout path unavailable")?;
-        let (runner, vcs) = self.resource_checkout_vcs(checkout, Path::new(path)).await?;
-        Ok(if let Some(convoy) = convoy {
-            let id = convoy_change_request_id_for_checkout(convoy, checkout, forges);
-            let observed = self.replicated_checkout_change_request(convoy, checkout, id.as_deref()).await?;
-            inspect_convoy_checkout_integration(
-                &*runner,
-                vcs.as_ref(),
-                Path::new(path),
-                &checkout.spec,
-                convoy,
-                id.as_deref(),
-                ChangeRequestIntegrationInput {
-                    status: observed.as_ref(),
-                    landed_evidence: checkout.status.as_ref().and_then(|status| status.integration.landed_evidence.as_ref()),
-                },
-            )
-            .await
-        } else {
-            inspect_checkout_integration(
-                &*runner,
-                vcs.as_ref(),
-                Path::new(path),
-                &checkout.spec,
-                checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL).map(String::as_str),
-            )
-            .await
-        })
-    }
-
-    async fn replicated_checkout_change_request(
-        &self,
-        convoy: &ResourceObject<ResourceConvoy>,
-        checkout: &ResourceObject<ResourceCheckout>,
-        id: Option<&str>,
-    ) -> Result<Option<flotilla_resources::ChangeRequestStatus>, String> {
-        let Some(number) = id.and_then(|id| id.parse::<u64>().ok()) else { return Ok(None) };
-        let Some(repository) = convoy.spec.repositories.iter().find(|repository| repository.repo_ref == *checkout.spec.repo_ref()) else {
-            return Ok(None);
-        };
-        let canonical = flotilla_resources::canonicalize_repo_url(&repository.url)?;
-        let qualified = canonical.split_once("://").map(|(_, qualified)| qualified).unwrap_or(&canonical);
-        let Some((service, scope)) = qualified.split_once('/') else { return Ok(None) };
-        let records = self
-            .resource_backend
-            .query_declared::<ResourceChangeRequest>(
-                &convoy.metadata.namespace,
-                &flotilla_store::StoreQuery {
-                    fields: BTreeMap::from([
-                        ("spec.service".into(), service.into()),
-                        ("spec.scope".into(), scope.into()),
-                        ("spec.number".into(), number.to_string()),
-                    ]),
-                    include_replicas: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(flotilla_resources::pick_replica_read(
-            records.items.into_iter().filter(|record| {
-                record.object.spec.number == number && record.object.spec.service == service && record.object.spec.scope == scope
-            }),
-            |record| (&record.object, matches!(record.provenance, ResourceProvenance::Local)),
-        )
-        .and_then(|record| record.object.status))
-    }
-
-    /// A checkout's `env_ref` names an Environment resource, which resolves
-    /// through the environment manager like every other checkout path. Observed
-    /// checkouts carry no `env_ref` and live on this host.
-    async fn resource_checkout_vcs(
-        &self,
-        checkout: &ResourceObject<ResourceCheckout>,
-        path: &Path,
-    ) -> Result<(Arc<dyn CommandRunner>, Arc<dyn flotilla_vcs::vcs::Vcs>), String> {
-        let environment = match checkout.spec.env_ref() {
-            Some(env_ref) => self
-                .resolve_environment_ref(env_ref)
-                .ok_or_else(|| format!("checkout environment {env_ref} is unavailable on this host"))?,
-            None => ResolvedEnvironment {
-                runner: self.local_command_runner().ok_or("local command runner unavailable")?,
-                id: self.local_environment_id.clone(),
-            },
-        };
-        let vcs = self.vcs_for_checkout(&environment.id, path).await?;
-        Ok((environment.runner, vcs))
-    }
-
     pub async fn verify_convoy_teardown_gate(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
         self.crew.teardown(namespace, name, force).await
+    }
+
+    /// A crew's turn ended (its Stop hook, #3108): the checkouts its terminal session works in
+    /// here, those ready in its environment whose path holds its working directory, are inspected
+    /// afresh through their home's checkout inspector, so their records show what the turn did.
+    /// The hook does not wait for it: the inspections run on their own task.
+    pub fn inspect_after_turn(self: &Arc<Self>, namespace: &str, session: &str) {
+        let (daemon, namespace, session) = (Arc::clone(self), namespace.to_owned(), session.to_owned());
+        tokio::spawn(async move {
+            if let Err(error) = daemon.inspect_session_checkouts(&namespace, &session).await {
+                tracing::warn!(%session, %error, "the checkouts a turn worked in were not inspected after it");
+            }
+        });
+    }
+
+    async fn inspect_session_checkouts(&self, namespace: &str, session: &str) -> Result<(), String> {
+        let primitives = self.message_primitives().ok_or("the Message path is not installed")?;
+        let session = self
+            .resource_backend
+            .using::<flotilla_resources::TerminalSession>(namespace)
+            .get(session)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (environment, cwd) = (session.spec.env_ref.clone(), std::path::PathBuf::from(&session.spec.cwd));
+        let reads = self.lifecycle_reads();
+        let launches = tokio::task::spawn_blocking(move || reads.checkouts()?.in_environment(&environment, None))
+            .await
+            .map_err(|error| error.to_string())??;
+        let worked_in = flotilla_resources::checkout_records::latest_launches(launches)
+            .into_values()
+            .filter(|checkout| checkout.is_ready() && checkout.ready_path().is_some_and(|path| cwd.starts_with(path)));
+        for checkout in worked_in {
+            primitives.inspect_checkout(namespace, &checkout.home, checkout.checkout_name()).await?;
+        }
+        Ok(())
+    }
+
+    /// The checkout launches the engine holds for `convoy`, at every home (#3108).
+    pub async fn held_checkouts(
+        &self,
+        convoy: &ResourceObject<ResourceConvoy>,
+    ) -> Result<Vec<flotilla_resources::checkout_records::CheckoutRecord>, String> {
+        self.crew.held_checkouts(convoy).await
     }
 
     pub async fn verify_convoy_teardown_gate_for_checkouts(
         &self,
         convoy: &ResourceObject<ResourceConvoy>,
-        checkout_list: &[ResourceObject<ResourceCheckout>],
+        checkout_list: &[flotilla_resources::checkout_records::CheckoutRecord],
         force: bool,
     ) -> Result<(), String> {
         self.crew.verify_convoy_teardown_gate_for_checkouts(convoy, checkout_list, force).await
@@ -5598,8 +5554,6 @@ impl InProcessDaemon {
             namespace: &self.provisioning_namespace,
             port: self,
             resource_backend: &self.resource_backend,
-            observed_resource_backend: &self.observed_resource_backend,
-            observed_checkout_reconciliation: &self.observed_checkout_reconciliation,
             admission: &self.admission,
             events: action_events::ActionEvents { node_id: &self.node_id, sink: &self.event_sink },
         };
@@ -6193,14 +6147,6 @@ impl executor_actions::ExecutorActionPort for InProcessDaemon {
             None => Err("operator reconciliation is unavailable before runtime startup".to_string()),
         }
     }
-    async fn delete_stale_adopted_checkouts(&self, namespace: &str) -> Result<(), ResourceError> {
-        flotilla_observation::observed_resources::delete_stale_adopted_checkouts(
-            &self.resource_backend,
-            &self.observed_resource_backend,
-            namespace,
-        )
-        .await
-    }
     async fn peer_connection_status(&self, node_id: &NodeId) -> PeerConnectionState {
         InProcessDaemon::peer_connection_status(self, node_id).await
     }
@@ -6328,55 +6274,11 @@ struct CheckoutInspector(Weak<InProcessDaemon>);
 
 #[async_trait]
 impl flotilla_crew::ports::CheckoutIntegrationInspector for CheckoutInspector {
-    #[tracing::instrument(name = "checkout_landing_evidence", skip_all)]
-    async fn inspect(
-        &self,
-        convoy: &ResourceObject<ResourceConvoy>,
-        checkout: &ResourceObject<ResourceCheckout>,
-    ) -> Result<flotilla_resources::CheckoutIntegrationStatus, String> {
+    #[tracing::instrument(name = "checkout_landing_evidence", skip_all, fields(checkout = %checkout.name, home = %checkout.home))]
+    async fn inspect_now(&self, namespace: &str, checkout: &flotilla_resources::checkout_records::CheckoutRecord) -> Result<(), String> {
         let daemon = self.0.upgrade().ok_or("checkout inspector daemon unavailable")?;
-        if let Some(env_ref) = checkout.spec.env_ref().filter(|env_ref| daemon.resolve_environment_ref(env_ref).is_none()) {
-            return Err(daemon.unreachable_checkout_environment(&checkout.metadata.namespace, env_ref).await);
-        }
-        let forges = daemon.checkout_integration_forges(&convoy.metadata.namespace).await?;
-        daemon.inspect_resource_checkout_integration(checkout, Some(convoy), &forges).await
-    }
-}
-
-impl InProcessDaemon {
-    /// Delete runs at the convoy's home, so name the host that owns an environment it cannot reach.
-    async fn unreachable_checkout_environment(&self, namespace: &str, env_ref: &str) -> String {
-        // The owner's Environment and Host usually reach the convoy's home only as replicas.
-        let by_name = |name: &str| flotilla_store::StoreQuery {
-            fields: BTreeMap::from([("metadata.name".into(), name.into())]),
-            include_replicas: true,
-            ..Default::default()
-        };
-        let reads = self.lifecycle_reads();
-        let name = env_ref.to_owned();
-        let found = tokio::task::spawn_blocking(move || reads.environments()?.find(&name))
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|found| found);
-        let host_ref = match found {
-            Ok(found) => found.and_then(|environment| environment.spec.host_ref().map(str::to_string)),
-            Err(error) => {
-                tracing::warn!(%env_ref, %error, "could not read checkout environment owner");
-                None
-            }
-        };
-        let Some(host_ref) = host_ref else {
-            return format!("checkout environment {env_ref} is unavailable on this host and its owning host is unknown");
-        };
-        let display = match self.resource_backend.query_declared::<flotilla_resources::Host>(namespace, &by_name(&host_ref)).await {
-            Ok(found) => found.items.into_iter().map(|source| source.object.spec.display_name).find(|name| !name.is_empty()),
-            Err(error) => {
-                tracing::warn!(%host_ref, %error, "could not read checkout environment owner's host");
-                None
-            }
-        };
-        let host = display.map_or_else(|| host_ref.clone(), |display| format!("{display} ({host_ref})"));
-        format!("checkout environment {env_ref} belongs to host {host}, not this host; it can only be inspected there")
+        let primitives = daemon.message_primitives().ok_or("the Message path is not installed")?;
+        primitives.inspect_checkout(namespace, &checkout.home, checkout.checkout_name()).await
     }
 }
 

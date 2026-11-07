@@ -48,7 +48,7 @@ use super::{
     reads::StoreReads,
 };
 use crate::{
-    reconcilers::{checkout::managed_checkout_reason, CheckoutRemoval, CheckoutRemovalOutcome, PreparedCheckout},
+    checkout_runtime::{managed_checkout_reason, CheckoutRemoval, CheckoutRemovalOutcome, PreparedCheckout},
     stored::{
         checkout::{CheckoutFacts, CheckoutIntegration, CheckoutKind, CheckoutRequest, Source},
         clone::{CloneKind, CloneRequest},
@@ -515,9 +515,43 @@ impl<P: CheckoutProvider> CheckoutActuator<P> {
         self.provider.protect(&request.environment.name, &clone_path, &request.path, &reason).await
     }
 
+    /// Inspects checkout `checkout` of this home for a gate that asked its inspector, reading the
+    /// branch's ref on its remote when `remote`, and records the inspection on its latest launch.
+    /// `Ok(None)` when this home holds no realised launch of it: there is nothing to inspect.
+    pub async fn inspect_for_gate(&self, checkout: &str, remote: bool) -> Result<Option<String>, String> {
+        let home = self.home.clone();
+        let view = self
+            .reads
+            .read(|read| super::reads::latest::<CheckoutKind>(read, checkout, &home))
+            .map_err(|error| format!("read checkout {checkout}: {error}"))?;
+        let Some(view) = view.filter(|view| matches!(view.state, LifecycleState::Realised { .. })) else { return Ok(None) };
+        let holder = view.request.holder.as_ref().and_then(super::checkouts::checkout_holder);
+        let inputs = self.inputs.inputs(holder.as_ref(), &spec_of(&view.request)).await?;
+        self.record_inspection(&view.name, &view.request, &inputs, remote).await?;
+        Ok(Some(view.name))
+    }
+
     /// Inspects launch `name` afresh and records it; the integration its removal is decided from.
     /// A failed inspection is recorded as failing and judges nothing.
     async fn inspected(&self, name: &str, request: &CheckoutRequest, inputs: &CheckoutInputs) -> Option<Inspection> {
+        match self.record_inspection(name, request, inputs, false).await {
+            Ok(integration) => integration,
+            Err(error) => {
+                warn!(checkout = name, %error, "a released checkout could not be inspected; it is archived before removal");
+                None
+            }
+        }
+    }
+
+    /// Inspects launch `name` afresh, reading its branch's remote ref when `remote`, and records
+    /// it: the inspection as held after, or the failure, recorded as failing.
+    async fn record_inspection(
+        &self,
+        name: &str,
+        request: &CheckoutRequest,
+        inputs: &CheckoutInputs,
+        remote: bool,
+    ) -> Result<Option<Inspection>, String> {
         let spec = spec_of(request);
         let records = Arc::clone(&self.records);
         let launch = name.to_owned();
@@ -536,12 +570,12 @@ impl<P: CheckoutProvider> CheckoutActuator<P> {
             change_request: inputs.change_request.as_deref(),
             change_request_searched: inputs.change_request_searched,
             held: held.as_ref(),
-            remote: false,
+            remote,
         };
         let inspection = self.provider.inspect(&request.environment.name, &request.path, &spec, against).await;
         let records = Arc::clone(&self.records);
         let launch = name.to_owned();
-        let written = tokio::task::spawn_blocking(move || match inspection {
+        tokio::task::spawn_blocking(move || match inspection {
             Ok(inspection) => {
                 records.inspected(&launch, inspection)?;
                 // Latched onto the held one: a landing found before stays found.
@@ -553,14 +587,7 @@ impl<P: CheckoutProvider> CheckoutActuator<P> {
             }
         })
         .await
-        .unwrap_or_else(|error| Err(format!("checkout inspection did not finish: {error}")));
-        match written {
-            Ok(integration) => integration,
-            Err(error) => {
-                warn!(checkout = name, %error, "a released checkout could not be inspected; it is archived before removal");
-                None
-            }
-        }
+        .unwrap_or_else(|error| Err(format!("checkout inspection did not finish: {error}")))
     }
 }
 

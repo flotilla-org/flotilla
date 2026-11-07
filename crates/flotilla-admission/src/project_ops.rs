@@ -216,14 +216,9 @@ impl RepositoryIndex<'_> {
     // candidates, require a unique main checkout without re-inspecting identity.
     async fn select_checkout(&self, key: &RepositoryKey) -> Result<CheckoutSelection, String> {
         let namespace = self.namespace.read().expect("namespace lock poisoned").clone();
-        let checkouts = crate::repository_addressing::local_checkouts_with_lifecycle_reads(
-            self.backend,
-            self.observed,
-            &namespace,
-            self.host,
-            self.lifecycle_reads,
-        )
-        .await?;
+        let checkouts =
+            crate::repository_addressing::local_checkouts_with_lifecycle_reads(self.observed, &namespace, self.host, self.lifecycle_reads)
+                .await?;
         let mut candidates = checkouts.iter().filter(|checkout| checkout.spec.repo_ref() == key).collect::<Vec<_>>();
         if candidates.is_empty() {
             return Ok(CheckoutSelection::Unavailable);
@@ -246,18 +241,12 @@ impl RepositoryIndex<'_> {
 
     async fn paths_for(&self, key: &RepositoryKey) -> Result<Vec<PathBuf>, String> {
         let namespace = self.namespace.read().expect("namespace lock poisoned").clone();
-        Ok(crate::repository_addressing::local_checkouts_with_lifecycle_reads(
-            self.backend,
-            self.observed,
-            &namespace,
-            self.host,
-            self.lifecycle_reads,
-        )
-        .await?
-        .into_iter()
-        .filter(|checkout| checkout.spec.repo_ref() == key)
-        .filter_map(|checkout| checkout_path(&checkout).map(PathBuf::from))
-        .collect())
+        Ok(crate::repository_addressing::local_checkouts_with_lifecycle_reads(self.observed, &namespace, self.host, self.lifecycle_reads)
+            .await?
+            .into_iter()
+            .filter(|checkout| checkout.spec.repo_ref() == key)
+            .filter_map(|checkout| checkout_path(&checkout).map(PathBuf::from))
+            .collect())
     }
 }
 
@@ -1414,7 +1403,6 @@ impl ProjectService<'_> {
         // refreshing one clone cannot erase a sibling clone's identity facts.
         let mut inspections = vec![inspection.clone()];
         for known in crate::repository_addressing::local_checkouts_with_lifecycle_reads(
-            self.resource_backend,
             self.observed_resource_backend,
             namespace,
             &inspection.checkout.host_ref,
@@ -1739,7 +1727,7 @@ mod tests {
                 clock: &clock,
                 namespace: &namespace,
                 repository_index: RepositoryIndex {
-                    lifecycle_reads: &flotilla_resources::lifecycle_reads::NoLifecycleReads,
+                    lifecycle_reads: crate::test_support::no_held_checkouts().as_ref(),
                     backend: &backend,
                     observed: &observed,
                     namespace: &namespace,
@@ -1925,7 +1913,7 @@ mod tests {
             clock: &clock,
             namespace: &namespace,
             repository_index: RepositoryIndex {
-                lifecycle_reads: &flotilla_resources::lifecycle_reads::NoLifecycleReads,
+                lifecycle_reads: crate::test_support::no_held_checkouts().as_ref(),
                 backend: &backend,
                 observed: &observed,
                 namespace: &namespace,
@@ -2050,7 +2038,7 @@ mod tests {
                     None
                 };
                 let index = RepositoryIndex {
-                    lifecycle_reads: &flotilla_resources::lifecycle_reads::NoLifecycleReads,
+                    lifecycle_reads: crate::test_support::no_held_checkouts().as_ref(),
                     backend: &backend,
                     observed: &observed,
                     namespace: &namespace,

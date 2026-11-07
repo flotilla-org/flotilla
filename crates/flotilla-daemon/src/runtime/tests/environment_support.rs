@@ -780,7 +780,7 @@ fn daemon_key(daemon: &InProcessDaemon) -> usize {
     daemon as *const InProcessDaemon as usize
 }
 
-/// The engine's environments (and clones) a test daemon reads (#3108), on its decided store: installed as its
+/// The engine's environments (and clones and checkouts) a test daemon reads (#3108), on its decided store: installed as its
 /// lifecycle reads on first use, and the same fixture after. Records are written as the
 /// Environment controller would write them; a daemon whose controller runs opens its lifecycles
 /// with [`engine_provisioning`] instead.
@@ -791,10 +791,11 @@ pub(super) fn engine_environments(daemon: &InProcessDaemon) -> Arc<EnvironmentFi
     }
     let store = daemon.decided_store().expect("decided store").store();
     let home = flotilla_engine_store::StoreLog::new(Arc::clone(&store)).home().to_owned();
-    // Its readings serve the engine's clones on the same store too, as the runtime's do.
-    let clones = flotilla_provisioning_testkit::CloneFixture::over(&home, Arc::clone(&store));
-    let fixture = Arc::new(EnvironmentFixture::over(&home, store).serving_clones(clones.clones));
-    daemon.install_lifecycle_reads(Arc::clone(&fixture.reads)).expect("install the engine's environments");
+    // Its readings serve the engine's clones and checkouts on the same store too, as the
+    // runtime's do.
+    let engine = flotilla_provisioning_testkit::EngineFixture::over(&home, store);
+    daemon.install_lifecycle_reads(engine.reads()).expect("install the engine's environments");
+    let fixture = Arc::new(engine.environments);
     fixtures.insert(daemon_key(daemon), Arc::clone(&fixture));
     fixture
 }
@@ -812,11 +813,41 @@ pub(super) async fn engine_startup(
 }
 
 /// The provisioning lifecycles a test daemon's controllers run on, opened as the runtime opens
-/// them: the Environment controller among its controller loops realises its environments.
+/// them, after the Message path: the Environment controller among its controller loops realises
+/// its environments, and its convoys are admitted on the engine, which holds their checkouts.
+/// Its fleet is designated, as every engine fleet is: a checkout's branch is looked up through
+/// the fleet's forge observer role.
 pub(super) async fn engine_provisioning(daemon: &Arc<InProcessDaemon>) -> flotilla_provisioning::engine::ProvisioningLifecycles {
-    let (lifecycles, _environment_changes, _clone_changes) =
-        super::super::open_provisioning_lifecycles(daemon).await.expect("open the provisioning lifecycles");
+    designate_fleet(daemon).await;
+    if daemon.message_primitives().is_none() {
+        super::super::open_message_primitives(daemon).await.expect("open the Message path");
+    }
+    let (lifecycles, _followers) = super::super::open_provisioning_lifecycles(daemon).await.expect("open the provisioning lifecycles");
     lifecycles
+}
+
+/// Designates the daemon's fleet, under project `fleet`, unless a FleetDesignation is held.
+pub(super) async fn designate_fleet(daemon: &InProcessDaemon) {
+    use flotilla_resources::{FleetDesignation, FleetDesignationSpec, Project, ProjectSpec, FLEET_DESIGNATION_NAME};
+    let backend = daemon.resource_backend();
+    let designations = backend.definitions::<FleetDesignation>(NAMESPACE);
+    if designations.get(FLEET_DESIGNATION_NAME).await.is_ok() {
+        return;
+    }
+    let projects = backend.definitions::<Project>(NAMESPACE);
+    if projects.get("fleet").await.is_err() {
+        projects
+            .create(&InputMeta::builder().name("fleet".into()).build(), &ProjectSpec::builder().display_name("Fleet".into()).build())
+            .await
+            .expect("fleet project");
+    }
+    designations
+        .create(
+            &InputMeta::builder().name(FLEET_DESIGNATION_NAME.into()).build(),
+            &FleetDesignationSpec { fleet: Some("fleet".into()), project: "fleet".into(), image_cache: None },
+        )
+        .await
+        .expect("fleet designation");
 }
 
 /// A Docker environment's request on `host_ref`, declaring `declared_agent_adapters`.

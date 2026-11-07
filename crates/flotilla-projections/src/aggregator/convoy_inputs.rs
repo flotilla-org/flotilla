@@ -8,8 +8,6 @@ pub(super) struct ConvoyInputs {
     ready: bool,
     sessions: HashMap<Parent, Vec<SessionKey>>,
     vessels: HashMap<Parent, Vec<RepositorySourceKey>>,
-    checkouts: HashMap<Parent, Vec<RepositorySourceKey>>,
-    named_checkouts: HashMap<Parent, Vec<RepositorySourceKey>>,
 }
 impl Aggregator {
     pub(super) fn rebuild_convoy_inputs(&mut self) {
@@ -25,12 +23,6 @@ impl Aggregator {
                 .entry((item.object.metadata.namespace.clone(), item.object.spec.convoy_ref.clone()))
                 .or_default()
                 .push(key.clone());
-        }
-        for (key, item) in &self.readiness_checkouts {
-            if let Some(parent) = item.object.metadata.labels.get(CONVOY_LABEL) {
-                index.checkouts.entry((item.object.metadata.namespace.clone(), parent.clone())).or_default().push(key.clone());
-            }
-            index.named_checkouts.entry((key.0.clone(), key.1.clone())).or_default().push(key.clone());
         }
         self.convoy_inputs = index;
     }
@@ -69,30 +61,9 @@ impl Aggregator {
                 .filter_map(|key| self.readiness_vessels.get(key)),
         )
     }
-    pub(super) fn convoy_checkouts(&self, namespace: &str, name: &str) -> Box<dyn Iterator<Item = &ReadResourceObject<Checkout>> + '_> {
-        if !self.convoy_inputs.ready {
-            return Box::new(self.readiness_checkouts.values());
-        }
-        Box::new(
-            self.convoy_inputs
-                .checkouts
-                .get(&(namespace.into(), name.into()))
-                .into_iter()
-                .flatten()
-                .filter_map(|key| self.readiness_checkouts.get(key)),
-        )
-    }
-    pub(super) fn named_checkouts(&self, namespace: &str, name: &str) -> Box<dyn Iterator<Item = &ReadResourceObject<Checkout>> + '_> {
-        if !self.convoy_inputs.ready {
-            return Box::new(self.readiness_checkouts.values());
-        }
-        Box::new(
-            self.convoy_inputs
-                .named_checkouts
-                .get(&(namespace.into(), name.into()))
-                .into_iter()
-                .flatten()
-                .filter_map(|key| self.readiness_checkouts.get(key)),
-        )
+    /// The checkouts the engine holds for `convoy`, at every home, by checkout name (#3108).
+    pub(super) fn held_checkouts(&self, convoy: &ResourceObject<Convoy>) -> HeldCheckouts {
+        let holder = CheckoutHolder::Convoy(flotilla_resources::convoy::engine::engine_name(convoy)?);
+        Ok(latest_launches(self.lifecycle_reads.checkouts()?.held(&holder)?))
     }
 }

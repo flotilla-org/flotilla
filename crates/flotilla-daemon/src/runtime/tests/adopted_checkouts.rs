@@ -52,6 +52,7 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
                     .name("implement".to_string())
                     .crew(vec![CrewSpec::builder()
                         .role("coder".to_string())
+                        .promises(vec![flotilla_resources::TemplatePromise::decision_ledger("coder")])
                         .source(CrewSource::Tool { command: "bash -lc 'echo adopted-stage4a'".to_string() })
                         .build()])
                     .build()])
@@ -80,8 +81,14 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
         .expect("convoy create command should start");
     assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "convoy-adopted".to_string() });
 
-    let checkouts = backend.clone().using::<ResourceCheckout>(NAMESPACE);
-    let checkout_count = checkouts.list().await.expect("list adopted checkouts").items.len();
+    // The checkouts the engine holds here, and the ones this host observes.
+    let checkout_count = || async {
+        let reads = daemon.lifecycle_reads();
+        let held = reads.checkouts().expect("checkouts").here().expect("held here").len();
+        let observed = daemon.observed_resource_backend().using::<ResourceCheckout>(NAMESPACE).list().await.expect("observed").items.len();
+        (held, observed)
+    };
+    let checkout_count_before = checkout_count().await;
     let duplicate_id = daemon
         .execute(
             Command::builder()
@@ -103,11 +110,7 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
         wait_for_command_result(&mut rx, duplicate_id).await,
         CommandValue::Error { message: "live convoy convoy-adopted generation 1 already exists".to_string() }
     );
-    assert_eq!(
-        checkouts.list().await.expect("list adopted checkouts after duplicate").items.len(),
-        checkout_count,
-        "a rejected duplicate must not persist an orphan adopted checkout"
-    );
+    assert_eq!(checkout_count().await, checkout_count_before, "a rejected duplicate must not persist an orphan adopted checkout");
 
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let adopted_record = convoy_record_name(&backend, "convoy-adopted").await;
@@ -125,7 +128,6 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
     })
     .await;
 
-    daemon.reconcile_adopted_checkouts(NAMESPACE).await.expect("adopted checkout integration observation should succeed");
     record_successful_empty_branch_scan(&backend, &adopted_record).await;
     let complete_id = daemon
         .execute(
@@ -141,8 +143,6 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
         .expect("convoy completion command should start");
     assert_eq!(wait_for_command_result(&mut rx, complete_id).await, CommandValue::Ok);
 
-    daemon.reconcile_adopted_checkouts(NAMESPACE).await.expect("Landing should refresh adopted checkout integration evidence");
-
     wait_until(|| {
         let convoys = convoys.clone();
         let adopted_record = adopted_record.clone();
@@ -157,18 +157,18 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
     })
     .await;
 
-    let checkout = backend
-        .clone()
-        .using::<ResourceCheckout>(NAMESPACE)
-        .list()
-        .await
-        .expect("list adopted checkouts")
-        .items
-        .into_iter()
-        .find(|checkout| checkout.metadata.lifecycle_authority().ok().flatten() == Some(LifecycleAuthority::Adopted))
-        .expect("adopted checkout should remain after completion");
-    assert_eq!(checkout.metadata.lifecycle_authority().expect("authority should parse"), Some(LifecycleAuthority::Adopted));
-    assert_eq!(backend.clone().using::<ResourceCheckout>(NAMESPACE).list().await.expect("checkout list").items.len(), 1);
+    // The adopted checkout is the engine's, held for the convoy; it is seen, and landing never
+    // removes it (#3108).
+    let convoy = convoys.get(&adopted_record).await.expect("landed convoy");
+    let holder = flotilla_resources::checkout_records::CheckoutHolder::Convoy(
+        flotilla_resources::convoy::engine::engine_name(&convoy).expect("engine name"),
+    );
+    let held = daemon.lifecycle_reads().checkouts().expect("checkouts").held(&holder).expect("held checkouts");
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert!(
+        matches!(&held[0].spec, CheckoutSpec::Observed(spec) if std::path::Path::new(&spec.path) == repo.canonicalize().expect("repo"))
+    );
+    assert!(repo.join(".git").exists(), "adopted checkout should remain after completion");
 
     for handle in controller_handles {
         handle.abort();

@@ -13,3 +13,11 @@ mod message_port;
 pub mod ports;
 pub mod reconcilers;
 pub mod review_bundle;
+
+/// Readings that serve the engine's checkouts with none held, as a daemon's readings always serve
+/// them (#3108). One store serves every unit test: it is only read.
+#[cfg(test)]
+pub(crate) fn no_held_checkouts() -> std::sync::Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads> {
+    static READS: std::sync::OnceLock<std::sync::Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>> = std::sync::OnceLock::new();
+    std::sync::Arc::clone(READS.get_or_init(|| flotilla_provisioning_testkit::CheckoutFixture::default().reads))
+}

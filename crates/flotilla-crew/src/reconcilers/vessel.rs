@@ -1,5 +1,6 @@
 use flotilla_resources::account_access::AccountRecords;
 use flotilla_resources::checkout_path::checkout_path_component;
+use flotilla_resources::checkout_records::{CheckoutHolder, CheckoutRecords, HOLDER_NOT_OPEN};
 use flotilla_resources::environment_records::{EnvironmentRecord, EnvironmentRecords};
 use flotilla_resources::lifecycle_reads::{LifecycleReads, NoLifecycleReads, ProvisioningKind};
 use flotilla_resources::Actuation;
@@ -8,8 +9,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     marker::PhantomData,
     path::PathBuf,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    sync::Arc,
+    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -21,31 +22,27 @@ use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, LifecycleReading, PlacementDecision};
 use flotilla_resources::{
     address::artifact_slot_record_name, canonicalize_repo_url, host_direct_environment_name, is_prepared_snapshot,
-    repository_workspace_slugs, Artifact, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, CloneSpec, Convoy, CrewSource,
-    CrewWorkPhase, DockerEnvironmentSpec, EnvironmentMount, EnvironmentMountMode, EnvironmentSpec, FreshCloneCheckoutSpec, FulfilmentKind,
-    FulfilmentKindSpec, FulfilmentRealisation, InputMeta, LifecycleAuthority, OwnerReference, PlacementImageSource, Repository,
-    RepositoryKey, RepositorySpec, Resource, ResourceError, ResourceObject, ResourceProvenance, Stance, TerminalSession,
-    TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, Vessel, VesselImage, VesselPhase, VesselStatusPatch, WorkPhase,
-    ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
+    repository_workspace_slugs, Artifact, CheckoutSpec, CheckoutWorktreeSpec, CloneSpec, Convoy, CrewSource, CrewWorkPhase,
+    DockerEnvironmentSpec, EnvironmentMount, EnvironmentMountMode, EnvironmentSpec, FreshCloneCheckoutSpec, FulfilmentKind,
+    FulfilmentKindSpec, FulfilmentRealisation, PlacementImageSource, Repository, RepositoryKey, RepositorySpec, Resource, ResourceError,
+    ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec,
+    Vessel, VesselImage, VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
     CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
     CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND, VESSEL_REF_LABEL,
 };
 use flotilla_resources::{clone_records::CloneRecords, realisation_settings, BRIEF_ARTIFACTS_ANNOTATION};
 use flotilla_store::{
-    controller::{delete_lifecycle_owned_matching, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
+    controller::{delete_lifecycle_owned_matching, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
     ReplicaReadResolver, ResourceBackend, TypedResolver,
 };
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
-const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
-const ENV_LABEL: &str = "flotilla.work/env";
 const VESSEL_PROVISIONING_REQUEUE_AFTER: Duration = Duration::from_secs(5);
 const VESSEL_INTERRUPTED_REQUEUE_AFTER: Duration = Duration::from_millis(250);
 /// A vessel older than this still waiting for its convoy's snapshot is stuck, not racing admission.
 const VESSEL_SNAPSHOT_WAIT_WARN_AFTER: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
 const VESSEL_PROVISIONING_STUCK_SECONDS: i64 = 2 * 60;
-const CHECKOUT_RECREATE_BACKOFF: Duration = Duration::from_secs(60);
 
 // Compare the grants we own, independent of serialization order and unrelated
 // policy mounts. Legacy config/hooks overlays identify old shared roots too, so
@@ -89,7 +86,6 @@ pub struct VesselReconciler {
     convoys: TypedResolver<Convoy>,
     repositories: TypedResolver<Repository>,
     kinds: TypedResolver<FulfilmentKind>,
-    checkouts: TypedResolver<Checkout>,
     terminal_sessions: TypedResolver<TerminalSession>,
     artifacts: ReplicaReadResolver<Artifact>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
@@ -99,20 +95,12 @@ pub struct VesselReconciler {
     namespace: String,
     worktree_metadata: Option<Arc<dyn WorktreeMetadataResolver>>,
     brief_templates: CrewBriefTemplateResolver,
-    // A local backstop for rapid create/delete fights; it resets on restart.
-    recent_checkout_create_attempts: Mutex<BTreeMap<String, Instant>>,
 }
 
 struct EnvironmentDependency {
     ready: bool,
     waiting: Option<String>,
     unavailable: Option<VesselPrepared>,
-}
-
-struct CheckoutDependency {
-    phase: CheckoutPhase,
-    failure: Option<String>,
-    path: Option<String>,
 }
 
 impl VesselReconciler {
@@ -124,7 +112,6 @@ impl VesselReconciler {
             convoys: backend.clone().using::<Convoy>(namespace),
             repositories: backend.clone().using::<Repository>(namespace),
             kinds: backend.clone().using::<FulfilmentKind>(namespace),
-            checkouts: backend.clone().using::<Checkout>(namespace),
             terminal_sessions: backend.clone().using::<TerminalSession>(namespace),
             artifacts: backend.including_replicas::<Artifact>(namespace),
             federated_convoys: None,
@@ -134,7 +121,6 @@ impl VesselReconciler {
             namespace: namespace.to_string(),
             worktree_metadata: None,
             brief_templates: CrewBriefTemplateResolver::default(),
-            recent_checkout_create_attempts: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -171,30 +157,9 @@ impl VesselReconciler {
         self
     }
 
-    fn checkout_dependency(&self, checkout: &ResourceObject<Checkout>) -> Result<CheckoutDependency, ResourceError> {
-        let reading =
-            self.lifecycle_reads.try_reading(ProvisioningKind::Checkout, &checkout.metadata.name, None).map_err(ResourceError::other)?;
-        Ok(match reading {
-            Some(LifecycleReading::Ready { identity }) => {
-                CheckoutDependency { phase: CheckoutPhase::Ready, failure: None, path: Some(identity) }
-            }
-            Some(
-                LifecycleReading::Failed { reason: cause } | LifecycleReading::GaveUp { cause } | LifecycleReading::Exhausted { cause },
-            ) => CheckoutDependency { phase: CheckoutPhase::Failed, failure: Some(cause), path: None },
-            Some(LifecycleReading::Lost { .. } | LifecycleReading::Released) => {
-                CheckoutDependency { phase: CheckoutPhase::Gone, failure: None, path: None }
-            }
-            Some(_) => CheckoutDependency { phase: CheckoutPhase::Pending, failure: None, path: None },
-            None => CheckoutDependency {
-                phase: checkout.status.as_ref().map(|status| status.phase).unwrap_or_default(),
-                failure: checkout.status.as_ref().and_then(|status| status.message.clone()),
-                path: checkout
-                    .status
-                    .as_ref()
-                    .and_then(|status| status.path.clone())
-                    .or_else(|| checkout.spec.target_path().map(str::to_string)),
-            },
-        })
+    /// The engine's checkouts (#3108).
+    fn checkouts(&self) -> Result<&dyn CheckoutRecords, ResourceError> {
+        self.lifecycle_reads.checkouts().map_err(ResourceError::other)
     }
 
     /// The engine's environments (#3108).
@@ -242,7 +207,11 @@ impl VesselReconciler {
                     "contained worktree checkout {checkout_name} refers to missing clone {clone_ref}"
                 )));
             }
-            let checkout = self.checkouts.get(checkout_name).await?;
+            let checkout = self
+                .checkouts()?
+                .get(checkout_name, None)
+                .map_err(ResourceError::other)?
+                .ok_or_else(|| ResourceError::not_found(format!("checkout {checkout_name}")))?;
             let CheckoutSpec::Worktree(spec) = &checkout.spec else {
                 return Err(ResourceError::invalid(format!("checkout {checkout_name} is no longer a managed worktree")));
             };
@@ -287,13 +256,10 @@ impl VesselReconciler {
         self
     }
 
-    /// The old-store kinds a vessel follows. Its environment is the engine's: the daemon adds the
-    /// engine's environment holder wake beside these.
+    /// The old-store kinds a vessel follows. Its environment and checkouts are the engine's: the
+    /// daemon adds the engine's environment holder wake and checkout wake beside these.
     pub fn secondary_watches() -> Vec<Box<dyn SecondaryWatch<Primary = Vessel>>> {
-        vec![
-            Box::new(LabelJoinWatch::<Checkout, Vessel> { label_key: CONVOY_LABEL, _marker: PhantomData }),
-            Box::new(LabelMappedWatch::<TerminalSession, Vessel> { label_key: VESSEL_REF_LABEL, _marker: PhantomData }),
-        ]
+        vec![Box::new(LabelMappedWatch::<TerminalSession, Vessel> { label_key: VESSEL_REF_LABEL, _marker: PhantomData })]
     }
 
     async fn dependency<T: Resource>(
@@ -401,15 +367,13 @@ impl VesselReconciler {
         Ok(environment_dependency(environment, &retained))
     }
 
-    /// The paths of `vessel`'s checkouts that are still present, sorted. Checkouts are not on the
-    /// engine yet, so they are read from the vessel's checkout refs.
+    /// The paths of `vessel`'s checkouts that are still present, sorted: those of its checkout
+    /// refs whose latest launch is ready.
     async fn retained_checkout_paths(&self, vessel: &ResourceObject<Vessel>) -> Result<Vec<String>, ResourceError> {
         let mut paths = Vec::new();
         for checkout in vessel.status.iter().flat_map(|status| status.checkout_refs.values()) {
-            match self.checkouts.get(checkout).await {
-                Ok(checkout) => paths.extend(checkout.status.and_then(|status| status.path)),
-                Err(ResourceError::NotFound { .. }) => {}
-                Err(error) => return Err(error),
+            if let Some(record) = self.checkouts()?.get(checkout, None).map_err(ResourceError::other)? {
+                paths.extend(record.ready_path().map(str::to_owned));
             }
         }
         paths.sort();
@@ -468,13 +432,6 @@ enum PlannedPatch {
         image: Option<VesselImage>,
     },
     EnvironmentRecreation {
-        observed_kind_ref: String,
-        observed_kind_version: String,
-        placement_decision: Option<PlacementDecision>,
-        message: String,
-        image: Option<VesselImage>,
-    },
-    CheckoutChurn {
         observed_kind_ref: String,
         observed_kind_version: String,
         placement_decision: Option<PlacementDecision>,
@@ -554,25 +511,6 @@ impl VesselPrepared {
     ) -> Self {
         let waiting_for = legible_waiting_for(waiting_for.into(), placement_decision.as_ref());
         Self { phase: None, patch: provisioning_patch(placement, placement_decision, waiting_for), actuations }
-    }
-
-    fn checkout_churn(
-        placement: &Placement,
-        placement_decision: Option<PlacementDecision>,
-        checkout_name: &str,
-        actuations: Vec<Actuation>,
-    ) -> Self {
-        Self {
-            phase: None,
-            patch: PlannedPatch::CheckoutChurn {
-                observed_kind_ref: placement.kind.metadata.name.clone(),
-                observed_kind_version: placement.kind.metadata.resource_version.clone(),
-                placement_decision,
-                message: format!("checkout {checkout_name} is missing shortly after a create attempt; retrying after backoff"),
-                image: composed_image(placement, None),
-            },
-            actuations,
-        }
     }
 
     fn waiting() -> Self {
@@ -841,7 +779,6 @@ impl VesselReconciler {
                 Err(error) => return Ok(VesselPrepared::failed(error)),
             };
             let repository_key = convoy_repository.repo_ref.clone();
-            let repo_key = repository_key.to_string();
             let adopted_checkout_ref = obj.spec.adopted_checkout_refs.get(&repository_key).cloned();
             // The shared clone a worktree checkout is made from: its name and the spec a request
             // for it makes. The checkout names the launch serving that request when it is made.
@@ -917,36 +854,22 @@ impl VesselReconciler {
                     }
                 }
             };
-            match self.checkouts.get(&checkout_name).await {
-                Ok(existing) => {
-                    if existing.spec.repo_ref() != &repository_key {
-                        return Ok(VesselPrepared::failed(format!("checkout {checkout_name} belongs to a different repository")));
-                    }
-                    if adopted_checkout_ref.is_some() && existing.metadata.lifecycle_authority()? != Some(LifecycleAuthority::Adopted) {
-                        return Ok(VesselPrepared::failed(format!("checkout {checkout_name} is not adopted")));
-                    }
-                    let dependency = self.checkout_dependency(&existing)?;
-                    if dependency.phase == CheckoutPhase::Gone {
-                        if adopted_checkout_ref.is_some() {
-                            return Ok(VesselPrepared::failed(format!("adopted checkout {checkout_name} is gone")));
+            // The checkout's latest launch here, if any: a live one is the checkout, whatever this
+            // pass would request; an ended one is followed by the next launch a request starts.
+            let existing = self.checkouts()?.get(&checkout_name, None).map_err(ResourceError::other)?;
+            if let Some(existing) = &existing {
+                if existing.spec.repo_ref() != &repository_key {
+                    return Ok(VesselPrepared::failed(format!("checkout {checkout_name} belongs to a different repository")));
+                }
+                if adopted_checkout_ref.is_some() != matches!(existing.spec, CheckoutSpec::Observed(_)) {
+                    let what = if adopted_checkout_ref.is_some() { "is not adopted" } else { "is adopted" };
+                    return Ok(VesselPrepared::failed(format!("checkout {checkout_name} {what}")));
+                }
+                match &existing.reading {
+                    LifecycleReading::Ready { identity } => {
+                        if let Some(message) = &existing.degraded {
+                            degraded.insert(checkout_name.clone(), message.clone());
                         }
-                        if existing.metadata.deletion_timestamp.is_none() {
-                            actuations.push(Actuation::DeleteCheckout { name: checkout_name.clone() });
-                        }
-                        waiting_for_checkouts.push(checkout_name);
-                        continue;
-                    }
-                    if dependency.phase == CheckoutPhase::Failed {
-                        let message = dependency.failure.unwrap_or_else(|| format!("checkout {checkout_name} failed"));
-                        return Ok(VesselPrepared::failed(message));
-                    }
-                    if dependency.phase == CheckoutPhase::Ready {
-                        if let Some(message) = existing.status.as_ref().and_then(|status| status.degraded.clone()) {
-                            degraded.insert(checkout_name.clone(), message);
-                        }
-                        let Some(path) = dependency.path else {
-                            return Ok(VesselPrepared::failed(format!("checkout {checkout_name} is ready but has no target path")));
-                        };
                         if matches!(&strategy, PlacementStrategy::DockerHostCheckoutAndMount { .. }) {
                             if let CheckoutSpec::Worktree(spec) = &existing.spec {
                                 contained_branches.insert(spec.r#ref.strip_prefix("refs/heads/").unwrap_or(&spec.r#ref).to_string());
@@ -960,76 +883,74 @@ impl VesselReconciler {
                             ));
                         }
                         checkout_refs.insert(repository_key.clone(), checkout_name);
-                        checkout_paths.insert(repository_key, path);
-                    } else {
+                        checkout_paths.insert(repository_key, identity.clone());
+                        continue;
+                    }
+                    LifecycleReading::Failed { reason: cause }
+                    | LifecycleReading::GaveUp { cause }
+                    | LifecycleReading::Exhausted { cause } => {
+                        return Ok(VesselPrepared::failed(cause.clone()));
+                    }
+                    LifecycleReading::Lost { .. } | LifecycleReading::Released if adopted_checkout_ref.is_some() => {
+                        return Ok(VesselPrepared::failed(format!("adopted checkout {checkout_name} is gone")));
+                    }
+                    // Gone: the request below starts its next launch.
+                    LifecycleReading::Lost { .. } | LifecycleReading::Released => {}
+                    LifecycleReading::InProgress | LifecycleReading::Retrying { .. } => {
                         waiting_for_checkouts.push(checkout_name);
+                        continue;
                     }
                 }
-                Err(ResourceError::NotFound { .. }) => {
-                    if adopted_checkout_ref.is_some() {
-                        return Ok(VesselPrepared::failed(format!("adopted checkout {checkout_name} not found")));
-                    }
-                    let now = Instant::now();
-                    let mut recent = self.recent_checkout_create_attempts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    recent.retain(|_, created_at| now.duration_since(*created_at) < CHECKOUT_RECREATE_BACKOFF);
-                    if recent.contains_key(&checkout_name) {
-                        warn!(checkout = %checkout_name, convoy = %convoy.metadata.name, "checkout is missing shortly after a create attempt; backing off");
-                        return Ok(VesselPrepared::checkout_churn(&placement, placement_decision.clone(), &checkout_name, actuations));
-                    }
-                    recent.insert(checkout_name.clone(), now);
-                    drop(recent);
-                    let spec = match &strategy {
-                        PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerHostCheckoutAndMount { .. } => {
-                            let clone_spec = shared_clone.expect("shared-clone strategy requires a clone");
-                            let clone_launch = match self.clones()?.request(&repository_spec, &clone_spec, false) {
-                                Ok(launch) => launch,
-                                Err(error) => return Ok(VesselPrepared::failed(error)),
-                            };
-                            CheckoutSpec::Worktree(CheckoutWorktreeSpec {
-                                repo_ref: repository_key.clone(),
-                                env_ref: clone_env_ref.clone(),
-                                r#ref: git_ref.clone().expect("repository checkout requires a convoy ref"),
-                                base_ref: Some(convoy_repository.source_ref.clone()),
-                                target_path: checkout_target_path,
-                                clone_ref: clone_launch,
-                            })
-                        }
-                        PlacementStrategy::CloneInVessel { .. } => CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
-                            source_clone_ref: None,
+            }
+            let spec = if adopted_checkout_ref.is_some() {
+                // The checkout the convoy adopts, as admission recorded it on the convoy.
+                match flotilla_resources::convoy::adopted_checkout(&convoy) {
+                    Ok(Some(spec)) if spec.repo_ref() == &repository_key => spec,
+                    Ok(_) => return Ok(VesselPrepared::failed(format!("adopted checkout {checkout_name} not found"))),
+                    Err(message) => return Ok(VesselPrepared::failed(message)),
+                }
+            } else {
+                match &strategy {
+                    PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerHostCheckoutAndMount { .. } => {
+                        let clone_spec = shared_clone.expect("shared-clone strategy requires a clone");
+                        let clone_launch = match self.clones()?.request(&repository_spec, &clone_spec, false) {
+                            Ok(launch) => launch,
+                            Err(error) => return Ok(VesselPrepared::failed(error)),
+                        };
+                        CheckoutSpec::Worktree(CheckoutWorktreeSpec {
                             repo_ref: repository_key.clone(),
-                            env_ref: precreated_environment
-                                .as_ref()
-                                .map(|(environment_ref, _)| environment_ref.clone())
-                                .expect("fresh-clone strategy should precreate environment"),
+                            env_ref: clone_env_ref.clone(),
                             r#ref: git_ref.clone().expect("repository checkout requires a convoy ref"),
                             base_ref: Some(convoy_repository.source_ref.clone()),
                             target_path: checkout_target_path,
-                            url: convoy_repository.url.clone(),
-                        }),
-                    };
-                    let env_ref = spec.env_ref().expect("managed checkout should have an env_ref").to_string();
-                    let mut labels = BTreeMap::from([(ENV_LABEL.to_string(), env_ref), (REPO_KEY_LABEL.to_string(), repo_key)]);
-                    if let Some(change_request) =
-                        convoy.spec.change_request.as_ref().filter(|change_request| change_request.repository_ref == repository_key)
-                    {
-                        labels.insert(CHANGE_REQUEST_ID_LABEL.to_string(), change_request.id.clone());
+                            clone_ref: clone_launch,
+                        })
                     }
-                    let mut meta = convoy_owned_child_meta(&checkout_name, &convoy, obj, labels);
-                    if matches!(spec, CheckoutSpec::FreshClone(_)) {
-                        // #4218: a cloud vessel clones before any crew session exists,
-                        // so its checkout carries the grants that cover this repository.
-                        flotilla_resources::CloneCredentials::for_repository(
-                            &repository_key,
-                            &requirement.credential_refs,
-                            &requirement.credential_scopes,
-                            &requirement.credential_permissions,
-                        )
-                        .annotate(&mut meta.annotations);
-                    }
-                    actuations.push(Actuation::CreateCheckout { meta, spec });
-                    waiting_for_checkouts.push(checkout_name);
+                    PlacementStrategy::CloneInVessel { .. } => CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                        source_clone_ref: None,
+                        repo_ref: repository_key.clone(),
+                        env_ref: precreated_environment
+                            .as_ref()
+                            .map(|(environment_ref, _)| environment_ref.clone())
+                            .expect("fresh-clone strategy should precreate environment"),
+                        r#ref: git_ref.clone().expect("repository checkout requires a convoy ref"),
+                        base_ref: Some(convoy_repository.source_ref.clone()),
+                        target_path: checkout_target_path,
+                        url: convoy_repository.url.clone(),
+                    }),
                 }
-                Err(err) => return Err(err),
+            };
+            // Held for the convoy's engine Convoy: the Checkout controller releases it once that
+            // convoy has ended. The convoy supplies its inputs (branch policy, credentials) too.
+            let holder = match flotilla_resources::convoy::engine::engine_name(&convoy) {
+                Ok(name) => CheckoutHolder::Convoy(name),
+                Err(message) => return Ok(VesselPrepared::failed(message)),
+            };
+            match self.checkouts()?.request(&checkout_name, &spec, Some(&holder)) {
+                Ok(_) => waiting_for_checkouts.push(checkout_name),
+                // The engine has not admitted the convoy yet: its checkouts wait for it.
+                Err(error) if error.contains(HOLDER_NOT_OPEN) => waiting_for_checkouts.push(format!("{checkout_name} ({error})")),
+                Err(error) => return Ok(VesselPrepared::failed(error)),
             }
         }
         if !waiting_for_checkouts.is_empty() {
@@ -1515,8 +1436,7 @@ impl Reconciler for VesselReconciler {
                     (obj.status.as_ref().and_then(|status| status.message.as_deref()) != Some(message))
                         .then(|| VesselStatusPatch::RequireEnvironmentRecreation { message: message.clone() })
                 }
-                PlannedPatch::CheckoutChurn { observed_kind_ref, observed_kind_version, placement_decision, message, image }
-                | PlannedPatch::EnvironmentRecreation { observed_kind_ref, observed_kind_version, placement_decision, message, image } => {
+                PlannedPatch::EnvironmentRecreation { observed_kind_ref, observed_kind_version, placement_decision, message, image } => {
                     if obj.status.as_ref().is_some_and(|status| {
                         prepared.phase == Some(VesselPhase::Provisioning) && status.message.as_deref() == Some(message)
                     }) {
@@ -1570,12 +1490,8 @@ impl Reconciler for VesselReconciler {
             };
 
         let mut outcome = ReconcileOutcome::with_actuations(patch, prepared.actuations.clone());
-        if matches!(&prepared.patch, PlannedPatch::CheckoutChurn { .. }) {
-            outcome.requeue_after = Some(CHECKOUT_RECREATE_BACKOFF);
-        } else if matches!(
-            &prepared.patch,
-            PlannedPatch::Provisioning { .. } | PlannedPatch::EnvironmentRecreation { .. } | PlannedPatch::Waiting
-        ) {
+        if matches!(&prepared.patch, PlannedPatch::Provisioning { .. } | PlannedPatch::EnvironmentRecreation { .. } | PlannedPatch::Waiting)
+        {
             outcome.requeue_after = Some(VESSEL_PROVISIONING_REQUEUE_AFTER);
         } else if matches!(&prepared.patch, PlannedPatch::Interrupted { .. }) {
             outcome.requeue_after = Some(VESSEL_INTERRUPTED_REQUEUE_AFTER);
@@ -1863,26 +1779,6 @@ fn actuator_annotations(workspace: &ResourceObject<Vessel>) -> BTreeMap<String, 
         .collect()
 }
 
-fn convoy_owned_child_meta(
-    name: &str,
-    convoy: &ResourceObject<Convoy>,
-    workspace: &ResourceObject<Vessel>,
-    mut extra_labels: BTreeMap<String, String>,
-) -> InputMeta {
-    extra_labels.insert(CONVOY_LABEL.to_string(), convoy.metadata.name.clone());
-    InputMeta::builder()
-        .name(name.to_string())
-        .labels(extra_labels)
-        .annotations(actuator_annotations(workspace))
-        .owner_references(vec![OwnerReference {
-            api_version: format!("{}/{}", Convoy::API_PATHS.group, Convoy::API_PATHS.version),
-            kind: Convoy::API_PATHS.kind.to_string(),
-            name: convoy.metadata.name.clone(),
-            controller: true,
-        }])
-        .build()
-}
-
 impl PlacementStrategy {
     fn effective_stance(&self) -> Stance {
         match self {
@@ -1943,7 +1839,7 @@ mod tests {
     // refuse invalid/unavailable metadata instead of granting writable siblings.
     #[tokio::test]
     async fn contained_mounts_cover_empty_duplicate_and_invalid_metadata() {
-        use flotilla_resources::{Checkout, CheckoutSpec, CheckoutWorktreeSpec, CloneSpec, EnvironmentMountMode, RepositoryKey};
+        use flotilla_resources::{CheckoutSpec, CheckoutWorktreeSpec, CloneSpec, EnvironmentMountMode, RepositoryKey};
         use flotilla_vcs::vcs::WorktreeMetadata;
         struct Metadata(Result<WorktreeMetadata, String>);
         // VCS process boundary fake; stores and mount planning are real.
@@ -1966,25 +1862,26 @@ mod tests {
                 path: "/clone".into(),
             },
         );
-        backend
-            .clone()
-            .using::<Checkout>(namespace)
-            .create(
-                &InputMeta::builder().name("own".to_string()).build(),
-                &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
-                    repo_ref,
-                    env_ref: "host".into(),
-                    r#ref: "branch".into(),
-                    base_ref: None,
-                    target_path: "/own".into(),
-                    clone_ref: "clone".into(),
-                }),
-            )
-            .await
-            .expect("checkout");
+        // The engine holds the worktree, beside its clone.
+        let checkouts = flotilla_provisioning_testkit::CheckoutFixture::over("home", Arc::clone(&clones.store)).serving(
+            Arc::clone(&flotilla_provisioning_testkit::EnvironmentFixture::over("home", Arc::clone(&clones.store)).environments) as _,
+            Arc::clone(&clones.clones) as _,
+        );
+        checkouts.put_ready(
+            "own",
+            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                repo_ref,
+                env_ref: "host".into(),
+                r#ref: "branch".into(),
+                base_ref: None,
+                target_path: "/own".into(),
+                clone_ref: "clone".into(),
+            }),
+            None,
+        );
         let valid = WorktreeMetadata { common_dir: "/clone/.git".into(), admin_dir: "/clone/.git/worktrees/actual".into() };
         let reconciler = VesselReconciler::new(backend.clone(), namespace)
-            .with_lifecycle_reads(clones.reads.clone())
+            .with_lifecycle_reads(checkouts.reads.clone())
             .with_worktree_metadata(Arc::new(Metadata(Ok(valid.clone()))));
         assert!(reconciler.contained_git_mounts(&[]).await.expect("empty").is_empty());
         let own = ("own".into(), Some("clone".into()));
@@ -2004,11 +1901,11 @@ mod tests {
             Ok(WorktreeMetadata { admin_dir: "/clone/.git/worktrees/own/nested".into(), ..valid.clone() }),
         ] {
             let refusing = VesselReconciler::new(backend.clone(), namespace)
-                .with_lifecycle_reads(clones.reads.clone())
+                .with_lifecycle_reads(checkouts.reads.clone())
                 .with_worktree_metadata(Arc::new(Metadata(metadata)));
             assert!(refusing.contained_git_mounts(std::slice::from_ref(&own)).await.is_err(), "invalid metadata must fail closed");
         }
-        let unavailable = VesselReconciler::new(backend, namespace).with_lifecycle_reads(clones.reads.clone());
+        let unavailable = VesselReconciler::new(backend, namespace).with_lifecycle_reads(checkouts.reads.clone());
         assert!(
             matches!(unavailable.contained_git_mounts(&[own]).await, Err(ResourceError::Other { .. })),
             "missing resolver must retry without guessing paths or failing the vessel"
@@ -2615,39 +2512,5 @@ mod tests {
         assert!(reconciler.reconcile(&vessel, &prepared, chrono::Utc::now()).patch.is_none());
         fixture.poison();
         assert!(reconciler.prepare(&vessel).await.expect_err("checked read").to_string().contains("poisoned"));
-    }
-
-    // Vessel checkout gates take phase, failure and realised path from one engine judgement.
-    // A stale path cannot override the realised identity or hide a checked read failure.
-    #[tokio::test]
-    async fn vessel_reads_checkout_dependencies_without_a_copy() {
-        use flotilla_provisioning::engine::checkout::CheckoutBinding;
-        use flotilla_provisioning_testkit::{object, Ending, LifecycleFixture};
-        use flotilla_resources::{Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, RepositoryKey};
-        let mut checkout = object::<Checkout>(
-            "checkout",
-            CheckoutSpec::Worktree(CheckoutWorktreeSpec {
-                repo_ref: RepositoryKey("repo".into()),
-                env_ref: "env".into(),
-                r#ref: "feature".into(),
-                base_ref: None,
-                target_path: "/work".into(),
-                clone_ref: "source".into(),
-            }),
-            CheckoutStatus { phase: CheckoutPhase::Gone, path: Some("/stale".into()), ..Default::default() },
-        );
-        checkout.metadata.labels.insert(flotilla_resources::CONVOY_LABEL.into(), "crew".into());
-        let fixture = LifecycleFixture::<CheckoutBinding>::new(false);
-        let reconciler = VesselReconciler::new(ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()), "flotilla")
-            .with_lifecycle_reads(fixture.reads.clone());
-        fixture.request(&checkout);
-        assert_eq!(reconciler.checkout_dependency(&checkout).expect("requested").phase, CheckoutPhase::Pending);
-        fixture.finish(&checkout, Ending::Ready("/engine-path"));
-        let ready = reconciler.checkout_dependency(&checkout).expect("ready");
-        assert_eq!((ready.phase, ready.path.as_deref()), (CheckoutPhase::Ready, Some("/engine-path")));
-        fixture.finish(&checkout, Ending::Lost("/engine-path"));
-        assert_eq!(reconciler.checkout_dependency(&checkout).expect("lost").phase, CheckoutPhase::Gone);
-        fixture.poison();
-        assert!(reconciler.checkout_dependency(&checkout).err().expect("checked read").to_string().contains("poisoned"));
     }
 }
