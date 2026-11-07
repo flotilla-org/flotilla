@@ -1,6 +1,7 @@
 //! Domain decision for the host on which a command executes.
 
 use flotilla_protocol::{qualified_path::HostId, CommandAction, NodeId};
+use flotilla_store::off_frame;
 
 use crate::in_process::{ExistingConvoyTarget, InProcessDaemon};
 
@@ -167,20 +168,20 @@ impl InProcessDaemon {
         let host = match action {
             A::ConvoyStart { intent } => {
                 let namespace = intent.namespace.clone().unwrap_or(self.provisioning_namespace().await);
-                self.convoy_start_placement_host(&namespace, intent)
+                off_frame(|| self.convoy_start_placement_host(&namespace, intent))
                     .await
                     .map_err(TargetError::Admission)?
                     .map_or(TargetHost::Local, TargetHost::Placement)
             }
             A::ConvoyCreate { placement_policy, .. } => {
                 let namespace = self.provisioning_namespace().await;
-                self.remote_placement_host(&namespace, placement_policy.as_deref())
+                off_frame(|| self.remote_placement_host(&namespace, placement_policy.as_deref()))
                     .await
                     .map_err(TargetError::Admission)?
                     .map_or(TargetHost::Local, TargetHost::Placement)
             }
             A::QueryCrewCapabilities { context } => {
-                let routing = self.resolve_crew_routing_context(context).await.map_err(TargetError::CrewSessionHome)?;
+                let routing = off_frame(|| self.resolve_crew_routing_context(context)).await.map_err(TargetError::CrewSessionHome)?;
                 let session_name =
                     routing.session_name.ok_or_else(|| TargetError::CrewSessionHome("capabilities requires a live crew session".into()))?;
                 let session_action = A::ResourceReconcileNow {
@@ -188,7 +189,7 @@ impl InProcessDaemon {
                     kind: "TerminalSession".into(),
                     name: session_name,
                 };
-                self.resource_mutation_origin(&session_action)
+                off_frame(|| self.resource_mutation_origin(&session_action))
                     .await
                     .map_err(TargetError::CrewSessionHome)?
                     .map_or(TargetHost::Local, TargetHost::Node)
@@ -199,7 +200,9 @@ impl InProcessDaemon {
                     kind: "TerminalSession".into(),
                     name: session_id.clone(),
                 };
-                if let Some(origin) = self.resource_mutation_origin(&session_action).await.map_err(TargetError::CrewSessionHome)? {
+                if let Some(origin) =
+                    off_frame(|| self.resource_mutation_origin(&session_action)).await.map_err(TargetError::CrewSessionHome)?
+                {
                     delivery = RemoteDelivery::Command;
                     TargetHost::Node(origin)
                 } else if let Some(node) = requested_node {
@@ -223,10 +226,10 @@ impl InProcessDaemon {
                 }
             }
             _ => {
-                if let Some(convoy) = self.resolve_existing_convoy_target(action).await.map_err(TargetError::RecordHome)? {
+                if let Some(convoy) = off_frame(|| self.resolve_existing_convoy_target(action)).await.map_err(TargetError::RecordHome)? {
                     reason = TargetReason::RecordHome;
                     TargetHost::ConvoyHome(convoy)
-                } else if let Some(origin) = self.resource_mutation_origin(action).await.map_err(TargetError::RecordHome)? {
+                } else if let Some(origin) = off_frame(|| self.resource_mutation_origin(action)).await.map_err(TargetError::RecordHome)? {
                     reason = TargetReason::RecordHome;
                     TargetHost::Node(origin)
                 } else if let Some(node) = requested_node {

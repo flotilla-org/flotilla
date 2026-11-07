@@ -20,6 +20,7 @@ use flotilla_protocol::{
     PeerWireMessage, RepoIdentity, RepoSelector, RoutedPeerMessage, Step, StepStatus,
 };
 use flotilla_resources::CrewCompletionPending;
+use flotilla_store::off_frame;
 use tokio::sync::{oneshot, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, Instrument};
@@ -227,12 +228,20 @@ impl std::ops::Deref for RemoteCommandRouter {
     }
 }
 
+/// Where a routed query or acknowledged mutation runs.
+struct QueryRoute {
+    target_node_id: NodeId,
+    /// The convoy authority the command addresses, named when it is unreachable.
+    existing_convoy_target: Option<flotilla_core::in_process::ExistingConvoyTarget>,
+    crew_convoy: Option<String>,
+}
+
 #[async_trait]
 impl flotilla_crew::leaf_engine::ResourceIntentPublisher for RemoteCommandRouterInner {
     async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<flotilla_protocol::ResourceRef, String> {
         let router = RemoteCommandRouter { inner: self };
         let command = Command::builder().action(CommandAction::ResourceApply { namespace: namespace.to_string(), document }).build();
-        match router.dispatch_and_wait(command, uuid::Uuid::nil()).await? {
+        match off_frame(|| router.dispatch_and_wait(command, uuid::Uuid::nil())).await? {
             CommandValue::ResourceObject(object) => Ok(flotilla_protocol::ResourceRef::new(
                 object.value.get("apiVersion").and_then(serde_json::Value::as_str).unwrap_or("flotilla.work/v1"),
                 &object.kind,
@@ -254,7 +263,7 @@ impl flotilla_crew::leaf_engine::ResourceIntentPublisher for RemoteCommandRouter
     ) -> Result<(flotilla_protocol::ResourceRef, Option<String>), String> {
         let router = RemoteCommandRouter { inner: self };
         let command = Command::builder().action(CommandAction::ResourceApply { namespace: namespace.to_string(), document }).build();
-        match router.dispatch_and_wait(command, uuid::Uuid::nil()).await? {
+        match off_frame(|| router.dispatch_and_wait(command, uuid::Uuid::nil())).await? {
             CommandValue::ResourceObject(object) => {
                 let name = object
                     .value
@@ -292,7 +301,7 @@ impl flotilla_crew::leaf_engine::ResourceIntentPublisher for RemoteCommandRouter
                 expected_resource_version: Some(expected_resource_version.into()),
             })
             .build();
-        match router.dispatch_and_wait(command, uuid::Uuid::nil()).await? {
+        match off_frame(|| router.dispatch_and_wait(command, uuid::Uuid::nil())).await? {
             CommandValue::ResourceObject(_) => Ok(()),
             CommandValue::Error { message } => Err(message),
             value => Err(format!("unexpected resource status mutation result: {value:?}")),
@@ -524,13 +533,26 @@ impl RemoteCommandRouter {
         if matches!(command.action, CommandAction::QueryChangeStream { .. }) {
             return Err("change-stream queries require peer replication transport".into());
         }
-        self.dispatch_with_query_origin(command, Some(session_id)).await
+        off_frame(|| self.dispatch_with_query_origin(command, Some(session_id))).await
     }
 
+    /// Runs a query or acknowledged mutation at its target node. Each step is its own function run
+    /// off this frame: a debug build's poll frame holds every local of its function, and
+    /// resource intents route deep from crew turn delivery (#3108).
     async fn dispatch_with_query_origin(&self, mut command: Command, session_id: Option<uuid::Uuid>) -> Result<CommandValue, String> {
+        let route = off_frame(|| self.query_route(&mut command)).await?;
+        if route.target_node_id == *self.daemon.node_id() {
+            return off_frame(|| self.answer_query_locally(command, session_id)).await;
+        }
+        off_frame(|| self.send_query_to_target(command, session_id, route)).await
+    }
+
+    /// Where a query or acknowledged mutation runs, recorded on the command.
+    async fn query_route(&self, command: &mut Command) -> Result<QueryRoute, String> {
         self.resolve_crew_command_routing(&mut command.action).await?;
-        let target =
-            self.daemon.resolve_command_target(&command.action, command.node_id.as_ref()).await.map_err(|error| error.to_string())?;
+        let target = off_frame(|| self.daemon.resolve_command_target(&command.action, command.node_id.as_ref()))
+            .await
+            .map_err(|error| error.to_string())?;
         let existing_convoy_target = match &target.host {
             TargetHost::ConvoyHome(home) => Some(home.clone()),
             _ => None,
@@ -541,34 +563,42 @@ impl RemoteCommandRouter {
         };
         let target_node_id = self.target_node_id(&target.host).await.map_err(|error| error.to_string())?;
         command.node_id = if matches!(&target.host, TargetHost::Local) { None } else { Some(target_node_id.clone()) };
+        Ok(QueryRoute { target_node_id, existing_convoy_target, crew_convoy })
+    }
 
-        if target_node_id == *self.daemon.node_id() {
-            if command.action.is_query() {
-                if let CommandAction::QueryChangeStream { home, after, session } = &command.action {
-                    return self
-                        .daemon
-                        .next_change_stream_frame(self.daemon.node_id().as_str(), home.clone(), *after, session.clone())
-                        .await;
-                }
-                return self.execute_projected_query(command, session_id.unwrap_or(uuid::Uuid::nil())).await;
+    /// Answers a query here, or awaits this daemon's acknowledgement of a mutation.
+    async fn answer_query_locally(&self, command: Command, session_id: Option<uuid::Uuid>) -> Result<CommandValue, String> {
+        if command.action.is_query() {
+            if let CommandAction::QueryChangeStream { home, after, session } = &command.action {
+                return self.daemon.next_change_stream_frame(self.daemon.node_id().as_str(), home.clone(), *after, session.clone()).await;
             }
-            let mut events = self.daemon.subscribe();
-            let command_id = self.daemon.execute_for_caller(command, None).await?;
-            return tokio::time::timeout(Duration::from_secs(30), async {
-                loop {
-                    match events.recv().await {
-                        Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == command_id => return Ok(result),
-                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            return Err("local resource acknowledgement channel closed".into())
-                        }
+            return self.execute_projected_query(command, session_id.unwrap_or(uuid::Uuid::nil())).await;
+        }
+        let mut events = self.daemon.subscribe();
+        let command_id = self.daemon.execute_for_caller(command, None).await?;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match events.recv().await {
+                    Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == command_id => return Ok(result),
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err("local resource acknowledgement channel closed".into())
                     }
                 }
-            })
-            .await
-            .map_err(|_| "timed out waiting for local resource acknowledgement".to_string())?;
-        }
+            }
+        })
+        .await
+        .map_err(|_| "timed out waiting for local resource acknowledgement".to_string())?
+    }
 
+    /// Sends a query or mutation to its target node and awaits the answer.
+    async fn send_query_to_target(
+        &self,
+        command: Command,
+        session_id: Option<uuid::Uuid>,
+        route: QueryRoute,
+    ) -> Result<CommandValue, String> {
+        let QueryRoute { target_node_id, existing_convoy_target, crew_convoy } = route;
         let request_id = {
             let mut pm = self.peer_manager.lock().await;
             pm.next_request_id()

@@ -31,6 +31,7 @@ use flotilla_discovery_api::EnvironmentBag;
 use flotilla_executor::action_support::{fallback_repo_identity, AddRepoOutcome};
 use flotilla_resources::ResumeIntent;
 use flotilla_store::get_resource_kind;
+use flotilla_store::off_frame;
 use flotilla_store::ResolvedCascadeStoreExt;
 use flotilla_store_memory::InMemoryBackend;
 
@@ -5064,7 +5065,7 @@ impl InProcessDaemon {
             Err(ResourceError::NotFound { .. }) => {
                 if kind == "Message" {
                     if let CommandAction::ResourceApply { document, .. } = action {
-                        return self.message_creation_origin(namespace, document).await;
+                        return off_frame(|| self.message_creation_origin(namespace, document)).await;
                     }
                 }
                 return Ok(None);
@@ -5130,54 +5131,14 @@ impl InProcessDaemon {
         let receiver = spec.receiver.as_str();
         if receiver.starts_with("system:") {
             let original_id = spec.in_reply_to.as_deref().ok_or("a system receiver requires a correlated reply")?;
-            if let Some(primitives) = self.message_primitives() {
-                return self.fleet_role_reply_origin(&primitives, namespace, &spec, original_id).await.map(Some);
-            }
-            let original = self
-                .resource_backend
-                .including_replicas::<flotilla_resources::Message>(namespace)
-                .get(original_id)
-                .await
-                .map_err(|error| error.to_string())?;
-            if original.object.spec.sender != receiver {
-                return Err("reply system receiver does not match the original sender".into());
-            }
-            return Ok(Some(match original.provenance {
-                ResourceProvenance::Local => self.node_id.clone(),
-                ResourceProvenance::Replica { origin_root, .. } => origin_root,
-            }));
+            return off_frame(|| self.system_reply_origin(namespace, &spec, original_id)).await;
         }
         let parts = receiver.split('/').collect::<Vec<_>>();
-        let receiver_convoy = if let [project, convoy_name, vessel, _role] = parts.as_slice() {
-            let convoy = self
-                .resource_backend
-                .including_replicas::<ResourceConvoy>(namespace)
-                .get(convoy_name)
-                .await
-                .map_err(|error| format!("receiver `{receiver}` has no admitted convoy: {error}"))?;
-            if convoy.object.spec.project_ref.as_deref().unwrap_or(namespace) != *project {
-                return Err(format!("receiver `{receiver}` does not belong to the convoy's project"));
-            }
-            if let Some(status) = &convoy.object.status {
-                if status.phase.is_terminal() {
-                    return Err(format!("receiver `{receiver}` names a terminal convoy"));
-                }
-                if status
-                    .workflow_snapshot
-                    .as_ref()
-                    .is_some_and(|snapshot| !snapshot.vessels.iter().any(|declared| declared.name == *vessel))
-                {
-                    return Err(format!("receiver `{receiver}` names an undeclared vessel"));
-                }
-            }
-            Some(convoy)
-        } else {
-            None
-        };
+        let receiver_convoy = off_frame(|| self.receiver_admitted_convoy(namespace, receiver, &parts)).await?;
         let holder = if receiver.starts_with("topic:") {
-            flotilla_messaging::resolve_topic_receiver(&self.resource_backend, namespace, receiver, &spec.sender).await
+            off_frame(|| flotilla_messaging::resolve_topic_receiver(&self.resource_backend, namespace, receiver, &spec.sender)).await
         } else {
-            flotilla_messaging::resolve_message_receiver(&self.resource_backend, namespace, receiver).await
+            off_frame(|| flotilla_messaging::resolve_message_receiver(&self.resource_backend, namespace, receiver)).await
         }
         .map_err(|error| error.to_string())?;
         if let Some(holder) = holder {
@@ -5189,76 +5150,147 @@ impl InProcessDaemon {
         // An admitted vessel has a home before its agent starts. This lets its
         // messages wait at the receiver while a holder is absent or provisioning.
         if let (Some(convoy), [_, _, vessel, _]) = (receiver_convoy, parts.as_slice()) {
-            if let Some(pin) = flotilla_resources::vessel_placement_pin(&convoy.object, vessel) {
-                let actuator = placement_actuator_host_ref(&self.resource_backend, namespace, &pin.decision.target_host).await?;
-                if self.canonical_local_host_id().as_ref() == Some(&actuator) {
-                    return Ok(Some(self.node_id.clone()));
-                }
-                let host = canonical_placement_host_ref(&self.resource_backend, namespace, actuator.as_str())
-                    .await?
-                    .ok_or_else(|| format!("receiver `{receiver}` has an unknown home host"))?;
-                return self
-                    .host_registry
-                    .node_id_for_host_name(&HostName::new(host.display_name))
-                    .await?
-                    .map(Some)
-                    .ok_or_else(|| format!("receiver `{receiver}` home host has no route"));
+            return off_frame(|| self.vessel_receiver_origin(namespace, receiver, convoy, vessel)).await;
+        }
+        if let [project, role] = parts.as_slice() {
+            if let Some(home) = off_frame(|| self.project_role_receiver_origin(namespace, project, role)).await? {
+                return Ok(Some(home));
             }
-            return Ok(Some(match convoy.provenance {
+        }
+        Err(format!("receiver `{receiver}` has no declared home yet"))
+    }
+
+    /// The home of a reply to a system receiver: the original's sender.
+    async fn system_reply_origin(
+        &self,
+        namespace: &str,
+        spec: &flotilla_resources::MessageSpec,
+        original_id: &str,
+    ) -> Result<Option<NodeId>, String> {
+        let receiver = spec.receiver.as_str();
+        if let Some(primitives) = self.message_primitives() {
+            return self.fleet_role_reply_origin(&primitives, namespace, spec, original_id).await.map(Some);
+        }
+        let original = self
+            .resource_backend
+            .including_replicas::<flotilla_resources::Message>(namespace)
+            .get(original_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if original.object.spec.sender != receiver {
+            return Err("reply system receiver does not match the original sender".into());
+        }
+        Ok(Some(match original.provenance {
+            ResourceProvenance::Local => self.node_id.clone(),
+            ResourceProvenance::Replica { origin_root, .. } => origin_root,
+        }))
+    }
+
+    /// The admitted convoy a crew receiver names, refused when the receiver does not fit it.
+    async fn receiver_admitted_convoy(
+        &self,
+        namespace: &str,
+        receiver: &str,
+        parts: &[&str],
+    ) -> Result<Option<flotilla_resources::ReadResourceObject<ResourceConvoy>>, String> {
+        let [project, convoy_name, vessel, _role] = parts else { return Ok(None) };
+        let convoy = self
+            .resource_backend
+            .including_replicas::<ResourceConvoy>(namespace)
+            .get(convoy_name)
+            .await
+            .map_err(|error| format!("receiver `{receiver}` has no admitted convoy: {error}"))?;
+        if convoy.object.spec.project_ref.as_deref().unwrap_or(namespace) != *project {
+            return Err(format!("receiver `{receiver}` does not belong to the convoy's project"));
+        }
+        if let Some(status) = &convoy.object.status {
+            if status.phase.is_terminal() {
+                return Err(format!("receiver `{receiver}` names a terminal convoy"));
+            }
+            if status.workflow_snapshot.as_ref().is_some_and(|snapshot| !snapshot.vessels.iter().any(|declared| declared.name == *vessel)) {
+                return Err(format!("receiver `{receiver}` names an undeclared vessel"));
+            }
+        }
+        Ok(Some(convoy))
+    }
+
+    /// The home of an admitted vessel's crew receiver: its placement's host, else its convoy's home.
+    async fn vessel_receiver_origin(
+        &self,
+        namespace: &str,
+        receiver: &str,
+        convoy: flotilla_resources::ReadResourceObject<ResourceConvoy>,
+        vessel: &str,
+    ) -> Result<Option<NodeId>, String> {
+        if let Some(pin) = flotilla_resources::vessel_placement_pin(&convoy.object, vessel) {
+            let actuator = placement_actuator_host_ref(&self.resource_backend, namespace, &pin.decision.target_host).await?;
+            if self.canonical_local_host_id().as_ref() == Some(&actuator) {
+                return Ok(Some(self.node_id.clone()));
+            }
+            let host = canonical_placement_host_ref(&self.resource_backend, namespace, actuator.as_str())
+                .await?
+                .ok_or_else(|| format!("receiver `{receiver}` has an unknown home host"))?;
+            return self
+                .host_registry
+                .node_id_for_host_name(&HostName::new(host.display_name))
+                .await?
+                .map(Some)
+                .ok_or_else(|| format!("receiver `{receiver}` home host has no route"));
+        }
+        Ok(Some(match convoy.provenance {
+            ResourceProvenance::Local => self.node_id.clone(),
+            ResourceProvenance::Replica { origin_root, .. } => origin_root,
+        }))
+    }
+
+    /// The home of a project role receiver: its one holder declaration's stored origin.
+    async fn project_role_receiver_origin(&self, namespace: &str, project: &str, role: &str) -> Result<Option<NodeId>, String> {
+        let declarations = self
+            .resource_backend
+            .including_replicas::<flotilla_resources::ConvoyEnsure>(namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut homes = declarations
+            .items
+            .into_iter()
+            .filter(|declaration| declaration.object.spec.project_ref == *project && declaration.object.spec.role == *role);
+        if let Some(home) = homes.next() {
+            if homes.next().is_some() {
+                return Err("project role has multiple holder declarations".into());
+            }
+            // Definitions reads merge sources and report Local even
+            // when the declaration exists only at a remote origin.
+            // Keep the merged spec for selection, but recover the home
+            // from the original stored declaration sources.
+            let home = if self.resource_backend.serves_read_views() {
+                home
+            } else {
+                let sources = self
+                    .resource_backend
+                    .including_replicas::<flotilla_resources::ConvoyEnsure>(namespace)
+                    .list_replica_sources()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                sources
+                    .items
+                    .into_iter()
+                    .filter(|source| source.object.metadata.name == home.object.metadata.name)
+                    .min_by_key(|source| {
+                        let origin = match &source.provenance {
+                            ResourceProvenance::Local => self.node_id.clone(),
+                            ResourceProvenance::Replica { origin_root, .. } => origin_root.clone(),
+                        };
+                        (source.object.metadata.creation_timestamp, origin)
+                    })
+                    .ok_or_else(|| "project role declaration has no stored origin".to_string())?
+            };
+            return Ok(Some(match home.provenance {
                 ResourceProvenance::Local => self.node_id.clone(),
                 ResourceProvenance::Replica { origin_root, .. } => origin_root,
             }));
         }
-        if let [project, role] = parts.as_slice() {
-            {
-                let declarations = self
-                    .resource_backend
-                    .including_replicas::<flotilla_resources::ConvoyEnsure>(namespace)
-                    .list()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let mut homes = declarations
-                    .items
-                    .into_iter()
-                    .filter(|declaration| declaration.object.spec.project_ref == *project && declaration.object.spec.role == *role);
-                if let Some(home) = homes.next() {
-                    if homes.next().is_some() {
-                        return Err("project role has multiple holder declarations".into());
-                    }
-                    // Definitions reads merge sources and report Local even
-                    // when the declaration exists only at a remote origin.
-                    // Keep the merged spec for selection, but recover the home
-                    // from the original stored declaration sources.
-                    let home = if self.resource_backend.serves_read_views() {
-                        home
-                    } else {
-                        let sources = self
-                            .resource_backend
-                            .including_replicas::<flotilla_resources::ConvoyEnsure>(namespace)
-                            .list_replica_sources()
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        sources
-                            .items
-                            .into_iter()
-                            .filter(|source| source.object.metadata.name == home.object.metadata.name)
-                            .min_by_key(|source| {
-                                let origin = match &source.provenance {
-                                    ResourceProvenance::Local => self.node_id.clone(),
-                                    ResourceProvenance::Replica { origin_root, .. } => origin_root.clone(),
-                                };
-                                (source.object.metadata.creation_timestamp, origin)
-                            })
-                            .ok_or_else(|| "project role declaration has no stored origin".to_string())?
-                    };
-                    return Ok(Some(match home.provenance {
-                        ResourceProvenance::Local => self.node_id.clone(),
-                        ResourceProvenance::Replica { origin_root, .. } => origin_root,
-                    }));
-                }
-            }
-        }
-        Err(format!("receiver `{receiver}` has no declared home yet"))
+        Ok(None)
     }
 
     pub async fn route_remote_attach_binding(&self, binding: &AttachBinding) -> Result<ResolvedAttachPlan, String> {
