@@ -11,6 +11,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, Weak},
     time::Duration,
 };
@@ -39,7 +40,7 @@ use flotilla_resources::{
 #[cfg(test)]
 use flotilla_resources::{CrewMessageDelivery, TerminalCrewMessage};
 use flotilla_store::{
-    apply_status_patch as apply_resource_status_patch, controller::delete_lifecycle_owned_matching, ResourceBackend, StoreQuery,
+    apply_status_patch as apply_resource_status_patch, controller::delete_lifecycle_owned_matching, off_frame, ResourceBackend, StoreQuery,
 };
 use tokio::sync::{Mutex, RwLock};
 #[cfg(test)]
@@ -439,6 +440,43 @@ fn ensure_crew_work_is_defined(
     } else {
         Err(format!("crew work for role `{}` is not defined on vessel `{}`", context.caller_role, context.vessel))
     }
+}
+
+/// The convoy a resume reads and the crew member it selected.
+struct ResumeSelection {
+    convoys: flotilla_store::TypedResolver<ResourceConvoy>,
+    /// Read with a status: selection refuses a convoy with none.
+    convoy: ResourceObject<ResourceConvoy>,
+    vessel: String,
+    role: String,
+}
+
+impl ResumeSelection {
+    fn status(&self) -> &flotilla_resources::ConvoyStatus {
+        self.convoy.status.as_ref().expect("a selected convoy has a status")
+    }
+
+    fn project<'a>(&'a self, namespace: &'a str) -> &'a str {
+        self.convoy.spec.project_ref.as_deref().unwrap_or(namespace)
+    }
+}
+
+/// The selected crew member's terminal session as a resume read it.
+struct ResumeSession {
+    session: Result<Option<flotilla_resources::ReadResourceObject<ResourceTerminalSession>>, String>,
+    session_launch: Option<String>,
+    queue_until_boundary: bool,
+}
+
+/// A resume whose crew work is reopened, ready to publish.
+struct ResumeDelivery {
+    session: flotilla_resources::ReadResourceObject<ResourceTerminalSession>,
+    session_launch: Option<String>,
+    receiver: String,
+    resume_intent: flotilla_resources::MessageSpec,
+    message_name: String,
+    reopened: ResourceObject<ResourceConvoy>,
+    displaced: Option<String>,
 }
 
 pub struct MessageAttribution {
@@ -2482,6 +2520,9 @@ impl CrewService {
         self.convoy_resume_with_sender_locked(namespace, name, prompt, target, attribution, intent).await
     }
 
+    /// Resumes one crew member, the message lock held. Each step is its own function and runs from
+    /// this small frame: a debug build's poll frame holds every local of its function, and the
+    /// publication at the end of each path routes deep (#3108).
     async fn convoy_resume_with_sender_locked(
         &self,
         namespace: &str,
@@ -2491,7 +2532,20 @@ impl CrewService {
         attribution: MessageAttribution,
         intent: ResumeIntent,
     ) -> Result<ConvoyResumeOutcome, String> {
-        let MessageAttribution { sender, in_reply_to } = attribution;
+        let selected = off_frame(|| self.resume_selection(namespace, name, target)).await?;
+        if intent == ResumeIntent::Reminder && selected.status().crew_claim_is_settled(&selected.vessel, &selected.role) {
+            return off_frame(|| self.publish_settled_reminder(namespace, name, &selected, prompt, attribution)).await;
+        }
+        let session = off_frame(|| self.resume_session(namespace, name, &selected, &attribution.sender)).await?;
+        if session.queue_until_boundary {
+            return off_frame(|| self.queue_resume_until_boundary(namespace, name, &selected, prompt, attribution)).await;
+        }
+        let delivery = off_frame(|| self.reopen_crew_work(namespace, name, &selected, prompt, attribution, intent, session)).await?;
+        off_frame(|| self.deliver_resume(namespace, name, &selected, intent, delivery)).await
+    }
+
+    /// The convoy and the one crew member a resume addresses, or why there is none.
+    async fn resume_selection(&self, namespace: &str, name: &str, target: (Option<&str>, Option<&str>)) -> Result<ResumeSelection, String> {
         let (requested_vessel, requested_role) = target;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(name).await.map_err(|err| err.to_string())?;
@@ -2533,26 +2587,42 @@ impl CrewService {
                 ));
             }
         };
+        Ok(ResumeSelection { convoys, convoy, vessel, role })
+    }
 
-        if intent == ResumeIntent::Reminder && status.crew_claim_is_settled(&vessel, &role) {
-            let receiver = crew_role_address(convoy.spec.project_ref.as_deref().unwrap_or(namespace), name, &vessel, &role);
-            let message_name = flotilla_resources::message_record_name(&receiver, &sender, &format!("resume:{}", uuid::Uuid::new_v4()));
-            let intent = flotilla_resources::MessageSpec::builder()
-                .sender(sender)
-                .receiver(receiver)
-                .relation(flotilla_resources::MessageRelation::Supervisor)
-                .body(prompt.to_string())
-                .maybe_in_reply_to(in_reply_to)
-                .build();
-            self.publish_message_intent(namespace, &message_name, &intent).await?;
-            return Ok(ConvoyResumeOutcome::Informational);
-        }
+    /// A reminder to a crew member whose claim is settled: only the message is published.
+    async fn publish_settled_reminder(
+        &self,
+        namespace: &str,
+        name: &str,
+        selected: &ResumeSelection,
+        prompt: &str,
+        attribution: MessageAttribution,
+    ) -> Result<ConvoyResumeOutcome, String> {
+        let MessageAttribution { sender, in_reply_to } = attribution;
+        let receiver = crew_role_address(selected.project(namespace), name, &selected.vessel, &selected.role);
+        let message_name = flotilla_resources::message_record_name(&receiver, &sender, &format!("resume:{}", uuid::Uuid::new_v4()));
+        let intent = flotilla_resources::MessageSpec::builder()
+            .sender(sender)
+            .receiver(receiver)
+            .relation(flotilla_resources::MessageRelation::Supervisor)
+            .body(prompt.to_string())
+            .maybe_in_reply_to(in_reply_to)
+            .build();
+        self.publish_message_intent(namespace, &message_name, &intent).await?;
+        Ok(ConvoyResumeOutcome::Informational)
+    }
 
-        self.ensure_vessel_backing_available(namespace, name, &vessel).await?;
-        let crew_phase = status
+    /// The selected crew member's terminal session, and whether its resume waits for a turn
+    /// boundary; refused when its vessel's backing is gone.
+    async fn resume_session(&self, namespace: &str, name: &str, selected: &ResumeSelection, sender: &str) -> Result<ResumeSession, String> {
+        let (vessel, role) = (&selected.vessel, &selected.role);
+        self.ensure_vessel_backing_available(namespace, name, vessel).await?;
+        let crew_phase = selected
+            .status()
             .crew_work
-            .get(&vessel)
-            .and_then(|crew| crew.get(&role))
+            .get(vessel)
+            .and_then(|crew| crew.get(role))
             .map(|state| state.phase)
             .expect("selected candidate has crew work");
         let session = self
@@ -2575,6 +2645,20 @@ impl CrewService {
             }
             other => other,
         };
+        let queue_until_boundary = self.resume_decision(name, sender, vessel, role, crew_phase, &session);
+        Ok(ResumeSession { session, session_launch, queue_until_boundary })
+    }
+
+    /// Whether a resume of a crew member in `crew_phase` waits for its turn boundary, logged.
+    fn resume_decision(
+        &self,
+        name: &str,
+        sender: &str,
+        vessel: &str,
+        role: &str,
+        crew_phase: flotilla_resources::CrewWorkPhase,
+        session: &Result<Option<flotilla_resources::ReadResourceObject<ResourceTerminalSession>>, String>,
+    ) -> bool {
         // Fresh idle evidence is a turn boundary, including crews already idle when queued.
         let at_turn_boundary = session.as_ref().ok().and_then(Option::as_ref).is_some_and(|session| {
             session.object.status.as_ref().is_some_and(|status| {
@@ -2607,52 +2691,82 @@ impl CrewService {
             else { "release_non_working_crew" },
             "crew turn delivery decision"
         );
-        if queue_until_boundary {
-            let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
-            let receiver = crew_role_address(project, name, &vessel, &role);
-            let address = sender.clone();
-            let relation = flotilla_resources::MessageRelation::Supervisor;
-            let prior = self
-                .open_messages_to(namespace, &receiver)
-                .await
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .filter(|message| {
-                    message.object.spec.receiver == receiver
-                        && message.object.spec.sender == address
-                        && message
-                            .object
-                            .status
-                            .as_ref()
-                            .is_none_or(|status| !status.phase.is_terminal() && !status.phase.has_delivery_evidence())
-                })
-                .max_by_key(|message| message.object.metadata.creation_timestamp);
-            let displaced = prior.as_ref().map(|message| message.object.spec.body.clone());
-            let message_name = flotilla_resources::message_record_name(&receiver, &address, &format!("resume:{}", uuid::Uuid::new_v4()));
-            let intent = flotilla_resources::MessageSpec::builder()
-                .sender(address)
-                .receiver(receiver.clone())
-                .relation(relation)
-                .body(prompt.to_string())
-                .maybe_supersedes(prior.map(|message| message.object.metadata.name))
-                .maybe_in_reply_to(in_reply_to.clone())
-                .build();
-            // This per-command ID survives router retries. The publisher still
-            // returns canonical admission, as it does for subject-based producers.
-            let admitted = self.publish_message_intent(namespace, &message_name, &intent).await?;
-            if admitted.name == message_name {
-                apply_resource_status_patch(
-                    &convoys,
-                    name,
-                    &ConvoyStatusPatch::QueueMessageFollowUp { vessel: vessel.clone(), role: role.clone(), message: Some(admitted) },
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            }
-            return Ok(self.queued_resume(namespace, &receiver, displaced).await);
-        }
+        queue_until_boundary
+    }
 
-        let pending_ref = status.crew_work.get(&vessel).and_then(|crew| crew.get(&role)).and_then(|state| state.pending_follow_up.as_ref());
+    /// Queues a resume behind a working crew member's turn boundary, superseding its sender's
+    /// undelivered prior resume.
+    async fn queue_resume_until_boundary(
+        &self,
+        namespace: &str,
+        name: &str,
+        selected: &ResumeSelection,
+        prompt: &str,
+        attribution: MessageAttribution,
+    ) -> Result<ConvoyResumeOutcome, String> {
+        let MessageAttribution { sender, in_reply_to } = attribution;
+        let (vessel, role) = (&selected.vessel, &selected.role);
+        let receiver = crew_role_address(selected.project(namespace), name, vessel, role);
+        let address = sender;
+        let relation = flotilla_resources::MessageRelation::Supervisor;
+        let prior = self
+            .open_messages_to(namespace, &receiver)
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|message| {
+                message.object.spec.receiver == receiver
+                    && message.object.spec.sender == address
+                    && message
+                        .object
+                        .status
+                        .as_ref()
+                        .is_none_or(|status| !status.phase.is_terminal() && !status.phase.has_delivery_evidence())
+            })
+            .max_by_key(|message| message.object.metadata.creation_timestamp);
+        let displaced = prior.as_ref().map(|message| message.object.spec.body.clone());
+        let message_name = flotilla_resources::message_record_name(&receiver, &address, &format!("resume:{}", uuid::Uuid::new_v4()));
+        let intent = flotilla_resources::MessageSpec::builder()
+            .sender(address)
+            .receiver(receiver.clone())
+            .relation(relation)
+            .body(prompt.to_string())
+            .maybe_supersedes(prior.map(|message| message.object.metadata.name))
+            .maybe_in_reply_to(in_reply_to)
+            .build();
+        // This per-command ID survives router retries. The publisher still
+        // returns canonical admission, as it does for subject-based producers.
+        let admitted = self.publish_message_intent(namespace, &message_name, &intent).await?;
+        if admitted.name == message_name {
+            apply_resource_status_patch(
+                &selected.convoys,
+                name,
+                &ConvoyStatusPatch::QueueMessageFollowUp { vessel: vessel.clone(), role: role.clone(), message: Some(admitted) },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+        Ok(self.queued_resume(namespace, &receiver, displaced).await)
+    }
+
+    /// Reopens the selected crew member's work for a resume released now, superseding its pending
+    /// follow-up; refused when its session is missing or failed, or the convoy became terminal.
+    #[allow(clippy::too_many_arguments)]
+    async fn reopen_crew_work(
+        &self,
+        namespace: &str,
+        name: &str,
+        selected: &ResumeSelection,
+        prompt: &str,
+        attribution: MessageAttribution,
+        intent: ResumeIntent,
+        session: ResumeSession,
+    ) -> Result<ResumeDelivery, String> {
+        let MessageAttribution { sender, in_reply_to } = attribution;
+        let (vessel, role) = (&selected.vessel, &selected.role);
+        let ResumeSession { session, session_launch, .. } = session;
+        let pending_ref =
+            selected.status().crew_work.get(vessel).and_then(|crew| crew.get(role)).and_then(|state| state.pending_follow_up.as_ref());
         let pending_message = if let Some(reference) = pending_ref {
             self.message_record(namespace, &reference.name)
                 .await
@@ -2668,7 +2782,7 @@ impl CrewService {
             let reason = session.object.status.as_ref().and_then(|status| status.message.as_deref()).unwrap_or("terminal session failed");
             return Err(format!("crew member `{role}` on vessel `{vessel}` failed and cannot be resumed: {reason}"));
         }
-        let receiver = crew_role_address(convoy.spec.project_ref.as_deref().unwrap_or(namespace), name, &vessel, &role);
+        let receiver = crew_role_address(selected.project(namespace), name, vessel, role);
         let resume_intent = flotilla_resources::MessageSpec::builder()
             .sender(sender.clone())
             .receiver(receiver.clone())
@@ -2688,7 +2802,7 @@ impl CrewService {
             .build();
         let message_name = flotilla_resources::message_record_name(&receiver, &sender, &format!("resume:{}", uuid::Uuid::new_v4()));
         let reopened = apply_resource_status_patch(
-            &convoys,
+            &selected.convoys,
             name,
             &ConvoyStatusPatch::ResumeCrewWork {
                 vessel: vessel.clone(),
@@ -2704,7 +2818,23 @@ impl CrewService {
         if reopened.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
             return Err(terminal_convoy_refusal(name, "became terminal"));
         }
-        if intent == ResumeIntent::Reminder && reopened.status.as_ref().is_some_and(|status| status.crew_claim_is_settled(&vessel, &role)) {
+        Ok(ResumeDelivery { session, session_launch, receiver, resume_intent, message_name, reopened, displaced })
+    }
+
+    /// Publishes a reopened resume: from the session's home for a replica session, after
+    /// restarting a stopped terminal here otherwise. A failed publication restores the crew
+    /// work the resume reopened.
+    async fn deliver_resume(
+        &self,
+        namespace: &str,
+        name: &str,
+        selected: &ResumeSelection,
+        intent: ResumeIntent,
+        delivery: ResumeDelivery,
+    ) -> Result<ConvoyResumeOutcome, String> {
+        let ResumeDelivery { session, session_launch, receiver, resume_intent, message_name, reopened, displaced } = delivery;
+        let (vessel, role, convoys, status) = (&selected.vessel, &selected.role, &selected.convoys, selected.status());
+        if intent == ResumeIntent::Reminder && reopened.status.as_ref().is_some_and(|status| status.crew_claim_is_settled(vessel, role)) {
             // The claim guard made the patch a no-op; only the message is published.
             self.publish_message_intent(namespace, &message_name, &resume_intent).await?;
             return Ok(ConvoyResumeOutcome::Informational);
@@ -2712,13 +2842,13 @@ impl CrewService {
         if matches!(session.provenance, ResourceProvenance::Replica { .. }) {
             if let Err(error) = self.publish_message_intent(namespace, &message_name, &resume_intent).await {
                 return Err(self
-                    .restore_crew_work_after_delivery_failure(&convoys, name, &reopened.metadata.resource_version, status, error)
+                    .restore_crew_work_after_delivery_failure(convoys, name, &reopened.metadata.resource_version, status, error)
                     .await);
             }
             return Ok(self.queued_resume(namespace, &receiver, displaced).await);
         }
         let session = session.object;
-        self.reconcile_or_restore_crew_work(namespace, &session.spec.env_ref, &convoys, name, status.clone(), &reopened).await?;
+        self.reconcile_or_restore_crew_work(namespace, &session.spec.env_ref, convoys, name, status.clone(), &reopened).await?;
         let delivery_result: Result<(), String> = async {
             if session.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Stopped) {
                 self.restart_terminal(namespace, &session, session_launch.as_deref()).await?;
@@ -2729,7 +2859,7 @@ impl CrewService {
         .await;
         if let Err(error) = delivery_result {
             return Err(self
-                .restore_crew_work_after_delivery_failure(&convoys, name, &reopened.metadata.resource_version, status, error)
+                .restore_crew_work_after_delivery_failure(convoys, name, &reopened.metadata.resource_version, status, error)
                 .await);
         }
         Ok(self.queued_resume(namespace, &receiver, displaced).await)
@@ -3445,13 +3575,17 @@ impl CrewService {
         Ok(())
     }
 
-    pub async fn publish_message_intent(
-        &self,
-        namespace: &str,
-        name: &str,
-        intent: &flotilla_resources::MessageSpec,
-    ) -> Result<ResourceRef, String> {
-        self.publish_message_intent_traced(namespace, name, intent).instrument(flotilla_tracing::queued_span(name, "send")).await
+    /// Publishes a message intent at its receiver's home. The publication routes deep, so its
+    /// future is built off the caller's frame and every caller holds only the box (#3108).
+    pub fn publish_message_intent<'a>(
+        &'a self,
+        namespace: &'a str,
+        name: &'a str,
+        intent: &'a flotilla_resources::MessageSpec,
+    ) -> Pin<Box<dyn Future<Output = Result<ResourceRef, String>> + Send + 'a>> {
+        off_frame(move || {
+            self.publish_message_intent_traced(namespace, name, intent).instrument(flotilla_tracing::queued_span(name, "send"))
+        })
     }
 
     async fn publish_message_intent_traced(
