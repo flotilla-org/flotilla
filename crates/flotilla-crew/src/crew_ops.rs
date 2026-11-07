@@ -458,6 +458,9 @@ enum PreparedTurn {
     New(Box<CrewTurn>),
 }
 
+/// A turn receiver's terminal session, its launch, and the admission rung it observes.
+type TurnReceiverSession = (Option<flotilla_resources::ReadResourceObject<ResourceTerminalSession>>, Option<String>, TurnDeliveryRung);
+
 /// A new crew turn's message and the session that receives it.
 struct CrewTurn {
     target: flotilla_resources::ReadResourceObject<ResourceConvoy>,
@@ -3288,7 +3291,16 @@ impl CrewService {
             &sender,
             &turn_message_producer_key(&request.source, &request.subject_revision),
         );
-        let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, &request.namespace, &receiver)
+        let (holder, holder_launch, rung) = off_frame(|| self.turn_receiver_session(request, &receiver)).await?;
+        if let Some(admission) = off_frame(|| self.earlier_turn_admission(request, &intent, &name, rung)).await? {
+            return Ok(PreparedTurn::Admitted(admission));
+        }
+        Ok(PreparedTurn::New(Box::new(CrewTurn { target, intent, name, holder, holder_launch, rung })))
+    }
+
+    /// The receiver's terminal session, its launch, and the admission rung it observes.
+    async fn turn_receiver_session(&self, request: &CrewTurnIntent, receiver: &str) -> Result<TurnReceiverSession, String> {
+        let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, &request.namespace, receiver)
             .await
             .map_err(|error| error.to_string())?;
         let (holder, holder_launch) = match holder {
@@ -3307,12 +3319,23 @@ impl CrewService {
         } else {
             TurnDeliveryRung::FreshAgent
         };
-        match self.message_record(&request.namespace, &name).await {
-            Ok(existing) if self.same_message_intent(&existing.object.spec, &intent) => {
+        Ok((holder, holder_launch, rung))
+    }
+
+    /// The admission that already answers a turn: the same intent sent before, or an open
+    /// message that supersedes it.
+    async fn earlier_turn_admission(
+        &self,
+        request: &CrewTurnIntent,
+        intent: &flotilla_resources::MessageSpec,
+        name: &str,
+        rung: TurnDeliveryRung,
+    ) -> Result<Option<CrewTurnAdmission>, String> {
+        match self.message_record(&request.namespace, name).await {
+            Ok(existing) if self.same_message_intent(&existing.object.spec, intent) => {
                 // A repeat records what an earlier send could not (record is idempotent).
-                self.record_awaiting(&request.namespace, &name, &intent, self.admitted_home(&existing), request.stall_of.as_deref())
-                    .await?;
-                return Ok(PreparedTurn::Admitted(CrewTurnAdmission {
+                self.record_awaiting(&request.namespace, name, intent, self.admitted_home(&existing), request.stall_of.as_deref()).await?;
+                return Ok(Some(CrewTurnAdmission {
                     new_turn: false,
                     rung,
                     message: existing
@@ -3320,7 +3343,7 @@ impl CrewService {
                         .status
                         .as_ref()
                         .and_then(|status| status.canonical_predecessor.clone())
-                        .unwrap_or_else(|| ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, &name)),
+                        .unwrap_or_else(|| ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, name)),
                 }));
             }
             Ok(_) => return Err("message producer ID already names different intent".into()),
@@ -3330,16 +3353,16 @@ impl CrewService {
         let records = self.active_message_records(&request.namespace, Some(&intent.receiver)).await.map_err(|error| error.to_string())?;
         if let Some(existing) = records.iter().find(|record| {
             intent.supersedes.is_none()
-                && flotilla_resources::message_supersedes(&intent, &record.object)
+                && flotilla_resources::message_supersedes(intent, &record.object)
                 && flotilla_resources::message_expectation_open(&record.object)
         }) {
-            return Ok(PreparedTurn::Admitted(CrewTurnAdmission {
+            return Ok(Some(CrewTurnAdmission {
                 new_turn: false,
                 rung,
                 message: ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, &existing.object.metadata.name),
             }));
         }
-        Ok(PreparedTurn::New(Box::new(CrewTurn { target, intent, name, holder, holder_launch, rung })))
+        Ok(None)
     }
 
     /// Activates and publishes a new turn; a failed or suppressed publication restores the
