@@ -191,7 +191,7 @@ mod agent_sessions {
     pub(super) async fn follow(service: Arc<Service>) -> Result<AgentSessionFollow, String> {
         let home = NodeId::new(service.home());
         // Started first: a write landing before the read below still reaches the stream.
-        let watch = EngineWatch::start(Arc::clone(&service), [CODE]).map_err(|error| error.to_string())?;
+        let watch = EngineWatch::start_hearing(Arc::clone(&service), [CODE]).map_err(|error| error.to_string())?;
         let homes = service.homes();
         let held = watch
             .read(move |read| {
@@ -207,8 +207,9 @@ mod agent_sessions {
             .map_err(|error| error.to_string())?;
         let heard = heard_from(&service);
         let held_heard = heard.iter().map(|(home, at)| (home.clone(), *at)).collect();
-        // Every commit wakes the watch, a keepalive-only round included, so each home's heard
-        // time is read again then: one wake per keepalive, and no timer.
+        // A commit that hears from another home wakes the watch, a keepalive-only round
+        // included, so each home's heard time is read again then: one wake per keepalive, and no
+        // timer.
         let updates = futures::stream::unfold((watch, service, heard), |(mut watch, service, mut last)| async move {
             loop {
                 // A pass that fails is tried again at the next commit.

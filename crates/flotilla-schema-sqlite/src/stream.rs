@@ -456,9 +456,34 @@ pub struct ServedRound {
 pub type AppliedListener = dyn Fn(&std::collections::BTreeSet<KindCode>) + Send + Sync;
 pub type AppliedListeners = std::sync::Arc<std::sync::RwLock<Vec<std::sync::Arc<AppliedListener>>>>;
 
-/// Called after each committed write, local or applied from another home; listeners must not
-/// block. A listener held only weakly here lapses when its owner drops it.
-pub type CommitListener = dyn Fn() + Send + Sync;
+/// Called after each committed write, local or applied from another home, with what it changed;
+/// listeners must not block. A listener held only weakly here lapses when its owner drops it.
+pub type CommitListener = dyn Fn(&Committed<'_>) + Send + Sync;
+
+/// What one commit changed, so a listener wakes only for commits that concern it.
+pub struct Committed<'a> {
+    /// The kinds of the resources it wrote, applied or restored.
+    pub kinds: &'a std::collections::BTreeSet<KindCode>,
+    /// The homes whose sequence it moved.
+    pub homes: &'a std::collections::BTreeSet<String>,
+    /// The homes whose watermark it moved: a keepalive moves only this.
+    pub heard: &'a std::collections::BTreeSet<String>,
+    /// A home's state moved without entries to read (a snapshot cut, a replica reset), or a home
+    /// is newly held here: every follower looks.
+    pub rescan: bool,
+}
+
+impl Committed<'_> {
+    /// Whether a follower of `kinds` has anything to read.
+    pub fn touches(&self, kinds: &std::collections::BTreeSet<KindCode>) -> bool {
+        self.rescan || !self.kinds.is_disjoint(kinds)
+    }
+
+    /// Whether `home`'s sequence moved, or a follower must look anyway.
+    pub fn moved(&self, home: &str) -> bool {
+        self.rescan || self.homes.contains(home)
+    }
+}
 
 /// The store's committed writes, told to each listener, so a reader holding a round open or
 /// following the log wakes when one lands, without holding a thread.
@@ -469,11 +494,11 @@ pub struct CommitSignal {
 pub(crate) type Commits = std::sync::Arc<CommitSignal>;
 
 impl CommitSignal {
-    pub(crate) fn committed(&self) {
+    pub(crate) fn committed(&self, committed: &Committed<'_>) {
         let mut listeners = self.listeners.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         listeners.retain(|listener| match listener.upgrade() {
             Some(listener) => {
-                listener();
+                listener(committed);
                 true
             }
             None => false,

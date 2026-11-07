@@ -83,7 +83,7 @@ impl EngineManifestRoots {
         let roots = open_home::<ManifestRoot>(log)?;
         let resident = Resident { follower: Follower::new([ROOT]), roots: BTreeMap::new() };
         let opened = Self {
-            commits: CommitsSeen::follow(&service),
+            commits: CommitsSeen::follow(&service, [ROOT]),
             service,
             home,
             roots: Mutex::new(roots),

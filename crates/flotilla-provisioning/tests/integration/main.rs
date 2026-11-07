@@ -1,5 +1,6 @@
 #[path = "../common/mod.rs"]
 mod common;
+mod engine_watch;
 mod image_build;
 mod lifecycle_read_contract;
 mod repository_reconciler;

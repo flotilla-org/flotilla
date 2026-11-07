@@ -248,8 +248,15 @@ impl EngineObservations {
         let home = log.home().to_owned();
         let follower = Follower::new([CHANGE_REQUEST_CODE, ISSUE_CODE]);
         let resident = Resident { follower, records: Records::new(), warned: Default::default() };
-        let opened =
-            Self { commits: CommitsSeen::follow(&service), service, home, log, resident: Mutex::new(resident), clock, observers: None };
+        let opened = Self {
+            commits: CommitsSeen::follow(&service, [CHANGE_REQUEST_CODE, ISSUE_CODE]),
+            service,
+            home,
+            log,
+            resident: Mutex::new(resident),
+            clock,
+            observers: None,
+        };
         let homes = opened.service.homes();
         {
             let mut resident = locked(&opened.resident);

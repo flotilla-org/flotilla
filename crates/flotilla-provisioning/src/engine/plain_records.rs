@@ -111,7 +111,7 @@ impl<K: PlainKind> PlainRecords<K> {
         let log = PlainLog::new(service.store());
         let home = log.home().to_owned();
         let opened = Self {
-            commits: CommitsSeen::follow(&service),
+            commits: CommitsSeen::follow(&service, [K::CODE]),
             service,
             home,
             log,

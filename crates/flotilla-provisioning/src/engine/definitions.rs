@@ -311,7 +311,7 @@ impl EngineDefinitions {
         let home = log.home().to_owned();
         let follower = Follower::new(followed());
         let opened = Self {
-            commits: CommitsSeen::follow(&service),
+            commits: CommitsSeen::follow(&service, followed()),
             service,
             home,
             log,

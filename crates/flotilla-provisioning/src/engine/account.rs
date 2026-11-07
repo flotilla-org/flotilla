@@ -88,7 +88,7 @@ impl EngineAccounts {
         let provisions = PlainLog::new(service.store());
         let resident = Resident { follower: Follower::new([BINDING, PROVISION]), bindings: BTreeMap::new(), provisions: BTreeMap::new() };
         let accounts = Self {
-            commits: CommitsSeen::follow(&service),
+            commits: CommitsSeen::follow(&service, [BINDING, PROVISION]),
             service,
             home,
             bindings: Mutex::new(bindings),

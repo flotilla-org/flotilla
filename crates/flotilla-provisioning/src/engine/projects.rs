@@ -233,7 +233,7 @@ impl EngineProjects {
         let log = PlainLog::new(service.store());
         let home = log.home().to_owned();
         let opened = Self {
-            commits: CommitsSeen::follow(&service),
+            commits: CommitsSeen::follow(&service, [PROJECT, OPS, ROOT]),
             service,
             home,
             log,

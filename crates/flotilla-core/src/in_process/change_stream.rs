@@ -8,7 +8,7 @@
 use flotilla_protocol::CommandValue;
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::{
-    stream::{CommitListener, Frame, Service},
+    stream::{CommitListener, Committed, Frame, Service},
     StoreError,
 };
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -194,14 +194,19 @@ impl Rounds {
 }
 
 /// Holds a tail round open until `home`'s log here passes `after`, a home is newly held here
-/// (so a follower hears of it at once), or [`HOLD`] passes. It waits on the store's commits, not
-/// a timer, and holds no thread while it waits. A snapshot round (`after` absent) is not held.
+/// (so a follower hears of it at once), or [`HOLD`] passes. It waits on the store's commits that
+/// move `home` or add a home, not a timer, and holds no thread while it waits. A snapshot round
+/// (`after` absent) is not held.
 async fn hold(service: &Arc<Service>, home: &str, after: Option<u64>, told: &Told, follower: &Follower) -> Result<(), String> {
     let Some(after) = after else { return Ok(()) };
     let wake = Arc::new(tokio::sync::Notify::new());
     let listener: Arc<CommitListener> = {
-        let wake = Arc::clone(&wake);
-        Arc::new(move || wake.notify_one())
+        let (wake, home) = (Arc::clone(&wake), home.to_owned());
+        Arc::new(move |committed: &Committed<'_>| {
+            if committed.moved(&home) {
+                wake.notify_one()
+            }
+        })
     };
     service.on_commit(Arc::downgrade(&listener));
     let homes = told.lock().expect("told homes").get(follower).cloned().unwrap_or_default();

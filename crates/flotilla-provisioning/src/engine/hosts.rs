@@ -309,7 +309,7 @@ impl EngineHosts {
         let home = log.home().to_owned();
         let follower = Follower::new([HOST, OBSERVATION]);
         let opened = Self {
-            commits: CommitsSeen::follow(&service),
+            commits: CommitsSeen::follow(&service, [HOST, OBSERVATION]),
             service,
             home,
             own_host,

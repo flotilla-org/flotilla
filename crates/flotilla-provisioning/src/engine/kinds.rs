@@ -191,7 +191,7 @@ impl EngineKinds {
         let home = log.home().to_owned();
         let follower = Follower::new([CODE, ROOT]);
         let opened = Self {
-            commits: CommitsSeen::follow(&service),
+            commits: CommitsSeen::follow(&service, [CODE, ROOT]),
             service,
             home,
             log,

@@ -142,7 +142,7 @@ impl EngineRepositories {
         let log = PlainLog::new(service.store());
         let home = log.home().to_owned();
         let opened = Self {
-            commits: CommitsSeen::follow(&service),
+            commits: CommitsSeen::follow(&service, [CODE]),
             service,
             home,
             log,

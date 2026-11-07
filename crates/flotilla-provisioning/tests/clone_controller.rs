@@ -155,7 +155,7 @@ impl World {
         let commits = Arc::new(Notify::new());
         let listener: Arc<CommitListener> = {
             let commits = Arc::clone(&commits);
-            Arc::new(move || commits.notify_waiters())
+            Arc::new(move |_: &flotilla_schema_sqlite::stream::Committed<'_>| commits.notify_waiters())
         };
         service.on_commit(Arc::downgrade(&listener));
         let environments = EnvironmentFixture::over(HOME, service.store());

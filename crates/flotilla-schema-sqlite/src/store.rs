@@ -487,6 +487,10 @@ struct Pending {
     watermarks: HashMap<String, crate::stream::Watermark>,
     /// The kinds of other homes' entries and snapshots applied.
     applied: std::collections::BTreeSet<KindCode>,
+    /// What this transaction changed, told to commit listeners: see [`crate::stream::Committed`].
+    kinds: BTreeSet<KindCode>,
+    moved: BTreeSet<String>,
+    rescan: bool,
     strings: HashMap<StringKey, i64>,
     identities: HashMap<Identity, ResourceId>,
     ids: HashMap<ResourceId, Identity>,
@@ -497,6 +501,9 @@ enum Journal {
     Watermark(String, Option<crate::stream::Watermark>),
     String(StringKey),
     Identity(Identity, ResourceId),
+    Kind(KindCode),
+    Moved(String),
+    Rescan,
 }
 
 impl Pending {
@@ -518,6 +525,13 @@ impl Pending {
                     self.identities.remove(&identity);
                     self.ids.remove(&id);
                 }
+                Journal::Kind(kind) => {
+                    self.kinds.remove(&kind);
+                }
+                Journal::Moved(home) => {
+                    self.moved.remove(&home);
+                }
+                Journal::Rescan => self.rescan = false,
             }
         }
     }
@@ -598,6 +612,7 @@ impl Write<'_> {
                 }
             }
             ctx.remember_watermark(home.to_owned(), crate::stream::Watermark::ZERO);
+            ctx.note_rescan();
             Ok(())
         })
     }
@@ -652,6 +667,7 @@ impl Write<'_> {
             let home = ctx.intern(HOME_DOMAIN, home)?;
             let seq = i64::try_from(home_seq).map_err(|_| Malformed::Sequence { home_seq })?;
             ctx.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, seq])?;
+            ctx.note_rescan();
             let mark = crate::stream::Watermark { home_seq, ..current };
             ctx.conn.prepare_cached(WATERMARK_PUT)?.execute(params![home, seq, mark.applied_through.micros()])?;
             ctx.remember_watermark(home_name, mark);
@@ -880,7 +896,8 @@ impl Write<'_> {
 
     pub fn commit(self) -> Result<(), StoreError> {
         self.tx.commit()?;
-        let Pending { strings, identities, ids, watermarks, applied, .. } = self.pending;
+        let Pending { strings, identities, ids, watermarks, applied, kinds, moved, rescan, .. } = self.pending;
+        let heard: BTreeSet<String> = watermarks.keys().cloned().collect();
         self.runtime.watermarks.write().unwrap_or_else(std::sync::PoisonError::into_inner).extend(watermarks);
         if !applied.is_empty() {
             for listener in self.runtime.applied.read().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
@@ -897,7 +914,7 @@ impl Write<'_> {
             self.runtime.ids.insert(id, identity);
         }
         // Last, so a woken reader sees the new watermarks and interned names.
-        self.runtime.commits.committed();
+        self.runtime.commits.committed(&crate::stream::Committed { kinds: &kinds, homes: &moved, heard: &heard, rescan });
         Ok(())
     }
 }
@@ -1011,9 +1028,44 @@ pub(crate) struct Ctx<'a> {
 
 impl Ctx<'_> {
     fn remember_watermark(&mut self, home: String, mark: crate::stream::Watermark) {
+        let held = self.runtime.watermarks.read().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&home);
         if let Some(pending) = &mut self.pending {
             let previous = pending.watermarks.insert(home.clone(), mark);
+            if previous.is_none() && !held {
+                // A home newly held here: every follower looks at it.
+                if !pending.rescan {
+                    pending.rescan = true;
+                    pending.journal.push(Journal::Rescan);
+                }
+            }
             pending.journal.push(Journal::Watermark(home, previous));
+        }
+    }
+    /// A resource of `kind` was written or restored under `home`.
+    fn note_written(&mut self, kind: KindCode, home: &str) {
+        self.note_moved(home);
+        if let Some(pending) = &mut self.pending {
+            if pending.kinds.insert(kind) {
+                pending.journal.push(Journal::Kind(kind));
+            }
+        }
+    }
+    /// `home`'s sequence moved.
+    fn note_moved(&mut self, home: &str) {
+        if let Some(pending) = &mut self.pending {
+            if !pending.moved.contains(home) {
+                pending.moved.insert(home.to_owned());
+                pending.journal.push(Journal::Moved(home.to_owned()));
+            }
+        }
+    }
+    /// A home's state moved without entries to read: every follower looks.
+    fn note_rescan(&mut self) {
+        if let Some(pending) = &mut self.pending {
+            if !pending.rescan {
+                pending.rescan = true;
+                pending.journal.push(Journal::Rescan);
+            }
         }
     }
     fn watermark(&mut self, home: &str) -> Result<crate::stream::Watermark, StoreError> {
@@ -1169,6 +1221,7 @@ impl Ctx<'_> {
     /// Returns it as stored and as a version.
     fn next_sequence(&mut self) -> Result<(i64, u64), StoreError> {
         let home = self.runtime.home.clone();
+        self.note_moved(&home);
         let home = self.intern(HOME_DOMAIN, &home)?;
         let last: i64 = self.conn.prepare_cached(SEQUENCE_NEXT)?.query_row([home], |row| row.get(0))?;
         let version = u64::try_from(last).map_err(|_| StoreError::Corrupt { table: "home_sequence".into(), column: "last".into() })?;
@@ -1568,7 +1621,7 @@ impl Ctx<'_> {
         self.remove_identity(id, &identity)?;
         let effect = Effect { expunged: Some(identity.clone()), ..Effect::default() };
         let bytes = effect.encode()?;
-        self.append_log(&identity.home, None, header, prev_seq, sequence, &bytes)?;
+        self.append_log(identity.kind, &identity.home, None, header, prev_seq, sequence, &bytes)?;
         Ok(version)
     }
 
@@ -1643,7 +1696,7 @@ impl Ctx<'_> {
         if !self.execute(code, id, &ops, sequence, expected)? {
             return Ok(false);
         }
-        self.append_log(home, Some(id), header, prev_seq, sequence, bytes)?;
+        self.append_log(code, home, Some(id), header, prev_seq, sequence, bytes)?;
         self.set_identity_seq(id, sequence)?;
         Ok(true)
     }
@@ -1758,7 +1811,7 @@ impl Ctx<'_> {
         let header =
             Header { topic: event.topic, cause: Cause::Expunge, change: event.change, about: None, arguments: event.arguments.clone() };
         let bytes = event.effect.encode()?;
-        self.append_log(&event.home, None, header, event.prev_seq, sequence, &bytes)?;
+        self.append_log(event.kind, &event.home, None, header, event.prev_seq, sequence, &bytes)?;
         let home = self.intern(HOME_DOMAIN, &event.home)?;
         self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
         Ok(Applied::Expunged)
@@ -1805,6 +1858,7 @@ impl Ctx<'_> {
             let seq = i64::try_from(cause.seq).map_err(|_| Malformed::Sequence { home_seq: cause.seq })?;
             self.conn.prepare_cached(SNAPSHOT_CAUSE_PUT)?.execute(params![id.0, home, seq])?;
         }
+        self.note_written(snapshot.kind, &snapshot.home);
         let home = self.intern(HOME_DOMAIN, &snapshot.home)?;
         self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
         Ok(Stamp { id, version: snapshot.version })
@@ -1822,8 +1876,10 @@ impl Ctx<'_> {
     }
 
     /// Appends one entry under `home` at `sequence`: `resource` is `None` only for an expunge.
+    #[allow(clippy::too_many_arguments)]
     fn append_log(
         &mut self,
+        kind: KindCode,
         home: &str,
         resource: Option<ResourceId>,
         header: Header,
@@ -1831,6 +1887,7 @@ impl Ctx<'_> {
         sequence: i64,
         effect: &[u8],
     ) -> Result<(), StoreError> {
+        self.note_written(kind, home);
         let home = self.intern(HOME_DOMAIN, home)?;
         let change = i64::try_from(header.change).map_err(|_| Malformed::Sequence { home_seq: header.change })?;
         let about = header.about.as_ref().map(|about| self.ensure_identity(about)).transpose()?.map(|id| id.0);
@@ -2179,6 +2236,7 @@ impl Ctx<'_> {
             // A home's reset keeps its change rows, so the sequence they took is raised again.
             return match self.change(&change.home, change.seq)? {
                 Some(held) if held == *change => {
+                    self.note_moved(&change.home);
                     self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
                     Ok(())
                 }
@@ -2186,6 +2244,7 @@ impl Ctx<'_> {
             };
         }
         self.insert_change(&change.home, sequence, &change.writer, change.at, &change.items)?;
+        self.note_moved(&change.home);
         self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
         Ok(())
     }
