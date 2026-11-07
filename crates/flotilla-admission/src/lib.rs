@@ -11,6 +11,7 @@ pub mod project_image_layers;
 pub mod project_ops;
 pub mod provider_placement;
 pub mod random;
+pub mod reach;
 pub mod reconcilers;
 pub mod repository_addressing;
 pub mod repository_inspection;

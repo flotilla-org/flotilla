@@ -33,6 +33,10 @@ pub struct ProjectDeclaration {
     /// Crew image selection (ADR 0062). Previous-generation declarations omit it.
     #[serde(default)]
     pub image: Option<flotilla_resources::ImageSelection>,
+    /// Destinations the project's vessels must reach that nothing they are
+    /// given names (#4299). Previous-generation declarations omit it.
+    #[serde(default)]
+    pub reach: Vec<flotilla_resources::reach::ReachDestination>,
     pub members: Vec<ProjectDeclarationMember>,
 }
 
@@ -54,6 +58,8 @@ pub fn parse_project_declaration(yaml: &str) -> Result<ProjectDeclaration, Strin
     if declaration.members.is_empty() {
         return Err("project declaration must contain at least one member".to_string());
     }
+    flotilla_resources::reach::validate_declared(&declaration.reach)
+        .map_err(|error| format!("invalid {DECLARATION_FILE} reach: {error}"))?;
     for refs in declaration.skills.values() {
         for reference in refs {
             flotilla_resources::validate_skill_ref(reference)?;

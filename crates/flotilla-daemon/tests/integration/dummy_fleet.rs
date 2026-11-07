@@ -286,7 +286,8 @@ async fn a_missing_fleet_designation_waits_and_delivery_resumes_when_it_arrives(
     tokio::time::sleep(Duration::from_secs(1)).await;
     let conditions = host_conditions(&fleet).await;
     assert!(conditions.iter().all(|c| !c.condition_type.starts_with("Controller/")), "no controller exhausted its budget: {conditions:?}");
-    let designation = FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None };
+    let designation =
+        FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None, reach: Default::default() };
     fleet.apply::<FleetDesignation>(FLEET_DESIGNATION_NAME, designation).await;
     fleet.wait("Landed", in_phase(&name, ConvoyPhase::Landed)).await;
     tokio::time::timeout(Duration::from_secs(20), async {

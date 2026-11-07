@@ -419,10 +419,15 @@ fn a_cloud_sandbox_environment_is_requested_from_its_recipe(tc: hegel::TestCase)
         1 => [CapabilityNeed::Gpu].into(),
         _ => [CapabilityNeed::Platform("linux".into()), CapabilityNeed::Network("lab".into())].into(),
     };
+    let reach: std::collections::BTreeSet<flotilla_resources::reach::ReachDestination> = match pick(&tc, 2) {
+        0 => Default::default(),
+        _ => [flotilla_resources::reach::ReachDestination::new("forge.lab.test", 443).expect("destination")].into(),
+    };
     let mut obj = environment_object(false);
     obj.spec.host_direct = None;
     obj.spec.provider_address = Some("account:dummy-cloud/provider:dummy-cloud".parse().expect("provider"));
     obj.spec.cloud_sandbox = Some(CloudSandboxEnvironmentSpec {
+        reach: reach.clone(),
         probe_needs: probe_needs.clone(),
         image: reference.into(),
         image_build_ref: built.then(|| "image-00-amd64".into()),
@@ -446,8 +451,12 @@ fn a_cloud_sandbox_environment_is_requested_from_its_recipe(tc: hegel::TestCase)
         lifetime_cap_seconds,
         env: [("A".to_owned(), "1".to_owned())].into(),
         probe_needs,
+        reach: reach.clone(),
     };
     assert_eq!(request.recipe.value().read::<CloudSandboxRecipe>().expect("the cloud sandbox recipe"), expected);
+    // An empty reach set is omitted, so a recipe frozen before #4299 is unchanged.
+    let stored = serde_json::to_value(&expected).expect("the recipe serializes");
+    assert_eq!(stored.get("reach").is_some(), !reach.is_empty(), "{stored}");
 
     let home = lifecycles::<EnvironmentBinding>();
     let ready = EnvironmentStatusPatch::MarkCloudReady {
@@ -461,6 +470,7 @@ fn a_cloud_sandbox_environment_is_requested_from_its_recipe(tc: hegel::TestCase)
             module_version: "1".into(),
             capabilities: Default::default(),
             agent_connection: None,
+            reach: Default::default(),
         }),
     };
     let decision = decide::<EnvironmentBinding>(home.as_ref(), &obj, Some(ready.clone()), Utc::now());
@@ -967,6 +977,7 @@ fn cloud_environment_object() -> ResourceObject<flotilla_resources::Environment>
     obj.spec.host_direct = None;
     obj.spec.provider_address = Some("account:dummy-cloud/provider:dummy-cloud".parse().expect("provider"));
     obj.spec.cloud_sandbox = Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+        reach: Default::default(),
         probe_needs: Default::default(),
         image: "registry/flotilla@sha256:00".into(),
         image_build_ref: None,

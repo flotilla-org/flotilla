@@ -33,7 +33,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_protocol::{EnvironmentId, ImageId};
+use flotilla_protocol::{
+    reach::{ReachDestination, ReachRoute, ReachWay},
+    EnvironmentId, ImageId,
+};
 use flotilla_provider_runtime::{ChannelLabel, CommandOutput, CommandRunner};
 use flotilla_resources::PlacedImageIdentity;
 
@@ -92,6 +95,30 @@ pub struct DummyEnvironmentBehaviour {
     pub seed: u64,
     pub realise_delay: Duration,
     pub failure_rate: f64,
+    /// The ways the vendor declares for reaching a destination; `None` keeps
+    /// its class's: a container shares the host network, a cloud sandbox has
+    /// only its egress.
+    pub reach_ways: Option<Vec<ReachWay>>,
+    /// Names that resolve to a private address on the vendor's host; every
+    /// other name resolves to a public one. Nothing is looked up.
+    pub private_destinations: BTreeSet<String>,
+}
+
+/// The dummy vendor's host's name resolution: its configured private names.
+struct DummyResolver<'a>(&'a BTreeSet<String>);
+
+#[async_trait]
+impl crate::reach::ReachResolver for DummyResolver<'_> {
+    async fn resolve(&self, destination: &ReachDestination) -> crate::reach::Resolution {
+        let private = std::net::IpAddr::from([10, 88, 0, 1]);
+        if self.0.contains(&destination.host) {
+            return crate::reach::Resolution::Private(private);
+        }
+        match destination.host.trim_start_matches('[').trim_end_matches(']').parse() {
+            Ok(address) => crate::reach::classify([address]),
+            Err(_) => crate::reach::Resolution::Public,
+        }
+    }
 }
 
 /// In-process providers model resources that a real container destroys with it.
@@ -184,15 +211,16 @@ impl DummyEnvironmentProvider {
 
     /// What a cloud vendor reports about a backing: the instance the kind
     /// freezes, its class and capabilities, and the image it ran.
-    fn descriptor(&self, image: &str) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
+    fn descriptor(&self, image: &str, reach: &[ReachRoute]) -> Option<flotilla_resources::EnvironmentProviderDescriptor> {
         (self.class == DummyEnvironmentClass::CloudSandbox).then(|| flotilla_resources::EnvironmentProviderDescriptor {
             instance: DUMMY_CLOUD_ENVIRONMENT_INSTANCE.into(),
             kind: self.kind(),
             image_digest: dummy_image_id(image),
             host_version: "dummy".into(),
             module_version: "dummy".into(),
-            capabilities: Self::capability_declaration(),
+            capabilities: self.capabilities(),
             agent_connection: None,
+            reach: reach.to_vec(),
         })
     }
 }
@@ -229,7 +257,18 @@ impl EnvironmentProvider for DummyEnvironmentProvider {
         super::ProviderKind::new(class, "dummy")
     }
     fn capabilities(&self) -> super::ProviderCapabilities {
-        Self::capability_declaration()
+        let class_ways = match self.class {
+            DummyEnvironmentClass::Container => vec![ReachWay::HostNetwork],
+            DummyEnvironmentClass::CloudSandbox => Vec::new(),
+        };
+        super::ProviderCapabilities {
+            reach_ways: self.behaviour.reach_ways.clone().unwrap_or(class_ways),
+            ..Self::capability_declaration()
+        }
+    }
+
+    async fn answer_reach(&self, reach: &BTreeSet<ReachDestination>) -> Vec<crate::reach::ReachAnswer> {
+        crate::reach::answer(&DummyResolver(&self.behaviour.private_destinations), reach, &self.capabilities().reach_ways).await
     }
 
     fn legacy_input(&self) -> Option<EnvironmentInput> {
@@ -250,10 +289,15 @@ impl EnvironmentProvider for DummyEnvironmentProvider {
                 &spec.docker.as_ref().filter(|_| spec.host_direct.is_none()).ok_or("dummy provider requires legacy image inputs")?.image
             }
             DummyEnvironmentClass::CloudSandbox => {
-                &spec.cloud_sandbox.as_ref().ok_or("dummy cloud provider requires cloud sandbox inputs")?.image
+                let cloud = spec.cloud_sandbox.as_ref().ok_or("dummy cloud provider requires cloud sandbox inputs")?;
+                // A cloud vendor meets the reach set or refuses, naming the destination.
+                let resolver = DummyResolver(&self.behaviour.private_destinations);
+                let routes = crate::reach::routes(&resolver, &cloud.reach, &self.capabilities().reach_ways).await?;
+                let routes = routes.into_iter().map(|planned| planned.route).collect::<Vec<_>>();
+                return Ok(PreparedEnvironment::new(&self.owner, (cloud.image.clone(), routes)));
             }
         };
-        Ok(PreparedEnvironment::new(&self.owner, image.clone()))
+        Ok(PreparedEnvironment::new(&self.owner, (image.clone(), Vec::<ReachRoute>::new())))
     }
 
     async fn provision(
@@ -262,7 +306,7 @@ impl EnvironmentProvider for DummyEnvironmentProvider {
         prepared: &PreparedEnvironment,
         opts: ProvisionOpts,
     ) -> Result<EnvironmentHandle, super::EnvironmentProvisionError> {
-        let image = prepared.get::<String>(&self.owner)?.clone();
+        let (image, reach) = prepared.get::<(String, Vec<ReachRoute>)>(&self.owner)?.clone();
         self.handles().retain(|_, handle| handle.held());
         if let Some(existing) = self.handles().get(&id) {
             return Ok(Arc::clone(existing) as EnvironmentHandle);
@@ -282,7 +326,8 @@ impl EnvironmentProvider for DummyEnvironmentProvider {
         let handle = Arc::new(DummyEnvironment {
             container_name: format!("flotilla-dummy-{id}"),
             local_image_id: dummy_image_id(&image),
-            descriptor: self.descriptor(&image),
+            descriptor: self.descriptor(&image, &reach),
+            capabilities: self.capabilities(),
             image: ImageId::new(image),
             mounts: opts.provisioned_mounts,
             environment,
@@ -364,6 +409,7 @@ struct DummyEnvironment {
     local_image_id: String,
     container_name: String,
     descriptor: Option<flotilla_resources::EnvironmentProviderDescriptor>,
+    capabilities: super::ProviderCapabilities,
     mounts: Vec<ProvisionedMount>,
     environment: HashMap<String, String>,
     runner: Arc<DummyCommandRunner>,
@@ -382,7 +428,7 @@ impl ProvisionedEnvironment for DummyEnvironment {
         self.descriptor.clone()
     }
     fn capabilities(&self) -> super::ProviderCapabilities {
-        DummyEnvironmentProvider::capability_declaration()
+        self.capabilities.clone()
     }
     fn backing_id(&self) -> &str {
         &self.container_name
@@ -757,6 +803,7 @@ mod tests {
         assert!(provider.prepare(&docker_spec("dummy/crew:latest"), &PrepareOpts::default()).await.is_err());
         let spec = EnvironmentSpec {
             cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+                reach: Default::default(),
                 image: "dummy/crew:latest".into(),
                 image_build_ref: None,
                 size: flotilla_resources::CloudSandboxSize { cpus: 1, memory_bytes: 1, disk_bytes: 1 },
@@ -806,7 +853,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_failure_rate_refuses_exactly_the_drawn_environments() {
-        let behaviour = DummyEnvironmentBehaviour { seed: 11, realise_delay: Duration::ZERO, failure_rate: 0.5 };
+        let behaviour = DummyEnvironmentBehaviour { seed: 11, failure_rate: 0.5, ..Default::default() };
         let provider = DummyEnvironmentProvider::new(behaviour);
         let mut failures = 0;
         for index in 0..200 {

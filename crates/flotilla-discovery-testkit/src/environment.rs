@@ -23,6 +23,7 @@ pub fn injected_capabilities() -> ProviderCapabilities {
         reference_root: Some("/ref/repo".into()),
         receives_host_tools: true,
         per_vessel: true,
+        reach_ways: vec![flotilla_protocol::reach::ReachWay::HostNetwork],
         ..Default::default()
     }
 }

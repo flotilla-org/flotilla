@@ -307,6 +307,7 @@ async fn registry_delivery_uses_the_deterministic_builder() {
         .apply(
             &test_meta(FLEET_DESIGNATION_NAME),
             &FleetDesignationSpec {
+                reach: Default::default(),
                 fleet: None,
                 project: "flotilla".into(),
                 image_cache: Some(ImageCacheBinding {
@@ -344,6 +345,7 @@ async fn declare_image_cache(backend: &ResourceBackend) {
         .apply(
             &test_meta(FLEET_DESIGNATION_NAME),
             &FleetDesignationSpec {
+                reach: Default::default(),
                 fleet: None,
                 project: "flotilla".into(),
                 image_cache: Some(ImageCacheBinding {

@@ -775,6 +775,7 @@ mod tests {
             .create(
                 &InputMeta::builder().name("widgets".to_string()).build(),
                 &ProjectSpec {
+                    reach: Default::default(),
                     image: None,
                     charter: None,
                     role_definitions: BTreeMap::new(),

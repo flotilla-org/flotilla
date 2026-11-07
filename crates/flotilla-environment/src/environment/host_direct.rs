@@ -193,6 +193,8 @@ impl HostDirectEnvironmentProvider {
             receives_host_tools: false,
             per_vessel: false,
             egress_route: super::EgressRoute::Open,
+            // Vessels share the controlling host's network view.
+            reach_ways: vec![flotilla_protocol::reach::ReachWay::HostNetwork],
             ..Default::default()
         }
     }

@@ -62,6 +62,14 @@ pub struct DummyEnvironmentConfig {
     /// Probability that provisioning one environment fails.
     #[serde(default, deserialize_with = "deserialize_rate")]
     pub failure_rate: f64,
+    /// The ways the vendors declare for reaching a destination (#4299);
+    /// unset keeps each class's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach_ways: Option<Vec<flotilla_protocol::reach::ReachWay>>,
+    /// Names that resolve to a private address on the vendors' host; every
+    /// other name resolves to a public one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub private_destinations: Vec<String>,
 }
 
 /// How dummy crews behave once launched.

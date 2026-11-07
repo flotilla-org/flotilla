@@ -79,7 +79,7 @@ mod tests {
             .definitions::<FleetDesignation>("test")
             .apply(
                 &InputMeta::builder().name("fleet".into()).build(),
-                &FleetDesignationSpec { fleet: None, project: "fleet".into(), image_cache: None },
+                &FleetDesignationSpec { reach: Default::default(), fleet: None, project: "fleet".into(), image_cache: None },
             )
             .await
             .expect("designation");

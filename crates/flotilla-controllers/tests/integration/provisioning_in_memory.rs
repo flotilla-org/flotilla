@@ -424,6 +424,7 @@ async fn controller_materializes_a_missing_repository_for_a_multi_repository_con
                     exit: None,
                     turn_delivery: Default::default(),
                     vessels: vec![VesselRequirement {
+                        reach: Default::default(),
                         needs: Default::default(),
                         name: "implement".to_string(),
                         depends_on: Vec::new(),

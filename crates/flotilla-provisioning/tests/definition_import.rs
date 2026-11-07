@@ -268,6 +268,7 @@ fn forge(tc: &TestCase) -> ForgeSpec {
 
 fn fleet(tc: &TestCase) -> FleetDesignationSpec {
     FleetDesignationSpec {
+        reach: Default::default(),
         fleet: maybe(tc, word),
         project: word(tc),
         image_cache: maybe(tc, |tc| ImageCacheBinding {

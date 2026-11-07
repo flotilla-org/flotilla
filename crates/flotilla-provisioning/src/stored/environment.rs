@@ -116,6 +116,10 @@ pub struct CloudSandboxRecipe {
     /// As [`DockerRecipe::env`]: nothing derived at launch.
     pub env: std::collections::BTreeMap<String, String>,
     pub probe_needs: std::collections::BTreeSet<flotilla_resources::CapabilityNeed>,
+    /// What the vessel must reach, frozen at admission (#4299); omitted when
+    /// empty, so a recipe frozen before it decodes and serializes unchanged.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub reach: std::collections::BTreeSet<flotilla_resources::reach::ReachDestination>,
 }
 
 impl CloudSandboxRecipe {

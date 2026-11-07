@@ -165,6 +165,7 @@ fn providers() -> Vec<(Arc<dyn EnvironmentProvider>, flotilla_resources::Environ
             flotilla_resources::EnvironmentSpec {
                 provider_address: Some("account:dummy-cloud/provider:dummy-cloud".parse().unwrap()),
                 cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+                    reach: Default::default(),
                     image: DIGEST.into(),
                     image_build_ref: None,
                     size: flotilla_resources::CloudSandboxSize { cpus: 1, memory_bytes: 1 << 30, disk_bytes: 1 << 30 },

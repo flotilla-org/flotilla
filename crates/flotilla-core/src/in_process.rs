@@ -3581,6 +3581,12 @@ impl InProcessDaemon {
         self.admission.set_account_random(random);
     }
 
+    /// Answer reach sets at placement with the provider instances this host
+    /// acts for (#4299); the daemon's runtime gives its own.
+    pub fn set_reach_answers(&self, answers: Arc<dyn flotilla_admission::reach::ReachAnswers>) {
+        self.admission.set_reach_answers(answers);
+    }
+
     /// The home pass over one convoy's account bindings (#3907).
     pub async fn reconcile_convoy_accounts(
         &self,

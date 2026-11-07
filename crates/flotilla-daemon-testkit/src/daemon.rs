@@ -396,7 +396,8 @@ impl TestDaemon {
                 .repositories(Vec::new())
                 .build();
             self.apply::<Project>("fleet", fleet).await;
-            let designation = FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None };
+            let designation =
+                FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None, reach: Default::default() };
             self.apply::<FleetDesignation>(FLEET_DESIGNATION_NAME, designation).await;
         }
         let host = self.list::<Host>().await.into_iter().next().expect("local host").metadata.name;

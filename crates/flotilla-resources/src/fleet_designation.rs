@@ -23,6 +23,7 @@ impl Resource for FleetDesignation {
         if let Some(cache) = &spec.image_cache {
             cache.validate().map_err(ResourceError::invalid)?;
         }
+        crate::reach::validate_declared(&spec.reach).map_err(ResourceError::invalid)?;
         Ok(())
     }
 }
@@ -38,6 +39,10 @@ pub struct FleetDesignationSpec {
     /// Optional shared OCI cache; ADR 0047 default may retire after one roll.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_cache: Option<ImageCacheBinding>,
+    /// Destinations every vessel of this fleet must reach that nothing it is
+    /// given names (#4299). Previous-generation designations omit it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reach: Vec<crate::reach::ReachDestination>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Stored)]

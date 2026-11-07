@@ -44,7 +44,7 @@ async fn engine(daemon: &Arc<InProcessDaemon>, dir: &tempfile::TempDir) -> (Arc<
         .definitions::<FleetDesignation>(NS)
         .create(
             &InputMeta::builder().name(FLEET_DESIGNATION_NAME.to_string()).build(),
-            &FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
+            &FleetDesignationSpec { reach: Default::default(), fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
         )
         .await
         .expect("fleet designation");

@@ -77,6 +77,7 @@ fn normalize_project_name(name: &str) -> Result<String, String> {
 
 fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: String) -> Result<ProjectSpec, String> {
     normalize_project_spec(ProjectSpec {
+        reach: Default::default(),
         charter: None,
         role_definitions: BTreeMap::new(),
         charter_prose: BTreeMap::new(),
@@ -539,6 +540,7 @@ impl ProjectService<'_> {
                 .dispatch_policy
                 .or_else(|| existing_project.as_ref().and_then(|project| project.spec.dispatch_policy.clone())),
             image: declaration.image,
+            reach: declaration.reach,
         })?;
         let mut meta = existing_project
             .as_ref()

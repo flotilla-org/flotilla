@@ -59,8 +59,8 @@ use crate::project_ops;
 use crate::support::{
     authoritative_placement_host, check_placement_capacity, ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot,
     home_copy_wins_by_name, host_generation, host_occupancies, host_occupancy, is_ssh_host, placement_actuator_host_ref,
-    placement_host_not_ready_reason, placement_target_host, prepared_snapshot_name, resolve_placement_provider, unready_placement_refusal,
-    SSH_HOST_PIN_ONLY,
+    placement_host_not_ready_reason, placement_target_host, prepared_snapshot_name, resolve_placement_advertisement,
+    unready_placement_refusal, SSH_HOST_PIN_ONLY,
 };
 
 /// Routing uses replicated observations as hints; only admission may refuse on
@@ -132,6 +132,11 @@ pub struct ConvoyAdmission {
     #[builder(default = std::sync::RwLock::new(Arc::new(crate::random::SeededRandom::from_entropy())))]
     random: std::sync::RwLock<Arc<dyn crate::random::RandomSource>>,
     fulfilment_decider: Arc<dyn FulfilmentDecider>,
+    /// The provider instances this host acts for, answering for a reach set
+    /// at placement (#4299). None answer until the daemon's runtime gives
+    /// admission its providers.
+    #[builder(default = std::sync::RwLock::new(Arc::new(crate::reach::NoReachAnswers)))]
+    reach_answers: std::sync::RwLock<Arc<dyn crate::reach::ReachAnswers>>,
     /// Serializes the identity selector check with Convoy creation on the owner host.
     #[builder(default)]
     guard: Mutex<()>,
@@ -167,6 +172,7 @@ struct AdmissionRuntime<'a> {
     issue_port: &'a dyn IssueQueryPort,
     clock: &'a dyn Clock,
     fulfilment_decider: &'a dyn FulfilmentDecider,
+    reach_answers: Arc<dyn crate::reach::ReachAnswers>,
     builds: PlacementBuildJoiner<'a>,
 }
 
@@ -213,6 +219,7 @@ impl ConvoyAdmission {
                 issue_port: self.issue_port.as_ref(),
                 clock: self.clock.as_ref(),
                 fulfilment_decider: self.fulfilment_decider.as_ref(),
+                reach_answers: Arc::clone(&self.reach_answers.read().unwrap_or_else(|poisoned| poisoned.into_inner())),
                 builds: PlacementBuildJoiner { backend: &self.backend },
             },
         }
@@ -1627,6 +1634,12 @@ impl ConvoyAdmission {
         *self.random.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = random;
     }
 
+    /// Answer reach sets at placement with the provider instances this host
+    /// acts for (#4299).
+    pub fn set_reach_answers(&self, answers: Arc<dyn crate::reach::ReachAnswers>) {
+        *self.reach_answers.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = answers;
+    }
+
     /// The home pass over one convoy's account bindings (#3882 lifecycle). Only binding a
     /// requester that has none is serialised against admission; the rest is per convoy.
     pub async fn reconcile_convoy_accounts(
@@ -1887,6 +1900,30 @@ impl AdmissionRuntime<'_> {
 }
 
 impl AdmissionReadContext<'_> {
+    /// A candidate's own answers for the reach set (#4299). A provider
+    /// instance this host acts for answers here, resolving names on this host.
+    /// A candidate acted for from another daemon answers from the ways it
+    /// advertises, and its host checks what it resolves when it provisions:
+    /// the interim answer until placement asks that daemon directly.
+    async fn candidate_reach_answers(
+        &self,
+        namespace: &str,
+        candidate: &ResourceObject<FulfilmentKind>,
+        provider: &flotilla_protocol::provider::ProviderAdvertisement,
+        reach: &BTreeSet<flotilla_resources::reach::ReachDestination>,
+    ) -> Result<Vec<flotilla_environment::reach::ReachAnswer>, String> {
+        if reach.is_empty() {
+            return Ok(Vec::new());
+        }
+        let target = placement_target_host(&self.backend, namespace, candidate).await?;
+        if self.runtime.local_host.as_ref() == Some(&placement_actuator_host_ref(&self.backend, namespace, &target).await?) {
+            if let Some(answers) = self.runtime.reach_answers.answer(&provider.instance, reach).await {
+                return Ok(answers);
+            }
+        }
+        Ok(crate::reach::advertised_answers(&provider.capabilities.reach_ways, reach))
+    }
+
     async fn check_remote_placement_free_space_floor(&self, namespace: &str, placement: Option<&PlacementDecision>) -> Result<(), String> {
         let Some(placement) = placement else {
             return Ok(());
@@ -2608,7 +2645,7 @@ impl AdmissionReadContext<'_> {
         workflow: &WorkflowTemplateSpec,
         needs: &BTreeSet<CapabilityNeed>,
     ) -> Result<(PlacementResolution, Vec<String>), String> {
-        let PlacementContext { namespace, project_ref, repositories: _, intent, purpose } = *context;
+        let PlacementContext { namespace, project_ref, repositories, intent, purpose } = *context;
         let pin = intent.placement_policy.as_deref();
         let escalation_reason = intent.escalation_reason.as_deref();
         // Admission's own snapshots are kinds too, frozen for their convoys; none is a candidate.
@@ -2650,6 +2687,23 @@ impl AdmissionReadContext<'_> {
                 return Err(format!("fulfilment kind `{pin}` does not exist"));
             }
         }
+        // Each destination the vessels must reach (#4299); each candidate answers for them.
+        let reach: BTreeSet<_> = match purpose {
+            PlacementPurpose::Admission => {
+                // A credential that does not resolve is refused, in its own
+                // words, by the validation that follows placement; until then
+                // the set is composed without the servers it would name.
+                let mut resolved = workflow.clone();
+                if resolve_workflow_credentials(&self.backend, namespace, project_ref, repositories, &mut resolved).await.is_err() {
+                    resolved = workflow.clone();
+                }
+                crate::reach::freeze_workflow_reach(&self.backend, namespace, project_ref, repositories, &mut resolved).await?;
+                resolved.vessels.into_iter().flat_map(|vessel| vessel.reach).collect()
+            }
+            // Routing only picks the host that admits; there the candidates
+            // answer and refuse, so routing reads no credentials.
+            PlacementPurpose::Routing => BTreeSet::new(),
+        };
         let mut candidates = Vec::new();
         let mut rejected = Vec::new();
         let composed_images = tokio::sync::OnceCell::new();
@@ -2783,7 +2837,11 @@ impl AdmissionReadContext<'_> {
             let mut selected = kind.clone();
             if purpose == PlacementPurpose::Admission {
                 let checked = async {
-                    resolve_placement_provider(&self.backend, namespace, &mut selected).await?;
+                    let provider = resolve_placement_advertisement(&self.backend, namespace, &mut selected).await?.1;
+                    let answers = self.candidate_reach_answers(namespace, &selected, &provider, &reach).await?;
+                    if let Some(reason) = crate::reach::unmet_reach(&reach, &answers) {
+                        return Err(format!("provider {}: {reason}", provider.instance));
+                    }
                     // A literal image is checked now; composed images freeze per vessel once the
                     // placement is final.
                     if let FulfilmentRealisation::DockerPerVessel {
@@ -4498,6 +4556,7 @@ pub async fn resolve_and_validate_workflow_credentials(
     workflow: &mut WorkflowTemplateSpec,
 ) -> Result<(), String> {
     resolve_workflow_credentials(backend, namespace, project_ref, repositories, workflow).await?;
+    crate::reach::freeze_workflow_reach(backend, namespace, project_ref, repositories, workflow).await?;
     validate_workflow_credentials(backend, namespace, workflow, placement).await?;
     crate::account_access::validate_account_access(backend, namespace, project_ref, repositories, workflow, placement).await.map(|_| ())
 }
@@ -4511,6 +4570,7 @@ pub async fn resolve_and_validate_workflow_credentials_for_capability_admission(
     workflow: &mut WorkflowTemplateSpec,
 ) -> Result<(), String> {
     resolve_workflow_credentials(backend, namespace, project_ref, repositories, workflow).await?;
+    crate::reach::freeze_workflow_reach(backend, namespace, project_ref, repositories, workflow).await?;
     validate_workflow_credentials_for_admission(backend, namespace, workflow, placement, true).await?;
     crate::account_access::validate_account_access(backend, namespace, project_ref, repositories, workflow, placement).await.map(|_| ())
 }
@@ -4955,6 +5015,7 @@ pub async fn register_host_direct_kind(backend: &ResourceBackend, host: &str) {
         capabilities: ProviderCapabilities {
             material_modes: vec![MaterialMode::Shared],
             checkout_strategies: vec![CheckoutStrategy::HostWorktree],
+            reach_ways: vec![flotilla_protocol::reach::ReachWay::HostNetwork],
             ..Default::default()
         },
     }];

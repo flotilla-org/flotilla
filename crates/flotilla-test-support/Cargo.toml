@@ -14,6 +14,8 @@ workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 flotilla-build-features = { path = "../flotilla-build-features" }
 flotilla-build-features-os = { path = "../flotilla-build-features-os" }
+# tempfile already reaches getrandom 0.4; select what drydock's rand selects.
+getrandom_04 = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 
 [dev-dependencies]
 flotilla-build-features-async = { path = "../flotilla-build-features-async" }

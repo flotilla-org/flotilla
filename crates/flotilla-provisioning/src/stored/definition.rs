@@ -70,7 +70,14 @@ impl FleetDesignationDefinition {
     }
 
     pub fn spec(&self) -> FleetDesignationSpec {
-        FleetDesignationSpec { fleet: self.fleet.clone(), project: self.project.clone(), image_cache: self.image_cache.clone() }
+        FleetDesignationSpec {
+            // The engine does not store the fleet's declared reach yet; that
+            // column awaits its schema review (#4308).
+            reach: Default::default(),
+            fleet: self.fleet.clone(),
+            project: self.project.clone(),
+            image_cache: self.image_cache.clone(),
+        }
     }
 }
 

@@ -25,14 +25,14 @@ mod contract_tests;
 mod tests;
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use async_trait::async_trait;
-use flotilla_protocol::{DaemonHostPath, EnvironmentId, ExecutionEnvironmentPath, ImageId};
+use flotilla_protocol::{reach::ReachDestination, DaemonHostPath, EnvironmentId, ExecutionEnvironmentPath, ImageId};
 use serde::{Deserialize, Serialize};
 
 use flotilla_provider_runtime::CommandRunner;
@@ -452,6 +452,13 @@ pub trait EnvironmentProvider: Send + Sync {
     /// this controlling host before returning Ready. Unknown fails closed.
     async fn detect_readiness(&self) -> ProviderReadiness {
         ProviderReadiness::default()
+    }
+
+    /// How this instance's vessels would meet each destination, or why they
+    /// cannot (#4299): answered at placement, on this controlling host, from
+    /// the ways the instance declares.
+    async fn answer_reach(&self, reach: &BTreeSet<ReachDestination>) -> Vec<crate::reach::ReachAnswer> {
+        crate::reach::answer(&crate::reach::SystemResolver, reach, &self.capabilities().reach_ways).await
     }
 
     /// Compatibility with unlabelled preceding-generation stored inputs only.

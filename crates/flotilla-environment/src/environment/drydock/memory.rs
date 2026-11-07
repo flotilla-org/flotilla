@@ -37,6 +37,7 @@ impl MemoryApi {
                     workspace_root: "/workspace".into(),
                     fallback_runner: false,
                     host_filesystem: false,
+                    reach_ways: vec![ReachWay::OutwardExposure],
                 },
                 readiness: Readiness::Ready,
             }),
@@ -142,6 +143,22 @@ impl ProviderApi for MemoryApi {
     }
     async fn put_outward(&self, provider: &str, id: &str, name: &str, request: &OutwardRequest) -> ApiResult<Outward> {
         self.environment(provider, id)?;
+        // Drydock's own rules: names become file IDs, and a guest name is a DNS name.
+        let valid_name = (1..=64).contains(&name.len())
+            && name.as_bytes()[0].is_ascii_alphanumeric()
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+        if !valid_name {
+            return Err(ApiError::protocol(
+                ProtocolErrorKind::Refused,
+                "refused",
+                "exposure name must be 1 to 64 letters, digits, '_', '.' or '-'",
+            ));
+        }
+        if let Guest::Name { name: guest, .. } = &request.guest {
+            if guest.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().is_ok() {
+                return Err(ApiError::protocol(ProtocolErrorKind::Refused, "refused", "guest name must be a DNS name, not an address"));
+            }
+        }
         let outward = Outward { guest: request.guest.clone(), destination: request.destination.clone(), ready: true, error: None };
         self.outwards.lock().expect("outwards").insert((id.into(), name.into()), outward.clone());
         Ok(outward)

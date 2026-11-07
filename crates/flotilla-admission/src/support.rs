@@ -350,6 +350,15 @@ pub async fn resolve_placement_provider(
     namespace: &str,
     policy: &mut ResourceObject<FulfilmentKind>,
 ) -> Result<Option<String>, String> {
+    resolve_placement_advertisement(backend, namespace, policy).await.map(|(root, _)| root)
+}
+
+/// [`resolve_placement_provider`], with the selected provider's advertisement.
+pub async fn resolve_placement_advertisement(
+    backend: &ResourceBackend,
+    namespace: &str,
+    policy: &mut ResourceObject<FulfilmentKind>,
+) -> Result<(Option<String>, flotilla_protocol::provider::ProviderAdvertisement), String> {
     use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
     use flotilla_protocol::provider::ProviderAdvertisement;
     let target = placement_target_host(backend, namespace, policy).await?;
@@ -374,9 +383,9 @@ pub async fn resolve_placement_provider(
         if !selected.capabilities.workspace_root.to_string_lossy().starts_with('/') {
             return Err("cloud provider workspace root must be absolute".into());
         }
-        return Ok(Some(selected.capabilities.workspace_root.to_string_lossy().into_owned()));
+        return Ok((Some(selected.capabilities.workspace_root.to_string_lossy().into_owned()), selected.clone()));
     }
-    Ok(None)
+    Ok((None, selected.clone()))
 }
 
 /// Freeze only cloud guest roots in placement decisions, never metadata labels.

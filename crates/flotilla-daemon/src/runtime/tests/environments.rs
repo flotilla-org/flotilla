@@ -736,6 +736,7 @@ async fn cloud_backing_without_a_descriptor_is_discarded() {
         let spec = flotilla_resources::EnvironmentSpec {
             provider_address: Some("account:cloud/provider:cloud".parse().unwrap()),
             cloud_sandbox: Some(flotilla_resources::CloudSandboxEnvironmentSpec {
+                reach: Default::default(),
                 probe_needs: Default::default(),
                 image: image.clone(),
                 image_build_ref: None,
