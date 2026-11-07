@@ -3,8 +3,8 @@ use flotilla_observation::change_request_observer::{ChangeRequestRefreshCadence,
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
     promises::{self, PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission},
-    ChangeRequest, ChangeRequestLeafSubject, ChangeRequestSpec, ChangeRequestStatus, ConvoyStatus, IssueSourceBindingSpec, LeafSubject,
-    Observation, ObservedChangeRequestState, ObservedChecks, Project, ProjectSpec,
+    ChangeRequest, ChangeRequestLeafSubject, ChangeRequestStatus, ConvoyStatus, IssueSourceBindingSpec, LeafSubject, Observation,
+    ObservedChangeRequestState, ObservedChecks, Project, ProjectSpec,
 };
 use tokio_util::task::AbortOnDropHandle;
 
@@ -38,48 +38,50 @@ impl ChangeRequestObservationSource for ForbiddenForge {
     }
 }
 
-// #3030: remote convoy demand must reach the source owner, repair a foreign
-// authority, and replicate state/checks/readiness that can keep a PR promise.
+// #3030: remote convoy demand must reach the source owner and replicate
+// state/checks/readiness that can keep a PR promise.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn remote_produced_change_request_is_owner_observed() {
-    remote_change_request_scenario(ExistingRecord::Requester, false).await;
+    remote_change_request_scenario(false).await;
 }
 
-// A source owner must also reclaim an existing local shadow, even when that
-// shadow is attributed to the producer and contains stale forge observations.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn source_owner_recovers_stale_misattributed_local_record() {
-    remote_change_request_scenario(ExistingRecord::StaleOwner, true).await;
-}
-
+// The requester's demand writes nothing of its own: it reads the record the source's
+// observer writes, replicated from the observer's home, even when the demand arrives
+// before the observer watches for it.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn new_remote_change_request_names_source_owner() {
-    remote_change_request_scenario(ExistingRecord::Missing, false).await;
+    remote_change_request_scenario(true).await;
 }
 
-#[derive(Clone, Copy)]
-enum ExistingRecord {
-    Missing,
-    Requester,
-    StaleOwner,
-}
-
-// Generated schedules cover missing records, empty/stale shadows and demand arriving
-// before/after watcher startup, through the same routed replication scenario.
+// Generated schedules cover demand arriving before/after watcher startup, through the
+// same routed replication scenario.
 #[hegel::test]
 fn generated_remote_change_request_observation(tc: hegel::TestCase) {
-    let existing = [ExistingRecord::Missing, ExistingRecord::Requester, ExistingRecord::StaleOwner]
-        [tc.draw(gs::integers::<usize>().min_value(0).max_value(2))];
     let late_watcher = tc.draw(gs::booleans());
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .start_paused(true)
         .build()
         .expect("runtime")
-        .block_on(remote_change_request_scenario(existing, late_watcher));
+        .block_on(remote_change_request_scenario(late_watcher));
 }
 
-async fn remote_change_request_scenario(existing: ExistingRecord, late_watcher: bool) {
+/// The homes holding a copy of ChangeRequest `name`, as `daemon` reads them.
+async fn change_request_homes(daemon: &InProcessDaemon, name: &str) -> Vec<String> {
+    let local = daemon.resource_backend().local_root().expect("local root").to_string();
+    let sources = daemon.resource_backend().including_replicas::<ChangeRequest>("flotilla").list_replica_sources().await.expect("sources");
+    sources
+        .items
+        .into_iter()
+        .filter(|source| source.object.metadata.name == name)
+        .map(|source| match source.provenance {
+            flotilla_resources::ResourceProvenance::Local => local.clone(),
+            flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => origin_root.to_string(),
+        })
+        .collect()
+}
+
+async fn remote_change_request_scenario(late_watcher: bool) {
     let owner = empty_daemon_named("cr-owner").await;
     let requester = empty_daemon_named("cr-requester").await;
     let source = IssueSource { service: "github.com".into(), scope: "org/shared".into() };
@@ -129,51 +131,24 @@ async fn remote_change_request_scenario(existing: ExistingRecord, late_watcher: 
             .expect("change request address"),
     )
     .expect("record name");
-    // Existing misattribution from the live failure: an empty nonowner record.
-    if !matches!(existing, ExistingRecord::Missing) {
-        requester
-            .resource_backend()
-            .using::<ChangeRequest>("flotilla")
-            .create(
-                &InputMeta::builder().name(name.clone()).build(),
-                &ChangeRequestSpec::builder()
-                    .service(source.service.clone())
-                    .scope(source.scope.clone())
-                    .number(330)
-                    .observing_authority(requester.node_id().to_string())
-                    .build(),
-            )
-            .await
-            .unwrap();
-    }
     let forge = Arc::new(ForgeObservation(tokio::sync::Mutex::new(ObservedChangeRequestState::Open)));
+    // Each observer writes to its daemon's engine records, as composition installs them.
     let refresher = |daemon: &Arc<InProcessDaemon>, source: Arc<dyn ChangeRequestObservationSource>| {
-        ChangeRequestRefresher::new(
+        let refresher = ChangeRequestRefresher::new(
             daemon.host_name().to_string(),
             daemon.resource_backend(),
             daemon.node_id().to_string(),
             source,
             ChangeRequestRefreshCadence::default(),
+        );
+        let records = flotilla_provisioning::engine::observations::EngineObservations::open(
+            daemon.decided_store().expect("decided store"),
+            Arc::new(flotilla_resources::SystemClock),
         )
+        .expect("engine observations");
+        refresher.engine().install(Arc::new(records)).expect("observer on the engine");
+        refresher
     };
-    if matches!(existing, ExistingRecord::StaleOwner) {
-        let records = owner.resource_backend().using::<ChangeRequest>("flotilla");
-        let created = records
-            .create(
-                &InputMeta::builder().name(name.clone()).build(),
-                &ChangeRequestSpec::builder()
-                    .service(source.service.clone())
-                    .scope(source.scope.clone())
-                    .number(330)
-                    .observing_authority(requester.node_id().to_string())
-                    .build(),
-            )
-            .await
-            .expect("owner's foreign shadow");
-        let mut stale = forge.observe(&subject).await.expect("fixture observation");
-        stale.state = Observation::known(ObservedChangeRequestState::Draft, Utc::now() - chrono::Duration::hours(1));
-        records.update_status(&name, &created.metadata.resource_version, &stale).await.expect("stale status");
-    }
     let owner_observer = refresher(&owner, forge.clone());
     let forbidden = Arc::new(ForbiddenForge(std::sync::atomic::AtomicUsize::new(0)));
     let requester_observer = refresher(&requester, forbidden.clone());
@@ -207,10 +182,10 @@ async fn remote_change_request_scenario(existing: ExistingRecord, late_watcher: 
         .unwrap();
     convoys.update_status("producer", &convoy.metadata.resource_version, &status).await.unwrap();
     requester_observer.demand(uuid::Uuid::new_v4(), subject.clone(), None).await.unwrap();
-    if matches!(existing, ExistingRecord::Missing) {
-        let record = requester.resource_backend().using::<ChangeRequest>("flotilla").get(&name).await.expect("new requester record");
-        assert_eq!(record.spec.observing_authority, owner.node_id().to_string(), "new records name the source owner");
-    }
+    assert!(
+        !change_request_homes(&requester, &name).await.contains(&requester.node_id().to_string()),
+        "a requester that does not observe the source writes no record of its own"
+    );
     if late_watcher {
         eventually(Duration::from_secs(5), Duration::from_millis(10), "convoy replicated before observer startup", || async {
             owner.resource_backend().including_replicas::<Convoy>("flotilla").get("producer").await.is_ok()
@@ -234,6 +209,11 @@ async fn remote_change_request_scenario(existing: ExistingRecord, late_watcher: 
         .into_values()
         .next()
         .expect("selected owner observation");
+    assert_eq!(
+        change_request_homes(&requester, &name).await,
+        vec![owner.node_id().to_string()],
+        "the requester reads the observer's record, replicated from its home"
+    );
     assert_eq!(
         ChangeRequestLeafSubject { change_request: &record, now: Utc::now(), stale_after: Duration::from_secs(180) }
             .value(".ready")
