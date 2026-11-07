@@ -25,7 +25,7 @@ use flotilla_state_machines::{
 const NS: &str = "flotilla";
 
 /// The engine path at one daemon: its decided store homed at its node id.
-async fn engine(daemon: &Arc<InProcessDaemon>) -> (Arc<Service>, Arc<MessagePrimitives>) {
+pub(super) async fn engine(daemon: &Arc<InProcessDaemon>) -> (Arc<Service>, Arc<MessagePrimitives>) {
     let backend = daemon.resource_backend();
     backend
         .clone()

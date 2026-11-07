@@ -68,8 +68,8 @@ use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
-    Artifact, ArtifactSubjectBinding, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Convoy, ConvoyPhase as ResourceConvoyPhase,
-    ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
+    Artifact, ArtifactSubjectBinding, Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus,
+    CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
     CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewCompletionExpectation, CrewSessionStatus,
     CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, Event, EventRegarding, EventSpec, FulfilmentKind, FulfilmentKindSpec, Host,
     HostSpec, HostStatus, InputMeta, Message, RepositoryKey, Resource, ResourceError, ResourceProvenance, Selector, SystemClock,
@@ -2681,16 +2681,21 @@ async fn mistargeted_convoy_delete_routes_to_remote_home() {
 
 #[tokio::test]
 async fn active_convoy_delete_names_the_host_owning_an_unreachable_checkout_environment() {
+    use flotilla_inbox::InboxBackend;
+    use futures::StreamExt;
+
     let leader = empty_daemon_named("leader").await;
     let follower = empty_daemon_named("follower").await;
     let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
     let namespace = "flotilla";
     let convoy_name = "remote-checkout";
     let home = topology.follower.resource_backend();
+    // The convoy's home asks for inspections on the Message path, as its runtime composes it.
+    let (decided, primitives) = message_homes::engine(&topology.follower).await;
 
     let convoys = home.clone().using::<Convoy>(namespace);
     let convoy = convoys.create(&convoy_meta(convoy_name, convoy_name), &convoy_spec("scratch", convoy_name)).await.expect("convoy");
-    convoys
+    let convoy = convoys
         .update_status(
             convoy_name,
             &convoy.metadata.resource_version,
@@ -2698,58 +2703,41 @@ async fn active_convoy_delete_names_the_host_owning_an_unreachable_checkout_envi
         )
         .await
         .expect("active convoy");
+    // Host feta is homed at its own daemon, which no peer of this mesh reaches. Its daemon holds
+    // the environment and the convoy's checkout in it, and its log reached the convoy's home.
     let owner = "01HFETA";
-    let env_ref = flotilla_resources::host_direct_environment_name(owner);
-    home.clone()
-        .using::<Host>(namespace)
-        .create(&InputMeta::builder().name(owner.to_string()).build(), &HostSpec { display_name: "feta".into(), ..HostSpec::default() })
-        .await
-        .expect("owning host");
-    home.clone()
-        .using::<flotilla_resources::Environment>(namespace)
-        .create(
-            &InputMeta::builder().name(env_ref.clone()).build(),
-            &flotilla_resources::EnvironmentSpec {
-                host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec {
-                    host_ref: owner.into(),
-                    repo_default_dir: "/srv/repos".into(),
-                }),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("owning host's environment");
-    let checkouts = home.clone().using::<Checkout>(namespace);
-    let checkout = checkouts
-        .create(
-            &InputMeta::builder()
-                .name("checkout-remote".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy_name.to_string())]))
+    let owner_home = format!("node-of-{owner}");
+    flotilla_provisioning_testkit::put_host_at_its_home(
+        &decided,
+        owner,
+        &HostSpec { display_name: "feta".into(), ..HostSpec::default() },
+        None,
+    )
+    .await;
+    let owning_daemon = flotilla_provisioning_testkit::other_home_for(&decided, &owner_home);
+    let checkouts = flotilla_provisioning_testkit::CheckoutFixture::over(owning_daemon.home(), owning_daemon.service().store());
+    let engine_convoy = flotilla_resources::convoy::engine::engine_name(&convoy).expect("engine convoy name");
+    checkouts.open_convoy(&engine_convoy);
+    checkouts.put_ready(
+        "checkout-remote",
+        &CheckoutSpec::Worktree(
+            flotilla_resources::CheckoutWorktreeSpec::builder()
+                .repo_ref(RepositoryKey("repo".into()))
+                .env_ref(flotilla_resources::host_direct_environment_name(owner))
+                .r#ref("topic".into())
+                .target_path("/srv/repos/topic".into())
+                .clone_ref("clone".into())
                 .build(),
-            &CheckoutSpec::Worktree(
-                flotilla_resources::CheckoutWorktreeSpec::builder()
-                    .repo_ref(RepositoryKey("repo".into()))
-                    .env_ref(env_ref.clone())
-                    .r#ref("topic".into())
-                    .target_path("/srv/repos/topic".into())
-                    .clone_ref("clone".into())
-                    .build(),
-            ),
-        )
-        .await
-        .expect("checkout");
-    checkouts
-        .update_status(
-            "checkout-remote",
-            &checkout.metadata.resource_version,
-            &CheckoutStatus { phase: CheckoutPhase::Ready, path: Some("/srv/repos/topic".into()), ..Default::default() },
-        )
-        .await
-        .expect("ready checkout");
+        ),
+        Some(&flotilla_resources::checkout_records::CheckoutHolder::Convoy(engine_convoy)),
+    );
+    owning_daemon.replicate_to(&decided);
     apply_convoy_replica_feed(&topology.leader, namespace, convoy_name, topology.follower_host.clone()).await;
 
-    let mut rx = topology.leader.subscribe();
-    let command_id = topology
+    // The inspection is asked of the owning host's checkout inspector.
+    let inspector = flotilla_core::primitives::roles::checkout_inspector(&owner_home).expect("inspector inbox");
+    let mut asked = primitives.inbox().watch(&inspector, None).await.expect("watch the owning host's inspector");
+    topology
         .client
         .execute(
             Command::builder()
@@ -2759,16 +2747,21 @@ async fn active_convoy_delete_names_the_host_owning_an_unreachable_checkout_envi
         .await
         .expect("dispatch convoy delete");
 
-    let CommandValue::Error { message } = await_command_result(&mut rx, command_id).await else {
-        panic!("delete of an uninspectable checkout must be refused");
-    };
-    assert!(
-        message.contains(&format!(
-            "fresh inspection failed for checkout checkout-remote: checkout environment {env_ref} belongs to host feta ({owner})"
-        )),
-        "{message}"
-    );
-    convoys.get(convoy_name).await.expect("refused delete keeps the convoy at its home");
+    let change = tokio::time::timeout(Duration::from_secs(10), asked.next())
+        .await
+        .expect("delete asks the owning host for a fresh inspection")
+        .expect("inspector watch open")
+        .expect("inspector change");
+    let request = primitives.inbox().get_async(change.message.as_str()).await.expect("read request").expect("request held");
+    assert_eq!(request.spec().inbox, inspector, "the request names the host holding the checkout's environment");
+    let subject = request.spec().references.iter().find(|reference| reference.subject).expect("subject").address.to_string();
+    assert_eq!(subject, format!("host:{owner_home}/checkout:checkout-remote"));
+    // Unreachable, the host never answers: the delete waits on the request, it does not proceed.
+    assert!(matches!(
+        primitives.request_answer(change.message.as_str()).await.expect("answer"),
+        flotilla_core::primitives::RequestAnswer::Waiting
+    ));
+    convoys.get(convoy_name).await.expect("an unanswered inspection keeps the convoy at its home");
 }
 
 #[tokio::test]
