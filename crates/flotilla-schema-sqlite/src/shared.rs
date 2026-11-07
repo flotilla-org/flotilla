@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use crate::{quote_ident, render_ddl_with, render_views, DdlMode, StoreError, CODES_DDL, LOG_EDGE_FIELD, LOG_LABEL_FIELD};
-use flotilla_schema::{ColumnType, KindRegistry, Table, TableSet};
+use flotilla_schema::{ColumnDef, ColumnType, KindRegistry, Table, TableSet};
 use rusqlite::{Connection, OptionalExtension};
 
 /// `strings` interns names and interned columns; `resource_identity` holds every resource's
@@ -378,7 +378,9 @@ pub(crate) fn check_kind_columns(conn: &Connection, kinds: &KindRegistry) -> Res
 /// `CREATE TABLE` text, less only the columns [`check_kind_columns`] may add (those declaring a
 /// previous-generation default), which the rebuild adds with their default; it runs first, so a
 /// table needing both is widened rather than refused. A table whose text an earlier `ALTER TABLE`
-/// changed is not widened: it refuses with [`StoreError::KindCodeDrift`].
+/// changed is not widened: it refuses with [`StoreError::KindCodeDrift`]. A table whose stored
+/// text differs only in holding NOT NULL on columns this build declares nullable is widened the
+/// same way (ADR 0047 N→N+1), with or without missing codes.
 ///
 /// Any other difference refuses: a stored code the kind no longer declares, a missing code in a
 /// table that differs in more than its codes, or a coded column whose CHECK cannot be read, which
@@ -420,8 +422,25 @@ pub(crate) fn check_kind_codes(conn: &Connection, kinds: &KindRegistry) -> Resul
                 }
                 *codes = stored;
             }
-            let Some((column, missing)) = missing else { continue };
-            if crate::ddl::create_table(set, &stored_table, "") != sql {
+            // A column this build declares nullable that the stored table holds NOT NULL is a
+            // widening too (ADR 0047 N→N+1): every stored row is still valid, and the rebuild
+            // lets the column hold NULL. Taken only when the stored text is otherwise this
+            // build's table, as for codes.
+            let mut was_required = stored_table.clone();
+            for column in was_required.columns.iter_mut().filter(|column| column.nullable && present.contains(&column.name)) {
+                let required = ColumnDef { nullable: false, ..column.clone() };
+                if sql.contains(&crate::ddl::column(&required)) {
+                    *column = required;
+                }
+            }
+            let nullability_widens = was_required != stored_table && crate::ddl::create_table(set, &was_required, "") == sql;
+            let Some((column, missing)) = missing else {
+                if nullability_widens {
+                    widen_table(conn, set, table, &present)?;
+                }
+                continue;
+            };
+            if crate::ddl::create_table(set, &stored_table, "") != sql && !nullability_widens {
                 return Err(StoreError::KindCodeDrift { table: table.name.clone(), column, missing });
             }
             // Every coded column is rebuilt with its kind's codes, not only the first one missing some.

@@ -235,9 +235,9 @@ impl World {
         tokio::time::timeout(Duration::from_secs(10), wait).await.unwrap_or_else(|_| panic!("timed out waiting for {what}"));
     }
 
-    /// Writes this host's observation: below the free-space floor or not, and how it last found
+    /// Writes this host's observation: below the free-space floor, above it or unknown, and how it last found
     /// the remote, if it tried.
-    fn observe(&self, below_free_space_floor: bool, remote: Option<Value>) {
+    fn observe(&self, below_free_space_floor: Option<bool>, remote: Option<Value>) {
         let conditions = remote
             .map(|value| {
                 let condition = Condition {
@@ -300,7 +300,7 @@ async fn a_clone_waits_for_its_environment_then_clones_once() {
     let launch = world.clones.request(&repository(), &spec(), false).expect("request");
     assert_eq!(launch, launch_of(1));
     assert_eq!(world.reading(&launch), Some(LifecycleReading::InProgress));
-    world.observe(false, None);
+    world.observe(Some(false), None);
     assert_eq!(world.cloned(), 0, "untried while its environment is not realised");
     world.environment_ready();
     world.until("ready", |world| world.ready(&launch)).await;
@@ -353,32 +353,35 @@ async fn a_transport_failure_waits_for_the_remote_to_be_reached_again() {
     let world = World::start(RecordingRuntime::answering([Err(
         "fatal: unable to access 'https://forge.example/o/widgets.git/': Could not resolve host: forge.example".into(),
     )]));
-    world.observe(false, None);
+    world.observe(Some(false), None);
     world.environment_ready();
     let launch = world.clones.request(&repository(), &spec(), false).expect("request");
     world.until("a failure", |world| world.failures(&launch) == Some(1)).await;
     assert_eq!(*world.remotes.0.lock().expect("remotes"), vec![("forge.example".to_owned(), URL.to_owned())]);
-    world.observe(false, Some(Value::False));
+    world.observe(Some(false), Some(Value::False));
     world.passed("marker").await;
     assert_eq!(world.cloned(), 2, "untried while the remote is unreachable: the marker's clone is the second");
-    world.observe(false, Some(Value::True));
+    world.observe(Some(false), Some(Value::True));
     world.until("ready", |world| world.ready(&launch)).await;
     assert_eq!(world.cloned(), 3);
 }
 
-// Behaviour: a full disk waits for the host's free-space fact, and is tried again once the host is
-// back above its floor.
+// Behaviour: a full disk waits for the host's free-space fact, below the floor or unknown alike,
+// and is tried again once the host is known to be back above its floor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_full_disk_waits_for_free_space() {
     let world = World::start(RecordingRuntime::answering([Err("error: could not write: No space left on device".into())]));
-    world.observe(false, None);
+    world.observe(Some(false), None);
     world.environment_ready();
     let launch = world.clones.request(&repository(), &spec(), false).expect("request");
     world.until("a failure", |world| world.failures(&launch) == Some(1)).await;
-    world.observe(true, None);
+    world.observe(Some(true), None);
     world.passed("marker").await;
     assert_eq!(world.cloned(), 2, "untried below the floor");
-    world.observe(false, None);
+    world.observe(None, None);
+    world.passed("marker").await;
+    assert_eq!(world.cloned(), 2, "untried while free space is unknown");
+    world.observe(Some(false), None);
     world.until("ready", |world| world.ready(&launch)).await;
 }
 
@@ -386,16 +389,16 @@ async fn a_full_disk_waits_for_free_space() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_clone_gives_up_after_three_tries_and_is_renewed() {
     let world = World::start(RecordingRuntime::answering((0..3).map(|_| Err("fatal: early EOF".to_owned()))));
-    world.observe(false, None);
+    world.observe(Some(false), None);
     world.environment_ready();
     let launch = world.clones.request(&repository(), &spec(), false).expect("request");
     world.until("a failure", |world| world.failures(&launch) == Some(1)).await;
     // Each change of what it waits on is another try.
-    world.observe(true, None);
-    world.observe(false, None);
+    world.observe(Some(true), None);
+    world.observe(Some(false), None);
     world.until("a second failure", |world| world.failures(&launch) == Some(2)).await;
-    world.observe(true, None);
-    world.observe(false, None);
+    world.observe(Some(true), None);
+    world.observe(Some(false), None);
     world.until("gave up", |world| world.gave_up(&launch).is_some()).await;
     assert_eq!(world.cloned(), 3);
     let Ok(CloneRenewal::Started(next)) = world.clones.renew(&name()) else { panic!("renewal") };

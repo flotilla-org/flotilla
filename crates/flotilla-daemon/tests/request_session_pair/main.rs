@@ -250,8 +250,7 @@ async fn await_host_capacity(daemon: &Arc<InProcessDaemon>, host_id: &str) {
     eventually(Duration::from_secs(5), Duration::from_millis(10), "host capacity should replicate", || async {
         daemon.resource_backend().including_replicas::<Host>("flotilla").list().await.expect("list federated hosts").items.into_iter().any(
             |source| {
-                source.object.metadata.name == host_id
-                    && source.object.status.is_some_and(|status| status.admission_free_space_floor_bytes.is_some())
+                source.object.metadata.name == host_id && source.object.status.is_some_and(|status| status.below_free_space_floor.is_some())
             },
         )
     })
@@ -3457,7 +3456,15 @@ async fn placement_host_capacity_scenario(hold_definitions: bool) {
 
 #[tokio::test]
 async fn remote_docker_admission_fails_closed_without_target_capacity() {
-    remote_docker_admission_refusal_scenario(None, false).await;
+    remote_docker_admission_refusal_scenario(None, false, false).await;
+}
+
+// Behaviour (#3108 owner ruling): a remote host whose free disk it reports below its admission
+// floor is refused through both start and create, naming the floor and the remedies and no
+// figures, before persisting a convoy.
+#[tokio::test]
+async fn remote_docker_admission_refuses_a_host_below_its_floor() {
+    remote_docker_admission_refusal_scenario(None, false, true).await;
 }
 
 // Behaviour (#3578): an admitter below its own floor still judges work placed
@@ -3465,7 +3472,7 @@ async fn remote_docker_admission_fails_closed_without_target_capacity() {
 // without an adopted checkout. Its own floor must not preempt the refusal.
 #[tokio::test]
 async fn full_admitter_judges_remote_placement_by_target_evidence() {
-    remote_docker_admission_refusal_scenario(None, true).await;
+    remote_docker_admission_refusal_scenario(None, true, false).await;
 }
 
 // Admission refuses provider deficiencies at the target host through both
@@ -3479,16 +3486,18 @@ fn remote_provider_refusals_fail_closed(tc: hegel::TestCase) {
         .start_paused(true)
         .build()
         .unwrap()
-        .block_on(remote_docker_admission_refusal_scenario(Some(case), false));
+        .block_on(remote_docker_admission_refusal_scenario(Some(case), false, false));
 }
 
-async fn remote_docker_admission_refusal_scenario(provider_case: Option<usize>, admitter_full: bool) {
+/// `below_floor`: the remote host reports free disk below its floor; otherwise it reports no
+/// free-space figures, so whether it has room is unknown.
+async fn remote_docker_admission_refusal_scenario(provider_case: Option<usize>, admitter_full: bool, below_floor: bool) {
     let daemon = empty_daemon_named_with_floor("leader", Some(if admitter_full { 1_000_000 } else { 0 })).await;
     let namespace = "flotilla";
     seed_trusted_remote_convoy_project(&daemon, namespace).await;
 
     // The remote Docker host is homed at its own daemon; its record arrives here as its home's
-    // log would. It is ready and heard, without admission capacity.
+    // log would. It is ready and heard, without known room.
     let host_spec = HostSpec { display_name: "remote-docker".to_string(), connection: Default::default(), ..HostSpec::default() };
     let mut host_status = HostStatus {
         capabilities: [
@@ -3505,10 +3514,10 @@ async fn remote_docker_admission_refusal_scenario(provider_case: Option<usize>, 
         fulfilment_facts: BTreeMap::from([("remote-docker".into(), compatible_codex_facts())]),
         heartbeat_at: Some(Utc::now()),
         ready: true,
-        // Below its admission free-space floor: the engine holds the host's judgement as a flag,
-        // which reads back as nothing free of a one-byte floor.
-        disk_free_bytes: Some(0),
-        admission_free_space_floor_bytes: Some(1),
+        // The figures the host reports, if any; the engine keeps only whether free disk is below
+        // the floor, unknown without both.
+        disk_free_bytes: below_floor.then_some(0),
+        admission_free_space_floor_bytes: below_floor.then_some(1),
         ..HostStatus::default()
     };
     daemon
@@ -3531,7 +3540,11 @@ async fn remote_docker_admission_refusal_scenario(provider_case: Option<usize>, 
         .await
         .expect("remote Docker kind");
 
-    let mut expected = "placement refused on host `remote-docker`: 0.0 GiB free is below the";
+    let mut expected = if below_floor {
+        "placement refused on host `remote-docker`: free space is below the admission floor; reap settled convoys, run scripts/prune-target.sh, or pick another host"
+    } else {
+        "placement refused on host `remote-docker`: free space is unavailable"
+    };
     if let Some(case) = provider_case {
         use flotilla_protocol::provider::{MaterialMode, ProviderReadiness};
         let mut providers = flotilla_discovery_testkit::environment::ready_placement_advertisements();

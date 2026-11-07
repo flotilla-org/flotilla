@@ -118,7 +118,7 @@ CREATE TABLE "host_observation" (
   "version" INTEGER NOT NULL,
   "daemon_generation" TEXT,
   "architecture" TEXT,
-  "below_free_space_floor" INTEGER NOT NULL CHECK ("below_free_space_floor" IN (0, 1)),
+  "below_free_space_floor" INTEGER CHECK ("below_free_space_floor" IN (0, 1)),
   "codex_central_login" INTEGER NOT NULL CHECK ("codex_central_login" IN (0, 1))
 ) STRICT;
 CREATE TABLE "host_observation_conditions" (

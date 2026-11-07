@@ -224,7 +224,14 @@ pub(crate) fn observation(
         architecture: description
             .and_then(|summary| summary.system.arch.as_deref())
             .map(|arch| canonical_image_architecture(arch).to_owned()),
-        below_free_space_floor: matches!((status.disk_free_bytes, status.admission_free_space_floor_bytes), (Some(free), Some(floor)) if free < floor),
+        below_free_space_floor: match (status.disk_free_bytes, status.admission_free_space_floor_bytes) {
+            (Some(free), Some(floor)) => Some(free < floor),
+            // No figures at all: a status read back from the engine and written again carries
+            // the judgement it read, which stands.
+            (None, None) => status.below_free_space_floor,
+            // Either figure unknown: unknown.
+            _ => None,
+        },
         codex_central_login: codex_central_login.unwrap_or_default(),
         conditions,
         providers,

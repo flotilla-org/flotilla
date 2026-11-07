@@ -240,7 +240,13 @@ fn the_observation_keeps_the_facts_admission_and_health_read() {
         "system": {"arch": "aarch64"}
     }))
     .expect("summary");
-    for (free, floor, below) in [(Some(5), Some(10), true), (Some(10), Some(10), false), (None, Some(10), false), (Some(5), None, false)] {
+    for (free, floor, below) in [
+        (Some(5), Some(10), Some(true)),
+        (Some(10), Some(10), Some(false)),
+        (None, Some(10), None),
+        (Some(5), None, None),
+        (None, None, None),
+    ] {
         let status = HostStatus {
             description: Some(summary.clone()),
             disk_free_bytes: free,
@@ -499,4 +505,57 @@ fn a_refused_observation_write_refuses_its_host() {
         [("HostObservation", "kiwi")]
     );
     assert!(report.imported.is_empty(), "{report:?}");
+}
+
+/// The host kinds as the build before #3108's free-space ruling rendered them: the free-space
+/// flag NOT NULL.
+fn registry_with_a_required_flag() -> flotilla_schema::KindRegistry {
+    let mut older = flotilla_schema::KindRegistry::new();
+    for set in host_kinds::registry().expect("registry").iter() {
+        let mut set = set.clone();
+        for table in &mut set.tables {
+            for column in table.columns.iter_mut().filter(|column| column.name == "below_free_space_floor") {
+                column.nullable = false;
+            }
+        }
+        older.register_table_set(set).expect("older registry");
+    }
+    older
+}
+
+// Behaviour (ADR 0047 N→N+1, #3108): a store written while the free-space flag was required
+// (#4142) opens under this build, which widens the column: each stored row reads back as known,
+// and an unknown flag is then written.
+#[test]
+fn a_stored_required_free_space_flag_reads_as_known_and_widens_to_unknown() {
+    use flotilla_schema::NewChange;
+    let mut old =
+        Store::open(rusqlite::Connection::open_in_memory().expect("memory"), "home", registry_with_a_required_flag()).expect("old store");
+    let mut ids = Vec::new();
+    for (name, below) in [("kiwi", true), ("feta", false)] {
+        let observation = host_kinds::HostObservation { below_free_space_floor: Some(below), ..Default::default() };
+        let mut write = old.write().expect("write");
+        let change = write.open_change(&NewChange::new("probe", Timestamp(1))).expect("change");
+        ids.push((write.insert(name, &observation, change).expect("insert").id, below));
+        write.commit().expect("commit");
+    }
+    let conn = old.into_connection();
+    assert!(conn.execute("UPDATE host_observation SET below_free_space_floor = NULL", []).is_err(), "the old column is required");
+
+    let mut store = Store::open(conn, "home", host_kinds::registry().expect("registry")).expect("opens widened");
+    for (id, below) in &ids {
+        let read = store.read().expect("read").load::<host_kinds::HostObservation>(*id).expect("load").expect("kept");
+        assert_eq!(read.value.below_free_space_floor, Some(*below));
+    }
+    let mut write = store.write().expect("write");
+    let current = write.load::<host_kinds::HostObservation>(ids[0].0).expect("load").expect("held");
+    let change = write.open_change(&NewChange::new("probe", Timestamp(2))).expect("change");
+    write.update(&current, &host_kinds::HostObservation::default(), change).expect("an unknown flag is written");
+    write.commit().expect("commit");
+    let read = store.read().expect("read").load::<host_kinds::HostObservation>(ids[0].0).expect("load").expect("kept");
+    assert_eq!(read.value.below_free_space_floor, None);
+    let conn = store.into_connection();
+    let stored: String =
+        conn.query_row("SELECT sql FROM sqlite_schema WHERE name = 'host_observation'", [], |row| row.get(0)).expect("table");
+    assert!(schema_ddl(&host_kinds::registry().expect("registry"), DdlMode::Create).contains(&format!("{stored};\n")), "{stored}");
 }

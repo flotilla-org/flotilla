@@ -1890,19 +1890,19 @@ impl AdmissionReadContext<'_> {
         }
 
         let owns_target_identity = self.runtime.local_host.as_ref().is_some_and(|host_id| host_id == &target_host.reference);
-        let capacity = if owns_target_identity {
+        let knows = |status: &&flotilla_resources::HostStatus| {
+            status.below_free_space_floor.is_some() || status.admission_free_space_floor_bytes.is_some()
+        };
+        let status = if owns_target_identity {
             matching_sources
                 .iter()
                 .find(|source| matches!(source.provenance, ResourceProvenance::Local))
                 .and_then(|source| source.object.status.as_ref())
-                .and_then(|status| status.admission_free_space_floor_bytes.map(|floor| (floor, status.disk_free_bytes)))
+                .filter(knows)
         } else {
-            matching_sources
-                .into_iter()
-                .filter_map(|source| source.object.status)
-                .find_map(|status| status.admission_free_space_floor_bytes.map(|floor| (floor, status.disk_free_bytes)))
+            matching_sources.iter().filter_map(|source| source.object.status.as_ref()).find(knows)
         };
-        check_placement_capacity(target_host, capacity)
+        check_placement_capacity(target_host, status)
     }
 
     async fn start_placement_host(

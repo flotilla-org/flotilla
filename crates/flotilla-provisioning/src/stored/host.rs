@@ -271,8 +271,11 @@ pub struct HostObservation {
     pub daemon_generation: Option<String>,
     /// The image architecture (`amd64`, `arm64`); none for an SSH host.
     pub architecture: Option<String>,
-    /// Free disk is below admission's floor; false when either figure is unknown.
-    pub below_free_space_floor: bool,
+    /// Free disk is below admission's floor; none when either figure is unknown, which placement
+    /// and clones treat as unusable. Stored rows from before it was optional (#4142) hold 0 or 1
+    /// and read as known; opening widens the column to nullable.
+    /// Moves to an external observation (metrics) after the transition (owner, #3108).
+    pub below_free_space_floor: Option<bool>,
     /// An SSH host's owning daemon keeps a central Codex login.
     pub codex_central_login: bool,
     /// Only conditions that can block readiness or forge observation; diagnostics are metrics.

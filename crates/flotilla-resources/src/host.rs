@@ -231,6 +231,11 @@ pub struct HostStatus {
     pub daemon_rss_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_free_space_floor_bytes: Option<u64>,
+    /// Whether free disk is below the admission floor, as the engine holds it: the judgement a
+    /// Host reads back with, in place of figures it does not keep. Writers report the figures;
+    /// none is unknown. ADR 0047: added with a default; earlier records omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub below_free_space_floor: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
     pub conditions: Vec<HostCondition>,

@@ -188,10 +188,6 @@ pub fn status(
         providers: Vec::new(),
         environments: Vec::new(),
     });
-    // The figures stand in for the stored flag: below the floor reads as nothing free of one byte,
-    // else as no floor.
-    let (disk_free_bytes, admission_free_space_floor_bytes) =
-        if observation.below_free_space_floor { (Some(0), Some(1)) } else { (None, Some(0)) };
     let mut status = HostStatus {
         description,
         capabilities: capabilities(&spec.connection, observation),
@@ -219,8 +215,7 @@ pub fn status(
         heartbeat_at: heard,
         ready: true,
         daemon_generation: observation.daemon_generation.clone(),
-        disk_free_bytes,
-        admission_free_space_floor_bytes,
+        below_free_space_floor: observation.below_free_space_floor,
         conditions,
         ..HostStatus::default()
     };

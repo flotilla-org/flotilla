@@ -220,7 +220,7 @@ where
             == Some(Value::False);
         facts.push(Usability {
             fact: Identity { kind: OBSERVATION, name: host, home: self.home.clone() },
-            usable: !observation.value.below_free_space_floor && !unreachable,
+            usable: observation.value.below_free_space_floor == Some(false) && !unreachable,
         });
         Ok(facts)
     }

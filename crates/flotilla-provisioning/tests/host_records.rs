@@ -150,7 +150,9 @@ async fn a_host_reads_back_with_its_judgements() {
     assert!(status.fulfilment_facts["docker-on-kiwi"].observed_at >= before);
     assert_eq!(status.daemon_generation.as_deref(), Some("g7"));
     assert_eq!(status.description.and_then(|summary| summary.system.arch).as_deref(), Some("arm64"));
-    assert_eq!((status.disk_free_bytes, status.admission_free_space_floor_bytes), (Some(0), Some(1)), "below the floor");
+    // The judgement, with no figures invented for it.
+    assert_eq!(status.below_free_space_floor, Some(true), "below the floor");
+    assert_eq!((status.disk_free_bytes, status.admission_free_space_floor_bytes), (None, None));
     assert_eq!(status.capabilities["agent_adapters"], json!(["claude-code"]));
     assert_eq!(status.capabilities["held_credentials"], json!(["claude-max"]));
     assert_eq!(status.capabilities["image_digests"], json!({"docker": ["sha256:a"]}));

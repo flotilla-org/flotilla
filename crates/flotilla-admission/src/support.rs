@@ -11,6 +11,7 @@ use flotilla_resources::FulfilmentKind;
 use flotilla_resources::FulfilmentKindSpec;
 use flotilla_resources::FulfilmentRealisation;
 use flotilla_resources::Host as ResourceHost;
+use flotilla_resources::HostStatus;
 use flotilla_resources::HostStatus as ResourceHostStatus;
 use flotilla_resources::InputMeta;
 use flotilla_resources::ObservedCheckoutSpec as ResourceObservedCheckoutSpec;
@@ -212,16 +213,20 @@ pub fn unready_placement_refusal(
     Some(reason)
 }
 
-pub fn check_placement_capacity(target_host: &PlacementTargetHost, capacity: Option<(u64, Option<u64>)>) -> Result<(), String> {
-    let Some((floor_bytes, free_bytes)) = capacity else {
-        return Err(format!("placement refused on host `{}`: admission free-space floor is unavailable", target_host.display_name));
-    };
-    if floor_bytes == 0 {
-        return Ok(());
+/// Whether the target host has room, from its status: the engine's judgement when it holds one
+/// (no figures, none invented), else the figures a status still carries. Unknown refuses.
+pub fn check_placement_capacity(target_host: &PlacementTargetHost, status: Option<&HostStatus>) -> Result<(), String> {
+    let host = &target_host.display_name;
+    let unavailable = || format!("placement refused on host `{host}`: free space is unavailable");
+    let Some(status) = status else { return Err(unavailable()) };
+    match (status.below_free_space_floor, status.admission_free_space_floor_bytes, status.disk_free_bytes) {
+        (Some(false), _, _) | (None, Some(0), _) => Ok(()),
+        (Some(true), _, _) => Err(format!(
+            "placement refused on host `{host}`: free space is below the admission floor; reap settled convoys, run scripts/prune-target.sh, or pick another host"
+        )),
+        (None, Some(floor_bytes), Some(free_bytes)) => crate::admission::check_measured_free_space(host, free_bytes, floor_bytes),
+        (None, _, _) => Err(unavailable()),
     }
-    let free_bytes =
-        free_bytes.ok_or_else(|| format!("placement refused on host `{}`: free space is unavailable", target_host.display_name))?;
-    crate::admission::check_measured_free_space(&target_host.display_name, free_bytes, floor_bytes)
 }
 
 /// SSH hosts run crews in an account the owning daemon does not
