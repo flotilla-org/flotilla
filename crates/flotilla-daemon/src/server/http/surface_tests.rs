@@ -583,7 +583,10 @@ async fn named_query_tables_carry_the_framed_result_set() {
     daemon.convoy("second").await;
     loop {
         let framed = daemon.framed(&query).await;
-        if framed.seq == mirror.sequence && framed.rows.len() == 2 {
+        // A sequence's changes arrive as several messages carrying it: when both convoys land
+        // after the snapshot in one sequence, the mirror holds that sequence after its first
+        // upsert but holds all of it only after its last.
+        if framed.seq == mirror.sequence && framed.rows.len() == 2 && mirror.rows.len() == 2 {
             let names: BTreeSet<_> = framed.rows.as_convoys().unwrap().iter().map(|row| row.name.clone()).collect();
             let carried: BTreeSet<_> = mirror.rows.values().map(|row| row["name"].as_str().unwrap().to_owned()).collect();
             assert_eq!(carried, names);
