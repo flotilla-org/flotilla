@@ -163,7 +163,9 @@ impl DaemonRuntime {
         daemon_socket_path: Option<PathBuf>,
         options: RuntimeOptions,
     ) -> Result<Self, String> {
-        result_phase("initialize_runtime", Self::initialize_with_options(daemon, config, daemon_socket_path, options)).await
+        // Boxed: initialisation composes the whole daemon, and its future is too large for a
+        // caller's stack (a 2 MiB test thread overflowed polling it in place).
+        result_phase("initialize_runtime", Box::pin(Self::initialize_with_options(daemon, config, daemon_socket_path, options))).await
     }
 
     async fn initialize_with_options(
