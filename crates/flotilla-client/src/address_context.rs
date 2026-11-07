@@ -24,11 +24,12 @@ pub struct ContextSources {
 }
 
 impl ContextSources {
-    /// The vessel's convoy and role from `env`, and `checkout_project` as found from the
-    /// current directory.
-    pub fn from_env(env: impl Fn(&str) -> Option<String>, checkout_project: Option<String>) -> Self {
+    /// The vessel's convoy and role from `env`; an empty variable is unset. The checkout's
+    /// project is the caller's to find, and only when [`Self::convoy`] is `None`: a vessel's own
+    /// convoy is the deeper context.
+    pub fn from_env(env: impl Fn(&str) -> Option<String>) -> Self {
         let set = |name| env(name).filter(|value: &String| !value.is_empty());
-        Self { checkout_project, convoy: set("FLOTILLA_CONVOY"), role: set("FLOTILLA_CREW_ROLE") }
+        Self { checkout_project: None, convoy: set("FLOTILLA_CONVOY"), role: set("FLOTILLA_CREW_ROLE") }
     }
 
     /// The context address: the vessel's own convoy, under its project, with its role; or the
@@ -163,20 +164,22 @@ mod tests {
         for typed in ["convoy:lander", "lander"] {
             assert_eq!(complete_convoy(typed, &checkout, &convoys()), Ok("lander@flotilla".into()), "{typed}");
         }
-        let vessel = ContextSources::from_env(
-            |name| match name {
-                "FLOTILLA_CONVOY" => Some("convoy-3".into()),
-                "FLOTILLA_CREW_ROLE" => Some("coder".into()),
-                _ => None,
-            },
-            None,
-        );
+        let vessel = ContextSources::from_env(|name| match name {
+            "FLOTILLA_CONVOY" => Some("convoy-3".into()),
+            "FLOTILLA_CREW_ROLE" => Some("coder".into()),
+            _ => None,
+        });
         assert_eq!(
             vessel.address(&convoys()).map(|address| address.to_string()).as_deref(),
             Some("project:flotilla/convoy:convoy-3/role:coder")
         );
         assert_eq!(complete_convoy("convoy-3", &vessel, &convoys()), Ok("convoy-3@flotilla".into()));
         assert_eq!(complete_convoy("lander", &vessel, &convoys()), Ok("lander@flotilla".into()));
+        // An empty `FLOTILLA_CONVOY` is no vessel: the checkout is asked, and places the reference.
+        let mut unset = ContextSources::from_env(|name| (name == "FLOTILLA_CONVOY").then(String::new));
+        assert_eq!(unset.convoy, None);
+        unset.checkout_project = Some("other".into());
+        assert_eq!(complete_convoy("lander", &unset, &convoys()), Ok("lander@other".into()));
 
         let none = ContextSources::default();
         let ambiguous = complete_convoy("lander", &none, &convoys()).unwrap_err();

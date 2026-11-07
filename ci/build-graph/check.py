@@ -81,10 +81,6 @@ STATE_MACHINE_DEPENDENTS = frozenset({
 })
 # #3317: the Message switch composes the engine inbox; only these use it directly.
 INBOX_DEPENDENTS = frozenset({"flotilla-core", "flotilla-daemon"})
-# #4267 ruling 2: the native-verb types stay light, so any crate performing a verb's effect can
-# declare one without reaching storage, the daemon or a capability crate.
-VERBS = "flotilla-verbs"
-VERBS_ALLOWED = ("flotilla-address", "flotilla-protocol", *SCHEMA_CRATES[:2], *SCHEMA_ALLOWED)
 # Known C packages and compiler drivers catch new anchors that reach them.
 # This is a metadata deny list, not build-script analysis: crates invoking a
 # compiler without these drivers need an explicit entry when introduced.
@@ -251,11 +247,6 @@ def violations(metadata):
             if target not in allowed and not target.startswith("flotilla-build-features"):
                 errors.append(f"{schema}: must not depend on {target}, directly or transitively; schema crates depend only "
                               "on flotilla-address, flotilla-cbor, rigging-condition, lower schema crates and flotilla-build-features anchors")
-    if VERBS in packages:
-        for target in sorted(reached_from(VERBS)):
-            if target not in VERBS_ALLOWED and not target.startswith("flotilla-build-features"):
-                errors.append(f"{VERBS}: must not depend on {target}, directly or transitively; the verb types depend only "
-                              "on flotilla-address, flotilla-protocol, the schema crates and what they reach")
     if STATE_MACHINES in packages:
         for target in sorted(reached_from(STATE_MACHINES)):
             if target not in STATE_MACHINES_ALLOWED and not target.startswith("flotilla-build-features"):

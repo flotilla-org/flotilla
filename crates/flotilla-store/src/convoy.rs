@@ -138,6 +138,34 @@ impl<'a> ConvoyIdentity<'a> {
             terminal: convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()),
         }
     }
+
+    /// The convoy `document` is, as a resource table reads it.
+    pub fn of_document(document: &'a serde_json::Value) -> Option<Self> {
+        let metadata = &document["metadata"];
+        let label = |name: &str| metadata["labels"][name].as_str();
+        let phase = &document["status"]["phase"];
+        Some(Self {
+            record: metadata["name"].as_str()?,
+            role: label(flotilla_resources::ROLE_LABEL),
+            project: label(flotilla_resources::PROJECT_LABEL),
+            terminal: !phase.is_null()
+                && <flotilla_resources::ConvoyPhase as serde::Deserialize>::deserialize(phase).is_ok_and(|phase| phase.is_terminal()),
+        })
+    }
+
+    /// The convoy's canonical address, the one [`ConvoyName`] selects it by: a live convoy's role
+    /// under its project, as the CLI prints it, and an ended convoy's record, since its role names
+    /// any live holder ahead of it. A record named like a role in its project would name that
+    /// role's holder; record names are `convoy-<uuid>` and `ensure-<hash>`, which no role is.
+    pub fn address(&self) -> Option<flotilla_address::Address> {
+        let name = self.role.filter(|role| !self.terminal && !role.is_empty()).unwrap_or(self.record);
+        match self.project.filter(|project| !project.is_empty()) {
+            Some(project) => {
+                flotilla_address::Address::project(project).and_then(|project| project.child(flotilla_address::Kind::Convoy, name)).ok()
+            }
+            None => flotilla_address::Address::convoy(name).ok(),
+        }
+    }
 }
 
 impl std::fmt::Display for ConvoyName<'_> {
@@ -322,6 +350,35 @@ mod lookup_tests {
                 assert!(!named.contains("old-a") && !named.contains("old-b"), "{error}");
             }
             assert_eq!(role.select_indices(&[]), Ok(vec![]));
+        }
+    }
+
+    // Behaviour (#4199, #4272): a convoy's canonical address, a table row's own, names that
+    // convoy and no other. Exhaustive finite generator, with and without a project: a live record
+    // named `lander` holding `coder`, two holders of `lander`, a holder of `reviewer` and a convoy
+    // of no role, over every live/ended assignment that leaves `lander` at most one live holder.
+    #[test]
+    fn a_convoys_canonical_address_selects_that_convoy() {
+        for project in [None, Some("flotilla")] {
+            for ended in 0..16u8 {
+                let ended = |bit: u8| ended & (1 << bit) != 0;
+                if !ended(0) && !ended(1) {
+                    continue;
+                }
+                let identity = |record, role, terminal| ConvoyIdentity { record, role, project, terminal };
+                let identities = [
+                    identity("lander", Some("coder"), false),
+                    identity("convoy-1", Some("lander"), ended(0)),
+                    identity("convoy-2", Some("lander"), ended(1)),
+                    identity("convoy-3", Some("reviewer"), ended(2)),
+                    identity("convoy-4", None, ended(3)),
+                ];
+                for convoy in &identities {
+                    let address = convoy.address().unwrap();
+                    let selected = ConvoyName::of(&address).select_indices(&identities).unwrap();
+                    assert_eq!(selected.iter().map(|index| identities[*index].record).collect::<Vec<_>>(), [convoy.record], "{address}");
+                }
+            }
         }
     }
 

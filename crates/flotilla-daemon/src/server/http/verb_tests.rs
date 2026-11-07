@@ -506,3 +506,60 @@ async fn convoy_explain_finds_a_convoy_by_its_record_name_or_role() {
         json!({"subject": subjects[2], "status": "failed", "error": format!("no convoy at `{}`", subjects[2])})
     );
 }
+
+/// A read verb answering with the record its subject's row is.
+#[derive(Verb, Deserialize)]
+#[verb(name = "convoy.record", subject = "convoy", effect = "read")]
+struct Record {}
+
+struct Records;
+
+#[async_trait]
+impl NativeVerb for Records {
+    type Params = Record;
+
+    async fn run(&self, call: Call<'_>, _params: &Record) -> Result<Option<Value>, String> {
+        Ok(call.subjects.first().map(|subject| subject.row["metadata.name"].clone()))
+    }
+}
+
+// Behaviour (#4199, #4272): a convoy row's own address acts on that row's convoy. A record named
+// like a role (`lander`, holding `coder`) is not displaced by the live holder of `lander`, nor an
+// ended holder of a role by its live one: each row read from `/tables/convoys` is invoked on by
+// its `address`, and the verb sees that row's record.
+#[tokio::test]
+async fn a_convoy_rows_address_acts_on_that_rows_convoy() {
+    use flotilla_resources::{ConvoyPhase, ConvoyStatus};
+    let (_dir, daemon) = super::super::tests::empty_daemon().await;
+    let namespace = daemon.provisioning_namespace().await;
+    let backend = daemon.resource_backend();
+    let convoys = backend.using::<Convoy>(&namespace);
+    for (record, role, phase) in
+        [("lander", "coder", None), ("convoy-1", "lander", Some(ConvoyPhase::Landed)), ("convoy-2", "lander", Some(ConvoyPhase::Active))]
+    {
+        let labels = BTreeMap::from([(ROLE_LABEL.to_owned(), role.to_owned()), (PROJECT_LABEL.to_owned(), "flotilla".to_owned())]);
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).role(role.into()).build();
+        let created = convoys.create(&InputMeta::builder().name(record.into()).labels(labels).build(), &spec).await.unwrap();
+        if let Some(phase) = phase {
+            convoys.update_status(record, &created.metadata.resource_version, &ConvoyStatus { phase, ..Default::default() }).await.unwrap();
+        }
+    }
+    let mut registry = VerbRegistry::new();
+    registry.register(Records, Presentation::default()).unwrap();
+    let verbs = verbs::serve(registry, Arc::new(verbs::subjects::ResourceSubjects::new(backend.clone())));
+    let router = HttpRouter::builder()
+        .backend(backend)
+        .daemon(Arc::clone(&daemon))
+        .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
+        .verbs(Arc::new(verbs))
+        .build()
+        .into_router();
+    let rows = rows(&router, &format!("/tables/convoys/rows?namespace={namespace}")).await;
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        let request = json!({"invocation": "r", "subjects": [row["address"]]});
+        let (status, body) = invoke(&router, CallerAuth::Bearer, "convoy.record", request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!((&body["outcomes"][0]["status"], &body["outcomes"][0]["result"]), (&json!("done"), &row["metadata.name"]), "{body}");
+    }
+}

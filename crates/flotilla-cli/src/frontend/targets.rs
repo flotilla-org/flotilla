@@ -236,12 +236,11 @@ pub async fn complete_command_convoy(daemon: std::sync::Arc<dyn DaemonHandle>, c
     let env = |name: &str| std::env::var(name).ok();
     let namespace = namespace.or_else(|| env("FLOTILLA_NAMESPACE")).unwrap_or_else(|| "flotilla".into());
     let known = flotilla_client::address_context::known_convoys(daemon.clone(), &namespace).await;
+    let mut sources = flotilla_client::address_context::ContextSources::from_env(env);
     // A vessel's own convoy is the deeper context; the checkout is asked only without one.
-    let checkout_project = match (env("FLOTILLA_CONVOY"), std::env::current_dir()) {
-        (None, Ok(path)) => flotilla_client::address_context::checkout_project(&*daemon, path).await,
-        _ => None,
-    };
-    let sources = flotilla_client::address_context::ContextSources::from_env(env, checkout_project);
+    if let (None, Ok(path)) = (&sources.convoy, std::env::current_dir()) {
+        sources.checkout_project = flotilla_client::address_context::checkout_project(&*daemon, path).await;
+    }
     *name = flotilla_client::address_context::complete_convoy(name, &sources, &known)?;
     Ok(())
 }
