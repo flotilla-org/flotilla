@@ -3723,11 +3723,27 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
     {
         off_frame(|| seed_supervision_crew(daemon, name, vessel, role, crew_id)).await;
     }
-    let a_backend = a.resource_backend();
     let b_backend = b.resource_backend();
     if subscriptions {
         off_frame(|| seed_governor_subscription(a, b)).await;
     }
+    off_frame(|| stall_source_crew(a, legacy_cursor, unavailable)).await;
+    off_frame(|| replicate_governor_to_source(a, b, stale_home)).await;
+
+    for _ in 0..passes {
+        off_frame(|| check_supervision_escalation_pass(a, b)).await;
+    }
+    let escalation_name =
+        b_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("governor inbox").items[0].metadata.name.clone();
+    off_frame(|| replicate_stall_to_governor(a, b)).await;
+    off_frame(|| supervise_stall_from_governor(&topology, a)).await;
+    off_frame(|| check_supervised_resume(a, &escalation_name)).await;
+}
+
+/// The source crew at `a` declares a stall; a legacy cursor or an unavailable governor pass as
+/// the scenario asks.
+async fn stall_source_crew(a: &InProcessDaemon, legacy_cursor: bool, unavailable: bool) {
+    let a_backend = a.resource_backend();
     let convoys = a_backend.using::<Convoy>("flotilla");
     flotilla_store::apply_status_patch(
         &convoys,
@@ -3759,6 +3775,12 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
         assert!(stall.evidence.contains("no live governor for project project"), "{}", stall.evidence);
         assert!(!stall.supervision_exhausted);
     }
+}
+
+/// The governor's convoy and session replicate to `a`, with its presentation feed.
+async fn replicate_governor_to_source(a: &InProcessDaemon, b: &InProcessDaemon, stale_home: bool) {
+    let a_backend = a.resource_backend();
+    let b_backend = b.resource_backend();
     a_backend
         .replica_writer::<Convoy>(b.node_id().clone(), "flotilla")
         .replace(&b_backend.using::<Convoy>("flotilla").list().await.expect("governor"), Utc::now())
@@ -3775,27 +3797,32 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
         // older presentation feed incorrectly projects the convoy as local.
         apply_convoy_replica_feed(a, "flotilla", "governor", a.host_name().clone()).await;
     }
+}
 
-    for _ in 0..passes {
-        off_frame(|| check_supervision_escalation_pass(a, b)).await;
-    }
-    let escalation_name =
-        b_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("governor inbox").items[0].metadata.name.clone();
-    // The governor may issue supervision from B: route back to A and
-    // validate B's replicated identity at the stalled convoy's home.
+/// The stalled convoy replicates to the governor's host `b`, with its presentation feed: the
+/// governor may issue supervision from B, which routes back to A and validates B's replicated
+/// identity at the stalled convoy's home.
+async fn replicate_stall_to_governor(a: &InProcessDaemon, b: &InProcessDaemon) {
+    let b_backend = b.resource_backend();
+    let convoys = a.resource_backend().using::<Convoy>("flotilla");
     apply_convoy_replica_feed(b, "flotilla", "stalled-work", a.host_name().clone()).await;
     b_backend
         .replica_writer::<Convoy>(a.node_id().clone(), "flotilla")
         .replace(&convoys.list().await.expect("stalled convoy"), Utc::now())
         .await
         .expect("replicate stall to governor");
-    off_frame(|| supervise_stall_from_governor(&topology, a)).await;
+}
+
+/// The supervised crew at `a` is working again, and the ruling replies to the escalation.
+async fn check_supervised_resume(a: &InProcessDaemon, escalation_name: &str) {
+    let a_backend = a.resource_backend();
+    let convoys = a_backend.using::<Convoy>("flotilla");
     let status = convoys.get("stalled-work").await.expect("source").status.expect("status");
     assert!(status.stalled.is_none());
     assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
     // Reply identity does not depend on the escalation replicating back from B.
     let replies = a_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("source replies");
-    assert!(replies.items.iter().any(|message| message.spec.in_reply_to.as_deref() == Some(escalation_name.as_str())));
+    assert!(replies.items.iter().any(|message| message.spec.in_reply_to.as_deref() == Some(escalation_name)));
 }
 
 /// One convoy with a working crew member and its running session, at `daemon`.
