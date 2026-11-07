@@ -442,6 +442,32 @@ fn ensure_crew_work_is_defined(
     }
 }
 
+/// Who a crew turn addresses (see `CrewService::turn_receiver`).
+enum TurnReceiver {
+    /// A receiver address taken as given.
+    Addressed(String),
+    /// A managed subscriber's crew member, resolved from its holder's labels.
+    Managed(Box<CrewTurnIntent>),
+    /// The request's own convoy crew member.
+    Convoy,
+}
+
+/// A prepared crew turn: an earlier admission that answers it, or a new turn to publish.
+enum PreparedTurn {
+    Admitted(CrewTurnAdmission),
+    New(Box<CrewTurn>),
+}
+
+/// A new crew turn's message and the session that receives it.
+struct CrewTurn {
+    target: flotilla_resources::ReadResourceObject<ResourceConvoy>,
+    intent: flotilla_resources::MessageSpec,
+    name: String,
+    holder: Option<flotilla_resources::ReadResourceObject<ResourceTerminalSession>>,
+    holder_launch: Option<String>,
+    rung: TurnDeliveryRung,
+}
+
 /// The convoy a resume reads and the crew member it selected.
 struct ResumeSelection {
     convoys: flotilla_store::TypedResolver<ResourceConvoy>,
@@ -1488,14 +1514,16 @@ impl CrewService {
         if let Some(principal) = principal
             .filter(|_| status.stalled.is_none() && actor_crew_id.is_none() && action == flotilla_protocol::CrewSupervisionAction::Resume)
         {
-            self.convoy_resume_with_sender_internal(
-                namespace,
-                convoy_name,
-                message,
-                (Some(vessel), Some(role)),
-                MessageAttribution::operator(Some(principal)),
-                ResumeIntent::Reminder,
-            )
+            off_frame(|| {
+                self.convoy_resume_with_sender_internal(
+                    namespace,
+                    convoy_name,
+                    message,
+                    (Some(vessel), Some(role)),
+                    MessageAttribution::operator(Some(principal)),
+                    ResumeIntent::Reminder,
+                )
+            })
             .await?;
             return Ok(CommandValue::Ok);
         }
@@ -1507,6 +1535,81 @@ impl CrewService {
         }) {
             return Err(format!("crew `{vessel}/{role}` is not the stalled obligation"));
         }
+        off_frame(|| self.authorize_supervision(namespace, stalled, actor_crew_id, principal)).await?;
+        if action == flotilla_protocol::CrewSupervisionAction::Escalate && stalled.rung == flotilla_resources::StallRung::Operator {
+            return Ok(CommandValue::CrewEscalationRefused {
+                rung: flotilla_resources::StallRung::Operator,
+                reason: "stall is already at the operator rung".into(),
+            });
+        }
+        let receiver = crew_role_address(convoy.spec.project_ref.as_deref().unwrap_or(namespace), convoy_name, vessel, role);
+        let sender = off_frame(|| self.supervision_sender(namespace, stalled, actor_crew_id, principal)).await?;
+        let in_reply_to =
+            off_frame(|| self.supervision_reply_to(namespace, convoy_name, stalled, &sender, &receiver, actor_crew_id)).await?;
+        let ruling = match action {
+            flotilla_protocol::CrewSupervisionAction::Resume => SupervisorRuling::Resume,
+            flotilla_protocol::CrewSupervisionAction::Fail => SupervisorRuling::Fail,
+            flotilla_protocol::CrewSupervisionAction::Escalate => {
+                match off_frame(|| self.leaf_subscriptions.escalate_stall(namespace, &convoy, &sender, message, vessel, role)).await? {
+                    EscalationAdmission::Refused(value) => return Ok(*value),
+                    EscalationAdmission::Admitted { receiver, condition } => SupervisorRuling::Escalate { receiver, condition },
+                }
+            }
+        };
+        // Persist the ruling before mutating workflow state: a failed authority CAS
+        // must not erase the supervisor's durable decision. Fail/Escalate ruling Messages
+        // are notifications (no expectation and no resume/activation); delivery
+        // cannot itself fail work or advance a rung. The command still reports
+        // any state-patch failure, so the supervisor can retry that mutation.
+        if !matches!(ruling, SupervisorRuling::Resume) {
+            let name = flotilla_resources::message_record_name(&receiver, &sender, &format!("supervision:{}", uuid::Uuid::new_v4()));
+            let intent = flotilla_resources::MessageSpec::builder()
+                .sender(sender.clone())
+                .receiver(receiver)
+                .relation(flotilla_resources::MessageRelation::Supervisor)
+                .body(message.into())
+                .maybe_in_reply_to(in_reply_to.clone())
+                .build();
+            self.publish_message_intent(namespace, &name, &intent).await?;
+        }
+        match ruling {
+            SupervisorRuling::Resume => {
+                off_frame(|| {
+                    self.convoy_resume_with_sender_internal(
+                        namespace,
+                        convoy_name,
+                        message,
+                        (Some(vessel), Some(role)),
+                        MessageAttribution { sender, in_reply_to },
+                        ResumeIntent::Reminder,
+                    )
+                })
+                .await?;
+            }
+            SupervisorRuling::Fail => {
+                let failed = convoy_external_patches::mark_crew_failed(
+                    vessel.to_string(),
+                    role.to_string(),
+                    chrono::Utc::now(),
+                    message.to_string(),
+                );
+                off_frame(|| apply_resource_status_patch(&convoys, convoy_name, &failed)).await.map_err(|error| error.to_string())?;
+            }
+            SupervisorRuling::Escalate { receiver, condition } => {
+                return off_frame(|| self.record_escalation(&convoys, convoy_name, vessel, role, status, receiver, condition)).await;
+            }
+        }
+        Ok(CommandValue::Ok)
+    }
+
+    /// Refuses supervision by anyone but the stall's named crew supervisor or an operator.
+    async fn authorize_supervision(
+        &self,
+        namespace: &str,
+        stalled: &flotilla_resources::StalledCondition,
+        actor_crew_id: Option<&str>,
+        principal: Option<&PrincipalRef>,
+    ) -> Result<(), String> {
         if let Some(crew_id) = actor_crew_id {
             let supervisor = stalled.supervisor.as_ref().ok_or_else(|| "this stall has no crew supervisor".to_string())?;
             let sessions = self
@@ -1532,13 +1635,17 @@ impl CrewService {
         } else if principal.is_none() {
             return Err("crew supervision requires the named supervisor or an operator principal".to_string());
         }
-        if action == flotilla_protocol::CrewSupervisionAction::Escalate && stalled.rung == flotilla_resources::StallRung::Operator {
-            return Ok(CommandValue::CrewEscalationRefused {
-                rung: flotilla_resources::StallRung::Operator,
-                reason: "stall is already at the operator rung".into(),
-            });
-        }
-        let receiver = crew_role_address(convoy.spec.project_ref.as_deref().unwrap_or(namespace), convoy_name, vessel, role);
+        Ok(())
+    }
+
+    /// Who a supervision ruling is from: the stall's crew supervisor, or the operator.
+    async fn supervision_sender(
+        &self,
+        namespace: &str,
+        stalled: &flotilla_resources::StalledCondition,
+        actor_crew_id: Option<&str>,
+        principal: Option<&PrincipalRef>,
+    ) -> Result<String, String> {
         let sender = if actor_crew_id.is_some() {
             let supervisor = stalled.supervisor.as_ref().expect("checked supervisor above");
             let supervisor_convoy = self
@@ -1556,10 +1663,23 @@ impl CrewService {
         } else {
             format!("principal:{}", principal.expect("authenticated operator").name)
         };
+        Ok(sender)
+    }
+
+    /// The escalation a supervision ruling replies to.
+    async fn supervision_reply_to(
+        &self,
+        namespace: &str,
+        convoy_name: &str,
+        stalled: &flotilla_resources::StalledCondition,
+        sender: &str,
+        receiver: &str,
+        actor_crew_id: Option<&str>,
+    ) -> Result<Option<String>, String> {
         let in_reply_to = if let Some(reference) = &stalled.supervision_message {
             Some(reference.name.clone())
         } else {
-            self.active_message_records(namespace, Some(&sender))
+            self.active_message_records(namespace, Some(sender))
                 .await
                 .map_err(|error| error.to_string())?
                 .into_iter()
@@ -1580,8 +1700,8 @@ impl CrewService {
                         // The escalation is receiver-homed and may not have replicated
                         // back to this authority. Use judge_stalls' immutable producer key.
                         flotilla_resources::message_record_name(
-                            &sender,
-                            &receiver,
+                            sender,
+                            receiver,
                             &turn_message_producer_key(
                                 &supervision_message_source(convoy_name, index),
                                 &stalled.began_at.timestamp_micros().to_string(),
@@ -1590,89 +1710,49 @@ impl CrewService {
                     })
                 })
         };
-        let ruling = match action {
-            flotilla_protocol::CrewSupervisionAction::Resume => SupervisorRuling::Resume,
-            flotilla_protocol::CrewSupervisionAction::Fail => SupervisorRuling::Fail,
-            flotilla_protocol::CrewSupervisionAction::Escalate => {
-                match self.leaf_subscriptions.escalate_stall(namespace, &convoy, &sender, message, vessel, role).await? {
-                    EscalationAdmission::Refused(value) => return Ok(*value),
-                    EscalationAdmission::Admitted { receiver, condition } => SupervisorRuling::Escalate { receiver, condition },
-                }
-            }
-        };
-        // Persist the ruling before mutating workflow state: a failed authority CAS
-        // must not erase the supervisor's durable decision. Fail/Escalate ruling Messages
-        // are notifications (no expectation and no resume/activation); delivery
-        // cannot itself fail work or advance a rung. The command still reports
-        // any state-patch failure, so the supervisor can retry that mutation.
-        if !matches!(ruling, SupervisorRuling::Resume) {
-            let name = flotilla_resources::message_record_name(&receiver, &sender, &format!("supervision:{}", uuid::Uuid::new_v4()));
-            let intent = flotilla_resources::MessageSpec::builder()
-                .sender(sender.clone())
-                .receiver(receiver)
-                .relation(flotilla_resources::MessageRelation::Supervisor)
-                .body(message.into())
-                .maybe_in_reply_to(in_reply_to.clone())
-                .build();
-            self.publish_message_intent(namespace, &name, &intent).await?;
+        Ok(in_reply_to)
+    }
+
+    /// Records an admitted escalation's next stall condition, refused when the stall changed
+    /// meanwhile.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_escalation(
+        &self,
+        convoys: &flotilla_store::TypedResolver<ResourceConvoy>,
+        convoy_name: &str,
+        vessel: &str,
+        role: &str,
+        status: &flotilla_resources::ConvoyStatus,
+        receiver: String,
+        condition: Box<flotilla_resources::StalledCondition>,
+    ) -> Result<CommandValue, String> {
+        let current = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
+        let mut updated = current.status.ok_or("convoy has no status")?;
+        // Local supervisor activation legitimately changes this convoy
+        // and clears its stall. Accept only the activation proved by the
+        // admitted Message, while preserving every other current field.
+        let local_activation = updated.stalled.is_none()
+            && condition.supervisor.as_ref().is_some_and(|supervisor| {
+                supervisor.convoy == convoy_name
+                    && updated.crew_work.get(&supervisor.vessel).and_then(|crew| crew.get(&supervisor.role)).is_some_and(|work| {
+                        work.phase == CrewWorkPhase::Working
+                            && condition
+                                .supervision_message
+                                .as_ref()
+                                .is_some_and(|message| work.resume_brief_id.as_deref() == Some(message.name.as_str()))
+                    })
+            });
+        let obligation_unchanged =
+            updated.crew_work.get(vessel).and_then(|crew| crew.get(role)) == status.crew_work.get(vessel).and_then(|crew| crew.get(role));
+        if updated.phase.is_terminal() || !obligation_unchanged || (updated.stalled != status.stalled && !local_activation) {
+            return Err(
+                "stall changed during escalation; the current ruling was preserved; the next receiver may already have been notified"
+                    .into(),
+            );
         }
-        match ruling {
-            SupervisorRuling::Resume => {
-                self.convoy_resume_with_sender_internal(
-                    namespace,
-                    convoy_name,
-                    message,
-                    (Some(vessel), Some(role)),
-                    MessageAttribution { sender, in_reply_to },
-                    ResumeIntent::Reminder,
-                )
-                .await?;
-            }
-            SupervisorRuling::Fail => {
-                apply_resource_status_patch(
-                    &convoys,
-                    convoy_name,
-                    &convoy_external_patches::mark_crew_failed(
-                        vessel.to_string(),
-                        role.to_string(),
-                        chrono::Utc::now(),
-                        message.to_string(),
-                    ),
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            }
-            SupervisorRuling::Escalate { receiver, condition } => {
-                let current = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
-                let mut updated = current.status.ok_or("convoy has no status")?;
-                // Local supervisor activation legitimately changes this convoy
-                // and clears its stall. Accept only the activation proved by the
-                // admitted Message, while preserving every other current field.
-                let local_activation = updated.stalled.is_none()
-                    && condition.supervisor.as_ref().is_some_and(|supervisor| {
-                        supervisor.convoy == convoy_name
-                            && updated.crew_work.get(&supervisor.vessel).and_then(|crew| crew.get(&supervisor.role)).is_some_and(|work| {
-                                work.phase == CrewWorkPhase::Working
-                                    && condition
-                                        .supervision_message
-                                        .as_ref()
-                                        .is_some_and(|message| work.resume_brief_id.as_deref() == Some(message.name.as_str()))
-                            })
-                    });
-                let obligation_unchanged = updated.crew_work.get(vessel).and_then(|crew| crew.get(role))
-                    == status.crew_work.get(vessel).and_then(|crew| crew.get(role));
-                if updated.phase.is_terminal() || !obligation_unchanged || (updated.stalled != status.stalled && !local_activation) {
-                    return Err("stall changed during escalation; the current ruling was preserved; the next receiver may already have been notified".into());
-                }
-                updated.stalled = Some(*condition);
-                convoys
-                    .update_status(convoy_name, &current.metadata.resource_version, &updated)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                return Ok(CommandValue::CrewEscalated { receiver });
-            }
-        }
-        Ok(CommandValue::Ok)
+        updated.stalled = Some(*condition);
+        convoys.update_status(convoy_name, &current.metadata.resource_version, &updated).await.map_err(|error| error.to_string())?;
+        Ok(CommandValue::CrewEscalated { receiver })
     }
 
     pub fn set_checkout_inspector(&self, inspector: Arc<dyn crate::ports::CheckoutIntegrationInspector>) {
@@ -3126,32 +3206,54 @@ impl CrewService {
         }
     }
 
+    /// Delivers one crew turn as a Message. Each step is its own function and runs off this
+    /// frame: a debug build's poll frame holds every local of its function, and the publication
+    /// routes deep (#3108).
     pub async fn deliver_turn(&self, request: &CrewTurnIntent) -> Result<CrewTurnAdmission, String> {
-        use flotilla_resources::MessageSpec;
         let managed_request;
-        let request = if let Some(receiver) = &request.receiver {
-            let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, &request.namespace, receiver)
-                .await
-                .map_err(|error| error.to_string())?;
-            if holder.as_ref().is_none_or(|holder| {
-                holder.object.metadata.annotations.get(flotilla_resources::ROLE_ADDRESS_ANNOTATION) == Some(receiver)
-                    || !holder.object.metadata.labels.contains_key(CONVOY_LABEL)
-            }) {
-                return self.deliver_addressed_turn(request, receiver).await;
+        let request = match off_frame(|| self.turn_receiver(request)).await? {
+            TurnReceiver::Addressed(receiver) => return off_frame(|| self.deliver_addressed_turn(request, &receiver)).await,
+            TurnReceiver::Managed(resolved) => {
+                managed_request = *resolved;
+                &managed_request
             }
-            // A managed subscriber still needs workflow activation and staged
-            // credentials; an externally adopted holder owns its own lifecycle.
-            let holder = holder.expect("managed holder checked above");
-            let mut resolved = request.clone();
-            resolved.receiver = None;
-            resolved.convoy = holder.object.metadata.labels.get(CONVOY_LABEL).cloned().ok_or("holder has no convoy")?;
-            resolved.vessel = holder.object.metadata.labels.get(VESSEL_LABEL).cloned().ok_or("holder has no vessel")?;
-            resolved.role = holder.object.metadata.labels.get(ROLE_LABEL).cloned().ok_or("holder has no role")?;
-            managed_request = resolved;
-            &managed_request
-        } else {
-            request
+            TurnReceiver::Convoy => request,
         };
+        let turn = match off_frame(|| self.prepare_crew_turn(request)).await? {
+            PreparedTurn::Admitted(admission) => return Ok(admission),
+            PreparedTurn::New(turn) => turn,
+        };
+        off_frame(|| self.publish_crew_turn(request, *turn)).await
+    }
+
+    /// Who a turn addresses: a receiver taken as addressed, a managed subscriber's crew member,
+    /// or the request's own convoy crew member.
+    async fn turn_receiver(&self, request: &CrewTurnIntent) -> Result<TurnReceiver, String> {
+        let Some(receiver) = &request.receiver else { return Ok(TurnReceiver::Convoy) };
+        let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, &request.namespace, receiver)
+            .await
+            .map_err(|error| error.to_string())?;
+        if holder.as_ref().is_none_or(|holder| {
+            holder.object.metadata.annotations.get(flotilla_resources::ROLE_ADDRESS_ANNOTATION) == Some(receiver)
+                || !holder.object.metadata.labels.contains_key(CONVOY_LABEL)
+        }) {
+            return Ok(TurnReceiver::Addressed(receiver.clone()));
+        }
+        // A managed subscriber still needs workflow activation and staged
+        // credentials; an externally adopted holder owns its own lifecycle.
+        let holder = holder.expect("managed holder checked above");
+        let mut resolved = request.clone();
+        resolved.receiver = None;
+        resolved.convoy = holder.object.metadata.labels.get(CONVOY_LABEL).cloned().ok_or("holder has no convoy")?;
+        resolved.vessel = holder.object.metadata.labels.get(VESSEL_LABEL).cloned().ok_or("holder has no vessel")?;
+        resolved.role = holder.object.metadata.labels.get(ROLE_LABEL).cloned().ok_or("holder has no role")?;
+        Ok(TurnReceiver::Managed(Box::new(resolved)))
+    }
+
+    /// The turn's message and its receiver's session; the earlier admission instead when the same
+    /// intent was already sent or an open message supersedes it.
+    async fn prepare_crew_turn(&self, request: &CrewTurnIntent) -> Result<PreparedTurn, String> {
+        use flotilla_resources::MessageSpec;
         let target = self
             .resource_backend
             .including_replicas::<ResourceConvoy>(&request.namespace)
@@ -3210,7 +3312,7 @@ impl CrewService {
                 // A repeat records what an earlier send could not (record is idempotent).
                 self.record_awaiting(&request.namespace, &name, &intent, self.admitted_home(&existing), request.stall_of.as_deref())
                     .await?;
-                return Ok(CrewTurnAdmission {
+                return Ok(PreparedTurn::Admitted(CrewTurnAdmission {
                     new_turn: false,
                     rung,
                     message: existing
@@ -3219,7 +3321,7 @@ impl CrewService {
                         .as_ref()
                         .and_then(|status| status.canonical_predecessor.clone())
                         .unwrap_or_else(|| ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, &name)),
-                });
+                }));
             }
             Ok(_) => return Err("message producer ID already names different intent".into()),
             Err(ResourceError::NotFound { .. }) => {}
@@ -3231,78 +3333,21 @@ impl CrewService {
                 && flotilla_resources::message_supersedes(&intent, &record.object)
                 && flotilla_resources::message_expectation_open(&record.object)
         }) {
-            return Ok(CrewTurnAdmission {
+            return Ok(PreparedTurn::Admitted(CrewTurnAdmission {
                 new_turn: false,
                 rung,
                 message: ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, &existing.object.metadata.name),
-            });
+            }));
         }
+        Ok(PreparedTurn::New(Box::new(CrewTurn { target, intent, name, holder, holder_launch, rung })))
+    }
+
+    /// Activates and publishes a new turn; a failed or suppressed publication restores the
+    /// activation it made.
+    async fn publish_crew_turn(&self, request: &CrewTurnIntent, turn: CrewTurn) -> Result<CrewTurnAdmission, String> {
         let mut activation = None;
-        let publication: Result<ResourceRef, String> = async {
-            // Workflow activation remains at the convoy authority and precedes
-            // publication, so a delivered turn has its staged work credentials.
-            if matches!(target.provenance, ResourceProvenance::Local) {
-                if let Some(previous) = convoy.status.as_ref().filter(|_| holder.is_some() || request.source == "handoff") {
-                    let convoys = self.resource_backend.using::<ResourceConvoy>(&request.namespace);
-                    let reopened = apply_resource_status_patch(
-                        &convoys,
-                        &request.convoy,
-                        &convoy_external_patches::resume_crew_work(
-                            request.vessel.clone(),
-                            request.role.clone(),
-                            self.clock.now(),
-                            request.brief.clone(),
-                            Some(name.clone()),
-                            ResumeIntent::Reopen,
-                        ),
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
-                    activation = Some((reopened.status.clone().expect("activated workflow"), previous.clone()));
-                    // A latent handoff activates the addressed work; its Vessel controller
-                    // stages credentials and creates the receiver before Message delivery.
-                    if let Some(holder) = &holder {
-                        self.reconcile_resumed_work_credentials(&request.namespace, &holder.object.spec.env_ref).await?;
-                        if matches!(holder.provenance, ResourceProvenance::Local)
-                            && holder.object.status.as_ref().is_some_and(|status| {
-                                matches!(status.phase, ResourceTerminalSessionPhase::Stopped | ResourceTerminalSessionPhase::Lost)
-                            })
-                        {
-                            self.restart_terminal(&request.namespace, &holder.object, holder_launch.as_deref()).await?;
-                        }
-                    }
-                }
-            }
-            let publisher = self.resource_intent_publisher.read().expect("resource intent publisher lock").as_ref().and_then(Weak::upgrade);
-            let message = if let Some(publisher) = publisher {
-                let document = serde_json::json!({
-                    "apiVersion": "flotilla.work/v1", "kind": "Message",
-                    "metadata": { "name": name, "namespace": request.namespace }, "spec": intent
-                });
-                let (reference, home) = publisher.publish_admitted(&request.namespace, document).await?;
-                self.record_awaiting(&request.namespace, &name, &intent, home, request.stall_of.as_deref()).await?;
-                reference
-            } else {
-                if matches!(target.provenance, ResourceProvenance::Replica { .. })
-                    || holder.as_ref().is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. }))
-                {
-                    return Err("receiver-home resource mutation router unavailable".into());
-                }
-                let admission = self
-                    .admit_message(&request.namespace, &InputMeta::builder().name(name.clone()).build(), &intent)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let record = match admission {
-                    flotilla_messaging::MessageAdmission::Accepted(record) => record,
-                    flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
-                };
-                let home = record.metadata.annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION).cloned();
-                self.record_awaiting(&request.namespace, &name, &intent, home, request.stall_of.as_deref()).await?;
-                ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, record.metadata.name)
-            };
-            Ok(message)
-        }
-        .await;
+        let publication = off_frame(|| self.activate_and_publish_turn(request, &turn, &mut activation)).await;
+        let CrewTurn { name, rung, .. } = turn;
         let should_restore = match &publication {
             Err(_) => true,
             Ok(message) => message.name != name,
@@ -3324,6 +3369,95 @@ impl CrewService {
         let new_turn = message.name == name;
 
         Ok(CrewTurnAdmission { new_turn, rung, message })
+    }
+
+    /// Activates the turn's work, recording the activation in `activation`, then publishes its
+    /// message.
+    async fn activate_and_publish_turn(
+        &self,
+        request: &CrewTurnIntent,
+        turn: &CrewTurn,
+        activation: &mut Option<(flotilla_resources::ConvoyStatus, flotilla_resources::ConvoyStatus)>,
+    ) -> Result<ResourceRef, String> {
+        off_frame(|| self.activate_turn_work(request, turn, activation)).await?;
+        off_frame(|| self.publish_turn_message(request, turn)).await
+    }
+
+    /// Workflow activation remains at the convoy authority and precedes publication, so a
+    /// delivered turn has its staged work credentials.
+    async fn activate_turn_work(
+        &self,
+        request: &CrewTurnIntent,
+        turn: &CrewTurn,
+        activation: &mut Option<(flotilla_resources::ConvoyStatus, flotilla_resources::ConvoyStatus)>,
+    ) -> Result<(), String> {
+        let CrewTurn { target, name, holder, holder_launch, .. } = turn;
+        if matches!(target.provenance, ResourceProvenance::Local) {
+            if let Some(previous) = target.object.status.as_ref().filter(|_| holder.is_some() || request.source == "handoff") {
+                let convoys = self.resource_backend.using::<ResourceConvoy>(&request.namespace);
+                let reopened = apply_resource_status_patch(
+                    &convoys,
+                    &request.convoy,
+                    &convoy_external_patches::resume_crew_work(
+                        request.vessel.clone(),
+                        request.role.clone(),
+                        self.clock.now(),
+                        request.brief.clone(),
+                        Some(name.clone()),
+                        ResumeIntent::Reopen,
+                    ),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                *activation = Some((reopened.status.clone().expect("activated workflow"), previous.clone()));
+                // A latent handoff activates the addressed work; its Vessel controller
+                // stages credentials and creates the receiver before Message delivery.
+                if let Some(holder) = holder {
+                    self.reconcile_resumed_work_credentials(&request.namespace, &holder.object.spec.env_ref).await?;
+                    if matches!(holder.provenance, ResourceProvenance::Local)
+                        && holder.object.status.as_ref().is_some_and(|status| {
+                            matches!(status.phase, ResourceTerminalSessionPhase::Stopped | ResourceTerminalSessionPhase::Lost)
+                        })
+                    {
+                        self.restart_terminal(&request.namespace, &holder.object, holder_launch.as_deref()).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Publishes the turn's message at its receiver's home.
+    async fn publish_turn_message(&self, request: &CrewTurnIntent, turn: &CrewTurn) -> Result<ResourceRef, String> {
+        let CrewTurn { target, intent, name, holder, .. } = turn;
+        let publisher = self.resource_intent_publisher.read().expect("resource intent publisher lock").as_ref().and_then(Weak::upgrade);
+        let message = if let Some(publisher) = publisher {
+            let document = serde_json::json!({
+                "apiVersion": "flotilla.work/v1", "kind": "Message",
+                "metadata": { "name": name, "namespace": request.namespace }, "spec": intent
+            });
+            let (reference, home) = publisher.publish_admitted(&request.namespace, document).await?;
+            self.record_awaiting(&request.namespace, name, intent, home, request.stall_of.as_deref()).await?;
+            reference
+        } else {
+            if matches!(target.provenance, ResourceProvenance::Replica { .. })
+                || holder.as_ref().is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. }))
+            {
+                return Err("receiver-home resource mutation router unavailable".into());
+            }
+            let admission = self
+                .admit_message(&request.namespace, &InputMeta::builder().name(name.clone()).build(), intent)
+                .await
+                .map_err(|error| error.to_string())?;
+            let record = match admission {
+                flotilla_messaging::MessageAdmission::Accepted(record) => record,
+                flotilla_messaging::MessageAdmission::Suppressed { predecessor } => predecessor,
+            };
+            let home = record.metadata.annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION).cloned();
+            self.record_awaiting(&request.namespace, name, intent, home, request.stall_of.as_deref()).await?;
+            ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, record.metadata.name)
+        };
+        Ok(message)
     }
 
     // Convoy queues remain decodable and adoptable for #2710's one-generation window.
